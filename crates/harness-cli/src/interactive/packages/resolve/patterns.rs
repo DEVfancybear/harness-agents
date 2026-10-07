@@ -282,6 +282,7 @@ pub(crate) fn glob_paths(pattern: &str, root: &Path) -> Vec<PathBuf> {
     let mut matched_paths = Vec::new();
     let mut queue = vec![root.to_path_buf()];
     while let Some(dir) = queue.pop() {
+        super::super::probe::note(&dir);
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };

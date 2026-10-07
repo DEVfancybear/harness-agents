@@ -655,3 +655,47 @@ def __getattr__(name: str) -> Any:  # noqa: D401 - module-level lazy attr hook
     if name == "run":
         raise AttributeError(_RENAMED_RUN_MESSAGE)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+class _LazyModule:
+    """A kernel global that imports its module on first use.
+
+    The bootstrap cell binds ``mcp`` for every kernel, but most turns never
+    touch MCP, and importing ``rlm.mcp`` is a large share of a kernel's start.
+    The first attribute read imports the module and rebinds the global to it,
+    so from then on ``mcp`` is the real module (``help``, ``isinstance`` and
+    ``dir`` included). The snapshot never saves ``mcp`` (``_ALWAYS_SKIP``), and
+    shutdown closes MCP only when ``rlm.mcp`` was imported.
+    """
+
+    __slots__ = ("_ha_name", "_ha_namespace", "_ha_global")
+
+    def __init__(self, name: str, namespace: dict[str, Any], global_name: str) -> None:
+        object.__setattr__(self, "_ha_name", name)
+        object.__setattr__(self, "_ha_namespace", namespace)
+        object.__setattr__(self, "_ha_global", global_name)
+
+    def _ha_load(self) -> types.ModuleType:
+        import importlib
+
+        module = importlib.import_module(object.__getattribute__(self, "_ha_name"))
+        namespace = object.__getattribute__(self, "_ha_namespace")
+        global_name = object.__getattribute__(self, "_ha_global")
+        if namespace.get(global_name) is self:
+            namespace[global_name] = module
+        return module
+
+    def __getattribute__(self, attr: str) -> Any:
+        return getattr(_LazyModule._ha_load(self), attr)
+
+    def __setattr__(self, attr: str, value: Any) -> None:
+        setattr(_LazyModule._ha_load(self), attr, value)
+
+    def __delattr__(self, attr: str) -> None:
+        delattr(_LazyModule._ha_load(self), attr)
+
+    def __dir__(self) -> list[str]:
+        return dir(_LazyModule._ha_load(self))
+
+    def __repr__(self) -> str:
+        return repr(_LazyModule._ha_load(self))

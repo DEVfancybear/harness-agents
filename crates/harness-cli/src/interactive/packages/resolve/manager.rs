@@ -96,6 +96,7 @@ pub(crate) fn collect_files_from_paths(
 ) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for path in paths {
+        super::super::probe::note(path);
         let Ok(stats) = std::fs::metadata(path) else {
             continue;
         };
@@ -220,6 +221,9 @@ impl PackageManager {
                 ParsedSource::Npm(npm_source) => {
                     let installed_path =
                         self.npm_install_path_for_scope(npm_source, configured.scope);
+                    // The pinned-version check reads the installed manifest.
+                    super::super::probe::note(&installed_path.join("package.json"));
+                    super::super::probe::note(&installed_path);
                     let needs_install = !installed_path.exists()
                         || (npm_source.pinned
                             && !installed_npm_matches_pinned_version(npm_source, &installed_path));
@@ -247,6 +251,7 @@ impl PackageManager {
                         self.cwd(),
                         self.agent_dir(),
                     );
+                    super::super::probe::note(&installed_path);
                     if !installed_path.exists() {
                         if !self.install_missing(
                             &configured.source,
@@ -317,6 +322,7 @@ impl PackageManager {
         base_dir: &Path,
     ) {
         let resolved = PackageManager::resolve_path_from_base(path, base_dir);
+        super::super::probe::note(&resolved);
         if !resolved.exists() {
             return;
         }

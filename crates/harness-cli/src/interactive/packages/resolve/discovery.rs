@@ -28,6 +28,7 @@ struct DirEntry {
 }
 
 fn read_entries_sorted(dir: &Path) -> Vec<DirEntry> {
+    super::super::probe::note(dir);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -84,9 +85,13 @@ impl IgnoreMatcher {
             format!("{relative_dir}/")
         };
         for filename in IGNORE_FILE_NAMES {
-            let Ok(content) = std::fs::read_to_string(dir.join(filename)) else {
+            let path = dir.join(filename);
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                // An ignore file that appears changes the listing of `dir`,
+                // which the walk notes; only a present one's content counts.
                 continue;
             };
+            super::super::probe::note(&path);
             for line in content.split('\n').flat_map(|line| line.split('\r')) {
                 if let Some(pattern) = prefix_ignore_pattern(line, &prefix) {
                     self.add_pattern(&pattern);
@@ -226,6 +231,7 @@ fn collect_files_inner(
     root: &Path,
 ) -> Vec<PathBuf> {
     let mut files = Vec::new();
+    super::super::probe::note(dir);
     if !dir.exists() {
         return files;
     }
@@ -271,6 +277,7 @@ fn collect_skill_entries_inner(
     root: &Path,
 ) -> Vec<PathBuf> {
     let mut entries = Vec::new();
+    super::super::probe::note(dir);
     if !dir.exists() {
         return entries;
     }
@@ -334,6 +341,7 @@ pub(crate) fn collect_auto_theme_entries(dir: &Path) -> Vec<PathBuf> {
 
 fn collect_top_level_files(dir: &Path, kind: FileKind) -> Vec<PathBuf> {
     let mut entries = Vec::new();
+    super::super::probe::note(dir);
     if !dir.exists() {
         return entries;
     }
@@ -359,6 +367,7 @@ fn collect_top_level_files(dir: &Path, kind: FileKind) -> Vec<PathBuf> {
 /// manifest, per the TS product).
 pub(crate) fn read_pi_manifest(package_root: &Path) -> Option<super::PiManifest> {
     let package_json = package_root.join("package.json");
+    super::super::probe::note(&package_json);
     if !package_json.exists() {
         return None;
     }
@@ -406,7 +415,9 @@ pub(crate) fn collect_resource_files(
 fn find_git_repo_root(start_dir: &Path) -> Option<PathBuf> {
     let mut dir = start_dir.to_path_buf();
     loop {
-        if dir.join(".git").exists() {
+        let git = dir.join(".git");
+        super::super::probe::note_presence(&git);
+        if git.exists() {
             return Some(dir);
         }
         let parent = dir.parent()?;

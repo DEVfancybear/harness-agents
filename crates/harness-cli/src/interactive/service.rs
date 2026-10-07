@@ -181,6 +181,19 @@ pub struct SubmitRequest {
     pub refine: Option<super::refine::RefineOptions>,
 }
 
+/// Everything the status line shows about the model in use.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatusSnapshot {
+    /// [`SessionPort::label`].
+    pub label: String,
+    /// [`SessionPort::thinking_level`].
+    pub thinking_level: Option<String>,
+    /// [`SessionPort::thinking_levels`].
+    pub thinking_levels: Vec<String>,
+    /// [`SessionPort::service_tier`].
+    pub service_tier: (String, Vec<&'static str>),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShellPrefix {
     pub command: String,
@@ -474,6 +487,18 @@ pub trait SessionPort: Send {
     /// The tier in force (clamped to the model) and the tiers the model takes.
     fn service_tier(&self) -> (String, Vec<&'static str>) {
         ("default".to_owned(), vec!["default"])
+    }
+    /// The label, thinking level, thinking levels and tier together. The
+    /// controller refreshes all four after every turn and model change; a
+    /// backend whose answers share an expensive lookup (the real service
+    /// resolves every settings layer for each one) answers them from one.
+    fn status_snapshot(&self) -> StatusSnapshot {
+        StatusSnapshot {
+            label: self.label(),
+            thinking_level: self.thinking_level(),
+            thinking_levels: self.thinking_levels(),
+            service_tier: self.service_tier(),
+        }
     }
     /// The thinking level in force and the levels the model offers.
     fn thinking_status(&self) -> Vec<String> {
@@ -3444,6 +3469,65 @@ impl AgentSessionService {
         )
     }
 
+    /// [`SessionPort::label`] for a resolved configuration.
+    fn label_of(configured: Result<&ProviderConfig, &String>) -> String {
+        match configured {
+            Ok(config) => format!("{} via {}", config.model, config.endpoint),
+            Err(_) => "setup required (no provider configured)".to_owned(),
+        }
+    }
+
+    /// [`SessionPort::service_tier`] for a resolved configuration.
+    fn service_tier_of(&self, config: Option<&ProviderConfig>) -> (String, Vec<&'static str>) {
+        let Some(config) = config else {
+            return ("default".to_owned(), vec!["default"]);
+        };
+        let requested = self
+            .service_tier
+            .lock()
+            .ok()
+            .and_then(|tier| tier.clone())
+            .or_else(|| default_service_tier(&self.config_file));
+        let current = super::service_tier::clamp(
+            requested.as_deref(),
+            &config.provider_id,
+            &config.protocol,
+            &config.model,
+        )
+        .unwrap_or_else(|| "default".to_owned());
+        (
+            current,
+            super::service_tier::available(&config.provider_id, &config.protocol, &config.model),
+        )
+    }
+
+    /// [`SessionPort::thinking_levels`] for a resolved model.
+    fn thinking_levels_of(
+        model: Option<harness_providers::thinking::ReasoningModel>,
+    ) -> Vec<String> {
+        harness_providers::thinking::offered(model)
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect()
+    }
+
+    /// [`SessionPort::thinking_level`] for a resolved configuration and model.
+    fn thinking_level_of(
+        &self,
+        config: &ProviderConfig,
+        model: Option<harness_providers::thinking::ReasoningModel>,
+    ) -> String {
+        let chosen = self
+            .thinking
+            .or_else(|| default_thinking_level(&self.config_file))
+            .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
+            .unwrap_or_default();
+        harness_providers::thinking::provider_name(
+            model,
+            harness_providers::thinking::clamp(model, chosen),
+        )
+    }
+
     /// Show the user the conversation a resumed session continues.
     ///
     /// Resuming used to print one line and nothing else, so the user could not see
@@ -3692,10 +3776,7 @@ fn catalog_models_scoped(
 
 impl SessionPort for AgentSessionService {
     fn label(&self) -> String {
-        match self.configured() {
-            Ok(config) => format!("{} via {}", config.model, config.endpoint),
-            Err(_) => "setup required (no provider configured)".to_owned(),
-        }
+        Self::label_of(self.configured().as_ref())
     }
 
     fn current_model(&self) -> Option<(String, String)> {
@@ -5023,50 +5104,34 @@ impl SessionPort for AgentSessionService {
     }
 
     fn service_tier(&self) -> (String, Vec<&'static str>) {
-        let Ok(config) = self.configured() else {
-            return ("default".to_owned(), vec!["default"]);
-        };
-        let requested = self
-            .service_tier
-            .lock()
-            .ok()
-            .and_then(|tier| tier.clone())
-            .or_else(|| default_service_tier(&self.config_file));
-        let current = super::service_tier::clamp(
-            requested.as_deref(),
-            &config.provider_id,
-            &config.protocol,
-            &config.model,
-        )
-        .unwrap_or_else(|| "default".to_owned());
-        (
-            current,
-            super::service_tier::available(&config.provider_id, &config.protocol, &config.model),
-        )
+        self.service_tier_of(self.configured().ok().as_ref())
     }
 
     fn thinking_levels(&self) -> Vec<String> {
-        let Ok(config) = self.configured() else {
-            return Vec::new();
-        };
-        harness_providers::thinking::offered(self.reasoning_of(&config))
-            .into_iter()
-            .map(|(_, name)| name)
-            .collect()
+        self.configured()
+            .map(|config| Self::thinking_levels_of(self.reasoning_of(&config)))
+            .unwrap_or_default()
     }
 
     fn thinking_level(&self) -> Option<String> {
         let config = self.configured().ok()?;
-        let model = self.reasoning_of(&config);
-        let chosen = self
-            .thinking
-            .or_else(|| default_thinking_level(&self.config_file))
-            .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
-            .unwrap_or_default();
-        Some(harness_providers::thinking::provider_name(
-            model,
-            harness_providers::thinking::clamp(model, chosen),
-        ))
+        Some(self.thinking_level_of(&config, self.reasoning_of(&config)))
+    }
+
+    fn status_snapshot(&self) -> StatusSnapshot {
+        // One settings resolution and one catalog load instead of the four
+        // (and two) the separate getters make; this runs after every turn.
+        let configured = self.configured();
+        let config = configured.as_ref().ok();
+        let reasoning = config.and_then(|config| self.reasoning_of(config));
+        StatusSnapshot {
+            label: Self::label_of(configured.as_ref()),
+            thinking_level: config.map(|config| self.thinking_level_of(config, reasoning)),
+            thinking_levels: config
+                .map(|_| Self::thinking_levels_of(reasoning))
+                .unwrap_or_default(),
+            service_tier: self.service_tier_of(config),
+        }
     }
 
     fn thinking_status(&self) -> Vec<String> {

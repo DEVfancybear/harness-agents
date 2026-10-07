@@ -12,6 +12,7 @@
 mod git;
 mod manager;
 mod npm;
+pub(crate) mod probe;
 mod process;
 pub(crate) mod resolve;
 pub mod resource_config;

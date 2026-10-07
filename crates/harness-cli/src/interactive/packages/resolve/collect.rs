@@ -60,6 +60,7 @@ impl PackageManager {
         let mut has_any_dir = false;
         for resource_type in RESOURCE_TYPES {
             let dir = package_root.join(resource_type_dir_name(resource_type));
+            super::super::probe::note(&dir);
             if dir.exists() {
                 for file in collect_resource_files(&dir, resource_type) {
                     accumulator
@@ -125,6 +126,7 @@ impl PackageManager {
         }
 
         let convention_dir = package_root.join(resource_type_dir_name(resource_type));
+        super::super::probe::note(&convention_dir);
         if !convention_dir.exists() {
             return Vec::new();
         }
@@ -198,6 +200,7 @@ impl PackageManager {
             return;
         }
         let dir = package_root.join(resource_type_dir_name(resource_type));
+        super::super::probe::note(&dir);
         if dir.exists() {
             for file in collect_resource_files(&dir, resource_type) {
                 accumulator
