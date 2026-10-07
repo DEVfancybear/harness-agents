@@ -552,6 +552,15 @@ pub struct RunRequest {
 }
 
 impl RunRequest {
+    /// prime-agent's `setAutoCompactionEnabled(false)`: this input never
+    /// compacts the context on its own; a context over the window is the
+    /// turn's overflow.
+    #[must_use]
+    pub fn without_auto_compaction(self) -> Self {
+        self.auto_compaction_attempted.store(true, Ordering::SeqCst);
+        self
+    }
+
     #[must_use]
     pub fn new(
         session_id: SessionId,
@@ -1315,6 +1324,69 @@ pub async fn previous_in_conversation(
         .await?
         .and_then(|session| SessionId::parse(session).ok())
         .filter(|forked_from| forked_from != session_id))
+}
+
+/// One turn of a conversation tree: its session, the turn it continues, its
+/// input, its answer and when it began.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationTreeTurn {
+    pub session: SessionId,
+    pub parent: Option<SessionId>,
+    pub question: String,
+    pub answer: Option<String>,
+    pub created_at: String,
+}
+
+/// prime-agent's session tree for the conversation `leaf` ends: every turn of
+/// its task - the branches `/tree` left included - and the turns before a
+/// fork, each with the turn it continues.
+///
+/// # Errors
+/// The store cannot be read.
+pub async fn conversation_tree(
+    store: &SqliteStore,
+    leaf: &SessionId,
+) -> Result<Vec<ConversationTreeTurn>, RuntimeError> {
+    let task = store.session_task(leaf).await?;
+    let mut sessions: Vec<(SessionId, String)> = store
+        .list_sessions()
+        .await?
+        .into_iter()
+        .filter(|summary| Some(&summary.task_id) == task.as_ref())
+        .map(|summary| (summary.session_id, summary.created_at))
+        .collect();
+    // The turns before a fork live in the task it was made from.
+    let mut current = previous_in_conversation(store, leaf).await?;
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(session) = current.take() {
+        if !visited.insert(session.as_str().to_owned()) || visited.len() > CONVERSATION_MAX_SESSIONS
+        {
+            break;
+        }
+        if !sessions.iter().any(|(known, _)| *known == session) {
+            let created = store
+                .session_summary(&session)
+                .await?
+                .map(|summary| summary.created_at)
+                .unwrap_or_default();
+            sessions.push((session.clone(), created));
+        }
+        current = previous_in_conversation(store, &session).await?;
+    }
+    let mut turns = Vec::new();
+    for (session, created_at) in sessions {
+        let Some((_, question)) = store.session_admitted_input(&session).await? else {
+            continue;
+        };
+        turns.push(ConversationTreeTurn {
+            parent: previous_in_conversation(store, &session).await?,
+            answer: final_answer(store, &session).await?,
+            session,
+            question,
+            created_at,
+        });
+    }
+    Ok(turns)
 }
 
 /// The turns of the conversation `session_id` ends, oldest first: each turn's

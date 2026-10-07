@@ -19,6 +19,7 @@ pub mod checks;
 pub mod cli_extras;
 pub mod commands;
 pub mod config;
+pub mod config_selector;
 pub mod controller;
 pub mod cost;
 pub mod credentials;
@@ -42,10 +43,23 @@ pub mod keybindings;
 pub mod learned;
 pub mod lifecycle;
 pub mod mcp;
+pub mod mcp_catalog;
 pub mod mcp_config;
 pub mod mcp_oauth;
 pub mod oauth;
 pub mod offline;
+#[allow(
+    dead_code,
+    unused_imports,
+    clippy::collapsible_if,
+    clippy::items_after_statements,
+    clippy::type_complexity,
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    clippy::unused_self,
+    reason = "prime-agent's package manager is ported whole, as prime wrote it; ha calls part of its API"
+)]
+pub mod packages;
 pub mod paths;
 pub mod permissions;
 pub mod project;
@@ -54,6 +68,7 @@ pub mod providers;
 pub mod queue;
 pub mod refine;
 pub mod repl;
+pub mod resources;
 pub mod routing;
 pub mod rpc;
 pub mod schedules;
@@ -64,6 +79,7 @@ pub mod skill_requests;
 pub mod skills;
 pub mod store_lease;
 pub mod terminal;
+pub mod tree_view;
 pub mod tui;
 pub mod update_check;
 pub mod verify;
@@ -162,6 +178,10 @@ pub struct HeadlessOptions {
     /// prime-agent's `--append-system-prompt`, repeatable: added at the end.
     #[serde(default)]
     pub append_system_prompt: Vec<String>,
+    /// prime-agent's `--autonomous*` flags: the run continues after each turn
+    /// until its gates pass or a budget runs out.
+    #[serde(default)]
+    pub autonomous: Option<self::autonomous::Options>,
 }
 
 /// Validate parser output into a launch mode.

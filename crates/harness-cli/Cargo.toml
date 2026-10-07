@@ -24,6 +24,8 @@ scrolling-regions = ["ratatui/scrolling-regions"]
 
 [dependencies]
 clap.workspace = true
+# prime-agent's package manager is written against anyhow; already in Cargo.lock.
+anyhow = "=1.0.104"
 # G06 file mention traversal respects Git ignore rules and is capped by the controller.
 ignore = "=0.4.25"
 # A pasted screenshot lives in the clipboard as a bitmap, which no terminal sends

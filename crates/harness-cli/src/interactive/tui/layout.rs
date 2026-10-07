@@ -226,7 +226,20 @@ fn modal_rows(modal: &Modal, available: u16) -> u16 {
         // The panel owns its own height: a row added to it without raising the
         // reservation would be clipped off the bottom of the viewport instead.
         Modal::Approval { summary, .. } => super::widgets::approval::requested_rows(summary),
+        Modal::Tree(tree) => u16::try_from(
+            tree.rows.len()
+                + 3
+                + match &tree.prompt {
+                    Some(crate::interactive::events::TreePrompt::Summarize { options, .. }) => {
+                        options.len() + 1
+                    }
+                    Some(_) => 2,
+                    None => 0,
+                },
+        )
+        .unwrap_or(u16::MAX),
         Modal::Picker { items, .. }
+        | Modal::ServicePicker { items, .. }
         | Modal::FilePicker { items, .. }
         | Modal::TurnPicker { items, .. } => u16::try_from(items.len() + 2).unwrap_or(u16::MAX),
         Modal::Question {

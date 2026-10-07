@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use harness_providers::{CancellationToken, MockProvider, ModelCapabilities, ModelProvider};
@@ -104,6 +104,8 @@ struct HeadlessObserver {
     stream_json: bool,
     approval_blocked: AtomicBool,
     out: Arc<dyn Output>,
+    /// Prompt and completion tokens so far: an autonomous run's token budget.
+    tokens: AtomicU64,
 }
 
 impl HeadlessObserver {
@@ -118,17 +120,51 @@ impl HeadlessObserver {
 impl TurnObserver for HeadlessObserver {
     fn observe(&self, progress: TurnProgress) {
         match &progress {
-            TurnProgress::TextDelta(text) => self.stream_event("text.delta", &serde_json::json!({"text": text})),
-            TurnProgress::ThinkingDelta(text) => self.stream_event("thinking.delta", &serde_json::json!({"text": text})),
-            TurnProgress::StreamRestarted => self.stream_event("stream.restarted", &serde_json::json!({})),
-            TurnProgress::ToolProgress { name, text, .. } => self.stream_event("tool.progress", &serde_json::json!({"name": name, "text": text})),
-            TurnProgress::Usage { prompt_tokens, completion_tokens, .. } => self.stream_event("usage", &serde_json::json!({"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens})),
-            TurnProgress::ToolStarted { name, summary, .. } => self.stream_event("tool.started", &serde_json::json!({"name": name, "summary": summary})),
-            TurnProgress::ToolSettled { name, ok, detail, .. } => {
-                self.stream_event("tool.settled", &serde_json::json!({"name": name, "ok": ok, "detail": detail}));
-                if !ok && detail.as_deref().is_some_and(|text| text.contains("approval") || text.contains("denied by the user")) {
+            TurnProgress::TextDelta(text) => {
+                self.stream_event("text.delta", &serde_json::json!({"text": text}));
+            }
+            TurnProgress::ThinkingDelta(text) => {
+                self.stream_event("thinking.delta", &serde_json::json!({"text": text}));
+            }
+            TurnProgress::StreamRestarted => {
+                self.stream_event("stream.restarted", &serde_json::json!({}));
+            }
+            TurnProgress::ToolProgress { name, text, .. } => self.stream_event(
+                "tool.progress",
+                &serde_json::json!({"name": name, "text": text}),
+            ),
+            TurnProgress::Usage {
+                prompt_tokens,
+                completion_tokens,
+                ..
+            } => {
+                self.tokens.fetch_add(
+                    prompt_tokens.saturating_add(*completion_tokens),
+                    Ordering::SeqCst,
+                );
+                self.stream_event("usage", &serde_json::json!({"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}));
+            }
+            TurnProgress::ToolStarted { name, summary, .. } => self.stream_event(
+                "tool.started",
+                &serde_json::json!({"name": name, "summary": summary}),
+            ),
+            TurnProgress::ToolSettled {
+                name, ok, detail, ..
+            } => {
+                self.stream_event(
+                    "tool.settled",
+                    &serde_json::json!({"name": name, "ok": ok, "detail": detail}),
+                );
+                if !ok
+                    && detail.as_deref().is_some_and(|text| {
+                        text.contains("approval") || text.contains("denied by the user")
+                    })
+                {
                     self.approval_blocked.store(true, Ordering::SeqCst);
-                    self.stream_event("approval.blocked", &serde_json::json!({"name": name, "reason": detail}));
+                    self.stream_event(
+                        "approval.blocked",
+                        &serde_json::json!({"name": name, "reason": detail}),
+                    );
                 }
             }
             _ => {}
@@ -438,7 +474,7 @@ pub async fn run_with(
     // One project identity per workspace root, resolved before anything scoped to the
     // project is written.
     let project_id = project::resolve_project_id(&store, &context.project.root).await?;
-    let observation = observe_workspace(project_id, &context.project.root)?;
+    let observation = observe_workspace(project_id.clone(), &context.project.root)?;
     acceptance_trace("workspace_observed");
     let capabilities = match &provider_config {
         Some(config) => ModelCapabilities {
@@ -593,6 +629,31 @@ pub async fn run_with(
     // `--system-prompt` replaces the static layers and `--append-system-prompt`
     // adds to the end, as prime-agent's print mode takes them.
     let system_prompt = {
+        let config_dir = context
+            .paths
+            .config_file
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        // prime-agent's resource loader: a `SYSTEM.md` stands in for
+        // `--system-prompt`, an `APPEND_SYSTEM.md` for `--append-system-prompt`.
+        let custom = request.options.system_prompt.clone().or_else(|| {
+            super::resources::system_prompt(
+                &context.project.root,
+                config_dir,
+                resolved_config.project_trusted,
+            )
+        });
+        let appended = if request.options.append_system_prompt.is_empty() {
+            super::resources::append_system_prompt(
+                &context.project.root,
+                config_dir,
+                resolved_config.project_trusted,
+            )
+            .into_iter()
+            .collect::<Vec<_>>()
+        } else {
+            request.options.append_system_prompt.clone()
+        };
         let (git_branch, changed_files) = super::service::prompt_git_facts(&context.project.root);
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let shell = if cfg!(windows) { "PowerShell" } else { "sh" };
@@ -605,7 +666,7 @@ pub async fn run_with(
             })
             .collect::<Vec<_>>();
         super::prompt::assemble(
-            request.options.system_prompt.as_deref(),
+            custom.as_deref(),
             &super::prompt::PromptEnvironment {
                 os: std::env::consts::OS,
                 shell,
@@ -617,7 +678,7 @@ pub async fn run_with(
                 limits: bounds::limits_from_environment(environment),
             },
             &tool_names,
-            &request.options.append_system_prompt,
+            &appended,
         )
     };
     let run_request = RunRequest::new(
@@ -694,33 +755,88 @@ pub async fn run_with(
         stream_json: format == OutputFormat::StreamJson,
         approval_blocked: AtomicBool::new(false),
         out: Arc::clone(&out),
+        tokens: AtomicU64::new(0),
     });
     observer.stream_event(
         "turn.started",
         &serde_json::json!({"session_id": session_id, "task_id": task_id}),
     );
     let turn_observer: Arc<dyn TurnObserver> = observer.clone();
-    let outcome = match &resumed_from {
-        Some((source, _)) => {
-            driver
-                .run_turn_continuing(
-                    source,
-                    run_request,
-                    options,
-                    Arc::clone(&turn_observer),
-                    cancellation.clone(),
-                )
-                .await?
+    // prime-agent's headless autonomous run (`--autonomous*`): after a turn
+    // that ends cleanly the gates run in the workspace, and the run goes on
+    // with prime's continuation until they pass or a budget runs out.
+    let mut autonomous = super::autonomous::Autonomous::default();
+    if let Some(autonomous_options) = &request.options.autonomous {
+        autonomous.turn_on(autonomous_options, std::time::Instant::now());
+    }
+    let mut continuing_from = resumed_from.as_ref().map(|(source, _)| source.clone());
+    let mut next_request = run_request;
+    let outcome = loop {
+        let tokens_before = observer.tokens.load(Ordering::SeqCst);
+        let outcome = match &continuing_from {
+            Some(source) => {
+                driver
+                    .run_turn_continuing(
+                        source,
+                        next_request.clone(),
+                        options.clone(),
+                        Arc::clone(&turn_observer),
+                        cancellation.clone(),
+                    )
+                    .await?
+            }
+            None => {
+                driver
+                    .run_turn(
+                        next_request.clone(),
+                        options.clone(),
+                        Arc::clone(&turn_observer),
+                        cancellation.clone(),
+                    )
+                    .await?
+            }
+        };
+        if !autonomous.enabled {
+            break outcome;
         }
-        None => {
-            driver
-                .run_turn(
-                    run_request,
-                    options,
-                    Arc::clone(&turn_observer),
-                    cancellation,
+        autonomous.record_turn(
+            observer
+                .tokens
+                .load(Ordering::SeqCst)
+                .saturating_sub(tokens_before),
+        );
+        let clean =
+            outcome.stop == harness_tools::TurnStop::Final && outcome.pending_question.is_none();
+        let gates = match autonomous.gate_job() {
+            Some(job) if clean => Some(
+                super::autonomous::run_gates(&context.project.root, job, cancellation.clone())
+                    .await,
+            ),
+            _ => None,
+        };
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        match autonomous.decide(clean, gates, std::time::Instant::now(), &timestamp) {
+            super::autonomous::Decision::Continue(text) => {
+                observer.stream_event(
+                    "autonomous.continuation",
+                    &serde_json::json!({
+                        "continuations": autonomous.continuations_used,
+                        "text": text,
+                    }),
+                );
+                continuing_from = Some(outcome.session_id.clone());
+                next_request = RunRequest::new(
+                    SessionId::generate(),
+                    next_request.task_id.clone(),
+                    InputId::generate(),
+                    text,
+                    observe_workspace(project_id.clone(), &context.project.root)?,
                 )
-                .await?
+                .with_tool_schemas(next_request.tool_schemas.clone())
+                .with_system_policy(next_request.system_policy.clone())
+                .with_project_rules(next_request.project_rules.clone());
+            }
+            super::autonomous::Decision::Stop(_) => break outcome,
         }
     };
     if let Some(question_id) = &outcome.pending_question {
@@ -888,6 +1004,11 @@ pub async fn run_with(
             out.stdout(&format!("[info] {message}"));
         }
         out.stdout(output["response"].as_str().unwrap_or_default());
+    }
+    // prime-agent's print-mode autonomous contract applies to every output.
+    if let Some(line) = autonomous.exit_stderr(std::time::Instant::now()) {
+        out.stderr(&line);
+        return Ok(1);
     }
     let exit = match outcome.stop {
         _ if request.options.output_format.is_none() => 0,

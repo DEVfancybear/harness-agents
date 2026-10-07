@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 62] = [
+pub const SLASH_COMMANDS: [SlashCommand; 63] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -119,10 +119,15 @@ pub const SLASH_COMMANDS: [SlashCommand; 62] = [
         ],
         ..command(
             "/mcp",
-            "[add|list|get|remove]",
+            "[add|list|get|remove|login|logout]",
             "Show MCP servers, or add, inspect and remove them",
         )
     },
+    command(
+        "/plugins",
+        "[search]",
+        "Browse and connect external services",
+    ),
     SlashCommand {
         aliases: &["/clear"],
         ..command("/new", "[prompt]", "Start a new session")

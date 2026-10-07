@@ -357,6 +357,8 @@ pub(super) fn controller_for_with_overrides(
     config_overrides: super::config::ConfigOverrides,
 ) -> InteractiveController {
     let initial_prompt = config_overrides.initial_prompt.clone();
+    let initial_thinking = config_overrides.thinking.clone();
+    let initial_goal = config_overrides.goal.clone();
     let channel = SessionChannel::new();
     let service: Box<dyn SessionPort> = if fixture {
         Box::new(FixtureService::new(channel.sender()))
@@ -366,6 +368,7 @@ pub(super) fn controller_for_with_overrides(
         // skips every startup download.
         if !super::offline::is_offline(environment) {
             super::providers::refresh_in_background(&context.paths.data_dir);
+            super::mcp_catalog::refresh_in_background(&context.paths.data_dir);
             super::providers::refresh_listed_models_for_logins(
                 environment,
                 &context.paths.data_dir,
@@ -384,6 +387,8 @@ pub(super) fn controller_for_with_overrides(
     InteractiveController::new(context, service, channel, plain)
         .with_continuations(super::bounds::continuations_from_environment(environment))
         .with_initial_prompt(initial_prompt)
+        .with_initial_thinking(initial_thinking)
+        .with_initial_goal(initial_goal)
 }
 
 /// Whether the cursor sits at the start of a line, so partial output is never

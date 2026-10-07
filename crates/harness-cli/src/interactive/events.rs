@@ -480,6 +480,10 @@ pub enum Modal {
     Picker { items: Vec<String>, selected: usize },
     /// Git-aware workspace file picker opened by `@` in the composer.
     FilePicker { items: Vec<String>, selected: usize },
+    /// prime-agent's `/plugins` service catalog; Enter connects a service.
+    ServicePicker { items: Vec<String>, selected: usize },
+    /// prime-agent's `/tree` selector.
+    Tree(TreeModal),
     /// prime-agent's tree selector (`/tree`) or its fork selector (`/fork`):
     /// the conversation's messages, the highlighted one picked with Enter.
     TurnPicker {
@@ -715,8 +719,77 @@ pub enum TurnsPurpose {
     Tree,
 }
 
+/// One turn of the conversation tree `/tree` shows.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TreeTurn {
+    pub session: String,
+    pub parent: Option<String>,
+    pub question: String,
+    pub answer: Option<String>,
+    pub label: Option<String>,
+    pub label_time: Option<String>,
+    pub created_at: String,
+}
+
+/// The `/tree` selector as the TUI draws it.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TreeModal {
+    pub rows: Vec<TreeRow>,
+    /// `(n/total)` and the filter mode.
+    pub footer: String,
+    pub search: String,
+    pub prompt: Option<TreePrompt>,
+}
+
+/// One row of the tree.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TreeRow {
+    pub selected: bool,
+    /// The gutters and the connector (`├─`, `└─`, `⊞`, `⊟`).
+    pub prefix: String,
+    pub folded: bool,
+    /// On the path to the current leaf.
+    pub active: bool,
+    pub label: Option<String>,
+    pub label_time: Option<String>,
+    pub user: bool,
+    pub text: String,
+    /// An answer with no text.
+    pub empty: bool,
+}
+
+/// What the selector asks over its list.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum TreePrompt {
+    Label {
+        input: String,
+    },
+    Summarize {
+        options: Vec<String>,
+        selected: usize,
+    },
+    Custom {
+        input: String,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionEvent {
+    /// The conversation tree `/tree` asked for, and the turn it ends on.
+    TreeRead {
+        turns: Vec<TreeTurn>,
+        leaf: Option<String>,
+    },
+    /// The conversation's messages, in prime-agent's message shapes, as
+    /// [`super::service::SessionPort::read_conversation`] asked for them.
+    ConversationRead {
+        messages: Vec<serde_json::Value>,
+    },
+    /// The outcome of [`super::service::SessionPort::export_html`]: the
+    /// written path, or why nothing was written.
+    HtmlExported {
+        result: Result<String, String>,
+    },
     Accepted {
         input_id: InputId,
     },

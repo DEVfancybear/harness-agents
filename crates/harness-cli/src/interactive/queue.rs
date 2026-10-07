@@ -117,6 +117,20 @@ impl InputQueue {
             .collect()
     }
 
+    /// Remove every message `drop` picks; the removed ones, oldest first.
+    pub fn remove_where(&mut self, drop: impl Fn(&str) -> bool) -> Vec<(Lane, String)> {
+        let mut removed = Vec::new();
+        self.items.retain(|(lane, text)| {
+            if drop(text) {
+                removed.push((*lane, text.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
+
     /// Remove the message at `index` (0-based, oldest first).
     pub fn remove(&mut self, index: usize) -> Option<(Lane, String)> {
         (index < self.items.len()).then(|| self.items.remove(index))

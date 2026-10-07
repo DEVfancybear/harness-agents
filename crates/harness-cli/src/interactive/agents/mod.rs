@@ -43,6 +43,26 @@ pub trait SessionHost: Send + Sync {
     /// The name is taken, the model or thinking level is unknown, or no
     /// worker could start the agent.
     fn create_session(&self, request: CreateSession) -> Result<serde_json::Value, String>;
+
+    /// prime-agent's root siblings ("roots are siblings"): the other
+    /// top-level agents, as `agent_observe.list_agents` rows.
+    fn siblings(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+
+    /// Deliver `text` to the sibling `selector` (id, name or id prefix) with
+    /// steering delivery; the answer is `delivered` or `queued`.
+    ///
+    /// # Errors
+    /// No such sibling, the target is this agent, or its messaging is paused.
+    fn message_sibling(&self, _selector: &str, _text: &str) -> Result<String, String> {
+        Err("this agent has no siblings".to_owned())
+    }
+
+    /// This agent's own name, the sender a sibling reads.
+    fn agent_name(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Whether an interactive session runs as a background agent: yes, unless
@@ -84,7 +104,10 @@ pub fn spec_for_launch(
         approval: overrides.approval.clone(),
         name: None,
         prompt: overrides.initial_prompt.clone(),
-        thinking: None,
+        thinking: overrides.thinking.clone(),
+        goal: overrides.goal.clone(),
+        system_prompt: overrides.system_prompt.clone(),
+        append_system_prompt: overrides.append_system_prompt.clone(),
         id: None,
     }
 }

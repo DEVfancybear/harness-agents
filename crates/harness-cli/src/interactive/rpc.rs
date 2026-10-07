@@ -10,13 +10,19 @@
 //! `message_update` (`text_delta` / `thinking_delta`), `message_end`,
 //! `tool_execution_start` / `_update` / `_end` and `agent_end`.
 //!
-//! The commands ha serves: `prompt` (with `streamingBehavior` `steer` or
-//! `followUp` while a turn runs), `steer`, `follow_up`, `abort`,
-//! `new_session`, `get_state`, `set_model`, `cycle_model`,
-//! `get_available_models`, `set_thinking_level`, `compact`,
-//! `get_last_assistant_text` and `set_session_name`. Nobody can answer an
-//! approval here, so a gated action is refused, as `ha exec` refuses it.
-//! Closing stdin lets the running turn finish, then the process exits.
+//! The commands are prime-agent's in-process RPC set: `prompt` (with
+//! `streamingBehavior` `steer` or `followUp` while a turn runs), `steer`,
+//! `follow_up`, `abort`, `new_session`, `get_state`, `set_model`,
+//! `cycle_model`, `get_available_models`, `set_thinking_level`,
+//! `cycle_thinking_level`, `set_steering_mode`, `set_follow_up_mode`,
+//! `compact`, `refine`, `set_auto_compaction`, `set_auto_retry`,
+//! `abort_retry`, `switch_session`, `fork`, `clone`, `get_fork_messages`,
+//! `get_last_assistant_text`, `set_session_name`, `get_messages`,
+//! `export_html`, `get_session_stats` and `get_commands`; the scheduling,
+//! messaging, `observe` and `bash` commands answer as prime's in-process
+//! transport answers them. Nobody can answer an approval here, so a gated
+//! action is refused, as `ha exec` refuses it. Closing stdin lets the
+//! running turn finish, then the process exits.
 
 use std::collections::VecDeque;
 use std::io::BufRead;
@@ -35,6 +41,26 @@ const BUSY: &str = "Agent is already processing. Specify streamingBehavior ('ste
 
 /// prime-agent's thinking-level wire names.
 const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// prime-agent's in-process answers for the daemon-only commands.
+const CRON_REQUIRES_DAEMON: &str = "Cron jobs require daemon mode";
+const HEARTBEATS_REQUIRE_DAEMON: &str = "Heartbeats require daemon mode";
+const AGENT_MESSAGING_REQUIRES_DAEMON: &str = "Agent messaging requires daemon mode";
+const BASH_BACKEND_GAP: &str = "Bash execution requires the session bash executor, which is not linked into the in-process RPC transport yet; the daemon-attached RPC transport serves it";
+
+/// A command whose answer waits for the session.
+enum Pending {
+    /// `get_fork_messages`: the conversation's turns.
+    ForkMessages(Option<Value>),
+    /// `fork`: the turn to fork before, once the turns are listed.
+    Fork(Option<Value>, String),
+    /// `get_messages`.
+    Messages(Option<Value>),
+    /// `get_session_stats`.
+    Stats(Option<Value>),
+    /// `export_html`.
+    Export(Option<Value>),
+}
 
 /// A success response; `data` is left out when `None`.
 #[must_use]
@@ -150,6 +176,14 @@ struct Rpc {
     compacting: Option<Option<Value>>,
     /// A `compact` asked for while a turn ran: it starts when the turn ends.
     compact_next: Option<(Option<Value>, Option<String>)>,
+    /// A `refine` waiting for its run to end, and what it applied.
+    #[allow(clippy::option_option)] // no refinement, or one with or without an id
+    refining: Option<Option<Value>>,
+    refined: Option<Value>,
+    /// Commands waiting for the session to read something.
+    pending: Vec<Pending>,
+    steering_mode: super::queue::QueueMode,
+    follow_up_mode: super::queue::QueueMode,
     out: Vec<Value>,
 }
 
@@ -292,13 +326,179 @@ impl Rpc {
                 self.finish(&RunOutcome::Failed(message));
             }
             SessionEvent::RunTerminal { outcome } if self.running => self.finish(&outcome),
+            SessionEvent::Refined {
+                header,
+                summary,
+                details,
+            } if self.refining.is_some() => {
+                self.refined = Some(json!({
+                    "header": header,
+                    "summary": summary,
+                    "details": details,
+                }));
+            }
+            SessionEvent::TurnsListed { turns, .. } => self.turns_listed(&turns),
+            SessionEvent::ConversationRead { messages } => self.conversation_read(&messages),
+            SessionEvent::HtmlExported { result } => {
+                if let Some(index) = self
+                    .pending
+                    .iter()
+                    .position(|pending| matches!(pending, Pending::Export(_)))
+                    && let Pending::Export(id) = self.pending.remove(index)
+                {
+                    let response = match result {
+                        Ok(path) => {
+                            success(id.as_ref(), "export_html", Some(json!({ "path": path })))
+                        }
+                        Err(message) => error(id.as_ref(), "export_html", &message),
+                    };
+                    self.emit(response);
+                }
+            }
             _ => {}
         }
     }
 
+    /// The turns `get_fork_messages` or `fork` waited for.
+    fn turns_listed(&mut self, turns: &[(String, String)]) {
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| matches!(pending, Pending::ForkMessages(_) | Pending::Fork(..)))
+        else {
+            return;
+        };
+        match self.pending.remove(index) {
+            Pending::ForkMessages(id) => {
+                // prime-agent's `getUserMessagesForForking`: the user
+                // messages with text, in order.
+                let messages = turns
+                    .iter()
+                    .filter(|(_, text)| !text.is_empty())
+                    .map(|(entry, text)| json!({ "entryId": entry, "text": text }))
+                    .collect::<Vec<_>>();
+                self.emit(success(
+                    id.as_ref(),
+                    "get_fork_messages",
+                    Some(json!({ "messages": messages })),
+                ));
+            }
+            Pending::Fork(id, entry) => {
+                let response = match turns.iter().find(|(session, _)| *session == entry) {
+                    None => error(id.as_ref(), "fork", "Invalid entry ID for forking"),
+                    Some((session, text)) => match self.service.fork(session, true) {
+                        Ok(()) => success(
+                            id.as_ref(),
+                            "fork",
+                            Some(json!({ "text": text, "cancelled": false })),
+                        ),
+                        Err(message) => error(id.as_ref(), "fork", &message),
+                    },
+                };
+                self.emit(response);
+            }
+            _ => {}
+        }
+    }
+
+    /// The messages `get_messages` or `get_session_stats` waited for.
+    fn conversation_read(&mut self, messages: &[Value]) {
+        let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| matches!(pending, Pending::Messages(_) | Pending::Stats(_)))
+        else {
+            return;
+        };
+        match self.pending.remove(index) {
+            Pending::Messages(id) => {
+                self.emit(success(
+                    id.as_ref(),
+                    "get_messages",
+                    Some(json!({ "messages": messages })),
+                ));
+            }
+            Pending::Stats(id) => {
+                let stats = self.stats(messages);
+                self.emit(success(id.as_ref(), "get_session_stats", Some(stats)));
+            }
+            _ => {}
+        }
+    }
+
+    /// prime-agent's `getSessionStats`, over the conversation's messages and
+    /// the session's usage.
+    fn stats(&self, messages: &[Value]) -> Value {
+        let role = |name: &str| {
+            messages
+                .iter()
+                .filter(|message| message["role"] == name)
+                .count()
+        };
+        let tool_calls = messages
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+            .filter(|block| block["type"] == "toolCall")
+            .count();
+        let (input, output, cost) = self.service.session_usage();
+        json!({
+            "sessionFile": Value::Null,
+            "sessionId": self.service.conversation_id(),
+            "userMessages": role("user"),
+            "assistantMessages": role("assistant"),
+            "toolCalls": tool_calls,
+            "toolResults": role("toolResult"),
+            "totalMessages": role("user") + role("assistant"),
+            "tokens": {
+                "input": input,
+                "output": output,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": input + output,
+            },
+            "cost": cost,
+        })
+    }
+
+    /// prime-agent's `get_commands`: extension commands (ha has none), then
+    /// prompt templates, then skills.
+    fn commands(&self) -> Value {
+        let mut prompts = Vec::new();
+        let mut skills = Vec::new();
+        for command in self.service.menu_commands() {
+            let name = command.name.trim_start_matches('/').to_owned();
+            let mut entry = json!({ "name": name, "source": command.tag });
+            if !command.description.is_empty() {
+                entry["description"] = json!(command.description);
+            }
+            if !command.argument_hint.is_empty() {
+                entry["argumentHint"] = json!(command.argument_hint);
+            }
+            if command.tag == "skill" {
+                skills.push(entry);
+            } else {
+                prompts.push(entry);
+            }
+        }
+        prompts.extend(skills);
+        json!({ "commands": prompts })
+    }
+
     fn finish(&mut self, outcome: &RunOutcome) {
         self.running = false;
-        if let Some(id) = self.compacting.take() {
+        if let Some(id) = self.refining.take() {
+            let refined = self.refined.take();
+            let response = match (outcome, self.last_error.take()) {
+                (RunOutcome::Done, _) => success(id.as_ref(), "refine", refined),
+                (_, message) => error(
+                    id.as_ref(),
+                    "refine",
+                    message.as_deref().unwrap_or("refinement failed"),
+                ),
+            };
+            self.emit(response);
+        } else if let Some(id) = self.compacting.take() {
             let response = match (outcome, self.last_error.take()) {
                 (RunOutcome::Done, _) => {
                     self.emit(
@@ -345,11 +545,18 @@ impl Rpc {
         if self.paused {
             return;
         }
-        // prime-agent's queue pump: the steering lane first, then follow-ups.
-        if let Some(next) = self
-            .steering
-            .pop_front()
-            .or_else(|| self.follow_ups.pop_front())
+        // prime-agent's queue pump: the steering lane first, then follow-ups,
+        // each drained one at a time or all at once.
+        let take = |lane: &mut VecDeque<String>, mode| match mode {
+            super::queue::QueueMode::OneAtATime => lane.pop_front(),
+            super::queue::QueueMode::All => {
+                (!lane.is_empty()).then(|| lane.drain(..).collect::<Vec<_>>().join("\n\n"))
+            }
+        };
+        let steering_mode = self.steering_mode;
+        let follow_up_mode = self.follow_up_mode;
+        if let Some(next) = take(&mut self.steering, steering_mode)
+            .or_else(|| take(&mut self.follow_ups, follow_up_mode))
         {
             self.start(next);
         }
@@ -456,6 +663,149 @@ impl Rpc {
                 }
                 return;
             }
+            "cycle_thinking_level" => {
+                let levels = self.service.thinking_levels();
+                if levels.is_empty() {
+                    Ok(Some(Value::Null))
+                } else {
+                    let current = self.service.thinking_level();
+                    let next = match levels
+                        .iter()
+                        .position(|level| Some(level) == current.as_ref())
+                    {
+                        Some(index) => levels[(index + 1) % levels.len()].clone(),
+                        None => levels[0].clone(),
+                    };
+                    self.service
+                        .set_thinking(&next)
+                        .map(|_| Some(json!({ "level": next })))
+                }
+            }
+            "set_steering_mode" | "set_follow_up_mode" => match text("mode") {
+                None => Err(format!("{name} requires a mode")),
+                Some(mode) => match super::queue::QueueMode::parse(&mode) {
+                    None => Err(format!(
+                        "Invalid queue mode \"{mode}\". Valid values: all, one-at-a-time"
+                    )),
+                    Some(mode) => {
+                        let steering = name == "set_steering_mode";
+                        if steering {
+                            self.steering_mode = mode;
+                        } else {
+                            self.follow_up_mode = mode;
+                        }
+                        self.service.set_queue_mode(steering, mode).map(|()| None)
+                    }
+                },
+            },
+            "refine" => {
+                if self.running {
+                    Err(BUSY.to_owned())
+                } else {
+                    self.running = true;
+                    self.refining = Some(id);
+                    self.refined = None;
+                    self.last_error = None;
+                    self.service.submit(SubmitRequest {
+                        input_id: InputId::generate(),
+                        text: "/refine".to_owned(),
+                        answer_question_id: None,
+                        shell_prefix: None,
+                        compact_guidance: None,
+                        refine: Some(super::refine::RefineOptions {
+                            instructions: text("instructions"),
+                            global: payload
+                                .get("global")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            rollback: text("rollbackId"),
+                            curate: false,
+                        }),
+                    });
+                    return;
+                }
+            }
+            "set_auto_compaction" | "set_auto_retry" => {
+                match payload.get("enabled").and_then(Value::as_bool) {
+                    None => Err(format!("{name} requires enabled")),
+                    Some(enabled) if name == "set_auto_compaction" => {
+                        self.service.set_auto_compaction(enabled).map(|()| None)
+                    }
+                    Some(enabled) => self.service.set_auto_retry(enabled).map(|()| None),
+                }
+            }
+            // prime-agent's `abortRetry` always answers success, as do
+            // `unobserve` and `abort_bash` in-process.
+            "abort_retry" | "unobserve" | "abort_bash" => Ok(None),
+            "switch_session" => match text("sessionPath") {
+                None => Err("switch_session requires a sessionPath".to_owned()),
+                Some(session) => self
+                    .service
+                    .resume(Some(session))
+                    .map(|()| Some(json!({ "cancelled": false }))),
+            },
+            "fork" => match text("entryId") {
+                None => Err("fork requires an entryId".to_owned()),
+                Some(entry) => match self.service.list_turns(super::events::TurnsPurpose::Fork) {
+                    Ok(()) => {
+                        self.pending.push(Pending::Fork(id, entry));
+                        return;
+                    }
+                    Err(message) => Err(message),
+                },
+            },
+            "clone" => self
+                .service
+                .clone_conversation()
+                .map(|()| Some(json!({ "cancelled": false })))
+                .map_err(|_| "Cannot clone session: no current entry selected".to_owned()),
+            "get_fork_messages" => {
+                match self.service.list_turns(super::events::TurnsPurpose::Fork) {
+                    Ok(()) => {
+                        self.pending.push(Pending::ForkMessages(id));
+                        return;
+                    }
+                    Err(message) => Err(message),
+                }
+            }
+            "get_messages" | "get_session_stats" => match self.service.read_conversation() {
+                Ok(()) => {
+                    self.pending.push(if name == "get_messages" {
+                        Pending::Messages(id)
+                    } else {
+                        Pending::Stats(id)
+                    });
+                    return;
+                }
+                Err(message) => Err(message),
+            },
+            "export_html" => match self.service.export_html(text("outputPath")) {
+                Ok(()) => {
+                    self.pending.push(Pending::Export(id));
+                    return;
+                }
+                Err(message) => Err(message),
+            },
+            "get_commands" => Ok(Some(self.commands())),
+            // prime-agent's in-process transport: no scheduler, no family,
+            // no bash executor live here.
+            "list_schedules" => Ok(Some(json!({ "jobs": [] }))),
+            "list_heartbeats" => Ok(Some(json!({ "heartbeats": [] }))),
+            "get_heartbeat" => Ok(Some(json!({ "heartbeat": Value::Null }))),
+            "add_schedule" | "cancel_schedule" => Err(CRON_REQUIRES_DAEMON.to_owned()),
+            "set_heartbeat" | "update_heartbeat" | "manage_heartbeat" => {
+                Err(HEARTBEATS_REQUIRE_DAEMON.to_owned())
+            }
+            "send_message"
+            | "agent_messages_status"
+            | "agent_messages_pause"
+            | "agent_messages_resume"
+            | "agent_messages_clear" => Err(AGENT_MESSAGING_REQUIRES_DAEMON.to_owned()),
+            "observe" => Err(format!(
+                "Unknown active session: {}",
+                text("activeSessionId").unwrap_or_default()
+            )),
+            "bash" => Err(BASH_BACKEND_GAP.to_owned()),
             "get_last_assistant_text" => Ok(Some(json!({ "text": self.last_answer }))),
             "set_session_name" => match text("name").map(|name| name.trim().to_owned()) {
                 None => Err("set_session_name requires a name".to_owned()),
@@ -489,7 +839,7 @@ impl Rpc {
 
     /// prime-agent's `RpcSessionState`, as far as ha knows it.
     fn state(&self) -> Value {
-        let (steering_mode, follow_up_mode) = self.service.queue_modes();
+        let (steering_mode, follow_up_mode) = (self.steering_mode, self.follow_up_mode);
         let mode = |mode| match mode {
             super::queue::QueueMode::All => "all",
             super::queue::QueueMode::OneAtATime => "one-at-a-time",
@@ -508,7 +858,7 @@ impl Rpc {
             "isCompacting": self.compacting.is_some(),
             "steeringMode": mode(steering_mode),
             "followUpMode": mode(follow_up_mode),
-            "autoCompactionEnabled": true,
+            "autoCompactionEnabled": self.service.auto_compaction(),
             "sessionActions": actions,
         });
         let model = self.model();
@@ -557,6 +907,7 @@ pub async fn run(overrides: ConfigOverrides) -> Result<ExitCode, HarnessError> {
             }
         }
     });
+    let (steering_mode, follow_up_mode) = service.queue_modes();
     let mut rpc = Rpc {
         service: Box::new(service),
         running: false,
@@ -571,6 +922,11 @@ pub async fn run(overrides: ConfigOverrides) -> Result<ExitCode, HarnessError> {
         last_error: None,
         compacting: None,
         compact_next: None,
+        refining: None,
+        refined: None,
+        pending: Vec::new(),
+        steering_mode,
+        follow_up_mode,
         out: Vec::new(),
     };
     let mut stdin_open = true;

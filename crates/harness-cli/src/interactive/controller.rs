@@ -304,10 +304,25 @@ pub struct InteractiveController {
     escape_armed_at: Option<Instant>,
     /// The shared picker is prime-agent's tree (or fork) selector.
     turn_picker: Option<super::events::TurnsPurpose>,
+    /// The shared picker is `/plugins`: the service id of each row.
+    plugin_picker: Option<Vec<String>>,
+    /// prime-agent's `/tree` selector, while it is open.
+    tree_view: Option<super::tree_view::TreeView>,
+    /// The turns the selector was opened over.
+    tree_turns: Vec<super::events::TreeTurn>,
     /// A tool call's arguments are streaming (prime-agent's "Writing code").
     writing_code: bool,
     /// The prompt the app was started with, until it is sent.
     initial_prompt: Option<String>,
+    /// prime-agent's `agentMessagesPaused`: other agents' messages are refused.
+    agent_messages_paused: bool,
+    /// The queued messages other agents sent, which `/agents messages clear`
+    /// drops.
+    agent_messages_queued: Vec<String>,
+    /// `--thinking`: the level the session starts at, until it is applied.
+    initial_thinking: Option<String>,
+    /// `--goal`: the goal the session starts with, until it is set.
+    initial_goal: Option<String>,
     /// The provider whose API key the masked prompt is collecting.
     login_provider: Option<String>,
     /// Whose login the running `/login` or `/subagent-login` saves.
@@ -408,8 +423,15 @@ impl InteractiveController {
             exit_armed_at: None,
             escape_armed_at: None,
             turn_picker: None,
+            plugin_picker: None,
+            tree_view: None,
+            tree_turns: Vec::new(),
             writing_code: false,
             initial_prompt: None,
+            agent_messages_paused: false,
+            agent_messages_queued: Vec::new(),
+            initial_thinking: None,
+            initial_goal: None,
             login_provider: None,
             login_scope: super::credentials::Scope::Main,
             signing_in: None,
@@ -468,6 +490,18 @@ impl InteractiveController {
         self.service.has_scheduled_work()
     }
 
+    /// The agent's subagents, for the agents view's forest.
+    #[must_use]
+    pub fn subagents(&self) -> Vec<super::agents::protocol::SubagentInfo> {
+        self.service.subagents()
+    }
+
+    /// How many heartbeats the agent keeps.
+    #[must_use]
+    pub fn heartbeat_count(&self) -> usize {
+        self.service.heartbeat_count()
+    }
+
     /// The model this agent's turns use, as the session port names it.
     #[must_use]
     pub fn model_label(&self) -> String {
@@ -498,6 +532,28 @@ impl InteractiveController {
     /// prime-agent's daemon delivers one: an idle agent starts a turn with it, a
     /// busy one reads it at its next step (`auto`, `steer`) or after the turn
     /// (`follow_up`). Returns what happened: `delivered` or `queued`.
+    /// Whether other agents' messages are refused (`/agents messages pause`).
+    #[must_use]
+    pub const fn agent_messages_paused(&self) -> bool {
+        self.agent_messages_paused
+    }
+
+    /// [`Self::deliver_external`] for a message another agent sent: one that
+    /// waits in the queue can be cleared with `/agents messages clear`.
+    pub fn deliver_external_from(
+        &mut self,
+        text: String,
+        steer: bool,
+        from_agent: bool,
+        effects: &mut Vec<Effect>,
+    ) -> &'static str {
+        let outcome = self.deliver_external(text.clone(), steer, effects);
+        if from_agent && outcome == "queued" {
+            self.agent_messages_queued.push(text);
+        }
+        outcome
+    }
+
     pub fn deliver_external(
         &mut self,
         text: String,
@@ -565,6 +621,23 @@ impl InteractiveController {
     #[must_use]
     pub fn with_initial_prompt(mut self, prompt: Option<String>) -> Self {
         self.initial_prompt = prompt.filter(|prompt| !prompt.trim().is_empty());
+        self
+    }
+
+    /// prime-agent's `--thinking`: the thinking level the session starts at,
+    /// applied as `/effort` applies one.
+    #[must_use]
+    pub fn with_initial_thinking(mut self, level: Option<String>) -> Self {
+        self.initial_thinking = level.filter(|level| !level.trim().is_empty());
+        self
+    }
+
+    /// `--goal`: the goal the session starts with, set as `/goal <objective>`
+    /// sets one. With an initial message the message is the first turn and
+    /// the goal continues it.
+    #[must_use]
+    pub fn with_initial_goal(mut self, goal: Option<String>) -> Self {
+        self.initial_goal = goal.filter(|goal| !goal.trim().is_empty());
         self
     }
 
@@ -683,6 +756,11 @@ impl InteractiveController {
 
     /// The modal panel for the current state, if any.
     fn modal(&self) -> Option<Modal> {
+        if self.pending_approval.is_none()
+            && let Some(view) = &self.tree_view
+        {
+            return Some(Modal::Tree(view.modal()));
+        }
         if let Some(pending) = &self.pending_approval {
             return Some(Modal::Approval {
                 request_id: pending.request_id.clone(),
@@ -718,6 +796,12 @@ impl InteractiveController {
             }
             if self.file_picker_active {
                 return Some(Modal::FilePicker {
+                    items: picker.items().to_vec(),
+                    selected: picker.selected(),
+                });
+            }
+            if self.plugin_picker.is_some() {
+                return Some(Modal::ServicePicker {
                     items: picker.items().to_vec(),
                     selected: picker.selected(),
                 });
@@ -886,6 +970,17 @@ impl InteractiveController {
         reason = "this is the single ordered keyboard state machine for modal, running, and composer input"
     )]
     pub fn handle_key(&mut self, key: Key) -> Vec<Effect> {
+        // prime-agent's `/tree` selector owns the keyboard while it is open.
+        if self.pending_approval.is_none()
+            && let Some(view) = &mut self.tree_view
+            && !matches!(key, Key::Resize { .. } | Key::Mouse(_))
+        {
+            let action = view.handle_key(&key);
+            let mut effects = Vec::new();
+            self.tree_action(action, &mut effects);
+            effects.push(Effect::Redraw);
+            return effects;
+        }
         if key == Key::Redraw {
             return vec![Effect::Redraw];
         }
@@ -1056,9 +1151,24 @@ impl InteractiveController {
                     self.file_picker_active = false;
                     self.file_picker_query.clear();
                     self.turn_picker = None;
+                    self.plugin_picker = None;
                     return vec![Effect::Redraw];
                 }
                 Key::Enter => {
+                    if let Some(ids) = self.plugin_picker.take() {
+                        let chosen = self
+                            .editor
+                            .picker()
+                            .and_then(|picker| ids.get(picker.selected()))
+                            .cloned();
+                        self.editor.close_picker();
+                        let mut effects = Vec::new();
+                        if let Some(id) = chosen {
+                            self.connect_plugin(&id, &mut effects);
+                        }
+                        effects.push(Effect::Redraw);
+                        return effects;
+                    }
                     if let Some(purpose) = self.turn_picker.take() {
                         let chosen = self.editor.picker().map(|picker| picker.selected() + 1);
                         self.editor.close_picker();
@@ -1231,6 +1341,21 @@ impl InteractiveController {
     /// Move everything the session port produced into effects.
     pub fn pump_events(&mut self) -> Vec<Effect> {
         let mut effects = self.deliver_heartbeats();
+        if let Some(level) = self.initial_thinking.take()
+            && let Err(message) = self.service.set_thinking(&level)
+        {
+            self.push_history(&mut effects, HistoryItem::Notice { message });
+        }
+        if !self.phase.has_active_run()
+            && let Some(objective) = self.initial_goal.take()
+        {
+            if self.initial_prompt.is_some() {
+                self.goal = Some(GoalState::new(objective.clone()));
+                self.service.set_goal(Some(objective));
+            } else {
+                self.goal_command(Some(&objective), &mut effects);
+            }
+        }
         if !self.phase.has_active_run()
             && let Some(prompt) = self.initial_prompt.take()
         {
@@ -1306,7 +1431,269 @@ impl InteractiveController {
             self.branch_command("/tree", Some(number), effects);
             return;
         }
+        // prime-agent's tree selector; the plain renderer keeps the list.
+        if words.is_empty() && !self.plain && self.service.read_tree().is_ok() {
+            effects.push(Effect::Redraw);
+            return;
+        }
         self.branch_command("/tree", words.first().copied(), effects);
+    }
+
+    fn tree_question(&self, session: &str) -> Option<String> {
+        self.tree_turns
+            .iter()
+            .find(|turn| turn.session == session)
+            .map(|turn| turn.question.clone())
+    }
+
+    fn tree_parent(&self, session: &str) -> Option<String> {
+        self.tree_turns
+            .iter()
+            .find(|turn| turn.session == session)
+            .and_then(|turn| turn.parent.clone())
+    }
+
+    /// Open the `/tree` selector over the conversation's turns.
+    fn open_tree(
+        &mut self,
+        turns: &[super::events::TreeTurn],
+        leaf: Option<&str>,
+        effects: &mut Vec<Effect>,
+    ) {
+        // prime-agent's `branchSummary.skipPrompt`: pick without the choice.
+        let skip = super::config::load_setting(&self.context.paths.config_file, "branchSummary")
+            .and_then(|setting| {
+                setting
+                    .get("skipPrompt")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false);
+        match super::tree_view::TreeView::new(turns, leaf, 15, skip) {
+            Some(view) => self.tree_view = Some(view),
+            None => self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: "Nothing to show yet".to_owned(),
+                },
+            ),
+        }
+        effects.push(Effect::Redraw);
+    }
+
+    /// What the tree selector asked for.
+    fn tree_action(&mut self, action: super::tree_view::TreeAction, effects: &mut Vec<Effect>) {
+        use super::tree_view::TreeAction;
+        match action {
+            TreeAction::None => {}
+            TreeAction::Cancel => self.tree_view = None,
+            TreeAction::Label { session, label } => {
+                if let Err(message) = self
+                    .service
+                    .label_turn(&session, label.as_deref().unwrap_or_default())
+                {
+                    self.push_history(effects, HistoryItem::Error { message });
+                }
+            }
+            TreeAction::Navigate {
+                target,
+                summarize,
+                custom,
+            } => {
+                self.tree_view = None;
+                self.navigate_tree(&target, summarize, custom, effects);
+            }
+        }
+    }
+
+    /// prime-agent's `navigateTree`: an answer becomes the point the next
+    /// message follows; a message puts its text back in the editor and the
+    /// conversation continues from the turn before it.
+    fn navigate_tree(
+        &mut self,
+        target: &str,
+        summarize: bool,
+        custom: Option<String>,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some((user, session)) = super::tree_view::parse_id(target) else {
+            return;
+        };
+        let leaf = self.service.conversation_leaf();
+        if !user && leaf.as_deref() == Some(session) {
+            self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: "Already at this point".to_owned(),
+                },
+            );
+            return;
+        }
+        let question = self.tree_question(session).unwrap_or_default();
+        let parent = if user {
+            self.tree_parent(session)
+        } else {
+            Some(session.to_owned())
+        };
+        if summarize && let Err(message) = self.service.plan_branch_summary(custom) {
+            self.push_history(effects, HistoryItem::Error { message });
+            return;
+        }
+        let result = match parent {
+            Some(parent) => self.service.switch_to(&parent),
+            // A conversation's first message: a fork before it starts afresh.
+            None => self.service.fork(session, true),
+        };
+        match result {
+            Ok(()) => {
+                if user {
+                    self.editor.set_text(&question);
+                }
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message: "Navigated to selected point".to_owned(),
+                    },
+                );
+            }
+            Err(message) => self.push_history(effects, HistoryItem::Error { message }),
+        }
+    }
+
+    /// prime-agent's `agent_messages_status|pause|resume|clear` for this agent.
+    fn agent_messages_command(&mut self, action: &str, effects: &mut Vec<Effect>) {
+        let status = |paused: bool| {
+            format!(
+                "agent messaging {} · at most 16,384 characters a message · 20 pending · 3 per sender per second",
+                if paused { "paused" } else { "active" }
+            )
+        };
+        let message = match action {
+            "status" => status(self.agent_messages_paused),
+            "pause" => {
+                self.agent_messages_paused = true;
+                let cleared = self.clear_agent_messages();
+                format!("{} · {cleared} queued message(s) dropped", status(true))
+            }
+            "resume" => {
+                self.agent_messages_paused = false;
+                status(false)
+            }
+            "clear" => format!(
+                "{} queued agent message(s) dropped",
+                self.clear_agent_messages()
+            ),
+            other => {
+                self.push_history(
+                    effects,
+                    HistoryItem::Error {
+                        message: format!(
+                            "unknown /agents messages action {other:?}: status, pause, resume or clear"
+                        ),
+                    },
+                );
+                effects.push(Effect::Redraw);
+                return;
+            }
+        };
+        self.push_history(effects, HistoryItem::Notice { message });
+        effects.push(Effect::Redraw);
+    }
+
+    /// prime-agent's `clearQueuedAgentMessages`: only messages other agents
+    /// sent, never the user's own queue.
+    fn clear_agent_messages(&mut self) -> usize {
+        let sent = std::mem::take(&mut self.agent_messages_queued);
+        self.queue
+            .remove_where(|text| sent.iter().any(|queued| queued == text))
+            .len()
+    }
+
+    /// prime-agent's `/plugins [search]`: the service catalog, connected
+    /// first; Enter connects the highlighted service. `/plugins connect <id>`
+    /// connects one directly (the plain renderer's way).
+    fn plugins_command(&mut self, argument: Option<&str>, effects: &mut Vec<Effect>) {
+        let argument = argument.map(str::trim).unwrap_or_default();
+        if let Some(id) = argument.strip_prefix("connect ") {
+            self.connect_plugin(id.trim(), effects);
+            effects.push(Effect::Redraw);
+            return;
+        }
+        let cards = self.service.plugin_cards();
+        let mut cards = if argument.is_empty() {
+            cards
+        } else {
+            super::mcp_catalog::search(&cards, argument, cards.len())
+        };
+        if cards.is_empty() {
+            self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: format!("No services match \"{argument}\""),
+                },
+            );
+            effects.push(Effect::Redraw);
+            return;
+        }
+        let rank = |card: &serde_json::Value| match card["connectionStatus"].as_str() {
+            Some("connected") => 0,
+            Some("pending") => 1,
+            Some("not_connected") => 2,
+            _ => 3,
+        };
+        cards.sort_by_key(rank);
+        let rows: Vec<String> = cards
+            .iter()
+            .map(|card| {
+                let status = card["connectionStatus"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .replace('_', " ");
+                let category = card["category"].as_str().unwrap_or_default();
+                let description: String = card["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(80)
+                    .collect();
+                format!(
+                    "{} · {status}{} · {description}",
+                    card["label"].as_str().unwrap_or_default(),
+                    if category.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {category}")
+                    }
+                )
+            })
+            .collect();
+        let ids: Vec<String> = cards
+            .iter()
+            .map(|card| card["serviceId"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        if self.plain {
+            let mut lines: Vec<String> = rows
+                .iter()
+                .zip(&ids)
+                .map(|(row, id)| format!("{row}  [{id}]"))
+                .collect();
+            lines.push(String::new());
+            lines.push("connect one with /plugins connect <id>".to_owned());
+            self.reference("/plugins", lines, effects);
+        } else {
+            self.editor.open_picker(rows);
+            self.plugin_picker = Some(ids);
+        }
+        effects.push(Effect::Redraw);
+    }
+
+    fn connect_plugin(&mut self, id: &str, effects: &mut Vec<Effect>) {
+        match self.service.connect_plugin(id) {
+            Ok(message) => self.push_history(effects, HistoryItem::Notice { message }),
+            Err(message) => self.push_history(effects, HistoryItem::Error { message }),
+        }
     }
 
     fn branch_command(&mut self, name: &str, argument: Option<&str>, effects: &mut Vec<Effect>) {
@@ -2493,6 +2880,15 @@ impl InteractiveController {
                 self.close_run_grant();
                 self.finish_pending_exit(effects);
             }
+            // The RPC mode's reads; the app asks for neither.
+            SessionEvent::ConversationRead { .. } | SessionEvent::HtmlExported { .. } => {}
+            SessionEvent::TreeRead { turns, leaf } => {
+                self.tree_turns.clone_from(&turns);
+                // `/tree <number>` and `/tree label <number>` count the turns
+                // on the path to the leaf, as the numbered list showed them.
+                self.turn_points = tree_path(&turns, leaf.as_deref());
+                self.open_tree(&turns, leaf.as_deref(), effects);
+            }
         }
     }
 
@@ -3317,6 +3713,7 @@ impl InteractiveController {
                     }
                 }
             }
+            "/plugins" => self.plugins_command(raw_argument, &mut effects),
             "/queue" => self.queue_command(raw_argument, &mut effects),
             "/stash" => return self.stash_prompt(),
             "/autonomous" => self.autonomous_command(raw_argument, &mut effects),
@@ -3410,6 +3807,11 @@ impl InteractiveController {
                         }
                     }
                     effects.push(Effect::Redraw);
+                }
+                // prime-agent's agent-message ingestion controls
+                // (`agent_messages_status|pause|resume|clear`).
+                Some(("messages", action)) if !action.trim().is_empty() => {
+                    self.agent_messages_command(action.trim(), &mut effects);
                 }
                 Some(("messages", _)) => {
                     self.reference("/agents messages", self.service.agent_exchanges(), &mut effects);
@@ -5339,6 +5741,24 @@ const PERMISSION_MODES: [(&str, &str); 3] = [
         "nothing asks: every tool runs unasked; deny rules still apply",
     ),
 ];
+
+/// The turns from the conversation's root to `leaf`, each with its message.
+fn tree_path(turns: &[super::events::TreeTurn], leaf: Option<&str>) -> Vec<(String, String)> {
+    let mut path = Vec::new();
+    let mut current = leaf.map(str::to_owned);
+    while let Some(session) = current.take() {
+        let Some(turn) = turns.iter().find(|turn| turn.session == session) else {
+            break;
+        };
+        if path.len() > turns.len() {
+            break;
+        }
+        path.push((turn.session.clone(), turn.question.clone()));
+        current.clone_from(&turn.parent);
+    }
+    path.reverse();
+    path
+}
 
 #[cfg(test)]
 mod tests {

@@ -283,6 +283,15 @@ pub trait SessionPort: Send {
     fn manage_mcp(&mut self, _args: &[String]) -> Result<Vec<String>, String> {
         Err("this backend does not manage MCP servers".to_owned())
     }
+    /// prime-agent's service-catalog cards (`/plugins`).
+    fn plugin_cards(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    /// Connect a catalog service: add it as an MCP server and sign in. The
+    /// sign-in's progress arrives as notices; the answer says what started.
+    fn connect_plugin(&mut self, _id: &str) -> Result<String, String> {
+        Err("this backend does not manage MCP servers".to_owned())
+    }
     fn agents_summary(&self) -> Vec<String> {
         vec!["no delegated workers have run in this session".to_owned()]
     }
@@ -397,6 +406,14 @@ pub trait SessionPort: Send {
     /// Whether a schedule or a heartbeat will start a turn on its own.
     fn has_scheduled_work(&self) -> bool {
         false
+    }
+    /// The session's subagents, for the agents view.
+    fn subagents(&self) -> Vec<super::agents::protocol::SubagentInfo> {
+        Vec::new()
+    }
+    /// How many heartbeats the session keeps.
+    fn heartbeat_count(&self) -> usize {
+        0
     }
     /// The conversation this session is in.
     fn conversation_id(&self) -> Option<String> {
@@ -595,6 +612,15 @@ pub trait SessionPort: Send {
     fn clone_conversation(&mut self) -> Result<(), String> {
         Err("this backend keeps no conversation".to_owned())
     }
+    /// prime-agent's `/tree` selector data; it arrives as
+    /// [`SessionEvent::TreeRead`].
+    fn read_tree(&mut self) -> Result<(), String> {
+        Err("this backend keeps no conversation".to_owned())
+    }
+    /// The turn the conversation's next message follows.
+    fn conversation_leaf(&self) -> Option<String> {
+        None
+    }
     /// `/tree`: continue this conversation from after the turn of `session`.
     fn switch_to(&mut self, _session: &str) -> Result<(), String> {
         Err("this backend keeps no conversation".to_owned())
@@ -603,6 +629,43 @@ pub trait SessionPort: Send {
     /// [`SessionEvent::SideAnswer`].
     fn side_question(&mut self, _question: &str) -> Result<(), String> {
         Err("side questions are not available here".to_owned())
+    }
+    /// Read the conversation's messages; they arrive as
+    /// [`SessionEvent::ConversationRead`].
+    fn read_conversation(&mut self) -> Result<(), String> {
+        Err("this backend keeps no conversation".to_owned())
+    }
+    /// prime-agent's `exportToHtml`: write the conversation as a standalone
+    /// HTML page (`output` relative to the project, or the default name);
+    /// the outcome arrives as [`SessionEvent::HtmlExported`].
+    fn export_html(&mut self, _output: Option<String>) -> Result<(), String> {
+        Err("Cannot export an in-memory session".to_owned())
+    }
+    /// The session's input and output tokens and its cost in US dollars.
+    fn session_usage(&self) -> (u64, u64, f64) {
+        (0, 0, 0.0)
+    }
+    /// prime-agent's `setAutoCompactionEnabled`, kept as the `compaction.enabled`
+    /// setting.
+    fn set_auto_compaction(&mut self, _enabled: bool) -> Result<(), String> {
+        Err("this backend does not compact".to_owned())
+    }
+    /// Whether the context is compacted on its own when it fills.
+    fn auto_compaction(&self) -> bool {
+        true
+    }
+    /// prime-agent's `setAutoRetryEnabled`, kept as the `retry.enabled` setting.
+    fn set_auto_retry(&mut self, _enabled: bool) -> Result<(), String> {
+        Err("this backend does not retry".to_owned())
+    }
+    /// prime-agent's `setSteeringMode` / `setFollowUpMode`, kept as the
+    /// `steeringMode` / `followUpMode` settings.
+    fn set_queue_mode(
+        &mut self,
+        _steering: bool,
+        _mode: super::queue::QueueMode,
+    ) -> Result<(), String> {
+        Err("this backend keeps no queue".to_owned())
     }
     /// Start a browser sign-in; returns the URL to open. The outcome arrives as
     /// [`SessionEvent::LoginFinished`].
@@ -1344,6 +1407,10 @@ pub struct LiveTurn {
     selection: Mutex<LiveSelection>,
     /// The session model a turn left for the backup model, until it answers again.
     left_primary: Arc<Mutex<Option<String>>>,
+    /// prime-agent's `compaction.enabled: false`: turns do not compact on their own.
+    auto_compaction_off: std::sync::atomic::AtomicBool,
+    /// prime-agent's `retry.enabled: false`: a failed model call is not retried.
+    auto_retry_off: std::sync::atomic::AtomicBool,
 }
 
 /// The model and the thinking level a running turn's next call uses.
@@ -1354,6 +1421,21 @@ struct LiveSelection {
 }
 
 impl LiveTurn {
+    /// The switches prime-agent keeps as settings: `compaction.enabled` and
+    /// `retry.enabled` (both on unless set to `false`).
+    fn from_settings(config_file: &Path) -> Self {
+        let off = |key: &str| {
+            super::config::load_setting(config_file, key)
+                .and_then(|value| value.get("enabled").and_then(serde_json::Value::as_bool))
+                == Some(false)
+        };
+        Self {
+            auto_compaction_off: std::sync::atomic::AtomicBool::new(off("compaction")),
+            auto_retry_off: std::sync::atomic::AtomicBool::new(off("retry")),
+            ..Self::default()
+        }
+    }
+
     /// A new turn starts from what it resolved.
     fn start(&self, level: harness_providers::ThinkingLevel) {
         if let Ok(mut current) = self.selection.lock() {
@@ -2991,7 +3073,35 @@ pub struct SavedConversation {
 
 /// The saved conversations of the project whose store is `store_dir`, newest
 /// first, as `/resume` lists them; nothing when the store cannot be read.
+/// The saved conversations the agents view deleted: listed nowhere again.
+/// ha's store keeps every conversation durably, so a delete hides it.
+#[must_use]
+pub fn hidden_conversations_path(store_dir: &Path) -> PathBuf {
+    store_dir.join("hidden-conversations.json")
+}
+
+/// Hide the saved conversation `task` from the listings.
+///
+/// # Errors
+/// The list could not be written.
+pub fn hide_conversation(store_dir: &Path, task: &str) -> Result<(), String> {
+    let path = hidden_conversations_path(store_dir);
+    let mut hidden: Vec<String> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    if !hidden.iter().any(|known| known == task) {
+        hidden.push(task.to_owned());
+    }
+    let text = serde_json::to_string_pretty(&hidden).map_err(|error| error.to_string())?;
+    std::fs::write(&path, text).map_err(|error| error.to_string())
+}
+
 pub async fn saved_conversations(store_dir: PathBuf, limit: usize) -> Vec<SavedConversation> {
+    let hidden: Vec<String> = std::fs::read_to_string(hidden_conversations_path(&store_dir))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
     let Ok(store) = SqliteStore::open_read_only(store_dir).await else {
         return Vec::new();
     };
@@ -3001,7 +3111,11 @@ pub async fn saved_conversations(store_dir: PathBuf, limit: usize) -> Vec<SavedC
     let summaries = user_conversation_sessions(&store, summaries).await;
     let (summaries, turns) = conversation_heads(summaries);
     let mut saved = Vec::new();
-    for summary in summaries.into_iter().take(limit) {
+    for summary in summaries
+        .into_iter()
+        .filter(|summary| !hidden.iter().any(|task| task == summary.task_id.as_str()))
+        .take(limit)
+    {
         let title = store
             .session_setting(&summary.task_id, "title")
             .await
@@ -3090,6 +3204,7 @@ impl AgentSessionService {
         }
         let (agents, child_questions) = session_agents(context, &sender, &gate);
         let task_id = TaskId::generate();
+        agents.bind_ledger(task_id.as_str());
         let schedules = Arc::new(super::schedules::Schedules::default());
         schedules.bind(super::schedules::path_for(
             &context.paths.data_dir,
@@ -3152,13 +3267,14 @@ impl AgentSessionService {
             heartbeats,
             schedules,
             gate_cancellation: None,
-            live: Arc::new(LiveTurn::default()),
+            live: Arc::new(LiveTurn::from_settings(&context.paths.config_file)),
             auto_refine,
         }
     }
 
     /// The jobs of the conversation this session is now in.
     fn follow_schedules(&self) {
+        self.agents.bind_ledger(self.task_id.as_str());
         self.schedules.bind(super::schedules::path_for(
             &self.data_dir,
             self.task_id.as_str(),
@@ -3328,6 +3444,7 @@ impl AgentSessionService {
         let store_dir = self.store_dir.clone();
         let schedules = Arc::clone(&self.schedules);
         let heartbeats = Arc::clone(&self.heartbeats);
+        let agents = Arc::clone(&self.agents);
         let data_dir = self.data_dir.clone();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
@@ -3350,6 +3467,9 @@ impl AgentSessionService {
                     // The resumed conversation's scheduled jobs come back with it.
                     schedules.bind(super::schedules::path_for(&data_dir, task.as_str()));
                     heartbeats.bind(super::heartbeat::path_for(&data_dir, task.as_str()));
+                    // prime-agent: a reopened conversation lists and reaches its
+                    // children again.
+                    agents.bind_ledger(task.as_str());
                     store
                         .session_setting(&task, super::goal::GOAL_SETTING)
                         .await
@@ -3830,7 +3950,111 @@ impl SessionPort for AgentSessionService {
         }
     }
 
+    fn plugin_cards(&self) -> Vec<serde_json::Value> {
+        let servers = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .map(|resolved| resolved.mcp_servers)
+        .unwrap_or_default();
+        super::mcp_catalog::session_cards(
+            &self.global_config_dir,
+            &self.data_dir,
+            &servers,
+            &super::credentials::resolve_path(&self.environment, &self.data_dir),
+        )
+    }
+
+    fn connect_plugin(&mut self, id: &str) -> Result<String, String> {
+        let service = super::mcp_catalog::load(&self.global_config_dir, &self.data_dir)
+            .into_iter()
+            .find(|service| service.id == id)
+            .ok_or_else(|| format!("no service {id} in the catalog"))?;
+        if !service.connectable() {
+            return Err(format!(
+                "{} cannot be connected from /plugins: {}",
+                service.label,
+                if service.auth == "api_key" {
+                    "it needs an API key; add it with /mcp add".to_owned()
+                } else {
+                    service
+                        .setup_reason
+                        .clone()
+                        .unwrap_or_else(|| "it needs manual setup; add it with /mcp add".to_owned())
+                }
+            ));
+        }
+        let url = service.url.clone().unwrap_or_default();
+        let configured = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .map(|resolved| resolved.mcp_servers)
+        .map_err(|error| error.to_string())?;
+        if !configured.contains_key(id) {
+            super::mcp_config::run(
+                &self.config_file,
+                &[
+                    "add".to_owned(),
+                    id.to_owned(),
+                    "--url".to_owned(),
+                    url.clone(),
+                ],
+                &configured,
+            )?;
+        }
+        self.start_mcp_login(id, &url);
+        Ok(format!(
+            "Connecting {}: sign in in the browser; the connection activates on the next call",
+            service.label
+        ))
+    }
+
     fn manage_mcp(&mut self, args: &[String]) -> Result<Vec<String>, String> {
+        // prime-agent's `/mcp login <service>` and `/mcp logout <service>`.
+        match (args.first().map(String::as_str), args.get(1)) {
+            (Some("login"), Some(name)) => {
+                let configured = super::config::resolve_layers(
+                    &self.config_file,
+                    &self.workspace_root,
+                    &self.environment,
+                    &self.config_overrides,
+                )
+                .map(|resolved| resolved.mcp_servers)
+                .map_err(|error| error.to_string())?;
+                let url = match configured.get(name.as_str()) {
+                    Some(server) => server
+                        .url
+                        .clone()
+                        .filter(|_| server.transport.as_deref() == Some("streamable_http"))
+                        .ok_or_else(|| {
+                            format!("MCP server {name} is not a Streamable HTTP server")
+                        })?,
+                    // A catalog service that is not configured yet connects as
+                    // `/plugins` connects it.
+                    None => return self.connect_plugin(name).map(|line| vec![line]),
+                };
+                self.start_mcp_login(name, &url);
+                return Ok(vec![format!("Signing in to MCP server {name}...")]);
+            }
+            (Some("logout"), Some(name)) => {
+                let removed = super::credentials::remove(
+                    &super::credentials::resolve_path(&self.environment, &self.data_dir),
+                    &super::mcp_oauth::credential_key(name),
+                )
+                .map_err(|error| error.to_string())?;
+                return Ok(vec![if removed {
+                    format!("Signed out of MCP server {name}")
+                } else {
+                    format!("MCP server {name} has no sign-in")
+                }]);
+            }
+            _ => {}
+        }
         let configured = super::config::resolve_layers(
             &self.config_file,
             &self.workspace_root,
@@ -4524,6 +4748,14 @@ impl SessionPort for AgentSessionService {
 
     fn has_scheduled_work(&self) -> bool {
         self.schedules.has_active() || self.heartbeats.has_active()
+    }
+
+    fn subagents(&self) -> Vec<super::agents::protocol::SubagentInfo> {
+        self.agents.view_rows()
+    }
+
+    fn heartbeat_count(&self) -> usize {
+        self.heartbeats.count()
     }
 
     fn conversation_id(&self) -> Option<String> {
@@ -5325,6 +5557,81 @@ impl SessionPort for AgentSessionService {
         Ok(())
     }
 
+    fn conversation_leaf(&self) -> Option<String> {
+        self.previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.as_ref().map(|session| session.as_str().to_owned()))
+    }
+
+    fn read_tree(&mut self) -> Result<(), String> {
+        let leaf = self
+            .previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.clone());
+        let store_dir = self.store_dir.clone();
+        let task_id = self.task_id.clone();
+        let sender = self.sender.clone();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let Some(leaf) = leaf else {
+                let _ = sender.send(SessionEvent::TreeRead {
+                    turns: Vec::new(),
+                    leaf: None,
+                });
+                return;
+            };
+            let read = async {
+                let store = SqliteStore::open_read_only(store_dir)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let tree = harness_runtime::conversation_tree(&store, &leaf)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let task = conversation_task(&store, Some(&leaf), task_id).await;
+                let mut turns = Vec::new();
+                for turn in tree {
+                    let label = store
+                        .session_setting(
+                            &task,
+                            &format!("{TURN_LABEL_PREFIX}{}", turn.session.as_str()),
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|label| !label.is_empty());
+                    turns.push(super::events::TreeTurn {
+                        session: turn.session.as_str().to_owned(),
+                        parent: turn.parent.map(|parent| parent.as_str().to_owned()),
+                        question: turn.question,
+                        answer: turn.answer,
+                        label,
+                        label_time: None,
+                        created_at: turn.created_at,
+                    });
+                }
+                Ok::<_, String>(turns)
+            }
+            .await;
+            match read {
+                Ok(turns) => {
+                    let _ = sender.send(SessionEvent::TreeRead {
+                        turns,
+                        leaf: Some(leaf.as_str().to_owned()),
+                    });
+                }
+                Err(error) => {
+                    let _ = sender.send(SessionEvent::Notice {
+                        message: format!("the conversation could not be read: {error}"),
+                    });
+                }
+            }
+        });
+        Ok(())
+    }
+
     fn switch_to(&mut self, session: &str) -> Result<(), String> {
         let session = SessionId::parse(session.to_owned()).map_err(|error| error.to_string())?;
         let mut previous = self
@@ -5429,19 +5736,153 @@ impl SessionPort for AgentSessionService {
     }
 
     fn queue_modes(&self) -> (super::queue::QueueMode, super::queue::QueueMode) {
-        let parse = |mode: Option<&String>| {
+        let parse = |mode: Option<&String>, setting: &str| {
             mode.and_then(|mode| super::queue::QueueMode::parse(mode))
+                .or_else(|| {
+                    // prime-agent's `steeringMode` / `followUpMode` settings.
+                    super::config::load_setting(&self.config_file, setting)
+                        .and_then(|value| value.as_str().and_then(super::queue::QueueMode::parse))
+                })
                 .unwrap_or_default()
         };
         self.configured().map_or_else(
             |_| Default::default(),
             |config| {
                 (
-                    parse(config.queue_modes.0.as_ref()),
-                    parse(config.queue_modes.1.as_ref()),
+                    parse(config.queue_modes.0.as_ref(), "steeringMode"),
+                    parse(config.queue_modes.1.as_ref(), "followUpMode"),
                 )
             },
         )
+    }
+
+    fn set_queue_mode(
+        &mut self,
+        steering: bool,
+        mode: super::queue::QueueMode,
+    ) -> Result<(), String> {
+        let value = match mode {
+            super::queue::QueueMode::All => "all",
+            super::queue::QueueMode::OneAtATime => "one-at-a-time",
+        };
+        super::config::save_setting(
+            &self.config_file,
+            if steering {
+                "steeringMode"
+            } else {
+                "followUpMode"
+            },
+            Some(serde_json::json!(value)),
+        )
+    }
+
+    fn set_auto_compaction(&mut self, enabled: bool) -> Result<(), String> {
+        save_nested_setting(&self.config_file, "compaction", "enabled", enabled)?;
+        self.live
+            .auto_compaction_off
+            .store(!enabled, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn auto_compaction(&self) -> bool {
+        !self
+            .live
+            .auto_compaction_off
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn set_auto_retry(&mut self, enabled: bool) -> Result<(), String> {
+        save_nested_setting(&self.config_file, "retry", "enabled", enabled)?;
+        self.live
+            .auto_retry_off
+            .store(!enabled, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn session_usage(&self) -> (u64, u64, f64) {
+        self.cost_tracker.lock().map_or((0, 0, 0.0), |tracker| {
+            let (input, output) = tracker.tokens();
+            (input, output, tracker.total_usd())
+        })
+    }
+
+    fn read_conversation(&mut self) -> Result<(), String> {
+        let source = self
+            .previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.clone());
+        let store_dir = self.store_dir.clone();
+        let sender = self.sender.clone();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let messages = match source {
+                None => Vec::new(),
+                Some(source) => match SqliteStore::open_read_only(store_dir).await {
+                    Ok(store) => harness_runtime::conversation_history(&store, &source)
+                        .await
+                        .map(|history| prime_messages(&history.messages))
+                        .unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                },
+            };
+            let _ = sender.send(SessionEvent::ConversationRead { messages });
+        });
+        Ok(())
+    }
+
+    fn export_html(&mut self, output: Option<String>) -> Result<(), String> {
+        let source = self
+            .previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.clone())
+            .ok_or_else(|| "Cannot export an in-memory session".to_owned())?;
+        let config = self.configured()?;
+        let store_dir = self.store_dir.clone();
+        let data_dir = self.data_dir.clone();
+        let environment = self.environment.clone();
+        let task_id = self.task_id.clone();
+        let workspace_root = self.workspace_root.clone();
+        let sender = self.sender.clone();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let result = async {
+                let store = SqliteStore::open_read_only(store_dir)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let html = render_session_html(
+                    &store,
+                    &task_id,
+                    Some(&source),
+                    &environment,
+                    &data_dir,
+                    &config.api_key_env,
+                    &config.model,
+                )
+                .await?;
+                // prime-agent: a relative path lands in the session's project,
+                // and the default is `<app>-session-<id>.html`.
+                let path = output.map_or_else(
+                    || workspace_root.join(format!("ha-session-{}.html", task_id.as_str())),
+                    |output| {
+                        let output = PathBuf::from(output);
+                        if output.is_absolute() {
+                            output
+                        } else {
+                            workspace_root.join(output)
+                        }
+                    },
+                );
+                std::fs::write(&path, html).map_err(|error| error.to_string())?;
+                Ok::<_, String>(path.display().to_string())
+            }
+            .await;
+            let _ = sender.send(SessionEvent::HtmlExported { result });
+        });
+        Ok(())
     }
 
     fn fullscreen_prefs(&self) -> super::tui::fullscreen::Prefs {
@@ -5642,6 +6083,31 @@ impl AgentSessionService {
         self.fork_plan = Some(plan);
         // The fork carries the conversation it came from: it is resumed, not new.
         self.mark_session_start("resume");
+    }
+
+    /// Run prime-agent's MCP sign-in for `server` at `url` off the UI thread;
+    /// each step arrives as a notice.
+    fn start_mcp_login(&self, server: &str, url: &str) {
+        let sender = self.sender.clone();
+        let auth_path = super::credentials::resolve_path(&self.environment, &self.data_dir);
+        let server = server.to_owned();
+        let url = url.to_owned();
+        let _ = std::thread::Builder::new()
+            .name("ha-mcp-login".to_owned())
+            .spawn(move || {
+                let progress = |message: &str| {
+                    let _ = sender.send(SessionEvent::Notice {
+                        message: message.to_owned(),
+                    });
+                };
+                let message =
+                    match super::mcp_oauth::login(&server, &url, None, None, &auth_path, &progress)
+                    {
+                        Ok(()) => format!("Signed in to MCP server {server}"),
+                        Err(error) => format!("MCP sign-in for {server} failed: {error}"),
+                    };
+                progress(&message);
+            });
     }
 
     /// The next prompt opens a session for `source`.
@@ -6379,12 +6845,16 @@ async fn run_turn(
         data_dir.clone(),
     )
     .map(|provider| {
-        let router = provider.router_for(
-            sender.clone(),
-            &environment,
-            thinking_level,
-            RuntimeConfig::default().max_attempts,
-        );
+        let max_attempts = if live
+            .auto_retry_off
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            1
+        } else {
+            RuntimeConfig::default().max_attempts
+        };
+        let router =
+            provider.router_for(sender.clone(), &environment, thinking_level, max_attempts);
         Arc::new(provider.with_router(router)) as Arc<dyn ModelProvider>
     });
     let provider = match provider {
@@ -6874,10 +7344,18 @@ async fn run_turn(
             // Always answered, even with no server configured: an unanswered
             // `mcp.list_connections` reached the model as "request failed", and it
             // kept retrying a bridge that had nothing behind it.
-            chain.push(Arc::new(super::skill_requests::McpRequests::new(
-                config.mcp_servers.clone(),
-                workspace_root.clone(),
-            )));
+            chain.push(Arc::new(
+                super::skill_requests::McpRequests::new(
+                    config.mcp_servers.clone(),
+                    workspace_root.clone(),
+                )
+                .with_plugins(super::mcp_catalog::session_cards(
+                    &global_config_dir,
+                    &data_dir,
+                    &config.mcp_servers,
+                    &super::credentials::resolve_path(&environment, &data_dir),
+                )),
+            ));
             let requests: Arc<dyn super::repl::HostRequests> =
                 Arc::new(super::skill_requests::ChainedRequests(chain));
             super::repl::ReplHost::for_turn(
@@ -7038,6 +7516,22 @@ async fn run_turn(
         })
         .collect::<Vec<_>>();
     let mut built_prompt = SystemPromptBuilder::build(&prompt_environment, &prompt_tools);
+    // prime-agent's custom prompt: `--system-prompt`, else a `SYSTEM.md`,
+    // replaces the static layers; the session's blocks still follow it.
+    if let Some(custom) = turn_overrides
+        .system_prompt
+        .clone()
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| {
+            super::resources::system_prompt(
+                &workspace_root,
+                &global_config_dir,
+                config.project_trusted,
+            )
+        })
+    {
+        built_prompt.text = custom;
+    }
     if repl_host.is_some()
         && let Some(block) = super::prompt::python_skills_block(&kernel_skill_imports)
     {
@@ -7069,6 +7563,22 @@ async fn run_turn(
         repl_host.is_some().then(super::repl::kernel_packages),
         0,
     ));
+    // `--append-system-prompt`, else an `APPEND_SYSTEM.md`, closes the prompt.
+    let appended = if turn_overrides.append_system_prompt.is_empty() {
+        super::resources::append_system_prompt(
+            &workspace_root,
+            &global_config_dir,
+            config.project_trusted,
+        )
+        .into_iter()
+        .collect()
+    } else {
+        turn_overrides.append_system_prompt.clone()
+    };
+    for text in appended.iter().filter(|text| !text.trim().is_empty()) {
+        built_prompt.text.push_str("\n\n");
+        built_prompt.text.push_str(text);
+    }
     let mut project_blocks = loaded_instructions.blocks;
     if let Ok(active) = active_skills.lock() {
         project_blocks.extend(
@@ -7146,6 +7656,12 @@ async fn run_turn(
     });
     if let Some(imported) = imported {
         run_request = run_request.with_conversation(imported);
+    }
+    if live
+        .auto_compaction_off
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        run_request = run_request.without_auto_compaction();
     }
     // A fork's first turn carries the conversation up to its fork point, as a
     // continued turn carries the one before it.
@@ -8031,6 +8547,59 @@ fn export_secrets(
 }
 
 /// `/export session.html`: the conversation as one self-contained page.
+/// Set `key` inside the object setting `section` (`compaction.enabled`),
+/// keeping its other keys.
+fn save_nested_setting(
+    config_file: &Path,
+    section: &str,
+    key: &str,
+    value: bool,
+) -> Result<(), String> {
+    let mut object = super::config::load_setting(config_file, section)
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    object[key] = serde_json::json!(value);
+    super::config::save_setting(config_file, section, Some(object))
+}
+
+/// A conversation's messages in prime-agent's message shapes (`get_messages`):
+/// user and assistant text, the assistant's tool calls, and tool results.
+fn prime_messages(messages: &[harness_providers::ProviderMessage]) -> Vec<serde_json::Value> {
+    use harness_providers::MessageRole;
+    messages
+        .iter()
+        .filter_map(|message| match message.role {
+            MessageRole::System => None,
+            MessageRole::User => Some(serde_json::json!({
+                "role": "user",
+                "content": [{ "type": "text", "text": message.content }],
+            })),
+            MessageRole::Assistant => {
+                let mut content = Vec::new();
+                if !message.content.is_empty() {
+                    content.push(serde_json::json!({ "type": "text", "text": message.content }));
+                }
+                for call in &message.tool_calls {
+                    let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                        .unwrap_or_else(|_| serde_json::json!(call.arguments));
+                    content.push(serde_json::json!({
+                        "type": "toolCall",
+                        "id": call.call_id,
+                        "name": call.name,
+                        "arguments": arguments,
+                    }));
+                }
+                Some(serde_json::json!({ "role": "assistant", "content": content }))
+            }
+            MessageRole::Tool => Some(serde_json::json!({
+                "role": "toolResult",
+                "toolCallId": message.tool_call_id,
+                "content": [{ "type": "text", "text": message.content }],
+            })),
+        })
+        .collect()
+}
+
 async fn render_session_html(
     store: &SqliteStore,
     task_id: &TaskId,
