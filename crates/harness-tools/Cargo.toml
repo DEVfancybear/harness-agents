@@ -17,8 +17,11 @@ harness-types = { path = "../harness-types" }
 fancy-regex = "=0.16.2"
 globset.workspace = true
 ignore.workspace = true
+memchr.workspace = true
+notify.workspace = true
 process-wrap.workspace = true
 regex.workspace = true
+regex-syntax.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

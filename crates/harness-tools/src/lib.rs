@@ -12,14 +12,17 @@ mod edit_diff;
 mod execution;
 mod git_guard;
 mod hooks;
+mod index;
 mod loop_service;
 mod policy;
 mod process;
+mod search;
 mod secrets;
 mod service;
 mod truncate;
 mod turn_driver;
 mod validation;
+mod walk;
 mod workspace;
 
 pub use capture::{

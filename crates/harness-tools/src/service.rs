@@ -30,9 +30,8 @@ use crate::{
     secrets::{HostEnvironmentSecrets, ProcessEnvironment, SecretResolver},
     workspace::{
         apply_text_patch, edit_text, glob_files, inspect_workspace, inspect_workspace_for_read,
-        list_files, plan_edit_text, read_file_range, read_file_range_with_hash, read_text,
-        redact_text, resolve_relative, search_text, validate_glob, validate_search,
-        write_text_checked,
+        list_files, plan_edit_text, read_file_range_with_hash, read_text, redact_text,
+        resolve_relative, search_text, validate_glob, validate_search, write_text_checked,
     },
 };
 use harness_store_sqlite::HistoryScope;
@@ -575,8 +574,10 @@ impl ToolExecutionService {
             .register_project(workspace.registration())
             .await
             .map_err(store_error)?;
-        Self::validate_workspace_action(&workspace.root, &request.action)?;
-        Self::validate_workspace_action(&workspace.root, &final_action)?;
+        if request.action != final_action {
+            Self::validate_workspace_action(&workspace.root, &request.action, true)?;
+        }
+        Self::validate_workspace_action(&workspace.root, &final_action, true)?;
         let action_hash = final_action.canonical_hash()?;
         Ok(PreparedToolRequest {
             request,
@@ -801,7 +802,9 @@ impl ToolExecutionService {
                 .record_denied_begun(&prepared, execution_id, Some(&approval), code, &reason)
                 .await;
         }
-        Self::validate_workspace_action(&prepared.workspace_root, &transformed)?;
+        // The file content is checked again by the preconditions below, after
+        // the identity check; here only the paths and bounds.
+        Self::validate_workspace_action(&prepared.workspace_root, &transformed, false)?;
         // The dispatch must act on the workspace the approval named: the same root
         // and repository. Its file contents are not compared: an indexer, an
         // editor or the app's own export writes files while a turn runs, and a
@@ -1133,6 +1136,7 @@ impl ToolExecutionService {
     fn validate_workspace_action(
         root: &Path,
         action: &CodingToolAction,
+        check_content: bool,
     ) -> Result<(), HarnessError> {
         match action {
             CodingToolAction::ReadFile { path, .. }
@@ -1198,7 +1202,9 @@ impl ToolExecutionService {
                     ));
                 }
                 let target = resolve_relative(root, path, false)?;
-                if target.exists() {
+                if !check_content {
+                    // The preconditions read the file; only the parent below.
+                } else if target.exists() {
                     let current = read_text(&target)?;
                     let current_hash = ContentHash::from_bytes(current.as_bytes());
                     if expected_hash.as_ref() != Some(&current_hash) {
@@ -1233,8 +1239,10 @@ impl ToolExecutionService {
                 replace_all,
             } => {
                 let target = resolve_relative(root, path, false)?;
-                let current = read_text(&target)?;
-                let _ = plan_edit_text(&current, old_string, new_string, *replace_all, path)?;
+                if check_content {
+                    let current = read_text(&target)?;
+                    let _ = plan_edit_text(&current, old_string, new_string, *replace_all, path)?;
+                }
             }
             _ => {}
         }
@@ -1258,22 +1266,13 @@ impl ToolExecutionService {
     ) -> Result<(), HarnessError> {
         let root = prepared.workspace_root.as_path();
         match action {
-            CodingToolAction::ReadFile {
-                path,
-                offset,
-                limit,
-            } => {
+            CodingToolAction::ReadFile { path, .. } => {
                 // Deterministic content-policy failures (binary or unsupported
                 // encoding) are denied before an intent is created. A later
                 // disappearance/race remains an ordinary settled/unknown
                 // dispatch result, never an unsafe success.
                 let target = resolve_relative(root, path, false)?;
                 let _ = read_text(&target)?;
-                let _ = read_file_range(
-                    &target,
-                    offset.unwrap_or(0),
-                    limit.unwrap_or(crate::contracts::READ_FILE_DEFAULT_LINES),
-                )?;
             }
             CodingToolAction::Glob { pattern, .. } => validate_glob(pattern)?,
             CodingToolAction::SearchText {
@@ -1526,8 +1525,10 @@ impl ToolExecutionService {
             } => {
                 let target = resolve_relative(root, path, false)?;
                 let before = read_text(&target)?;
-                let artifact = self.publish_before_content(Some(&before))?;
-                let mutation = apply_text_patch(&target, expected_hash, replacement)?;
+                let artifact = self.stage_before_content(Some(&before))?;
+                let mutation = self.while_flushing(artifact.as_ref(), || {
+                    apply_text_patch(&target, expected_hash, replacement)
+                })?;
                 let output = ToolOutput::ApplyPatch {
                     path: path.replace('\\', "/"),
                     before_hash: mutation.before_hash.clone(),
@@ -1546,7 +1547,7 @@ impl ToolExecutionService {
                 } else {
                     None
                 };
-                let artifact = self.publish_before_content(before.as_deref())?;
+                let artifact = self.stage_before_content(before.as_deref())?;
                 if let Some(parent) = target.parent()
                     && !parent.exists()
                 {
@@ -1560,7 +1561,9 @@ impl ToolExecutionService {
                     // still resolves there before anything is written.
                     resolve_relative(root, path, false)?;
                 }
-                let mutation = write_text_checked(&target, expected_hash.as_ref(), content)?;
+                let mutation = self.while_flushing(artifact.as_ref(), || {
+                    write_text_checked(&target, expected_hash.as_ref(), content)
+                })?;
                 let output = ToolOutput::WriteFile {
                     path: path.replace('\\', "/"),
                     before_hash: mutation.before_hash.clone(),
@@ -1576,9 +1579,10 @@ impl ToolExecutionService {
             } => {
                 let target = resolve_relative(root, path, false)?;
                 let before = read_text(&target)?;
-                let artifact = self.publish_before_content(Some(&before))?;
-                let (mutation, diff) =
-                    edit_text(&target, path, old_string, new_string, *replace_all)?;
+                let artifact = self.stage_before_content(Some(&before))?;
+                let (mutation, diff) = self.while_flushing(artifact.as_ref(), || {
+                    edit_text(&target, path, old_string, new_string, *replace_all)
+                })?;
                 let output = ToolOutput::EditFile {
                     path: path.replace('\\', "/"),
                     before_hash: mutation.before_hash.clone(),
@@ -2021,22 +2025,32 @@ impl ToolExecutionService {
             .retain(|pending| pending.execution_id != execution_id);
         state.revision = sequence;
         state.through_event_seq = sequence;
-        // A read changed nothing: its workspace after is the one it started from.
-        let after_fingerprint = if is_read_only(&prepared.final_action) {
-            prepared.workspace_fingerprint.clone()
-        } else {
-            inspect_workspace(&prepared.workspace_root, prepared.project_id.clone()).map_or_else(
-                |_| prepared.workspace_fingerprint.clone(),
-                |workspace| workspace.fingerprint,
-            )
-        };
         // A process capture is its own durable evidence: the receipt points at
         // the captured bytes rather than at a re-serialization of them. Every
         // other output keeps the long-standing behavior of publishing its own
-        // model-facing view.
-        let artifact = match artifact {
-            Some(artifact) => Some(artifact),
-            None => self.publish_output_artifact(&output)?,
+        // model-facing view: a read's unflushed, a write's flushed while the
+        // workspace is fingerprinted after it, and before the receipt commits.
+        let read_only = is_read_only(&prepared.final_action);
+        let staged = match artifact {
+            Some(artifact) => (Some(artifact), false),
+            None => (self.publish_output_artifact(&output)?, !read_only),
+        };
+        let (artifact, flush) = staged;
+        let after_fingerprint = if read_only {
+            // A read changed nothing: its workspace after is the one it started from.
+            prepared.workspace_fingerprint.clone()
+        } else {
+            let observe = || {
+                inspect_workspace(&prepared.workspace_root, prepared.project_id.clone())
+                    .map_or_else(
+                        |_| prepared.workspace_fingerprint.clone(),
+                        |workspace| workspace.fingerprint,
+                    )
+            };
+            match artifact.as_ref().filter(|_| flush) {
+                Some(published) => self.while_flushing(Some(published), || Ok(observe()))?,
+                None => observe(),
+            }
         };
         let (before_hash, after_hash) = match &output {
             ToolOutput::ApplyPatch {
@@ -2228,6 +2242,11 @@ impl ToolExecutionService {
         Ok(view)
     }
 
+    /// The model-facing view of a call's output, as evidence, in place but not
+    /// flushed. What a read returned can be read again, so it is never
+    /// flushed: a flush costs more than the whole read (70-80 ms on Windows)
+    /// and only a power loss could make the difference. The caller flushes a
+    /// write's output itself, beside other work.
     fn publish_output_artifact(
         &self,
         output: &ToolOutput,
@@ -2239,12 +2258,42 @@ impl ToolExecutionService {
             )
         })?;
         self.store
-            .publish_artifact(&bytes)
+            .publish_artifact_unsynced(&bytes)
             .map(Some)
             .map_err(store_error)
     }
 
-    fn publish_before_content(
+    /// Run a workspace mutation while the pre-edit artifact is flushed beside
+    /// it. The artifact is in place before the mutation starts, as before; its
+    /// flush and the mutation's own now overlap instead of following each
+    /// other, and both are done before the receipt is committed.
+    fn while_flushing<T>(
+        &self,
+        artifact: Option<&PublishedArtifact>,
+        mutation: impl FnOnce() -> Result<T, HarnessError>,
+    ) -> Result<T, HarnessError> {
+        let Some(artifact) = artifact else {
+            return mutation();
+        };
+        let (flushed, result) = std::thread::scope(|scope| {
+            let flush = scope.spawn(|| self.store.sync_artifact(artifact));
+            let result = mutation();
+            (flush.join(), result)
+        });
+        let value = result?;
+        match flushed {
+            Ok(Ok(())) => Ok(value),
+            Ok(Err(error)) => Err(store_error(error)),
+            Err(_) => Err(HarnessError::new(
+                ErrorCode::ArtifactWriteFailed,
+                "the pre-edit artifact flush stopped unexpectedly",
+            )),
+        }
+    }
+
+    /// The pre-edit content, in place but not yet flushed: see
+    /// [`Self::while_flushing`].
+    fn stage_before_content(
         &self,
         before: Option<&str>,
     ) -> Result<Option<PublishedArtifact>, HarnessError> {
@@ -2258,7 +2307,7 @@ impl ToolExecutionService {
             ));
         }
         self.store
-            .publish_artifact(before.as_bytes())
+            .publish_artifact_unsynced(before.as_bytes())
             .map(Some)
             .map_err(store_error)
     }

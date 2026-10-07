@@ -1514,6 +1514,50 @@ impl SqliteStore {
     /// disk but whose row was never committed is invisible to backup and to
     /// garbage collection.
     pub fn publish_artifact(&self, bytes: &[u8]) -> Result<PublishedArtifact, StoreError> {
+        self.publish_artifact_with(bytes, true)
+    }
+
+    /// Flush a published artifact's bytes to disk.
+    ///
+    /// A flush costs 70-80 ms on a Windows disk with antivirus scanning, more
+    /// than everything else a tool call does. [`Self::publish_artifact`]
+    /// flushes before it returns; a caller that has other work to do first
+    /// publishes with [`Self::publish_artifact_unsynced`] and flushes here, on
+    /// another thread, while that work runs.
+    pub fn sync_artifact(&self, artifact: &PublishedArtifact) -> Result<(), StoreError> {
+        let path = self.paths.data_dir.join(&artifact.relative_path);
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                StoreError::new(
+                    ErrorCode::ArtifactWriteFailed,
+                    format!("cannot flush artifact bytes: {error}"),
+                )
+            })
+    }
+
+    /// Publish an artifact without waiting for its bytes to reach the disk.
+    ///
+    /// The file is complete and in place when this returns, so every reader in
+    /// this or any later process finds it; only a power loss before the
+    /// operating system writes it back can lose it. That is the right trade
+    /// for evidence that can be produced again - what a read-only tool call
+    /// returned - and for an artifact the caller flushes with
+    /// [`Self::sync_artifact`] before it commits anything that depends on it.
+    pub fn publish_artifact_unsynced(&self, bytes: &[u8]) -> Result<PublishedArtifact, StoreError> {
+        self.publish_artifact_with(bytes, false)
+    }
+
+    /// Write the bytes to a temporary file and rename it into place, flushing
+    /// it first when `flush` is set, so the final name never holds a partial
+    /// file even after a power loss.
+    fn publish_artifact_with(
+        &self,
+        bytes: &[u8],
+        flush: bool,
+    ) -> Result<PublishedArtifact, StoreError> {
         self.fence()?;
         fs::create_dir_all(&self.paths.artifact_dir).map_err(|error| {
             StoreError::new(
@@ -1548,12 +1592,14 @@ impl SqliteStore {
                 format!("cannot write artifact bytes: {error}"),
             )
         })?;
-        file.sync_all().map_err(|error| {
-            StoreError::new(
-                ErrorCode::ArtifactWriteFailed,
-                format!("cannot flush artifact bytes: {error}"),
-            )
-        })?;
+        if flush {
+            file.sync_all().map_err(|error| {
+                StoreError::new(
+                    ErrorCode::ArtifactWriteFailed,
+                    format!("cannot flush artifact bytes: {error}"),
+                )
+            })?;
+        }
         drop(file);
         fs::rename(&temporary_path, &final_path).map_err(|error| {
             StoreError::new(
