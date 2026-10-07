@@ -1365,8 +1365,10 @@ fn assert_doctor_is_honest(data: &std::path::Path) {
         .as_array()
         .expect("doctor names what it did not verify");
     assert!(!not_verified.is_empty());
+    // The per-project worker is a background service ha provides now, so the
+    // doctor no longer lists "no daemon" among what it did not verify.
     assert!(
-        not_verified
+        !not_verified
             .iter()
             .any(|item| item.as_str().is_some_and(|text| text.contains("daemon")))
     );
