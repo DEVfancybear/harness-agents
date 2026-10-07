@@ -110,6 +110,7 @@ mod g03_model_selection_tests {
             agents_default_model: None,
             queue_modes: (None, None),
             routing: super::super::config::Routing::default(),
+            verify: super::super::verify::Verify::default(),
             credential: super::CredentialSource::Environment {
                 variable: String::new(),
             },
@@ -282,6 +283,15 @@ pub trait SessionPort: Send {
     fn manage_mcp(&mut self, _args: &[String]) -> Result<Vec<String>, String> {
         Err("this backend does not manage MCP servers".to_owned())
     }
+    /// prime-agent's service-catalog cards (`/plugins`).
+    fn plugin_cards(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    /// Connect a catalog service: add it as an MCP server and sign in. The
+    /// sign-in's progress arrives as notices; the answer says what started.
+    fn connect_plugin(&mut self, _id: &str) -> Result<String, String> {
+        Err("this backend does not manage MCP servers".to_owned())
+    }
     fn agents_summary(&self) -> Vec<String> {
         vec!["no delegated workers have run in this session".to_owned()]
     }
@@ -397,6 +407,14 @@ pub trait SessionPort: Send {
     fn has_scheduled_work(&self) -> bool {
         false
     }
+    /// The session's subagents, for the agents view.
+    fn subagents(&self) -> Vec<super::agents::protocol::SubagentInfo> {
+        Vec::new()
+    }
+    /// How many heartbeats the session keeps.
+    fn heartbeat_count(&self) -> usize {
+        0
+    }
     /// The conversation this session is in.
     fn conversation_id(&self) -> Option<String> {
         None
@@ -404,6 +422,31 @@ pub trait SessionPort: Send {
     /// Where `rlm.create_session` starts a separate top-level session; only a
     /// background agent has one.
     fn set_session_host(&mut self, _host: Arc<dyn super::agents::SessionHost>) {}
+    /// The project's `[verify]` checks.
+    fn verify_checks(&self) -> Vec<super::verify::Check> {
+        Vec::new()
+    }
+    /// `/verify`: run the project's checks now; the report arrives as
+    /// [`SessionEvent::Verified`].
+    fn run_verify(&mut self) -> Result<(), String> {
+        Err("this backend cannot run checks".to_owned())
+    }
+    /// `/features`: the project's feature list.
+    fn features(&self) -> Result<Vec<String>, String> {
+        Err("this backend has no workspace".to_owned())
+    }
+    /// What leaving now would leave the next session to trip over.
+    fn clean_state(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// `/doctor`: how ready the repository is for an agent.
+    fn doctor(&self) -> Result<Vec<String>, String> {
+        Err("this backend has no workspace".to_owned())
+    }
+    /// `/checks`: the checks refinements proposed, and the user's verdict.
+    fn checks(&mut self, _argument: Option<&str>) -> Result<Vec<String>, String> {
+        Err("this backend has no workspace".to_owned())
+    }
     /// Run autonomous quality gates in the workspace; the verdict arrives as
     /// [`SessionEvent::GatesChecked`].
     fn run_gates(&mut self, _job: super::autonomous::GateJob) -> Result<(), String> {
@@ -569,6 +612,15 @@ pub trait SessionPort: Send {
     fn clone_conversation(&mut self) -> Result<(), String> {
         Err("this backend keeps no conversation".to_owned())
     }
+    /// prime-agent's `/tree` selector data; it arrives as
+    /// [`SessionEvent::TreeRead`].
+    fn read_tree(&mut self) -> Result<(), String> {
+        Err("this backend keeps no conversation".to_owned())
+    }
+    /// The turn the conversation's next message follows.
+    fn conversation_leaf(&self) -> Option<String> {
+        None
+    }
     /// `/tree`: continue this conversation from after the turn of `session`.
     fn switch_to(&mut self, _session: &str) -> Result<(), String> {
         Err("this backend keeps no conversation".to_owned())
@@ -577,6 +629,43 @@ pub trait SessionPort: Send {
     /// [`SessionEvent::SideAnswer`].
     fn side_question(&mut self, _question: &str) -> Result<(), String> {
         Err("side questions are not available here".to_owned())
+    }
+    /// Read the conversation's messages; they arrive as
+    /// [`SessionEvent::ConversationRead`].
+    fn read_conversation(&mut self) -> Result<(), String> {
+        Err("this backend keeps no conversation".to_owned())
+    }
+    /// prime-agent's `exportToHtml`: write the conversation as a standalone
+    /// HTML page (`output` relative to the project, or the default name);
+    /// the outcome arrives as [`SessionEvent::HtmlExported`].
+    fn export_html(&mut self, _output: Option<String>) -> Result<(), String> {
+        Err("Cannot export an in-memory session".to_owned())
+    }
+    /// The session's input and output tokens and its cost in US dollars.
+    fn session_usage(&self) -> (u64, u64, f64) {
+        (0, 0, 0.0)
+    }
+    /// prime-agent's `setAutoCompactionEnabled`, kept as the `compaction.enabled`
+    /// setting.
+    fn set_auto_compaction(&mut self, _enabled: bool) -> Result<(), String> {
+        Err("this backend does not compact".to_owned())
+    }
+    /// Whether the context is compacted on its own when it fills.
+    fn auto_compaction(&self) -> bool {
+        true
+    }
+    /// prime-agent's `setAutoRetryEnabled`, kept as the `retry.enabled` setting.
+    fn set_auto_retry(&mut self, _enabled: bool) -> Result<(), String> {
+        Err("this backend does not retry".to_owned())
+    }
+    /// prime-agent's `setSteeringMode` / `setFollowUpMode`, kept as the
+    /// `steeringMode` / `followUpMode` settings.
+    fn set_queue_mode(
+        &mut self,
+        _steering: bool,
+        _mode: super::queue::QueueMode,
+    ) -> Result<(), String> {
+        Err("this backend keeps no queue".to_owned())
     }
     /// Start a browser sign-in; returns the URL to open. The outcome arrives as
     /// [`SessionEvent::LoginFinished`].
@@ -883,6 +972,8 @@ pub struct ProviderConfig {
     pub queue_modes: (Option<String>, Option<String>),
     /// `[routing]`: scoped, auxiliary, backup and image models.
     pub routing: super::config::Routing,
+    /// `[verify]`: the project's checks and whether a verifier judges goals.
+    pub verify: super::verify::Verify,
     /// Name of the source that holds the key; never the key.
     pub credential: CredentialSource,
     /// The service tier the session asked for (`/tier`, `/fast`), before it is
@@ -1028,6 +1119,7 @@ pub(super) fn resolve_provider_with_overrides(
         agents_default_model: resolved.agents_default_model,
         queue_modes: resolved.queue_modes,
         routing: resolved.routing,
+        verify: resolved.verify,
         credential,
         service_tier: None,
     })
@@ -1315,6 +1407,10 @@ pub struct LiveTurn {
     selection: Mutex<LiveSelection>,
     /// The session model a turn left for the backup model, until it answers again.
     left_primary: Arc<Mutex<Option<String>>>,
+    /// prime-agent's `compaction.enabled: false`: turns do not compact on their own.
+    auto_compaction_off: std::sync::atomic::AtomicBool,
+    /// prime-agent's `retry.enabled: false`: a failed model call is not retried.
+    auto_retry_off: std::sync::atomic::AtomicBool,
 }
 
 /// The model and the thinking level a running turn's next call uses.
@@ -1325,6 +1421,21 @@ struct LiveSelection {
 }
 
 impl LiveTurn {
+    /// The switches prime-agent keeps as settings: `compaction.enabled` and
+    /// `retry.enabled` (both on unless set to `false`).
+    fn from_settings(config_file: &Path) -> Self {
+        let off = |key: &str| {
+            super::config::load_setting(config_file, key)
+                .and_then(|value| value.get("enabled").and_then(serde_json::Value::as_bool))
+                == Some(false)
+        };
+        Self {
+            auto_compaction_off: std::sync::atomic::AtomicBool::new(off("compaction")),
+            auto_retry_off: std::sync::atomic::AtomicBool::new(off("retry")),
+            ..Self::default()
+        }
+    }
+
     /// A new turn starts from what it resolved.
     fn start(&self, level: harness_providers::ThinkingLevel) {
         if let Ok(mut current) = self.selection.lock() {
@@ -2096,6 +2207,8 @@ pub struct AgentSessionService {
     system_prompt: Arc<Mutex<String>>,
     turn_tools: Arc<Mutex<Vec<serde_json::Value>>>,
     active_skills: Arc<Mutex<BTreeMap<String, harness_extensions::SkillActivation>>>,
+    /// The subdirectory instructions each conversation has been given.
+    nested_instructions: Arc<Mutex<std::collections::BTreeSet<(String, PathBuf)>>>,
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
     /// The session's delegated children and the store they share with its turns.
@@ -2969,7 +3082,35 @@ pub struct SavedConversation {
 
 /// The saved conversations of the project whose store is `store_dir`, newest
 /// first, as `/resume` lists them; nothing when the store cannot be read.
+/// The saved conversations the agents view deleted: listed nowhere again.
+/// ha's store keeps every conversation durably, so a delete hides it.
+#[must_use]
+pub fn hidden_conversations_path(store_dir: &Path) -> PathBuf {
+    store_dir.join("hidden-conversations.json")
+}
+
+/// Hide the saved conversation `task` from the listings.
+///
+/// # Errors
+/// The list could not be written.
+pub fn hide_conversation(store_dir: &Path, task: &str) -> Result<(), String> {
+    let path = hidden_conversations_path(store_dir);
+    let mut hidden: Vec<String> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    if !hidden.iter().any(|known| known == task) {
+        hidden.push(task.to_owned());
+    }
+    let text = serde_json::to_string_pretty(&hidden).map_err(|error| error.to_string())?;
+    std::fs::write(&path, text).map_err(|error| error.to_string())
+}
+
 pub async fn saved_conversations(store_dir: PathBuf, limit: usize) -> Vec<SavedConversation> {
+    let hidden: Vec<String> = std::fs::read_to_string(hidden_conversations_path(&store_dir))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
     let Ok(store) = SqliteStore::open_read_only(store_dir).await else {
         return Vec::new();
     };
@@ -2979,7 +3120,11 @@ pub async fn saved_conversations(store_dir: PathBuf, limit: usize) -> Vec<SavedC
     let summaries = user_conversation_sessions(&store, summaries).await;
     let (summaries, turns) = conversation_heads(summaries);
     let mut saved = Vec::new();
-    for summary in summaries.into_iter().take(limit) {
+    for summary in summaries
+        .into_iter()
+        .filter(|summary| !hidden.iter().any(|task| task == summary.task_id.as_str()))
+        .take(limit)
+    {
         let title = store
             .session_setting(&summary.task_id, "title")
             .await
@@ -3068,6 +3213,7 @@ impl AgentSessionService {
         }
         let (agents, child_questions) = session_agents(context, &sender, &gate);
         let task_id = TaskId::generate();
+        agents.bind_ledger(task_id.as_str());
         let schedules = Arc::new(super::schedules::Schedules::default());
         schedules.bind(super::schedules::path_for(
             &context.paths.data_dir,
@@ -3113,6 +3259,7 @@ impl AgentSessionService {
             system_prompt: Arc::new(Mutex::new(String::new())),
             turn_tools: Arc::new(Mutex::new(Vec::new())),
             active_skills: Arc::new(Mutex::new(BTreeMap::new())),
+            nested_instructions: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             pending_mcp_elicitations: Arc::new(Mutex::new(HashMap::new())),
             mcp_status: Arc::new(Mutex::new(Vec::new())),
             agents,
@@ -3129,13 +3276,14 @@ impl AgentSessionService {
             heartbeats,
             schedules,
             gate_cancellation: None,
-            live: Arc::new(LiveTurn::default()),
+            live: Arc::new(LiveTurn::from_settings(&context.paths.config_file)),
             auto_refine,
         }
     }
 
     /// The jobs of the conversation this session is now in.
     fn follow_schedules(&self) {
+        self.agents.bind_ledger(self.task_id.as_str());
         self.schedules.bind(super::schedules::path_for(
             &self.data_dir,
             self.task_id.as_str(),
@@ -3305,6 +3453,7 @@ impl AgentSessionService {
         let store_dir = self.store_dir.clone();
         let schedules = Arc::clone(&self.schedules);
         let heartbeats = Arc::clone(&self.heartbeats);
+        let agents = Arc::clone(&self.agents);
         let data_dir = self.data_dir.clone();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
@@ -3327,6 +3476,9 @@ impl AgentSessionService {
                     // The resumed conversation's scheduled jobs come back with it.
                     schedules.bind(super::schedules::path_for(&data_dir, task.as_str()));
                     heartbeats.bind(super::heartbeat::path_for(&data_dir, task.as_str()));
+                    // prime-agent: a reopened conversation lists and reaches its
+                    // children again.
+                    agents.bind_ledger(task.as_str());
                     store
                         .session_setting(&task, super::goal::GOAL_SETTING)
                         .await
@@ -3413,6 +3565,7 @@ impl Drop for AgentSessionService {
                     task: self.task_id.as_str().to_owned(),
                     session,
                     turns,
+                    in_play: self.refine_cadence.take_in_play(),
                 },
             );
         }
@@ -3548,6 +3701,10 @@ impl SessionPort for AgentSessionService {
             .map(|config| (config.provider_id, config.model))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one clone per piece of session state the turn shares, handed over in one place"
+    )]
     fn submit(&mut self, request: SubmitRequest) {
         self.gate.clear_turn_rules();
         let cancellation = CancellationToken::new();
@@ -3581,6 +3738,7 @@ impl SessionPort for AgentSessionService {
         let system_prompt = Arc::clone(&self.system_prompt);
         let turn_tools = Arc::clone(&self.turn_tools);
         let active_skills = Arc::clone(&self.active_skills);
+        let nested_instructions = Arc::clone(&self.nested_instructions);
         let pending_mcp_elicitations = Arc::clone(&self.pending_mcp_elicitations);
         let mcp_status = Arc::clone(&self.mcp_status);
         let agents = Arc::clone(&self.agents);
@@ -3627,6 +3785,7 @@ impl SessionPort for AgentSessionService {
                 system_prompt,
                 turn_tools,
                 active_skills,
+                nested_instructions,
                 pending_mcp_elicitations,
                 mcp_status,
                 agents,
@@ -3800,7 +3959,111 @@ impl SessionPort for AgentSessionService {
         }
     }
 
+    fn plugin_cards(&self) -> Vec<serde_json::Value> {
+        let servers = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .map(|resolved| resolved.mcp_servers)
+        .unwrap_or_default();
+        super::mcp_catalog::session_cards(
+            &self.global_config_dir,
+            &self.data_dir,
+            &servers,
+            &super::credentials::resolve_path(&self.environment, &self.data_dir),
+        )
+    }
+
+    fn connect_plugin(&mut self, id: &str) -> Result<String, String> {
+        let service = super::mcp_catalog::load(&self.global_config_dir, &self.data_dir)
+            .into_iter()
+            .find(|service| service.id == id)
+            .ok_or_else(|| format!("no service {id} in the catalog"))?;
+        if !service.connectable() {
+            return Err(format!(
+                "{} cannot be connected from /plugins: {}",
+                service.label,
+                if service.auth == "api_key" {
+                    "it needs an API key; add it with /mcp add".to_owned()
+                } else {
+                    service
+                        .setup_reason
+                        .clone()
+                        .unwrap_or_else(|| "it needs manual setup; add it with /mcp add".to_owned())
+                }
+            ));
+        }
+        let url = service.url.clone().unwrap_or_default();
+        let configured = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .map(|resolved| resolved.mcp_servers)
+        .map_err(|error| error.to_string())?;
+        if !configured.contains_key(id) {
+            super::mcp_config::run(
+                &self.config_file,
+                &[
+                    "add".to_owned(),
+                    id.to_owned(),
+                    "--url".to_owned(),
+                    url.clone(),
+                ],
+                &configured,
+            )?;
+        }
+        self.start_mcp_login(id, &url);
+        Ok(format!(
+            "Connecting {}: sign in in the browser; the connection activates on the next call",
+            service.label
+        ))
+    }
+
     fn manage_mcp(&mut self, args: &[String]) -> Result<Vec<String>, String> {
+        // prime-agent's `/mcp login <service>` and `/mcp logout <service>`.
+        match (args.first().map(String::as_str), args.get(1)) {
+            (Some("login"), Some(name)) => {
+                let configured = super::config::resolve_layers(
+                    &self.config_file,
+                    &self.workspace_root,
+                    &self.environment,
+                    &self.config_overrides,
+                )
+                .map(|resolved| resolved.mcp_servers)
+                .map_err(|error| error.to_string())?;
+                let url = match configured.get(name.as_str()) {
+                    Some(server) => server
+                        .url
+                        .clone()
+                        .filter(|_| server.transport.as_deref() == Some("streamable_http"))
+                        .ok_or_else(|| {
+                            format!("MCP server {name} is not a Streamable HTTP server")
+                        })?,
+                    // A catalog service that is not configured yet connects as
+                    // `/plugins` connects it.
+                    None => return self.connect_plugin(name).map(|line| vec![line]),
+                };
+                self.start_mcp_login(name, &url);
+                return Ok(vec![format!("Signing in to MCP server {name}...")]);
+            }
+            (Some("logout"), Some(name)) => {
+                let removed = super::credentials::remove(
+                    &super::credentials::resolve_path(&self.environment, &self.data_dir),
+                    &super::mcp_oauth::credential_key(name),
+                )
+                .map_err(|error| error.to_string())?;
+                return Ok(vec![if removed {
+                    format!("Signed out of MCP server {name}")
+                } else {
+                    format!("MCP server {name} has no sign-in")
+                }]);
+            }
+            _ => {}
+        }
         let configured = super::config::resolve_layers(
             &self.config_file,
             &self.workspace_root,
@@ -4021,6 +4284,7 @@ impl SessionPort for AgentSessionService {
     )]
     fn skills_rows(&self) -> Vec<super::events::RefLine> {
         use super::events::{BadgeKind, RefLine};
+        use std::fmt::Write as _;
         let trusted = super::config::resolve_layers(
             &self.config_file,
             &self.workspace_root,
@@ -4129,6 +4393,55 @@ impl SessionPort for AgentSessionService {
                     meta: entry.version.clone(),
                     badges,
                     detail: entry.description.clone(),
+                });
+            }
+            rows.push(RefLine::Blank);
+        }
+        // What learning did lately, background runs included: a run nobody saw
+        // is not lost.
+        let runs = super::learned::recent_runs(
+            &super::learned::Layers::new(
+                &self.global_config_dir,
+                &self.data_dir,
+                &self.workspace_root,
+                trusted,
+            ),
+            5,
+        );
+        if !runs.is_empty() {
+            rows.push(RefLine::Heading {
+                title: "✦ Recent learning".to_owned(),
+                note: format!("{}", runs.len()),
+            });
+            for run in &runs {
+                let list = |field: &str| {
+                    run[field]
+                        .as_array()
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        })
+                        .unwrap_or_default()
+                };
+                let landed = list("landed");
+                let refused = list("refused");
+                let mut detail = if landed.is_empty() {
+                    "nothing landed".to_owned()
+                } else {
+                    format!("landed: {landed}")
+                };
+                if !refused.is_empty() {
+                    let _ = write!(detail, " · refused: {refused}");
+                }
+                rows.push(RefLine::Item {
+                    glyph: "·".to_owned(),
+                    name: run["trigger"].as_str().unwrap_or("refine").to_owned(),
+                    meta: run["at"].as_str().unwrap_or_default().to_owned(),
+                    badges: Vec::new(),
+                    detail,
                 });
             }
             rows.push(RefLine::Blank);
@@ -4446,6 +4759,14 @@ impl SessionPort for AgentSessionService {
         self.schedules.has_active() || self.heartbeats.has_active()
     }
 
+    fn subagents(&self) -> Vec<super::agents::protocol::SubagentInfo> {
+        self.agents.view_rows()
+    }
+
+    fn heartbeat_count(&self) -> usize {
+        self.heartbeats.count()
+    }
+
     fn conversation_id(&self) -> Option<String> {
         self.resumed_task
             .lock()
@@ -4456,6 +4777,74 @@ impl SessionPort for AgentSessionService {
 
     fn set_session_host(&mut self, host: Arc<dyn super::agents::SessionHost>) {
         self.agents.set_session_host(host);
+    }
+
+    fn verify_checks(&self) -> Vec<super::verify::Check> {
+        self.configured()
+            .map(|config| config.verify.checks)
+            .unwrap_or_default()
+    }
+
+    fn run_verify(&mut self) -> Result<(), String> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        let checks = self.verify_checks();
+        let sender = self.sender.clone();
+        let root = self.workspace_root.clone();
+        let cancellation = CancellationToken::new();
+        handle.spawn(async move {
+            let report = super::verify::run(&root, &checks, &cancellation).await;
+            let _ = sender.send(SessionEvent::Verified {
+                passed: report.passed(),
+                lines: report.lines(),
+            });
+        });
+        Ok(())
+    }
+
+    fn clean_state(&self) -> Vec<String> {
+        super::lifecycle::clean_state(&self.workspace_root)
+    }
+
+    fn checks(&mut self, argument: Option<&str>) -> Result<Vec<String>, String> {
+        let config = self.configured()?;
+        let layers = super::learned::Layers::new(
+            &self.global_config_dir,
+            &self.data_dir,
+            &self.workspace_root,
+            config.project_trusted,
+        );
+        super::checks::command(&layers, &self.workspace_root, argument)
+    }
+
+    fn doctor(&self) -> Result<Vec<String>, String> {
+        let config = self.configured()?;
+        let facts = super::doctor::Facts {
+            trusted: config.project_trusted,
+            checks: config.verify.checks.len(),
+            judge: config.verify.judge,
+            hooks: config.hooks.len(),
+            mcp_servers: config.mcp_servers.len(),
+        };
+        let subsystems = super::doctor::audit(
+            &self.global_config_dir,
+            &self.workspace_root,
+            &self.caller_dir,
+            &facts,
+        );
+        Ok(super::doctor::lines(&self.workspace_root, &subsystems))
+    }
+
+    fn features(&self) -> Result<Vec<String>, String> {
+        Ok(super::features::load(&self.workspace_root)?.map_or_else(
+            || {
+                vec![format!(
+                    "no feature list: the agent creates {} with its feature tool when work is split into features",
+                    super::features::FEATURES_FILE
+                )]
+            },
+            |list| list.lines(),
+        ))
     }
 
     fn run_gates(&mut self, job: super::autonomous::GateJob) -> Result<(), String> {
@@ -5177,6 +5566,81 @@ impl SessionPort for AgentSessionService {
         Ok(())
     }
 
+    fn conversation_leaf(&self) -> Option<String> {
+        self.previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.as_ref().map(|session| session.as_str().to_owned()))
+    }
+
+    fn read_tree(&mut self) -> Result<(), String> {
+        let leaf = self
+            .previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.clone());
+        let store_dir = self.store_dir.clone();
+        let task_id = self.task_id.clone();
+        let sender = self.sender.clone();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let Some(leaf) = leaf else {
+                let _ = sender.send(SessionEvent::TreeRead {
+                    turns: Vec::new(),
+                    leaf: None,
+                });
+                return;
+            };
+            let read = async {
+                let store = SqliteStore::open_read_only(store_dir)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let tree = harness_runtime::conversation_tree(&store, &leaf)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let task = conversation_task(&store, Some(&leaf), task_id).await;
+                let mut turns = Vec::new();
+                for turn in tree {
+                    let label = store
+                        .session_setting(
+                            &task,
+                            &format!("{TURN_LABEL_PREFIX}{}", turn.session.as_str()),
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|label| !label.is_empty());
+                    turns.push(super::events::TreeTurn {
+                        session: turn.session.as_str().to_owned(),
+                        parent: turn.parent.map(|parent| parent.as_str().to_owned()),
+                        question: turn.question,
+                        answer: turn.answer,
+                        label,
+                        label_time: None,
+                        created_at: turn.created_at,
+                    });
+                }
+                Ok::<_, String>(turns)
+            }
+            .await;
+            match read {
+                Ok(turns) => {
+                    let _ = sender.send(SessionEvent::TreeRead {
+                        turns,
+                        leaf: Some(leaf.as_str().to_owned()),
+                    });
+                }
+                Err(error) => {
+                    let _ = sender.send(SessionEvent::Notice {
+                        message: format!("the conversation could not be read: {error}"),
+                    });
+                }
+            }
+        });
+        Ok(())
+    }
+
     fn switch_to(&mut self, session: &str) -> Result<(), String> {
         let session = SessionId::parse(session.to_owned()).map_err(|error| error.to_string())?;
         let mut previous = self
@@ -5281,19 +5745,153 @@ impl SessionPort for AgentSessionService {
     }
 
     fn queue_modes(&self) -> (super::queue::QueueMode, super::queue::QueueMode) {
-        let parse = |mode: Option<&String>| {
+        let parse = |mode: Option<&String>, setting: &str| {
             mode.and_then(|mode| super::queue::QueueMode::parse(mode))
+                .or_else(|| {
+                    // prime-agent's `steeringMode` / `followUpMode` settings.
+                    super::config::load_setting(&self.config_file, setting)
+                        .and_then(|value| value.as_str().and_then(super::queue::QueueMode::parse))
+                })
                 .unwrap_or_default()
         };
         self.configured().map_or_else(
             |_| Default::default(),
             |config| {
                 (
-                    parse(config.queue_modes.0.as_ref()),
-                    parse(config.queue_modes.1.as_ref()),
+                    parse(config.queue_modes.0.as_ref(), "steeringMode"),
+                    parse(config.queue_modes.1.as_ref(), "followUpMode"),
                 )
             },
         )
+    }
+
+    fn set_queue_mode(
+        &mut self,
+        steering: bool,
+        mode: super::queue::QueueMode,
+    ) -> Result<(), String> {
+        let value = match mode {
+            super::queue::QueueMode::All => "all",
+            super::queue::QueueMode::OneAtATime => "one-at-a-time",
+        };
+        super::config::save_setting(
+            &self.config_file,
+            if steering {
+                "steeringMode"
+            } else {
+                "followUpMode"
+            },
+            Some(serde_json::json!(value)),
+        )
+    }
+
+    fn set_auto_compaction(&mut self, enabled: bool) -> Result<(), String> {
+        save_nested_setting(&self.config_file, "compaction", "enabled", enabled)?;
+        self.live
+            .auto_compaction_off
+            .store(!enabled, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn auto_compaction(&self) -> bool {
+        !self
+            .live
+            .auto_compaction_off
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn set_auto_retry(&mut self, enabled: bool) -> Result<(), String> {
+        save_nested_setting(&self.config_file, "retry", "enabled", enabled)?;
+        self.live
+            .auto_retry_off
+            .store(!enabled, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn session_usage(&self) -> (u64, u64, f64) {
+        self.cost_tracker.lock().map_or((0, 0, 0.0), |tracker| {
+            let (input, output) = tracker.tokens();
+            (input, output, tracker.total_usd())
+        })
+    }
+
+    fn read_conversation(&mut self) -> Result<(), String> {
+        let source = self
+            .previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.clone());
+        let store_dir = self.store_dir.clone();
+        let sender = self.sender.clone();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let messages = match source {
+                None => Vec::new(),
+                Some(source) => match SqliteStore::open_read_only(store_dir).await {
+                    Ok(store) => harness_runtime::conversation_history(&store, &source)
+                        .await
+                        .map(|history| prime_messages(&history.messages))
+                        .unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                },
+            };
+            let _ = sender.send(SessionEvent::ConversationRead { messages });
+        });
+        Ok(())
+    }
+
+    fn export_html(&mut self, output: Option<String>) -> Result<(), String> {
+        let source = self
+            .previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.clone())
+            .ok_or_else(|| "Cannot export an in-memory session".to_owned())?;
+        let config = self.configured()?;
+        let store_dir = self.store_dir.clone();
+        let data_dir = self.data_dir.clone();
+        let environment = self.environment.clone();
+        let task_id = self.task_id.clone();
+        let workspace_root = self.workspace_root.clone();
+        let sender = self.sender.clone();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let result = async {
+                let store = SqliteStore::open_read_only(store_dir)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let html = render_session_html(
+                    &store,
+                    &task_id,
+                    Some(&source),
+                    &environment,
+                    &data_dir,
+                    &config.api_key_env,
+                    &config.model,
+                )
+                .await?;
+                // prime-agent: a relative path lands in the session's project,
+                // and the default is `<app>-session-<id>.html`.
+                let path = output.map_or_else(
+                    || workspace_root.join(format!("ha-session-{}.html", task_id.as_str())),
+                    |output| {
+                        let output = PathBuf::from(output);
+                        if output.is_absolute() {
+                            output
+                        } else {
+                            workspace_root.join(output)
+                        }
+                    },
+                );
+                std::fs::write(&path, html).map_err(|error| error.to_string())?;
+                Ok::<_, String>(path.display().to_string())
+            }
+            .await;
+            let _ = sender.send(SessionEvent::HtmlExported { result });
+        });
+        Ok(())
     }
 
     fn fullscreen_prefs(&self) -> super::tui::fullscreen::Prefs {
@@ -5496,6 +6094,31 @@ impl AgentSessionService {
         self.mark_session_start("resume");
     }
 
+    /// Run prime-agent's MCP sign-in for `server` at `url` off the UI thread;
+    /// each step arrives as a notice.
+    fn start_mcp_login(&self, server: &str, url: &str) {
+        let sender = self.sender.clone();
+        let auth_path = super::credentials::resolve_path(&self.environment, &self.data_dir);
+        let server = server.to_owned();
+        let url = url.to_owned();
+        let _ = std::thread::Builder::new()
+            .name("ha-mcp-login".to_owned())
+            .spawn(move || {
+                let progress = |message: &str| {
+                    let _ = sender.send(SessionEvent::Notice {
+                        message: message.to_owned(),
+                    });
+                };
+                let message =
+                    match super::mcp_oauth::login(&server, &url, None, None, &auth_path, &progress)
+                    {
+                        Ok(()) => format!("Signed in to MCP server {server}"),
+                        Err(error) => format!("MCP sign-in for {server} failed: {error}"),
+                    };
+                progress(&message);
+            });
+    }
+
     /// The next prompt opens a session for `source`.
     fn mark_session_start(&self, source: &'static str) {
         if let Ok(mut pending) = self.session_start.lock() {
@@ -5577,6 +6200,9 @@ struct AutoRefine {
     scopes: super::refine::HarnessScopes,
     learning: super::refine::Learning,
     turns: u32,
+    /// The newest session the review reads; once reviewed, the next review
+    /// treats the conversation up to it as already learned from.
+    reviewed: String,
 }
 
 impl AutoRefine {
@@ -5601,6 +6227,7 @@ impl AutoRefine {
                 curate: false,
             },
             Ok(review) => {
+                super::refine::mark_reviewed(&self.scopes.local, &self.reviewed);
                 send(SessionEvent::Notice {
                     message: format!("auto-refine: nothing to refine ({})", review.rationale),
                 });
@@ -5623,7 +6250,10 @@ impl AutoRefine {
         )
         .await
         {
-            Ok(refinement) => send(refined_event(&refinement)),
+            Ok(refinement) => {
+                super::refine::mark_reviewed(&self.scopes.local, &self.reviewed);
+                send(refined_event(&refinement));
+            }
             Err(error) => send(SessionEvent::Notice {
                 message: format!("refine failed: {error}"),
             }),
@@ -5637,10 +6267,17 @@ const REFINE_TRANSCRIPT_TURNS: usize = 50;
 
 /// The conversation a refinement reads: prime-agent's serialized transcript, with
 /// what the tools were asked and what they returned.
-async fn refine_transcript(store: &SqliteStore, session: &SessionId) -> String {
-    harness_runtime::conversation_transcript(store, session, REFINE_TRANSCRIPT_TURNS)
-        .await
-        .unwrap_or_default()
+/// The turns an earlier review of this conversation read are marked as such.
+async fn refine_transcript(store: &SqliteStore, session: &SessionId, local: &Path) -> String {
+    let reviewed = super::refine::reviewed_through(local).and_then(|id| SessionId::parse(id).ok());
+    harness_runtime::conversation_transcript(
+        store,
+        session,
+        REFINE_TRANSCRIPT_TURNS,
+        reviewed.as_ref(),
+    )
+    .await
+    .unwrap_or_default()
 }
 
 /// What `/refine` needs to write learned skills in this workspace.
@@ -5775,6 +6412,7 @@ async fn run_turn(
     system_prompt: Arc<Mutex<String>>,
     turn_tools: Arc<Mutex<Vec<serde_json::Value>>>,
     active_skills: Arc<Mutex<BTreeMap<String, harness_extensions::SkillActivation>>>,
+    nested_instructions: Arc<Mutex<std::collections::BTreeSet<(String, PathBuf)>>>,
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
     agents: Arc<super::delegation::SessionAgents>,
@@ -6216,12 +6854,16 @@ async fn run_turn(
         data_dir.clone(),
     )
     .map(|provider| {
-        let router = provider.router_for(
-            sender.clone(),
-            &environment,
-            thinking_level,
-            RuntimeConfig::default().max_attempts,
-        );
+        let max_attempts = if live
+            .auto_retry_off
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            1
+        } else {
+            RuntimeConfig::default().max_attempts
+        };
+        let router =
+            provider.router_for(sender.clone(), &environment, thinking_level, max_attempts);
         Arc::new(provider.with_router(router)) as Arc<dyn ModelProvider>
     });
     let provider = match provider {
@@ -6391,16 +7033,18 @@ async fn run_turn(
             local: super::harness::local_dir(&data_dir, task_id.as_str()),
         };
         let conversation = match source.as_ref() {
-            Some(source_session) => refine_transcript(&store, source_session).await,
+            Some(source_session) => refine_transcript(&store, source_session, &scopes.local).await,
             None => String::new(),
         };
-        let learning = refine_learning(
+        let mut learning = refine_learning(
             &global_config_dir,
             &data_dir,
             &workspace_root,
             &environment,
             config.project_trusted,
         );
+        learning.in_play = refine_cadence.take_in_play();
+        learning.project_checks.clone_from(&config.verify.checks);
         let result = super::refine::refine(
             &helper_provider,
             &helper_model,
@@ -6416,6 +7060,13 @@ async fn run_turn(
         }
         match result {
             Ok(refinement) => {
+                // A rollback or a curation read no conversation.
+                if options.rollback.is_none()
+                    && !options.curate
+                    && let Some(source_session) = source.as_ref()
+                {
+                    super::refine::mark_reviewed(&scopes.local, source_session.as_str());
+                }
                 send(refined_event(&refinement));
                 send(SessionEvent::RunTerminal {
                     outcome: RunOutcome::Done,
@@ -6621,7 +7272,7 @@ async fn run_turn(
         .as_ref()
         .map(|catalog| super::skills::SkillHost::new(catalog.clone(), Arc::clone(&active_skills)));
     // The skills ha learned, where `/refine` writes them and their use is counted.
-    let learning = super::refine::Learning::new(
+    let mut learning = super::refine::Learning::new(
         super::learned::Layers::new(
             &global_config_dir,
             &data_dir,
@@ -6631,8 +7282,31 @@ async fn run_turn(
         &workspace_root,
         skill_catalog.as_ref(),
     );
-    let goal_host =
-        matches!(goal, GoalRecord::Active(_)).then(|| super::goal::GoalHost::new(sender.clone()));
+    learning.project_checks.clone_from(&config.verify.checks);
+    // The model's `goal_complete` is a request: the project's checks run, then an
+    // independent verifier judges, before the goal completes.
+    let goal_host = match &goal {
+        GoalRecord::Active(objective) => Some(
+            super::goal::GoalHost::new(sender.clone()).with_check(super::goal::GoalCheck {
+                root: workspace_root.clone(),
+                objective: objective.clone(),
+                checks: config.verify.checks.clone(),
+                judge: delegate_host
+                    .as_ref()
+                    .filter(|_| config.verify.judge)
+                    .map(|host| (host.verifier(), config.routing.verifier.clone())),
+                cancellation: cancellation.clone(),
+            }),
+        ),
+        _ => None,
+    };
+    // The project's feature list: the model works it, the harness verifies it.
+    let feature_host = Some(super::features::FeatureHost::new(
+        workspace_root.clone(),
+        config.verify.checks.clone(),
+        cancellation.clone(),
+        sender.clone(),
+    ));
     let kernel_skills = skill_catalog
         .as_ref()
         .map(|catalog| {
@@ -6683,10 +7357,18 @@ async fn run_turn(
             // Always answered, even with no server configured: an unanswered
             // `mcp.list_connections` reached the model as "request failed", and it
             // kept retrying a bridge that had nothing behind it.
-            chain.push(Arc::new(super::skill_requests::McpRequests::new(
-                config.mcp_servers.clone(),
-                workspace_root.clone(),
-            )));
+            chain.push(Arc::new(
+                super::skill_requests::McpRequests::new(
+                    config.mcp_servers.clone(),
+                    workspace_root.clone(),
+                )
+                .with_plugins(super::mcp_catalog::session_cards(
+                    &global_config_dir,
+                    &data_dir,
+                    &config.mcp_servers,
+                    &super::credentials::resolve_path(&environment, &data_dir),
+                )),
+            ));
             let requests: Arc<dyn super::repl::HostRequests> =
                 Arc::new(super::skill_requests::ChainedRequests(chain));
             super::repl::ReplHost::for_turn(
@@ -6705,7 +7387,13 @@ async fn run_turn(
     };
     let mut tools = ToolExecutionService::new(Arc::clone(&store))
         .with_policy(tool_policy)
-        .with_hooks(config.hooks.clone());
+        .with_hooks(config.hooks.clone())
+        .with_result_context(Arc::new(super::instructions::NestedInstructions::new(
+            &workspace_root,
+            &caller_dir,
+            task_id.as_str(),
+            nested_instructions,
+        )));
     if let Some(dispatcher) = super::mcp::combined_dispatcher_with_delegate(
         active_mcp.as_ref(),
         active_extensions.as_ref(),
@@ -6713,6 +7401,7 @@ async fn run_turn(
         skill_host.as_ref(),
         web_host.as_ref(),
         goal_host.as_ref(),
+        feature_host.as_ref(),
         repl_host.as_ref(),
     ) {
         tools = tools.with_external(dispatcher);
@@ -6725,6 +7414,7 @@ async fn run_turn(
         skill_host.as_ref(),
         web_host.as_ref(),
         goal_host.as_ref(),
+        feature_host.as_ref(),
         repl_host.as_ref(),
     );
     let driver = match &external_tools {
@@ -6839,6 +7529,22 @@ async fn run_turn(
         })
         .collect::<Vec<_>>();
     let mut built_prompt = SystemPromptBuilder::build(&prompt_environment, &prompt_tools);
+    // prime-agent's custom prompt: `--system-prompt`, else a `SYSTEM.md`,
+    // replaces the static layers; the session's blocks still follow it.
+    if let Some(custom) = turn_overrides
+        .system_prompt
+        .clone()
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| {
+            super::resources::system_prompt(
+                &workspace_root,
+                &global_config_dir,
+                config.project_trusted,
+            )
+        })
+    {
+        built_prompt.text = custom;
+    }
     if repl_host.is_some()
         && let Some(block) = super::prompt::python_skills_block(&kernel_skill_imports)
     {
@@ -6856,6 +7562,11 @@ async fn run_turn(
     if let Some(catalog) = &skill_catalog {
         built_prompt.text =
             super::prompt::append_skill_metadata(built_prompt.text, catalog.entries());
+        if let Some(note) = super::learned::prompt_note(&super::learned::library(&learning.layers))
+        {
+            built_prompt.text.push_str("\n\n");
+            built_prompt.text.push_str(&note);
+        }
     }
     // The session-specific tail last, after everything that is stable for the
     // session. What changes between turns - the date, the branch, the changed
@@ -6867,6 +7578,22 @@ async fn run_turn(
         repl_host.is_some().then(super::repl::kernel_packages),
         0,
     ));
+    // `--append-system-prompt`, else an `APPEND_SYSTEM.md`, closes the prompt.
+    let appended = if turn_overrides.append_system_prompt.is_empty() {
+        super::resources::append_system_prompt(
+            &workspace_root,
+            &global_config_dir,
+            config.project_trusted,
+        )
+        .into_iter()
+        .collect()
+    } else {
+        turn_overrides.append_system_prompt.clone()
+    };
+    for text in appended.iter().filter(|text| !text.trim().is_empty()) {
+        built_prompt.text.push_str("\n\n");
+        built_prompt.text.push_str(text);
+    }
     let mut project_blocks = vec![harness_session::ContextBlock::mandatory(
         "environment",
         harness_session::ContextBlockKind::Instruction,
@@ -6882,6 +7609,16 @@ async fn run_turn(
     }
     if let GoalRecord::Active(objective) = &goal {
         project_blocks.push(super::goal::goal_block(objective));
+    }
+    // Where the project's feature list stands, and its rules.
+    if let Some(block) = super::features::context_block(&workspace_root) {
+        project_blocks.push(block);
+    }
+    // A session's first prompt starts from where the last one left the project.
+    if start_source.is_some()
+        && let Some(block) = super::lifecycle::startup_brief(&workspace_root)
+    {
+        project_blocks.push(block);
     }
     // Memory is prime-agent's continual harness state: the model keeps it through
     // `rlm.harness`, and every turn carries a digest of it ranked for this task.
@@ -6939,6 +7676,12 @@ async fn run_turn(
     });
     if let Some(imported) = imported {
         run_request = run_request.with_conversation(imported);
+    }
+    if live
+        .auto_compaction_off
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        run_request = run_request.without_auto_compaction();
     }
     // A fork's first turn carries the conversation up to its fork point, as a
     // continued turn carries the one before it.
@@ -7140,11 +7883,11 @@ async fn run_turn(
                 let _ = sender.send(event);
             });
         }
-        super::learned::record_turn(
+        refine_cadence.note_in_play(super::learned::record_turn(
             &learning.layers,
             &learning.context.workspace,
             &turn.executions,
-        );
+        ));
         if super::learned::lifecycle_enabled(&environment) {
             for (layer, name) in super::learned::run_lifecycle(&learning.layers) {
                 send(SessionEvent::Notice {
@@ -7182,7 +7925,9 @@ async fn run_turn(
                 global: super::harness::global_dir(&data_dir),
                 local: super::harness::local_dir(&data_dir, goal_task.as_str()),
             };
-            let conversation = refine_transcript(&store, &session_id).await;
+            let conversation = refine_transcript(&store, &session_id, &scopes.local).await;
+            let mut learning = learning.clone();
+            learning.in_play = refine_cadence.take_in_play();
             if let Some(options) = requested {
                 // The user asked: the refinement is part of the turn, and it covers
                 // the review that came due with it.
@@ -7196,7 +7941,10 @@ async fn run_turn(
                 )
                 .await
                 {
-                    Ok(refinement) => send(refined_event(&refinement)),
+                    Ok(refinement) => {
+                        super::refine::mark_reviewed(&scopes.local, session_id.as_str());
+                        send(refined_event(&refinement));
+                    }
                     Err(error) => send(SessionEvent::Notice {
                         message: format!("refine failed: {error}"),
                     }),
@@ -7216,8 +7964,9 @@ async fn run_turn(
                     model: config.model.clone(),
                     conversation,
                     scopes,
-                    learning: learning.clone(),
+                    learning,
                     turns,
+                    reviewed: session_id.as_str().to_owned(),
                 };
                 let cadence = Arc::clone(&refine_cadence);
                 tokio::spawn(async move {
@@ -7234,10 +7983,13 @@ async fn run_turn(
             let Ok(ended) = SessionId::parse(deferred.session.clone()) else {
                 continue;
             };
-            let conversation = refine_transcript(&store, &ended).await;
+            let local = super::harness::local_dir(&data_dir, &deferred.task);
+            let conversation = refine_transcript(&store, &ended, &local).await;
             if conversation.is_empty() {
                 continue;
             }
+            let mut ended_learning = learning.clone();
+            ended_learning.in_play.clone_from(&deferred.in_play);
             let background = AutoRefine {
                 sender: sender.clone(),
                 helper_provider: Arc::clone(&helper_provider),
@@ -7247,10 +7999,11 @@ async fn run_turn(
                 conversation,
                 scopes: super::refine::HarnessScopes {
                     global: super::harness::global_dir(&data_dir),
-                    local: super::harness::local_dir(&data_dir, &deferred.task),
+                    local,
                 },
-                learning: learning.clone(),
+                learning: ended_learning,
                 turns: deferred.turns,
+                reviewed: deferred.session.clone(),
             };
             send(SessionEvent::Notice {
                 message: format!(
@@ -7814,6 +8567,59 @@ fn export_secrets(
 }
 
 /// `/export session.html`: the conversation as one self-contained page.
+/// Set `key` inside the object setting `section` (`compaction.enabled`),
+/// keeping its other keys.
+fn save_nested_setting(
+    config_file: &Path,
+    section: &str,
+    key: &str,
+    value: bool,
+) -> Result<(), String> {
+    let mut object = super::config::load_setting(config_file, section)
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    object[key] = serde_json::json!(value);
+    super::config::save_setting(config_file, section, Some(object))
+}
+
+/// A conversation's messages in prime-agent's message shapes (`get_messages`):
+/// user and assistant text, the assistant's tool calls, and tool results.
+fn prime_messages(messages: &[harness_providers::ProviderMessage]) -> Vec<serde_json::Value> {
+    use harness_providers::MessageRole;
+    messages
+        .iter()
+        .filter_map(|message| match message.role {
+            MessageRole::System => None,
+            MessageRole::User => Some(serde_json::json!({
+                "role": "user",
+                "content": [{ "type": "text", "text": message.content }],
+            })),
+            MessageRole::Assistant => {
+                let mut content = Vec::new();
+                if !message.content.is_empty() {
+                    content.push(serde_json::json!({ "type": "text", "text": message.content }));
+                }
+                for call in &message.tool_calls {
+                    let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                        .unwrap_or_else(|_| serde_json::json!(call.arguments));
+                    content.push(serde_json::json!({
+                        "type": "toolCall",
+                        "id": call.call_id,
+                        "name": call.name,
+                        "arguments": arguments,
+                    }));
+                }
+                Some(serde_json::json!({ "role": "assistant", "content": content }))
+            }
+            MessageRole::Tool => Some(serde_json::json!({
+                "role": "toolResult",
+                "toolCallId": message.tool_call_id,
+                "content": [{ "type": "text", "text": message.content }],
+            })),
+        })
+        .collect()
+}
+
 async fn render_session_html(
     store: &SqliteStore,
     task_id: &TaskId,

@@ -67,7 +67,8 @@ impl Default for Gates {
 }
 
 /// What `/autonomous on` asked for; unnamed fields keep their current value.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// The `--autonomous*` flags of a headless run carry the same fields.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Options {
     pub max_continuations: Option<u64>,
     pub max_turns: Option<u64>,
@@ -429,6 +430,75 @@ impl Autonomous {
         ))
     }
 
+    /// prime-agent's `describe_autonomous_limit`.
+    #[must_use]
+    pub fn describe_limit(&self, reason: &str, now: Instant) -> String {
+        match reason {
+            "maxContinuations" => format!(
+                "maxContinuations reached ({}/{})",
+                self.continuations_used, self.limits.max_continuations
+            ),
+            "maxTurns" => format!(
+                "maxTurns reached ({}/{})",
+                self.turns_used, self.limits.max_turns
+            ),
+            "maxTokens" => format!(
+                "maxTokens reached ({}/{})",
+                self.tokens_used, self.limits.max_tokens
+            ),
+            _ => {
+                let elapsed = self.started_at.map_or(0, |started| {
+                    u64::try_from(now.saturating_duration_since(started).as_millis())
+                        .unwrap_or(u64::MAX)
+                });
+                format!("timeoutMs reached ({elapsed}/{})", self.limits.timeout_ms)
+            }
+        }
+    }
+
+    /// prime-agent's headless exit contract (`HeadlessAutonomous::exit_stderr`):
+    /// the stderr line of a run that must exit non-zero - a configured gate
+    /// still failing, or a run without gates that a limit stopped.
+    #[must_use]
+    pub fn exit_stderr(&self, now: Instant) -> Option<String> {
+        let limit = self.limit_reason(now);
+        if self.enabled
+            && !self.gates.commands.is_empty()
+            && let Some(failure) = &self.gate_state.last_failure
+        {
+            let attempt = self
+                .gate_state
+                .attempts
+                .values()
+                .copied()
+                .chain([failure.attempt])
+                .max()
+                .unwrap_or(0);
+            let limit_text = limit
+                .map(|reason| {
+                    format!(
+                        "; autonomous limit reached: {}",
+                        self.describe_limit(reason, now)
+                    )
+                })
+                .unwrap_or_default();
+            return Some(format!(
+                "Autonomous quality gate still failing after attempt {attempt}/{}: {}{limit_text}",
+                self.gates.max_retries, failure.exit_text
+            ));
+        }
+        if self.enabled
+            && self.gates.commands.is_empty()
+            && let Some(reason) = limit
+        {
+            return Some(format!(
+                "Autonomous run stopped before terminal evidence; {}",
+                self.describe_limit(reason, now)
+            ));
+        }
+        None
+    }
+
     /// prime-agent's `_formatAutonomousStatus`, without the keep-alive clause.
     #[must_use]
     pub fn status(&self, now: Instant) -> String {
@@ -553,7 +623,7 @@ async fn git(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// prime-agent's `captureGitWorktreeSnapshot`.
-async fn snapshot(root: &Path) -> Option<Snapshot> {
+pub(crate) async fn snapshot(root: &Path) -> Option<Snapshot> {
     let status = git(
         root,
         &[
@@ -715,6 +785,31 @@ mod tests {
         let mut state = Autonomous::default();
         state.turn_on(options, now);
         (state, now)
+    }
+
+    #[test]
+    fn the_headless_exit_contract_reports_a_failing_gate_and_a_spent_budget() {
+        let (mut state, now) = on(&Options {
+            gates: Some(vec!["cargo test".into()]),
+            ..Options::default()
+        });
+        assert_eq!(state.exit_stderr(now), None);
+        state.gate_state.last_failure = Some(GateFailure {
+            command: "cargo test".into(),
+            attempt: 2,
+            exit_text: "exited with code 101".into(),
+            output: String::new(),
+        });
+        assert_eq!(
+            state.exit_stderr(now).as_deref(),
+            Some("Autonomous quality gate still failing after attempt 2/3: exited with code 101")
+        );
+        let (mut ungated, now) = on(&Options::default());
+        ungated.turns_used = 12;
+        assert_eq!(
+            ungated.exit_stderr(now).as_deref(),
+            Some("Autonomous run stopped before terminal evidence; maxTurns reached (12/12)")
+        );
     }
 
     #[test]

@@ -625,9 +625,24 @@ impl SkillCatalog {
     /// in a stream and dropped. A missing root is reported as unavailable
     /// rather than silently contributing nothing.
     pub fn discover(roots: &[TrustedSkillRoot]) -> Result<Self, ExtensionError> {
+        Self::discover_excluding(roots, &[])
+    }
+
+    /// [`SkillCatalog::discover`] without the skill documents at `excluded`
+    /// (canonical paths): the skills prime-agent's resource settings turn off.
+    pub fn discover_excluding(
+        roots: &[TrustedSkillRoot],
+        excluded: &[PathBuf],
+    ) -> Result<Self, ExtensionError> {
         let mut candidates = Vec::new();
         for root in roots {
             for path in skill_files(&root.path)? {
+                if !excluded.is_empty()
+                    && excluded
+                        .contains(&std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()))
+                {
+                    continue;
+                }
                 candidates.push(scan_entry(&path, root.source)?);
                 if candidates.len() > MAX_SKILL_CATALOG_ENTRIES {
                     return Err(ExtensionError::new(
@@ -925,6 +940,11 @@ impl ContextContributor for SkillContributor {
 
 /// List the skill documents under one root, in a deterministic order.
 fn skill_files(root: &Path) -> Result<Vec<PathBuf>, ExtensionError> {
+    // A root may name one skill document: a package's skill, which the
+    // package manager resolves file by file.
+    if root.is_file() {
+        return Ok(vec![root.to_path_buf()]);
+    }
     if !root.is_dir() {
         return Err(ExtensionError::new(
             ErrorCode::SkillUnavailable,

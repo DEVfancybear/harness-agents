@@ -1500,11 +1500,13 @@ impl TurnDriver {
                                 detail: blocked,
                             });
                         }
-                        let rendered = match hook_notes
-                            .get(&transcript_id)
-                            .and_then(crate::HookResponse::context_text)
-                        {
+                        let note = hook_notes.get(&transcript_id);
+                        let rendered = match note.and_then(crate::HookResponse::context_text) {
                             Some(context) => format!("{rendered}\n\nHook feedback:\n{context}"),
+                            None => rendered,
+                        };
+                        let rendered = match note.and_then(crate::HookResponse::host_context_text) {
+                            Some(context) => format!("{rendered}\n\n{context}"),
                             None => rendered,
                         };
                         appended.push(
@@ -2012,6 +2014,7 @@ async fn complete_action(
             hook_note.context.push(reason);
         }
         hook_note.context.extend(answer.context);
+        hook_note.host_context.extend(answer.host_context);
         if answer.stop.is_some() {
             hook_note.stop = answer.stop;
         }
@@ -2158,12 +2161,15 @@ async fn run_post_tool_hooks(
     payload["tool_response"] = Value::String(render_tool_output(name, &view.output));
     let payload =
         crate::hooks::fit_payload(payload, &["/tool_response", "/tool_input", "/tool/args"]);
-    let answer = tools
+    let mut answer = tools
         .event_hooks("post_tool_use", &payload, cancellation)
         .await;
     for notice in &answer.notices {
         observer.observe(TurnProgress::Notice(notice.clone()));
     }
+    answer
+        .host_context
+        .extend(tools.result_context(&prepared.final_action));
     answer
 }
 

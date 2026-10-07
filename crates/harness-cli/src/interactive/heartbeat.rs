@@ -420,6 +420,12 @@ impl Heartbeats {
         }
     }
 
+    /// How many heartbeats there are, paused ones included.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.items.lock().map_or(0, |items| items.len())
+    }
+
     /// Whether a heartbeat will still run.
     #[must_use]
     pub fn has_active(&self) -> bool {

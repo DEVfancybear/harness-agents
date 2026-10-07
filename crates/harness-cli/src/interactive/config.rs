@@ -84,6 +84,19 @@ pub struct ConfigOverrides {
     /// prime-agent's initial message (`ha "fix the parser"`): sent as the
     /// first prompt once the app is up.
     pub initial_prompt: Option<String>,
+    /// prime-agent's `--thinking`: the thinking level the session starts at.
+    pub thinking: Option<String>,
+    /// `--goal`: a goal set as the session starts, as `/goal` sets one.
+    pub goal: Option<String>,
+    /// `--system-prompt`: replaces the static layers of the system prompt
+    /// (and a `SYSTEM.md`).
+    pub system_prompt: Option<String>,
+    /// `--append-system-prompt`, repeatable: added at the end of the system
+    /// prompt (in place of an `APPEND_SYSTEM.md`).
+    pub append_system_prompt: Vec<String>,
+    /// MCP servers this session alone adds (an ACP client's `mcpServers`):
+    /// held in memory, never written to configuration.
+    pub mcp_servers: BTreeMap<String, McpServerConfigV2>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -266,6 +279,8 @@ pub struct ResolvedConfig {
     pub queue_modes: (Option<String>, Option<String>),
     /// `[routing]`, merged across layers key by key.
     pub routing: Routing,
+    /// `[verify]`: the checks the harness runs before work counts as done.
+    pub verify: super::verify::Verify,
     pub explain: Vec<ConfigExplainEntry>,
     pub project_config_reason: Option<String>,
 }
@@ -299,6 +314,7 @@ pub fn resolve_layers(
     let mut agents_default_model: Option<String> = None;
     let mut queue_modes: (Option<String>, Option<String>) = (None, None);
     let mut routing = Routing::new();
+    let mut verify = super::verify::Verify::default();
     let mut approval = "ask".to_owned();
     let mut approval_layer = ConfigLayer::Default;
     let mut allow_rules = Vec::new();
@@ -382,6 +398,7 @@ pub fn resolve_layers(
         );
         apply_queue(&mut queue_modes, config, ConfigLayer::User, &mut entries)?;
         apply_routing(&mut routing, config, ConfigLayer::User, &mut entries);
+        apply_verify(&mut verify, config, ConfigLayer::User, &mut entries);
         mcp_servers.extend(config.mcp_servers.clone());
     }
     // The servers `/mcp add` saved beside the user config, at the user layer: a
@@ -481,6 +498,7 @@ pub fn resolve_layers(
                 &mut entries,
             )?;
             apply_routing(&mut routing, &config, ConfigLayer::Project, &mut entries);
+            apply_verify(&mut verify, &config, ConfigLayer::Project, &mut entries);
             mcp_servers.extend(config.mcp_servers.clone());
         }
     } else if project_path.exists() {
@@ -556,6 +574,9 @@ pub fn resolve_layers(
         apply_queue(&mut queue_modes, &config, ConfigLayer::Local, &mut entries)?;
         apply_routing(&mut routing, &config, ConfigLayer::Local, &mut entries);
     }
+
+    // The session's own servers (ACP `mcpServers`) come last.
+    mcp_servers.extend(overrides.mcp_servers.clone());
 
     let mut profile = overrides.profile.clone().or_else(|| {
         environment
@@ -738,6 +759,7 @@ pub fn resolve_layers(
         agents_default_model,
         queue_modes,
         routing,
+        verify,
         explain,
         project_config_reason: project_reason,
     })
@@ -841,6 +863,8 @@ pub struct Routing {
     pub auxiliary: Option<String>,
     pub backup: Option<String>,
     pub image: Option<String>,
+    /// The model the independent verifier runs on.
+    pub verifier: Option<String>,
     pub wait_for_usage: bool,
 }
 
@@ -884,6 +908,7 @@ fn apply_routing(
         ),
         ("routing.backup", &section.backup, &mut routing.backup),
         ("routing.image", &section.image, &mut routing.image),
+        ("routing.verifier", &section.verifier, &mut routing.verifier),
     ] {
         if let Some(value) = value.as_deref().map(str::trim) {
             *slot = (!value.is_empty()).then(|| value.to_owned());
@@ -899,6 +924,26 @@ fn apply_routing(
             layer,
             None,
         );
+    }
+}
+
+/// `[verify]` of one layer: its checks replace the earlier list, its `judge`
+/// the earlier choice.
+fn apply_verify(
+    verify: &mut super::verify::Verify,
+    config: &HarnessConfigV2,
+    layer: ConfigLayer,
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+) {
+    let Some(section) = &config.verify else {
+        return;
+    };
+    verify.apply(section);
+    if !section.checks.is_empty() {
+        set_explain(entries, "verify.checks", &verify.describe(), layer, None);
+    }
+    if let Some(judge) = section.judge {
+        set_explain(entries, "verify.judge", &judge.to_string(), layer, None);
     }
 }
 
@@ -1702,6 +1747,67 @@ mod tests {
                 .project_config_reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("trust"))
+        );
+    }
+
+    /// `[verify]` runs commands, so like hooks it comes from the user and a trusted
+    /// project only - never an untrusted project or the local file.
+    #[test]
+    fn verify_checks_load_from_trusted_layers_only() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join(".harness")).expect("project config dir");
+        let user = temp.path().join("user.toml");
+        let project = "schema_version = 2\n[verify]\ntimeout_seconds = 60\njudge = false\n[[verify.checks]]\nname = 'types'\ncommand = 'cargo check'\n[[verify.checks]]\nname = 'tests'\ncommand = 'cargo test'\nhint = 'fix the failing test, do not delete it'\ntimeout_seconds = 900\n[routing]\nverifier = 'openai/gpt-5.5'\n";
+        std::fs::write(root.join(".harness/config.toml"), project).expect("project config");
+        std::fs::write(
+            root.join(".harness/config.local.toml"),
+            "schema_version = 2\n[[verify.checks]]\nname = 'local'\ncommand = 'must-not-run'\n",
+        )
+        .expect("local config");
+        std::fs::write(&user, "schema_version = 2\n").expect("user config");
+        let resolve = || {
+            resolve_layers(
+                &user,
+                &root,
+                &super::super::paths::LaunchEnvironment::default(),
+                &ConfigOverrides::default(),
+            )
+            .expect("config resolves")
+        };
+        let untrusted = resolve();
+        assert!(untrusted.verify.checks.is_empty(), "{:?}", untrusted.verify);
+        assert!(untrusted.verify.judge, "the judge is on by default");
+
+        std::fs::write(
+            &user,
+            format!(
+                "schema_version = 2\n[trust]\nprojects = [{:?}]\n",
+                root.canonicalize()
+                    .expect("canonical root")
+                    .to_string_lossy()
+            ),
+        )
+        .expect("trusted user config");
+        let trusted = resolve();
+        let names = trusted
+            .verify
+            .checks
+            .iter()
+            .map(|check| (check.name.as_str(), check.timeout_ms))
+            .collect::<Vec<_>>();
+        assert_eq!(names, [("types", 60_000), ("tests", 900_000)]);
+        assert_eq!(
+            trusted.verify.checks[1].hint.as_deref(),
+            Some("fix the failing test, do not delete it")
+        );
+        assert!(!trusted.verify.judge);
+        assert_eq!(trusted.routing.verifier.as_deref(), Some("openai/gpt-5.5"));
+        assert!(
+            trusted
+                .explain
+                .iter()
+                .any(|entry| entry.key == "verify.checks" && entry.value == "types, tests")
         );
     }
 

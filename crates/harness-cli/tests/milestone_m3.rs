@@ -2236,7 +2236,7 @@ async fn the_refine_transcript_carries_tool_calls_and_their_results() {
         )
         .await
         .expect("turn runs");
-    let transcript = harness_runtime::conversation_transcript(&store, &session, 50)
+    let transcript = harness_runtime::conversation_transcript(&store, &session, 50, None)
         .await
         .expect("transcript");
     for expected in [
@@ -2253,6 +2253,14 @@ async fn the_refine_transcript_carries_tool_calls_and_their_results() {
             "{expected} in:\n{transcript}"
         );
     }
+    // A turn an earlier review read is followed by the line that says so.
+    let marked = harness_runtime::conversation_transcript(&store, &session, 50, Some(&session))
+        .await
+        .expect("transcript");
+    assert!(
+        marked.ends_with(harness_runtime::REVIEWED_MARKER),
+        "{marked}"
+    );
     drop(driver);
     close(store).await;
 }

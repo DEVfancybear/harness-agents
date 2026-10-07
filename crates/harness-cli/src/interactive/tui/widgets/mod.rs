@@ -49,8 +49,14 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
                 },
                 theme,
             ),
-            Some(crate::interactive::events::Modal::Picker { items, selected }) => {
+            Some(
+                crate::interactive::events::Modal::Picker { items, selected }
+                | crate::interactive::events::Modal::ServicePicker { items, selected },
+            ) => {
                 picker::render(frame, area, items, *selected, theme);
+            }
+            Some(crate::interactive::events::Modal::Tree(tree)) => {
+                picker::render_tree(frame, area, tree, theme);
             }
             Some(crate::interactive::events::Modal::FilePicker { items, selected }) => {
                 picker::render_files(frame, area, items, *selected, theme);

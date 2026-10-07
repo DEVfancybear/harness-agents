@@ -3114,12 +3114,14 @@ fn q08b_pty_tree_labels_and_summarizes_the_branch_it_leaves() {
     session.wait_for("answer-one-q08b", Duration::from_mins(1));
     session.send("second ask\r");
     session.wait_for("answer-two-q08b", Duration::from_mins(1));
+    // prime-agent's tree selector opens on the current answer; Enter there
+    // stays put.
     session.send("/tree\r");
     std::thread::sleep(Duration::from_millis(300));
     session.send("\r");
-    session.wait_for("current", Duration::from_secs(30));
-    session.send("\u{1b}");
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(Duration::from_millis(500));
+    session.send("\r");
+    session.wait_for("Already at this point", Duration::from_secs(30));
     session.send("/tree label 1 start-here\r");
     session.wait_for("Label set: start-here", Duration::from_secs(30));
     session.send("/tree\r");

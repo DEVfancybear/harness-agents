@@ -668,6 +668,10 @@ pub struct HarnessConfigV2 {
     /// `imageModel`.
     #[serde(default)]
     pub routing: Option<RoutingConfigV2>,
+    /// The project's own checks, which the harness runs itself - not the model -
+    /// before a goal or a feature counts as done, and as autonomous gates.
+    #[serde(default)]
+    pub verify: Option<VerifyConfigV2>,
 }
 
 impl HarnessConfigV2 {
@@ -689,6 +693,9 @@ impl HarnessConfigV2 {
         }
         for (name, server) in &self.mcp_servers {
             server.validate(name)?;
+        }
+        if let Some(verify) = &self.verify {
+            verify.validate()?;
         }
         for (event, hooks) in &self.hooks {
             if !matches!(
@@ -1070,6 +1077,76 @@ pub struct RoutingConfigV2 {
     /// Wait for a rate-limited provider to recover instead of failing (default true).
     #[serde(default)]
     pub wait_for_usage: Option<bool>,
+    /// The model the independent verifier runs on; it judges a goal before the
+    /// goal completes. Defaults to the delegated children's model.
+    #[serde(default)]
+    pub verifier: Option<String>,
+}
+
+/// `[verify]`: what "done" means for this project, as commands.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyConfigV2 {
+    /// The checks, run in order; the first that fails stops the run. Put the
+    /// cheap ones (format, types, lint) before the slow ones (tests, e2e).
+    #[serde(default)]
+    pub checks: Vec<VerifyCheckV2>,
+    /// Default time limit of one check, in seconds (300 when omitted).
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    /// Whether an independent verifier agent judges a goal after its checks
+    /// pass and before it completes (default true).
+    #[serde(default)]
+    pub judge: Option<bool>,
+}
+
+/// One `[[verify.checks]]` entry.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyCheckV2 {
+    /// A short name shown in results, such as `types` or `tests`.
+    pub name: String,
+    /// The shell command; exit 0 passes.
+    pub command: String,
+    /// How to fix a failure, told to the agent with the check's output.
+    #[serde(default)]
+    pub hint: Option<String>,
+    /// This check's time limit, in seconds.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
+impl VerifyConfigV2 {
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        let mut names = BTreeSet::new();
+        for check in &self.checks {
+            if check.name.trim().is_empty() || check.command.trim().is_empty() {
+                return Err(HarnessError::new(
+                    ErrorCode::ConfigParseError,
+                    "every [[verify.checks]] entry needs a name and a command",
+                ));
+            }
+            if !names.insert(check.name.trim()) {
+                return Err(HarnessError::new(
+                    ErrorCode::ConfigParseError,
+                    format!("verify check {:?} is named twice", check.name.trim()),
+                ));
+            }
+            if check.timeout_seconds == Some(0) {
+                return Err(HarnessError::new(
+                    ErrorCode::ConfigParseError,
+                    format!("verify check {:?} has a zero timeout", check.name.trim()),
+                ));
+            }
+        }
+        if self.timeout_seconds == Some(0) {
+            return Err(HarnessError::new(
+                ErrorCode::ConfigParseError,
+                "verify.timeout_seconds must be positive",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

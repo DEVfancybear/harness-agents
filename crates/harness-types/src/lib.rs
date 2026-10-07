@@ -28,8 +28,8 @@ pub use contracts::{
     NextActionProposal, PendingToolCall, PendingToolState, PermissionsConfigV2, PlanItem,
     PlanItemStatus, PluginManifest, ProducerIdentity, ProfileConfigV2, ProviderConfigV2,
     ServiceContract, SourceAuthority, SourceRef, ToolExecutionReceipt, ToolIntentState,
-    ToolOutcomeState, TrustConfigV2, UiConfigV2, Validity, WorkingState, WorkspaceChange,
-    WorkspaceObservation, validate_schema_version,
+    ToolOutcomeState, TrustConfigV2, UiConfigV2, Validity, VerifyCheckV2, VerifyConfigV2,
+    WorkingState, WorkspaceChange, WorkspaceObservation, validate_schema_version,
 };
 pub use error::{ErrorCode, ErrorReport, HarnessError, RetryClass, without_code_prefix};
 pub use fixture::{ContinuationFixtureReport, verify_continuation_fixture};

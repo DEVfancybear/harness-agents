@@ -6,6 +6,7 @@ mod extension_cli;
 mod interactive;
 mod maintenance_cli;
 mod mcp_cli;
+mod package_cli;
 mod sandbox_cli;
 
 use std::{io::Read, path::PathBuf, process::ExitCode, sync::Arc};
@@ -85,6 +86,20 @@ struct Cli {
     /// The model for `--mode rpc` or `--mode acp`, as `/model` takes it.
     #[arg(long, requires = "mode")]
     model: Option<String>,
+    /// prime-agent's `--thinking`: the thinking level to start at (off,
+    /// minimal, low, medium, high, xhigh or max).
+    #[arg(long)]
+    thinking: Option<String>,
+    /// A goal to keep working on, as `/goal <objective>` sets one.
+    #[arg(long)]
+    goal: Option<String>,
+    /// Replace the system prompt's static layers (a `SYSTEM.md` does too).
+    #[arg(long = "system-prompt")]
+    system_prompt: Option<String>,
+    /// Text added at the end of the system prompt; repeatable (an
+    /// `APPEND_SYSTEM.md` does too).
+    #[arg(long = "append-system-prompt")]
+    append_system_prompt: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -101,8 +116,12 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Parse, validate, or explain strict non-secret configuration.
+    /// prime-agent's resource configuration: turn skills, prompt templates
+    /// and themes on or off. `validate` and `explain` check the TOML config.
     Config(ConfigCommand),
+    /// prime-agent's packages: install, remove, update and list packages of
+    /// skills, prompt templates and themes (npm, git or a local directory).
+    Package(package_cli::PackageCommand),
     /// List persisted sessions without starting an execution runtime.
     Sessions(SessionsCommand),
     /// Render a durable session recovery/status view without executing work.
@@ -169,6 +188,16 @@ enum Command {
     /// The models of the catalog you can call (prime-agent's `model list`).
     #[command(subcommand)]
     Model(ModelCommand),
+    /// Audit how ready a project is for an agent: instructions, tools,
+    /// environment, state and feedback, each shortfall with its fix.
+    Doctor {
+        /// The project directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the system prompt a run in this project is sent.
     Prompt {
         /// The project directory.
@@ -316,9 +345,9 @@ struct ChatArgs {
     /// provider is called and the JSON result says `"fixture": true`.
     #[arg(long, requires = "headless")]
     mock: bool,
-    /// Goal objective for a headless turn. Without it the turn is one bounded
-    /// pass; with it the host evaluates typed criteria and may continue.
-    #[arg(long, requires = "headless")]
+    /// A goal to keep working on, as `/goal <objective>` sets one. In a
+    /// headless turn the host evaluates typed criteria and may continue.
+    #[arg(long)]
     goal: Option<String>,
     /// Evidence a goal criterion requires; repeatable. One of: `response`,
     /// `tool_execution`, `file_change`, `check`, `artifact`.
@@ -333,16 +362,18 @@ struct ChatArgs {
     /// Token budget for a headless run; the run reserves against it.
     #[arg(long, requires = "headless")]
     budget: Option<u64>,
-    /// Thinking level for a headless run: off, minimal, low, medium, high,
-    /// xhigh or max.
-    #[arg(long, requires = "headless")]
+    /// Thinking level: off, minimal, low, medium, high, xhigh or max.
+    #[arg(long)]
     thinking: Option<String>,
-    /// Replace the system prompt's static layers for a headless run.
-    #[arg(long = "system-prompt", requires = "headless")]
+    /// Replace the system prompt's static layers (a `SYSTEM.md` does too).
+    #[arg(long = "system-prompt")]
     system_prompt: Option<String>,
-    /// Text added at the end of the system prompt of a headless run; repeatable.
-    #[arg(long = "append-system-prompt", requires = "headless")]
+    /// Text added at the end of the system prompt; repeatable (an
+    /// `APPEND_SYSTEM.md` does too).
+    #[arg(long = "append-system-prompt")]
     append_system_prompt: Vec<String>,
+    #[command(flatten)]
+    autonomous: AutonomousFlags,
 }
 
 #[derive(Debug, Subcommand)]
@@ -401,6 +432,63 @@ struct ExecArgs {
     /// Deterministic fixture provider, labelled in machine output.
     #[arg(long)]
     mock: bool,
+    #[command(flatten)]
+    autonomous: AutonomousFlags,
+}
+
+/// prime-agent's `--autonomous*` flags: any of them turns autonomous mode on
+/// for a headless run.
+#[derive(Clone, Debug, Default, Args)]
+struct AutonomousFlags {
+    /// Keep working after each turn until the quality gates pass or a limit
+    /// is reached (prime-agent's autonomous mode).
+    #[arg(long)]
+    autonomous: bool,
+    /// A quality gate command run after each turn; repeatable.
+    #[arg(long = "autonomous-gate", value_name = "COMMAND")]
+    autonomous_gate: Vec<String>,
+    /// How many times a failing gate is retried.
+    #[arg(long = "autonomous-gate-retries", value_parser = clap::value_parser!(u64).range(1..))]
+    autonomous_gate_retries: Option<u64>,
+    /// How long one gate may run, in milliseconds.
+    #[arg(long = "autonomous-gate-timeout-ms", value_parser = clap::value_parser!(u64).range(1..))]
+    autonomous_gate_timeout_ms: Option<u64>,
+    /// The most continuations the run may take.
+    #[arg(long = "autonomous-max-continuations", value_parser = clap::value_parser!(u64).range(1..))]
+    autonomous_max_continuations: Option<u64>,
+    /// The most turns the run may take.
+    #[arg(long = "autonomous-max-turns", value_parser = clap::value_parser!(u64).range(1..))]
+    autonomous_max_turns: Option<u64>,
+    /// The most tokens the run may use.
+    #[arg(long = "autonomous-max-tokens", value_parser = clap::value_parser!(u64).range(1..))]
+    autonomous_max_tokens: Option<u64>,
+    /// How long the run may take, in milliseconds.
+    #[arg(long = "autonomous-timeout-ms", value_parser = clap::value_parser!(u64).range(1..))]
+    autonomous_timeout_ms: Option<u64>,
+}
+
+impl AutonomousFlags {
+    /// prime-agent's `AutonomousConfig::from_args`: `None` when no flag was given.
+    fn options(&self) -> Option<interactive::autonomous::Options> {
+        let gate_options = !self.autonomous_gate.is_empty()
+            || self.autonomous_gate_retries.is_some()
+            || self.autonomous_gate_timeout_ms.is_some();
+        let any = self.autonomous
+            || gate_options
+            || self.autonomous_max_continuations.is_some()
+            || self.autonomous_max_turns.is_some()
+            || self.autonomous_max_tokens.is_some()
+            || self.autonomous_timeout_ms.is_some();
+        any.then(|| interactive::autonomous::Options {
+            max_continuations: self.autonomous_max_continuations,
+            max_turns: self.autonomous_max_turns,
+            max_tokens: self.autonomous_max_tokens,
+            timeout_ms: self.autonomous_timeout_ms,
+            gates: gate_options.then(|| self.autonomous_gate.clone()),
+            gate_retries: self.autonomous_gate_retries,
+            gate_timeout_ms: self.autonomous_gate_timeout_ms,
+        })
+    }
 }
 
 impl From<ExecArgs> for ChatArgs {
@@ -429,6 +517,7 @@ impl From<ExecArgs> for ChatArgs {
             thinking: args.thinking,
             system_prompt: args.system_prompt,
             append_system_prompt: args.append_system_prompt,
+            autonomous: args.autonomous,
         }
     }
 }
@@ -482,8 +571,18 @@ impl ChatArgs {
                 thinking: self.thinking.clone(),
                 system_prompt: self.system_prompt.clone(),
                 append_system_prompt: self.append_system_prompt.clone(),
+                autonomous: self.autonomous.options(),
             },
         )?;
+        if matches!(mode, interactive::LaunchMode::Interactive { .. })
+            && self.autonomous.options().is_some()
+        {
+            // prime-agent reads the flags in print mode only; in the app
+            // `/autonomous on` takes the same options.
+            return Err(interactive::UsageError::new(
+                "--autonomous applies to a headless run (ha exec); in the app use /autonomous on",
+            ));
+        }
         match &mut mode {
             interactive::LaunchMode::Interactive {
                 config_overrides, ..
@@ -497,6 +596,14 @@ impl ChatArgs {
                 config_overrides
                     .disallowed_tools
                     .clone_from(&self.disallowed_tools);
+                config_overrides.thinking.clone_from(&self.thinking);
+                config_overrides.goal.clone_from(&self.goal);
+                config_overrides
+                    .system_prompt
+                    .clone_from(&self.system_prompt);
+                config_overrides
+                    .append_system_prompt
+                    .clone_from(&self.append_system_prompt);
             }
             interactive::LaunchMode::Headless { .. } if self.profile.is_some() => {
                 return Err(interactive::UsageError::new(
@@ -591,7 +698,7 @@ enum CodingSubcommand {
 #[derive(Debug, Args)]
 struct ConfigCommand {
     #[command(subcommand)]
-    command: ConfigSubcommand,
+    command: Option<ConfigSubcommand>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -796,6 +903,7 @@ fn legacy_command(cli: &Cli) -> bool {
                 | Command::List { .. }
                 | Command::Model(_)
                 | Command::Prompt { .. }
+                | Command::Doctor { .. }
                 | Command::Attach { .. }
                 | Command::Send { .. }
                 | Command::Schedule(_)
@@ -867,6 +975,10 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
         offline,
         mode,
         model,
+        thinking,
+        goal,
+        system_prompt,
+        append_system_prompt,
     } = cli;
     if offline {
         interactive::offline::enable();
@@ -874,6 +986,9 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
     if let Some(mode) = mode {
         let overrides = interactive::config::ConfigOverrides {
             model,
+            thinking,
+            system_prompt,
+            append_system_prompt,
             ..interactive::config::ConfigOverrides::default()
         };
         return if mode == "acp" {
@@ -902,7 +1017,12 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
             else {
                 unreachable!("`ha exec` parses as Command::Exec")
             };
-            run_chat(args.into(), false).await
+            let mut args: ChatArgs = args.into();
+            args.thinking = thinking;
+            args.goal = goal;
+            args.system_prompt = system_prompt;
+            args.append_system_prompt = append_system_prompt;
+            run_chat(args, false).await
         }
         None => {
             Box::pin(interactive::launch(interactive::LaunchMode::Interactive {
@@ -912,6 +1032,10 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
                 plain: interactive::plain_requested_from_environment(),
                 config_overrides: interactive::config::ConfigOverrides {
                     initial_prompt: message,
+                    thinking,
+                    goal,
+                    system_prompt,
+                    append_system_prompt,
                     ..interactive::config::ConfigOverrides::default()
                 },
             }))
@@ -940,6 +1064,9 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
         }
         Some(Command::Prompt { cwd, json }) => {
             interactive::cli_extras::prompt(cwd.as_deref(), json)
+        }
+        Some(Command::Doctor { cwd, json }) => {
+            interactive::cli_extras::doctor(cwd.as_deref(), json)
         }
         Some(Command::Attach { agent }) => interactive::app::attach(&agent),
         Some(Command::Abort { agent, json }) => interactive::agents::abort_command(&agent, json),
@@ -1019,6 +1146,10 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
                 offline: false,
                 mode: None,
                 model: None,
+                thinking: None,
+                goal: None,
+                system_prompt: None,
+                append_system_prompt: Vec::new(),
             }))
             .await?;
             Ok(ExitCode::SUCCESS)
@@ -1034,8 +1165,21 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
         // cheaper than reshaping the dispatch.
         Some(Command::Mcp(command)) => mcp_cli::run(command),
         Some(Command::Init { data_dir, json }) => init_store(&data_dir, json).await,
+        Some(Command::Package(command)) => package_cli::run(command),
+        Some(Command::Config(ConfigCommand { command: None })) => {
+            let cwd = std::env::current_dir().map_err(|error| {
+                HarnessError::new(
+                    ErrorCode::ConfigReadError,
+                    format!("current directory unavailable: {error}"),
+                )
+            })?;
+            let agent_dir = package_cli::agent_dir()?;
+            let bundled = interactive::skills::bundled_skills_root(&agent_dir).ok();
+            interactive::config_selector::run(&cwd, &agent_dir, bundled)
+                .map_err(|message| HarnessError::new(ErrorCode::ConfigReadError, message))
+        }
         Some(Command::Config(ConfigCommand {
-            command: ConfigSubcommand::Validate { config, json },
+            command: Some(ConfigSubcommand::Validate { config, json }),
         })) => {
             let config = interactive::config::load(&config)?;
             let (version, value) = match config {
@@ -1064,13 +1208,13 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
         }
         Some(Command::Config(ConfigCommand {
             command:
-                ConfigSubcommand::Explain {
+                Some(ConfigSubcommand::Explain {
                     config,
                     model,
                     profile,
                     approval,
                     json,
-                },
+                }),
         })) => {
             let environment = interactive::paths::LaunchEnvironment::capture();
             let caller_dir = std::env::current_dir().map_err(|error| {
@@ -1224,6 +1368,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
             | Command::List { .. }
             | Command::Model(_)
             | Command::Prompt { .. }
+            | Command::Doctor { .. }
             | Command::Attach { .. }
             | Command::Send { .. }
             | Command::Schedule(_)

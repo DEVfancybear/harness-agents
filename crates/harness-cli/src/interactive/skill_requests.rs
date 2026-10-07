@@ -85,11 +85,12 @@ impl HostRequests for ChainedRequests {
 /// kernel's `mcp` object (`rlm.mcp`) opens a configured server itself and calls its
 /// tools, asking the host only for the server's configuration (`mcp.config`) and the
 /// user's connections (`mcp.list_connections`), as `McpManager.hostHandlers` answers.
-/// ha has no MCP service catalog or OAuth login, so the plugin listings are empty and
-/// a refresh is refused.
+/// The plugin listings are prime's service-catalog cards
+/// ([`super::mcp_catalog`]); connecting stays the user's (`/plugins`).
 pub struct McpRequests {
     servers: std::collections::BTreeMap<String, harness_types::McpServerConfigV2>,
     workspace: std::path::PathBuf,
+    plugins: Vec<Value>,
 }
 
 impl McpRequests {
@@ -98,7 +99,19 @@ impl McpRequests {
         servers: std::collections::BTreeMap<String, harness_types::McpServerConfigV2>,
         workspace: std::path::PathBuf,
     ) -> Self {
-        Self { servers, workspace }
+        Self {
+            servers,
+            workspace,
+            plugins: Vec::new(),
+        }
+    }
+
+    /// The service-catalog cards `mcp.list_plugins` and `mcp.search_plugins`
+    /// answer from.
+    #[must_use]
+    pub fn with_plugins(mut self, plugins: Vec<Value>) -> Self {
+        self.plugins = plugins;
+        self
     }
 
     /// ha's server configuration in prime-agent's `McpServerConfig` shape. A
@@ -193,11 +206,28 @@ impl HostRequests for McpRequests {
                         "source": "ha config",
                     })).collect::<Vec<_>>(),
                 })),
-                "mcp.list_plugins" | "mcp.search_plugins" => {
-                    Ok(json!({ "plugins": [], "nextCursor": null }))
-                }
+                "mcp.list_plugins" => super::mcp_catalog::page(
+                    &self.plugins,
+                    request["connectionStatus"].as_str(),
+                    request["cursor"].as_str(),
+                    request["limit"]
+                        .as_u64()
+                        .and_then(|limit| usize::try_from(limit).ok())
+                        .unwrap_or(50),
+                ),
+                "mcp.search_plugins" => Ok(json!({
+                    "plugins": super::mcp_catalog::search(
+                        &self.plugins,
+                        request["query"].as_str().unwrap_or_default(),
+                        request["limit"]
+                            .as_u64()
+                            .and_then(|limit| usize::try_from(limit).ok())
+                            .unwrap_or(10),
+                    ),
+                    "nextCursor": Value::Null,
+                })),
                 "mcp.refresh" | "mcp.begin_login" | "mcp.connect" => Err(format!(
-                    "{kind} is not available in ha: MCP servers are configured in ha's config, and credentials come from the environment"
+                    "{kind} is not available to the agent: the user connects services with /plugins or /mcp login <service>"
                 )),
                 _ => return None,
             })
@@ -301,7 +331,7 @@ impl SkillRequests {
         })
     }
 
-    fn goal(&self, kind: &str, request: &Value) -> Result<Value, String> {
+    async fn goal(&self, kind: &str, request: &Value) -> Result<Value, String> {
         match kind {
             "goal.get" => Ok(self.goal_response()),
             "goal.create" => {
@@ -340,14 +370,19 @@ impl SkillRequests {
                 let Some(objective) = self.objective() else {
                     return Err("there is no goal to complete".to_owned());
                 };
-                if !self.completed.swap(true, Ordering::SeqCst) {
+                if !self.completed.load(Ordering::SeqCst) {
                     let summary = format!("completed: {objective}");
                     match &self.goal_host {
-                        Some(host) => host.complete(&summary),
+                        // The harness verifies before it completes; what is left
+                        // reaches the kernel as the call's error.
+                        Some(host) => {
+                            host.finish(&summary).await?;
+                        }
                         None => {
                             let _ = self.sender.send(SessionEvent::GoalCompleted { summary });
                         }
                     }
+                    self.completed.store(true, Ordering::SeqCst);
                 }
                 Ok(self.goal_response())
             }
@@ -455,7 +490,7 @@ impl HostRequests for SkillRequests {
                     "provider": self.model.provider,
                     "input": if self.model.images { json!(["text", "image"]) } else { json!(["text"]) },
                 })),
-                kind if kind.starts_with("goal.") => self.goal(kind, request),
+                kind if kind.starts_with("goal.") => self.goal(kind, request).await,
                 kind if kind.starts_with("compact.") => self.compact(kind, request),
                 kind if kind.starts_with("refine.") => self.refine(kind, request),
                 _ => return None,

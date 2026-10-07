@@ -144,7 +144,9 @@ enum Command {
     Send {
         text: String,
         mode: SendMode,
-        reply: Sender<&'static str>,
+        /// Sent by another agent (`from`), so the pause gate applies.
+        from_agent: bool,
+        reply: Sender<Result<&'static str, String>>,
     },
     Abort {
         reply: Sender<bool>,
@@ -595,15 +597,26 @@ impl Worker {
         Ok(info)
     }
 
-    fn send(&self, selector: &str, text: String, mode: SendMode) -> Result<&'static str, String> {
+    fn send(
+        &self,
+        selector: &str,
+        text: String,
+        mode: SendMode,
+        from_agent: bool,
+    ) -> Result<&'static str, String> {
         let id = self.resolve(selector)?;
         let (reply, answer) = mpsc::channel();
         self.inbox(&id)?
-            .send(Command::Send { text, mode, reply })
+            .send(Command::Send {
+                text,
+                mode,
+                from_agent,
+                reply,
+            })
             .map_err(|_| format!("agent {id} has stopped"))?;
         answer
             .recv_timeout(Duration::from_secs(30))
-            .map_err(|_| format!("agent {id} did not answer"))
+            .map_err(|_| format!("agent {id} did not answer"))?
     }
 
     /// End the agent's running turn; `false` when it was not running one.
@@ -812,6 +825,9 @@ impl Agent {
             model: spec.model.clone(),
             profile: spec.profile.clone(),
             approval: spec.approval.clone(),
+            goal: spec.goal.clone(),
+            system_prompt: spec.system_prompt.clone(),
+            append_system_prompt: spec.append_system_prompt.clone(),
             ..ConfigOverrides::default()
         };
         let mut controller = super::super::app::controller_for_with_overrides(
@@ -824,11 +840,14 @@ impl Agent {
         controller.set_detachable();
         controller.set_session_host(Arc::new(WorkerSessionHost {
             worker: Weak::clone(worker),
+            id: id.clone(),
+            name: spec.name.clone(),
             base: CreateAgent {
                 prompt: None,
                 name: None,
                 resume: None,
                 thinking: None,
+                goal: None,
                 id: None,
                 cwd: Some(context.project.root.clone()),
                 caller_dir: context.project.root.clone(),
@@ -867,6 +886,8 @@ impl Agent {
                 last_request: None,
                 idle_seconds: 0,
                 worker_pid: std::process::id(),
+                subagents: Vec::new(),
+                heartbeats: 0,
             },
             last_activity: Instant::now(),
         }));
@@ -982,15 +1003,26 @@ impl Agent {
                     self.controller.set_columns(columns);
                 }
             }
-            Command::Send { text, mode, reply } => {
+            Command::Send {
+                text,
+                mode,
+                from_agent,
+                reply,
+            } => {
+                // prime-agent's delivery gate: "Agent messaging is paused".
+                if from_agent && self.controller.agent_messages_paused() {
+                    let _ = reply.send(Err("Agent messaging is paused".to_owned()));
+                    return false;
+                }
                 let mut effects = Vec::new();
-                let outcome = self.controller.deliver_external(
+                let outcome = self.controller.deliver_external_from(
                     text,
                     mode != SendMode::FollowUp,
+                    from_agent,
                     &mut effects,
                 );
                 self.forward(&effects, None);
-                let _ = reply.send(outcome);
+                let _ = reply.send(Ok(outcome));
             }
             Command::Abort { reply } => {
                 let (aborted, effects) = self.controller.abort_run();
@@ -1020,7 +1052,11 @@ impl Agent {
         let busy = self.controller.is_busy();
         let scheduled = self.controller.has_scheduled_work();
         let conversation = self.controller.conversation_id();
+        let subagents = self.controller.subagents();
+        let heartbeats = self.controller.heartbeat_count();
         if let Ok(mut status) = self.status.lock() {
+            status.info.subagents = subagents;
+            status.info.heartbeats = heartbeats;
             state.phase.label().clone_into(&mut status.info.status);
             status.info.busy = busy;
             status.info.scheduled = scheduled;
@@ -1188,13 +1224,14 @@ fn serve(worker: &Arc<Worker>, stream: TcpStream) {
                 from,
                 mode,
             } => {
+                let from_agent = from.is_some();
                 let text = match from {
                     Some(from) => format!("[message from {from}]\n\n{text}"),
                     None => text,
                 };
                 reply_of(
                     worker
-                        .send(&agent, text, mode)
+                        .send(&agent, text, mode, from_agent)
                         .map(|outcome| json!({ "status": outcome })),
                 )
             }
@@ -1442,6 +1479,9 @@ struct WorkerSessionHost {
     worker: Weak<Worker>,
     /// The creating agent's launch: its environment and options.
     base: CreateAgent,
+    /// The agent this host serves, and its name.
+    id: String,
+    name: Option<String>,
 }
 
 impl SessionHost for WorkerSessionHost {
@@ -1470,6 +1510,55 @@ impl SessionHost for WorkerSessionHost {
             "session_file": store_dir.display().to_string(),
             "model": info.model,
         }))
+    }
+
+    fn siblings(&self) -> Vec<serde_json::Value> {
+        let Ok(registry) = super::client::user_registry() else {
+            return Vec::new();
+        };
+        super::client::list_all(&registry)
+            .into_iter()
+            .filter(|listed| listed.agent.id != self.id)
+            .map(|listed| {
+                let agent = listed.agent;
+                let status = if agent.status == "running" || agent.busy {
+                    "running"
+                } else {
+                    "idle"
+                };
+                json!({
+                    "sessionId": agent.conversation.clone().unwrap_or_else(|| agent.id.clone()),
+                    "activeSessionId": agent.id,
+                    "sessionName": agent.name,
+                    "relationship": "sibling",
+                    "status": status,
+                    "isSessionActive": true,
+                    "activity": agent.status,
+                    "projectRoot": agent.project_root.display().to_string(),
+                    "latestMessage": agent.last_request,
+                })
+            })
+            .collect()
+    }
+
+    fn message_sibling(&self, selector: &str, text: &str) -> Result<String, String> {
+        let registry = super::client::user_registry()?;
+        let listed = super::client::find(&registry, selector)?;
+        if listed.agent.id == self.id {
+            return Err("an agent cannot message itself".to_owned());
+        }
+        let mut connection = super::client::open(&listed)?;
+        let value = connection.call(&super::protocol::Request::Send {
+            agent: listed.agent.id.clone(),
+            text: text.to_owned(),
+            from: Some(self.agent_name().unwrap_or_else(|| self.id.clone())),
+            mode: super::protocol::SendMode::Steer,
+        })?;
+        Ok(value["status"].as_str().unwrap_or("delivered").to_owned())
+    }
+
+    fn agent_name(&self) -> Option<String> {
+        Some(self.name.clone().unwrap_or_else(|| self.id.clone()))
     }
 }
 
@@ -1537,6 +1626,8 @@ mod tests {
             last_request: None,
             idle_seconds: 0,
             worker_pid: 1,
+            subagents: Vec::new(),
+            heartbeats: 0,
         }
     }
 

@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 55] = [
+pub const SLASH_COMMANDS: [SlashCommand; 63] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -119,10 +119,15 @@ pub const SLASH_COMMANDS: [SlashCommand; 55] = [
         ],
         ..command(
             "/mcp",
-            "[add|list|get|remove]",
+            "[add|list|get|remove|login|logout]",
             "Show MCP servers, or add, inspect and remove them",
         )
     },
+    command(
+        "/plugins",
+        "[search]",
+        "Browse and connect external services",
+    ),
     SlashCommand {
         aliases: &["/clear"],
         ..command("/new", "[prompt]", "Start a new session")
@@ -136,6 +141,44 @@ pub const SLASH_COMMANDS: [SlashCommand; 55] = [
         "/refine",
         "[--global] [--rollback <id>] [--curate] [instructions]",
         "Refine continual harness prompt notes, skills, subagents, and memory",
+    ),
+    command(
+        "/learn",
+        "[focus]",
+        "Distill what this conversation taught into learned skills now",
+    ),
+    SlashCommand {
+        options: &["list", "accept", "reject"],
+        ..command(
+            "/checks",
+            "[list|accept <name>|reject <name>]",
+            "Review the checks learning proposed; accepted ones join [verify]",
+        )
+    },
+    command(
+        "/doctor",
+        "",
+        "Audit how ready this repository is for an agent, subsystem by subsystem",
+    ),
+    command(
+        "/handoff",
+        "[--reset] [focus]",
+        "Write the handoff for the next session to .harness/progress.md; --reset continues in a fresh conversation",
+    ),
+    command(
+        "/verify",
+        "",
+        "Run the project's [verify] checks now and show what passed",
+    ),
+    command(
+        "/review",
+        "[focus]",
+        "Have an independent verifier judge the work in this workspace",
+    ),
+    command(
+        "/features",
+        "",
+        "Show the project's feature list and what is verified",
     ),
     SlashCommand {
         options: &["status", "pause", "resume", "clear"],

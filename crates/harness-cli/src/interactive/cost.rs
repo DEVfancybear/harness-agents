@@ -61,6 +61,16 @@ impl CostTracker {
         (self.input_tokens, self.output_tokens)
     }
 
+    /// The session's cost so far in US dollars (0 when it is not priced).
+    #[must_use]
+    pub const fn total_usd(&self) -> f64 {
+        if self.unpriced_usage {
+            0.0
+        } else {
+            self.total_usd
+        }
+    }
+
     /// What the context held at the last response, when there was one.
     #[must_use]
     pub const fn context_tokens(&self) -> Option<u64> {
