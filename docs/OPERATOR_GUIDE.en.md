@@ -34,11 +34,7 @@ What that means in practice:
   API, so no release claim depends on one.
 
 The machine-readable statement of the verification state is
-`ha maintenance release-matrix --json`. Its `capabilities` list still reports
-`background_daemon` as `unsupported` (the matrix is a conservative, hand-kept
-table); the background worker of [12.7](#127-background-agents) exists and is
-documented there. For platforms, benchmarks and unverified checks the output is
-authoritative.
+`ha maintenance release-matrix --json`.
 
 ## 2. Diagnosing a data directory
 

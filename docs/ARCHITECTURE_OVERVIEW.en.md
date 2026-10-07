@@ -256,7 +256,6 @@ Current limits to preserve in code and docs:
 - no guarantee of perfect model reasoning or unlimited context retention;
 - no signed or published release artifact unless the release evidence explicitly says otherwise;
 - provider authentication and paid remote API behavior are not proven by offline/unit gates;
-- `ha maintenance release-matrix` still lists `remote_mcp_endpoints` and `background_daemon` as unsupported and a Web UI as out of scope; the code now supports Streamable HTTP MCP and background workers, so that command's capability list lags this document and should be reconciled.
 
 ## 13. Verification map
 

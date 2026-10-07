@@ -256,7 +256,6 @@ Các giới hạn phải được giữ nhất quán trong code và docs:
 - không bảo đảm model reasoning hoàn hảo hoặc giữ context không giới hạn;
 - không có signed/published release artifact nếu evidence release chưa nói rõ điều đó;
 - provider authentication và hành vi gọi remote API trả phí không được chứng minh bằng offline/unit gates;
-- `ha maintenance release-matrix` vẫn liệt kê `remote_mcp_endpoints` và `background_daemon` là unsupported và Web UI là out of scope; code nay đã hỗ trợ MCP Streamable HTTP và worker nền, nên danh sách capability của lệnh đó đang lệch so với tài liệu này và cần được đối chiếu lại.
 
 ## 13. Bản đồ kiểm chứng
 

@@ -54,7 +54,7 @@ async fn p7_s01_release_matrix_is_complete_and_honest() {
     );
 
     // Surfaces an operator might assume are present are declared unsupported.
-    for name in ["remote_mcp_endpoints", "os_sandboxing", "background_daemon"] {
+    for name in ["os_sandboxing"] {
         let capability = capability_named(&matrix, name);
         assert_eq!(capability.status, CapabilityStatus::Unsupported);
         assert!(
@@ -167,9 +167,7 @@ fn matrix_with(retrieval_p95_ms: Option<u64>, restore_ms: Option<u64>) -> Releas
         capabilities: vec![
             capability("backup_restore", CapabilityStatus::Supported),
             capability("packaged_linux_artifact", CapabilityStatus::ComponentOnly),
-            capability("remote_mcp_endpoints", CapabilityStatus::Unsupported),
             capability("os_sandboxing", CapabilityStatus::Unsupported),
-            capability("background_daemon", CapabilityStatus::Unsupported),
         ],
         benchmarks: vec![
             benchmark("retrieval_p95", 250, retrieval_p95_ms),
@@ -1532,8 +1530,8 @@ async fn p7_s07_operator_docs_and_release_record_are_consistent() {
     assert!(
         out_of_scope
             .iter()
-            .any(|item| item.as_str() == Some("P8 Web UI")),
-        "the next phase must be declared out of scope rather than implied"
+            .any(|item| item.as_str().is_some_and(|text| text.contains("web UI"))),
+        "the removed web surface must be declared out of scope rather than implied"
     );
     assert!(
         parsed["verdict"]

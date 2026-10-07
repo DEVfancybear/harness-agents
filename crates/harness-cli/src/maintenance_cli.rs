@@ -351,7 +351,6 @@ async fn doctor(data_dir: &PathBuf, json_output: bool) -> Result<(), HarnessErro
         "retention": retention,
         "not_verified": [
             "live provider credentials were not exercised",
-            "no daemon or background service is provided",
             "remote backup targets are out of scope",
         ],
     });
@@ -556,7 +555,7 @@ pub fn release_matrix(retrieval_p95_ms: Option<u64>, restore_ms: Option<u64>) ->
                 toolchain: "1.97.1".to_owned(),
                 status: PlatformStatus::Verified,
                 evidence:
-                    "P0-P7 gates run locally on this platform; CI matrix run recorded in the evidence"
+                    "the workspace tests and the PTY acceptance suite run on this platform; CI runs the gates here"
                         .to_owned(),
             },
             PlatformSupport {
@@ -575,7 +574,7 @@ pub fn release_matrix(retrieval_p95_ms: Option<u64>, restore_ms: Option<u64>) ->
         capabilities: vec![
             capability("coding_tools", CapabilityStatus::Supported, "policy gate with receipts"),
             capability("delegation", CapabilityStatus::Supported, "task DAG with isolated worktrees"),
-            capability("extensions", CapabilityStatus::Supported, "trusted stdio plugins and local MCP"),
+            capability("extensions", CapabilityStatus::Supported, "trusted stdio plugins and MCP over stdio or Streamable HTTP"),
             capability("backup_restore", CapabilityStatus::Supported, "consistent snapshot into a new directory"),
             capability(
                 "packaged_linux_artifact",
@@ -584,8 +583,8 @@ pub fn release_matrix(retrieval_p95_ms: Option<u64>, restore_ms: Option<u64>) ->
             ),
             capability(
                 "remote_mcp_endpoints",
-                CapabilityStatus::Unsupported,
-                "needs an explicit trust and network policy",
+                CapabilityStatus::Supported,
+                "Streamable HTTP servers, with OAuth sign-in through `ha mcp login`",
             ),
             capability(
                 "os_sandboxing",
@@ -594,8 +593,8 @@ pub fn release_matrix(retrieval_p95_ms: Option<u64>, restore_ms: Option<u64>) ->
             ),
             capability(
                 "background_daemon",
-                CapabilityStatus::Unsupported,
-                "work stops when the host exits",
+                CapabilityStatus::Supported,
+                "a per-project worker keeps agents running after the terminal closes; HA_DAEMON=off disables it",
             ),
         ],
         benchmarks: vec![
@@ -621,8 +620,7 @@ pub fn release_matrix(retrieval_p95_ms: Option<u64>, restore_ms: Option<u64>) ->
             "published release artifacts: none were produced or published".to_owned(),
         ],
         out_of_scope: vec![
-            "P8 Web UI".to_owned(),
-            "daemon or background execution after CLI exit".to_owned(),
+            "a web UI or HTTP server surface (the removed `ha web`)".to_owned(),
             "marketplace, Wasm or arbitrary native dynamic loading".to_owned(),
             "production host activation".to_owned(),
         ],

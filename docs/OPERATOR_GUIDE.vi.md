@@ -35,10 +35,7 @@ phải một dịch vụ mạng.
   mô hình trả phí, nên không có tuyên bố phát hành nào phụ thuộc vào nó.
 
 Phát biểu đọc được bằng máy về trạng thái kiểm chứng là
-`ha maintenance release-matrix --json`. Danh sách `capabilities` của nó vẫn báo
-`background_daemon` là `unsupported` (ma trận là bảng thận trọng, cập nhật bằng tay);
-worker nền ở [12.7](#127-agent-chạy-nền) có tồn tại và được mô tả ở đó. Với nền tảng,
-benchmark và các kiểm tra chưa chạy thì kết quả đó có thẩm quyền.
+`ha maintenance release-matrix --json`.
 
 ## 2. Chẩn đoán một thư mục dữ liệu
 

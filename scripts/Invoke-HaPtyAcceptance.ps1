@@ -8,20 +8,17 @@ transcript when the process that creates the pseudo-console owns one, and a sand
 `cargo test` does not. This helper launches the compiled test binary in a new console
 window, waits with a hard bound, and writes the result next to the transcript.
 
-The CP-E run includes 25 cases. The existing HA_LAUNCH cases cover bare launch, active-run exit and writer
-release, Vietnamese input, idle/running Ctrl-C, backend failure recovery, unreachable
-provider behavior, settled-receipt recovery, staged install, and a multiline draft.
-Six HA_TUI cases cover the inline viewport, multiline paste, approval by `y`, resize,
-plain fallback, and `NO_COLOR`.
-Seven G14 cases cover local rules, ask_user, the @ picker, shell approval,
-undo, /login with a spaced key, and /more scrolling.
+The run covers every `#[ignore]`d case of `crates/harness-cli/tests/interactive_terminal.rs`:
+launch and exit, Vietnamese input, Ctrl-C, backend failure and recovery, the inline and
+fullscreen views, multiline paste, approvals, resize, plain fallback, `NO_COLOR`, local
+rules, ask_user, the @ picker, undo, /login, scrolling and the later TUI and agent cases.
 
-The gate requires one bounded run with PTY_EXIT 0 and "25 passed; 0 failed". The cases stay
-`#[ignore]`d because `cargo test` in a sandbox has no console; this helper is how they
-are run for evidence.
+The gate requires one bounded run with PTY_EXIT 0 and no failed case; the transcript names
+the passed and failed counts. The cases stay `#[ignore]`d because `cargo test` in a sandbox
+has no console; this helper is how they are run for evidence.
 
 .PARAMETER Filter
-Test-name filter passed to the test binary. Defaults to all 25 PTY cases.
+Test-name filter passed to the test binary. Defaults to every PTY case.
 
 .PARAMETER TimeoutSeconds
 Hard bound before the console run is killed. Defaults to 600.
