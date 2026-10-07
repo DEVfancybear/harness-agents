@@ -945,8 +945,15 @@ impl ToolExecutionService {
         let outcome = self.run_begun_inner(call, cancellation).await;
         // A process, an extension tool or a write may have changed any file:
         // cached walks, hashes and index entries are not trusted past what
-        // the watcher reported of it (or past it at all, without one).
-        if !is_read_only(&call.transformed) {
+        // the watcher reported of it (or past it at all, without one). A
+        // process call that succeeded settled already, beside its capture's
+        // flush - or was refused before anything ran.
+        let settled = outcome.is_ok()
+            && matches!(
+                call.transformed,
+                CodingToolAction::RunProcess { .. } | CodingToolAction::RunShell { .. }
+            );
+        if !is_read_only(&call.transformed) && !settled {
             crate::walk::settle_changes(&call.prepared.workspace_root).await;
         }
         outcome
@@ -1665,7 +1672,7 @@ impl ToolExecutionService {
                     &self.spool,
                 )
                 .await;
-                self.finish_backend_lease(lease, output).await
+                self.finish_backend_lease(root, lease, output).await
             }
             CodingToolAction::RunShell {
                 command,
@@ -1696,7 +1703,7 @@ impl ToolExecutionService {
                     &self.spool,
                 )
                 .await;
-                self.finish_backend_lease(lease, output).await
+                self.finish_backend_lease(root, lease, output).await
             }
             CodingToolAction::GitStatus => {
                 let output = process::run_internal_git(
@@ -1862,13 +1869,39 @@ impl ToolExecutionService {
     /// Close the lease after the capture is published, and keep the artifact
     /// digest in the record: export is what happens next, and it must be able to
     /// check the digest the execution recorded.
+    ///
+    /// The capture is published unflushed, and flushed on a blocking thread
+    /// while the watcher catches up with what the process changed (see
+    /// [`crate::walk::settle_changes`]): the flush costs 70-80 ms on Windows,
+    /// and the settle is the only other work left before the lease row. The
+    /// flush is joined before that row - the first durable record to name the
+    /// artifact - is written, so no row ever points at bytes a power loss
+    /// could take back.
     async fn finish_backend_lease(
         &self,
+        root: &Path,
         lease: crate::LeaseOwner,
         output: Result<ProcessResult, HarnessError>,
     ) -> Result<Dispatched, HarnessError> {
         let output = output?;
         let dispatched = self.dispatched_process(output)?;
+        let flush = dispatched.artifact.clone().map(|artifact| {
+            let store = Arc::clone(&self.store);
+            tokio::task::spawn_blocking(move || store.sync_artifact(&artifact))
+        });
+        crate::walk::settle_changes(root).await;
+        if let Some(flush) = flush {
+            match flush.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(store_error(error)),
+                Err(_) => {
+                    return Err(HarnessError::new(
+                        ErrorCode::ArtifactWriteFailed,
+                        "the process capture flush stopped unexpectedly",
+                    ));
+                }
+            }
+        }
         let artifact = dispatched.artifact.as_ref().map(|artifact| {
             (
                 artifact.artifact_id.as_str(),
@@ -1920,19 +1953,23 @@ impl ToolExecutionService {
     /// Publish a finished process capture as the durable artifact the receipt
     /// will reference, and describe it in the model-facing output.
     ///
-    /// The capture is published *before* the receipt exists, so a receipt can
-    /// only ever point at bytes that are already flushed.
+    /// The capture is published *before* the receipt exists, but not flushed:
+    /// the caller flushes it before the lease row names it, so a lease row or
+    /// a receipt can only ever point at bytes that are already flushed.
     fn dispatched_process(&self, output: ProcessResult) -> Result<Dispatched, HarnessError> {
         let (artifact, captured_bytes, capture_hash, capture_truncated, capture_tail) =
             match &output.capture {
                 Some(capture) => {
                     let bytes = capture.payload()?;
                     let tail = capture.tail_of(&bytes);
-                    // Flushed before it returns: the lease record written next
-                    // already names this artifact, so its bytes must be durable
-                    // before any row points at them. The store hashes the bytes
-                    // it writes, and that digest is the one the receipt carries.
-                    let published = self.store.publish_artifact(&bytes).map_err(store_error)?;
+                    // In place, not yet flushed: [`Self::finish_backend_lease`]
+                    // flushes it before the lease record that names it. The
+                    // store hashes the bytes it writes, and that digest is the
+                    // one the receipt carries.
+                    let published = self
+                        .store
+                        .publish_artifact_unsynced(&bytes)
+                        .map_err(store_error)?;
                     let hash = published.content_hash.clone();
                     (
                         Some(published),
