@@ -168,7 +168,7 @@ pub(crate) fn adapter_stream(
             {
                 object.insert(
                     "tools".to_owned(),
-                    serde_json::Value::Array(request.tool_schemas.clone()),
+                    serde_json::Value::Array(request.tool_schemas.to_vec()),
                 );
             }
             let response = tokio::select! {

@@ -793,7 +793,7 @@ async fn a07_a_canceled_answer_keeps_what_it_streamed() {
     let session = SessionId::generate();
     let error = runtime
         .run_streaming(
-            RunRequest::new(
+            &RunRequest::new(
                 session.clone(),
                 TaskId::generate(),
                 InputId::generate(),
@@ -885,7 +885,7 @@ async fn a07_a_canceled_answer_keeps_its_text_when_the_stream_errors() {
     let session = SessionId::generate();
     let error = runtime
         .run_streaming(
-            RunRequest::new(
+            &RunRequest::new(
                 session.clone(),
                 TaskId::generate(),
                 InputId::generate(),

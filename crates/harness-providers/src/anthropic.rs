@@ -71,7 +71,7 @@ impl AnthropicMessagesAdapter {
     fn request_body(request: &ProviderRequest, thinking: Option<&crate::Thinking>) -> Value {
         let mut system = Vec::new();
         let mut messages = Vec::new();
-        for message in &request.messages {
+        for message in request.messages.iter() {
             match message.role {
                 super::MessageRole::System => system.push(message.content.clone()),
                 super::MessageRole::Tool => {

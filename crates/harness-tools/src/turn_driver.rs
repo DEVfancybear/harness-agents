@@ -844,7 +844,7 @@ impl TurnDriver {
             None => {
                 self.runtime
                     .run_streaming(
-                        request.clone(),
+                        &request,
                         cancellation.clone(),
                         sink_with(&observer, prefetcher.clone()),
                     )
@@ -1031,8 +1031,8 @@ impl TurnDriver {
                             result = self
                                 .runtime
                                 .continue_run(
-                                    request.clone(),
-                                    transcript.clone(),
+                                    &request,
+                                    &transcript,
                                     cancellation.clone(),
                                     Some(sink_with(&observer, prefetcher.clone())),
                                 )
@@ -1074,8 +1074,8 @@ impl TurnDriver {
                     result = self
                         .runtime
                         .continue_run(
-                            request.clone(),
-                            transcript.clone(),
+                            &request,
+                            &transcript,
                             cancellation.clone(),
                             Some(sink_with(&observer, prefetcher.clone())),
                         )
@@ -1123,8 +1123,8 @@ impl TurnDriver {
                     result = self
                         .runtime
                         .continue_run(
-                            request.clone(),
-                            transcript.clone(),
+                            &request,
+                            &transcript,
                             cancellation.clone(),
                             Some(sink_with(&observer, prefetcher.clone())),
                         )
@@ -1718,8 +1718,8 @@ impl TurnDriver {
             result = self
                 .runtime
                 .continue_run(
-                    request.clone(),
-                    transcript.clone(),
+                    &request,
+                    &transcript,
                     cancellation.clone(),
                     Some(sink_with(&observer, prefetcher.clone())),
                 )

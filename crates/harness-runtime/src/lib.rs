@@ -2147,21 +2147,23 @@ impl RuntimeService {
         request: RunRequest,
         cancellation: CancellationToken,
     ) -> Result<RunResult, RuntimeError> {
-        self.run_recovering_overflow(request, cancellation, None, true, Vec::new())
+        self.run_recovering_overflow(&request, cancellation, None, true, &[])
             .await
     }
 
     /// Run one turn and forward provider events while the response is arriving.
     ///
     /// The sink receives decoded events; durable admission, frozen requests and
-    /// receipts are unchanged.
+    /// receipts are unchanged. The request is borrowed: a turn driver keeps it
+    /// for the turn's later steps, and the request carries the conversation's
+    /// earlier turns, which a by-value call made it copy for every step.
     pub async fn run_streaming(
         &self,
-        request: RunRequest,
+        request: &RunRequest,
         cancellation: CancellationToken,
         sink: ProviderEventSink,
     ) -> Result<RunResult, RuntimeError> {
-        self.run_recovering_overflow(request, cancellation, Some(sink), true, Vec::new())
+        self.run_recovering_overflow(request, cancellation, Some(sink), true, &[])
             .await
     }
 
@@ -2170,10 +2172,14 @@ impl RuntimeService {
     /// No new user input is admitted: appended messages (assistant tool calls and
     /// their results) are added to the same conversation, so a bounded
     /// model -> tool -> model loop keeps one input identity per user message.
+    ///
+    /// Both the request and the turn's transcript are borrowed: they are the
+    /// whole conversation so far, and the step copies them once, into the
+    /// provider request it builds, instead of the caller copying them first.
     pub async fn continue_run(
         &self,
-        request: RunRequest,
-        appended: Vec<ProviderMessage>,
+        request: &RunRequest,
+        appended: &[ProviderMessage],
         cancellation: CancellationToken,
         sink: Option<ProviderEventSink>,
     ) -> Result<RunResult, RuntimeError> {
@@ -2187,21 +2193,26 @@ impl RuntimeService {
     /// The pre-send check only estimates, and a request it let through used to
     /// fail the turn outright. The input was admitted by the first attempt, so
     /// the retry admits nothing.
+    ///
+    /// The first send borrows the request and the transcript; only a step the
+    /// provider refused for its size copies them, to change them for the retry.
+    /// Copying both up front, in case of an overflow, cost two transcripts per
+    /// step of every turn.
     async fn run_recovering_overflow(
         &self,
-        request: RunRequest,
+        request: &RunRequest,
         cancellation: CancellationToken,
         sink: Option<ProviderEventSink>,
         admit_input: bool,
-        appended: Vec<ProviderMessage>,
+        appended: &[ProviderMessage],
     ) -> Result<RunResult, RuntimeError> {
         let first = self
             .run_inner(
-                request.clone(),
+                request,
                 cancellation.clone(),
                 sink.clone(),
                 admit_input,
-                appended.clone(),
+                appended,
             )
             .await;
         let Err(error) = &first else {
@@ -2213,12 +2224,12 @@ impl RuntimeService {
         let Ok(compacted) = self.compact(&request.session_id).await else {
             return first;
         };
-        let mut request = request;
+        let mut request = request.clone();
         request.continuation_context = Some(compacted.packet.content);
-        let mut appended = appended;
+        let mut appended = appended.to_vec();
         let budget = messages_tokens(&appended) / 2;
         fit_tool_results(&mut appended, budget);
-        self.run_inner(request, cancellation, sink, false, appended)
+        self.run_inner(&request, cancellation, sink, false, &appended)
             .await
     }
 
@@ -2239,12 +2250,17 @@ impl RuntimeService {
     #[allow(clippy::too_many_lines)]
     async fn run_inner(
         &self,
-        request: RunRequest,
+        request: &RunRequest,
         cancellation: CancellationToken,
         sink: Option<ProviderEventSink>,
         admit_input: bool,
-        mut appended: Vec<ProviderMessage>,
+        appended: &[ProviderMessage],
     ) -> Result<RunResult, RuntimeError> {
+        // The request and the transcript are borrowed and copied once, into the
+        // provider request. What this step changes - a summary in place of the
+        // earlier turns, shortened tool results, a continuation context - is
+        // held beside them and copies only when it happens.
+        let mut appended = std::borrow::Cow::Borrowed(appended);
         let config = self
             .config
             .lock()
@@ -2325,10 +2341,13 @@ impl RuntimeService {
         self.last_attempts.store(command.attempts, Ordering::SeqCst);
         let recovery = self.recover_step(&session, &request.session_id).await?;
         // The run scope is validated up front even though nothing narrows it here.
-        self.run_scope(&request, &config)?;
-        let mut request = request;
+        self.run_scope(request, &config)?;
         let mut notices = Vec::new();
-        if request.continuation_context.is_none()
+        let mut continuation_context = request
+            .continuation_context
+            .as_deref()
+            .map(std::borrow::Cow::Borrowed);
+        if continuation_context.is_none()
             && let Some(checkpoint) = self
                 .store
                 .latest_context_checkpoint(&request.session_id)
@@ -2336,11 +2355,13 @@ impl RuntimeService {
             && checkpoint.through_sequence <= recovery.replayed_through_sequence
             && let Some(summary) = checkpoint.content.get("packet").and_then(Value::as_str)
         {
-            request.continuation_context = Some(summary.to_owned());
+            continuation_context = Some(std::borrow::Cow::Owned(summary.to_owned()));
         }
+        // The earlier turns, or the summary that replaces their older part.
+        let mut earlier = std::borrow::Cow::Borrowed(request.conversation.as_slice());
         let checkpoint_id = format!("checkpoint-{}", recovery.replayed_through_sequence);
         let mut build_recovery = recovery.clone();
-        if request.continuation_context.is_some() {
+        if continuation_context.is_some() {
             build_recovery.instruction_texts = vec![request.text.clone()];
         }
         // prime-agent's compaction, measured the way the context builder measures
@@ -2364,7 +2385,9 @@ impl RuntimeService {
                 .map_or(u64::MAX, |built| built.packet.token_estimate)
         };
         let mut attempt = self.build_context(
-            &request,
+            request,
+            continuation_context.as_deref(),
+            &earlier,
             build_recovery.clone(),
             checkpoint_id.clone(),
             &appended,
@@ -2392,9 +2415,11 @@ impl RuntimeService {
                             format!("{COMPACTED_PREFIX}\n\n{summary}"),
                         )];
                         conversation.extend(recent);
-                        request.conversation = conversation;
+                        earlier = std::borrow::Cow::Owned(conversation);
                         attempt = self.build_context(
-                            &request,
+                            request,
+                            continuation_context.as_deref(),
+                            &earlier,
                             build_recovery.clone(),
                             checkpoint_id.clone(),
                             &appended,
@@ -2426,10 +2451,12 @@ impl RuntimeService {
                 .min(window.saturating_mul(2))
                 .saturating_sub(threshold);
             let budget = messages_tokens(&appended).saturating_sub(over.max(1));
-            let shortened = fit_tool_results(&mut appended, budget);
+            let shortened = fit_tool_results(appended.to_mut(), budget);
             if shortened > 0 {
                 attempt = self.build_context(
-                    &request,
+                    request,
+                    continuation_context.as_deref(),
+                    &earlier,
                     build_recovery.clone(),
                     checkpoint_id.clone(),
                     &appended,
@@ -2446,10 +2473,17 @@ impl RuntimeService {
                 .is_ok()
         {
             let compacted = self.compact(&request.session_id).await?;
-            request.continuation_context = Some(compacted.packet.content);
+            continuation_context = Some(std::borrow::Cow::Owned(compacted.packet.content));
             let mut compacted_recovery = self.recover_step(&session, &request.session_id).await?;
             compacted_recovery.instruction_texts = vec![request.text.clone()];
-            attempt = self.build_context(&request, compacted_recovery, checkpoint_id, &appended);
+            attempt = self.build_context(
+                request,
+                continuation_context.as_deref(),
+                &earlier,
+                compacted_recovery,
+                checkpoint_id,
+                &appended,
+            );
         }
         let built = match attempt {
             Ok(built) if built.packet.token_estimate <= window => built,
@@ -2478,7 +2512,7 @@ impl RuntimeService {
         // A step that compacted the context sends its new packet, which is kept.
         let packet_key = format!("{}|{}", request.session_id, request.input_id);
         let packet = {
-            let fresh = appended.is_empty() || request.continuation_context.is_some();
+            let fresh = appended.is_empty() || continuation_context.is_some();
             match self.turn_packets.lock() {
                 Ok(mut packets) if fresh => {
                     if packets.len() >= 64 {
@@ -2505,22 +2539,32 @@ impl RuntimeService {
                 request.images.clone(),
             )
         };
-        let mut conversation = vec![ProviderMessage::new(
+        let mut conversation = Vec::with_capacity(
+            earlier.len() + request.recovered_messages.len() + appended.len() + 2,
+        );
+        conversation.push(ProviderMessage::new(
             MessageRole::System,
             request.system_policy.clone(),
-        )];
+        ));
         // Earlier turns come before the new question, as they did when they were
-        // said; the packet that follows is this turn's own input. Nothing reads
-        // the request's messages after this point, so they are moved, not copied:
-        // the earlier turns are the bulk of a long conversation's request.
-        conversation.append(&mut request.conversation);
+        // said; the packet that follows is this turn's own input. This is the
+        // one copy a step makes of the conversation: the request and the turn's
+        // transcript were borrowed to get here, and a summary or shortened
+        // results this step made are moved in.
+        match earlier {
+            std::borrow::Cow::Borrowed(earlier) => conversation.extend_from_slice(earlier),
+            std::borrow::Cow::Owned(earlier) => conversation.extend(earlier),
+        }
         conversation.push(user_message);
         // A resumed turn replays committed tool results before this step's own
         // appended messages, so the model sees what already executed exactly
         // once and the pairing stays valid.
-        conversation.append(&mut request.recovered_messages);
+        conversation.extend_from_slice(&request.recovered_messages);
         // Continuation turns carry the tool results back to the model.
-        conversation.extend(appended);
+        match appended {
+            std::borrow::Cow::Borrowed(appended) => conversation.extend_from_slice(appended),
+            std::borrow::Cow::Owned(appended) => conversation.extend(appended),
+        }
         // The protocol is validated before anything is frozen or dispatched: a
         // tool result that cannot be correlated, or a request that needs a
         // capability the provider explicitly lacks, is a host bug, not a model
@@ -2536,7 +2580,7 @@ impl RuntimeService {
             capabilities.model.clone(),
             conversation,
         )
-        .with_tool_schemas(std::mem::take(&mut request.tool_schemas));
+        .with_tool_schemas(request.tool_schemas.clone());
         harness_providers::CapabilityMatrix::from_capabilities(&capabilities)
             .validate(&provider_request)
             .map_err(|error| {
@@ -2667,6 +2711,8 @@ impl RuntimeService {
                 attempt_reservation = Some(reservation.reservation_id);
             }
             let mut streamed = Vec::new();
+            // Each attempt takes its own request; its messages and tool
+            // definitions are shared, so this is not a copy of the transcript.
             let result = match &sink {
                 Some(sink) => {
                     stream_with_sink(
@@ -2905,8 +2951,8 @@ impl RuntimeService {
                 .await?;
             let dispatchable = response.is_dispatchable();
             Ok(RunResult {
-                session_id: request.session_id,
-                task_id: request.task_id,
+                session_id: request.session_id.clone(),
+                task_id: request.task_id.clone(),
                 run_id: run.run_id,
                 run_revision: run.revision,
                 step_id,
@@ -3160,7 +3206,14 @@ impl RuntimeService {
                 context_text.push_str(&tail);
             }
             let request = request.with_continuation_context(context_text);
-            let built = self.build_context(&request, recovery, checkpoint_id.clone(), &[])?;
+            let built = self.build_context(
+                &request,
+                request.continuation_context.as_deref(),
+                &request.conversation,
+                recovery,
+                checkpoint_id.clone(),
+                &[],
+            )?;
             let manifest_json = serde_json::to_value(&built.manifest).map_err(|_| {
                 RuntimeError::new(
                     ErrorCode::InvalidPayload,
@@ -3667,7 +3720,7 @@ impl RuntimeService {
             .await?;
         let session_id = request.session_id.clone();
         let task_id = request.task_id.clone();
-        let result = match self.run_streaming(request, cancellation, sink).await {
+        let result = match self.run_streaming(&request, cancellation, sink).await {
             Ok(result) => result,
             Err(error) => {
                 // A turn that was admitted and then canceled or failed is still a
@@ -3895,9 +3948,14 @@ impl RuntimeService {
         (digests, bytes)
     }
 
+    /// Build a step's context. `continuation` and `earlier` stand in for the
+    /// request's own continuation context and earlier turns, which a step may
+    /// have replaced without copying the request.
     fn build_context(
         &self,
         request: &RunRequest,
+        continuation: Option<&str>,
+        earlier: &[ProviderMessage],
         recovery: RecoveryView,
         checkpoint_id: String,
         appended: &[ProviderMessage],
@@ -3909,15 +3967,13 @@ impl RuntimeService {
                 RuntimeError::new(ErrorCode::RuntimeBlocked, "runtime config lock is poisoned")
             })?
             .clone();
-        let continuation = request
-            .continuation_context
-            .as_ref()
+        let continuation = continuation
             .map(|text| {
                 vec![
                     ContextBlock::mandatory(
                         "continuation-context",
                         harness_session::ContextBlockKind::RecentTail,
-                        text.clone(),
+                        text.to_owned(),
                     )
                     .on_channel(harness_session::ContextChannel::Summary),
                 ]
@@ -3936,7 +3992,7 @@ impl RuntimeService {
                 .map(|image| serde_json::to_string(image).map_or(0, |rendered| rendered.len()))
                 .sum::<usize>()
             + message_bytes(&request.recovered_messages)
-            + message_bytes(&request.conversation)
+            + message_bytes(earlier)
             // The continuation transcript is sent with every step of a turn and
             // grows with it. A budget that counts only the packet would let a
             // long turn overflow the window without the threshold ever noticing.

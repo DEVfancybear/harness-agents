@@ -611,16 +611,25 @@ pub fn validate_transcript(messages: &[ProviderMessage]) -> Result<(), ProviderE
     Ok(())
 }
 
+/// One model call.
+///
+/// The messages and the tool definitions are shared, not owned: a request is
+/// the whole conversation so far, and every attempt at it (a retry, a router
+/// trying the primary again or handing it to the backup, a wrapper filling in
+/// the output budget) takes a request of its own. Each used to copy the whole
+/// transcript; a shared one makes that copy a reference count. They serialize
+/// exactly as the vectors they hold, so a frozen request and its hash do not
+/// change.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderRequest {
     pub request_id: RequestId,
     pub model: String,
-    pub messages: Vec<ProviderMessage>,
+    pub messages: Arc<Vec<ProviderMessage>>,
     /// Optional per-request output cap, used for bounded nested sampling calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
     #[serde(default)]
-    pub tool_schemas: Vec<Value>,
+    pub tool_schemas: Arc<Vec<Value>>,
     pub temperature: Option<f32>,
     pub metadata: Value,
 }
@@ -635,9 +644,9 @@ impl ProviderRequest {
         Self {
             request_id,
             model: model.into(),
-            messages,
+            messages: Arc::new(messages),
             max_output_tokens: None,
-            tool_schemas: Vec::new(),
+            tool_schemas: Arc::default(),
             temperature: None,
             metadata: json!({}),
         }
@@ -645,7 +654,7 @@ impl ProviderRequest {
 
     #[must_use]
     pub fn with_tool_schemas(mut self, tool_schemas: Vec<Value>) -> Self {
-        self.tool_schemas = tool_schemas;
+        self.tool_schemas = Arc::new(tool_schemas);
         self
     }
 
@@ -1529,7 +1538,10 @@ impl ModelProvider for OpenAiChatAdapter {
             if !request.tool_schemas.is_empty()
                 && let Some(object) = body.as_object_mut()
             {
-                object.insert("tools".to_owned(), Value::Array(request.tool_schemas));
+                object.insert(
+                    "tools".to_owned(),
+                    Value::Array(Arc::unwrap_or_clone(request.tool_schemas)),
+                );
             }
             let response = tokio::select! {
                 result = headers
