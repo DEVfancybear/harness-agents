@@ -526,11 +526,32 @@ impl ToolPolicy {
 }
 
 fn pattern_matches(pattern: &str, target: &str) -> bool {
-    globset::GlobBuilder::new(pattern)
-        .case_insensitive(cfg!(windows))
-        .build()
-        .ok()
-        .is_some_and(|glob| glob.compile_matcher().is_match(target))
+    // Every decision checks every rule, two or three times over, and building
+    // a glob matcher costs far more than running one. Rules come from
+    // configuration and confirmed approvals, so there are few distinct
+    // patterns; the cap only guards against a host that is never restarted.
+    const MAX_CACHED_PATTERNS: usize = 1024;
+    static COMPILED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<globset::GlobMatcher>>>,
+    > = std::sync::OnceLock::new();
+    let compile = || {
+        globset::GlobBuilder::new(pattern)
+            .case_insensitive(cfg!(windows))
+            .build()
+            .ok()
+            .map(|glob| glob.compile_matcher())
+    };
+    let Ok(mut compiled) = COMPILED.get_or_init(Default::default).lock() else {
+        return compile().is_some_and(|matcher| matcher.is_match(target));
+    };
+    if compiled.len() >= MAX_CACHED_PATTERNS && !compiled.contains_key(pattern) {
+        compiled.clear();
+    }
+    compiled
+        .entry(pattern.to_owned())
+        .or_insert_with(compile)
+        .as_ref()
+        .is_some_and(|matcher| matcher.is_match(target))
 }
 
 fn tool_pattern_target(action: &CodingToolAction) -> String {

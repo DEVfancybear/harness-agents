@@ -416,13 +416,35 @@ pub(crate) fn ensure_watched(root: &Path) -> bool {
     active
 }
 
-fn remember_directories(root: &Path, walk: &Walk) {
-    relevant_directories()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(root.to_owned())
-        .or_default()
-        .extend(walk.directories.iter().cloned());
+fn remember_directories(root: &Path, base: &Path, walk: &Walk) {
+    let reset = {
+        let mut directories = relevant_directories()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let known = directories.entry(root.to_owned()).or_default();
+        // Directories deleted or renamed since earlier walks were never
+        // removed, so a long session kept growing the set. Once it holds far
+        // more than a complete walk of the whole root just saw, that walk
+        // replaces it.
+        let reset = base == root
+            && walk.complete
+            && known.len() > walk.directories.len().saturating_mul(2) + 1024;
+        if reset {
+            known.clear();
+        }
+        known.extend(walk.directories.iter().cloned());
+        reset
+    };
+    if reset {
+        // A cached walk of a narrower base may have registered directories
+        // the root walk does not visit (an ignored folder walked on its own);
+        // with them gone, its changes would no longer invalidate it, so it is
+        // dropped and walked again when asked for.
+        walk_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|cached_base, _| cached_base == root || !cached_base.starts_with(root));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -473,7 +495,7 @@ pub(crate) fn cached_walk(
     // result stamped old, so it is not trusted for longer than it saw.
     let stamp = generation();
     let walk = walk_files_within(base, MAX_WALK_FILES, deadline)?;
-    remember_directories(root, &walk);
+    remember_directories(root, base, &walk);
     let walk = Arc::new(walk);
     if walk.complete {
         let mut cache = walk_cache()
