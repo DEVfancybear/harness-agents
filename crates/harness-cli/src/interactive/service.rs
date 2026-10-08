@@ -7776,6 +7776,7 @@ async fn run_turn(
     } else {
         None
     };
+    let indexed_task = task_id.clone();
     let mut run_request = RunRequest::new(
         session_id.clone(),
         task_id,
@@ -7880,6 +7881,17 @@ async fn run_turn(
     // The turn's children belong to the session: they keep running, and what they
     // find reaches the parent as a notice.
     drop(delegate_host);
+
+    // Index this turn's journal while the answer is read, so the next
+    // `history_search` does not pay for a turn's worth of entries first (a
+    // long turn writes several hundred). The search still catches up itself
+    // when this has not finished.
+    {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            let _ = store.index_task_history(&indexed_task).await;
+        });
+    }
 
     // prime-agent syncs the kernel after every compaction, the automatic ones a
     // turn ran included: the next prompt says the kernel and its names lived on.

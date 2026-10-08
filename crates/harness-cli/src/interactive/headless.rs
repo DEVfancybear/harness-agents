@@ -395,6 +395,12 @@ pub async fn run_with(
         Some(config)
     };
 
+    // The prompt's Git facts start a `git` process: run it while the store
+    // opens and the workspace is observed, not after.
+    let git_facts = {
+        let root = context.project.root.clone();
+        tokio::task::spawn_blocking(move || super::service::prompt_git_facts(&root))
+    };
     // Name the directory that could not be opened: an operator has to know which
     // path failed, and the typed code must survive the extra context.
     let store_dir = context.project_store_dir();
@@ -663,7 +669,7 @@ pub async fn run_with(
         } else {
             request.options.append_system_prompt.clone()
         };
-        let (git_branch, changed_files) = super::service::prompt_git_facts(&context.project.root);
+        let (git_branch, changed_files) = git_facts.await.unwrap_or_default();
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let shell = if cfg!(windows) { "PowerShell" } else { "sh" };
         let tool_names = tool_schemas

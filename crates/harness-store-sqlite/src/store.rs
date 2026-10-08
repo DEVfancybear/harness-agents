@@ -31,6 +31,7 @@ use crate::{
 };
 
 pub mod backend_leases;
+mod checkpoint;
 pub mod delegation;
 pub mod history;
 mod maintenance;
@@ -139,6 +140,7 @@ const MIGRATION_2: &[&str] = &["CREATE TABLE IF NOT EXISTS session_settings (
 struct WriterLease {
     lock_file: File,
     fence: HostFence,
+    checkpointer: checkpoint::Checkpointer,
 }
 
 /// The P1 `SQLite` transaction coordinator.
@@ -206,7 +208,8 @@ impl SqliteStore {
         // data directory from a newer host must not be migrated or rewritten.
         let marker = read_data_directory_marker(&paths)?;
         let existed = paths.database_path.is_file();
-        let pool = open_pool(&paths, false).await?;
+        let signal = std::sync::Arc::new(checkpoint::CommitSignal::default());
+        let pool = open_pool(&paths, false, Some(std::sync::Arc::clone(&signal))).await?;
         // The interactive app opens the writer once per turn. Migrating and
         // re-checking every table each time was about seventy statements before
         // the first useful one; a database this process already brought up to date
@@ -222,13 +225,14 @@ impl SqliteStore {
                     return Err(error);
                 }
             };
-            return Ok(Self {
+            return Ok(Self::writer(
                 paths,
                 pool,
-                writer: Some(WriterLease { lock_file, fence }),
-                fault_plan: options.fault_plan,
-                last_frozen: std::sync::Arc::default(),
-            });
+                lock_file,
+                fence,
+                options.fault_plan,
+                signal,
+            ));
         }
         if let Err(error) = run_migrations(&pool, &options.fault_plan).await {
             let _ = FileExt::unlock(&lock_file);
@@ -273,14 +277,38 @@ impl SqliteStore {
         if let Some(stamp) = schema_stamp(&pool).await {
             mark_schema_ensured(&paths.database_path, stamp);
         }
-
-        Ok(Self {
+        Ok(Self::writer(
             paths,
             pool,
-            writer: Some(WriterLease { lock_file, fence }),
-            fault_plan: options.fault_plan,
+            lock_file,
+            fence,
+            options.fault_plan,
+            signal,
+        ))
+    }
+
+    /// A writer store on an open, migrated pool, with its checkpointer.
+    fn writer(
+        paths: StorePaths,
+        pool: SqlitePool,
+        lock_file: File,
+        fence: HostFence,
+        fault_plan: StoreFaultPlan,
+        signal: std::sync::Arc<checkpoint::CommitSignal>,
+    ) -> Self {
+        let checkpointer =
+            checkpoint::Checkpointer::start(&paths.database_path, BUSY_TIMEOUT, signal);
+        Self {
+            paths,
+            pool,
+            writer: Some(WriterLease {
+                lock_file,
+                fence,
+                checkpointer,
+            }),
+            fault_plan,
             last_frozen: std::sync::Arc::default(),
-        })
+        }
     }
 
     /// Open an existing store without lock acquisition, creation, or migration.
@@ -294,7 +322,7 @@ impl SqliteStore {
                 "read-only open requires an initialized database",
             ));
         }
-        let pool = open_pool(&paths, true).await?;
+        let pool = open_pool(&paths, true, None).await?;
         Ok(Self {
             paths,
             pool,
@@ -2975,6 +3003,9 @@ impl SqliteStore {
     /// Close the connection pool explicitly. The lock is released only after
     /// the pool is closed, allowing the kernel to make storage its last phase.
     pub async fn close(mut self) -> Result<(), StoreError> {
+        if let Some(writer) = self.writer.as_mut() {
+            writer.checkpointer.stop().await;
+        }
         self.pool.close().await;
         if let Some(writer) = self.writer.take() {
             FileExt::unlock(&writer.lock_file).map_err(|error| {
@@ -3099,7 +3130,18 @@ fn mark_schema_ensured(path: &std::path::Path, stamp: String) {
     }
 }
 
-async fn open_pool(paths: &StorePaths, read_only: bool) -> Result<SqlitePool, StoreError> {
+/// Pages the write-ahead log may hold before the writer checkpoints it
+/// itself: 16 MiB, four times `SQLite`'s default, so a long turn leaves the
+/// copy to the background checkpointer.
+const WAL_AUTOCHECKPOINT_PAGES: &str = "4000";
+
+/// Open the store's one connection. A writer's connection reports each
+/// commit to `on_commit`, which is what wakes its checkpointer.
+async fn open_pool(
+    paths: &StorePaths,
+    read_only: bool,
+    on_commit: Option<std::sync::Arc<checkpoint::CommitSignal>>,
+) -> Result<SqlitePool, StoreError> {
     let mut options = SqliteConnectOptions::new()
         .filename(&paths.database_path)
         .read_only(read_only)
@@ -3114,16 +3156,31 @@ async fn open_pool(paths: &StorePaths, read_only: bool) -> Result<SqlitePool, St
         // times per tool call - which is what made every tool call slow.
         options = options
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal);
+            .synchronous(SqliteSynchronous::Normal)
+            // The writer copies the log back itself only when it has grown
+            // this long; before that its checkpointer does it while the writer
+            // is idle (see `checkpoint`).
+            .pragma("wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES);
     }
-    SqlitePoolOptions::new()
+    let mut pool_options = SqlitePoolOptions::new()
         .max_connections(1)
-        .min_connections(1)
-        .connect_with(options)
-        .await
-        .map_err(|error| {
-            database_error(ErrorCode::StorageOpenFailed, "open SQLite database", error)
-        })
+        .min_connections(1);
+    if let Some(signal) = on_commit {
+        // Set on every connection the pool makes, so a reconnect keeps it.
+        pool_options = pool_options.after_connect(move |connection, _| {
+            let signal = std::sync::Arc::clone(&signal);
+            Box::pin(async move {
+                connection.lock_handle().await?.set_commit_hook(move || {
+                    signal.committed();
+                    true
+                });
+                Ok(())
+            })
+        });
+    }
+    pool_options.connect_with(options).await.map_err(|error| {
+        database_error(ErrorCode::StorageOpenFailed, "open SQLite database", error)
+    })
 }
 
 /// Read and validate the data directory marker, if this directory has one.
