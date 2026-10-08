@@ -1036,7 +1036,23 @@ fn check_subfile(path: &str) -> Result<(), String> {
             })
             && !segment.contains("..")
     };
-    if segments.len() < 2 || !SUBFILE_DIRS.contains(&segments[0]) || !segments.iter().all(plain) {
+    // Windows opens a device, not a file, for these names with any extension.
+    let device = |segment: &&str| {
+        let stem = segment
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        matches!(stem.as_str(), "con" | "prn" | "aux" | "nul")
+            || ((stem.starts_with("com") || stem.starts_with("lpt"))
+                && stem.len() == 4
+                && stem[3..].chars().all(|digit| digit.is_ascii_digit()))
+    };
+    if segments.len() < 2
+        || !SUBFILE_DIRS.contains(&segments[0])
+        || !segments.iter().all(plain)
+        || segments.iter().any(device)
+    {
         return Err(format!(
             "{path:?} must be a relative path under one of {}",
             SUBFILE_DIRS.join("/, ")
@@ -1082,7 +1098,7 @@ fn local_path_spellings(workspace: &Path) -> Vec<String> {
 }
 
 /// Lint the shaped skill. `body` is the whole `SKILL.md` that would land, `None`
-/// for `delete` and `remove_file`.
+/// for `delete` and `remove_file`; `previous` is the live one a patch changes.
 #[allow(
     clippy::too_many_lines,
     reason = "the format spec's checks, one after another"
@@ -1090,6 +1106,7 @@ fn local_path_spellings(workspace: &Path) -> Vec<String> {
 fn lint(
     intent: &Intent,
     body: Option<&str>,
+    previous: Option<&str>,
     layer: Layer,
     directory: &Path,
     context: &PromoteContext,
@@ -1105,6 +1122,26 @@ fn lint(
         return findings;
     };
     let rewritten = matches!(intent.action.as_str(), "create" | "update");
+    // A patch is held to the size limits too, but only for what it adds: a
+    // description or body already over a limit may still be patched shorter.
+    let measure = |text: &str| {
+        FrontMatter::parse(text).map(|front| {
+            let description = front.get("description").map_or(0, |d| d.chars().count());
+            let lines = text[front.body_start..]
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count();
+            (description, lines)
+        })
+    };
+    let before = if rewritten {
+        None
+    } else {
+        previous.and_then(measure)
+    };
+    let grows = |now: usize, field: fn((usize, usize)) -> usize| {
+        rewritten || before.is_none_or(|before| now > field(before))
+    };
     match FrontMatter::parse(body) {
         None => findings.push("structure: SKILL.md must open with --- front matter ---".to_owned()),
         Some(front) => {
@@ -1116,15 +1153,14 @@ fn lint(
             }
             match front.get("description") {
                 None => findings.push("structure: description is required".to_owned()),
-                Some(description) if rewritten => {
+                Some(description) => {
                     let length = description.chars().count();
-                    if length > DESCRIPTION_MAX_CHARS {
+                    if length > DESCRIPTION_MAX_CHARS && grows(length, |(d, _)| d) {
                         findings.push(format!(
                             "description: {length} characters, over {DESCRIPTION_MAX_CHARS}: state when to use the skill, put the procedure in the body"
                         ));
                     }
                 }
-                Some(_) => {}
             }
             if let Some(category) = front.get("category")
                 && !category.chars().all(|character| {
@@ -1140,7 +1176,7 @@ fn lint(
             if lines == 0 {
                 findings.push("structure: the body is empty".to_owned());
             }
-            if rewritten && lines > BODY_MAX_LINES {
+            if lines > BODY_MAX_LINES && grows(lines, |(_, l)| l) {
                 findings.push(format!(
                     "altitude: {lines} body lines, over {BODY_MAX_LINES}: keep the rule in SKILL.md, move detail to references/"
                 ));
@@ -1268,7 +1304,9 @@ pub fn promote(layers: &Layers, intent: &Intent, context: &PromoteContext) -> Ve
     let root = layers.root(layer).expect("layer is present").to_path_buf();
     let directory = root.join(&intent.name);
     if action == "create" {
-        if directory.exists() || layers.find(&intent.name).is_some() {
+        // A folder without SKILL.md is what a failed write left behind, not a
+        // skill: a create may take its place.
+        if directory.join("SKILL.md").exists() || layers.find(&intent.name).is_some() {
             return Verdict::reject(
                 Some(layer),
                 vec![format!(
@@ -1326,7 +1364,14 @@ pub fn promote(layers: &Layers, intent: &Intent, context: &PromoteContext) -> Ve
         }
         _ => None,
     };
-    let mut findings = lint(intent, shaped.as_deref(), layer, &directory, context);
+    let mut findings = lint(
+        intent,
+        shaped.as_deref(),
+        live.as_deref(),
+        layer,
+        &directory,
+        context,
+    );
     if action == "remove_file" {
         match intent.path.as_deref() {
             None => findings.push("shape: remove_file requires path".to_owned()),
@@ -1469,6 +1514,7 @@ fn land(
         }
         _ => {
             let body = body.expect("shaped body");
+            let existed = directory.exists();
             // Every target is resolved before anything is written.
             let targets = intent
                 .files
@@ -1484,12 +1530,21 @@ fn land(
                     json!(std::fs::read_to_string(target).ok()),
                 );
             }
-            for (relative, target) in &targets {
-                write_atomic(target, &intent.files[*relative])?;
+            let written = targets
+                .iter()
+                .try_for_each(|(relative, target)| write_atomic(target, &intent.files[*relative]))
+                // SKILL.md last: the commit point. A reader never sees it point
+                // at a file not yet written.
+                .and_then(|()| write_atomic(&directory.join("SKILL.md"), body));
+            if let Err(error) = written {
+                // A create that failed half way leaves nothing behind: a folder
+                // without SKILL.md would hold the name for ever, neither
+                // creatable again nor a live skill to patch.
+                if intent.action == "create" && !existed {
+                    let _ = std::fs::remove_dir_all(&directory);
+                }
+                return Err(error);
             }
-            // SKILL.md last: the commit point. A reader never sees it point at a
-            // file not yet written.
-            write_atomic(&directory.join("SKILL.md"), body)?;
             let (requests, _) = usage(layers, layer);
             if intent.action == "create" {
                 write_atomic(

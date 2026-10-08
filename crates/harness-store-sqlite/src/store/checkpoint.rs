@@ -186,7 +186,10 @@ mod tests {
             .fetch_one(&reopened.pool)
             .await
             .expect("count");
-        assert_eq!(rows, i64::try_from(CHECKPOINT_COMMITS + 1).expect("count fits"));
+        assert_eq!(
+            rows,
+            i64::try_from(CHECKPOINT_COMMITS + 1).expect("count fits")
+        );
         reopened.close().await.expect("close");
     }
 }
