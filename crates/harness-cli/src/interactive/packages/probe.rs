@@ -8,8 +8,10 @@
 //! those is recorded with its stamp (length and modification time), and the
 //! result stays valid while every recorded path still has the same stamp. A
 //! directory's modification time changes when an entry is added, removed or
-//! renamed in it, which is exactly what its listing depends on; a file found
-//! by a listing needs no stamp of its own, because only its presence counts.
+//! renamed in it, but a clock too coarse for two changes close together (or a
+//! file system that updates it late) can leave it unchanged, so a directory's
+//! stamp also holds a digest of its entry names; a file found by a listing
+//! needs no stamp of its own, because only its presence counts.
 //!
 //! Recording is per thread and only while [`record`] runs, so the package
 //! commands that use the same code outside a session pay nothing.
@@ -28,6 +30,8 @@ struct Stamp {
     is_dir: bool,
     len: u64,
     modified: Option<SystemTime>,
+    /// For a directory, a digest of its entry names (0 for a file).
+    names: u64,
 }
 
 /// What a resolution saw of one path.
@@ -56,7 +60,29 @@ fn stamp(path: &Path) -> Option<Stamp> {
         is_dir: metadata.is_dir(),
         len: metadata.len(),
         modified: metadata.modified().ok(),
+        names: if metadata.is_dir() {
+            names_digest(path)
+        } else {
+            0
+        },
     })
+}
+
+/// A digest of the entry names in a directory that does not depend on the
+/// order the file system lists them in.
+fn names_digest(dir: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            entry.file_name().hash(&mut hasher);
+            hasher.finish()
+        })
+        .fold(0_u64, u64::wrapping_add)
 }
 
 /// Note that the running resolution's result depends on `path`: its listing
