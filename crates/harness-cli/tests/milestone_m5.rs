@@ -1084,6 +1084,111 @@ async fn m5_03_index_rebuild_is_identical_and_scope_is_a_filter() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // batches, sessions, previews and pages in one story
+async fn m5_03_batched_index_previews_and_pages_match_the_journal() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let task = TaskId::generate();
+    let first = SessionId::generate();
+    admit_into(&store, &bench, &first, &task, "the first turn").await;
+    // More entries than one index transaction holds, so the batches meet.
+    let long = format!(
+        "Bước một: sửa trình phân tích.\r\nDòng hai có mã ZK-42 và {}",
+        "chữ có dấu ".repeat(40)
+    );
+    for index in 0..300 {
+        let text = if index == 150 {
+            long.clone()
+        } else {
+            format!("entry {index} mentions the parser budget")
+        };
+        append_note(&store, &first, &task, &text).await;
+    }
+    // A second session of the same task, as the next turn is.
+    store
+        .release_task_lease(&task)
+        .await
+        .expect("lease released");
+    let second = SessionId::generate();
+    admit_into(&store, &bench, &second, &task, "the second turn").await;
+    append_note(&store, &second, &task, "the follow-up names ZK-42 again").await;
+
+    let indexed = store.index_task_history(&task).await.expect("index");
+    assert_eq!(indexed, 303, "every entry of both sessions is a source");
+    assert_eq!(
+        store.index_task_history(&task).await.expect("index again"),
+        0,
+        "an up-to-date task indexes nothing"
+    );
+
+    let scope = HistoryScope::new(bench.project_id.clone(), task.clone());
+    let hits = store
+        .history_search(&scope, "ZK-42", 10)
+        .await
+        .expect("search");
+    assert_eq!(hits.len(), 2, "both sessions answer: {hits:?}");
+    assert!(hits[0].sequence > 0 && hits[0].preview.contains("ZK-42"));
+    let hit = hits
+        .iter()
+        .find(|hit| hit.preview.starts_with("Bước một"))
+        .expect("the long entry is a hit");
+    let flattened = long.replace(['\n', '\r'], " ");
+    let expected = format!("{}…", flattened.chars().take(160).collect::<String>());
+    assert_eq!(
+        hit.preview, expected,
+        "the preview is the first 160 characters, flattened, with a mark"
+    );
+    let short = hits
+        .iter()
+        .find(|hit| hit.preview == "the follow-up names ZK-42 again")
+        .expect("a short entry previews whole, without a mark");
+    assert_eq!(short.matched_terms, hit.matched_terms);
+
+    // Pages are bytes of the stored text, wherever they cut it.
+    let bytes = long.as_bytes();
+    for (offset, length) in [
+        (0, 16),
+        (1, 7),
+        (3, 64),
+        (bytes.len() - 5, 64),
+        (bytes.len(), 8),
+    ] {
+        let page = store
+            .history_read(&scope, &hit.source_id, offset as u64, length)
+            .await
+            .expect("page");
+        let end = (offset + length).min(bytes.len());
+        assert_eq!(page.bytes, bytes[offset..end], "page at {offset}+{length}");
+        assert_eq!(page.total_bytes, bytes.len() as u64);
+        assert_eq!(page.offset, offset as u64);
+    }
+    let past = store
+        .history_read(&scope, &hit.source_id, bytes.len() as u64 + 1, 8)
+        .await
+        .expect_err("an offset past the end is refused");
+    assert_eq!(past.code(), ErrorCode::InvalidPayload);
+    assert!(
+        past.to_string()
+            .contains(&format!("past the {} stored bytes", bytes.len())),
+        "{past}"
+    );
+
+    // A rebuild of a session, sources and terms, answers exactly as before.
+    let before = store
+        .history_search(&scope, "parser budget", 100)
+        .await
+        .expect("search");
+    store.rebuild_history_index(&first).await.expect("rebuild");
+    let after = store
+        .history_search(&scope, "parser budget", 100)
+        .await
+        .expect("search");
+    assert_eq!(before, after, "a rebuild is indistinguishable");
+    assert_eq!(before.len(), 100);
+    close(store).await;
+}
+
+#[tokio::test]
 async fn m5_03_notes_are_revision_checked_model_reports() {
     let bench = bench();
     let store = bench.open_store().await;

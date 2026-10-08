@@ -3569,7 +3569,16 @@ async fn ensure_context_schema(pool: &SqlitePool) -> Result<(), StoreError> {
         "CREATE TABLE IF NOT EXISTS history_sources (source_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, project_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, content_hash TEXT NOT NULL, availability TEXT NOT NULL)",
         "CREATE INDEX IF NOT EXISTS history_sources_by_task ON history_sources(task_id, sequence)",
         "CREATE TABLE IF NOT EXISTS history_terms (term TEXT NOT NULL, source_id TEXT NOT NULL REFERENCES history_sources(source_id) ON DELETE CASCADE, PRIMARY KEY(term, source_id))",
-        "CREATE INDEX IF NOT EXISTS history_terms_by_term ON history_terms(term)",
+        // The primary key already leads with the term; a second index on it
+        // only made every term insert write twice.
+        "DROP INDEX IF EXISTS history_terms_by_term",
+        // Clearing one source's terms (a re-index, a rebuild, the cascade from
+        // a deleted source) looks them up by source.
+        "CREATE INDEX IF NOT EXISTS history_terms_by_source ON history_terms(source_id)",
+        // The index's high-water mark per session, read before every search.
+        "CREATE INDEX IF NOT EXISTS history_sources_by_session ON history_sources(session_id, sequence)",
+        // A task's sessions, listed before every search.
+        "CREATE INDEX IF NOT EXISTS sessions_by_task ON sessions(task_id, created_at)",
         "CREATE TABLE IF NOT EXISTS session_notes (note_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, session_id TEXT NOT NULL, note_key TEXT NOT NULL, revision INTEGER NOT NULL, content TEXT NOT NULL, sources_json TEXT NOT NULL, authority TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(task_id, note_key))",
         "CREATE INDEX IF NOT EXISTS session_notes_by_task ON session_notes(task_id, note_key)",
     ];

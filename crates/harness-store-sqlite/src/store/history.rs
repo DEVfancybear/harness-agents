@@ -43,6 +43,28 @@ pub const NOTE_KEY_LIMIT_CHARS: usize = 120;
 /// Longest note body.
 pub const NOTE_CONTENT_LIMIT_BYTES: usize = 16 * 1024;
 
+/// Journal entries written per index transaction.
+const HISTORY_SOURCES_PER_TRANSACTION: usize = 128;
+
+/// Term rows per `INSERT` statement; two bind parameters each, far below
+/// `SQLite`'s limit.
+const HISTORY_TERMS_PER_STATEMENT: usize = 400;
+
+/// A journal entry about to be indexed.
+struct NewSource {
+    source_id: String,
+    sequence: u64,
+    kind: String,
+    content: String,
+}
+
+/// The session, task and project every source of one batch belongs to.
+struct SourceOwner<'a> {
+    session: &'a SessionId,
+    task: &'a TaskId,
+    project: &'a ProjectId,
+}
+
 /// One indexed journal entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistorySource {
@@ -252,7 +274,7 @@ impl SqliteStore {
                 error,
             )
         })?;
-        let mut written = 0_u64;
+        let mut sources = Vec::with_capacity(rows.len());
         for row in rows {
             let event_id: String = row_get(&row, "event_id")?;
             let sequence = u64::try_from(row_get::<i64>(&row, "sequence")?).unwrap_or_default();
@@ -274,16 +296,39 @@ impl SqliteStore {
             } else {
                 content
             };
-            self.write_history_source(
-                session_id,
-                &event_id,
+            sources.push(NewSource {
+                source_id: event_id,
                 sequence,
-                &kind,
-                &content,
-                SourceAvailability::Available,
-            )
-            .await?;
-            written += 1;
+                kind,
+                content,
+            });
+        }
+        if sources.is_empty() {
+            return Ok(0);
+        }
+        // The session's task and project are the same for every entry: look
+        // them up once, not once per entry (the project is behind a parse of
+        // the task's working state).
+        let task_id = self
+            .session_task(session_id)
+            .await?
+            .ok_or_else(|| StoreError::new(ErrorCode::InvalidPayload, "session does not exist"))?;
+        let project_id = self
+            .session_project(session_id)
+            .await?
+            .ok_or_else(|| StoreError::new(ErrorCode::InvalidPayload, "session has no project"))?;
+        let owner = SourceOwner {
+            session: session_id,
+            task: &task_id,
+            project: &project_id,
+        };
+        let mut written = 0_u64;
+        // Several entries per transaction, but bounded, so a long backlog does
+        // not hold the writer away from the runtime for the whole catch-up.
+        for batch in sources.chunks(HISTORY_SOURCES_PER_TRANSACTION) {
+            self.write_history_sources(&owner, batch, SourceAvailability::Available)
+                .await?;
+            written += u64::try_from(batch.len()).unwrap_or(u64::MAX);
         }
         Ok(written)
     }
@@ -331,15 +376,27 @@ impl SqliteStore {
     /// doing the asking would hide the task's own history from it — measured:
     /// a continuation session searched for a source its predecessor wrote and
     /// found nothing.
+    ///
+    /// Called before every search, so the common case — nothing new — must
+    /// cost one query, not two per session: a session whose last journal entry
+    /// is already indexed is skipped in SQL. A session whose newest entries had
+    /// nothing to index stays listed and is re-read from its last source on;
+    /// that read is small and writes nothing.
     pub async fn index_task_history(&self, task_id: &TaskId) -> Result<u64, StoreError> {
-        let rows =
-            sqlx::query("SELECT session_id FROM sessions WHERE task_id = ? ORDER BY created_at")
-                .bind(task_id.as_str())
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|error| {
-                    database_error(ErrorCode::StorageWriteFailed, "list task sessions", error)
-                })?;
+        let rows = sqlx::query(
+            "SELECT session_id FROM sessions
+             WHERE task_id = ?
+               AND next_sequence - 1 > COALESCE(
+                   (SELECT MAX(h.sequence) FROM history_sources h
+                    WHERE h.session_id = sessions.session_id), 0)
+             ORDER BY created_at",
+        )
+        .bind(task_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "list task sessions", error)
+        })?;
         let mut indexed = 0_u64;
         for row in rows {
             let session_id = SessionId::parse(row_get::<String>(&row, "session_id")?)?;
@@ -367,8 +424,8 @@ impl SqliteStore {
         }
         let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(20);
         let mut sql = String::from(
-            "SELECT s.source_id, s.sequence, s.kind, s.content, s.content_hash, s.availability,
-                    COUNT(DISTINCT t.term) AS matched
+            "SELECT s.source_id, s.sequence, s.kind, substr(s.content, 1, ?) AS head,
+                    s.content_hash, s.availability, COUNT(DISTINCT t.term) AS matched
              FROM history_sources s JOIN history_terms t ON t.source_id = s.source_id
              WHERE s.project_id = ? AND (s.task_id = ?",
         );
@@ -387,7 +444,10 @@ impl SqliteStore {
         // The statement is assembled from a fixed template: every caller value
         // is a bind parameter, and the only thing that varies is how many `?`
         // placeholders the scope grants and the query terms need.
+        // A hit shows a preview, never the source: fetch one character more
+        // than the preview keeps, which is enough to know it was cut.
         let mut statement = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(i64::try_from(PREVIEW_CHARS + 1).unwrap_or(i64::MAX))
             .bind(scope.project_id.as_str())
             .bind(scope.task_id.as_str());
         for granted in &scope.granted_source_ids {
@@ -406,7 +466,7 @@ impl SqliteStore {
             })?;
         rows.iter()
             .map(|row| {
-                let content: String = row_get(row, "content")?;
+                let head: String = row_get(row, "head")?;
                 Ok(HistoryHit {
                     source_id: row_get(row, "source_id")?,
                     sequence: u64::try_from(row_get::<i64>(row, "sequence")?).unwrap_or_default(),
@@ -422,7 +482,7 @@ impl SqliteStore {
                             "history source has an unknown availability",
                         )
                     })?,
-                    preview: preview_of(&content),
+                    preview: preview_of(&head),
                     matched_terms: u64::try_from(row_get::<i64>(row, "matched")?)
                         .unwrap_or_default(),
                 })
@@ -439,9 +499,15 @@ impl SqliteStore {
         length: usize,
     ) -> Result<HistoryPage, StoreError> {
         let row = sqlx::query(
-            "SELECT session_id, task_id, project_id, sequence, kind, content, content_hash, availability
+            "SELECT task_id, project_id, sequence, kind, content_hash, availability,
+                    length(CAST(content AS BLOB)) AS total_bytes,
+                    substr(CAST(content AS BLOB), ?, ?) AS page
              FROM history_sources WHERE source_id = ?",
         )
+        // Only the page leaves the database, not the whole source: SQLite
+        // counts a blob's substr in bytes, from 1.
+        .bind(i64::try_from(offset).unwrap_or(i64::MAX).saturating_add(1))
+        .bind(i64::try_from(length).unwrap_or(i64::MAX))
         .bind(source_id)
         .fetch_optional(&self.pool)
         .await
@@ -485,29 +551,20 @@ impl SqliteStore {
                 "the source behind this reference is no longer available",
             ));
         }
-        let content: String = row_get(&row, "content")?;
-        let total_bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
+        let total_bytes = u64::try_from(row_get::<i64>(&row, "total_bytes")?).unwrap_or_default();
         if offset > total_bytes {
             return Err(StoreError::new(
                 ErrorCode::InvalidPayload,
                 format!("requested offset {offset} is past the {total_bytes} stored bytes"),
             ));
         }
-        let room = usize::try_from(total_bytes - offset).unwrap_or(usize::MAX);
-        let end = offset.saturating_add(u64::try_from(length.min(room)).unwrap_or(u64::MAX));
-        let start = usize::try_from(offset).unwrap_or(usize::MAX);
-        let end = usize::try_from(end).unwrap_or(usize::MAX);
         Ok(HistoryPage {
             source_id: source_id.to_owned(),
             sequence: u64::try_from(row_get::<i64>(&row, "sequence")?).unwrap_or_default(),
             kind: row_get(&row, "kind")?,
             content_hash: ContentHash::parse(row_get::<String>(&row, "content_hash")?)?,
             offset,
-            bytes: content
-                .as_bytes()
-                .get(start..end)
-                .map(<[u8]>::to_vec)
-                .unwrap_or_default(),
+            bytes: row_get::<Option<Vec<u8>>>(&row, "page")?.unwrap_or_default(),
             total_bytes,
         })
     }
@@ -768,64 +825,87 @@ impl SqliteStore {
             .unwrap_or(0))
     }
 
-    async fn write_history_source(
+    /// Write a batch of one session's sources and their terms in one
+    /// transaction.
+    ///
+    /// A source that is written again (a concurrent indexer got there first)
+    /// replaces its content and its terms, so the index never keeps a term
+    /// the stored content no longer has.
+    async fn write_history_sources(
         &self,
-        session_id: &SessionId,
-        source_id: &str,
-        sequence: u64,
-        kind: &str,
-        content: &str,
+        owner: &SourceOwner<'_>,
+        sources: &[NewSource],
         availability: SourceAvailability,
     ) -> Result<(), StoreError> {
-        let task_id = self
-            .session_task(session_id)
-            .await?
-            .ok_or_else(|| StoreError::new(ErrorCode::InvalidPayload, "session does not exist"))?;
-        let project_id = self
-            .session_project(session_id)
-            .await?
-            .ok_or_else(|| StoreError::new(ErrorCode::InvalidPayload, "session has no project"))?;
-        let content_hash = ContentHash::from_bytes(content.as_bytes());
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
-        sqlx::query(
-            "INSERT INTO history_sources(source_id, session_id, task_id, project_id, sequence, kind, content, content_hash, availability)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(source_id) DO UPDATE SET
-                 content = excluded.content,
-                 content_hash = excluded.content_hash,
-                 availability = excluded.availability",
-        )
-        .bind(source_id)
-        .bind(session_id.as_str())
-        .bind(task_id.as_str())
-        .bind(project_id.as_str())
-        .bind(to_i64(sequence, "history sequence")?)
-        .bind(kind)
-        .bind(content)
-        .bind(content_hash.as_str())
-        .bind(availability.as_str())
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| {
-            database_error(ErrorCode::StorageWriteFailed, "write history source", error)
-        })?;
-        sqlx::query("DELETE FROM history_terms WHERE source_id = ?")
-            .bind(source_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| {
-                database_error(ErrorCode::StorageWriteFailed, "clear history terms", error)
-            })?;
-        for term in history_terms(content) {
+        let mut terms = Vec::new();
+        for source in sources {
+            let content_hash = ContentHash::from_bytes(source.content.as_bytes());
+            let existed =
+                sqlx::query_scalar::<_, i64>("SELECT 1 FROM history_sources WHERE source_id = ?")
+                    .bind(&source.source_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|error| {
+                        database_error(ErrorCode::StorageWriteFailed, "read history source", error)
+                    })?
+                    .is_some();
             sqlx::query(
-                "INSERT INTO history_terms(term, source_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                "INSERT INTO history_sources(source_id, session_id, task_id, project_id, sequence, kind, content, content_hash, availability)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(source_id) DO UPDATE SET
+                     content = excluded.content,
+                     content_hash = excluded.content_hash,
+                     availability = excluded.availability",
             )
-            .bind(term)
-            .bind(source_id)
+            .bind(&source.source_id)
+            .bind(owner.session.as_str())
+            .bind(owner.task.as_str())
+            .bind(owner.project.as_str())
+            .bind(to_i64(source.sequence, "history sequence")?)
+            .bind(&source.kind)
+            .bind(&source.content)
+            .bind(content_hash.as_str())
+            .bind(availability.as_str())
             .execute(&mut *tx)
             .await
             .map_err(|error| {
+                database_error(ErrorCode::StorageWriteFailed, "write history source", error)
+            })?;
+            if existed {
+                sqlx::query("DELETE FROM history_terms WHERE source_id = ?")
+                    .bind(&source.source_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| {
+                        database_error(ErrorCode::StorageWriteFailed, "clear history terms", error)
+                    })?;
+            }
+            terms.extend(
+                history_terms(&source.content)
+                    .into_iter()
+                    .map(|term| (term, source.source_id.as_str())),
+            );
+        }
+        // Many rows per statement: one round trip per term was most of the
+        // cost of indexing a long journal.
+        for chunk in terms.chunks(HISTORY_TERMS_PER_STATEMENT) {
+            let mut sql = String::from("INSERT INTO history_terms(term, source_id) VALUES ");
+            for index in 0..chunk.len() {
+                if index > 0 {
+                    sql.push(',');
+                }
+                sql.push_str("(?, ?)");
+            }
+            sql.push_str(" ON CONFLICT DO NOTHING");
+            // A fixed template: only the number of `(?, ?)` rows varies, and
+            // every value is a bind parameter.
+            let mut statement = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for (term, source_id) in chunk {
+                statement = statement.bind(term.as_str()).bind(*source_id);
+            }
+            statement.execute(&mut *tx).await.map_err(|error| {
                 database_error(ErrorCode::StorageWriteFailed, "write history term", error)
             })?;
         }
@@ -887,8 +967,10 @@ fn note_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<NoteRecord, StoreError
     })
 }
 
+/// Characters a search hit previews.
+const PREVIEW_CHARS: usize = 160;
+
 fn preview_of(content: &str) -> String {
-    const PREVIEW_CHARS: usize = 160;
     let flattened = content.replace(['\n', '\r'], " ");
     let mut preview = flattened.chars().take(PREVIEW_CHARS).collect::<String>();
     if flattened.chars().count() > PREVIEW_CHARS {
