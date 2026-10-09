@@ -210,6 +210,14 @@ impl Collector<'_> {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
+                // A path that went away while the walk was reading its parent
+                // is another process's business, not a failure of this walk:
+                // skip it. Temporary files under a home folder - a browser's
+                // cache, an installer's scratch directory - come and go
+                // constantly, and one of them must not end the turn.
+                if error.io_error().is_some_and(crate::workspace::is_vanished) {
+                    return Ok(WalkState::Continue);
+                }
                 // The walker wraps the failing path in its own error types, so
                 // recover the location instead of leaving the message anonymous.
                 let path = match &error {
@@ -242,10 +250,19 @@ impl Collector<'_> {
         }
         // `DirEntry::metadata` is the listing's own on Windows, and an `lstat`
         // elsewhere: links are never followed.
-        let metadata = entry.metadata().map_err(|error| match error.io_error() {
-            Some(io) => crate::workspace::entry_failure(path, io),
-            None => walk_failure(path, &error),
-        })?;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            // Deleted between the listing and the stat: skip it, as above.
+            Err(error) if error.io_error().is_some_and(crate::workspace::is_vanished) => {
+                return Ok(WalkState::Continue);
+            }
+            Err(error) => {
+                return Err(match error.io_error() {
+                    Some(io) => crate::workspace::entry_failure(path, io),
+                    None => walk_failure(path, &error),
+                });
+            }
+        };
         if is_reparse(&metadata) || !metadata.is_file() {
             return Ok(WalkState::Continue);
         }

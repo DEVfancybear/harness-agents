@@ -669,7 +669,12 @@ fn fingerprint_of(
     })?;
     let mut records = vec![format!("head\u{0}{head}")];
     for (relative, digest) in entries.iter().zip(&digests) {
-        records.push(format!("{relative}\u{0}{}", digest.as_str()));
+        // A file listed by Git and deleted before it was hashed leaves no
+        // record: the next listing will not carry it either, so the two
+        // fingerprints agree once the deletion has settled.
+        if let Some(digest) = digest {
+            records.push(format!("{relative}\u{0}{}", digest.as_str()));
+        }
     }
     let joined = records.join("\n");
     Ok(ContentHash::from_bytes(joined.as_bytes()))
@@ -697,7 +702,10 @@ fn digest_cache() -> &'static StdMutex<HashMap<PathBuf, CachedDigest>> {
     CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-fn file_digest(absolute: &Path) -> Result<ContentHash, OrchestratorError> {
+/// `Ok(None)` when the file is gone: it was listed, then another process
+/// deleted it before it could be read. Losing that race is not a failure of
+/// the turn - the file simply is not part of the workspace any more.
+fn file_digest(absolute: &Path) -> Result<Option<ContentHash>, OrchestratorError> {
     let unreadable = |error: std::io::Error| {
         OrchestratorError::new(
             ErrorCode::StorageOpenFailed,
@@ -706,7 +714,11 @@ fn file_digest(absolute: &Path) -> Result<ContentHash, OrchestratorError> {
     };
     // Stream the file: a fingerprint must not load a whole tree into memory,
     // and an unreadable file is a typed failure, not silently an empty file.
-    let mut file = std::fs::File::open(absolute).map_err(unreadable)?;
+    let mut file = match std::fs::File::open(absolute) {
+        Ok(file) => file,
+        Err(error) if vanished(&error) => return Ok(None),
+        Err(error) => return Err(unreadable(error)),
+    };
     let stamp = file
         .metadata()
         .ok()
@@ -717,14 +729,18 @@ fn file_digest(absolute: &Path) -> Result<ContentHash, OrchestratorError> {
         && cached.len == len
         && cached.modified == modified
     {
-        return Ok(cached.digest.clone());
+        return Ok(Some(cached.digest.clone()));
     }
-    let digest = ContentHash::from_reader(&mut file).map_err(|error| {
-        OrchestratorError::new(
-            ErrorCode::StorageOpenFailed,
-            format!("cannot hash workspace file {}: {error}", absolute.display()),
-        )
-    })?;
+    let digest = match ContentHash::from_reader(&mut file) {
+        Ok(digest) => digest,
+        Err(error) if vanished(&error) => return Ok(None),
+        Err(error) => {
+            return Err(OrchestratorError::new(
+                ErrorCode::StorageOpenFailed,
+                format!("cannot hash workspace file {}: {error}", absolute.display()),
+            ));
+        }
+    };
     if let Some((len, modified)) = stamp
         && modified.elapsed().is_ok_and(|age| age >= RACY_WINDOW)
         && let Ok(mut cache) = digest_cache().lock()
@@ -741,7 +757,26 @@ fn file_digest(absolute: &Path) -> Result<ContentHash, OrchestratorError> {
             },
         );
     }
-    Ok(digest)
+    Ok(Some(digest))
+}
+
+/// Whether an I/O failure means the file is no longer where the listing saw it.
+///
+/// Windows reports a path whose parent went away as `ERROR_PATH_NOT_FOUND` (3)
+/// rather than `ERROR_FILE_NOT_FOUND` (2), and only the latter is mapped onto
+/// `ErrorKind::NotFound`, so both numbers are matched as well.
+fn vanished(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(2 | 3))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn git(root: &Path, arguments: &[&str]) -> Result<String, OrchestratorError> {
@@ -815,14 +850,23 @@ mod scope_tests {
             }
         };
         write("one", Some(60));
-        let first = super::file_digest(&path).expect("hashed");
-        assert_eq!(super::file_digest(&path).expect("hashed"), first);
+        let first = super::file_digest(&path).expect("hashed").expect("present");
+        assert_eq!(
+            super::file_digest(&path).expect("hashed").expect("present"),
+            first
+        );
         write("two", Some(30));
-        let second = super::file_digest(&path).expect("hashed");
+        let second = super::file_digest(&path).expect("hashed").expect("present");
         assert_ne!(second, first, "same length, new time: hashed again");
         write("one", None);
-        assert_eq!(super::file_digest(&path).expect("hashed"), first);
+        assert_eq!(
+            super::file_digest(&path).expect("hashed").expect("present"),
+            first
+        );
         write("six", None);
-        assert_ne!(super::file_digest(&path).expect("hashed"), first);
+        assert_ne!(
+            super::file_digest(&path).expect("hashed").expect("present"),
+            first
+        );
     }
 }

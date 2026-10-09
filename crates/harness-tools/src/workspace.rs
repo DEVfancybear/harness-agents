@@ -339,11 +339,14 @@ fn git_index_hash(root: &Path) -> Option<ContentHash> {
         len: metadata.len(),
         modified: metadata.modified().ok(),
     };
-    hash_files(std::slice::from_ref(&file))
+    match hash_files(std::slice::from_ref(&file))
         .ok()?
         .into_iter()
-        .next()
-        .flatten()
+        .next()?
+    {
+        FileHash::Hashed(hash) => Some(hash),
+        FileHash::Unreadable(_) | FileHash::Vanished => None,
+    }
 }
 
 pub(crate) fn inspect_workspace(
@@ -425,17 +428,23 @@ pub(crate) fn workspace_fingerprint(
     let mut entries = Vec::with_capacity(walk.files.len());
     for (item, hash) in walk.files.iter().zip(hashes) {
         match hash {
-            Some(hash) => entries.push(json!({"path": item.relative, "content_hash": hash})),
-            // Present but locked by another process. The path stays in the
-            // fingerprint; its content does not. Once it becomes readable the
-            // content hash appears and the fingerprint changes, so an approval
-            // bound to the unreadable state is invalidated rather than silently
-            // comparing equal.
-            None => entries.push(json!({
+            FileHash::Hashed(hash) => {
+                entries.push(json!({"path": item.relative, "content_hash": hash}));
+            }
+            // Present but locked by another process, or not ours to read. The
+            // path stays in the fingerprint; its content does not. Once it
+            // becomes readable the content hash appears and the fingerprint
+            // changes, so an approval bound to the unreadable state is
+            // invalidated rather than silently comparing equal.
+            FileHash::Unreadable(reason) => entries.push(json!({
                 "path": item.relative,
                 "content_hash": null,
-                "unreadable": "locked",
+                "unreadable": reason,
             })),
+            // Deleted between the walk and the read. It is no longer part of
+            // the workspace, so it is no part of its fingerprint either: the
+            // next walk will not list it, and the fingerprint then matches.
+            FileHash::Vanished => {}
         }
     }
     // What `git status` added beyond the files themselves is the index: what
@@ -1192,10 +1201,23 @@ fn bound_hash_cache(cache: &mut HashCache, files: &[WalkFile]) {
     cache.retain(|path, _| current.contains(path.as_path()));
 }
 
+/// What hashing one workspace file produced.
+#[derive(Clone)]
+enum FileHash {
+    /// The file was read: this is its content hash.
+    Hashed(ContentHash),
+    /// Present, but it cannot be read right now - another process holds a byte
+    /// range of it, or the user cannot open it.
+    Unreadable(&'static str),
+    /// Gone between the walk and the read: another process's temporary file,
+    /// deleted while the tree was being hashed.
+    Vanished,
+}
+
 /// Hash every file, reusing cached hashes and reading the rest on all cores.
-fn hash_files(files: &[WalkFile]) -> Result<Vec<Option<ContentHash>>, HarnessError> {
+fn hash_files(files: &[WalkFile]) -> Result<Vec<FileHash>, HarnessError> {
     let now = SystemTime::now();
-    let mut hashes: Vec<Option<Option<ContentHash>>> = vec![None; files.len()];
+    let mut hashes: Vec<Option<FileHash>> = vec![None; files.len()];
     let mut misses = Vec::new();
     if let Ok(cache) = hash_cache().lock() {
         for (index, file) in files.iter().enumerate() {
@@ -1207,7 +1229,7 @@ fn hash_files(files: &[WalkFile]) -> Result<Vec<Option<ContentHash>>, HarnessErr
                 (Some(modified), Some((len, cached_modified, hash)))
                     if *len == file.len && *cached_modified == modified =>
                 {
-                    hashes[index] = Some(Some(hash.clone()));
+                    hashes[index] = Some(FileHash::Hashed(hash.clone()));
                 }
                 _ => misses.push(index),
             }
@@ -1244,7 +1266,9 @@ fn hash_files(files: &[WalkFile]) -> Result<Vec<Option<ContentHash>>, HarnessErr
     for (index, hash) in computed {
         let hash = hash?;
         let file = &files[index];
-        if let (Some(cache), Some(hash), Some(modified)) = (cache.as_mut(), &hash, file.modified) {
+        if let (Some(cache), FileHash::Hashed(hash), Some(modified)) =
+            (cache.as_mut(), &hash, file.modified)
+        {
             let settled = now
                 .duration_since(modified)
                 .is_ok_and(|age| age >= RACY_WINDOW);
@@ -1254,7 +1278,10 @@ fn hash_files(files: &[WalkFile]) -> Result<Vec<Option<ContentHash>>, HarnessErr
         }
         hashes[index] = Some(hash);
     }
-    Ok(hashes.into_iter().map(Option::flatten).collect())
+    Ok(hashes
+        .into_iter()
+        .map(|hash| hash.unwrap_or(FileHash::Vanished))
+        .collect())
 }
 
 /// Flush a workspace file's temporary copy before it is renamed over (or
@@ -1453,14 +1480,22 @@ fn decode_utf8(bytes: &[u8]) -> Result<String, HarnessError> {
 ///
 /// A lock violation means another process holds a byte range of the file — the
 /// app's own store does exactly that for `-shm`/`-wal` when it lives inside the
-/// workspace. It is reported as `Ok(None)` so the fingerprint can record the
-/// path as present-but-unreadable instead of failing the whole turn. Every
-/// other failure is a read failure with its own typed code: `workspace_escape`
-/// would send an operator looking for a path bug that does not exist.
-fn hash_file(path: &Path) -> Result<Option<ContentHash>, HarnessError> {
+/// workspace. A file the user may not open is the same kind of answer. Both are
+/// reported as `Unreadable` so the fingerprint can record the path as
+/// present-but-unreadable instead of failing the whole turn.
+///
+/// A file that is no longer there is `Vanished`: between the walk and the read
+/// another process deleted its own temporary file — a browser cache under a
+/// home folder does this constantly — and losing that race must not fail the
+/// turn. Every other failure is a read failure with its own typed code:
+/// `workspace_escape` would send an operator looking for a path bug that does
+/// not exist.
+fn hash_file(path: &Path) -> Result<FileHash, HarnessError> {
     let mut file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if is_lock_violation(&error) => return Ok(None),
+        Err(error) if is_lock_violation(&error) => return Ok(FileHash::Unreadable("locked")),
+        Err(error) if is_vanished(&error) => return Ok(FileHash::Vanished),
+        Err(error) if is_denied(&error) => return Ok(FileHash::Unreadable("denied")),
         Err(error) => return Err(hash_failure(path, &error)),
     };
     let mut hash = Sha256::new();
@@ -1468,7 +1503,9 @@ fn hash_file(path: &Path) -> Result<Option<ContentHash>, HarnessError> {
     loop {
         let read = match file.read(&mut buffer) {
             Ok(read) => read,
-            Err(error) if is_lock_violation(&error) => return Ok(None),
+            Err(error) if is_lock_violation(&error) => return Ok(FileHash::Unreadable("locked")),
+            Err(error) if is_vanished(&error) => return Ok(FileHash::Vanished),
+            Err(error) if is_denied(&error) => return Ok(FileHash::Unreadable("denied")),
             Err(error) => return Err(hash_failure(path, &error)),
         };
         if read == 0 {
@@ -1483,7 +1520,46 @@ fn hash_file(path: &Path) -> Result<Option<ContentHash>, HarnessError> {
         use std::fmt::Write as _;
         let _ = write!(text, "{byte:02x}");
     }
-    ContentHash::parse(text).map(Some)
+    ContentHash::parse(text).map(FileHash::Hashed)
+}
+
+/// Whether an I/O failure means the file is no longer where the walk saw it.
+///
+/// Windows reports a path whose parent went away as `ERROR_PATH_NOT_FOUND` (3)
+/// rather than `ERROR_FILE_NOT_FOUND` (2), and neither maps onto a single
+/// `ErrorKind` on every toolchain, so both numbers are matched as well.
+pub(crate) fn is_vanished(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(2 | 3))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Whether an I/O failure is the user not being allowed to open the file.
+///
+/// A home folder holds plenty of these — another account's files, folders the
+/// system keeps to itself — and they are present-but-unreadable, not a bug.
+/// Windows uses `ERROR_ACCESS_DENIED` (5) for a file pending deletion too,
+/// which is the same answer for a fingerprint's purposes.
+fn is_denied(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(5))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn hash_failure(path: &Path, error: &std::io::Error) -> HarnessError {
@@ -1593,6 +1669,41 @@ fn is_sensitive_relative(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file deleted between the walk and the hash is a race the workspace
+    /// loses all the time - a browser cache under a home folder deletes its
+    /// own temporary files while the tree is being read - and it must leave
+    /// the fingerprint intact rather than failing the turn.
+    #[test]
+    fn a_file_that_disappeared_before_it_was_hashed_is_not_a_failure() {
+        let root =
+            std::env::temp_dir().join(format!("gone-{}", harness_types::InputId::generate()));
+        fs::create_dir_all(&root).expect("root");
+        let present = root.join("present.txt");
+        fs::write(&present, "here").expect("written");
+        let gone = root.join("gone.txt");
+
+        let files = vec![
+            WalkFile {
+                absolute: present.clone(),
+                relative: "present.txt".to_owned(),
+                len: 4,
+                modified: fs::metadata(&present).ok().and_then(|m| m.modified().ok()),
+            },
+            // Listed by a walk that saw it, and deleted before it was read.
+            WalkFile {
+                absolute: gone,
+                relative: "gone.txt".to_owned(),
+                len: 7,
+                modified: None,
+            },
+        ];
+        let hashes = hash_files(&files).expect("a vanished file is not a hashing failure");
+        assert!(matches!(hashes[0], FileHash::Hashed(_)));
+        assert!(matches!(hashes[1], FileHash::Vanished));
+
+        fs::remove_dir_all(&root).ok();
+    }
 
     /// The branch read from the repository files is what `git rev-parse
     /// --abbrev-ref HEAD` says: nothing before the first commit, the branch
