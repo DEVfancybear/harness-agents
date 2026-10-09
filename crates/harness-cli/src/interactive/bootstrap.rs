@@ -20,11 +20,6 @@ use super::paths::{self, HostPlatform, LaunchEnvironment, PathRequest, ResolvedP
 /// owns the order the variables are probed in.
 pub const CREDENTIAL_VARIABLES: [&str; 5] = credentials::CREDENTIAL_VARIABLES;
 
-/// Compatibility re-exports; the actual provider preset is owned by config.
-#[cfg(test)]
-#[allow(unused_imports, reason = "kept for provider fixture compatibility")]
-pub use super::config::{DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL};
-
 /// Inputs for the launch context.
 #[derive(Clone, Debug)]
 pub struct LaunchRequest {
@@ -55,24 +50,6 @@ pub enum ProviderState {
     /// The source carries the *name* of where the key lives — an environment
     /// variable or the file `/login` saved — and never the key itself.
     CredentialPresent { source: CredentialSource },
-}
-
-impl ProviderState {
-    /// The source name for a rendered line; never the value.
-    ///
-    /// Kept as the one place that turns a state into operator-facing text, so a
-    /// future header or status line cannot invent a second spelling of it.
-    #[allow(
-        dead_code,
-        reason = "the header composes its own line; tests assert this"
-    )]
-    #[must_use]
-    pub fn describe(&self) -> String {
-        match self {
-            Self::CredentialPresent { source } => source.describe(),
-            Self::SetupRequired { reason } => reason.clone(),
-        }
-    }
 }
 
 /// Everything the app needs to render its header and open lazily.
@@ -205,8 +182,7 @@ impl LaunchContext {
             }
         };
         let provider = ProviderState::CredentialPresent { source };
-        let setup_required =
-            config.is_first_run() || matches!(provider, ProviderState::SetupRequired { .. });
+        let setup_required = matches!(provider, ProviderState::SetupRequired { .. });
         let mut updated = self.clone();
         updated.config = config;
         updated.provider = provider;
@@ -288,8 +264,7 @@ pub fn resolve(request: LaunchRequest) -> Result<LaunchContext, HarnessError> {
     })?;
     let config = config::load(&paths.config_file)?;
     let provider = provider_state(&request.environment, &paths.data_dir);
-    let setup_required =
-        config.is_first_run() || matches!(provider, ProviderState::SetupRequired { .. });
+    let setup_required = matches!(provider, ProviderState::SetupRequired { .. });
 
     Ok(LaunchContext {
         project: ProjectIdentity {
@@ -592,6 +567,24 @@ mod tests {
                 .next()
                 .is_none(),
             "launch must not write into the project"
+        );
+    }
+
+    #[test]
+    fn an_environment_credential_is_ready_without_a_configuration_file() {
+        let fixture = Fixture::new("project");
+        let environment = fixture.environment(&[("DEEPSEEK_API_KEY", "fixture-key")]);
+        let context = resolve(fixture.request(&environment)).expect("context resolves");
+
+        assert!(context.config.is_first_run());
+        assert!(!context.setup_required);
+        assert!(context.setup_hint().is_none());
+        assert!(
+            std::fs::read_dir(&fixture.home)
+                .expect("fixture home")
+                .next()
+                .is_none(),
+            "launch with an environment credential must not create files"
         );
     }
 

@@ -61,7 +61,7 @@ $stdout = Join-Path $OutputDirectory "pty-$label.txt"
 $stderr = Join-Path $OutputDirectory "pty-$label.err.txt"
 
 Write-Host "Running $($candidate.Name) in a new console (bound $TimeoutSeconds s)"
-$process = Start-Process -FilePath $candidate.FullName -ArgumentList $arguments -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+$process = Start-Process -FilePath $candidate.FullName -ArgumentList $arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
 $exited = $process.WaitForExit($TimeoutSeconds * 1000)
 if (-not $exited) {
     Write-Host "PTY_TIMEOUT: the console run exceeded $TimeoutSeconds s and was killed (see $stderr)"
@@ -73,4 +73,8 @@ Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue | Select-String -
 Get-Content -LiteralPath $stderr -ErrorAction SilentlyContinue | Select-String -Pattern 'panicked|timed out|assertion' | Select-Object -First 5 | ForEach-Object { Write-Host $_.Line }
 Write-Host "Transcript: $stdout"
 if ($process.ExitCode -ne 0) { exit 1 }
+if (-not (Select-String -LiteralPath $stdout -Pattern 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' -Quiet)) {
+    Write-Host 'PTY_EMPTY_OR_INCOMPLETE: the filter must run at least one test and leave none ignored'
+    exit 1
+}
 exit 0

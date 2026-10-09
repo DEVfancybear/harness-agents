@@ -2860,6 +2860,28 @@ mod tests {
             memories[0].content.as_deref(),
             Some("The user prefers tabs")
         );
+        std::fs::remove_file(dirs.local.join("harness_state.json")).expect("reset memory");
+        assert_eq!(
+            run(
+                "[entry.id for entry in rlm.harness.list('memory')]",
+                60,
+                dirs.clone()
+            )
+            .await,
+            "[]",
+            "the running kernel must observe removal of the memory file"
+        );
+        let recreated = run(
+            "rlm.harness.create_memory('Formatting', 'Keep existing formatting').id",
+            60,
+            dirs.clone(),
+        )
+        .await;
+        assert!(!recreated.contains("Traceback"), "{recreated}");
+        let state = crate::interactive::harness::load(&dirs.local, "local");
+        let memories = state.entries.get("memory").expect("new memories");
+        assert_eq!(memories.len(), 1, "reset entries must not be resurrected");
+        assert_eq!(memories[0].title.as_deref(), Some("Formatting"));
         if super::default_shell().is_some() {
             let bash = run(
                 "(await bash('echo from-bash')).output.strip()",

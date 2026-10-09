@@ -215,12 +215,6 @@ pub fn find_destructive_git_discard_commands(command: &str) -> Vec<usize> {
     indices
 }
 
-/// True when `command` contains a git discard command.
-#[allow(dead_code)]
-pub fn is_destructive_git_discard_command(command: &str) -> bool {
-    !find_destructive_git_discard_commands(command).is_empty()
-}
-
 /// Where a discard command's probe must run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiscardProbeTarget {

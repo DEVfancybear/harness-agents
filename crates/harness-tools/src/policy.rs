@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
-use crate::{CodingToolAction, ToolKind};
+use crate::CodingToolAction;
 
 /// A path-scoped policy result. Denial is monotonic: any matching deny wins
 /// regardless of a deeper matching allow.
@@ -757,11 +757,6 @@ fn policy_components(path: &str) -> Vec<String> {
             }
         })
         .collect()
-}
-
-#[allow(dead_code)]
-fn _assert_tool_kind_is_exhaustive(kind: ToolKind) -> &'static str {
-    kind.as_str()
 }
 
 #[cfg(test)]

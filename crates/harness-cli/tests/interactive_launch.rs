@@ -482,11 +482,15 @@ fn wait_for_loopback_fixture(address: std::net::SocketAddr, ready: &std::sync::m
 /// Stop a retry-capable SSE fixture after its client process has exited.
 struct SseFixtureServer {
     stop: std::sync::mpsc::Sender<()>,
-    thread: std::thread::JoinHandle<String>,
+    thread: std::thread::JoinHandle<Vec<String>>,
 }
 
 impl SseFixtureServer {
     fn join(self) -> String {
+        self.join_requests().into_iter().next().unwrap_or_default()
+    }
+
+    fn join_requests(self) -> Vec<String> {
         let _ = self.stop.send(());
         self.thread.join().expect("fixture server finishes")
     }
@@ -504,7 +508,7 @@ fn sse_fixture(text: &'static str) -> (String, SseFixtureServer) {
     let (stop, stop_rx) = std::sync::mpsc::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
-        let mut first_request = None;
+        let mut requests = Vec::new();
         loop {
             match stop_rx.try_recv() {
                 Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
@@ -520,9 +524,7 @@ fn sse_fixture(text: &'static str) -> (String, SseFixtureServer) {
                         .expect("fixture reads a complete HTTP request");
                     if let Some(request) = read_http_request(&mut socket) {
                         let _ = ready_tx.send(());
-                        if first_request.is_none() {
-                            first_request = Some(request);
-                        }
+                        requests.push(request);
                         let body = format!(
                             "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
                         );
@@ -542,7 +544,7 @@ fn sse_fixture(text: &'static str) -> (String, SseFixtureServer) {
                 Err(error) => panic!("fixture accepts: {error}"),
             }
         }
-        first_request.unwrap_or_default()
+        requests
     });
     wait_for_loopback_fixture(address, &ready_rx);
     (
@@ -860,52 +862,10 @@ fn i12_headless_turn_without_provider_configuration_fails_closed() {
     );
 }
 
-/// SSE fixture that serves several requests and returns the full request bodies.
-fn sse_fixture_multi(
-    text: &'static str,
-    requests: usize,
-) -> (String, std::thread::JoinHandle<Vec<String>>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
-    let address = listener.local_addr().expect("fixture address");
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        let mut bodies = Vec::new();
-        // Served requests are counted; a connect that closes without sending a
-        // request (the warm-up below) is not one of them.
-        while bodies.len() < requests {
-            let (mut socket, _) = listener.accept().expect("fixture accepts");
-            match read_http_request(&mut socket) {
-                Some(request) => {
-                    let _ = ready_tx.send(());
-                    let body = format!(
-                        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
-                    );
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    finish_fixture_response(&mut socket, response.as_bytes());
-                    bodies.push(request);
-                }
-                None => {
-                    // A warm-up probe or an interrupted upload is not a provider
-                    // request. Leave the scripted response for the next complete
-                    // attempt so a transient loopback reset cannot eat an answer.
-                    let _ = ready_tx.send(());
-                }
-            }
-        }
-        bodies
-    });
-    wait_for_loopback_fixture(address, &ready_rx);
-    (format!("http://{address}/chat/completions"), handle)
-}
-
 #[test]
 fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
     let _loopback = loopback_test_guard();
-    let (endpoint, server) = sse_fixture_multi("fixture answer", 2);
+    let (endpoint, server) = sse_fixture("fixture answer");
     let sandbox = Sandbox::new();
     let project = sandbox.path().join("project");
     std::fs::create_dir_all(&project).expect("project dir");
@@ -915,6 +875,8 @@ fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
             .args(arguments)
             .current_dir(&project)
             .env("HA_HOME", sandbox.path())
+            .env("HA_DAEMON", "off")
+            .env("HA_TURN_DEADLINE_SECONDS", "30")
             .env("HA_PROVIDER_ENDPOINT", &endpoint)
             .env("HA_PROVIDER_MODEL", "fixture-model")
             .env("DEEPSEEK_API_KEY", "fixture-secret-value")
@@ -978,7 +940,7 @@ fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
     );
     assert_eq!(second_json["tool_calls"], serde_json::Value::from(0));
 
-    let requests = server.join().expect("fixture server finishes");
+    let requests = server.join_requests();
     assert_eq!(requests.len(), 2, "one provider call per turn");
     assert!(
         requests[1].contains("first prompt from the test"),

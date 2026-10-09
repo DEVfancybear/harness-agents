@@ -163,6 +163,8 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
+      - name: Verify Python memory persistence without dependencies
+        run: python -m unittest discover -s crates/harness-cli/python/tests -v
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt

@@ -127,23 +127,25 @@ fn filter_of(bytes: &[u8]) -> Box<[u64]> {
     bits
 }
 
-fn index_file(file: &WalkFile) -> Filter {
+fn index_file(file: &WalkFile) -> Option<Filter> {
     let indexed_at = SystemTime::now();
-    let bits = (file.len <= MAX_TEXT_FILE_BYTES as u64)
-        .then(|| std::fs::read(&file.absolute).ok())
-        .flatten()
-        .filter(|bytes| {
-            bytes.len() <= MAX_TEXT_FILE_BYTES
-                && memchr::memchr(0, bytes).is_none()
-                && std::str::from_utf8(bytes).is_ok()
-        })
-        .map(|bytes| filter_of(&bytes));
-    Filter {
+    let bits = if file.len <= MAX_TEXT_FILE_BYTES as u64 {
+        // A transient read failure is not evidence that a file has no match.
+        // Leave it unindexed so searches read it and later refreshes retry it.
+        let bytes = std::fs::read(&file.absolute).ok()?;
+        (bytes.len() <= MAX_TEXT_FILE_BYTES
+            && memchr::memchr(0, &bytes).is_none()
+            && std::str::from_utf8(&bytes).is_ok())
+        .then(|| filter_of(&bytes))
+    } else {
+        None
+    };
+    Some(Filter {
         len: file.len,
         modified: file.modified,
         indexed_at,
         bits,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +220,13 @@ fn refresh(index: &RwLock<Index>, files: &[WalkFile]) {
     index
         .filters
         .retain(|path, _| live.contains(path.as_path()));
-    index.filters.extend(built);
+    for (path, filter) in built {
+        if let Some(filter) = filter {
+            index.filters.insert(path, filter);
+        } else {
+            index.filters.remove(&path);
+        }
+    }
     index.ready = true;
     index.refreshing = false;
 }
@@ -651,6 +659,54 @@ mod tests {
             ..filter
         };
         assert!(!absent.admits(&skip));
+    }
+
+    #[test]
+    fn a_failed_read_is_retried_when_the_file_returns_unchanged() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let path = temp.path().join("source.txt");
+        std::fs::write(&path, "needle").expect("source");
+        let modified = SystemTime::now() - Duration::from_secs(10);
+        let set_time = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open source")
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .expect("source time");
+        };
+        set_time();
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        let file = WalkFile {
+            absolute: path.clone(),
+            relative: "source.txt".to_owned(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        };
+        // The file disappears after the walk but before the index reads it.
+        std::fs::remove_file(&path).expect("remove source");
+        let index = RwLock::new(Index::default());
+        refresh(&index, std::slice::from_ref(&file));
+        std::fs::write(&path, "needle").expect("restore source");
+        set_time();
+        let guard = index.read().expect("index");
+        assert!(
+            guard
+                .filters
+                .get(&path)
+                .is_none_or(|filter| !filter.current(&file)),
+            "a failed read must not become a current negative filter"
+        );
+        drop(guard);
+        refresh(&index, std::slice::from_ref(&file));
+        let query = Query::from_pattern("needle", false).expect("query");
+        let guard = index.read().expect("refreshed index");
+        let filter = guard.filters.get(&path).expect("restored file indexed");
+        assert!(filter.current(&file));
+        assert!(
+            query.admits(filter),
+            "the restored file must remain searchable"
+        );
     }
 
     #[test]

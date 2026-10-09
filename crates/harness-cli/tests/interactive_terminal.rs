@@ -1294,30 +1294,29 @@ fn i21_pty_survives_a_multiline_draft_and_keeps_the_prompt_usable() {
 #[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
 #[test]
 fn i07a_ctrl_c_clears_an_idle_prompt() {
-    // One pseudo-console per test: opening a second one in the same process blocks
-    // on this host, so the idle and running phases cannot share one test.
-    let (temp, project) = sandbox();
-    let mut session = PtySession::spawn(&project, &base_env(&temp));
-    session.wait_for("Harness Agents", Duration::from_secs(30));
+    let provider = ScriptedSse::start(|_| Reply::Text("idle-clear-audit-done".to_owned()));
+    let (_temp, mut session) = scripted_session(&provider);
     // The banner is drawn before the loop reads keys; the composer is drawn by it.
     session.wait_for("Nhập yêu cầu", Duration::from_secs(15));
 
     session.send("typo");
-    wait_for_normalized(&session, "typo", Duration::from_secs(15));
     session.send("\u{3}");
-    session.send("z");
-    wait_for_normalized(&session, "z", Duration::from_secs(15));
-    assert!(
-        !session.transcript().contains("> typoz"),
-        "an idle Ctrl-C clears the buffer:\n{}",
-        session.transcript()
-    );
+    session.send("z\r");
+    session.wait_for("idle-clear-audit-done", Duration::from_secs(30));
+    // Cursor repaints can split a word in the transcript. Check the input the
+    // real provider received, which also catches a draft that was not cleared.
+    let requests = provider.requests();
+    assert!(!requests.is_empty());
+    for (_, request) in requests {
+        let text = last_user_text(&request);
+        assert!(text.lines().any(|line| line == "z"), "{text}");
+        assert!(
+            !text.contains("typo"),
+            "the old draft reached the provider: {text}"
+        );
+    }
     assert!(session.is_alive());
 
-    // Clear the marker character first: "/exit" appended to it would be submitted
-    // as a request instead of a command.
-    session.send("\u{3}");
-    wait_for_normalized(&session, ">", Duration::from_secs(10));
     session.send("/exit\r");
     assert_eq!(
         session.wait_exit(Duration::from_secs(20)),

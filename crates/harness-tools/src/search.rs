@@ -179,6 +179,18 @@ fn file_matches(
     anchors: bool,
     cap: usize,
 ) -> Vec<RawMatch> {
+    // CRLF mode makes `.` exclude every CR, whereas `str::lines` removes only
+    // the CR immediately before LF. Keep the per-line engine for bare CRs.
+    let bytes = text.as_bytes();
+    let buffer = matchers
+        .buffer
+        .as_ref()
+        .filter(|_| !memchr::memchr_iter(b'\r', bytes).any(|at| bytes.get(at + 1) != Some(&b'\n')));
+    // Most candidate files have no hit. Avoid allocating their line offsets
+    // and scanning their newlines when the regex can reject the whole buffer.
+    if buffer.is_some_and(|buffer| !buffer.is_match(bytes)) {
+        return Vec::new();
+    }
     let lines = Lines::new(text);
     let mut found = Vec::new();
     let on_line = |index: usize, found: &mut Vec<RawMatch>| {
@@ -206,9 +218,8 @@ fn file_matches(
             });
         }
     };
-    match &matchers.buffer {
+    match buffer {
         Some(buffer) => {
-            let bytes = text.as_bytes();
             let mut position = 0;
             while position <= bytes.len() && found.len() < cap {
                 let Some(hit) = buffer.find_at(bytes, position) else {
@@ -457,6 +468,15 @@ mod tests {
         for text in texts {
             for (query, regex, insensitive) in queries {
                 agree(text, query, regex, insensitive);
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_carriage_returns_keep_per_line_regex_semantics() {
+        for text in ["a\rb", "a\r", "a\rb\r\nnext\n", "\r\n\ra\r\n"] {
+            for pattern in ["a.b", "^.*$", ".+", "a.*b", "^a.*", "b$"] {
+                agree(text, pattern, true, false);
             }
         }
     }

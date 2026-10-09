@@ -374,7 +374,13 @@ class HarnessState:
             self.load()
 
     def load(self) -> "HarnessState":
-        if self.file_path is None or not self.file_path.exists():
+        if self.file_path is None:
+            return self
+        if not self.file_path.exists():
+            # Removing the backing file resets persistent state. Keeping the old
+            # snapshot here would resurrect its entries on the next mutation.
+            self.entries = {kind: {} for kind in _KINDS}
+            self.refinements = []
             self._loaded_mtime = None
             return self
         mtime = self._disk_mtime()
