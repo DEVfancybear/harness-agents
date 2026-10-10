@@ -373,9 +373,9 @@ class HarnessState:
         self.entries: dict[HarnessKind, dict[str, HarnessEntry]] = {kind: {} for kind in _KINDS}
         self.refinements: list[RefinementEvent] = []
         self._global_target_state_dir: Path | None = None
-        # mtime of the file as of the last load/save, used to detect out-of-process
-        # writes (e.g. the host `/refine` command) and avoid clobbering them.
-        self._loaded_mtime: int | None = None
+        # File identity and metadata detect replacements even when rapid writes
+        # share a timestamp, as can happen on Windows.
+        self._loaded_revision: tuple[int, int, int, int, int] | None = None
         self.load()
 
     def _ensure_local_writable(self) -> None:
@@ -437,11 +437,18 @@ class HarnessState:
                     else:
                         fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
-    def _disk_mtime(self) -> int | None:
+    def _disk_revision(self) -> tuple[int, int, int, int, int] | None:
         if self.file_path is None:
             return None
         try:
-            return self.file_path.stat().st_mtime_ns
+            revision = self.file_path.stat()
+            return (
+                revision.st_dev,
+                revision.st_ino,
+                revision.st_size,
+                revision.st_mtime_ns,
+                revision.st_ctime_ns,
+            )
         except OSError:
             return None
 
@@ -451,10 +458,10 @@ class HarnessState:
         The kernel keeps a long-lived ``HarnessState`` in memory while the host
         ``/refine`` command rewrites the same file from a separate process. Without
         this guard the next in-kernel ``save()`` would overwrite host edits with a
-        stale snapshot. We re-read whenever the on-disk mtime no longer matches the
-        value recorded at our last load/save.
+        stale snapshot. We re-read whenever the file identity or metadata no
+        longer matches the revision recorded at our last load/save.
         """
-        if self._disk_mtime() != self._loaded_mtime:
+        if self._disk_revision() != self._loaded_revision:
             self.load()
 
     @_serialized_state()
@@ -466,9 +473,9 @@ class HarnessState:
             # snapshot here would resurrect its entries on the next mutation.
             self.entries = {kind: {} for kind in _KINDS}
             self.refinements = []
-            self._loaded_mtime = None
+            self._loaded_revision = None
             return self
-        mtime = self._disk_mtime()
+        revision = self._disk_revision()
         try:
             with self.file_path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -544,7 +551,7 @@ class HarnessState:
                     elif not isinstance(changes, list):
                         continue
                     self.refinements.append(RefinementEvent(**event_data))
-        self._loaded_mtime = mtime
+        self._loaded_revision = revision
         return self
 
     def _global_target(self, global_: bool, extra: dict[str, Any] | None = None) -> "HarnessState | None":
@@ -587,7 +594,7 @@ class HarnessState:
             os.replace(temp_path, target_path)
         finally:
             temp_path.unlink(missing_ok=True)
-        self._loaded_mtime = self._disk_mtime()
+        self._loaded_revision = self._disk_revision()
         return self
 
     @_serialized_state(writable=True)

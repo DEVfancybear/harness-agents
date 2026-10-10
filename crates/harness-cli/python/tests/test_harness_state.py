@@ -47,6 +47,27 @@ class HarnessPersistenceTests(unittest.TestCase):
             {f"{side}-{number}" for side in ("a", "b") for number in range(24)},
         )
 
+    def test_replaced_state_with_same_mtime_preserves_external_writes(self):
+        cached = self.state()
+        cached.create_memory("First", "First memory", id="first")
+        previous_stat = self.path.stat()
+        self.state().create_memory("External", "External memory", id="external")
+        os.utime(self.path, ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns))
+        cached.create_memory("Next", "Next memory", id="next")
+        self.assertEqual(
+            {entry.id for entry in self.state().list("memory")},
+            {"first", "external", "next"},
+        )
+
+    def test_replaced_state_with_same_mtime_and_size_reloads_on_read(self):
+        cached = self.state()
+        cached.create_memory("First", "Before edit", id="first")
+        previous_stat = self.path.stat()
+        self.state().update_memory("first", "First", "After edits")
+        self.assertEqual(self.path.stat().st_size, previous_stat.st_size)
+        os.utime(self.path, ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns))
+        self.assertEqual(cached.get("memory", "first").content, "After edits")
+
     def test_separate_kernels_preserve_concurrent_global_writes(self):
         code = """
 import importlib.util, pathlib, sys, time

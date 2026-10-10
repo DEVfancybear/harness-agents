@@ -331,6 +331,7 @@ pub async fn process_alive(pid: u32) -> bool {
 /// Every running pid from one `tasklist` on Windows, or `None` when the listing
 /// cannot be trusted (it must at least show this process). Elsewhere per-pid
 /// checks are already cheap, so there is no listing.
+#[cfg_attr(not(windows), allow(clippy::unused_async))]
 async fn running_pids() -> Option<std::collections::HashSet<u32>> {
     #[cfg(windows)]
     {
