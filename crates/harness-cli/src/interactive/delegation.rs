@@ -565,6 +565,10 @@ impl ChildRecord {
         };
         json!({
             "rlm_child_id": self.task_id.as_str(),
+            "session_id": self.task_id.as_str(),
+            "active_session_id": (!self.state.settled())
+                .then(|| self.session_id.as_ref().map(SessionId::as_str))
+                .flatten(),
             "session_name": self.name,
             "session_dir": session_dir,
             "status": status,
@@ -587,6 +591,28 @@ impl ChildRecord {
                 ChildState::Cancelled { reason } => Some(reason),
                 _ => None,
             },
+        })
+    }
+
+    fn observation(&self) -> Value {
+        let active = !self.state.settled() && self.session_id.is_some();
+        json!({
+            "sessionId": self.task_id.as_str(),
+            "sessionName": self.name,
+            "activeSessionId": active.then(|| self.session_id.as_ref().map(SessionId::as_str)).flatten(),
+            "relationship": "child",
+            "status": if self.state.settled() { "inactive" } else { "running" },
+            "isSessionActive": active,
+            "activity": match (&self.state, &self.activity_tool) {
+                (ChildState::Running, Some(tool)) => json!({"kind": "executing", "tool_name": tool}),
+                (ChildState::Running, None) => json!({"kind": "waiting"}),
+                _ => Value::Null,
+            },
+            "model": self.model,
+            "toolUseCount": self.tool_calls,
+            "messageCount": self.history.len(),
+            "latestMessage": self.history.last().map(|message| message_preview(message, 800)),
+            "firstMessage": (!active).then(|| json!({"role": "user", "text": self.objective.chars().take(800).collect::<String>()})),
         })
     }
 
@@ -717,6 +743,7 @@ struct AgentsShared {
     /// The launch of the latest turn: what a woken child that came back from
     /// the ledger runs with.
     default_launch: Mutex<Option<ChildLaunch>>,
+    root_identity: Mutex<(Option<String>, Option<String>)>,
 }
 
 /// One message between two agents of the family.
@@ -754,6 +781,7 @@ impl AgentsShared {
             ledger_dir: std::sync::OnceLock::new(),
             ledger_path: Mutex::new(None),
             default_launch: Mutex::new(None),
+            root_identity: Mutex::new((None, None)),
         }
     }
 
@@ -1096,10 +1124,34 @@ impl AgentsShared {
     }
 
     fn find(&self, parent: Option<&TaskId>, selector: &str) -> Option<TaskId> {
-        self.names(parent)
-            .into_iter()
-            .find(|(task_id, name, _)| task_id.as_str() == selector || name == selector)
-            .map(|(task_id, ..)| task_id)
+        if selector.is_empty() {
+            return None;
+        }
+        let children = self.children.lock().ok()?;
+        let family = || {
+            children
+                .iter()
+                .filter(move |child| !child.deleted && child.parent.as_ref() == parent)
+        };
+        if let Some(child) = family().find(|child| {
+            child.task_id.as_str() == selector
+                || child.name == selector
+                || child
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == selector)
+        }) {
+            return Some(child.task_id.clone());
+        }
+        let mut matches = family().filter(|child| {
+            child.task_id.as_str().starts_with(selector)
+                || child.task_id.as_str().ends_with(selector)
+                || child.session_id.as_ref().is_some_and(|id| {
+                    id.as_str().starts_with(selector) || id.as_str().ends_with(selector)
+                })
+        });
+        let found = matches.next()?;
+        matches.next().is_none().then(|| found.task_id.clone())
     }
 
     /// A message from the parent (the root agent) to its children.
@@ -1698,6 +1750,9 @@ impl SessionAgents {
     /// prime-agent's ledger reseed: the conversation `conversation` is the
     /// one in use; its children come back from its spawn ledger, settled.
     pub fn bind_ledger(&self, conversation: &str) {
+        if let Ok(mut identity) = self.shared.root_identity.lock() {
+            identity.0 = Some(conversation.to_owned());
+        }
         let Some(dir) = self.shared.ledger_dir.get() else {
             return;
         };
@@ -2943,6 +2998,9 @@ impl RlmChildren {
             return Err("a name is at most 60 characters".to_owned());
         }
         let Some(selector) = request["session_id"].as_str() else {
+            if let Ok(mut identity) = self.agents.shared.root_identity.lock() {
+                identity.1 = Some(name.clone());
+            }
             let _ = self
                 .agents
                 .shared
@@ -3042,30 +3100,98 @@ impl RlmChildren {
             .and_then(|host| host.clone())
     }
 
+    fn current_observation(&self) -> Value {
+        let (id, name) = self
+            .agents
+            .shared
+            .root_identity
+            .lock()
+            .map(|identity| identity.clone())
+            .unwrap_or_default();
+        json!({
+            "sessionId": id.unwrap_or_else(|| "root".to_owned()),
+            "sessionName": self.host().and_then(|host| host.agent_name()).or(name),
+            "status": "running",
+            "isSessionActive": true,
+            "activity": {"kind": "executing", "tool_name": "ipython"},
+        })
+    }
+
     fn observe(&self, kind: &str, request: &Value) -> Result<Value, String> {
         if kind == "agent_observe.list" {
-            let children = self.list()?;
-            // prime-agent: "roots are siblings" - the other top-level agents.
-            let siblings = self.host().map(|host| host.siblings()).unwrap_or_default();
-            return Ok(
-                json!({ "parent": null, "siblings": siblings, "children": children["subagents"] }),
+            let mut agents = self.host().map(|host| host.siblings()).unwrap_or_default();
+            let children = self
+                .agents
+                .shared
+                .children
+                .lock()
+                .map_err(|_| "the child registry is unavailable")?;
+            agents.extend(
+                children
+                    .iter()
+                    .filter(|child| !child.deleted && child.parent.is_none())
+                    .map(ChildRecord::observation),
             );
+            return Ok(json!({"current": self.current_observation(), "agents": agents}));
         }
         let target = request["target"].as_str().unwrap_or_default().to_owned();
         let ids = self.select(std::slice::from_ref(&target))?;
-        let row = self.rows(&ids, false)?.pop().ok_or("no such child")?;
-        Ok(if kind == "agent_observe.get" {
-            row
+        let task_id = ids.first().ok_or("no such child")?;
+        let children = self
+            .agents
+            .shared
+            .children
+            .lock()
+            .map_err(|_| "the child registry is unavailable")?;
+        let child = children
+            .iter()
+            .find(|child| &child.task_id == task_id)
+            .ok_or("no such child")?;
+        if kind == "agent_observe.get" {
+            return Ok(json!({"agent": child.observation()}));
+        }
+        let bound = |key: &str, default, min, max| {
+            request
+                .get(key)
+                .map_or(Some(default), Value::as_u64)
+                .filter(|value| (min..=max).contains(value))
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    format!("agent_observe.recent {key} must be an integer from {min} to {max}")
+                })
+        };
+        let limit = bound("limit", 8, 1, 50)?;
+        let max_chars = bound("max_chars", 800, 80, 2000)?;
+        let messages = child
+            .history
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|message| message_preview(message, max_chars))
+            .collect::<Vec<_>>();
+        let messages = if messages.is_empty() {
+            match &child.state {
+                ChildState::Done { answer, .. } | ChildState::Partial { answer, .. } => vec![
+                    json!({"role": "assistant", "text": answer.chars().take(max_chars).collect::<String>()}),
+                ],
+                _ => Vec::new(),
+            }
         } else {
-            json!({
-                "target": target,
-                "messages": row["answer_preview"]
-                    .as_str()
-                    .map(|answer| vec![json!({"role": "assistant", "text": answer})])
-                    .unwrap_or_default(),
-            })
-        })
+            messages.into_iter().rev().collect()
+        };
+        Ok(json!({"target": target, "messages": messages}))
     }
+}
+
+fn message_preview(message: &ProviderMessage, max_chars: usize) -> Value {
+    json!({
+        "role": match message.role {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            _ => "system",
+        },
+        "text": message.content.chars().take(max_chars).collect::<String>(),
+    })
 }
 
 fn clip(text: &str, whole: Option<&Path>) -> String {
@@ -3393,13 +3519,30 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     )
                     .await;
                 self.shared.update(&task_id, |child| child.in_turn = false);
+                // A later wake opens a new session of this task. Release this
+                // turn's lease before its child can settle and be woken again.
+                // An admission conflict belongs to another session; leave it.
+                let admitted = match &result {
+                    Ok(_) => true,
+                    Err(error) if error.code() == ErrorCode::TaskLeaseConflict => false,
+                    Err(_) => matches!(store.session_summary(&session_id).await, Ok(Some(_))),
+                };
+                let released = if admitted {
+                    store
+                        .release_task_lease(&task_id)
+                        .await
+                        .map_err(|error| OrchestratorError::new(error.code(), error.to_string()))
+                } else {
+                    Ok(())
+                };
+                let result = result
+                    .map_err(|error| OrchestratorError::new(error.code(), error.to_string()))
+                    .and_then(|outcome| released.map(|()| outcome));
                 let cost = observer
                     .cost_tracker
                     .lock()
                     .map_or_else(|_| "n/a".to_owned(), |tracker| tracker.display());
                 self.shared.update(&task_id, |child| child.cost = cost);
-                let result =
-                    result.map_err(|error| OrchestratorError::new(error.code(), error.to_string()));
                 let result = if let Some(error) = observer
                     .budget_error
                     .lock()
@@ -3463,7 +3606,6 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 }
                 prompt = next.join("\n\n");
                 session_id = SessionId::generate();
-                let _ = store.release_task_lease(&task_id).await;
                 self.shared.update(&task_id, |child| {
                     child.session_id = Some(session_id.clone());
                 });
@@ -4850,6 +4992,86 @@ mod real_worker_tests {
         );
     }
 
+    #[tokio::test]
+    async fn observation_returns_the_documented_family_and_agent_shapes() {
+        let bench = bench();
+        bench.agents.bind_ledger("observation-root");
+        let host = host(&bench, Scripted::new(vec![Reply::Text("child answer")]));
+        let spawned = spawn(&host, "observed", "read the fixture").await;
+        state_of(&bench.agents, "observed").await;
+        let requests = host.rlm_requests();
+        let roster = requests
+            .handle(&json!({"type": "agent_observe.list"}))
+            .await
+            .expect("known request")
+            .expect("roster");
+        assert_eq!(roster["current"]["sessionId"], "observation-root");
+        let agents = roster["agents"].as_array().expect("family roster");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["relationship"], "child");
+        assert_eq!(agents[0]["sessionName"], "observed");
+        assert_eq!(agents[0]["sessionId"], spawned["rlm_child_id"]);
+        assert_eq!(agents[0]["status"], "inactive");
+        assert_eq!(agents[0]["isSessionActive"], false);
+        let observed = requests
+            .handle(&json!({"type": "agent_observe.get", "target": "observed"}))
+            .await
+            .expect("known request")
+            .expect("agent summary");
+        assert_eq!(observed["agent"], agents[0]);
+        let id = spawned["rlm_child_id"].as_str().expect("child id");
+        let by_suffix = requests
+            .handle(&json!({"type": "agent_observe.get", "target": &id[id.len() - 8..]}))
+            .await
+            .expect("known request")
+            .expect("unambiguous suffix");
+        assert_eq!(by_suffix["agent"], agents[0]);
+    }
+
+    #[tokio::test]
+    async fn observation_bounds_recent_messages_and_rejects_invalid_limits() {
+        let bench = bench();
+        let answer = Box::leak("🦊".repeat(150).into_boxed_str());
+        let host = host(&bench, Scripted::new(vec![Reply::Text(answer)]));
+        spawn(&host, "observed", "read the fixture").await;
+        state_of(&bench.agents, "observed").await;
+        let requests = host.rlm_requests();
+        let recent = requests
+            .handle(&json!({"type": "agent_observe.recent", "target": "observed", "limit": 1, "max_chars": 80}))
+            .await
+            .expect("known request")
+            .expect("bounded messages");
+        let messages = recent["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0]["text"]
+                .as_str()
+                .expect("preview")
+                .chars()
+                .count(),
+            80
+        );
+        assert_eq!(messages[0]["role"], "assistant");
+        for (field, bad) in [
+            ("limit", json!(0)),
+            ("limit", json!(51)),
+            ("limit", json!(true)),
+            ("max_chars", json!(79)),
+            ("max_chars", json!(2001)),
+        ] {
+            let mut request = json!({"type": "agent_observe.recent", "target": "observed"});
+            request[field] = bad;
+            assert!(
+                requests
+                    .handle(&request)
+                    .await
+                    .expect("known request")
+                    .is_err(),
+                "{request}"
+            );
+        }
+    }
+
     /// Several children spawned at once from the kernel each run to an answer.
     #[tokio::test]
     async fn children_spawned_together_each_answer() {
@@ -5073,8 +5295,19 @@ mod real_worker_tests {
     #[tokio::test]
     async fn a_message_wakes_a_finished_child() {
         let bench = bench();
+        // The parent or a sibling keeps this writer open across the wake-up.
+        // Closing it between runs would change the fence and hide a stale lease.
+        let _parent_lease = bench
+            .agents
+            .shared
+            .store
+            .lease()
+            .await
+            .expect("parent lease");
         let provider = Scripted::new(vec![
+            Reply::Tool("read_file", json!({"path": "a.txt"})),
             Reply::Text("first answer"),
+            Reply::Tool("read_file", json!({"path": "a.txt"})),
             Reply::Text("second answer"),
         ]);
         let host = host(&bench, Arc::clone(&provider) as Arc<dyn ModelProvider>);
@@ -5083,6 +5316,15 @@ mod real_worker_tests {
             state_of(&bench.agents, "worker").await,
             ChildState::Done { .. }
         ));
+        let task_id = bench.agents.shared.find(None, "worker").expect("child");
+        let first_session = bench
+            .agents
+            .shared
+            .update(&task_id, |child| {
+                assert_eq!(child.tool_calls, 1, "the first run used a native tool");
+                child.session_id.clone().expect("first session")
+            })
+            .expect("record");
         let receipts = host
             .rlm_requests()
             .handle(&json!({
@@ -5100,12 +5342,12 @@ mod real_worker_tests {
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
-            let task_id = bench.agents.shared.find(None, "worker").expect("child");
             let answer = bench
                 .agents
                 .shared
                 .update(&task_id, |child| match &child.state {
                     ChildState::Done { answer, .. } => Some(answer.clone()),
+                    ChildState::Failed { error } => panic!("the woken child failed: {error}"),
                     _ => None,
                 });
             if answer.flatten().as_deref() == Some("second answer") {
@@ -5117,12 +5359,84 @@ mod real_worker_tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        bench.agents.shared.update(&task_id, |child| {
+            assert_ne!(child.session_id.as_ref(), Some(&first_session));
+            assert_eq!(child.tool_calls, 1, "the follow-up used a native tool");
+        });
         let seen = provider.requests_text();
         assert!(
             seen.contains("first answer"),
             "the follow-up carries the history: {seen}"
         );
         assert!(seen.contains("one more thing"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn a_message_wakes_a_child_stopped_after_native_tools() {
+        for canceled in [false, true] {
+            let bench = bench();
+            let _parent_lease = bench
+                .agents
+                .shared
+                .store
+                .lease()
+                .await
+                .expect("parent lease");
+            let mut replies = vec![Reply::Tool("read_file", json!({"path": "a.txt"}))];
+            if canceled {
+                replies.push(Reply::Delay(5_000, Box::new(Reply::Text("unused"))));
+            } else {
+                replies.extend(vec![Reply::Broken; 6]);
+            }
+            let provider = Scripted::new(replies);
+            let host = host(&bench, Arc::clone(&provider) as Arc<dyn ModelProvider>);
+            spawn(&host, "worker", "read a.txt").await;
+            if canceled {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while provider.seen.lock().expect("seen").len() < 2 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the native read completed before cancellation");
+                let _ = bench.agents.stop("worker", "fixture cancellation");
+            }
+            let stopped = state_of(&bench.agents, "worker").await;
+            assert!(
+                if canceled {
+                    matches!(stopped, ChildState::Cancelled { .. })
+                } else {
+                    matches!(stopped, ChildState::Failed { .. })
+                },
+                "{stopped:?}"
+            );
+            let task_id = bench.agents.shared.find(None, "worker").expect("child");
+            bench.agents.shared.update(&task_id, |child| {
+                assert_eq!(child.tool_calls, 1, "the stopped run used a native tool");
+            });
+            {
+                let mut replies = provider.replies.lock().expect("replies");
+                replies.clear();
+                replies.extend([
+                    Reply::Tool("read_file", json!({"path": "a.txt"})),
+                    Reply::Text("recovered"),
+                ]);
+            }
+            host.rlm_requests()
+                .handle(&json!({
+                    "type": "agent_message.send",
+                    "message": "try again",
+                    "receiver_role": "child",
+                    "receiver_name": "worker",
+                }))
+                .await
+                .expect("known")
+                .expect("wake");
+            match state_of(&bench.agents, "worker").await {
+                ChildState::Done { answer, .. } => assert_eq!(answer, "recovered"),
+                other => panic!("the stopped child failed to recover: {other:?}"),
+            }
+        }
     }
 
     /// prime-agent's spawn ledger: a conversation opened again lists its

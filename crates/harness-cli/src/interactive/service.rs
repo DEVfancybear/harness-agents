@@ -1583,6 +1583,8 @@ impl super::delegation::ChildModels for ServiceChildModels {
         let level = match level {
             None => self.level,
             Some(level) => {
+                let level = harness_providers::thinking::resolve(reasoning, level.as_str())
+                    .unwrap_or(level);
                 let offered = harness_providers::thinking::supported_levels(reasoning);
                 if strict && !offered.contains(&level) {
                     return Err(format!(
@@ -11681,6 +11683,80 @@ mod tests {
         )
         .expect("settings");
         assert_eq!(super::default_thinking_level(&config), None);
+    }
+
+    fn deepseek_child_models() -> (tempfile::TempDir, super::ServiceChildModels) {
+        let temp = tempfile::tempdir().expect("temp");
+        let environment = LaunchEnvironment::from_pairs([
+            ("HA_API_KEY".to_owned(), "fixture-main-key".to_owned()),
+            (
+                "OPENCODE_API_KEY".to_owned(),
+                "fixture-child-key".to_owned(),
+            ),
+            (
+                credentials::CREDENTIAL_DIRECTORY_VARIABLE.to_owned(),
+                temp.path().join("private").to_string_lossy().into_owned(),
+            ),
+        ]);
+        let config_file = temp.path().join("config.toml");
+        let base = super::resolve_provider_with_config(
+            &config_file,
+            temp.path(),
+            &environment,
+            temp.path(),
+        )
+        .expect("fixture provider");
+        let models = super::ServiceChildModels {
+            base,
+            level: harness_providers::ThinkingLevel::Max,
+            environment,
+            data_dir: temp.path().to_path_buf(),
+            session: "child-effort-regression".to_owned(),
+            config_file,
+            configured: None,
+        };
+        (temp, models)
+    }
+
+    #[test]
+    fn child_thinking_accepts_the_provider_max_alias() {
+        use crate::interactive::delegation::ChildModels;
+        use harness_providers::ThinkingLevel;
+        let (_temp, models) = deepseek_child_models();
+        for level in [ThinkingLevel::Max, ThinkingLevel::Xhigh] {
+            let child = models.resolve_at("opencode-go/deepseek-v4-flash", Some(level), true);
+            assert!(
+                child.is_ok(),
+                "{level}: {}",
+                child.err().unwrap_or_default()
+            );
+        }
+    }
+
+    #[test]
+    fn child_thinking_rejects_a_truly_unsupported_strict_level() {
+        use crate::interactive::delegation::ChildModels;
+        let (_temp, models) = deepseek_child_models();
+        let error = models
+            .resolve_at(
+                "opencode-go/deepseek-v4-flash",
+                Some(harness_providers::ThinkingLevel::Medium),
+                true,
+            )
+            .err()
+            .expect("strict medium remains unsupported");
+        assert!(error.contains("thinking level \"medium\""), "{error}");
+        assert!(error.contains("not supported"), "{error}");
+    }
+
+    #[test]
+    fn child_thinking_keeps_inherited_and_clamped_levels() {
+        use crate::interactive::delegation::ChildModels;
+        let (_temp, models) = deepseek_child_models();
+        for level in [None, Some(harness_providers::ThinkingLevel::Medium)] {
+            let child = models.resolve_at("opencode-go/deepseek-v4-flash", level, false);
+            assert!(child.is_ok(), "{}", child.err().unwrap_or_default());
+        }
     }
 
     /// `/subagent-login`: a delegated child reads its own login for a
