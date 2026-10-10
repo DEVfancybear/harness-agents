@@ -14,7 +14,12 @@ import math
 import os
 import re
 import stat
+import threading
+import time
 import unicodedata
+from contextlib import contextmanager
+from functools import wraps
+from inspect import signature
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +33,30 @@ _DEFAULT_FILE_NAME = "harness_state.json"
 _DEFAULT_HARNESS_DIR_NAME = "harness"
 _KINDS: tuple[HarnessKind, ...] = ("prompt", "memory", "skill", "subagent")
 _state_cache: dict[tuple[Path, HarnessScope], "HarnessState"] = {}
+_state_locks: dict[Path, threading.RLock] = {}
+_state_locks_guard = threading.Lock()
+_state_transactions = threading.local()
+
+
+def _serialized_state(*, writable: bool = False):
+    def decorate(method):
+        parameters = signature(method).parameters
+        @wraps(method)
+        def locked(self, *args, **kwargs):
+            global_ = kwargs.get("global_", False)
+            if method.__name__ in {"upsert", "create", "get", "update", "delete"}:
+                entry_id = kwargs.get("id")
+                if method.__name__ in {"get", "update", "delete"} and len(args) > 1:
+                    entry_id = args[1]
+                _, global_ = _strip_scope_prefix(entry_id, global_)
+            extra = {key: value for key, value in kwargs.items() if key not in parameters}
+            target = self._global_target(global_, extra) or self
+            if writable and method.__name__ != "save":
+                target._ensure_local_writable()
+            with target._transaction(writable=writable):
+                return method(self, *args, **kwargs)
+        return locked
+    return decorate
 
 
 def _now() -> str:
@@ -353,6 +382,61 @@ class HarnessState:
         if self._local_write_error is not None:
             raise RuntimeError(self._local_write_error)
 
+    @contextmanager
+    def _transaction(self, *, writable: bool = False):
+        if self.file_path is None:
+            yield
+            return
+        target = Path(os.path.realpath(self.file_path))
+        with _state_locks_guard:
+            lock = _state_locks.setdefault(target, threading.RLock())
+        # Lock the whole reload/mutate/save operation, across instances and kernels.
+        with lock:
+            active = getattr(_state_transactions, "paths", None)
+            if active is None:
+                active = _state_transactions.paths = set()
+            if target in active:
+                yield
+                return
+            if writable:
+                target.parent.mkdir(parents=True, exist_ok=True)
+            elif not target.exists():
+                yield
+                return
+            try:
+                descriptor = os.open(target.with_name(target.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+            except OSError:
+                if writable:
+                    raise
+                # Read-only stores must remain readable without creating a sidecar.
+                yield
+                return
+            with os.fdopen(descriptor, "r+b", buffering=0) as stream:
+                if os.name == "nt":
+                    import msvcrt
+                    deadline = time.monotonic() + 30
+                    while True:
+                        try:
+                            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                            break
+                        except OSError:
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError(f"timed out locking harness state {target}")
+                            time.sleep(0.005)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                active.add(target)
+                try:
+                    yield
+                finally:
+                    active.remove(target)
+                    if os.name == "nt":
+                        stream.seek(0)
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
     def _disk_mtime(self) -> int | None:
         if self.file_path is None:
             return None
@@ -373,6 +457,7 @@ class HarnessState:
         if self._disk_mtime() != self._loaded_mtime:
             self.load()
 
+    @_serialized_state()
     def load(self) -> "HarnessState":
         if self.file_path is None:
             return self
@@ -470,6 +555,7 @@ class HarnessState:
             return None
         return target
 
+    @_serialized_state(writable=True)
     def save(self) -> "HarnessState":
         if self.file_path is None:
             # in_memory fallback: nothing to persist.
@@ -504,6 +590,7 @@ class HarnessState:
         self._loaded_mtime = self._disk_mtime()
         return self
 
+    @_serialized_state(writable=True)
     def upsert(
         self,
         kind: HarnessKind,
@@ -623,6 +710,7 @@ class HarnessState:
         self.save()
         return entry
 
+    @_serialized_state()
     def get(self, kind: HarnessKind, id: str, *, global_: bool = False, **kwargs: Any) -> HarnessEntry | None:
         id, global_ = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
@@ -632,6 +720,7 @@ class HarnessState:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
         return self.entries[kind].get(id)
 
+    @_serialized_state(writable=True)
     def delete(self, kind: HarnessKind, id: str, *, global_: bool = False, **kwargs: Any) -> bool:
         id, global_ = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
@@ -646,6 +735,7 @@ class HarnessState:
         self.save()
         return True
 
+    @_serialized_state()
     def list(self, kind: HarnessKind | None = None, *, global_: bool = False, **kwargs: Any) -> list[HarnessEntry]:
         if target := self._global_target(global_, kwargs):
             return target.list(kind)
@@ -658,6 +748,7 @@ class HarnessState:
             records.extend(self.entries[current_kind].values())
         return sorted(records, key=lambda entry: (entry.kind, entry.path, entry.title, entry.id))
 
+    @_serialized_state(writable=True)
     def create(
         self,
         kind: HarnessKind,
@@ -708,6 +799,7 @@ class HarnessState:
             source=source,
         )
 
+    @_serialized_state(writable=True)
     def update(
         self,
         kind: HarnessKind,
@@ -903,6 +995,7 @@ class HarnessState:
     def delete_subagent(self, id: str, *, global_: bool = False, **kwargs: Any) -> bool:
         return self.delete("subagent", id, global_=global_, **kwargs)
 
+    @_serialized_state(writable=True)
     def record_refinement(
         self,
         trigger: str,
@@ -953,6 +1046,7 @@ class HarnessState:
             plan.append(f"Immediate validation step: {next_step}")
         return plan
 
+    @_serialized_state()
     def overview(self, *, max_entries_per_kind: int = 20, global_: bool = False, **kwargs: Any) -> str:
         if target := self._global_target(global_, kwargs):
             return target.overview(max_entries_per_kind=max_entries_per_kind)
@@ -1002,6 +1096,7 @@ class HarnessState:
             lines.append("refinements: 0")
         return "\n".join(lines)
 
+    @_serialized_state()
     def search(
         self,
         query: str,

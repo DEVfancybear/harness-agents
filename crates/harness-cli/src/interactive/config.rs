@@ -1480,6 +1480,15 @@ impl ConfigState {
 
 /// Load the user configuration file.
 pub fn load(path: &Path) -> Result<ConfigState, HarnessError> {
+    load_with_diagnostics(path, false)
+}
+
+/// Explicit validation includes parser diagnostics instead of suggesting itself.
+pub fn load_for_validation(path: &Path) -> Result<ConfigState, HarnessError> {
+    load_with_diagnostics(path, true)
+}
+
+fn load_with_diagnostics(path: &Path, detailed: bool) -> Result<ConfigState, HarnessError> {
     let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1498,18 +1507,47 @@ pub fn load(path: &Path) -> Result<ConfigState, HarnessError> {
         }
     };
 
-    let document: toml::Value = toml::from_str(&contents)
-        .map_err(|error| invalid(path, error.to_string().contains("unknown field")))?;
+    let parser_error = |error: toml::de::Error| {
+        let unknown_field = error.message().contains("unknown field");
+        if detailed {
+            HarnessError::new(
+                if unknown_field {
+                    ErrorCode::ConfigUnknownField
+                } else {
+                    ErrorCode::ConfigParseError
+                },
+                format!("configuration file {} is invalid: {error}", path.display()),
+            )
+        } else {
+            invalid(path, unknown_field)
+        }
+    };
+    let document: toml::Value = toml::from_str(&contents).map_err(parser_error)?;
     let version = document
         .get("schema_version")
         .and_then(toml::Value::as_integer)
         .and_then(|value| u16::try_from(value).ok())
-        .ok_or_else(|| invalid(path, false))?;
+        .ok_or_else(|| {
+            if detailed {
+                HarnessError::new(
+                    ErrorCode::ConfigParseError,
+                    format!(
+                        "configuration file {} is invalid: schema_version must be an integer between 0 and {}",
+                        path.display(),
+                        u16::MAX
+                    ),
+                )
+            } else {
+                invalid(path, false)
+            }
+        })?;
     if version == 2 {
-        let config: HarnessConfigV2 =
-            toml::Value::try_into(document).map_err(|error: toml::de::Error| {
-                invalid(path, error.to_string().contains("unknown field"))
-            })?;
+        let config: HarnessConfigV2 = if detailed {
+            toml::from_str(&contents)
+        } else {
+            toml::Value::try_into(document)
+        }
+        .map_err(parser_error)?;
         config.validate().map_err(|error| {
             HarnessError::new(
                 error.code(),
@@ -1521,10 +1559,12 @@ pub fn load(path: &Path) -> Result<ConfigState, HarnessError> {
             config: Box::new(config),
         });
     }
-    let config: HarnessConfig =
-        toml::Value::try_into(document).map_err(|error: toml::de::Error| {
-            invalid(path, error.to_string().contains("unknown field"))
-        })?;
+    let config: HarnessConfig = if detailed {
+        toml::from_str(&contents)
+    } else {
+        toml::Value::try_into(document)
+    }
+    .map_err(parser_error)?;
     if let Err(error) = config.validate() {
         return Err(HarnessError::new(
             error.code(),

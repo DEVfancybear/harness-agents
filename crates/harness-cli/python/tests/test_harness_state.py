@@ -1,11 +1,15 @@
 """Persistence regressions for the exact harness module embedded by ha (stdlib only)."""
 
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import random
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -26,6 +30,66 @@ class HarnessPersistenceTests(unittest.TestCase):
 
     def state(self):
         return harness.HarnessState(self.path)
+
+    def test_concurrent_writers_preserve_every_successful_memory(self):
+        start = threading.Barrier(2)
+
+        def write(side):
+            state = self.state()
+            start.wait(timeout=10)
+            for number in range(24):
+                state.create_memory(side, str(number), id=f"{side}-{number}")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(write, ("a", "b")))
+        self.assertEqual(
+            {entry.id for entry in self.state().list("memory")},
+            {f"{side}-{number}" for side in ("a", "b") for number in range(24)},
+        )
+
+    def test_separate_kernels_preserve_concurrent_global_writes(self):
+        code = """
+import importlib.util, pathlib, sys, time
+spec = importlib.util.spec_from_file_location('harness_worker', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+state = module.HarnessState(sys.argv[2], scope='global')
+start, side = pathlib.Path(sys.argv[3]), sys.argv[4]
+start.with_name(side + '.ready').touch()
+deadline = time.monotonic() + 10
+while not start.exists():
+    if time.monotonic() >= deadline: raise TimeoutError('start barrier')
+    time.sleep(0.005)
+for number in range(24):
+    state.create_memory(side, str(number), id=f'{side}-{number}')
+"""
+        start = self.root / "start"
+        workers = [
+            subprocess.Popen(
+                [sys.executable, "-c", code, str(MODULE_PATH), str(self.path), str(start), side],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            for side in ("a", "b")
+        ]
+        try:
+            deadline = time.monotonic() + 10
+            while not all((self.root / (side + ".ready")).exists() for side in ("a", "b")):
+                self.assertLess(time.monotonic(), deadline, "both kernels start")
+                time.sleep(0.005)
+            start.touch()
+            for worker in workers:
+                _, error = worker.communicate(timeout=20)
+                self.assertEqual(worker.returncode, 0, error.decode(errors="replace"))
+        finally:
+            for worker in workers:
+                if worker.poll() is None:
+                    worker.kill()
+                    worker.communicate()
+        self.assertEqual(
+            {entry.id for entry in self.state().list("memory")},
+            {f"{side}-{number}" for side in ("a", "b") for number in range(24)},
+        )
 
     def test_crud_survives_reopen_and_preserves_unicode_and_version(self):
         state = self.state()

@@ -69,6 +69,11 @@ fn p0_f02_cli_rejects_unknown_config_and_option_inputs() {
     assert!(!unknown.status.success());
     assert!(output_text(&unknown.stdout).is_empty());
     assert!(output_text(&unknown.stderr).starts_with("config_unknown_field:"));
+    assert!(
+        output_text(&unknown.stderr).contains("unknown field `unknown`"),
+        "explicit validation must identify the rejected field: {}",
+        output_text(&unknown.stderr)
+    );
 
     let unsupported_path = fixture_path("p0/config/unsupported-schema.toml");
     let unsupported = run_ha(&[
@@ -87,6 +92,35 @@ fn p0_f02_cli_rejects_unknown_config_and_option_inputs() {
     assert!(!option_error.status.success());
     assert!(output_text(&option_error.stdout).is_empty());
     assert!(output_text(&option_error.stderr).contains("unexpected argument"));
+}
+
+#[test]
+fn explicit_config_validation_identifies_syntax_and_version_errors() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let config = temp.path().join("config.toml");
+    for (contents, detail) in [
+        ("schema_version = 2\n[provider\n", "line 2"),
+        (
+            "schema_version = \"not-a-number\"\n",
+            "schema_version must be an integer",
+        ),
+        (
+            "schema_version = 2\n[provider]\nunknown = true\n",
+            "unknown field `unknown`",
+        ),
+    ] {
+        fs::write(&config, contents).expect("config fixture");
+        let result = run_ha(&[
+            "config",
+            "validate",
+            "--config",
+            config.to_str().expect("config path"),
+        ]);
+        assert!(!result.status.success());
+        let message = output_text(&result.stderr);
+        assert!(message.contains(detail), "{message}");
+        assert!(!message.contains("run ha config validate"), "{message}");
+    }
 }
 
 #[test]

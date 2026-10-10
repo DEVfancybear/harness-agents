@@ -1181,7 +1181,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
         Some(Command::Config(ConfigCommand {
             command: Some(ConfigSubcommand::Validate { config, json }),
         })) => {
-            let config = interactive::config::load(&config)?;
+            let config = interactive::config::load_for_validation(&config)?;
             let (version, value) = match config {
                 interactive::config::ConfigState::Loaded { config, .. } => (
                     1,

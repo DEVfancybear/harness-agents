@@ -2167,19 +2167,45 @@ impl VerifierHandle {
     /// # Errors
     /// The verifier could not start, failed, or was stopped.
     pub async fn judge(&self, brief: String, model: Option<&str>) -> Result<String, String> {
+        struct Verification<'a>(&'a SessionAgents, &'a TaskId);
+        impl Drop for Verification<'_> {
+            fn drop(&mut self) {
+                let running = self.0.shared.update(self.1, |child| {
+                    if child.state.settled() {
+                        return false;
+                    }
+                    child.suppress_notice = true;
+                    true
+                });
+                if running == Some(true) {
+                    let _ = self
+                        .0
+                        .stop(self.1.as_str(), "the verification was canceled");
+                }
+            }
+        }
+        if self.cancellation.is_cancelled() {
+            return Err("the verification was canceled before it started".to_owned());
+        }
         let launch = self.launch.for_model(model)?;
         let (task_id, _) = self
             .agents
             .start(AgentRole::Verifier, brief, None, &launch, None)
             .await
             .map_err(|error| error.to_string())?;
+        let _verification = Verification(&self.agents, &task_id);
         match self
             .agents
             .shared
             .wait(&task_id, None, Some(&self.cancellation))
             .await
-            .map_err(|error| error.to_string())?
-        {
+            .map_err(|error| {
+                if error.code() == ErrorCode::ProviderCanceled {
+                    "the verification was canceled and its child was stopped".to_owned()
+                } else {
+                    error.to_string()
+                }
+            })? {
             Some(ChildState::Done { answer, .. }) => Ok(answer),
             Some(ChildState::Partial { error, .. } | ChildState::Failed { error }) => Err(error),
             Some(ChildState::Cancelled { reason }) => Err(reason),
@@ -4586,7 +4612,11 @@ mod real_worker_tests {
             ModelCapabilities::deepseek_fixture()
         }
 
-        fn stream(&self, request: ProviderRequest, _: CancellationToken) -> ProviderFuture {
+        fn stream(
+            &self,
+            request: ProviderRequest,
+            cancellation: CancellationToken,
+        ) -> ProviderFuture {
             let request_id = request.request_id.clone();
             self.seen.lock().expect("seen").push(request);
             let mut reply = self
@@ -4597,7 +4627,15 @@ mod real_worker_tests {
                 .unwrap_or(Reply::Text("done"));
             Box::pin(async move {
                 while let Reply::Delay(ms, next) = reply {
-                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_millis(ms)) => {}
+                        () = cancellation.cancelled() => {
+                            return Err(harness_providers::ProviderError::new(
+                                harness_types::ErrorCode::ProviderCanceled,
+                                "the provider request was canceled",
+                            ));
+                        }
+                    }
                     reply = *next;
                 }
                 let body = match reply {
@@ -4774,6 +4812,41 @@ mod real_worker_tests {
         assert!(
             instructions.contains("independent verifier"),
             "{instructions}"
+        );
+    }
+
+    /// A canceled harness-owned verification releases its running child.
+    #[tokio::test]
+    async fn cancelling_a_harness_verification_stops_its_child() {
+        let bench = bench();
+        let provider = Scripted::new(vec![Reply::Delay(
+            5_000,
+            Box::new(Reply::Text("VERDICT: PASS")),
+        )]);
+        let host = host(&bench, Arc::clone(&provider) as Arc<dyn ModelProvider>);
+        let verifier = host.verifier();
+        let cancel = verifier.cancellation.clone();
+        let judge =
+            tokio::spawn(async move { verifier.judge("verify a.txt".to_owned(), None).await });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while provider.seen.lock().expect("seen").is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the verifier starts");
+        cancel.cancel();
+        assert!(judge.await.expect("judge task").is_err());
+        let stopped = tokio::time::timeout(Duration::from_secs(1), async {
+            while bench.agents.running() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let _ = bench.agents.stop("all", "test cleanup");
+        assert!(
+            stopped.is_ok(),
+            "a canceled verification must stop calling its model"
         );
     }
 
