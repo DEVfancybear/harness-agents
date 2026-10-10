@@ -381,7 +381,8 @@ fn relevant(root: &Path, path: &Path, directories: &HashSet<PathBuf>) -> bool {
 /// Start watching `root` once per process. Returns whether changes under it
 /// are reported.
 pub(crate) fn ensure_watched(root: &Path) -> bool {
-    use notify::Watcher as _;
+    use notify::event::{AccessKind, AccessMode};
+    use notify::{EventKind, Watcher as _};
 
     if std::env::var_os("HA_FILE_WATCH").is_some_and(|value| value == "off") {
         return false;
@@ -401,6 +402,16 @@ pub(crate) fn ensure_watched(root: &Path) -> bool {
             mark_sentinels(&event.paths);
             if event.need_rescan() {
                 note_change();
+                return;
+            }
+            // Opening or reading a file leaves the walk unchanged. Keep write
+            // closes and unknown access events conservative.
+            if matches!(
+                event.kind,
+                EventKind::Access(
+                    AccessKind::Read | AccessKind::Open(_) | AccessKind::Close(AccessMode::Read)
+                )
+            ) {
                 return;
             }
             let directories = relevant_directories()
