@@ -94,7 +94,15 @@ try {
         Remove-Item -LiteralPath $errorFile -Force
     }
     if ($exit -ne 0) { throw 'npm pack failed' }
-    $tarball = Join-Path $OutputDirectory (($packed | ConvertFrom-Json)[0].filename)
+    # npm 11 returns an array; npm 12 keys the result by package name.
+    $packResult = ($packed -join [Environment]::NewLine) | ConvertFrom-Json -AsHashtable -NoEnumerate
+    $packedPackage = if ($packResult -is [System.Collections.IDictionary]) {
+        $packResult[$package.name]
+    } else {
+        $packResult[0]
+    }
+    if (-not $packedPackage -or -not $packedPackage['filename']) { throw 'npm pack returned no tarball filename' }
+    $tarball = Join-Path $OutputDirectory $packedPackage['filename']
 } finally {
     Pop-Location
 }
