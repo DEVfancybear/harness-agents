@@ -115,7 +115,14 @@ pub fn config_for(
         .protocol()
         .unwrap_or("openai_chat")
         .clone_into(&mut config.protocol);
-    config.endpoint = entry.endpoint();
+    // A delegated call to the same model keeps the user's configured transport.
+    // Switching model or protocol selects the catalog transport instead.
+    if base.provider_id != entry.provider
+        || base.model != entry.id
+        || base.protocol != config.protocol
+    {
+        config.endpoint = entry.endpoint();
+    }
     config.model.clone_from(&entry.id);
     config.api_key_env = entry.key_env();
     config.thinking_format = entry
@@ -688,6 +695,50 @@ mod tests {
     use crate::interactive::providers::Catalog;
     use harness_providers::ThinkingLevel;
     use std::time::Duration;
+
+    #[test]
+    fn config_for_keeps_the_same_models_configured_endpoint() {
+        let temp = tempfile::tempdir().expect("temp");
+        let environment = super::LaunchEnvironment::from_pairs([(
+            "HA_API_KEY".to_owned(),
+            "fixture-key".to_owned(),
+        )]);
+        let mut base =
+            super::super::service::resolve_provider(&environment, temp.path()).expect("provider");
+        let entry = Catalog::bundled()
+            .find("opencode-go/deepseek-v4-flash")
+            .cloned()
+            .expect("model");
+        base.provider_id.clone_from(&entry.provider);
+        base.model.clone_from(&entry.id);
+        base.protocol = entry.protocol().expect("protocol").to_owned();
+        base.endpoint = "http://127.0.0.1:54321/chat/completions".to_owned();
+        let credential = super::super::credentials::CredentialSource::Environment {
+            variable: "CHILD_KEY".to_owned(),
+        };
+        let resolved = super::config_for(&base, &entry, credential.clone());
+        assert_eq!(
+            resolved.endpoint, base.endpoint,
+            "a child using the same model must keep the configured transport"
+        );
+        assert_eq!(
+            resolved.credential, credential,
+            "the child still selects its own credential scope"
+        );
+        for change in ["model", "provider", "protocol"] {
+            let mut switched = base.clone();
+            match change {
+                "model" => switched.model.push_str("-other"),
+                "provider" => switched.provider_id.push_str("-other"),
+                _ => switched.protocol = "anthropic_messages".to_owned(),
+            }
+            assert_eq!(
+                super::config_for(&switched, &entry, credential.clone()).endpoint,
+                entry.endpoint(),
+                "{change} switch must use the selected model's transport"
+            );
+        }
+    }
 
     #[test]
     fn q11_scope_patterns_match_like_prime() {

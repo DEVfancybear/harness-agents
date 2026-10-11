@@ -379,6 +379,8 @@ struct ChildRecord {
     max_depth: u32,
     /// The child is inside a turn: a message reaches it through its run's inbox.
     in_turn: bool,
+    /// Sends that selected this turn's inbox and have not finished enqueueing.
+    in_flight_messages: usize,
     /// Messages and its own children's notices that arrived between its turns;
     /// its next turn opens with them.
     pending: Vec<String>,
@@ -522,6 +524,7 @@ impl ChildRecord {
             depth: entry.depth,
             max_depth: entry.max_depth,
             in_turn: false,
+            in_flight_messages: 0,
             pending: Vec::new(),
             brief: None,
             run_id: None,
@@ -754,6 +757,21 @@ struct Exchange {
     text: String,
 }
 
+/// A send that selected a live inbox must finish before that turn drains it.
+struct ChildMessageDelivery<'a> {
+    shared: &'a AgentsShared,
+    task_id: &'a TaskId,
+}
+
+impl Drop for ChildMessageDelivery<'_> {
+    fn drop(&mut self) {
+        self.shared.update(self.task_id, |child| {
+            child.in_flight_messages = child.in_flight_messages.saturating_sub(1);
+        });
+        self.shared.changed.notify_waiters();
+    }
+}
+
 /// How many exchanges `/agents messages` keeps.
 const EXCHANGES_KEPT: usize = 500;
 
@@ -878,7 +896,13 @@ impl AgentsShared {
                 {
                     child.answer_file = save_answer(dir, &child.task_id, answer);
                 }
-                let notice = (child.waiters == 0 && !child.suppress_notice)
+                // A send can queue after the backend's last quiet check but
+                // before this scheduler boundary. Keep that accepted message
+                // with a successful child and wake it before announcing idle.
+                let pending = !child.deleted
+                    && matches!(child.state, ChildState::Done { .. })
+                    && !child.pending.is_empty();
+                let notice = (!pending && child.waiters == 0 && !child.suppress_notice)
                     .then(|| {
                         terminal_notice(
                             &child.name,
@@ -891,6 +915,7 @@ impl AgentsShared {
                 (
                     child.parent.clone(),
                     notice.map(|notice| (child.name.clone(), notice)),
+                    pending,
                 )
             });
         self.cancel_descendants(task_id, "its parent agent finished");
@@ -898,13 +923,24 @@ impl AgentsShared {
         match notice {
             // A nested child reports to the child that spawned it, which reads
             // the notice when its turn ends (prime-agent's `waitForRlmQuiescence`).
-            Some((Some(parent), Some((_, notice)))) => {
+            Some((Some(parent), Some((_, notice)), _)) => {
                 self.update(&parent, |parent| parent.pending.push(notice));
             }
-            Some((None, Some((name, notice)))) => {
+            Some((None, Some((name, notice)), _)) => {
                 let _ = self
                     .sender
                     .send(SessionEvent::ChildSettled { name, notice });
+            }
+            Some((_, _, true)) => {
+                // Leave pending attached until wake claims it under the same
+                // lock that marks Running. A competing sender's wake must
+                // claim these messages too, even if it finishes before here.
+                let _ = self
+                    .agents
+                    .get()
+                    .and_then(std::sync::Weak::upgrade)
+                    .ok_or_else(|| "the session's agents are gone".to_owned())
+                    .and_then(|agents| agents.wake_messages(task_id, None));
             }
             _ => {}
         }
@@ -1041,43 +1077,61 @@ impl AgentsShared {
         task_id: &TaskId,
         text: String,
     ) -> Result<&'static str, String> {
-        // prime-agent: a message to a child that finished wakes it for an
-        // ordinary follow-up turn in the same conversation.
-        if self
-            .update(task_id, |child| child.state.settled())
-            .unwrap_or(false)
-        {
-            let agents = self
-                .agents
-                .get()
-                .and_then(std::sync::Weak::upgrade)
-                .ok_or("the session's agents are gone")?;
-            agents.wake(task_id, text)?;
-            return Ok("delivered");
+        enum Route {
+            Wake,
+            Queued,
+            Inbox(SessionId),
         }
-        let session = self
-            .update(task_id, |child| {
-                if child.state.settled() {
-                    return Err("the child has finished; spawn a new one".to_owned());
-                }
-                match &child.session_id {
-                    None => {
-                        child.backlog.push(text.clone());
-                        Ok(None)
+        let session = loop {
+            let route = self
+                .update(task_id, |child| {
+                    if child.deleted {
+                        return Err("the child was deleted".to_owned());
                     }
-                    // Between turns - waiting for its own children - the child
-                    // reads it when its next turn opens.
-                    Some(_) if !child.in_turn => {
-                        child.pending.push(text.clone());
-                        Ok(None)
+                    if child.state.settled() {
+                        return Ok(Route::Wake);
                     }
-                    Some(session) => Ok(Some(session.clone())),
+                    match &child.session_id {
+                        None => {
+                            child.backlog.push(text.clone());
+                            Ok(Route::Queued)
+                        }
+                        Some(_) if !child.in_turn => {
+                            child.pending.push(text.clone());
+                            Ok(Route::Queued)
+                        }
+                        Some(session) => {
+                            child.in_flight_messages += 1;
+                            Ok(Route::Inbox(session.clone()))
+                        }
+                    }
+                })
+                .ok_or_else(|| "no such child".to_owned())??;
+            match route {
+                Route::Inbox(session) => break session,
+                Route::Queued => {
+                    self.changed.notify_waiters();
+                    return Ok("queued");
                 }
-            })
-            .ok_or_else(|| "no such child".to_owned())??;
-        let Some(session) = session else {
-            self.changed.notify_waiters();
-            return Ok("queued");
+                Route::Wake => {
+                    let agents = self
+                        .agents
+                        .get()
+                        .and_then(std::sync::Weak::upgrade)
+                        .ok_or("the session's agents are gone")?;
+                    match agents.wake(task_id, text.clone()) {
+                        Ok(()) => return Ok("delivered"),
+                        // Another accepted message may have just woken it.
+                        // Route this one to that run rather than dropping it.
+                        Err(error) if error == "the child is still running" => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        };
+        let _delivery = ChildMessageDelivery {
+            shared: self,
+            task_id,
         };
         let lease = self
             .store
@@ -1100,7 +1154,7 @@ impl AgentsShared {
             .deliver(&run, text, harness_runtime::now_unix_ms())
             .await
             .map_err(|error| error.to_string())?;
-        Ok("delivered")
+        Ok("queued")
     }
 
     /// The children of `parent` (`None`: the root agent's own children).
@@ -1169,7 +1223,6 @@ impl AgentsShared {
             "all" => self
                 .names(None)
                 .into_iter()
-                .filter(|(_, _, settled)| !settled)
                 .map(|(task_id, name, _)| (task_id, name))
                 .collect(),
             _ => return Err(AGENT_FAMILY_REACH_ERROR.to_owned()),
@@ -1243,12 +1296,17 @@ impl AgentsShared {
                 receipts.push(receipt(&name, &sender_name, &message, status));
             }
             "all" => {
-                let status = to_parent(format!(
+                let delivery = to_parent(format!(
                     "[agent-message from child:{sender_name}]\n\n{message}"
                 ))
-                .await?;
-                self.record(&sender_name, &parent_name, &message);
-                receipts.push(receipt("parent", &sender_name, &message, status));
+                .await;
+                receipts.push(match delivery {
+                    Ok(status) => {
+                        self.record(&sender_name, &parent_name, &message);
+                        receipt("parent", &sender_name, &message, status)
+                    }
+                    Err(error) => json!({"target": "parent", "error": error}),
+                });
                 let siblings = self
                     .names(parent.as_ref())
                     .into_iter()
@@ -1257,8 +1315,8 @@ impl AgentsShared {
                     .names(Some(from))
                     .into_iter()
                     .map(|entry| (entry, "parent"));
-                for ((task_id, name, settled), relation) in siblings.chain(children) {
-                    if &task_id == from || settled {
+                for ((task_id, name, _), relation) in siblings.chain(children) {
+                    if &task_id == from {
                         continue;
                     }
                     let text =
@@ -1333,8 +1391,9 @@ fn message_root_sibling(
 }
 
 fn receipt(target: &str, from: &str, message: &str, status: &str) -> Value {
+    let at = harness_runtime::now_unix_ms();
     let mut receipt = json!({
-        "id": format!("msg-{}", harness_runtime::now_unix_ms()),
+        "id": format!("msg-{}", InputId::generate()),
         "source": "agent_message",
         "target": target,
         "from": from,
@@ -1343,6 +1402,10 @@ fn receipt(target: &str, from: &str, message: &str, status: &str) -> Value {
     });
     if status == "delivered" {
         receipt["deliveryMode"] = json!("steer");
+        receipt["deliveredAt"] = json!(at);
+    } else if status == "queued" {
+        receipt["deliveryMode"] = json!("steer");
+        receipt["queuedAt"] = json!(at);
     }
     receipt
 }
@@ -1360,6 +1423,7 @@ fn message_arguments(arguments: &Value) -> Result<(String, String, Option<String
     }
     let role = arguments["receiver_role"]
         .as_str()
+        .or_else(|| arguments["target"].as_str())
         .unwrap_or("parent")
         .to_owned();
     let name = arguments["receiver_name"]
@@ -1784,6 +1848,16 @@ impl SessionAgents {
     /// continues its conversation (prime-agent's revival of an inactive
     /// child). The child reports as it did when it first ran.
     fn wake(self: &Arc<Self>, task_id: &TaskId, text: String) -> Result<(), String> {
+        self.wake_messages(task_id, Some(text))
+    }
+
+    /// Atomically claim queued follow-ups when reviving a settled child.
+    /// With no new text, a competing wake may already have claimed them.
+    fn wake_messages(
+        self: &Arc<Self>,
+        task_id: &TaskId,
+        text: Option<String>,
+    ) -> Result<(), String> {
         let launch = self
             .shared
             .launches
@@ -1799,14 +1873,21 @@ impl SessionAgents {
             })
             .ok_or("the child cannot be woken before its parent has run a turn")?;
         let cancellation = CancellationToken::new();
-        let (depth, brief, run_id, generation, worktree) = self
+        let Some((depth, brief, run_id, generation, worktree)) = self
             .shared
             .update(task_id, |child| {
                 if child.deleted {
                     return Err("the child was deleted".to_owned());
                 }
                 if !child.state.settled() {
-                    return Err("the child is still running".to_owned());
+                    return if text.is_none() {
+                        Ok(None)
+                    } else {
+                        Err("the child is still running".to_owned())
+                    };
+                }
+                if text.is_none() && child.pending.is_empty() {
+                    return Ok(None);
                 }
                 let brief = match child.brief.clone() {
                     Some(brief) => brief,
@@ -1834,17 +1915,22 @@ impl SessionAgents {
                 child.cancel_reason = None;
                 child.suppress_notice = false;
                 child.replied = false;
-                child.wake = Some(text);
+                let mut pending = std::mem::take(&mut child.pending);
+                pending.extend(text);
+                child.wake = Some(pending.join("\n\n"));
                 "queued".clone_into(&mut child.activity);
-                Ok((
+                Ok(Some((
                     child.depth,
                     brief,
                     run_id,
                     child.generation,
                     child.worktree.clone(),
-                ))
+                )))
             })
-            .ok_or("no such child")??;
+            .ok_or("no such child")??
+        else {
+            return Ok(());
+        };
         if let Ok(mut launches) = self.shared.launches.lock() {
             launches.entry(task_id.clone()).or_insert(launch);
         }
@@ -2067,6 +2153,7 @@ impl SessionAgents {
                 depth,
                 max_depth,
                 in_turn: false,
+                in_flight_messages: 0,
                 pending: Vec::new(),
                 brief: Some(brief.clone()),
                 run_id: Some(run_id.clone()),
@@ -3519,6 +3606,55 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     )
                     .await;
                 self.shared.update(&task_id, |child| child.in_turn = false);
+                // Sends already admitted to this inbox can finish after its
+                // final poll. New sends now go to pending, so wait for those
+                // admitted sends, then carry only commands the driver did not
+                // claim into the next child turn.
+                loop {
+                    let changed = self.shared.changed.notified();
+                    if self
+                        .shared
+                        .update(&task_id, |child| child.in_flight_messages)
+                        .unwrap_or_default()
+                        == 0
+                    {
+                        break;
+                    }
+                    changed.await;
+                }
+                let carried = async {
+                    let inbox = RunInbox::new(Arc::clone(&store));
+                    let Some(run) = store.latest_run(&session_id).await? else {
+                        return Ok::<(), harness_runtime::RuntimeError>(());
+                    };
+                    loop {
+                        let now = harness_runtime::now_unix_ms();
+                        let commands = inbox.claim(&run, 64, now).await?;
+                        let count = commands.len();
+                        for command in commands {
+                            if command.kind == harness_store_sqlite::RunCommandKind::Steer {
+                                if let Some(text) = RunInbox::steering_text(&command) {
+                                    inbox
+                                        .apply(&command, "carried to the next child turn", now)
+                                        .await?;
+                                    self.shared
+                                        .update(&task_id, |child| child.pending.push(text));
+                                } else {
+                                    inbox.reject(&command, "message has no text", now).await?;
+                                }
+                            } else {
+                                inbox
+                                    .apply(&command, "the child turn already stopped", now)
+                                    .await?;
+                            }
+                        }
+                        if count < 64 {
+                            break;
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
                 // A later wake opens a new session of this task. Release this
                 // turn's lease before its child can settle and be woken again.
                 // An admission conflict belongs to another session; leave it.
@@ -3537,6 +3673,11 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 };
                 let result = result
                     .map_err(|error| OrchestratorError::new(error.code(), error.to_string()))
+                    .and_then(|outcome| {
+                        carried.map(|()| outcome).map_err(|error| {
+                            OrchestratorError::new(error.code(), error.to_string())
+                        })
+                    })
                     .and_then(|outcome| released.map(|()| outcome));
                 let cost = observer
                     .cost_tracker
@@ -5292,6 +5433,156 @@ mod real_worker_tests {
 
     /// prime-agent: a message to a child that finished wakes it for a
     /// follow-up turn over its conversation so far.
+    #[test]
+    #[ignore = "subprocess barrier for a_message_after_the_final_inbox_poll_is_not_lost"]
+    fn message_final_poll_hook_fixture() {
+        use std::io::{Read, Write};
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .expect("hook input");
+        let payload: Value = serde_json::from_str(&input).expect("hook payload");
+        let marker = std::path::Path::new(payload["cwd"].as_str().expect("cwd"))
+            .join("final-poll-hook.port");
+        let Ok(port) = std::fs::read_to_string(marker) else {
+            return;
+        };
+        let mut socket = std::net::TcpStream::connect(port.trim()).expect("hook barrier");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("bound");
+        socket.write_all(b"ready").expect("hook ready");
+        let mut released = [0];
+        socket.read_exact(&mut released).expect("hook release");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Keep the final-poll barrier and canceled-send assertions together.
+    async fn a_message_after_the_final_inbox_poll_is_not_lost() {
+        use sqlx::Connection;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let bench = bench();
+        let parent_lease = bench
+            .agents
+            .shared
+            .store
+            .lease()
+            .await
+            .expect("parent lease");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("barrier");
+        let marker = bench.repo.join("final-poll-hook.port");
+        std::fs::write(&marker, listener.local_addr().expect("address").to_string())
+            .expect("hook address");
+        let provider = Scripted::new(vec![
+            Reply::Tool("read_file", json!({"path": "a.txt"})),
+            Reply::Text("first answer"),
+            Reply::Text("after-late-message"),
+        ]);
+        let mut launch = super::tests::launch_for(&bench.repo, provider.clone());
+        launch.hooks.push(harness_tools::ConfiguredToolHook {
+            event: "subagent_stop".to_owned(),
+            matcher: None,
+            command: std::env::current_exe()
+                .expect("test executable")
+                .to_string_lossy()
+                .into_owned(),
+            args: vec![
+                "--exact".to_owned(),
+                "interactive::delegation::real_worker_tests::message_final_poll_hook_fixture"
+                    .to_owned(),
+                "--ignored".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            timeout_seconds: 20,
+            source: "late message regression".to_owned(),
+        });
+        let host = DelegateHost::new(&bench.agents, launch, CancellationToken::new());
+        spawn(&host, "worker", "read a.txt").await;
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(20), listener.accept())
+            .await
+            .expect("the final poll finishes")
+            .expect("hook connects");
+        let mut ready = [0; 5];
+        socket.read_exact(&mut ready).await.expect("hook ready");
+        let receipt = host
+            .rlm_requests()
+            .handle(&json!({
+                "type": "agent_message.send", "receiver_role": "child", "receiver_name": "worker",
+                "message": "late-nonce-7b31: include this in the follow-up",
+            }))
+            .await
+            .expect("known")
+            .expect("accepted message");
+        assert_eq!(receipt["receipts"][0]["deliveryStatus"], "queued");
+        // Dropping a sender while SQLite is busy must release its admission
+        // counter, so the receiver's cleanup cannot wait forever.
+        let store = parent_lease.store();
+        let options =
+            sqlx::sqlite::SqliteConnectOptions::new().filename(&store.paths().database_path);
+        let mut writer = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .expect("fixture writer");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut writer)
+            .await
+            .expect("hold writes");
+        let task_id = bench.agents.shared.find(None, "worker").expect("child");
+        let mut dropped_send = Box::pin(
+            bench
+                .agents
+                .shared
+                .deliver_to_child(&task_id, "dropped-before-enqueue-nonce".to_owned()),
+        );
+        assert!(futures_util::poll!(dropped_send.as_mut()).is_pending());
+        assert_eq!(
+            bench
+                .agents
+                .shared
+                .update(&task_id, |child| child.in_flight_messages),
+            Some(1)
+        );
+        drop(dropped_send);
+        assert_eq!(
+            bench
+                .agents
+                .shared
+                .update(&task_id, |child| child.in_flight_messages),
+            Some(0)
+        );
+        sqlx::query("ROLLBACK")
+            .execute(&mut writer)
+            .await
+            .expect("release writes");
+        std::fs::remove_file(&marker).expect("the follow-up does not block");
+        socket
+            .write_all(b"x")
+            .await
+            .expect("release the final hook");
+        match state_of(&bench.agents, "worker").await {
+            ChildState::Done { answer, .. } => assert_eq!(answer, "after-late-message"),
+            other => panic!("late message follow-up failed: {other:?}"),
+        }
+        let seen = provider.seen.lock().expect("requests");
+        let final_request = seen.last().expect("follow-up request");
+        let deliveries = final_request
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == harness_providers::MessageRole::User
+                    && message.content.contains("late-nonce-7b31")
+            })
+            .count();
+        assert_eq!(deliveries, 1, "the accepted nonce reaches the model once");
+        assert!(
+            !final_request
+                .messages
+                .iter()
+                .any(|message| message.content.contains("dropped-before-enqueue-nonce"))
+        );
+    }
+
     #[tokio::test]
     async fn a_message_wakes_a_finished_child() {
         let bench = bench();
@@ -5369,6 +5660,301 @@ mod real_worker_tests {
             "the follow-up carries the history: {seen}"
         );
         assert!(seen.contains("one more thing"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn wake_claims_messages_accepted_before_another_sender_wakes_the_child() {
+        let bench = bench();
+        let _parent_lease = bench
+            .agents
+            .shared
+            .store
+            .lease()
+            .await
+            .expect("parent lease");
+        let provider = Scripted::new(vec![
+            Reply::Text("initial answer"),
+            Reply::Text("answer after both messages"),
+        ]);
+        let host = host(&bench, provider.clone());
+        spawn(&host, "worker", "look around").await;
+        state_of(&bench.agents, "worker").await;
+        let task_id = bench.agents.shared.find(None, "worker").expect("child");
+        // The scheduler just published Done with a message accepted in the
+        // dispatch/settle gap. A second sender wins the race to wake it.
+        bench.agents.shared.update(&task_id, |child| {
+            child.pending.push("accepted-gap-nonce-e32f".to_owned());
+        });
+        bench
+            .agents
+            .wake(&task_id, "competing-wake-nonce-b941".to_owned())
+            .expect("wake");
+        bench.agents.shared.update(&task_id, |child| {
+            assert!(
+                child.pending.is_empty(),
+                "wake must claim earlier accepted messages atomically"
+            );
+            let wake = child.wake.as_deref().expect("wake prompt");
+            assert_eq!(wake.matches("accepted-gap-nonce-e32f").count(), 1);
+            assert_eq!(wake.matches("competing-wake-nonce-b941").count(), 1);
+        });
+        match state_of(&bench.agents, "worker").await {
+            ChildState::Done { answer, .. } => assert_eq!(answer, "answer after both messages"),
+            other => panic!("competing wake failed: {other:?}"),
+        }
+        let seen = provider.seen.lock().expect("requests");
+        assert_eq!(seen.len(), 2, "both messages share the next turn");
+        let request = seen.last().expect("follow-up request");
+        for nonce in ["accepted-gap-nonce-e32f", "competing-wake-nonce-b941"] {
+            assert_eq!(
+                request
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        message.role == harness_providers::MessageRole::User
+                            && message.content.contains(nonce)
+                    })
+                    .count(),
+                1,
+                "{nonce} reaches the model once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_after_dispatch_returns_is_not_lost_at_settle() {
+        use harness_orchestrator::{WorkerBackend, WorkerRequest};
+        let bench = bench();
+        let _parent_lease = bench
+            .agents
+            .shared
+            .store
+            .lease()
+            .await
+            .expect("parent lease");
+        let provider = Scripted::new(vec![
+            Reply::Text("initial answer"),
+            Reply::Tool("read_file", json!({"path": "a.txt"})),
+            Reply::Text("pre-late-answer"),
+            Reply::Text("after-settle-gap-message"),
+        ]);
+        let host = host(&bench, provider.clone());
+        spawn(&host, "worker", "read a.txt").await;
+        state_of(&bench.agents, "worker").await;
+        let task_id = bench.agents.shared.find(None, "worker").expect("child");
+        // Run the backend directly so this test owns the exact boundary between
+        // its return and the scheduler publishing the child as settled.
+        let request = bench
+            .agents
+            .shared
+            .update(&task_id, |child| {
+                child.state = ChildState::Running;
+                child.wake = Some("read a.txt once more".to_owned());
+                WorkerRequest {
+                    task_id: task_id.clone(),
+                    run_id: child.run_id.clone().expect("run id"),
+                    generation: child.generation.into(),
+                    depth: child.depth,
+                    brief: child.brief.clone().expect("brief"),
+                    worktree: child.worktree.clone(),
+                    cancellation: child.cancellation.clone(),
+                }
+            })
+            .expect("record");
+        let backend = super::InteractiveWorkerBackend {
+            shared: Arc::clone(&bench.agents.shared),
+        };
+        let outcome = backend.dispatch(request).await;
+        assert!(matches!(
+            outcome,
+            harness_orchestrator::WorkerOutcome::Reported(_)
+        ));
+        let receipt = host
+            .rlm_requests()
+            .handle(&json!({
+                "type": "agent_message.send", "receiver_role": "child", "receiver_name": "worker",
+                "message": "settle-gap-nonce-c419: answer after this message",
+            }))
+            .await
+            .expect("known")
+            .expect("accepted message");
+        assert_eq!(receipt["receipts"][0]["deliveryStatus"], "queued");
+        bench.agents.shared.settle(&task_id, outcome);
+        match state_of(&bench.agents, "worker").await {
+            ChildState::Done { answer, .. } => assert_eq!(answer, "after-settle-gap-message"),
+            other => panic!("settle gap follow-up failed: {other:?}"),
+        }
+        let seen = provider.seen.lock().expect("requests");
+        let deliveries = seen
+            .last()
+            .expect("follow-up request")
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == harness_providers::MessageRole::User
+                    && message.content.contains("settle-gap-nonce-c419")
+            })
+            .count();
+        assert_eq!(deliveries, 1, "the queued nonce reaches the model once");
+    }
+
+    #[test]
+    fn broadcast_sdk_shape_selects_all() {
+        assert_eq!(
+            super::message_arguments(&json!({"target": "all", "message": "hello"}))
+                .expect("SDK broadcast"),
+            ("hello".to_owned(), "all".to_owned(), None)
+        );
+    }
+
+    #[test]
+    fn message_receipts_identify_each_delivery_and_its_timestamp() {
+        let receipts = (0..1000)
+            .map(|_| super::receipt("worker", "root", "hello", "queued"))
+            .collect::<Vec<_>>();
+        let ids = receipts
+            .iter()
+            .map(|receipt| receipt["id"].as_str().expect("id"))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            ids.len(),
+            receipts.len(),
+            "simultaneous receipts have unique ids"
+        );
+        assert!(
+            receipts
+                .iter()
+                .all(|receipt| receipt["queuedAt"].as_u64().is_some())
+        );
+        let delivered = super::receipt("worker", "root", "hello", "delivered");
+        assert!(delivered["deliveredAt"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One family fixture verifies both broadcast directions and their boundaries.
+    async fn broadcast_wakes_inactive_family_and_excludes_grandchildren_of_the_root() {
+        let bench = bench();
+        let _parent_lease = bench
+            .agents
+            .shared
+            .store
+            .lease()
+            .await
+            .expect("parent lease");
+        let provider = Scripted::new(
+            [
+                vec![Reply::Text("initial"); 3],
+                vec![Reply::Text("root broadcast read"); 3],
+                vec![Reply::Text("native broadcast read"); 3],
+            ]
+            .concat(),
+        );
+        let host = host(&bench, provider.clone());
+        for name in ["alpha", "beta", "gamma"] {
+            spawn(&host, name, "wait for messages").await;
+            state_of(&bench.agents, name).await;
+        }
+        let alpha = bench.agents.shared.find(None, "alpha").expect("alpha");
+        let inner = TaskId::generate();
+        let record = ChildRecord::from_ledger(LedgerEntry {
+            task_id: inner.as_str().to_owned(),
+            name: "inner".to_owned(),
+            role: "explorer".to_owned(),
+            model: "deepseek/fixture-model".to_owned(),
+            depth: 2,
+            max_depth: 2,
+            parent: Some(alpha.as_str().to_owned()),
+            status: "completed".to_owned(),
+            answer: Some("inner initial".to_owned()),
+            error: None,
+            duration_ms: Some(1),
+            tool_calls: 0,
+            objective: "wait for messages".to_owned(),
+            history: Vec::new(),
+        })
+        .expect("grandchild record");
+        bench
+            .agents
+            .shared
+            .children
+            .lock()
+            .expect("registry")
+            .push(record);
+        let launch = bench
+            .agents
+            .shared
+            .launches
+            .lock()
+            .expect("launches")
+            .get(&alpha)
+            .expect("alpha launch")
+            .clone();
+        bench
+            .agents
+            .shared
+            .launches
+            .lock()
+            .expect("launches")
+            .insert(inner.clone(), launch);
+        let receipt = host.rlm_requests().handle(&json!({
+            "type": "agent_message.send", "receiver_role": "all", "message": "root-broadcast-nonce",
+        })).await.expect("known").expect("root broadcast");
+        assert_eq!(receipt["receipts"].as_array().expect("receipts").len(), 3);
+        for name in ["alpha", "beta", "gamma"] {
+            match state_of(&bench.agents, name).await {
+                ChildState::Done { answer, .. } => assert_eq!(answer, "root broadcast read"),
+                other => panic!("root broadcast failed: {other:?}"),
+            }
+        }
+        bench.agents.shared.update(&inner, |child| {
+            assert!(
+                matches!(&child.state, ChildState::Done { answer, .. } if answer == "inner initial")
+            );
+        });
+        let receipt = bench
+            .agents
+            .shared
+            .send_from_child(
+                &alpha,
+                &json!({
+                    "receiver_role": "all", "message": "native-broadcast-nonce",
+                }),
+            )
+            .await
+            .expect("native broadcast");
+        assert_eq!(receipt["receipts"].as_array().expect("receipts").len(), 4);
+        for name in ["beta", "gamma"] {
+            match state_of(&bench.agents, name).await {
+                ChildState::Done { answer, .. } => assert_eq!(answer, "native broadcast read"),
+                other => panic!("native broadcast failed: {other:?}"),
+            }
+        }
+        let _ = bench
+            .agents
+            .shared
+            .wait(&inner, None, None)
+            .await
+            .expect("grandchild settles");
+        bench.agents.shared.update(&inner, |child| {
+            assert!(matches!(&child.state, ChildState::Done { answer, .. } if answer == "native broadcast read"));
+        });
+        let seen = provider.seen.lock().expect("requests");
+        let inner_request = seen
+            .iter()
+            .find(|request| {
+                request.messages.iter().any(|message| {
+                    message.content.contains("native-broadcast-nonce")
+                        && !message.content.contains("sibling:")
+                        && message.content.contains("parent:alpha")
+                })
+            })
+            .expect("own grandchild received its parent broadcast");
+        assert!(
+            !inner_request
+                .messages
+                .iter()
+                .any(|message| message.content.contains("root-broadcast-nonce"))
+        );
     }
 
     #[tokio::test]

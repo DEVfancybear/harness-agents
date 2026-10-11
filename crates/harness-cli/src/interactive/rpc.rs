@@ -223,6 +223,17 @@ impl Rpc {
         self.emit(json!({ "type": "compaction_start", "reason": "manual" }));
     }
 
+    fn deliver_agent_message(&mut self, text: String) {
+        if self.running && !self.paused && self.service.deliver_message(&text).is_ok() {
+            return;
+        }
+        if self.running || self.paused {
+            self.steering.push_back(text);
+        } else {
+            self.start(text);
+        }
+    }
+
     /// End the assistant message in progress, if one started.
     fn end_message(&mut self, stop_reason: &str, error_message: Option<&str>) {
         if !self.message.started {
@@ -319,6 +330,8 @@ impl Rpc {
                 text,
                 verbatim: false,
             } => self.steering.push_back(text),
+            SessionEvent::AgentMessage { text } => self.deliver_agent_message(text),
+            SessionEvent::ChildSettled { notice, .. } => self.deliver_agent_message(notice),
             // A turn that broke is over, as the app's controller ends it; a
             // terminal event after it finds nothing running.
             SessionEvent::RecoverableError { message } if self.running => {
@@ -958,6 +971,105 @@ pub async fn run(overrides: ConfigOverrides) -> Result<ExitCode, HarnessError> {
 mod tests {
     use super::{error, parse_line, success};
     use serde_json::json;
+
+    struct MessagePort {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        accepting: bool,
+    }
+
+    impl super::SessionPort for MessagePort {
+        fn label(&self) -> String {
+            "message fixture".to_owned()
+        }
+        fn submit(&mut self, request: super::SubmitRequest) {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(format!("submit:{}", request.text));
+        }
+        fn cancel(&mut self) {}
+        fn deliver_message(&mut self, text: &str) -> Result<(), String> {
+            if !self.accepting {
+                return Err("the run just ended".to_owned());
+            }
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(format!("deliver:{text}"));
+            Ok(())
+        }
+    }
+
+    fn message_rpc(accepting: bool) -> (super::Rpc, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            super::Rpc {
+                service: Box::new(MessagePort {
+                    calls: std::sync::Arc::clone(&calls),
+                    accepting,
+                }),
+                running: false,
+                paused: false,
+                steering: super::VecDeque::default(),
+                follow_ups: super::VecDeque::default(),
+                message: super::Message::default(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+                tool_output: None,
+                last_answer: None,
+                last_error: None,
+                compacting: None,
+                compact_next: None,
+                refining: None,
+                refined: None,
+                pending: Vec::new(),
+                steering_mode: super::super::queue::QueueMode::All,
+                follow_up_mode: super::super::queue::QueueMode::All,
+                out: Vec::new(),
+            },
+            calls,
+        )
+    }
+
+    #[test]
+    fn child_messages_reach_idle_and_busy_rpc_parents() {
+        let (mut idle, idle_calls) = message_rpc(true);
+        idle.event(super::SessionEvent::AgentMessage {
+            text: "idle report".to_owned(),
+        });
+        assert!(idle.running, "a child message wakes an idle RPC parent");
+        assert_eq!(*idle_calls.lock().expect("calls"), ["submit:idle report"]);
+        let (mut busy, busy_calls) = message_rpc(true);
+        busy.running = true;
+        busy.event(super::SessionEvent::AgentMessage {
+            text: "busy report".to_owned(),
+        });
+        assert_eq!(*busy_calls.lock().expect("calls"), ["deliver:busy report"]);
+        assert!(busy.steering.is_empty());
+    }
+
+    #[test]
+    fn child_messages_survive_rpc_terminal_races_and_respect_abort() {
+        let (mut rpc, calls) = message_rpc(false);
+        rpc.running = true;
+        rpc.event(super::SessionEvent::AgentMessage {
+            text: "late report".to_owned(),
+        });
+        assert_eq!(rpc.steering.len(), 1);
+        rpc.event(super::SessionEvent::RunTerminal {
+            outcome: super::RunOutcome::Done,
+        });
+        assert_eq!(*calls.lock().expect("calls"), ["submit:late report"]);
+        let (mut paused, calls) = message_rpc(true);
+        paused.paused = true;
+        paused.event(super::SessionEvent::ChildSettled {
+            name: "worker".to_owned(),
+            notice: "completion".to_owned(),
+        });
+        assert!(!paused.running);
+        assert!(calls.lock().expect("calls").is_empty());
+        assert_eq!(paused.steering.pop_front().as_deref(), Some("completion"));
+    }
 
     #[test]
     fn frames_have_prime_agents_shape() {
