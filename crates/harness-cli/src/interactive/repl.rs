@@ -953,6 +953,41 @@ impl ReplShared {
         }
     }
 
+    /// Cancel only the cell that belongs to the aborted turn. A new turn may
+    /// start before cleanup acquires the slot, so compare its id and link again.
+    pub fn interrupt_current(self: &Arc<Self>) {
+        let link = self
+            .link
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(link) = link else {
+            return;
+        };
+        let Some(id) = link.state().active.clone() else {
+            return;
+        };
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let _ = link.write(&json!({"type": "interrupt", "id": id})).await;
+            let mut slot = this.kernel.lock().await;
+            let Some(kernel) = slot.kernel.as_mut() else {
+                return;
+            };
+            if !Arc::ptr_eq(&kernel.link, &link)
+                || kernel
+                    .in_flight
+                    .as_ref()
+                    .is_none_or(|(active, _)| *active != id)
+            {
+                return;
+            }
+            if kernel.settle_stale().await.is_err() {
+                this.lose(&mut slot);
+            }
+        });
+    }
+
     /// Dispose the kernel as prime-agent's session teardown does: a cell still
     /// running is interrupted, the namespace gets its final snapshot, host requests in
     /// flight get a moment, and the kernel is asked to shut down before it is

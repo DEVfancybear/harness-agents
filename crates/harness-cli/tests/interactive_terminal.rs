@@ -3108,11 +3108,16 @@ fn q08b_pty_tree_labels_and_summarizes_the_branch_it_leaves() {
             Reply::Text("answer-one-q08b".to_owned())
         }
     });
-    let (_temp, mut session) = scripted_session(&provider);
+    let (temp, mut session) = scripted_session(&provider);
+    let project = temp.path().join("project with spaces");
     session.send("first ask\r");
     session.wait_for("answer-one-q08b", Duration::from_mins(1));
+    // A streamed answer precedes RunTerminal: typing now can steer the same
+    // turn. The branch needs two completed turns in the store.
+    wait_for_idle_agent(&temp, &project, Duration::from_mins(1));
     session.send("second ask\r");
     session.wait_for("answer-two-q08b", Duration::from_mins(1));
+    wait_for_idle_agent(&temp, &project, Duration::from_mins(1));
     // prime-agent's tree selector opens on the current answer; Enter there
     // stays put.
     session.send("/tree\r");
@@ -3314,6 +3319,157 @@ fn d02_pty_create_session_starts_a_top_level_agent() {
     );
     assert_ne!(helper["conversation"], serde_json::Value::Null);
     finish(session);
+}
+
+/// A resident agent can create a session in a project whose worker has never
+/// been started. The new worker must survive detaching its creator's terminal.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn d08_pty_create_session_starts_another_projects_worker() {
+    let (temp, project) = sandbox();
+    let other = temp.path().join("other-project");
+    std::fs::create_dir_all(&other).expect("other project");
+    let code = format!(
+        "h = await rlm.create_session('helper-task-d08', name='other-helper', cwd={})\nprint('created-other-d08', h.active_session_id)",
+        serde_json::to_string(&other.to_string_lossy()).expect("quoted cwd")
+    );
+    let provider = ScriptedSse::start(move |request| {
+        if last_user_text(request).contains("helper-task-d08") {
+            Reply::Text("helper-done-d08".to_owned())
+        } else if tool_results(request) == 0 {
+            Reply::Tool("ipython", serde_json::json!({"code": code}))
+        } else {
+            Reply::Text("creator-done-d08".to_owned())
+        }
+    });
+    let mut env = provider_env(&temp, &provider.endpoint());
+    env.push(("HA_APPROVAL", "full-auto".to_owned()));
+    let mut session = PtySession::spawn(&project, &env);
+    session.keep_workers();
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+    session.send("start another project\r");
+    session.wait_for("creator-done-d08", Duration::from_mins(5));
+    let helper = wait_for_agent(&temp, &project, Duration::from_secs(30), |agent| {
+        agent["name"] == "other-helper" && agent["status"] == "ready"
+    });
+    assert_eq!(helper["project_root"], other.to_string_lossy().as_ref());
+    let creator = listed_agents(&temp, &project)
+        .into_iter()
+        .find(|agent| agent["project_root"] == project.to_string_lossy().as_ref())
+        .expect("creator");
+    assert_ne!(helper["worker_pid"], creator["worker_pid"]);
+    session.send("/quit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+    drop(session);
+    let sent = run_cli_json(
+        &temp,
+        &other,
+        &[
+            "send",
+            "other-helper",
+            "helper-task-d08",
+            "--wait",
+            "--json",
+        ],
+    );
+    assert_eq!(sent["text"], "helper-done-d08");
+    run_cli_json(&temp, &project, &["shutdown", "--force", "--json"]);
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn d09_pty_send_wait_returns_each_follow_ups_answer() {
+    let provider = ScriptedSse::start(|request| {
+        let text = last_user_text(request);
+        if text.contains("follow-one-d09") {
+            Reply::Text("one-d09".into())
+        } else if text.contains("follow-two-d09") {
+            Reply::Text("two-d09".into())
+        } else {
+            Reply::Delay(
+                Duration::from_secs(4),
+                Box::new(Reply::Text("slow-d09".into())),
+            )
+        }
+    });
+    let (temp, project) = sandbox();
+    let env = provider_env(&temp, &provider.endpoint());
+    let mut terminal = PtySession::spawn(&project, &env);
+    terminal.wait_for("Harness Agents", Duration::from_secs(30));
+    terminal.send("slow-d09\r");
+    let id = wait_for_agent(&temp, &project, Duration::from_secs(30), |a| {
+        a["busy"] == true
+    })["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let mut senders = Vec::new();
+    for text in ["follow-one-d09", "follow-two-d09"] {
+        let mut cmd = std::process::Command::new(cli_binary());
+        cmd.args(["send", &id, text, "--follow-up", "--wait", "--json"])
+            .current_dir(&project)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for (key, value) in &env {
+            cmd.env(key, value);
+        }
+        senders.push(cmd.spawn().expect("sender"));
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    for (sender, expected) in senders.into_iter().zip(["one-d09", "two-d09"]) {
+        let result = sender.wait_with_output().expect("send answer");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&result.stdout).expect("JSON");
+        assert_eq!(result["text"], expected, "{result}");
+    }
+    finish(terminal);
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn d10_pty_abort_interrupts_a_running_python_cell() {
+    let provider = ScriptedSse::start(|request| {
+        if last_user_text(request).contains("after-abort-d10") {
+            Reply::Text("recovered-d10".into())
+        } else if tool_results(request) == 0 {
+            Reply::Tool(
+                "ipython",
+                serde_json::json!({"code":
+                "import asyncio\nfrom pathlib import Path\nPath('started-d10').write_text('start')\nawait asyncio.sleep(90)\nPath('wrong-d10').write_text('should not run')"}),
+            )
+        } else {
+            Reply::Text("should-have-aborted-d10".into())
+        }
+    });
+    let (temp, project) = sandbox();
+    let mut env = provider_env(&temp, &provider.endpoint());
+    env.push(("HA_APPROVAL", "full-auto".to_owned()));
+    let mut terminal = PtySession::spawn(&project, &env);
+    terminal.wait_for("Harness Agents", Duration::from_secs(30));
+    terminal.send("python-abort-d10\r");
+    let deadline = Instant::now() + Duration::from_mins(3);
+    while !project.join("started-d10").is_file() {
+        assert!(Instant::now() < deadline, "Python cell never started");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let agent = only_agent(&temp, &project);
+    let id = agent["id"].as_str().expect("id");
+    let abort = run_cli_json(&temp, &project, &["abort", id, "--json"]);
+    assert_eq!(abort["aborted"], true);
+    wait_for_idle_agent(&temp, &project, Duration::from_secs(15));
+    assert!(!project.join("wrong-d10").exists());
+    let answer = run_cli_json(
+        &temp,
+        &project,
+        &["send", id, "after-abort-d10", "--wait", "--json"],
+    );
+    assert_eq!(answer["text"], "recovered-d10");
+    finish(terminal);
 }
 
 /// F01: prime-agent's fullscreen rendering is the default: the alternate

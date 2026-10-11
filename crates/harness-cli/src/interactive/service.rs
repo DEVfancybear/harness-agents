@@ -5564,6 +5564,9 @@ impl SessionPort for AgentSessionService {
         if let Some(token) = self.cancellation.take() {
             token.cancel();
         }
+        if let Some(repl) = &self.repl {
+            repl.interrupt_current();
+        }
         self.gate.cancel_pending();
     }
 

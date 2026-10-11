@@ -205,6 +205,9 @@ pub struct InteractiveController {
     pending_text: String,
     /// The assistant answer accumulated for `/copy`.
     last_answer: String,
+    next_delivery: u64,
+    active_deliveries: Vec<(u64, String)>,
+    delivery_answers: std::collections::BTreeMap<u64, Result<String, String>>,
     /// Number of line breaks in `pending_text`. It is maintained as deltas
     /// arrive, so the common streaming path does not rescan an ever-growing
     /// buffer on every token.
@@ -379,6 +382,9 @@ impl InteractiveController {
             channel,
             pending_text: String::new(),
             last_answer: String::new(),
+            next_delivery: 0,
+            active_deliveries: Vec::new(),
+            delivery_answers: std::collections::BTreeMap::new(),
             pending_newlines: 0,
             pending_approval: None,
             pending_question: None,
@@ -538,33 +544,76 @@ impl InteractiveController {
         self.agent_messages_paused
     }
 
-    /// [`Self::deliver_external`] for a message another agent sent: one that
-    /// waits in the queue can be cleared with `/agents messages clear`.
-    pub fn deliver_external_from(
-        &mut self,
-        text: String,
-        steer: bool,
-        from_agent: bool,
-        effects: &mut Vec<Effect>,
-    ) -> &'static str {
-        let outcome = self.deliver_external(text.clone(), steer, effects);
-        if from_agent && outcome == "queued" {
-            self.agent_messages_queued.push(text);
-        }
-        outcome
-    }
-
     pub fn deliver_external(
         &mut self,
         text: String,
         steer: bool,
         effects: &mut Vec<Effect>,
     ) -> &'static str {
+        self.deliver_external_with_receipt(text, steer, None, effects)
+    }
+
+    /// A background sender waits for this delivery's turn, even when later
+    /// queued turns start before the sender can poll again.
+    pub fn deliver_tracked(
+        &mut self,
+        text: String,
+        steer: bool,
+        from_agent: bool,
+        effects: &mut Vec<Effect>,
+    ) -> (u64, &'static str) {
+        self.next_delivery += 1;
+        let receipt = self.next_delivery;
+        let outcome =
+            self.deliver_external_with_receipt(text.clone(), steer, Some(receipt), effects);
+        if from_agent && outcome == "queued" {
+            self.agent_messages_queued.push(text);
+        }
+        (receipt, outcome)
+    }
+
+    pub fn take_delivery_answer(&mut self, receipt: u64) -> Result<Option<String>, String> {
+        if let Some(answer) = self.delivery_answers.remove(&receipt) {
+            return answer.map(Some);
+        }
+        if self.active_deliveries.iter().any(|(id, _)| *id == receipt)
+            || self.queue.contains_receipt(receipt)
+        {
+            return Ok(None);
+        }
+        Err("the message's delivery is no longer available (removed, expired, or the agent restarted)".to_owned())
+    }
+
+    fn deliver_external_with_receipt(
+        &mut self,
+        text: String,
+        steer: bool,
+        receipt: Option<u64>,
+        effects: &mut Vec<Effect>,
+    ) -> &'static str {
         if self.free_for_automatic_turn() {
-            effects.extend(self.submit(text));
+            let produced = self.submit(text.clone());
+            if let Some(receipt) = receipt {
+                if self.phase.has_active_run() {
+                    self.active_deliveries.push((receipt, text));
+                } else {
+                    let error = produced.iter().find_map(|effect| match effect {
+                        Effect::History(HistoryItem::Error { message }) => Some(message.clone()),
+                        _ => None,
+                    });
+                    self.record_delivery_answer(
+                        receipt,
+                        error.map_or_else(|| Ok(String::new()), Err),
+                    );
+                }
+            }
+            effects.extend(produced);
             return "delivered";
         }
         if steer && self.phase == AppPhase::Running && self.service.steer(&text).is_ok() {
+            if let Some(receipt) = receipt {
+                self.active_deliveries.push((receipt, text.clone()));
+            }
             effects.push(Effect::History(HistoryItem::User { text }));
             effects.push(Effect::History(HistoryItem::Notice {
                 message: "a message reached the running agent; it reads this at its next step"
@@ -578,7 +627,7 @@ impl InteractiveController {
         } else {
             super::queue::Lane::FollowUp
         };
-        self.queue.push(lane, text);
+        self.queue.push_tracked(lane, text, receipt);
         effects.push(Effect::History(HistoryItem::Notice {
             message: format!(
                 "a message is queued ({}): sent after the active run finishes",
@@ -2615,7 +2664,15 @@ impl InteractiveController {
             SessionEvent::UnreadMessage { text, verbatim } => {
                 // It arrived as the turn was ending: another agent's message is read
                 // like a child's report, the user's steer waits in the steering lane.
-                if verbatim {
+                let receipt = self
+                    .active_deliveries
+                    .iter()
+                    .position(|(_, sent)| *sent == text)
+                    .map(|at| self.active_deliveries.remove(at).0);
+                if let Some(receipt) = receipt {
+                    self.queue
+                        .push_tracked(super::queue::Lane::Steer, text, Some(receipt));
+                } else if verbatim {
                     self.pending_notices.push_back(text);
                 } else {
                     self.queue.push(super::queue::Lane::Steer, text);
@@ -2811,13 +2868,23 @@ impl InteractiveController {
                 }
                 // What the user queued runs first: steering, then follow-ups.
                 if !self.notices_held
-                    && let Some(text) = self
+                    && let Some((text, receipts)) = self
                         .queue
-                        .take_next(super::queue::Lane::Steer)
-                        .or_else(|| self.queue.take_next(super::queue::Lane::FollowUp))
+                        .take_next_tracked(super::queue::Lane::Steer)
+                        .or_else(|| self.queue.take_next_tracked(super::queue::Lane::FollowUp))
                 {
                     self.close_run_grant();
-                    effects.extend(self.dispatch(text, false));
+                    effects.extend(self.dispatch(text.clone(), false));
+                    for receipt in receipts {
+                        if self.phase.has_active_run() {
+                            self.active_deliveries.push((receipt, text.clone()));
+                        } else {
+                            self.record_delivery_answer(
+                                receipt,
+                                Err("the queued message could not start a turn".to_owned()),
+                            );
+                        }
+                    }
                     return;
                 }
                 // What a child reported while this turn ran is read now, one turn
@@ -2893,7 +2960,7 @@ impl InteractiveController {
             }
             SessionEvent::RecoverableError { message } => {
                 self.flush_stream(effects);
-                self.settle_run(None);
+                self.settle_run(Some(RunOutcome::Failed(message.clone())));
                 self.push_history(effects, HistoryItem::Error { message });
                 self.finish_run();
                 // A turn that broke is over: nothing continues it from here.
@@ -3478,6 +3545,7 @@ impl InteractiveController {
         self.pending_text.clear();
         self.pending_newlines = 0;
         self.last_answer.clear();
+        self.active_deliveries.clear();
         self.open_tools.clear();
         self.tool_progress.clear();
         self.steps = 0;
@@ -3491,13 +3559,31 @@ impl InteractiveController {
     }
 
     /// Close the accounting for a finished turn.
-    fn settle_run(&mut self, _outcome: Option<RunOutcome>) {
+    fn settle_run(&mut self, outcome: Option<RunOutcome>) {
+        let answer = match outcome {
+            Some(RunOutcome::Failed(reason) | RunOutcome::Blocked(reason)) => Err(reason),
+            Some(RunOutcome::Canceled) => Err("the message's turn was canceled".to_owned()),
+            Some(RunOutcome::WaitingInput { .. } | RunOutcome::ExternalWait) => {
+                Err("the message's turn is waiting for input".to_owned())
+            }
+            _ => Ok(self.last_answer.clone()),
+        };
+        for (receipt, _) in std::mem::take(&mut self.active_deliveries) {
+            self.record_delivery_answer(receipt, answer.clone());
+        }
         self.last_run_elapsed = self
             .run_started_at
             .take()
             .map_or(Duration::ZERO, |started| started.elapsed());
         self.open_tools.clear();
         self.tool_progress.clear();
+    }
+
+    fn record_delivery_answer(&mut self, receipt: u64, answer: Result<String, String>) {
+        self.delivery_answers.insert(receipt, answer);
+        while self.delivery_answers.len() > 256 {
+            self.delivery_answers.pop_first();
+        }
     }
 
     fn interrupt(&mut self) -> Vec<Effect> {
@@ -6235,6 +6321,159 @@ mod tests {
     fn submit_text(controller: &mut InteractiveController, text: &str) -> Vec<Effect> {
         type_text(controller, text);
         controller.handle_key(Key::Enter)
+    }
+
+    #[test]
+    fn delivery_receipts_keep_each_queued_turns_answer() {
+        let mut h = bench(true);
+        let mut effects = Vec::new();
+        let (first, _) = h
+            .controller
+            .deliver_tracked("first".into(), true, false, &mut effects);
+        let (second, status) =
+            h.controller
+                .deliver_tracked("same text".into(), false, false, &mut effects);
+        assert_eq!(status, "queued");
+        let (third, _) =
+            h.controller
+                .deliver_tracked("same text".into(), false, false, &mut effects);
+        for answer in ["one", "two", "three"] {
+            h.events
+                .send(SessionEvent::TextDelta {
+                    text: answer.into(),
+                })
+                .unwrap();
+            h.events
+                .send(SessionEvent::RunTerminal {
+                    outcome: RunOutcome::Done,
+                })
+                .unwrap();
+            h.controller.pump_events();
+        }
+        assert_eq!(
+            h.controller.take_delivery_answer(first),
+            Ok(Some("one".into()))
+        );
+        assert_eq!(
+            h.controller.take_delivery_answer(second),
+            Ok(Some("two".into()))
+        );
+        assert_eq!(
+            h.controller.take_delivery_answer(third),
+            Ok(Some("three".into()))
+        );
+    }
+
+    #[test]
+    fn delivery_receipts_follow_batching_edits_and_removal() {
+        let mut h = bench(true);
+        h.controller.queue = super::super::queue::InputQueue::new(
+            super::super::queue::QueueMode::OneAtATime,
+            super::super::queue::QueueMode::All,
+        );
+        let mut effects = Vec::new();
+        h.controller
+            .deliver_tracked("first".into(), true, false, &mut effects);
+        let (edited, _) =
+            h.controller
+                .deliver_tracked("edit me".into(), false, false, &mut effects);
+        let (removed, _) =
+            h.controller
+                .deliver_tracked("drop me".into(), false, false, &mut effects);
+        let (other, _) = h
+            .controller
+            .deliver_tracked("other".into(), false, false, &mut effects);
+        h.controller.queue.edit(0, "edited".into());
+        h.controller.queue.remove(1);
+        assert!(h.controller.take_delivery_answer(removed).is_err());
+        for answer in ["first answer", "batch answer"] {
+            h.events
+                .send(SessionEvent::TextDelta {
+                    text: answer.into(),
+                })
+                .unwrap();
+            h.events
+                .send(SessionEvent::RunTerminal {
+                    outcome: RunOutcome::Done,
+                })
+                .unwrap();
+            h.controller.pump_events();
+        }
+        assert_eq!(
+            h.controller.take_delivery_answer(edited),
+            Ok(Some("batch answer".into()))
+        );
+        assert_eq!(
+            h.controller.take_delivery_answer(other),
+            Ok(Some("batch answer".into()))
+        );
+    }
+
+    #[test]
+    fn delivery_receipts_report_failures_cancellation_and_unclaimed_steers() {
+        let mut h = bench(true);
+        let mut effects = Vec::new();
+        let (failed, _) = h
+            .controller
+            .deliver_tracked("fail".into(), true, false, &mut effects);
+        h.events
+            .send(SessionEvent::RecoverableError {
+                message: "provider failed".into(),
+            })
+            .unwrap();
+        h.controller.pump_events();
+        assert_eq!(
+            h.controller.take_delivery_answer(failed),
+            Err("provider failed".into())
+        );
+        let (cancelled, _) =
+            h.controller
+                .deliver_tracked("cancel".into(), true, false, &mut effects);
+        h.events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Canceled,
+            })
+            .unwrap();
+        h.controller.pump_events();
+        assert!(
+            h.controller
+                .take_delivery_answer(cancelled)
+                .unwrap_err()
+                .contains("canceled")
+        );
+        h.controller
+            .deliver_tracked("active".into(), true, false, &mut effects);
+        let (steer, _) =
+            h.controller
+                .deliver_tracked("late steer".into(), true, false, &mut effects);
+        h.events
+            .send(SessionEvent::UnreadMessage {
+                text: "late steer".into(),
+                verbatim: false,
+            })
+            .unwrap();
+        h.events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .unwrap();
+        h.controller.pump_events();
+        assert_eq!(h.controller.take_delivery_answer(steer), Ok(None));
+        h.events
+            .send(SessionEvent::TextDelta {
+                text: "steer answer".into(),
+            })
+            .unwrap();
+        h.events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .unwrap();
+        h.controller.pump_events();
+        assert_eq!(
+            h.controller.take_delivery_answer(steer),
+            Ok(Some("steer answer".into()))
+        );
     }
 
     /// Type one line without submitting it, so a caller can inspect the prompt.

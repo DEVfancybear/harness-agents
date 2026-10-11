@@ -152,13 +152,17 @@ enum Command {
         mode: SendMode,
         /// Sent by another agent (`from`), so the pause gate applies.
         from_agent: bool,
-        reply: Sender<Result<&'static str, String>>,
+        reply: Sender<Result<(u64, &'static str), String>>,
     },
     Abort {
         reply: Sender<bool>,
     },
     LastAnswer {
         reply: Sender<String>,
+    },
+    DeliveryAnswer {
+        receipt: u64,
+        reply: Sender<Result<Option<String>, String>>,
     },
     Schedule {
         argument: String,
@@ -609,7 +613,7 @@ impl Worker {
         text: String,
         mode: SendMode,
         from_agent: bool,
-    ) -> Result<&'static str, String> {
+    ) -> Result<(u64, &'static str), String> {
         let id = self.resolve(selector)?;
         let (reply, answer) = mpsc::channel();
         self.inbox(&id)?
@@ -647,6 +651,17 @@ impl Worker {
         answer
             .recv_timeout(Duration::from_secs(30))
             .map_err(|_| format!("agent {id} did not answer"))
+    }
+
+    fn delivery_answer(&self, selector: &str, receipt: u64) -> Result<Option<String>, String> {
+        let id = self.resolve(selector)?;
+        let (reply, answer) = mpsc::channel();
+        self.inbox(&id)?
+            .send(Command::DeliveryAnswer { receipt, reply })
+            .map_err(|_| format!("agent {id} has stopped"))?;
+        answer
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| format!("agent {id} did not answer"))?
     }
 
     /// Run `/schedule <argument>` in the agent's conversation.
@@ -1062,7 +1077,7 @@ impl Agent {
                     return false;
                 }
                 let mut effects = Vec::new();
-                let outcome = self.controller.deliver_external_from(
+                let outcome = self.controller.deliver_tracked(
                     text,
                     mode != SendMode::FollowUp,
                     from_agent,
@@ -1078,6 +1093,9 @@ impl Agent {
             }
             Command::LastAnswer { reply } => {
                 let _ = reply.send(self.controller.last_answer().to_owned());
+            }
+            Command::DeliveryAnswer { receipt, reply } => {
+                let _ = reply.send(self.controller.take_delivery_answer(receipt));
             }
             Command::Schedule { argument, reply } => {
                 let _ = reply.send(self.controller.schedule(&argument));
@@ -1334,7 +1352,7 @@ fn serve(worker: &Arc<Worker>, stream: TcpStream) {
                 reply_of(
                     worker
                         .send(&agent, text, mode, from_agent)
-                        .map(|outcome| json!({ "status": outcome })),
+                        .map(|(receipt, outcome)| json!({ "status": outcome, "receipt": receipt })),
                 )
             }
             Request::Stop { agent } => reply_of(
@@ -1351,6 +1369,11 @@ fn serve(worker: &Arc<Worker>, stream: TcpStream) {
                 worker
                     .last_answer(&agent)
                     .map(|text| json!({ "text": text })),
+            ),
+            Request::DeliveryAnswer { agent, receipt } => reply_of(
+                worker
+                    .delivery_answer(&agent, receipt)
+                    .map(|answer| json!({ "text": answer })),
             ),
             Request::Schedule { agent, argument } => reply_of(
                 worker
@@ -1603,7 +1626,7 @@ impl SessionHost for WorkerSessionHost {
         let info = if store_dir == worker.store_dir {
             worker.create(spec)?
         } else {
-            super::client::create_in(&context, spec)?
+            super::client::create_from_worker(&context, spec)?
         };
         Ok(json!({
             "active_session_id": info.id,

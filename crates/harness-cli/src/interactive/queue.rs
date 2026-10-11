@@ -52,9 +52,15 @@ impl QueueMode {
 /// The queued messages, oldest first.
 #[derive(Clone, Debug, Default)]
 pub struct InputQueue {
-    items: Vec<(Lane, String)>,
+    items: Vec<QueuedInput>,
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedInput {
+    input: (Lane, String),
+    receipt: Option<u64>,
 }
 
 impl InputQueue {
@@ -68,7 +74,18 @@ impl InputQueue {
     }
 
     pub fn push(&mut self, lane: Lane, text: String) {
-        self.items.push((lane, text));
+        self.push_tracked(lane, text, None);
+    }
+
+    pub fn push_tracked(&mut self, lane: Lane, text: String, receipt: Option<u64>) {
+        self.items.push(QueuedInput {
+            input: (lane, text),
+            receipt,
+        });
+    }
+
+    pub fn contains_receipt(&self, receipt: u64) -> bool {
+        self.items.iter().any(|item| item.receipt == Some(receipt))
     }
 
     #[must_use]
@@ -83,25 +100,33 @@ impl InputQueue {
 
     /// The next turn's text from `lane`: its oldest message, or all of them
     /// joined when the lane is drained all at once.
+    #[cfg(test)]
     pub fn take_next(&mut self, lane: Lane) -> Option<String> {
+        self.take_next_tracked(lane).map(|(text, _)| text)
+    }
+
+    pub fn take_next_tracked(&mut self, lane: Lane) -> Option<(String, Vec<u64>)> {
         let mode = match lane {
             Lane::Steer => self.steering_mode,
             Lane::FollowUp => self.follow_up_mode,
         };
-        let first = self.items.iter().position(|(each, _)| *each == lane)?;
+        let first = self.items.iter().position(|item| item.input.0 == lane)?;
         if mode == QueueMode::OneAtATime {
-            return Some(self.items.remove(first).1);
+            let item = self.items.remove(first);
+            return Some((item.input.1, item.receipt.into_iter().collect()));
         }
         let mut taken = Vec::new();
-        self.items.retain(|(each, text)| {
-            if *each == lane {
-                taken.push(text.clone());
+        let mut receipts = Vec::new();
+        self.items.retain(|item| {
+            if item.input.0 == lane {
+                taken.push(item.input.1.clone());
+                receipts.extend(item.receipt);
                 false
             } else {
                 true
             }
         });
-        Some(taken.join("\n\n"))
+        Some((taken.join("\n\n"), receipts))
     }
 
     /// prime-agent's preview rows (`formatQueuedMessagePreview`): the lane
@@ -110,7 +135,8 @@ impl InputQueue {
     pub fn previews(&self) -> Vec<String> {
         self.items
             .iter()
-            .map(|(lane, text)| {
+            .map(|item| {
+                let (lane, text) = &item.input;
                 let first = text.lines().next().unwrap_or_default();
                 format!("{}: {first}", lane.label())
             })
@@ -120,7 +146,8 @@ impl InputQueue {
     /// Remove every message `drop` picks; the removed ones, oldest first.
     pub fn remove_where(&mut self, drop: impl Fn(&str) -> bool) -> Vec<(Lane, String)> {
         let mut removed = Vec::new();
-        self.items.retain(|(lane, text)| {
+        self.items.retain(|item| {
+            let (lane, text) = &item.input;
             if drop(text) {
                 removed.push((*lane, text.clone()));
                 false
@@ -133,7 +160,7 @@ impl InputQueue {
 
     /// Remove the message at `index` (0-based, oldest first).
     pub fn remove(&mut self, index: usize) -> Option<(Lane, String)> {
-        (index < self.items.len()).then(|| self.items.remove(index))
+        (index < self.items.len()).then(|| self.items.remove(index).input)
     }
 
     /// Replace the text at `index`; an empty text removes the message.
@@ -144,7 +171,7 @@ impl InputQueue {
         if text.trim().is_empty() {
             self.items.remove(index);
         } else {
-            self.items[index].1 = text;
+            self.items[index].input.1 = text;
         }
         true
     }
@@ -170,7 +197,7 @@ impl InputQueue {
     #[cfg(test)]
     #[must_use]
     pub fn get(&self, index: usize) -> Option<&(Lane, String)> {
-        self.items.get(index)
+        self.items.get(index).map(|item| &item.input)
     }
 
     /// One line per message, numbered from 1: `1. Follow-up: text`.
@@ -179,7 +206,8 @@ impl InputQueue {
         self.items
             .iter()
             .enumerate()
-            .map(|(index, (lane, text))| {
+            .map(|(index, item)| {
+                let (lane, text) = &item.input;
                 let first = text.lines().next().unwrap_or_default();
                 format!("{}. {}: {first}", index + 1, lane.label())
             })

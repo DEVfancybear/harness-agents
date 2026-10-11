@@ -370,9 +370,12 @@ impl Heartbeats {
                         "rlm_heartbeat.update requires at least one field to update".to_owned()
                     );
                 }
-                let Some(heartbeat) = items.iter_mut().find(|heartbeat| heartbeat.id == id) else {
+                let Some(index) = items.iter().position(|heartbeat| heartbeat.id == id) else {
                     return Ok(json!({ "heartbeat": null }));
                 };
+                // Validate the entire update before replacing the live entry:
+                // a bad interval must not change an earlier valid field.
+                let mut heartbeat = items[index].clone();
                 if let Some(instruction) = instruction.map(|text| text.trim().to_owned()) {
                     if instruction.is_empty() {
                         return Err("RLM heartbeat instruction cannot be empty".to_owned());
@@ -402,6 +405,7 @@ impl Heartbeats {
                 }
                 heartbeat.updated_at = now_label();
                 let response = heartbeat.response();
+                items[index] = heartbeat;
                 self.save(&items);
                 Ok(json!({ "heartbeat": response }))
             }
@@ -556,6 +560,43 @@ mod tests {
     use super::{Delivery, Heartbeats, parse_schedule};
     use serde_json::json;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn rejected_update_keeps_live_and_persisted_heartbeat_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heartbeats.json");
+        let heartbeats = Heartbeats::default();
+        heartbeats.bind(path.clone());
+        let created = heartbeats
+            .handle(
+                "rlm_heartbeat.create",
+                &json!({"instruction": "original", "interval": "1h"}),
+            )
+            .unwrap();
+        heartbeats
+            .handle(
+                "rlm_heartbeat.update",
+                &json!({"id": created["heartbeat"]["id"], "status": "pause"}),
+            )
+            .unwrap();
+        let expected = heartbeats.handle("rlm_heartbeat.list", &json!({})).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(heartbeats
+            .handle(
+                "rlm_heartbeat.update",
+                &json!({"id": created["heartbeat"]["id"], "instruction": "changed", "interval": "5s", "status": "pause"}),
+            )
+            .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let listed = heartbeats.handle("rlm_heartbeat.list", &json!({})).unwrap();
+        assert_eq!(listed, expected);
+        heartbeats.bind(temp.path().join("other.json"));
+        heartbeats.bind(path);
+        assert_eq!(
+            heartbeats.handle("rlm_heartbeat.list", &json!({})).unwrap(),
+            listed
+        );
+    }
 
     #[test]
     fn schedules_follow_prime_agent() {

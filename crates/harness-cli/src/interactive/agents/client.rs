@@ -205,14 +205,23 @@ pub fn ensure(
     store_dir: &Path,
     project_root: &Path,
 ) -> Result<(Descriptor, Connection), String> {
+    ensure_from(directory, store_dir, project_root, false)
+}
+
+fn ensure_from(
+    directory: &Path,
+    store_dir: &Path,
+    project_root: &Path,
+    resident: bool,
+) -> Result<(Descriptor, Connection), String> {
     let key = registry::project_key(store_dir);
     if let Some(found) = connect(directory, &key) {
         if found.0.build == registry::build_identity() {
             return Ok(found);
         }
-        replace_old_worker(directory, &key, found)?;
+        replace_old_worker(directory, &key, found, resident)?;
     }
-    spawn_worker(directory, &key, store_dir, project_root)?;
+    spawn_worker(directory, &key, store_dir, project_root, resident)?;
     let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
         if let Some(found) = connect(directory, &key) {
@@ -246,6 +255,7 @@ fn replace_old_worker(
     directory: &Path,
     key: &str,
     (descriptor, mut connection): (Descriptor, Connection),
+    resident: bool,
 ) -> Result<(), String> {
     let agents: Vec<AgentInfo> = connection
         .call(&Request::List)
@@ -265,7 +275,7 @@ fn replace_old_worker(
             "the project's background worker runs another build of ha and {working} of its agents are working; `ha shutdown` replaces it once they are done"
         ));
     }
-    if !can_start_worker() {
+    if !resident && !can_start_worker() {
         return Err(
             "the project's background worker runs another build of ha; a terminal replaces it"
                 .to_owned(),
@@ -306,7 +316,15 @@ pub fn recover_journals(directory: &Path) -> usize {
         if connect(directory, &key).is_some() || !journal.project_root.is_dir() {
             continue;
         }
-        if spawn_worker(directory, &key, &journal.store_dir, &journal.project_root).is_ok() {
+        if spawn_worker(
+            directory,
+            &key,
+            &journal.store_dir,
+            &journal.project_root,
+            false,
+        )
+        .is_ok()
+        {
             started += 1;
         }
     }
@@ -320,8 +338,12 @@ fn spawn_worker(
     key: &str,
     store_dir: &Path,
     project_root: &Path,
+    resident: bool,
 ) -> Result<(), String> {
-    if !can_start_worker() {
+    // A resident worker's output goes to its own log, so it cannot hold a
+    // caller's output pipe open. Only this internal session-host path bypasses
+    // the terminal requirement; redirected CLI commands still cannot launch.
+    if !resident && !can_start_worker() {
         return Err(
             "no background worker runs for this project, and one is started from a terminal only"
                 .to_owned(),
@@ -401,17 +423,33 @@ pub fn create_in(context: &LaunchContext, spec: CreateAgent) -> Result<AgentInfo
     create_with_worker(context, spec).map(|(_, info)| info)
 }
 
+pub(super) fn create_from_worker(
+    context: &LaunchContext,
+    spec: CreateAgent,
+) -> Result<AgentInfo, String> {
+    create_with_worker_from(context, spec, true).map(|(_, info)| info)
+}
+
 /// The agent, and the connection that created it: the worker takes more
 /// requests on it, so a terminal can attach without a second handshake.
 fn create_with_worker(
     context: &LaunchContext,
     spec: CreateAgent,
 ) -> Result<(Connection, AgentInfo), String> {
+    create_with_worker_from(context, spec, false)
+}
+
+fn create_with_worker_from(
+    context: &LaunchContext,
+    spec: CreateAgent,
+    resident: bool,
+) -> Result<(Connection, AgentInfo), String> {
     let directory = registry::directory(&context.paths.data_dir);
-    let (_, mut connection) = ensure(
+    let (_, mut connection) = ensure_from(
         &directory,
         &context.project_store_dir(),
         &context.project.root,
+        resident,
     )?;
     let value = connection.call(&Request::Create(Box::new(spec)))?;
     let info = serde_json::from_value(value).map_err(|error| error.to_string())?;

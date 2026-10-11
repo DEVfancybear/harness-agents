@@ -62,6 +62,11 @@ pub enum Request {
     LastAnswer {
         agent: String,
     },
+    /// The answer to one accepted send, independent of later turns.
+    DeliveryAnswer {
+        agent: String,
+        receipt: u64,
+    },
     /// prime-agent's `cron.*`: the agent's `/schedule` with this argument
     /// (`list`, `add <when> -- <prompt>`, `cancel <id>`).
     Schedule {

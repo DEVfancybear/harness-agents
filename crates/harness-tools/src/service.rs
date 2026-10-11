@@ -978,16 +978,24 @@ impl ToolExecutionService {
                 timeout_ms,
                 ..
             } => match &self.external {
-                Some(external) => external
-                    .dispatch_external(
-                        &ToolDispatchAuthorization::after_gate_commit(),
+                Some(external) => {
+                    let authorization = ToolDispatchAuthorization::after_gate_commit();
+                    let dispatch = external.dispatch_external(
+                        &authorization,
                         plugin_id,
                         tool_name,
                         arguments,
                         *timeout_ms,
-                    )
-                    .await
-                    .map(Dispatched::plain),
+                    );
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => Err(HarnessError::new(
+                            ErrorCode::ProviderCanceled,
+                            "external tool call was canceled",
+                        )),
+                        result = dispatch => result.map(Dispatched::plain),
+                    }
+                }
                 None => Err(HarnessError::new(
                     ErrorCode::PolicyDenied,
                     "no external tool dispatcher is configured for this host",

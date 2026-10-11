@@ -220,32 +220,33 @@ pub fn send_command(
     wait: bool,
 ) -> Result<ExitCode, HarnessError> {
     let registry = client::user_registry().map_err(failure)?;
-    let (listed, status) = match client::find(&registry, selector) {
-        Ok(listed) => {
-            let mut connection = client::open(&listed).map_err(failure)?;
-            let value = connection
-                .call(&protocol::Request::Send {
-                    agent: listed.agent.id.clone(),
-                    text,
-                    from,
-                    mode,
-                })
-                .map_err(failure)?;
-            let status = value["status"].as_str().unwrap_or("delivered").to_owned();
-            (listed, status)
-        }
+    let listed = match client::find(&registry, selector) {
+        Ok(listed) => listed,
         // prime-agent wakes a saved session a message is sent to: a
         // conversation of this project, named by its session id, starts again
         // as an agent with the message as its first prompt.
-        Err(unknown) => match wake_saved(&registry, selector, text) {
-            Some(woken) => (woken.map_err(failure)?, "delivered".to_owned()),
+        Err(unknown) => match wake_saved(&registry, selector) {
+            Some(woken) => woken.map_err(failure)?,
             None => return Err(failure(unknown)),
         },
     };
+    let mut connection = client::open(&listed).map_err(failure)?;
+    let value = connection
+        .call(&protocol::Request::Send {
+            agent: listed.agent.id.clone(),
+            text,
+            from,
+            mode,
+        })
+        .map_err(failure)?;
+    let status = value["status"].as_str().unwrap_or("delivered").to_owned();
     if wait {
         // prime-agent's `prompt_and_wait`: the turn the message started runs
         // to its end, and its answer is the result.
-        let answer = wait_for_answer(&registry, &listed.agent.id)?;
+        let receipt = value["receipt"]
+            .as_u64()
+            .ok_or_else(|| failure("the worker did not return a delivery receipt".to_owned()))?;
+        let answer = wait_for_answer(&mut connection, &listed.agent.id, receipt)?;
         if json {
             print_json(&serde_json::json!({
                 "schema_version": 1,
@@ -277,7 +278,6 @@ pub fn send_command(
 fn wake_saved(
     registry: &std::path::Path,
     selector: &str,
-    text: String,
 ) -> Option<Result<client::Listed, String>> {
     harness_types::SessionId::parse(selector.to_owned()).ok()?;
     Some((|| {
@@ -290,10 +290,7 @@ fn wake_saved(
             explicit_data_dir: None,
         })
         .map_err(|error| error.to_string())?;
-        let overrides = super::config::ConfigOverrides {
-            initial_prompt: Some(text),
-            ..super::config::ConfigOverrides::default()
-        };
+        let overrides = super::config::ConfigOverrides::default();
         let spec = spec_for_launch(
             &context,
             &environment,
@@ -309,25 +306,22 @@ fn wake_saved(
 
 /// Wait until agent `id` has started on what was sent and gone idle again,
 /// then read its answer.
-fn wait_for_answer(registry: &std::path::Path, id: &str) -> Result<String, HarnessError> {
-    let started = std::time::Instant::now();
-    let mut seen_working = false;
+fn wait_for_answer(
+    connection: &mut client::Connection,
+    id: &str,
+    receipt: u64,
+) -> Result<String, HarnessError> {
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let listed = client::find(registry, id).map_err(failure)?;
-        let working = listed.agent.status != "ready" || listed.agent.busy;
-        seen_working |= working;
-        // A message that started nothing visible within a few seconds has
-        // been answered already, or was queued behind nothing.
-        if !working && (seen_working || started.elapsed() > std::time::Duration::from_secs(5)) {
-            let mut connection = client::open(&listed).map_err(failure)?;
-            let value = connection
-                .call(&protocol::Request::LastAnswer {
-                    agent: id.to_owned(),
-                })
-                .map_err(failure)?;
-            return Ok(value["text"].as_str().unwrap_or_default().to_owned());
+        let value = connection
+            .call(&protocol::Request::DeliveryAnswer {
+                agent: id.to_owned(),
+                receipt,
+            })
+            .map_err(failure)?;
+        if let Some(answer) = value["text"].as_str() {
+            return Ok(answer.to_owned());
         }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
