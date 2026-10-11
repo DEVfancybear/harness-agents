@@ -2663,13 +2663,18 @@ fn q08_pty_fork_then_answer() {
             Reply::Text("answer-one".to_owned())
         }
     });
-    let (_temp, mut session) = scripted_session(&provider);
+    let (temp, mut session) = scripted_session(&provider);
+    let project = temp.path().join("project with spaces");
     session.send("first ask\r");
     session.wait_for("answer-one", Duration::from_mins(1));
+    wait_for_idle_agent(&temp, &project, Duration::from_mins(1));
     session.send("second ask\r");
     session.wait_for("answer-two", Duration::from_mins(1));
+    wait_for_idle_agent(&temp, &project, Duration::from_mins(1));
     session.send("third ask\r");
     session.wait_for("answer-three", Duration::from_mins(1));
+    // The answer can stream before RunTerminal makes /fork available.
+    wait_for_idle_agent(&temp, &project, Duration::from_mins(1));
     // Like every command with an optional argument, the first Enter types
     // `/fork ` from the menu and the second runs it.
     session.send("/fork\r");

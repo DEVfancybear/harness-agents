@@ -54,7 +54,14 @@ def _serialized_state(*, writable: bool = False):
             if writable and method.__name__ != "save":
                 target._ensure_local_writable()
             with target._transaction(writable=writable):
-                return method(self, *args, **kwargs)
+                try:
+                    return method(self, *args, **kwargs)
+                except Exception:
+                    if method.__name__ == "save" and target.file_path is not None:
+                        # A failed atomic write must not leave unsaved entries in
+                        # the cache, looking as though the mutation succeeded.
+                        target.load()
+                    raise
         return locked
     return decorate
 
@@ -121,7 +128,7 @@ def _harness_query_terms(query: str) -> list[str]:
     """
     terms: list[str] = []
     seen: set[str] = set()
-    for run in _harness_query_runs(query.lower()):
+    for run in _harness_query_runs(unicodedata.normalize("NFC", query).lower()):
         if _CJK_TERM_CHARS.search(run):
             # Bigrams keep whitespace-free CJK findable without single
             # characters matching too loosely.
@@ -591,7 +598,22 @@ class HarnessState:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             if existing_mode is not None:
                 os.chmod(temp_path, existing_mode)
-            os.replace(temp_path, target_path)
+            deadline = time.monotonic() + 1.0
+            while True:
+                try:
+                    os.replace(temp_path, target_path)
+                    break
+                except OSError as exc:
+                    # Windows readers and scanners can briefly deny deletion of
+                    # the destination. Keep the transaction and atomic temp file
+                    # until they close; permanent failures still reach the caller.
+                    if (
+                        os.name != "nt"
+                        or getattr(exc, "winerror", None) not in (5, 32, 33)
+                        or time.monotonic() >= deadline
+                    ):
+                        raise
+                    time.sleep(0.02)
         finally:
             temp_path.unlink(missing_ok=True)
         self._loaded_revision = self._disk_revision()
@@ -1133,15 +1155,19 @@ class HarnessState:
             return []
 
         entries = self.list(kind, **kwargs) if kind is not None else self.list(None, **kwargs)
+        fields_by_entry = {
+            id(entry): tuple(
+                unicodedata.normalize("NFC", text).lower()
+                for text in (entry.title, entry.content, f"{entry.path} {entry.id}")
+            )
+            for entry in entries
+        }
 
         # Document frequency per term over the ranked corpus: a term in
         # every entry weighs log(2), a term in one entry of N weighs
         # log(1 + N), so rare distinctive terms outrank ubiquitous ones.
         matches: dict[str, int] = {term: 0 for term in terms}
-        for entry in entries:
-            title = entry.title.lower()
-            content = entry.content.lower()
-            path_and_id = f"{entry.path} {entry.id}".lower()
+        for title, content, path_and_id in fields_by_entry.values():
             for term in terms:
                 if term in title or term in content or term in path_and_id:
                     matches[term] += 1
@@ -1152,9 +1178,7 @@ class HarnessState:
         }
 
         def score(entry: HarnessEntry) -> float:
-            title = entry.title.lower()
-            content = entry.content.lower()
-            path_and_id = f"{entry.path} {entry.id}".lower()
+            title, content, path_and_id = fields_by_entry[id(entry)]
             total = 0.0
             for term, idf in term_idf.items():
                 fields = (1 if term in title else 0) + (1 if term in content else 0) + (
@@ -1167,9 +1191,13 @@ class HarnessState:
         def recency(entry: HarnessEntry) -> str:
             return entry.updated_at if isinstance(entry.updated_at, str) else ""
 
-        ranked = sorted(entries, key=lambda e: (score(e), recency(e)), reverse=True)
-        ranked = [e for e in ranked if score(e) > 0]
-        return ranked[:limit]
+        scored = [(score(entry), entry) for entry in entries]
+        ranked = sorted(
+            (item for item in scored if item[0] > 0),
+            key=lambda item: (item[0], recency(item[1])),
+            reverse=True,
+        )
+        return [entry for _, entry in ranked[:limit]]
 
     def snapshot(self, *, global_: bool = False, **kwargs: Any) -> dict[str, Any]:
         if target := self._global_target(global_, kwargs):

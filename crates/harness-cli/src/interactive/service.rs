@@ -3539,6 +3539,7 @@ impl AgentSessionService {
     fn show_conversation(&self, source: SessionId) {
         let sender = self.sender.clone();
         let resumed_task = Arc::clone(&self.resumed_task);
+        let selected = Arc::clone(&self.previous_session);
         let store_dir = self.store_dir.clone();
         let schedules = Arc::clone(&self.schedules);
         let heartbeats = Arc::clone(&self.heartbeats);
@@ -3559,15 +3560,23 @@ impl AgentSessionService {
             };
             let goal = match store.session_task(&source).await {
                 Ok(Some(task)) => {
-                    if let Ok(mut resumed) = resumed_task.lock() {
-                        *resumed = Some(task.as_str().to_owned());
+                    {
+                        // /new, /fork or another resume may have won while the
+                        // store was opening. Bind only the still-selected source,
+                        // holding its lock through the related state changes.
+                        let Ok(previous) = selected.lock() else {
+                            return;
+                        };
+                        if previous.as_ref() != Some(&source) {
+                            return;
+                        }
+                        if let Ok(mut resumed) = resumed_task.lock() {
+                            *resumed = Some(task.as_str().to_owned());
+                        }
+                        schedules.bind(super::schedules::path_for(&data_dir, task.as_str()));
+                        heartbeats.bind(super::heartbeat::path_for(&data_dir, task.as_str()));
+                        agents.bind_ledger(task.as_str());
                     }
-                    // The resumed conversation's scheduled jobs come back with it.
-                    schedules.bind(super::schedules::path_for(&data_dir, task.as_str()));
-                    heartbeats.bind(super::heartbeat::path_for(&data_dir, task.as_str()));
-                    // prime-agent: a reopened conversation lists and reaches its
-                    // children again.
-                    agents.bind_ledger(task.as_str());
                     store
                         .session_setting(&task, super::goal::GOAL_SETTING)
                         .await
@@ -3577,21 +3586,30 @@ impl AgentSessionService {
                 }
                 _ => None,
             };
-            match harness_runtime::conversation_history(&store, &source).await {
-                Ok(history) => {
-                    let _ = sender.send(SessionEvent::ConversationRestored {
-                        turns: history.turns(),
-                        omitted: history.omitted,
-                        summarized: history.summary.is_some(),
-                    });
-                    if let Some(objective) = goal {
-                        let _ = sender.send(SessionEvent::GoalRestored { objective });
-                    }
+            let history = harness_runtime::conversation_history(&store, &source).await;
+            {
+                let Ok(previous) = selected.lock() else {
+                    return;
+                };
+                if previous.as_ref() != Some(&source) {
+                    return;
                 }
-                Err(error) => {
-                    let _ = sender.send(SessionEvent::RecoverableError {
-                        message: format!("the resumed conversation could not be read: {error}"),
-                    });
+                match history {
+                    Ok(history) => {
+                        let _ = sender.send(SessionEvent::ConversationRestored {
+                            turns: history.turns(),
+                            omitted: history.omitted,
+                            summarized: history.summary.is_some(),
+                        });
+                        if let Some(objective) = goal {
+                            let _ = sender.send(SessionEvent::GoalRestored { objective });
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(SessionEvent::RecoverableError {
+                            message: format!("the resumed conversation could not be read: {error}"),
+                        });
+                    }
                 }
             }
             let _ = store.close().await;
@@ -6177,6 +6195,12 @@ impl AgentSessionService {
     /// A new conversation, as `/new` starts one, that its first turn will
     /// continue from the fork point.
     fn start_fork(&mut self, plan: ForkPlan) {
+        if let Ok(mut previous) = self.previous_session.lock() {
+            *previous = None;
+            if let Ok(mut resumed) = self.resumed_task.lock() {
+                *resumed = None;
+            }
+        }
         self.branch_plan = None;
         self.agents.reset();
         // The next conversation reads its own tier.
@@ -6190,9 +6214,6 @@ impl AgentSessionService {
         self.follow_schedules();
         if let Ok(mut tracker) = self.cost_tracker.lock() {
             tracker.forget_context();
-        }
-        if let Ok(mut previous) = self.previous_session.lock() {
-            *previous = None;
         }
         self.fork_plan = Some(plan);
         // The fork carries the conversation it came from: it is resumed, not new.

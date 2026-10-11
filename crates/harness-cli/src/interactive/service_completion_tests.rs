@@ -182,6 +182,112 @@ async fn read_http(socket: &mut tokio::net::TcpStream) -> String {
     }
 }
 
+#[tokio::test]
+async fn a_fork_of_a_resumed_session_reports_its_new_conversation() {
+    let temp = tempfile::tempdir().expect("project");
+    let environment =
+        LaunchEnvironment::from_pairs([("HA_HOME", temp.path().join("home").into_os_string())]);
+    let context = bootstrap::resolve(LaunchRequest {
+        cwd: None,
+        caller_dir: temp.path().to_path_buf(),
+        platform: HostPlatform::current(),
+        environment: environment.clone(),
+        explicit_data_dir: None,
+    })
+    .expect("context");
+    let channel = SessionChannel::new();
+    let mut service = AgentSessionService::new(&context, environment, channel.sender());
+    let resumed = TaskId::generate();
+    let source = SessionId::generate();
+    *service.resumed_task.lock().expect("resumed task") = Some(resumed.as_str().to_owned());
+    *service.previous_session.lock().expect("source") = Some(source.clone());
+    service.clone_conversation().expect("clone");
+    let cloned = service.conversation_id().expect("clone identity");
+    assert_ne!(
+        cloned,
+        resumed.as_str(),
+        "the worker must journal the clone, not its parent"
+    );
+    assert_eq!(cloned, service.task_id.as_str());
+    // /fork uses the same transition, including when its source was resumed.
+    *service.resumed_task.lock().expect("resumed task") = Some(resumed.as_str().to_owned());
+    service.fork(source.as_str(), true).expect("fork");
+    assert_eq!(
+        service.conversation_id().as_deref(),
+        Some(service.task_id.as_str())
+    );
+    assert_ne!(service.conversation_id().as_deref(), Some(cloned.as_str()));
+}
+
+#[tokio::test]
+async fn a_late_resume_lookup_cannot_rebind_a_new_conversation() {
+    let temp = tempfile::tempdir().expect("project");
+    let environment =
+        LaunchEnvironment::from_pairs([("HA_HOME", temp.path().join("home").into_os_string())]);
+    let context = bootstrap::resolve(LaunchRequest {
+        cwd: None,
+        caller_dir: temp.path().to_path_buf(),
+        platform: HostPlatform::current(),
+        environment: environment.clone(),
+        explicit_data_dir: None,
+    })
+    .expect("context");
+    let source = SessionId::generate();
+    let source_task = TaskId::generate();
+    let store = Arc::new(
+        SqliteStore::open_writer(WriterOpenOptions::new(
+            context.project_store_dir(),
+            HostId::generate(),
+        ))
+        .await
+        .expect("store"),
+    );
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        Arc::new(harness_providers::MockProvider::text("previous answer")),
+        RuntimeConfig::default(),
+    );
+    runtime
+        .run(RunRequest::new(
+            source.clone(),
+            source_task,
+            InputId::generate(),
+            "previous question",
+            observe_workspace(ProjectId::generate(), temp.path()).expect("workspace"),
+        ))
+        .await
+        .expect("seed");
+    drop(runtime);
+    Arc::try_unwrap(store)
+        .expect("store owner")
+        .close()
+        .await
+        .expect("close");
+    let mut channel = SessionChannel::new();
+    let mut service = AgentSessionService::new(&context, environment, channel.sender());
+    service
+        .resume(Some(source.as_str().to_owned()))
+        .expect("resume");
+    // On the current-thread runtime, the background lookup cannot run until
+    // this test yields; /new wins the selection before the old lookup starts.
+    service.resume(None).expect("new");
+    let new_conversation = service.conversation_id().expect("new identity");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        service.conversation_id().as_deref(),
+        Some(new_conversation.as_str())
+    );
+    for event in channel.drain() {
+        assert!(
+            !matches!(
+                event,
+                SessionEvent::ConversationRestored { .. } | SessionEvent::GoalRestored { .. }
+            ),
+            "a stale lookup must not restore the abandoned view: {event:?}"
+        );
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn resume_flow() {
     let temp = tempfile::tempdir().expect("temp project");

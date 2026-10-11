@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use harness_session::{ContextBlock, ContextBlockKind};
 use serde_json::{Map, Value};
+use unicode_normalization::UnicodeNormalization as _;
 
 /// The entry kinds, in the order prime-agent renders them.
 const KINDS: [&str; 4] = ["prompt", "memory", "skill", "subagent"];
@@ -164,10 +165,15 @@ fn is_term_character(character: char) -> bool {
 
 /// `harnessQueryTerms`: lowercase runs of letters, digits and marks; a CJK run
 /// becomes overlapping bigrams, since it has no spaces between words; other runs
-/// shorter than four characters are noise and dropped. Each term once, in order.
+/// shorter than four characters are dropped for ASCII conversation text.
+/// Other spaced scripts keep short words, with common Vietnamese noise removed.
+/// Each term once, in order, with canonically equivalent Unicode normalized.
 #[must_use]
 pub fn query_terms(text: &str) -> Vec<String> {
-    let lowered = text.to_lowercase();
+    let lowered = normalized_search_text(text);
+    let short_words = lowered
+        .chars()
+        .any(|character| character.is_alphabetic() && !character.is_ascii() && !is_cjk(character));
     let mut terms = Vec::new();
     let push = |term: String, terms: &mut Vec<String>| {
         if !terms.contains(&term) {
@@ -196,8 +202,33 @@ pub fn query_terms(text: &str) -> Vec<String> {
                         push(pair.iter().collect(), &mut terms);
                     }
                 }
-            } else if segment.len() >= 4 {
-                push(segment.iter().collect(), &mut terms);
+            } else {
+                let term: String = segment.iter().collect();
+                let short_noise = matches!(
+                    term.as_str(),
+                    "tôi"
+                        | "và"
+                        | "bạn"
+                        | "của"
+                        | "là"
+                        | "các"
+                        | "cho"
+                        | "với"
+                        | "một"
+                        | "hãy"
+                        | "có"
+                        | "này"
+                        | "đó"
+                        | "để"
+                        | "về"
+                        | "như"
+                        | "khi"
+                        | "thì"
+                        | "nên"
+                );
+                if segment.len() >= 4 || (short_words && segment.len() >= 2 && !short_noise) {
+                    push(term, &mut terms);
+                }
             }
             start = end;
         }
@@ -232,11 +263,15 @@ pub fn weighted_terms(goal: Option<&str>, recent_newest_first: &[&str]) -> Vec<(
     terms
 }
 
+fn normalized_search_text(text: &str) -> String {
+    text.nfc().collect::<String>().to_lowercase()
+}
+
 fn searchable(entry: &Entry) -> (String, String, String) {
     (
-        entry.title.clone().unwrap_or_default().to_lowercase(),
-        entry.content.clone().unwrap_or_default().to_lowercase(),
-        format!("{} {}", entry.path.to_lowercase(), entry.id.to_lowercase()),
+        normalized_search_text(entry.title.as_deref().unwrap_or_default()),
+        normalized_search_text(entry.content.as_deref().unwrap_or_default()),
+        normalized_search_text(&format!("{} {}", entry.path, entry.id)),
     )
 }
 
@@ -592,5 +627,56 @@ mod tests {
         let digest = format_digest(&super::State::default(), DigestOptions::default(), &[]);
         assert!(digest.contains("No saved harness entries yet."));
         assert!(digest.contains("routing/context hints only"));
+    }
+
+    fn retrieval_fixture() -> super::State {
+        let directory = tempfile::tempdir().expect("state");
+        let mut memories = serde_json::Map::new();
+        for number in 0..12 {
+            memories.insert(
+                format!("alpha-{number}"),
+                json!({
+                    "title": format!("Alpha {number}"), "content": "Unrelated fixture item"
+                }),
+            );
+        }
+        memories.insert(
+            "printer".to_owned(),
+            json!({
+                "title": "Zebra Máy in", "content": "PRINTER=orange-63"
+            }),
+        );
+        memories.insert(
+            "config".to_owned(),
+            json!({
+                "title": "Zebra Cấu hình", "content": "CONFIG=violet-64"
+            }),
+        );
+        write(directory.path(), &json!({"entries":{"memory":memories}}));
+        load(directory.path(), "local")
+    }
+
+    #[test]
+    fn short_vietnamese_words_route_the_relevant_memory() {
+        let digest = format_digest(
+            &retrieval_fixture(),
+            DigestOptions::default(),
+            &weighted_terms(None, &["tôi và bạn hỏi về máy in"]),
+        );
+        assert!(digest.contains("PRINTER=orange-63"), "{digest}");
+        assert_eq!(query_terms("tôi và bạn máy in"), ["máy", "in"]);
+    }
+
+    #[test]
+    fn canonically_equivalent_unicode_routes_the_same_memory() {
+        let state = retrieval_fixture();
+        for query in ["cấu hình", "ca\u{0302}\u{0301}u hi\u{0300}nh"] {
+            let digest = format_digest(
+                &state,
+                DigestOptions::default(),
+                &weighted_terms(None, &[query]),
+            );
+            assert!(digest.contains("CONFIG=violet-64"), "{digest}");
+        }
     }
 }

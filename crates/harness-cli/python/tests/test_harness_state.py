@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unicodedata
 from unittest.mock import patch
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "rlm" / "harness.py"
@@ -124,6 +125,48 @@ for number in range(24):
         self.assertEqual(self.state().list("memory"), [])
         self.assertFalse(reopened.delete_memory("language"))
 
+    @unittest.skipUnless(os.name == "nt", "Windows readers can deny atomic replacement")
+    def test_brief_external_reader_does_not_fail_memory_save(self):
+        state = self.state()
+        state.create_memory("Existing", "Keep this memory", id="existing")
+        ready = threading.Event()
+
+        def read():
+            with self.path.open("rb"):
+                ready.set()
+                time.sleep(0.25)
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        try:
+            self.assertTrue(ready.wait(5))
+            state.create_memory("Next", "Saved after the reader closes", id="next")
+        finally:
+            reader.join(timeout=5)
+        self.assertEqual(
+            {entry.id for entry in self.state().list("memory")},
+            {"existing", "next"},
+        )
+        self.assertEqual(list(self.root.glob("*.tmp")), [])
+
+    def test_failed_save_restores_cache_to_persisted_memory(self):
+        state = self.state()
+        state.create_memory("Existing", "Original", id="existing")
+        operations = (
+            lambda: state.create_memory("New", "Not saved", id="new"),
+            lambda: state.update_memory("existing", "Changed", "Not saved"),
+            lambda: state.delete_memory("existing"),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation):
+                with patch.object(harness.os, "replace", side_effect=PermissionError("permanent denial")):
+                    with self.assertRaises(PermissionError):
+                        operation()
+                self.assertEqual(state.get("memory", "existing").content, "Original")
+                self.assertEqual(state.get("memory", "existing").version, 1)
+                self.assertIsNone(state.get("memory", "new"))
+                self.assertEqual(list(self.root.glob("*.tmp")), [])
+
     def test_removed_state_file_clears_cached_memories(self):
         state = self.state()
         state.create_memory("Removed", "This entry was removed", id="removed")
@@ -175,6 +218,15 @@ for number in range(24):
             self.assertEqual(state.get("memory", "same", global_=True).content, "Every conversation")
             self.assertEqual(harness.HarnessState(local_dir / "harness_state.json").get("memory", "same").scope, "local")
             self.assertEqual(harness.HarnessState(global_dir / "harness_state.json", scope="global").get("memory", "same").scope, "global")
+
+    def test_search_matches_canonically_equivalent_unicode(self):
+        state = self.state()
+        state.create_memory("Cấu hình", "Keep this configuration", id="config")
+        state.create_memory(unicodedata.normalize("NFD", "Độ trễ"), "Keep this latency", id="latency")
+        for query in ["cấu hình", unicodedata.normalize("NFD", "cấu hình")]:
+            self.assertEqual([entry.id for entry in state.search(query)], ["config"])
+        for query in ["độ trễ", unicodedata.normalize("NFD", "độ trễ")]:
+            self.assertEqual([entry.id for entry in state.search(query)], ["latency"])
 
     def test_corrupt_and_non_object_state_are_empty(self):
         for raw in ["{broken", "null", "[]", '"text"', '{"entries": {"memory": {"broken": {"title": 5}}}}']:
