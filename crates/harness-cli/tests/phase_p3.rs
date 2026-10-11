@@ -149,7 +149,7 @@ async fn review_p3_large_invalid_utf8_is_not_silently_repaired() {
 async fn review_p3_search_redacts_before_truncation() {
     let temp = TempDir::new().unwrap();
     let root = setup_workspace(&temp);
-    let line = format!("FAKE_VALUE_ONLY_FOR_TEST {} token", "x".repeat(300));
+    let line = format!("api_key=FAKE_VALUE_ONLY_FOR_TEST {}", "x".repeat(300));
     fs::write(root.join("output.txt"), line).unwrap();
     let store = writer(&temp).await;
     let (session, task, _) = admit(&store, &root).await;
@@ -174,6 +174,7 @@ async fn review_p3_search_redacts_before_truncation() {
         panic!("expected search output")
     };
     assert_eq!(matches.len(), 1);
+    assert!(matches[0].preview.contains("api_key=[REDACTED]"));
     assert!(!matches[0].preview.contains("FAKE_VALUE_ONLY_FOR_TEST"));
     drop(tools);
     close_writer(store).await;
@@ -1371,7 +1372,7 @@ async fn p3_c29_secret_output_is_redacted_and_artifact_scope_is_enforced() {
     let root = setup_workspace(&temp);
     fs::write(
         root.join("notes.txt"),
-        "api_key=fixture-secret-value\nnormal=visible\n",
+        "api_key=fixture-secret-value\nnormal=visible\nRead source.txt and copy its source token into artifact.txt.\n",
     )
     .expect("secret fixture file");
     let store = writer(&temp).await;
@@ -1398,6 +1399,7 @@ async fn p3_c29_secret_output_is_redacted_and_artifact_scope_is_enforced() {
     };
     assert!(content.contains("api_key=[REDACTED]"));
     assert!(!content.contains("fixture-secret-value"));
+    assert!(content.contains("copy its source token into artifact.txt"));
     let receipt = view.receipt.expect("read has receipt");
     let artifact_id = receipt.artifact_id.expect("redacted output has artifact");
     assert!(

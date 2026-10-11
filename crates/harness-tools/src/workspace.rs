@@ -1080,31 +1080,47 @@ pub(crate) fn plan_edit_text(
 }
 
 pub(crate) fn redact_text(text: &str) -> String {
-    text.split_inclusive('\n')
-        .map(|segment| {
-            let lower = segment.to_ascii_lowercase();
-            let sensitive = [
+    let mut redacted = String::with_capacity(text.len());
+    for segment in text.split_inclusive('\n') {
+        // Match a secret field being assigned a value. A mention in prose
+        // or an identifier such as token_count is not itself a secret.
+        let sensitive = segment.match_indices(['=', ':']).find(|(index, _)| {
+            let before = segment[..*index].trim_end().trim_end_matches(['"', '\'']);
+            let key = before
+                .rsplit(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .replace(['_', '-'], "");
+            [
                 "secret",
+                "secretkey",
                 "token",
                 "password",
-                "api_key",
+                "apikey",
                 "credential",
+                "credentials",
                 "authorization",
             ]
             .iter()
-            .any(|needle| lower.contains(needle));
-            if !sensitive {
-                return segment.to_owned();
-            }
-            let ending = if segment.ends_with('\n') { "\n" } else { "" };
-            let body = segment.strip_suffix('\n').unwrap_or(segment);
-            if let Some(index) = body.find(['=', ':']) {
-                format!("{}=[REDACTED]{ending}", &body[..index])
-            } else {
-                format!("[REDACTED]{ending}")
-            }
-        })
-        .collect()
+            .any(|suffix| key.ends_with(suffix))
+        });
+        let Some((index, _)) = sensitive else {
+            redacted.push_str(segment);
+            continue;
+        };
+        let ending = if segment.ends_with("\r\n") {
+            "\r\n"
+        } else if segment.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+        redacted.push_str(&segment[..index]);
+        redacted.push_str("=[REDACTED]");
+        redacted.push_str(ending);
+    }
+    redacted
 }
 
 /// Classify a failure to open or inspect a directory during the walk.
@@ -1669,6 +1685,46 @@ fn is_sensitive_relative(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redaction_preserves_delegation_instructions_and_code() {
+        for text in [
+            "Read source.txt and copy its source token into artifact.txt.\n",
+            "Send this message: verify the source token and return the result.\n",
+            "The password reset flow requires authorization.\r\n",
+            "token_count: 42\ntokenizer: parse(source)\n",
+            "fn credentials_available() -> bool { true }\n",
+        ] {
+            assert_eq!(
+                redact_text(text),
+                text,
+                "ordinary text must remain readable"
+            );
+        }
+    }
+
+    #[test]
+    fn redaction_still_hides_secret_field_values() {
+        for key in [
+            "api_key",
+            "MY_API_TOKEN",
+            "client_secret",
+            "SECRET_KEY",
+            "sessionToken",
+            "password",
+            "Authorization",
+            "credential",
+        ] {
+            for text in [
+                format!("{key}=fixture-sensitive-value\n"),
+                format!("{{\"{key}\": \"fixture-sensitive-value\"}}\n"),
+            ] {
+                let redacted = redact_text(&text);
+                assert!(redacted.contains("[REDACTED]"), "{key} must be hidden");
+                assert!(!redacted.contains("fixture-sensitive-value"));
+            }
+        }
+    }
 
     /// A file deleted between the walk and the hash is a race the workspace
     /// loses all the time - a browser cache under a home folder deletes its
