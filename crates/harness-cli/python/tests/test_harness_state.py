@@ -228,6 +228,27 @@ for number in range(24):
         for query in ["độ trễ", unicodedata.normalize("NFD", "độ trễ")]:
             self.assertEqual([entry.id for entry in state.search(query)], ["latency"])
 
+    def test_search_keeps_short_words_across_scripts(self):
+        state = self.state()
+        queries = ["go ui", "máy in", "le thé", "миф", "خط", "गति", "登录"]
+        for number, query in enumerate(queries):
+            state.create_memory(query, "CANARY", id=f"language-{number}")
+        for number, query in enumerate(queries):
+            with self.subTest(query=query):
+                self.assertEqual(
+                    [entry.id for entry in state.search(query)],
+                    [f"language-{number}"],
+                )
+
+    def test_search_discounts_common_terms_without_stopwords(self):
+        state = self.state()
+        for number in range(24):
+            state.create_memory(f"Alpha we can use {number}", "we can use", id=f"alpha-{number}")
+        for number in range(12):
+            state.create_memory(f"Other {number}", "Unrelated", id=f"other-{number}")
+        state.create_memory("Zebra UI", "RESULT=42", id="target")
+        self.assertEqual(state.search("we can use ui", limit=1)[0].id, "target")
+
     def test_corrupt_and_non_object_state_are_empty(self):
         for raw in ["{broken", "null", "[]", '"text"', '{"entries": {"memory": {"broken": {"title": 5}}}}']:
             with self.subTest(raw=raw):

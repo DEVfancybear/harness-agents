@@ -164,16 +164,13 @@ fn is_term_character(character: char) -> bool {
 }
 
 /// `harnessQueryTerms`: lowercase runs of letters, digits and marks; a CJK run
-/// becomes overlapping bigrams, since it has no spaces between words; other runs
-/// shorter than four characters are dropped for ASCII conversation text.
-/// Other spaced scripts keep short words, with common Vietnamese noise removed.
+/// becomes overlapping bigrams, since it has no spaces between words. Other runs
+/// retain at least two characters across scripts. Document frequency discounts
+/// common words without language-specific stoplists.
 /// Each term once, in order, with canonically equivalent Unicode normalized.
 #[must_use]
 pub fn query_terms(text: &str) -> Vec<String> {
     let lowered = normalized_search_text(text);
-    let short_words = lowered
-        .chars()
-        .any(|character| character.is_alphabetic() && !character.is_ascii() && !is_cjk(character));
     let mut terms = Vec::new();
     let push = |term: String, terms: &mut Vec<String>| {
         if !terms.contains(&term) {
@@ -202,33 +199,8 @@ pub fn query_terms(text: &str) -> Vec<String> {
                         push(pair.iter().collect(), &mut terms);
                     }
                 }
-            } else {
-                let term: String = segment.iter().collect();
-                let short_noise = matches!(
-                    term.as_str(),
-                    "tôi"
-                        | "và"
-                        | "bạn"
-                        | "của"
-                        | "là"
-                        | "các"
-                        | "cho"
-                        | "với"
-                        | "một"
-                        | "hãy"
-                        | "có"
-                        | "này"
-                        | "đó"
-                        | "để"
-                        | "về"
-                        | "như"
-                        | "khi"
-                        | "thì"
-                        | "nên"
-                );
-                if segment.len() >= 4 || (short_words && segment.len() >= 2 && !short_noise) {
-                    push(term, &mut terms);
-                }
+            } else if segment.len() >= 2 {
+                push(segment.iter().collect(), &mut terms);
             }
             start = end;
         }
@@ -275,7 +247,8 @@ fn searchable(entry: &Entry) -> (String, String, String) {
     )
 }
 
-/// `harnessQueryTermIdf`: `ln(1 + documents / matches)` per term that matches.
+/// Smoothed corpus IDF: ubiquitous terms approach zero without a stoplist,
+/// while matching terms retain a positive score even in a one-entry corpus.
 fn idf(entries: &[Entry], terms: &[(String, f64)]) -> BTreeMap<String, f64> {
     let fields = entries.iter().map(searchable).collect::<Vec<_>>();
     #[allow(
@@ -295,7 +268,11 @@ fn idf(entries: &[Entry], terms: &[(String, f64)]) -> BTreeMap<String, f64> {
             .count();
         if matches > 0 {
             #[allow(clippy::cast_precision_loss, reason = "small counts")]
-            weights.insert(term.clone(), (1.0 + documents / matches as f64).ln());
+            let matches = matches as f64;
+            weights.insert(
+                term.clone(),
+                ((documents - matches + 0.5) / (matches + 0.5)).ln_1p(),
+            );
         }
     }
     weights
@@ -551,13 +528,16 @@ mod tests {
     }
 
     #[test]
-    fn query_terms_follow_prime_agent() {
-        assert_eq!(query_terms("Fix the worktree? now"), ["worktree"]);
+    fn query_terms_preserve_words_without_language_stoplists() {
+        assert_eq!(
+            query_terms("Fix the worktree? now"),
+            ["fix", "the", "worktree", "now"]
+        );
         assert_eq!(query_terms("修复登录"), ["修复", "复登", "登录"]);
         assert_eq!(query_terms("naïve naïve"), ["naïve"]);
         // Vietnamese words are letters, so they count like any other script.
         assert_eq!(query_terms("người dùng thích"), ["người", "dùng", "thích"]);
-        assert_eq!(query_terms("tôi và bạn"), Vec::<String>::new());
+        assert_eq!(query_terms("tôi và bạn"), ["tôi", "và", "bạn"]);
     }
 
     #[test]
@@ -664,7 +644,7 @@ mod tests {
             &weighted_terms(None, &["tôi và bạn hỏi về máy in"]),
         );
         assert!(digest.contains("PRINTER=orange-63"), "{digest}");
-        assert_eq!(query_terms("tôi và bạn máy in"), ["máy", "in"]);
+        assert_eq!(query_terms("máy in"), ["máy", "in"]);
     }
 
     #[test]
@@ -678,5 +658,71 @@ mod tests {
             );
             assert!(digest.contains("CONFIG=violet-64"), "{digest}");
         }
+    }
+
+    #[test]
+    fn short_queries_route_memory_across_scripts() {
+        let directory = tempfile::tempdir().expect("state");
+        let mut memories = serde_json::Map::new();
+        for number in 0..12 {
+            memories.insert(
+                format!("alpha-{number}"),
+                json!({"title": format!("Alpha {number}"), "content": "Unrelated fixture"}),
+            );
+        }
+        let queries = ["go ui", "máy in", "le thé", "миф", "خط", "गति", "登录"];
+        for (number, query) in queries.iter().enumerate() {
+            memories.insert(
+                format!("language-{number}"),
+                json!({"title": format!("Zebra {query}"), "content": format!("CANARY={number}")}),
+            );
+        }
+        write(directory.path(), &json!({"entries":{"memory":memories}}));
+        let state = load(directory.path(), "local");
+        for (number, query) in queries.iter().enumerate() {
+            let digest = format_digest(
+                &state,
+                DigestOptions::default(),
+                &weighted_terms(None, &[query]),
+            );
+            assert!(
+                digest.contains(&format!("CANARY={number}")),
+                "query {query:?}: {digest}"
+            );
+        }
+    }
+
+    #[test]
+    fn common_words_do_not_hide_a_distinctive_short_term() {
+        let directory = tempfile::tempdir().expect("state");
+        let mut memories = serde_json::Map::new();
+        for number in 0..24 {
+            memories.insert(
+                format!("alpha-{number}"),
+                json!({"title": format!("Alpha we can use {number}"), "content": "we can use"}),
+            );
+        }
+        for number in 0..12 {
+            memories.insert(
+                format!("other-{number}"),
+                json!({"title": format!("Other {number}"), "content": "Unrelated"}),
+            );
+        }
+        memories.insert(
+            "target".to_owned(),
+            json!({"title": "Zebra UI", "content": "RESULT=42"}),
+        );
+        write(directory.path(), &json!({"entries":{"memory":memories}}));
+        let digest = format_digest(
+            &load(directory.path(), "local"),
+            DigestOptions::default(),
+            &weighted_terms(None, &["we can use ui"]),
+        );
+        assert!(digest.contains("RESULT=42"), "{digest}");
+        assert!(
+            digest.find("[local:target]").expect("target")
+                < digest.find("[local:alpha-").expect("alpha"),
+            "{digest}"
+        );
     }
 }

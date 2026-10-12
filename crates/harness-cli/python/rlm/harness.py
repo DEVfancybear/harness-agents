@@ -120,11 +120,10 @@ def _harness_query_terms(query: str) -> list[str]:
     marks. CJK runs carry no spaces between words, so each run becomes
     overlapping bigrams: ``修复登录`` yields ``修复``/``复登``/``登录`` and
     still matches an entry containing ``登录故障``. Each term counts once.
-    Minimum lengths stay below the digest builder's four-character cut
-    because ``search`` tokenizes explicit queries, not mined conversation:
-    three ASCII characters keep real terms (rlm, api, cli), two characters
-    keep short words of other scripts (мир), and single characters are
-    terms only for CJK, where one character is a word.
+    Runs of at least two characters are retained across scripts, including
+    short technical terms such as ``go`` and ``ui``. There are no language
+    stoplists; search discounts common terms using document frequency.
+    Single characters are terms only for CJK, where one character is a word.
     """
     terms: list[str] = []
     seen: set[str] = set()
@@ -133,11 +132,8 @@ def _harness_query_terms(query: str) -> list[str]:
             # Bigrams keep whitespace-free CJK findable without single
             # characters matching too loosely.
             candidates = [run[i : i + 2] for i in range(len(run) - 1)] or [run]
-        elif run.isascii():
-            candidates = [run] if len(run) >= 3 else []
         else:
-            # Other scripts space out words: lone characters match too
-            # broadly, so two characters is the floor.
+            # Lone characters match too broadly in spaced scripts.
             candidates = [run] if len(run) >= 2 else []
         for term in candidates:
             if term not in seen:
@@ -1163,16 +1159,16 @@ class HarnessState:
             for entry in entries
         }
 
-        # Document frequency per term over the ranked corpus: a term in
-        # every entry weighs log(2), a term in one entry of N weighs
-        # log(1 + N), so rare distinctive terms outrank ubiquitous ones.
+        # Smoothed corpus IDF discounts ubiquitous terms towards zero
+        # without language stoplists. Every matching term stays positive,
+        # including a query over a one-entry corpus.
         matches: dict[str, int] = {term: 0 for term in terms}
         for title, content, path_and_id in fields_by_entry.values():
             for term in terms:
                 if term in title or term in content or term in path_and_id:
                     matches[term] += 1
         term_idf = {
-            term: math.log(1 + len(entries) / count)
+            term: math.log1p((len(entries) - count + 0.5) / (count + 0.5))
             for term, count in matches.items()
             if count > 0
         }
