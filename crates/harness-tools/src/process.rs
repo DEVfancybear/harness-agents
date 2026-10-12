@@ -621,6 +621,130 @@ fn windows_shell(host: &HostEnvironment) -> (String, String) {
     }
 }
 
+/// The program a bare name starts, found the way a Windows shell finds it.
+///
+/// `CreateProcess` only tries `<name>.exe`, so the batch shims most JavaScript
+/// tools install - `npm.cmd`, `npx.cmd`, `pnpm.cmd`, `yarn.cmd` - were "program
+/// not found" for `run_process`. A name without a directory or an extension is
+/// looked up in the child's own `PATH`, trying each `PATHEXT` extension in each
+/// directory in order. std starts a resolved `.cmd`/`.bat` through `cmd.exe`
+/// with its own argument escaping, and refuses arguments it cannot pass safely.
+/// Anything else, or a name found nowhere, is left for `CreateProcess` as given.
+#[cfg(windows)]
+fn windows_program(
+    executable: &str,
+    environment: &ProcessEnvironment,
+    host: &HostEnvironment,
+) -> std::path::PathBuf {
+    let given = std::path::PathBuf::from(executable);
+    if executable.contains(['/', '\\', ':']) || given.extension().is_some() {
+        return given;
+    }
+    let child = |name: &str| {
+        environment
+            .values()
+            .iter()
+            .rev()
+            .find(|(existing, _)| same_name(existing, name))
+            .map(|(_, value)| value.as_str())
+            .or_else(|| host.lookup(name))
+    };
+    let extensions = child("PATHEXT")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(".COM;.EXE;.BAT;.CMD");
+    for directory in child("PATH").unwrap_or_default().split(';') {
+        let directory = directory.trim().trim_matches('"');
+        if directory.is_empty() {
+            continue;
+        }
+        for extension in extensions
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+        {
+            let candidate = Path::new(directory).join(format!("{executable}{extension}"));
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    given
+}
+
+#[cfg(all(test, windows))]
+mod windows_program_tests {
+    use super::{HostEnvironment, run_structured_with_host, windows_program};
+    use crate::{capture::ProcessSpoolConfig, secrets::ProcessEnvironment};
+    use harness_providers::CancellationToken;
+
+    fn host(path: &std::path::Path) -> HostEnvironment {
+        HostEnvironment::from_pairs([
+            ("PATH".to_owned(), path.display().to_string()),
+            (
+                "SystemRoot".to_owned(),
+                std::env::var("SystemRoot").expect("Windows system root"),
+            ),
+            (
+                "COMSPEC".to_owned(),
+                std::env::var("COMSPEC").expect("Windows command processor"),
+            ),
+        ])
+    }
+
+    #[test]
+    fn a_bare_name_finds_its_batch_shim_through_path_and_pathext() {
+        let bin = tempfile::tempdir().expect("bin");
+        std::fs::write(bin.path().join("tool.cmd"), "@echo off").expect("shim");
+        let host = host(bin.path());
+        let empty = ProcessEnvironment::empty();
+        // PATHEXT spells the extension; Windows paths ignore case.
+        assert!(
+            windows_program("tool", &empty, &host)
+                .as_os_str()
+                .eq_ignore_ascii_case(bin.path().join("tool.cmd").as_os_str())
+        );
+        // A path or an extension is the caller's choice; an unknown name is
+        // left for CreateProcess to report.
+        assert_eq!(
+            windows_program("tool.exe", &empty, &host),
+            std::path::PathBuf::from("tool.exe")
+        );
+        assert_eq!(
+            windows_program(".\\tool", &empty, &host),
+            std::path::PathBuf::from(".\\tool")
+        );
+        assert_eq!(
+            windows_program("missing", &empty, &host),
+            std::path::PathBuf::from("missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_process_starts_a_cmd_shim_by_its_bare_name() {
+        let bin = tempfile::tempdir().expect("bin");
+        std::fs::write(
+            bin.path().join("shim.cmd"),
+            "@echo off\r\necho shim-ran %1\r\n",
+        )
+        .expect("shim");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let result = run_structured_with_host(
+            workspace.path(),
+            "shim",
+            &["lint".to_owned()],
+            60_000,
+            CancellationToken::new(),
+            &ProcessEnvironment::empty(),
+            &ProcessSpoolConfig::default(),
+            &host(bin.path()),
+        )
+        .await
+        .expect("the shim starts");
+        assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
+        assert!(result.stdout.contains("shim-ran lint"), "{}", result.stdout);
+        assert_eq!(result.executable, "shim");
+    }
+}
+
 #[cfg(all(test, windows))]
 mod windows_shell_tests {
     use super::{HostEnvironment, run_shell_with_host, windows_shell};
@@ -773,7 +897,11 @@ async fn run(
         return Ok(canceled_before_spawn(executable, queued));
     }
     let pipe_stdin = stdin.is_some();
-    let mut command = CommandWrap::with_new(executable, |child_command| {
+    #[cfg(windows)]
+    let program = windows_program(executable, environment, host);
+    #[cfg(not(windows))]
+    let program = executable;
+    let mut command = CommandWrap::with_new(program, |child_command| {
         child_command
             .args(args)
             .current_dir(root)
