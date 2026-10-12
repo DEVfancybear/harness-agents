@@ -26,6 +26,14 @@ pub const PROGRESS_FILE: &str = ".harness/progress.md";
 /// How much of the handoff a session's first prompt carries.
 const HANDOFF_BRIEF_BYTES: usize = 6 * 1024;
 
+/// Commits the brief shows.
+const BRIEF_COMMITS: usize = 5;
+
+/// Commit subjects and tracked paths the prompt is compared with, to tell a
+/// task about the project from a greeting or a general question.
+const RELEVANCE_COMMITS: usize = 50;
+const RELEVANCE_PATHS: usize = 20_000;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HandoffStamp {
     hash: harness_types::ContentHash,
@@ -81,22 +89,81 @@ fn handoff(root: &Path, limit: usize) -> Option<(String, bool)> {
     Some((text[..end].to_owned(), true))
 }
 
-/// The brief a session's first prompt carries, when there is anything to say.
-#[must_use]
-pub fn startup_brief(root: &Path) -> Option<ContextBlock> {
-    let mut text = String::new();
-    // The two reads are independent; each is a process start on Windows, so
-    // they run side by side.
-    let (log, status) = std::thread::scope(|scope| {
-        let status = scope.spawn(|| git(root, &["--no-optional-locks", "status", "--short"]));
-        let log = git(root, &["log", "--oneline", "-5"]);
-        (log, status.join().ok().flatten())
-    });
-    if let Some(log) = log.filter(|log| !log.is_empty()) {
-        let _ = write!(text, "Recent commits:\n{log}\n");
+/// Whether the prompt is about the project: one of its terms names something
+/// the project holds - a tracked path, a recent commit, a pending change, a
+/// line of the handoff - and is distinctive there, found in at most half of
+/// those documents. Terms come from `harness::query_terms`, so no script or
+/// language is special and no word list decides; a greeting shares no
+/// distinctive term with the project, a task names what it is about.
+fn concerns_project(prompt: &str, documents: &[&str]) -> bool {
+    let terms = super::harness::query_terms(prompt);
+    if terms.is_empty() || documents.is_empty() {
+        return false;
     }
-    if let Some(status) = status {
+    let mut matches = vec![0_usize; terms.len()];
+    for document in documents {
+        let words = super::harness::query_terms(document)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        for (count, term) in matches.iter_mut().zip(&terms) {
+            if words.contains(term) {
+                *count += 1;
+            }
+        }
+    }
+    matches
+        .into_iter()
+        .any(|count| count > 0 && 2 * count <= documents.len())
+}
+
+/// The brief a session's first prompt carries, when there is anything to say.
+/// It asks for a baseline check outright when the prompt concerns the project,
+/// and leaves the call to the model otherwise.
+#[must_use]
+pub fn startup_brief(root: &Path, prompt: &str) -> Option<ContextBlock> {
+    let mut text = String::new();
+    // The reads are independent; each is a process start on Windows, so they
+    // run side by side.
+    let (log, status, files) = std::thread::scope(|scope| {
+        let status = scope.spawn(|| git(root, &["--no-optional-locks", "status", "--short"]));
+        let files = scope.spawn(|| git(root, &["ls-files", "-z"]));
+        let log = git(
+            root,
+            &["log", "--format=%h %s", &format!("-{RELEVANCE_COMMITS}")],
+        );
+        (
+            log,
+            status.join().ok().flatten(),
+            files.join().ok().flatten(),
+        )
+    });
+    let commits = log
+        .as_deref()
+        .map(|log| log.lines().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if !commits.is_empty() {
+        let shown = commits
+            .iter()
+            .take(BRIEF_COMMITS)
+            .copied()
+            .collect::<Vec<_>>();
+        let _ = write!(text, "Recent commits:\n{}\n", shown.join("\n"));
+    }
+    let mut documents = commits
+        .iter()
+        .map(|line| line.split_once(' ').map_or(*line, |(_, subject)| subject))
+        .collect::<Vec<_>>();
+    documents.extend(
+        files
+            .as_deref()
+            .unwrap_or_default()
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .take(RELEVANCE_PATHS),
+    );
+    if let Some(status) = &status {
         let lines = status.lines().collect::<Vec<_>>();
+        documents.extend(lines.iter().map(|line| line.get(3..).unwrap_or(line)));
         if lines.is_empty() {
             text.push_str("The worktree is clean.\n");
         } else {
@@ -114,7 +181,12 @@ pub fn startup_brief(root: &Path) -> Option<ContextBlock> {
             );
         }
     }
-    if let Some((handoff, cut)) = handoff(root, HANDOFF_BRIEF_BYTES) {
+    let handoff = handoff(root, HANDOFF_BRIEF_BYTES);
+    if let Some((handoff, _)) = &handoff {
+        documents.extend(handoff.lines().filter(|line| !line.trim().is_empty()));
+    }
+    let baseline = concerns_project(prompt, &documents);
+    if let Some((handoff, cut)) = handoff {
         let _ = write!(
             text,
             "\nHandoff from the last session ({PROGRESS_FILE}):\n{}{}\n",
@@ -133,7 +205,14 @@ pub fn startup_brief(root: &Path) -> Option<ContextBlock> {
         0,
         "Session start - the harness gathered where the project stands, so you need not rediscover it:\n\n",
     );
-    text.push_str("\nBefore new work, check that the starting state is sound (the project's checks pass); fix a broken baseline first instead of building on it.");
+    // A shared term settles it; without one the prompt may still be a task
+    // written in other words or another language than the project's, so the
+    // model, which reads any language, decides.
+    if baseline {
+        text.push_str("\nBefore new work, check that the starting state is sound (the project's checks pass); fix a broken baseline first instead of building on it.");
+    } else {
+        text.push_str("\nIf this request asks you to change the project, first check that the starting state is sound (the project's checks pass) and fix a broken baseline before building on it. If it is a greeting or a question, answer it directly without running the checks.");
+    }
     Some(ContextBlock::mandatory(
         "session-start",
         ContextBlockKind::Instruction,
@@ -259,12 +338,58 @@ mod tests {
             "# Progress\n## Next step\nwire the parser into main",
         )
         .expect("handoff");
-        let brief = startup_brief(root.path()).expect("a brief").text;
+        let brief = startup_brief(root.path(), "wire the parser")
+            .expect("a brief")
+            .text;
         assert!(brief.contains("add the parser"), "{brief}");
         assert!(brief.contains("wire the parser into main"), "{brief}");
         assert!(brief.contains("Uncommitted (1 file(s))"), "{brief}");
+        assert!(brief.contains("Before new work"), "{brief}");
         let empty = tempfile::tempdir().expect("empty");
-        assert!(startup_brief(empty.path()).is_none(), "nothing to say");
+        assert!(
+            startup_brief(empty.path(), "wire the parser").is_none(),
+            "nothing to say"
+        );
+    }
+
+    #[test]
+    fn a_prompt_about_the_project_asks_for_a_baseline_check_outright() {
+        let root = tempfile::tempdir().expect("root");
+        git(root.path(), &["init", "-q"]);
+        std::fs::create_dir_all(root.path().join("src/cart")).expect("dir");
+        std::fs::write(root.path().join("src/cart/total.ts"), "x").expect("file");
+        std::fs::write(root.path().join("README.md"), "x").expect("file");
+        git(root.path(), &["add", "."]);
+        git(
+            root.path(),
+            &["commit", "-q", "-m", "feat(shop): giỏ hàng và voucher"],
+        );
+        for (prompt, asks) in [
+            ("hello bạn", false),
+            ("chào bạn, hôm nay thế nào?", false),
+            ("😀", false),
+            ("fix the cart total", true),
+            ("sửa lỗi voucher trong giỏ hàng", true),
+            // A task in words the project does not use: the model decides.
+            ("thêm tính năng thanh toán", false),
+        ] {
+            let brief = startup_brief(root.path(), prompt).expect("a brief").text;
+            assert!(brief.contains("Recent commits"), "{prompt}: {brief}");
+            assert_eq!(brief.contains("Before new work"), asks, "{prompt}: {brief}");
+            assert_eq!(
+                brief.contains("If this request asks you to change the project"),
+                !asks,
+                "{prompt}: {brief}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_term_in_most_of_the_project_is_not_distinctive() {
+        let documents = ["fix the cart", "the docs", "the build", "src/main.rs"];
+        assert!(!super::concerns_project("the", &documents));
+        assert!(super::concerns_project("the cart", &documents));
+        assert!(!super::concerns_project("cart", &[]));
     }
 
     #[test]

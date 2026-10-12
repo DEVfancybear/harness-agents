@@ -7598,7 +7598,8 @@ async fn run_turn(
     };
     let startup_brief = start_source.is_some().then(|| {
         let root = workspace_root.clone();
-        tokio::task::spawn_blocking(move || super::lifecycle::startup_brief(&root))
+        let text = request.text.clone();
+        tokio::task::spawn_blocking(move || super::lifecycle::startup_brief(&root, &text))
     });
     let mut prompt = format!(
         "{}{}",
