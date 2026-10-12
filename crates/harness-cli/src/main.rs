@@ -298,7 +298,7 @@ struct ChatArgs {
     /// Open the project at this path instead of the caller working directory.
     #[arg(long)]
     cwd: Option<PathBuf>,
-    /// Resume one persisted session inside the interactive app.
+    /// Resume by session ID, conversation ID, unique ID abbreviation or name (or latest).
     #[arg(long)]
     resume: Option<String>,
     /// Continue the newest persisted session in this project.
@@ -399,6 +399,7 @@ struct ExecArgs {
     cwd: Option<PathBuf>,
     #[arg(long = "continue", conflicts_with = "resume")]
     continue_session: bool,
+    /// Resume by session/conversation ID, unique ID abbreviation, name or latest.
     #[arg(long)]
     resume: Option<String>,
     #[arg(long = "output-format", default_value = "text", value_parser = ["text", "json", "stream-json"])]

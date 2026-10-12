@@ -1308,9 +1308,20 @@ mod tests {
                         "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
-                    let _ = socket.write_all(head.as_bytes()).await;
-                    let _ = socket.write_all(&body).await;
-                    let _ = socket.shutdown().await;
+                    socket.write_all(head.as_bytes()).await.expect("headers");
+                    socket.write_all(&body).await.expect("body");
+                    socket.shutdown().await.expect("response shutdown");
+                    // Keep the read half alive until the client has consumed the
+                    // response and closed. Dropping the socket immediately can
+                    // reset a still-active connection on Windows.
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        while let Ok(read) = socket.read(&mut buffer).await {
+                            if read == 0 {
+                                break;
+                            }
+                        }
+                    })
+                    .await;
                 });
             }
         });

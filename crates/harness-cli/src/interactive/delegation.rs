@@ -1770,6 +1770,20 @@ impl SessionAgents {
         }
     }
 
+    /// Reserve the conversation before leaving the current one.
+    ///
+    /// # Errors
+    /// The host reports another owner or its state is unavailable.
+    pub fn claim_conversation(&self, task: &str) -> Result<(), String> {
+        let host = self
+            .shared
+            .session_host
+            .lock()
+            .map_err(|_| "session host is unavailable")?
+            .clone();
+        host.map_or(Ok(()), |host| host.claim_conversation(task))
+    }
+
     /// How many children are still working.
     #[must_use]
     pub fn running(&self) -> usize {

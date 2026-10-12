@@ -435,42 +435,7 @@ pub async fn run_with(
     // Resuming continues the task of the named session: the new turn runs in a
     // fresh session linked to it, exactly like a follow-up in the interactive app.
     let resumed_from = match &request.resume {
-        Some(session_text) => {
-            let session_text = if session_text == "latest" {
-                store
-                    .newest_session_id()
-                    .await
-                    .map_err(StoreError::into_harness_error)?
-                    .map(|id| id.as_str().to_owned())
-                    .ok_or_else(|| {
-                        HarnessError::new(
-                            ErrorCode::InvalidPayload,
-                            "this project has no session to continue",
-                        )
-                    })?
-            } else {
-                session_text.clone()
-            };
-            let parsed = SessionId::parse(session_text.clone()).map_err(|error| {
-                HarnessError::new(
-                    error.code(),
-                    format!("--resume needs a canonical session id: {error}"),
-                )
-            })?;
-            let task = store
-                .session_task(&parsed)
-                .await
-                .map_err(StoreError::into_harness_error)?
-                .ok_or_else(|| {
-                    HarnessError::new(
-                        ErrorCode::InvalidPayload,
-                        format!(
-                            "session {session_text} is not in this project's store; nothing was resumed"
-                        ),
-                    )
-                })?;
-            Some((parsed, task))
-        }
+        Some(selector) => Some(super::service::resolve_resume_session(&store, selector).await?),
         None => None,
     };
     let task_id = resumed_from

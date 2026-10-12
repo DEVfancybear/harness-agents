@@ -206,8 +206,8 @@ pub const SLASH_COMMANDS: [SlashCommand; 63] = [
     },
     command(
         "/resume",
-        "[id]",
-        "Open the session picker, or resume a session by id",
+        "[selector]",
+        "Open the session picker, or resume by id/name/latest; --compact summarizes first",
     ),
     command(
         "/reload",

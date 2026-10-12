@@ -655,14 +655,38 @@ mod tests {
     /// a sign-in made for another URL is not used.
     #[test]
     fn an_expiring_token_is_refreshed_and_saved() {
-        use std::io::{Read, Write};
+        use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
         let port = listener.local_addr().expect("address").port();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("token request");
-            let mut buffer = [0_u8; 4096];
-            let read = stream.read(&mut buffer).expect("request");
-            let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .expect("read timeout");
+            let mut reader = BufReader::new(stream.try_clone().expect("reader"));
+            let mut request = String::new();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(
+                    reader.read_line(&mut line).expect("header") > 0,
+                    "complete request headers"
+                );
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse::<usize>().expect("content length");
+                }
+                let end = line == "\r\n";
+                request.push_str(&line);
+                if end {
+                    break;
+                }
+            }
+            assert!(length <= 4096, "bounded token fixture body");
+            let mut payload = vec![0; length];
+            reader.read_exact(&mut payload).expect("complete body");
+            request.push_str(std::str::from_utf8(&payload).expect("form encoding"));
             let body = r#"{"access_token":"fresh","expires_in":3600}"#;
             write!(
                 stream,
@@ -670,6 +694,13 @@ mod tests {
                 body.len()
             )
             .expect("response");
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("response shutdown");
+            // Let the client consume the response before closing the read half;
+            // an immediate close can reset the connection on Windows.
+            let mut remaining = Vec::new();
+            let _ = reader.read_to_end(&mut remaining);
             request
         });
         let dir = tempfile::tempdir().expect("temporary directory");

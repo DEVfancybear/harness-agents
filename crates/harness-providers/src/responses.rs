@@ -403,6 +403,11 @@ impl OpenAiResponsesAdapter {
                 if !flush(&mut events).await {
                     return Ok(());
                 }
+                // A terminal Responses event settles the request. A proxy may
+                // keep the transport open after it, so do not wait for EOF.
+                if decoder.finished {
+                    break;
+                }
             }
             decoder.finish(&mut events)?;
             flush(&mut events).await;
@@ -829,21 +834,48 @@ mod tests {
         assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
     }
 
+    async fn consume_test_request(socket: &mut tokio::net::TcpStream) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+        let mut reader = BufReader::new(socket);
+        let mut length = 0;
+        let mut header_bytes = 0;
+        loop {
+            let mut line = String::new();
+            let read = reader.read_line(&mut line).await.expect("request header");
+            assert!(read > 0, "complete request headers");
+            header_bytes += read;
+            assert!(header_bytes <= 64 * 1024, "bounded request headers");
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse::<usize>().expect("content length");
+            }
+            if line == "\r\n" {
+                break;
+            }
+        }
+        assert!(length <= 64 * 1024, "bounded request body");
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).await.expect("request body");
+    }
+
     /// The answer's text reaches the caller while the response is still
     /// open, as prime-agent streams a Responses answer; it used to arrive only
     /// once the whole response had been read.
     #[tokio::test]
     async fn text_streams_before_the_response_completes() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
         let address = listener.local_addr().expect("address");
         let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (close, closed) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept");
-            let mut head = vec![0_u8; 64 * 1024];
-            let _ = socket.read(&mut head).await;
+            tokio::time::timeout(Duration::from_secs(10), consume_test_request(&mut socket))
+                .await
+                .expect("complete request arrives");
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n")
                 .await
@@ -860,6 +892,10 @@ mod tests {
                 .write_all(b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
                 .await
                 .expect("completed");
+            socket.flush().await.expect("completed frame flush");
+            // A terminal event completes the response even if a server or proxy
+            // leaves the HTTP connection open. Closing it is a separate step.
+            let _ = closed.await;
         });
         let adapter = OpenAiResponsesAdapter::new(
             format!("http://{address}/v1/responses"),
@@ -902,13 +938,20 @@ mod tests {
         }
         assert_eq!(early.as_deref(), Some("early"));
         release.send(()).expect("release");
-        let rest = crate::collect_events(stream).await.expect("completes");
+        let rest = tokio::time::timeout(Duration::from_secs(10), crate::collect_events(stream))
+            .await
+            .expect("completion arrives after the server is released")
+            .expect("completes");
         assert!(
             rest.iter()
                 .any(|event| matches!(event, ProviderStreamEvent::Completed { .. })),
             "{rest:?}"
         );
-        server.await.expect("server");
+        close.send(()).expect("close server after completion");
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("server closes after the client consumes the response")
+            .expect("server");
     }
     #[test]
     fn a_stream_cut_before_completion_is_refused() {

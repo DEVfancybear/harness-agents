@@ -149,9 +149,16 @@ fn run_terminal(
                 }
                 return Ok(code);
             }
-            Err(error) => eprintln!(
-                "ha: the background agent could not start ({error}); this terminal runs the session\r"
-            ),
+            Err(error) => {
+                // A refused resume may mean another agent owns the conversation.
+                // Starting it locally would bypass the worker's admission checks.
+                if launch.resume.is_some() {
+                    return Err(HarnessError::new(ErrorCode::RuntimeBlocked, error));
+                }
+                eprintln!(
+                    "ha: the background agent could not start ({error}); this terminal runs the session\r"
+                );
+            }
         }
     }
     // The plain renderer is the pre-T02 host and stays authoritative: the TUI is

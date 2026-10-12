@@ -651,6 +651,145 @@ async fn g07_compact_falls_back_when_the_provider_fails() {
 }
 
 #[tokio::test]
+async fn compact_fallback_keeps_prior_turns_and_refuses_to_drop_an_oversized_history() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let (first, task) = admit(
+        &store,
+        &bench,
+        "ORIGINAL_LONG_TASK: still finish milestone two",
+    )
+    .await;
+    store
+        .release_task_lease(&task)
+        .await
+        .expect("release first turn");
+    let latest = SessionId::generate();
+    admit_into(
+        &store,
+        &bench,
+        &latest,
+        &task,
+        "continue without repeating the objective",
+    )
+    .await;
+    store
+        .record_continuation_link(&first, &latest, &task)
+        .await
+        .expect("link");
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        ProviderStreamEvent::completed("stop"),
+    ]]));
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    )
+    .with_summarizer(Arc::new(FailingSummaryProvider));
+    let result = runtime
+        .compact(&latest)
+        .await
+        .expect("bounded transcript fallback");
+    assert!(result.fallback_used);
+    assert!(result.packet.content.contains("ORIGINAL_LONG_TASK"));
+    assert!(result.packet.content.contains("still finish milestone two"));
+    assert!(result.packet.content.contains("continue without repeating"));
+    let before = store
+        .latest_context_checkpoint(&latest)
+        .await
+        .expect("checkpoint")
+        .expect("published");
+    let small = RuntimeService::new(
+        Arc::clone(&store),
+        provider,
+        RuntimeConfig {
+            optional_token_budget: 64,
+            ..RuntimeConfig::default()
+        },
+    )
+    .with_summarizer(Arc::new(FailingSummaryProvider));
+    let error = small
+        .compact(&latest)
+        .await
+        .expect_err("cannot safely shrink without model");
+    assert!(error.to_string().contains("checkpoint was kept unchanged"));
+    let after = store
+        .latest_context_checkpoint(&latest)
+        .await
+        .expect("checkpoint")
+        .expect("retained");
+    assert_eq!(after.checkpoint_id, before.checkpoint_id);
+    assert!(after.content.to_string().contains("ORIGINAL_LONG_TASK"));
+    drop(small);
+    drop(runtime);
+    close(store).await;
+}
+
+#[tokio::test]
+async fn compact_summary_cache_respects_guidance_and_budget() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let input = "SUMMARY_CACHE_LONG_TASK: inspect the failing check";
+    let mut sessions = Vec::new();
+    for _ in 0..4 {
+        sessions.push(admit(&store, &bench, input).await.0);
+    }
+    let responses = [
+        "SUMMARY_GUIDANCE_A",
+        "SUMMARY_GUIDANCE_B",
+        "SUMMARY_SMALL_BUDGET",
+    ]
+    .into_iter()
+    .map(|text| {
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text(text),
+            ProviderStreamEvent::completed("stop"),
+        ]
+    })
+    .collect();
+    let provider = Arc::new(ScriptedProvider::for_model_summary(responses));
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    );
+    let first = runtime
+        .compact_with_guidance(&sessions[0], Some("retain A"))
+        .await
+        .expect("first");
+    let second = runtime
+        .compact_with_guidance(&sessions[1], Some("retain B"))
+        .await
+        .expect("second");
+    assert!(first.packet.content.contains("SUMMARY_GUIDANCE_A"));
+    assert!(second.packet.content.contains("SUMMARY_GUIDANCE_B"));
+    let small = RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig {
+            optional_token_budget: 64,
+            ..RuntimeConfig::default()
+        },
+    );
+    let third = small
+        .compact_with_guidance(&sessions[2], Some("retain B"))
+        .await
+        .expect("small budget");
+    assert!(third.packet.content.contains("SUMMARY_SMALL_BUDGET"));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    let fourth = runtime
+        .compact_with_guidance(&sessions[3], Some("retain B"))
+        .await
+        .expect("same request cached");
+    assert!(fourth.packet.content.contains("SUMMARY_GUIDANCE_B"));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    drop(small);
+    drop(runtime);
+    close(store).await;
+}
+
+#[tokio::test]
 async fn g07_auto_compaction_triggers_at_threshold_and_never_loops() {
     let bench = bench();
     let store = bench.open_store().await;

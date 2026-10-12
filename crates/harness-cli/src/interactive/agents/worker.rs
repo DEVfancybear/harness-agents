@@ -19,7 +19,7 @@
 //!   what the agent draws reaches all of them, and `/quit` detaches only the
 //!   terminal that typed it.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{BufReader, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -182,6 +182,12 @@ struct AgentHandle {
     thread: Option<JoinHandle<()>>,
 }
 
+#[derive(Default)]
+struct ResumeOwners {
+    agents: BTreeMap<String, String>,
+    execs: HashSet<String>,
+}
+
 pub struct Worker {
     id: String,
     key: String,
@@ -190,6 +196,9 @@ pub struct Worker {
     project_root: PathBuf,
     token: String,
     agents: Mutex<BTreeMap<String, AgentHandle>>,
+    /// Serialize resume admission, not the agents' running turns.
+    create_gate: Mutex<()>,
+    resume_owners: Mutex<ResumeOwners>,
     /// `Restart`: stop, but keep the journal for the next worker.
     preserve: AtomicBool,
     /// When the worker last had no agent.
@@ -238,6 +247,8 @@ pub fn run(args: &WorkerArgs) -> Result<(), String> {
         project_root: args.project_root.clone(),
         token: new_token(),
         agents: Mutex::new(BTreeMap::new()),
+        create_gate: Mutex::new(()),
+        resume_owners: Mutex::new(ResumeOwners::default()),
         preserve: AtomicBool::new(false),
         empty_since: Mutex::new(Some(Instant::now())),
         stopping: AtomicBool::new(false),
@@ -605,7 +616,14 @@ impl Worker {
     /// # Errors
     /// The name is taken, the launch is for another project, or the app could
     /// not start.
-    fn create(self: &Arc<Self>, spec: CreateAgent) -> Result<AgentInfo, String> {
+    fn create(self: &Arc<Self>, mut spec: CreateAgent) -> Result<AgentInfo, String> {
+        let _creation = self
+            .create_gate
+            .lock()
+            .map_err(|_| "agent admission is unavailable")?;
+        if let Some(existing) = self.prepare_resume(&mut spec)? {
+            return Ok(existing);
+        }
         if let Some(name) = &spec.name {
             let taken = self
                 .list()
@@ -663,6 +681,97 @@ impl Worker {
         log(&format!("agent {} started", info.id));
         self.keep_journal();
         Ok(info)
+    }
+
+    fn resume_owner(&self, task: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .resume_owners
+            .lock()
+            .map_err(|_| "resume admission is unavailable")?
+            .agents
+            .get(task)
+            .cloned())
+    }
+
+    fn prepare_resume(&self, spec: &mut CreateAgent) -> Result<Option<AgentInfo>, String> {
+        if let Some(selector) = &spec.resume {
+            let environment = LaunchEnvironment::from_pairs(spec.environment.clone());
+            if resolve_context(spec, &environment)?.project_store_dir() != self.store_dir {
+                return Err("this worker serves another project".to_owned());
+            }
+            let (session, task) =
+                super::super::service::resolve_resume_in_project(&self.store_dir, selector)?;
+            if self
+                .resume_owners
+                .lock()
+                .map_err(|_| "resume admission is unavailable")?
+                .execs
+                .contains(task.as_str())
+            {
+                return Err("this conversation is running a headless turn; wait for it to finish before resuming".to_owned());
+            }
+            let owner = self.resume_owner(task.as_str())?;
+            if let Some(existing) = self
+                .list()
+                .into_iter()
+                .find(|a| Some(&a.id) == owner.as_ref())
+            {
+                if spec.fixture
+                    || spec.model.is_some()
+                    || spec.profile.is_some()
+                    || spec.approval.is_some()
+                    || spec.thinking.is_some()
+                    || spec.goal.is_some()
+                    || spec.system_prompt.is_some()
+                    || !spec.append_system_prompt.is_empty()
+                    || spec
+                        .name
+                        .as_ref()
+                        .is_some_and(|name| existing.name.as_ref() != Some(name))
+                {
+                    return Err(format!(
+                        "this conversation already runs as agent {}; use ha attach {} and change its settings there, or stop it before resuming with launch overrides",
+                        existing.id, existing.id
+                    ));
+                }
+                if let Some(prompt) = spec.prompt.take() {
+                    self.send(&existing.id, prompt, SendMode::FollowUp, false)?;
+                }
+                return Ok(Some(existing));
+            }
+            // Pin latest/name selection while this creation owns admission.
+            spec.resume = Some(session.as_str().to_owned());
+        }
+        Ok(None)
+    }
+
+    fn reserve_exec_resume(self: &Arc<Self>, selector: &str) -> Result<ResumeReservation, String> {
+        let _creation = self
+            .create_gate
+            .lock()
+            .map_err(|_| "agent admission is unavailable")?;
+        let (session, task) =
+            super::super::service::resolve_resume_in_project(&self.store_dir, selector)?;
+        let mut owners = self
+            .resume_owners
+            .lock()
+            .map_err(|_| "resume admission is unavailable")?;
+        if let Some(agent) = owners.agents.get(task.as_str()) {
+            return Err(format!(
+                "this conversation is open as agent {agent}; use ha send {agent} <prompt> --wait, or stop it before a headless resume"
+            ));
+        }
+        if !owners.execs.insert(task.as_str().to_owned()) {
+            return Err(
+                "this conversation already has a headless turn running; wait for it to finish"
+                    .to_owned(),
+            );
+        }
+        Ok(ResumeReservation {
+            worker: Arc::downgrade(self),
+            task: task.as_str().to_owned(),
+            session: session.as_str().to_owned(),
+        })
     }
 
     fn send(
@@ -934,22 +1043,11 @@ impl Agent {
             overrides,
         );
         controller.set_detachable();
-        controller.set_session_host(Arc::new(WorkerSessionHost {
-            worker: Weak::clone(worker),
-            id: id.clone(),
-            name: spec.name.clone(),
-            base: CreateAgent {
-                prompt: None,
-                name: None,
-                resume: None,
-                thinking: None,
-                goal: None,
-                id: None,
-                cwd: Some(context.project.root.clone()),
-                caller_dir: context.project.root.clone(),
-                ..spec.clone()
-            },
-        }));
+        let host = WorkerSessionHost::new(worker, &id, &spec, &context);
+        if let Some(task) = controller.conversation_id() {
+            host.claim_conversation(&task)?;
+        }
+        controller.set_session_host(host);
         if let Some(level) = &spec.thinking {
             controller.set_thinking(level)?;
         }
@@ -1561,6 +1659,24 @@ fn attach(
 /// An `ha exec` run's lines, sent to the terminal that asked for it.
 struct ExecOutput(Sender<Reply>);
 
+/// Keep one resumed conversation owned until its headless turn settles, including
+/// cancellation and errors. Other conversations remain free to run in parallel.
+struct ResumeReservation {
+    worker: Weak<Worker>,
+    task: String,
+    session: String,
+}
+
+impl Drop for ResumeReservation {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.upgrade()
+            && let Ok(mut owners) = worker.resume_owners.lock()
+        {
+            owners.execs.remove(&self.task);
+        }
+    }
+}
+
 impl super::super::headless::Output for ExecOutput {
     fn stdout(&self, line: &str) {
         let _ = self.0.send(Reply::Output {
@@ -1581,7 +1697,7 @@ impl super::super::headless::Output for ExecOutput {
 /// back as they come. The terminal going away cancels the turn.
 fn exec(
     worker: &Arc<Worker>,
-    spec: ExecSpec,
+    mut spec: ExecSpec,
     mut reader: BufReader<TcpStream>,
     mut writer: TcpStream,
 ) {
@@ -1614,6 +1730,19 @@ fn exec(
             return;
         }
     };
+    let reservation = match &spec.request.resume {
+        Some(selector) => match worker.reserve_exec_resume(selector) {
+            Ok(reservation) => {
+                spec.request.resume = Some(reservation.session.clone());
+                Some(reservation)
+            }
+            Err(message) => {
+                let _ = protocol::write_line(&mut writer, &Reply::Error { message });
+                return;
+            }
+        },
+        None => None,
+    };
     worker.execs.fetch_add(1, Ordering::SeqCst);
     if let Ok(agents) = worker.agents.lock() {
         worker.note_empty(&agents);
@@ -1631,6 +1760,7 @@ fn exec(
     let done = sender.clone();
     let shared = super::super::store_lease::SharedStore::for_dir(worker.store_dir.clone());
     worker.runtime.spawn(async move {
+        let _reservation = reservation;
         let result = super::super::headless::run_with(
             spec.request,
             &context,
@@ -1673,7 +1803,66 @@ struct WorkerSessionHost {
     name: Option<String>,
 }
 
+impl WorkerSessionHost {
+    fn new(
+        worker: &Weak<Worker>,
+        id: &str,
+        spec: &CreateAgent,
+        context: &LaunchContext,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            worker: Weak::clone(worker),
+            id: id.to_owned(),
+            name: spec.name.clone(),
+            base: CreateAgent {
+                prompt: None,
+                name: None,
+                resume: None,
+                thinking: None,
+                goal: None,
+                id: None,
+                cwd: Some(context.project.root.clone()),
+                caller_dir: context.project.root.clone(),
+                ..spec.clone()
+            },
+        })
+    }
+}
+
+impl Drop for WorkerSessionHost {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.upgrade()
+            && let Ok(mut owners) = worker.resume_owners.lock()
+        {
+            owners.agents.retain(|_, owner| owner != &self.id);
+        }
+    }
+}
+
 impl SessionHost for WorkerSessionHost {
+    fn claim_conversation(&self, task: &str) -> Result<(), String> {
+        let worker = self.worker.upgrade().ok_or("the worker is stopping")?;
+        let mut owners = worker
+            .resume_owners
+            .lock()
+            .map_err(|_| "resume admission is unavailable")?;
+        if owners.execs.contains(task) {
+            return Err(
+                "this conversation is running a headless turn; wait for it to finish".to_owned(),
+            );
+        }
+        if let Some(owner) = owners.agents.get(task)
+            && owner != &self.id
+        {
+            return Err(format!(
+                "this conversation already runs as agent {owner}; use ha attach {owner}; nothing was resumed"
+            ));
+        }
+        owners.agents.retain(|_, owner| owner != &self.id);
+        owners.agents.insert(task.to_owned(), self.id.clone());
+        Ok(())
+    }
+
     fn create_session(&self, request: CreateSession) -> Result<serde_json::Value, String> {
         let worker = self.worker.upgrade().ok_or("the worker is stopping")?;
         let spec = CreateAgent {
@@ -1798,8 +1987,215 @@ fn log(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::{AgentInfo, idle_eviction_from, resolve_selector, same_token};
+    use super::{CreateAgent, ResumeOwners, SessionHost, Worker, WorkerSessionHost};
     use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    struct TestWorker(Arc<Worker>);
+
+    impl Drop for TestWorker {
+        fn drop(&mut self) {
+            self.0.stop_all();
+        }
+    }
+
+    async fn resume_worker() -> (tempfile::TempDir, TestWorker, CreateAgent) {
+        use crate::interactive::{bootstrap, paths, project};
+        use harness_session::{AdmitInputRequest, SessionService};
+        use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
+        use harness_types::{HostId, InputId, SessionId, SourceAuthority, TaskId};
+
+        let temp = tempfile::tempdir().expect("temporary root");
+        let home = temp.path().join("home");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).expect("project");
+        let environment = paths::LaunchEnvironment::from_pairs([
+            ("HA_HOME", home.to_string_lossy().into_owned()),
+            ("HA_OFFLINE", "1".to_owned()),
+            ("HA_WEB", "off".to_owned()),
+            ("HA_AUTO_REFINE", "off".to_owned()),
+        ]);
+        let context = bootstrap::resolve(bootstrap::LaunchRequest {
+            cwd: None,
+            caller_dir: root.clone(),
+            platform: paths::HostPlatform::current(),
+            environment: environment.clone(),
+            explicit_data_dir: None,
+        })
+        .expect("context");
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                context.project_store_dir(),
+                HostId::generate(),
+            ))
+            .await
+            .expect("store"),
+        );
+        let project_id = project::resolve_project_id(&store, &root)
+            .await
+            .expect("project id");
+        for title in ["long job", "another job"] {
+            let task = TaskId::generate();
+            SessionService::new(Arc::clone(&store))
+                .admit_input(AdmitInputRequest {
+                    session_id: SessionId::generate(),
+                    task_id: task.clone(),
+                    input_id: InputId::generate(),
+                    expected_sequence: 1,
+                    authority: SourceAuthority::User,
+                    raw_text: title.to_owned(),
+                    workspace: harness_tools::observe_workspace(project_id.clone(), &root)
+                        .expect("workspace"),
+                    initial_plan_items: Vec::new(),
+                })
+                .await
+                .expect("admitted");
+            store
+                .set_session_setting(&task, "title", title)
+                .await
+                .expect("title");
+        }
+        Arc::try_unwrap(store)
+            .expect("store released")
+            .close()
+            .await
+            .expect("close");
+        let worker = Arc::new(Worker {
+            id: super::new_id(),
+            key: "test".to_owned(),
+            registry: home.join("registry"),
+            store_dir: context.project_store_dir(),
+            project_root: root.clone(),
+            token: super::new_token(),
+            agents: Mutex::new(BTreeMap::new()),
+            create_gate: Mutex::new(()),
+            resume_owners: Mutex::new(ResumeOwners::default()),
+            preserve: AtomicBool::new(false),
+            empty_since: Mutex::new(None),
+            stopping: AtomicBool::new(false),
+            connections: AtomicU64::new(0),
+            execs: AtomicUsize::new(0),
+            config_file: Mutex::new(None),
+            runtime: tokio::runtime::Handle::current(),
+        });
+        let spec = CreateAgent {
+            caller_dir: root,
+            environment: environment.pairs(),
+            resume: Some("long job".to_owned()),
+            ..CreateAgent::default()
+        };
+        (temp, TestWorker(worker), spec)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_resumes_reuse_one_agent_and_reject_launch_overrides() {
+        let (_temp, worker, spec) = resume_worker().await;
+        let create = || {
+            let worker = Arc::clone(&worker.0);
+            let spec = spec.clone();
+            tokio::task::spawn_blocking(move || worker.create(spec))
+        };
+        let (first, second) = tokio::join!(create(), create());
+        let first = first.expect("join").expect("first resume");
+        let second = second.expect("join").expect("second resume");
+        assert_eq!(first.id, second.id);
+        assert_eq!(worker.0.list().len(), 1);
+        let mut override_spec = spec.clone();
+        override_spec.model = Some("another-model".to_owned());
+        assert!(
+            worker
+                .0
+                .create(override_spec)
+                .expect_err("explicit overrides")
+                .contains("launch overrides")
+        );
+        assert!(worker.0.reserve_exec_resume("long job").is_err());
+        worker
+            .0
+            .send(&first.id, "/clone".to_owned(), super::SendMode::Auto, false)
+            .expect("clone");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while worker
+            .0
+            .resume_owner(first.conversation.as_deref().expect("conversation"))
+            .expect("owner")
+            .is_some()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let original = worker
+            .0
+            .create(spec.clone())
+            .expect("clone releases original conversation");
+        assert_ne!(original.id, first.id);
+        worker.0.stop_all();
+        let reservation = worker
+            .0
+            .reserve_exec_resume("long job")
+            .expect("released owner");
+        assert!(worker.0.reserve_exec_resume("long job").is_err());
+        assert!(
+            worker
+                .0
+                .create(spec.clone())
+                .expect_err("headless owns it")
+                .contains("headless")
+        );
+        let independent = worker
+            .0
+            .reserve_exec_resume("another job")
+            .expect("independent conversation");
+        drop(independent);
+        drop(reservation);
+        assert!(
+            worker.0.create(spec).is_ok(),
+            "finishing releases admission"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slash_resume_cannot_claim_another_owners_conversation() {
+        let (_temp, worker, _spec) = resume_worker().await;
+        let host = |id: &str| WorkerSessionHost {
+            worker: Arc::downgrade(&worker.0),
+            base: CreateAgent::default(),
+            id: id.to_owned(),
+            name: None,
+        };
+        let first = host("first");
+        let second = host("second");
+        first.claim_conversation("task_a").expect("first owns a");
+        second.claim_conversation("task_b").expect("second owns b");
+        assert!(
+            second
+                .claim_conversation("task_a")
+                .expect_err("occupied")
+                .contains("ha attach first")
+        );
+        assert_eq!(
+            worker.0.resume_owner("task_b").expect("owner"),
+            Some("second".to_owned())
+        );
+        first
+            .claim_conversation("task_c")
+            .expect("switch conversation");
+        second
+            .claim_conversation("task_a")
+            .expect("old conversation released");
+        assert!(worker.0.resume_owner("task_b").expect("owner").is_none());
+        let reservation = worker
+            .0
+            .reserve_exec_resume("long job")
+            .expect("headless owner");
+        assert!(first.claim_conversation(&reservation.task).is_err());
+        drop(reservation);
+        drop(second);
+        assert!(worker.0.resume_owner("task_a").expect("owner").is_none());
+    }
 
     fn agent(id: &str, name: Option<&str>) -> AgentInfo {
         AgentInfo {

@@ -31,7 +31,7 @@ use harness_tools::{
     observe_workspace, observed_file_hash, validate_tool_pattern,
 };
 use harness_types::{
-    ErrorCode, InputId, QuestionId, RequestId, SessionId, SourceAuthority, TaskId,
+    ErrorCode, HarnessError, InputId, QuestionId, RequestId, SessionId, SourceAuthority, TaskId,
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
@@ -3101,6 +3101,77 @@ fn conversation_heads(
     (sessions, turns)
 }
 
+/// Resolve a saved conversation consistently for interactive and headless runs.
+/// Exact session IDs retain their historical position; names and abbreviated IDs
+/// select the newest turn of the matching user conversation.
+pub(super) async fn resolve_resume_session(
+    store: &SqliteStore,
+    selector: &str,
+) -> Result<(SessionId, TaskId), HarnessError> {
+    use harness_store_sqlite::StoreError;
+
+    let selector = selector.trim();
+    let invalid = |message| HarnessError::new(ErrorCode::InvalidPayload, message);
+    if selector.is_empty() {
+        return Err(invalid(
+            "resume needs an id, name or latest; nothing was resumed".to_owned(),
+        ));
+    }
+    if let Ok(session) = SessionId::parse(selector.to_owned()) {
+        let task = store
+            .session_task(&session)
+            .await
+            .map_err(StoreError::into_harness_error)?
+            .ok_or_else(|| {
+                invalid(format!(
+                    "session {selector} is not in this project's store; nothing was resumed"
+                ))
+            })?;
+        return Ok((session, task));
+    }
+    let sessions = store
+        .list_sessions()
+        .await
+        .map_err(StoreError::into_harness_error)?;
+    let sessions = user_conversation_sessions(store, sessions).await;
+    let abbreviated = selector.strip_prefix("...").unwrap_or(selector);
+    let matches_id = |id: &str| {
+        abbreviated.len() >= 6 && (id.starts_with(abbreviated) || id.ends_with(abbreviated))
+    };
+    let matching_tasks = sessions
+        .iter()
+        .filter(|s| matches_id(s.session_id.as_str()) || matches_id(s.task_id.as_str()))
+        .map(|s| s.task_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let (heads, _) = conversation_heads(sessions);
+    if matches!(selector, "latest" | "--last") {
+        return heads
+            .into_iter()
+            .next()
+            .map(|s| (s.session_id, s.task_id))
+            .ok_or_else(|| invalid("this project has no session to continue".to_owned()));
+    }
+    let mut matches = Vec::new();
+    for head in heads {
+        let title = store
+            .session_setting(&head.task_id, "title")
+            .await
+            .map_err(StoreError::into_harness_error)?;
+        if matching_tasks.contains(&head.task_id) || title.as_deref() == Some(selector) {
+            matches.push((head.session_id, head.task_id));
+        }
+    }
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(invalid(format!(
+            "no saved conversation matches {selector:?} in this project's store; nothing was resumed"
+        ))),
+        count => Err(invalid(format!(
+            "resume selector {selector:?} matches {count} conversations; use a canonical session id or a unique name; nothing was resumed"
+        ))),
+    }
+}
+
 /// One saved conversation of a project, as the agents view lists it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SavedConversation {
@@ -3622,59 +3693,35 @@ impl AgentSessionService {
         });
     }
 
-    /// The task (conversation) of a stored session, read now; `None` when it
-    /// cannot be read, which leaves it to the background lookup.
-    fn session_task_now(&self, session: &SessionId) -> Option<String> {
-        let store_dir = self.store_dir.clone();
-        let session = session.clone();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .ok()?;
-            runtime.block_on(async move {
-                let store = SqliteStore::open_read_only(store_dir).await.ok()?;
-                let task = store.session_task(&session).await.ok().flatten();
-                let _ = store.close().await;
-                task.map(|task| task.as_str().to_owned())
-            })
-        })
-        .join()
-        .ok()
-        .flatten()
+    fn resolve_project_session(&self, selector: &str) -> Result<(SessionId, TaskId), String> {
+        resolve_resume_in_project(&self.store_dir, selector)
     }
+}
 
-    fn newest_project_session(&self) -> Result<SessionId, String> {
-        let store_dir = self.store_dir.clone();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| format!("session lookup runtime could not start: {error}"))?;
-            runtime.block_on(async move {
-                let store = SqliteStore::open_read_only(store_dir)
-                    .await
-                    .map_err(|error| format!("project session store could not open: {error}"))?;
-                let sessions = store
-                    .list_sessions()
-                    .await
-                    .map_err(|error| format!("project sessions could not be listed: {error}"))?;
-                // "latest" is the user's latest conversation, never a child that
-                // happened to write last.
-                let mut sessions = user_conversation_sessions(&store, sessions).await;
-                sort_newest_first(&mut sessions);
-                let latest = sessions
-                    .into_iter()
-                    .next()
-                    .map(|session| session.session_id)
-                    .ok_or_else(|| "this project has no session to continue".to_owned());
-                let _ = store.close().await;
-                latest
-            })
+pub(super) fn resolve_resume_in_project(
+    store_dir: &Path,
+    selector: &str,
+) -> Result<(SessionId, TaskId), String> {
+    let store_dir = store_dir.to_owned();
+    let selector = selector.to_owned();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("session lookup runtime could not start: {error}"))?;
+        runtime.block_on(async move {
+            let store = SqliteStore::open_read_only(store_dir)
+                .await
+                .map_err(|error| format!("project session store could not open: {error}"))?;
+            let selected = resolve_resume_session(&store, &selector)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = store.close().await;
+            selected
         })
-        .join()
-        .map_err(|_| "project session lookup thread failed".to_owned())?
-    }
+    })
+    .join()
+    .map_err(|_| "project session lookup thread failed".to_owned())?
 }
 
 /// The app is closing: its Python kernel is disposed the way prime-agent disposes a
@@ -4775,7 +4822,11 @@ impl SessionPort for AgentSessionService {
         if title.is_empty() || title.chars().count() > 60 {
             return Err("usage: /rename <name up to 60 characters>".to_owned());
         }
-        let task_id = self.task_id.clone();
+        let task_id = TaskId::parse(
+            self.conversation_id()
+                .unwrap_or_else(|| self.task_id.to_string()),
+        )
+        .map_err(|error| error.to_string())?;
         let store_dir = self.store_dir.clone();
         let sender = self.sender.clone();
         let title_for_write = title.clone();
@@ -5534,18 +5585,22 @@ impl SessionPort for AgentSessionService {
     }
 
     fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
-        let source = match session_id.as_deref() {
-            Some("latest") => Some(self.newest_project_session()?),
-            Some(value) => Some(
-                SessionId::parse(value.to_owned())
-                    .map_err(|error| format!("resume needs a canonical session id: {error}"))?,
-            ),
+        // Validate before leaving the current conversation or stopping its children.
+        let selection = match session_id.as_deref() {
+            Some(value) => Some(self.resolve_project_session(value)?),
             None => None,
         };
+        let next_task = selection
+            .as_ref()
+            .map_or_else(TaskId::generate, |(_, task)| task.clone());
+        let (source, task) = selection.map_or((None, None), |(session, task)| {
+            (Some(session), Some(task.as_str().to_owned()))
+        });
         let mut previous = self
             .previous_session
             .lock()
             .map_err(|_| "conversation state is unavailable; nothing was resumed".to_owned())?;
+        self.agents.claim_conversation(next_task.as_str())?;
         // Selection is synchronous: submit cannot overtake a background lookup.
         // The turn validates ownership in this project's store before dispatch.
         // The children worked for the conversation being left; they stop quietly.
@@ -5564,14 +5619,11 @@ impl SessionPort for AgentSessionService {
         // landed, and a worker that wrote its journal in that window - it
         // does so right after recovering an agent - brought the agent back on
         // an empty conversation the next time it died.
-        let task = source
-            .as_ref()
-            .and_then(|source| self.session_task_now(source));
         if let Ok(mut resumed) = self.resumed_task.lock() {
             *resumed = task;
         }
         if source.is_none() {
-            self.task_id = TaskId::generate();
+            self.task_id = next_task;
             self.follow_schedules();
             if let Ok(mut tracker) = self.cost_tracker.lock() {
                 tracker.forget_context();
@@ -5679,8 +5731,7 @@ impl SessionPort for AgentSessionService {
 
     fn fork(&mut self, session: &str, before: bool) -> Result<(), String> {
         let from = SessionId::parse(session.to_owned()).map_err(|error| error.to_string())?;
-        self.start_fork(ForkPlan { from, before });
-        Ok(())
+        self.start_fork(ForkPlan { from, before })
     }
 
     fn clone_conversation(&mut self) -> Result<(), String> {
@@ -5693,8 +5744,7 @@ impl SessionPort for AgentSessionService {
         self.start_fork(ForkPlan {
             from,
             before: false,
-        });
-        Ok(())
+        })
     }
 
     fn conversation_leaf(&self) -> Option<String> {
@@ -6202,7 +6252,9 @@ struct ForkPlan {
 impl AgentSessionService {
     /// A new conversation, as `/new` starts one, that its first turn will
     /// continue from the fork point.
-    fn start_fork(&mut self, plan: ForkPlan) {
+    fn start_fork(&mut self, plan: ForkPlan) -> Result<(), String> {
+        let next_task = TaskId::generate();
+        self.agents.claim_conversation(next_task.as_str())?;
         if let Ok(mut previous) = self.previous_session.lock() {
             *previous = None;
             if let Ok(mut resumed) = self.resumed_task.lock() {
@@ -6218,7 +6270,7 @@ impl AgentSessionService {
         if let Ok(mut thread) = self.side_thread.lock() {
             thread.clear();
         }
-        self.task_id = TaskId::generate();
+        self.task_id = next_task;
         self.follow_schedules();
         if let Ok(mut tracker) = self.cost_tracker.lock() {
             tracker.forget_context();
@@ -6226,6 +6278,7 @@ impl AgentSessionService {
         self.fork_plan = Some(plan);
         // The fork carries the conversation it came from: it is resumed, not new.
         self.mark_session_start("resume");
+        Ok(())
     }
 
     /// Run prime-agent's MCP sign-in for `server` at `url` off the UI thread;
@@ -10731,7 +10784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn g08_rename_persists_and_shows_in_the_picker() {
+    async fn g08_rename_persists_on_the_resumed_conversation_and_shows_in_the_picker() {
         let temp = tempfile::tempdir().expect("temporary root");
         let home = temp.path().join("home");
         let project = temp.path().join("project");
@@ -10749,7 +10802,7 @@ mod tests {
         .expect("launch context");
         let mut channel = SessionChannel::new();
         let mut service = AgentSessionService::new(&context, environment, channel.sender());
-        let task_id = service.task_id.clone();
+        let task_id = harness_types::TaskId::generate();
         let session_id = harness_types::SessionId::generate();
         let store = Arc::new(
             SqliteStore::open_writer(WriterOpenOptions::new(
@@ -10767,7 +10820,7 @@ mod tests {
             observe_workspace(project_id, &context.project.root).expect("workspace snapshot");
         SessionService::new(Arc::clone(&store))
             .admit_input(AdmitInputRequest {
-                session_id,
+                session_id: session_id.clone(),
                 task_id,
                 input_id: InputId::generate(),
                 expected_sequence: 1,
@@ -10784,6 +10837,9 @@ mod tests {
             .await
             .expect("close setup store");
 
+        service
+            .resume(Some(session_id.to_string()))
+            .expect("resume");
         service
             .rename("CP-C review")
             .expect("rename schedules persistence");
@@ -11070,11 +11126,17 @@ mod tests {
             .expect("close project B store");
 
         assert_eq!(
-            service_a.newest_project_session().expect("continue lookup"),
+            service_a
+                .resolve_project_session("latest")
+                .expect("continue lookup")
+                .0,
             newest
         );
         assert_ne!(
-            service_a.newest_project_session().expect("repeat lookup"),
+            service_a
+                .resolve_project_session("latest")
+                .expect("repeat lookup")
+                .0,
             foreign
         );
     }
@@ -11145,6 +11207,11 @@ mod tests {
             .set_session_setting(&user_task, "title", "agents test")
             .await
             .expect("title");
+        store
+            .release_task_lease(&user_task)
+            .await
+            .expect("release first turn");
+        let user_head = admit("one more saved turn", user_task.clone()).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         // A child the user typed into through "latest" before this fix: kept.
         let typed_into = harness_types::TaskId::generate();
@@ -11190,6 +11257,54 @@ mod tests {
         assert!(listed.contains(&typed_into));
         assert!(!listed.contains(&marked), "a marked child is left out");
         assert!(!listed.contains(&legacy), "an unmarked child is left out");
+        for selector in [
+            "agents test",
+            user_task.as_str(),
+            &conversation.as_str()[conversation.as_str().len() - 12..],
+            &user_head.as_str()[..user_head.as_str().len() - 12],
+        ] {
+            assert_eq!(
+                super::resolve_resume_session(&store, selector)
+                    .await
+                    .expect("selector"),
+                (user_head.clone(), user_task.clone()),
+                "names and abbreviations continue at the newest turn: {selector}"
+            );
+        }
+        assert_eq!(
+            super::resolve_resume_session(&store, conversation.as_str())
+                .await
+                .expect("exact id")
+                .0,
+            conversation,
+            "an exact session id retains its explicitly selected historical position"
+        );
+        assert!(
+            super::resolve_resume_session(&store, "session_")
+                .await
+                .expect_err("ambiguous")
+                .to_string()
+                .contains("matches 2 conversations"),
+            "ambiguity counts user conversations, not their turns or children"
+        );
+        store
+            .set_session_setting(&typed_into, "title", "agents test")
+            .await
+            .expect("duplicate title");
+        assert!(
+            super::resolve_resume_session(&store, "agents test")
+                .await
+                .is_err()
+        );
+        store
+            .set_session_setting(&typed_into, "title", "renamed task")
+            .await
+            .expect("restore unique title");
+        assert!(
+            super::resolve_resume_session(&store, "missing task")
+                .await
+                .is_err()
+        );
         Arc::try_unwrap(store)
             .expect("store consumers released")
             .close()
@@ -11197,7 +11312,7 @@ mod tests {
             .expect("close store");
         // "latest" is the newest conversation of the user's, not the children
         // that wrote after it.
-        let latest = service.newest_project_session().expect("latest");
+        let latest = service.resolve_project_session("latest").expect("latest").0;
         assert_eq!(latest, typed_session);
         let _ = conversation;
     }

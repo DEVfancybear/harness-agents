@@ -94,7 +94,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
 
 #[cfg(test)]
 mod tests {
-    use super::{NAME_COLUMN, rows, window};
+    use super::{rows, window};
     use crate::interactive::events::{AppPhase, UiState};
     use crate::interactive::input::matching;
     use crate::interactive::tui::layout::MAX_SUGGEST_ROWS;
@@ -172,10 +172,7 @@ mod tests {
         assert!(text.contains("/attach <path>"), "{text}");
         assert_eq!(
             plain_text(&rows(&state("/resu", 0), &Theme::plain())).trim_start_matches("  ❯ "),
-            format!(
-                "{:<NAME_COLUMN$}{}",
-                "/resume [id]", "Open the session picker, or resume a session by id"
-            ),
+            "/resume [selector]  Open the session picker, or resume by id/name/latest; --compact summarizes first",
             "the name column is padded so the summaries line up"
         );
     }

@@ -434,29 +434,21 @@ async fn resume_flow() {
     );
     store.close().await.expect("reader close");
 
+    // A failed selection must leave the working conversation intact, rather
+    // than rebinding it to a missing source or canceling its children.
+    let before = service.previous_session.lock().expect("source").clone();
+    let missing = SessionId::generate();
+    let error = service
+        .resume(Some(missing.as_str().to_owned()))
+        .expect_err("unknown source");
+    assert!(error.contains("not in this project's store"), "{error}");
+    assert_eq!(*service.previous_session.lock().expect("source"), before);
     service.resume(None).expect("new conversation");
     assert_ne!(
         service.task_id, initially_new_task,
         "/new must allocate a new task"
     );
     assert!(service.previous_session.lock().expect("source").is_none());
-    let missing = SessionId::generate();
-    service
-        .resume(Some(missing.as_str().to_owned()))
-        .expect("canonical but unknown source");
-    service.submit(SubmitRequest {
-        input_id: InputId::generate(),
-        text: "must not start fresh".to_owned(),
-        answer_question_id: None,
-        shell_prefix: None,
-        compact_guidance: None,
-        refine: None,
-    });
-    let outcome = terminal(&mut channel).await;
-    assert!(
-        matches!(outcome, SessionEvent::RecoverableError { ref message } if message.contains("not in this project's store")),
-        "{outcome:?}"
-    );
     assert!(
         tokio::time::timeout(Duration::from_millis(75), listener.accept())
             .await

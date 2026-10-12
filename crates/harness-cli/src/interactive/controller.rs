@@ -620,6 +620,23 @@ impl InteractiveController {
     ) -> (u64, &'static str) {
         self.next_delivery += 1;
         let receipt = self.next_delivery;
+        // A user's goal control is a host command even while the model is busy.
+        // Steering it into the model left a background goal running after pause.
+        if !from_agent && steer && text.split_whitespace().next() == Some("/goal") {
+            let was_running = self.phase.has_active_run();
+            let produced = self.command(&text);
+            if !was_running && self.phase.has_active_run() {
+                self.active_deliveries.push((receipt, text));
+            } else {
+                let error = produced.iter().find_map(|effect| match effect {
+                    Effect::History(HistoryItem::Error { message }) => Some(message.clone()),
+                    _ => None,
+                });
+                self.record_delivery_answer(receipt, error.map_or_else(|| Ok(String::new()), Err));
+            }
+            effects.extend(produced);
+            return (receipt, "delivered");
+        }
         let outcome =
             self.deliver_external_with_receipt(text.clone(), steer, Some(receipt), effects);
         if from_agent && outcome == "queued" {
@@ -1308,7 +1325,7 @@ impl InteractiveController {
                     let chosen = self.selected_candidate();
                     self.editor.close_picker();
                     return match chosen {
-                        Some(session_id) => self.continue_session(&session_id),
+                        Some(session_id) => self.continue_session(&session_id, false),
                         None => vec![Effect::Redraw],
                     };
                 }
@@ -3541,6 +3558,11 @@ impl InteractiveController {
                     Some(goal) => format!("the goal is already {}", goal.status.label()),
                     None => "no goal is set".to_owned(),
                 };
+                if self.goal.is_some() {
+                    // A step/tool bound must not start a generic continuation
+                    // after the user paused the goal driving this turn.
+                    self.continuations = self.max_continuations;
+                }
                 self.service.set_goal(None);
                 self.push_history(effects, HistoryItem::Notice { message });
             }
@@ -4597,7 +4619,7 @@ impl InteractiveController {
             "/resume" if argument.is_none() && self.detachable => {
                 return vec![Effect::Exit(super::agents_view::AGENTS_VIEW_EXIT)];
             }
-            "/resume" => match argument {
+            "/resume" => match raw_argument {
                 None => {
                     self.service.list_sessions();
                     self.push_history(
@@ -4608,20 +4630,23 @@ impl InteractiveController {
                     );
                 }
                 Some(selector) => {
+                    let compact = argument == Some("--compact");
+                    let selector = if compact {
+                        selector["--compact".len()..].trim()
+                    } else {
+                        selector
+                    };
+                    let selector = if selector.is_empty() { "latest" } else { selector };
                     let chosen = match selector.parse::<usize>() {
                         Ok(index) => index
                             .checked_sub(1)
                             .and_then(|index| self.session_candidates.get(index))
                             .map(|candidate| candidate.session_id.clone()),
-                        Err(_) => self
-                            .session_candidates
-                            .iter()
-                            .find(|candidate| candidate.session_id == selector)
-                            .map(|candidate| candidate.session_id.clone()),
+                        Err(_) => Some(selector.to_owned()),
                     };
                     match chosen {
                         Some(session_id) => {
-                            effects.extend(self.continue_session(&session_id));
+                            effects.extend(self.continue_session(&session_id, compact));
                         }
                         None => {
                             self.push_history(
@@ -5281,8 +5306,8 @@ impl InteractiveController {
         }
     }
 
-    /// Continue from one session id, reporting the outcome like the pre-T02 code.
-    fn continue_session(&mut self, session_id: &str) -> Vec<Effect> {
+    /// Select a conversation, optionally summarizing it before the next prompt.
+    fn continue_session(&mut self, session_id: &str, compact: bool) -> Vec<Effect> {
         let mut effects = Vec::new();
         if let Err(error) = self.service.resume(Some(session_id.to_owned())) {
             return vec![
@@ -5290,6 +5315,10 @@ impl InteractiveController {
                 Effect::Redraw,
             ];
         }
+        // A prompt (including compaction) can arrive before the asynchronous
+        // transcript restore. Never carry this conversation's goal to that one.
+        self.goal = None;
+        self.service.set_goal(None);
         self.push_history(
             &mut effects,
             HistoryItem::Notice {
@@ -5297,6 +5326,9 @@ impl InteractiveController {
             },
         );
         effects.push(Effect::Redraw);
+        if compact {
+            effects.extend(self.command("/compact"));
+        }
         effects
     }
 
@@ -8056,6 +8088,46 @@ Command: \"npm run build\""
     }
 
     #[test]
+    fn resume_selectors_work_without_listing_first() {
+        for selector in ["latest", "session_direct", "nightly build", "01a12e3c"] {
+            let mut h = bench(true);
+            h.controller.boot_lines();
+            submit_text(&mut h.controller, &format!("/resume {selector}"));
+            assert_eq!(
+                h.port.resumes.lock().expect("resumes").as_slice(),
+                [Some(selector.to_owned())],
+                "the service resolves a direct selector without a stale menu: {selector}"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_can_compact_the_selected_conversation_before_continuing() {
+        for (command, selector) in [
+            ("/resume --compact", "latest"),
+            ("/resume --compact nightly build", "nightly build"),
+        ] {
+            let mut h = bench(true);
+            h.controller.boot_lines();
+            h.controller.goal = Some(super::GoalState::new(
+                "another conversation's goal".to_owned(),
+            ));
+            submit_text(&mut h.controller, command);
+            assert_eq!(
+                h.port.resumes.lock().expect("resumes").as_slice(),
+                [Some(selector.to_owned())]
+            );
+            let requests = submissions(&h);
+            assert_eq!(requests, ["/compact"]);
+            assert!(h.controller.phase.has_active_run());
+            assert!(
+                h.controller.goal.is_none(),
+                "selection clears the previous goal before the restore event"
+            );
+        }
+    }
+
+    #[test]
     fn h05_resume_lists_sessions_and_selects_one_by_number() {
         let mut harness = bench(true);
         let _ = harness.controller.boot_lines();
@@ -10340,6 +10412,87 @@ Command: \"npm run build\""
         assert!(
             plain.iter().any(|line| line.contains("no goal is set")),
             "{plain:#?}"
+        );
+    }
+
+    #[test]
+    fn remote_goal_pause_is_a_control_while_busy_and_its_receipt_finishes_immediately() {
+        let mut harness = bench(true);
+        let _ = submit_text(&mut harness.controller, "/goal finish the long task");
+        let mut effects = Vec::new();
+        let (receipt, outcome) =
+            harness
+                .controller
+                .deliver_tracked("/goal pause".to_owned(), true, false, &mut effects);
+        assert_eq!(outcome, "delivered");
+        assert_eq!(
+            harness.controller.goal.as_ref().expect("goal").status,
+            super::GoalStatus::Paused
+        );
+        assert_eq!(
+            harness
+                .controller
+                .take_delivery_answer(receipt)
+                .expect("receipt"),
+            Some(String::new())
+        );
+        assert!(harness.controller.queue.is_empty());
+        let _ = end_done(&mut harness);
+        assert_eq!(
+            submissions(&harness).len(),
+            1,
+            "paused goal cannot automatically continue"
+        );
+        let (receipt, _) = harness.controller.deliver_tracked(
+            "/goal resume".to_owned(),
+            true,
+            false,
+            &mut effects,
+        );
+        assert!(
+            harness
+                .controller
+                .take_delivery_answer(receipt)
+                .expect("running receipt")
+                .is_none()
+        );
+        let _ =
+            harness
+                .controller
+                .deliver_tracked("/goal pause".to_owned(), true, false, &mut effects);
+        let _ = end_done(&mut harness);
+        assert!(
+            harness
+                .controller
+                .take_delivery_answer(receipt)
+                .expect("finished receipt")
+                .is_some()
+        );
+        assert_eq!(submissions(&harness).len(), 2);
+    }
+
+    #[test]
+    fn goal_pause_also_stops_a_turns_automatic_bound_continuation() {
+        let mut harness = bench(true);
+        harness.controller.max_continuations = 3;
+        let _ = submit_text(&mut harness.controller, "/goal finish the long task");
+        let mut effects = Vec::new();
+        let _ =
+            harness
+                .controller
+                .deliver_tracked("/goal pause".to_owned(), true, false, &mut effects);
+        let _ = end_at(&mut harness, PauseReason::StepLimit);
+        assert_eq!(
+            submissions(&harness).len(),
+            1,
+            "a paused goal cannot continue at a bound"
+        );
+        let _ = submit_text(&mut harness.controller, "a new explicitly requested turn");
+        let _ = end_at(&mut harness, PauseReason::StepLimit);
+        assert_eq!(
+            submissions(&harness).len(),
+            3,
+            "new user work gets its own continuation budget"
         );
     }
 

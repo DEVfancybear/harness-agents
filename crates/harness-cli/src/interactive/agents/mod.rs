@@ -36,6 +36,14 @@ pub struct CreateSession {
 /// Where `rlm.create_session` starts a separate top-level agent. Only an agent
 /// that runs in a background worker has one.
 pub trait SessionHost: Send + Sync {
+    /// Claim a conversation before switching this agent to it.
+    ///
+    /// # Errors
+    /// Another agent or headless turn already owns the conversation.
+    fn claim_conversation(&self, _task: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Start the agent and send it the prompt; the answer is prime-agent's
     /// `RLMCreateSessionHandle` payload.
     ///
