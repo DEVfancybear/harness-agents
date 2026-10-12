@@ -1653,6 +1653,10 @@ impl TurnDriver {
                             Some(context) => format!("{rendered}\n\nHook feedback:\n{context}"),
                             None => rendered,
                         };
+                        let rendered = match note.and_then(crate::HookResponse::host_context_text) {
+                            Some(context) => format!("{rendered}\n\n{context}"),
+                            None => rendered,
+                        };
                         appended.push(ProviderMessage::tool_result(transcript_id, rendered));
                     }
                     Slot::Ready(_) | Slot::Taken => {}

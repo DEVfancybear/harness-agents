@@ -78,21 +78,63 @@ fn broken_links(text: &str, base: &Path) -> Vec<String> {
     let mut rest = text;
     while let Some(start) = rest.find("](") {
         rest = &rest[start + 2..];
-        let Some(end) = rest.find(')') else {
-            break;
-        };
-        let target = rest[..end].trim();
-        rest = &rest[end..];
-        let target = target.split('#').next().unwrap_or_default().trim();
-        let target = target.split_whitespace().next().unwrap_or_default();
+        rest = rest.trim_start();
+        let mut target = String::new();
+        let mut depth = 0_usize;
+        let angle = rest.starts_with('<');
+        let mut escaped = false;
+        let mut consumed = 0;
+        for (index, ch) in rest.char_indices().skip(usize::from(angle)) {
+            consumed = index + ch.len_utf8();
+            if escaped {
+                target.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if (angle && ch == '>')
+                || (!angle && (ch.is_whitespace() || (ch == ')' && depth == 0)))
+            {
+                break;
+            } else {
+                if !angle && ch == '(' {
+                    depth += 1;
+                } else if !angle && ch == ')' {
+                    depth = depth.saturating_sub(1);
+                }
+                target.push(ch);
+            }
+        }
+        rest = &rest[consumed..];
+        let target = target.split(['#', '?']).next().unwrap_or_default();
         if target.is_empty() || target.contains("://") || target.starts_with("mailto:") {
             continue;
         }
-        if !base.join(target).exists() {
-            broken.push(target.to_owned());
+        let target = decode_link_path(target);
+        if !base.join(&target).exists() {
+            broken.push(target);
         }
     }
     broken
+}
+
+fn decode_link_path(target: &str) -> String {
+    let mut decoded = Vec::with_capacity(target.len());
+    let mut bytes = target.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let mut lookahead = bytes.clone();
+            if let (Some(high), Some(low)) = (lookahead.next(), lookahead.next())
+                && let (Some(high), Some(low)) =
+                    (char::from(high).to_digit(16), char::from(low).to_digit(16))
+            {
+                decoded.push(u8::try_from(high * 16 + low).expect("two hex digits"));
+                bytes = lookahead;
+                continue;
+            }
+        }
+        decoded.push(byte);
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| target.to_owned())
 }
 
 /// The manifests a project may have and the lock files that pin them.
@@ -175,7 +217,8 @@ fn instructions(global_config_dir: &Path, root: &Path, cwd: &Path) -> Subsystem 
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     subsystem.pass(format!("{name} at the project root"));
-    let oversized = super::instructions::oversized(global_config_dir, root, cwd);
+    let loaded = super::instructions::load(global_config_dir, root, cwd);
+    let oversized = super::instructions::oversized(&loaded);
     if oversized.is_empty() {
         subsystem.pass(format!(
             "instruction files stay within {} lines",
@@ -193,16 +236,29 @@ fn instructions(global_config_dir: &Path, root: &Path, cwd: &Path) -> Subsystem 
             );
         }
     }
-    let text = std::fs::read_to_string(&entry).unwrap_or_default();
-    let broken = broken_links(&text, root);
-    if broken.is_empty() {
-        subsystem.pass(format!("the links in {name} resolve"));
-    } else {
+    for notice in &loaded.notices {
         subsystem.short(
             Level::Warn,
-            format!("{name} links to missing files: {}", broken.join(", ")),
-            "fix or remove the links; a stale map sends the agent the wrong way",
+            notice,
+            "correct the instruction file so the agent can load it completely",
         );
+    }
+    for (file, block) in loaded.files.iter().zip(&loaded.blocks) {
+        let source = file
+            .strip_prefix(root)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+        let broken = broken_links(&block.text, file.parent().unwrap_or(root));
+        if broken.is_empty() {
+            subsystem.pass(format!("the links in {source} resolve"));
+        } else {
+            subsystem.short(
+                Level::Warn,
+                format!("{source} links to missing files: {}", broken.join(", ")),
+                "fix or remove the links; a stale map sends the agent the wrong way",
+            );
+        }
     }
     subsystem
 }
@@ -557,5 +613,57 @@ mod tests {
             root.path(),
         );
         assert_eq!(broken, ["missing.md"]);
+    }
+}
+
+#[cfg(test)]
+mod link_regressions {
+    use super::*;
+
+    #[test]
+    fn markdown_destinations_support_spaces_escapes_and_balanced_parentheses() {
+        let root = tempfile::tempdir().expect("root");
+        for name in ["My Report.md", "api(v2).md"] {
+            std::fs::write(root.path().join(name), "ok").expect("target");
+        }
+        let text = r#"[a](<My Report.md>) [b](My%20Report.md#part "title") [c](api(v2).md) [d](api\(v2\).md) [e](https://example.invalid) [f](#anchor)"#;
+        assert!(broken_links(text, root.path()).is_empty());
+        assert_eq!(
+            broken_links("[missing](absent.md)", root.path()),
+            ["absent.md"]
+        );
+    }
+
+    #[test]
+    fn audit_includes_local_and_cwd_instruction_links_relative_to_their_files() {
+        let root = tempfile::tempdir().expect("root");
+        let cwd = root.path().join("src");
+        std::fs::create_dir(&cwd).expect("cwd");
+        std::fs::write(root.path().join("AGENTS.md"), "root").expect("root rule");
+        std::fs::write(
+            root.path().join("AGENTS.local.md"),
+            "[missing](local-missing.md)",
+        )
+        .expect("local");
+        std::fs::write(
+            cwd.join("CLAUDE.md"),
+            "[ok](valid.md) [missing](nested-missing.md)",
+        )
+        .expect("nested");
+        std::fs::write(cwd.join("valid.md"), "ok").expect("target");
+        let report = instructions(&root.path().join("global"), root.path(), &cwd);
+        let warnings = report
+            .findings
+            .iter()
+            .filter(|f| f.level == Level::Warn)
+            .map(|f| f.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            warnings.contains("AGENTS.local.md") && warnings.contains("local-missing.md"),
+            "{warnings}"
+        );
+        assert!(warnings.contains("nested-missing.md"), "{warnings}");
+        assert!(!warnings.contains("valid.md"), "{warnings}");
     }
 }

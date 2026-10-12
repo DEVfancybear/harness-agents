@@ -87,8 +87,12 @@ fn read_bounded(path: &Path, limit: usize, source: &str) -> Result<(String, bool
     let truncated = bytes.len() > limit;
     if truncated {
         bytes.truncate(limit);
-        while std::str::from_utf8(&bytes).is_err() && !bytes.is_empty() {
-            bytes.pop();
+        if let Err(error) = std::str::from_utf8(&bytes) {
+            if error.error_len().is_some() {
+                return Err(format!("ignored non-UTF-8 instruction file {source}"));
+            }
+            // Only an incomplete final character is a truncation boundary.
+            bytes.truncate(error.valid_up_to());
         }
     }
     String::from_utf8(bytes)
@@ -202,7 +206,7 @@ fn chain(project_root: &Path, cwd: &Path) -> Vec<PathBuf> {
 pub struct NestedInstructions {
     project_root: PathBuf,
     conversation: String,
-    /// `(conversation, directory)` pairs already handled, shared by the turns
+    /// `(conversation, instruction file)` pairs already delivered, shared by the turns
     /// of a session.
     seen: Arc<Mutex<BTreeSet<(String, PathBuf)>>>,
     /// What this turn may still add.
@@ -220,7 +224,9 @@ impl NestedInstructions {
         // What every turn loads already is never added again.
         if let Ok(mut seen) = seen.lock() {
             for directory in chain(project_root, cwd) {
-                seen.insert((conversation.to_owned(), directory));
+                for (path, _) in directory_files(&directory, true) {
+                    seen.insert((conversation.to_owned(), path));
+                }
             }
         }
         Self {
@@ -277,17 +283,19 @@ impl harness_tools::ToolResultContext for NestedInstructions {
         };
         let mut added = Vec::new();
         for directory in directories {
-            if !seen.insert((self.conversation.clone(), directory.clone())) {
-                continue;
-            }
             for (path, _) in directory_files(&directory, true) {
+                let key = (self.conversation.clone(), path.clone());
+                if seen.contains(&key) || *remaining == 0 {
+                    continue;
+                }
                 let source = display_source(&path, &self.project_root, false);
-                if admissible(&path, &self.project_root, &source).is_err() || *remaining == 0 {
+                if admissible(&path, &self.project_root, &source).is_err() {
                     continue;
                 }
                 let Ok((text, truncated)) = read_bounded(&path, *remaining, &source) else {
                     continue;
                 };
+                seen.insert(key);
                 *remaining = remaining.saturating_sub(text.len());
                 let scope = source
                     .rsplit_once('/')
@@ -310,12 +318,8 @@ impl harness_tools::ToolResultContext for NestedInstructions {
 /// Instruction files longer than the entry-file guideline, as
 /// `(source, lines)`, for `ha doctor`.
 #[must_use]
-pub fn oversized(
-    global_config_dir: &Path,
-    project_root: &Path,
-    cwd: &Path,
-) -> Vec<(String, usize)> {
-    load(global_config_dir, project_root, cwd)
+pub fn oversized(loaded: &InstructionLoad) -> Vec<(String, usize)> {
+    loaded
         .blocks
         .iter()
         .filter_map(|block| {
@@ -501,5 +505,60 @@ mod tests {
                 .iter()
                 .any(|notice| notice.contains("protected instruction file"))
         );
+    }
+
+    #[test]
+    fn nested_files_deferred_by_the_turn_budget_are_not_marked_seen() {
+        use harness_tools::ToolResultContext as _;
+        let root = tempfile::tempdir().expect("root");
+        for name in ["a", "b"] {
+            std::fs::create_dir(root.path().join(name)).expect("directory");
+        }
+        std::fs::write(
+            root.path().join("a/AGENTS.md"),
+            "x".repeat(super::MAX_NESTED_BYTES),
+        )
+        .expect("large rule");
+        std::fs::write(root.path().join("a/AGENTS.local.md"), "deferred local").expect("local");
+        std::fs::write(root.path().join("b/AGENTS.md"), "deferred sibling").expect("sibling");
+        let seen = std::sync::Arc::default();
+        let read = |path: &str| harness_tools::CodingToolAction::ReadFile {
+            path: path.to_owned(),
+            offset: None,
+            limit: None,
+        };
+        let first = super::NestedInstructions::new(
+            root.path(),
+            root.path(),
+            "conversation",
+            std::sync::Arc::clone(&seen),
+        );
+        assert_eq!(first.context_for(&read("a/code.rs")).len(), 1);
+        assert!(first.context_for(&read("b/code.rs")).is_empty());
+        let next = super::NestedInstructions::new(root.path(), root.path(), "conversation", seen);
+        assert!(
+            next.context_for(&read("a/code.rs"))
+                .join("\n")
+                .contains("deferred local")
+        );
+        assert!(
+            next.context_for(&read("b/code.rs"))
+                .join("\n")
+                .contains("deferred sibling")
+        );
+        assert!(next.context_for(&read("b/code.rs")).is_empty());
+    }
+
+    #[test]
+    fn bounded_utf8_reads_trim_only_incomplete_final_characters() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("AGENTS.md");
+        std::fs::write(&path, "a😀more").expect("utf8");
+        assert_eq!(
+            super::read_bounded(&path, 3, "rule").expect("cut"),
+            ("a".to_owned(), true)
+        );
+        std::fs::write(&path, b"a\xffsome more").expect("invalid");
+        assert!(super::read_bounded(&path, 8, "rule").is_err());
     }
 }

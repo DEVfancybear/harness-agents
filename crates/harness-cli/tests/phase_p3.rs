@@ -146,6 +146,69 @@ async fn review_p3_large_invalid_utf8_is_not_silently_repaired() {
 }
 
 #[tokio::test]
+async fn handoff_file_is_writable_while_harness_configuration_stays_protected() {
+    let temp = TempDir::new().unwrap();
+    let root = setup_workspace(&temp);
+    fs::create_dir(root.join(".harness")).unwrap();
+    let store = writer(&temp).await;
+    let (session, task, _) = admit(&store, &root).await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let (prepared, approval) = prepared_and_approved(
+        &tools,
+        &session,
+        &task,
+        &root,
+        CodingToolAction::WriteFile {
+            path: ".harness/progress.md".into(),
+            content: "# Progress\nverified handoff".into(),
+            expected_hash: None,
+        },
+    )
+    .await;
+    tools
+        .execute(prepared, Some(approval))
+        .await
+        .expect("write handoff");
+    assert_eq!(
+        fs::read_to_string(root.join(".harness/progress.md")).unwrap(),
+        "# Progress\nverified handoff"
+    );
+    let (prepared, approval) = prepared_and_approved(
+        &tools,
+        &session,
+        &task,
+        &root,
+        CodingToolAction::ReadFile {
+            path: ".harness/progress.md".into(),
+            offset: None,
+            limit: None,
+        },
+    )
+    .await;
+    let view = tools
+        .execute(prepared, Some(approval))
+        .await
+        .expect("read handoff");
+    assert!(
+        matches!(view.output, ToolOutput::ReadFile { ref content, .. } if content.contains("verified handoff"))
+    );
+    for path in [
+        ".harness/config.toml",
+        ".harness/auth.json",
+        ".harness/private/progress.md",
+        "nested/.harness/progress.md",
+        ".harness/progress.md/secret.txt",
+    ] {
+        assert!(
+            harness_tools::is_sensitive_workspace_path(Path::new(path)),
+            "protected: {path}"
+        );
+    }
+    drop(tools);
+    close_writer(store).await;
+}
+
+#[tokio::test]
 async fn review_p3_search_redacts_before_truncation() {
     let temp = TempDir::new().unwrap();
     let root = setup_workspace(&temp);

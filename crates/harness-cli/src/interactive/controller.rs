@@ -343,6 +343,7 @@ pub struct InteractiveController {
     gates_pending: bool,
     /// `/handoff --reset`: a fresh conversation follows the handoff turn.
     handoff_reset: bool,
+    handoff_before: Option<super::lifecycle::HandoffStamp>,
     /// The session's tokens when the running turn started, for its share.
     turn_tokens_start: u64,
 }
@@ -447,6 +448,7 @@ impl InteractiveController {
             autonomous: super::autonomous::Autonomous::default(),
             gates_pending: false,
             handoff_reset: false,
+            handoff_before: None,
             turn_tokens_start: 0,
         }
     }
@@ -2919,7 +2921,9 @@ impl InteractiveController {
                 // conversation starts from it.
                 if self.handoff_reset {
                     self.handoff_reset = false;
-                    if matches!(outcome, RunOutcome::Done) {
+                    let after = super::lifecycle::handoff_stamp(&self.context.project.root);
+                    let updated = after.is_some() && after != self.handoff_before.take();
+                    if matches!(outcome, RunOutcome::Done) && updated {
                         self.close_run_grant();
                         effects.extend(
                             self.command(&format!(
@@ -2934,7 +2938,7 @@ impl InteractiveController {
                         effects,
                         HistoryItem::Notice {
                             message:
-                                "the handoff turn did not finish; the conversation was not reset"
+                                "the handoff turn did not persist an updated handoff; the conversation was not reset"
                                     .to_owned(),
                         },
                     );
@@ -4228,6 +4232,7 @@ impl InteractiveController {
                 } else {
                     let mut focus = raw_argument.unwrap_or_default().to_owned();
                     self.handoff_reset = focus.split_whitespace().any(|word| word == "--reset");
+                    self.handoff_before = self.handoff_reset.then(|| super::lifecycle::handoff_stamp(&self.context.project.root)).flatten();
                     focus = focus
                         .split_whitespace()
                         .filter(|word| *word != "--reset")
@@ -6321,6 +6326,45 @@ mod tests {
     fn submit_text(controller: &mut InteractiveController, text: &str) -> Vec<Effect> {
         type_text(controller, text);
         controller.handle_key(Key::Enter)
+    }
+
+    #[test]
+    fn handoff_reset_requires_an_updated_persisted_handoff() {
+        for updated in [false, true] {
+            let mut h = bench(true);
+            h.controller.boot_lines();
+            let root = h.controller.context.project.root.clone();
+            std::fs::create_dir_all(root.join(".harness")).expect("harness dir");
+            std::fs::write(
+                root.join(super::super::lifecycle::PROGRESS_FILE),
+                "old handoff",
+            )
+            .expect("old");
+            submit_text(&mut h.controller, "/handoff --reset");
+            if updated {
+                std::fs::write(
+                    root.join(super::super::lifecycle::PROGRESS_FILE),
+                    "updated verified handoff",
+                )
+                .expect("updated");
+            }
+            h.events
+                .send(SessionEvent::RunTerminal {
+                    outcome: RunOutcome::Done,
+                })
+                .expect("done");
+            let rendered = effects_to_plain(&h.controller.pump_events()).join("\n");
+            assert_eq!(
+                rendered.contains("the conversation was not reset"),
+                !updated,
+                "updated={updated}: {rendered}"
+            );
+            assert_eq!(
+                h.controller.phase.has_active_run(),
+                updated,
+                "only a persisted handoff may start the continuation"
+            );
+        }
     }
 
     #[test]

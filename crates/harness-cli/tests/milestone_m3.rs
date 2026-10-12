@@ -1307,6 +1307,86 @@ async fn m3_03_loop_detection() {
 }
 
 #[tokio::test]
+async fn multi_file_reads_deliver_host_context_to_the_next_provider_request() {
+    struct FileContext;
+    impl harness_tools::ToolResultContext for FileContext {
+        fn context_for(&self, action: &harness_tools::CodingToolAction) -> Vec<String> {
+            match action {
+                harness_tools::CodingToolAction::ReadFile { path, .. } => {
+                    vec![format!("scoped instruction for {path}")]
+                }
+                _ => Vec::new(),
+            }
+        }
+    }
+    let bench = bench();
+    std::fs::write(bench.workspace.join("src/other.rs"), "fn other() {}\n").expect("other file");
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptStep::Events(vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "batch",
+                "read_file",
+                r#"{"paths":["src/parser.rs","src/other.rs"]}"#,
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ]),
+        ScriptStep::Events(vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("done"),
+            ProviderStreamEvent::completed("stop"),
+        ]),
+    ]));
+    let (runtime, _) = runtime_for(&store, provider.clone(), None, None).await;
+    let driver = TurnDriver::new(
+        runtime,
+        ToolExecutionService::new(Arc::clone(&store)).with_result_context(Arc::new(FileContext)),
+    );
+    let outcome = driver
+        .run_turn(
+            request(
+                &bench.workspace,
+                SessionId::generate(),
+                TaskId::generate(),
+                "read both",
+            ),
+            options(&bench.workspace),
+            Arc::new(RecordingObserver::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn");
+    assert_eq!(outcome.executions.len(), 2);
+    let seen = provider.seen();
+    let result = seen[1]
+        .messages
+        .iter()
+        .find(|m| m.role == MessageRole::Tool)
+        .expect("tool reply");
+    assert!(
+        result
+            .content
+            .contains("scoped instruction for src/parser.rs"),
+        "{}",
+        result.content
+    );
+    assert!(
+        result
+            .content
+            .contains("scoped instruction for src/other.rs"),
+        "{}",
+        result.content
+    );
+    assert!(
+        !result.content.contains("Hook feedback:"),
+        "host context retains its authority"
+    );
+    drop(driver);
+    close(store).await;
+}
+
+#[tokio::test]
 async fn m3_03_valid_polling_is_not_a_loop() {
     let bench = bench();
     let store = bench.open_store().await;

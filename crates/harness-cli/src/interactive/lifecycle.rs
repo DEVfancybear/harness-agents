@@ -26,6 +26,28 @@ pub const PROGRESS_FILE: &str = ".harness/progress.md";
 /// How much of the handoff a session's first prompt carries.
 const HANDOFF_BRIEF_BYTES: usize = 6 * 1024;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandoffStamp {
+    hash: harness_types::ContentHash,
+    modified: Option<std::time::SystemTime>,
+}
+
+/// A nonempty, readable handoff actually persisted in the workspace.
+#[must_use]
+pub fn handoff_stamp(root: &Path) -> Option<HandoffStamp> {
+    let path = root.join(PROGRESS_FILE);
+    let text = std::fs::read_to_string(&path).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(HandoffStamp {
+        hash: harness_types::ContentHash::from_bytes(text.as_bytes()),
+        modified: std::fs::metadata(path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok()),
+    })
+}
+
 /// What `/handoff --reset` asks the fresh conversation.
 pub const CONTINUE_FROM_HANDOFF: &str = "Continue from the handoff the previous session left in .harness/progress.md (shown in the session brief): check its current state against the repository, then carry on with its next step.";
 
@@ -136,11 +158,32 @@ pub fn handoff_request(focus: Option<&str>) -> String {
 #[must_use]
 pub fn clean_state(root: &Path) -> Vec<String> {
     let mut lines = Vec::new();
-    let status = git(root, &["--no-optional-locks", "status", "--short"]);
-    let changed = status
-        .as_deref()
-        .map(|status| status.lines().collect::<Vec<_>>())
-        .unwrap_or_default();
+    // NUL-separated porcelain leaves spaces, Unicode and rename destinations
+    // intact. Human-readable status quotes paths and is not a filesystem path.
+    let status = git(
+        root,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
+    );
+    let mut records = status.as_deref().unwrap_or_default().split('\0');
+    let mut changed = Vec::new();
+    while let Some(record) = records.next() {
+        if let Some(path) = record.get(3..) {
+            changed.push(path);
+            if record.as_bytes()[..2]
+                .iter()
+                .any(|byte| matches!(byte, b'R' | b'C'))
+            {
+                // In -z output, the destination precedes the source.
+                let _ = records.next();
+            }
+        }
+    }
     if !changed.is_empty() {
         lines.push(format!(
             "{} uncommitted file(s) ({}{}): commit what is safe, or say in the handoff why not",
@@ -148,7 +191,7 @@ pub fn clean_state(root: &Path) -> Vec<String> {
             changed
                 .iter()
                 .take(4)
-                .map(|line| line.get(3..).unwrap_or(line).trim())
+                .copied()
                 .collect::<Vec<_>>()
                 .join(", "),
             if changed.len() > 4 { ", ..." } else { "" }
@@ -173,8 +216,7 @@ pub fn clean_state(root: &Path) -> Vec<String> {
             Ok(written) => {
                 let newest_change = changed
                     .iter()
-                    .filter_map(|line| line.get(3..))
-                    .filter_map(|path| std::fs::metadata(root.join(path.trim())).ok())
+                    .filter_map(|path| std::fs::metadata(root.join(path)).ok())
                     .filter_map(|meta| meta.modified().ok())
                     .max();
                 newest_change
@@ -257,5 +299,42 @@ mod tests {
         assert!(text.contains(PROGRESS_FILE));
         assert!(text.contains("## Next step"));
         assert!(text.contains("Focus on: the parser"));
+    }
+
+    #[test]
+    fn stale_handoff_checks_quoted_paths_and_rename_destinations() {
+        use std::fs::File;
+        use std::time::{Duration, SystemTime};
+        for rename in [false, true] {
+            let root = tempfile::tempdir().expect("root");
+            git(root.path(), &["init", "-q"]);
+            std::fs::create_dir(root.path().join(".harness")).expect("dir");
+            let original = "report é.txt";
+            std::fs::write(root.path().join(original), "a").expect("file");
+            std::fs::write(root.path().join(PROGRESS_FILE), "handoff").expect("handoff");
+            git(root.path(), &["add", "."]);
+            git(root.path(), &["commit", "-qm", "start"]);
+            let written = SystemTime::now() - Duration::from_mins(1);
+            File::options()
+                .write(true)
+                .open(root.path().join(PROGRESS_FILE))
+                .expect("open")
+                .set_modified(written)
+                .expect("mtime");
+            if rename {
+                git(root.path(), &["mv", original, "renamed é.txt"]);
+            } else {
+                std::fs::write(root.path().join(original), "changed").expect("edit");
+            }
+            let warnings = clean_state(root.path()).join("\n");
+            assert!(
+                warnings.contains("older than the latest changes"),
+                "rename={rename}: {warnings}"
+            );
+            assert!(
+                warnings.contains(if rename { "renamed é.txt" } else { original }),
+                "{warnings}"
+            );
+        }
     }
 }

@@ -51,11 +51,13 @@ pub fn store_path(layers: &super::learned::Layers) -> Option<PathBuf> {
         .map(|harness| harness.join(PROPOSED_FILE))
 }
 
-fn load(path: &Path) -> Store {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+fn load(path: &Path) -> Result<Store, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|error| format!("invalid {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Store::default()),
+        Err(error) => Err(format!("could not read {}: {error}", path.display())),
+    }
 }
 
 fn save(path: &Path, store: &Store) -> Result<(), String> {
@@ -64,10 +66,17 @@ fn save(path: &Path, store: &Store) -> Result<(), String> {
     }
     let mut text = serde_json::to_string_pretty(store).map_err(|error| error.to_string())?;
     text.push('\n');
-    let temporary = path.with_extension("json.tmp");
+    write_atomic(path, &text)
+}
+
+fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    let temporary = path.with_extension(format!("{}.tmp", harness_types::RequestId::generate()));
     std::fs::write(&temporary, text)
         .and_then(|()| std::fs::rename(&temporary, path))
-        .map_err(|error| error.to_string())
+        .map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            format!("{}: {error}", path.display())
+        })
 }
 
 fn valid_name(name: &str) -> bool {
@@ -92,7 +101,10 @@ fn lint(
     if !valid_name(name) {
         return Err("name must be kebab-case, at most 40 characters".to_owned());
     }
-    if command.is_empty() || command.contains('\n') || command.chars().count() > MAX_COMMAND_CHARS {
+    if command.is_empty()
+        || command.chars().any(char::is_control)
+        || command.chars().count() > MAX_COMMAND_CHARS
+    {
         return Err(format!(
             "command must be one line of at most {MAX_COMMAND_CHARS} characters"
         ));
@@ -137,7 +149,7 @@ fn lint(
         name: name.to_owned(),
         command: command.to_owned(),
         hint: hint.to_owned(),
-        reason: text("reason").to_owned(),
+        reason: super::learned::redact(text("reason")),
         evidence: super::learned::redact(text("evidence")),
         proposed_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     })
@@ -160,19 +172,32 @@ pub fn propose(
                 "id": intent["name"],
                 "applied": false,
                 "error": "checks are proposed for a trusted project only",
-                "reason": intent["reason"],
+                "reason": intent["reason"].as_str().map(super::learned::redact),
             }));
         }
         return records;
     };
-    let mut store = load(&path);
+    let mut store = match load(&path) {
+        Ok(store) => store,
+        Err(error) => {
+            return intents
+                .iter()
+                .map(|intent| {
+                    json!({
+                        "kind": "check", "action": "propose", "id": intent["name"],
+                        "applied": false, "error": error,
+                    })
+                })
+                .collect();
+        }
+    };
     let mut changed = false;
     for intent in intents {
         let mut record = json!({
             "kind": "check",
             "action": "propose",
             "id": intent["name"],
-            "reason": intent["reason"],
+            "reason": intent["reason"].as_str().map(super::learned::redact),
         });
         match lint(intent, existing, &store.proposals) {
             Ok(proposal) => {
@@ -212,7 +237,7 @@ pub fn prompt_part(existing: &[super::verify::Check]) -> String {
             .join(", ")
     };
     format!(
-        "<check_proposals>\nWhen the conversation shows a mistake that was corrected or that recurred, and a command can detect it mechanically - a linter rule, a search for a forbidden import or call, a script that checks a boundary - propose it in `checks`: {{\"name\": \"kebab-case\", \"command\": \"one shell line that exits non-zero exactly when the problem is present\", \"hint\": \"what is wrong, why, and how to fix it - what the agent reads when the check fails\", \"reason\": \"why\", \"evidence\": \"verbatim quote\"}}. A check is stronger than a skill: it is run on every goal and feature instead of being remembered. The user reviews each proposal before it runs. Propose none when no command can tell the problem apart reliably. The project's checks now: {names}.\n</check_proposals>"
+        "<check_proposals>\nWhen the conversation shows a mistake that was corrected or that recurred, and a command can detect it mechanically - a linter rule, a search for a forbidden import or call, a script that checks a boundary - propose it in `checks`: {{\"name\": \"kebab-case\", \"command\": \"one shell line that exits non-zero exactly when the problem is present\", \"hint\": \"what is wrong, why, and how to fix it - what the agent reads when the check fails\", \"reason\": \"why\", \"evidence\": \"verbatim quote\"}}. A check is stronger than a skill: it is run on every goal and feature instead of being remembered. The user reviews each proposal before it runs. Propose none when no command can tell the problem apart reliably. Names must be kebab-case (at most 40 characters), commands a single line of at most 300 characters, and hints 20-400 characters. Keep hints concise and actionable. The project's checks now: {names}.\n</check_proposals>"
     )
 }
 
@@ -228,7 +253,7 @@ pub fn command(
 ) -> Result<Vec<String>, String> {
     let path = store_path(layers)
         .ok_or("checks are proposed for a trusted project only; /trust yes first")?;
-    let mut store = load(&path);
+    let mut store = load(&path)?;
     let words = argument
         .unwrap_or_default()
         .split_whitespace()
@@ -264,7 +289,8 @@ pub fn command(
                 .ok_or_else(|| format!("no proposed check named {name}"))?;
             let proposal = store.proposals.remove(index);
             let message = if words[0] == "accept" {
-                accept(workspace, &proposal)?;
+                let config = workspace.join(".harness/config.toml");
+                accept(&config, &proposal)?;
                 format!(
                     "check {} joins [verify] in .harness/config.toml; /verify runs it now",
                     proposal.name
@@ -281,15 +307,38 @@ pub fn command(
 
 /// Append the check to the project config, refusing a result that would not
 /// load.
-fn accept(workspace: &Path, proposal: &Proposal) -> Result<(), String> {
-    let path = workspace.join(".harness").join("config.toml");
-    let current = std::fs::read_to_string(&path).unwrap_or_default();
-    let quote = |text: &str| toml::Value::String(text.to_owned()).to_string();
-    let mut next = if current.trim().is_empty() {
+fn accept(path: &Path, proposal: &Proposal) -> Result<(), String> {
+    let current = match std::fs::read_to_string(path) {
+        Ok(current) => current,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
+    };
+    let current = if current.trim().is_empty() {
         "schema_version = 2\n".to_owned()
     } else {
-        current.clone()
+        current
     };
+    let parsed: harness_types::HarnessConfigV2 = toml::from_str(&current)
+        .map_err(|error| format!(".harness/config.toml would not load with the check: {error}"))?;
+    let existing = parsed.verify.map_or_else(Vec::new, |verify| {
+        verify
+            .checks
+            .into_iter()
+            .map(|check| super::verify::Check {
+                name: check.name.trim().to_owned(),
+                command: check.command.trim().to_owned(),
+                hint: check.hint,
+                timeout_ms: 0,
+            })
+            .collect()
+    });
+    lint(
+        &json!({"name":proposal.name,"command":proposal.command,"hint":proposal.hint,"reason":proposal.reason,"evidence":proposal.evidence}),
+        &existing,
+        &[],
+    )?;
+    let quote = |text: &str| toml::Value::String(text.to_owned()).to_string();
+    let mut next = current;
     if !next.ends_with('\n') {
         next.push('\n');
     }
@@ -308,7 +357,7 @@ fn accept(workspace: &Path, proposal: &Proposal) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    std::fs::write(&path, next).map_err(|error| error.to_string())
+    std::fs::write(path, next).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 #[cfg(test)]
@@ -412,5 +461,65 @@ mod tests {
             .join("\n");
         assert!(empty.contains("no checks are waiting"), "{empty}");
         assert!(command(&layers, &workspace, Some("reject nothing")).is_err());
+    }
+
+    #[test]
+    fn corrupt_queue_is_reported_and_not_overwritten() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("project");
+        let layers = layers(root.path());
+        let path = store_path(&layers).expect("path");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(&path, "{broken").expect("queue");
+        assert!(command(&layers, &workspace, None).is_err());
+        let records = propose(&layers, &[intent("new", "exit 0")], &[]);
+        assert_eq!(records[0]["applied"], false);
+        assert_eq!(std::fs::read_to_string(path).expect("read"), "{broken");
+    }
+
+    #[test]
+    fn acceptance_revalidates_and_preserves_existing_config_on_error() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("project");
+        std::fs::create_dir_all(workspace.join(".harness")).expect("dir");
+        let layers = layers(root.path());
+        let config = workspace.join(".harness/config.toml");
+        let pending = store_path(&layers).expect("queue");
+        assert_eq!(
+            propose(&layers, &[intent("guard", "exit 0")], &[])[0]["applied"],
+            true
+        );
+        let original =
+            "schema_version = 2\n[[verify.checks]]\nname = 'guard'\ncommand = 'exit 0'\n";
+        std::fs::write(&config, original).expect("config");
+        assert!(command(&layers, &workspace, Some("accept guard")).is_err());
+        assert_eq!(std::fs::read_to_string(&config).expect("config"), original);
+        let invalid = b"schema_version = 2\n# original \xff\n";
+        std::fs::write(&config, invalid).expect("invalid config");
+        assert!(command(&layers, &workspace, Some("accept guard")).is_err());
+        assert_eq!(std::fs::read(&config).expect("bytes"), invalid);
+        assert_eq!(super::load(&pending).expect("queue").proposals.len(), 1);
+    }
+
+    #[test]
+    fn accepting_from_another_workspace_updates_its_own_verification_config() {
+        let root = tempfile::tempdir().expect("root");
+        let layers = layers(root.path());
+        let other = root.path().join("linked-worktree");
+        std::fs::create_dir_all(&other).expect("worktree");
+        assert_eq!(
+            propose(&layers, &[intent("guard", "exit 0")], &[])[0]["applied"],
+            true
+        );
+        command(&layers, &other, Some("accept guard")).expect("accept");
+        assert!(!root.path().join("project/.harness/config.toml").exists());
+        assert!(other.join(".harness/config.toml").is_file());
+    }
+
+    #[test]
+    fn commands_with_embedded_control_characters_are_not_single_lines() {
+        for command in ["echo ok\recho bad", "echo ok\0bad"] {
+            assert!(super::lint(&intent("guard", command), &[], &[]).is_err());
+        }
     }
 }

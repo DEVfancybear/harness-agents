@@ -1663,6 +1663,11 @@ pub fn is_sensitive_workspace_path(path: &Path) -> bool {
 }
 
 fn is_sensitive_relative(path: &Path) -> bool {
+    // The public session handoff is agent-authored project content. All other
+    // harness state and configuration keep their protected-path policy.
+    if path == Path::new(".harness/progress.md") {
+        return false;
+    }
     let mut last = None;
     for component in path.components() {
         let Component::Normal(value) = component else {
