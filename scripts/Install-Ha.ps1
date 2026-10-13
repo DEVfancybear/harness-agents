@@ -255,15 +255,19 @@ function Get-CopyFailureKind {
 # `m9_04_install_smoke_preserves_existing_data`) holds the new file for a moment.
 # A short, bounded retry absorbs that; a binary that really is running keeps
 # failing and is reported as `in_use` exactly as before.
+#
+# Deleting is the same race with a different code: Windows refuses to delete an
+# executable whose image is still mapped with access denied (5), not a sharing
+# violation, so uninstall passes `-TransientKinds` to retry that kind as well.
 function Invoke-FileStepWithRetry {
-    param([scriptblock] $Step, [int] $Attempts = 6)
+    param([scriptblock] $Step, [int] $Attempts = 6, [string[]] $TransientKinds = @('in_use'))
     for ($attempt = 1; ; $attempt++) {
         try {
             & $Step
             return
         }
         catch {
-            if ($attempt -ge $Attempts -or (Get-CopyFailureKind -Exception $_.Exception) -ne 'in_use') {
+            if ($attempt -ge $Attempts -or (Get-CopyFailureKind -Exception $_.Exception) -notin $TransientKinds) {
                 throw
             }
             Start-Sleep -Milliseconds (250 * $attempt)
@@ -433,8 +437,13 @@ function Invoke-Uninstall {
     $removed = [System.Collections.Generic.List[string]]::new()
     foreach ($file in @($manifest.owned_files)) {
         if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { continue }
+        # Uninstalling right after an install or a run races the scanner that still
+        # holds the new executable: measured 13/10/2026 in the M9 install smoke, no
+        # process ran from the install directory, Restart Manager named no holder,
+        # and every retry succeeded within 60-450 ms. A running `ha` outlasts the
+        # bounded retry and still gets the message below.
         try {
-            Remove-Item -LiteralPath $file -Force
+            Invoke-FileStepWithRetry -TransientKinds 'in_use', 'access_denied' { Remove-Item -LiteralPath $file -Force }
             $removed.Add($file)
         }
         catch {
