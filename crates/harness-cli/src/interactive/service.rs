@@ -6394,6 +6394,76 @@ const REFINE_TRANSCRIPT_TURNS: usize = 50;
 /// The conversation a refinement reads: prime-agent's serialized transcript, with
 /// what the tools were asked and what they returned.
 /// The turns an earlier review of this conversation read are marked as such.
+/// Whether a model reads images, for `model.info`: the catalog's `input` for
+/// it, else the protocol's documented claim, else text only.
+fn model_reads_images(
+    catalog: &super::providers::Catalog,
+    provider: &str,
+    model: &str,
+    protocol: &str,
+) -> bool {
+    if let Some(entry) = catalog.find(&format!("{provider}/{model}")) {
+        return entry.input.iter().any(|kind| kind == "image");
+    }
+    match protocol {
+        "anthropic_messages" => true,
+        _ => {
+            provider == "deepseek"
+                && harness_providers::CapabilityMatrix::deepseek_documented(model.to_owned()).images
+                    == harness_providers::CapabilityClaim::Supported
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_reads_images_tests {
+    /// Seen in a session: the computer-use skill refused `gpt-6.1-sol` as "does
+    /// not support vision" - every `OpenAI` model read as text only, whatever the
+    /// catalog said.
+    #[test]
+    fn the_catalog_says_whether_a_model_reads_images() {
+        let catalog = crate::interactive::providers::Catalog::bundled();
+        let vision = catalog
+            .models()
+            .iter()
+            .find(|model| {
+                model.provider == "openai" && model.input.iter().any(|kind| kind == "image")
+            })
+            .expect("an OpenAI model that reads images");
+        assert!(super::model_reads_images(
+            &catalog,
+            "openai",
+            &vision.id,
+            "openai_responses"
+        ));
+        if let Some(text_only) = catalog
+            .models()
+            .iter()
+            .find(|model| model.input.iter().all(|kind| kind != "image"))
+        {
+            assert!(!super::model_reads_images(
+                &catalog,
+                &text_only.provider,
+                &text_only.id,
+                "anthropic_messages"
+            ));
+        }
+        // A model the catalog does not know: the protocol's claim.
+        assert!(super::model_reads_images(
+            &catalog,
+            "anthropic",
+            "claude-unknown",
+            "anthropic_messages"
+        ));
+        assert!(!super::model_reads_images(
+            &catalog,
+            "openai",
+            "unknown-model",
+            "openai_responses"
+        ));
+    }
+}
+
 /// A title for a compacted session: the first line under the summary's
 /// `## Goal` heading (the format the summarization prompt asks for), as a
 /// list marker-free line of at most 60 characters. `None` when the summary
@@ -6982,18 +7052,18 @@ async fn run_turn(
             return;
         }
     };
-    // What the model reads, for `model.info`: the provider's documented claim, as
-    // `pi-ai`'s model table carries `input`; a model with no claim reads text, as a
-    // `pi-ai` custom model does.
-    let capabilities_images = match config.protocol.as_str() {
-        "anthropic_messages" => true,
-        _ => {
-            config.provider_id == "deepseek"
-                && harness_providers::CapabilityMatrix::deepseek_documented(config.model.clone())
-                    .images
-                    == harness_providers::CapabilityClaim::Supported
-        }
-    };
+    // What the model reads, for `model.info`: the catalog's `input`, as `pi-ai`'s
+    // model table carries it - a model a provider lists ahead of the catalog
+    // takes its family's. Only a model the catalog does not know falls back to
+    // the protocol's documented claim, else text, as a `pi-ai` custom model
+    // does. Before, every OpenAI model read as text only, and the computer-use
+    // skill refused gpt-6.1-sol as a model without vision.
+    let capabilities_images = model_reads_images(
+        &super::providers::Catalog::load(&data_dir),
+        &config.provider_id,
+        &config.model,
+        &config.protocol,
+    );
     let capabilities = ModelCapabilities {
         provider_id: config.provider_id.clone(),
         model: config.model.clone(),
