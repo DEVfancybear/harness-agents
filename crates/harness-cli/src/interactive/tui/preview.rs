@@ -684,6 +684,7 @@ fn state(phase: AppPhase) -> UiState {
         open_tools: Vec::new(),
         live_tool_output: Vec::new(),
         child_activity: Vec::new(),
+        activity: None,
         modal: None,
         granted_for_run: false,
         queued_input: false,

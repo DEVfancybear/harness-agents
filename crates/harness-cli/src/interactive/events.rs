@@ -640,6 +640,10 @@ pub struct UiState {
     /// shows it under its header.
     #[serde(default)]
     pub child_activity: Vec<ChildActivity>,
+    /// What the run is doing after the model's answer (`Refining the
+    /// harness`), shown in place of "Writing".
+    #[serde(default)]
+    pub activity: Option<String>,
     pub modal: Option<Modal>,
     /// Whether the user allowed every gated action for the run in flight, so the
     /// status row can say the gate is open instead of leaving a silent widening of
@@ -806,6 +810,11 @@ pub enum SessionEvent {
     },
     Accepted {
         input_id: InputId,
+    },
+    /// What the turn is doing after its answer, for the status line: the
+    /// answer is complete, and "Writing" over it read as a stuck turn.
+    TurnActivity {
+        label: String,
     },
     /// The session has a new title the harness gave it (after `/compact`, the
     /// goal the summary names): the top bar and the agents view show it.

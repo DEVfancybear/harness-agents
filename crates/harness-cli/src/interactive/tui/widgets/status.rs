@@ -240,6 +240,8 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
             // been at it, then the counters.
             let activity = if state.phase == AppPhase::Canceling {
                 "Canceling"
+            } else if let Some(label) = state.activity.as_deref() {
+                label
             } else if !state.open_tools.is_empty() {
                 "Executing"
             } else if state.writing_code {
@@ -417,6 +419,7 @@ mod tests {
             open_tools: Vec::new(),
             live_tool_output: Vec::new(),
             child_activity: Vec::new(),
+            activity: None,
             modal: None,
             granted_for_run: false,
             queued_input: false,

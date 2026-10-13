@@ -7980,6 +7980,13 @@ async fn run_turn(
     // The turn's children belong to the session: they keep running, and what they
     // find reaches the parent as a notice.
     drop(delegate_host);
+    // The answer is complete. What follows - learning, a requested refine, the
+    // MCP and extension shutdown - is the turn's own work, said as such.
+    if outcome.is_ok() && !cancellation.is_cancelled() {
+        send(SessionEvent::TurnActivity {
+            label: "Finishing the turn".to_owned(),
+        });
+    }
 
     // Index this turn's journal while the answer is read, so the next
     // `history_search` does not pay for a turn's worth of entries first (a
@@ -8163,7 +8170,11 @@ async fn run_turn(
             learning.in_play = refine_cadence.take_in_play();
             if let Some(options) = requested {
                 // The user asked: the refinement is part of the turn, and it covers
-                // the review that came due with it.
+                // the review that came due with it. It is a model call after the
+                // answer; the status line says so instead of "Writing".
+                send(SessionEvent::TurnActivity {
+                    label: "Refining the harness".to_owned(),
+                });
                 match super::refine::refine(
                     &provider,
                     &config.model,

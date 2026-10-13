@@ -264,6 +264,8 @@ pub struct InteractiveController {
     tool_progress: Vec<(String, String)>,
     /// The run's delegated agents and what each has done so far.
     child_activity: Vec<super::events::ChildActivity>,
+    /// What the run is doing after its answer, for the status line.
+    turn_activity: Option<String>,
     // Progress accounting for the status bar.
     steps: u32,
     tool_calls: u32,
@@ -410,6 +412,7 @@ impl InteractiveController {
             open_tools: Vec::new(),
             tool_progress: Vec::new(),
             child_activity: Vec::new(),
+            turn_activity: None,
             pending_allowance: None,
             steps: 0,
             tool_calls: 0,
@@ -832,6 +835,7 @@ impl InteractiveController {
                 .map(|(_, text)| last_lines(text, LIVE_TOOL_LINES))
                 .unwrap_or_default(),
             child_activity: self.child_activity.clone(),
+            activity: self.turn_activity.clone(),
             modal: self.modal(),
             granted_for_run: self.granted_for_run,
             queued_input: !self.queue.is_empty(),
@@ -2552,6 +2556,13 @@ impl InteractiveController {
                     ),
                 }
             }
+            SessionEvent::TurnActivity { label } => {
+                // The answer is complete: it goes into the conversation now,
+                // and the status line says what the turn still does.
+                self.flush_stream(effects);
+                self.turn_activity = Some(label);
+                effects.push(Effect::Redraw);
+            }
             SessionEvent::SessionTitled { title } => {
                 self.chat_title = Some(title);
                 effects.push(Effect::Redraw);
@@ -2900,6 +2911,7 @@ impl InteractiveController {
             }
             SessionEvent::RunTerminal { outcome } => {
                 self.provider_wait = None;
+                self.turn_activity = None;
                 self.refresh_menu();
                 self.flush_stream(effects);
                 self.settle_run(Some(outcome.clone()));
@@ -3610,6 +3622,7 @@ impl InteractiveController {
         self.open_tools.clear();
         self.tool_progress.clear();
         self.child_activity.clear();
+        self.turn_activity = None;
         self.steps = 0;
         self.tool_calls = 0;
         self.last_run_elapsed = Duration::ZERO;
@@ -6429,6 +6442,38 @@ mod tests {
                 "only a persisted handoff may start the continuation"
             );
         }
+    }
+
+    /// Seen in a session: the answer was complete, the turn was refining the
+    /// harness, and the status line said "Writing" over the answer for the
+    /// whole refine. The answer is committed and the status names the work.
+    #[test]
+    fn work_after_the_answer_is_named_and_the_answer_is_committed() {
+        let mut h = bench(true);
+        h.controller.boot_lines();
+        let _ = submit_text(&mut h.controller, "do it");
+        h.events
+            .send(SessionEvent::TextDelta {
+                text: "Done: PASS.".to_owned(),
+            })
+            .expect("text");
+        h.events
+            .send(SessionEvent::TurnActivity {
+                label: "Refining the harness".to_owned(),
+            })
+            .expect("activity");
+        let rendered = effects_to_plain(&h.controller.pump_events()).join("\n");
+        assert!(rendered.contains("Done: PASS."), "{rendered}");
+        let state = h.controller.ui_state();
+        assert!(state.live_text.is_empty(), "the answer left the live block");
+        assert_eq!(state.activity.as_deref(), Some("Refining the harness"));
+        h.events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("done");
+        let _ = h.controller.pump_events();
+        assert_eq!(h.controller.ui_state().activity, None);
     }
 
     #[test]
