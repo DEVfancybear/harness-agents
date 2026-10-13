@@ -28,15 +28,15 @@ pub use capability::{
     StrictProfile,
 };
 pub use export::{
-    ARTIFACT_EXPORT_SCHEMA_VERSION, ArtifactExport, ExportProvenance, MAX_EXPORT_BYTES,
-    export_artifact, export_destination,
+    ARTIFACT_EXPORT_SCHEMA_VERSION, ArtifactExport, ExportProvenance, export_artifact,
+    export_destination,
 };
 pub use lease::{
-    LEASE_GRACE_MS, LEASE_LOCK_SUFFIX, LEASE_SCHEMA_VERSION, LeaseOutcome, LeaseOwner,
-    LeaseRequest, ReconcileReport, reconcile_backend_leases,
+    LEASE_GRACE_MS, LeaseOutcome, LeaseOwner, LeaseRequest, ReconcileReport,
+    reconcile_backend_leases,
 };
 pub use plan::{
     EXECUTION_PLAN_SCHEMA_VERSION, EnvironmentPlan, ExecutionPlan, ScopeAccess, ScopeGrant,
-    UnmappedControl, resolve_within,
+    UnmappedControl,
 };
-pub use probe::{BoundaryBreakObservation, CapabilityProbe, PROBE_CANARY_NAME, ProbeChild};
+pub use probe::{BoundaryBreakObservation, CapabilityProbe, ProbeChild};

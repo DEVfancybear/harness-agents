@@ -29,7 +29,7 @@ pub const ARTIFACT_EXPORT_SCHEMA_VERSION: u16 = 1;
 /// The cap is deliberate: a capture is bounded by the spool quota, and an export
 /// that quietly copied something far larger would be moving bytes nobody
 /// budgeted for.
-pub const MAX_EXPORT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_EXPORT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One exported artifact, with what a reader needs to check it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -94,15 +94,22 @@ pub async fn export_artifact(
         })?;
     let recorded_digest = first.content_hash.clone();
     let total = first.total_bytes;
+    // The record says how large the artifact is, so the cap is checked against
+    // that before another byte is read. Checked inside the loop instead, it ran
+    // only between pages: one page that held the whole artifact skipped it, and
+    // the last page could always carry an export one page past the cap.
+    if total > MAX_EXPORT_BYTES {
+        return Err(HarnessError::new(
+            ErrorCode::OutputLimitExceeded,
+            format!(
+                "artifact {} is {total} bytes, over the {MAX_EXPORT_BYTES} byte export cap",
+                parsed.as_str()
+            ),
+        ));
+    }
     let mut bytes = first.bytes;
     let mut offset = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     while offset < total {
-        if offset > MAX_EXPORT_BYTES {
-            return Err(HarnessError::new(
-                ErrorCode::OutputLimitExceeded,
-                format!("artifact exceeds the {MAX_EXPORT_BYTES} byte export cap"),
-            ));
-        }
         let page = store
             .read_artifact_page(parsed.as_str(), offset, page_bytes)
             .await

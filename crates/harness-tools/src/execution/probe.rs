@@ -44,7 +44,7 @@ use super::{
 /// The variable the probe injects into a *synthetic* host environment. It is
 /// deliberately outside [`crate::PROCESS_ENVIRONMENT_ALLOWLIST`], so the only
 /// way a child can see it is by inheriting the host environment.
-pub const PROBE_CANARY_NAME: &str = "HA_M12_PROBE_HOST_CANARY";
+pub(crate) const PROBE_CANARY_NAME: &str = "HA_M12_PROBE_HOST_CANARY";
 
 /// How long a boundary-break control lets the fixture run before killing only
 /// the process it started.

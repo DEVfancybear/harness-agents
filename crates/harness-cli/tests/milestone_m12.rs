@@ -682,6 +682,7 @@ async fn m12_02_artifact_export_is_bounded_and_digest_bound() {
 
 /// The lifecycle: a row exists before the process, moves once, and settles once.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one lease, opened, refused twice over, acquired and settled
 async fn m12_03_a_lease_is_written_before_the_process_and_settled_once() {
     let bench = bench();
     let store = bench.open_store().await;
@@ -743,6 +744,14 @@ async fn m12_03_a_lease_is_written_before_the_process_and_settled_once() {
         second.is_err(),
         "a second lease for the same execution must be refused"
     );
+    // The refused attempt took a lock file of its own before the row was
+    // refused; it must not stay behind.
+    assert_eq!(
+        lock_files(&lock_root),
+        vec![owner.lock_path().to_path_buf()],
+        "only the owner's lock file is left"
+    );
+    let lock_path = owner.lock_path().to_path_buf();
 
     owner.acquired(&store).await.expect("acquired");
     assert_eq!(
@@ -770,6 +779,12 @@ async fn m12_03_a_lease_is_written_before_the_process_and_settled_once() {
     assert_eq!(released.state, "released");
     assert!(released.released_at_unix_ms.is_some());
     assert_eq!(released.artifact_id.as_deref(), Some("artifact_fixture"));
+    // Measured: 277 lock files had piled up over five projects, one per
+    // process execution. A settled lease takes its lock file with it.
+    assert!(
+        !lock_path.exists(),
+        "the released lease's lock file is removed"
+    );
 
     // Repeating the settling statement is a no-op that says so.
     assert!(
@@ -837,6 +852,8 @@ async fn m12_03_recovery_protects_a_live_owner_and_settles_an_orphan() {
     .expect("orphan lease");
     orphan.acquired(&store).await.expect("acquired");
     let orphan_id = orphan.lease_id().to_owned();
+    let orphan_lock = orphan.lock_path().to_path_buf();
+    let live_lock = live.lock_path().to_path_buf();
     drop(orphan);
 
     // Everything is old enough to be a candidate: the grace window only narrows
@@ -887,6 +904,14 @@ async fn m12_03_recovery_protects_a_live_owner_and_settles_an_orphan() {
         recovery.contains("terminated when its job handle closed"),
         "the note has to say what was assumed: {recovery}"
     );
+    assert!(
+        !orphan_lock.exists(),
+        "a recovered lease's lock file is removed"
+    );
+    assert!(
+        live_lock.is_file(),
+        "a live owner's lock file is never touched"
+    );
 
     // A second pass has nothing left to do: the settled row is not a candidate.
     let again = reconcile_backend_leases(&store, u64::MAX, 1_800_000_000_001)
@@ -925,6 +950,84 @@ async fn m12_03_recovery_protects_a_live_owner_and_settles_an_orphan() {
     );
 
     live.release(&store, None).await.expect("live release");
+    close(store).await;
+}
+
+/// The lock files of a directory.
+fn lock_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = std::fs::read_dir(root).map_or_else(
+        |_| Vec::new(),
+        |entries| entries.flatten().map(|entry| entry.path()).collect(),
+    );
+    files.sort();
+    files
+}
+
+/// Lock files an older host left behind are swept the first time a lease is
+/// opened in their directory: those of settled leases and of leases that never
+/// got a row - but never one young enough to be an owner still starting up.
+#[tokio::test]
+async fn m12_03_stale_lock_files_are_swept_but_a_young_one_is_kept() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let plan = ExecutionPlan::for_process_action(
+        &CodingToolAction::RunShell {
+            command: "echo hi".to_owned(),
+            timeout_ms: 1_000,
+            isolation: IsolationMode::BestEffort,
+            env: Vec::new(),
+        },
+        &bench.workspace,
+        &CapabilityMatrix::new(HostIdentity::observed("test"), Vec::new()),
+        StrictProfile::Containment,
+        1_000,
+        65_536,
+    );
+    // A settled lease, written through the first lock directory.
+    let settled = LeaseOwner::open(
+        &store,
+        &LeaseRequest::from_plan(
+            &plan,
+            "s",
+            "t",
+            "execution.settled",
+            bench.data_dir.join("leases-a"),
+        ),
+    )
+    .await
+    .expect("lease");
+    let settled_id = settled.lease_id().to_owned();
+    settled.release(&store, None).await.expect("released");
+
+    // What an older host left in the second one.
+    let root = bench.data_dir.join("leases-b");
+    std::fs::create_dir_all(&root).expect("root");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_mins(2);
+    let stale_settled = root.join(format!("{settled_id}.owner.lock"));
+    let stale_rowless = root.join("lease_never_recorded.owner.lock");
+    let young_rowless = root.join("lease_just_starting.owner.lock");
+    for path in [&stale_settled, &stale_rowless, &young_rowless] {
+        std::fs::write(path, b"").expect("lock file");
+    }
+    for path in [&stale_settled, &stale_rowless] {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open")
+            .set_modified(old)
+            .expect("age it");
+    }
+
+    let owner = LeaseOwner::open(
+        &store,
+        &LeaseRequest::from_plan(&plan, "s", "t", "execution.sweeper", &root),
+    )
+    .await
+    .expect("lease");
+    let mut expected = vec![young_rowless, owner.lock_path().to_path_buf()];
+    expected.sort();
+    assert_eq!(lock_files(&root), expected);
+    owner.release(&store, None).await.expect("released");
     close(store).await;
 }
 
@@ -1003,7 +1106,12 @@ async fn m12_03_a_real_execution_records_its_lease_and_artifact() {
         not_claimed.contains(&"network_egress_denial".to_owned()),
         "the record says what was not promised: {not_claimed:?}"
     );
-    assert!(std::path::Path::new(&lease.lock_path).is_file());
+    // The lock proved the owner alive while the lease was open; settled, it
+    // proves nothing, and it used to stay behind for every command run.
+    assert!(
+        !std::path::Path::new(&lease.lock_path).exists(),
+        "a settled lease leaves no lock file"
+    );
 
     drop(tools);
     close(store).await;

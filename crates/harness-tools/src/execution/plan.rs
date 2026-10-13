@@ -218,7 +218,7 @@ fn env_references(action: &CodingToolAction) -> Vec<String> {
 /// stored name (an artifact's relative path, an export destination): an
 /// absolute path, a `..` component, or a Windows drive/UNC prefix is refused
 /// rather than normalized into something plausible.
-pub fn resolve_within(root: &Path, relative: &str) -> Result<PathBuf, HarnessError> {
+pub(crate) fn resolve_within(root: &Path, relative: &str) -> Result<PathBuf, HarnessError> {
     let trimmed = relative.trim();
     if trimmed.is_empty() {
         return Err(HarnessError::new(

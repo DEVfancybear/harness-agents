@@ -27,14 +27,14 @@ use serde_json::json;
 use super::{ExecutionPlan, capability::now_unix_ms};
 
 /// Version of the lease record shape this module writes.
-pub const LEASE_SCHEMA_VERSION: u16 = 1;
+pub(crate) const LEASE_SCHEMA_VERSION: u16 = 1;
 
 /// A lease whose heartbeat is older than this is a *candidate* for
 /// reconciliation. It is a filter, not a decision: the lock decides.
 pub const LEASE_GRACE_MS: u64 = 30_000;
 
 /// Suffix of the file whose exclusive lock the owner holds.
-pub const LEASE_LOCK_SUFFIX: &str = ".owner.lock";
+pub(crate) const LEASE_LOCK_SUFFIX: &str = ".owner.lock";
 
 /// Everything one lease needs to be opened.
 #[derive(Clone, Debug)]
@@ -144,14 +144,16 @@ impl LeaseOwner {
                 ));
             }
         }
-        let host_id = store
-            .fence()
-            .map_err(StoreError::into_harness_error)?
-            .host_id
-            .as_str()
-            .to_owned();
+        sweep_settled_lock_files(store, &request.lock_root, &lock_path).await;
+        let host_id = match store.fence() {
+            Ok(fence) => fence.host_id.as_str().to_owned(),
+            Err(error) => {
+                discard_lock(file, &lock_path);
+                return Err(error.into_harness_error());
+            }
+        };
         let now = to_i64(now_unix_ms());
-        store
+        let created = store
             .create_backend_lease(&StoredBackendLease {
                 lease_id: lease_id.clone(),
                 owner_generation: 1,
@@ -173,8 +175,13 @@ impl LeaseOwner {
                 released_at_unix_ms: None,
                 recovery_json: None,
             })
-            .await
-            .map_err(StoreError::into_harness_error)?;
+            .await;
+        if let Err(error) = created {
+            // No row names this lock - a second lease for one execution is
+            // refused here - so the file is nobody's and goes with the refusal.
+            discard_lock(file, &lock_path);
+            return Err(error.into_harness_error());
+        }
         Ok(Self {
             lease_id,
             lock_path,
@@ -237,7 +244,12 @@ impl LeaseOwner {
             )
             .await
             .map_err(StoreError::into_harness_error)?;
-        self.file = None;
+        // The row is settled, so the lock proves nothing any more: drop it and
+        // its file. Every process execution makes one of these, and leaving them
+        // behind grew the lock directory by one file per command for good.
+        if let Some(file) = self.file.take() {
+            discard_lock(file, &self.lock_path);
+        }
         Ok(released)
     }
 
@@ -332,6 +344,8 @@ pub async fn reconcile_backend_leases(
                     )
                     .await
                     .map_err(StoreError::into_harness_error)?;
+                // Settled either way, and its lock was free: the file is spent.
+                let _ = std::fs::remove_file(&lease.lock_path);
                 if settled {
                     report.recovered.push(lease.lease_id);
                 } else {
@@ -361,7 +375,88 @@ fn owner_is_gone(lock_path: &str) -> LockProbe {
             Err(TryLockError::WouldBlock | TryLockError::Error(_)) => LockProbe::Held,
         },
         // No lock file at all: nobody can hold it.
-        Err(_) => LockProbe::Free { had_lock_file },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            LockProbe::Free { had_lock_file }
+        }
+        // A file that is there but cannot be opened - denied, or held open
+        // exclusively - says nothing about its owner. Reading that as "gone"
+        // settled a lease whose owner might still be running, the one outcome
+        // this module exists to rule out.
+        Err(_) => LockProbe::Held,
+    }
+}
+
+/// Release a lock and remove its file, best effort: a file that cannot be
+/// removed now is swept later.
+fn discard_lock(file: File, lock_path: &Path) {
+    drop(file);
+    let _ = std::fs::remove_file(lock_path);
+}
+
+/// How many stale lock files one sweep looks at, so a directory grown large
+/// before lock files were removed costs a bounded first lease.
+const SWEEP_LIMIT: usize = 512;
+
+/// Remove the lock files of leases that are settled, or that never got a row.
+///
+/// Lock files used to stay behind after their lease was settled - one per
+/// process execution, for good. Release and reconciliation now remove their
+/// own; this clears what an older host left, once per lock directory per
+/// process. A file is removed only when its lock can be taken right now and
+/// its lease is settled or absent: a live owner's lock is never touched.
+async fn sweep_settled_lock_files(store: &SqliteStore, lock_root: &Path, own: &Path) {
+    static SWEPT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    let first = SWEPT
+        .get_or_init(Default::default)
+        .lock()
+        .is_ok_and(|mut swept| swept.insert(lock_root.to_path_buf()));
+    if !first {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(lock_root) else {
+        return;
+    };
+    let stale = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path != own)
+        .filter_map(|path| {
+            let lease_id = path
+                .file_name()?
+                .to_str()?
+                .strip_suffix(LEASE_LOCK_SUFFIX)?
+                .to_owned();
+            Some((lease_id, path))
+        })
+        .take(SWEEP_LIMIT)
+        .collect::<Vec<_>>();
+    for (lease_id, path) in stale {
+        // An owner creates its file, then locks it, then writes its row. A file
+        // younger than the grace window may be one taken a moment ago and not
+        // yet locked or recorded; removing it would leave a live lease pointing
+        // at nothing, which reconciliation reads as an owner that is gone.
+        let old_enough = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age.as_millis() >= u128::from(LEASE_GRACE_MS));
+        if !old_enough {
+            continue;
+        }
+        let settled = match store.backend_lease(&lease_id).await {
+            Ok(Some(lease)) => lease.released_at_unix_ms.is_some(),
+            Ok(None) => true,
+            Err(_) => false,
+        };
+        if !settled {
+            continue;
+        }
+        if let Ok(file) = OpenOptions::new().read(true).write(true).open(&path)
+            && file.try_lock().is_ok()
+        {
+            discard_lock(file, &path);
+        }
     }
 }
 

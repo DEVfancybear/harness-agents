@@ -51,10 +51,9 @@ pub use execution::{
     CAPABILITY_MATRIX_SCHEMA_VERSION, CONTAINMENT_BACKEND, CONTAINMENT_BACKEND_VERSION, Capability,
     CapabilityEvidence, CapabilityFinding, CapabilityMatrix, CapabilityProbe, CapabilityVerdict,
     EXECUTION_PLAN_SCHEMA_VERSION, EnvironmentPlan, ExecutionPlan, ExportProvenance, HostIdentity,
-    LEASE_GRACE_MS, LEASE_LOCK_SUFFIX, LEASE_SCHEMA_VERSION, LeaseOutcome, LeaseOwner,
-    LeaseRequest, MAX_EXPORT_BYTES, PROBE_CANARY_NAME, ProbeChild, ReconcileReport, ScopeAccess,
-    ScopeGrant, StrictProfile, UnmappedControl, export_artifact, export_destination,
-    reconcile_backend_leases, resolve_within,
+    LEASE_GRACE_MS, LeaseOutcome, LeaseOwner, LeaseRequest, ProbeChild, ReconcileReport,
+    ScopeAccess, ScopeGrant, StrictProfile, UnmappedControl, export_artifact, export_destination,
+    reconcile_backend_leases,
 };
 pub use policy::{
     Decision, PolicyEffect, PolicyMode, PolicyRule, ToolPatternRule, ToolPolicy, ToolPolicyRules,
