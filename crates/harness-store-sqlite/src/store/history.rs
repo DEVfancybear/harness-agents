@@ -65,20 +65,6 @@ struct SourceOwner<'a> {
     project: &'a ProjectId,
 }
 
-/// One indexed journal entry.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HistorySource {
-    pub source_id: String,
-    pub session_id: SessionId,
-    pub task_id: TaskId,
-    pub project_id: ProjectId,
-    pub sequence: u64,
-    pub kind: String,
-    pub content: String,
-    pub content_hash: ContentHash,
-    pub availability: SourceAvailability,
-}
-
 /// Whether the bytes behind a reference can still be read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceAvailability {

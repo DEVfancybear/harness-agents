@@ -153,17 +153,27 @@ pub struct SqliteStore {
     pool: SqlitePool,
     writer: Option<WriterLease>,
     fault_plan: StoreFaultPlan,
-    /// The messages of the last frozen request this store wrote, so the next one
-    /// of the same session is stored as what it adds (see `persist_frozen_request`).
-    last_frozen: std::sync::Arc<std::sync::Mutex<Option<LastFrozen>>>,
+    /// The messages of the last frozen request of each recently active session,
+    /// so the next one of the same session is stored as what it adds (see
+    /// `persist_hashed_frozen_request`). Most recent first.
+    last_frozen: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<LastFrozen>>>,
 }
 
-/// The last frozen request written: its session, its id and its full messages.
+/// The last frozen request a session wrote: its id and its full messages.
 struct LastFrozen {
     session_id: String,
     request_id: String,
     messages: Vec<Value>,
 }
+
+/// How many sessions keep their last frozen request.
+///
+/// One slot was measured to lose most deltas: a main session and the child and
+/// auxiliary sessions it drives freeze requests in turn, each overwrote the
+/// others' slot, and 257 of 265 requests that extended their session's previous
+/// one were stored whole - 25 of a 36 MB table. Up to six sessions were seen
+/// stepping between two requests of one session.
+const LAST_FROZEN_SESSIONS: usize = 8;
 
 impl std::fmt::Debug for SqliteStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1968,36 +1978,6 @@ impl SqliteStore {
             .collect()
     }
 
-    /// The oldest retained sequence without loading the journal into memory.
-    pub async fn oldest_event_sequence(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Option<u64>, StoreError> {
-        let sequence = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT MIN(sequence) FROM events WHERE session_id = ?",
-        )
-        .bind(session_id.as_str())
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|error| {
-            database_error(
-                ErrorCode::StorageWriteFailed,
-                "read oldest journal sequence",
-                error,
-            )
-        })?;
-        sequence
-            .map(|sequence| {
-                u64::try_from(sequence).map_err(|_| {
-                    StoreError::new(
-                        ErrorCode::StorageWriteFailed,
-                        "stored journal sequence is negative",
-                    )
-                })
-            })
-            .transpose()
-    }
-
     pub async fn latest_snapshot(
         &self,
         session_id: &SessionId,
@@ -2421,11 +2401,11 @@ impl SqliteStore {
             .and_then(Value::as_array_mut)
             .map(std::mem::take);
         let delta = match (&messages, self.last_frozen.lock()) {
-            (Some(messages), Ok(last)) => last
-                .as_ref()
+            (Some(messages), Ok(recent)) => recent
+                .iter()
+                .find(|last| last.session_id == record.session_id.as_str())
                 .filter(|last| {
-                    last.session_id == record.session_id.as_str()
-                        && !last.messages.is_empty()
+                    !last.messages.is_empty()
                         && last.messages.len() <= messages.len()
                         && messages[..last.messages.len()] == last.messages[..]
                 })
@@ -2484,12 +2464,14 @@ impl SqliteStore {
                 error,
             )
         })?;
-        if let (Some(messages), Ok(mut last)) = (messages, self.last_frozen.lock()) {
-            *last = Some(LastFrozen {
+        if let (Some(messages), Ok(mut recent)) = (messages, self.last_frozen.lock()) {
+            recent.retain(|last| last.session_id != record.session_id.as_str());
+            recent.push_front(LastFrozen {
                 session_id: record.session_id.as_str().to_owned(),
                 request_id: record.request_id.as_str().to_owned(),
                 messages,
             });
+            recent.truncate(LAST_FROZEN_SESSIONS);
         }
         Ok(())
     }
@@ -3459,6 +3441,7 @@ async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     if current < 7 {
         apply_runtime_slice_7(&mut tx).await?;
     }
+    apply_runtime_statements(&mut tx, &QUERY_INDEXES, "apply runtime indexes").await?;
     if current < RUNTIME_SCHEMA_VERSION {
         sqlx::query("INSERT INTO runtime_schema_migrations(version) VALUES (?)")
             .bind(RUNTIME_SCHEMA_VERSION)
@@ -3476,6 +3459,32 @@ async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
         )
     })
 }
+
+/// Indexes for the reads that scanned a whole table, found by running every
+/// statement of this crate through `EXPLAIN QUERY PLAN`.
+///
+/// Like the per-session indexes above they are plain `IF NOT EXISTS`
+/// statements, not a numbered slice: an index changes no row and no reader, so
+/// an older host must still open the database. They run after the slices,
+/// because some of the tables they index are created there.
+const QUERY_INDEXES: [&str; 6] = [
+    // A session's receipts, in order: every recovery that is not served from
+    // a cache reads them.
+    "CREATE INDEX IF NOT EXISTS receipts_by_session ON receipts(session_id, sequence)",
+    // `receipts.artifact_id` references `artifacts`, so deleting an artifact
+    // checks it - and without an index the maintenance sweep scanned every
+    // receipt once per artifact it removed.
+    "CREATE INDEX IF NOT EXISTS receipts_by_artifact ON receipts(artifact_id)",
+    // A session's unfinished commands, counted before each step settles.
+    "CREATE INDEX IF NOT EXISTS runtime_commands_by_session ON runtime_commands(session_id, state)",
+    "CREATE INDEX IF NOT EXISTS questions_by_session ON questions(session_id)",
+    // The stale-lease sweep asks for open leases by heartbeat. The index it
+    // replaces led with `state`, which no query filters on, and with the
+    // heartbeat in it every heartbeat rewrote an entry no read could use; the
+    // per-task index had no reader at all.
+    "CREATE INDEX IF NOT EXISTS backend_leases_open_by_heartbeat ON backend_leases(heartbeat_at_unix_ms) WHERE released_at_unix_ms IS NULL",
+    "DROP INDEX IF EXISTS backend_leases_unsettled",
+];
 
 /// Apply one additive runtime schema slice, statement by statement.
 ///
@@ -5562,6 +5571,67 @@ mod one_commit_step_tests {
         assert_eq!(stored[0].content_hash, first_hash);
         assert_eq!(stored[1].content_hash, second_hash);
         assert_eq!(stored[1].request_json, second_json);
+        store.close().await.expect("close store");
+    }
+
+    /// The measured failure: a main session and the sessions it drives freeze
+    /// requests in turn, and with one remembered request each overwrote the
+    /// other's, so nearly every step was stored as its whole transcript.
+    #[tokio::test]
+    async fn interleaved_sessions_still_store_each_step_as_a_delta() {
+        let directory = tempfile::tempdir().expect("temporary store");
+        let store =
+            SqliteStore::open_writer(WriterOpenOptions::new(directory.path(), HostId::generate()))
+                .await
+                .expect("store migration");
+        let task_id = TaskId::generate();
+        let sessions = (0..3).map(|_| SessionId::generate()).collect::<Vec<_>>();
+        let draft = |session_id: &SessionId, turns: usize| FrozenRequestDraft {
+            request_id: RequestId::generate(),
+            packet_id: ContextPacketId::generate(),
+            composition_snapshot_id: None,
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            request_json: json!({
+                "model": "m",
+                "messages": (0..turns)
+                    .map(|turn| json!({"role": "user", "content": format!("{session_id} turn {turn}")}))
+                    .collect::<Vec<_>>(),
+            }),
+            provider_id: "p".to_owned(),
+            model: "m".to_owned(),
+            config_revision: 1,
+        };
+        let mut expected = std::collections::HashMap::<SessionId, Vec<serde_json::Value>>::new();
+        for turns in 1..=3 {
+            for session_id in &sessions {
+                let request = draft(session_id, turns);
+                expected
+                    .entry(session_id.clone())
+                    .or_default()
+                    .push(request.request_json.clone());
+                store.freeze_request(request).await.expect("freeze");
+            }
+        }
+
+        let stored_as_delta = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM frozen_requests WHERE json_extract(request_json, '$.delta_of') IS NOT NULL",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        // Every step after a session's first extends that session's previous one.
+        assert_eq!(stored_as_delta, 6);
+        for session_id in &sessions {
+            let rebuilt = store
+                .list_frozen_requests(session_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|record| record.request_json)
+                .collect::<Vec<_>>();
+            assert_eq!(rebuilt, expected[session_id]);
+        }
         store.close().await.expect("close store");
     }
 

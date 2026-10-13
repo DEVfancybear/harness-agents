@@ -642,15 +642,6 @@ pub struct QuestionRecord {
     pub answered_at_unix_ms: Option<u64>,
 }
 
-/// What one answer attempt did.
-#[derive(Clone, Debug, PartialEq)]
-pub enum QuestionAnswer {
-    /// First answer for this question; persisted now.
-    Answered(QuestionRecord),
-    /// The same answer was already recorded; the stored record comes back.
-    Duplicate(QuestionRecord),
-}
-
 /// The outcome of answering, including the states that are not an answer.
 #[derive(Clone, Debug, PartialEq)]
 pub enum QuestionOutcome {
