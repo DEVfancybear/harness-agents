@@ -11,8 +11,8 @@ use std::{
 
 use harness_types::{
     AcceptanceCommand, AcceptanceRecord, AgentProfileId, AgentRunId, ArtifactId, CheckOutcome,
-    ContentHash, CriterionEvidence, CriterionState, CriterionStatus, ErrorCode, ProjectId,
-    SessionId, TaskId, ToolExecutionReceipt, WorkspaceObservation,
+    ContentHash, CriterionEvidence, CriterionState, CriterionStatus, ErrorCode, ProjectId, TaskId,
+    ToolExecutionReceipt, WorkspaceObservation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,7 +26,6 @@ pub const DEFAULT_MAX_WORKERS: u32 = 3;
 pub const DEFAULT_MAX_QUEUED_WORKERS: u32 = 8;
 pub const DEFAULT_MAX_DEPTH: u32 = 2;
 pub const DEFAULT_MAX_MODEL_REQUESTS: u32 = 24;
-pub const MAX_ROLE_PRESETS: usize = 4;
 
 /// Typed P5 failure carrying a stable `ErrorCode` plus detail.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -1104,67 +1103,6 @@ impl DelegatedResult {
     }
 }
 
-/// Delivery state of a durable parent message.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeliveryState {
-    Pending,
-    Consumed,
-}
-
-impl DeliveryState {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Consumed => "consumed",
-        }
-    }
-
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "pending" => Some(Self::Pending),
-            "consumed" => Some(Self::Consumed),
-            _ => None,
-        }
-    }
-}
-
-/// A durable parent message. Exactly-once logical delivery is enforced by
-/// `message_id` deduplication and a `Consumed` flag checked inside the write
-/// transaction; a notification only wakes a reader.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct ParentDelivery {
-    pub message_id: String,
-    pub sender_task_id: TaskId,
-    pub recipient_task_id: TaskId,
-    pub recipient_session_id: SessionId,
-    pub payload_hash: ContentHash,
-    pub payload: Value,
-    pub state: DeliveryState,
-    pub result_id: Option<String>,
-    pub consumed_by: Option<String>,
-}
-
-impl ParentDelivery {
-    pub fn validate(&self) -> Result<(), OrchestratorError> {
-        if self.message_id.trim().is_empty() {
-            return Err(OrchestratorError::new(
-                ErrorCode::InvalidPayload,
-                "a parent delivery requires a stable message id",
-            ));
-        }
-        if self.sender_task_id == self.recipient_task_id {
-            return Err(OrchestratorError::new(
-                ErrorCode::AmbiguousTaskOwner,
-                "a task cannot deliver a message to itself",
-            ));
-        }
-        Ok(())
-    }
-}
-
 /// Scheduler bounds. These are host policy, not model input.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SchedulerConfig {
@@ -1413,35 +1351,5 @@ impl IntegrationReport {
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.conflicts.is_empty() && self.checks.iter().all(|check| check.passed)
-    }
-}
-
-/// Token-free notification handle. Notifications carry no payload authority;
-/// a woken reader must re-read the durable inbox.
-#[derive(Clone, Debug, Default)]
-pub struct DeliveryNotifier {
-    waiters: std::sync::Arc<tokio::sync::Notify>,
-    wake_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl DeliveryNotifier {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn notify(&self) {
-        self.wake_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.waiters.notify_waiters();
-    }
-
-    pub async fn wait(&self) {
-        self.waiters.notified().await;
-    }
-
-    #[must_use]
-    pub fn wake_count(&self) -> u64 {
-        self.wake_count.load(std::sync::atomic::Ordering::SeqCst)
     }
 }

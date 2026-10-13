@@ -62,14 +62,6 @@ impl StepOutcome {
     }
 }
 
-/// Token that marks one physical session slot per task. A child task owns its
-/// own session, so one agent never appends to another agent's session log.
-#[derive(Clone, Debug)]
-pub struct TaskSession {
-    pub task_id: TaskId,
-    pub session_id: SessionId,
-}
-
 /// Host-side verification the coordinator needs before a result can be
 /// accepted. Keeping it a trait means the acceptance rule is testable without
 /// touching a model.
@@ -578,12 +570,6 @@ impl DelegationCoordinator {
             "a delegated delivery requires a durable session for the recipient task",
         ))
     }
-}
-
-/// Deterministic generation for a fresh coordinator activation.
-#[must_use]
-pub fn coordinator_generation(previous: Option<u64>) -> u64 {
-    previous.map_or(1, |value| value.saturating_add(1))
 }
 
 /// A fresh worker run identity for one activation.

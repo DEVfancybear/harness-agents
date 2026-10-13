@@ -184,8 +184,18 @@ pub struct WorkerScheduler {
     live: Arc<Mutex<BTreeMap<String, WorkerTask>>>,
     /// Task ids reserved by a dispatch that has not settled yet.
     reserved: Arc<Mutex<std::collections::BTreeSet<String>>>,
-    /// Dispatched-but-not-yet-reported workers. This is what makes an exhausted
-    /// outcome stream distinguishable from a temporarily empty one.
+    /// Dispatched workers whose outcome has not been taken off the channel yet.
+    /// This is what makes an exhausted outcome stream distinguishable from a
+    /// temporarily empty one.
+    ///
+    /// It is raised at dispatch and lowered by the receiver, when it takes the
+    /// outcome - never by the worker. Lowered by the worker before its send, a
+    /// reader between the two saw no outstanding work and no outcome, returned
+    /// "nothing left", and the outcome sat in the channel: the app's pump then
+    /// slept until another child was dispatched, and a coordinator failed with
+    /// "no worker is running". Lowered after the send instead, a reader that had
+    /// just taken the last outcome could see the count still at one and wait
+    /// forever. Counting on the receiving side keeps the two in step.
     outstanding: Arc<AtomicU32>,
     shutting_down: Arc<AtomicBool>,
     drained: Arc<Mutex<Vec<String>>>,
@@ -314,7 +324,6 @@ impl WorkerScheduler {
         let backend = Arc::clone(&self.backend);
         let live = Arc::clone(&self.live);
         let reserved = Arc::clone(&self.reserved);
-        let outstanding = Arc::clone(&self.outstanding);
         let shutting_down = Arc::clone(&self.shutting_down);
         let key_for_task = key.clone();
         let sender = self.settled.clone();
@@ -332,11 +341,12 @@ impl WorkerScheduler {
         }
         // Marked before the spawned task can report, so the outcome stream can
         // never look exhausted while this worker is still in flight.
-        outstanding.fetch_add(1, Ordering::SeqCst);
+        self.outstanding.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
-            // Retire this worker before its outcome becomes observable, so a
-            // caller waiting for outstanding work never waits on a worker that
-            // has already reported.
+            // Give back the task's slot and reservation before its outcome
+            // becomes observable, so a caller that reacts to the outcome by
+            // dispatching again is not refused by this worker's leftovers. The
+            // outstanding count is the receiver's to lower (see `outstanding`).
             macro_rules! retire {
                 () => {
                     if let Ok(mut live) = live.lock() {
@@ -345,7 +355,6 @@ impl WorkerScheduler {
                     if let Ok(mut reserved) = reserved.lock() {
                         reserved.remove(&key_for_task);
                     }
-                    outstanding.fetch_sub(1, Ordering::SeqCst);
                 };
             }
             let permit = tokio::select! {
@@ -432,10 +441,16 @@ impl WorkerScheduler {
     /// still drain them.
     pub async fn next_settled(&self) -> Option<Result<(TaskId, WorkerOutcome), OrchestratorError>> {
         let mut receiver = self.settled_rx.lock().await;
+        // Every outcome in the channel is still counted, so none outstanding
+        // means none on its way either.
         if self.outstanding.load(Ordering::SeqCst) == 0 {
-            return receiver.try_recv().ok();
+            return None;
         }
-        receiver.recv().await
+        let settled = receiver.recv().await;
+        if settled.is_some() {
+            self.outstanding.fetch_sub(1, Ordering::SeqCst);
+        }
+        settled
     }
 
     /// Authorize an editing workspace for one worker from the verified snapshot.
@@ -482,36 +497,20 @@ impl WorkerScheduler {
         self.cancel_descendants();
         let mut unknowns = Vec::new();
         let mut receiver = self.settled_rx.lock().await;
-        // Keep collecting until no dispatched worker is outstanding. A canceled
-        // worker always settles, so this terminates.
-        loop {
-            if self.outstanding.load(Ordering::SeqCst) == 0 {
+        // Keep collecting until every dispatched worker's outcome has been taken.
+        // A canceled worker always settles - a queued one too, through the same
+        // channel - so this terminates, and nothing is left behind in it.
+        while self.outstanding.load(Ordering::SeqCst) > 0 {
+            let Some(settled) = receiver.recv().await else {
                 break;
-            }
-            let remaining = 1;
-            let _ = remaining;
-            {
-                match receiver.recv().await {
-                    Some(Ok((task_id, outcome))) => {
-                        if let WorkerOutcome::OutcomeUnknown { reason } = outcome {
-                            unknowns.push(format!("{}: {reason}", task_id.as_str()));
-                        }
-                    }
-                    Some(Err(error)) => unknowns.push(format!("join-error: {error}")),
-                    None => break,
-                }
-            }
-        }
-        // Workers that were canceled while queued for a slot report themselves
-        // through the same channel; collect whatever has already settled.
-        loop {
-            match receiver.try_recv() {
-                Ok(Ok((task_id, WorkerOutcome::OutcomeUnknown { reason }))) => {
+            };
+            self.outstanding.fetch_sub(1, Ordering::SeqCst);
+            match settled {
+                Ok((task_id, WorkerOutcome::OutcomeUnknown { reason })) => {
                     unknowns.push(format!("{}: {reason}", task_id.as_str()));
                 }
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => unknowns.push(format!("join-error: {error}")),
-                Err(_) => break,
+                Ok(_) => {}
+                Err(error) => unknowns.push(format!("join-error: {error}")),
             }
         }
         drop(receiver);
@@ -533,7 +532,7 @@ impl WorkerScheduler {
         self.live.lock().map_or(0, |live| live.len())
     }
 
-    /// Number of dispatched workers that have not settled yet.
+    /// Number of dispatched workers whose outcome has not been taken yet.
     #[must_use]
     pub fn outstanding_workers(&self) -> u32 {
         self.outstanding.load(Ordering::SeqCst)

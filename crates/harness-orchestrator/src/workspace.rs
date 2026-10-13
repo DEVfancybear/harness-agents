@@ -596,12 +596,31 @@ fn staged_changes(root: &Path) -> Result<ChangeSet, OrchestratorError> {
 /// a scope entry that names a directory.
 #[must_use]
 pub fn scope_violations(paths: &[String], write_scope: &[String]) -> Vec<ScopeViolation> {
+    // A scope entry is spelled the way the path is: forward slashes, no leading
+    // `./`. Only the path used to be normalized, so a scope written `src\lib.rs`
+    // or `./src` refused every write it was meant to allow.
+    let scopes = write_scope
+        .iter()
+        .map(|scope| {
+            let scope = scope.trim().replace('\\', "/");
+            let trimmed = scope.trim_end_matches('/');
+            // `.` and `./` stay the whole repository, as before; an empty entry
+            // stays one that matches nothing, never a wider grant.
+            if trimmed == "." {
+                return ".".to_owned();
+            }
+            let mut rest = trimmed;
+            while let Some(inner) = rest.strip_prefix("./") {
+                rest = inner;
+            }
+            rest.to_owned()
+        })
+        .collect::<Vec<_>>();
     let mut violations = Vec::new();
     for path in paths {
         let normalized = path.replace('\\', "/");
-        let allowed = write_scope.iter().any(|scope| {
-            let scope = scope.trim_end_matches('/');
-            scope == "." || normalized == scope || normalized.starts_with(&format!("{scope}/"))
+        let allowed = scopes.iter().any(|scope| {
+            scope == "." || normalized == *scope || normalized.starts_with(&format!("{scope}/"))
         });
         if !allowed {
             violations.push(ScopeViolation {
@@ -836,6 +855,31 @@ fn git_ok(root: &Path, arguments: &[&str]) -> bool {
 #[cfg(test)]
 mod scope_tests {
     use super::scope_violations;
+
+    /// Only the path was normalized, so a scope spelled with backslashes or a
+    /// leading `./` refused every write it was written to allow.
+    #[test]
+    fn a_scope_is_read_in_the_spelling_of_the_paths() {
+        let paths = ["src/lib.rs".to_owned(), "src/nested/mod.rs".to_owned()];
+        for scope in ["src", "./src", "src/", ".\\src", "src\\", " src "] {
+            assert!(
+                scope_violations(&paths, &[scope.to_owned()]).is_empty(),
+                "{scope:?} covers src/"
+            );
+        }
+        assert!(
+            scope_violations(&["src/lib.rs".to_owned()], &["src\\lib.rs".to_owned()]).is_empty()
+        );
+        // Normalizing never widens a grant: an empty entry still allows nothing,
+        // and a sibling with a shared prefix is still outside.
+        assert_eq!(scope_violations(&paths, &[String::new()]).len(), 2);
+        assert_eq!(scope_violations(&paths, &["  ".to_owned()]).len(), 2);
+        assert_eq!(
+            scope_violations(&["srcx/lib.rs".to_owned()], &["./src".to_owned()]).len(),
+            1
+        );
+        assert!(scope_violations(&paths, &["./".to_owned()]).is_empty());
+    }
 
     #[test]
     fn repository_root_scope_allows_every_relative_path() {

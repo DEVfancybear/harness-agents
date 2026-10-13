@@ -487,6 +487,143 @@ async fn p5_k06_provider_loss_drains_dependent_children() {
     assert!(scheduler.drained_unknowns().len() <= 2);
 }
 
+/// A completion whose own checks failed is not completed work.
+///
+/// Every receipt here matches its check and the artifact is present, so the
+/// report passes validation; what refuses it is the acceptance reducer behind
+/// `accepted_completion`, which reads the failed check as an unmet criterion.
+/// Nothing else tested that a red check keeps a "done" report from landing.
+#[tokio::test]
+async fn p5_a_completion_with_failing_checks_is_not_accepted() {
+    let repo = test_repo();
+    let store = Arc::new(open_store(&repo).await);
+    let manager = Arc::new(harness_orchestrator::WorkspaceManager::new(
+        repo.data_dir("delegation"),
+    ));
+    let snapshot = repo.snapshot(&manager).await;
+    let (session, root) = coordinator_root(&store).await;
+    let task_id = TaskId::generate();
+    let plan = plan_from(vec![make_node(
+        &task_id,
+        Some(&root),
+        AgentRole::Coder,
+        &snapshot,
+        2,
+        &[],
+        &["edit:src/lib.rs"],
+        vec!["src/lib.rs".to_owned()],
+    )]);
+    let coordinator = harness_orchestrator::DelegationCoordinator::new(
+        Arc::clone(&store),
+        Arc::new(
+            WorkerScheduler::new(
+                SchedulerConfig::default(),
+                Arc::new(ScriptedWorker::explorer()),
+                None,
+            )
+            .unwrap(),
+        ),
+        1,
+    );
+    coordinator.admit(&plan).await.expect("admit");
+    let worker = worker_ref(AgentRole::Coder, 1);
+    coordinator
+        .claim(&task_id, &worker, &session)
+        .await
+        .expect("claim");
+
+    let mut report = explorer_report(&task_id, &worker, &snapshot.base_commit, "edit:src/lib.rs");
+    report.checked_revisions[0].passed = false;
+    report.checked_revisions[0].exit_code = Some(1);
+    report.check_receipts[0].exit_code = Some(1);
+    let step = coordinator
+        .settle(&plan, &task_id, WorkerOutcome::Reported(Box::new(report)))
+        .await
+        .expect("settle");
+    assert!(!step.accepted, "a failing check is not completed work");
+    assert_ne!(step.status, TaskStatus::Completed, "{}", step.detail);
+    assert!(
+        store.task_result(&task_id).await.unwrap().is_none(),
+        "no accepted result is recorded"
+    );
+    close(store).await;
+}
+
+/// A finished worker stays outstanding until its outcome is taken.
+///
+/// The worker used to lower the count itself, just before sending its outcome.
+/// A reader between the two saw nothing outstanding and nothing in the channel
+/// and was told "no more work": the app's pump then slept until another child
+/// was dispatched, and a coordinator failed with "no worker is running" - while
+/// the outcome waited in the channel. The count is now the receiver's to lower,
+/// so it covers every outcome not yet taken.
+#[tokio::test]
+async fn p5_a_finished_worker_is_outstanding_until_its_outcome_is_taken() {
+    let repo = test_repo();
+    let manager = Arc::new(harness_orchestrator::WorkspaceManager::new(
+        repo.data_dir("delegation"),
+    ));
+    let snapshot = repo.snapshot(&manager).await;
+    let census = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let scheduler = Arc::new(
+        WorkerScheduler::new(
+            SchedulerConfig::default(),
+            Arc::new(ScriptedWorker::census(Arc::clone(&census))),
+            None,
+        )
+        .expect("scheduler"),
+    );
+    let task_id = TaskId::generate();
+    let plan = plan_from(vec![make_node(
+        &task_id,
+        None,
+        AgentRole::Explorer,
+        &snapshot,
+        2,
+        &[],
+        &["observe:x"],
+        Vec::new(),
+    )]);
+    let node = plan.node(&task_id).unwrap();
+    scheduler
+        .dispatch(WorkerRequest {
+            task_id: TaskId::generate(),
+            run_id: AgentRunId::generate(),
+            generation: 1,
+            depth: node.depth,
+            brief: node.brief.clone(),
+            worktree: None,
+            cancellation: harness_providers::CancellationToken::new(),
+        })
+        .expect("dispatch");
+
+    // Wait until the worker has finished and given its slot back: its outcome
+    // is in the channel and nobody has taken it.
+    for _ in 0..200 {
+        if census.load(std::sync::atomic::Ordering::SeqCst) == 1
+            && scheduler.reserved_workers() == 0
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(scheduler.reserved_workers(), 0, "the worker finished");
+    assert_eq!(
+        scheduler.outstanding_workers(),
+        1,
+        "its outcome has not been taken, so it is still outstanding"
+    );
+    assert!(
+        matches!(scheduler.next_settled().await, Some(Ok(_))),
+        "the outcome is delivered"
+    );
+    assert_eq!(scheduler.outstanding_workers(), 0);
+    assert!(
+        scheduler.next_settled().await.is_none(),
+        "nothing is left"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // K07 — racing shutdown shares one completion and reports failures
 // ---------------------------------------------------------------------------

@@ -17,14 +17,12 @@ pub mod workspace;
 pub use contracts::{
     AgentRole, BudgetUsage, CheckedRevision, DEFAULT_MAX_DEPTH, DEFAULT_MAX_MODEL_REQUESTS,
     DEFAULT_MAX_QUEUED_WORKERS, DEFAULT_MAX_WORKERS, DELEGATION_CONTRACT_VERSION, DelegatedOutcome,
-    DelegatedResult, DelegationBudget, DelegationGrants, DeliveryNotifier, DeliveryState,
-    DirtyReason, GrantAction, IntegrationReport, IntegrationStep, OrchestratorError,
-    ParentDelivery, SchedulerConfig, TaskBrief, TaskGraph, TaskNode, TaskPlan, TaskStatus,
-    VerifiedSnapshot, WorkerRef, WorktreeRecord, WorktreeState,
+    DelegatedResult, DelegationBudget, DelegationGrants, DirtyReason, GrantAction,
+    IntegrationReport, IntegrationStep, OrchestratorError, SchedulerConfig, TaskBrief, TaskGraph,
+    TaskNode, TaskPlan, TaskStatus, VerifiedSnapshot, WorkerRef, WorktreeRecord, WorktreeState,
 };
 pub use coordinator::{
-    DelegationCoordinator, EvidenceVerifier, ResultVerifier, StepOutcome, TaskSession,
-    coordinator_generation, fresh_run,
+    DelegationCoordinator, EvidenceVerifier, ResultVerifier, StepOutcome, fresh_run,
 };
 pub use integration::{
     BranchCandidate, FinalApply, IntegrationOutcome, ResultIntegrator, workspace_candidate,
