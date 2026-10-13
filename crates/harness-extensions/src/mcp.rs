@@ -1109,30 +1109,39 @@ impl McpClient {
     }
 
     /// Register the discovered tools in a scoped registry. A duplicate name in
-    /// the same layer is refused rather than overwritten.
+    /// the same layer is refused rather than overwritten, and the refusal
+    /// undoes the tools this call already registered: every tool lands or
+    /// none does.
     pub fn register_tools(
         &mut self,
         registry: &mut ScopedRegistry,
         instance_id: &PluginInstanceId,
     ) -> Result<Vec<String>, ExtensionError> {
+        let mut tokens = Vec::new();
         let mut registered = Vec::new();
         for name in self.tools.keys() {
-            let token = registry
-                .register(
-                    &self.scope_id,
-                    format!("mcp.tool:{name}"),
-                    instance_id.clone(),
-                    self.generation,
-                )
-                .map_err(|error| {
-                    ExtensionError::new(
+            match registry.register(
+                &self.scope_id,
+                format!("mcp.tool:{name}"),
+                instance_id.clone(),
+                self.generation,
+            ) {
+                Ok(token) => {
+                    tokens.push(token);
+                    registered.push(name.clone());
+                }
+                Err(error) => {
+                    for token in &tokens {
+                        registry.undo(token);
+                    }
+                    return Err(ExtensionError::new(
                         error.code(),
                         format!("cannot register MCP tool {name}: {error}"),
-                    )
-                })?;
-            self.tokens.push(token);
-            registered.push(name.clone());
+                    ));
+                }
+            }
         }
+        self.tokens.extend(tokens);
         Ok(registered)
     }
 

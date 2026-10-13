@@ -11,6 +11,7 @@
 //!   `unknown_capability` | `denied_host_method` | `exit_before_handshake`
 //!   | `crash_after_effect` | `noisy_stderr` | `honour_cancel`
 //!   | `crash_mid_call` | `flood_stdout` | `malformed_after_handshake`
+//!   | `duplicate_capability`
 //! - `P6_FIXTURE_SECRET`: if set, the plugin echoes only whether the variable
 //!   exists, never its value. It exists to prove the host does not leak one.
 
@@ -102,6 +103,14 @@ fn main() {
             } else {
                 "tools"
             };
+            let offer = serde_json::json!({"capability": capability, "api_version": 1});
+            // A plugin that advertises one capability twice: the second
+            // registration collides with the first one of the same attempt.
+            let capabilities = if mode == "duplicate_capability" {
+                vec![offer.clone(), offer]
+            } else {
+                vec![offer]
+            };
             let host_methods = if mode == "denied_host_method" {
                 vec!["host.dangerous.unrestricted"]
             } else {
@@ -116,7 +125,7 @@ fn main() {
                     "plugin_id": "p6.fixture.tools",
                     "implementation_version": "0.1.0",
                     "executable_digest": executable_digest(),
-                    "capabilities": [{"capability": capability, "api_version": 1}],
+                    "capabilities": capabilities,
                     "host_methods": host_methods,
                     "config_schema_version": 1,
                 },

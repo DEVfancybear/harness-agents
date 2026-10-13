@@ -31,6 +31,7 @@ pub enum FixtureMode {
     DeniedHostMethod,
     ExitBeforeHandshake,
     CrashAfterEffect,
+    DuplicateCapability,
 }
 
 impl FixtureMode {
@@ -48,6 +49,7 @@ impl FixtureMode {
             Self::DeniedHostMethod => "denied_host_method",
             Self::ExitBeforeHandshake => "exit_before_handshake",
             Self::CrashAfterEffect => "crash_after_effect",
+            Self::DuplicateCapability => "duplicate_capability",
         }
     }
 }

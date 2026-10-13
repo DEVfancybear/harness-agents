@@ -167,7 +167,12 @@ impl ExtensionRuntime {
                     Ok(token) => tokens.push(token),
                     Err(error) => {
                         // A duplicate name in the same layer is refused rather
-                        // than overwritten.
+                        // than overwritten. Activation is all or nothing: what
+                        // this attempt already registered is undone, or it
+                        // would refuse every later load of the same plugin.
+                        for token in &tokens {
+                            registry.undo(token);
+                        }
                         transport.shutdown().await;
                         let duplicate = ExtensionError::new(error.code(), error.to_string());
                         return self.inactive_with_error(

@@ -620,6 +620,32 @@ async fn p6_s04_mcp_client_registers_scoped_tools_and_renegotiates() {
         "a duplicate registration in one layer is refused"
     );
 
+    // Registration is all or nothing: when a later tool collides, the tools
+    // this call already registered are undone rather than left behind.
+    let mut crowded = harness_kernel::ScopedRegistry::default();
+    crowded.add_root(scope.clone()).expect("root scope");
+    let occupant = crowded
+        .register(
+            &scope,
+            "mcp.tool:write_note",
+            PluginInstanceId::generate(),
+            1,
+        )
+        .expect("occupant registers");
+    let refused = client.register_tools(&mut crowded, &instance).unwrap_err();
+    assert_eq!(refused.code(), ErrorCode::DuplicateRegistration);
+    assert!(
+        crowded.lookup(&scope, "mcp.tool:observe").is_none(),
+        "a refused registration leaves no tool behind"
+    );
+    assert_eq!(
+        crowded
+            .lookup(&scope, "mcp.tool:write_note")
+            .expect("occupant stays")
+            .token,
+        occupant
+    );
+
     // Schema drift is detected rather than ignored: a pinned digest that differs
     // from the advertised schema requires renegotiation before use.
     let actual = client
@@ -1229,6 +1255,50 @@ async fn p6_s07_fixture_extension_installs_registers_and_unloads() {
 // ---------------------------------------------------------------------------
 // Cross-cutting: the host never inherits its whole environment
 // ---------------------------------------------------------------------------
+
+/// A load refused part way through registration undoes what it registered, so
+/// the same plugin can still load afterwards in the same process.
+#[tokio::test]
+async fn p6_refused_activation_leaves_no_registration_behind() {
+    let manifest = fixture_manifest();
+    let grant = grant_for(&manifest, Vec::new());
+    let (host, _scope) = runtime();
+
+    // The plugin advertises Tools twice: the first registration succeeds and
+    // the second collides with it, so the activation is refused.
+    let refused = host
+        .load(
+            fixture_plugin(),
+            manifest.clone(),
+            Some(&grant),
+            environment(FixtureMode::DuplicateCapability),
+        )
+        .await;
+    match refused {
+        LoadOutcome::Inactive { reason, detail, .. } => {
+            assert_eq!(reason, InactiveReason::HandshakeRejected);
+            assert!(!detail.is_empty());
+        }
+        LoadOutcome::Active { .. } => panic!("a duplicated capability must not activate"),
+    }
+    assert_eq!(host.live_process_count().await, 0);
+
+    // The first registration did not outlive the refusal: a well-behaved load
+    // of the same plugin id activates instead of colliding with it.
+    let loaded = host
+        .load(
+            fixture_plugin(),
+            manifest.clone(),
+            Some(&grant),
+            environment(FixtureMode::Normal),
+        )
+        .await;
+    assert!(
+        matches!(loaded, LoadOutcome::Active { .. }),
+        "the plugin loads after a refused attempt: {loaded:?}"
+    );
+    host.shutdown_all().await;
+}
 
 #[tokio::test]
 async fn p6_extension_processes_receive_a_minimal_environment() {
