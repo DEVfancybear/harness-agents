@@ -157,6 +157,16 @@ impl GoalHost {
     /// # Errors
     /// The goal is not verified; the text says why and what to fix.
     pub async fn finish(&self, summary: &str) -> Result<String, String> {
+        self.finish_checked(summary, &mut None).await
+    }
+
+    /// [`Self::finish`], also saying in `outcome` how the project's checks
+    /// ended when they ran.
+    async fn finish_checked(
+        &self,
+        summary: &str,
+        outcome: &mut Option<bool>,
+    ) -> Result<String, String> {
         let Some(check) = self.check.clone() else {
             self.complete(summary);
             return Ok(format!("The goal is marked complete: {summary}"));
@@ -177,6 +187,7 @@ impl GoalHost {
             ));
         }
         let report = super::verify::run(&check.root, &check.checks, &check.cancellation).await;
+        *outcome = report.outcome();
         if let Some(failure) = report.failure_text() {
             self.remember_failure(&check.root).await;
             if let Some(run) = report.failure() {
@@ -358,11 +369,15 @@ impl ExternalToolDispatcher for GoalHost {
             let summary = Self::summary(arguments)?;
             // A goal that is not verified yet is not an error of the call: the
             // model reads what to fix and goes on.
-            let text = self.finish(&summary).await.unwrap_or_else(|left| left);
+            let mut outcome = None;
+            let text = self
+                .finish_checked(&summary, &mut outcome)
+                .await
+                .unwrap_or_else(|left| left);
             Ok(ToolOutput::ExternalTool {
                 plugin_id: "goal".to_owned(),
                 tool_name: "goal_complete".to_owned(),
-                payload: json!({ "text": text }),
+                payload: super::verify::payload(&text, outcome),
                 inflight: 1,
             })
         })

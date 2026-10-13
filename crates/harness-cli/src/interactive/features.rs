@@ -423,7 +423,18 @@ impl FeatureHost {
     }
 
     /// Run one action and return the text the model reads.
+    #[cfg(test)]
     async fn run(&self, arguments: &Value) -> Result<String, HarnessError> {
+        self.run_checked(arguments, &mut None).await
+    }
+
+    /// [`Self::run`], also saying in `outcome` how the checks a `verify` ran
+    /// ended.
+    async fn run_checked(
+        &self,
+        arguments: &Value,
+        outcome: &mut Option<bool>,
+    ) -> Result<String, HarnessError> {
         let action = arguments["action"].as_str().unwrap_or_default();
         let mut list = load(&self.root).map_err(Self::refused)?.unwrap_or_default();
         match action {
@@ -508,7 +519,7 @@ impl FeatureHost {
                 save(&self.root, &list).map_err(Self::refused)?;
                 Ok(text)
             }
-            "verify" => self.verify(list, arguments).await,
+            "verify" => self.verify(list, arguments, outcome).await,
             _ => Err(Self::refused(
                 "action must be list, add, start, block, update or verify",
             )),
@@ -519,6 +530,7 @@ impl FeatureHost {
         &self,
         mut list: FeatureList,
         arguments: &Value,
+        outcome: &mut Option<bool>,
     ) -> Result<String, HarnessError> {
         let index = Self::feature_id(&list, arguments)?;
         let feature = list.features[index].clone();
@@ -556,6 +568,7 @@ impl FeatureHost {
             message: format!("feature {}: running {} check(s)", feature.id, checks.len()),
         });
         let report = super::verify::run(&self.root, &checks, &self.cancellation).await;
+        *outcome = report.outcome();
         if let Some(failure) = report.failure_text() {
             let _ = self.sender.send(SessionEvent::Notice {
                 message: format!(
@@ -712,11 +725,12 @@ impl ExternalToolDispatcher for FeatureHost {
                     "feature tool target is unavailable",
                 ));
             }
-            let text = self.run(arguments).await?;
+            let mut outcome = None;
+            let text = self.run_checked(arguments, &mut outcome).await?;
             Ok(ToolOutput::ExternalTool {
                 plugin_id: "feature".to_owned(),
                 tool_name: "feature".to_owned(),
-                payload: json!({ "text": text }),
+                payload: super::verify::payload(&text, outcome),
                 inflight: 1,
             })
         })

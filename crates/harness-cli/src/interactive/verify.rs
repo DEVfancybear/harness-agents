@@ -128,6 +128,19 @@ impl Report {
         self.runs.iter().find(|run| !run.passed)
     }
 
+    /// Whether the checks passed, when they said anything: no check run, or a
+    /// run cut short before any failed, is no result at all.
+    #[must_use]
+    pub fn outcome(&self) -> Option<bool> {
+        if self.failure().is_some() {
+            Some(false)
+        } else if self.passed() && !self.runs.is_empty() {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
     /// The names of the checks that passed, as `types, tests`.
     #[must_use]
     pub fn passed_names(&self) -> String {
@@ -243,6 +256,32 @@ fn head_and_tail(output: &str) -> String {
         "{head}\n... [{} characters omitted] ...\n{tail}",
         count - OUTPUT_HEAD_CHARS - OUTPUT_TAIL_CHARS
     )
+}
+
+/// The field of a tool's payload that carries how the checks it ran ended. The
+/// model reads only `text`; the field is for the learned-skill counters, which
+/// credit the outcome to the skills the turn used before it.
+const CHECKS_FIELD: &str = "checks";
+
+/// A tool payload: the text the model reads and, when checks ran and said
+/// something, whether they passed.
+#[must_use]
+pub fn payload(text: &str, outcome: Option<bool>) -> serde_json::Value {
+    let mut payload = serde_json::json!({ "text": text });
+    if let Some(passed) = outcome {
+        payload[CHECKS_FIELD] = serde_json::json!(if passed { "pass" } else { "fail" });
+    }
+    payload
+}
+
+/// How the checks a tool ran ended, read back from its payload.
+#[must_use]
+pub fn checked(payload: &serde_json::Value) -> Option<bool> {
+    match payload[CHECKS_FIELD].as_str() {
+        Some("pass") => Some(true),
+        Some("fail") => Some(false),
+        _ => None,
+    }
 }
 
 /// Run `checks` in `root`, in order, stopping at the first failure. A check
@@ -399,7 +438,7 @@ pub async fn changes(root: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Check, Report, Verdict, Verify, head_and_tail, run, verdict};
+    use super::{Check, Report, Verdict, Verify, checked, head_and_tail, payload, run, verdict};
 
     fn check(name: &str, command: &str) -> Check {
         Check {
@@ -466,6 +505,8 @@ mod tests {
         assert!(text.contains("Passed before it: first."), "{text}");
         let lines = report.lines().join("\n");
         assert!(lines.contains("1 later check(s) not run"), "{lines}");
+        assert_eq!(report.outcome(), Some(false));
+        assert_eq!(checked(&payload("x", report.outcome())), Some(false));
     }
 
     #[tokio::test]
@@ -481,6 +522,12 @@ mod tests {
         assert!(report.failure_text().is_none());
         assert!(report.evidence().contains("only (`echo ok`)"));
         assert!(Report::default().passed(), "no checks is not a failure");
+        assert_eq!(report.outcome(), Some(true));
+        assert_eq!(Report::default().outcome(), None, "no checks is no result");
+        assert_eq!(checked(&payload("x", Some(true))), Some(true));
+        let silent = payload("x", None);
+        assert_eq!(checked(&silent), None);
+        assert_eq!(silent, serde_json::json!({"text": "x"}));
     }
 
     #[test]

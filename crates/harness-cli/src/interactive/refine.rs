@@ -1591,6 +1591,7 @@ Refinements write learned SKILL.md skills one conversation at a time, so the lib
 Rules:
 - Only the learned skills listed below exist for you. Never name, absorb into, or recreate any other skill.
 - Judge overlap on content, never on usage counts: retiring unused skills is the lifecycle's job, and a count of zero is no evidence of a bad skill. The one use for the counts: a skill past probation that was never used likely has a description that does not name what the user types - patch its description.
+- "checks after use" is no reason to merge or delete either. A skill whose checks repeatedly fail after use is a candidate for a patch, or for a split into conditional variants, as <learned_skill_format> says; never delete or absorb a skill only because checks failed after it.
 - Do not ask whether two skills are distinct. Ask whether a maintainer would write them as N separate skills or as one skill with N subsections. When the answer is one, merge.
 - Consolidate a cluster in one of three ways: patch the broadest member to add a labeled subsection for each sibling's unique content, then delete each sibling with absorbed_into set to it; or create a new umbrella skill and delete the absorbed siblings with absorbed_into set to it; or move narrow but valuable detail into the umbrella's references/<topic>.md (carried in `files`, pointed at from SKILL.md) and delete the sibling.
 - Order matters: the umbrella's create/patch/update comes before the deletes that name it.

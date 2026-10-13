@@ -268,6 +268,11 @@ pub struct Usage {
     pub patches: u64,
     /// The layer's request count when the skill landed.
     pub anchor: u64,
+    /// Turns that used the skill and then ran the harness's verification checks
+    /// (`goal_complete`, a feature's `verify`), by how the last run ended. A
+    /// turn that ran no check counts in neither.
+    pub checked_pass: u64,
+    pub checked_fail: u64,
     /// The skill was archived. Seen on a live skill, it means the skill was
     /// moved back since - by hand or by a rollback.
     pub archived: bool,
@@ -281,6 +286,8 @@ impl Usage {
             views: count("view"),
             patches: count("patch"),
             anchor: count("anchor"),
+            checked_pass: count("checked_pass"),
+            checked_fail: count("checked_fail"),
             archived: value["archived"].as_bool().unwrap_or(false),
         }
     }
@@ -508,18 +515,20 @@ pub fn usage(layers: &Layers, layer: Layer) -> (u64, BTreeMap<String, Usage>) {
 /// Count what one finished turn did with learned skills, and say which learned
 /// skills it used: activations are uses,
 /// `read_skill_file` and a `read_file` inside a learned skill's folder are views.
+///
+/// When the harness ran verification checks later in the turn, the last run's
+/// result counts against each skill used before it: which skills the work that
+/// passed or failed followed. Nothing is inferred for a turn that ran no check.
 pub fn record_turn(
     layers: &Layers,
     workspace: &Path,
     executions: &[harness_tools::ToolExecutionView],
 ) -> BTreeSet<String> {
-    let mut used = BTreeSet::new();
-    let mut count = |name: &str, kind: UseKind| {
-        if record_use(layers, name, kind) {
-            used.insert(name.to_owned());
-        }
-    };
+    let mut used = BTreeSet::<String>::new();
+    // The last check result after each used skill.
+    let mut checked = BTreeMap::new();
     for execution in executions {
+        let mut touched = Vec::new();
         match &execution.output {
             harness_tools::ToolOutput::SkillActivated { block } => {
                 if let Some(name) = block
@@ -527,7 +536,7 @@ pub fn record_turn(
                     .strip_prefix("skill:")
                     .and_then(|reference| reference.rsplit_once('@').map(|(name, _)| name))
                 {
-                    count(name, UseKind::Use);
+                    touched.push((name.to_owned(), UseKind::Use));
                 }
             }
             harness_tools::ToolOutput::ExternalTool {
@@ -537,7 +546,14 @@ pub fn record_turn(
                 ..
             } if plugin_id == "skill" && tool_name == "read_skill_file" => {
                 if let Some(name) = payload["name"].as_str() {
-                    count(name, UseKind::View);
+                    touched.push((name.to_owned(), UseKind::View));
+                }
+            }
+            harness_tools::ToolOutput::ExternalTool { payload, .. } => {
+                if let Some(passed) = super::verify::checked(payload) {
+                    for name in &used {
+                        checked.insert(name.clone(), passed);
+                    }
                 }
             }
             harness_tools::ToolOutput::ReadFile { path, .. } => {
@@ -553,14 +569,42 @@ pub fn record_turn(
                             relative.components().next()
                         && relative.components().count() > 1
                     {
-                        count(&name.to_string_lossy(), UseKind::View);
+                        touched.push((name.to_string_lossy().into_owned(), UseKind::View));
                     }
                 }
             }
             _ => {}
         }
+        for (name, kind) in touched {
+            if record_use(layers, &name, kind) {
+                used.insert(name);
+            }
+        }
     }
+    record_checks(layers, &checked);
     used
+}
+
+/// Count, for each learned skill, whether the checks run after it was used
+/// passed.
+fn record_checks(layers: &Layers, checked: &BTreeMap<String, bool>) {
+    for (name, passed) in checked {
+        let Some(layer) = layers.find(name) else {
+            continue;
+        };
+        let root = layers.root(layer).expect("found layer is present");
+        update_usage(&layers.usage_file(layer, root), |usage| {
+            bump(
+                usage,
+                name,
+                if *passed {
+                    "checked_pass"
+                } else {
+                    "checked_fail"
+                },
+            );
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -724,11 +768,19 @@ pub fn library_overview(skills: &[LearnedSkill]) -> String {
         } else {
             ""
         };
+        let checks = if skill.usage.checked_pass + skill.usage.checked_fail > 0 {
+            format!(
+                "; checks after use: {} pass, {} fail",
+                skill.usage.checked_pass, skill.usage.checked_fail
+            )
+        } else {
+            String::new()
+        };
         groups
             .entry(skill.category.as_str())
             .or_default()
             .push(format!(
-                "- {} [{}]: {} (used {}, viewed {} in {seen} requests{probation})",
+                "- {} [{}]: {} (used {}, viewed {} in {seen} requests{probation}{checks})",
                 skill.name,
                 skill.layer.as_str(),
                 skill.description,
@@ -1673,6 +1725,8 @@ Compare first: if a learned skill already covers the class of work, patch or upd
 
 Create skills at the altitude of the class of work (`rust-test-debugging`, not `fix-test-in-foo-rs`), so the next lesson of the same kind patches into it.
 
+"checks after use" under <learned_skills> counts turns that used the skill and then ran the project's verification checks, by how they ended. Repeated fails after use make a skill a candidate to fix: patch the step the failing work followed, or, when it passes in some situations and fails in others, split it into variants whose descriptions name when each applies. Never delete a skill because checks failed after it: a failure can come from the task, not the skill, and a skill that helps only in some contexts averages out to no effect while still being worth keeping.
+
 Intent fields: {"action":"create|update|patch|remove_file|delete","name":"lowercase-hyphenated","level":"project|global (create only)","body":"full SKILL.md (create/update)","old_string":"patch: text that occurs exactly once in the live SKILL.md","new_string":"patch: replacement","files":{"references/<topic>.md":"content"},"path":"remove_file: relative path","absorbed_into":"delete: the learned skill that absorbed this one","reason":"why","evidence":"a verbatim quote from the conversation"}
 
 Format, enforced:
@@ -1947,6 +2001,8 @@ mod tests {
                 views,
                 patches: 0,
                 anchor,
+                checked_pass: 0,
+                checked_fail: 0,
                 archived: false,
             },
         };
@@ -2254,6 +2310,94 @@ mod tests {
         assert!(
             note.contains("ci-test-debugging") && note.contains("activate it"),
             "{note}"
+        );
+    }
+
+    fn ran(
+        plugin_id: &str,
+        tool_name: &str,
+        payload: serde_json::Value,
+    ) -> harness_tools::ToolExecutionView {
+        harness_tools::ToolExecutionView {
+            schema_version: 1,
+            execution_id: None,
+            receipt: None,
+            output: harness_tools::ToolOutput::ExternalTool {
+                plugin_id: plugin_id.to_owned(),
+                tool_name: tool_name.to_owned(),
+                payload,
+                inflight: 1,
+            },
+            observer_failure: None,
+        }
+    }
+
+    fn viewed(name: &str) -> harness_tools::ToolExecutionView {
+        ran("skill", "read_skill_file", json!({"name": name}))
+    }
+
+    fn checks(outcome: Option<bool>) -> harness_tools::ToolExecutionView {
+        ran(
+            "feature",
+            "feature",
+            super::super::verify::payload("F01", outcome),
+        )
+    }
+
+    /// A check result counts against the skills a turn used before it, by the
+    /// turn's last result; a turn that ran no check, or a skill used only after
+    /// the checks, says nothing. The refiner reads the counts in the overview.
+    #[test]
+    fn checks_after_use_are_counted_only_when_checks_ran_and_shown_to_the_refiner() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let workspace = directory.path().join("workspace");
+        for name in ["flaky-fix", "late", "unchecked"] {
+            assert!(promote(&layers, &create(name, "Do it."), &PromoteContext::default()).ok);
+        }
+        let turns = [
+            // Failed, fixed, passed: the turn's result is the pass.
+            vec![
+                viewed("flaky-fix"),
+                checks(Some(false)),
+                checks(Some(true)),
+                viewed("late"),
+            ],
+            vec![viewed("flaky-fix"), checks(Some(false))],
+            vec![viewed("flaky-fix"), checks(Some(false))],
+            // No check ran, or one ran without a result.
+            vec![viewed("unchecked"), checks(None)],
+            vec![viewed("unchecked")],
+        ];
+        for turn in &turns {
+            super::record_turn(&layers, &workspace, turn);
+        }
+        let (_, counters) = usage(&layers, Layer::Project);
+        let fix = counters["flaky-fix"];
+        assert_eq!((fix.views, fix.checked_pass, fix.checked_fail), (3, 1, 2));
+        for name in ["late", "unchecked"] {
+            let usage = counters[name];
+            assert_eq!((usage.checked_pass, usage.checked_fail), (0, 0), "{name}");
+        }
+        let overview = super::library_overview(&library(&layers));
+        let line = |name: &str| {
+            overview
+                .lines()
+                .find(|line| line.starts_with(&format!("- {name} ")))
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert!(
+            line("flaky-fix").ends_with("on probation; checks after use: 1 pass, 2 fail)"),
+            "{overview}"
+        );
+        assert!(
+            !line("unchecked").contains("checks after use"),
+            "{overview}"
+        );
+        assert!(
+            !line("late").is_empty() && !line("late").contains("checks"),
+            "{overview}"
         );
     }
 
