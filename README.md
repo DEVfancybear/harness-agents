@@ -17,6 +17,16 @@ npm install -g harness-agents
 ha                      # then /login and start typing
 ```
 
+### Screenshots / Ảnh chụp
+
+![A child verifier agent investigating read-only and messaging the main agent](docs/assets/child-verifier.png)
+
+*An independent `verifier` child agent re-checks the work read-only and reports back to the main agent as a message the running turn picks up, while the status line shows cost, cache hit rate and context use. / Agent con `verifier` kiểm tra độc lập ở chế độ chỉ đọc và báo lại cho agent chính bằng một tin nhắn mà lượt đang chạy nhận được; thanh trạng thái hiện chi phí, tỉ lệ cache và mức dùng context.*
+
+![The reasoning panel next to a Python REPL call and a verifier finding](docs/assets/reasoning-and-verifier.png)
+
+*The model's reasoning shown as its own block, then a call into the persistent Python REPL and the verifier's next finding. / Phần suy nghĩ của model hiện thành một khối riêng, rồi một lời gọi vào Python REPL bền và phát hiện tiếp theo của verifier.*
+
 ---
 
 ## English
@@ -27,10 +37,10 @@ ha                      # then /login and start typing
 | --- | --- |
 | **Guarded tools** | Read, search, patch and write files, run shell commands and processes, inspect Git, fetch and search the web. Every action passes the host policy: `ask`, `auto-edit` or `full-auto`, with deny rules that always hold. |
 | **Persistent Python REPL** | prime-agent's kernel: variables survive across turns, `bash()` runs commands in the background, `rlm.spawn()` fans out explorer agents in parallel. |
-| **Verified work** | `[verify]` checks the harness runs itself, an independent `verifier` agent that cannot edit, goals that only complete when both pass, and a feature list only a real verification can mark passing. |
+| **Verified work** | `[verify]` checks the harness runs itself, an independent `verifier` agent that cannot edit and reports its findings back to the running turn, goals that only complete when both pass, and a feature list only a real verification can mark passing. |
 | **Long-running work** | `/goal` keeps working across turns, `ha exec --autonomous` loops until your gates pass, and background agents keep running after the terminal closes. |
 | **Session continuity** | Every session starts from a brief of recent commits, uncommitted files and the last `/handoff`; `/resume`, `/tree` and forks move around a conversation's history. |
-| **Learned skills** | `/refine`, `/learn` and a background review write `SKILL.md` skills that pass a lint, are counted when used and archived when never used. |
+| **Learned skills** | `/refine`, `/learn` and a background review write `SKILL.md` skills that pass a lint and are counted when used, together with whether your checks passed afterwards. A skill nobody uses is archived; moving it back gives it a new trial. |
 | **Prompt caching** | A request's prefix stays byte-for-byte still across steps and turns; each provider gets its cache key, breakpoints and retention, and the status line shows `⚡ cache NN%`. |
 | **Open ecosystem** | Agent Skills, MCP servers with OAuth sign-in and a service catalog (`/plugins`), prompt templates, hooks, `ha package` (npm, git, local), and `--mode rpc` / `--mode acp` for editors. |
 
@@ -160,10 +170,10 @@ CI runs the phase and milestone gates on Windows; a test that fails in the crowd
 | --- | --- |
 | **Công cụ có kiểm soát** | Đọc, tìm, sửa và ghi file, chạy lệnh shell và tiến trình, xem Git, tìm và đọc web. Mọi thao tác đi qua chính sách của host: `ask`, `auto-edit` hoặc `full-auto`, rule deny luôn được giữ. |
 | **Python REPL bền** | Kernel của prime-agent: biến được giữ qua các lượt, `bash()` chạy lệnh nền, `rlm.spawn()` chạy song song các agent khám phá. |
-| **Kiểm chứng thật** | Các check `[verify]` do harness tự chạy, agent `verifier` độc lập không được sửa file, goal chỉ hoàn thành khi cả hai qua, và feature list chỉ được đánh dấu passing bằng một lượt kiểm chứng thật. |
+| **Kiểm chứng thật** | Các check `[verify]` do harness tự chạy, agent `verifier` độc lập không được sửa file và báo phát hiện của nó về lượt đang chạy, goal chỉ hoàn thành khi cả hai qua, và feature list chỉ được đánh dấu passing bằng một lượt kiểm chứng thật. |
 | **Việc dài hơi** | `/goal` làm tiếp qua nhiều lượt, `ha exec --autonomous` lặp tới khi các gate qua, agent nền vẫn chạy sau khi đóng terminal. |
 | **Liền mạch giữa các phiên** | Mỗi phiên bắt đầu với tóm tắt commit gần đây, file chưa commit và `/handoff` cuối; `/resume`, `/tree` và fork để đi lại trong lịch sử hội thoại. |
-| **Tự học skill** | `/refine`, `/learn` và lượt xem xét nền viết skill `SKILL.md` qua lint, được đếm khi dùng và lưu trữ khi không ai dùng. |
+| **Tự học skill** | `/refine`, `/learn` và lượt xem xét nền viết skill `SKILL.md` qua lint, được đếm mỗi khi dùng cùng việc check của bạn có qua sau đó hay không. Skill không ai dùng bị lưu trữ; chuyển lại thì được thử việc lại. |
 | **Prompt caching** | Phần đầu request giữ nguyên từng byte qua các bước và các lượt; mỗi provider nhận cache key, breakpoint và thời hạn riêng, thanh trạng thái hiện `⚡ cache NN%`. |
 | **Hệ sinh thái mở** | Agent Skills, MCP server có đăng nhập OAuth và danh mục dịch vụ (`/plugins`), prompt template, hook, `ha package` (npm, git, local), và `--mode rpc` / `--mode acp` cho editor. |
 
