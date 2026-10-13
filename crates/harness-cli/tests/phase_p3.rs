@@ -243,6 +243,58 @@ async fn review_p3_search_redacts_before_truncation() {
     close_writer(store).await;
 }
 
+/// Seen in a session: `search_text path=README.md` failed with "`search_text`
+/// path must be a directory" under "side effect may be uncertain; do not rerun
+/// automatically" - for a read. A file is searched now, and a read that fails
+/// settles as a plain failure the model may correct.
+#[tokio::test]
+async fn p3_a_search_names_a_file_and_a_failed_read_is_not_an_unknown_outcome() {
+    let temp = TempDir::new().unwrap();
+    let root = setup_workspace(&temp);
+    let store = writer(&temp).await;
+    let (session, task, _) = admit(&store, &root).await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let search = |path: &str| CodingToolAction::SearchText {
+        query: "parser".into(),
+        path: Some(path.into()),
+        regex: false,
+        case_insensitive: false,
+        glob: None,
+        context_lines: None,
+    };
+    let (prepared, approval) =
+        prepared_and_approved(&tools, &session, &task, &root, search("src/parser.txt")).await;
+    let view = tools.execute(prepared, Some(approval)).await.unwrap();
+    let ToolOutput::SearchText { matches, .. } = view.output else {
+        panic!("expected search output, got {:?}", view.output)
+    };
+    assert_eq!(matches.len(), 1);
+
+    // An ignored file is not searched, as a folder search would skip it.
+    let (prepared, approval) =
+        prepared_and_approved(&tools, &session, &task, &root, search("ignored.tmp")).await;
+    let view = tools.execute(prepared, Some(approval)).await.unwrap();
+    let ToolOutput::Denied { code, reason } = &view.output else {
+        panic!("expected a plain failure, got {:?}", view.output)
+    };
+    assert_eq!(code, "invalid_payload");
+    assert!(!reason.contains("side effect"), "{reason}");
+    assert_eq!(
+        view.receipt.expect("receipt").outcome_state,
+        ToolOutcomeState::Settled
+    );
+    assert!(
+        store
+            .pending_tool_intents(&session)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a failed read leaves nothing to reconcile"
+    );
+    drop(tools);
+    close_writer(store).await;
+}
+
 use std::{
     collections::BTreeSet,
     fs,

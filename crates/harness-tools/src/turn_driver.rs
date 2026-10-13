@@ -2697,8 +2697,16 @@ fn tool_output_images(output: &ToolOutput) -> Vec<harness_providers::ImageAttach
 fn summarize_arguments(arguments: &str) -> String {
     const VALUE_CHARS: usize = 60;
     let summary = match serde_json::from_str::<Value>(arguments) {
+        // The path first: keys come sorted, so an edit's `path` followed its
+        // `new_string` and `old_string` and was the part the cut removed.
         Ok(Value::Object(fields)) => fields
             .iter()
+            .filter(|(key, _)| matches!(key.as_str(), "path" | "paths"))
+            .chain(
+                fields
+                    .iter()
+                    .filter(|(key, _)| !matches!(key.as_str(), "path" | "paths")),
+            )
             .filter(|(_, value)| !value.is_null())
             .map(|(key, value)| {
                 let value = match value {
@@ -2718,7 +2726,14 @@ fn summarize_arguments(arguments: &str) -> String {
             .join(" "),
         _ => arguments.replace(['\n', '\r'], " "),
     };
-    truncate_text(&summary, 160)
+    // A display line, not a tool result: the result's "request a narrower
+    // range" notice read as part of a path in the transcript header.
+    if summary.chars().count() > 160 {
+        let cut = summary.chars().take(160).collect::<String>();
+        format!("{cut}…")
+    } else {
+        summary
+    }
 }
 
 /// A stable signature of one requested tool call.
@@ -3208,6 +3223,23 @@ mod tool_output_render_tests {
     };
     use crate::{ToolOutput, contracts::SearchMatch};
     use harness_types::ContentHash;
+
+    /// Seen in the transcript: `Edit file src/lib/o [truncated: 8 more
+    /// characters; request a narrower range]` - the edit's path came last and
+    /// the cut, with the tool result's notice, fell inside it.
+    #[test]
+    fn a_long_edit_summary_keeps_its_whole_path_first() {
+        let arguments = serde_json::json!({
+            "path": "src/lib/orders.ts",
+            "old_string": "x".repeat(200),
+            "new_string": "y".repeat(200),
+        })
+        .to_string();
+        let summary = super::summarize_arguments(&arguments);
+        assert!(summary.starts_with("path=src/lib/orders.ts "), "{summary}");
+        assert!(!summary.contains("request a narrower range"), "{summary}");
+        assert!(summary.ends_with('…'), "{summary}");
+    }
 
     fn stream(text: &str) -> StreamTail {
         StreamTail {

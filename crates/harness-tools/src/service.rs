@@ -1046,6 +1046,24 @@ impl ToolExecutionService {
                 )
                 .await
             }
+            // A read that failed changed nothing, so its outcome is known: the
+            // error, which the model may correct and retry. "Side effect may be
+            // uncertain" on a search that named a file kept models from retrying.
+            Err(error) if is_read_only(&call.transformed) => {
+                self.settle(
+                    &prepared,
+                    execution_id,
+                    Some(approval.approval_id.as_str()),
+                    ToolOutput::Denied {
+                        code: error.code().as_str().to_owned(),
+                        reason: error.message().to_owned(),
+                    },
+                    None,
+                    ToolOutcomeState::Settled,
+                    ToolIntentStatus::Settled,
+                )
+                .await
+            }
             Err(error) => {
                 let reason =
                     format!("side effect may be uncertain; do not rerun automatically: {error}");

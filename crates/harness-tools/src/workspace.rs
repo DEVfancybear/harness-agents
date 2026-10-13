@@ -677,6 +677,39 @@ pub(crate) fn tool_walk(
     cached_walk(root, &base, Some(Instant::now() + TOOL_WALK_DEADLINE))
 }
 
+/// What `search_text` searches: a directory's walk, or one file. Models name a
+/// file as often as a folder (`path=README.md`), and refusing it cost a turn.
+/// The file comes out of its folder's walk, so an ignored or sensitive file is
+/// refused here exactly as a folder search would skip it.
+fn search_walk(root: &Path, requested: Option<&str>) -> Result<std::sync::Arc<Walk>, HarnessError> {
+    let file = match requested {
+        Some(path) => resolve_relative(root, path, true)?,
+        None => root.to_owned(),
+    };
+    if !file.is_file() {
+        return tool_walk(root, requested, "search_text");
+    }
+    let parent = file.parent().unwrap_or(root);
+    let walk = cached_walk(root, parent, Some(Instant::now() + TOOL_WALK_DEADLINE))?;
+    let files = walk
+        .files
+        .iter()
+        .filter(|entry| entry.absolute == file)
+        .cloned()
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            "search_text path names a file the workspace search skips (ignored or sensitive)",
+        ));
+    }
+    Ok(std::sync::Arc::new(Walk {
+        files,
+        complete: true,
+        directories: walk.directories.clone(),
+    }))
+}
+
 fn root_relative(root: &Path, file: &WalkFile) -> Result<String, HarnessError> {
     let relative = file.absolute.strip_prefix(root).map_err(|_| {
         HarnessError::new(
@@ -791,7 +824,7 @@ pub(crate) fn search_text(
     }
     let stamp = crate::walk::generation();
     let watched = crate::walk::ensure_watched(root);
-    let walk = tool_walk(root, requested, "search_text")?;
+    let walk = search_walk(root, requested)?;
     let found = crate::search::search(
         root,
         &walk,
@@ -1959,6 +1992,43 @@ mod tests {
             preview.chars().count(),
             crate::truncate::GREP_MAX_LINE_LENGTH + 15
         );
+    }
+
+    #[test]
+    fn search_text_searches_one_file_when_the_path_names_a_file() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        fs::create_dir(directory.path().join("docs")).expect("docs");
+        fs::write(directory.path().join("docs/a.md"), "needle in a\n").expect("a");
+        fs::write(directory.path().join("docs/b.md"), "needle in b\n").expect("b");
+        fs::write(directory.path().join(".env"), "needle=secret\n").expect("env");
+        let root = fs::canonicalize(directory.path()).expect("root");
+        let output = search_text(
+            &root,
+            "needle",
+            Some("docs/a.md"),
+            false,
+            false,
+            None,
+            0,
+            false,
+        )
+        .expect("a file is searched");
+        let paths = output
+            .matches
+            .iter()
+            .map(|found| found.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["docs/a.md"]);
+        // A folder still searches the folder; a file the walk skips is refused
+        // as a folder search would skip it.
+        assert_eq!(
+            search_text(&root, "needle", Some("docs"), false, false, None, 0, false)
+                .expect("folder")
+                .matches
+                .len(),
+            2
+        );
+        assert!(search_text(&root, "needle", Some(".env"), false, false, None, 0, false).is_err());
     }
 
     fn spec(old: &str, new: &str) -> EditSpec {

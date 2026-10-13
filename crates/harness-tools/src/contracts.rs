@@ -367,7 +367,7 @@ fn workspace_tool_schemas(hashline: bool) -> Vec<Value> {
                 "path": string_schema(),
                 "paths": {"type": "array", "items": string_schema(), "minItems": 1, "maxItems": READ_FILE_MAX_PATHS},
                 "offset": {"type": "integer", "minimum": 0},
-                "limit": {"type": "integer", "minimum": 1, "maximum": READ_FILE_MAX_LINES}
+                "limit": {"type": "integer", "minimum": 1, "description": format!("Lines to read, at most {READ_FILE_MAX_LINES}; more is read as {READ_FILE_MAX_LINES}.")}
             }),
             &[],
         ),
@@ -379,14 +379,14 @@ fn workspace_tool_schemas(hashline: bool) -> Vec<Value> {
         ),
         function_schema(
             "search_text",
-            "Search bounded UTF-8 workspace text without following links. Regex and context are bounded.",
+            "Search bounded UTF-8 workspace text without following links. path is a folder or one file. Regex and context are bounded.",
             json!({
                 "query": string_schema(),
                 "path": nullable_string_schema(),
                 "regex": {"type": "boolean"},
                 "case_insensitive": {"type": "boolean"},
                 "glob": nullable_string_schema(),
-                "context_lines": {"type": "integer", "minimum": 0, "maximum": SEARCH_CONTEXT_MAX_LINES, "description": "Lines of context around each match, at most 3; more is read as 3."}
+                "context_lines": {"type": "integer", "minimum": 0, "description": "Lines of context around each match, at most 3; more is read as 3."}
             }),
             &["query"],
         ),
@@ -870,7 +870,10 @@ impl CodingToolAction {
         match name {
             "read_file" => {
                 let offset = parse_optional_u64(object, "offset")?;
-                let limit = parse_optional_bounded_u32(object, "limit", 1, READ_FILE_MAX_LINES)?;
+                // A page longer than the bound is read as the bound, like
+                // context_lines: refusing limit=520 cost the model a step.
+                let limit = parse_optional_bounded_u32(object, "limit", 1, u32::MAX)?
+                    .map(|limit| limit.min(READ_FILE_MAX_LINES));
                 Ok(Self::ReadFile {
                     path: required_string(object, "path")?,
                     offset,
@@ -1835,6 +1838,45 @@ mod search_context_tests {
                 "{bad}"
             );
         }
+    }
+
+    /// Seen in a session: `read_file limit=520` was refused as invalid
+    /// arguments by the schema the model was shown, and the model re-read the
+    /// file in two halves. The schema no longer refuses a page past the bound,
+    /// and the parser reads it as the bound - for `context_lines` too, which
+    /// the parser already clamped but the schema still refused.
+    #[test]
+    fn a_page_past_the_bound_passes_the_schema_and_is_read_as_the_bound() {
+        let schemas = super::workspace_tool_schemas(false);
+        let parameters = |name: &str| {
+            schemas
+                .iter()
+                .find(|schema| schema["function"]["name"] == name)
+                .map(|schema| schema["function"]["parameters"].clone())
+                .expect("schema")
+        };
+        for (name, arguments) in [
+            ("read_file", r#"{"path":"a.rs","limit":520}"#),
+            ("search_text", r#"{"query":"x","context_lines":5}"#),
+        ] {
+            assert!(
+                crate::validation::validate_tool_arguments_json(name, &parameters(name), arguments)
+                    .is_ok(),
+                "{name} {arguments}"
+            );
+        }
+        match CodingToolAction::from_provider_call("read_file", r#"{"path":"a.rs","limit":520}"#)
+            .expect("parses")
+        {
+            CodingToolAction::ReadFile { limit, .. } => {
+                assert_eq!(limit, Some(super::READ_FILE_MAX_LINES));
+            }
+            other => panic!("not a read: {other:?}"),
+        }
+        assert!(
+            CodingToolAction::from_provider_call("read_file", r#"{"path":"a.rs","limit":0}"#)
+                .is_err()
+        );
     }
 }
 
