@@ -2167,8 +2167,8 @@ mod venv {
     /// The Python the venv is built on (prime-agent's `PYTHON_VERSION`).
     const PYTHON_VERSION: &str = "3.11";
     /// `dill` for state snapshots, prime-agent's `DEFAULT_RLM_EXTRA_PACKAGES`, and
-    /// the packages the bundled skills import (`pillow` for `attach_image`).
-    pub const PACKAGES: [&str; 15] = [
+    /// the packages the bundled skills import (image capture and desktop input).
+    pub const PACKAGES: [&str; 16] = [
         "dill",
         "requests",
         "httpx",
@@ -2183,6 +2183,7 @@ mod venv {
         "pydantic",
         "tyro",
         "pillow",
+        "pyautogui==0.9.54",
         // prime-agent-runtime's own dependency, for `rlm.mcp`.
         "mcp>=2,<3",
     ];
@@ -2755,6 +2756,42 @@ mod tests {
         let first = write_runtime(directory.path()).expect("runtime");
         assert!(first.join("rlm").join("repl.py").is_file());
         assert_eq!(write_runtime(directory.path()).expect("runtime"), first);
+    }
+
+    /// Bundled desktop input is discoverable and callable without importing a GUI
+    /// backend at kernel startup, including on machines without a desktop.
+    #[tokio::test]
+    async fn the_desktop_skill_loads_without_probing_the_desktop() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let Some(python) = super::find_python(None).await else {
+            eprintln!("skipped: no Python 3.11+ on this machine");
+            return;
+        };
+        let skills =
+            super::super::skills::bundled_skills_root(directory.path()).expect("bundled skills");
+        let context = KernelContext {
+            skills: super::python_skill_packages(&skills.join("computer-use/SKILL.md")),
+            ..KernelContext::default()
+        };
+        assert_eq!(context.skills.len(), 1);
+        let shared = Arc::new(ReplShared::new(
+            directory.path(),
+            directory.path(),
+            Some(python.display().to_string()),
+            super::default_shell(),
+        ));
+        let output = shared
+            .execute(
+                "import sys\nassert callable(computer_use)\nassert callable(computer_use.screenshot)\nassert 'pyautogui' not in sys.modules\nprint('desktop skill loaded lazily')",
+                Duration::from_mins(1),
+                Arc::new(NoHostRequests),
+                Some(&context),
+            )
+            .await
+            .expect("cell");
+        assert_eq!(output.text, "desktop skill loaded lazily\n");
+        assert!(output.images.is_empty());
+        shared.dispose().await;
     }
 
     /// The kernel end to end, when this machine has Python 3.11+: state persists

@@ -163,7 +163,9 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
-      - name: Verify Python memory persistence without dependencies
+      - name: Install image support for mock desktop tests
+        run: python -m pip install pillow
+      - name: Verify Python memory and desktop-skill regressions (no GUI input)
         run: python -m unittest discover -s crates/harness-cli/python/tests -v
       - name: Install pinned Rust toolchain
         shell: pwsh

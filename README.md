@@ -158,6 +158,7 @@ CI runs the phase and milestone gates on Windows; a test that fails in the crowd
 
 - [Operator guide](docs/OPERATOR_GUIDE.en.md): every command, setting and workflow
 - [Architecture overview](docs/ARCHITECTURE_OVERVIEW.en.md) · [Terminal interface](docs/TUI.md) · [Plugin architecture](docs/PLUGIN_ARCHITECTURE.en.md)
+- [Desktop computer use](docs/COMPUTER_USE.md): real screenshots, mouse and keyboard on Windows
 - [Build and release](docs/BUILD_AND_RELEASE.md) · [Changelog](https://github.com/DEVfancybear/harness-agents/releases)
 
 ---

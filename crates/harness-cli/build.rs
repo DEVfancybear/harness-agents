@@ -80,6 +80,14 @@ fn collect_files(
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
+        if entry.file_name() == "__pycache__"
+            || matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("pyc" | "pyo")
+            )
+        {
+            continue;
+        }
         let kind = entry.file_type()?;
         if kind.is_dir() {
             collect_files(root, &path, files)?;

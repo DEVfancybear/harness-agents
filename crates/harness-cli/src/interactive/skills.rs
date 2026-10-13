@@ -921,6 +921,13 @@ mod tests {
     /// package is found for the kernel, and the prompt names its import.
     #[test]
     fn the_bundled_prime_agent_skills_carry_their_python_packages() {
+        for (path, _) in super::BUNDLED_SKILL_FILES {
+            assert!(!path.split('/').any(|part| part == "__pycache__"), "{path}");
+            let extension = std::path::Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str());
+            assert!(!matches!(extension, Some("pyc" | "pyo")), "{path}");
+        }
         let temporary = tempfile::tempdir().expect("temporary directory");
         let catalog = discover(
             &temporary.path().join("config"),
@@ -945,6 +952,7 @@ mod tests {
             "refine",
             "websearch",
             "attach_image",
+            "computer_use",
             "agent_message",
             "agent_observe",
             "rlm_heartbeat",
@@ -957,7 +965,8 @@ mod tests {
         let prompt =
             crate::interactive::prompt::append_skill_metadata(String::new(), catalog.entries());
         assert!(
-            prompt.contains("<python_import>edit</python_import>"),
+            prompt.contains("<python_import>edit</python_import>")
+                && prompt.contains("<python_import>computer_use</python_import>"),
             "{prompt}"
         );
     }
