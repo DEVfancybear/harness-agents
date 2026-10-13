@@ -134,10 +134,18 @@ impl PluginGraph {
                         format!("provided service is invalid: {error}"),
                     )
                 })?;
-                providers
+                // One plugin may offer several API versions of a service; the
+                // requirement match below picks the version. Only a second
+                // plugin offering it is a duplicate provider.
+                let candidates = providers
                     .entry((descriptor.scope_id.clone(), service.service_id.clone()))
-                    .or_default()
-                    .push(descriptor);
+                    .or_default();
+                if !candidates
+                    .iter()
+                    .any(|candidate| candidate.instance_id == descriptor.instance_id)
+                {
+                    candidates.push(descriptor);
+                }
             }
         }
         for ((_, service_id), candidates) in &providers {
@@ -272,12 +280,17 @@ impl ScopedRegistry {
                 "scope parent has not been registered",
             ));
         }
-        if self.parents.insert(scope_id, parent).is_some() {
+        // Checked before the insert: inserting first replaced the existing
+        // scope's parent and only then reported the duplicate, so a refused
+        // call had already moved the scope - into another tree, or under
+        // itself, after which `lookup` walked the parent chain forever.
+        if self.parents.contains_key(&scope_id) {
             return Err(KernelError::new(
                 ErrorCode::DuplicateRegistration,
                 "scope already exists",
             ));
         }
+        self.parents.insert(scope_id, parent);
         Ok(())
     }
 
@@ -439,6 +452,10 @@ pub struct ServiceProvider {
     active_calls: Mutex<BTreeSet<String>>,
     drained: Notify,
     resource: Arc<dyn ManagedResource>,
+    /// The calls that were active when the provider was lost, taken once.
+    lost_with: Mutex<Option<Vec<String>>>,
+    /// The resource's release, run once however often loss is reported.
+    released: OnceCell<ShutdownReport>,
 }
 
 impl ServiceProvider {
@@ -456,6 +473,8 @@ impl ServiceProvider {
             active_calls: Mutex::new(BTreeSet::new()),
             drained: Notify::new(),
             resource,
+            lost_with: Mutex::new(None),
+            released: OnceCell::new(),
         })
     }
 
@@ -474,7 +493,9 @@ impl ServiceProvider {
     ) -> Result<ServiceCall, KernelError> {
         // Serialise admission with provider loss. Without this guard a call
         // could pass the health check while loss is snapshotting active calls,
-        // leaving the drain report unaware of an in-flight operation.
+        // leaving the drain report unaware of an in-flight operation. Loss
+        // changes health and generation only while holding this lock, so one
+        // check under it is enough.
         let mut active_calls = self
             .active_calls
             .lock()
@@ -497,20 +518,6 @@ impl ServiceProvider {
             ));
         }
         self.in_flight.fetch_add(1, Ordering::AcqRel);
-        if !self.healthy.load(Ordering::Acquire)
-            || self.generation.load(Ordering::Acquire) != lease_generation
-        {
-            if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
-                self.drained.notify_waiters();
-            }
-            return Err(KernelError::new(
-                ErrorCode::ServiceUnavailable,
-                format!(
-                    "service {} changed generation during admission",
-                    self.service_id
-                ),
-            ));
-        }
         active_calls.insert(call_id.clone());
         drop(active_calls);
         Ok(ServiceCall {
@@ -532,15 +539,27 @@ impl ServiceProvider {
 
     /// Stop new calls, invalidate old leases, wait for active calls, then
     /// release the owned resource. Any active call at loss becomes uncertain.
+    ///
+    /// Loss happens once. A second report of it - a health monitor and a
+    /// shutdown both noticing, or a retry after a cancelled drain - waits for
+    /// the same drain and returns the same report: the resource is released
+    /// once, and the uncertain calls are the ones active at the first loss,
+    /// not the (fewer) ones still active when the retry arrived.
     pub async fn lose_and_drain(&self) -> ShutdownReport {
         let uncertainties = {
             let active_calls = self
                 .active_calls
                 .lock()
                 .expect("service call mutex is not poisoned");
-            self.healthy.store(false, Ordering::Release);
-            self.generation.fetch_add(1, Ordering::AcqRel);
-            active_calls.iter().cloned().collect::<Vec<_>>()
+            self.lost_with
+                .lock()
+                .expect("provider loss mutex is not poisoned")
+                .get_or_insert_with(|| {
+                    self.healthy.store(false, Ordering::Release);
+                    self.generation.fetch_add(1, Ordering::AcqRel);
+                    active_calls.iter().cloned().collect()
+                })
+                .clone()
         };
         loop {
             let notified = self.drained.notified();
@@ -549,7 +568,11 @@ impl ServiceProvider {
             }
             notified.await;
         }
-        let mut report = close_resources(std::iter::once(Arc::clone(&self.resource))).await;
+        let mut report = self
+            .released
+            .get_or_init(|| close_resources(std::iter::once(Arc::clone(&self.resource))))
+            .await
+            .clone();
         report.outcome_uncertainties = uncertainties;
         report
     }
@@ -604,11 +627,20 @@ pub enum ShutdownPhase {
 struct ShutdownItem {
     phase: ShutdownPhase,
     resource: Arc<dyn ManagedResource>,
+    /// Set once this resource's `shutdown` / `join` has returned.
+    shut_down: AtomicBool,
+    joined: AtomicBool,
 }
 
 /// A concurrent shutdown coordinator with a single shared completion result.
+///
+/// A shutdown that is cancelled part-way - dropped by a timeout, say - leaves
+/// its progress behind, and the next call carries on from there: a resource
+/// that already finished closing is not closed again, and the report it
+/// produced is kept.
 pub struct ShutdownCoordinator {
     items: Vec<ShutdownItem>,
+    progress: Mutex<ShutdownReport>,
     completion: OnceCell<ShutdownReport>,
 }
 
@@ -618,8 +650,14 @@ impl ShutdownCoordinator {
         Self {
             items: items
                 .into_iter()
-                .map(|(phase, resource)| ShutdownItem { phase, resource })
+                .map(|(phase, resource)| ShutdownItem {
+                    phase,
+                    resource,
+                    shut_down: AtomicBool::new(false),
+                    joined: AtomicBool::new(false),
+                })
                 .collect(),
+            progress: Mutex::new(ShutdownReport::default()),
             completion: OnceCell::new(),
         }
     }
@@ -627,29 +665,56 @@ impl ShutdownCoordinator {
     pub async fn shutdown(&self) -> ShutdownReport {
         self.completion
             .get_or_init(|| async {
-                let mut report = ShutdownReport::default();
                 for phase in [
                     ShutdownPhase::Consumer,
                     ShutdownPhase::Provider,
                     ShutdownPhase::Store,
                 ] {
-                    let phase_resources = self
-                        .items
-                        .iter()
-                        .filter(|item| item.phase == phase)
-                        .map(|item| Arc::clone(&item.resource))
-                        .collect::<Vec<_>>();
-                    let phase_report = close_resources(phase_resources.into_iter().rev()).await;
-                    report.closed.extend(phase_report.closed);
-                    report.errors.extend(phase_report.errors);
-                    report
-                        .outcome_uncertainties
-                        .extend(phase_report.outcome_uncertainties);
+                    for item in self.items.iter().rev().filter(|item| item.phase == phase) {
+                        let name = item.resource.name().to_owned();
+                        if !item.shut_down.load(Ordering::Acquire) {
+                            let outcome = item.resource.shutdown().await;
+                            self.record("shutdown", &name, outcome);
+                            item.shut_down.store(true, Ordering::Release);
+                        }
+                        if !item.joined.load(Ordering::Acquire) {
+                            let outcome = item.resource.join().await;
+                            self.record("join", &name, outcome);
+                            item.joined.store(true, Ordering::Release);
+                        }
+                    }
                 }
-                report
+                self.progress
+                    .lock()
+                    .expect("shutdown progress mutex is not poisoned")
+                    .clone()
             })
             .await
             .clone()
+    }
+
+    fn record(&self, step: &str, name: &str, outcome: Result<(), KernelError>) {
+        record_step(
+            &mut self
+                .progress
+                .lock()
+                .expect("shutdown progress mutex is not poisoned"),
+            step,
+            name,
+            outcome,
+        );
+    }
+}
+
+fn record_step(
+    report: &mut ShutdownReport,
+    step: &str,
+    name: &str,
+    outcome: Result<(), KernelError>,
+) {
+    match outcome {
+        Ok(()) => report.closed.push(format!("{step}:{name}")),
+        Err(error) => report.errors.push(format!("{step}:{name}:{error}")),
     }
 }
 
@@ -660,14 +725,8 @@ where
     let mut report = ShutdownReport::default();
     for resource in resources {
         let name = resource.name().to_owned();
-        match resource.shutdown().await {
-            Ok(()) => report.closed.push(format!("shutdown:{name}")),
-            Err(error) => report.errors.push(format!("shutdown:{name}:{error}")),
-        }
-        match resource.join().await {
-            Ok(()) => report.closed.push(format!("join:{name}")),
-            Err(error) => report.errors.push(format!("join:{name}:{error}")),
-        }
+        record_step(&mut report, "shutdown", &name, resource.shutdown().await);
+        record_step(&mut report, "join", &name, resource.join().await);
     }
     report
 }
