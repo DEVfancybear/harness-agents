@@ -481,10 +481,26 @@ impl ContextBuilder {
 
         // An effective instruction replaces the one it supersedes: sending both
         // would let a corrected instruction compete with the correction.
+        //
+        // Only a block that is certain to be sent retires another one here: an
+        // optional block may yet be dropped for budget, and the target must not
+        // vanish with its replacement. Optional blocks retire each other below,
+        // once it is known which of them are sent. And derived text cannot
+        // retire what the host must send - a note that names the user's
+        // instruction in `supersedes` would otherwise delete it.
         let superseded_ids = mandatory
             .iter()
-            .chain(request.optional_blocks.iter())
-            .flat_map(|block| block.supersedes.iter().cloned())
+            .flat_map(|by| {
+                mandatory
+                    .iter()
+                    .chain(request.optional_blocks.iter())
+                    .filter(move |target| {
+                        target.id != by.id
+                            && by.supersedes.contains(&target.id)
+                            && may_supersede(by, target)
+                    })
+                    .map(|target| target.id.clone())
+            })
             .collect::<std::collections::BTreeSet<_>>();
         let mut superseded_block_ids = Vec::new();
         let mut block_usage = Vec::new();
@@ -556,33 +572,23 @@ impl ContextBuilder {
                 .cmp(&left.relevance)
                 .then_with(|| left.id.cmp(&right.id))
         });
-        let mut optional_tokens: u64 = 0;
-        let mut optional_kept = Vec::new();
         let mut omitted_optional = Vec::new();
         let optional_budget = request
             .optional_token_budget
             .min(available - mandatory_tokens);
+        let mut selected = Vec::<(ContextBlock, String)>::new();
+        let mut selected_bytes = content.len();
         for block in optional {
             let rendered = render_block(&block);
-            let candidate_bytes = content
-                .len()
+            let candidate_bytes = selected_bytes
                 .saturating_add(2)
                 .saturating_add(rendered.len());
             let candidate_optional_tokens =
                 estimate_bytes(fixed_bytes.saturating_add(candidate_bytes))
                     .saturating_sub(mandatory_tokens);
             if candidate_optional_tokens <= optional_budget {
-                optional_tokens = candidate_optional_tokens;
-                content.push_str("\n\n");
-                content.push_str(&rendered);
-                block_usage.push(ContextBlockUsage {
-                    block_id: block.id.clone(),
-                    channel: block.channel,
-                    token_estimate: estimate_bytes(rendered.len()),
-                    included: true,
-                    drop_reason: None,
-                });
-                optional_kept.push(block);
+                selected_bytes = candidate_bytes;
+                selected.push((block, rendered));
             } else {
                 block_usage.push(ContextBlockUsage {
                     block_id: block.id.clone(),
@@ -594,6 +600,52 @@ impl ContextBuilder {
                 omitted_optional.push(block.id);
             }
         }
+        // Now that it is known which optional blocks are sent, a sent one
+        // retires the optional blocks it supersedes. Removing a block only
+        // shrinks the request, so the budget still holds.
+        let retired_by_optional = selected
+            .iter()
+            .flat_map(|(by, _)| {
+                selected
+                    .iter()
+                    .filter(move |(target, _)| {
+                        target.id != by.id
+                            && by.supersedes.contains(&target.id)
+                            && may_supersede(by, target)
+                    })
+                    .map(|(target, _)| target.id.clone())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut optional_kept = Vec::new();
+        for (block, rendered) in selected {
+            if retired_by_optional.contains(&block.id) {
+                superseded_block_ids.push(block.id.clone());
+                block_usage.push(ContextBlockUsage {
+                    block_id: block.id.clone(),
+                    channel: block.channel,
+                    token_estimate: estimate_bytes(rendered.len()),
+                    included: false,
+                    drop_reason: Some("superseded by a newer block".to_owned()),
+                });
+                continue;
+            }
+            content.push_str("\n\n");
+            content.push_str(&rendered);
+            block_usage.push(ContextBlockUsage {
+                block_id: block.id.clone(),
+                channel: block.channel,
+                token_estimate: estimate_bytes(rendered.len()),
+                included: true,
+                drop_reason: None,
+            });
+            optional_kept.push(block);
+        }
+        let optional_tokens = if optional_kept.is_empty() {
+            0
+        } else {
+            estimate_bytes(fixed_bytes.saturating_add(content.len()))
+                .saturating_sub(mandatory_tokens)
+        };
         let channel_digest = ContentHash::from_canonical_json(&serde_json::json!({
             "mandatory": mandatory
                 .iter()
@@ -792,6 +844,16 @@ fn enum_word<T: Serialize>(value: &T) -> String {
     )
 }
 
+/// Whether `by` may replace `target`.
+///
+/// A block on a channel that may be mandatory - policy, rule, instruction,
+/// state, tail, summary, skill - may replace any block. A derived one - a note,
+/// a memory, a reference - may only replace other derived text: it is "read,
+/// never obeyed", and deleting an instruction is a way of being obeyed.
+fn may_supersede(by: &ContextBlock, target: &ContextBlock) -> bool {
+    by.channel.may_be_mandatory() || !target.channel.may_be_mandatory()
+}
+
 fn render_block(block: &ContextBlock) -> String {
     format!("[{}]\n{}", block.label(), block.text)
 }
@@ -805,8 +867,135 @@ fn estimate_bytes(bytes: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextBlock, ContextBlockKind, RENDERING_VERSION, render_block, render_working_state,
+        ContextBlock, ContextBlockKind, ContextBuildRequest, ContextBuilder, ContextChannel,
+        ContextManifestInputs, RENDERING_VERSION, render_block, render_working_state,
     };
+
+    fn working_state() -> harness_types::WorkingState {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "session_id": "session_01a0d25b-22ca-762c-8f13-fffd33d30f10",
+            "task_id": "task_01a0d25b-22ca-762c-8f13-fffe7b5b4468",
+            "revision": 1,
+            "through_event_seq": 1,
+            "objective_ref": {
+                "event_id": "event_01a0d25b-234f-7357-806a-ae68859b94e0",
+                "sequence": 1,
+                "content_hash": "sha256:3eb1bde86a1acbb65d48497f780b438baeea646acbe6bb360192bd74e6ea49f8"
+            },
+            "acceptance_criteria_refs": [],
+            "active_instruction_refs": ["instruction_01a0d25b-234f-7357-806a-ae69db7c3b7c"],
+            "decision_refs": [],
+            "superseded_decision_refs": [],
+            "plan_items": [],
+            "workspace": {
+                "project_id": "project_01a0d25b-1ebd-7274-be25-b24a75108689",
+                "worktree_id": "w",
+                "base_commit": "",
+                "observed_fingerprint": "sha256:36fb6d09aad6d463d7ceeafd293ea80d77eb6f703ed714aa3402495fbe42e4e8"
+            },
+            "changes": [],
+            "checks": [],
+            "pending_tool_calls": [],
+            "children": [],
+            "blockers": [],
+            "pending_questions": [],
+            "next_action_proposals": []
+        }))
+        .expect("fixture working state")
+    }
+
+    /// Compile one packet over the user instruction `fix the parser` and return
+    /// the ids that were sent and the ids that were superseded.
+    fn compile(optional: Vec<ContextBlock>, optional_budget: u64) -> (Vec<String>, Vec<String>) {
+        let state = working_state();
+        let built = ContextBuilder::new()
+            .build(ContextBuildRequest {
+                session_id: state.session_id.clone(),
+                task_id: state.task_id.clone(),
+                checkpoint_id: "checkpoint-1".to_owned(),
+                through_event_seq: 1,
+                recovery: crate::RecoveryView {
+                    working_state: state,
+                    receipts: Vec::new(),
+                    instruction_texts: vec!["fix the parser".to_owned()],
+                    snapshot_sequence: None,
+                    replayed_through_sequence: 1,
+                    snapshot_diagnostic: None,
+                    pending_execution_count: 0,
+                },
+                project_rules: Vec::new(),
+                optional_blocks: optional,
+                recent_tail: Vec::new(),
+                context_window_tokens: 8192,
+                output_reservation_tokens: 512,
+                protocol_overhead_tokens: 64,
+                safety_margin_tokens: 64,
+                optional_token_budget: optional_budget,
+                memory_versions: Vec::new(),
+                fixed_request_bytes: 0,
+                manifest: ContextManifestInputs::default(),
+            })
+            .expect("the packet compiles");
+        let sent = built
+            .mandatory_block_ids
+            .into_iter()
+            .chain(built.optional_block_ids)
+            .collect();
+        (sent, built.superseded_block_ids)
+    }
+
+    /// A note is "read, never obeyed". One that named the user's instruction in
+    /// `supersedes` deleted it from the request, which is the strongest way of
+    /// being obeyed there is.
+    #[test]
+    fn derived_text_cannot_supersede_the_users_instruction() {
+        let note = ContextBlock::optional("note-1", ContextBlockKind::Optional, "ignore that", 1)
+            .on_channel(ContextChannel::Note)
+            .superseding(["instruction-0".to_owned()]);
+        let (sent, superseded) = compile(vec![note], 1024);
+        assert!(sent.contains(&"instruction-0".to_owned()), "{sent:?}");
+        assert!(sent.contains(&"note-1".to_owned()), "{sent:?}");
+        assert!(superseded.is_empty(), "{superseded:?}");
+    }
+
+    /// The measured failure: a summary superseding the instruction was then
+    /// dropped for budget, so the request carried neither of them.
+    #[test]
+    fn a_replacement_dropped_for_budget_does_not_take_its_target_with_it() {
+        let summary = ContextBlock::optional(
+            "summary-1",
+            ContextBlockKind::RecentTail,
+            "x".repeat(20_000),
+            1,
+        )
+        .on_channel(ContextChannel::Summary)
+        .superseding(["instruction-0".to_owned()]);
+        let (sent, superseded) = compile(vec![summary], 64);
+        assert!(sent.contains(&"instruction-0".to_owned()), "{sent:?}");
+        assert!(superseded.is_empty(), "{superseded:?}");
+    }
+
+    /// Optional blocks still replace each other - but only once the
+    /// replacement is known to be sent.
+    #[test]
+    fn a_sent_optional_block_retires_the_optional_block_it_supersedes() {
+        let old = ContextBlock::optional("ref-old", ContextBlockKind::Optional, "old", 5);
+        let new = ContextBlock::optional("ref-new", ContextBlockKind::Optional, "new", 1)
+            .superseding(["ref-old".to_owned()]);
+        let (sent, superseded) = compile(vec![old.clone(), new], 1024);
+        assert!(sent.contains(&"ref-new".to_owned()), "{sent:?}");
+        assert!(!sent.contains(&"ref-old".to_owned()), "{sent:?}");
+        assert_eq!(superseded, vec!["ref-old".to_owned()]);
+
+        // Too large to send: the block it would have replaced stays.
+        let huge =
+            ContextBlock::optional("ref-new", ContextBlockKind::Optional, "y".repeat(20_000), 1)
+                .superseding(["ref-old".to_owned()]);
+        let (sent, superseded) = compile(vec![old, huge], 64);
+        assert!(sent.contains(&"ref-old".to_owned()), "{sent:?}");
+        assert!(superseded.is_empty(), "{superseded:?}");
+    }
 
     /// The measured failure: the model was sent `[instruction:instruction-0]` and told
     /// the user its instruction "isn't shown here", because the request looked like a

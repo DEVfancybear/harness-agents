@@ -58,6 +58,12 @@ pub struct RecoverySnapshot {
     pub working_state: WorkingState,
     pub receipts: Vec<ToolExecutionReceipt>,
     pub instruction_texts: Vec<String>,
+    /// The decision event each of `instruction_texts` came from, index for
+    /// index; `None` for the admitted input. A later supersession needs it to
+    /// retire the superseded text. A snapshot written before this field existed
+    /// has none, cannot be restored, and recovery replays the journal instead.
+    #[serde(default)]
+    pub instruction_sources: Vec<Option<EventId>>,
 }
 
 /// State rebuilt exclusively from a snapshot plus committed journal tail.
@@ -292,13 +298,18 @@ impl SessionService {
         &self,
         session_id: &SessionId,
     ) -> Result<SnapshotRecord, StoreError> {
-        let recovered = self.recover(session_id).await?;
+        let mut cache = None;
+        let recovered = self.recover_cached(session_id, &mut cache).await?;
+        let instruction_sources = cache
+            .map(|cache| cache.seen.instruction_sources)
+            .unwrap_or_default();
         let task_id = recovered.working_state.task_id.clone();
         let content = serde_json::to_value(RecoverySnapshot {
             schema_version: P0_SCHEMA_VERSION,
             working_state: recovered.working_state.clone(),
             receipts: recovered.receipts,
             instruction_texts: recovered.instruction_texts,
+            instruction_sources,
         })
         .map_err(|_| {
             StoreError::new(
@@ -399,7 +410,11 @@ impl SessionService {
                         "snapshot claims coverage beyond the committed journal",
                     ));
                 }
-                let seen = FoldSeen::seed(seeded.state.as_ref(), &seeded.receipts);
+                let seen = FoldSeen::seed(
+                    seeded.state.as_ref(),
+                    &seeded.receipts,
+                    seeded.instruction_sources,
+                );
                 (
                     seeded.state,
                     seeded.receipts,
@@ -482,6 +497,7 @@ impl SessionService {
         let mut state = None;
         let mut receipts = Vec::new();
         let mut instruction_texts = Vec::new();
+        let mut instruction_sources = Vec::new();
 
         match self.store.latest_snapshot(session_id).await {
             Ok(Some(snapshot)) => match restore_snapshot(&snapshot, session_id, task_id) {
@@ -490,6 +506,7 @@ impl SessionService {
                     state = Some(restored.working_state);
                     receipts = restored.receipts;
                     instruction_texts = restored.instruction_texts;
+                    instruction_sources = restored.instruction_sources;
                 }
                 Err(error) => {
                     snapshot_diagnostic = Some(error.to_string());
@@ -506,6 +523,7 @@ impl SessionService {
             state,
             receipts,
             instruction_texts,
+            instruction_sources,
             snapshot_sequence,
             snapshot_diagnostic,
         })
@@ -583,7 +601,18 @@ impl SessionService {
                 "decision session does not own task",
             ));
         }
-        let sequence = self.store.next_sequence(session_id).await?;
+        // Only a decision still in force can be replaced. Superseding one that
+        // is already superseded, or a ref that was never a decision, comes from
+        // a caller working on a stale view: it is refused rather than journaled.
+        if let Some(old) = &supersedes
+            && !state.decision_refs.contains(old)
+        {
+            return Err(StoreError::new(
+                harness_types::ErrorCode::InvalidPayload,
+                "a decision can only supersede a decision that is still in force",
+            ));
+        }
+        let sequence = self.sequence_after(session_id, &state).await?;
         let event_id = self.event_id()?;
         let mut payload = Map::new();
         payload.insert(
@@ -614,13 +643,7 @@ impl SessionService {
             sequence,
             content_hash: payload_hash.clone(),
         };
-        if let Some(old) = supersedes.clone() {
-            state.decision_refs.retain(|current| current != &old);
-            state.superseded_decision_refs.push(old);
-        }
-        state.decision_refs.push(source.clone());
-        state.revision = sequence;
-        state.through_event_seq = sequence;
+        apply_decision(&mut state, source.clone(), supersedes);
         let event = EventEnvelope {
             schema_version: P0_SCHEMA_VERSION,
             event_id: event_id.clone(),
@@ -680,7 +703,7 @@ impl SessionService {
                 "runtime event session does not own task",
             ));
         }
-        let sequence = self.store.next_sequence(session_id).await?;
+        let sequence = self.sequence_after(session_id, &state).await?;
         let event_id = self.event_id()?;
         let payload_hash = ContentHash::from_canonical_json(&Value::Object(payload.clone()))
             .map_err(|error| {
@@ -733,6 +756,57 @@ impl SessionService {
     pub async fn list_plugins(&self) -> Result<Vec<PersistedPluginManifest>, StoreError> {
         self.store.list_plugin_manifests().await
     }
+
+    /// The sequence of the event that follows `state`, the projection it is
+    /// about to replace.
+    ///
+    /// The projection is read before the next sequence, and every journal
+    /// write stores a projection, so the two agree unless another writer
+    /// committed in between. Taking the sequence alone would then commit a
+    /// projection built on the older state over the newer one - whatever that
+    /// writer added (a pending tool call, a decision) silently gone from the
+    /// projection while the journal still has it. A conflict is reported
+    /// instead, as the store's own sequence check does.
+    async fn sequence_after(
+        &self,
+        session_id: &SessionId,
+        state: &WorkingState,
+    ) -> Result<u64, StoreError> {
+        let next = self.store.next_sequence(session_id).await?;
+        let expected = state.through_event_seq.checked_add(1).ok_or_else(|| {
+            StoreError::new(
+                harness_types::ErrorCode::SequenceConflict,
+                "projection sequence overflow",
+            )
+        })?;
+        if next != expected {
+            return Err(StoreError::new(
+                harness_types::ErrorCode::SequenceConflict,
+                format!(
+                    "the task projection covers the journal through {} but the next sequence is {next}: another writer committed first",
+                    state.through_event_seq
+                ),
+            ));
+        }
+        Ok(next)
+    }
+}
+
+/// Apply one decision to a working state.
+///
+/// The live command and the journal fold both go through here, so the stored
+/// projection is what the journal folds to. They used to differ: the command
+/// recorded a supersession every time it was asked to, the fold only once.
+fn apply_decision(state: &mut WorkingState, source: SourceRef, supersedes: Option<SourceRef>) {
+    if let Some(old) = supersedes {
+        state.decision_refs.retain(|current| current != &old);
+        if !state.superseded_decision_refs.contains(&old) {
+            state.superseded_decision_refs.push(old);
+        }
+    }
+    state.revision = source.sequence;
+    state.through_event_seq = source.sequence;
+    state.decision_refs.push(source);
 }
 
 fn input_payload(
@@ -844,6 +918,12 @@ fn restore_snapshot(
             "snapshot identity or coverage does not match",
         ));
     }
+    if restored.instruction_sources.len() != restored.instruction_texts.len() {
+        return Err(StoreError::new(
+            harness_types::ErrorCode::SnapshotCorrupt,
+            "snapshot does not record where its instructions came from",
+        ));
+    }
     restored.working_state.validate().map_err(|error| {
         StoreError::new(
             error.code(),
@@ -885,6 +965,7 @@ struct Seeded {
     state: Option<WorkingState>,
     receipts: Vec<ToolExecutionReceipt>,
     instruction_texts: Vec<String>,
+    instruction_sources: Vec<Option<EventId>>,
     snapshot_sequence: Option<u64>,
     snapshot_diagnostic: Option<String>,
 }
@@ -893,11 +974,20 @@ struct Seeded {
 struct FoldSeen {
     receipts: BTreeSet<String>,
     pending: BTreeSet<String>,
+    /// The decision event behind each instruction text, index for index.
+    instruction_sources: Vec<Option<EventId>>,
 }
 
 impl FoldSeen {
-    fn seed(state: Option<&WorkingState>, receipts: &[ToolExecutionReceipt]) -> Self {
-        let mut seen = Self::default();
+    fn seed(
+        state: Option<&WorkingState>,
+        receipts: &[ToolExecutionReceipt],
+        instruction_sources: Vec<Option<EventId>>,
+    ) -> Self {
+        let mut seen = Self {
+            instruction_sources,
+            ..Self::default()
+        };
         seen.receipts.extend(
             receipts
                 .iter()
@@ -1011,6 +1101,7 @@ fn fold_event(
                 event.seq,
             ));
             instruction_texts.push(text);
+            seen.instruction_sources.push(None);
         }
         "receipt.recorded" => {
             let current = state.as_mut().ok_or_else(|| {
@@ -1118,22 +1209,33 @@ fn fold_event(
                 sequence: event.seq,
                 content_hash: event.payload_hash.clone(),
             };
-            if let Some(raw) = event.payload.get("supersedes") {
-                let old: SourceRef = serde_json::from_value(raw.clone()).map_err(|_| {
-                    StoreError::new(
-                        harness_types::ErrorCode::InvalidPayload,
-                        "decision supersession is invalid",
-                    )
-                })?;
-                current.decision_refs.retain(|existing| existing != &old);
-                if !current.superseded_decision_refs.contains(&old) {
-                    current.superseded_decision_refs.push(old);
-                }
+            let supersedes = event
+                .payload
+                .get("supersedes")
+                .map(|raw| {
+                    serde_json::from_value::<SourceRef>(raw.clone()).map_err(|_| {
+                        StoreError::new(
+                            harness_types::ErrorCode::InvalidPayload,
+                            "decision supersession is invalid",
+                        )
+                    })
+                })
+                .transpose()?;
+            // A superseded decision stops being an instruction: its text is
+            // retired with it, or the model would keep reading the old
+            // decision as a user instruction next to the one that replaced it.
+            if let Some(old) = &supersedes
+                && let Some(index) = seen
+                    .instruction_sources
+                    .iter()
+                    .position(|origin| origin.as_ref() == Some(&old.event_id))
+            {
+                instruction_texts.remove(index);
+                seen.instruction_sources.remove(index);
             }
-            current.decision_refs.push(source);
-            current.revision = event.seq;
-            current.through_event_seq = event.seq;
+            apply_decision(current, source, supersedes);
             instruction_texts.push(text);
+            seen.instruction_sources.push(Some(event.event_id));
         }
         _ if event.continuity_critical => {
             return Err(StoreError::new(

@@ -676,6 +676,75 @@ async fn p2_c09_decision_supersession_survives_context_and_resume() {
     close_writer(store).await;
 }
 
+/// The measured failure: after B superseded A, the packet still carried A as a
+/// `[user instruction]` next to B - and the compaction summary listed both - so
+/// the model was told to follow the decision that had been replaced. The live
+/// projection also recorded a repeated supersession twice where the journal
+/// fold recorded it once.
+#[tokio::test]
+async fn p2_c09_a_superseded_decision_is_no_longer_an_instruction() {
+    let temp = TempDir::new().unwrap();
+    let store = writer(&temp).await;
+    let provider = Arc::new(MockProvider::text("done"));
+    let runtime = RuntimeService::new(Arc::clone(&store), provider, RuntimeConfig::default());
+    let session_id = SessionId::generate();
+    let task_id = TaskId::generate();
+    runtime
+        .run(request(
+            session_id.clone(),
+            task_id.clone(),
+            "fix the parser",
+        ))
+        .await
+        .unwrap();
+    let session = SessionService::new(Arc::clone(&store));
+    let a = session
+        .record_decision(&session_id, &task_id, "indent with TABS-ALPHA", None)
+        .await
+        .unwrap();
+    // A snapshot between the two decisions: the supersession must still find
+    // A's text when recovery starts from the snapshot instead of the journal.
+    let snapshot = session.write_snapshot(&session_id).await.unwrap();
+    session
+        .record_decision(
+            &session_id,
+            &task_id,
+            "indent with SPACES-BRAVO",
+            Some(a.clone()),
+        )
+        .await
+        .unwrap();
+
+    let recovered = session.recover(&session_id).await.unwrap();
+    assert_eq!(recovered.snapshot_sequence, Some(snapshot.through_sequence));
+    assert_eq!(recovered.snapshot_diagnostic, None);
+    assert_eq!(
+        recovered.instruction_texts,
+        vec![
+            "fix the parser".to_owned(),
+            "indent with SPACES-BRAVO".to_owned()
+        ]
+    );
+    let packet = runtime.compact(&session_id).await.unwrap().packet.content;
+    assert!(packet.contains("SPACES-BRAVO"), "{packet}");
+    assert!(!packet.contains("TABS-ALPHA"), "{packet}");
+
+    // A caller working on a stale view supersedes A again: refused, and the
+    // stored projection stays what the journal folds to.
+    let stale = session
+        .record_decision(&session_id, &task_id, "indent with CHARLIE", Some(a))
+        .await
+        .expect_err("an already superseded decision cannot be superseded again");
+    assert_eq!(stale.code(), ErrorCode::InvalidPayload);
+    let live = store.current_projection(&task_id).await.unwrap().unwrap();
+    let folded = session.recover(&session_id).await.unwrap().working_state;
+    assert_eq!(live, folded);
+    assert_eq!(folded.superseded_decision_refs.len(), 1);
+    drop(session);
+    drop(runtime);
+    close_writer(store).await;
+}
+
 #[tokio::test]
 async fn p2_c06_new_session_continuation_reuses_task_checkpoint_and_scope() {
     let temp = TempDir::new().unwrap();
