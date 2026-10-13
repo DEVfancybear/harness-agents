@@ -262,6 +262,8 @@ pub struct InteractiveController {
     /// What each running call has printed, bounded, by call id: the live
     /// block shows the last lines of the newest under its card.
     tool_progress: Vec<(String, String)>,
+    /// The run's delegated agents and what each has done so far.
+    child_activity: Vec<super::events::ChildActivity>,
     // Progress accounting for the status bar.
     steps: u32,
     tool_calls: u32,
@@ -407,6 +409,7 @@ impl InteractiveController {
             plain,
             open_tools: Vec::new(),
             tool_progress: Vec::new(),
+            child_activity: Vec::new(),
             pending_allowance: None,
             steps: 0,
             tool_calls: 0,
@@ -520,6 +523,54 @@ impl InteractiveController {
     #[must_use]
     pub fn conversation_id(&self) -> Option<String> {
         self.service.conversation_id()
+    }
+
+    /// Count a delegated agent's progress notice (`[child verifier] read_file:
+    /// path=a.js`) for the running delegate card: a notice that starts a call
+    /// (`tool: arguments`) counts one, a failure notice of the same call only
+    /// becomes the latest line.
+    fn note_child_activity(&mut self, message: &str) {
+        let Some((name, text)) = message
+            .strip_prefix("[child ")
+            .and_then(|rest| rest.split_once("] "))
+        else {
+            return;
+        };
+        let latest = text
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(120)
+            .collect::<String>();
+        let starts_call = text
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| word.ends_with(':') && word.len() > 1);
+        let index = if let Some(index) = self
+            .child_activity
+            .iter()
+            .position(|entry| entry.name == name)
+        {
+            index
+        } else {
+            self.child_activity.push(super::events::ChildActivity {
+                name: name.to_owned(),
+                ..Default::default()
+            });
+            self.child_activity.len() - 1
+        };
+        let entry = &mut self.child_activity[index];
+        if starts_call {
+            entry.tool_calls = entry.tool_calls.saturating_add(1);
+        }
+        entry.latest = latest;
+    }
+
+    /// The session's title, once it has one (`/name`, or after `/compact`).
+    #[must_use]
+    pub fn session_title(&self) -> Option<String> {
+        self.chat_title.clone()
     }
 
     /// Choose the thinking level, as `/effort` does.
@@ -780,6 +831,7 @@ impl InteractiveController {
                 .last()
                 .map(|(_, text)| last_lines(text, LIVE_TOOL_LINES))
                 .unwrap_or_default(),
+            child_activity: self.child_activity.clone(),
             modal: self.modal(),
             granted_for_run: self.granted_for_run,
             queued_input: !self.queue.is_empty(),
@@ -2500,6 +2552,10 @@ impl InteractiveController {
                     ),
                 }
             }
+            SessionEvent::SessionTitled { title } => {
+                self.chat_title = Some(title);
+                effects.push(Effect::Redraw);
+            }
             SessionEvent::Notice { message } => {
                 // Child progress can arrive between two tokens of the parent's
                 // answer. Keep the TUI's live text together so markdown spans
@@ -2507,6 +2563,7 @@ impl InteractiveController {
                 if self.plain || !message.starts_with("[child ") {
                     self.flush_stream(effects);
                 }
+                self.note_child_activity(&message);
                 // An action that ran without a panel is announced before it runs. In
                 // the TUI that was one `[info] allowed by ...` row above every tool
                 // card - half the transcript of a read-heavy turn. The reason now rides
@@ -3552,6 +3609,7 @@ impl InteractiveController {
         self.active_deliveries.clear();
         self.open_tools.clear();
         self.tool_progress.clear();
+        self.child_activity.clear();
         self.steps = 0;
         self.tool_calls = 0;
         self.last_run_elapsed = Duration::ZERO;
@@ -3925,6 +3983,12 @@ impl InteractiveController {
                 }
                 Some(("messages", _)) => {
                     self.reference("/agents messages", self.service.agent_exchanges(), &mut effects);
+                }
+                // The agents view: every session and its subagents, which a
+                // bare `/resume` or Left on an empty prompt also open. The
+                // agent keeps running; Enter on its row comes back to it.
+                None if self.detachable => {
+                    return vec![Effect::Exit(super::agents_view::AGENTS_VIEW_EXIT)];
                 }
                 _ => self.reference("/agents", self.service.agents_summary(), &mut effects),
             },
@@ -6365,6 +6429,32 @@ mod tests {
                 "only a persisted handoff may start the continuation"
             );
         }
+    }
+
+    #[test]
+    fn a_delegated_agents_notices_count_its_calls_for_the_running_card() {
+        let mut h = bench(true);
+        h.controller.boot_lines();
+        for message in [
+            "[child verifier] read_file: path=game.js",
+            "[child verifier] run_process: args=[\"--check\"] executable=node",
+            "[child verifier] run_process failed: invalid_payload: the program did not start",
+            "[child explorer] list_files: path=.",
+            "not a child notice",
+        ] {
+            h.events
+                .send(SessionEvent::Notice {
+                    message: message.to_owned(),
+                })
+                .expect("notice");
+        }
+        let _ = h.controller.pump_events();
+        let activity = h.controller.ui_state().child_activity;
+        assert_eq!(activity.len(), 2, "{activity:?}");
+        assert_eq!(activity[0].name, "verifier");
+        assert_eq!(activity[0].tool_calls, 2, "a failure is the same call");
+        assert!(activity[0].latest.starts_with("run_process failed"));
+        assert_eq!(activity[1].tool_calls, 1);
     }
 
     #[test]

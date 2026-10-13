@@ -235,7 +235,7 @@ pub const SLASH_COMMANDS: [SlashCommand; 63] = [
     command(
         "/agents",
         "",
-        "Show delegated children; /agents stop [name] stops them",
+        "Open the agents view (sessions and subagents); /agents stop [name] stops children",
     ),
     command("/fast", "", "Toggle OpenAI Fast mode"),
     command(

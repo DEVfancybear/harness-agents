@@ -603,6 +603,15 @@ impl Modal {
 
 /// The controller state the TUI viewport draws.
 ///
+/// One delegated agent's progress in the run: its name, its tool calls so
+/// far, and the latest one as its notice described it.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ChildActivity {
+    pub name: String,
+    pub tool_calls: u32,
+    pub latest: String,
+}
+
 /// Pure data: the renderer never reaches back into the controller, so a frame is
 /// a function of this snapshot plus the theme.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -626,6 +635,11 @@ pub struct UiState {
     /// runs (pa-agent's `tool_execution_update`).
     #[serde(default)]
     pub live_tool_output: Vec<String>,
+    /// What each delegated agent of the run has done so far, by its name:
+    /// how many tool calls and the latest one. The running delegate card
+    /// shows it under its header.
+    #[serde(default)]
+    pub child_activity: Vec<ChildActivity>,
     pub modal: Option<Modal>,
     /// Whether the user allowed every gated action for the run in flight, so the
     /// status row can say the gate is open instead of leaving a silent widening of
@@ -792,6 +806,11 @@ pub enum SessionEvent {
     },
     Accepted {
         input_id: InputId,
+    },
+    /// The session has a new title the harness gave it (after `/compact`, the
+    /// goal the summary names): the top bar and the agents view show it.
+    SessionTitled {
+        title: String,
     },
     /// A browser sign-in ended: the credential is saved, or why it is not.
     LoginFinished {

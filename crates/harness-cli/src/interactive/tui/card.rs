@@ -59,6 +59,48 @@ pub fn split_summary(summary: &str) -> Arguments {
         .filter(|note| !note.is_empty())
         .map(str::to_owned)
         .collect();
+    let (mut pairs, loose) = parse_pairs(head);
+    let mut arguments = Arguments {
+        notes,
+        ..Arguments::default()
+    };
+    if !loose.is_empty() {
+        arguments.rest.push(loose);
+    }
+    let target = TARGET_KEYS
+        .iter()
+        .find_map(|key| pairs.iter().position(|(name, _)| name == key));
+    if let Some(index) = target {
+        arguments.target = Some(pairs.remove(index).1);
+    }
+    arguments.rest.extend(
+        pairs
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}")),
+    );
+    arguments
+}
+
+/// A delegate call as its card names it: the agent's role, and what it was
+/// asked in its own words. `brief=… wait=true` was the protocol, not the task.
+#[must_use]
+pub fn delegate_parts(summary: &str) -> (String, Option<String>) {
+    let head = summary.split(" · ").next().unwrap_or_default().trim();
+    let (pairs, _) = parse_pairs(head);
+    let value = |keys: &[&str]| {
+        keys.iter().find_map(|key| {
+            pairs
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        })
+    };
+    let role = value(&["role", "name"]).unwrap_or_else(|| "agent".to_owned());
+    (role, value(&["brief", "task", "prompt", "goal"]))
+}
+
+/// `key=value` pairs of a summary head, and the words before the first pair.
+fn parse_pairs(head: &str) -> (Vec<(String, String)>, String) {
     let mut pairs: Vec<(String, String)> = Vec::new();
     let mut loose = String::new();
     for token in head.split(' ') {
@@ -81,25 +123,7 @@ pub fn split_summary(summary: &str) -> Arguments {
             }
         }
     }
-    let mut arguments = Arguments {
-        notes,
-        ..Arguments::default()
-    };
-    if !loose.is_empty() {
-        arguments.rest.push(loose);
-    }
-    let target = TARGET_KEYS
-        .iter()
-        .find_map(|key| pairs.iter().position(|(name, _)| name == key));
-    if let Some(index) = target {
-        arguments.target = Some(pairs.remove(index).1);
-    }
-    arguments.rest.extend(
-        pairs
-            .into_iter()
-            .map(|(key, value)| format!("{key}={value}")),
-    );
-    arguments
+    (pairs, loose)
 }
 
 /// `read_file` as `Read file`.
@@ -140,21 +164,27 @@ pub fn header(
         Outcome::Done(duration) => (format!("✓ {duration}"), theme.tool_ok),
         Outcome::Failed(duration) => (format!("✗ {duration}"), theme.tool_failed),
     };
-    let arguments = split_summary(summary);
+    let (title, arguments) = if name == "delegate" {
+        let (role, brief) = delegate_parts(summary);
+        (
+            role,
+            Arguments {
+                target: brief,
+                ..Arguments::default()
+            },
+        )
+    } else if name == "ipython" {
+        ("Python".to_owned(), split_summary(summary))
+    } else {
+        (label(name), split_summary(summary))
+    };
     let mut head = vec![
         Span::raw("  "),
         Span::styled(
             format!("{} ", kind.glyph()),
             base.add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            if name == "ipython" {
-                "Python".to_owned()
-            } else {
-                label(name)
-            },
-            base.add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(title, base.add_modifier(Modifier::BOLD)),
     ];
     if let Some(target) = &arguments.target {
         head.push(Span::raw("  "));
@@ -265,6 +295,29 @@ mod tests {
         assert!(text.contains("▤ Read file  src/main.rs"), "{text}");
         assert!(text.trim_end().ends_with("✓ 206ms"), "{text}");
         assert_eq!(text.trim_end_matches('\n').chars().count(), 59, "{text}");
+    }
+
+    /// Seen running: `◆ Delegate  verifier  brief=Perform final … wait=true`.
+    /// The card names the agent and what it was asked, without the protocol.
+    #[test]
+    fn a_delegate_card_names_the_agent_and_its_brief() {
+        let row = header(
+            "delegate",
+            "brief=Perform final independent verification of Skyline Flap role=verifier wait=true",
+            &Outcome::Running("⣾"),
+            100,
+            &Theme::plain(),
+        );
+        let text = plain_text(&[row]);
+        assert!(
+            text.contains("verifier  Perform final independent verification of Skyline Flap"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("brief=") && !text.contains("wait="),
+            "{text}"
+        );
+        assert!(!text.contains("Delegate"), "{text}");
     }
 
     #[test]

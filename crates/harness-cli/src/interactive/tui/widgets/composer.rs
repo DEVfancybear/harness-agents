@@ -312,6 +312,25 @@ pub fn hint(state: &UiState) -> String {
     }
 }
 
+/// The progress of the agent a running `delegate` call started, when its
+/// notices have arrived: the agent's notices carry its role as their name.
+#[must_use]
+pub fn delegate_activity<'a>(
+    name: &str,
+    summary: &str,
+    state: &'a UiState,
+) -> Option<&'a crate::interactive::events::ChildActivity> {
+    if name != "delegate" {
+        return None;
+    }
+    let (role, _) = super::super::card::delegate_parts(summary);
+    state
+        .child_activity
+        .iter()
+        .rev()
+        .find(|activity| activity.name == role || activity.name.starts_with(&format!("{role}-")))
+}
+
 /// Draw the live block: model text that has not been committed yet.
 pub fn render_live(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
     if area.height == 0 || (state.live_text.is_empty() && state.open_tools.is_empty()) {
@@ -330,6 +349,23 @@ pub fn render_live(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme
             area.width,
             theme,
         ));
+        // A running delegate shows what its agent has done so far.
+        if let Some(activity) = delegate_activity(name, summary, state) {
+            let text = format!(
+                "{} tool call{} · {}",
+                activity.tool_calls,
+                if activity.tool_calls == 1 { "" } else { "s" },
+                activity.latest
+            );
+            let budget = usize::from(area.width.saturating_sub(6));
+            lines.push(Line::from(vec![
+                ratatui::text::Span::styled("    └ ".to_owned(), theme.dim),
+                ratatui::text::Span::styled(
+                    text.chars().take(budget).collect::<String>(),
+                    theme.dim,
+                ),
+            ]));
+        }
     }
     // What the newest running call printed last, under its card.
     for line in &state.live_tool_output {
@@ -363,6 +399,7 @@ mod tests {
             live_text: String::new(),
             open_tools: Vec::new(),
             live_tool_output: Vec::new(),
+            child_activity: Vec::new(),
             modal: None,
             granted_for_run: false,
             queued_input: false,
@@ -457,6 +494,31 @@ mod tests {
 
         let running = state(AppPhase::Running);
         assert!(hint(&running).contains("Ctrl-C"));
+    }
+
+    /// The running delegate card carries a line of its agent's progress, and
+    /// the layout reserves the row for it.
+    #[test]
+    fn a_running_delegate_shows_its_agents_progress() {
+        let mut running = state(AppPhase::Running);
+        running.open_tools = vec![(
+            "delegate".to_owned(),
+            "brief=Verify the game role=verifier wait=true".to_owned(),
+        )];
+        assert!(super::delegate_activity("delegate", &running.open_tools[0].1, &running).is_none());
+        let without = crate::interactive::tui::layout::live_rows(&running, 80);
+        running.child_activity = vec![crate::interactive::events::ChildActivity {
+            name: "verifier".to_owned(),
+            tool_calls: 14,
+            latest: "read_file: path=game.js".to_owned(),
+        }];
+        let activity = super::delegate_activity("delegate", &running.open_tools[0].1, &running)
+            .expect("the verifier's progress");
+        assert_eq!(activity.tool_calls, 14);
+        assert_eq!(
+            crate::interactive::tui::layout::live_rows(&running, 80),
+            without + 1
+        );
     }
 
     #[test]

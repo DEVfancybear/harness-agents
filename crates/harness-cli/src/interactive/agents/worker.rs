@@ -845,6 +845,10 @@ struct Client {
 }
 
 impl Agent {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one agent's start, told in order: its launch, its controller, its status"
+    )]
     fn start(id: String, spec: CreateAgent, worker: &Weak<Worker>) -> Result<Self, String> {
         let owner = worker.upgrade().ok_or("the worker is stopping")?;
         let environment = LaunchEnvironment::from_pairs(spec.environment.clone());
@@ -918,6 +922,7 @@ impl Agent {
                 model: controller.model_label(),
                 conversation: controller.conversation_id(),
                 last_request: None,
+                title: None,
                 idle_seconds: 0,
                 worker_pid: std::process::id(),
                 subagents: Vec::new(),
@@ -1129,6 +1134,7 @@ impl Agent {
             status.info.scheduled = scheduled;
             status.info.attached = !self.clients.is_empty();
             status.info.last_request = state.last_request;
+            status.info.title = self.controller.session_title();
             status.info.conversation = conversation;
         }
         // The journal names the conversation a worker that dies brings the
@@ -1749,6 +1755,7 @@ mod tests {
             model: "m".to_owned(),
             conversation: None,
             last_request: None,
+            title: None,
             idle_seconds: 0,
             worker_pid: 1,
             subagents: Vec::new(),

@@ -216,6 +216,15 @@ pub fn live_rows(state: &UiState, width: u16) -> u16 {
         }
     }
     rows = rows.saturating_add(u16::try_from(state.open_tools.len()).unwrap_or(u16::MAX));
+    // A running delegate's progress line under its card.
+    let progress = state
+        .open_tools
+        .iter()
+        .filter(|(name, summary)| {
+            super::widgets::composer::delegate_activity(name, summary, state).is_some()
+        })
+        .count();
+    rows = rows.saturating_add(u16::try_from(progress).unwrap_or(u16::MAX));
     rows = rows.saturating_add(u16::try_from(state.live_tool_output.len()).unwrap_or(u16::MAX));
     rows.min(MAX_LIVE_ROWS)
 }
@@ -327,6 +336,7 @@ mod tests {
             live_text: String::new(),
             open_tools: Vec::new(),
             live_tool_output: Vec::new(),
+            child_activity: Vec::new(),
             modal: None,
             granted_for_run: false,
             queued_input: false,

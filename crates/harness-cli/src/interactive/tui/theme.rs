@@ -437,10 +437,12 @@ impl Theme {
         }
     }
 
-    /// The spinner frame for a tick counter: prime-agent's `Loader` braille frames.
+    /// The spinner frame for a tick counter: a full braille cell with one gap
+    /// moving round it. prime-agent's thin `Loader` frames (one to four dots)
+    /// read as specks in Windows Terminal's fonts.
     #[must_use]
     pub const fn spinner(tick: u64) -> &'static str {
-        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        const FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
         // The modulo bounds the value to the frame count, so the cast is exact.
         #[allow(
             clippy::cast_possible_truncation,
@@ -479,12 +481,9 @@ mod tests {
 
     #[test]
     fn t05_the_spinner_cycles_through_its_frames() {
-        let frames: Vec<&str> = (0..10).map(Theme::spinner).collect();
-        assert_eq!(
-            frames,
-            vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-        );
-        assert_eq!(Theme::spinner(10), Theme::spinner(0), "it wraps");
+        let frames: Vec<&str> = (0..8).map(Theme::spinner).collect();
+        assert_eq!(frames, vec!["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]);
+        assert_eq!(Theme::spinner(8), Theme::spinner(0), "it wraps");
     }
 
     /// prime-agent's palette in true colour, quantised where true colour is not

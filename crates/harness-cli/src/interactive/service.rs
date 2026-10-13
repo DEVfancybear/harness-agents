@@ -6394,6 +6394,64 @@ const REFINE_TRANSCRIPT_TURNS: usize = 50;
 /// The conversation a refinement reads: prime-agent's serialized transcript, with
 /// what the tools were asked and what they returned.
 /// The turns an earlier review of this conversation read are marked as such.
+/// A title for a compacted session: the first line under the summary's
+/// `## Goal` heading (the format the summarization prompt asks for), as a
+/// list marker-free line of at most 60 characters. `None` when the summary
+/// has no such section, as a deterministic fallback summary does not.
+fn compacted_title(summary: &str) -> Option<String> {
+    let mut lines = summary.lines();
+    lines.find(|line| line.trim().eq_ignore_ascii_case("## goal"))?;
+    let goal = lines
+        .map(str::trim)
+        .take_while(|line| !line.starts_with('#'))
+        .find(|line| !line.is_empty())?;
+    // A list marker: `- `, `* `, `+ `, `1. `, `1) `, then a `[ ]`/`[x]` box.
+    let goal = goal
+        .strip_prefix(['-', '*', '+'])
+        .or_else(|| {
+            let digits = goal.len() - goal.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            (digits > 0)
+                .then(|| goal[digits..].strip_prefix(['.', ')']))
+                .flatten()
+        })
+        .unwrap_or(goal)
+        .trim_start();
+    let goal = ["[ ]", "[x]", "[X]"]
+        .iter()
+        .find_map(|box_| goal.strip_prefix(box_))
+        .unwrap_or(goal)
+        .trim_start();
+    let title = goal
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(60)
+        .collect::<String>();
+    (!title.is_empty()).then_some(title)
+}
+
+#[cfg(test)]
+mod compacted_title_tests {
+    #[test]
+    fn the_title_is_the_first_line_of_the_summarys_goal() {
+        let summary = "Context checkpoint\n\n## Goal\n\n- Build a polished Flappy Bird game in plain HTML, CSS and JavaScript with a start screen\n- also add sounds\n\n## Progress\n- [x] index.html";
+        assert_eq!(
+            super::compacted_title(summary).as_deref(),
+            Some("Build a polished Flappy Bird game in plain HTML, CSS and Jav")
+        );
+        assert_eq!(
+            super::compacted_title("## Goal\n1. Sửa lỗi giỏ hàng\n").as_deref(),
+            Some("Sửa lỗi giỏ hàng")
+        );
+        assert_eq!(super::compacted_title("## Goal\n\n## Progress\n- x"), None);
+        assert_eq!(
+            super::compacted_title("deterministic fallback summary"),
+            None
+        );
+    }
+}
+
 async fn refine_transcript(store: &SqliteStore, session: &SessionId, local: &Path) -> String {
     let reviewed = super::refine::reviewed_through(local).and_then(|id| SessionId::parse(id).ok());
     harness_runtime::conversation_transcript(
@@ -7109,10 +7167,24 @@ async fn run_turn(
                             compacted.covered_through, compacted.summary_source
                         ),
                     });
+                    compacted_title(&compacted.packet.content)
                 })
                 .map_err(|error| format!("compaction failed: {error}")),
             None => Err("there is no earlier session to compact".to_owned()),
         };
+        // The session is named after what it is doing now: the goal the
+        // summary states. A list of sessions read `/compact` for one before.
+        if let Ok(Some(title)) = &result {
+            match store.set_session_setting(&task_id, "title", title).await {
+                Ok(()) => send(SessionEvent::SessionTitled {
+                    title: title.clone(),
+                }),
+                Err(error) => send(SessionEvent::Notice {
+                    message: format!("session title could not be saved: {error}"),
+                }),
+            }
+        }
+        let result = result.map(|_| ());
         drop(runtime);
         if let Ok(store) = Arc::try_unwrap(store) {
             let _ = store.close().await;

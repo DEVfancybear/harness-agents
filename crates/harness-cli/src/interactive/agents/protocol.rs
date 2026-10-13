@@ -157,6 +157,10 @@ pub struct AgentInfo {
     pub model: String,
     pub conversation: Option<String>,
     pub last_request: Option<String>,
+    /// The session's title (`/name`, or the goal `/compact` summarized), which
+    /// the agents view prefers to the last request: that was `/compact` itself.
+    #[serde(default)]
+    pub title: Option<String>,
     pub idle_seconds: u64,
     pub worker_pid: u32,
     /// The agent's subagents (prime-agent's agents-view forest).

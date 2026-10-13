@@ -189,10 +189,19 @@ pub fn rows_with(
                     | "waiting_mcp_input"
                     | "canceling"
             );
+        // The name the user gave, the session's title, then the last request -
+        // unless that was a command (`/compact` named a row of its own).
         let mut title = agent
             .name
             .clone()
-            .or_else(|| agent.last_request.as_deref().map(first_line))
+            .or_else(|| agent.title.clone())
+            .or_else(|| {
+                agent
+                    .last_request
+                    .as_deref()
+                    .filter(|request| !request.trim_start().starts_with('/'))
+                    .map(first_line)
+            })
             .filter(|title| !title.is_empty())
             .unwrap_or_else(|| agent.id.clone());
         // prime-agent's row heartbeat count.
@@ -1028,6 +1037,7 @@ mod tests {
                 model: "openai/gpt-5".to_owned(),
                 conversation: Some(conversation.to_owned()),
                 last_request: Some("fix the parser\nplease".to_owned()),
+                title: None,
                 idle_seconds: 120,
                 worker_pid: 1,
                 subagents: Vec::new(),
@@ -1073,6 +1083,21 @@ mod tests {
         let hits = rows(&live, &saved, "old", now);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "old work");
+    }
+
+    /// Seen in the agents view: a session that had just run `/compact` was
+    /// listed as `/compact`. Its title (the goal the summary named) comes
+    /// first, and a command is never a row's name.
+    #[test]
+    fn a_row_is_named_by_the_session_title_never_by_a_command() {
+        let now = chrono::Utc::now();
+        let mut compacted = agent("a1", "ready", "t1");
+        compacted.agent.last_request = Some("/compact".to_owned());
+        let untitled = rows(&[compacted.clone()], &[], "", now);
+        assert_eq!(untitled[0].title, "a1", "the id, not the command");
+        compacted.agent.title = Some("Build a Flappy Bird game".to_owned());
+        let titled = rows(&[compacted], &[], "", now);
+        assert_eq!(titled[0].title, "Build a Flappy Bird game");
     }
 
     #[test]

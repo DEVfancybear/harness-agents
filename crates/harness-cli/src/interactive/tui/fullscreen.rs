@@ -536,9 +536,9 @@ pub struct FullscreenScreen<B: Backend> {
     /// entry again.
     row_counts: VecDeque<usize>,
     rows_key: Option<(u16, Detail)>,
-    /// The dock's tallest height in the current run. The live block grows and
-    /// shrinks with every tool card and output line; holding the window at the
-    /// smallest it had to be keeps the conversation from jumping each frame.
+    /// The live block's tallest height in the current run (never more than
+    /// its cap). It grows and shrinks with every tool card and output line;
+    /// holding its room keeps the conversation from jumping each frame.
     dock_floor: u16,
     assistant_continuing: bool,
     viewport: Viewport,
@@ -727,6 +727,10 @@ where
     ///
     /// # Errors
     /// The terminal cannot be drawn to.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one frame, top to bottom: the bar, the window, the dock, the hints"
+    )]
     pub fn draw(&mut self, state: &UiState) -> io::Result<()> {
         self.detail = state.detail;
         let size = self.terminal.size().map_err(to_io)?;
@@ -764,16 +768,31 @@ where
                     .min()
                     .unwrap_or(dock_area.y)
                     .max(area.y + header);
-                // While a run lasts the window is as short as the tallest dock
-                // it has had, so cards and output lines coming and going in the
-                // live block do not move the conversation up and down.
-                let bottom = area.y + area.height;
-                if running {
-                    *dock_floor = (*dock_floor).max(bottom - dock_top);
+                // While a run lasts the room above the composer is held at the
+                // tallest the live block has been, so cards and output lines
+                // coming and going there do not move the conversation up and
+                // down. Only the live block is held, at most its own cap: a
+                // panel (approval, picker) takes its room while it is open and
+                // gives it back, instead of shrinking the window for the rest
+                // of the run.
+                let rest_top = [plan.modal, plan.queue, plan.suggest]
+                    .into_iter()
+                    .flatten()
+                    .chain([plan.composer])
+                    .filter(|rect| rect.height > 0)
+                    .map(|rect| rect.y)
+                    .min()
+                    .unwrap_or(dock_area.y);
+                if running && plan.modal.is_none() {
+                    // The live block and the spacing that comes with it.
+                    *dock_floor = (*dock_floor).max(rest_top.saturating_sub(dock_top));
                 }
-                let window_bottom = dock_top
-                    .min(bottom.saturating_sub(*dock_floor))
-                    .max(area.y + header);
+                let held = if plan.modal.is_some() {
+                    dock_top
+                } else {
+                    rest_top.saturating_sub(*dock_floor)
+                };
+                let window_bottom = dock_top.min(held).max(area.y + header);
                 // One blank row between the conversation and the dock, so the
                 // newest row never sits on the composer's border.
                 let window_rows = window_bottom - (area.y + header);
@@ -1223,6 +1242,41 @@ mod tests {
         state.phase = AppPhase::Ready;
         screen.draw(&state).expect("drawn");
         assert!(newest_row(&screen) > tall);
+    }
+
+    /// Seen in 0.3.4: a tall panel opened during a run set the held height, and
+    /// for the rest of the run the conversation was two rows over a blank
+    /// screen. Only the live block's room is held; a panel gives its back.
+    #[test]
+    fn a_panel_opened_in_a_run_gives_its_room_back_when_it_closes() {
+        let mut screen = screen(60, 30);
+        let mut state = crate::interactive::tui::tests::idle_state();
+        state.phase = AppPhase::Running;
+        screen.insert_history_batch(
+            &(0..80)
+                .map(|index| HistoryItem::Notice {
+                    message: format!("line-{index}"),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let shown = |screen: &FullscreenScreen<_>| {
+            painted(screen)
+                .iter()
+                .filter(|row| row.contains("line-"))
+                .count()
+        };
+        screen.draw(&state).expect("drawn");
+        let before = shown(&screen);
+        state.modal = Some(crate::interactive::events::Modal::Question {
+            prompt: "pick one".to_owned(),
+            options: (0..12).map(|index| format!("option {index}")).collect(),
+            selected: 0,
+        });
+        screen.draw(&state).expect("drawn");
+        assert!(shown(&screen) < before, "the panel takes its room");
+        state.modal = None;
+        screen.draw(&state).expect("drawn");
+        assert_eq!(shown(&screen), before, "and gives it back");
     }
 
     #[test]

@@ -19,6 +19,7 @@
 //! Children write through the session's [`SharedStore`]: the store stays open while
 //! a turn or a child holds a lease on it.
 
+use std::fmt::Write as _;
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -652,31 +653,54 @@ impl ChildRecord {
     }
 
     /// One line of `/agents`.
-    fn line(&self) -> String {
-        let state = match &self.state {
-            ChildState::Running => format!("running, {}", self.activity),
-            ChildState::Done { .. } => "completed".to_owned(),
-            ChildState::Failed { error } => format!("failed: {}", first_line(error)),
-            ChildState::Partial { error, .. } => {
-                format!("failed (partial answer): {}", first_line(error))
-            }
-            ChildState::Cancelled { reason } => format!("cancelled: {}", first_line(reason)),
+    /// The `/agents` panel's columns for this child: status, name, state,
+    /// time, tool calls, cost, model; the note, when there is one, last.
+    fn columns(&self) -> [String; 8] {
+        let (glyph, state) = match &self.state {
+            ChildState::Running => ("●", format!("running · {}", self.activity)),
+            ChildState::Done { .. } => ("✓", "completed".to_owned()),
+            ChildState::Failed { error } => ("✗", format!("failed: {}", first_line(error))),
+            ChildState::Partial { error, .. } => (
+                "✗",
+                format!("failed (partial answer): {}", first_line(error)),
+            ),
+            ChildState::Cancelled { reason } => ("○", format!("cancelled: {}", first_line(reason))),
         };
         let indent = "  ".repeat(usize::try_from(self.depth.saturating_sub(1)).unwrap_or(0));
-        let mut line = format!(
-            "{indent}{} · {} · {} · {state} · {}s · {} tool call(s) · cost {}",
-            self.name,
-            self.role.as_str(),
-            self.model,
-            self.elapsed_ms() / 1000,
-            self.tool_calls,
-            self.cost,
-        );
-        if let Some(note) = self.notes.back() {
-            line.push_str(" · note: ");
-            line.push_str(first_line(note));
-        }
-        line
+        // `verifier-018e27b1` already says it is a verifier.
+        let name = if self.name.starts_with(self.role.as_str()) {
+            self.name.clone()
+        } else {
+            format!("{} ({})", self.name, self.role.as_str())
+        };
+        let seconds = self.elapsed_ms() / 1000;
+        let elapsed = if seconds >= 60 {
+            format!("{}m {:02}s", seconds / 60, seconds % 60)
+        } else {
+            format!("{seconds}s")
+        };
+        let model = self
+            .model
+            .rsplit_once('/')
+            .map_or(self.model.as_str(), |(_, model)| model)
+            .to_owned();
+        [
+            format!("{indent}{glyph}"),
+            name,
+            state,
+            elapsed,
+            format!(
+                "{} tool{}",
+                self.tool_calls,
+                if self.tool_calls == 1 { "" } else { "s" }
+            ),
+            self.cost.clone(),
+            model,
+            self.notes
+                .back()
+                .map(|note| format!("note: {}", first_line(note)))
+                .unwrap_or_default(),
+        ]
     }
 }
 
@@ -1683,16 +1707,42 @@ impl SessionAgents {
     /// `/agents`: one line per child, newest last.
     #[must_use]
     pub fn summary(&self) -> Vec<String> {
-        let lines = self.shared.children.lock().map_or_else(
+        let rows = self.shared.children.lock().map_or_else(
             |_| Vec::new(),
             |children| {
                 children
                     .iter()
                     .filter(|child| !child.deleted)
-                    .map(ChildRecord::line)
+                    .map(ChildRecord::columns)
                     .collect::<Vec<_>>()
             },
         );
+        // One table: each column as wide as its widest cell, so the names,
+        // states and numbers line up instead of running on after ` · `.
+        let mut widths = [0_usize; 8];
+        for row in &rows {
+            for (width, cell) in widths.iter_mut().zip(row) {
+                *width = (*width).max(cell.chars().count());
+            }
+        }
+        let lines = rows
+            .iter()
+            .map(|row| {
+                let mut line = String::new();
+                for (index, (cell, width)) in row.iter().zip(widths).enumerate() {
+                    if index > 0 {
+                        line.push_str("  ");
+                    }
+                    // Numbers read best right-aligned.
+                    let _ = if matches!(index, 3..=5) {
+                        write!(line, "{cell:>width$}")
+                    } else {
+                        write!(line, "{cell:<width$}")
+                    };
+                }
+                line.trim_end().to_owned()
+            })
+            .collect::<Vec<_>>();
         if lines.is_empty() {
             vec![format!(
                 "no delegated workers; {} model requests so far",
@@ -5245,7 +5295,7 @@ mod real_worker_tests {
         spawn(&host, "late", "take your time").await;
         drop(host);
         let summary = bench.agents.summary().join("\n");
-        assert!(summary.contains("late · explorer"), "{summary}");
+        assert!(summary.contains("late (explorer)"), "{summary}");
         assert!(
             summary.contains("running"),
             "still running after its turn: {summary}"
