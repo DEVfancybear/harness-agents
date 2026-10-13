@@ -97,15 +97,6 @@ const DELEGATION_SCHEMA: &[&str] = &[
     )",
     "CREATE INDEX IF NOT EXISTS delegation_worktrees_by_project
         ON delegation_worktrees(project_id, state)",
-    "CREATE TABLE IF NOT EXISTS delegation_integrations (
-        integration_id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        base_commit TEXT NOT NULL,
-        final_commit TEXT NOT NULL,
-        final_fingerprint TEXT NOT NULL,
-        report_json TEXT NOT NULL,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )",
 ];
 
 pub(super) async fn ensure_delegation_schema(pool: &SqlitePool) -> Result<(), StoreError> {
@@ -124,6 +115,9 @@ pub(super) async fn ensure_delegation_schema(pool: &SqlitePool) -> Result<(), St
                 database_error(ErrorCode::MigrationFailed, "apply delegation schema", error)
             })?;
     }
+    // An integration table was created here and never read or written; it is
+    // no longer created, and an empty one is dropped.
+    super::drop_if_empty(&mut tx, "delegation_integrations").await?;
     let current = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT MAX(version) FROM delegation_schema_migrations",
     )

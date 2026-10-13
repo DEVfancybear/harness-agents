@@ -164,6 +164,7 @@ struct LastFrozen {
     session_id: String,
     request_id: String,
     messages: Vec<Value>,
+    tool_schemas: Option<Value>,
 }
 
 /// How many sessions keep their last frozen request.
@@ -2400,6 +2401,9 @@ impl SqliteStore {
             .get_mut("messages")
             .and_then(Value::as_array_mut)
             .map(std::mem::take);
+        // The tool schemas are the same at every step of a turn - about 10 KB
+        // each time - so a delta that would repeat them names its base's instead.
+        let tool_schemas = stored.get("tool_schemas").cloned();
         let delta = match (&messages, self.last_frozen.lock()) {
             (Some(messages), Ok(recent)) => recent
                 .iter()
@@ -2409,14 +2413,21 @@ impl SqliteStore {
                         && last.messages.len() <= messages.len()
                         && messages[..last.messages.len()] == last.messages[..]
                 })
-                .map(|last| (last.request_id.clone(), last.messages.len())),
+                .map(|last| {
+                    let same_tools = tool_schemas.is_some() && last.tool_schemas == tool_schemas;
+                    (last.request_id.clone(), last.messages.len(), same_tools)
+                }),
             _ => None,
         };
         let stored_json = match (&messages, delta) {
-            (Some(all), Some((delta_of, prefix))) => {
+            (Some(all), Some((delta_of, prefix, same_tools))) => {
                 stored["messages"] = Value::Array(all[prefix..].to_vec());
                 stored["delta_of"] = Value::String(delta_of);
                 stored["delta_prefix"] = Value::from(prefix);
+                if same_tools && let Some(object) = stored.as_object_mut() {
+                    object.remove("tool_schemas");
+                    object.insert("delta_tools".to_owned(), Value::Bool(true));
+                }
                 to_json(&stored, "serialize frozen request")?
             }
             (Some(_), None) => {
@@ -2470,6 +2481,7 @@ impl SqliteStore {
                 session_id: record.session_id.as_str().to_owned(),
                 request_id: record.request_id.as_str().to_owned(),
                 messages,
+                tool_schemas,
             });
             recent.truncate(LAST_FROZEN_SESSIONS);
         }
@@ -2531,7 +2543,7 @@ impl SqliteStore {
         session_id: &SessionId,
     ) -> Result<Vec<FrozenRequestRecord>, StoreError> {
         let rows = sqlx::query("SELECT request_id, packet_id, composition_snapshot_id, session_id, task_id, request_json, content_hash, provider_id, model, config_revision FROM frozen_requests WHERE session_id = ? ORDER BY rowid").bind(session_id.as_str()).fetch_all(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list frozen requests", error))?;
-        let mut full = std::collections::HashMap::new();
+        let mut full = FrozenBases::new();
         rows.into_iter()
             .map(|row| frozen_request_from_row(&row, &mut full))
             .collect()
@@ -3425,15 +3437,11 @@ async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     if current < 2 {
         apply_runtime_slice_2(&mut tx).await?;
     }
-    if current < 3 {
-        apply_runtime_slice_3(&mut tx).await?;
-    }
-    if current < 4 {
-        apply_runtime_slice_4(&mut tx).await?;
-    }
-    if current < 5 {
-        apply_runtime_slice_5(&mut tx).await?;
-    }
+    // Versions 3 to 5 created the schedule, external-job, approval and
+    // notification tables. Nothing ever read or wrote them, so they are no
+    // longer created, and an empty one left by those versions is dropped
+    // below. The versions keep their numbers: an older host still opens the
+    // database.
     if current < 6 {
         apply_runtime_slice_6(&mut tx).await?;
     }
@@ -3442,6 +3450,17 @@ async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
         apply_runtime_slice_7(&mut tx).await?;
     }
     apply_runtime_statements(&mut tx, &QUERY_INDEXES, "apply runtime indexes").await?;
+    // Children before the tables they reference.
+    for table in [
+        "schedule_occurrences",
+        "schedule_approvals",
+        "schedules",
+        "external_job_polls",
+        "external_jobs",
+        "notification_outbox",
+    ] {
+        drop_if_empty(&mut tx, table).await?;
+    }
     if current < RUNTIME_SCHEMA_VERSION {
         sqlx::query("INSERT INTO runtime_schema_migrations(version) VALUES (?)")
             .bind(RUNTIME_SCHEMA_VERSION)
@@ -3486,6 +3505,43 @@ const QUERY_INDEXES: [&str; 6] = [
     "DROP INDEX IF EXISTS backend_leases_unsettled",
 ];
 
+/// Drop a table this host no longer creates, if it holds no row.
+///
+/// A table with rows is kept: nothing in this host wrote them, so they are
+/// someone else's, and a schema cleanup must never be the thing that loses
+/// them.
+pub(super) async fn drop_if_empty(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table: &'static str,
+) -> Result<(), StoreError> {
+    let present = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+    )
+    .bind(table)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| database_error(ErrorCode::MigrationFailed, "find unused table", error))?;
+    if present == 0 {
+        return Ok(());
+    }
+    // The name is one of this file's constants, never caller input.
+    let empty = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+        "SELECT NOT EXISTS(SELECT 1 FROM \"{table}\")"
+    )))
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| database_error(ErrorCode::MigrationFailed, "inspect unused table", error))?;
+    if empty == 1 {
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE \"{table}\"")))
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::MigrationFailed, "drop unused table", error)
+            })?;
+    }
+    Ok(())
+}
+
 /// Apply one additive runtime schema slice, statement by statement.
 ///
 /// Each slice is idempotent, so a database at an older version upgrades in
@@ -3528,64 +3584,6 @@ async fn apply_runtime_slice_2(
         "CREATE INDEX IF NOT EXISTS run_commands_by_run ON run_commands(run_id)",
     ];
     apply_runtime_statements(tx, &STATEMENTS, "apply runtime schema 2").await
-}
-
-/// M11: the durable schedule and occurrence tables.
-///
-/// The occurrence primary key is what makes a launch idempotent: it is built
-/// from the schedule, its revision and the nominal due instant, so two hosts
-/// that evaluate the same schedule for the same instant insert the same row and
-/// the second insert loses. Nothing about the wall clock is in the key.
-async fn apply_runtime_slice_3(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-) -> Result<(), StoreError> {
-    const STATEMENTS: [&str; 5] = [
-        "CREATE TABLE IF NOT EXISTS schedules (schedule_id TEXT PRIMARY KEY, title TEXT NOT NULL, state TEXT NOT NULL, revision INTEGER NOT NULL CHECK (revision >= 1), next_due_unix_ms INTEGER NOT NULL, spec_json TEXT NOT NULL, grants_json TEXT NOT NULL, created_at_unix_ms INTEGER NOT NULL, updated_at_unix_ms INTEGER NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS schedules_by_due ON schedules(state, next_due_unix_ms)",
-        "CREATE TABLE IF NOT EXISTS schedule_occurrences (occurrence_key TEXT PRIMARY KEY, schedule_id TEXT NOT NULL REFERENCES schedules(schedule_id), revision INTEGER NOT NULL, due_unix_ms INTEGER NOT NULL, claimed_at_unix_ms INTEGER NOT NULL, state TEXT NOT NULL, trigger_kind TEXT NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS occurrences_by_schedule ON schedule_occurrences(schedule_id, due_unix_ms)",
-        "CREATE INDEX IF NOT EXISTS occurrences_by_state ON schedule_occurrences(state)",
-    ];
-    apply_runtime_statements(tx, &STATEMENTS, "apply runtime schema 3").await
-}
-
-/// M11-03: the external-job tables.
-///
-/// The partial unique index over `(server_id, request_digest)` for unsettled
-/// jobs is the load-bearing constraint: an unresolved submission of the same
-/// request cannot be recorded twice, so a retry after a lost answer is a typed
-/// refusal instead of a second mutation.
-async fn apply_runtime_slice_4(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-) -> Result<(), StoreError> {
-    const STATEMENTS: [&str; 6] = [
-        "CREATE TABLE IF NOT EXISTS external_jobs (job_id TEXT PRIMARY KEY, parent_task_id TEXT NOT NULL, session_id TEXT NOT NULL, server_id TEXT NOT NULL, operation TEXT NOT NULL, request_json TEXT NOT NULL, request_digest TEXT NOT NULL, remote_task_id TEXT, state TEXT NOT NULL, attempt INTEGER NOT NULL, poll_interval_ms INTEGER, next_poll_unix_ms INTEGER NOT NULL, deadline_unix_ms INTEGER NOT NULL, submitted_at_unix_ms INTEGER NOT NULL, updated_at_unix_ms INTEGER NOT NULL, settled_at_unix_ms INTEGER, outcome_json TEXT, outcome_digest TEXT, remote_state TEXT, ambiguity TEXT, delivery_message_id TEXT)",
-        "CREATE INDEX IF NOT EXISTS external_jobs_by_poll ON external_jobs(state, next_poll_unix_ms)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS external_jobs_open_request ON external_jobs(server_id, request_digest) WHERE settled_at_unix_ms IS NULL",
-        "CREATE UNIQUE INDEX IF NOT EXISTS external_jobs_remote_task ON external_jobs(server_id, remote_task_id) WHERE remote_task_id IS NOT NULL",
-        "CREATE TABLE IF NOT EXISTS external_job_polls (poll_id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, polled_at_unix_ms INTEGER NOT NULL, observed_state TEXT NOT NULL, outcome TEXT NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS external_job_polls_by_job ON external_job_polls(job_id)",
-    ];
-    apply_runtime_statements(tx, &STATEMENTS, "apply runtime schema 4").await
-}
-
-/// M11-04: schedule approvals and the notification outbox.
-///
-/// The unique index on `(subject_kind, subject_id, change_digest)` is what makes
-/// a duplicate event one logical delivery, and it is on the *meaningful* change
-/// rather than on the event: the same change reported twice is one row, and a
-/// different change is a different row.
-async fn apply_runtime_slice_5(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-) -> Result<(), StoreError> {
-    const STATEMENTS: [&str; 5] = [
-        "CREATE TABLE IF NOT EXISTS schedule_approvals (approval_id TEXT PRIMARY KEY, occurrence_key TEXT NOT NULL UNIQUE, schedule_id TEXT NOT NULL, revision INTEGER NOT NULL, state TEXT NOT NULL, prompt TEXT NOT NULL, requested_at_unix_ms INTEGER NOT NULL, expires_at_unix_ms INTEGER NOT NULL, decided_at_unix_ms INTEGER, decided_by TEXT, reason TEXT)",
-        "CREATE INDEX IF NOT EXISTS schedule_approvals_by_state ON schedule_approvals(state, expires_at_unix_ms)",
-        "CREATE TABLE IF NOT EXISTS notification_outbox (notification_id TEXT PRIMARY KEY, subject_kind TEXT NOT NULL, subject_id TEXT NOT NULL, change_digest TEXT NOT NULL, kind TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL, next_attempt_unix_ms INTEGER NOT NULL, created_at_unix_ms INTEGER NOT NULL, updated_at_unix_ms INTEGER NOT NULL, delivered_at_unix_ms INTEGER, detail TEXT)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS notification_outbox_logical ON notification_outbox(subject_kind, subject_id, change_digest)",
-        "CREATE INDEX IF NOT EXISTS notification_outbox_due ON notification_outbox(state, next_attempt_unix_ms)",
-    ];
-    apply_runtime_statements(tx, &STATEMENTS, "apply runtime schema 5").await
 }
 
 /// M12: the backend leases that give an execution's resource an owner.
@@ -5123,12 +5121,76 @@ fn context_packet_from_row(
     })
 }
 
+/// The messages and tool schemas of each request rebuilt so far, by request
+/// id: what a later delta of the same session extends.
+type FrozenBases = std::collections::HashMap<String, (Vec<Value>, Option<Value>)>;
+
+/// Put a request stored as a delta back together: the messages of the request
+/// it extends up to `delta_prefix`, then its own, and - when it shares them -
+/// that request's tool schemas. A request stored whole is left as it is.
+fn join_frozen_delta(request_json: &mut Value, full: &FrozenBases) -> Result<(), StoreError> {
+    let Some(base) = request_json
+        .get("delta_of")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(());
+    };
+    let prefix = request_json
+        .get("delta_prefix")
+        .and_then(Value::as_u64)
+        .and_then(|prefix| usize::try_from(prefix).ok())
+        .unwrap_or(usize::MAX);
+    let (base_messages, base_tools) = full
+        .get(&base)
+        .filter(|(messages, _)| messages.len() >= prefix)
+        .ok_or_else(|| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "frozen request extends a request that is not stored",
+            )
+        })?;
+    let mut messages = base_messages[..prefix].to_vec();
+    messages.extend(
+        request_json
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    let shared_tools = request_json
+        .get("delta_tools")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let tools = if shared_tools {
+        Some(base_tools.clone().ok_or_else(|| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "frozen request shares the tool schemas of a request that has none",
+            )
+        })?)
+    } else {
+        None
+    };
+    if let Some(object) = request_json.as_object_mut() {
+        object.remove("delta_of");
+        object.remove("delta_prefix");
+        object.remove("delta_tools");
+        object.insert("messages".to_owned(), Value::Array(messages));
+        if let Some(tools) = tools {
+            object.insert("tool_schemas".to_owned(), tools);
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::needless_borrow)]
 /// One frozen request, whole: a request stored as a delta is joined to the
-/// messages of the request it extends, which `full` holds by request id.
+/// messages - and, when it shares them, the tool schemas - of the request it
+/// extends, which `full` holds by request id.
 fn frozen_request_from_row(
     row: &sqlx::sqlite::SqliteRow,
-    full: &mut std::collections::HashMap<String, Vec<Value>>,
+    full: &mut FrozenBases,
 ) -> Result<FrozenRequestRecord, StoreError> {
     let mut request_json: Value = serde_json::from_str(&row_get::<String>(row, "request_json")?)
         .map_err(|_| {
@@ -5137,44 +5199,15 @@ fn frozen_request_from_row(
                 "frozen request JSON is invalid",
             )
         })?;
-    let delta_of = request_json
-        .get("delta_of")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    if let Some(base) = delta_of {
-        let prefix = request_json
-            .get("delta_prefix")
-            .and_then(Value::as_u64)
-            .and_then(|prefix| usize::try_from(prefix).ok())
-            .unwrap_or(usize::MAX);
-        let base_messages = full
-            .get(&base)
-            .filter(|messages| messages.len() >= prefix)
-            .ok_or_else(|| {
-                StoreError::new(
-                    ErrorCode::StorageWriteFailed,
-                    "frozen request extends a request that is not stored",
-                )
-            })?;
-        let mut messages = base_messages[..prefix].to_vec();
-        messages.extend(
-            request_json
-                .get("messages")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
-        );
-        if let Some(object) = request_json.as_object_mut() {
-            object.remove("delta_of");
-            object.remove("delta_prefix");
-            object.insert("messages".to_owned(), Value::Array(messages));
-        }
-    }
+    join_frozen_delta(&mut request_json, full)?;
     if let (Some(messages), Ok(id)) = (
         request_json.get("messages").and_then(Value::as_array),
         row_get::<String>(row, "request_id"),
     ) {
-        full.insert(id, messages.clone());
+        full.insert(
+            id,
+            (messages.clone(), request_json.get("tool_schemas").cloned()),
+        );
     }
     let content_hash =
         ContentHash::parse(row_get::<String>(&row, "content_hash")?).map_err(|_| {
@@ -5574,6 +5607,50 @@ mod one_commit_step_tests {
         store.close().await.expect("close store");
     }
 
+    /// Seven tables were created and never read or written. A new database no
+    /// longer gets them; an old one loses them only while they are empty.
+    #[tokio::test]
+    async fn unused_tables_are_dropped_only_while_empty() {
+        let directory = tempfile::tempdir().expect("temporary store");
+        let open = || async {
+            SqliteStore::open_writer(WriterOpenOptions::new(directory.path(), HostId::generate()))
+                .await
+                .expect("store opens")
+        };
+        let tables = |store: &SqliteStore| {
+            let pool = store.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('schedules', 'schedule_occurrences', 'schedule_approvals', 'notification_outbox', 'external_jobs', 'external_job_polls', 'delegation_integrations') ORDER BY name",
+                )
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let store = open().await;
+        assert!(tables(&store).await.is_empty(), "a new database has none");
+
+        // What an older host left: one of them empty, one holding a row.
+        sqlx::query("CREATE TABLE external_jobs (job_id TEXT PRIMARY KEY)")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE delegation_integrations (integration_id TEXT PRIMARY KEY)")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO delegation_integrations VALUES ('kept')")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        store.close().await.expect("close store");
+
+        let store = open().await;
+        assert_eq!(tables(&store).await, vec!["delegation_integrations"]);
+        store.close().await.expect("close store");
+    }
+
     /// The measured failure: a main session and the sessions it drives freeze
     /// requests in turn, and with one remembered request each overwrote the
     /// other's, so nearly every step was stored as its whole transcript.
@@ -5586,7 +5663,7 @@ mod one_commit_step_tests {
                 .expect("store migration");
         let task_id = TaskId::generate();
         let sessions = (0..3).map(|_| SessionId::generate()).collect::<Vec<_>>();
-        let draft = |session_id: &SessionId, turns: usize| FrozenRequestDraft {
+        let draft = |session_id: &SessionId, turns: usize, tools: &str| FrozenRequestDraft {
             request_id: RequestId::generate(),
             packet_id: ContextPacketId::generate(),
             composition_snapshot_id: None,
@@ -5594,6 +5671,7 @@ mod one_commit_step_tests {
             task_id: task_id.clone(),
             request_json: json!({
                 "model": "m",
+                "tool_schemas": [{"name": tools, "parameters": {"type": "object"}}],
                 "messages": (0..turns)
                     .map(|turn| json!({"role": "user", "content": format!("{session_id} turn {turn}")}))
                     .collect::<Vec<_>>(),
@@ -5604,8 +5682,14 @@ mod one_commit_step_tests {
         };
         let mut expected = std::collections::HashMap::<SessionId, Vec<serde_json::Value>>::new();
         for turns in 1..=3 {
-            for session_id in &sessions {
-                let request = draft(session_id, turns);
+            for (index, session_id) in sessions.iter().enumerate() {
+                // One session changes its tool set at its last step.
+                let tools = if index == 0 && turns == 3 {
+                    "write_file"
+                } else {
+                    "read_file"
+                };
+                let request = draft(session_id, turns, tools);
                 expected
                     .entry(session_id.clone())
                     .or_default()
@@ -5622,6 +5706,15 @@ mod one_commit_step_tests {
         .unwrap();
         // Every step after a session's first extends that session's previous one.
         assert_eq!(stored_as_delta, 6);
+        // And names its base's tool schemas instead of repeating them - except
+        // the one step whose tool set changed, which stores its own.
+        let shared_tools = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM frozen_requests WHERE json_extract(request_json, '$.delta_tools') = 1 AND json_extract(request_json, '$.tool_schemas') IS NULL",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(shared_tools, 5);
         for session_id in &sessions {
             let rebuilt = store
                 .list_frozen_requests(session_id)
