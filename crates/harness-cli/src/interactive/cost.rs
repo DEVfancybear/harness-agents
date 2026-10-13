@@ -34,6 +34,10 @@ pub struct CostTracker {
     /// The last request's prompt plus its answer: what the context holds now, as
     /// prime-agent reads it off the latest response's usage.
     context_tokens: Option<u64>,
+    /// The provider's measured prompt over the runtime's estimate of it, at
+    /// the conversation's last response: what the next turn's compaction
+    /// decision is scaled by.
+    estimate_scale: Option<f64>,
 }
 
 impl CostTracker {
@@ -93,6 +97,22 @@ impl CostTracker {
     /// A new conversation starts with an empty context.
     pub fn forget_context(&mut self) {
         self.context_tokens = None;
+        self.estimate_scale = None;
+    }
+
+    /// After a compaction the last response's usage measured a context that
+    /// is gone: pi shows `?` until a response measures the new one.
+    pub fn context_compacted(&mut self) {
+        self.context_tokens = None;
+    }
+
+    #[must_use]
+    pub const fn estimate_scale(&self) -> Option<f64> {
+        self.estimate_scale
+    }
+
+    pub const fn set_estimate_scale(&mut self, scale: f64) {
+        self.estimate_scale = Some(scale);
     }
 
     #[must_use]

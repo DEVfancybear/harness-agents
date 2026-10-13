@@ -699,6 +699,87 @@ async fn g07_auto_compaction_triggers_at_threshold_and_never_loops() {
     close(store).await;
 }
 
+/// Self-test of compaction against pi and prime-agent: they compact when the
+/// provider's own count of the context passes the threshold. This host decides
+/// before sending, on an estimate, so it reads that estimate in the provider's
+/// measure (`estimate_scale`). One conversation, two measures: where the
+/// provider counted about what was estimated it is sent whole; where it counted
+/// two and a half times as much - Vietnamese text, dense JSON - its older part
+/// is summarized first, although the raw estimate is under the threshold.
+#[tokio::test]
+async fn compaction_decides_on_the_providers_measure_of_the_context() {
+    for (scale, compacts) in [(None, false), (Some(1.0), false), (Some(2.5), true)] {
+        let bench = bench();
+        let store = bench.open_store().await;
+        let provider = Arc::new(ScriptedProvider::for_model_summary(vec![vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("done"),
+            ProviderStreamEvent::completed("stop"),
+        ]]));
+        let runtime = RuntimeService::new(
+            Arc::clone(&store),
+            provider.clone(),
+            RuntimeConfig {
+                context_window_tokens: 16_000,
+                output_reservation_tokens: 1024,
+                compaction_reserve_tokens: 1000,
+                estimate_scale: scale,
+                ..RuntimeConfig::default()
+            },
+        );
+        // About 8000 tokens of earlier turns: under the 13,976-token threshold
+        // as estimated, over it at two and a half times.
+        let conversation = (0..40)
+            .map(|index| {
+                harness_providers::ProviderMessage::new(
+                    if index % 2 == 0 {
+                        MessageRole::User
+                    } else {
+                        MessageRole::Assistant
+                    },
+                    format!("turn {index}: {}", "earlier work ".repeat(60)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let result = runtime
+            .run(
+                RunRequest::new(
+                    SessionId::generate(),
+                    TaskId::generate(),
+                    InputId::generate(),
+                    "continue".to_owned(),
+                    observe_workspace(bench.project_id.clone(), &bench.workspace)
+                        .expect("workspace"),
+                )
+                .with_conversation(conversation),
+            )
+            .await;
+        assert!(result.is_ok(), "scale {scale:?}: {result:?}");
+        let seen = provider.seen();
+        assert_eq!(
+            seen.len(),
+            if compacts { 2 } else { 1 },
+            "scale {scale:?}: a summary call only when the provider's measure is over"
+        );
+        let sent = seen.last().expect("the turn's request");
+        let earlier = sent
+            .messages
+            .iter()
+            .filter(|message| message.content.contains("earlier work"))
+            .count();
+        if compacts {
+            assert!(
+                earlier < 40,
+                "scale {scale:?}: the older part was summarized"
+            );
+        } else {
+            assert_eq!(earlier, 40, "scale {scale:?}: sent whole");
+        }
+        drop(runtime);
+        close(store).await;
+    }
+}
+
 #[tokio::test]
 async fn g08_diff_since_session_start_uses_the_recorded_base() {
     let bench = bench();

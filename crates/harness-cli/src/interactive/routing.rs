@@ -139,9 +139,11 @@ pub fn config_for(
             cache_read_per_mtok: Some(cost.cache_read),
             cache_write_per_mtok: Some(cost.cache_write),
         });
-    if let Some(window) = entry.context_window {
-        config.context_window_tokens = window;
-    }
+    // A model without a window takes pi's default, never the window of the
+    // model it replaced.
+    config.context_window_tokens = entry
+        .context_window
+        .unwrap_or(super::config::UNKNOWN_MODEL_CONTEXT_WINDOW);
     config
 }
 

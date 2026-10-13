@@ -218,7 +218,15 @@ pub struct RuntimeConfig {
     pub max_attempts: u32,
     pub max_retry_after_seconds: u64,
     pub config_revision: u64,
+    /// How the provider's measured prompt compares with this host's estimate
+    /// of it (`measured / estimated`) at the conversation's last response,
+    /// carried from the previous turn. See [`RuntimeService::estimate_scale`].
+    pub estimate_scale: Option<f64>,
 }
+
+/// The range a measured estimate scale is kept within: one odd response (an
+/// image, a cache quirk) must not make the next request look empty or full.
+const ESTIMATE_SCALE_RANGE: (f64, f64) = (0.6, 2.5);
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
@@ -232,6 +240,7 @@ impl Default for RuntimeConfig {
             max_attempts: 3,
             max_retry_after_seconds: 30,
             config_revision: 1,
+            estimate_scale: None,
         }
     }
 }
@@ -2058,6 +2067,69 @@ pub struct RuntimeService {
     /// says the same refers to it instead of storing a copy. See
     /// `same_packet_content`.
     stored_packet: Arc<Mutex<Option<ContextPacketRecord>>>,
+    /// The provider's measured prompt over this host's estimate of it, at the
+    /// last response that reported usage. See [`Self::estimate_scale`].
+    estimate_scale: Arc<Mutex<Option<f64>>>,
+}
+
+/// The prompt tokens the provider reported for an attempt, when it did.
+fn measured_prompt(events: &[ProviderStreamEvent]) -> Option<u64> {
+    events.iter().rev().find_map(|event| match event {
+        ProviderStreamEvent::Usage { prompt_tokens, .. } if *prompt_tokens > 0 => {
+            Some(*prompt_tokens)
+        }
+        _ => None,
+    })
+}
+
+/// The measured prompt over the estimate of it, kept in range; `None` when
+/// there is nothing to compare.
+fn estimate_scale_of(measured: u64, estimated: u64) -> Option<f64> {
+    if measured == 0 || estimated == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss, reason = "a ratio of token counts")]
+    let scale = measured as f64 / estimated as f64;
+    Some(scale.clamp(ESTIMATE_SCALE_RANGE.0, ESTIMATE_SCALE_RANGE.1))
+}
+
+/// An estimate in the provider's measure, by a scale kept in range.
+fn scale_estimate(estimate: u64, scale: Option<f64>) -> u64 {
+    let Some(scale) = scale else {
+        return estimate;
+    };
+    let scale = scale.clamp(ESTIMATE_SCALE_RANGE.0, ESTIMATE_SCALE_RANGE.1);
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a token estimate, scaled by a bounded positive ratio"
+    )]
+    let scaled = (estimate as f64 * scale).round() as u64;
+    scaled
+}
+
+#[cfg(test)]
+mod estimate_scale_tests {
+    use super::{ESTIMATE_SCALE_RANGE, estimate_scale_of, scale_estimate};
+
+    /// The point compaction runs on is the provider's count: an estimate that
+    /// read 100k for a prompt the provider measured at 130k is scaled by 1.3.
+    #[test]
+    fn an_estimate_is_read_in_the_providers_measure() {
+        let scale = estimate_scale_of(130_000, 100_000).expect("a scale");
+        assert!((scale - 1.3).abs() < 1e-9);
+        assert_eq!(scale_estimate(200_000, Some(scale)), 260_000);
+        assert_eq!(scale_estimate(200_000, None), 200_000, "no response yet");
+        // One odd response cannot make a request look empty or full.
+        assert_eq!(estimate_scale_of(1, 100_000), Some(ESTIMATE_SCALE_RANGE.0));
+        assert_eq!(
+            estimate_scale_of(900_000, 100_000),
+            Some(ESTIMATE_SCALE_RANGE.1)
+        );
+        assert_eq!(estimate_scale_of(0, 100_000), None);
+        assert_eq!(estimate_scale_of(100, 0), None);
+    }
 }
 
 /// Whether a packet just built says what a stored one says.
@@ -2136,6 +2208,7 @@ impl RuntimeService {
             turn_packets: Arc::new(Mutex::new(std::collections::HashMap::new())),
             tool_schema_facts: Arc::new(Mutex::new(None)),
             stored_packet: Arc::new(Mutex::new(None)),
+            estimate_scale: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2143,6 +2216,39 @@ impl RuntimeService {
     #[must_use]
     pub fn compactions(&self) -> u32 {
         self.compactions.load(Ordering::SeqCst)
+    }
+
+    /// The provider's measured prompt over this host's estimate of it, at the
+    /// last response that reported usage, for the host to carry into the next
+    /// turn's [`RuntimeConfig::estimate_scale`].
+    ///
+    /// Compaction is decided before a request is sent, so it reads an estimate
+    /// (a quarter of the UTF-8 bytes). pi and prime-agent decide it from the
+    /// last response's real usage. The estimate drifts from that - Vietnamese
+    /// text is two or three bytes a letter, a tool schema is dense JSON - so the
+    /// percentage the status line showed and the point compaction ran on did
+    /// not agree. Scaling the estimate by what the provider last measured puts
+    /// the decision on the provider's count.
+    #[must_use]
+    pub fn estimate_scale(&self) -> Option<f64> {
+        self.estimate_scale.lock().ok().and_then(|scale| *scale)
+    }
+
+    fn note_measured(&self, events: &[ProviderStreamEvent], estimated: u64) {
+        let Some(measured) = measured_prompt(events) else {
+            return;
+        };
+        if let Some(scale) = estimate_scale_of(measured, estimated)
+            && let Ok(mut current) = self.estimate_scale.lock()
+        {
+            *current = Some(scale);
+        }
+    }
+
+    /// An estimate in the provider's measure: scaled by the last measured
+    /// ratio of this turn, else the previous turn's, else as estimated.
+    fn scaled_estimate(&self, config: &RuntimeConfig, estimate: u64) -> u64 {
+        scale_estimate(estimate, self.estimate_scale().or(config.estimate_scale))
     }
     #[must_use]
     pub fn with_summarizer(mut self, summarizer: Arc<dyn SummaryProvider>) -> Self {
@@ -2426,7 +2532,9 @@ impl RuntimeService {
         let window = config
             .context_window_tokens
             .saturating_sub(config.output_reservation_tokens);
-        let fits = |built: &Result<harness_session::ContextBuildResult, RuntimeError>| matches!(built, Ok(built) if built.packet.token_estimate <= threshold);
+        // In the provider's measure when a response has reported one: the
+        // point compaction runs on is the one the usage line counts toward.
+        let fits = |built: &Result<harness_session::ContextBuildResult, RuntimeError>| matches!(built, Ok(built) if self.scaled_estimate(&config, built.packet.token_estimate) <= threshold);
         let estimate = |built: &Result<harness_session::ContextBuildResult, RuntimeError>| {
             built
                 .as_ref()
@@ -2534,8 +2642,15 @@ impl RuntimeService {
             );
         }
         let mut built = match attempt {
-            Ok(built) if built.packet.token_estimate <= window => built,
-            Ok(built) => return Err(context_overflow(built.packet.token_estimate, window)),
+            Ok(built) if self.scaled_estimate(&config, built.packet.token_estimate) <= window => {
+                built
+            }
+            Ok(built) => {
+                return Err(context_overflow(
+                    self.scaled_estimate(&config, built.packet.token_estimate),
+                    window,
+                ));
+            }
             // Compaction could not make the mandatory part fit: the turn's
             // overflow, with the builder's measure of what it needed.
             Err(error) if error.code() == ErrorCode::MandatoryContextOverflow => {
@@ -2862,6 +2977,7 @@ impl RuntimeService {
                     // Settle this attempt before anything else reads the
                     // result: measured when the response has text, unknown
                     // when it does not (an empty response is not free).
+                    self.note_measured(&events, built.packet.token_estimate);
                     self.settle_attempt(
                         attempt_reservation.as_ref(),
                         &built.packet.token_estimate,

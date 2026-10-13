@@ -39,7 +39,11 @@ pub const DEEPSEEK_PRESET: ProviderPreset = ProviderPreset {
     endpoint: "https://api.deepseek.com/chat/completions",
     model: "deepseek-v4-flash",
     api_key_env: "DEEPSEEK_API_KEY",
-    thinking: "off",
+    // pi's and prime-agent's `DEFAULT_THINKING_LEVEL`: a session with no level
+    // of its own and no `defaultThinkingLevel` reasons at medium, clamped to
+    // what the model offers (`off` for a model that does not reason). `off`
+    // here sent reasoning models out without reasoning.
+    thinking: "medium",
 };
 #[cfg(test)]
 pub const DEEPSEEK_ENDPOINT: &str = DEEPSEEK_PRESET.endpoint;
@@ -1223,8 +1227,14 @@ fn apply_context_limits(
 
 /// A model's context window from the model catalog, when the configuration did
 /// not set one: the notice a missing window leaves is how that is told apart.
+/// The window `/model` saved with the selection is the catalog's of that day,
+/// not a setting: the catalog's current one replaces it, as pi reads the window
+/// off the model each time.
 pub fn apply_catalog_context_window(resolved: &mut ResolvedConfig, data_dir: &Path) {
-    if resolved.context_window_notice.is_none() {
+    let from_selection = resolved.explain.iter().any(|entry| {
+        entry.key == "runtime.context_window_tokens" && entry.layer == ConfigLayer::Selection
+    });
+    if resolved.context_window_notice.is_none() && !from_selection {
         return;
     }
     let reference = format!("{}/{}", resolved.provider.id, resolved.provider.model);
@@ -1240,6 +1250,7 @@ pub fn apply_catalog_context_window(resolved: &mut ResolvedConfig, data_dir: &Pa
             .find(|entry| entry.key == "runtime.context_window_tokens")
         {
             entry.value = window.to_string();
+            entry.layer = ConfigLayer::Default;
             entry.reason = Some("from the model catalog".to_owned());
         }
     }
@@ -1733,6 +1744,44 @@ mod tests {
         )
         .expect("project layer resolves");
         assert_eq!(project_only.provider.model, "project-model");
+    }
+
+    /// The window `/model` saved with the selection was the catalog's of that
+    /// day; a newer catalog's replaces it, as pi reads the window off the model.
+    /// A model the catalog does not know keeps the saved one.
+    #[test]
+    fn a_selection_window_gives_way_to_the_catalog() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).expect("project root");
+        let user = temp.path().join("user.toml");
+        std::fs::write(&user, "schema_version = 2\n").expect("user config");
+        let select = |model: &str| {
+            super::save_selection(
+                &user,
+                &super::Selection {
+                    provider: "deepseek".to_owned(),
+                    model: model.to_owned(),
+                    protocol: "openai_chat".to_owned(),
+                    endpoint: super::DEEPSEEK_ENDPOINT.to_owned(),
+                    context_window: Some(4242),
+                    thinking_format: None,
+                    api_key_env: None,
+                },
+            )
+            .expect("selection saved");
+            let mut resolved = resolve_layers(
+                &user,
+                &root,
+                &super::super::paths::LaunchEnvironment::default(),
+                &ConfigOverrides::default(),
+            )
+            .expect("resolves");
+            super::apply_catalog_context_window(&mut resolved, &temp.path().join("data"));
+            resolved.context_window_tokens
+        };
+        assert_eq!(select("deepseek-v4-pro"), 1_000_000);
+        assert_eq!(select("deepseek-not-in-any-catalog"), 4242);
     }
 
     #[test]

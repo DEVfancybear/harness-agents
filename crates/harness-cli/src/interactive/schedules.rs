@@ -419,6 +419,38 @@ pub fn tasks_with_active_jobs(data_dir: &Path) -> Vec<String> {
     tasks
 }
 
+/// The conversations whose provider-quota resume (`prompt`) is due at `now`.
+///
+/// Other jobs of a conversation nobody has open stay dormant (prime-agent's
+/// no-auto-resume contract). A quota park is the exception: the session said
+/// it "will resume automatically", and prime-agent's daemon keeps a parked
+/// session to do so. Seen: a session parked until 14:34 resumed 35 hours
+/// later, when its conversation was next opened.
+#[must_use]
+pub fn tasks_with_due_resume(data_dir: &Path, prompt: &str, now: DateTime<Utc>) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(data_dir.join("schedules")) else {
+        return Vec::new();
+    };
+    let mut tasks = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .filter(|path| {
+            load(path).iter().any(|job| {
+                job.status == Status::Active
+                    && job.prompt == prompt.trim()
+                    && job.next_run_at.is_some_and(|next| next <= now)
+            })
+        })
+        .filter_map(|path| Some(path.file_stem()?.to_str()?.to_owned()))
+        .collect::<Vec<_>>();
+    tasks.sort();
+    tasks
+}
+
 /// Cancel every job of a conversation that is stopped, as prime-agent's stop
 /// cancels the session's scheduled jobs: a stopped agent's schedule must not
 /// bring it back. The number of jobs cancelled.
@@ -532,6 +564,39 @@ impl Schedules {
             jobs.push(job.clone());
             Ok(job)
         })
+    }
+
+    /// A one-shot job running `prompt` at `at`, or the one already waiting to
+    /// run it, moved to the later time. Every call of a turn that hit a usage
+    /// limit - its own and each child's - parked the session, and one reset
+    /// woke it with the same resume prompt several times.
+    pub fn once_at(
+        &self,
+        at: DateTime<Utc>,
+        prompt: &str,
+        delivery: Delivery,
+        now: DateTime<Utc>,
+    ) -> Result<Job, String> {
+        let stamp = at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let waiting = self.change(|jobs| {
+            let Some(job) = jobs.iter_mut().find(|job| {
+                job.status == Status::Active
+                    && job.schedule.kind == Kind::Once
+                    && job.prompt == prompt.trim()
+            }) else {
+                return Ok(None);
+            };
+            if job.next_run_at.is_none_or(|next| next < at) {
+                job.schedule.expression = format!("at {stamp}");
+                job.next_run_at = Some(at);
+                job.updated_at = now;
+            }
+            Ok(Some(job.clone()))
+        })?;
+        match waiting {
+            Some(job) => Ok(job),
+            None => self.add(&format!("at {stamp}"), prompt, delivery, now),
+        }
     }
 
     /// Pause, resume or cancel a job.
@@ -801,6 +866,47 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("job-2 completed"))
         );
+    }
+
+    /// Every call of a turn that hit a usage limit parked the session - its
+    /// own and each child's - and one reset woke it once for each. One resume
+    /// waits now, at the latest reset any of them reported; once it is due,
+    /// the worker finds its conversation to wake.
+    #[test]
+    fn a_session_parks_once_and_is_found_when_its_reset_comes() {
+        let dir = tempfile::tempdir().unwrap();
+        let schedules = Schedules::default();
+        schedules.bind(path_for(dir.path(), "task-parked"));
+        let now = Utc.with_ymd_and_hms(2026, 10, 9, 9, 51, 0).unwrap();
+        let reset = Utc.with_ymd_and_hms(2026, 10, 9, 14, 34, 54).unwrap();
+        let prompt = "<resume>continue</resume>";
+        for (at, minutes) in [
+            (reset, 0),
+            (reset + chrono::Duration::seconds(1), 1),
+            (reset, 2),
+        ] {
+            schedules
+                .once_at(
+                    at,
+                    prompt,
+                    Delivery::FollowUp,
+                    now + chrono::Duration::minutes(minutes),
+                )
+                .unwrap();
+        }
+        assert_eq!(schedules.list().len(), 1, "{:?}", schedules.list());
+        assert!(
+            super::tasks_with_due_resume(dir.path(), prompt, reset).is_empty(),
+            "moved to the later reset"
+        );
+        let due_at = reset + chrono::Duration::seconds(1);
+        assert_eq!(
+            super::tasks_with_due_resume(dir.path(), prompt, due_at),
+            ["task-parked"]
+        );
+        assert!(super::tasks_with_due_resume(dir.path(), "another prompt", due_at).is_empty());
+        assert_eq!(schedules.due(due_at).len(), 1);
+        assert!(super::tasks_with_due_resume(dir.path(), prompt, due_at).is_empty());
     }
 
     #[test]

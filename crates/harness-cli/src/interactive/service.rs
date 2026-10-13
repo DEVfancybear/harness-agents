@@ -1874,6 +1874,12 @@ pub(super) fn effective_output_tokens(
     data_dir: &Path,
     level: harness_providers::ThinkingLevel,
 ) -> u64 {
+    // Codex takes no output budget (pi and prime-agent send none, nor does the
+    // Responses adapter here), and its 272k is the input window: reserving the
+    // model's 32k output for it compacted 32k tokens earlier than upstream.
+    if config.protocol == "openai_codex" {
+        return config.output_reservation_tokens;
+    }
     let Some(model) = super::providers::Catalog::load(data_dir)
         .find(&format!("{}/{}", config.provider_id, config.model))
         .cloned()
@@ -4336,8 +4342,10 @@ impl SessionPort for AgentSessionService {
         let at = until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         // A job kept with the conversation survives quitting the app: it runs
         // when the app is open again, or once when the conversation is resumed.
-        let job = self.schedules.add(
-            &format!("at {at}"),
+        // One resume per conversation: a turn's own call and each child's
+        // parked it, and one reset woke it once for each.
+        let job = self.schedules.once_at(
+            until,
             super::routing::QUOTA_RESUME_PROMPT,
             super::heartbeat::Delivery::FollowUp,
             chrono::Utc::now(),
@@ -6462,6 +6470,81 @@ mod model_reads_images_tests {
             "openai_responses"
         ));
     }
+
+    fn config(provider: &str, protocol: &str, model: &str) -> super::ProviderConfig {
+        super::ProviderConfig {
+            provider_id: provider.to_owned(),
+            protocol: protocol.to_owned(),
+            endpoint: String::new(),
+            model: model.to_owned(),
+            api_key_env: String::new(),
+            thinking: String::new(),
+            thinking_format: None,
+            approval: "ask".to_owned(),
+            allow_rules: Vec::new(),
+            deny_rules: Vec::new(),
+            model_price: None,
+            context_window_tokens: 200_000,
+            context_window_notice: None,
+            output_reservation_tokens: 1024,
+            compaction_reserve_tokens: 16_384,
+            max_retry_after_seconds: 0,
+            hooks: Vec::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+            project_trusted: false,
+            bell: false,
+            agents_default_model: None,
+            queue_modes: (None, None),
+            routing: crate::interactive::config::Routing::default(),
+            verify: crate::interactive::verify::Verify::default(),
+            credential: crate::interactive::credentials::CredentialSource::Environment {
+                variable: String::new(),
+            },
+            service_tier: None,
+        }
+    }
+
+    /// Codex takes no output budget, so compaction reserves none for it: a
+    /// 272k Codex window compacted 32k tokens earlier than pi and prime-agent.
+    #[test]
+    fn codex_reserves_no_output_budget_before_compaction() {
+        let data = tempfile::tempdir().expect("data");
+        let level = harness_providers::ThinkingLevel::High;
+        let codex = config("openai-codex", "openai_codex", "gpt-5.2");
+        assert_eq!(
+            super::effective_output_tokens(&codex, data.path(), level),
+            1024
+        );
+        let responses = config("openai", "openai_responses", "gpt-5");
+        assert!(super::effective_output_tokens(&responses, data.path(), level) > 1024);
+    }
+
+    /// A model without a window takes pi's default, never the window of the
+    /// model it replaced.
+    #[test]
+    fn a_switch_to_a_model_without_a_window_takes_the_default() {
+        let catalog = crate::interactive::providers::Catalog::bundled();
+        let mut entry = catalog
+            .models()
+            .iter()
+            .find(|model| model.provider == "openai")
+            .expect("an OpenAI model")
+            .clone();
+        entry.context_window = None;
+        let mut base = config("anthropic", "anthropic_messages", "claude-opus-4-8");
+        base.context_window_tokens = 1_000_000;
+        let switched = crate::interactive::routing::config_for(
+            &base,
+            &entry,
+            crate::interactive::credentials::CredentialSource::Environment {
+                variable: String::new(),
+            },
+        );
+        assert_eq!(
+            switched.context_window_tokens,
+            crate::interactive::config::UNKNOWN_MODEL_CONTEXT_WINDOW
+        );
+    }
 }
 
 /// A title for a compacted session: the first line under the summary's
@@ -7201,6 +7284,13 @@ async fn run_turn(
         || (Arc::clone(&provider), config.model.clone()),
         |(auxiliary, entry)| (Arc::clone(auxiliary), entry.id.clone()),
     );
+    // How the provider counted this conversation's last request against the
+    // estimate, carried from the turn before: compaction decides on it.
+    let scale_tracker = Arc::clone(&cost_tracker);
+    let carried_scale = scale_tracker
+        .lock()
+        .ok()
+        .and_then(|tracker| tracker.estimate_scale());
     let mut runtime = RuntimeService::new(
         Arc::clone(&store),
         Arc::clone(&provider),
@@ -7209,6 +7299,7 @@ async fn run_turn(
             output_reservation_tokens: effective_output_tokens(&config, &data_dir, thinking_level),
             compaction_reserve_tokens: config.compaction_reserve_tokens,
             max_retry_after_seconds: config.max_retry_after_seconds,
+            estimate_scale: carried_scale,
             ..RuntimeConfig::default()
         },
     );
@@ -7276,6 +7367,19 @@ async fn run_turn(
         }
         match result {
             Ok(()) => {
+                // The last response measured the context before the summary
+                // replaced it: unknown until the next response, as pi's
+                // footer shows `?` after a compaction.
+                if let Ok(mut tracker) = cost_tracker.lock() {
+                    tracker.context_compacted();
+                }
+                send(SessionEvent::UsageUpdated {
+                    label: format!(
+                        "?/{}",
+                        super::cost::format_tokens(config.context_window_tokens)
+                    ),
+                    tokens: 0,
+                });
                 // Claude Code's `SessionStart` with `compact`: the prompt after a
                 // compaction starts from the summary.
                 if let Ok(mut pending) = session_start.lock() {
@@ -8366,6 +8470,11 @@ async fn run_turn(
         && let Ok(mut guard) = previous_session.lock()
     {
         *guard = Some(session_id.clone());
+    }
+    if let Some(scale) = runtime.estimate_scale()
+        && let Ok(mut tracker) = scale_tracker.lock()
+    {
+        tracker.set_estimate_scale(scale);
     }
     drop(runtime);
     if let Some(repl) = &repl {

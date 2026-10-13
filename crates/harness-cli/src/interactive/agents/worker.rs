@@ -309,6 +309,7 @@ fn supervise(worker: &Arc<Worker>) {
         }
         worker.evict_idle();
         worker.reap();
+        worker.wake_parked();
         worker.keep_journal();
         let empty = worker
             .empty_since
@@ -414,7 +415,64 @@ impl Worker {
                 "{dormant} conversation(s) with scheduled jobs stay dormant until opened"
             ));
         }
+        self.wake_parked();
         self.keep_journal();
+    }
+
+    /// Open the conversations parked on a provider's usage limit whose reset
+    /// has come, when no agent has them open: the session said it would
+    /// resume by itself, as prime-agent's daemon resumes a parked session.
+    /// Seen: a session parked until 14:34 resumed 35 hours later, when the
+    /// user next opened its conversation. The opened agent's own schedule
+    /// then delivers the resume prompt, once.
+    fn wake_parked(self: &Arc<Self>) {
+        let Some(data_dir) = self.registry.parent() else {
+            return;
+        };
+        let due = super::super::schedules::tasks_with_due_resume(
+            data_dir,
+            super::super::routing::QUOTA_RESUME_PROMPT,
+            chrono::Utc::now(),
+        );
+        if due.is_empty() {
+            return;
+        }
+        let open = self
+            .list()
+            .into_iter()
+            .filter_map(|agent| agent.conversation)
+            .collect::<std::collections::BTreeSet<_>>();
+        let waiting = due
+            .into_iter()
+            .filter(|task| !open.contains(task))
+            .collect::<Vec<_>>();
+        if waiting.is_empty() {
+            return;
+        }
+        // Only this worker's project: the schedules folder is shared.
+        let newest = self.newest_sessions();
+        let environment = LaunchEnvironment::capture().pairs();
+        for task in waiting {
+            let Some(session) = newest.get(&task) else {
+                continue;
+            };
+            let spec = CreateAgent {
+                caller_dir: self.project_root.clone(),
+                cwd: Some(self.project_root.clone()),
+                environment: environment.clone(),
+                resume: Some(session.clone()),
+                ..CreateAgent::default()
+            };
+            match self.create(spec) {
+                Ok(info) => log(&format!(
+                    "agent {} resumed conversation {task}: its provider usage limit has reset",
+                    info.id
+                )),
+                Err(error) => log(&format!(
+                    "the parked conversation {task} could not be resumed: {error}"
+                )),
+            }
+        }
     }
 
     /// The newest session of every task in this worker's store.
