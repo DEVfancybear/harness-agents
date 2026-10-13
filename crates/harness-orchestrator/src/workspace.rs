@@ -453,6 +453,24 @@ fn add_worktree_locked(
             ],
         )?;
     }
+    // The clone is made once and kept, so it holds the commits the project
+    // had then. A later delegation from a newer commit failed with "not a
+    // valid branch point"; the clone takes what it is missing from the
+    // project first.
+    let commit = format!("{base_commit}^{{commit}}");
+    if git(clone_source, &["cat-file", "-e", &commit]).is_err() {
+        git(
+            clone_source,
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                &source.to_string_lossy(),
+                "+HEAD:refs/harness/source-head",
+                "+refs/heads/*:refs/remotes/source/*",
+            ],
+        )?;
+    }
     git(
         clone_source,
         &["branch", "--force", base_branch, base_commit],

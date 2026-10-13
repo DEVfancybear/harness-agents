@@ -913,6 +913,50 @@ async fn p5_s04_clean_worktrees_isolate_workers_and_block_out_of_scope_writes() 
     );
 }
 
+/// Seen delegating a coder: `git branch --force harness/base/... <commit>
+/// failed: fatal: not a valid branch point`. The integration clone is made
+/// once and kept, so a commit the project gained after it was missing there.
+#[tokio::test]
+async fn p5_a_worktree_from_a_commit_newer_than_the_integration_clone() {
+    let repo = test_repo();
+    let manager = workspace_for(&repo);
+    let snapshot = repo.snapshot(&manager).await;
+    manager
+        .create_worktree(
+            &snapshot,
+            &TaskId::generate(),
+            &AgentRunId::generate(),
+            &["src/first.rs".to_owned()],
+            1,
+        )
+        .await
+        .expect("the first worktree makes the integration clone");
+    std::fs::write(repo.root().join("later.txt"), "later\n").expect("file");
+    assert!(repo.git(&["add", "later.txt"]).status.success());
+    assert!(
+        repo.git(&["commit", "-qm", "a later commit"])
+            .status
+            .success()
+    );
+    let newer = repo.snapshot(&manager).await;
+    assert_ne!(newer.base_commit, snapshot.base_commit);
+    let worktree = manager
+        .create_worktree(
+            &newer,
+            &TaskId::generate(),
+            &AgentRunId::generate(),
+            &["src/second.rs".to_owned()],
+            1,
+        )
+        .await
+        .expect("a worktree from the newer commit");
+    assert!(
+        std::path::Path::new(&worktree.path)
+            .join("later.txt")
+            .is_file()
+    );
+}
+
 #[tokio::test]
 async fn p5_s04_dirty_input_is_refused_without_touching_user_changes() {
     let repo = test_repo();
