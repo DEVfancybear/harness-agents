@@ -677,6 +677,53 @@ pub(crate) fn tool_walk(
     cached_walk(root, &base, Some(Instant::now() + TOOL_WALK_DEADLINE))
 }
 
+/// Most paths a "file not found" names in its place.
+const SIMILAR_PATHS: usize = 5;
+
+/// Workspace files with the file name of `missing` (ignoring case), the ones
+/// sharing most of its trailing folders first: what a read of a guessed path
+/// (`crates/x/python/harness_state.py` for `crates/x/python/rlm/harness.py`)
+/// most likely meant. Empty when the walk fails or nothing matches.
+pub(crate) fn files_named_like(root: &Path, missing: &str) -> Vec<String> {
+    let wanted = missing
+        .replace('\\', "/")
+        .to_lowercase()
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let Some(name) = wanted.last() else {
+        return Vec::new();
+    };
+    let Ok(walk) = tool_walk(root, None, "read_file") else {
+        return Vec::new();
+    };
+    let mut found = walk
+        .files
+        .iter()
+        .filter_map(|file| {
+            let relative = root_relative(root, file).ok()?;
+            let lowered = relative.to_lowercase();
+            let parts = lowered.split('/').collect::<Vec<_>>();
+            (parts.last() == Some(&name.as_str())).then(|| {
+                let shared = parts
+                    .iter()
+                    .rev()
+                    .zip(wanted.iter().rev())
+                    .take_while(|(have, want)| **have == want.as_str())
+                    .count();
+                (shared, relative)
+            })
+        })
+        .collect::<Vec<_>>();
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    found
+        .into_iter()
+        .take(SIMILAR_PATHS)
+        .map(|(_, path)| path)
+        .collect()
+}
+
 /// What `search_text` searches: a directory's walk, or one file. Models name a
 /// file as often as a folder (`path=README.md`), and refusing it cost a turn.
 /// The file comes out of its folder's walk, so an ignored or sensitive file is
@@ -1992,6 +2039,23 @@ mod tests {
             preview.chars().count(),
             crate::truncate::GREP_MAX_LINE_LENGTH + 15
         );
+    }
+
+    #[test]
+    fn a_guessed_path_is_answered_with_the_files_of_that_name() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        for path in ["skills/goal/goal.py", "other/goal.py", "src/main.rs"] {
+            let file = directory.path().join(path);
+            fs::create_dir_all(file.parent().expect("parent")).expect("dir");
+            fs::write(file, "x\n").expect("file");
+        }
+        let root = fs::canonicalize(directory.path()).expect("root");
+        assert_eq!(
+            files_named_like(&root, ".agents/skills/goal/src/goal/goal.py"),
+            ["skills/goal/goal.py", "other/goal.py"],
+            "the one sharing more trailing folders first"
+        );
+        assert!(files_named_like(&root, "missing.txt").is_empty());
     }
 
     #[test]

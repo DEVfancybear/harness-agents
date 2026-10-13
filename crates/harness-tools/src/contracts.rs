@@ -597,8 +597,17 @@ fn nullable_string_schema() -> Value {
     json!({"type": ["string", "null"]})
 }
 
+/// Only what this build can run is offered to the model. `strict` is still
+/// parsed - an operator or an API caller may ask for it and is refused with
+/// the reason - but this revision has no confinement adapter, so a model shown
+/// it asked for it, was refused, and asked again: a verifier spent most of its
+/// calls that way.
 fn isolation_schema() -> Value {
-    json!({"type": "string", "enum": ["best_effort", "strict"]})
+    json!({
+        "type": "string",
+        "enum": ["best_effort"],
+        "description": "best_effort runs the process on this host; strict confinement is not available in this build."
+    })
 }
 
 /// The child environment is never inherited. A call may name `secret://`

@@ -29,6 +29,16 @@ use crate::{
     secrets::ProcessEnvironment,
 };
 
+/// How a spawn the operating system refused begins: `py` or `which` on a host
+/// without them. No process existed, so it is reported as a plain failure,
+/// never as "side effect may be uncertain".
+const NOT_STARTED: &str = "the program did not start:";
+
+/// Whether this error is a spawn the operating system refused.
+pub(crate) fn never_started(error: &HarnessError) -> bool {
+    error.code() == ErrorCode::InvalidPayload && error.message().starts_with(NOT_STARTED)
+}
+
 /// How long a kill may take to be confirmed as a fully reaped tree.
 const CLEANUP_BOUND: Duration = Duration::from_secs(5);
 
@@ -932,11 +942,19 @@ async fn run(
     command.wrap(JobObject);
     #[cfg(unix)]
     command.wrap(ProcessSession);
-    let mut child = command.spawn().map_err(|error| {
-        HarnessError::new(
+    let mut child = command.spawn().map_err(|error| match error.kind() {
+        // The operating system refused to create the process: nothing ran, so
+        // the outcome is known and the caller may correct the call and retry.
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput => {
+            HarnessError::new(
+                ErrorCode::InvalidPayload,
+                format!("{NOT_STARTED} `{executable}`: {error}; nothing ran"),
+            )
+        }
+        _ => HarnessError::new(
             ErrorCode::ProcessOutcomeUnknown,
             format!("cannot spawn structured process: {error}"),
-        )
+        ),
     })?;
     #[cfg(unix)]
     let process_group_id = child.id().ok_or_else(|| {

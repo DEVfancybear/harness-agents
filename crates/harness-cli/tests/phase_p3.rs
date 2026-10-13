@@ -243,6 +243,129 @@ async fn review_p3_search_redacts_before_truncation() {
     close_writer(store).await;
 }
 
+/// A new project often starts as an empty folder, with no Git repository yet.
+/// Every tool that does not need Git works there, and the Git tools say there
+/// is no repository instead of failing as an unknown outcome.
+#[tokio::test]
+async fn p3_a_folder_without_git_supports_the_coding_tools() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("workspace");
+    fs::create_dir_all(&root).unwrap();
+    let store = writer(&temp).await;
+    let (session, task, _) = admit(&store, &root).await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let run = |action: CodingToolAction| {
+        let tools = &tools;
+        let session = &session;
+        let task = &task;
+        let root = &root;
+        async move {
+            let (prepared, approval) =
+                prepared_and_approved(tools, session, task, root, action).await;
+            tools.execute(prepared, Some(approval)).await
+        }
+    };
+    let written = run(CodingToolAction::WriteFile {
+        path: "game.js".to_owned(),
+        content: "let score = 0;\n".to_owned(),
+        expected_hash: None,
+    })
+    .await
+    .expect("write");
+    assert!(
+        matches!(written.output, ToolOutput::WriteFile { .. }),
+        "{:?}",
+        written.output
+    );
+    for action in [
+        CodingToolAction::ListFiles { path: None },
+        CodingToolAction::ReadFile {
+            path: "game.js".to_owned(),
+            offset: None,
+            limit: None,
+        },
+        CodingToolAction::SearchText {
+            query: "score".into(),
+            path: None,
+            regex: false,
+            case_insensitive: false,
+            glob: None,
+            context_lines: None,
+        },
+        process_action("Write-Output ok", 30_000),
+        CodingToolAction::GitStatus,
+        CodingToolAction::GitDiff { path: None },
+        CodingToolAction::GitLog {
+            limit: None,
+            path: None,
+        },
+    ] {
+        let name = format!("{action:?}");
+        let view = run(action)
+            .await
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        match &view.output {
+            ToolOutput::Git { output, .. } => {
+                assert!(output.contains("not a Git repository"), "{name}: {output}");
+                assert!(output.len() < 300, "{name}: no usage text: {output}");
+            }
+            ToolOutput::OutcomeUnknown { .. } | ToolOutput::Denied { .. } => {
+                panic!("{name}: {:?}", view.output)
+            }
+            _ => {}
+        }
+    }
+    drop(tools);
+    close_writer(store).await;
+}
+
+/// Seen in a session: `run_process executable=py` (and `which chromium`) on a
+/// host without them failed with "side effect may be uncertain; do not rerun
+/// automatically: `process_outcome_unknown`: ... program not found". Nothing
+/// ran, so it settles as a plain failure the model may correct.
+#[tokio::test]
+async fn p3_a_program_that_is_not_found_is_a_plain_failure() {
+    let temp = TempDir::new().unwrap();
+    let root = setup_workspace(&temp);
+    let store = writer(&temp).await;
+    let (session, task, _) = admit(&store, &root).await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let (prepared, approval) = prepared_and_approved(
+        &tools,
+        &session,
+        &task,
+        &root,
+        CodingToolAction::RunProcess {
+            executable: "ha-no-such-program-anywhere".to_owned(),
+            args: vec!["--version".to_owned()],
+            timeout_ms: 10_000,
+            isolation: IsolationMode::BestEffort,
+            env: Vec::new(),
+        },
+    )
+    .await;
+    let view = tools.execute(prepared, Some(approval)).await.unwrap();
+    let ToolOutput::Denied { code, reason } = &view.output else {
+        panic!("expected a plain failure, got {:?}", view.output)
+    };
+    assert_eq!(code, "invalid_payload");
+    assert!(reason.contains("did not start"), "{reason}");
+    assert!(reason.contains("ha-no-such-program-anywhere"), "{reason}");
+    assert_eq!(
+        view.receipt.expect("receipt").outcome_state,
+        ToolOutcomeState::Settled
+    );
+    assert!(
+        store
+            .pending_tool_intents(&session)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(tools);
+    close_writer(store).await;
+}
+
 /// Seen in a session: `search_text path=README.md` failed with "`search_text`
 /// path must be a directory" under "side effect may be uncertain; do not rerun
 /// automatically" - for a read. A file is searched now, and a read that fails

@@ -1337,6 +1337,22 @@ impl ToolExecutionService {
                 // disappearance/race remains an ordinary settled/unknown
                 // dispatch result, never an unsafe success.
                 let target = resolve_relative(root, path, false)?;
+                if !target.exists() {
+                    // A guessed path: name the files that do have its name,
+                    // so the next call reads one instead of guessing again.
+                    let found = crate::workspace::files_named_like(root, path);
+                    if !found.is_empty() {
+                        let shown = target.to_string_lossy();
+                        return Err(HarnessError::new(
+                            ErrorCode::InvalidPayload,
+                            format!(
+                                "File not found: {}; the workspace has: {}",
+                                shown.strip_prefix(r"\\?\").unwrap_or(&shown),
+                                found.join(", ")
+                            ),
+                        ));
+                    }
+                }
                 let _ = read_text(&target)?;
             }
             CodingToolAction::Glob { pattern, .. } => validate_glob(pattern)?,
@@ -1909,7 +1925,18 @@ impl ToolExecutionService {
         lease: crate::LeaseOwner,
         output: Result<ProcessResult, HarnessError>,
     ) -> Result<Dispatched, HarnessError> {
-        let output = output?;
+        let output = match output {
+            // Nothing ran: a plain failure the model may correct (another
+            // program, a full path), not an outcome to reconcile.
+            Err(error) if process::never_started(&error) => {
+                lease.release(&self.store, None).await?;
+                return Ok(Dispatched::plain(ToolOutput::Denied {
+                    code: error.code().as_str().to_owned(),
+                    reason: error.message().to_owned(),
+                }));
+            }
+            output => output?,
+        };
         let dispatched = self.dispatched_process(output)?;
         let flush = dispatched.artifact.clone().map(|artifact| {
             let store = Arc::clone(&self.store);
@@ -2590,6 +2617,19 @@ fn git_log_arguments(path: Option<&str>, limit: Option<u32>) -> Vec<String> {
 }
 
 fn git_output(operation: &str, output: ProcessResult) -> ToolOutput {
+    // A new project is often a folder with no repository yet. Git answers
+    // `diff` there with its whole usage text (6 KB the model reads for
+    // nothing) and the others with a fatal line; one sentence says it.
+    let lowered = output.stderr.to_ascii_lowercase();
+    if output.exit_code != Some(0) && lowered.contains("not a git repository") {
+        return ToolOutput::Git {
+            operation: operation.to_owned(),
+            output: format!(
+                "this workspace is not a Git repository, so git {operation} has nothing to show; the file tools work without one, and `git init` starts one when the user wants it"
+            ),
+            truncated: false,
+        };
+    }
     let combined = if output.stderr.is_empty() {
         output.stdout
     } else if output.stdout.is_empty() {
