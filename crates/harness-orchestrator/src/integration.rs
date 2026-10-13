@@ -6,6 +6,7 @@
 //! user's workspace fingerprint, and only then offers the final revision.
 
 use std::{
+    future::Future,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -61,6 +62,30 @@ pub enum FinalApply {
     Refused { reason: String },
 }
 
+/// What applying a ready integration to the user's checkout did.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ApplyOutcome {
+    /// The user's branch was fast-forwarded from `previous_head` to
+    /// `final_commit`; `git reset --keep <previous_head>` takes it back.
+    Applied {
+        branch: String,
+        previous_head: String,
+        final_commit: String,
+    },
+    /// Nothing in the user's checkout was touched.
+    Refused { reason: String },
+}
+
+/// How one final check ended, as a caller-supplied runner reports it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckResult {
+    pub command: String,
+    pub passed: bool,
+    pub exit_code: Option<i32>,
+    /// Why a failed check failed: its exit and output, for the failure list.
+    pub detail: String,
+}
+
 /// One branch to integrate.
 #[derive(Clone, Debug)]
 pub struct BranchCandidate {
@@ -99,6 +124,30 @@ impl ResultIntegrator {
         candidates: &[BranchCandidate],
         checks: &[String],
     ) -> Result<IntegrationOutcome, OrchestratorError> {
+        self.integrate_with(snapshot, order, candidates, |root| async move {
+            checks
+                .iter()
+                .map(|check| run_declared_check(&root, check))
+                .collect()
+        })
+        .await
+    }
+
+    /// [`Self::integrate`], with the final checks run by `run_checks` in the
+    /// integration root - so a host can run them the way it runs its own
+    /// project checks (its shell, its time limits). The shared Git lock is held
+    /// while they run: nothing resets the integration worktree under them.
+    pub async fn integrate_with<F, Fut>(
+        &self,
+        snapshot: &VerifiedSnapshot,
+        order: &[TaskId],
+        candidates: &[BranchCandidate],
+        run_checks: F,
+    ) -> Result<IntegrationOutcome, OrchestratorError>
+    where
+        F: FnOnce(PathBuf) -> Fut,
+        Fut: Future<Output = Vec<CheckResult>>,
+    {
         let by_task: std::collections::BTreeMap<String, &BranchCandidate> = candidates
             .iter()
             .map(|candidate| (candidate.task_id.as_str().to_owned(), candidate))
@@ -149,8 +198,17 @@ impl ResultIntegrator {
                         });
                     }
                     Err(error) => {
+                        let files = unmerged_paths(&root);
                         abort(&root);
-                        report.conflicts.push(format!("{task_id}: {error}"));
+                        report.conflicts.push(if files.is_empty() {
+                            format!("{task_id}: {error}")
+                        } else {
+                            format!(
+                                "{task_id}: {} conflicts in {}",
+                                candidate.branch,
+                                files.join(", ")
+                            )
+                        });
                     }
                 }
             }
@@ -165,7 +223,8 @@ impl ResultIntegrator {
         // `fingerprint_locked` is called directly: `integrate` already holds the
         // shared Git lock, and taking it again would deadlock.
         report.final_fingerprint = fingerprint_locked(&root)?;
-        let failures = run_final_checks(&root, &mut report, checks)?;
+        let results = run_checks(root.clone()).await;
+        let failures = record_final_checks(&root, &mut report, results)?;
         if !failures.is_empty() {
             return Ok(IntegrationOutcome::ChecksFailed {
                 report: Box::new(report),
@@ -199,6 +258,94 @@ impl ResultIntegrator {
             final_commit: report.final_commit.clone(),
         })
     }
+
+    /// Bring a ready integration into the user's checkout: recheck the
+    /// workspace fingerprint and fast-forward the user's branch to the final
+    /// revision, both under the shared Git lock so nothing moves in between.
+    ///
+    /// Only a fast-forward is made. The checkout must still be on a branch at
+    /// the commit the integration started from, with the fingerprint the
+    /// coders were given; otherwise nothing is touched and the refusal says
+    /// why. Uncommitted work is never reset, stashed or overwritten.
+    pub async fn apply_final(
+        &self,
+        user_root: impl AsRef<Path>,
+        expected: &ContentHash,
+        report: &IntegrationReport,
+    ) -> Result<ApplyOutcome, OrchestratorError> {
+        let user_root = user_root.as_ref().to_path_buf();
+        let _guard = self.git_lock.lock().await;
+        let current = fingerprint_locked(&user_root)?;
+        if &current != expected {
+            return Ok(ApplyOutcome::Refused {
+                reason: format!(
+                    "the user's workspace changed since the coders started ({} -> {}); \
+                     nothing was applied",
+                    expected.as_str(),
+                    current.as_str()
+                ),
+            });
+        }
+        let previous_head = head(&user_root)?;
+        if previous_head != report.base_commit {
+            return Ok(ApplyOutcome::Refused {
+                reason: format!(
+                    "the user's checkout is at {previous_head}, not at the integration base {}; \
+                     nothing was applied",
+                    report.base_commit
+                ),
+            });
+        }
+        let branch = git(&user_root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .map(|name| name.trim().to_owned())
+            .unwrap_or_default();
+        if branch.is_empty() {
+            return Ok(ApplyOutcome::Refused {
+                reason: "the user's checkout has a detached HEAD; nothing was applied".to_owned(),
+            });
+        }
+        let integration_root = PathBuf::from(&report.integration_root);
+        if head(&integration_root)? != report.final_commit {
+            return Ok(ApplyOutcome::Refused {
+                reason: format!(
+                    "the integration worktree no longer holds {}; integrate again",
+                    report.final_commit
+                ),
+            });
+        }
+        // The fetch writes only objects and FETCH_HEAD; the working tree
+        // changes with the fast-forward alone, which Git refuses rather than
+        // overwrite a local change.
+        git(
+            &user_root,
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                &integration_root.to_string_lossy(),
+                "HEAD",
+            ],
+        )?;
+        let fetched = git(&user_root, &["rev-parse", "FETCH_HEAD"])?;
+        if fetched.trim() != report.final_commit {
+            return Ok(ApplyOutcome::Refused {
+                reason: format!(
+                    "fetched {} instead of the final revision {}; nothing was applied",
+                    fetched.trim(),
+                    report.final_commit
+                ),
+            });
+        }
+        git(
+            &user_root,
+            &["merge", "--ff-only", "--quiet", &report.final_commit],
+        )?;
+        Ok(ApplyOutcome::Applied {
+            branch,
+            previous_head,
+            final_commit: report.final_commit.clone(),
+        })
+    }
 }
 
 fn prepare_integration_worktree(
@@ -215,7 +362,23 @@ fn prepare_integration_worktree(
         })?;
     }
     if root.join(".git").exists() {
-        let _ = git(root, &["checkout", "--force", &snapshot.base_commit]);
+        // The clone is kept between integrations, so a base the project
+        // committed since is fetched before it is checked out: a checkout that
+        // failed quietly left the next integration on an older base.
+        let commit = format!("{}^{{commit}}", snapshot.base_commit);
+        if git(root, &["cat-file", "-e", &commit]).is_err() {
+            git(
+                root,
+                &[
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    &source.to_string_lossy(),
+                    "+HEAD:refs/harness/source-head",
+                ],
+            )?;
+        }
+        git(root, &["checkout", "--force", &snapshot.base_commit])?;
         let _ = git(root, &["merge", "--abort"]);
         let _ = git(root, &["reset", "--hard", &snapshot.base_commit]);
         let _ = git(root, &["clean", "-fd"]);
@@ -263,6 +426,20 @@ fn integrate_branch(
     Ok(())
 }
 
+/// The paths a failed merge left unmerged.
+fn unmerged_paths(root: &Path) -> Vec<String> {
+    git(root, &["diff", "--name-only", "--diff-filter=U"])
+        .map(|names| {
+            names
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn abort(root: &Path) {
     let _ = git(root, &["merge", "--abort"]);
 }
@@ -270,61 +447,62 @@ fn abort(root: &Path) {
 fn head(root: &Path) -> Result<String, OrchestratorError> {
     Ok(git(root, &["rev-parse", "HEAD"])?.trim().to_owned())
 }
-fn run_check(root: &Path, command: &str) -> Result<std::process::Output, OrchestratorError> {
+
+/// Run one declared check without a shell, as [`split_command`] reads it.
+fn run_declared_check(root: &Path, command: &str) -> CheckResult {
     let (program, arguments) = split_command(command);
     if program.is_empty() {
-        return Err(OrchestratorError::new(
-            ErrorCode::InvalidPayload,
-            "an integration check requires a command",
-        ));
+        return CheckResult {
+            command: command.to_owned(),
+            passed: false,
+            exit_code: None,
+            detail: "an integration check requires a command".to_owned(),
+        };
     }
-    let output = Command::new(&program)
+    match Command::new(&program)
         .args(&arguments)
         .current_dir(root)
         .output()
-        .map_err(|error| {
-            OrchestratorError::new(
-                ErrorCode::ProcessCanceled,
-                format!("cannot run check {command}: {error}"),
-            )
-        })?;
-    Ok(output)
+    {
+        Ok(output) => CheckResult {
+            command: command.to_owned(),
+            passed: output.status.success(),
+            exit_code: output.status.code(),
+            detail: format!(
+                "exited with status {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        },
+        Err(error) => CheckResult {
+            command: command.to_owned(),
+            passed: false,
+            exit_code: None,
+            detail: format!("cannot run check {command}: {error}"),
+        },
+    }
 }
 
-fn run_final_checks(
+/// Record each check against the integrated revision and the tree it ran on;
+/// the failures come back as `command: why`.
+fn record_final_checks(
     root: &Path,
     report: &mut IntegrationReport,
-    checks: &[String],
+    results: Vec<CheckResult>,
 ) -> Result<Vec<String>, OrchestratorError> {
     let mut failures = Vec::new();
-    for check in checks {
-        let execution = run_check(root, check);
-        let exit_code = execution
-            .as_ref()
-            .ok()
-            .and_then(|output| output.status.code());
-        let passed = execution
-            .as_ref()
-            .is_ok_and(|output| output.status.success());
-        if !passed {
-            let detail = match execution {
-                Ok(output) => format!(
-                    "exited with status {:?}: {}",
-                    output.status.code(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-                Err(error) => error.to_string(),
-            };
-            failures.push(format!("{check}: {detail}"));
+    for result in results {
+        if !result.passed {
+            failures.push(format!("{}: {}", result.command, result.detail));
         }
         let workspace_digest = fingerprint_locked(root)?;
         report.final_fingerprint = workspace_digest.clone();
         report.checks.push(CheckedRevision {
-            command: check.clone(),
+            command: result.command,
             revision: report.final_commit.clone(),
-            passed,
+            passed: result.passed,
             workspace_digest: Some(workspace_digest),
-            exit_code,
+            exit_code: result.exit_code,
             artifact_id: None,
         });
     }
@@ -332,12 +510,74 @@ fn run_final_checks(
 }
 
 /// Split a check string into a program and arguments without a shell.
+///
+/// Words are separated by whitespace outside quotes. Single quotes keep
+/// everything literally; double quotes keep everything but `\"` and `\\`,
+/// which stand for `"` and `\`. Outside quotes a backslash escapes only a
+/// quote or whitespace, so a Windows path such as `C:\tools\x` or
+/// `\\server\share` keeps its separators. `""` and `''` are empty arguments; an unterminated
+/// quote runs to the end of the string.
 #[must_use]
 pub fn split_command(command: &str) -> (String, Vec<String>) {
-    let mut parts = command.split_whitespace();
-    let program = parts.next().unwrap_or_default().to_owned();
-    let arguments = parts.map(str::to_owned).collect();
-    (program, arguments)
+    #[derive(Clone, Copy)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    // A quoted empty string is still a word.
+    let mut started = false;
+    let mut quote = Quote::None;
+    let mut characters = command.chars().peekable();
+    while let Some(character) = characters.next() {
+        match (quote, character) {
+            (Quote::Single, '\'') | (Quote::Double, '"') => quote = Quote::None,
+            (Quote::Double, '\\') => match characters.peek() {
+                Some(&next @ ('"' | '\\')) => {
+                    word.push(next);
+                    characters.next();
+                }
+                _ => word.push('\\'),
+            },
+            (Quote::Single | Quote::Double, other) => word.push(other),
+            (Quote::None, '\'') => {
+                quote = Quote::Single;
+                started = true;
+            }
+            (Quote::None, '"') => {
+                quote = Quote::Double;
+                started = true;
+            }
+            (Quote::None, '\\') => {
+                match characters.peek() {
+                    Some(&next) if matches!(next, '"' | '\'') || next.is_whitespace() => {
+                        word.push(next);
+                        characters.next();
+                    }
+                    _ => word.push('\\'),
+                }
+                started = true;
+            }
+            (Quote::None, space) if space.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            (Quote::None, other) => {
+                word.push(other);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    let mut words = words.into_iter();
+    let program = words.next().unwrap_or_default();
+    (program, words.collect())
 }
 
 /// Build one branch candidate from a host-owned worktree record.
@@ -392,4 +632,57 @@ fn git(root: &Path, arguments: &[&str]) -> Result<String, OrchestratorError> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_command;
+
+    fn split(command: &str) -> Vec<String> {
+        let (program, mut arguments) = split_command(command);
+        arguments.insert(0, program);
+        arguments
+    }
+
+    #[test]
+    fn plain_words_split_on_whitespace() {
+        assert_eq!(
+            split("cargo  test\t--workspace"),
+            ["cargo", "test", "--workspace"]
+        );
+        assert_eq!(split_command("   "), (String::new(), Vec::new()));
+    }
+
+    /// A quoted argument used to be cut at its spaces, so `--format="%H %s"`
+    /// reached the program as two broken arguments.
+    #[test]
+    fn quoted_arguments_stay_whole() {
+        assert_eq!(
+            split(r#"git log --format="%H %s" -n 1"#),
+            ["git", "log", "--format=%H %s", "-n", "1"]
+        );
+        assert_eq!(
+            split("grep -r 'two words' src"),
+            ["grep", "-r", "two words", "src"]
+        );
+        assert_eq!(split(r#"echo "" ''"#), ["echo", "", ""]);
+        assert_eq!(
+            split(r#"echo "say \"hi\"" 'it''s'"#),
+            ["echo", r#"say "hi""#, "its"]
+        );
+        assert_eq!(
+            split(r#"echo "unterminated arg"#),
+            ["echo", "unterminated arg"]
+        );
+    }
+
+    #[test]
+    fn backslashes_escape_only_quotes_and_spaces() {
+        assert_eq!(
+            split(r"C:\tools\check.exe --dir \server\share"),
+            [r"C:\tools\check.exe", "--dir", r"\server\share"]
+        );
+        assert_eq!(split(r"echo a\ b \'x"), ["echo", "a b", "'x"]);
+        assert_eq!(split(r#"echo "C:\dir\\""#), ["echo", r"C:\dir\"]);
+    }
 }

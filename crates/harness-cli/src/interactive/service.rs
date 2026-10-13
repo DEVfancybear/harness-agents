@@ -7633,6 +7633,7 @@ async fn run_turn(
             web: web_host
                 .as_ref()
                 .map(|host| (host.tools(), host.dispatcher())),
+            checks: config.verify.checks.clone(),
         },
         cancellation.clone(),
     ));

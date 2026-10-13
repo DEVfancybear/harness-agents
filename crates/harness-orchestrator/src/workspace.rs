@@ -302,6 +302,13 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    /// The commit a worktree's HEAD is at.
+    pub async fn head_revision(&self, worktree: &str) -> Result<String, OrchestratorError> {
+        let root = PathBuf::from(worktree);
+        let _guard = self.git_lock.lock().await;
+        Ok(git(&root, &["rev-parse", "HEAD"])?.trim().to_owned())
+    }
+
     /// Compute the change set of a branch relative to a base commit.
     pub async fn branch_changes(
         &self,

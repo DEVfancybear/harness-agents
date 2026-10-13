@@ -62,7 +62,8 @@ impl ToolKind {
             }
             "git_status" | "git_diff" | "git_log" => Self::Git,
             "web_search" | "web_fetch" => Self::Web,
-            "delegate" | "list_subagents" | "agent_message" | "stop_subagent" => Self::Agent,
+            "delegate" | "list_subagents" | "agent_message" | "stop_subagent"
+            | "integrate_children" => Self::Agent,
             "ipython" => Self::Python,
             "activate_skill" | "list_skills" | "read_skill_file" => Self::Skill,
             "ask_user" => Self::Ask,

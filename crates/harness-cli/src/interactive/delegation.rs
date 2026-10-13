@@ -31,10 +31,11 @@ use std::{
 };
 
 use harness_orchestrator::{
-    AgentRole, BudgetLedger, BudgetUsage, DelegatedOutcome, DelegatedResult, DelegationBudget,
-    DelegationGrants, DirtyReason, GrantAction, InputInspection, OrchestratorError,
-    SchedulerConfig, TaskBrief, VerifiedSnapshot, WorkerBackend, WorkerOutcome, WorkerRequest,
-    WorkerScheduler, WorkspaceManager, WorktreeRecord,
+    AgentRole, ApplyOutcome, BudgetLedger, BudgetUsage, CheckResult, DelegatedOutcome,
+    DelegatedResult, DelegationBudget, DelegationGrants, DirtyReason, FinalApply, GrantAction,
+    InputInspection, IntegrationOutcome, OrchestratorError, ResultIntegrator, SchedulerConfig,
+    TaskBrief, VerifiedSnapshot, WorkerBackend, WorkerOutcome, WorkerRequest, WorkerScheduler,
+    WorkspaceManager, WorktreeRecord,
 };
 use harness_providers::{CancellationToken, MessageRole, ModelProvider, ProviderMessage};
 use harness_runtime::{RunInbox, RunRequest, RuntimeConfig, RuntimeService};
@@ -253,6 +254,9 @@ pub struct ChildLaunch {
     pub web: Option<ChildWebTools>,
     /// Which models edit by hashline anchors; a child's own model decides.
     pub hashline: super::config::HashlineRule,
+    /// The project's `[verify]` checks: `integrate_children` runs them on the
+    /// merged revision of its coders before anything reaches the user.
+    pub checks: Vec<super::verify::Check>,
 }
 
 impl ChildLaunch {
@@ -397,6 +401,9 @@ struct ChildRecord {
     wake: Option<String>,
     /// The task the child was given, for a brief rebuilt after a restart.
     objective: String,
+    /// The commit a coder's work reached the user's checkout in, once
+    /// `integrate_children` applied it.
+    integrated: Option<String>,
 }
 
 /// One child in the spawn ledger.
@@ -547,6 +554,7 @@ impl ChildRecord {
                 .collect(),
             wake: None,
             objective: entry.objective,
+            integrated: None,
         })
     }
     fn elapsed_ms(&self) -> i64 {
@@ -1529,6 +1537,8 @@ fn state_payload(role: AgentRole, name: &str, state: &ChildState) -> Value {
             // object. Keep the failure/partial warning in that text as well.
             "text": if matches!(state, ChildState::Partial { .. }) {
                 terminal_notice(name, state, false, None).unwrap_or_default()
+            } else if let Some(branch) = detail["branch"].as_str() {
+                format!("{answer}\n\n[coder {name}: its changes are on branch {branch} in its own worktree, not in the user's checkout. Call integrate_children to merge them, run the project checks on the merged revision and bring them in.]")
             } else { answer.clone() },
             "partial_answer": if matches!(state, ChildState::Partial { .. }) { Some(answer) } else { None },
             "receipts_digest": detail["receipts_digest"],
@@ -2212,6 +2222,7 @@ impl SessionAgents {
                 history: Vec::new(),
                 wake: None,
                 objective: brief_text.clone(),
+                integrated: None,
             });
         }
         self.shared.persist_ledger();
@@ -2410,34 +2421,170 @@ struct DelegateCatalog;
 
 impl ExternalToolCatalog for DelegateCatalog {
     fn schemas(&self) -> Vec<Value> {
-        vec![json!({
-            "type": "function",
-            "function": {
-                "name": "delegate",
-                "description": "Delegate a bounded explorer or an isolated-worktree coder to investigate or implement the brief, or a verifier to check work independently: a verifier starts with a fresh context, cannot edit, runs what shows whether the work holds and ends with VERDICT: PASS or VERDICT: FAIL - use it before you call work done, since the agent that wrote the work is too generous grading it. By default the call waits for the child's answer; with wait=false it returns at once, the child keeps running after this turn, and its result arrives later as a [child-exited ...] or [child-failed ...] message.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "role": {"type": "string", "enum": ["explorer", "coder", "verifier"]},
-                        "brief": {"type": "string", "minLength": 1, "maxLength": MAX_BRIEF_BYTES},
-                        "wait": {"type": "boolean", "description": "Wait for the child's answer (default true)."}
-                    },
-                    "required": ["role", "brief"],
-                    "additionalProperties": false
+        vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "delegate",
+                    "description": "Delegate a bounded explorer or an isolated-worktree coder to investigate or implement the brief, or a verifier to check work independently: a verifier starts with a fresh context, cannot edit, runs what shows whether the work holds and ends with VERDICT: PASS or VERDICT: FAIL - use it before you call work done, since the agent that wrote the work is too generous grading it. By default the call waits for the child's answer; with wait=false it returns at once, the child keeps running after this turn, and its result arrives later as a [child-exited ...] or [child-failed ...] message.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "role": {"type": "string", "enum": ["explorer", "coder", "verifier"]},
+                            "brief": {"type": "string", "minLength": 1, "maxLength": MAX_BRIEF_BYTES},
+                            "wait": {"type": "boolean", "description": "Wait for the child's answer (default true)."}
+                        },
+                        "required": ["role", "brief"],
+                        "additionalProperties": false
+                    }
                 }
-            }
-        })]
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": INTEGRATE_TOOL,
+                    "description": "Bring finished coder children's work into the user's checkout. Each coder's remaining changes are committed on its branch, the branches are merged in order in a separate integration worktree, and the project's [verify] checks run on the merged revision. The result is `ready` (with the final commit), `conflicted` (with the conflicting files), `checks_failed` (with the failing check and its output) or `refused` (the user's checkout changed since the coders started; nothing is touched). With apply=true a ready result fast-forwards the user's current branch to the final commit - never a reset, never over uncommitted work - and says how to undo it; without it, nothing in the user's checkout changes.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "children": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1},
+                                "maxItems": 16,
+                                "description": "Coder children by name or id, merged in this order. Default: every finished coder not yet integrated, oldest first."
+                            },
+                            "apply": {"type": "boolean", "description": "Fast-forward the user's branch to a ready result (default false)."}
+                        },
+                        "additionalProperties": false
+                    }
+                }
+            }),
+        ]
     }
 
     fn resolve(&self, name: &str, arguments: &Value) -> Option<CodingToolAction> {
-        (name == "delegate").then(|| CodingToolAction::ExternalTool {
+        matches!(name, "delegate" | INTEGRATE_TOOL).then(|| CodingToolAction::ExternalTool {
             plugin_id: "delegate".to_owned(),
-            tool_name: "delegate".to_owned(),
+            tool_name: name.to_owned(),
             arguments: arguments.clone(),
             parent_invocation_id: None,
             timeout_ms: 120_000,
         })
     }
+}
+
+/// The root agent's tool that brings its coders' work back.
+const INTEGRATE_TOOL: &str = "integrate_children";
+
+/// What `integrate_children` was asked for.
+struct IntegrateRequest {
+    children: Option<Vec<String>>,
+    apply: bool,
+}
+
+impl IntegrateRequest {
+    fn parse(arguments: &Value) -> Result<Self, HarnessError> {
+        let invalid = |message: &str| HarnessError::new(ErrorCode::InvalidPayload, message);
+        let object = arguments
+            .as_object()
+            .ok_or_else(|| invalid("integrate_children arguments must be an object"))?;
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "children" | "apply"))
+        {
+            return Err(invalid(
+                "integrate_children accepts only children and apply",
+            ));
+        }
+        let children = match object.get("children") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(items)) => Some(
+                items
+                    .iter()
+                    .map(|item| {
+                        item.as_str()
+                            .map(str::trim)
+                            .filter(|item| !item.is_empty())
+                            .map(str::to_owned)
+                            .ok_or_else(|| invalid("each child must be a non-empty name or id"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .filter(|children| !children.is_empty()),
+            Some(_) => return Err(invalid("children must be a list of names or ids")),
+        };
+        let apply = match object.get("apply") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(apply)) => *apply,
+            Some(_) => return Err(invalid("apply must be true or false")),
+        };
+        Ok(Self { children, apply })
+    }
+}
+
+/// One coder `integrate_children` merges.
+struct IntegrationMember {
+    task_id: TaskId,
+    name: String,
+    worktree: WorktreeRecord,
+}
+
+/// The `integrate_children` result: the text the model reads and the fields
+/// a caller can match on.
+fn integration_payload(status: &str, text: String, extra: Value) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("status".to_owned(), Value::String(status.to_owned()));
+    payload.insert("text".to_owned(), Value::String(text));
+    if let Value::Object(extra) = extra {
+        payload.extend(extra);
+    }
+    Value::Object(payload)
+}
+
+/// Replace the task ids an integration report names with the children's names.
+fn name_children(text: &str, members: &[IntegrationMember]) -> String {
+    members.iter().fold(text.to_owned(), |text, member| {
+        text.replace(member.task_id.as_str(), &member.name)
+    })
+}
+
+/// The project's checks as the integration runs them: the `[verify]` way, in
+/// the shell, stopping at the first failure.
+async fn run_integration_checks(
+    root: PathBuf,
+    checks: Vec<super::verify::Check>,
+    cancellation: CancellationToken,
+) -> Vec<CheckResult> {
+    let report = super::verify::run(&root, &checks, &cancellation).await;
+    let mut results = report
+        .runs
+        .iter()
+        .map(|run| CheckResult {
+            command: format!("{} (`{}`)", run.name, run.command),
+            passed: run.passed,
+            exit_code: run
+                .exit_text
+                .strip_prefix("exited ")
+                .and_then(|code| code.parse().ok()),
+            detail: if run.output.is_empty() {
+                run.exit_text.clone()
+            } else {
+                format!("{}\n{}", run.exit_text, run.output)
+            },
+        })
+        .collect::<Vec<_>>();
+    // A check never reached is not a pass.
+    for check in checks.iter().skip(report.runs.len()) {
+        if report.failure().is_none() {
+            results.push(CheckResult {
+                command: format!("{} (`{}`)", check.name, check.command),
+                passed: false,
+                exit_code: None,
+                detail: "did not run".to_owned(),
+            });
+        }
+    }
+    results
 }
 
 /// The `delegate` tool of one turn.
@@ -2541,6 +2688,326 @@ impl DelegateTool {
         };
         Ok(payload)
     }
+
+    /// The coders `integrate_children` merges, in order: the named ones, or
+    /// every finished coder of the root agent not yet integrated.
+    fn integration_members(
+        &self,
+        selectors: Option<&[String]>,
+    ) -> Result<Vec<IntegrationMember>, HarnessError> {
+        let invalid = |message: String| HarnessError::new(ErrorCode::InvalidPayload, message);
+        let shared = &self.agents.shared;
+        let named = match selectors {
+            Some(selectors) => {
+                let mut ids = Vec::new();
+                for selector in selectors {
+                    let id = shared.find(None, selector).ok_or_else(|| {
+                        invalid(format!("no child of yours is named {selector:?}"))
+                    })?;
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                Some(ids)
+            }
+            None => None,
+        };
+        let children = shared
+            .children
+            .lock()
+            .map_err(|_| invalid("the children's records are unavailable".to_owned()))?;
+        let members = match named {
+            Some(ids) => ids
+                .iter()
+                .map(|id| {
+                    let child = children
+                        .iter()
+                        .find(|child| &child.task_id == id)
+                        .ok_or_else(|| invalid(format!("child {id} is gone")))?;
+                    if child.role != AgentRole::Coder {
+                        return Err(invalid(format!(
+                            "{} is a {}, and only a coder has work to integrate",
+                            child.name,
+                            child.role.as_str()
+                        )));
+                    }
+                    if !child.state.settled() {
+                        return Err(invalid(format!(
+                            "coder {} is still running; wait for its result first",
+                            child.name
+                        )));
+                    }
+                    let worktree = child.worktree.clone().ok_or_else(|| {
+                        invalid(format!(
+                            "coder {} has no worktree in this session (it came back from an earlier one)",
+                            child.name
+                        ))
+                    })?;
+                    Ok(IntegrationMember {
+                        task_id: child.task_id.clone(),
+                        name: child.name.clone(),
+                        worktree,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            None => children
+                .iter()
+                .filter(|child| {
+                    !child.deleted
+                        && child.parent.is_none()
+                        && child.role == AgentRole::Coder
+                        && matches!(child.state, ChildState::Done { .. })
+                        && child.integrated.is_none()
+                })
+                .filter_map(|child| {
+                    Some(IntegrationMember {
+                        task_id: child.task_id.clone(),
+                        name: child.name.clone(),
+                        worktree: child.worktree.clone()?,
+                    })
+                })
+                .collect(),
+        };
+        if members.is_empty() {
+            return Err(invalid(
+                "no finished coder child has work to integrate; delegate to a coder first, or name the coders"
+                    .to_owned(),
+            ));
+        }
+        Ok(members)
+    }
+
+    /// `integrate_children`: merge finished coders' branches in a separate
+    /// integration worktree, run the project's checks on the merged revision
+    /// and - when asked and the user's checkout has not moved - fast-forward
+    /// the user's branch to it. Every outcome is a result the model reads; an
+    /// error is left for what could not be attempted at all.
+    #[allow(clippy::too_many_lines, reason = "one integration, told in order")]
+    async fn integrate(&self, arguments: &Value) -> Result<Value, HarnessError> {
+        fn short(commit: &str) -> &str {
+            &commit[..commit.len().min(12)]
+        }
+        let failed = |error: OrchestratorError| HarnessError::new(error.code(), error.to_string());
+        let request = IntegrateRequest::parse(arguments)?;
+        let members = self.integration_members(request.children.as_deref())?;
+        let names = members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let first = &members[0].worktree;
+        if let Some(other) = members.iter().find(|member| {
+            member.worktree.base_commit != first.base_commit
+                || member.worktree.input_fingerprint != first.input_fingerprint
+        }) {
+            return Ok(integration_payload(
+                "refused",
+                format!(
+                    "Refused: coders {} and {} started from different states of the user's checkout ({} and {}), so one of them works on an outdated copy. Nothing was merged or applied. Integrate the coders that started from the current state, or delegate the work again.",
+                    members[0].name,
+                    other.name,
+                    short(&first.base_commit),
+                    short(&other.worktree.base_commit)
+                ),
+                json!({ "children": names }),
+            ));
+        }
+        let manager = &self.agents.workspace_manager;
+        let user_root = &self.launch.workspace_root;
+        let expected = first.input_fingerprint.clone();
+        let refused = |reason: &str| {
+            integration_payload(
+                "refused",
+                format!(
+                    "Refused: {reason}. The user's checkout was not touched. Ask the user how to proceed: commit or set aside their changes and delegate again, or merge the coders' branches by hand."
+                ),
+                json!({ "children": names, "reason": reason }),
+            )
+        };
+        if manager.fingerprint(user_root).await.map_err(failed)? != expected {
+            return Ok(refused(&format!(
+                "the user's checkout changed since coder {} started (a commit, an edit or a new file), so its work no longer applies to what the user has",
+                members[0].name
+            )));
+        }
+        let mut candidates = Vec::new();
+        for member in &members {
+            let title = self
+                .agents
+                .shared
+                .update(&member.task_id, |child| {
+                    first_line(&child.objective)
+                        .chars()
+                        .take(60)
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            match manager
+                .commit_worker_changes(&member.worktree, &format!("coder {}: {title}", member.name))
+                .await
+            {
+                // Nothing left uncommitted: the coder committed its work itself.
+                Err(error) if error.code() == ErrorCode::ResultIncomplete => {}
+                Err(error) => return Err(failed(error)),
+                Ok(_) => {}
+            }
+            let revision = manager
+                .head_revision(&member.worktree.path)
+                .await
+                .map_err(failed)?;
+            let changes = manager
+                .branch_changes(&member.worktree.path, &member.worktree.base_commit)
+                .await
+                .map_err(failed)?;
+            candidates.push(harness_orchestrator::workspace_candidate(
+                &member.worktree,
+                &revision,
+                changes.paths,
+            ));
+        }
+        if candidates
+            .iter()
+            .all(|candidate| candidate.files.is_empty())
+        {
+            return Ok(integration_payload(
+                "empty",
+                format!("Nothing to integrate: {names} changed no file in their worktrees."),
+                json!({ "children": names }),
+            ));
+        }
+        let snapshot = VerifiedSnapshot {
+            project_id: first.project_id.clone(),
+            root: user_root.to_string_lossy().into_owned(),
+            base_commit: first.base_commit.clone(),
+            base_branch: first.base_branch.clone(),
+            fingerprint: expected.clone(),
+        };
+        let order = members
+            .iter()
+            .map(|member| member.task_id.clone())
+            .collect::<Vec<_>>();
+        let integrator = ResultIntegrator::new(Arc::clone(manager));
+        let checks = self.launch.checks.clone();
+        let cancellation = self.parent_cancellation.clone();
+        let outcome = integrator
+            .integrate_with(&snapshot, &order, &candidates, |root| {
+                run_integration_checks(root, checks, cancellation)
+            })
+            .await
+            .map_err(failed)?;
+        let report = match outcome {
+            IntegrationOutcome::Conflicted { conflicts, report } => {
+                let conflicts = conflicts
+                    .iter()
+                    .map(|conflict| name_children(conflict, &members))
+                    .collect::<Vec<_>>();
+                return Ok(integration_payload(
+                    "conflicted",
+                    format!(
+                        "Conflicted: the coders' branches do not merge cleanly.\n{}\nNothing was applied and the user's checkout was not touched. {} of {} branch(es) merged before the conflict. Resolve it by delegating one coder to redo its change on top of the other's, or by narrowing the coders to separate files.",
+                        conflicts
+                            .iter()
+                            .map(|conflict| format!("- {conflict}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        report.steps.len(),
+                        members.len()
+                    ),
+                    json!({ "children": names, "conflicts": conflicts }),
+                ));
+            }
+            IntegrationOutcome::ChecksFailed { failures, report } => {
+                return Ok(integration_payload(
+                    "checks_failed",
+                    format!(
+                        "Checks failed on the merged revision {} of {names} (in the integration worktree {}):\n{}\nNothing was applied and the user's checkout was not touched. Fix the failure through a coder and integrate again; do not weaken or skip the check.",
+                        short(&report.final_commit),
+                        report.integration_root,
+                        failures
+                            .iter()
+                            .map(|failure| format!("- {failure}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ),
+                    json!({
+                        "children": names,
+                        "final_commit": report.final_commit,
+                        "failures": failures,
+                    }),
+                ));
+            }
+            IntegrationOutcome::Ready(report) => report,
+        };
+        let checks_line = if report.checks.is_empty() {
+            "No [verify] checks are configured, so the merged revision was not checked.".to_owned()
+        } else {
+            format!(
+                "The project checks passed on it: {}.",
+                report
+                    .checks
+                    .iter()
+                    .map(|check| check.command.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        if !request.apply {
+            return Ok(
+                match integrator
+                    .recheck_before_apply(user_root, &expected, &report)
+                    .await
+                    .map_err(failed)?
+                {
+                    FinalApply::Allowed { final_commit } => integration_payload(
+                        "ready",
+                        format!(
+                            "Ready: {names} merged cleanly into {final_commit} in the integration worktree {}. {checks_line} The user's checkout is unchanged. Call integrate_children again with apply=true to fast-forward the user's branch to it, or the user can do it with `git fetch \"{}\" HEAD` and then `git merge --ff-only {final_commit}`.",
+                            report.integration_root, report.integration_root
+                        ),
+                        json!({
+                            "children": names,
+                            "final_commit": final_commit,
+                            "integration_root": report.integration_root,
+                        }),
+                    ),
+                    FinalApply::Refused { reason } => refused(&reason),
+                },
+            );
+        }
+        Ok(
+            match integrator
+                .apply_final(user_root, &expected, &report)
+                .await
+                .map_err(failed)?
+            {
+                ApplyOutcome::Applied {
+                    branch,
+                    previous_head,
+                    final_commit,
+                } => {
+                    for member in &members {
+                        self.agents.shared.update(&member.task_id, |child| {
+                            child.integrated = Some(final_commit.clone());
+                        });
+                    }
+                    integration_payload(
+                        "applied",
+                        format!(
+                            "Applied: {names} merged into {final_commit}, and the user's branch {branch} was fast-forwarded to it from {}. {checks_line} To undo, the user can run `git reset --keep {previous_head}`.",
+                            short(&previous_head)
+                        ),
+                        json!({
+                            "children": names,
+                            "final_commit": final_commit,
+                            "previous_head": previous_head,
+                            "branch": branch,
+                        }),
+                    )
+                }
+                ApplyOutcome::Refused { reason } => refused(&reason),
+            },
+        )
+    }
 }
 
 impl ExternalToolDispatcher for DelegateTool {
@@ -2552,6 +3019,9 @@ impl ExternalToolDispatcher for DelegateTool {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), HarnessError>> + Send + 'a>>
     {
         Box::pin(async move {
+            if plugin_id == "delegate" && tool_name == INTEGRATE_TOOL {
+                return IntegrateRequest::parse(arguments).map(|_| ());
+            }
             if plugin_id != "delegate" || tool_name != "delegate" {
                 return Err(HarnessError::new(
                     ErrorCode::PolicyDenied,
@@ -2585,16 +3055,19 @@ impl ExternalToolDispatcher for DelegateTool {
         Box<dyn std::future::Future<Output = Result<ToolOutput, HarnessError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            if plugin_id != "delegate" || tool_name != "delegate" {
-                return Err(HarnessError::new(
-                    ErrorCode::PolicyDenied,
-                    "delegation target is unavailable",
-                ));
-            }
-            let payload = self.run(arguments).await?;
+            let payload = match (plugin_id, tool_name) {
+                ("delegate", "delegate") => self.run(arguments).await?,
+                ("delegate", INTEGRATE_TOOL) => self.integrate(arguments).await?,
+                _ => {
+                    return Err(HarnessError::new(
+                        ErrorCode::PolicyDenied,
+                        "delegation target is unavailable",
+                    ));
+                }
+            };
             Ok(ToolOutput::ExternalTool {
                 plugin_id: "delegate".to_owned(),
-                tool_name: "delegate".to_owned(),
+                tool_name: tool_name.to_owned(),
                 payload,
                 inflight: 1,
             })
@@ -3483,7 +3956,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                         child_policy(&launch.parent_policy),
                         harness_tools::coding_tool_schemas_for(hashline),
                         format!(
-                            "You are a delegated coder. Work only in the assigned isolated M8-03 worktree and follow the brief. Tool calls use the host approval and policy service. Leave your changes in that worktree and report what changed; do not claim the changes were merged into the user's checkout.{spawn_line}"
+                            "You are a delegated coder. Work only in the assigned isolated M8-03 worktree and follow the brief. Tool calls use the host approval and policy service. Leave your changes in that worktree (committed or not) and report what changed, with paths; do not merge, push or copy them into the user's checkout and do not claim they are there - your parent brings them in with integrate_children, which merges every coder's branch, runs the project checks on the result and applies it only if the user's checkout has not changed.{spawn_line}"
                         ),
                     )
                 }
@@ -4452,6 +4925,7 @@ pub(super) mod tests {
             child_limits: harness_tools::TurnLimits::default(),
             web: None,
             hashline: super::super::config::HashlineRule::Off,
+            checks: Vec::new(),
         }
     }
 
@@ -4524,6 +4998,308 @@ pub(super) mod tests {
             std::fs::read_to_string(repo.join("uncommitted.txt")).expect("user change remains"),
             "preserve me\n"
         );
+    }
+
+    /// A coder that writes each `path=content` line of its brief into its
+    /// worktree and reports what it did, as a real coder leaves its work.
+    struct EditingCoder;
+
+    impl harness_orchestrator::WorkerBackend for EditingCoder {
+        fn dispatch(
+            &self,
+            request: harness_orchestrator::WorkerRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = harness_orchestrator::WorkerOutcome> + Send + '_>,
+        > {
+            Box::pin(async move {
+                let worktree = request.worktree.clone().expect("a coder has its worktree");
+                for line in request.brief.objective.lines() {
+                    if let Some((path, content)) = line.split_once('=') {
+                        std::fs::write(
+                            std::path::Path::new(&worktree.path).join(path),
+                            format!("{content}\n"),
+                        )
+                        .expect("the coder writes in its worktree");
+                    }
+                }
+                harness_orchestrator::WorkerOutcome::Reported(Box::new(
+                    harness_orchestrator::DelegatedResult {
+                        schema_version: harness_orchestrator::DELEGATION_CONTRACT_VERSION,
+                        result_id: "result".to_owned(),
+                        task_id: request.task_id.clone(),
+                        worker: harness_orchestrator::WorkerRef {
+                            profile_id: harness_types::AgentProfileId::generate(),
+                            run_id: request.run_id,
+                            role: request.brief.role,
+                            generation: request.generation,
+                        },
+                        outcome: harness_orchestrator::DelegatedOutcome::Completed,
+                        summary: format!("edited: {}", request.brief.objective),
+                        artifact_refs: Vec::new(),
+                        base_revision: request.brief.base_commit.clone(),
+                        result_revision: request.brief.base_commit.clone(),
+                        checked_revisions: Vec::new(),
+                        check_receipts: Vec::new(),
+                        usage: harness_orchestrator::BudgetUsage {
+                            model_requests: 1,
+                            retries: 0,
+                        },
+                        detail: serde_json::json!({
+                            "worktree_id": worktree.worktree_id,
+                            "worktree_path": worktree.path,
+                            "branch": worktree.branch,
+                        }),
+                    },
+                ))
+            })
+        }
+    }
+
+    /// A user's repository with `notes.txt`, the session's children over it,
+    /// and the root agent's delegate tool.
+    struct IntegrationBench {
+        _temporary: tempfile::TempDir,
+        repo: std::path::PathBuf,
+        tool: super::DelegateTool,
+    }
+
+    impl IntegrationBench {
+        fn new() -> Self {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let repo = temporary.path().join("repo");
+            std::fs::create_dir_all(&repo).expect("repo directory");
+            clean_repository(&repo);
+            std::fs::write(repo.join("notes.txt"), "base\n").expect("notes");
+            git(&repo, &["add", "notes.txt"]);
+            git(&repo, &["commit", "-m", "notes"]);
+            let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+            let gate = Arc::new(crate::interactive::service::ChannelApprovalGate::new(
+                sender.clone(),
+                Duration::from_secs(5),
+            ));
+            let agents = SessionAgents::with_backend(
+                SharedStore::new(temporary.path().join("store")),
+                sender,
+                gate,
+                temporary.path().join("delegation"),
+                &(Arc::new(EditingCoder) as Arc<dyn harness_orchestrator::WorkerBackend>),
+            );
+            let launch = launch_for(
+                &repo,
+                Arc::new(harness_providers::MockProvider::scripted(Vec::new())),
+            );
+            Self {
+                _temporary: temporary,
+                repo,
+                tool: super::DelegateTool {
+                    agents,
+                    launch,
+                    parent_cancellation: CancellationToken::new(),
+                },
+            }
+        }
+
+        /// Run a coder to the end; it edits per `brief`.
+        async fn coder(&self, brief: &str) -> serde_json::Value {
+            let result = self
+                .tool
+                .run(&serde_json::json!({"role": "coder", "brief": brief}))
+                .await
+                .expect("the coder runs");
+            assert_eq!(result["status"], "completed", "{result}");
+            result
+        }
+
+        async fn integrate(&self, arguments: serde_json::Value) -> serde_json::Value {
+            self.tool
+                .integrate(&arguments)
+                .await
+                .expect("the integration answers")
+        }
+
+        fn check(&mut self, command: &str) {
+            self.tool.launch.checks = vec![crate::interactive::verify::Check {
+                name: "merged".to_owned(),
+                command: command.to_owned(),
+                hint: None,
+                timeout_ms: 60_000,
+            }];
+        }
+
+        fn head(&self) -> String {
+            let output = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&self.repo)
+                .output()
+                .expect("git starts");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        fn status(&self) -> String {
+            let output = Command::new("git")
+                .args(["status", "--porcelain=v1", "--untracked-files=all"])
+                .current_dir(&self.repo)
+                .output()
+                .expect("git starts");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        /// A file of the user's checkout, whatever line endings Git's checkout
+        /// settings gave it.
+        fn read(&self, path: &str) -> Option<String> {
+            std::fs::read_to_string(self.repo.join(path))
+                .ok()
+                .map(|text| text.replace("\r\n", "\n"))
+        }
+    }
+
+    /// Two coders that changed different files merge, the project's check runs
+    /// on the merged revision - it needs both files, which neither branch has
+    /// alone - and only `apply` moves the user's branch, by a fast-forward.
+    #[tokio::test]
+    async fn integrate_children_merges_checks_and_fast_forwards() {
+        let mut bench = IntegrationBench::new();
+        let coder = bench.coder("first.txt=from the first coder").await;
+        assert!(
+            coder["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("integrate_children")),
+            "the parent is told how the work comes back: {coder}"
+        );
+        bench.coder("second.txt=from the second coder").await;
+        let base = bench.head();
+
+        // A failing check on the merged revision stops everything.
+        bench.check("git show HEAD:first.txt HEAD:missing.txt");
+        let failed = bench.integrate(serde_json::json!({"apply": true})).await;
+        assert_eq!(failed["status"], "checks_failed", "{failed}");
+        assert!(failed["text"].as_str().unwrap().contains("missing.txt"));
+        assert_eq!(bench.head(), base);
+        assert_eq!(bench.status(), "");
+
+        bench.check("git show HEAD:first.txt HEAD:second.txt");
+        let ready = bench.integrate(serde_json::json!({})).await;
+        assert_eq!(ready["status"], "ready", "{ready}");
+        assert_eq!(bench.head(), base, "without apply the user's branch stays");
+        assert_eq!(bench.read("first.txt"), None);
+
+        let applied = bench.integrate(serde_json::json!({"apply": true})).await;
+        assert_eq!(applied["status"], "applied", "{applied}");
+        assert_eq!(applied["previous_head"], base.as_str());
+        assert_eq!(bench.head(), applied["final_commit"].as_str().unwrap());
+        assert_eq!(
+            bench.read("first.txt").as_deref(),
+            Some("from the first coder\n")
+        );
+        assert_eq!(
+            bench.read("second.txt").as_deref(),
+            Some("from the second coder\n")
+        );
+        assert_eq!(
+            bench.status(),
+            "",
+            "a fast-forward leaves nothing uncommitted"
+        );
+        let ancestry = Command::new("git")
+            .args(["merge-base", "--is-ancestor", &base, "HEAD"])
+            .current_dir(&bench.repo)
+            .status()
+            .expect("git starts");
+        assert!(
+            ancestry.success(),
+            "the user's old head is in the new history"
+        );
+
+        let again = bench
+            .tool
+            .integrate(&serde_json::json!({}))
+            .await
+            .expect_err("integrated coders are not offered twice");
+        assert!(again.message().contains("no finished coder"), "{again}");
+    }
+
+    /// Two coders that changed the same line conflict: the result names the
+    /// file and the coder, and the user's checkout does not move.
+    #[tokio::test]
+    async fn integrate_children_reports_a_conflict_and_touches_nothing() {
+        let bench = IntegrationBench::new();
+        bench.coder("notes.txt=first version").await;
+        let second = bench.coder("notes.txt=second version").await;
+        let base = bench.head();
+        let conflicted = bench.integrate(serde_json::json!({"apply": true})).await;
+        assert_eq!(conflicted["status"], "conflicted", "{conflicted}");
+        let conflicts = conflicted["conflicts"].to_string();
+        assert!(conflicts.contains("notes.txt"), "{conflicts}");
+        assert!(
+            conflicts.contains(second["name"].as_str().unwrap()),
+            "the conflict names the coder that could not be merged: {conflicts}"
+        );
+        assert_eq!(bench.head(), base);
+        assert_eq!(bench.read("notes.txt").as_deref(), Some("base\n"));
+        assert_eq!(bench.status(), "");
+    }
+
+    /// A checkout the user changed while the coders worked is refused, before
+    /// the merge and again at the moment of applying; the user's work stays.
+    #[tokio::test]
+    async fn integrate_children_refuses_a_checkout_the_user_changed() {
+        let mut bench = IntegrationBench::new();
+        bench.coder("first.txt=one").await;
+        bench.coder("second.txt=two").await;
+        let base = bench.head();
+
+        std::fs::write(bench.repo.join("notes.txt"), "the user's edit\n").expect("user edit");
+        let refused = bench.integrate(serde_json::json!({"apply": true})).await;
+        assert_eq!(refused["status"], "refused", "{refused}");
+        assert_eq!(
+            bench.read("notes.txt").as_deref(),
+            Some("the user's edit\n")
+        );
+        assert_eq!(bench.head(), base);
+        assert_eq!(bench.read("first.txt"), None);
+
+        // The edit is undone byte for byte (a checkout could convert line
+        // endings), then the user commits while the checks run: the recheck at
+        // apply time catches what the first one could not.
+        std::fs::write(bench.repo.join("notes.txt"), "base\n").expect("edit undone");
+        let repo = bench.repo.to_string_lossy().replace('\\', "/");
+        bench.check(&format!(
+            "git -C \"{repo}\" commit --allow-empty -q -m during-integration"
+        ));
+        let late = bench.integrate(serde_json::json!({"apply": true})).await;
+        assert_eq!(late["status"], "refused", "{late}");
+        assert_ne!(bench.head(), base, "the user's own commit landed");
+        assert_eq!(
+            bench.read("first.txt"),
+            None,
+            "no coder file reached the user"
+        );
+        assert_eq!(bench.read("notes.txt").as_deref(), Some("base\n"));
+        assert_eq!(bench.status(), "");
+    }
+
+    #[test]
+    fn integrate_children_arguments_are_bounded() {
+        use super::IntegrateRequest;
+        let parsed = IntegrateRequest::parse(&serde_json::json!({})).expect("defaults");
+        assert!(parsed.children.is_none() && !parsed.apply);
+        let parsed = IntegrateRequest::parse(
+            &serde_json::json!({"children": ["coder-a", " b "], "apply": true}),
+        )
+        .expect("named");
+        assert_eq!(
+            parsed.children.as_deref(),
+            Some(&["coder-a".to_owned(), "b".to_owned()][..])
+        );
+        assert!(parsed.apply);
+        for wrong in [
+            serde_json::json!({"apply": "yes"}),
+            serde_json::json!({"children": "coder-a"}),
+            serde_json::json!({"children": [""]}),
+            serde_json::json!({"force": true}),
+        ] {
+            assert!(IntegrateRequest::parse(&wrong).is_err(), "{wrong}");
+        }
     }
 
     /// Reports each brief back as its answer; "slow" briefs take a moment, "fail"

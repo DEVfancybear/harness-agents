@@ -618,10 +618,7 @@ async fn p5_a_finished_worker_is_outstanding_until_its_outcome_is_taken() {
         "the outcome is delivered"
     );
     assert_eq!(scheduler.outstanding_workers(), 0);
-    assert!(
-        scheduler.next_settled().await.is_none(),
-        "nothing is left"
-    );
+    assert!(scheduler.next_settled().await.is_none(), "nothing is left");
 }
 
 // ---------------------------------------------------------------------------

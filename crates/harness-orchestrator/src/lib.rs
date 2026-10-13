@@ -25,7 +25,8 @@ pub use coordinator::{
     DelegationCoordinator, EvidenceVerifier, ResultVerifier, StepOutcome, fresh_run,
 };
 pub use integration::{
-    BranchCandidate, FinalApply, IntegrationOutcome, ResultIntegrator, workspace_candidate,
+    ApplyOutcome, BranchCandidate, CheckResult, FinalApply, IntegrationOutcome, ResultIntegrator,
+    workspace_candidate,
 };
 pub use scheduler::{
     BudgetLedger, RefusingBackend, WorkerBackend, WorkerHandle, WorkerLease, WorkerOutcome,
