@@ -117,8 +117,10 @@ pub struct Viewport {
     anchor: Option<Point>,
     head: Option<Point>,
     mode: Option<Mode>,
-    /// The last frame's cells, row by row, for a frame selection.
-    frame: Vec<Vec<String>>,
+    /// The last frame, for a frame selection. Kept as the buffer and turned
+    /// into text only when a selection begins: a string per cell on every
+    /// frame was a large part of a frame's cost while agents streamed.
+    frame: Buffer,
     /// The frame a frame selection copies from: the one it began on.
     frame_snapshot: Option<Vec<Vec<String>>>,
     /// The first frame row a frame selection may start on (the dock's top),
@@ -137,7 +139,7 @@ impl Default for Viewport {
             anchor: None,
             head: None,
             mode: None,
-            frame: Vec::new(),
+            frame: Buffer::empty(Rect::default()),
             frame_snapshot: None,
             selectable_from: 0,
         }
@@ -232,7 +234,7 @@ impl Viewport {
 
     /// Begin a selection over the frame (the dock, or an open panel).
     pub fn begin_frame_selection(&mut self, row: u16, col: u16) -> bool {
-        if row < self.selectable_from || usize::from(row) >= self.frame.len() {
+        if row < self.selectable_from || row >= self.frame.area.height {
             self.clear_selection();
             return false;
         }
@@ -240,7 +242,7 @@ impl Viewport {
             line: usize::from(row),
             col: usize::from(col),
         };
-        self.frame_snapshot = Some(self.frame.clone());
+        self.frame_snapshot = Some(frame_cells(&self.frame));
         self.anchor = Some(point);
         self.head = Some(point);
         self.mode = Some(Mode::Frame);
@@ -258,7 +260,7 @@ impl Viewport {
                 let rows = self
                     .frame_snapshot
                     .as_ref()
-                    .map_or(self.frame.len(), Vec::len);
+                    .map_or(usize::from(self.frame.area.height), Vec::len);
                 (rows > 0).then(|| usize::from(row).min(rows - 1))
             }
             None => None,
@@ -344,6 +346,30 @@ impl Viewport {
         self.ordered().is_some()
     }
 
+    /// The first `count` conversation rows were dropped: what is on screen keeps
+    /// its place instead of sliding up under a reader who scrolled back.
+    fn rows_removed(&mut self, count: usize) {
+        if !self.following {
+            self.scroll_top = self.scroll_top.saturating_sub(count);
+        }
+        self.max_scroll = self.max_scroll.saturating_sub(count);
+        if self.mode == Some(Mode::Transcript) {
+            match (self.anchor, self.head) {
+                (Some(anchor), Some(head)) if anchor.line >= count && head.line >= count => {
+                    self.anchor = Some(Point {
+                        line: anchor.line - count,
+                        ..anchor
+                    });
+                    self.head = Some(Point {
+                        line: head.line - count,
+                        ..head
+                    });
+                }
+                _ => self.clear_selection(),
+            }
+        }
+    }
+
     pub fn clear_selection(&mut self) {
         self.anchor = None;
         self.head = None;
@@ -358,7 +384,7 @@ impl Viewport {
         let frame = self
             .frame_snapshot
             .take()
-            .unwrap_or_else(|| self.frame.clone());
+            .unwrap_or_else(|| frame_cells(&self.frame));
         self.clear_selection();
         let selection = selection?;
         let mut lines = Vec::new();
@@ -505,7 +531,15 @@ pub struct FullscreenScreen<B: Backend> {
     since_entered: usize,
     /// `shown` drawn at `rows_key`'s width and detail mode.
     rows: Vec<Line<'static>>,
+    /// How many of `rows` each entry of `shown` drew, while `rows_key` holds:
+    /// the oldest entry is dropped by removing its rows, not by drawing every
+    /// entry again.
+    row_counts: VecDeque<usize>,
     rows_key: Option<(u16, Detail)>,
+    /// The dock's tallest height in the current run. The live block grows and
+    /// shrinks with every tool card and output line; holding the window at the
+    /// smallest it had to be keeps the conversation from jumping each frame.
+    dock_floor: u16,
     assistant_continuing: bool,
     viewport: Viewport,
     /// A drag held at an edge: its direction, cell and last scroll.
@@ -542,7 +576,9 @@ where
             shown,
             since_entered: 0,
             rows: Vec::new(),
+            row_counts: VecDeque::new(),
             rows_key: None,
+            dock_floor: 0,
             assistant_continuing,
             viewport: Viewport::default(),
             auto_scroll: None,
@@ -575,18 +611,16 @@ where
             return;
         }
         let mut rows = Vec::new();
+        let mut counts = VecDeque::with_capacity(self.shown.len());
         for (index, item) in self.shown.iter().enumerate() {
             let continuing =
                 index > 0 && matches!(self.shown[index - 1], HistoryItem::Assistant { .. });
-            rows.extend(history::render_fragment(
-                item,
-                width,
-                &self.theme,
-                self.detail,
-                continuing,
-            ));
+            let drawn = history::render_fragment(item, width, &self.theme, self.detail, continuing);
+            counts.push_back(drawn.len());
+            rows.extend(drawn);
         }
         self.rows = rows;
+        self.row_counts = counts;
         self.rows_key = Some((width, self.detail));
         // Rows were re-wrapped: a selection anchored to the old ones is gone.
         self.viewport.clear_selection();
@@ -594,28 +628,59 @@ where
 
     pub fn insert_history_batch(&mut self, items: &[HistoryItem]) {
         let width = self.columns();
-        let mut dropped = false;
+        let drawn = self.rows_key == Some((width, self.detail));
         for item in items {
             if self.shown.len() == REPRINT_ENTRIES {
-                self.shown.pop_front();
-                dropped = true;
+                self.drop_oldest(drawn);
             }
             self.shown.push_back(item.clone());
             self.since_entered = (self.since_entered + 1).min(self.shown.len());
-            if !dropped && self.rows_key == Some((width, self.detail)) {
-                self.rows.extend(history::render_fragment(
+            if drawn {
+                let fragment = history::render_fragment(
                     item,
                     width,
                     &self.theme,
                     self.detail,
                     self.assistant_continuing,
-                ));
+                );
+                self.row_counts.push_back(fragment.len());
+                self.rows.extend(fragment);
             }
             self.assistant_continuing = matches!(item, HistoryItem::Assistant { .. });
         }
-        if dropped {
+    }
+
+    /// Drop the oldest entry. A long run with several agents reaches the cap,
+    /// and then every new row dropped one: drawing all 4000 entries again for
+    /// each was the lag, and the shifted rows moved the view under the reader.
+    /// Its rows are removed instead, the new first entry - drawn as a
+    /// continuation of the one dropped - is drawn again on its own, and the
+    /// window and any selection move with the rows.
+    fn drop_oldest(&mut self, drawn: bool) {
+        self.shown.pop_front();
+        if !drawn || self.row_counts.len() != self.shown.len() + 1 {
             self.rows_key = None;
+            self.row_counts.clear();
+            return;
         }
+        let dropped = self
+            .row_counts
+            .pop_front()
+            .unwrap_or(0)
+            .min(self.rows.len());
+        self.rows.drain(..dropped);
+        // Rows before the second kept entry: `dropped + old` then, `new` now.
+        let mut shift = dropped;
+        if let (Some(first), Some(count)) = (self.shown.front(), self.row_counts.front_mut()) {
+            let width = self.rows_key.map_or(0, |(width, _)| width);
+            let fragment = history::render_fragment(first, width, &self.theme, self.detail, false);
+            let old = (*count).min(self.rows.len());
+            let new = fragment.len();
+            self.rows.splice(..old, fragment);
+            *count = new;
+            shift = (dropped + old).saturating_sub(new);
+        }
+        self.viewport.rows_removed(shift);
     }
 
     /// Draw the conversation again in this detail mode (ctrl+o, a resize).
@@ -669,6 +734,11 @@ where
         let theme = self.theme;
         let rows = &self.rows;
         let viewport = &mut self.viewport;
+        let running = state.phase.has_active_run();
+        if !running {
+            self.dock_floor = 0;
+        }
+        let dock_floor = &mut self.dock_floor;
         let mut dock_top = 0;
         let completed = self
             .terminal
@@ -694,9 +764,19 @@ where
                     .min()
                     .unwrap_or(dock_area.y)
                     .max(area.y + header);
+                // While a run lasts the window is as short as the tallest dock
+                // it has had, so cards and output lines coming and going in the
+                // live block do not move the conversation up and down.
+                let bottom = area.y + area.height;
+                if running {
+                    *dock_floor = (*dock_floor).max(bottom - dock_top);
+                }
+                let window_bottom = dock_top
+                    .min(bottom.saturating_sub(*dock_floor))
+                    .max(area.y + header);
                 // One blank row between the conversation and the dock, so the
                 // newest row never sits on the composer's border.
-                let window_rows = dock_top - (area.y + header);
+                let window_rows = window_bottom - (area.y + header);
                 let window = Rect::new(
                     area.x,
                     area.y + header,
@@ -753,8 +833,7 @@ where
                 }
             })
             .map_err(to_io)?;
-        let cells = frame_cells(completed.buffer);
-        self.viewport.frame = cells;
+        self.viewport.frame = completed.buffer.clone();
         self.viewport.selectable_from = if state.modal.is_some() { 0 } else { dock_top };
         Ok(())
     }
@@ -1065,6 +1144,85 @@ mod tests {
         screen.draw(&state).expect("drawn");
         assert!(painted(&screen).iter().any(|row| row.contains("line-39")));
         assert_eq!(state.phase, AppPhase::Ready);
+    }
+
+    /// A long run with several agents fills the conversation to its cap, and
+    /// from then on every row drops the oldest one. That drew all entries again
+    /// per row (the lag) and slid the rows under a reader who had scrolled back.
+    #[test]
+    fn dropping_the_oldest_entry_keeps_the_view_and_draws_only_what_changed() {
+        let mut screen = screen(60, 20);
+        let state = crate::interactive::tui::tests::idle_state();
+        let notices = |range: std::ops::Range<usize>| {
+            range
+                .map(|index| HistoryItem::Notice {
+                    message: format!("line-{index}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        screen.insert_history_batch(&notices(0..super::REPRINT_ENTRIES));
+        screen.draw(&state).expect("drawn");
+        let wheel = MouseInput {
+            kind: MouseKind::WheelUp,
+            column: 5,
+            row: 3,
+            modified: false,
+        };
+        for _ in 0..10 {
+            screen.mouse(wheel, false);
+        }
+        screen.draw(&state).expect("drawn");
+        let before = painted(&screen);
+        screen.insert_history_batch(&notices(
+            super::REPRINT_ENTRIES..super::REPRINT_ENTRIES + 50,
+        ));
+        assert!(screen.rows_key.is_some(), "the rows were not drawn again");
+        screen.draw(&state).expect("drawn");
+        assert_eq!(painted(&screen), before, "the reader's view did not move");
+        assert_eq!(screen.shown.len(), super::REPRINT_ENTRIES);
+        assert_eq!(screen.rows.len(), screen.row_counts.iter().sum::<usize>());
+        let kept = screen.rows.clone();
+        screen.rows_key = None;
+        screen.ensure_rows(60);
+        assert_eq!(screen.rows, kept, "the same rows a full redraw gives");
+    }
+
+    /// Tool cards and output lines come and go in the live block while a run
+    /// lasts; the conversation above it must not move up and down with them.
+    #[test]
+    fn the_conversation_holds_still_while_the_live_block_changes_in_a_run() {
+        let mut screen = screen(60, 24);
+        let mut state = crate::interactive::tui::tests::idle_state();
+        state.phase = AppPhase::Running;
+        screen.insert_history_batch(
+            &(0..60)
+                .map(|index| HistoryItem::Notice {
+                    message: format!("line-{index}"),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let newest_row = |screen: &FullscreenScreen<_>| {
+            painted(screen)
+                .iter()
+                .position(|row| row.contains("line-59"))
+                .expect("the newest row is shown")
+        };
+        state.open_tools = vec![
+            ("read_file".to_owned(), "path=a".to_owned()),
+            ("read_file".to_owned(), "path=b".to_owned()),
+            ("read_file".to_owned(), "path=c".to_owned()),
+        ];
+        state.live_tool_output = vec!["one".to_owned(), "two".to_owned()];
+        screen.draw(&state).expect("drawn");
+        let tall = newest_row(&screen);
+        state.open_tools.clear();
+        state.live_tool_output.clear();
+        screen.draw(&state).expect("drawn");
+        assert_eq!(newest_row(&screen), tall, "the window kept its height");
+        // Once the run ends the window takes the room back.
+        state.phase = AppPhase::Ready;
+        screen.draw(&state).expect("drawn");
+        assert!(newest_row(&screen) > tall);
     }
 
     #[test]
