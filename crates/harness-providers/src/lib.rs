@@ -2560,9 +2560,29 @@ mod endpoint_tests {
 }
 
 #[cfg(test)]
+pub(crate) fn finish_loopback_response(stream: &mut std::net::TcpStream) {
+    use std::io::Read;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("response shutdown");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .expect("close timeout");
+    // Let the client consume the response before closing the read half;
+    // an immediate close can reset an active Windows connection.
+    let mut remaining = [0_u8; 1024];
+    while let Ok(read) = stream.read(&mut remaining) {
+        if read == 0 {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
 mod g03_openai_wire_snapshot_tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
     use std::sync::Arc;
 
     use super::{
@@ -2619,6 +2639,7 @@ mod g03_openai_wire_snapshot_tests {
                 body.len()
             )
             .expect("fixture response");
+            crate::finish_loopback_response(&mut stream);
         });
 
         let provider = OpenAiChatAdapter::with_options(

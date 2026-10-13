@@ -676,6 +676,7 @@ mod tests {
                 }
             }
             write!(stream, "{response}").expect("fixture response");
+            crate::finish_loopback_response(&mut stream);
         });
         (format!("http://{address}/v1/messages"), thread)
     }
@@ -798,7 +799,9 @@ mod tests {
         // The error keeps the provider's reset (bounded to a week): the runtime
         // caps its own retry sleep at 30 seconds, and a reset beyond the usage
         // wait is what parks the session (prime-agent's quota park).
-        let kept = error.retry_after().expect("the HTTP date is read");
+        let kept = error
+            .retry_after()
+            .unwrap_or_else(|| panic!("the HTTP date is read: {error:?}"));
         assert!(
             kept > Duration::from_secs(100) && kept <= Duration::from_mins(2),
             "a future HTTP date is kept as the wait until it: {kept:?}"
