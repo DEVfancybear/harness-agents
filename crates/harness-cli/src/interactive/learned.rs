@@ -268,6 +268,9 @@ pub struct Usage {
     pub patches: u64,
     /// The layer's request count when the skill landed.
     pub anchor: u64,
+    /// The skill was archived. Seen on a live skill, it means the skill was
+    /// moved back since - by hand or by a rollback.
+    pub archived: bool,
 }
 
 impl Usage {
@@ -278,7 +281,50 @@ impl Usage {
             views: count("view"),
             patches: count("patch"),
             anchor: count("anchor"),
+            archived: value["archived"].as_bool().unwrap_or(false),
         }
+    }
+}
+
+/// Record that `name` left recall, so its return can be told apart from a
+/// skill that never left.
+fn mark_archived(layers: &Layers, layer: Layer, root: &Path, name: &str) {
+    update_usage(&layers.usage_file(layer, root), |usage| {
+        if !usage["skills"][name].is_object() {
+            usage["skills"][name] = json!({});
+        }
+        usage["skills"][name]["archived"] = json!(true);
+    });
+}
+
+/// Give every skill moved back from the archive a new probation from now.
+///
+/// The archive notice tells the user to move a skill back to revive it. It came
+/// back with the counters that had it archived, and the lifecycle at the end of
+/// the next turn archived it again. Moving it back is a statement that it is
+/// wanted: it gets the probation a new skill gets, and earns its place again.
+fn revive_returned(layers: &Layers, layer: Layer, root: &Path) {
+    let (requests, counters) = usage(layers, layer);
+    let returned = learned_names(root)
+        .into_iter()
+        .filter(|name| counters.get(name).is_some_and(|usage| usage.archived))
+        .collect::<Vec<_>>();
+    if returned.is_empty() {
+        return;
+    }
+    update_usage(&layers.usage_file(layer, root), |usage| {
+        for name in &returned {
+            usage["skills"][name]["anchor"] = json!(requests);
+            if let Some(counters) = usage["skills"][name].as_object_mut() {
+                counters.remove("archived");
+            }
+        }
+    });
+    for name in &returned {
+        append_ledger(
+            &root.join(name),
+            &json!({"at": now(), "action": "revive", "reason": format!("moved back from the archive; new probation from request {requests}")}),
+        );
     }
 }
 
@@ -575,6 +621,7 @@ fn learned_names(root: &Path) -> Vec<String> {
 pub fn run_lifecycle(layers: &Layers) -> Vec<(Layer, String)> {
     let mut archived = Vec::new();
     for (layer, root) in layers.present() {
+        revive_returned(layers, layer, root);
         let (requests, counters) = usage(layers, layer);
         let members = learned_names(root)
             .into_iter()
@@ -596,6 +643,7 @@ pub fn run_lifecycle(layers: &Layers) -> Vec<(Layer, String)> {
                 &json!({"at": now(), "action": "archive", "reason": reason}),
             );
             if archive(root, &name).is_ok() {
+                mark_archived(layers, layer, root, &name);
                 archived.push((layer, name));
             }
         }
@@ -1081,6 +1129,26 @@ fn local_path_spellings(workspace: &Path) -> Vec<String> {
     spellings
 }
 
+/// What the spec limits in a `SKILL.md`.
+#[derive(Clone, Copy)]
+struct SkillSize {
+    description_chars: usize,
+    body_lines: usize,
+}
+
+fn skill_size(document: &str) -> Option<SkillSize> {
+    let front = FrontMatter::parse(document)?;
+    Some(SkillSize {
+        description_chars: front
+            .get("description")
+            .map_or(0, |description| description.chars().count()),
+        body_lines: document[front.body_start..]
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count(),
+    })
+}
+
 /// Lint the shaped skill. `body` is the whole `SKILL.md` that would land, `None`
 /// for `delete` and `remove_file`.
 #[allow(
@@ -1105,6 +1173,16 @@ fn lint(
         return findings;
     };
     let rewritten = matches!(intent.action.as_str(), "create" | "update");
+    // A patch is held to the limits too, or a run of them - the curator folds
+    // siblings into an umbrella by patching it - grows a skill past both. A skill
+    // already over a limit stays patchable as long as the patch does not grow it.
+    let live_size = std::fs::read_to_string(directory.join("SKILL.md"))
+        .ok()
+        .as_deref()
+        .and_then(skill_size);
+    let over = |size: usize, limit: usize, live: Option<usize>| {
+        size > limit && (rewritten || live.is_none_or(|live| size > live))
+    };
     match FrontMatter::parse(body) {
         None => findings.push("structure: SKILL.md must open with --- front matter ---".to_owned()),
         Some(front) => {
@@ -1116,15 +1194,18 @@ fn lint(
             }
             match front.get("description") {
                 None => findings.push("structure: description is required".to_owned()),
-                Some(description) if rewritten => {
+                Some(description) => {
                     let length = description.chars().count();
-                    if length > DESCRIPTION_MAX_CHARS {
+                    if over(
+                        length,
+                        DESCRIPTION_MAX_CHARS,
+                        live_size.map(|size| size.description_chars),
+                    ) {
                         findings.push(format!(
                             "description: {length} characters, over {DESCRIPTION_MAX_CHARS}: state when to use the skill, put the procedure in the body"
                         ));
                     }
                 }
-                Some(_) => {}
             }
             if let Some(category) = front.get("category")
                 && !category.chars().all(|character| {
@@ -1140,7 +1221,7 @@ fn lint(
             if lines == 0 {
                 findings.push("structure: the body is empty".to_owned());
             }
-            if rewritten && lines > BODY_MAX_LINES {
+            if over(lines, BODY_MAX_LINES, live_size.map(|size| size.body_lines)) {
                 findings.push(format!(
                     "altitude: {lines} body lines, over {BODY_MAX_LINES}: keep the rule in SKILL.md, move detail to references/"
                 ));
@@ -1455,6 +1536,7 @@ fn land(
         "delete" => {
             append_ledger(&directory, &ledger_entry(intent));
             let archived = archive(root, &intent.name)?;
+            mark_archived(layers, layer, root, &intent.name);
             Ok(json!({"archived": archived.display().to_string()}))
         }
         "remove_file" => {
@@ -1537,7 +1619,9 @@ pub fn restore(
                 return Err(format!("{name} is no longer live"));
             }
             append_ledger(&directory, &entry("rollback of create"));
-            archive(&root, name).map(|_| ())
+            archive(&root, name)?;
+            mark_archived(layers, layer, &root, name);
+            Ok(())
         }
         "delete" => {
             let archived =
@@ -1863,6 +1947,7 @@ mod tests {
                 views,
                 patches: 0,
                 anchor,
+                archived: false,
             },
         };
         let members = [
@@ -1914,6 +1999,148 @@ mod tests {
         let root = layers.project.clone().expect("project");
         assert!(is_learned(&root, "kept"));
         assert!(root.join(".archive/idle/SKILL.md").is_file());
+    }
+
+    /// The spec holds every skill to 200 description characters and 30 body
+    /// lines, but only `create` and `update` were measured: a run of patches -
+    /// the curator folds siblings into an umbrella by patching it - grew a skill
+    /// past both.
+    #[test]
+    fn a_patch_keeps_the_skill_within_the_limits() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let full = (0..BODY_MAX_LINES)
+            .map(|line| format!("step {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            promote(
+                &layers,
+                &create("at-the-limit", &full),
+                &PromoteContext::default()
+            )
+            .ok
+        );
+        let patch = |old: &str, new: &str| {
+            Intent::from_value(&json!({
+                "action": "patch",
+                "name": "at-the-limit",
+                "old_string": old,
+                "new_string": new,
+                "reason": "the user corrected the approach",
+                "evidence": "[User]: also do this",
+            }))
+        };
+        let longer = promote(
+            &layers,
+            &patch("step 0", "step 0\nstep 0b"),
+            &PromoteContext::default(),
+        );
+        assert!(!longer.ok, "a patch must not take the body past the limit");
+        assert!(
+            longer
+                .findings
+                .iter()
+                .any(|finding| finding.starts_with("altitude")),
+            "{:?}",
+            longer.findings
+        );
+        let wordy = promote(
+            &layers,
+            &patch(
+                "Use when a Rust test fails only on CI.",
+                &format!("Use when {}.", "a test fails ".repeat(20)),
+            ),
+            &PromoteContext::default(),
+        );
+        assert!(
+            !wordy.ok,
+            "a patch must not take the description past the limit"
+        );
+        // A patch that keeps the skill within the limits still lands.
+        assert!(
+            promote(
+                &layers,
+                &patch("step 0", "step zero"),
+                &PromoteContext::default()
+            )
+            .ok
+        );
+    }
+
+    /// The archive notice says "move it back from .archive to revive it". Done
+    /// as told, the skill came back with the counters that archived it, so the
+    /// lifecycle at the end of the next turn archived it again. A revived skill
+    /// starts a new probation.
+    #[test]
+    fn a_skill_moved_back_from_the_archive_starts_a_new_probation() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let root = layers.project.clone().expect("project");
+        assert!(
+            promote(
+                &layers,
+                &create("idle", "Idle."),
+                &PromoteContext::default()
+            )
+            .ok
+        );
+        for _ in 0..Layer::Project.maturity() {
+            super::count_request(&layers);
+        }
+        assert_eq!(
+            run_lifecycle(&layers),
+            vec![(Layer::Project, "idle".to_owned())]
+        );
+
+        // Revived by hand, as the notice says.
+        std::fs::rename(root.join(".archive/idle"), root.join("idle")).expect("move back");
+        super::count_request(&layers);
+        assert!(
+            run_lifecycle(&layers).is_empty(),
+            "revived, not re-archived"
+        );
+        assert!(is_learned(&root, "idle"));
+
+        // A new probation is a probation, not immunity.
+        for _ in 0..Layer::Project.maturity() {
+            super::count_request(&layers);
+        }
+        assert_eq!(
+            run_lifecycle(&layers),
+            vec![(Layer::Project, "idle".to_owned())]
+        );
+
+        // Revived by rolling back a delete: the same.
+        assert!(
+            promote(
+                &layers,
+                &create("merged", "Merged."),
+                &PromoteContext::default()
+            )
+            .ok
+        );
+        for _ in 0..Layer::Project.maturity() {
+            super::count_request(&layers);
+        }
+        let deleted = promote(
+            &layers,
+            &Intent::from_value(&json!({
+                "action": "delete",
+                "name": "merged",
+                "level": "project",
+                "reason": "folded into another skill",
+                "evidence": "[User]: one skill is enough",
+            })),
+            &PromoteContext::default(),
+        );
+        assert!(deleted.ok, "{:?}", deleted.findings);
+        restore(&layers, "delete", "merged", "project", &deleted.undo).expect("rollback of delete");
+        assert!(
+            run_lifecycle(&layers).is_empty(),
+            "rolled back, not re-archived"
+        );
+        assert!(is_learned(&root, "merged"));
     }
 
     /// A skill learned in a linked worktree lands in the main checkout, where it
