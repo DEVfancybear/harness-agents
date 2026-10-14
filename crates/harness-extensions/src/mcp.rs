@@ -28,11 +28,11 @@ use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use rmcp::{
     ClientHandler, RoleClient, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, CancelTaskParams, ClientCapabilities,
-        ClientConfig, GetPromptRequestParams, GetPromptResponse, GetTaskParams, Implementation,
-        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-        PaginatedRequestParams, Prompt, ReadResourceRequestParams, ResourceContents,
-        ResourceTemplate, SubscriptionFilter, TaskPayload, TaskStatus, Tool,
+        CallToolRequestParams, CallToolResponse, ClientCapabilities, ClientConfig,
+        GetPromptRequestParams, GetPromptResponse, Implementation, ListPromptsResult,
+        ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+        Prompt, ReadResourceRequestParams, ResourceContents, ResourceTemplate, SubscriptionFilter,
+        Tool,
     },
     service::{RequestContext, Subscription},
     transport::{
@@ -46,9 +46,6 @@ use tokio::time::Instant;
 use tokio::time::timeout;
 
 use crate::contracts::{CANCEL_GRACE_MS, ENVIRONMENT_ALLOWLIST, ExtensionError};
-use crate::tasks::{
-    RemoteTaskSnapshot, RemoteTaskState, SubmitFailure, TaskRemote, TaskSubmission,
-};
 
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
@@ -146,14 +143,18 @@ impl McpFeature {
                 | Self::Elicitation
                 | Self::Subscriptions
                 | Self::RemoteTransport
-                | Self::Tasks
         )
     }
 
     /// Why an unsupported feature is not advertised. Empty when supported.
     #[must_use]
     pub const fn unsupported_reason(self) -> &'static str {
-        ""
+        match self {
+            Self::Tasks => {
+                "this host polls no remote task, so it does not declare the extension; a server answers its tool calls with the result"
+            }
+            _ => "",
+        }
     }
 }
 
@@ -442,11 +443,15 @@ struct McpClientHandler {
 
 impl McpClientHandler {
     fn new(callbacks: Option<Arc<dyn McpRequestCallbacks>>) -> Self {
+        // The tasks extension is not declared: this host answers a tool call
+        // only with its result and polls no remote task. Declared, it let a
+        // SEP-2663 server answer an ordinary call with a task handle, which the
+        // dispatch path refused - the tool failed for the user while the work
+        // it started went on unwatched.
         #[allow(deprecated)]
         let info = if callbacks.is_some() {
             ClientConfig::new(
                 ClientCapabilities::builder()
-                    .enable_tasks()
                     .enable_sampling()
                     .enable_elicitation()
                     .build(),
@@ -454,7 +459,7 @@ impl McpClientHandler {
             )
         } else {
             ClientConfig::new(
-                ClientCapabilities::builder().enable_tasks().build(),
+                ClientCapabilities::default(),
                 Implementation::new("harness-agents", env!("CARGO_PKG_VERSION")),
             )
         };
@@ -1228,160 +1233,6 @@ impl McpClient {
         Ok(())
     }
 
-    /// Whether the server declared the tasks extension in the handshake.
-    ///
-    /// Read from the negotiated peer information, not from a claim in this
-    /// build: a server that never offered the extension can never return a task
-    /// handle, and a caller that assumed otherwise would wait for one.
-    #[must_use]
-    pub fn server_supports_tasks(&self) -> bool {
-        self.running
-            .peer_info()
-            .is_some_and(|info| info.capabilities.supports_tasks())
-    }
-
-    /// Submit one tool call and report what the remote did with it.
-    ///
-    /// This is `call_tool_once`, not the SDK's `call_tool` helper: the helper
-    /// drives MRTR rounds and deliberately refuses a task handle, while this
-    /// path has to *see* one. The classification is the whole contract:
-    ///
-    /// - a JSON-RPC error is an **answer**, so nothing was applied;
-    /// - a task result is a handle, so only polling is owed;
-    /// - anything else - a timeout, a closed transport, an `input_required`
-    ///   round this adapter does not drive - means the request may have landed,
-    ///   and a second send could apply it twice.
-    pub async fn submit_task(
-        &self,
-        name: &str,
-        arguments: Value,
-    ) -> Result<TaskSubmission, SubmitFailure> {
-        let Some(descriptor) = self.tools.get(name) else {
-            return Err(SubmitFailure::Definite(format!(
-                "MCP server did not advertise a tool named {name}"
-            )));
-        };
-        if let Err(error) = validate_arguments(name, &descriptor.input_schema, &arguments) {
-            return Err(SubmitFailure::Definite(format!(
-                "the arguments were refused before anything was sent: {error}"
-            )));
-        }
-        let arguments = arguments.as_object().cloned().unwrap_or_default();
-        let params = CallToolRequestParams::new(name.to_owned()).with_arguments(arguments);
-        let call = timeout(
-            Duration::from_millis(MCP_CALL_TIMEOUT_MS),
-            self.running.call_tool_once(params),
-        )
-        .await;
-        match call {
-            Err(_) => Err(SubmitFailure::Ambiguous(format!(
-                "the submit did not answer within {MCP_CALL_TIMEOUT_MS}ms; whether the remote applied it is unknown"
-            ))),
-            Ok(Err(error)) => Err(classify_send_failure(name, &error)),
-            Ok(Ok(CallToolResponse::Complete(result))) => {
-                let value = serde_json::to_value(&result).map_err(|_| {
-                    SubmitFailure::Ambiguous(
-                        "the remote completed the work inside the call but its result could not be read; the effect is applied and unknown to this host"
-                            .to_owned(),
-                    )
-                })?;
-                Ok(TaskSubmission::Completed { result: value })
-            }
-            Ok(Ok(CallToolResponse::Task(created))) => Ok(TaskSubmission::Accepted {
-                remote_task_id: created.task.task_id.clone(),
-                // The seed status of a task that was just materialised is
-                // `working`; an unknown one is treated the same way, because it
-                // is certainly not a terminal state this host may settle on.
-                state: state_of(created.task.status).unwrap_or(RemoteTaskState::Working),
-                poll_interval_ms: created.task.poll_interval_ms,
-            }),
-            Ok(Ok(CallToolResponse::InputRequired(_))) => Err(SubmitFailure::Ambiguous(
-                "the remote asked for input mid-call instead of answering; the call is unfinished"
-                    .to_owned(),
-            )),
-            // The response enum is non-exhaustive. An answer this build cannot
-            // interpret is an answer to a mutation it cannot interpret, which is
-            // the ambiguous case by definition.
-            Ok(Ok(_)) => Err(SubmitFailure::Ambiguous(
-                "the remote answered with a response this build does not understand".to_owned(),
-            )),
-        }
-    }
-
-    /// Read one remote task's current state.
-    ///
-    /// # Errors
-    /// Fails when the remote refuses or the reply carries a status this build
-    /// does not know.
-    pub async fn task_status(
-        &self,
-        remote_task_id: &str,
-    ) -> Result<RemoteTaskSnapshot, ExtensionError> {
-        let result = timeout(
-            Duration::from_millis(MCP_CALL_TIMEOUT_MS),
-            self.running.get_task(GetTaskParams::new(remote_task_id)),
-        )
-        .await
-        .map_err(|_| {
-            ExtensionError::new(
-                ErrorCode::ProcessTimedOut,
-                format!("MCP tasks/get {remote_task_id} exceeded {MCP_CALL_TIMEOUT_MS}ms"),
-            )
-        })?
-        .map_err(|error| {
-            ExtensionError::new(
-                ErrorCode::ExtensionProtocolError,
-                format!("MCP tasks/get failed: {error}"),
-            )
-        })?;
-        let task = &result.task.task;
-        let Some(status) = state_of(task.status) else {
-            return Err(ExtensionError::new(
-                ErrorCode::ExtensionProtocolError,
-                "the remote reported a task status this build does not know",
-            ));
-        };
-        let mut snapshot = RemoteTaskSnapshot::new(task.task_id.clone(), status);
-        snapshot.status_message.clone_from(&task.status_message);
-        snapshot.poll_interval_ms = task.poll_interval_ms;
-        match &result.task.payload {
-            TaskPayload::Completed { result } => {
-                snapshot.result = Some(Value::Object(result.clone()));
-            }
-            TaskPayload::Failed { error } => {
-                snapshot.error = Some(Value::Object(error.clone()));
-            }
-            _ => {}
-        }
-        Ok(snapshot)
-    }
-
-    /// Ask the remote to cancel a task. Cooperative: this reports delivery, and
-    /// the task's own next status is what says how the work ended.
-    ///
-    /// # Errors
-    /// Fails when the remote refuses the request.
-    pub async fn cancel_remote_task(&self, remote_task_id: &str) -> Result<(), ExtensionError> {
-        timeout(
-            Duration::from_millis(MCP_CALL_TIMEOUT_MS),
-            self.running
-                .cancel_task(CancelTaskParams::new(remote_task_id)),
-        )
-        .await
-        .map_err(|_| {
-            ExtensionError::new(
-                ErrorCode::ProcessTimedOut,
-                format!("MCP tasks/cancel {remote_task_id} exceeded {MCP_CALL_TIMEOUT_MS}ms"),
-            )
-        })?
-        .map_err(|error| {
-            ExtensionError::new(
-                ErrorCode::ExtensionProtocolError,
-                format!("MCP tasks/cancel failed: {error}"),
-            )
-        })
-    }
-
     /// Whether the server advertised a tool schema that differs from a pinned
     /// digest. A change requires renegotiation before the tool is used.
     #[must_use]
@@ -1447,112 +1298,6 @@ impl McpClient {
     /// Stop the client and its server process.
     pub async fn close(self) {
         let _ = self.running.cancel().await;
-    }
-}
-
-/// Map the SDK's task status onto this host's vocabulary.
-///
-/// `None` means a status this build does not know, which the SDK allows because
-/// its enum is non-exhaustive. A reader refuses it rather than guessing; a
-/// submit only ever sees it on the seed state of a task that was just created.
-fn state_of(status: TaskStatus) -> Option<RemoteTaskState> {
-    match status {
-        TaskStatus::Working => Some(RemoteTaskState::Working),
-        TaskStatus::InputRequired => Some(RemoteTaskState::InputRequired),
-        TaskStatus::Completed => Some(RemoteTaskState::Completed),
-        TaskStatus::Failed => Some(RemoteTaskState::Failed),
-        TaskStatus::Cancelled => Some(RemoteTaskState::Cancelled),
-        _ => None,
-    }
-}
-
-/// Classify a failed call: only a pre-send refusal is definite.
-///
-/// A JSON-RPC error is **not** proof that nothing happened. The pinned SDK's own
-/// SEP-2663 guard proves the point: a server that materialises a task for a
-/// client which did not declare the extension has already created and persisted
-/// that task by the time the guard replaces the response with an error. A remote
-/// error is therefore an answer about the *answer*, and the safe reading is the
-/// one that never sends the request again.
-fn classify_send_failure(operation: &str, error: &rmcp::ServiceError) -> SubmitFailure {
-    match error {
-        rmcp::ServiceError::McpError(data) => SubmitFailure::Ambiguous(format!(
-            "the remote refused {operation} after the request was sent ({}: {}); whether it applied the work first is unknown",
-            data.code.0, data.message
-        )),
-        other => SubmitFailure::Ambiguous(format!(
-            "the submit of {operation} did not get an answer: {other}"
-        )),
-    }
-}
-
-/// A [`TaskRemote`] over one MCP server's task-returning tool.
-///
-/// The MCP mapping, pinned to the SDK's SEP-2663 support: `submit` is the tool
-/// call that may answer with a task handle, `status` is `tasks/get`, `cancel` is
-/// `tasks/cancel` and is cooperative.
-pub struct McpTaskRemote {
-    client: Arc<McpClient>,
-    server_id: String,
-    tool: String,
-}
-
-impl McpTaskRemote {
-    #[must_use]
-    pub fn new(
-        client: Arc<McpClient>,
-        server_id: impl Into<String>,
-        tool: impl Into<String>,
-    ) -> Self {
-        Self {
-            client,
-            server_id: server_id.into(),
-            tool: tool.into(),
-        }
-    }
-
-    #[must_use]
-    pub fn client(&self) -> &Arc<McpClient> {
-        &self.client
-    }
-}
-
-impl TaskRemote for McpTaskRemote {
-    fn server_id(&self) -> &str {
-        &self.server_id
-    }
-
-    fn submit<'a>(
-        &'a self,
-        operation: &'a str,
-        request: &'a Value,
-    ) -> crate::tasks::RemoteFuture<'a, Result<TaskSubmission, SubmitFailure>> {
-        Box::pin(async move {
-            // A job names the operation it submitted, and the transport owns
-            // which tool implements it. A mismatch is refused *before* anything
-            // is sent, which is why it is a definite failure.
-            if operation != self.tool {
-                return Err(SubmitFailure::Definite(format!(
-                    "this transport serves {} and not {operation}",
-                    self.tool
-                )));
-            }
-            self.client.submit_task(&self.tool, request.clone()).await
-        })
-    }
-
-    fn status<'a>(
-        &'a self,
-        remote_task_id: &'a str,
-    ) -> crate::tasks::RemoteFuture<'a, Result<RemoteTaskSnapshot, ExtensionError>> {
-        Box::pin(async move { self.client.task_status(remote_task_id).await })
-    }
-
-    fn cancel<'a>(
-        &'a self,
-        remote_task_id: &'a str,
-    ) -> crate::tasks::RemoteFuture<'a, Result<(), ExtensionError>> {
-        Box::pin(async move { self.client.cancel_remote_task(remote_task_id).await })
     }
 }
 

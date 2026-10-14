@@ -1143,3 +1143,37 @@ fn read_skill_body(path: &Path) -> Result<String, ExtensionError> {
         )
     })
 }
+
+#[cfg(test)]
+mod resource_tests {
+    use super::{MAX_SKILL_RESOURCE_BYTES, SkillSource, scan_entry};
+
+    /// A skill's support file is shown up to the cap, and only that much is
+    /// read: a large asset is not loaded whole to show its head.
+    #[test]
+    fn a_large_support_file_is_cut_at_the_cap() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skill = directory.path().join("big-assets");
+        std::fs::create_dir_all(skill.join("references")).expect("dirs");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: big-assets\ndescription: Use when a reference is large.\n---\nRead references/big.md.\n",
+        )
+        .expect("skill");
+        std::fs::write(
+            skill.join("references/big.md"),
+            "x".repeat(MAX_SKILL_RESOURCE_BYTES * 3),
+        )
+        .expect("reference");
+        std::fs::write(skill.join("references/small.md"), "small").expect("reference");
+
+        let entry = scan_entry(&skill.join("SKILL.md"), SkillSource::User).expect("scans");
+        let (text, truncated) = entry.read_resource("references/big.md").expect("reads");
+        assert!(truncated);
+        assert_eq!(text.len(), MAX_SKILL_RESOURCE_BYTES);
+        let (text, truncated) = entry.read_resource("references/small.md").expect("reads");
+        assert!(!truncated);
+        assert_eq!(text, "small");
+        assert!(entry.read_resource("../outside.md").is_err());
+    }
+}

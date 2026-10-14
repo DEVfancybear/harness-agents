@@ -932,20 +932,37 @@ async fn m6_02_scope_lease_and_partial_init_cleanup() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one matrix, then a real server walked through every feature
 async fn m6_03_mcp_schema_and_resource_provenance() {
-    // G10 closes every gap that was previously listed as unsupported. The
-    // matrix describes host paths, not just methods present in rmcp.
+    // The matrix describes host paths, not just methods present in rmcp. G10
+    // closed every gap but one: the tasks extension had submit and poll
+    // machinery that nothing ever called, while the handshake declared it, so a
+    // task-capable server answered tool calls with handles the dispatch path
+    // refused. It is reported unsupported, with the reason, and not declared.
     assert_eq!(McpSupportMatrix::spec_revision(), "2026-07-28");
     assert_eq!(McpSupportMatrix::sdk_version(), "3.4.0");
     assert!(
         McpSupportMatrix::ALL
             .into_iter()
+            .filter(|feature| *feature != McpFeature::Tasks)
             .all(McpFeature::is_supported)
     );
-    assert!(McpSupportMatrix::unsupported().is_empty());
-    for feature in McpSupportMatrix::ALL {
+    let unsupported = McpSupportMatrix::unsupported();
+    assert_eq!(
+        unsupported
+            .iter()
+            .map(|(feature, _)| *feature)
+            .collect::<Vec<_>>(),
+        vec![McpFeature::Tasks]
+    );
+    assert!(
+        !unsupported[0].1.is_empty(),
+        "an unsupported feature says why"
+    );
+    for feature in McpSupportMatrix::supported() {
         assert!(McpSupportMatrix::require(feature).is_ok(), "{feature:?}");
     }
+    assert!(McpSupportMatrix::require(McpFeature::Tasks).is_err());
 
     // A real server process, discovered through the real SDK.
     let client = connect_mcp("normal", 1).await.expect("fixture connects");
@@ -1868,17 +1885,28 @@ fn m6_cli_reports_capability_matrix_and_catalog() {
         .expect("supported is an array");
     assert!(supported.iter().any(|value| value == "tools"));
     assert!(supported.iter().any(|value| value == "resources"));
-    for feature in McpSupportMatrix::ALL {
+    for feature in McpSupportMatrix::supported() {
         assert!(
             supported.iter().any(|value| value == feature.as_str()),
             "supported feature {} is advertised",
             feature.as_str()
         );
     }
+    assert!(
+        !supported.iter().any(|value| value == "tasks"),
+        "tasks is not advertised: nothing polls a remote task"
+    );
     let unsupported = reported["mcp"]["unsupported"]
         .as_array()
         .expect("unsupported is an array");
-    assert!(unsupported.is_empty(), "all matrix gaps were implemented");
+    assert_eq!(unsupported.len(), 1, "{unsupported:?}");
+    assert_eq!(unsupported[0]["feature"], "tasks");
+    assert!(
+        unsupported[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "the gap says why: {unsupported:?}"
+    );
 
     // A skill directory reports what it asks for and grants nothing.
     let directory = tempfile::tempdir().expect("tempdir");

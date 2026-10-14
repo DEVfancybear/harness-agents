@@ -14,8 +14,6 @@
 //! changing a server's schema makes every previously promoted definition stale,
 //! and a stale definition is refused rather than used.
 
-use std::sync::Arc;
-
 use harness_session::{
     ContextBlock, ContextBlockKind, ContextChannel, ContextContributor, ContextError,
     ContributorScope,
@@ -521,10 +519,4 @@ pub fn catalog_from_descriptors(
         .collect::<Vec<_>>();
     entries.extend(external);
     ToolCatalog::build(revision, entries)
-}
-
-/// Wrap one catalogue for shared ownership by the host.
-#[must_use]
-pub fn shared_catalog(catalog: ToolCatalog) -> Arc<ToolCatalog> {
-    Arc::new(catalog)
 }

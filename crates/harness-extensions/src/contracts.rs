@@ -8,10 +8,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    path::PathBuf,
 };
 
-use harness_types::{ContentHash, ErrorCode, HarnessError, PluginInstanceId, ScopeId};
+use harness_types::{ContentHash, ErrorCode, HarnessError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -653,16 +652,6 @@ impl ExtensionFrame {
         }
         Ok(frame)
     }
-}
-
-/// A loaded extension instance as the host sees it.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExtensionRegistration {
-    pub instance_id: PluginInstanceId,
-    pub scope_id: ScopeId,
-    pub generation: u64,
-    pub session: NegotiatedSession,
-    pub executable: PathBuf,
 }
 
 /// Why an extension is not active. Reported honestly instead of guessing.
