@@ -1,7 +1,7 @@
 {
   "name": "harness-agents",
   "version": "0.1.0",
-  "description": "ha - a local coding agent in Rust: terminal app, approval-gated tools, persistent memory in SQLite, resumable sessions.",
+  "description": "ha - a terminal coding agent in Rust: approval-gated tools, a persistent Python REPL, checks plus an independent verifier, memory that survives compaction and resume, and learned skills.",
   "license": "MIT",
   "repository": {
     "type": "git",
