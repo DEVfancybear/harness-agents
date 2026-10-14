@@ -1138,6 +1138,19 @@ fn child_context(
             &[],
         ),
     )];
+    // A child has no Python kernel; where the host has no `python` on PATH,
+    // the kernel's interpreter is how it runs a script or the tests. A
+    // verifier without it could only read the code and failed the work.
+    if let Some(python) = super::repl::kernel_python(data_dir) {
+        blocks.push(harness_session::ContextBlock::mandatory(
+            "python-interpreter",
+            harness_session::ContextBlockKind::ProjectRule,
+            format!(
+                "A Python 3 interpreter is available at {} (the harness kernel's). When `python` or `py` is not on PATH, run scripts and tests with run_process and this executable.",
+                python.display()
+            ),
+        ));
+    }
     let learned = super::learned::library_documents(layers);
     if !learned.trim().is_empty() {
         let mut text = learned;

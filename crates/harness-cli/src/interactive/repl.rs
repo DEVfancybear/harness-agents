@@ -2185,6 +2185,16 @@ pub fn kernel_packages() -> &'static [&'static str] {
     &venv::PACKAGES
 }
 
+/// The kernel venv's interpreter, when the venv is built: a Python a process
+/// can run even where `python` and `py` are not on PATH.
+#[must_use]
+pub fn kernel_python(data_dir: &Path) -> Option<PathBuf> {
+    let venv = venv::dir(data_dir);
+    venv::ready(&venv)
+        .then(|| venv::python(&venv))
+        .filter(|python| python.is_file())
+}
+
 mod venv {
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
