@@ -1136,10 +1136,28 @@ fn check_subfile(path: &str) -> Result<(), String> {
             })
             && !segment.contains("..")
     };
+    // Windows opens a device, not a file, for these names with any extension
+    // (`conin$` and `conout$` are already not plain).
+    let device = |segment: &&str| {
+        let stem = segment
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        matches!(stem.as_str(), "con" | "prn" | "aux" | "nul")
+            || ((stem.starts_with("com") || stem.starts_with("lpt"))
+                && stem.len() == 4
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+    };
     if segments.len() < 2 || !SUBFILE_DIRS.contains(&segments[0]) || !segments.iter().all(plain) {
         return Err(format!(
             "{path:?} must be a relative path under one of {}",
             SUBFILE_DIRS.join("/, ")
+        ));
+    }
+    if let Some(segment) = segments.iter().find(|segment| device(segment)) {
+        return Err(format!(
+            "{path:?}: {segment:?} is a Windows device name, not a file; choose another name"
         ));
     }
     Ok(())
@@ -1401,7 +1419,9 @@ pub fn promote(layers: &Layers, intent: &Intent, context: &PromoteContext) -> Ve
     let root = layers.root(layer).expect("layer is present").to_path_buf();
     let directory = root.join(&intent.name);
     if action == "create" {
-        if directory.exists() || layers.find(&intent.name).is_some() {
+        // A folder without SKILL.md is what a failed write left behind, not a
+        // skill: a create may take its place.
+        if directory.join("SKILL.md").exists() || layers.find(&intent.name).is_some() {
             return Verdict::reject(
                 Some(layer),
                 vec![format!(
@@ -1603,6 +1623,7 @@ fn land(
         }
         _ => {
             let body = body.expect("shaped body");
+            let existed = directory.exists();
             // Every target is resolved before anything is written.
             let targets = intent
                 .files
@@ -1618,12 +1639,21 @@ fn land(
                     json!(std::fs::read_to_string(target).ok()),
                 );
             }
-            for (relative, target) in &targets {
-                write_atomic(target, &intent.files[*relative])?;
+            let written = targets
+                .iter()
+                .try_for_each(|(relative, target)| write_atomic(target, &intent.files[*relative]))
+                // SKILL.md last: the commit point. A reader never sees it point
+                // at a file not yet written.
+                .and_then(|()| write_atomic(&directory.join("SKILL.md"), body));
+            if let Err(error) = written {
+                // A create that failed half way leaves nothing behind: a folder
+                // without SKILL.md would hold the name for ever, neither
+                // creatable again nor a live skill to patch.
+                if intent.action == "create" && !existed {
+                    let _ = std::fs::remove_dir_all(&directory);
+                }
+                return Err(error);
             }
-            // SKILL.md last: the commit point. A reader never sees it point at a
-            // file not yet written.
-            write_atomic(&directory.join("SKILL.md"), body)?;
             let (requests, _) = usage(layers, layer);
             if intent.action == "create" {
                 write_atomic(
@@ -1752,6 +1782,26 @@ mod tests {
             &root.join("workspace"),
             true,
         )
+    }
+
+    #[test]
+    fn windows_device_names_are_not_support_files() {
+        for refused in [
+            "references/nul",
+            "scripts/CON.py",
+            "assets/com1.txt",
+            "references/lpt9",
+        ] {
+            let error = super::check_subfile(refused).expect_err(refused);
+            assert!(error.contains("Windows device name"), "{refused}: {error}");
+        }
+        for allowed in [
+            "references/com0.md",
+            "scripts/console.py",
+            "assets/null.txt",
+        ] {
+            super::check_subfile(allowed).expect(allowed);
+        }
     }
 
     fn skill(name: &str, body: &str) -> String {

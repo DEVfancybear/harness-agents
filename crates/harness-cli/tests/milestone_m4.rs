@@ -4231,6 +4231,112 @@ async fn g06_ask_user_stops_the_turn_and_answer_resumes_it() {
 }
 
 #[tokio::test]
+// Measured: only the first step of a follow-up turn carried the earlier turns;
+// after one tool call the model had lost them, so a code word said in turn 1
+// was gone from step 2 of turn 2.
+async fn every_step_of_a_continued_turn_sends_the_conversation() {
+    let bench = bench();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("Noted: the code word is AZURE."),
+            ProviderStreamEvent::completed("stop"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "look",
+                "list_dir",
+                serde_json::json!({"path": ""}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("AZURE"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let task = TaskId::generate();
+    let workspace =
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("observation");
+    let options = || TurnOptions {
+        workspace_root: bench.workspace.clone(),
+        actor_id: "continuation.test".to_owned(),
+        approvals: ApprovalMode::Auto,
+        limits: TurnLimits::default(),
+    };
+    let mut previous: Option<SessionId> = None;
+    for text in [
+        "remember the code word AZURE",
+        "look around, then say the code word",
+    ] {
+        let store = bench.open_store().await;
+        let runtime = Arc::new(RuntimeService::new(
+            Arc::clone(&store),
+            provider.clone(),
+            RuntimeConfig::default(),
+        ));
+        let driver = TurnDriver::new(
+            Arc::clone(&runtime),
+            ToolExecutionService::new(Arc::clone(&store)),
+        );
+        let session = SessionId::generate();
+        let request = RunRequest::new(
+            session.clone(),
+            task.clone(),
+            InputId::generate(),
+            text.to_owned(),
+            workspace.clone(),
+        )
+        .with_tool_schemas(coding_tool_schemas());
+        let observer: Arc<dyn TurnObserver> = Arc::new(SilentObserver);
+        match &previous {
+            Some(source) => {
+                driver
+                    .run_turn_continuing(
+                        source,
+                        request,
+                        options(),
+                        observer,
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+            None => {
+                driver
+                    .run_turn(request, options(), observer, CancellationToken::new())
+                    .await
+            }
+        }
+        .expect("turn runs");
+        drop(driver);
+        drop(runtime);
+        close(store).await;
+        previous = Some(session);
+    }
+    let seen = provider.seen();
+    assert_eq!(seen.len(), 3, "one call for turn 1, two steps for turn 2");
+    for (step, request) in seen.iter().enumerate().skip(1) {
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|message| message.content.contains("remember the code word AZURE")),
+            "request {step} lost turn 1: {:#?}",
+            request
+                .messages
+                .iter()
+                .map(|message| (
+                    message.role,
+                    message.content.chars().take(60).collect::<String>()
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[tokio::test]
 async fn g06_bang_prefix_goes_through_the_same_approval_gate() {
     let bench = bench();
     let store = bench.open_store().await;

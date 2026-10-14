@@ -612,6 +612,9 @@ pub struct RunRequest {
     /// Shared across cloned continuation requests so one admitted input cannot
     /// start more than one automatic compaction.
     auto_compaction_attempted: Arc<AtomicBool>,
+    /// Shared the same way: every step of a turn sends the earlier turns, so
+    /// each one summarises them again (from the cache) and the user is told once.
+    earlier_compaction_noticed: Arc<AtomicBool>,
 }
 
 impl RunRequest {
@@ -647,6 +650,7 @@ impl RunRequest {
             conversation: Vec::new(),
             authority: SourceAuthority::User,
             auto_compaction_attempted: Arc::new(AtomicBool::new(false)),
+            earlier_compaction_noticed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2580,7 +2584,11 @@ impl RuntimeService {
                             checkpoint_id.clone(),
                             &appended,
                         );
-                        notices.push(format!(
+                        if !request
+                            .earlier_compaction_noticed
+                            .swap(true, Ordering::SeqCst)
+                        {
+                            notices.push(format!(
                             "context: compacted {} earlier message(s) into a summary to stay within the model's window{}",
                             older.len(),
                             match (&attempt, before) {
@@ -2591,6 +2599,7 @@ impl RuntimeService {
                                 _ => String::new(),
                             }
                         ));
+                        }
                     }
                     Err(error) => notices.push(format!(
                         "context: the earlier conversation could not be summarised ({error})"
@@ -3944,6 +3953,30 @@ impl RuntimeService {
         cancellation: CancellationToken,
         sink: ProviderEventSink,
     ) -> Result<RunResult, RuntimeError> {
+        let request = self
+            .prepare_continuation_request(source_session_id, request)
+            .await?;
+        self.run_prepared_continuation(source_session_id, &request, cancellation, sink)
+            .await
+    }
+
+    /// The request a continuation turn sends: `request` with the conversation
+    /// it continues, the summary of what a compaction folded away, and any
+    /// recovered tool results attached.
+    ///
+    /// Every step of the turn must send this same request, not only the first:
+    /// a later step built from the bare request dropped every earlier turn of
+    /// the conversation, so a model that called one tool forgot what the user
+    /// had said before.
+    ///
+    /// # Errors
+    /// The source session is unknown, belongs to another task, or the store
+    /// cannot be read.
+    pub async fn prepare_continuation_request(
+        &self,
+        source_session_id: &SessionId,
+        request: RunRequest,
+    ) -> Result<RunRequest, RuntimeError> {
         let source_task = self
             .store
             .session_task(source_session_id)
@@ -3957,12 +3990,25 @@ impl RuntimeService {
                 "continuation task does not match source session",
             ));
         }
-        let request = self
-            .prepare_continuation(source_session_id, request)
-            .await?;
+        self.prepare_continuation(source_session_id, request).await
+    }
+
+    /// Run the first step of a continuation `request` already prepared by
+    /// [`Self::prepare_continuation_request`], and link its session to the
+    /// one it continues.
+    ///
+    /// # Errors
+    /// The step failed; a turn that was admitted is still linked.
+    pub async fn run_prepared_continuation(
+        &self,
+        source_session_id: &SessionId,
+        request: &RunRequest,
+        cancellation: CancellationToken,
+        sink: ProviderEventSink,
+    ) -> Result<RunResult, RuntimeError> {
         let session_id = request.session_id.clone();
         let task_id = request.task_id.clone();
-        let result = match self.run_streaming(&request, cancellation, sink).await {
+        let result = match self.run_streaming(request, cancellation, sink).await {
             Ok(result) => result,
             Err(error) => {
                 // A turn that was admitted and then canceled or failed is still a

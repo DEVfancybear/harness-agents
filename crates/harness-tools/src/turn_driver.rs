@@ -832,10 +832,17 @@ impl TurnDriver {
 
         let first_step = match source_session_id {
             Some(source) => {
+                // The prepared request - the conversation this turn continues -
+                // is the one every later step sends too.
+                request = self
+                    .runtime
+                    .prepare_continuation_request(source, request)
+                    .await
+                    .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
                 self.runtime
-                    .continue_task_streaming(
+                    .run_prepared_continuation(
                         source,
-                        request.clone(),
+                        &request,
                         cancellation.clone(),
                         sink_with(&observer, prefetcher.clone()),
                     )
