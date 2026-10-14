@@ -23,7 +23,7 @@ use harness_tools::{
     CodingToolAction, ExternalToolCatalog, ExternalToolDispatcher, ExternalTools,
     ToolDispatchAuthorization, ToolOutput,
 };
-use harness_types::{ErrorCode, HarnessError};
+use harness_types::{ContentHash, ErrorCode, HarnessError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc::UnboundedSender;
@@ -70,6 +70,9 @@ pub struct Evidence {
     pub commit: Option<String>,
     pub checks: String,
     pub verified_by: String,
+    /// Evidence is valid only for the definition whose commands were run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<ContentHash>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -97,10 +100,18 @@ impl Feature {
     #[must_use]
     pub fn verified(&self) -> bool {
         self.state == State::Passing
-            && self
-                .evidence
-                .as_ref()
-                .is_some_and(|evidence| evidence.verified_by == VERIFIED_BY)
+            && self.evidence.as_ref().is_some_and(|evidence| {
+                evidence.verified_by == VERIFIED_BY
+                    && evidence.definition.as_ref() == Some(&self.definition_hash())
+            })
+    }
+
+    fn definition_hash(&self) -> ContentHash {
+        ContentHash::from_bytes(
+            json!([self.id, self.title, self.behavior, self.verification])
+                .to_string()
+                .as_bytes(),
+        )
     }
 
     fn state_label(&self) -> &'static str {
@@ -304,6 +315,43 @@ fn save(root: &Path, list: &FeatureList) -> Result<(), String> {
         .map_err(|error| format!("{FEATURES_FILE} cannot be written: {error}"))
 }
 
+/// Serialize each read/modify/write across tool calls and worker processes.
+/// The lock lives outside the project, so a read never dirties the checkout.
+async fn list_lock(root: &Path, cancellation: &CancellationToken) -> Result<std::fs::File, String> {
+    let root = root.canonicalize().map_err(|error| error.to_string())?;
+    let identity = root.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    let identity = identity.to_lowercase();
+    let key = ContentHash::from_bytes(identity.as_bytes());
+    let directory = std::env::temp_dir().join("harness-feature-locks");
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join(format!("{}.lock", key.as_str().replace(':', "-"))))
+        .map_err(|error| format!("the feature list lock could not be opened: {error}"))?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if cancellation.is_cancelled() {
+            return Err("the feature operation was canceled".to_owned());
+        }
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err("waiting for another feature operation timed out".to_owned());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(format!("the feature list could not be locked: {error}"));
+            }
+        }
+    }
+}
+
 /// The context block a turn carries when the project keeps a feature list.
 #[must_use]
 pub fn context_block(root: &Path) -> Option<ContextBlock> {
@@ -436,6 +484,9 @@ impl FeatureHost {
         outcome: &mut Option<bool>,
     ) -> Result<String, HarnessError> {
         let action = arguments["action"].as_str().unwrap_or_default();
+        let lock = list_lock(&self.root, &self.cancellation)
+            .await
+            .map_err(Self::refused)?;
         let mut list = load(&self.root).map_err(Self::refused)?.unwrap_or_default();
         match action {
             "list" => Ok(list.lines().join("\n")),
@@ -519,7 +570,7 @@ impl FeatureHost {
                 save(&self.root, &list).map_err(Self::refused)?;
                 Ok(text)
             }
-            "verify" => self.verify(list, arguments, outcome).await,
+            "verify" => self.verify(list, arguments, outcome, lock).await,
             _ => Err(Self::refused(
                 "action must be list, add, start, block, update or verify",
             )),
@@ -531,6 +582,7 @@ impl FeatureHost {
         mut list: FeatureList,
         arguments: &Value,
         outcome: &mut Option<bool>,
+        lock: std::fs::File,
     ) -> Result<String, HarnessError> {
         let index = Self::feature_id(&list, arguments)?;
         let feature = list.features[index].clone();
@@ -564,6 +616,12 @@ impl FeatureHost {
                 feature.id
             )));
         }
+        // A rerun replaces the previous proof even if it fails or is canceled.
+        // Persist this before starting a process, so a crash cannot retain a pass.
+        if list.features[index].evidence.take().is_some() {
+            save(&self.root, &list).map_err(Self::refused)?;
+        }
+        drop(lock);
         let _ = self.sender.send(SessionEvent::Notice {
             message: format!("feature {}: running {} check(s)", feature.id, checks.len()),
         });
@@ -580,6 +638,9 @@ impl FeatureHost {
         }
         // The file may have changed while the checks ran: record the result on
         // what is there now.
+        let _lock = list_lock(&self.root, &self.cancellation)
+            .await
+            .map_err(Self::refused)?;
         list = load(&self.root).map_err(Self::refused)?.unwrap_or_default();
         let Some(index) = list.find(&feature.id) else {
             return Err(Self::refused(format!(
@@ -587,11 +648,23 @@ impl FeatureHost {
                 feature.id
             )));
         };
+        let entry = &list.features[index];
+        if entry.definition_hash() != feature.definition_hash()
+            || entry.state != feature.state
+            || entry.blocker != feature.blocker
+        {
+            *outcome = Some(false);
+            return Err(Self::refused(format!(
+                "{} changed while its checks ran; no passing evidence was recorded. Verify the current definition again",
+                feature.id
+            )));
+        }
         let evidence = Evidence {
             at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             commit: commit(&self.root).await,
             checks: report.evidence(),
             verified_by: VERIFIED_BY.to_owned(),
+            definition: Some(feature.definition_hash()),
         };
         let entry = &mut list.features[index];
         entry.state = State::Passing;
@@ -742,6 +815,7 @@ mod tests {
     use super::{FEATURES_FILE, FeatureHost, State, load};
     use harness_tools::ExternalToolCatalog as _;
     use serde_json::{Value, json};
+    use std::sync::Arc;
 
     fn host(root: &std::path::Path) -> FeatureHost {
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -879,5 +953,117 @@ mod tests {
             .await
             .expect_err("nothing to run");
         assert!(refused.to_string().contains("no verification commands"));
+    }
+
+    #[tokio::test]
+    async fn verification_regression_a_failed_rerun_revokes_previous_evidence() {
+        let root = tempfile::tempdir().expect("root");
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root.path())
+                    .output()
+                    .expect("git")
+                    .status
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.path().join("ready.txt"), "good\n").expect("file");
+        git(&["add", "ready.txt"]);
+        git(&[
+            "-c",
+            "user.name=qa",
+            "-c",
+            "user.email=qa@localhost",
+            "commit",
+            "-qm",
+            "baseline",
+        ]);
+        let host = host(root.path());
+        host.run(&json!({"action":"add", "title":"ready", "verification":["git diff --exit-code -- ready.txt"]})).await.expect("add");
+        let request = resolved(&host, &json!({"action":"verify", "id":"F01"}));
+        host.run(&request).await.expect("passes");
+        assert!(load(root.path()).unwrap().unwrap().features[0].verified());
+        std::fs::write(root.path().join("ready.txt"), "broken\n").expect("break it");
+        let failed = host.run(&request).await.expect("failure reported");
+        assert!(failed.contains("NOT passing"), "{failed}");
+        assert!(
+            !load(root.path()).unwrap().unwrap().features[0].verified(),
+            "the old pass must not survive a failed rerun"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_regression_a_changed_definition_is_not_certified() {
+        let root = tempfile::tempdir().expect("root");
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let host = FeatureHost::new(
+            root.path().to_owned(),
+            Vec::new(),
+            harness_providers::CancellationToken::new(),
+            sender,
+        );
+        host.run(
+            &json!({"action":"add", "title":"old definition", "verification":["echo old check"]}),
+        )
+        .await
+        .expect("add");
+        let request = resolved(&host, &json!({"action":"verify", "id":"F01"}));
+        let (result, ()) = tokio::join!(host.run(&request), async {
+            events.recv().await.expect("check started");
+            let mut list = load(root.path()).unwrap().unwrap();
+            list.features[0].behavior = "new unchecked requirement".to_owned();
+            list.features[0].verification = vec!["exit 9".to_owned()];
+            super::save(root.path(), &list).expect("edit during check");
+        });
+        let refused = result.expect_err("the new definition was not checked");
+        assert!(refused.to_string().contains("changed"), "{refused}");
+        let list = load(root.path()).unwrap().unwrap();
+        assert!(!list.features[0].verified());
+        assert_eq!(list.features[0].verification, ["exit 9"]);
+    }
+
+    #[tokio::test]
+    async fn verification_regression_evidence_is_bound_to_the_definition() {
+        let root = tempfile::tempdir().expect("root");
+        let host = host(root.path());
+        host.run(&json!({"action":"add", "title":"original", "behavior":"old behavior", "verification":["echo ok"]})).await.expect("add");
+        host.run(&resolved(&host, &json!({"action":"verify", "id":"F01"})))
+            .await
+            .expect("verify");
+        let mut list = load(root.path()).unwrap().unwrap();
+        assert!(list.features[0].verified());
+        list.features[0].behavior = "different behavior".to_owned();
+        super::save(root.path(), &list).expect("external edit");
+        let list = load(root.path()).unwrap().unwrap();
+        assert!(
+            !list.features[0].verified(),
+            "evidence of the old behavior is not evidence of the new behavior"
+        );
+        assert_eq!(list.counts().unverified, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn verification_regression_parallel_additions_never_lose_features() {
+        let root = tempfile::tempdir().expect("root");
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut jobs = Vec::new();
+        for number in 0..4 {
+            let host = host(root.path());
+            let barrier = Arc::clone(&barrier);
+            jobs.push(tokio::spawn(async move {
+                barrier.wait();
+                for feature in 0..8 {
+                    host.run(&json!({"action":"add", "id":format!("{number}-{feature}"), "title":"concurrent feature"})).await.expect("add succeeds");
+                }
+            }));
+        }
+        for job in jobs {
+            job.await.expect("task");
+        }
+        let list = load(root.path()).unwrap().unwrap();
+        assert_eq!(list.features.len(), 32, "no add can overwrite another add");
     }
 }

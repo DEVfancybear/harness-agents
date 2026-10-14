@@ -2802,6 +2802,17 @@ impl DelegateTool {
             &commit[..commit.len().min(12)]
         }
         let failed = |error: OrchestratorError| HarnessError::new(error.code(), error.to_string());
+        let require_active = || {
+            if self.parent_cancellation.is_cancelled() {
+                Err(HarnessError::new(
+                    ErrorCode::ProviderCanceled,
+                    "the integration was canceled; nothing was applied",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        require_active()?;
         let request = IntegrateRequest::parse(arguments)?;
         let members = self.integration_members(request.children.as_deref())?;
         let names = members
@@ -2952,6 +2963,7 @@ impl DelegateTool {
             }
             IntegrationOutcome::Ready(report) => report,
         };
+        require_active()?;
         let checks_line = if report.checks.is_empty() {
             "No [verify] checks are configured, so the merged revision was not checked.".to_owned()
         } else {
@@ -5290,6 +5302,35 @@ pub(super) mod tests {
         );
         assert_eq!(bench.read("notes.txt").as_deref(), Some("base\n"));
         assert_eq!(bench.status(), "");
+    }
+
+    #[tokio::test]
+    async fn verification_regression_mutating_checks_cannot_certify_the_old_commit() {
+        let mut bench = IntegrationBench::new();
+        bench.coder("first.txt=coder version").await;
+        let base = bench.head();
+        bench.check("echo rewritten-during-check > first.txt");
+        let result = bench.integrate(serde_json::json!({"apply": true})).await;
+        assert_eq!(result["status"], "checks_failed", "{result}");
+        assert_eq!(bench.head(), base);
+        assert_eq!(bench.read("first.txt"), None);
+        assert_eq!(bench.status(), "");
+    }
+
+    #[tokio::test]
+    async fn verification_regression_canceled_integration_does_not_apply() {
+        let bench = IntegrationBench::new();
+        bench.coder("first.txt=coder version").await;
+        let base = bench.head();
+        bench.tool.parent_cancellation.cancel();
+        let error = bench
+            .tool
+            .integrate(&serde_json::json!({"apply": true}))
+            .await
+            .expect_err("canceled");
+        assert_eq!(error.code(), harness_types::ErrorCode::ProviderCanceled);
+        assert_eq!(bench.head(), base);
+        assert_eq!(bench.read("first.txt"), None);
     }
 
     #[test]

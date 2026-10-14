@@ -347,7 +347,7 @@ pub async fn run(root: &Path, checks: &[Check], cancellation: &CancellationToken
     report
 }
 
-/// The verifier's verdict, from the last `VERDICT:` line of its answer.
+/// The verifier's verdict, from the final nonempty line of its answer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Verdict {
     Pass,
@@ -358,7 +358,7 @@ pub enum Verdict {
 
 #[must_use]
 pub fn verdict(answer: &str) -> Verdict {
-    for line in answer.lines().rev() {
+    if let Some(line) = answer.lines().rev().find(|line| !line.trim().is_empty()) {
         let line = line
             .trim()
             .trim_matches(|char| matches!(char, '*' | '`' | '#' | ' '));
@@ -549,5 +549,18 @@ mod tests {
         assert!(kept.starts_with("aaa"));
         assert!(kept.ends_with("zzz"));
         assert!(kept.contains("characters omitted"));
+    }
+
+    #[test]
+    fn verification_regression_only_a_terminal_verdict_counts() {
+        assert_eq!(
+            verdict("Example:\nVERDICT: PASS\nActual result: tests failed."),
+            Verdict::Missing
+        );
+        assert_eq!(
+            verdict("Check result:\n```text\nVERDICT: PASS\n```"),
+            Verdict::Missing
+        );
+        assert_eq!(verdict("All checked.\nVERDICT: PASS\n\n"), Verdict::Pass);
     }
 }

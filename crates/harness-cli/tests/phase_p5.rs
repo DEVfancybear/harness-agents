@@ -1248,6 +1248,103 @@ async fn p5_s05_integration_is_dependency_ordered_and_rechecks_final_revision() 
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn verification_regression_a_moved_coder_branch_is_not_substituted() {
+    let repo = test_repo();
+    let manager = workspace_for(&repo);
+    let snapshot = repo.snapshot(&manager).await;
+    let task = TaskId::generate();
+    let worker = manager
+        .create_worktree(
+            &snapshot,
+            &task,
+            &AgentRunId::generate(),
+            &["src/first.rs".to_owned()],
+            1,
+        )
+        .await
+        .unwrap();
+    let file = std::path::Path::new(&worker.path).join("src/first.rs");
+    std::fs::write(&file, "reviewed revision\n").unwrap();
+    let reviewed = manager
+        .commit_worker_changes(&worker, "reviewed")
+        .await
+        .unwrap();
+    let candidate = harness_orchestrator::workspace_candidate(
+        &worker,
+        &reviewed,
+        vec!["src/first.rs".to_owned()],
+    );
+    std::fs::write(&file, "different revision\n").unwrap();
+    manager
+        .commit_worker_changes(&worker, "moved branch")
+        .await
+        .unwrap();
+    let integrator = harness_orchestrator::ResultIntegrator::new(manager);
+    let result = integrator
+        .integrate(&snapshot, &[task], &[candidate], &[])
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, IntegrationOutcome::Conflicted { .. }),
+        "a branch must not silently replace the recorded result revision: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn verification_regression_an_edited_integration_is_not_applied() {
+    let repo = test_repo();
+    let manager = workspace_for(&repo);
+    let snapshot = repo.snapshot(&manager).await;
+    let task = TaskId::generate();
+    let worker = manager
+        .create_worktree(
+            &snapshot,
+            &task,
+            &AgentRunId::generate(),
+            &["src/first.rs".to_owned()],
+            1,
+        )
+        .await
+        .unwrap();
+    std::fs::write(
+        std::path::Path::new(&worker.path).join("src/first.rs"),
+        "checked\n",
+    )
+    .unwrap();
+    let revision = manager
+        .commit_worker_changes(&worker, "checked")
+        .await
+        .unwrap();
+    let candidate = harness_orchestrator::workspace_candidate(
+        &worker,
+        &revision,
+        vec!["src/first.rs".to_owned()],
+    );
+    let integrator = harness_orchestrator::ResultIntegrator::new(manager);
+    let IntegrationOutcome::Ready(report) = integrator
+        .integrate(&snapshot, &[task], &[candidate], &[])
+        .await
+        .unwrap()
+    else {
+        panic!("ready");
+    };
+    std::fs::write(
+        std::path::Path::new(&report.integration_root).join("src/first.rs"),
+        "changed after checks\n",
+    )
+    .unwrap();
+    let result = integrator
+        .apply_final(&snapshot.root, &snapshot.fingerprint, &report)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, harness_orchestrator::ApplyOutcome::Refused { .. }),
+        "changed integration proof must not be applied: {result:?}"
+    );
+    assert_eq!(repo.commit_count(), 1);
+}
+
+#[tokio::test]
 async fn p5_concurrent_worktree_creation_serializes_git_metadata() {
     let repo = test_repo();
     let manager = workspace_for(&repo);

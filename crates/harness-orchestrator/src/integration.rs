@@ -188,7 +188,12 @@ impl ResultIntegrator {
                     applied_commit: head(&root)?,
                 });
             } else {
-                match integrate_branch(&root, &clone_source, &candidate.branch) {
+                match integrate_branch(
+                    &root,
+                    &clone_source,
+                    &candidate.branch,
+                    &candidate.result_revision,
+                ) {
                     Ok(()) => {
                         report.steps.push(IntegrationStep {
                             task_id: task_id.clone(),
@@ -304,15 +309,10 @@ impl ResultIntegrator {
                 reason: "the user's checkout has a detached HEAD; nothing was applied".to_owned(),
             });
         }
-        let integration_root = PathBuf::from(&report.integration_root);
-        if head(&integration_root)? != report.final_commit {
-            return Ok(ApplyOutcome::Refused {
-                reason: format!(
-                    "the integration worktree no longer holds {}; integrate again",
-                    report.final_commit
-                ),
-            });
+        if let Some(reason) = integration_refusal(report)? {
+            return Ok(ApplyOutcome::Refused { reason });
         }
+        let integration_root = PathBuf::from(&report.integration_root);
         // The fetch writes only objects and FETCH_HEAD; the working tree
         // changes with the fast-forward alone, which Git refuses rather than
         // overwrite a local change.
@@ -346,6 +346,23 @@ impl ResultIntegrator {
             final_commit: report.final_commit.clone(),
         })
     }
+}
+
+/// A ready report remains valid only while its checked revision and inputs do.
+fn integration_refusal(report: &IntegrationReport) -> Result<Option<String>, OrchestratorError> {
+    if report.checks.iter().any(|check| !check.passed) {
+        return Ok(Some(
+            "the integration has failed checks; nothing was applied".to_owned(),
+        ));
+    }
+    let root = Path::new(&report.integration_root);
+    if head(root)? != report.final_commit || fingerprint_locked(root)? != report.final_fingerprint {
+        return Ok(Some(format!(
+            "the integration worktree changed after {} was verified; integrate again. Nothing was applied",
+            report.final_commit
+        )));
+    }
+    Ok(None)
 }
 
 fn prepare_integration_worktree(
@@ -405,12 +422,23 @@ fn integrate_branch(
     root: &Path,
     clone_source: &Path,
     branch: &str,
+    result_revision: &str,
 ) -> Result<(), OrchestratorError> {
     // Worker branches live in the host-owned clone the worktrees were created
     // from, so that clone is the only fetch source.
     let reference = format!("refs/heads/{branch}");
     let source = clone_source.to_string_lossy().into_owned();
     git(root, &["fetch", "--quiet", &source, &reference])?;
+    let fetched = git(root, &["rev-parse", "FETCH_HEAD"])?;
+    if fetched.trim() != result_revision {
+        return Err(OrchestratorError::new(
+            ErrorCode::IntegrationConflict,
+            format!(
+                "coder branch {branch} moved from the recorded revision {result_revision} to {}; integrate again",
+                fetched.trim()
+            ),
+        ));
+    }
     let message = format!("integrate {branch}");
     let _ = git(
         root,
@@ -420,7 +448,7 @@ fn integrate_branch(
             "--no-edit",
             "-m",
             &message,
-            "FETCH_HEAD",
+            result_revision,
         ],
     )?;
     Ok(())
@@ -491,17 +519,31 @@ fn record_final_checks(
     results: Vec<CheckResult>,
 ) -> Result<Vec<String>, OrchestratorError> {
     let mut failures = Vec::new();
+    let workspace_digest = fingerprint_locked(root)?;
+    if workspace_digest != report.final_fingerprint {
+        failures.push(
+            "verification inputs changed: checks modified the integrated revision or its files; fix or commit those changes in a coder worktree and integrate again. Ignored build artifacts may be written, but the revision being verified must stay unchanged"
+                .to_owned(),
+        );
+        report.checks.push(CheckedRevision {
+            command: "verification inputs unchanged".to_owned(),
+            revision: report.final_commit.clone(),
+            passed: false,
+            workspace_digest: Some(workspace_digest.clone()),
+            exit_code: None,
+            artifact_id: None,
+        });
+    }
+    report.final_fingerprint = workspace_digest.clone();
     for result in results {
         if !result.passed {
             failures.push(format!("{}: {}", result.command, result.detail));
         }
-        let workspace_digest = fingerprint_locked(root)?;
-        report.final_fingerprint = workspace_digest.clone();
         report.checks.push(CheckedRevision {
             command: result.command,
             revision: report.final_commit.clone(),
             passed: result.passed,
-            workspace_digest: Some(workspace_digest),
+            workspace_digest: Some(workspace_digest.clone()),
             exit_code: result.exit_code,
             artifact_id: None,
         });

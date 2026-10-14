@@ -171,6 +171,9 @@ impl GoalHost {
             self.complete(summary);
             return Ok(format!("The goal is marked complete: {summary}"));
         };
+        if check.cancellation.is_cancelled() {
+            return Err("The goal is NOT complete: verification was canceled.".to_owned());
+        }
         let workspace = super::autonomous::snapshot(&check.root).await;
         let unchanged = workspace.is_some()
             && self
@@ -238,6 +241,9 @@ Fix every finding, check it yourself, then call goal_complete again.",
                     ));
                 }
             }
+        }
+        if check.cancellation.is_cancelled() {
+            return Err("The goal is NOT complete: verification was canceled.".to_owned());
         }
         let verified = format!("{summary} [verified: {evidence}]");
         self.complete(&verified);
@@ -625,6 +631,29 @@ mod tests {
         host.finish("done").await.expect_err("fails again");
         let runs = std::fs::read_to_string(root.path().join("runs.log")).expect("log");
         assert_eq!(runs.lines().count(), 2, "a change runs the check again");
+    }
+
+    /// Cancellation must also be honored when there is no process to cancel.
+    #[tokio::test]
+    async fn verification_regression_canceled_goal_without_checks_cannot_complete() {
+        let root = tempfile::tempdir().expect("root");
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let cancellation = harness_providers::CancellationToken::new();
+        cancellation.cancel();
+        let host = GoalHost::new(sender).with_check(super::GoalCheck {
+            root: root.path().to_owned(),
+            objective: "ship".to_owned(),
+            checks: Vec::new(),
+            judge: None,
+            cancellation,
+        });
+        let result = host
+            .finish("done")
+            .await
+            .expect_err("canceled goal is unfinished");
+        assert!(result.contains("canceled"), "{result}");
+        assert!(!host.completed());
+        assert!(completions(&mut events).is_empty());
     }
 
     /// Passing checks complete the goal, with their evidence in its summary.
