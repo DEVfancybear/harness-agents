@@ -565,6 +565,235 @@ fn split_recent_aligned(
     }
 }
 
+/// Which summary a request writes.
+#[derive(Clone, Copy)]
+enum SummaryKind {
+    /// The earlier conversation (prime-agent's history summary).
+    History,
+    /// The start of a turn cut in two (prime-agent's turn prefix summary).
+    TurnPrefix,
+}
+
+/// prime-agent's `TURN_PREFIX_SUMMARIZATION_PROMPT`, verbatim.
+const TURN_PREFIX_SUMMARIZATION_PROMPT: &str =
+    "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
+
+Summarize the prefix to provide context for the retained suffix:
+
+## Original Request
+[What did the user ask for in this turn?]
+
+## Early Progress
+- [Key decisions and work done in the prefix]
+
+## Context for Suffix
+- [Information needed to understand the retained recent work]
+
+Be concise. Focus on what's needed to understand the kept suffix.";
+
+/// The same, for a prefix too long for one request: the part above continues
+/// the prefix the summary in `<previous-summary>` already covers.
+const TURN_PREFIX_UPDATE_PROMPT: &str = "The messages above continue the PREFIX of a turn that was too large to keep; <previous-summary> summarizes the part of the prefix before them. The SUFFIX (recent work) is retained.
+
+Update the summary of the prefix with the messages above, keeping this format:
+
+## Original Request
+[What did the user ask for in this turn?]
+
+## Early Progress
+- [Key decisions and work done in the prefix]
+
+## Context for Suffix
+- [Information needed to understand the retained recent work]
+
+Be concise. Focus on what's needed to understand the kept suffix.";
+
+/// How a split turn's prefix summary follows the history summary
+/// (prime-agent's `compact`).
+const SPLIT_TURN_SEPARATOR: &str = "
+
+---
+
+**Turn Context (split turn):**
+
+";
+
+/// Where to cut a turn that alone holds more than `keep` tokens: prime-agent's
+/// `findCutPoint`, which cuts at an assistant message (never at a tool result,
+/// which must follow its call) when no user message is close enough. Returns
+/// the turn's start and the cut, `None` when `messages` ends in no such turn.
+fn split_turn(messages: &[ProviderMessage], keep: u64) -> Option<(usize, usize)> {
+    let start = messages
+        .iter()
+        .rposition(|message| message.role == MessageRole::User)?;
+    let mut kept = 0_u64;
+    let mut cut = None;
+    for (index, message) in messages.iter().enumerate().skip(start + 1).rev() {
+        kept = kept.saturating_add(messages_tokens(std::slice::from_ref(message)));
+        if message.role == MessageRole::Assistant {
+            cut = Some(index);
+        }
+        if kept > keep {
+            break;
+        }
+    }
+    cut.filter(|cut| *cut > start + 1).map(|cut| (start, cut))
+}
+
+/// The task setting that keeps the summary of a conversation's earlier part.
+const ROLLING_SUMMARY_SETTING: &str = "rolling_summary";
+
+/// The summary of the first `covers` messages of a conversation, whose content
+/// has `digest`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RollingSummary {
+    covers: usize,
+    digest: String,
+    summary: String,
+}
+
+/// What identifies messages for [`RollingSummary`]: their summary transcript,
+/// which holds every part a summary reads.
+fn messages_digest(messages: &[ProviderMessage]) -> String {
+    harness_types::ContentHash::from_bytes(
+        summary_entries(messages)
+            .join(
+                "
+",
+            )
+            .as_bytes(),
+    )
+    .as_str()
+    .to_owned()
+}
+
+/// The window assumed for the summarising model when none is configured.
+const UNKNOWN_SUMMARY_WINDOW: u64 = 128_000;
+/// The tokens of a summary request that are not the transcript: the
+/// instructions, a previous summary and the anchor.
+const SUMMARY_PROMPT_TOKENS: u64 = 12_000;
+/// The least transcript a summary request carries, however small the window.
+const SUMMARY_MIN_INPUT_CHARS: usize = 16_000;
+/// How much of the newest kept assistant text anchors a summary
+/// (prime-agent's `RECENT_STATE_ANCHOR_MAX_CHARS`).
+const RECENT_STATE_ANCHOR_MAX_CHARS: usize = 2_000;
+
+/// The end of `text`, at most `limit` characters: the newest state is last.
+fn tail_chars(text: &str, limit: usize) -> &str {
+    let count = text.chars().count();
+    if count <= limit {
+        return text;
+    }
+    let skip = text
+        .char_indices()
+        .nth(count - limit)
+        .map_or(0, |(index, _)| index);
+    &text[skip..]
+}
+
+/// The newest assistant text in `messages`, the recent-state anchor of a
+/// summary of what came before them.
+fn newest_assistant_text(messages: &[ProviderMessage]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == MessageRole::Assistant)
+        .map(|message| message.content.trim())
+        .find(|text| !text.is_empty())
+}
+
+/// Messages as prime-agent's `serializeConversation` writes them for a
+/// summary, one entry each: thinking, text, numbered tool calls, and each
+/// result under its call's number, cut to its head and tail.
+fn summary_entries(messages: &[ProviderMessage]) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut numbers = std::collections::HashMap::new();
+    for message in messages {
+        match message.role {
+            MessageRole::User | MessageRole::System => {
+                let label = if message.role == MessageRole::User {
+                    "User"
+                } else {
+                    "System"
+                };
+                if !message.content.trim().is_empty() {
+                    entries.push(format!("[{label}]: {}", message.content));
+                }
+            }
+            MessageRole::Assistant => {
+                if let Some(reasoning) = message
+                    .reasoning
+                    .as_ref()
+                    .filter(|reasoning| !reasoning.text.trim().is_empty())
+                {
+                    entries.push(format!("[Assistant thinking]: {}", reasoning.text));
+                }
+                if !message.content.trim().is_empty() {
+                    entries.push(format!("[Assistant]: {}", message.content));
+                }
+                if !message.tool_calls.is_empty() {
+                    let calls = message
+                        .tool_calls
+                        .iter()
+                        .map(|call| {
+                            let number = numbers.len() + 1;
+                            numbers.insert(call.call_id.clone(), (number, call.name.clone()));
+                            format!(
+                                "#{number} {}({})",
+                                call.name,
+                                transcript_arguments(&call.arguments)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    entries.push(format!("[Assistant tool calls]: {calls}"));
+                }
+            }
+            MessageRole::Tool => {
+                let label = message
+                    .tool_call_id
+                    .as_ref()
+                    .and_then(|id| numbers.get(id))
+                    .map_or_else(
+                        || "[Tool result]".to_owned(),
+                        |(number, name)| format!("[Tool result ({name}) #{number}]"),
+                    );
+                entries.push(format!("{label}: {}", head_and_tail(&message.content)));
+            }
+        }
+    }
+    entries
+}
+
+/// Entries joined into transcripts of at most `limit` bytes each, in order; an
+/// entry longer than `limit` is cut to it. At least one transcript, so a
+/// previous summary alone is still updated.
+fn summary_chunks(entries: &[String], limit: usize) -> Vec<String> {
+    let mut chunks = vec![String::new()];
+    for entry in entries {
+        let entry = if entry.len() > limit {
+            let mut end = limit;
+            while !entry.is_char_boundary(end) {
+                end -= 1;
+            }
+            &entry[..end]
+        } else {
+            entry.as_str()
+        };
+        if chunks
+            .last()
+            .is_some_and(|current| !current.is_empty() && current.len() + entry.len() + 2 > limit)
+        {
+            chunks.push(String::new());
+        }
+        if let Some(current) = chunks.last_mut() {
+            current.push_str(entry);
+            current.push_str("\n\n");
+        }
+    }
+    chunks
+}
+
 /// Summaries already written, by the content they summarise, so a later turn
 /// over the same earlier conversation does not ask the model again.
 fn summary_cache() -> &'static Mutex<std::collections::HashMap<String, String>> {
@@ -2676,15 +2905,63 @@ impl RuntimeService {
         let before = estimate(&attempt);
         if !fits(&attempt) {
             let keep = KEEP_RECENT_TOKENS.min(threshold / 4);
-            let (older, recent) =
-                split_recent_aligned(&request.conversation, keep, (threshold / 2).max(keep));
-            if !older.is_empty() {
-                let dropped = messages_tokens(&older);
+            let (older, recent, prefix) = match split_recent_aligned(
+                &request.conversation,
+                keep,
+                (threshold / 2).max(keep),
+            ) {
+                // The newest earlier turn alone is over `keep`: it is cut in
+                // two and its start summarised on its own, as prime-agent
+                // splits a turn, instead of summarising all of it away.
+                (older, recent) if recent.is_empty() => match split_turn(&older, keep) {
+                    Some((start, cut)) => (
+                        older[..start].to_vec(),
+                        older[cut..].to_vec(),
+                        older[start..cut].to_vec(),
+                    ),
+                    None => (older, recent, Vec::new()),
+                },
+                (older, recent) => (older, recent, Vec::new()),
+            };
+            if !older.is_empty() || !prefix.is_empty() {
+                let dropped = messages_tokens(&older) + messages_tokens(&prefix);
                 let budget = (config.compaction_reserve_tokens * 4 / 5)
                     .min(MAX_SUMMARY_TOKENS)
                     .min(dropped / 2)
                     .max(256);
-                match self.conversation_summary(&older, budget, None).await {
+                // The newest assistant text the request keeps - this turn's,
+                // else the recent end's - is the state the summary must not
+                // contradict (prime-agent's recent-state anchor).
+                let anchor = newest_assistant_text(&appended)
+                    .or_else(|| newest_assistant_text(&recent))
+                    .map(str::to_owned);
+                let summary = async {
+                    let history = if older.is_empty() {
+                        "No prior history.".to_owned()
+                    } else {
+                        self.rolling_summary(&request.task_id, &older, budget, anchor.as_deref())
+                            .await?
+                    };
+                    if prefix.is_empty() {
+                        return Ok::<_, RuntimeError>(history);
+                    }
+                    // prime-agent gives the prefix half the reserve the history gets.
+                    let prefix_budget =
+                        (config.compaction_reserve_tokens / 2).clamp(256, MAX_SUMMARY_TOKENS);
+                    let turn = self.turn_prefix_summary(&prefix, prefix_budget).await?;
+                    // The prefix's files belong in the lists too, which follow
+                    // the whole summary once (prime-agent adds the prefix's file
+                    // operations to the compaction's).
+                    let (read, modified) = file_lists(&prefix, Some(&history));
+                    Ok(format!(
+                        "{}{SPLIT_TURN_SEPARATOR}{}{}",
+                        strip_file_lists(&history),
+                        turn.trim_end(),
+                        format_file_lists(&read, &modified)
+                    ))
+                }
+                .await;
+                match summary {
                     Ok(summary) => {
                         let mut conversation = vec![ProviderMessage::new(
                             MessageRole::User,
@@ -2706,7 +2983,7 @@ impl RuntimeService {
                         {
                             notices.push(format!(
                             "context: compacted {} earlier message(s) into a summary to stay within the model's window{}",
-                            older.len(),
+                            older.len() + prefix.len(),
                             match (&attempt, before) {
                                 (Ok(built), before) if before != u64::MAX => format!(
                                     " (~{before} → ~{} tokens)",
@@ -3644,56 +3921,204 @@ impl RuntimeService {
         budget: u64,
         guidance: Option<&str>,
     ) -> Result<String, RuntimeError> {
-        // prime-agent's compaction: an earlier summary is updated, not
-        // summarized again with the messages after it, so what it kept is not
-        // worn away compaction after compaction.
+        self.anchored_summary(messages, budget, guidance, None)
+            .await
+    }
+
+    /// [`Self::conversation_summary`], told the newest assistant text the
+    /// conversation keeps after the summary (prime-agent's recent-state anchor),
+    /// so the summary does not describe a state the kept messages moved past.
+    ///
+    /// A first message that is an earlier summary is updated, not summarised
+    /// again (prime-agent's iterative update). Messages are written out as
+    /// prime-agent's `serializeConversation` writes them, and a transcript the
+    /// summarising model could not read in one request is folded in pieces,
+    /// each updating the summary the pieces before it made: the earlier turns
+    /// carry their tool calls and results, and one request for all of them
+    /// could exceed the window it is meant to relieve.
+    async fn anchored_summary(
+        &self,
+        messages: &[ProviderMessage],
+        budget: u64,
+        guidance: Option<&str>,
+        anchor: Option<&str>,
+    ) -> Result<String, RuntimeError> {
         let previous_whole = messages
             .first()
             .and_then(|message| message.content.strip_prefix(COMPACTED_PREFIX))
             .map(str::trim);
-        let previous = previous_whole.map(strip_file_lists);
-        let messages = if previous.is_some() {
+        let messages = if previous_whole.is_some() {
             &messages[1..]
         } else {
             messages
         };
-        let mut transcript = String::new();
-        for message in messages {
-            let role = match message.role {
-                MessageRole::User => "User",
-                MessageRole::Assistant => "Assistant",
-                MessageRole::Tool => "Tool result",
-                MessageRole::System => "System",
-            };
-            let text: String = message.content.chars().take(6_000).collect();
-            if !text.is_empty() {
-                let _ = writeln!(transcript, "[{role}]: {text}");
-            }
-            if !message.tool_calls.is_empty() {
-                let calls = message
-                    .tool_calls
-                    .iter()
-                    .map(|call| {
-                        let arguments: String = call.arguments.chars().take(400).collect();
-                        format!("{}({arguments})", call.name)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                let _ = writeln!(transcript, "[Assistant tool calls]: {calls}");
-            }
-        }
         let (read_files, modified_files) = file_lists(messages, previous_whole);
+        let entries = summary_entries(messages);
+        let chunks = summary_chunks(&entries, self.summary_input_chars(budget));
+        let mut previous = previous_whole.map(strip_file_lists);
+        let last = chunks.len().saturating_sub(1);
+        for (index, transcript) in chunks.iter().enumerate() {
+            let summary = self
+                .summary_call(
+                    transcript,
+                    previous.as_deref(),
+                    guidance,
+                    anchor.filter(|_| index == last),
+                    budget,
+                    SummaryKind::History,
+                )
+                .await?;
+            previous = Some(summary);
+        }
+        // prime-agent appends the files the summarized part read and changed
+        // mechanically, after the model's summary, so they never drift.
+        Ok(format!(
+            "{}{}",
+            previous.unwrap_or_default().trim_end(),
+            format_file_lists(&read_files, &modified_files)
+        ))
+    }
+
+    /// prime-agent's split-turn summary: the start of a turn too large to keep
+    /// whole, written so the part of it that is kept can be understood.
+    async fn turn_prefix_summary(
+        &self,
+        prefix: &[ProviderMessage],
+        budget: u64,
+    ) -> Result<String, RuntimeError> {
+        let entries = summary_entries(prefix);
+        let mut summary: Option<String> = None;
+        for transcript in summary_chunks(&entries, self.summary_input_chars(budget)) {
+            summary = Some(
+                self.summary_call(
+                    &transcript,
+                    summary.as_deref(),
+                    None,
+                    None,
+                    budget,
+                    SummaryKind::TurnPrefix,
+                )
+                .await?,
+            );
+        }
+        Ok(summary.unwrap_or_default())
+    }
+
+    /// The summary of `older`, the earlier part of a conversation, kept with the
+    /// task and extended rather than written again.
+    ///
+    /// prime-agent records each compaction in the session and the next one
+    /// updates its summary with only what came after. Here the summary of the
+    /// part that was cut away is kept under the task with what it covers: the
+    /// same part reads it back with no model call (after a restart too), and a
+    /// part that grew is folded in from where the kept one ends. Summarising the
+    /// whole earlier conversation again each time the cut moved cost a request
+    /// over all of it - its tool calls and results included - and lost what the
+    /// earlier summary had kept.
+    async fn rolling_summary(
+        &self,
+        task_id: &TaskId,
+        older: &[ProviderMessage],
+        budget: u64,
+        anchor: Option<&str>,
+    ) -> Result<String, RuntimeError> {
+        let stored = self
+            .store
+            .session_setting(task_id, ROLLING_SUMMARY_SETTING)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|text| serde_json::from_str::<RollingSummary>(&text).ok())
+            .filter(|stored| {
+                stored.covers <= older.len()
+                    && messages_digest(&older[..stored.covers]) == stored.digest
+            });
+        if let Some(stored) = &stored
+            && stored.covers == older.len()
+        {
+            return Ok(stored.summary.clone());
+        }
+        let messages = match &stored {
+            Some(stored) => {
+                let mut messages = vec![ProviderMessage::new(
+                    MessageRole::User,
+                    format!(
+                        "{COMPACTED_PREFIX}
+
+{}",
+                        stored.summary
+                    ),
+                )];
+                messages.extend_from_slice(&older[stored.covers..]);
+                messages
+            }
+            None => older.to_vec(),
+        };
+        let summary = self
+            .anchored_summary(&messages, budget, None, anchor)
+            .await?;
+        let record = RollingSummary {
+            covers: older.len(),
+            digest: messages_digest(older),
+            summary: summary.clone(),
+        };
+        // Keeping it only saves the next request a model call; a store that
+        // cannot take it does not fail this one.
+        if let Ok(text) = serde_json::to_string(&record) {
+            let _ = self
+                .store
+                .set_session_setting(task_id, ROLLING_SUMMARY_SETTING, &text)
+                .await;
+        }
+        Ok(summary)
+    }
+
+    /// How many characters of transcript one summary request may carry: the
+    /// window less the summary's own room and the prompt around it, at three
+    /// characters a token so dense text still fits.
+    fn summary_input_chars(&self, budget: u64) -> usize {
+        let window = self.config.lock().map_or(UNKNOWN_SUMMARY_WINDOW, |config| {
+            config.context_window_tokens
+        });
+        let tokens = window.saturating_sub(budget.saturating_add(SUMMARY_PROMPT_TOKENS));
+        usize::try_from(tokens.saturating_mul(3))
+            .unwrap_or(usize::MAX)
+            .max(SUMMARY_MIN_INPUT_CHARS)
+    }
+
+    /// One summary request: `transcript` summarised, or folded into `previous`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the parts of one summary prompt, each optional"
+    )]
+    async fn summary_call(
+        &self,
+        transcript: &str,
+        previous: Option<&str>,
+        guidance: Option<&str>,
+        anchor: Option<&str>,
+        budget: u64,
+        kind: SummaryKind,
+    ) -> Result<String, RuntimeError> {
         let mut prompt = format!("<conversation>\n{transcript}</conversation>\n\n");
-        if let Some(previous) = &previous {
+        if let Some(previous) = previous {
             let _ = write!(
                 prompt,
                 "<previous-summary>\n{previous}\n</previous-summary>\n\n"
             );
         }
-        prompt.push_str(if previous.is_some() {
-            UPDATE_SUMMARIZATION_PROMPT
-        } else {
-            SUMMARIZATION_PROMPT
+        if let Some(anchor) = anchor.map(str::trim).filter(|anchor| !anchor.is_empty()) {
+            let _ = write!(
+                prompt,
+                "<recent-state-anchor>\nNewest assistant message that stays retained below the summary. The conversation to summarize is older than this anchor; the retained messages below are authoritative, so treat this anchor, not the conversation above, as the current state.\n\n{}\n</recent-state-anchor>\n\n",
+                tail_chars(anchor, RECENT_STATE_ANCHOR_MAX_CHARS)
+            );
+        }
+        prompt.push_str(match (kind, previous.is_some()) {
+            (SummaryKind::History, false) => SUMMARIZATION_PROMPT,
+            (SummaryKind::History, true) => UPDATE_SUMMARIZATION_PROMPT,
+            (SummaryKind::TurnPrefix, false) => TURN_PREFIX_SUMMARIZATION_PROMPT,
+            (SummaryKind::TurnPrefix, true) => TURN_PREFIX_UPDATE_PROMPT,
         });
         if let Some(guidance) = guidance {
             let _ = write!(
@@ -3728,13 +4153,7 @@ impl RuntimeService {
                         "the summarizer task did not complete",
                     )
                 })??;
-        // prime-agent appends the files the summarized part read and changed
-        // mechanically, after the model's summary, so they never drift.
-        let summary = format!(
-            "{}{}",
-            summary.trim_end(),
-            format_file_lists(&read_files, &modified_files)
-        );
+        let summary = summary.trim_end().to_owned();
         if let Ok(mut cache) = summary_cache().lock() {
             if cache.len() > 64 {
                 cache.clear();
@@ -4517,7 +4936,10 @@ mod context_fit_tests {
 
 #[cfg(test)]
 mod compaction_cut_tests {
-    use super::{COMPACTION_CUT_STRIDE, file_lists, format_file_lists, split_recent_aligned};
+    use super::{
+        COMPACTION_CUT_STRIDE, file_lists, format_file_lists, split_recent_aligned, split_turn,
+        summary_chunks, summary_entries,
+    };
     use harness_providers::{MessageRole, ProviderMessage, ProviderToolCall};
 
     fn calls(calls: &[(&str, &str)]) -> ProviderMessage {
@@ -4533,6 +4955,72 @@ mod compaction_cut_tests {
                 })
                 .collect(),
         )
+    }
+
+    /// prime-agent's `serializeConversation`: calls numbered, each result
+    /// under its call's number and tool, long results cut to head and tail.
+    #[test]
+    fn summary_entries_number_calls_and_label_their_results() {
+        let entries = summary_entries(&[
+            ProviderMessage::new(MessageRole::User, "fix the parser".to_owned()),
+            calls(&[
+                ("read_file", r#"{"path":"a.rs"}"#),
+                ("run_shell", r#"{"command":"cargo test"}"#),
+            ]),
+            ProviderMessage::tool_result("call-1".to_owned(), "x".repeat(5_000)),
+            ProviderMessage::tool_result("call-0".to_owned(), "fn main() {}".to_owned()),
+        ]);
+        assert_eq!(entries[0], "[User]: fix the parser");
+        assert_eq!(
+            entries[1],
+            r#"[Assistant tool calls]: #1 read_file(path="a.rs"); #2 run_shell(command="cargo test")"#
+        );
+        assert!(entries[2].starts_with("[Tool result (run_shell) #2]: xxx"));
+        assert!(
+            entries[2].contains("characters truncated"),
+            "{}",
+            entries[2]
+        );
+        assert_eq!(entries[3], "[Tool result (read_file) #1]: fn main() {}");
+    }
+
+    #[test]
+    fn summary_chunks_keep_order_and_bound_each_piece() {
+        let entries = (0..10)
+            .map(|index| format!("entry {index} {}", "y".repeat(90)))
+            .collect::<Vec<_>>();
+        let chunks = summary_chunks(&entries, 400);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 400), "{chunks:?}");
+        assert_eq!(chunks.concat().matches("entry").count(), 10);
+        assert!(
+            chunks[0].starts_with("entry 0")
+                && chunks.last().is_some_and(|last| last.contains("entry 9"))
+        );
+        assert_eq!(summary_chunks(&[], 400), vec![String::new()]);
+    }
+
+    /// A turn too large to keep is cut at an assistant message, never between
+    /// a call and its result, and only past the turn's question.
+    #[test]
+    fn split_turn_cuts_a_large_turn_at_an_assistant_message() {
+        let mut messages = vec![ProviderMessage::new(
+            MessageRole::User,
+            "big task".to_owned(),
+        )];
+        for index in 0..20 {
+            messages.push(calls(&[("read_file", r#"{"path":"a.rs"}"#)]));
+            messages.push(ProviderMessage::tool_result(
+                "call-0".to_owned(),
+                format!("result {index} {}", "z".repeat(400)),
+            ));
+        }
+        let (start, cut) = split_turn(&messages, 1_000).expect("a cut");
+        assert_eq!(start, 0);
+        assert!(cut > 1 && cut < messages.len());
+        assert_eq!(messages[cut].role, MessageRole::Assistant);
+        assert!(super::messages_tokens(&messages[cut..]) <= 1_200);
+        assert_eq!(split_turn(&messages[..1], 1_000), None, "nothing to cut");
     }
 
     /// The second compaction updates the first one's summary: the files the

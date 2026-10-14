@@ -919,6 +919,211 @@ async fn compaction_decides_on_the_providers_measure_of_the_context() {
     }
 }
 
+/// A summarizer that answers every conversation summary with a numbered
+/// summary and keeps the prompts it was given.
+#[derive(Default)]
+struct RecordingSummary {
+    prompts: Mutex<Vec<String>>,
+}
+
+impl SummaryProvider for RecordingSummary {
+    fn summarize(&self, _recovery: &RecoveryView) -> Result<String, RuntimeError> {
+        Ok("session state".to_owned())
+    }
+
+    fn summarize_conversation(
+        &self,
+        prompt: &str,
+        _budget_tokens: u64,
+    ) -> Result<String, RuntimeError> {
+        let mut prompts = self.prompts.lock().expect("prompts");
+        prompts.push(prompt.to_owned());
+        Ok(format!("## Goal\nSUMMARY_{}", prompts.len()))
+    }
+}
+
+/// The earlier part of a conversation over the threshold, `turns` long, each
+/// turn a question, a call, its result and an answer.
+fn worked_turns(turns: usize, tag: &str) -> Vec<harness_providers::ProviderMessage> {
+    (0..turns)
+        .flat_map(|turn| {
+            let call = format!("{tag}-call-{turn}");
+            [
+                harness_providers::ProviderMessage::new(
+                    MessageRole::User,
+                    format!("{tag} question {turn}: {}", "context ".repeat(40)),
+                ),
+                harness_providers::ProviderMessage::assistant_with_calls(
+                    String::new(),
+                    vec![harness_providers::ProviderToolCall {
+                        call_id: call.clone(),
+                        name: "read_file".to_owned(),
+                        arguments: format!(r#"{{"path":"src/{tag}{turn}.rs"}}"#),
+                    }],
+                ),
+                harness_providers::ProviderMessage::tool_result(
+                    call,
+                    format!("{tag} result {turn}: {}", "line ".repeat(60)),
+                ),
+                harness_providers::ProviderMessage::new(
+                    MessageRole::Assistant,
+                    format!("{tag} answer {turn}"),
+                ),
+            ]
+        })
+        .collect()
+}
+
+/// Run one turn of `task` over `conversation` on a small window, with a
+/// summarizer that records its prompts. Each turn opens the store as its own
+/// writer generation, as the interactive app does.
+async fn compacting_turn(
+    bench: &Bench,
+    task: &TaskId,
+    conversation: Vec<harness_providers::ProviderMessage>,
+    summary: &Arc<RecordingSummary>,
+) {
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        ProviderStreamEvent::started(),
+        ProviderStreamEvent::text("done"),
+        ProviderStreamEvent::completed("stop"),
+    ]]));
+    let store = bench.open_store().await;
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        provider,
+        RuntimeConfig {
+            context_window_tokens: 16_000,
+            output_reservation_tokens: 1024,
+            compaction_reserve_tokens: 1000,
+            estimate_scale: Some(2.5),
+            ..RuntimeConfig::default()
+        },
+    )
+    .with_summarizer(Arc::clone(summary) as Arc<dyn SummaryProvider>);
+    runtime
+        .run(
+            RunRequest::new(
+                SessionId::generate(),
+                task.clone(),
+                InputId::generate(),
+                "continue".to_owned(),
+                observe_workspace(bench.project_id.clone(), &bench.workspace).expect("workspace"),
+            )
+            .with_conversation(conversation),
+        )
+        .await
+        .expect("the turn runs");
+    drop(runtime);
+    close(store).await;
+}
+
+/// prime-agent's compaction is recorded and the next one updates it with
+/// what came after. The summary of the part cut away is kept with the task:
+/// the same part reads it back with no model call, a part that grew is folded
+/// into it from where it ended, and every summary is told the newest kept
+/// assistant text (the recent-state anchor) and sees the turns' tool calls
+/// under their numbers.
+#[tokio::test]
+async fn the_earlier_summary_is_kept_and_extended_not_written_again() {
+    let bench = bench();
+    let task = TaskId::generate();
+    let summary = Arc::new(RecordingSummary::default());
+    let first = worked_turns(60, "alpha");
+
+    compacting_turn(&bench, &task, first.clone(), &summary).await;
+    let prompts = summary.prompts.lock().expect("prompts").clone();
+    // A small window takes the older part in pieces, each folded into the
+    // summary the pieces before it made.
+    let written = prompts.len();
+    assert!(written >= 1, "the older part was summarised");
+    for (index, prompt) in prompts.iter().enumerate().skip(1) {
+        assert!(
+            prompt.contains(&format!(
+                "<previous-summary>
+## Goal
+SUMMARY_{index}"
+            )),
+            "piece {index} folds into the summary before it: {prompt}"
+        );
+    }
+    assert!(
+        prompts[0].contains("[Assistant tool calls]: #1 read_file(path=")
+            && prompts[0].contains("[Tool result (read_file) #1]: alpha result"),
+        "{}",
+        prompts[0]
+    );
+    let last = prompts.last().expect("a summary");
+    assert!(
+        last.contains("<recent-state-anchor>") && last.contains("alpha answer"),
+        "{last}"
+    );
+    let store = bench.open_store().await;
+    let kept = store
+        .session_setting(&task, "rolling_summary")
+        .await
+        .expect("setting reads")
+        .expect("the summary is kept with the task");
+    close(store).await;
+    assert!(kept.contains(&format!("SUMMARY_{written}")), "{kept}");
+
+    // The same earlier part: read back, no model call.
+    compacting_turn(&bench, &task, first.clone(), &summary).await;
+    assert_eq!(summary.prompts.lock().expect("prompts").len(), written);
+
+    // It grew: only what came after is summarised, into the kept summary.
+    let mut grown = first;
+    grown.extend(worked_turns(60, "beta"));
+    compacting_turn(&bench, &task, grown, &summary).await;
+    let prompts = summary.prompts.lock().expect("prompts").clone();
+    assert!(prompts.len() > written, "the part that grew was summarised");
+    let update = &prompts[written];
+    assert!(
+        update.contains(&format!(
+            "<previous-summary>
+## Goal
+SUMMARY_{written}"
+        )),
+        "{update}"
+    );
+    let new = prompts[written..].join(
+        "
+",
+    );
+    assert!(
+        !new.contains("alpha question 0:"),
+        "the part already summarised is not sent again: {new}"
+    );
+    assert!(new.contains("beta question"), "{new}");
+}
+
+/// prime-agent cuts a turn too large to keep at an assistant message and
+/// summarises its start on its own, instead of summarising all of it away.
+#[tokio::test]
+async fn a_turn_too_large_to_keep_is_split_and_its_start_summarised() {
+    let bench = bench();
+    let task = TaskId::generate();
+    let summary = Arc::new(RecordingSummary::default());
+    // One earlier turn: a question, then a hundred calls and results.
+    let mut conversation = vec![harness_providers::ProviderMessage::new(
+        MessageRole::User,
+        "refactor every module".to_owned(),
+    )];
+    conversation.extend(
+        worked_turns(100, "gamma")
+            .into_iter()
+            .filter(|message| message.role != MessageRole::User),
+    );
+    compacting_turn(&bench, &task, conversation, &summary).await;
+    let prompts = summary.prompts.lock().expect("prompts").clone();
+    assert!(
+        prompts.iter().any(|prompt| prompt
+            .contains("This is the PREFIX of a turn that was too large to keep")
+            && prompt.contains("refactor every module")),
+        "{prompts:#?}"
+    );
+}
+
 #[tokio::test]
 async fn g08_diff_since_session_start_uses_the_recorded_base() {
     let bench = bench();

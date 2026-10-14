@@ -565,6 +565,19 @@ impl TurnDriver {
 
     /// Claim what the user sent to the running turn: steering notes, as user
     /// messages for the next model call, and a cancel with its reason.
+    /// Keep a message the host puts in front of the model with the turn, so
+    /// the conversation replay has it (see [`RunInbox::record_host_message`]).
+    /// The turn goes on without it when the store cannot take it: the message
+    /// still reaches this step.
+    async fn record_host_message(&self, run_id: &harness_types::AgentRunId, text: &str) {
+        let Ok(Some(run)) = self.runtime.run_record(run_id).await else {
+            return;
+        };
+        let _ = RunInbox::new(Arc::clone(self.runtime.store()))
+            .record_host_message(&run, text, now_unix_ms())
+            .await;
+    }
+
     async fn claim_inbox(
         &self,
         run_id: &harness_types::AgentRunId,
@@ -1024,12 +1037,12 @@ impl TurnDriver {
                             // a user-role message: providers fold every system
                             // message into the system prompt, so a system one here
                             // changed the cached prefix and lost the conversation.
-                            transcript.push(ProviderMessage::new(
-                                MessageRole::User,
-                                format!(
-                                    "The goal is not complete yet. Next action: {next_action}. Produce the missing evidence, then answer again."
-                                ),
-                            ));
+                            let continuation = format!(
+                                "The goal is not complete yet. Next action: {next_action}. Produce the missing evidence, then answer again."
+                            );
+                            self.record_host_message(&result.run_id, &continuation)
+                                .await;
+                            transcript.push(ProviderMessage::new(MessageRole::User, continuation));
                             result = self
                                 .runtime
                                 .continue_run(
@@ -1118,10 +1131,9 @@ impl TurnDriver {
                                 .with_reasoning(result.reasoning.clone()),
                         );
                     }
-                    transcript.push(ProviderMessage::new(
-                        MessageRole::User,
-                        format!("Stop hook feedback:\n{reason}"),
-                    ));
+                    let feedback = format!("Stop hook feedback:\n{reason}");
+                    self.record_host_message(&result.run_id, &feedback).await;
+                    transcript.push(ProviderMessage::new(MessageRole::User, feedback));
                     result = self
                         .runtime
                         .continue_run(
@@ -1700,6 +1712,7 @@ impl TurnDriver {
                     "the same read repeated with nothing changed; asking the model to answer"
                         .to_owned(),
                 ));
+                self.record_host_message(&result.run_id, &warning).await;
                 appended.push(ProviderMessage::new(MessageRole::User, warning));
             }
             transcript.extend(appended);

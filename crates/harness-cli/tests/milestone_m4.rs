@@ -4522,6 +4522,105 @@ async fn a_finished_turn_is_replayed_with_its_tool_calls_and_results() {
     );
 }
 
+/// What the host itself said to the model during a turn - here the warning
+/// after the same read three times - stays with the turn for later turns, as
+/// prime-agent keeps its custom messages in the session. It used to reach only
+/// the step after it, so the next turn read a turn with a gap in it.
+#[tokio::test]
+async fn a_host_message_stays_in_the_conversation_after_its_turn() {
+    let bench = bench();
+    let read = || {
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "read",
+                "read_file",
+                serde_json::json!({"path": "src/parser.txt"}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ]
+    };
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        read(),
+        read(),
+        read(),
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("It says BUG parser."),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let store = bench.open_store().await;
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let driver = TurnDriver::new(
+        Arc::clone(&runtime),
+        ToolExecutionService::new(Arc::clone(&store)),
+    );
+    let session = SessionId::generate();
+    let request = RunRequest::new(
+        session.clone(),
+        TaskId::generate(),
+        InputId::generate(),
+        "read the parser".to_owned(),
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("observation"),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    driver
+        .run_turn(
+            request,
+            TurnOptions {
+                workspace_root: bench.workspace.clone(),
+                actor_id: "history.test".to_owned(),
+                approvals: ApprovalMode::Auto,
+                limits: TurnLimits::default(),
+            },
+            Arc::new(SilentObserver),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn runs");
+    let seen = provider.seen();
+    let warned = |messages: &[harness_providers::ProviderMessage]| {
+        messages
+            .iter()
+            .any(|message| message.content.contains("You have made the same tool call"))
+    };
+    assert!(
+        warned(&seen.last().expect("the last step").messages),
+        "the step after the repeats is warned"
+    );
+    let history = harness_runtime::conversation_history(&store, &session)
+        .await
+        .expect("history reads")
+        .messages;
+    let warning = history
+        .iter()
+        .position(|message| {
+            message.role == MessageRole::User
+                && message.content.contains("You have made the same tool call")
+        })
+        .unwrap_or_else(|| panic!("the warning is replayed: {history:#?}"));
+    let last_result = history
+        .iter()
+        .rposition(|message| message.role == MessageRole::Tool)
+        .expect("results");
+    let answer = history
+        .iter()
+        .rposition(|message| message.content.contains("It says BUG parser."))
+        .expect("answer");
+    assert!(
+        last_result < warning && warning < answer,
+        "where it was said: {history:#?}"
+    );
+    drop(driver);
+    drop(runtime);
+    close(store).await;
+}
+
 #[tokio::test]
 async fn g06_bang_prefix_goes_through_the_same_approval_gate() {
     let bench = bench();

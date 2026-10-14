@@ -1225,6 +1225,37 @@ impl SqliteStore {
         Ok(inserted.rows_affected() == 1)
     }
 
+    /// Record a message the host already put in front of the model as a
+    /// delivered command, so the conversation replay has it where it was said.
+    pub async fn record_applied_run_command(
+        &self,
+        record: RunCommandRecord,
+        detail: &str,
+    ) -> Result<(), StoreError> {
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        assert_fence_in_tx(&mut tx, &fence).await?;
+        let payload = to_json(&record.payload, "serialize run command")?;
+        let at = to_i64(record.created_at_unix_ms, "command time")?;
+        sqlx::query("INSERT INTO run_commands(command_id, run_id, session_id, task_id, kind, state, payload_json, detail, created_at_unix_ms, claimed_at_unix_ms, applied_at_unix_ms) VALUES (?, ?, ?, ?, ?, 'applied', ?, ?, ?, ?, ?) ON CONFLICT(command_id) DO NOTHING")
+            .bind(record.command_id.as_str())
+            .bind(record.run_id.as_str())
+            .bind(record.session_id.as_str())
+            .bind(record.task_id.as_str())
+            .bind(record.kind.as_str())
+            .bind(payload)
+            .bind(detail)
+            .bind(at)
+            .bind(at)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "record run command", error))?;
+        tx.commit().await.map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "commit run command", error)
+        })
+    }
+
     /// Claim the oldest pending commands for one run at a safe boundary.
     ///
     /// Claiming is atomic: a command is claimed by exactly one turn, and a

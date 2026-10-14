@@ -124,6 +124,35 @@ impl RunInbox {
         Ok(record)
     }
 
+    /// Keep a message the host itself put in front of the model during a run -
+    /// a goal continuation, stop-hook feedback, a repeated-read warning - with
+    /// the turn, as prime-agent keeps its custom messages in the session: the
+    /// next turns are sent it where it was said, not a turn with a gap in it.
+    pub async fn record_host_message(
+        &self,
+        run: &RunRecord,
+        text: impl Into<String>,
+        now_unix_ms: u64,
+    ) -> Result<(), RuntimeError> {
+        let record = RunCommandRecord {
+            command_id: RuntimeCommandId::generate(),
+            run_id: run.run_id.clone(),
+            session_id: run.session_id.clone(),
+            task_id: run.task_id.clone(),
+            kind: RunCommandKind::Steer,
+            state: RunCommandState::Applied,
+            payload: json!({"text": text.into(), "verbatim": true, "host": true}),
+            detail: None,
+            created_at_unix_ms: now_unix_ms,
+            claimed_at_unix_ms: Some(now_unix_ms),
+            applied_at_unix_ms: Some(now_unix_ms),
+        };
+        self.store
+            .record_applied_run_command(record, "host message delivered to the next step")
+            .await
+            .map_err(RuntimeError::from)
+    }
+
     /// Claim the pending commands for this boundary, oldest first.
     pub async fn claim(
         &self,
