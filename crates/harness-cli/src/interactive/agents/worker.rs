@@ -487,30 +487,44 @@ impl Worker {
     }
 
     /// The newest session of every task in this worker's store.
+    ///
+    /// Read on a thread of its own: the supervisor sweeps on the worker's main
+    /// thread, which is inside the runtime, and blocking on the runtime there
+    /// panics.
     fn newest_sessions(&self) -> BTreeMap<String, String> {
         let shared = super::super::store_lease::SharedStore::for_dir(self.store_dir.clone());
-        self.runtime.block_on(async move {
-            let Ok(lease) = shared.lease().await else {
-                return BTreeMap::new();
-            };
-            let Ok(mut sessions) = lease.store().list_sessions().await else {
-                return BTreeMap::new();
-            };
-            sessions.sort_by(|left, right| {
-                left.created_at
-                    .cmp(&right.created_at)
-                    .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
-            });
-            sessions
-                .into_iter()
-                .map(|summary| {
-                    (
-                        summary.task_id.as_str().to_owned(),
-                        summary.session_id.as_str().to_owned(),
-                    )
-                })
-                .collect()
+        let runtime = self.runtime.clone();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || runtime.block_on(Self::read_newest_sessions(shared)))
+                .join()
+                .unwrap_or_default()
         })
+    }
+
+    async fn read_newest_sessions(
+        shared: Arc<super::super::store_lease::SharedStore>,
+    ) -> BTreeMap<String, String> {
+        let Ok(lease) = shared.lease().await else {
+            return BTreeMap::new();
+        };
+        let Ok(mut sessions) = lease.store().list_sessions().await else {
+            return BTreeMap::new();
+        };
+        sessions.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
+        });
+        sessions
+            .into_iter()
+            .map(|summary| {
+                (
+                    summary.task_id.as_str().to_owned(),
+                    summary.session_id.as_str().to_owned(),
+                )
+            })
+            .collect()
     }
 
     fn idle_eviction(&self) -> Option<Duration> {
@@ -2088,6 +2102,15 @@ mod tests {
             ..CreateAgent::default()
         };
         (temp, TestWorker(worker), spec)
+    }
+
+    /// The supervisor sweeps on the worker's main thread, inside the runtime:
+    /// reading the sessions there must not block on that runtime. Seen: a
+    /// parked conversation came due and the worker panicked every sweep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_newest_sessions_read_from_inside_the_runtime() {
+        let (_temp, worker, _spec) = resume_worker().await;
+        assert_eq!(worker.0.newest_sessions().len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
