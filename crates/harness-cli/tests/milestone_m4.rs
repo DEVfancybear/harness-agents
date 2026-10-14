@@ -915,8 +915,12 @@ async fn m4_01_a_turn_cut_mid_way_is_continued_with_what_it_did() {
             .position(matches)
             .unwrap_or_else(|| panic!("missing: {messages:#?}"))
     };
+    // Replayed as it was sent: the turn's packet, its instruction first.
     let asked = position(&|message| {
-        message.role == MessageRole::User && message.content == "describe this project"
+        message.role == MessageRole::User
+            && message
+                .content
+                .starts_with("[user instruction]\ndescribe this project")
     });
     let called = position(&|message| {
         message.role == MessageRole::Assistant
