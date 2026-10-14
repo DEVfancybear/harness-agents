@@ -379,6 +379,10 @@ impl KernelContext {
     /// itself, and a skill that fails to import is replaced by a stub that says why,
     /// so an unavailable skill reaches the model instead of failing the kernel. Paths
     /// are written as JSON strings, which Python reads as the same literals.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one bootstrap cell prepares and refreshes Python skill modules"
+    )]
     fn setup_code(&self) -> String {
         let quote = |text: &str| serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned());
         let mut code = format!(
@@ -386,9 +390,6 @@ impl KernelContext {
             quote(&self.global.display().to_string()),
             quote(&self.local.display().to_string())
         );
-        if self.skills.is_empty() {
-            return code;
-        }
         let mut paths = self
             .skills
             .iter()
@@ -398,19 +399,34 @@ impl KernelContext {
         let names = self
             .skills
             .iter()
-            .map(|skill| skill.import_name.clone())
-            .collect::<Vec<_>>();
+            .map(|skill| (skill.import_name.clone(), skill.src.display().to_string()))
+            .collect::<std::collections::BTreeMap<_, _>>();
         let _ = write!(
             code,
             r#"import importlib as _ha_importlib
+import importlib.util as _ha_import_util
 import inspect as _ha_inspect
 import sys as _ha_sys
 import types as _ha_types
+_ha_skills = {names}
+_ha_previous_skills = globals().get("_HA_PYTHON_SKILLS", {{}})
+for _ha_skill_name, _ha_old_path in _ha_previous_skills.items():
+    if _ha_skills.get(_ha_skill_name) != _ha_old_path:
+        globals().pop(_ha_skill_name, None)
+        for _ha_module_name in list(_ha_sys.modules):
+            if _ha_module_name == _ha_skill_name or _ha_module_name.startswith(_ha_skill_name + "."):
+                _ha_sys.modules.pop(_ha_module_name, None)
+for _ha_path in set(_ha_previous_skills.values()) - set(_ha_skills.values()):
+    if _ha_path in _ha_sys.path:
+        _ha_sys.path.remove(_ha_path)
 for _ha_path in {paths}:
     if _ha_path not in _ha_sys.path:
         _ha_sys.path.insert(0, _ha_path)
 
 class _HaCallableSkillModule(_ha_types.ModuleType):
+    def __reduce__(self):
+        return (_ha_importlib.import_module, (self.__name__,))
+
     async def __call__(self, *args, **kwargs):
         result = self.run(*args, **kwargs)
         if _ha_inspect.isawaitable(result):
@@ -439,23 +455,35 @@ def _ha_wrap_skill_module(module):
     run = getattr(module, "run", None)
     if not callable(run) or isinstance(module, _HaCallableSkillModule):
         return module
-    wrapped = _HaCallableSkillModule(module.__name__)
-    wrapped.__dict__.update(module.__dict__)
+    # Preserve the dictionary run() uses as its global namespace.
+    module.__class__ = _HaCallableSkillModule
     try:
-        wrapped.__signature__ = _ha_inspect.signature(run)
+        module.__signature__ = _ha_inspect.signature(run)
     except Exception:
         pass
     doc = getattr(run, "__doc__", None)
     if doc:
-        wrapped.__doc__ = doc
-    _ha_sys.modules[module.__name__] = wrapped
-    return wrapped
+        module.__doc__ = doc
+    return module
 
+_ha_importlib.invalidate_caches()
+_HA_PYTHON_SKILLS = _ha_skills
 _HA_SKILL_IMPORT_ERRORS = {{}}
-for _ha_skill_name in {names}:
+for _ha_skill_name, _ha_path in _ha_skills.items():
     try:
-        globals()[_ha_skill_name] = _ha_wrap_skill_module(_ha_importlib.import_module(_ha_skill_name))
+        if _ha_previous_skills.get(_ha_skill_name) == _ha_path and _ha_skill_name in _ha_sys.modules:
+            _ha_module = _ha_sys.modules[_ha_skill_name]
+        else:
+            _ha_spec = _ha_import_util.spec_from_file_location(
+                _ha_skill_name, _ha_path + "/" + _ha_skill_name + "/__init__.py",
+                submodule_search_locations=[_ha_path + "/" + _ha_skill_name],
+            )
+            _ha_module = _ha_import_util.module_from_spec(_ha_spec)
+            _ha_sys.modules[_ha_skill_name] = _ha_module
+            _ha_spec.loader.exec_module(_ha_module)
+        globals()[_ha_skill_name] = _ha_wrap_skill_module(_ha_module)
     except Exception as _ha_skill_error:
+        _ha_sys.modules.pop(_ha_skill_name, None)
         _ha_skill_error_text = str(_ha_skill_error) or type(_ha_skill_error).__name__
         _HA_SKILL_IMPORT_ERRORS[_ha_skill_name] = _ha_skill_error_text
         globals()[_ha_skill_name] = _HaUnavailableSkill(_ha_skill_name, _ha_skill_error_text)
@@ -2288,6 +2316,30 @@ mod venv {
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
                 .and_then(|marker| marker["identity"].as_str().map(str::to_owned))
                 .is_some_and(|built| built == identity() || built == system_identity())
+            && package_files_present(venv)
+    }
+
+    /// A marker can outlive an interrupted cleanup/uninstall. Do not reuse an
+    /// environment without the modules required for MCP, snapshots and images.
+    fn package_files_present(venv: &Path) -> bool {
+        let mut sites = vec![venv.join("Lib/site-packages")];
+        if let Ok(entries) = std::fs::read_dir(venv.join("lib")) {
+            sites.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path().join("site-packages")),
+            );
+        }
+        sites.iter().any(|site| {
+            [
+                "dill/__init__.py",
+                "mcp/__init__.py",
+                "PIL/Image.py",
+                "httpx/__init__.py",
+            ]
+            .iter()
+            .all(|relative| site.join(relative).is_file())
+        })
     }
 
     fn command(program: &Path) -> Command {
@@ -2368,7 +2420,20 @@ mod venv {
     /// Build (or rebuild) the venv with `builder`: the interpreter and the venv, then
     /// every package, and the marker last, so a build cut short is rebuilt next time.
     pub async fn build(builder: &Builder, venv: &Path) -> Result<(), String> {
+        // All sessions share this environment. Hold an OS lock (released even on
+        // cancellation/crash), then recheck the marker before replacing anything.
+        let _lock = build_lock(venv).await?;
+        if ready(venv) {
+            return Ok(());
+        }
         if venv.exists() {
+            if std::fs::symlink_metadata(venv)
+                .map_err(|error| error.to_string())?
+                .file_type()
+                .is_symlink()
+            {
+                return Err("the kernel venv must not be a symbolic link".to_owned());
+            }
             std::fs::remove_dir_all(venv)
                 .map_err(|error| format!("the old venv could not be removed: {error}"))?;
         }
@@ -2397,11 +2462,49 @@ mod venv {
                 run(&python(venv), "pip install", &install).await?;
             }
         }
+        if !package_files_present(venv) {
+            return Err(
+                "the kernel venv is missing required package files after installation".to_owned(),
+            );
+        }
         std::fs::write(
             venv.join(MARKER),
             serde_json::json!({ "identity": identity_of(builder) }).to_string(),
         )
         .map_err(|error| format!("the venv marker could not be written: {error}"))
+    }
+
+    async fn build_lock(venv: &Path) -> Result<std::fs::File, String> {
+        if !venv.is_absolute() || venv.file_name() != Some(std::ffi::OsStr::new("kernel-venv")) {
+            return Err("the kernel venv must be an absolute kernel-venv directory".to_owned());
+        }
+        let parent = venv.parent().ok_or("the kernel venv has no parent")?;
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(parent.join("kernel-venv.lock"))
+            .map_err(|error| format!("the kernel venv lock could not be opened: {error}"))?;
+        let deadline = tokio::time::Instant::now() + STEP_TIMEOUT * 3;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(
+                            "waiting for another session to build the kernel venv timed out"
+                                .to_owned(),
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(format!("the kernel venv could not be locked: {error}"));
+                }
+            }
+        }
     }
 }
 
@@ -2685,6 +2788,11 @@ mod tests {
             serde_json::json!({ "identity": super::venv::identity() }).to_string(),
         )
         .expect("marker");
+        assert!(
+            !super::venv::ready(&venv),
+            "the marker alone cannot hide missing packages"
+        );
+        write_venv_packages(&venv);
         assert!(super::venv::ready(&venv));
         std::fs::write(
             venv.join("ha-kernel.json"),
@@ -2695,6 +2803,82 @@ mod tests {
             super::venv::ready(&venv),
             "a venv the system Python built for the same packages is kept"
         );
+    }
+
+    #[tokio::test]
+    async fn a_venv_finished_by_another_session_is_reused() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let venv = super::venv::dir(directory.path());
+        let python = super::venv::python(&venv);
+        std::fs::create_dir_all(python.parent().expect("parent")).expect("scripts");
+        std::fs::write(&python, "finished interpreter").expect("interpreter");
+        std::fs::write(
+            venv.join("ha-kernel.json"),
+            json!({"identity":super::venv::identity()}).to_string(),
+        )
+        .expect("marker");
+        write_venv_packages(&venv);
+        // This session checked readiness before the other session finished.
+        super::venv::build(
+            &super::venv::Builder::Pip(directory.path().join("missing-python")),
+            &venv,
+        )
+        .await
+        .expect("the finished venv must survive the delayed builder");
+        assert_eq!(
+            std::fs::read_to_string(python).expect("interpreter preserved"),
+            "finished interpreter"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_venv_builders_wait_and_recheck_readiness() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let venv = super::venv::dir(directory.path());
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.path().join("kernel-venv.lock"))
+            .expect("lock file");
+        file.lock().expect("first builder owns the lock");
+        let waiting = venv.clone();
+        let builder = super::venv::Builder::Pip(directory.path().join("missing-python"));
+        let task = tokio::spawn(async move { super::venv::build(&builder, &waiting).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !task.is_finished(),
+            "second builder must not modify an environment under construction"
+        );
+        let python = super::venv::python(&venv);
+        std::fs::create_dir_all(python.parent().expect("scripts")).expect("directory");
+        std::fs::write(python, "finished").expect("interpreter");
+        std::fs::write(
+            venv.join("ha-kernel.json"),
+            json!({"identity":super::venv::identity()}).to_string(),
+        )
+        .expect("marker");
+        write_venv_packages(&venv);
+        drop(file);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("lock released")
+            .expect("task")
+            .expect("reuse completed environment");
+    }
+
+    fn write_venv_packages(venv: &std::path::Path) {
+        for relative in [
+            "dill/__init__.py",
+            "mcp/__init__.py",
+            "PIL/Image.py",
+            "httpx/__init__.py",
+        ] {
+            let path = venv.join("Lib/site-packages").join(relative);
+            std::fs::create_dir_all(path.parent().expect("package")).expect("package directory");
+            std::fs::write(path, "").expect("package file");
+        }
     }
 
     /// `uv` builds the venv first; without it (or when it fails) the system Python's
@@ -2756,6 +2940,57 @@ mod tests {
         let first = write_runtime(directory.path()).expect("runtime");
         assert!(first.join("rlm").join("repl.py").is_file());
         assert_eq!(write_runtime(directory.path()).expect("runtime"), first);
+    }
+
+    #[tokio::test]
+    async fn replacing_or_removing_a_python_skill_updates_the_live_kernel() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let Some(python) = super::find_python(None).await else {
+            return;
+        };
+        let shared = Arc::new(ReplShared::new(
+            directory.path(),
+            directory.path(),
+            Some(python.display().to_string()),
+            super::default_shell(),
+        ));
+        let mut context = KernelContext::default();
+        for (location, value) in [("first", "old"), ("second", "new")] {
+            let src = directory.path().join(location).join("src");
+            let package = src.join("qa_replaced_skill");
+            std::fs::create_dir_all(&package).expect("package");
+            std::fs::write(package.join("helper.py"), format!("value = {value:?}\n"))
+                .expect("helper");
+            std::fs::write(
+                package.join("__init__.py"),
+                "from .helper import value\ncalls = 0\nasync def run():\n    global calls\n    calls += 1\n    return value\n",
+            )
+            .expect("init");
+            context.skills = vec![super::PythonSkill {
+                import_name: "qa_replaced_skill".to_owned(),
+                src,
+            }];
+            let code = format!(
+                "qa_user_state = 42\nassert await qa_replaced_skill() == {value:?}\nassert qa_replaced_skill.calls == 1\nqa_replaced_skill.calls = 10\nassert await qa_replaced_skill() == {value:?}\nassert qa_replaced_skill.calls == 11\nprint('skill refreshed')"
+            );
+            let output = shared
+                .execute(
+                    &code,
+                    Duration::from_secs(30),
+                    Arc::new(NoHostRequests),
+                    Some(&context),
+                )
+                .await
+                .expect("cell");
+            assert_eq!(output.text, "skill refreshed\n");
+        }
+        context.skills.clear();
+        let output = shared.execute(
+            "import sys\nassert qa_user_state == 42\nassert 'qa_replaced_skill' not in globals()\nassert 'qa_replaced_skill' not in sys.modules\nassert 'qa_replaced_skill.helper' not in sys.modules\nprint('skill removed')",
+            Duration::from_secs(30), Arc::new(NoHostRequests), Some(&context),
+        ).await.expect("cell");
+        assert_eq!(output.text, "skill removed\n");
+        shared.dispose().await;
     }
 
     /// Bundled desktop input is discoverable and callable without importing a GUI
@@ -2972,7 +3207,12 @@ mod tests {
             dirs.clone(),
         )
         .await;
-        run("kept = [1, 2, 3]", 60, dirs.clone()).await;
+        run(
+            "kept = [1, 2, 3]\nsaved_skill = hello_skill",
+            60,
+            dirs.clone(),
+        )
+        .await;
         shared.dispose().await;
         assert_no_empty_log(&dirs.kernel_dir);
         if has_dill != "True" {
@@ -3001,6 +3241,10 @@ mod tests {
             "a preloaded skill is not reported as lost: {revived}"
         );
         assert_eq!(run("plain_skill.ping()", 60, dirs.clone()).await, "'pong'");
+        assert_eq!(
+            run("saved_skill is hello_skill", 60, dirs.clone()).await,
+            "True"
+        );
         assert_eq!(
             run("await hello_skill('again')", 60, dirs.clone()).await,
             "'hello again'"

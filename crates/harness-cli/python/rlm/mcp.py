@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from . import host_request
-from .mcp_base import McpToolError
+from .mcp_base import McpToolError, _parse_result
 
 __all__ = [
     "McpCredentialsUnavailable",
@@ -675,7 +675,7 @@ async def search_tools(
 
     With ``connection_id`` only that connection is searched and its errors
     propagate. Without it, at most ``_MAX_TOOL_SEARCH_SERVERS`` connections the
-    host reports as connected are searched in host order; per-connection
+    host reports as connected or configured are searched in host order; per-connection
     failures are reported as fixed, redaction-safe summaries, not raised.
 
     Returns ``{"tools": [{connectionId, name, description}, ...], "searched":
@@ -694,7 +694,7 @@ async def search_tools(
     candidates = [
         entry["connectionId"]
         for entry in await list_connections()
-        if entry.get("status") == "connected"
+        if entry.get("status") in ("connected", "configured")
     ]
     scoped = candidates[:_MAX_TOOL_SEARCH_SERVERS]
     tools: list[dict[str, Any]] = []
@@ -1092,32 +1092,3 @@ def _resolve_streamable_http():
     raise ImportError(
         "the installed `mcp` SDK exposes no streamable-HTTP client; upgrade `mcp`"
     )
-
-
-def _parse_result(result: Any) -> Any:
-    """Normalize a CallToolResult into plain Python (structured output preferred).
-
-    Raises McpToolError when the server flags the result as an error, so a failed
-    tool call doesn't look like a successful one to the caller.
-    """
-    texts: list[str] = []
-    for block in getattr(result, "content", None) or []:
-        text = getattr(block, "text", None)
-        if text is not None:
-            texts.append(text)
-    is_error = getattr(result, "is_error", getattr(result, "isError", False))
-    if is_error:
-        raise McpToolError("\n".join(texts) or "MCP tool returned an error")
-
-    structured = getattr(result, "structured_content", getattr(result, "structuredContent", None))
-    if structured is not None:  # falsy-but-valid payloads ({} / []) are real results
-        return structured
-    if texts:
-        return "\n".join(texts)
-
-    # Non-text content (images, embedded resources): return them as plain dicts
-    # rather than the opaque SDK object so callers get usable data.
-    blocks = getattr(result, "content", None) or []
-    if blocks:
-        return [b.model_dump(mode="json") if hasattr(b, "model_dump") else b for b in blocks]
-    return result

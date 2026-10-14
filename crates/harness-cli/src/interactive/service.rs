@@ -7746,10 +7746,16 @@ async fn run_turn(
     let kernel_skills = skill_catalog
         .as_ref()
         .map(|catalog| {
+            let active = active_skills.lock().ok();
             catalog
                 .entries()
                 .iter()
-                .filter(|entry| entry.model_invocable)
+                .filter(|entry| {
+                    entry.model_invocable
+                        || active
+                            .as_ref()
+                            .is_some_and(|skills| skills.contains_key(&entry.name))
+                })
                 .flat_map(|entry| super::repl::python_skill_packages(&entry.path))
                 .collect::<Vec<_>>()
         })

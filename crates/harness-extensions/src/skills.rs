@@ -531,9 +531,9 @@ impl SkillCatalogEntry {
                 self.name
             )));
         }
-        let bytes = std::fs::read(&target).map_err(|error| {
-            ExtensionError::new(ErrorCode::SkillUnavailable, format!("{relative}: {error}"))
-        })?;
+        // Read one byte beyond the output limit to detect truncation without
+        // allocating the entire resource (which may be arbitrarily large).
+        let bytes = read_prefix(&target, MAX_SKILL_RESOURCE_BYTES + 1)?;
         let truncated = bytes.len() > MAX_SKILL_RESOURCE_BYTES;
         // A cut can land inside one UTF-8 character; step back at most three bytes
         // to the boundary, so a truncated text file is not mistaken for binary.

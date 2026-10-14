@@ -326,12 +326,12 @@ def _parse_result(result: Any) -> Any:
     structured = getattr(result, "structured_content", getattr(result, "structuredContent", None))
     if structured is not None:  # falsy-but-valid payloads ({} / []) are real results
         return structured
-    if texts:
+    blocks = getattr(result, "content", None) or []
+    if texts and len(texts) == len(blocks):
         return "\n".join(texts)
 
     # Non-text content (images, embedded resources): return them as plain dicts
     # rather than the opaque SDK object so callers get usable data.
-    blocks = getattr(result, "content", None) or []
     if blocks:
         return [b.model_dump(mode="json") if hasattr(b, "model_dump") else b for b in blocks]
     return result

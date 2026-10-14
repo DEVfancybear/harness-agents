@@ -368,16 +368,7 @@ impl SkillToolDispatcher {
                 // the conversation: measured, a model asked to activate it again,
                 // was told the user must run it, and told the user to type the
                 // command they had just typed.
-                let user_ran = self
-                    .active
-                    .lock()
-                    .is_ok_and(|active| active.contains_key(name));
-                if !entry.model_invocable && !user_ran {
-                    return Err(HarnessError::new(
-                        ErrorCode::PolicyDenied,
-                        format!("skill {name} is run only by the user, with /skill:{name}"),
-                    ));
-                }
+                self.require_invocation(entry)?;
                 if let Some(digest) = digest
                     && !same_digest(entry.digest.as_str(), digest)
                 {
@@ -407,12 +398,13 @@ impl SkillToolDispatcher {
                         "skill file path must be a string",
                     )
                 })?;
-                self.catalog.entry(name).ok_or_else(|| {
+                let entry = self.catalog.entry(name).ok_or_else(|| {
                     HarnessError::new(
                         ErrorCode::SkillUnavailable,
                         format!("no trusted skill named {name} is in this catalogue"),
                     )
                 })?;
+                self.require_invocation(entry)?;
                 Ok(())
             }
             _ => Err(HarnessError::new(
@@ -420,6 +412,27 @@ impl SkillToolDispatcher {
                 "skill tool target is unavailable",
             )),
         }
+    }
+
+    fn require_invocation(
+        &self,
+        entry: &harness_extensions::SkillCatalogEntry,
+    ) -> Result<(), HarnessError> {
+        if !entry.model_invocable
+            && !self
+                .active
+                .lock()
+                .is_ok_and(|active| active.contains_key(&entry.name))
+        {
+            return Err(HarnessError::new(
+                ErrorCode::PolicyDenied,
+                format!(
+                    "skill {} is run only by the user, with /skill:{}",
+                    entry.name, entry.name
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// One of a skill's own files, as text the model reads.
@@ -653,6 +666,53 @@ mod tests {
         std::fs::write(root.join("secret.txt"), "outside the skill\n").expect("outside file");
         SkillCatalog::discover(&[TrustedSkillRoot::new(root, SkillSource::User)])
             .expect("catalog scans metadata")
+    }
+
+    #[test]
+    fn user_only_skill_files_require_the_users_invocation() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let catalog = skill_with_files(&temporary.path().join("skills"));
+        let activation = catalog
+            .activate("release", None, 0)
+            .expect("user activation");
+        let active = Arc::new(Mutex::new(BTreeMap::new()));
+        let dispatcher = SkillToolDispatcher {
+            catalog,
+            active: Arc::clone(&active),
+        };
+        let arguments = serde_json::json!({"name": "release", "path": "SKILL.md"});
+        assert_eq!(
+            dispatcher
+                .read_file(&arguments)
+                .expect_err("hidden instructions require invocation")
+                .code(),
+            ErrorCode::PolicyDenied
+        );
+        active
+            .lock()
+            .expect("active")
+            .insert("release".to_owned(), activation);
+        dispatcher
+            .read_file(&arguments)
+            .expect("user invoked this skill");
+    }
+
+    #[test]
+    fn skill_resource_reads_stop_at_the_limit_on_a_utf8_boundary() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = temporary.path().join("skills");
+        let catalog = skill_with_files(&root);
+        let mut text = "a".repeat(harness_extensions::MAX_SKILL_RESOURCE_BYTES - 1);
+        text.push('界');
+        text.push_str("unread suffix");
+        std::fs::write(root.join("research/references/large.txt"), text).expect("large resource");
+        let (text, truncated) = catalog
+            .entry("research")
+            .expect("skill")
+            .read_resource("references/large.txt")
+            .expect("truncated UTF-8");
+        assert!(truncated);
+        assert_eq!(text.len(), harness_extensions::MAX_SKILL_RESOURCE_BYTES - 1);
     }
 
     /// Measured: a skill said "read references/..." and "run scripts/...", and the
