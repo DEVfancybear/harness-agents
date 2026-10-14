@@ -180,6 +180,8 @@ struct AgentHandle {
     inbox: Sender<Command>,
     status: Arc<Mutex<Status>>,
     thread: Option<JoinHandle<()>>,
+    /// How it was launched, for the journal.
+    launch: registry::LaunchSettings,
 }
 
 #[derive(Default)]
@@ -343,14 +345,23 @@ impl Worker {
             store_dir: self.store_dir.clone(),
             project_root: self.project_root.clone(),
             agents: self
-                .list()
-                .into_iter()
-                .map(|agent| registry::JournalAgent {
-                    id: agent.id,
-                    name: agent.name,
-                    conversation: agent.conversation,
+                .agents
+                .lock()
+                .map(|agents| {
+                    agents
+                        .values()
+                        .map(|handle| {
+                            let agent = info_of(&handle.status);
+                            registry::JournalAgent {
+                                id: agent.id,
+                                name: agent.name,
+                                conversation: agent.conversation,
+                                launch: handle.launch.clone(),
+                            }
+                        })
+                        .collect()
                 })
-                .collect(),
+                .unwrap_or_default(),
         };
         if let Err(error) = registry::write_journal(&self.registry, &self.key, &journal) {
             log(&format!("the journal could not be written: {error}"));
@@ -368,13 +379,21 @@ impl Worker {
     /// sessions nobody had running.
     fn recover(self: &Arc<Self>) {
         let environment = LaunchEnvironment::capture().pairs();
-        let spec = |conversation: String, name: Option<String>, id: Option<String>| CreateAgent {
+        let spec = |conversation: String,
+                    name: Option<String>,
+                    id: Option<String>,
+                    launch: registry::LaunchSettings| CreateAgent {
             caller_dir: self.project_root.clone(),
             cwd: Some(self.project_root.clone()),
             environment: environment.clone(),
             resume: Some(conversation),
             name,
             id,
+            approval: launch.approval,
+            profile: launch.profile,
+            thinking: launch.thinking,
+            system_prompt: launch.system_prompt,
+            append_system_prompt: launch.append_system_prompt,
             ..CreateAgent::default()
         };
         let journal = registry::read_journal(&self.registry, &self.key);
@@ -406,7 +425,12 @@ impl Worker {
             else {
                 continue;
             };
-            match self.create(spec(session.clone(), agent.name, Some(agent.id.clone()))) {
+            match self.create(spec(
+                session.clone(),
+                agent.name,
+                Some(agent.id.clone()),
+                agent.launch,
+            )) {
                 Ok(info) => {
                     log(&format!("agent {} recovered", info.id));
                     open.extend(agent.conversation);
@@ -653,6 +677,13 @@ impl Worker {
             .clone()
             .filter(|id| self.list().iter().all(|agent| agent.id != *id))
             .unwrap_or_else(new_id);
+        let launch = registry::LaunchSettings {
+            approval: spec.approval.clone(),
+            profile: spec.profile.clone(),
+            thinking: spec.thinking.clone(),
+            system_prompt: spec.system_prompt.clone(),
+            append_system_prompt: spec.append_system_prompt.clone(),
+        };
         let (inbox, commands) = mpsc::channel();
         let (ready, started) = mpsc::channel::<Result<Arc<Mutex<Status>>, String>>();
         let worker = Arc::downgrade(self);
@@ -688,6 +719,7 @@ impl Worker {
                 inbox,
                 status,
                 thread: Some(thread),
+                launch,
             },
         );
         self.note_empty(&agents);

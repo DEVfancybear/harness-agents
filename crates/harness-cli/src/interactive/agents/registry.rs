@@ -99,6 +99,29 @@ pub struct JournalAgent {
     pub id: String,
     pub name: Option<String>,
     pub conversation: Option<String>,
+    /// How the agent was launched, so the worker that brings it back runs it
+    /// the same way. A recovered agent used to start on the defaults: one
+    /// launched with `--approval full-auto` came back asking to approve every
+    /// read, and with nobody attached each request expired and the turn did
+    /// nothing for forty minutes.
+    #[serde(default)]
+    pub launch: LaunchSettings,
+}
+
+/// The launch settings of an agent that its journal keeps (no credentials,
+/// no environment).
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LaunchSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub append_system_prompt: Vec<String>,
 }
 
 /// A worker's journal.
@@ -352,7 +375,10 @@ const fn restrict_to_owner(_path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod journal_tests {
-    use super::{Journal, JournalAgent, SCHEMA_VERSION, journals, read_journal, write_journal};
+    use super::{
+        Journal, JournalAgent, LaunchSettings, SCHEMA_VERSION, journals, read_journal,
+        write_journal,
+    };
 
     #[test]
     fn a_journal_keeps_the_agents_and_goes_when_they_do() {
@@ -365,6 +391,10 @@ mod journal_tests {
                 id: "ab12cd34".to_owned(),
                 name: Some("api".to_owned()),
                 conversation: Some("session_x".to_owned()),
+                launch: LaunchSettings {
+                    approval: Some("full-auto".to_owned()),
+                    ..LaunchSettings::default()
+                },
             }],
         };
         write_journal(directory.path(), "k1", &journal).expect("written");
