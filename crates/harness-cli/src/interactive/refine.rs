@@ -488,9 +488,19 @@ fn now() -> String {
 
 /// `slug`: lowercase ASCII words joined by `_`, at most 80 characters.
 fn slug(raw: &str, fallback: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
     let mut out = String::new();
     let mut gap = false;
-    for character in raw.trim().to_lowercase().chars() {
+    // Accents come off before the cut to ASCII ('Lịch sử' is 'lich_su'): a
+    // Vietnamese title used to lose every accented letter, 'l_ch_s'.
+    let plain = raw
+        .trim()
+        .to_lowercase()
+        .replace('đ', "d")
+        .nfd()
+        .filter(|character| !unicode_normalization::char::is_combining_mark(*character))
+        .collect::<String>();
+    for character in plain.chars() {
         if character.is_ascii_alphanumeric() {
             if gap && !out.is_empty() {
                 out.push('_');
@@ -1781,6 +1791,11 @@ mod tests {
             "use_tabs_not_spaces"
         );
         assert_eq!(slug("!!!", "memory"), "memory");
+        assert_eq!(
+            slug("Lịch sử hội thoại: tiếng Việt và thứ tự tool", "prompt"),
+            "lich_su_hoi_thoai_tieng_viet_va_thu_tu_tool"
+        );
+        assert_eq!(slug("Đường đi", "memory"), "duong_di");
     }
 
     #[test]

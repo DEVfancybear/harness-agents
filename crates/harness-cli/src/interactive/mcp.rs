@@ -219,6 +219,10 @@ impl ActiveMcp {
                 Ok(mut subscription) => {
                     let _ = subscription.cancel().await;
                 }
+                // A server without live subscriptions answers JSON-RPC's
+                // "method not found": an optional feature it does not have, not
+                // a fault worth a notice on every launch.
+                Err(error) if error.to_string().contains("-32601") => {}
                 Err(error) => report.push(format!("{name}: subscriptions unavailable ({error})")),
             }
         }

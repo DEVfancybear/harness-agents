@@ -133,6 +133,13 @@ pub fn run(command: McpCommand) -> Result<(), HarnessError> {
             config.validate(&name)?;
             mutate_server(&name, config, project, false)?;
             println!("MCP server {name} added to {} config", layer_name(project));
+            // A project's config is read only once the project is trusted:
+            // say so, or the server just never shows up in the app.
+            if project && !project_trusted() {
+                println!(
+                    "note: this project is not trusted yet, so its servers are not loaded; run /trust in the app here to review and trust it"
+                );
+            }
             Ok(())
         }
         McpSubcommand::List { project, json } => {
@@ -257,6 +264,30 @@ fn auth_path() -> Result<PathBuf, HarnessError> {
     ))
 }
 
+/// Whether the user config trusts this project, as the app decides before it
+/// reads a project's config.
+fn project_trusted() -> bool {
+    let (Ok(project), Ok(user)) = (config_path(true), config_path(false)) else {
+        return false;
+    };
+    let Some(root) = project
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|root| root.canonicalize().ok())
+    else {
+        return false;
+    };
+    read_document(&user)
+        .ok()
+        .as_ref()
+        .and_then(|document| document.get("trust")?.get("projects")?.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .filter_map(|trusted| Path::new(trusted).canonicalize().ok())
+        .any(|trusted| trusted == root)
+}
+
 fn layer_name(project: bool) -> &'static str {
     if project { "project" } else { "user" }
 }
@@ -296,12 +327,22 @@ fn read_document(path: &Path) -> Result<toml::Value, HarnessError> {
             ));
         }
     };
-    toml::from_str(&text).map_err(|error| {
+    let mut document: toml::Value = toml::from_str(&text).map_err(|error| {
         HarnessError::new(
             ErrorCode::ConfigParseError,
             format!("{} is invalid TOML: {error}", path.display()),
         )
-    })
+    })?;
+    // A config that names its version and nothing else (what `ha init` and
+    // older builds left) has nothing to migrate: it reads as an empty version 2
+    // one. It used to stop `ha mcp list` and `ha mcp add` outright.
+    if let Some(table) = document.as_table_mut()
+        && table.len() == 1
+        && table.contains_key("schema_version")
+    {
+        table.insert("schema_version".to_owned(), toml::Value::Integer(2));
+    }
+    Ok(document)
 }
 
 fn read_servers(
@@ -420,4 +461,32 @@ fn mutate_server(
             format!("{} cannot be updated: {error}", path.display()),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// A config holding only its version - what `ha init` and older builds
+    /// left - reads as an empty version 2 one; one with settings keeps its
+    /// version, and so its refusal.
+    #[test]
+    fn a_version_only_config_reads_as_an_empty_v2_config() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "schema_version = 1\n").expect("config");
+        let document = super::read_document(&path).expect("reads");
+        assert_eq!(
+            document
+                .get("schema_version")
+                .and_then(toml::Value::as_integer),
+            Some(2)
+        );
+        std::fs::write(&path, "schema_version = 1\nmodel = 'x'\n").expect("config");
+        let document = super::read_document(&path).expect("reads");
+        assert_eq!(
+            document
+                .get("schema_version")
+                .and_then(toml::Value::as_integer),
+            Some(1)
+        );
+    }
 }
