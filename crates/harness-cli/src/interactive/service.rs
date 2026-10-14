@@ -160,6 +160,61 @@ mod g03_model_selection_tests {
 #[path = "service_completion_tests.rs"]
 mod completion_tests;
 
+#[cfg(test)]
+mod child_context_tests {
+    /// A child is told what its parent learned: the conversation's memory and
+    /// the learned skills, in full, as blocks of its own requests.
+    #[test]
+    fn a_child_is_sent_the_memory_and_the_learned_skills() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp.path().join("config");
+        let data_dir = temp.path().join("data");
+        let skill = config_dir.join("skills").join("kernel-tests");
+        std::fs::create_dir_all(&skill).expect("skill dir");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---
+name: kernel-tests
+description: Run tests in the kernel.
+---
+Python is not on PATH: run the tests with runpy in the kernel.
+",
+        )
+        .expect("skill");
+        std::fs::write(skill.join(super::super::learned::MARKER_FILE), "{}").expect("marker");
+        let local = super::super::harness::local_dir(&data_dir, "task-1");
+        std::fs::create_dir_all(&local).expect("local harness");
+        std::fs::write(
+            local.join("harness_state.json"),
+            serde_json::json!({"schema": 1, "entries": {"memory": {"rules": {
+                "title": "Project rules", "content": "Every file starts with # KH-2049", "path": "project"
+            }}}})
+            .to_string(),
+        )
+        .expect("state");
+        let layers = super::super::learned::Layers::new(
+            &config_dir,
+            &data_dir,
+            &temp.path().join("workspace"),
+            false,
+        );
+        let blocks = super::child_context(&data_dir, "task-1", &layers);
+        let text = blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(text.contains("Every file starts with # KH-2049"), "{text}");
+        assert!(
+            text.contains("run the tests with runpy in the kernel"),
+            "{text}"
+        );
+    }
+}
+
 /// Environment variable holding the provider endpoint.
 pub const ENDPOINT_VARIABLE: &str = "HA_PROVIDER_ENDPOINT";
 /// Environment variable holding the model name.
@@ -1056,6 +1111,58 @@ fn resolve_provider_with_config(
         data_dir,
         &ConfigOverrides::default(),
     )
+}
+
+/// The most learned-skill text a child is sent.
+const CHILD_LEARNED_SKILLS_CHARS: usize = 16_000;
+
+/// What a child is told besides its brief: the conversation's harness memory
+/// and the skills ha learned from this user, in full - a child has no skill
+/// tools to open them with.
+fn child_context(
+    data_dir: &Path,
+    conversation: &str,
+    layers: &super::learned::Layers,
+) -> Vec<harness_session::ContextBlock> {
+    let state = super::harness::merge(
+        super::harness::load(&super::harness::global_dir(data_dir), "global"),
+        super::harness::load(&super::harness::local_dir(data_dir, conversation), "local"),
+    );
+    let mut blocks = vec![super::harness::digest_block(
+        &super::harness::format_digest(
+            &state,
+            super::harness::DigestOptions {
+                repl: false,
+                refine: false,
+            },
+            &[],
+        ),
+    )];
+    let learned = super::learned::library_documents(layers);
+    if !learned.trim().is_empty() {
+        let mut text = learned;
+        if text.len() > CHILD_LEARNED_SKILLS_CHARS {
+            let mut end = CHILD_LEARNED_SKILLS_CHARS;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            text.push_str(
+                "
+[more learned skills are not shown]",
+            );
+        }
+        blocks.push(harness_session::ContextBlock::mandatory(
+            "learned-skills",
+            harness_session::ContextBlockKind::ProjectRule,
+            format!(
+                "Skills ha learned from earlier work with this user. When your task matches one, follow it: it records how this work is done here and what does not work.
+
+{text}"
+            ),
+        ));
+    }
+    blocks
 }
 
 pub(super) fn resolve_provider_with_overrides(
@@ -7679,6 +7786,16 @@ async fn run_turn(
                 .as_ref()
                 .map(|host| (host.tools(), host.dispatcher())),
             checks: config.verify.checks.clone(),
+            context: child_context(
+                &data_dir,
+                task_id.as_str(),
+                &super::learned::Layers::new(
+                    &global_config_dir,
+                    &data_dir,
+                    &workspace_root,
+                    config.project_trusted,
+                ),
+            ),
         },
         cancellation.clone(),
     ));

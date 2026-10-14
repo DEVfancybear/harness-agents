@@ -5461,6 +5461,9 @@ impl InteractiveController {
         // left (bounded by the byte cap) instead of guessing.
         self.pending_newlines = self.pending_text.matches('\n').count();
         effects.push(Effect::Stream(committed.clone()));
+        // The lines that leave the live block are the answer's beginning:
+        // `ha send --wait` and /copy got only what was still in the block.
+        self.last_answer.push_str(&committed);
         self.transcript.push(committed.clone());
         self.remember(committed.split('\n').map(str::to_owned).collect());
     }
@@ -5473,8 +5476,10 @@ impl InteractiveController {
                 HistoryItem::Notice { .. } | HistoryItem::Refinement { .. }
             )
         {
-            self.run_report = Some(lines.join("
-"));
+            self.run_report = Some(lines.join(
+                "
+",
+            ));
         }
         self.transcript.extend(lines.clone());
         if !self.plain
@@ -11296,6 +11301,36 @@ Command: \"npm run build\""
             effects.contains(&Effect::Copy("final answer".to_owned())),
             "{effects:#?}"
         );
+    }
+
+    /// An answer longer than the live block is the whole answer for /copy and
+    /// `ha send --wait`: the lines that scrolled out of the block were missing.
+    #[test]
+    fn a_long_answer_is_copied_whole() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "question");
+        let answer = (1..=20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for line in answer.split_inclusive('\n') {
+            harness
+                .events
+                .send(SessionEvent::TextDelta {
+                    text: line.to_owned(),
+                })
+                .expect("answer delta");
+            let _ = harness.controller.pump_events();
+        }
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("turn finished");
+        let _ = harness.controller.pump_events();
+        assert_eq!(harness.controller.last_answer(), answer);
     }
 
     #[test]

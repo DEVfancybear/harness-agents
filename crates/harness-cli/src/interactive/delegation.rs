@@ -257,6 +257,12 @@ pub struct ChildLaunch {
     /// The project's `[verify]` checks: `integrate_children` runs them on the
     /// merged revision of its coders before anything reaches the user.
     pub checks: Vec<super::verify::Check>,
+    /// What the parent knows that a child must too: the conversation's harness
+    /// memory and the skills ha learned from this user. A child (a verifier
+    /// most visibly) was sent its brief alone, so a lesson the parent had just
+    /// learned - "python is not on PATH here, run the tests in the kernel" - was
+    /// unknown to it, and it spent its turn retrying what the lesson ruled out.
+    pub context: Vec<harness_session::ContextBlock>,
 }
 
 impl ChildLaunch {
@@ -4138,6 +4144,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     request.brief.workspace.clone(),
                 )
                 .with_system_policy(system_policy.clone())
+                .with_project_rules(launch.context.clone())
                 .with_tool_schemas(schemas.clone())
                 .with_authority(SourceAuthority::ModelProposed)
                 .with_conversation(conversation.clone());
@@ -4952,6 +4959,7 @@ pub(super) mod tests {
             web: None,
             hashline: super::super::config::HashlineRule::Off,
             checks: Vec::new(),
+            context: Vec::new(),
         }
     }
 

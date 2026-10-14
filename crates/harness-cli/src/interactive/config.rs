@@ -1421,7 +1421,12 @@ fn apply_selection(
     provider
         .thinking_format
         .clone_from(&selection.thinking_format);
-    if let Some(window) = selection.context_window {
+    // The catalog's window is the model's default: `--model` brings it only
+    // where no layer configured one, or it overrode a project's
+    // `[models.<id>] context_window`.
+    if let Some(window) = selection.context_window
+        && (layer != ConfigLayer::Cli || !model_context_windows.contains_key(&selection.model))
+    {
         model_context_windows.insert(selection.model.clone(), (window, layer));
     }
     explain_provider(entries, provider, layer, Some(reason.to_owned()));
@@ -1829,6 +1834,18 @@ mod tests {
         let unknown = resolve("not-in-any-catalog");
         assert_eq!(unknown.provider.id, "configured");
         assert_eq!(unknown.provider.model, "not-in-any-catalog");
+        // A window configured for the model stays: the catalog's is a default.
+        let catalog_window = resolve("deepseek/deepseek-v4-flash").context_window_tokens;
+        std::fs::write(
+            &user,
+            "schema_version = 2\n[provider]\nid = 'configured'\nmodel = 'configured-model'\n[models.deepseek-v4-flash]\ncontext_window = 60000\n",
+        )
+        .expect("user config");
+        assert_ne!(catalog_window, 60_000);
+        assert_eq!(
+            resolve("deepseek/deepseek-v4-flash").context_window_tokens,
+            60_000
+        );
     }
 
     /// The window `/model` saved with the selection was the catalog's of that
