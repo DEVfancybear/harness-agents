@@ -6,9 +6,9 @@
 ![rust](https://img.shields.io/badge/built%20with-Rust-0f766e)
 
 **A terminal coding agent whose harness, not the model, decides when the work is done.**
-**Coding agent chạy trong terminal, nơi harness chứ không phải model quyết định khi nào việc đã xong.**
+**Coding agent chạy trong terminal, nơi harness chứ không phải model quyết định khi nào việc đã xong, và không quên việc đã làm dù task kéo dài.**
 
-`ha` reads, edits and runs your code through approval-gated tools, keeps every conversation in a local SQLite store, checks its own work with your project's checks and an independent verifier, and learns reusable skills from the sessions you have with it. It works with DeepSeek, OpenAI, Anthropic, ChatGPT Plus/Pro and OpenCode, and keeps their prompt caches hitting from one step to the next.
+`ha` reads, edits and runs your code through approval-gated tools, keeps every conversation in a local SQLite store, checks its own work with your project's checks and an independent verifier, and learns reusable skills from the sessions you have with it. On long tasks it does not forget what it did earlier: every tool call, result and steer stays in the conversation, and compaction extends one summary instead of rewriting it. It works with DeepSeek, OpenAI, Anthropic, ChatGPT Plus/Pro and OpenCode, and keeps their prompt caches hitting from one step to the next.
 
 **Language / Ngôn ngữ:** [English](#english) · [Tiếng Việt](#tiếng-việt)
 
@@ -38,10 +38,11 @@ ha                      # then /login and start typing
 | **Guarded tools** | Read, search, patch and write files, run shell commands and processes, inspect Git, fetch and search the web. Every action passes the host policy: `ask`, `auto-edit` or `full-auto`, with deny rules that always hold. |
 | **Persistent Python REPL** | prime-agent's kernel: variables survive across turns, `bash()` runs commands in the background, `rlm.spawn()` fans out explorer agents in parallel. |
 | **Verified work** | `[verify]` checks the harness runs itself, an independent `verifier` agent that cannot edit and reports its findings back to the running turn, goals that only complete when both pass, and a feature list only a real verification can mark passing. |
-| **Long-running work** | `/goal` keeps working across turns, `ha exec --autonomous` loops until your gates pass, and background agents keep running after the terminal closes. |
+| **Long-running work** | `/goal` keeps working across turns, `ha exec --autonomous` loops until your gates pass, and background agents keep running after the terminal closes. A recovered agent comes back with the approval mode, profile and effort it was launched with. |
+| **Memory that holds** | Earlier turns are replayed with their tool calls, results, steers and host messages, not just the question and answer. Compaction keeps one rolling summary that each pass extends, splits a turn too large to keep and summarises its start, anchors the latest state, and keeps the cumulative list of files read and modified. `/resume` brings all of it back. |
 | **Session continuity** | Every session starts from a brief of recent commits, uncommitted files and the last `/handoff`; `/resume`, `/tree` and forks move around a conversation's history. |
-| **Learned skills** | `/refine`, `/learn` and a background review write `SKILL.md` skills that pass a lint and are counted when used, together with whether your checks passed afterwards. A skill nobody uses is archived; moving it back gives it a new trial. |
-| **Prompt caching** | A request's prefix stays byte-for-byte still across steps and turns; each provider gets its cache key, breakpoints and retention, and the status line shows `⚡ cache NN%`. |
+| **Learned skills** | `/learn` turns what a conversation taught (a corrected approach, a fix, a setup step, your preferences) into `SKILL.md` skills; `/refine` tunes the harness more broadly: memory, skills, checks, prompt addendums, with `--global`, `--curate` and `--rollback`. A background review does the same at checkpoints. Skills pass a lint, are counted when used together with whether your checks passed afterwards, and are handed to child agents too. A skill nobody uses is archived; moving it back gives it a new trial. |
+| **Prompt caching** | A follow-up request begins with the previous request word for word: tools are sorted, blocks already sent are not sent again, and history is replayed as it was sent. Each provider gets its cache key, breakpoints and retention, and the status line shows `⚡ cache NN%`. |
 | **Open ecosystem** | Agent Skills, MCP servers with OAuth sign-in and a service catalog (`/plugins`), prompt templates, hooks, `ha package` (npm, git, local), and `--mode rpc` / `--mode acp` for editors. |
 
 ### Install
@@ -88,9 +89,11 @@ ha                         open the app
 | Work until something is done | `/goal <objective>`, `/goal status\|pause\|resume\|clear` |
 | Check the work | `/verify`, `/review`, `/features` |
 | Hand over to the next session | `/handoff`, `/handoff --reset` |
-| Keep a lesson | `/learn [focus]`, `/refine`, `/skills` |
+| Keep a lesson as a skill | `/learn [focus]`, then `/skills` |
+| Tune memory, skills and checks | `/refine [instructions]`, `/refine --global`, `/refine --curate`, `/refine --rollback <id>` |
 | Shrink a long conversation | `/compact [what to keep]` |
-| Connect services | `/plugins`, `/mcp add`, `/mcp login <service>` |
+| Connect services | `/plugins`, `/mcp add`, `/mcp login <service>`, `@server:uri` to attach a resource |
+| Trust this project's config, hooks and MCP | `/trust`, then `/trust yes` |
 | See cost, context, permissions | `/cost`, `/context`, `/permissions` |
 | Audit the repository for agents | `/doctor` or `ha doctor` |
 
@@ -102,12 +105,15 @@ Keys: Enter sends, Shift+Enter / Alt+Enter / Ctrl-J add a line, Esc interrupts, 
 ha agents                          # the agents still running for this project
 ha attach <name>                   # reattach this terminal
 ha send <name> "next step" --wait  # wake a saved conversation
+ha send <name> "/compact" --wait   # slash commands run as commands
+ha stop <name>                     # stop it; the conversation stays
+ha chat --model openai-codex/gpt-5.6-terra --approval full-auto
 ha exec --autonomous --autonomous-gate "cargo test" "make the suite pass"
 ha --mode rpc                      # JSON commands on stdin, events on stdout
 ha --mode acp                      # Agent Client Protocol over stdio
 ```
 
-A per-project worker keeps sessions alive after the terminal closes and recovers them from its journal (`HA_DAEMON=off` disables it).
+A per-project worker keeps sessions alive after the terminal closes and recovers them from its journal with the settings they were launched with (`HA_DAEMON=off` disables it). `--model provider/id` picks a catalog model together with its provider.
 
 ### Configuration
 
@@ -172,10 +178,11 @@ CI runs the phase and milestone gates on Windows; a test that fails in the crowd
 | **Công cụ có kiểm soát** | Đọc, tìm, sửa và ghi file, chạy lệnh shell và tiến trình, xem Git, tìm và đọc web. Mọi thao tác đi qua chính sách của host: `ask`, `auto-edit` hoặc `full-auto`, rule deny luôn được giữ. |
 | **Python REPL bền** | Kernel của prime-agent: biến được giữ qua các lượt, `bash()` chạy lệnh nền, `rlm.spawn()` chạy song song các agent khám phá. |
 | **Kiểm chứng thật** | Các check `[verify]` do harness tự chạy, agent `verifier` độc lập không được sửa file và báo phát hiện của nó về lượt đang chạy, goal chỉ hoàn thành khi cả hai qua, và feature list chỉ được đánh dấu passing bằng một lượt kiểm chứng thật. |
-| **Việc dài hơi** | `/goal` làm tiếp qua nhiều lượt, `ha exec --autonomous` lặp tới khi các gate qua, agent nền vẫn chạy sau khi đóng terminal. |
+| **Việc dài hơi** | `/goal` làm tiếp qua nhiều lượt, `ha exec --autonomous` lặp tới khi các gate qua, agent nền vẫn chạy sau khi đóng terminal. Agent được khôi phục giữ nguyên chế độ duyệt, profile và mức suy luận lúc khởi chạy. |
+| **Trí nhớ bền** | Các lượt trước được phát lại cùng tool call, kết quả, steer và tin nhắn của host, không chỉ câu hỏi và câu trả lời. Compaction giữ một bản tóm tắt cuốn chiếu được nối thêm mỗi lần, tách lượt quá lớn và tóm tắt phần đầu của nó, neo trạng thái mới nhất, và giữ danh sách cộng dồn các file đã đọc và đã sửa. `/resume` nạp lại tất cả. |
 | **Liền mạch giữa các phiên** | Mỗi phiên bắt đầu với tóm tắt commit gần đây, file chưa commit và `/handoff` cuối; `/resume`, `/tree` và fork để đi lại trong lịch sử hội thoại. |
-| **Tự học skill** | `/refine`, `/learn` và lượt xem xét nền viết skill `SKILL.md` qua lint, được đếm mỗi khi dùng cùng việc check của bạn có qua sau đó hay không. Skill không ai dùng bị lưu trữ; chuyển lại thì được thử việc lại. |
-| **Prompt caching** | Phần đầu request giữ nguyên từng byte qua các bước và các lượt; mỗi provider nhận cache key, breakpoint và thời hạn riêng, thanh trạng thái hiện `⚡ cache NN%`. |
+| **Tự học skill** | `/learn` đúc điều hội thoại vừa dạy (cách làm đã được sửa, cách fix, bước setup, sở thích của bạn) thành skill `SKILL.md`; `/refine` tinh chỉnh harness rộng hơn: memory, skill, check, phần bổ sung prompt, với `--global`, `--curate` và `--rollback`. Lượt xem xét nền làm việc này ở các điểm dừng. Skill qua lint, được đếm mỗi khi dùng cùng việc check của bạn có qua sau đó hay không, và được chuyển cho cả agent con. Skill không ai dùng bị lưu trữ; chuyển lại thì được thử việc lại. |
+| **Prompt caching** | Request tiếp theo bắt đầu bằng đúng nguyên văn request trước: tool được sắp xếp, khối đã gửi không gửi lại, lịch sử được phát lại đúng như đã gửi. Mỗi provider nhận cache key, breakpoint và thời hạn riêng, thanh trạng thái hiện `⚡ cache NN%`. |
 | **Hệ sinh thái mở** | Agent Skills, MCP server có đăng nhập OAuth và danh mục dịch vụ (`/plugins`), prompt template, hook, `ha package` (npm, git, local), và `--mode rpc` / `--mode acp` cho editor. |
 
 ### Cài đặt
@@ -222,9 +229,11 @@ ha                         mở app
 | Làm tới khi xong việc | `/goal <mục tiêu>`, `/goal status\|pause\|resume\|clear` |
 | Kiểm tra kết quả | `/verify`, `/review`, `/features` |
 | Bàn giao cho phiên sau | `/handoff`, `/handoff --reset` |
-| Giữ lại bài học | `/learn [trọng tâm]`, `/refine`, `/skills` |
+| Giữ bài học thành skill | `/learn [trọng tâm]`, rồi `/skills` |
+| Tinh chỉnh memory, skill và check | `/refine [chỉ dẫn]`, `/refine --global`, `/refine --curate`, `/refine --rollback <id>` |
 | Rút gọn hội thoại dài | `/compact [điều cần giữ]` |
-| Kết nối dịch vụ | `/plugins`, `/mcp add`, `/mcp login <service>` |
+| Kết nối dịch vụ | `/plugins`, `/mcp add`, `/mcp login <service>`, `@server:uri` để đính kèm resource |
+| Trust config, hook và MCP của project | `/trust`, rồi `/trust yes` |
 | Xem chi phí, context, quyền | `/cost`, `/context`, `/permissions` |
 | Audit repo cho agent | `/doctor` hoặc `ha doctor` |
 
@@ -236,12 +245,15 @@ Phím: Enter gửi, Shift+Enter / Alt+Enter / Ctrl-J xuống dòng, Esc ngắt l
 ha agents                          # các agent còn chạy của project
 ha attach <name>                   # gắn lại terminal này
 ha send <name> "bước tiếp" --wait  # đánh thức một hội thoại đã lưu
+ha send <name> "/compact" --wait   # lệnh slash được chạy như lệnh
+ha stop <name>                     # dừng agent; hội thoại vẫn được giữ
+ha chat --model openai-codex/gpt-5.6-terra --approval full-auto
 ha exec --autonomous --autonomous-gate "cargo test" "làm cho bộ test qua"
 ha --mode rpc                      # lệnh JSON qua stdin, sự kiện qua stdout
 ha --mode acp                      # Agent Client Protocol qua stdio
 ```
 
-Mỗi project có một worker giữ các phiên sống sau khi đóng terminal và khôi phục chúng từ journal (`HA_DAEMON=off` để tắt).
+Mỗi project có một worker giữ các phiên sống sau khi đóng terminal và khôi phục chúng từ journal cùng cấu hình lúc khởi chạy (`HA_DAEMON=off` để tắt). `--model provider/id` chọn model trong catalog cùng provider của nó.
 
 ### Cấu hình
 
@@ -292,6 +304,7 @@ CI chạy các gate phase và milestone trên Windows; test fail trong lượt c
 
 - [Hướng dẫn vận hành](docs/OPERATOR_GUIDE.vi.md): mọi lệnh, cấu hình và quy trình
 - [Tổng quan kiến trúc](docs/ARCHITECTURE_OVERVIEW.vi.md) · [Giao diện terminal](docs/TUI.md) · [Kiến trúc plugin](docs/PLUGIN_ARCHITECTURE.vi.md)
+- [Điều khiển máy tính](docs/COMPUTER_USE.md): chụp màn hình, chuột và bàn phím thật trên Windows
 - [Build và release](docs/BUILD_AND_RELEASE.md) · [Changelog](https://github.com/DEVfancybear/harness-agents/releases)
 
 ---
