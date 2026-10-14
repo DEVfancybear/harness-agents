@@ -1136,7 +1136,8 @@ fn check_subfile(path: &str) -> Result<(), String> {
             })
             && !segment.contains("..")
     };
-    // Windows opens a device, not a file, for these names with any extension.
+    // Windows opens a device, not a file, for these names with any extension
+    // (`conin$` and `conout$` are already not plain).
     let device = |segment: &&str| {
         let stem = segment
             .split('.')
@@ -1146,16 +1147,17 @@ fn check_subfile(path: &str) -> Result<(), String> {
         matches!(stem.as_str(), "con" | "prn" | "aux" | "nul")
             || ((stem.starts_with("com") || stem.starts_with("lpt"))
                 && stem.len() == 4
-                && stem[3..].chars().all(|digit| digit.is_ascii_digit()))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'))
     };
-    if segments.len() < 2
-        || !SUBFILE_DIRS.contains(&segments[0])
-        || !segments.iter().all(plain)
-        || segments.iter().any(device)
-    {
+    if segments.len() < 2 || !SUBFILE_DIRS.contains(&segments[0]) || !segments.iter().all(plain) {
         return Err(format!(
             "{path:?} must be a relative path under one of {}",
             SUBFILE_DIRS.join("/, ")
+        ));
+    }
+    if let Some(segment) = segments.iter().find(|segment| device(segment)) {
+        return Err(format!(
+            "{path:?}: {segment:?} is a Windows device name, not a file; choose another name"
         ));
     }
     Ok(())
@@ -1780,6 +1782,26 @@ mod tests {
             &root.join("workspace"),
             true,
         )
+    }
+
+    #[test]
+    fn windows_device_names_are_not_support_files() {
+        for refused in [
+            "references/nul",
+            "scripts/CON.py",
+            "assets/com1.txt",
+            "references/lpt9",
+        ] {
+            let error = super::check_subfile(refused).expect_err(refused);
+            assert!(error.contains("Windows device name"), "{refused}: {error}");
+        }
+        for allowed in [
+            "references/com0.md",
+            "scripts/console.py",
+            "assets/null.txt",
+        ] {
+            super::check_subfile(allowed).expect(allowed);
+        }
     }
 
     fn skill(name: &str, body: &str) -> String {

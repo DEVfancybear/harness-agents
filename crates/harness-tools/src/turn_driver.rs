@@ -834,24 +834,19 @@ impl TurnDriver {
             Some(source) => {
                 // The prepared request - the conversation this turn continues -
                 // is the one every later step sends too.
-                match self
+                request = self
                     .runtime
-                    .prepare_continuation_request(source, request.clone())
+                    .prepare_continuation_request(source, request)
                     .await
-                {
-                    Ok(prepared) => {
-                        request = prepared;
-                        self.runtime
-                            .run_prepared_continuation(
-                                source,
-                                &request,
-                                cancellation.clone(),
-                                sink_with(&observer, prefetcher.clone()),
-                            )
-                            .await
-                    }
-                    Err(error) => Err(error),
-                }
+                    .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+                self.runtime
+                    .run_prepared_continuation(
+                        source,
+                        &request,
+                        cancellation.clone(),
+                        sink_with(&observer, prefetcher.clone()),
+                    )
+                    .await
             }
             None => {
                 self.runtime

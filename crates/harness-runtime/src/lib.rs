@@ -612,6 +612,9 @@ pub struct RunRequest {
     /// Shared across cloned continuation requests so one admitted input cannot
     /// start more than one automatic compaction.
     auto_compaction_attempted: Arc<AtomicBool>,
+    /// Shared the same way: every step of a turn sends the earlier turns, so
+    /// each one summarises them again (from the cache) and the user is told once.
+    earlier_compaction_noticed: Arc<AtomicBool>,
 }
 
 impl RunRequest {
@@ -647,6 +650,7 @@ impl RunRequest {
             conversation: Vec::new(),
             authority: SourceAuthority::User,
             auto_compaction_attempted: Arc::new(AtomicBool::new(false)),
+            earlier_compaction_noticed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2580,7 +2584,11 @@ impl RuntimeService {
                             checkpoint_id.clone(),
                             &appended,
                         );
-                        notices.push(format!(
+                        if !request
+                            .earlier_compaction_noticed
+                            .swap(true, Ordering::SeqCst)
+                        {
+                            notices.push(format!(
                             "context: compacted {} earlier message(s) into a summary to stay within the model's window{}",
                             older.len(),
                             match (&attempt, before) {
@@ -2591,6 +2599,7 @@ impl RuntimeService {
                                 _ => String::new(),
                             }
                         ));
+                        }
                     }
                     Err(error) => notices.push(format!(
                         "context: the earlier conversation could not be summarised ({error})"
