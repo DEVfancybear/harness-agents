@@ -1065,8 +1065,9 @@ pub(super) fn resolve_provider_with_overrides(
     data_dir: &Path,
     overrides: &ConfigOverrides,
 ) -> Result<ProviderConfig, String> {
+    let overrides = super::config::with_catalog_model(overrides.clone(), data_dir);
     let mut resolved =
-        super::config::resolve_layers(user_path, project_root, environment, overrides)
+        super::config::resolve_layers(user_path, project_root, environment, &overrides)
             .map_err(|error| error.to_string())?;
     super::config::apply_catalog_context_window(&mut resolved, data_dir);
     if !matches!(
@@ -4869,18 +4870,7 @@ impl SessionPort for AgentSessionService {
         // model selector sets its default model.
         if let Some(entry) = super::providers::Catalog::load(&self.data_dir).find(model) {
             super::allowlist::check(&self.config_file, &entry.provider, &entry.id)?;
-            let selection = super::config::Selection {
-                provider: entry.provider.clone(),
-                model: entry.id.clone(),
-                protocol: entry.protocol().unwrap_or("openai_chat").to_owned(),
-                endpoint: entry.endpoint(),
-                context_window: entry.context_window,
-                thinking_format: entry
-                    .compat
-                    .as_ref()
-                    .and_then(|compat| compat.thinking_format.clone()),
-                api_key_env: entry.key_variable.clone(),
-            };
+            let selection = super::config::selection_for(entry);
             super::config::save_selection(&self.config_file, &selection)
                 .map_err(|error| error.to_string())?;
             if let Ok(mut selection) = self.model_selection.lock() {

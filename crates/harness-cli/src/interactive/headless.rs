@@ -344,13 +344,16 @@ pub async fn run_with(
     // must fail fast with instructions and must not create state. The explicit
     // mock profile skips the provider configuration entirely, and the JSON
     // result labels it as a fixture.
-    let config_overrides = ConfigOverrides {
-        approval: request.options.approval.clone(),
-        allowed_tools: request.options.allowed_tools.clone(),
-        disallowed_tools: request.options.disallowed_tools.clone(),
-        model: request.options.model.clone(),
-        ..ConfigOverrides::default()
-    };
+    let config_overrides = super::config::with_catalog_model(
+        ConfigOverrides {
+            approval: request.options.approval.clone(),
+            allowed_tools: request.options.allowed_tools.clone(),
+            disallowed_tools: request.options.disallowed_tools.clone(),
+            model: request.options.model.clone(),
+            ..ConfigOverrides::default()
+        },
+        &context.paths.data_dir,
+    );
     // prime-agent's `--thinking`: a level the run names must be one.
     let thinking_override = match request.options.thinking.as_deref() {
         Some(level) => Some(harness_providers::ThinkingLevel::parse(level).ok_or_else(|| {

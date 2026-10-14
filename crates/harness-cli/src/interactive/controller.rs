@@ -620,9 +620,25 @@ impl InteractiveController {
     ) -> (u64, &'static str) {
         self.next_delivery += 1;
         let receipt = self.next_delivery;
-        // A user's goal control is a host command even while the model is busy.
-        // Steering it into the model left a background goal running after pause.
-        if !from_agent && steer && text.split_whitespace().next() == Some("/goal") {
+        // A user's command is a host command, sent as typed: `ha send <agent>
+        // "/compact"` used to reach the model as a message, which answered it
+        // instead of compacting - only `/goal` ran. `/goal` control runs even
+        // while the model is busy: steering it into the model left a background
+        // goal running after pause. `/quit` would end the agent the sender
+        // only addressed; `ha stop` does that.
+        let command = text
+            .split_whitespace()
+            .next()
+            .and_then(super::commands::builtin)
+            .map(|command| command.name);
+        if !from_agent && command == Some("/quit") {
+            self.record_delivery_answer(
+                receipt,
+                Err("/quit is not sent to an agent; `ha stop <agent>` stops it".to_owned()),
+            );
+            return (receipt, "delivered");
+        }
+        if !from_agent && steer && command.is_some() {
             let was_running = self.phase.has_active_run();
             let produced = self.command(&text);
             if !was_running && self.phase.has_active_run() {
@@ -6011,6 +6027,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingPort {
         submissions: Arc<Mutex<Vec<String>>>,
+        /// The guidance of each submission that was a compaction.
+        compactions: Arc<Mutex<Vec<String>>>,
         shell_prefixes: Arc<Mutex<Vec<Option<ShellPrefix>>>>,
         answer_questions: Arc<Mutex<Vec<Option<String>>>>,
         cancels: Arc<Mutex<u32>>,
@@ -6101,6 +6119,12 @@ mod tests {
         }
 
         fn submit(&mut self, request: SubmitRequest) {
+            if let Some(guidance) = &request.compact_guidance {
+                self.compactions
+                    .lock()
+                    .expect("compaction log")
+                    .push(guidance.clone());
+            }
             let shell_prefix = request.shell_prefix.clone();
             let answer_question = request.answer_question_id.clone();
             self.submissions
@@ -10469,6 +10493,38 @@ Command: \"npm run build\""
                 .is_some()
         );
         assert_eq!(submissions(&harness).len(), 2);
+    }
+
+    /// `ha send <agent> "/compact"` runs the command, as typing it does; it
+    /// used to reach the model as a message. A model never sees a sent command,
+    /// and `/quit` does not end the agent (`ha stop` does).
+    #[test]
+    fn a_sent_command_runs_as_a_command_not_as_a_message() {
+        let mut harness = bench(true);
+        let mut effects = Vec::new();
+        for command in ["/permissions full-auto", "/compact keep the deadline"] {
+            let (receipt, outcome) =
+                harness
+                    .controller
+                    .deliver_tracked(command.to_owned(), true, false, &mut effects);
+            assert_eq!(outcome, "delivered", "{command}");
+            let _ = harness.controller.take_delivery_answer(receipt);
+            let _ = end_done(&mut harness);
+        }
+        // `/permissions` sends nothing; `/compact` is the compaction itself.
+        assert_eq!(submissions(&harness), ["/compact keep the deadline"]);
+        assert_eq!(
+            *harness.port.compactions.lock().expect("compactions"),
+            ["keep the deadline"]
+        );
+        let mut quit = Vec::new();
+        let _ = harness
+            .controller
+            .deliver_tracked("/quit".to_owned(), true, false, &mut quit);
+        assert!(
+            !quit.iter().any(|effect| matches!(effect, Effect::Exit(_))),
+            "{quit:?}"
+        );
     }
 
     #[test]

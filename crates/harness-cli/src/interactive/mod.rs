@@ -215,17 +215,16 @@ pub fn mode_from_args(
                 "--json is only valid with --headless; run ha chat --headless --prompt <text> --json",
             ));
         }
+        // `--approval`, `--goal` and the tool lists set up the app too (`ha chat`
+        // passes them on as its launch overrides); refusing them here made
+        // `ha chat --approval full-auto`, which `--help` offers, fail to start.
         if options.mock
-            || options.goal.is_some()
             || !options.criteria.is_empty()
             || options.max_continuations.is_some()
             || options.budget_tokens.is_some()
-            || options.approval.is_some()
-            || !options.allowed_tools.is_empty()
-            || !options.disallowed_tools.is_empty()
         {
             return Err(UsageError::new(
-                "--mock, --goal, --criteria, --max-continuations, --budget, --allowed-tools and --disallowed-tools are only valid with --headless",
+                "--mock, --criteria, --max-continuations and --budget are only valid with --headless",
             ));
         }
         return Ok(LaunchMode::Interactive {

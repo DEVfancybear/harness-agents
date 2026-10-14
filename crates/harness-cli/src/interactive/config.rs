@@ -101,6 +101,44 @@ pub struct ConfigOverrides {
     /// MCP servers this session alone adds (an ACP client's `mcpServers`):
     /// held in memory, never written to configuration.
     pub mcp_servers: BTreeMap<String, McpServerConfigV2>,
+    /// The catalog model `model` names, with its provider and transport: what
+    /// [`with_catalog_model`] found, applied as `/model` applies a selection.
+    pub model_selection: Option<Selection>,
+}
+
+/// The selection a catalog model makes: its provider, wire format, endpoint,
+/// window and key together, as prime-agent's model selector sets them.
+#[must_use]
+pub fn selection_for(entry: &super::providers::Model) -> Selection {
+    Selection {
+        provider: entry.provider.clone(),
+        model: entry.id.clone(),
+        protocol: entry.protocol().unwrap_or("openai_chat").to_owned(),
+        endpoint: entry.endpoint(),
+        context_window: entry.context_window,
+        thinking_format: entry
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.thinking_format.clone()),
+        api_key_env: entry.key_variable.clone(),
+    }
+}
+
+/// `overrides` with `--model` read against the model catalog: a catalog model
+/// (`provider/id` or an unambiguous id) brings its provider and transport, as
+/// `/model` does. It used to change only the model id, so
+/// `ha exec --model deepseek-v4.1-flash` sent a `DeepSeek` id to the configured
+/// provider (Codex) and failed. A name the catalog does not know stays a model
+/// id for the configured provider.
+#[must_use]
+pub fn with_catalog_model(mut overrides: ConfigOverrides, data_dir: &Path) -> ConfigOverrides {
+    if overrides.model_selection.is_none()
+        && let Some(model) = overrides.model.as_deref()
+        && let Some(entry) = super::providers::Catalog::load(data_dir).find(model)
+    {
+        overrides.model_selection = Some(selection_for(entry));
+    }
+    overrides
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -511,6 +549,8 @@ pub fn resolve_layers(
             &mut model_context_windows,
             &selection,
             &mut entries,
+            ConfigLayer::Selection,
+            "chosen with /model",
         );
     }
 
@@ -729,7 +769,16 @@ pub fn resolve_layers(
             None,
         );
     }
-    if let Some(model) = &overrides.model {
+    if let Some(selection) = &overrides.model_selection {
+        apply_selection(
+            &mut provider,
+            &mut model_context_windows,
+            selection,
+            &mut entries,
+            ConfigLayer::Cli,
+            "chosen with --model",
+        );
+    } else if let Some(model) = &overrides.model {
         provider.model.clone_from(model);
         set_explain(
             &mut entries,
@@ -1357,6 +1406,8 @@ fn apply_selection(
     model_context_windows: &mut BTreeMap<String, (u64, ConfigLayer)>,
     selection: &Selection,
     entries: &mut BTreeMap<String, ConfigExplainEntry>,
+    layer: ConfigLayer,
+    reason: &str,
 ) {
     provider.id.clone_from(&selection.provider);
     provider.protocol.clone_from(&selection.protocol);
@@ -1371,14 +1422,9 @@ fn apply_selection(
         .thinking_format
         .clone_from(&selection.thinking_format);
     if let Some(window) = selection.context_window {
-        model_context_windows.insert(selection.model.clone(), (window, ConfigLayer::Selection));
+        model_context_windows.insert(selection.model.clone(), (window, layer));
     }
-    explain_provider(
-        entries,
-        provider,
-        ConfigLayer::Selection,
-        Some("chosen with /model".to_owned()),
-    );
+    explain_provider(entries, provider, layer, Some(reason.to_owned()));
 }
 
 fn explain_provider(
@@ -1744,6 +1790,45 @@ mod tests {
         )
         .expect("project layer resolves");
         assert_eq!(project_only.provider.model, "project-model");
+    }
+
+    /// `--model` names a catalog model as `/model` does: its provider and
+    /// transport come with it. A `DeepSeek` id used to be sent to the configured
+    /// provider. A name the catalog does not know stays a model id.
+    #[test]
+    fn a_catalog_model_on_the_command_line_brings_its_provider() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).expect("project");
+        let user = temp.path().join("user.toml");
+        std::fs::write(
+            &user,
+            "schema_version = 2\n[provider]\nid = 'configured'\nmodel = 'configured-model'\n",
+        )
+        .expect("user config");
+        let env = super::super::paths::LaunchEnvironment::default();
+        let resolve = |model: &str| {
+            let overrides = super::with_catalog_model(
+                ConfigOverrides {
+                    model: Some(model.to_owned()),
+                    ..ConfigOverrides::default()
+                },
+                &temp.path().join("data"),
+            );
+            resolve_layers(&user, &root, &env, &overrides).expect("configuration resolves")
+        };
+        for (reference, provider) in [
+            ("opencode-go/deepseek-v4-flash", "opencode-go"),
+            ("deepseek/deepseek-v4-flash", "deepseek"),
+        ] {
+            let resolved = resolve(reference);
+            assert_eq!(resolved.provider.id, provider, "{reference}");
+            assert_eq!(resolved.provider.model, "deepseek-v4-flash", "{reference}");
+            assert_eq!(resolved.provider.protocol, "openai_chat", "{reference}");
+        }
+        let unknown = resolve("not-in-any-catalog");
+        assert_eq!(unknown.provider.id, "configured");
+        assert_eq!(unknown.provider.model, "not-in-any-catalog");
     }
 
     /// The window `/model` saved with the selection was the catalog's of that
