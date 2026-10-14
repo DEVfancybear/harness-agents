@@ -455,6 +455,7 @@ async fn m5_01_channels_authority_and_manifest() {
             optional_token_budget: 1024,
             memory_versions: Vec::new(),
             fixed_request_bytes: 4096,
+            sent_earlier: Vec::new(),
             manifest: ContextManifestInputs {
                 config_revision: 7,
                 model_id: "fixture/model".to_owned(),
@@ -552,6 +553,7 @@ async fn m5_01_a_window_that_cannot_hold_the_request_pauses_typed() {
             optional_token_budget: 128,
             memory_versions: Vec::new(),
             fixed_request_bytes: 64 * 1024,
+            sent_earlier: Vec::new(),
             manifest: ContextManifestInputs::default(),
         })
         .expect_err("a request that cannot fit must pause");

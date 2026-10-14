@@ -207,6 +207,10 @@ pub struct InteractiveController {
     last_answer: String,
     next_delivery: u64,
     active_deliveries: Vec<(u64, String)>,
+    /// The newest notice or refinement a run showed: the answer `ha send
+    /// --wait` prints for a run the model never answered (`/compact`,
+    /// `/learn`, `/refine`), which printed nothing.
+    run_report: Option<String>,
     delivery_answers: std::collections::BTreeMap<u64, Result<String, String>>,
     /// Number of line breaks in `pending_text`. It is maintained as deltas
     /// arrive, so the common streaming path does not rescan an ever-growing
@@ -389,6 +393,7 @@ impl InteractiveController {
             last_answer: String::new(),
             next_delivery: 0,
             active_deliveries: Vec::new(),
+            run_report: None,
             delivery_answers: std::collections::BTreeMap::new(),
             pending_newlines: 0,
             pending_approval: None,
@@ -3656,6 +3661,7 @@ impl InteractiveController {
         self.pending_text.clear();
         self.pending_newlines = 0;
         self.last_answer.clear();
+        self.run_report = None;
         self.active_deliveries.clear();
         self.open_tools.clear();
         self.tool_progress.clear();
@@ -3679,7 +3685,11 @@ impl InteractiveController {
             Some(RunOutcome::WaitingInput { .. } | RunOutcome::ExternalWait) => {
                 Err("the message's turn is waiting for input".to_owned())
             }
-            _ => Ok(self.last_answer.clone()),
+            _ => Ok(if self.last_answer.trim().is_empty() {
+                self.run_report.take().unwrap_or_default()
+            } else {
+                self.last_answer.clone()
+            }),
         };
         for (receipt, _) in std::mem::take(&mut self.active_deliveries) {
             self.record_delivery_answer(receipt, answer.clone());
@@ -5457,6 +5467,15 @@ impl InteractiveController {
 
     fn push_history(&mut self, effects: &mut Vec<Effect>, item: HistoryItem) {
         let lines = view::plain_lines(&item);
+        if self.phase.has_active_run()
+            && matches!(
+                item,
+                HistoryItem::Notice { .. } | HistoryItem::Refinement { .. }
+            )
+        {
+            self.run_report = Some(lines.join("
+"));
+        }
         self.transcript.extend(lines.clone());
         if !self.plain
             && matches!(

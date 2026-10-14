@@ -5865,7 +5865,9 @@ impl SessionPort for AgentSessionService {
                         let history = harness_runtime::conversation_history(&store, source)
                             .await
                             .map_err(|error| error.to_string())?;
-                        (history.summary, history.messages)
+                        // As sent, so the side request shares the
+                        // conversation's cached prefix.
+                        (history.summary.clone(), history.as_sent())
                     }
                     None => (None, Vec::new()),
                 };
@@ -7856,7 +7858,20 @@ async fn run_turn(
     };
     let mut tool_schemas = harness_tools::coding_tool_schemas_for(hashline);
     if let Some(tools) = &external_tools {
-        tool_schemas.extend(tools.schemas());
+        // The tool definitions lead every request, so their order is part of
+        // the cached prefix: sorted by name, the order hosts and servers list
+        // them in cannot change it (as pi-deepseek-cache sorts `tools`).
+        let mut external = tools.schemas();
+        external.sort_by_cached_key(|schema| {
+            schema
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .or_else(|| schema.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        });
+        tool_schemas.extend(external);
     }
     // Content the message names rides with it: images as blocks the model is shown, files
     // as text the model reads. A candidate that cannot be attached is said out loud: a
@@ -8132,10 +8147,10 @@ async fn run_turn(
     // A fork's first turn carries the conversation up to its fork point, as a
     // continued turn carries the one before it.
     if let Some(history) = fork_history {
-        if let Some(summary) = history.summary {
+        if let Some(summary) = history.summary.clone() {
             run_request = run_request.with_continuation_context(summary);
         }
-        run_request = run_request.with_conversation(history.messages);
+        run_request = run_request.with_conversation(history.as_sent());
     }
     if !attached.is_empty() {
         for notice in attachments::attachment_notices(&attached.images, &attached.files) {

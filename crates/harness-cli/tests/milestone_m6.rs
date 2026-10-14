@@ -177,6 +177,7 @@ fn build_request(
         optional_token_budget: optional_budget,
         memory_versions: Vec::new(),
         fixed_request_bytes: 2048,
+        sent_earlier: Vec::new(),
         manifest: harness_session::ContextManifestInputs {
             config_revision: 1,
             model_id: "fixture/model".to_owned(),

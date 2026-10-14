@@ -1622,6 +1622,9 @@ pub struct ConversationHistory {
     /// Whether the newest turn was interrupted and is replayed step by step, with
     /// its tool calls and results; its committed results are then already here.
     pub interrupted_replayed: bool,
+    /// Where each turn's question is in `messages`, with the packet its first
+    /// request sent in its place when that packet is known.
+    pub turn_inputs: Vec<(usize, Option<String>)>,
 }
 
 impl ConversationHistory {
@@ -1629,11 +1632,22 @@ impl ConversationHistory {
     #[must_use]
     pub fn turns(&self) -> Vec<(String, String)> {
         // A question, then what the assistant said before the next question; an
-        // interrupted turn's tool calls and results sit between them.
+        // interrupted turn's tool calls and results sit between them. What the
+        // user or the host said inside a turn (steering, a goal continuation)
+        // belongs to that turn and starts no new one.
+        let first_turn = self
+            .turn_inputs
+            .first()
+            .map_or(usize::MAX, |(index, _)| *index);
+        let starts = |index: usize| {
+            index < first_turn || self.turn_inputs.iter().any(|(start, _)| *start == index)
+        };
         let mut turns: Vec<(String, String)> = Vec::new();
-        for message in &self.messages {
+        for (index, message) in self.messages.iter().enumerate() {
             match message.role {
-                MessageRole::User => turns.push((message.content.clone(), String::new())),
+                MessageRole::User if starts(index) => {
+                    turns.push((message.content.clone(), String::new()));
+                }
                 MessageRole::Assistant if !message.content.trim().is_empty() => {
                     if let Some((_, answer)) = turns.last_mut() {
                         if !answer.is_empty() {
@@ -1646,6 +1660,23 @@ impl ConversationHistory {
             }
         }
         turns
+    }
+
+    /// The messages as the model was sent them: each turn led by the packet
+    /// its requests carried - its instruction with the blocks it brought -
+    /// not its bare question. A continued turn's request then begins with the
+    /// previous turn's requests word for word, which is what a provider's
+    /// prompt cache matches; with the bare question the request differed from
+    /// that turn on, and nothing after it was read from the cache.
+    #[must_use]
+    pub fn as_sent(&self) -> Vec<ProviderMessage> {
+        let mut messages = self.messages.clone();
+        for (index, sent) in &self.turn_inputs {
+            if let (Some(sent), Some(message)) = (sent, messages.get_mut(*index)) {
+                message.content.clone_from(sent);
+            }
+        }
+        messages
     }
 }
 
@@ -1815,20 +1846,21 @@ pub async fn conversation_history(
             // killed) never gave an answer; what it did is its record. It is
             // replayed as it happened, the way prime-agent keeps an aborted turn's
             // messages, so "continue" continues the work instead of starting over.
+            let sent = store.sent_input_packet(&session).await?;
             let attempts = decoded_attempts(store, &session).await?;
             let body = match turn_steps(store, &session, &attempts).await? {
                 Some(body) => body,
                 None => TurnBody::Answer(final_answer_of(&attempts)),
             };
-            turns.push((question, body));
+            turns.push((question, sent, body));
         }
         current = previous_in_conversation(store, &session).await?;
     }
     // `turns` is newest first; keep what fits, then restore speaking order.
-    let interrupted_replayed = matches!(turns.first(), Some((_, TurnBody::Steps(_))));
+    let interrupted_replayed = matches!(turns.first(), Some((_, _, TurnBody::Steps(_))));
     let mut kept = Vec::new();
     let mut used = 0_usize;
-    for (question, body) in &turns {
+    for (question, sent, body) in &turns {
         let question = clip_turn(question);
         let answer = match body {
             TurnBody::Answer(answer) => vec![ProviderMessage::new(
@@ -1840,14 +1872,14 @@ pub async fn conversation_history(
             )],
             TurnBody::Steps(steps) | TurnBody::Worked(steps) => steps.clone(),
         };
-        let cost = question.len() + message_bytes(&answer);
+        let cost = sent.as_ref().map_or(question.len(), String::len) + message_bytes(&answer);
         if kept.len() == CONVERSATION_MAX_TURNS
             || (!kept.is_empty() && used + cost > CONVERSATION_MAX_BYTES)
         {
             break;
         }
         used += cost;
-        kept.push((question, answer));
+        kept.push((question, sent.clone(), answer));
     }
     let omitted = turns.len() - kept.len();
     let mut messages = Vec::new();
@@ -1870,7 +1902,9 @@ pub async fn conversation_history(
             ),
         ));
     }
-    for (question, answer) in kept.into_iter().rev() {
+    let mut turn_inputs = Vec::with_capacity(kept.len());
+    for (question, sent, answer) in kept.into_iter().rev() {
+        turn_inputs.push((messages.len(), sent));
         messages.push(ProviderMessage::new(MessageRole::User, question));
         messages.extend(answer);
     }
@@ -1879,6 +1913,7 @@ pub async fn conversation_history(
         summary,
         omitted,
         interrupted_replayed,
+        turn_inputs,
     })
 }
 
@@ -4608,12 +4643,13 @@ impl RuntimeService {
         // held the one before it, every turn re-sent every earlier packet nested
         // inside the next. What does carry forward is the summary of history a
         // compaction already folded away, since those turns are not replayed.
+        let sent = history.as_sent();
         let request = match history.summary {
             Some(summary) => request.with_continuation_context(summary),
             None => request,
         };
         let replayed = history.interrupted_replayed;
-        let request = request.with_conversation(history.messages);
+        let request = request.with_conversation(sent);
         // An interrupted source turn is already replayed with its results.
         let recovered = if replayed {
             Vec::new()
@@ -4846,6 +4882,14 @@ impl RuntimeService {
                 optional_token_budget: config.optional_token_budget,
                 memory_versions: Vec::new(),
                 fixed_request_bytes,
+                // The earlier turns' packets, as they are sent before this one.
+                sent_earlier: earlier
+                    .iter()
+                    .filter(|message| {
+                        message.role == MessageRole::User && message.content.starts_with('[')
+                    })
+                    .map(|message| message.content.clone())
+                    .collect(),
                 manifest: harness_session::ContextManifestInputs {
                     config_revision: config.config_revision,
                     model_id: format!("{}/{}", capabilities.provider_id, capabilities.model),

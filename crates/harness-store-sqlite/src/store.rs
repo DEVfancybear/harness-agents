@@ -2334,6 +2334,29 @@ impl SqliteStore {
             .collect()
     }
 
+    /// The packet the first request of a session sent as its user message:
+    /// the turn's input as the model read it, which every step of the turn
+    /// sent again. `None` when the session froze no request.
+    pub async fn sent_input_packet(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<String>, StoreError> {
+        let packet = sqlx::query_scalar::<_, String>(
+            "SELECT c.packet_json FROM frozen_requests f JOIN context_packets c ON c.packet_id = f.packet_id WHERE f.session_id = ? ORDER BY f.rowid LIMIT 1",
+        )
+        .bind(session_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read sent input", error))?;
+        Ok(packet.and_then(|packet| {
+            serde_json::from_str::<serde_json::Value>(&packet)
+                .ok()?
+                .get("content")?
+                .as_str()
+                .map(str::to_owned)
+        }))
+    }
+
     pub async fn latest_context_packet(
         &self,
         session_id: &SessionId,

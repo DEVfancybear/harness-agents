@@ -287,6 +287,18 @@ pub struct ContextBuildRequest {
     /// window the estimator called fine.
     pub fixed_request_bytes: usize,
     pub manifest: ContextManifestInputs,
+    /// The user messages the conversation already sends before this packet:
+    /// the packets of its earlier turns, as they were sent.
+    ///
+    /// A block found word for word in one of them is not sent again - an
+    /// activated skill, the project rules, a summary, a state that did not
+    /// change - as prime-agent sends a skill once, where it was loaded. Every
+    /// packet used to repeat them at the end of the request, the one part a
+    /// provider never has cached, and an earlier turn replayed as its bare
+    /// question made the request differ from the one before it at that turn,
+    /// so nothing after it was cached either. The user's instruction is
+    /// always sent.
+    pub sent_earlier: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -518,6 +530,28 @@ impl ContextBuilder {
             }
             !replaced
         });
+        let sent_earlier = |block: &ContextBlock| {
+            block.kind != ContextBlockKind::Instruction && {
+                let rendered = render_block(block);
+                request
+                    .sent_earlier
+                    .iter()
+                    .any(|earlier| earlier.contains(&rendered))
+            }
+        };
+        mandatory.retain(|block| {
+            let sent = sent_earlier(block);
+            if sent {
+                block_usage.push(ContextBlockUsage {
+                    block_id: block.id.clone(),
+                    channel: block.channel,
+                    token_estimate: estimate_bytes(render_block(block).len()),
+                    included: false,
+                    drop_reason: Some(SENT_EARLIER.to_owned()),
+                });
+            }
+            !sent
+        });
         for block in &mandatory {
             block_usage.push(ContextBlockUsage {
                 block_id: block.id.clone(),
@@ -552,6 +586,16 @@ impl ContextBuilder {
             }
         }
         optional.retain(|block| {
+            if sent_earlier(block) {
+                block_usage.push(ContextBlockUsage {
+                    block_id: block.id.clone(),
+                    channel: block.channel,
+                    token_estimate: estimate_bytes(render_block(block).len()),
+                    included: false,
+                    drop_reason: Some(SENT_EARLIER.to_owned()),
+                });
+                return false;
+            }
             if superseded_ids.contains(&block.id) {
                 superseded_block_ids.push(block.id.clone());
                 block_usage.push(ContextBlockUsage {
@@ -854,6 +898,9 @@ fn may_supersede(by: &ContextBlock, target: &ContextBlock) -> bool {
     by.channel.may_be_mandatory() || !target.channel.may_be_mandatory()
 }
 
+/// Why a block a turn already sent is left out of a later packet.
+const SENT_EARLIER: &str = "already sent earlier in the conversation";
+
 fn render_block(block: &ContextBlock) -> String {
     format!("[{}]\n{}", block.label(), block.text)
 }
@@ -934,6 +981,7 @@ mod tests {
                 optional_token_budget: optional_budget,
                 memory_versions: Vec::new(),
                 fixed_request_bytes: 0,
+                sent_earlier: Vec::new(),
                 manifest: ContextManifestInputs::default(),
             })
             .expect("the packet compiles");

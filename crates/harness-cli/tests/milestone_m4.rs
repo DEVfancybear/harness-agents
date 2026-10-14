@@ -4522,6 +4522,145 @@ async fn a_finished_turn_is_replayed_with_its_tool_calls_and_results() {
     );
 }
 
+/// The prompt cache of every provider matches a request by its prefix
+/// (`DeepSeek`: "fully matches a cache prefix unit", from the first token). A
+/// follow-up turn's request now begins with the previous turn's last request
+/// word for word: the earlier turn is replayed with the packet it sent, not its
+/// bare question, and a block a turn already sent (a project rule here; an
+/// activated skill, a summary) is not repeated at the end of the next packet.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "two turns, then the prefix the second one keeps"
+)]
+async fn a_follow_up_request_begins_with_the_previous_request() {
+    let bench = bench();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "read-parser",
+                "read_file",
+                serde_json::json!({"path": "src/parser.txt"}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("It says BUG parser."),
+            ProviderStreamEvent::completed("stop"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("Yes."),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let task = TaskId::generate();
+    let workspace =
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("observation");
+    let rule = harness_session::ContextBlock::mandatory(
+        "rule-cache",
+        harness_session::ContextBlockKind::ProjectRule,
+        "CACHE_RULE: answer in one sentence. ".repeat(20),
+    );
+    let mut previous: Option<SessionId> = None;
+    for text in ["read src/parser.txt", "is it a bug?"] {
+        let store = bench.open_store().await;
+        let runtime = Arc::new(RuntimeService::new(
+            Arc::clone(&store),
+            provider.clone(),
+            RuntimeConfig::default(),
+        ));
+        let driver = TurnDriver::new(
+            Arc::clone(&runtime),
+            ToolExecutionService::new(Arc::clone(&store)),
+        );
+        let session = SessionId::generate();
+        let request = RunRequest::new(
+            session.clone(),
+            task.clone(),
+            InputId::generate(),
+            text.to_owned(),
+            workspace.clone(),
+        )
+        .with_project_rules(vec![rule.clone()])
+        .with_tool_schemas(coding_tool_schemas());
+        let options = TurnOptions {
+            workspace_root: bench.workspace.clone(),
+            actor_id: "cache.test".to_owned(),
+            approvals: ApprovalMode::Auto,
+            limits: TurnLimits::default(),
+        };
+        let observer: Arc<dyn TurnObserver> = Arc::new(SilentObserver);
+        match &previous {
+            Some(source) => {
+                driver
+                    .run_turn_continuing(
+                        source,
+                        request,
+                        options,
+                        observer,
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+            None => {
+                driver
+                    .run_turn(request, options, observer, CancellationToken::new())
+                    .await
+            }
+        }
+        .expect("turn runs");
+        drop(driver);
+        drop(runtime);
+        close(store).await;
+        previous = Some(session);
+    }
+    let seen = provider.seen();
+    assert_eq!(seen.len(), 3);
+    let (last_of_first, second) = (&seen[1].messages, &seen[2].messages);
+    let shape = |message: &harness_providers::ProviderMessage| {
+        (
+            message.role,
+            message.content.clone(),
+            message
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    (
+                        call.call_id.clone(),
+                        call.name.clone(),
+                        call.arguments.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            message.tool_call_id.clone(),
+        )
+    };
+    assert!(second.len() > last_of_first.len());
+    for (index, (before, now)) in last_of_first.iter().zip(second.iter()).enumerate() {
+        assert_eq!(
+            shape(before),
+            shape(now),
+            "message {index} of the follow-up differs from the request before it"
+        );
+    }
+    // The rule rode with the first turn's packet and is not sent again.
+    let rules = second
+        .iter()
+        .filter(|message| message.content.contains("CACHE_RULE"))
+        .count();
+    assert_eq!(rules, 1, "the rule is sent once");
+    let newest = second.last().expect("the new packet");
+    assert!(
+        newest.content.contains("is it a bug?"),
+        "{}",
+        newest.content
+    );
+    assert!(!newest.content.contains("CACHE_RULE"), "{}", newest.content);
+}
+
 /// What the host itself said to the model during a turn - here the warning
 /// after the same read three times - stays with the turn for later turns, as
 /// prime-agent keeps its custom messages in the session. It used to reach only
