@@ -3463,6 +3463,22 @@ async fn steered_turn(
     limits: TurnLimits,
     steers: &[&str],
 ) -> (TurnOutcome, Vec<ProviderRequest>, Vec<String>) {
+    let (outcome, requests, unread, _) =
+        steered_turn_with_history(first_final, limits, steers).await;
+    (outcome, requests, unread)
+}
+
+/// [`steered_turn`], and what the next turn is sent of it.
+async fn steered_turn_with_history(
+    first_final: bool,
+    limits: TurnLimits,
+    steers: &[&str],
+) -> (
+    TurnOutcome,
+    Vec<ProviderRequest>,
+    Vec<String>,
+    Vec<harness_providers::ProviderMessage>,
+) {
     let bench = bench();
     let store = bench.open_store().await;
     let provider = Arc::new(SteeringProvider::answering(first_final));
@@ -3532,11 +3548,48 @@ async fn steered_turn(
         .iter()
         .filter_map(RunInbox::steering_text)
         .collect();
+    let history = harness_runtime::conversation_history(&store, &session)
+        .await
+        .expect("history reads")
+        .messages;
     drop(inbox);
     drop(runtime);
     drop(provider);
     close(store).await;
-    (outcome, requests, unread)
+    (outcome, requests, unread, history)
+}
+
+/// What the user sent while a turn ran is part of that turn for every later
+/// turn too: it used to reach only the step that read it, so the next turn did
+/// not know the user had asked for it.
+#[tokio::test]
+async fn a_steer_stays_in_the_conversation_after_its_turn() {
+    let (outcome, _, _, history) = steered_turn_with_history(
+        false,
+        TurnLimits::default(),
+        &["Keep the existing parser format"],
+    )
+    .await;
+    assert_eq!(outcome.stop, TurnStop::Final);
+    let position = |predicate: &dyn Fn(&harness_providers::ProviderMessage) -> bool| {
+        history
+            .iter()
+            .position(predicate)
+            .unwrap_or_else(|| panic!("missing from the replay: {history:#?}"))
+    };
+    let result = position(&|message| message.role == MessageRole::Tool);
+    let steer = position(&|message| {
+        message.role == MessageRole::User
+            && message.content.contains("Keep the existing parser format")
+    });
+    let answer = history
+        .iter()
+        .rposition(|message| message.role == MessageRole::Assistant)
+        .expect("the answer");
+    assert!(
+        result < steer && steer < answer,
+        "the steer sits between the result it followed and the answer that read it: {history:#?}"
+    );
 }
 
 /// pa-agent polls steering after the tool batch: a message sent while the
@@ -4334,6 +4387,139 @@ async fn every_step_of_a_continued_turn_sends_the_conversation() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+#[tokio::test]
+// Measured: a finished turn came back in the next turn as its question and its
+// last answer only. The files it read, the commands it ran and what they
+// returned were gone, so the model re-read files it had read and could not say
+// what it had done. Earlier turns are replayed with their calls and results, as
+// pi and prime-agent keep them.
+#[allow(
+    clippy::too_many_lines,
+    reason = "two turns, then the order of what the second one is sent"
+)]
+async fn a_finished_turn_is_replayed_with_its_tool_calls_and_results() {
+    let bench = bench();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("Reading the parser."),
+            ProviderStreamEvent::tool_delta(
+                "read-parser",
+                "read_file",
+                serde_json::json!({"path": "src/parser.txt"}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("I read it."),
+            ProviderStreamEvent::completed("stop"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("It says BUG parser."),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let task = TaskId::generate();
+    let workspace =
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("observation");
+    let options = || TurnOptions {
+        workspace_root: bench.workspace.clone(),
+        actor_id: "history.test".to_owned(),
+        approvals: ApprovalMode::Auto,
+        limits: TurnLimits::default(),
+    };
+    let mut previous: Option<SessionId> = None;
+    for text in ["read src/parser.txt", "what did the file say?"] {
+        let store = bench.open_store().await;
+        let runtime = Arc::new(RuntimeService::new(
+            Arc::clone(&store),
+            provider.clone(),
+            RuntimeConfig::default(),
+        ));
+        let driver = TurnDriver::new(
+            Arc::clone(&runtime),
+            ToolExecutionService::new(Arc::clone(&store)),
+        );
+        let session = SessionId::generate();
+        let request = RunRequest::new(
+            session.clone(),
+            task.clone(),
+            InputId::generate(),
+            text.to_owned(),
+            workspace.clone(),
+        )
+        .with_tool_schemas(coding_tool_schemas());
+        let observer: Arc<dyn TurnObserver> = Arc::new(SilentObserver);
+        match &previous {
+            Some(source) => {
+                driver
+                    .run_turn_continuing(
+                        source,
+                        request,
+                        options(),
+                        observer,
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+            None => {
+                driver
+                    .run_turn(request, options(), observer, CancellationToken::new())
+                    .await
+            }
+        }
+        .expect("turn runs");
+        drop(driver);
+        drop(runtime);
+        close(store).await;
+        previous = Some(session);
+    }
+    let seen = provider.seen();
+    assert_eq!(seen.len(), 3, "two steps for turn 1, one for turn 2");
+    let messages = &seen[2].messages;
+    let shown = messages
+        .iter()
+        .map(|message| {
+            (
+                message.role,
+                message.content.chars().take(60).collect::<String>(),
+                message
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let position = |found: &dyn Fn(&harness_providers::ProviderMessage) -> bool| {
+        messages
+            .iter()
+            .position(found)
+            .unwrap_or_else(|| panic!("missing from turn 2: {shown:#?}"))
+    };
+    let asked = position(&|message| message.content.contains("read src/parser.txt"));
+    let called = position(&|message| {
+        message.role == MessageRole::Assistant
+            && message
+                .tool_calls
+                .iter()
+                .any(|call| call.call_id == "read-parser" && call.name == "read_file")
+    });
+    let result = position(&|message| {
+        message.role == MessageRole::Tool && message.content.contains("BUG parser")
+    });
+    let answered = position(&|message| {
+        message.role == MessageRole::Assistant && message.content.contains("I read it.")
+    });
+    let now = position(&|message| message.content.contains("what did the file say?"));
+    assert!(
+        asked < called && called < result && result < answered && answered < now,
+        "turn 1 in the order it happened: {shown:#?}"
+    );
 }
 
 #[tokio::test]

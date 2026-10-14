@@ -1263,6 +1263,23 @@ impl SqliteStore {
         Ok(commands)
     }
 
+    /// The steering a session's turn delivered to the model, in the order it
+    /// was delivered: the conversation replay puts each message back between
+    /// the steps it came between.
+    pub async fn applied_steering(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<RunCommandRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT command_id, run_id, session_id, task_id, kind, state, payload_json, detail, created_at_unix_ms, claimed_at_unix_ms, applied_at_unix_ms FROM run_commands WHERE session_id = ? AND kind = 'steer' AND state = 'applied' ORDER BY applied_at_unix_ms, rowid"
+        )
+        .bind(session_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read applied steering", error))?;
+        rows.iter().map(command_from_row).collect()
+    }
+
     pub async fn complete_run_command(
         &self,
         command_id: &RuntimeCommandId,

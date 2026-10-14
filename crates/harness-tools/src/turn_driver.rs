@@ -605,12 +605,7 @@ impl TurnDriver {
                         .map_err(|failure| error(&failure))?;
                 }
                 RunCommandKind::Steer => {
-                    if let Some(text) = RunInbox::steering_text(command) {
-                        let text = if RunInbox::is_verbatim(command) {
-                            text
-                        } else {
-                            format!("[steering correction from the user]\n{text}")
-                        };
+                    if let Some(text) = RunInbox::steering_message(command) {
                         appended.push(ProviderMessage::new(MessageRole::User, text));
                     }
                     inbox

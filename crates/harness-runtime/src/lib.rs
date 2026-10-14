@@ -362,28 +362,74 @@ const KERNEL_PERSIST_SUMMARY_NOTE: &str = "Note: the Python kernel keeps running
 /// The files the summarized messages read and changed, from their tool calls,
 /// as prime-agent's `compute_file_lists`: a file both read and changed is
 /// listed as changed.
-fn file_lists(messages: &[ProviderMessage]) -> (Vec<String>, Vec<String>) {
-    let mut read = std::collections::BTreeSet::new();
-    let mut modified = std::collections::BTreeSet::new();
+///
+/// `previous` is the summary an earlier compaction left: its lists carry over,
+/// as prime-agent keeps them cumulative in the compaction's details. Updating a
+/// summary used to strip its lists and append only those of the new messages,
+/// so the second compaction forgot every file the first one had listed.
+fn file_lists(messages: &[ProviderMessage], previous: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let (mut read, mut modified) = previous.map(listed_files).unwrap_or_default();
     for call in messages.iter().flat_map(|message| &message.tool_calls) {
-        let Some(path) = serde_json::from_str::<Value>(&call.arguments)
-            .ok()
-            .and_then(|arguments| arguments.get("path")?.as_str().map(str::to_owned))
-        else {
+        let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments) else {
             continue;
         };
+        // `read_file` takes one `path` or several `paths`.
+        let paths = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .into_iter()
+            .chain(
+                arguments
+                    .get("paths")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            )
+            .map(str::to_owned);
         match call.name.as_str() {
-            "read_file" | "read_file_range" => {
-                read.insert(path);
-            }
-            "write_file" | "edit_file" | "apply_patch" => {
-                modified.insert(path);
-            }
+            "read_file" => read.extend(paths),
+            "write_file" | "edit_file" | "apply_patch" => modified.extend(paths),
             _ => {}
         }
     }
-    let read = read.difference(&modified).cloned().collect();
-    (read, modified.into_iter().collect())
+    let mut read = read.difference(&modified).cloned().collect::<Vec<_>>();
+    let mut modified = modified.into_iter().collect::<Vec<_>>();
+    // prime-agent caps both lists, so they never crowd out the summary.
+    read.truncate(FILE_LIST_MAX);
+    modified.truncate(FILE_LIST_MAX);
+    (read, modified)
+}
+
+/// How many paths each file list keeps (prime-agent's cap).
+const FILE_LIST_MAX: usize = 200;
+
+/// The paths a summary's `<read-files>` and `<modified-files>` blocks list.
+fn listed_files(
+    summary: &str,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    let block = |tag: &str| {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        summary
+            .find(&open)
+            .and_then(|start| {
+                let body = &summary[start + open.len()..];
+                body.find(&close).map(|end| &body[..end])
+            })
+            .map(|body| {
+                body.lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    (block("read-files"), block("modified-files"))
 }
 
 /// prime-agent's `format_file_operations`.
@@ -1541,8 +1587,8 @@ pub async fn conversation_history(
             // replayed as it happened, the way prime-agent keeps an aborted turn's
             // messages, so "continue" continues the work instead of starting over.
             let attempts = decoded_attempts(store, &session).await?;
-            let body = match interrupted_steps(store, &session, &attempts).await? {
-                Some(steps) => TurnBody::Steps(steps),
+            let body = match turn_steps(store, &session, &attempts).await? {
+                Some(body) => body,
                 None => TurnBody::Answer(final_answer_of(&attempts)),
             };
             turns.push((question, body));
@@ -1563,7 +1609,7 @@ pub async fn conversation_history(
                     clip_turn,
                 ),
             )],
-            TurnBody::Steps(steps) => steps.clone(),
+            TurnBody::Steps(steps) | TurnBody::Worked(steps) => steps.clone(),
         };
         let cost = question.len() + message_bytes(&answer);
         if kept.len() == CONVERSATION_MAX_TURNS
@@ -1654,6 +1700,9 @@ enum TurnBody {
     Answer(Option<String>),
     /// The assistant messages and tool results of a turn that never answered.
     Steps(Vec<ProviderMessage>),
+    /// The assistant messages, tool calls and results of a turn that used
+    /// tools and then answered, its answer last.
+    Worked(Vec<ProviderMessage>),
 }
 
 /// One provider attempt of a session, its events assembled once.
@@ -1759,36 +1808,74 @@ fn attempts_in<'a>(attempts: &'a [DecodedAttempt], states: &[&str]) -> Vec<&'a D
 /// How much of one tool result an interrupted turn replays.
 const REPLAYED_RESULT_CHARS: usize = 2000;
 
-/// The steps of a session whose last completed model call asked for tools - the
-/// turn stopped before the model saw their results and answered - or `None` when
-/// the session ended on an answer.
+/// The steps of a session that used tools, `None` for a turn that only answered.
+///
+/// A turn whose last completed model call asked for tools stopped before the
+/// model saw their results ([`TurnBody::Steps`]); one that went on to answer
+/// is replayed with everything it did on the way ([`TurnBody::Worked`]), as pi
+/// and prime-agent keep every message of a turn. Replaying only its answer made
+/// the next turn forget which files it had read, what it had run and what came
+/// back: the model read the same files again and could not say what it had done.
 ///
 /// Each completed call becomes its assistant message with the calls it made, and
 /// each call is answered by its recorded result, or by a note that it never
-/// returned, so the transcript stays valid for every provider.
-async fn interrupted_steps(
+/// returned, so the transcript stays valid for every provider. What the user
+/// sent while the turn ran (steering) goes back before the step that read it.
+async fn turn_steps(
     store: &SqliteStore,
     session_id: &SessionId,
     attempts: &[DecodedAttempt],
-) -> Result<Option<Vec<ProviderMessage>>, RuntimeError> {
-    let responses = attempts_in(attempts, &["completed"])
-        .into_iter()
-        .filter_map(|attempt| attempt.response.as_ref())
-        // A transport EOF can be stored as completed while the turn is still
-        // unverified. Never replay its unfinished text or unapproved calls.
-        .filter(|response| response.is_dispatchable())
+) -> Result<Option<TurnBody>, RuntimeError> {
+    // Every read is awaited before any borrowing iterator exists, so the
+    // future stays Send.
+    let steering = store
+        .applied_steering(session_id)
+        .await?
+        .iter()
+        .filter_map(|command| {
+            Some((
+                command
+                    .applied_at_unix_ms
+                    .unwrap_or(command.created_at_unix_ms),
+                inbox::RunInbox::steering_message(command)?,
+            ))
+        })
         .collect::<Vec<_>>();
-    if responses
-        .last()
-        .is_none_or(|response| response.tool_calls.is_empty())
-    {
+    let used_tools = attempts_in(attempts, &["completed"])
+        .into_iter()
+        .filter_map(dispatched)
+        .any(|response| !response.tool_calls.is_empty());
+    // A turn that only answered is read no further: most turns are.
+    if steering.is_empty() && !used_tools {
         return Ok(None);
     }
     let results = store.recovered_tool_results(session_id).await?;
     let started = store.tool_intent_call_ids(session_id).await?;
+    let answered = attempts_in(attempts, &["completed"])
+        .into_iter()
+        .filter_map(|attempt| Some((attempt.request_id.as_str(), dispatched(attempt)?)))
+        .collect::<Vec<_>>();
+    let mut steering = steering.into_iter().peekable();
+    let interrupted = answered
+        .last()
+        .map(|(_, response)| response)
+        .is_some_and(|response| !response.tool_calls.is_empty());
+    // An interrupted turn is a record of work cut short, read once; a finished
+    // one is the context the next turns build on, kept as it was sent.
+    let result_chars = if interrupted {
+        REPLAYED_RESULT_CHARS
+    } else {
+        CONVERSATION_TURN_CHARS
+    };
     let mut seen = std::collections::BTreeSet::new();
     let mut steps = Vec::new();
-    for response in &responses {
+    for (request_id, response) in answered {
+        // A steering message was delivered before the request that read it was
+        // frozen, and request ids carry the time they were made.
+        let asked_at = id_unix_ms(request_id).unwrap_or(u64::MAX);
+        while let Some((_, text)) = steering.next_if(|(at, _)| *at <= asked_at) {
+            steps.push(ProviderMessage::new(MessageRole::User, text));
+        }
         let calls = response
             .tool_calls
             .iter()
@@ -1818,12 +1905,28 @@ async fn interrupted_steps(
                 .rfind(|result| result.call_id.as_deref() == Some(call.call_id.as_str()))
                 .map_or_else(
                     || unanswered_call(&call.name, started.contains(&call.call_id)).to_owned(),
-                    |result| clip_result(&result.text),
+                    |result| clip_result(&result.text, result_chars),
                 );
             steps.push(ProviderMessage::tool_result(call.call_id, text));
         }
     }
-    Ok(Some(steps))
+    // Delivered to a step that never answered: still something the user said.
+    steps.extend(steering.map(|(_, text)| ProviderMessage::new(MessageRole::User, text)));
+    Ok(Some(if interrupted {
+        TurnBody::Steps(steps)
+    } else {
+        TurnBody::Worked(steps)
+    }))
+}
+
+/// An attempt's response, when it may be replayed: a transport EOF can be
+/// stored as completed while the turn is still unverified, and its unfinished
+/// text or unapproved calls are never replayed.
+fn dispatched(attempt: &DecodedAttempt) -> Option<&harness_providers::ProviderResponse> {
+    attempt
+        .response
+        .as_ref()
+        .filter(|response| response.is_dispatchable())
 }
 
 /// How much of one tool result the transcript keeps: the head up to this many
@@ -1974,11 +2077,24 @@ fn unanswered_call(name: &str, started: bool) -> &'static str {
     }
 }
 
-fn clip_result(text: &str) -> String {
-    if text.chars().count() <= REPLAYED_RESULT_CHARS {
+/// The Unix milliseconds a `UUIDv7` id (`<prefix>_<uuid>`) was made at.
+fn id_unix_ms(id: &str) -> Option<u64> {
+    let uuid = id.rsplit('_').next()?;
+    let hex = uuid
+        .chars()
+        .filter(|c| *c != '-')
+        .take(12)
+        .collect::<String>();
+    (hex.len() == 12)
+        .then(|| u64::from_str_radix(&hex, 16).ok())
+        .flatten()
+}
+
+fn clip_result(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
         return text.to_owned();
     }
-    let mut clipped = text.chars().take(REPLAYED_RESULT_CHARS).collect::<String>();
+    let mut clipped = text.chars().take(limit).collect::<String>();
     clipped.push_str("\n[truncated]");
     clipped
 }
@@ -3531,12 +3647,11 @@ impl RuntimeService {
         // prime-agent's compaction: an earlier summary is updated, not
         // summarized again with the messages after it, so what it kept is not
         // worn away compaction after compaction.
-        let previous = messages.first().and_then(|message| {
-            message
-                .content
-                .strip_prefix(COMPACTED_PREFIX)
-                .map(|summary| strip_file_lists(summary.trim()))
-        });
+        let previous_whole = messages
+            .first()
+            .and_then(|message| message.content.strip_prefix(COMPACTED_PREFIX))
+            .map(str::trim);
+        let previous = previous_whole.map(strip_file_lists);
         let messages = if previous.is_some() {
             &messages[1..]
         } else {
@@ -3567,7 +3682,7 @@ impl RuntimeService {
                 let _ = writeln!(transcript, "[Assistant tool calls]: {calls}");
             }
         }
-        let (read_files, modified_files) = file_lists(messages);
+        let (read_files, modified_files) = file_lists(messages, previous_whole);
         let mut prompt = format!("<conversation>\n{transcript}</conversation>\n\n");
         if let Some(previous) = &previous {
             let _ = write!(
@@ -4402,8 +4517,61 @@ mod context_fit_tests {
 
 #[cfg(test)]
 mod compaction_cut_tests {
-    use super::{COMPACTION_CUT_STRIDE, split_recent_aligned};
-    use harness_providers::{MessageRole, ProviderMessage};
+    use super::{COMPACTION_CUT_STRIDE, file_lists, format_file_lists, split_recent_aligned};
+    use harness_providers::{MessageRole, ProviderMessage, ProviderToolCall};
+
+    fn calls(calls: &[(&str, &str)]) -> ProviderMessage {
+        ProviderMessage::assistant_with_calls(
+            String::new(),
+            calls
+                .iter()
+                .enumerate()
+                .map(|(index, (name, arguments))| ProviderToolCall {
+                    call_id: format!("call-{index}"),
+                    name: (*name).to_owned(),
+                    arguments: (*arguments).to_owned(),
+                })
+                .collect(),
+        )
+    }
+
+    /// The second compaction updates the first one's summary: the files the
+    /// first one listed stay listed, and a file read then changed moves over.
+    #[test]
+    fn file_lists_carry_over_from_the_previous_summary() {
+        let first = file_lists(
+            &[calls(&[
+                ("read_file", r#"{"paths":["a.rs","b.rs"]}"#),
+                (
+                    "edit_file",
+                    r#"{"path":"c.rs","old_string":"x","new_string":"y"}"#,
+                ),
+            ])],
+            None,
+        );
+        assert_eq!(
+            first,
+            (
+                vec!["a.rs".to_owned(), "b.rs".to_owned()],
+                vec!["c.rs".to_owned()]
+            )
+        );
+        let previous = format!("## Goal\nfix it{}", format_file_lists(&first.0, &first.1));
+        let second = file_lists(
+            &[calls(&[
+                ("write_file", r#"{"path":"a.rs","content":""}"#),
+                ("read_file", r#"{"path":"d.rs"}"#),
+            ])],
+            Some(&previous),
+        );
+        assert_eq!(
+            second,
+            (
+                vec!["b.rs".to_owned(), "d.rs".to_owned()],
+                vec!["a.rs".to_owned(), "c.rs".to_owned()]
+            )
+        );
+    }
 
     fn conversation(turns: usize) -> Vec<ProviderMessage> {
         (0..turns)

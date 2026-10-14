@@ -181,6 +181,18 @@ impl RunInbox {
             .map(ToOwned::to_owned)
     }
 
+    /// The user message a steering command becomes for the model: the step
+    /// that receives it and every later replay of its turn read the same text.
+    #[must_use]
+    pub fn steering_message(command: &RunCommandRecord) -> Option<String> {
+        let text = Self::steering_text(command)?;
+        Some(if Self::is_verbatim(command) {
+            text
+        } else {
+            format!("[steering correction from the user]\n{text}")
+        })
+    }
+
     /// Reason of a cancel command, when the payload carries one.
     #[must_use]
     pub fn cancel_reason(command: &RunCommandRecord) -> Option<String> {
