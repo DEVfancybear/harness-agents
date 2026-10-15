@@ -424,7 +424,7 @@ fn workspace_tool_schemas(hashline: bool) -> Vec<Value> {
         ),
         function_schema(
             "glob",
-            "List workspace-relative file paths matching a bounded glob, respecting .gitignore.",
+            "List workspace-relative file paths matching a bounded glob, respecting .gitignore, newest-modified first. A bare word with no wildcard or folder (parser) finds every file whose name contains it.",
             json!({"pattern": string_schema(), "path": nullable_string_schema()}),
             &["pattern"],
         ),

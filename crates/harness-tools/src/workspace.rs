@@ -795,21 +795,39 @@ pub(crate) fn glob_files(
     requested: Option<&str>,
     pattern: &str,
 ) -> Result<(Vec<String>, bool), HarnessError> {
-    let matcher = Glob::new(pattern)
-        .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error.to_string()))?
-        .compile_matcher();
+    // CowAgent's file search: a bare word (no wildcard, no folder) is a name
+    // that contains it - `parser` finds `src/parser.rs`, where it matched
+    // nothing before.
+    let bare = !pattern.contains(['*', '?', '[', '{', '/', '\\']);
+    let matcher = Glob::new(&if bare {
+        format!("*{pattern}*")
+    } else {
+        pattern.to_owned()
+    })
+    .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error.to_string()))?
+    .compile_matcher();
     let walk = tool_walk(root, requested, "glob")?;
-    let mut paths = Vec::new();
-    let mut truncated = !walk.complete;
-    for file in &walk.files {
-        if matcher.is_match(Path::new(&file.relative)) {
-            if paths.len() == MAX_GLOB_MATCHES {
-                truncated = true;
-                break;
+    let mut hits = walk
+        .files
+        .iter()
+        .filter(|file| {
+            if bare {
+                let name = file.relative.rsplit('/').next().unwrap_or(&file.relative);
+                matcher.is_match(Path::new(name))
+            } else {
+                matcher.is_match(Path::new(&file.relative))
             }
-            paths.push(root_relative(root, file)?);
-        }
-    }
+        })
+        .collect::<Vec<_>>();
+    // Newest first: the file just worked on comes first, and the cut keeps
+    // the recent ones.
+    hits.sort_by(|left, right| right.modified.cmp(&left.modified));
+    let truncated = !walk.complete || hits.len() > MAX_GLOB_MATCHES;
+    let paths = hits
+        .into_iter()
+        .take(MAX_GLOB_MATCHES)
+        .map(|file| root_relative(root, file))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((paths, truncated))
 }
 
@@ -2031,6 +2049,26 @@ mod tests {
             "{}",
             &output.text[output.text.len() - 150..]
         );
+    }
+
+    /// A bare word finds the files whose name contains it (it matched nothing),
+    /// newest-modified first.
+    #[test]
+    fn a_bare_glob_word_finds_names_that_contain_it_newest_first() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        fs::create_dir_all(directory.path().join("src/deep")).expect("folders");
+        fs::write(directory.path().join("src/deep/old_parser.rs"), "a").expect("old");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(directory.path().join("src/parser.rs"), "b").expect("new");
+        fs::write(directory.path().join("src/lexer.rs"), "c").expect("other");
+        let root = fs::canonicalize(directory.path()).expect("root");
+        let (paths, truncated) = glob_files(&root, None, "parser").expect("glob");
+        assert!(!truncated);
+        assert_eq!(paths, ["src/parser.rs", "src/deep/old_parser.rs"]);
+        // A pattern with a wildcard or a folder is a glob as before (its `*`
+        // crosses folders, as globset does by default).
+        let (paths, _) = glob_files(&root, None, "src/*.rs").expect("glob");
+        assert_eq!(paths.len(), 3, "{paths:?}");
     }
 
     #[test]
