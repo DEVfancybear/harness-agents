@@ -404,7 +404,7 @@ pub(crate) fn line_anchor(number: usize, line: &str) -> String {
     format!("{number}#{}", line_hash(line))
 }
 
-/// `text` without the `12: ` or `12#a3: ` prefix read_file puts on each line,
+/// `text` without the `12: ` or `12#a3: ` prefix `read_file` puts on each line,
 /// or `None` when a line does not carry one.
 fn without_read_gutter(text: &str) -> Option<String> {
     let lines = text.split('\n').collect::<Vec<_>>();
@@ -771,7 +771,7 @@ mod tests {
         plan_edit(current, old, new, false, "f.txt")
     }
 
-    /// Seen: a model copied read_file's `12: ` prefixes into old_string and
+    /// Seen: a model copied `read_file`'s `12: ` prefixes into `old_string` and
     /// matched nothing. The prefixes are dropped and the edit tried again.
     #[test]
     fn read_file_line_prefixes_copied_into_an_edit_are_dropped() {

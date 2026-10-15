@@ -20,6 +20,7 @@ mod process;
 mod search;
 mod secrets;
 mod service;
+mod syntax_check;
 mod truncate;
 mod turn_driver;
 mod validation;

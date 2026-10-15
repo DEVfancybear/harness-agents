@@ -1076,12 +1076,14 @@ fn write_text_checked_locked(
         ));
     }
     let existed = path.exists();
+    let mut previous = None;
     let before_hash = if existed {
         // Read once, under the file's mutation lock, immediately before the
         // atomic replacement: a changed or unreadable preimage is never
         // overwritten.
         let current = read_text(path)?;
         let hash = ContentHash::from_bytes(current.as_bytes());
+        previous = Some(current);
         let Some(expected_hash) = expected_hash else {
             return Err(HarnessError::new(
                 ErrorCode::StaleWorkspace,
@@ -1104,6 +1106,11 @@ fn write_text_checked_locked(
         }
         ContentHash::from_canonical_json(&serde_json::json!({"exists": false}))?
     };
+    if let Some(reason) =
+        crate::syntax_check::broken_by_write(path, previous.as_deref(), replacement)
+    {
+        return Err(HarnessError::new(ErrorCode::InvalidPayload, reason));
+    }
     if existed {
         let written = write_text_atomically(path, replacement);
         note_change();
