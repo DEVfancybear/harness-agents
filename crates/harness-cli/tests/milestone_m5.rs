@@ -2184,3 +2184,45 @@ async fn a21_rollback_effects() {
     drop(tools);
     close(store).await;
 }
+
+/// Seen: `/compact` right after a `/compact` failed at once with
+/// "the model summary was unavailable and the complete conversation does not
+/// fit the summary budget" - nothing had been said since the first one.
+#[tokio::test]
+async fn compacting_again_with_nothing_new_keeps_the_summary() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let (first, task) = admit(&store, &bench, "ORIGINAL_LONG_TASK: build the game").await;
+    store.release_task_lease(&task).await.expect("release");
+    let latest = SessionId::generate();
+    admit_into(&store, &bench, &latest, &task, "continue with M2").await;
+    store
+        .record_continuation_link(&first, &latest, &task)
+        .await
+        .expect("link");
+    let summary = Arc::new(RecordingSummary::default());
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderStreamEvent::completed("stop"),
+        ]])),
+        RuntimeConfig::default(),
+    )
+    .with_summarizer(summary.clone());
+    let once = runtime.compact(&latest).await.expect("first compaction");
+    assert!(!once.fallback_used, "{}", once.summary_source);
+    let again = runtime.compact(&latest).await.expect("second compaction");
+    assert!(!again.fallback_used, "{}", again.summary_source);
+    assert!(
+        again.packet.content.contains("SUMMARY_1"),
+        "{}",
+        again.packet.content
+    );
+    assert_eq!(
+        summary.prompts.lock().expect("prompts").len(),
+        1,
+        "nothing new was said: the model is not asked again"
+    );
+    drop(runtime);
+    close(store).await;
+}

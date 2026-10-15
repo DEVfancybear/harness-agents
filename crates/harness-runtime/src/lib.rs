@@ -4045,8 +4045,20 @@ impl RuntimeService {
         };
         let (read_files, modified_files) = file_lists(messages, previous_whole);
         let entries = summary_entries(messages);
-        let chunks = summary_chunks(&entries, self.summary_input_chars(budget));
         let mut previous = previous_whole.map(strip_file_lists);
+        // Nothing said since the earlier summary: it stands as it is, while it
+        // fits the budget a model summary is held to. Asked to fold an empty
+        // conversation into it, a model wrote it again, longer than its
+        // budget, and `/compact` right after `/compact` failed with "the model
+        // summary was unavailable".
+        let still_fits = previous.as_deref().is_some_and(|previous| {
+            BudgetLedger::estimate_tokens(previous) <= budget.saturating_mul(2)
+        });
+        let chunks = if entries.is_empty() && still_fits {
+            Vec::new()
+        } else {
+            summary_chunks(&entries, self.summary_input_chars(budget))
+        };
         let last = chunks.len().saturating_sub(1);
         for (index, transcript) in chunks.iter().enumerate() {
             let summary = self
