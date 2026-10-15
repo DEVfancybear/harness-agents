@@ -2660,7 +2660,7 @@ impl ExternalToolCatalog for ReplCatalog {
             "type": "function",
             "function": {
                 "name": "ipython",
-                "description": "Execute Python code in a persistent Python REPL. Top-level `await` is supported. Variables, imports, and loaded data persist across calls. Run shell commands with `bash('cmd')` / `await bash('cmd')`. Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment.",
+                "description": "Execute Python code in a persistent Python REPL. Top-level `await` is supported. Variables, imports, and loaded data persist across calls. Run shell commands with `bash('cmd')` / `await bash('cmd')`; quote Python strings for the shell with `shlex.quote(...)`, never `json.dumps` (it turns non-ASCII text into \\uXXXX escapes), or write long text to a UTF-8 file (`git commit -F msg.txt`). Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment.",
                 "parameters": {
                     "type": "object",
                     "properties": {

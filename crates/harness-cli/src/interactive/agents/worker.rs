@@ -487,15 +487,33 @@ impl Worker {
         // Only this worker's project: the schedules folder is shared.
         let newest = self.newest_sessions();
         let environment = LaunchEnvironment::capture().pairs();
+        // How the conversation's agent was launched, when the journal still
+        // names it: woken without it, a full-auto session came back asking.
+        let journal = registry::read_journal(&self.registry, &self.key);
         for task in waiting {
             let Some(session) = newest.get(&task) else {
                 continue;
             };
+            let launch = journal
+                .as_ref()
+                .and_then(|journal| {
+                    journal
+                        .agents
+                        .iter()
+                        .find(|agent| agent.conversation.as_deref() == Some(task.as_str()))
+                })
+                .map(|agent| agent.launch.clone())
+                .unwrap_or_default();
             let spec = CreateAgent {
                 caller_dir: self.project_root.clone(),
                 cwd: Some(self.project_root.clone()),
                 environment: environment.clone(),
                 resume: Some(session.clone()),
+                approval: launch.approval,
+                profile: launch.profile,
+                thinking: launch.thinking,
+                system_prompt: launch.system_prompt,
+                append_system_prompt: launch.append_system_prompt,
                 ..CreateAgent::default()
             };
             match self.create(spec) {

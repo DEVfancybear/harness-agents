@@ -190,8 +190,16 @@ pub fn rows_with(
                     | "waiting_mcp_input"
                     | "canceling"
             );
-        // The name the user gave, the session's title, then the last request -
-        // unless that was a command (`/compact` named a row of its own).
+        // The name the user gave, the session's title, the last request -
+        // unless that was a command (`/compact` named a row of its own) or a
+        // scheduled run's prompt (a conversation woken after a usage limit was
+        // titled `[heartbeat: at ... run#1]`) - then the saved conversation's.
+        let saved_title = agent.conversation.as_deref().and_then(|task| {
+            saved
+                .iter()
+                .find(|conversation| conversation.task_id == task)
+                .and_then(|conversation| conversation.title.clone())
+        });
         let mut title = agent
             .name
             .clone()
@@ -200,9 +208,13 @@ pub fn rows_with(
                 agent
                     .last_request
                     .as_deref()
-                    .filter(|request| !request.trim_start().starts_with('/'))
+                    .filter(|request| {
+                        let request = request.trim_start();
+                        !request.starts_with('/') && !request.starts_with("[heartbeat:")
+                    })
                     .map(first_line)
             })
+            .or(saved_title)
             .filter(|title| !title.is_empty())
             .unwrap_or_else(|| agent.id.clone());
         // prime-agent's row heartbeat count.
@@ -218,7 +230,9 @@ pub fn rows_with(
             identity: format!("live:{}", agent.id),
             title,
             model: agent.model.clone(),
-            age: if running {
+            // A turn at work is "now"; one waiting on the user says how long
+            // it has waited - an unattended question read "now" for days.
+            age: if running && !agent.status.starts_with("waiting") {
                 "now".to_owned()
             } else {
                 age_label(agent.idle_seconds)
@@ -236,15 +250,25 @@ pub fn rows_with(
                 .iter()
                 .filter(|child| child.status == "running")
                 .count();
+            let failed = agent
+                .subagents
+                .iter()
+                .filter(|child| child.status == "error")
+                .count();
             let parent = format!("live:{}", agent.id);
             let expanded = forest.expanded.contains(&parent);
             rows.push(Row {
                 section,
                 identity: format!("subagents:{}", agent.id),
                 title: format!(
-                    "{} {} subagents ({running} running)",
+                    "{} {} subagents ({running} running{})",
                     if expanded { "▾" } else { "▸" },
-                    agent.subagents.len()
+                    agent.subagents.len(),
+                    if failed > 0 {
+                        format!(", {failed} failed")
+                    } else {
+                        String::new()
+                    }
                 ),
                 model: String::new(),
                 age: String::new(),
@@ -1078,6 +1102,48 @@ mod tests {
             updated_at: "2026-10-06 10:00:00".to_owned(),
             turns: 2,
         }
+    }
+
+    /// Seen: a conversation woken after a usage limit was listed as
+    /// `[heartbeat: at ... run#1]`, "now" for days, its failed children unseen.
+    #[test]
+    fn a_woken_conversation_keeps_its_title_and_says_how_long_it_waited() {
+        let now = chrono::Utc::now();
+        let mut woken = agent("a1", "waiting_input", "t1");
+        woken.agent.last_request =
+            Some("[heartbeat: at 2026-10-11T04:03:00Z run#1]\nresume".to_owned());
+        woken.agent.idle_seconds = 4 * 86_400;
+        woken.agent.subagents = ["running", "error", "error", "completed"]
+            .iter()
+            .enumerate()
+            .map(
+                |(index, status)| super::super::agents::protocol::SubagentInfo {
+                    name: format!("coder-{index}"),
+                    status: (*status).to_owned(),
+                    model: "m".to_owned(),
+                    depth: 1,
+                    program: String::new(),
+                },
+            )
+            .collect();
+        let listed = rows(
+            std::slice::from_ref(&woken),
+            &[saved("t1", "ninja school project")],
+            "",
+            now,
+        );
+        assert_eq!(listed[0].title, "ninja school project");
+        assert_eq!(listed[0].age, "4d");
+        assert!(
+            listed[1]
+                .title
+                .ends_with("4 subagents (1 running, 2 failed)"),
+            "{}",
+            listed[1].title
+        );
+        // Without a saved title the scheduled prompt is not a title either.
+        let listed = rows(std::slice::from_ref(&woken), &[], "", now);
+        assert_eq!(listed[0].title, "a1");
     }
 
     /// Esc goes back to the agent the view was opened from while it runs on
