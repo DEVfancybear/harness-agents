@@ -125,6 +125,23 @@ for number in range(24):
         self.assertEqual(self.state().list("memory"), [])
         self.assertFalse(reopened.delete_memory("language"))
 
+    def test_a_titled_id_is_ascii_whole_words_and_finds_its_earlier_form(self):
+        state = self.state()
+        title = "Monorepo: script cần gói phụ thuộc phải build gói đó trước, và phải kiểm trên checkout sạch"
+        entry = state.create_memory(title, "x")
+        self.assertEqual(entry.id, "monorepo_script_can_goi_phu_thuoc_phai_build_goi_do_truoc_va")
+        self.assertTrue(len(entry.id) <= 60 and entry.id.isascii())
+        # Words of other scripts stay whole: a mark there is part of the word.
+        self.assertEqual(harness._slug("गति 登录", "memory"), "गति_登录")
+        # An entry kept under the earlier, accented id is updated, not doubled.
+        older = "Ninja: M0 đã xong"
+        state.create_memory(older, "v1", id=harness._legacy_slug(older, "memory"))
+        state.upsert("memory", older, "v2")
+        self.assertEqual(
+            [entry.content for entry in self.state().list("memory") if entry.title == older],
+            ["v2"],
+        )
+
     @unittest.skipUnless(os.name == "nt", "Windows readers can deny atomic replacement")
     def test_brief_external_reader_does_not_fail_memory_save(self):
         state = self.state()

@@ -70,7 +70,52 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_SLUG_MAX = 60
+
+
+def _fold_latin(raw: str) -> str:
+    """Drop the accents of Latin letters (Vietnamese ``ở`` -> ``o``, ``đ`` -> ``d``).
+
+    Only marks on an ASCII letter go: a Devanagari vowel sign or a Hangul
+    syllable is part of its word and stays.
+    """
+    out: list[str] = []
+    base_ascii = False
+    for ch in unicodedata.normalize("NFD", raw.replace("đ", "d").replace("Đ", "D")):
+        if unicodedata.combining(ch):
+            if base_ascii:
+                continue
+        else:
+            base_ascii = ch.isascii() and ch.isalpha()
+        out.append(ch)
+    return unicodedata.normalize("NFC", "".join(out))
+
+
 def _slug(raw: str, fallback: str) -> str:
+    """An entry id from its title: ASCII where the title is Latin, whole words.
+
+    Seen: a Vietnamese title gave the id
+    ``monorepo_script_cần_gói_phụ_thuộc_phải_build_gói_đó_trước_và_phải_kiểm_trên_chec``,
+    accented and cut mid-word at 80 characters.
+    """
+    normalized = "".join(
+        ch.lower() if ch.isalnum() or unicodedata.category(ch).startswith("M") else "_"
+        for ch in _fold_latin(raw).strip()
+    )
+    parts = [part for part in normalized.split("_") if part]
+    slug = ""
+    for part in parts:
+        longer = f"{slug}_{part}" if slug else part
+        if len(longer) > _SLUG_MAX:
+            break
+        slug = longer
+    if not slug and parts:
+        slug = parts[0][:_SLUG_MAX]
+    return slug or fallback
+
+
+def _legacy_slug(raw: str, fallback: str) -> str:
+    """The id an entry titled ``raw`` was given before ids were folded and cut on words."""
     normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in raw.strip())
     normalized = "_".join(part for part in normalized.split("_") if part)
     return (normalized or fallback)[:80]
@@ -381,6 +426,15 @@ class HarnessState:
         self._loaded_revision: tuple[int, int, int, int, int] | None = None
         self.load()
 
+    def _title_id(self, kind: str, title: str) -> str:
+        """The id for an entry named by its title: the one an entry kept under
+        the earlier id scheme already has, so writing it again updates it."""
+        entry_id = _slug(title, kind)
+        legacy = _legacy_slug(title, kind)
+        if entry_id not in self.entries[kind] and legacy in self.entries[kind]:
+            return legacy
+        return entry_id
+
     def _ensure_local_writable(self) -> None:
         if self._local_write_error is not None:
             raise RuntimeError(self._local_write_error)
@@ -685,7 +739,7 @@ class HarnessState:
         _require_text(kind, _describe_entry(id, title), "title", title)
         if id is not None:
             _require_text(kind, _describe_entry(id, title), "id", id)
-        entry_id = id or _slug(title, kind)
+        entry_id = id or self._title_id(kind, title)
         existing = self.entries[kind].get(entry_id)
         _validate_entry_shape(
             kind,
@@ -809,7 +863,7 @@ class HarnessState:
         _require_text(kind, _describe_entry(id, title), "title", title)
         if id is not None:
             _require_text(kind, _describe_entry(id, title), "id", id)
-        entry_id = id or _slug(title, kind)
+        entry_id = id or self._title_id(kind, title)
         if entry_id in self.entries[kind]:
             raise ValueError(f"{kind} entry {entry_id!r} already exists")
         return self._upsert(
