@@ -34,6 +34,7 @@ const MAX_READ: usize = 32 * 1024;
 const MAX_LINES: usize = 200;
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct WritePage {
     pub path: String,
@@ -43,6 +44,33 @@ pub(crate) struct WritePage {
     pub sources: Vec<String>,
     pub related: Vec<String>,
     pub expected_hash: Option<String>,
+}
+
+/// A native update preserves metadata omitted by the caller. Explicit values,
+/// including empty reference arrays, replace the corresponding metadata.
+pub(crate) struct WritePageUpdate {
+    pub path: String,
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub content: String,
+    pub sources: Option<Vec<String>>,
+    pub related: Option<Vec<String>>,
+    pub expected_hash: Option<String>,
+}
+
+#[cfg(test)]
+impl From<WritePage> for WritePageUpdate {
+    fn from(input: WritePage) -> Self {
+        Self {
+            path: input.path,
+            title: Some(input.title),
+            summary: Some(input.summary),
+            content: input.content,
+            sources: Some(input.sources),
+            related: Some(input.related),
+            expected_hash: input.expected_hash,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -342,34 +370,59 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn write(&self, input: WritePage) -> Result<PageSummary, String> {
+        self.write_update(&input.into())
+    }
+
+    pub(crate) fn write_update(&self, input: &WritePageUpdate) -> Result<PageSummary, String> {
         let path = page_path(&input.path)?;
-        let title = single_line(&input.title, 256, "title")?;
-        if title.is_empty() {
-            return Err("knowledge page title is required".to_owned());
-        }
-        let summary = single_line(&input.summary, 1024, "summary")?;
-        if input.sources.len() > 32 || input.related.len() > 64 {
-            return Err("too many knowledge sources or related pages".to_owned());
-        }
-        let mut sources = BTreeSet::new();
-        for source in input.sources {
-            let source = single_line(&source, 2048, "source")?;
-            if !source.is_empty() {
-                sources.insert(source);
-            }
-        }
         self.with_lock(|root| {
             require_enabled(root)?;
             let mut pages = scan(root)?;
             let existing = pages
                 .iter()
                 .position(|p| normalized(&p.summary.path) == normalized(&path));
+            // Resolve omissions from the exact page protected by this lock and
+            // hash precondition, never from an earlier independent read. Keep
+            // declared links separate from links discovered in the old body.
+            let previous = existing.map(|i| &pages[i]);
+            let declared = previous
+                .map(|page| parse_metadata(&page.summary.path, &page.text))
+                .transpose()?
+                .unwrap_or_default();
+            let title = input
+                .title
+                .as_deref()
+                .or_else(|| previous.map(|page| page.summary.title.as_str()))
+                .ok_or("title is required for a new knowledge page")?;
+            let title = single_line(title, 256, "title")?;
+            if title.is_empty() {
+                return Err("knowledge page title is required".to_owned());
+            }
+            let summary = input
+                .summary
+                .as_deref()
+                .or_else(|| previous.map(|page| page.summary.summary.as_str()))
+                .ok_or("summary is required for a new knowledge page")?;
+            let summary = single_line(summary, 1024, "summary")?;
+            let source_values = input.sources.as_ref().unwrap_or(&declared.sources);
+            let related_values = input.related.as_ref().unwrap_or(&declared.related);
+            if source_values.len() > 32 || related_values.len() > 64 {
+                return Err("too many knowledge sources or related pages".to_owned());
+            }
+            let mut sources = BTreeSet::new();
+            for source in source_values {
+                let source = single_line(source, 2048, "source")?;
+                if !source.is_empty() {
+                    sources.insert(source);
+                }
+            }
             let before = existing.map(|i| pages[i].summary.hash.clone());
             let actual_path =
                 existing.map_or_else(|| path.clone(), |i| pages[i].summary.path.clone());
             let mut related = BTreeSet::new();
-            for target in &input.related {
+            for target in related_values {
                 let target = page_path(target)?;
                 if normalized(&target) == normalized(&actual_path) {
                     return Err("a knowledge page cannot relate to itself".to_owned());
@@ -842,7 +895,7 @@ fn resolve_page_links(page: &mut Page, admitted: &BTreeMap<String, String>) {
         .collect();
 }
 
-fn parse_page(path: &str, text: String) -> Result<Page, String> {
+fn parse_metadata(path: &str, text: &str) -> Result<Metadata, String> {
     let mut metadata = Metadata::default();
     if let Some(first) = text.lines().next().and_then(|line| line.strip_prefix(META)) {
         let value = first
@@ -851,6 +904,11 @@ fn parse_page(path: &str, text: String) -> Result<Page, String> {
         metadata = serde_json::from_str(value)
             .map_err(|e| format!("invalid knowledge metadata in {path}: {e}"))?;
     }
+    Ok(metadata)
+}
+
+fn parse_page(path: &str, text: String) -> Result<Page, String> {
+    let mut metadata = parse_metadata(path, &text)?;
     metadata.title = text
         .lines()
         .take(20)

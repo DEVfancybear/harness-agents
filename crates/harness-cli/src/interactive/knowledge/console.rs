@@ -29,6 +29,7 @@ struct Server {
     address: SocketAddr,
     token: String,
     cookie: String,
+    identity: Option<super::console_links::Identity>,
 }
 
 /// The caller explicitly starts this foreground server; binding is always local.
@@ -58,6 +59,11 @@ async fn run(host: KnowledgeHost, port: u16, json_output: bool) -> Result<(), St
             .map_err(|error| format!("cannot start Knowledge console: {error}"))?,
     };
     let address = listener.local_addr().map_err(|error| error.to_string())?;
+    let (project_root, global_root) = host.console_roots();
+    // Discovery is optional: an unwritable registry must not prevent the user
+    // from opening a console. The guard removes only this server's registration.
+    let registration = super::console_links::register(project_root, global_root, address).ok();
+    let identity = registration.as_ref().map(|entry| entry.identity.clone());
     let entropy = format!("{}:{}", TaskId::generate(), TaskId::generate());
     let server = Arc::new(Server {
         host,
@@ -66,6 +72,7 @@ async fn run(host: KnowledgeHost, port: u16, json_output: bool) -> Result<(), St
             .as_str()
             .to_owned(),
         cookie: format!("ha_knowledge_{}", address.port()),
+        identity,
     });
     let url = format!("http://{address}/");
     if json_output {
@@ -168,6 +175,16 @@ async fn connection(mut socket: TcpStream, server: Arc<Server>) -> Result<(), St
     }
     if request.method == "GET" {
         let path = request.target.split('?').next().unwrap_or_default();
+        if path == "/api/identity" {
+            let identity = server.identity.as_ref().filter(|identity| {
+                identity.accepts_probe(request.headers.get("x-ha-console-probe"))
+            });
+            let (status, body) = identity.map_or_else(
+                || (403, r#"{"error":"invalid console probe"}"#.to_owned()),
+                |identity| (200, serde_json::to_string(identity).unwrap_or_default()),
+            );
+            return respond(&mut socket, status, "application/json", &body, None).await;
+        }
         if let Some((mime, body)) = asset(path) {
             let cookie = (path == "/").then(|| {
                 format!(

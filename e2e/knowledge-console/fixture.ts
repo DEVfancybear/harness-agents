@@ -3,7 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
-type ConsoleFixture = { url: string; project: string; root: string; api: APIRequestContext };
+type ConsoleFixture = { url: string; project: string; root: string; api: APIRequestContext; stop: () => Promise<void> };
 export const test = base.extend<{ console: ConsoleFixture }>({
   console: async ({ playwright }, use, testInfo) => {
     const repo = path.resolve(__dirname, '../..');
@@ -22,6 +22,13 @@ export const test = base.extend<{ console: ConsoleFixture }>({
     let stdout = '', stderr = '';
     child.stderr.on('data', (chunk) => { stderr += chunk; });
     let api: APIRequestContext | undefined;
+    const stop = async () => {
+      if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+      await new Promise<void>(resolve => {
+        child.once('exit', () => resolve());
+        child.kill();
+      });
+    };
     try {
       const url = await new Promise<string>((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error('Console startup timed out: ' + stderr)), 15000);
@@ -37,10 +44,10 @@ export const test = base.extend<{ console: ConsoleFixture }>({
       });
       api = await playwright.request.newContext({ baseURL: url });
       await api.get('/'); // Authenticate this isolated API context through the real server.
-      await use({ url, project, root, api });
+      await use({ url, project, root, api, stop });
     } finally {
       await api?.dispose();
-      child.kill();
+      await stop();
       writeFileSync(path.join(root, 'server.log'), stdout + stderr);
       await testInfo.attach('native-console-log', { path: path.join(root, 'server.log'), contentType: 'text/plain' });
     }
