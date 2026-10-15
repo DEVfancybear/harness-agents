@@ -1413,6 +1413,7 @@ impl TurnDriver {
                                 path,
                                 offset,
                                 limit,
+                                tail: None,
                             },
                         );
                         let request = if call.call_id.trim().is_empty() {
@@ -2440,8 +2441,14 @@ fn summarize_action(action: &CodingToolAction) -> String {
     match action {
         CodingToolAction::ReadFile {
             path,
+            tail: Some(tail),
+            ..
+        } => format!("read the last {tail} lines of {path}"),
+        CodingToolAction::ReadFile {
+            path,
             offset,
             limit,
+            tail: None,
         } => format!(
             "read {path} (lines {}–{})",
             offset.unwrap_or(0).saturating_add(1),

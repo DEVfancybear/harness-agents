@@ -1551,8 +1551,24 @@ impl ToolExecutionService {
                 path,
                 offset,
                 limit,
+                tail,
             } => {
                 let target = resolve_relative(root, path, false)?;
+                let limit = match tail {
+                    // The last `tail` lines: up to the bound, ending at the end.
+                    Some(tail) => Some(
+                        limit
+                            .unwrap_or(crate::contracts::READ_FILE_MAX_LINES)
+                            .min(u32::try_from(*tail).unwrap_or(u32::MAX)),
+                    ),
+                    None => *limit,
+                };
+                let offset = match tail {
+                    Some(tail) => {
+                        Some(crate::workspace::line_count(&target)?.saturating_sub(*tail))
+                    }
+                    None => *offset,
+                };
                 let (output, hash) = read_file_range_with_hash(
                     &target,
                     offset.unwrap_or(0),
@@ -3031,6 +3047,7 @@ mod tests {
                         path: path.to_owned(),
                         offset: None,
                         limit: None,
+                        tail: None,
                     },
                 ))
                 .await
@@ -3054,6 +3071,7 @@ mod tests {
                     path: "src/main.rs".to_owned(),
                     offset: None,
                     limit: None,
+                    tail: None,
                 },
             ))
             .await
@@ -3124,6 +3142,7 @@ mod tests {
                     path: ".env".to_owned(),
                     offset: None,
                     limit: None,
+                    tail: None,
                 },
             ))
             .await

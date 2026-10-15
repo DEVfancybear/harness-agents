@@ -466,6 +466,7 @@ mod tests {
             path: path.to_owned(),
             offset: None,
             limit: None,
+            tail: None,
         };
         let added = nested.context_for(&read("src/api/users.rs"));
         assert_eq!(added.len(), 2, "{added:?}");
@@ -526,6 +527,7 @@ mod tests {
             path: path.to_owned(),
             offset: None,
             limit: None,
+            tail: None,
         };
         let first = super::NestedInstructions::new(
             root.path(),

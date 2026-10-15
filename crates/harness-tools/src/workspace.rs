@@ -580,6 +580,11 @@ pub(crate) fn resolve_relative(
     Ok(candidate)
 }
 
+/// How many lines `path` holds, as `read_file` numbers them.
+pub(crate) fn line_count(path: &Path) -> Result<u64, HarnessError> {
+    Ok(u64::try_from(read_text(path)?.lines().count()).unwrap_or(u64::MAX))
+}
+
 pub(crate) fn read_text(path: &Path) -> Result<String, HarnessError> {
     let metadata = fs::metadata(path).map_err(|error| {
         // A path that is not there is the common case, and the OS text ("The

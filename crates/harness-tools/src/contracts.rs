@@ -362,11 +362,11 @@ fn workspace_tool_schemas(hashline: bool) -> Vec<Value> {
     vec![
         function_schema(
             "read_file",
-            "Read bounded UTF-8 text with line numbers. Optional offset is zero-based lines. Name several files at once with paths (offset and limit then apply to each).",
+            "Read bounded UTF-8 text with line numbers. Optional offset is zero-based lines; a negative offset reads the last lines (-50: the last 50). Name several files at once with paths (offset and limit then apply to each).",
             json!({
                 "path": string_schema(),
                 "paths": {"type": "array", "items": string_schema(), "minItems": 1, "maxItems": READ_FILE_MAX_PATHS},
-                "offset": {"type": "integer", "minimum": 0},
+                "offset": {"type": "integer", "description": "Zero-based first line; negative counts from the end."},
                 "limit": {"type": "integer", "minimum": 1, "description": format!("Lines to read, at most {READ_FILE_MAX_LINES}; more is read as {READ_FILE_MAX_LINES}.")}
             }),
             &[],
@@ -642,6 +642,10 @@ pub enum CodingToolAction {
         offset: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
+        /// The last lines of the file, from a negative `offset` (CowAgent's
+        /// read): a log's end no longer needs its length guessed first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tail: Option<u64>,
     },
     ListFiles {
         path: Option<String>,
@@ -878,7 +882,17 @@ impl CodingToolAction {
         }
         match name {
             "read_file" => {
-                let offset = parse_optional_u64(object, "offset")?;
+                // A negative offset counts from the end: -50 is the last 50 lines.
+                let tail = object
+                    .get("offset")
+                    .and_then(Value::as_i64)
+                    .filter(|offset| *offset < 0)
+                    .map(i64::unsigned_abs);
+                let offset = if tail.is_some() {
+                    None
+                } else {
+                    parse_optional_u64(object, "offset")?
+                };
                 // A page longer than the bound is read as the bound, like
                 // context_lines: refusing limit=520 cost the model a step.
                 let limit = parse_optional_bounded_u32(object, "limit", 1, u32::MAX)?
@@ -887,6 +901,7 @@ impl CodingToolAction {
                     path: required_string(object, "path")?,
                     offset,
                     limit,
+                    tail,
                 })
             }
             "list_files" => Ok(Self::ListFiles {
@@ -1886,6 +1901,33 @@ mod search_context_tests {
             CodingToolAction::from_provider_call("read_file", r#"{"path":"a.rs","limit":0}"#)
                 .is_err()
         );
+        // A negative offset reads the end: CowAgent's read takes -50 for the
+        // last 50 lines, and a log's length no longer has to be guessed.
+        let schema = parameters("read_file");
+        assert!(
+            crate::validation::validate_tool_arguments_json(
+                "read_file",
+                &schema,
+                r#"{"path":"a.log","offset":-50}"#
+            )
+            .is_ok()
+        );
+        match CodingToolAction::from_provider_call("read_file", r#"{"path":"a.log","offset":-50}"#)
+            .expect("parses")
+        {
+            CodingToolAction::ReadFile { offset, tail, .. } => {
+                assert_eq!((offset, tail), (None, Some(50)));
+            }
+            other => panic!("not a read: {other:?}"),
+        }
+        match CodingToolAction::from_provider_call("read_file", r#"{"path":"a.rs","offset":7}"#)
+            .expect("parses")
+        {
+            CodingToolAction::ReadFile { offset, tail, .. } => {
+                assert_eq!((offset, tail), (Some(7), None));
+            }
+            other => panic!("not a read: {other:?}"),
+        }
     }
 }
 

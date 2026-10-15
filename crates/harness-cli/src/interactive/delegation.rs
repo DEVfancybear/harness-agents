@@ -4637,6 +4637,7 @@ pub(super) mod tests {
                 path: "src/lib.rs".to_owned(),
                 offset: None,
                 limit: None,
+                tail: None,
             },
             CodingToolAction::WriteFile {
                 path: "note.txt".to_owned(),
