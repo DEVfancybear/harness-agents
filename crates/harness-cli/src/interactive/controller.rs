@@ -5465,6 +5465,7 @@ impl InteractiveController {
             (None, Some(byte)) => byte,
             (None, None) => return,
         };
+        let cut = table_safe_cut(&self.pending_text, cut);
         if cut == 0 {
             return;
         }
@@ -6037,6 +6038,34 @@ fn tree_path(turns: &[super::events::TreeTurn], leaf: Option<&str>) -> Vec<(Stri
     }
     path.reverse();
     path
+}
+
+/// Where streamed text may be committed without cutting a markdown table in
+/// two: a committed piece is drawn on its own, so a table cut after its
+/// delimiter showed as an empty box with its rows below as raw `| ... |`
+/// lines. A cut inside a table that may still go on moves back to the line
+/// before the table; the table is committed whole once a line ends it.
+fn table_safe_cut(text: &str, cut: usize) -> usize {
+    let head = &text[..cut];
+    if !head.ends_with('\n') {
+        return cut;
+    }
+    let is_row = |line: &str| line.trim_start().starts_with('|');
+    let tail = &text[cut..];
+    let next = tail.split('\n').next().unwrap_or_default();
+    // Not yet a whole line, or another row: the table may go on.
+    let may_go_on = (next.is_empty() && !tail.starts_with('\n')) || is_row(next);
+    if !may_go_on {
+        return cut;
+    }
+    let mut start = cut;
+    for line in head[..head.len() - 1].rsplit('\n') {
+        if !is_row(line) {
+            break;
+        }
+        start -= line.len() + 1;
+    }
+    start
 }
 
 #[cfg(test)]
@@ -11344,6 +11373,62 @@ Command: \"npm run build\""
             .expect("turn finished");
         let _ = harness.controller.pump_events();
         assert_eq!(harness.controller.last_answer(), answer);
+    }
+
+    /// Seen: a table streamed past the live block's eight lines was committed
+    /// in pieces - an empty box, then its rows as raw `| ... |` lines.
+    #[test]
+    fn a_streamed_table_is_committed_whole() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "question");
+        let mut lines = (1..=6)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>();
+        lines.extend(["| a | b |".to_owned(), "|---|---|".to_owned()]);
+        lines.extend((1..=8).map(|row| format!("| r{row} | v{row} |")));
+        lines.extend([String::new(), "after the table".to_owned(), String::new()]);
+        let answer = lines.join("\n");
+        let mut committed = Vec::new();
+        for line in answer.split_inclusive('\n') {
+            harness
+                .events
+                .send(SessionEvent::TextDelta {
+                    text: line.to_owned(),
+                })
+                .expect("answer delta");
+            for effect in harness.controller.pump_events() {
+                if let Effect::Stream(text) = effect {
+                    committed.push(text);
+                }
+            }
+        }
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("turn finished");
+        for effect in harness.controller.pump_events() {
+            match effect {
+                Effect::Stream(text) | Effect::History(HistoryItem::Assistant { text }) => {
+                    committed.push(text);
+                }
+                _ => {}
+            }
+        }
+        let table = committed
+            .iter()
+            .filter(|piece| piece.contains("| a | b |") || piece.contains("| r"))
+            .collect::<Vec<_>>();
+        assert_eq!(table.len(), 1, "{committed:#?}");
+        assert!(
+            table[0].contains("| a | b |\n|---|---|\n| r1 | v1 |"),
+            "{committed:#?}"
+        );
+        assert!(table[0].contains("| r8 | v8 |"), "{committed:#?}");
+        assert_eq!(super::table_safe_cut("x\n| a |\n", 2), 2);
+        assert_eq!(super::table_safe_cut("x\n| a |\nnot a row", 8), 8);
     }
 
     #[test]
