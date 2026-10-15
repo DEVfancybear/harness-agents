@@ -2246,6 +2246,52 @@ mod tests {
         );
     }
 
+    /// Seen: a conversation resumed as a background agent showed nothing of
+    /// what it continued, only "Selected session ...".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resumed_conversation_is_shown_to_a_terminal_that_attaches() {
+        let (_temp, worker, mut spec) = resume_worker().await;
+        spec.environment
+            .push(("DEEPSEEK_API_KEY".to_owned(), "test-key".to_owned()));
+        let created = {
+            let worker = Arc::clone(&worker.0);
+            tokio::task::spawn_blocking(move || worker.create(spec))
+                .await
+                .expect("join")
+                .expect("agent")
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let shown = loop {
+            let (out, replies) = std::sync::mpsc::channel();
+            worker
+                .0
+                .inbox(&created.id)
+                .expect("inbox")
+                .send(super::Command::Attach {
+                    connection: 7,
+                    out,
+                    columns: 100,
+                })
+                .expect("attach");
+            let Ok(super::Reply::Attached { history, .. }) =
+                replies.recv_timeout(Duration::from_secs(10))
+            else {
+                panic!("no attach reply");
+            };
+            let _ = worker
+                .0
+                .inbox(&created.id)
+                .expect("inbox")
+                .send(super::Command::Detach { connection: 7 });
+            let text = format!("{history:?}");
+            if text.contains("resumed") || std::time::Instant::now() > deadline {
+                break text;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert!(shown.contains("resumed"), "{shown}");
+    }
+
     /// Seen: `/model` and `/effort` in an agent changed its status row, but the
     /// agents view and the banner a terminal got on attach kept the launch's.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

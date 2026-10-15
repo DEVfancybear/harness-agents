@@ -1917,6 +1917,62 @@ pub async fn conversation_history(
     })
 }
 
+/// One turn of a conversation as the user saw it: what was asked and the
+/// answer it got.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptTurn {
+    pub question: String,
+    pub answer: Option<String>,
+    /// A compaction summarised this turn and every one before it: the model
+    /// continues from the summary, the user still sees the turns.
+    pub compacted: bool,
+}
+
+/// The newest `limit` turns of the conversation `session_id` ends, oldest
+/// first, and how many older ones were left out.
+///
+/// What a resumed conversation shows. [`conversation_history`] is what the
+/// model is sent and stops at the newest compaction; shown that way, a resumed
+/// conversation was its summary and a turn or two of host notes, as if the
+/// user's own turns had gone. Claude Code, Codex and prime-agent show the
+/// whole conversation, compacted or not.
+///
+/// # Errors
+/// The store cannot be read.
+pub async fn resumed_turns(
+    store: &SqliteStore,
+    session_id: &SessionId,
+    limit: usize,
+) -> Result<(Vec<TranscriptTurn>, usize), RuntimeError> {
+    let mut turns = Vec::new();
+    let mut older = 0_usize;
+    let mut compacted = false;
+    let mut visited = std::collections::BTreeSet::new();
+    let mut current = Some(session_id.clone());
+    while let Some(session) = current.take() {
+        if !visited.insert(session.as_str().to_owned()) || visited.len() > CONVERSATION_MAX_SESSIONS
+        {
+            break;
+        }
+        compacted = compacted || store.latest_context_checkpoint(&session).await?.is_some();
+        if let Some((_, question)) = store.session_admitted_input(&session).await? {
+            if turns.len() < limit {
+                let attempts = decoded_attempts(store, &session).await?;
+                turns.push(TranscriptTurn {
+                    question,
+                    answer: final_answer_of(&attempts),
+                    compacted,
+                });
+            } else {
+                older += 1;
+            }
+        }
+        current = previous_in_conversation(store, &session).await?;
+    }
+    turns.reverse();
+    Ok((turns, older))
+}
+
 /// The messages of the session file the conversation of `root` was imported
 /// from, led by a note saying so; none when it was not imported or the file
 /// can no longer be read.

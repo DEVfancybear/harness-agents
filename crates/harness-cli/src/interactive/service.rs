@@ -51,6 +51,9 @@ use super::paths::LaunchEnvironment;
 use super::project;
 use super::prompt::{PromptEnvironment, SystemPromptBuilder};
 
+/// The most turns a resumed conversation shows.
+const RESTORED_TURNS: usize = 60;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct TurnModelSelection {
     active_model: Option<String>,
@@ -3750,6 +3753,10 @@ impl AgentSessionService {
 
     /// Show the user the conversation a resumed session continues.
     ///
+    /// The whole conversation, newest [`RESTORED_TURNS`] turns, compacted or
+    /// not: shown as the model is sent it, a compacted one was its summary and
+    /// a host note or two, and the user's own turns seemed gone.
+    ///
     /// Resuming used to print one line and nothing else, so the user could not see
     /// what they were continuing and had no way to tell whether the model could. What
     /// is shown here is read with the same function the runtime uses to build the next
@@ -3804,7 +3811,7 @@ impl AgentSessionService {
                 }
                 _ => None,
             };
-            let history = harness_runtime::conversation_history(&store, &source).await;
+            let history = harness_runtime::resumed_turns(&store, &source, RESTORED_TURNS).await;
             {
                 let Ok(previous) = selected.lock() else {
                     return;
@@ -3813,11 +3820,14 @@ impl AgentSessionService {
                     return;
                 }
                 match history {
-                    Ok(history) => {
+                    Ok((turns, omitted)) => {
                         let _ = sender.send(SessionEvent::ConversationRestored {
-                            turns: history.turns(),
-                            omitted: history.omitted,
-                            summarized: history.summary.is_some(),
+                            compacted: turns.iter().filter(|turn| turn.compacted).count(),
+                            turns: turns
+                                .into_iter()
+                                .map(|turn| (turn.question, turn.answer.unwrap_or_default()))
+                                .collect(),
+                            omitted,
                         });
                         if let Some(objective) = goal {
                             let _ = sender.send(SessionEvent::GoalRestored { objective });

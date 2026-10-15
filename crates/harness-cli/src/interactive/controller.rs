@@ -2507,34 +2507,40 @@ impl InteractiveController {
             SessionEvent::ConversationRestored {
                 turns,
                 omitted,
-                summarized,
+                compacted,
             } => {
                 self.flush_stream(effects);
                 // A goal belongs to its conversation; the resumed one sends its own.
                 self.goal = None;
                 self.service.set_goal(None);
-                if summarized {
-                    self.push_history(
-                        effects,
-                        HistoryItem::Notice {
-                            message: "earlier turns were compacted; the model continues from their summary".to_owned(),
-                        },
-                    );
-                }
                 if omitted > 0 {
                     self.push_history(
                         effects,
                         HistoryItem::Notice {
-                            message: format!(
-                                "{omitted} older turn(s) are not shown and are not sent to the model"
-                            ),
+                            message: format!("{omitted} older turn(s) are not shown"),
                         },
                     );
                 }
                 let count = turns.len();
-                for (question, answer) in turns {
-                    self.push_history(effects, HistoryItem::User { text: question });
-                    self.push_history(effects, HistoryItem::Assistant { text: answer });
+                for (index, (question, answer)) in turns.into_iter().enumerate() {
+                    // What the host sent itself (`[python-state]`,
+                    // `[child-exited: ...]`) is a note, not something the user said.
+                    if let Some(note) = host_note(&question) {
+                        self.push_history(effects, HistoryItem::Notice { message: note });
+                    } else {
+                        self.push_history(effects, HistoryItem::User { text: question });
+                    }
+                    if !answer.trim().is_empty() {
+                        self.push_history(effects, HistoryItem::Assistant { text: answer });
+                    }
+                    if compacted > 0 && index + 1 == compacted {
+                        self.push_history(
+                            effects,
+                            HistoryItem::Notice {
+                                message: "── compacted here: the model continues from a summary of the turns above ──".to_owned(),
+                            },
+                        );
+                    }
                 }
                 self.push_history(
                     effects,
@@ -6040,6 +6046,19 @@ fn tree_path(turns: &[super::events::TreeTurn], leaf: Option<&str>) -> Vec<(Stri
     path
 }
 
+/// The first line of a message the host sent itself - one that opens with a
+/// bracketed lowercase tag such as `[python-state]` or `[child-exited: ...]` -
+/// or `None` for what the user wrote.
+fn host_note(question: &str) -> Option<String> {
+    let first = question.lines().next().unwrap_or_default().trim();
+    let tag = first.strip_prefix('[')?.split([']', ':']).next()?;
+    let structural = !tag.is_empty()
+        && tag
+            .chars()
+            .all(|character| character.is_ascii_lowercase() || character == '-');
+    structural.then(|| first.to_owned())
+}
+
 /// Where streamed text may be committed without cutting a markdown table in
 /// two: a committed piece is drawn on its own, so a table cut after its
 /// delimiter showed as an empty box with its rows below as raw `| ... |`
@@ -8283,7 +8302,7 @@ Command: \"npm run build\""
                     ("còn resume?".to_owned(), "Resume đọc snapshot.".to_owned()),
                 ],
                 omitted: 3,
-                summarized: false,
+                compacted: 0,
             })
             .expect("restored");
         let plain = effects_to_plain(&harness.controller.pump_events()).join("\n");
@@ -8304,6 +8323,54 @@ Command: \"npm run build\""
             order.windows(2).all(|pair| pair[0] < pair[1]),
             "the conversation is shown in the order it was said: {plain}"
         );
+    }
+
+    /// Seen: a compacted conversation resumed as its summary and two host
+    /// notes shown as the user's words; the user's own turns seemed gone.
+    #[test]
+    fn a_compacted_conversation_resumes_with_every_turn_and_its_mark() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        harness
+            .events
+            .send(SessionEvent::ConversationRestored {
+                turns: vec![
+                    (
+                        "tạo dự án ninja".to_owned(),
+                        "Đã tạo khung dự án.".to_owned(),
+                    ),
+                    ("làm M1".to_owned(), "M1 xong.".to_owned()),
+                    (
+                        "[python-state]\n\nYour Python kernel persisted".to_owned(),
+                        "Tiếp tục M2.".to_owned(),
+                    ),
+                ],
+                omitted: 0,
+                compacted: 2,
+            })
+            .expect("restored");
+        let effects = harness.controller.pump_events();
+        let plain = effects_to_plain(&effects).join("\n");
+        let order = [
+            "tạo dự án ninja",
+            "M1 xong.",
+            "compacted here",
+            "[python-state]",
+            "Tiếp tục M2.",
+            "resumed 3 turn(s)",
+        ]
+        .map(|needle| {
+            plain
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} is missing: {plain}"))
+        });
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{plain}");
+        let users = history_items(&effects)
+            .into_iter()
+            .filter(|item| matches!(item, HistoryItem::User { .. }))
+            .count();
+        assert_eq!(users, 2, "a host note is not the user's: {plain}");
+        assert!(!plain.contains("Your Python kernel persisted"), "{plain}");
     }
 
     #[test]

@@ -962,14 +962,15 @@ pub enum SessionEvent {
     CompactRequested {
         instructions: Option<String>,
     },
-    /// The conversation a resumed session continues, as the model will be sent it.
+    /// The conversation a resumed session continues, as the user saw it.
     ConversationRestored {
-        /// (question, answer) pairs, oldest first.
+        /// (question, answer) pairs, oldest first; an empty answer was never given.
         turns: Vec<(String, String)>,
-        /// Turns older than the replay bound, which the model does not see.
+        /// Turns older than these, which are not shown.
         omitted: usize,
-        /// Whether a compaction summary stands for turns before these.
-        summarized: bool,
+        /// How many of the first `turns` a compaction summarised: the model
+        /// continues from the summary after them.
+        compacted: usize,
     },
     /// Read-only session diff result for the reference overlay.
     Reference {
