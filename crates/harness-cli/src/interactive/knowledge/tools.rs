@@ -552,13 +552,15 @@ impl KnowledgeHost {
                 let scopes = if global { vec![Scope::Global] } else { vec![Scope::Project, Scope::Global] };
                 scopes.into_iter().map(|scope| {
                     let stats = self.store(scope).stats()?;
-                    Ok(format!("{} knowledge: {}, {} page(s), {} link(s)", scope.label(),
-                        if stats.enabled { "on" } else { "off" }, stats.pages, stats.links))
+                    Ok(format!("{} knowledge: {}, {} page(s), {} link(s){}", scope.label(),
+                        if stats.enabled { "on" } else { "off" }, stats.pages, stats.links,
+                        skipped_note(&stats.skipped)))
                 }).collect()
             }
             "refresh" => {
                 let stats = store.refresh()?;
-                Ok(vec![format!("{} knowledge refreshed: {} page(s), {} link(s)", scope.label(), stats.pages, stats.links)])
+                Ok(vec![format!("{} knowledge refreshed: {} page(s), {} link(s){}", scope.label(),
+                    stats.pages, stats.links, skipped_note(&stats.skipped))])
             }
             "list" | "search" | "read" | "graph" => {
                 let mut args = json!({"action":action});
@@ -636,6 +638,19 @@ impl KnowledgeHost {
             }
         };
         Ok(vec![value.to_string()])
+    }
+}
+
+/// `; N file(s) skipped: path: why; ...` for files the scan left out.
+fn skipped_note(skipped: &[String]) -> String {
+    if skipped.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} file(s) skipped: {}",
+            skipped.len(),
+            skipped.join("; ")
+        )
     }
 }
 
@@ -1256,7 +1271,15 @@ mod tests {
             .execute(&json!({"action":"read","path":"large.md","max_lines":999_999}))
             .expect("read");
         assert!(read["results"][0]["hash"].as_str().is_some());
-        assert_eq!(read["results"][0]["start_line"], 1);
+        // A read from the top starts below the store's metadata line.
+        assert_eq!(read["results"][0]["start_line"], 2);
+        assert!(
+            !read["results"][0]["content"]
+                .as_str()
+                .expect("content")
+                .contains("ha-knowledge:"),
+            "the metadata line is not shown"
+        );
         assert_eq!(read["results"][0]["scope"], "project");
         assert!(serde_json::to_string(&read).expect("json").chars().count() <= MAX_OUTPUT_CHARS);
         assert!(

@@ -127,6 +127,10 @@ pub(crate) struct Stats {
     pub pages: usize,
     pub links: usize,
     pub enabled: bool,
+    /// Files left out of the scan, each with why: a broken one no longer takes
+    /// the whole store down with it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -261,7 +265,15 @@ impl Store {
             let pages = scan(root)?;
             let page = find_page(&pages, &path)?;
             let all = page.text.lines().collect::<Vec<_>>();
-            let start = start_line.max(1);
+            // The metadata line is the store's, not the page's: a read from
+            // the top starts below it, and line numbers still count it, as
+            // search's do.
+            let start = if start_line <= 1 && all.first().is_some_and(|line| line.starts_with(META))
+            {
+                2
+            } else {
+                start_line.max(1)
+            };
             let count = max_lines.clamp(1, MAX_LINES);
             let selected = all
                 .iter()
@@ -543,13 +555,9 @@ impl Store {
     pub(crate) fn refresh(&self) -> Result<Stats, String> {
         self.with_lock(|root| {
             if !enabled_at(root)? {
-                return Ok(Stats {
-                    pages: 0,
-                    links: 0,
-                    enabled: false,
-                });
+                return Ok(counts(&[], false, Vec::new()));
             }
-            let pages = scan(root)?;
+            let (pages, skipped) = scan_reporting(root)?;
             // A read-only refresh of an absent, empty store stays absent.
             if root.exists() || !pages.is_empty() {
                 transact(
@@ -557,7 +565,7 @@ impl Store {
                     vec![change(root, INDEX, Some(render_index(&pages)?))?],
                 )?;
             }
-            Ok(counts(&pages, true))
+            Ok(counts(&pages, true, skipped))
         })
     }
 
@@ -803,8 +811,18 @@ fn require_enabled(root: &Path) -> Result<(), String> {
 }
 
 fn scan(root: &Path) -> Result<Vec<Page>, String> {
+    scan_reporting(root).map(|(pages, _)| pages)
+}
+
+/// The store's pages, and the files left out with why. A page whose metadata
+/// does not parse, that is too large, is not UTF-8 or differs from another
+/// only by letter case is skipped and named: one such file failed every list,
+/// search, read and write of its scope. The store's own bounds (entries,
+/// depth, pages, bytes) still fail the scan.
+fn scan_reporting(root: &Path) -> Result<(Vec<Page>, Vec<String>), String> {
+    let mut skipped = Vec::new();
     if !root.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), skipped));
     }
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
     let mut pages = Vec::new();
@@ -855,16 +873,27 @@ fn scan(root: &Path) -> Result<Vec<Page>, String> {
                 return Err("knowledge page limit exceeded".to_owned());
             }
             if !paths.insert(normalized(&relative)) {
-                return Err("knowledge paths differ only by letter case".to_owned());
-            }
-            let Some(text) = read_bounded(&path, MAX_PAGE)? else {
+                skipped.push(format!(
+                    "{relative}: its path differs from another page's only by letter case"
+                ));
                 continue;
+            }
+            let text = match read_bounded(&path, MAX_PAGE) {
+                Ok(Some(text)) => text,
+                Ok(None) => continue,
+                Err(reason) => {
+                    skipped.push(format!("{relative}: {reason}"));
+                    continue;
+                }
             };
             bytes += text.len();
             if bytes > MAX_SCAN_BYTES {
                 return Err("knowledge scan size limit exceeded".to_owned());
             }
-            pages.push(parse_page(&relative, text)?);
+            match parse_page(&relative, text) {
+                Ok(page) => pages.push(page),
+                Err(reason) => skipped.push(format!("{relative}: {reason}")),
+            }
         }
     }
     pages.sort_by(|a, b| a.summary.path.cmp(&b.summary.path));
@@ -875,7 +904,8 @@ fn scan(root: &Path) -> Result<Vec<Page>, String> {
     for page in &mut pages {
         resolve_page_links(page, &admitted);
     }
-    Ok(pages)
+    skipped.sort();
+    Ok((pages, skipped))
 }
 
 fn resolve_page_links(page: &mut Page, admitted: &BTreeMap<String, String>) {
@@ -922,6 +952,21 @@ fn parse_page(path: &str, text: String) -> Result<Page, String> {
             .into_owned();
     }
     metadata.title = single_line(&metadata.title, 256, "title")?;
+    if metadata.summary.trim().is_empty() {
+        // A page written by hand has no summary: its first paragraph stands
+        // in, so the index and the catalog say what it is about.
+        metadata.summary = text
+            .lines()
+            .map(str::trim)
+            .find(|line| {
+                !line.is_empty()
+                    && !line.starts_with('#')
+                    && !line.starts_with(META)
+                    && !line.starts_with('>')
+            })
+            .map(|line| line.chars().take(160).collect::<String>())
+            .unwrap_or_default();
+    }
     metadata.summary = single_line(&metadata.summary, 1024, "summary")?;
     if metadata.sources.len() > 32 || metadata.related.len() > 64 {
         return Err("knowledge metadata has too many references".to_owned());
@@ -1038,28 +1083,44 @@ fn backlinks(pages: &[Page], path: &str) -> Vec<String> {
         .collect()
 }
 
-fn counts(pages: &[Page], enabled: bool) -> Stats {
+fn counts(pages: &[Page], enabled: bool, skipped: Vec<String>) -> Stats {
     Stats {
         pages: pages.len(),
         links: pages.iter().map(|p| p.summary.related.len()).sum(),
         enabled,
+        skipped,
     }
 }
 
 fn stats_at(root: &Path) -> Result<Stats, String> {
     if enabled_at(root)? {
-        Ok(counts(&scan(root)?, true))
+        let (pages, skipped) = scan_reporting(root)?;
+        Ok(counts(&pages, true, skipped))
     } else {
-        Ok(Stats {
-            pages: 0,
-            links: 0,
-            enabled: false,
-        })
+        Ok(counts(&[], false, Vec::new()))
     }
 }
 
 fn normalized(text: &str) -> String {
     text.nfc().collect::<String>().to_lowercase()
+}
+
+/// `text` without the accents of Latin letters (`ộ` as `o`, `đ` as `d`):
+/// marks on other scripts' letters are part of their words and stay.
+fn fold(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut latin = false;
+    for character in text.replace(['đ', 'Đ'], "d").nfd() {
+        if unicode_normalization::char::is_combining_mark(character) {
+            if latin {
+                continue;
+            }
+        } else {
+            latin = character.is_ascii_alphabetic();
+        }
+        out.push(character);
+    }
+    out.nfc().collect()
 }
 
 fn search_pages(pages: &[Page], query: &str, limit: usize) -> Vec<SearchHit> {
@@ -1110,6 +1171,27 @@ fn rank_pages(pages: &[Page], documents: &[String], query: &str, limit: usize) -
     if terms.is_empty() || limit == 0 {
         return Vec::new();
     }
+    // A query typed without accents (`bo nho dem`) reads the pages without
+    // theirs, so it finds `bộ nhớ đệm`; it found nothing. One with accents
+    // still matches them exactly, so words told apart by a tone stay apart.
+    let plain = fold(&normalized(query)) == normalized(query);
+    let folded_documents;
+    let documents: &[String] = if plain {
+        folded_documents = documents
+            .iter()
+            .map(|document| fold(document))
+            .collect::<Vec<_>>();
+        &folded_documents
+    } else {
+        documents
+    };
+    let prepare = |text: &str| {
+        if plain {
+            fold(&normalized(text))
+        } else {
+            normalized(text)
+        }
+    };
     let number = |n: usize| f64::from(u32::try_from(n).unwrap_or(u32::MAX));
     let lengths = documents
         .iter()
@@ -1127,8 +1209,8 @@ fn rank_pages(pages: &[Page], documents: &[String], query: &str, limit: usize) -
         .collect::<Vec<_>>();
     let mut hits = Vec::new();
     for (index, (page, document)) in pages.iter().zip(documents).enumerate() {
-        let title = normalized(&page.summary.title);
-        let summary = normalized(&page.summary.summary);
+        let title = prepare(&page.summary.title);
+        let summary = prepare(&page.summary.summary);
         let mut score = 0.0;
         for (term, frequency) in terms.iter().zip(&frequencies) {
             let count = number(occurrences(document, term));
@@ -1167,7 +1249,7 @@ fn rank_pages(pages: &[Page], documents: &[String], query: &str, limit: usize) -
                 if line.starts_with(META) {
                     return 0.0;
                 }
-                let line = normalized(line);
+                let line = prepare(line);
                 terms
                     .iter()
                     .zip(&frequencies)
@@ -1626,6 +1708,45 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::new(directory.path().join("knowledge"));
         (directory, store)
+    }
+
+    /// Found testing a release build: one page with broken metadata, one too
+    /// large and one not UTF-8 each failed every list, search and status of
+    /// the scope; an unaccented query found nothing in accented pages; and a
+    /// hand-written page had no summary in the index.
+    #[test]
+    fn broken_files_are_skipped_and_named_and_unaccented_queries_find_accents() {
+        let (dir, store) = store();
+        store.write(input("concepts/a.md", "A reference")).unwrap();
+        let root = dir.path().join("knowledge");
+        fs::write(
+            root.join("cache.md"),
+            "# Chính sách bộ nhớ đệm\n\nCache giữ 5 phút cho mỗi phiên.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("broken.md"),
+            "<!-- ha-knowledge: {not json} -->\n# B\n",
+        )
+        .unwrap();
+        fs::write(root.join("huge.md"), "a".repeat(MAX_PAGE + 1)).unwrap();
+        fs::write(root.join("bad.md"), b"# Bad\n\xff\xfe\n").unwrap();
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.pages, 2, "{stats:?}");
+        let skipped = stats.skipped.join("\n");
+        for name in ["bad.md", "broken.md", "huge.md"] {
+            assert!(skipped.contains(name), "{skipped}");
+        }
+        assert_eq!(store.list().unwrap().len(), 2);
+        let hits = store.search("bo nho dem", 5).unwrap();
+        assert_eq!(hits.first().map(|hit| hit.path.as_str()), Some("cache.md"));
+        let cache = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.path == "cache.md")
+            .unwrap();
+        assert_eq!(cache.summary, "Cache giữ 5 phút cho mỗi phiên.");
     }
 
     #[test]
