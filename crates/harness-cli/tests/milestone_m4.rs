@@ -3352,7 +3352,8 @@ async fn g04_glob_respects_gitignore_and_cap() {
     let output = serde_json::to_value(view.output).expect("glob output serializes");
     let paths = output["paths"].as_array().expect("glob paths");
     assert!(paths.len() <= 4096, "{} results", paths.len());
-    assert!(paths.iter().any(|path| path == "many/0000.txt"));
+    // Matches come newest-modified first, so the cut keeps the last written.
+    assert!(paths.iter().any(|path| path == "many/4093.txt"));
     assert!(!paths.iter().any(|path| path == "ignored/hidden.txt"));
     drop(tools);
     close(store).await;
