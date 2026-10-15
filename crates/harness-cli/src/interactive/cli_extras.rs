@@ -22,6 +22,7 @@ pub fn knowledge(
     cwd: Option<&Path>,
     global: bool,
     json: bool,
+    port: Option<u16>,
     action: &str,
     arguments: &[String],
 ) -> Result<ExitCode, HarnessError> {
@@ -42,6 +43,23 @@ pub fn knowledge(
     }
     let environment = LaunchEnvironment::capture();
     let host = super::knowledge::KnowledgeHost::new(&workspace, &data_dir(&environment)?);
+    if action == "serve" {
+        if !arguments.is_empty() || global {
+            return Err(HarnessError::new(
+                ErrorCode::InvalidPayload,
+                "usage: ha knowledge serve [--cwd DIR] [--port PORT] [--json]",
+            ));
+        }
+        super::knowledge::console::serve(host, port.unwrap_or(0), json)
+            .map_err(|message| HarnessError::new(ErrorCode::InvalidPayload, message))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if port.is_some() {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            "--port applies to knowledge serve only",
+        ));
+    }
     let mut words = vec![action.to_owned()];
     words.extend(arguments.iter().cloned());
     if global {

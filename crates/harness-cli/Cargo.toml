@@ -71,6 +71,7 @@ rmcp = { version = "=3.4.0", default-features = false, features = ["client", "se
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 reqwest.workspace = true
 regex.workspace = true
 # `web_fetch` decodes a page in the charset it declares; reqwest's `charset`

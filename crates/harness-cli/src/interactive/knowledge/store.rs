@@ -12,17 +12,24 @@ use harness_types::ContentHash;
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
+#[path = "links.rs"]
+mod links;
+#[path = "manage.rs"]
+mod manage;
+
 const STATE: &str = ".ha-state.json";
 const PENDING: &str = ".ha-pending.json";
 const INDEX: &str = "index.md";
 const LOG: &str = "log.md";
 const META: &str = "<!-- ha-knowledge: ";
+const CATEGORY_MARKER: &str = ".ha-category";
 const MAX_PAGE: usize = 256 * 1024;
 const MAX_PAGES: usize = 2048;
 const MAX_SCAN_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HISTORY: usize = 4 * 1024 * 1024;
 const MAX_INDEX: usize = 512 * 1024;
-const MAX_JOURNAL: usize = MAX_HISTORY + MAX_INDEX + MAX_PAGE * 2;
+// JSON escaping can expand the entire bounded corpus and history by 6x.
+const MAX_JOURNAL: usize = (MAX_SCAN_BYTES + MAX_HISTORY + MAX_INDEX) * 6;
 const MAX_READ: usize = 32 * 1024;
 const MAX_LINES: usize = 200;
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -63,6 +70,14 @@ pub(crate) struct PageRead {
     pub backlinks: Vec<String>,
     pub sources: Vec<String>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct PageDocument {
+    #[serde(flatten)]
+    pub page: PageSummary,
+    pub content: String,
+    pub backlinks: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -167,6 +182,31 @@ impl Store {
 
     pub(crate) fn stats(&self) -> Result<Stats, String> {
         self.with_lock(stats_at)
+    }
+
+    /// Full bounded Markdown for the local console, independent of model paging.
+    pub(crate) fn document(&self, path: &str) -> Result<PageDocument, String> {
+        let path = page_path(path)?;
+        self.with_lock(|root| {
+            require_enabled(root)?;
+            let pages = scan(root)?;
+            let page = find_page(&pages, &path)?;
+            Ok(PageDocument {
+                page: page.summary.clone(),
+                content: page.text.clone(),
+                backlinks: backlinks(&pages, &page.summary.path),
+            })
+        })
+    }
+
+    pub(crate) fn corpus(&self) -> Result<Vec<(PageSummary, String)>, String> {
+        self.with_lock(|root| {
+            require_enabled(root)?;
+            Ok(scan(root)?
+                .into_iter()
+                .map(|page| (page.summary, page.text))
+                .collect())
+        })
     }
 
     #[cfg(test)]
@@ -357,7 +397,13 @@ impl Store {
             } else if input.expected_hash.is_some() {
                 return Err("knowledge page no longer exists".to_owned());
             }
-            let page = parse_page(&actual_path, text.clone())?;
+            let mut page = parse_page(&actual_path, text.clone())?;
+            let mut admitted = pages
+                .iter()
+                .map(|p| (normalized(&p.summary.path), p.summary.path.clone()))
+                .collect::<BTreeMap<_, _>>();
+            admitted.insert(normalized(&actual_path), actual_path.clone());
+            resolve_page_links(&mut page, &admitted);
             let output = page.summary.clone();
             if let Some(i) = existing {
                 pages[i] = page;
@@ -413,9 +459,14 @@ impl Store {
     }
 
     pub(crate) fn graph(&self) -> Result<Graph, String> {
+        self.graph_bounded(usize::MAX).map(|(graph, _)| graph)
+    }
+
+    pub(crate) fn graph_bounded(&self, edge_limit: usize) -> Result<(Graph, usize), String> {
         self.with_lock(|root| {
             require_enabled(root)?;
             let pages = scan(root)?;
+            let total_edges = pages.iter().map(|page| page.summary.related.len()).sum();
             let edges = pages
                 .iter()
                 .flat_map(|page| {
@@ -424,11 +475,15 @@ impl Store {
                         target: target.clone(),
                     })
                 })
+                .take(edge_limit)
                 .collect();
-            Ok(Graph {
-                nodes: pages.into_iter().map(|p| p.summary).collect(),
-                edges,
-            })
+            Ok((
+                Graph {
+                    nodes: pages.into_iter().map(|p| p.summary).collect(),
+                    edges,
+                },
+                total_edges,
+            ))
         })
     }
 
@@ -566,7 +621,9 @@ fn page_path(path: &str) -> Result<String, String> {
             return Err("reserved knowledge filename".to_owned());
         }
     }
-    if !path.to_lowercase().ends_with(".md")
+    if ![".md", ".txt"]
+        .iter()
+        .any(|suffix| path.to_lowercase().ends_with(suffix))
         || path.eq_ignore_ascii_case(INDEX)
         || path.eq_ignore_ascii_case(LOG)
     {
@@ -629,10 +686,13 @@ fn is_link(metadata: &fs::Metadata) -> bool {
 }
 
 fn validate_existing(path: &Path) -> Result<(), String> {
-    for ancestor in path.ancestors() {
+    for (depth, ancestor) in path.ancestors().enumerate() {
         match fs::symlink_metadata(ancestor) {
             Ok(metadata) if is_link(&metadata) => {
                 return Err("knowledge paths cannot contain symlinks or reparse points".to_owned());
+            }
+            Ok(metadata) if depth > 0 && !metadata.is_dir() => {
+                return Err("knowledge destination conflicts with a parent file".to_owned());
             }
             Ok(_) => (),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
@@ -643,7 +703,9 @@ fn validate_existing(path: &Path) -> Result<(), String> {
 }
 
 fn safe_file(root: &Path, path: &str) -> Result<PathBuf, String> {
-    if ![STATE, PENDING, INDEX, LOG].contains(&path) {
+    if let Some(category) = path.strip_suffix(&format!("/{CATEGORY_MARKER}")) {
+        page_path(&format!("{category}/category-check.md"))?;
+    } else if ![STATE, PENDING, INDEX, LOG].contains(&path) {
         page_path(path)?;
     }
     let full = root.join(path);
@@ -719,7 +781,11 @@ fn scan(root: &Path) -> Result<Vec<Page>, String> {
                 pending.push((path, depth + 1));
                 continue;
             }
-            if !metadata.is_file() || !name.to_lowercase().ends_with(".md") {
+            if !metadata.is_file()
+                || ![".md", ".txt"]
+                    .iter()
+                    .any(|suffix| name.to_lowercase().ends_with(suffix))
+            {
                 continue;
             }
             let relative = path
@@ -754,23 +820,26 @@ fn scan(root: &Path) -> Result<Vec<Page>, String> {
         .map(|p| (normalized(&p.summary.path), p.summary.path.clone()))
         .collect::<BTreeMap<_, _>>();
     for page in &mut pages {
-        let own = normalized(&page.summary.path);
-        page.summary.related = page
-            .summary
-            .related
-            .iter()
-            .filter_map(|target| {
-                if normalized(target) == own {
-                    None
-                } else {
-                    admitted.get(&normalized(target)).cloned()
-                }
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        resolve_page_links(page, &admitted);
     }
     Ok(pages)
+}
+
+fn resolve_page_links(page: &mut Page, admitted: &BTreeMap<String, String>) {
+    let own = normalized(&page.summary.path);
+    page.summary.related = page
+        .summary
+        .related
+        .iter()
+        .filter_map(|target| {
+            let target = normalized(target);
+            (target != own)
+                .then(|| admitted.get(&target).cloned())
+                .flatten()
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
 }
 
 fn parse_page(path: &str, text: String) -> Result<Page, String> {
@@ -805,6 +874,7 @@ fn parse_page(path: &str, text: String) -> Result<Page, String> {
     for target in &metadata.related {
         page_path(target)?;
     }
+    metadata.related.extend(links::targets(path, &text));
     Ok(Page {
         summary: PageSummary {
             path: path.to_owned(),
@@ -1238,6 +1308,9 @@ fn sync_directory(directory: &Path) -> Result<(), String> {
 }
 
 fn file_limit(path: &str) -> usize {
+    if path.ends_with(&format!("/{CATEGORY_MARKER}")) {
+        return 64;
+    }
     match path {
         LOG => MAX_HISTORY,
         INDEX => MAX_INDEX,
@@ -1293,6 +1366,10 @@ fn transact(root: &Path, changes: Vec<Change>) -> Result<(), String> {
         id: unique_id(),
         changes,
     };
+    // Reject destination conflicts before recording an operation that cannot
+    // recover (for example, a page path occupied by a category directory).
+    validate_transaction(root, &transaction)?;
+    validate_entry_budget(root, &transaction.changes)?;
     let journal = serde_json::to_string(&transaction).map_err(error)?;
     if journal.len() > MAX_JOURNAL {
         return Err("knowledge transaction size limit exceeded".to_owned());
@@ -1307,8 +1384,57 @@ fn recover(root: &Path) -> Result<(), String> {
     };
     let transaction: Transaction = serde_json::from_str(&journal)
         .map_err(|e| format!("invalid pending knowledge transaction: {e}"))?;
-    if transaction.version != 1 || transaction.changes.is_empty() || transaction.changes.len() > 4 {
+    validate_transaction(root, &transaction)?;
+    // Validate every input before touching any remaining file.
+    for change in transaction.changes {
+        let destination = safe_file(root, &change.path)?;
+        let current = read_bounded(&destination, file_limit(&change.path))?.map(|text| hash(&text));
+        if current == change.after.as_deref().map(hash) {
+            if change.after.is_none() {
+                cleanup_category_marker(&destination);
+            }
+            continue;
+        }
+        if current != change.before {
+            return Err("knowledge changed while recovering its transaction".to_owned());
+        }
+        if let Some(text) = change.after {
+            atomic_write(root, &change.path, &text)?;
+        } else {
+            fs::remove_file(&destination).map_err(error)?;
+            sync_directory(
+                destination
+                    .parent()
+                    .ok_or("invalid knowledge destination")?,
+            )?;
+            cleanup_category_marker(&destination);
+        }
+    }
+    fs::remove_file(safe_file(root, PENDING)?).map_err(error)?;
+    sync_directory(root)
+}
+
+fn validate_transaction(root: &Path, transaction: &Transaction) -> Result<(), String> {
+    if transaction.version != 1
+        || transaction.changes.is_empty()
+        || transaction.changes.len() > 16_387
+    {
         return Err("unsupported pending knowledge transaction".to_owned());
+    }
+    let written_paths = transaction
+        .changes
+        .iter()
+        .filter(|change| change.after.is_some())
+        .map(|change| normalized(&change.path))
+        .collect::<BTreeSet<_>>();
+    for path in &written_paths {
+        let mut ancestor = path.as_str();
+        while let Some((parent, _)) = ancestor.rsplit_once('/') {
+            if written_paths.contains(parent) {
+                return Err("knowledge destination conflicts with a parent file".to_owned());
+            }
+            ancestor = parent;
+        }
     }
     let mut paths = BTreeSet::new();
     for change in &transaction.changes {
@@ -1332,29 +1458,94 @@ fn recover(root: &Path) -> Result<(), String> {
             ));
         }
     }
-    // Validate every input before touching any remaining file.
-    for change in transaction.changes {
-        let destination = safe_file(root, &change.path)?;
-        let current = read_bounded(&destination, file_limit(&change.path))?.map(|text| hash(&text));
-        if current == change.after.as_deref().map(hash) {
-            continue;
-        }
-        if current != change.before {
-            return Err("knowledge changed while recovering its transaction".to_owned());
-        }
-        if let Some(text) = change.after {
-            atomic_write(root, &change.path, &text)?;
-        } else {
-            fs::remove_file(&destination).map_err(error)?;
-            sync_directory(
-                destination
-                    .parent()
-                    .ok_or("invalid knowledge destination")?,
-            )?;
+    Ok(())
+}
+
+/// Keep successful writes within the same entry budget used by later reads.
+fn validate_entry_budget(root: &Path, changes: &[Change]) -> Result<(), String> {
+    let mut entries = BTreeSet::new();
+    let mut duplicate_entries = 0;
+    let mut directories = BTreeSet::new();
+    let mut queue = if root.exists() {
+        vec![root.to_path_buf()]
+    } else {
+        Vec::new()
+    };
+    while let Some(directory) = queue.pop() {
+        for entry in fs::read_dir(directory).map_err(error)? {
+            let entry = entry.map_err(error)?;
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .map_err(error)?
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            // The recovery journal is removed before the next store read.
+            if relative == PENDING {
+                continue;
+            }
+            if !entries.insert(normalized(&relative)) {
+                duplicate_entries += 1;
+            }
+            if entries.len() + duplicate_entries > 8192 {
+                return Err("knowledge directory entry limit exceeded".to_owned());
+            }
+            let metadata = fs::symlink_metadata(&path).map_err(error)?;
+            if metadata.is_dir()
+                && !is_link(&metadata)
+                && !entry.file_name().to_string_lossy().starts_with('.')
+            {
+                directories.insert(normalized(&relative));
+                queue.push(path);
+            }
         }
     }
-    fs::remove_file(safe_file(root, PENDING)?).map_err(error)?;
-    sync_directory(root)
+    for change in changes {
+        let path = normalized(&change.path);
+        if change.after.is_none() {
+            entries.remove(&path);
+        } else {
+            entries.insert(path.clone());
+            let mut ancestor = path.as_str();
+            while let Some((parent, _)) = ancestor.rsplit_once('/') {
+                entries.insert(parent.to_owned());
+                directories.insert(parent.to_owned());
+                ancestor = parent;
+            }
+        }
+    }
+    let mut pruned = changes
+        .iter()
+        .filter(|change| change.after.is_none())
+        .filter_map(|change| change.path.strip_suffix(&format!("/{CATEGORY_MARKER}")))
+        .map(normalized)
+        .collect::<Vec<_>>();
+    pruned.sort_by_key(|path| std::cmp::Reverse(path.split('/').count()));
+    for directory in pruned {
+        let prefix = format!("{directory}/");
+        if directories.contains(&directory) && !entries.iter().any(|path| path.starts_with(&prefix))
+        {
+            entries.remove(&directory);
+        }
+    }
+    if entries.len() + duplicate_entries > 8192 {
+        return Err("knowledge directory entry limit exceeded".to_owned());
+    }
+    Ok(())
+}
+
+fn cleanup_category_marker(destination: &Path) {
+    if destination
+        .file_name()
+        .is_some_and(|name| name == CATEGORY_MARKER)
+    {
+        // Never recurse or remove a directory that still contains data.
+        if let Some(parent) = destination.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1516,6 +1707,115 @@ mod tests {
     }
 
     #[test]
+    fn external_markdown_links_update_graph_backlinks_and_deletion_guards() {
+        let (_dir, store) = store();
+        let target = store
+            .write(input("concepts/École notes.md", "target fact"))
+            .unwrap();
+        fs::create_dir_all(store.root.join("notes")).unwrap();
+        fs::write(
+            store.root.join("notes/ref.md"),
+            "# Reference\n[Read](../concepts/%C3%89cole%20notes.md#details \"title\")\n",
+        )
+        .unwrap();
+        let graph = store.graph().unwrap();
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].target, target.path);
+        assert_eq!(
+            store.document(&target.path).unwrap().backlinks,
+            ["notes/ref.md"]
+        );
+        assert!(
+            store
+                .delete(&target.path, &target.hash)
+                .unwrap_err()
+                .contains("backlinks")
+        );
+        fs::write(store.root.join("notes/ref.md"), "# Reference\nlink removed").unwrap();
+        assert!(store.document(&target.path).unwrap().backlinks.is_empty());
+        fs::write(
+            store.root.join("notes/ref.md"),
+            "# Reference\n[Read](<../concepts/École notes.md>)",
+        )
+        .unwrap();
+        assert_eq!(store.graph().unwrap().edges.len(), 1);
+        fs::remove_file(store.root.join("notes/ref.md")).unwrap();
+        store.delete(&target.path, &target.hash).unwrap();
+    }
+
+    #[test]
+    fn markdown_graph_excludes_code_images_remote_self_and_escaping_links() {
+        let (_dir, store) = store();
+        store.write(input("target.md", "target")).unwrap();
+        fs::create_dir_all(store.root.join("notes")).unwrap();
+        fs::write(
+            store.root.join("notes/ref.md"),
+            concat!(
+                "# Reference\n[Valid](../target.md#part)\n[Duplicate](<../target.md> 'title')\n",
+                "![Image](../target.md)\n`[Code](../target.md)`\n",
+                "```markdown\n[Fenced](../target.md)\n```\n",
+                "~~~\n[Tilde](../target.md)\n~~~\n    [Indented](../target.md)\n",
+                "<!-- [Comment](../target.md) -->\n[Remote](https://example.com/target.md)\n",
+                "[Absolute](/target.md)\n[Drive](C:/target.md)\n[Outside](../../target.md)\n",
+                "[EncodedOutside](%2e%2e/%2e%2e/target.md)\n[Missing](../missing.md)\n",
+                "[Self](ref.md#anchor)\n[Anchor](#anchor)\n"
+            ),
+        )
+        .unwrap();
+        let graph = store.graph().unwrap();
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].source, "notes/ref.md");
+        assert_eq!(graph.edges[0].target, "target.md");
+        fs::write(
+            store.root.join("notes/ref.md"),
+            concat!(
+                "# Reference\n![Image](../target.md)\n`[Code](../target.md)`\n",
+                "```\n[Fenced](../target.md)\n```\n<!-- [Comment](../target.md) -->\n",
+                "[Outside](../../target.md)\n[Self](ref.md)\n"
+            ),
+        )
+        .unwrap();
+        assert!(store.graph().unwrap().edges.is_empty());
+    }
+
+    #[test]
+    fn native_content_links_and_reference_links_use_actual_page_paths() {
+        let (_dir, store) = store();
+        store.write(input("Target (one).md", "fact")).unwrap();
+        let value = store
+            .write(input(
+                "notes/ref.md",
+                concat!(
+                    "[Inline](../Target%20%28one%29.md)\n[Reference][ID]\n",
+                    "[ID]: <../Target (one).md#part> \"title\"\n",
+                    "[Unused]: ../missing.md\n"
+                ),
+            ))
+            .unwrap();
+        assert_eq!(value.related, ["Target (one).md"]);
+        assert_eq!(store.graph().unwrap().edges.len(), 1);
+    }
+
+    #[test]
+    fn console_document_is_full_bounded_and_respects_off_and_safe_paths() {
+        let (_dir, store) = store();
+        let value = store
+            .write(input("long.md", &"long reference\n".repeat(5000)))
+            .unwrap();
+        assert!(store.read("long.md", 1, 200).unwrap().truncated);
+        let document = store.document("long.md").unwrap();
+        assert_eq!(document.page.hash, value.hash);
+        assert_eq!(
+            document.content,
+            fs::read_to_string(store.root.join("long.md")).unwrap()
+        );
+        assert!(store.document("../long.md").is_err());
+        store.set_enabled(false).unwrap();
+        assert!(store.document("long.md").is_err());
+        assert!(store.corpus().is_err());
+    }
+
+    #[test]
     fn invalid_paths_and_missing_related_pages_are_refused() {
         let (_dir, store) = store();
         for path in [
@@ -1533,7 +1833,7 @@ mod tests {
             "COM1.md",
             "bad .md/next.md",
             "a.md:stream",
-            "a.txt",
+            "a.pdf",
         ] {
             // A space before the extension is valid; trailing component spaces are not.
             if path == "bad .md/next.md" {
