@@ -98,7 +98,9 @@
             "config_trust_required",
             "backup_manifest_invalid",
             "restore_target_conflict",
-            "retention_refused"
+            "retention_refused",
+            "resource_not_found",
+            "access_denied"
           ],
           "type": "string"
         },

@@ -116,11 +116,18 @@ pub enum ErrorCode {
     BackupManifestInvalid,
     RestoreTargetConflict,
     RetentionRefused,
+    /// A remote resource answered that it does not exist (HTTP 404, 410):
+    /// asking again will not find it.
+    ResourceNotFound,
+    /// A remote resource refused this client (HTTP 401, 403): it needs a login
+    /// or a key, or it turns automated readers away.
+    AccessDenied,
 }
 
 impl ErrorCode {
     /// The stable serialized spelling for diagnostics and scripting.
     #[must_use]
+    #[allow(clippy::too_many_lines, reason = "one arm per error code")]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidHash => "invalid_hash",
@@ -221,6 +228,8 @@ impl ErrorCode {
             Self::BackupManifestInvalid => "backup_manifest_invalid",
             Self::RestoreTargetConflict => "restore_target_conflict",
             Self::RetentionRefused => "retention_refused",
+            Self::ResourceNotFound => "resource_not_found",
+            Self::AccessDenied => "access_denied",
         }
     }
 }
@@ -265,6 +274,7 @@ impl ErrorCode {
     /// The retry class of this failure. Total by construction: adding a code
     /// forces an explicit decision here.
     #[must_use]
+    #[allow(clippy::too_many_lines, reason = "one arm per error code")]
     pub const fn retry_class(self) -> RetryClass {
         match self {
             Self::WriterLocked
@@ -364,7 +374,9 @@ impl ErrorCode {
             | Self::SourceUnavailable
             | Self::EditNotFound
             | Self::EditAmbiguous
-            | Self::BackupManifestInvalid => RetryClass::Never,
+            | Self::BackupManifestInvalid
+            | Self::ResourceNotFound
+            | Self::AccessDenied => RetryClass::Never,
         }
     }
 
@@ -372,6 +384,7 @@ impl ErrorCode {
     /// 2 invalid usage/config, 3 waiting for input or action, 4 execution failed,
     /// 5 ownership/conflict, 130 user cancel, 1 otherwise.
     #[must_use]
+    #[allow(clippy::too_many_lines, reason = "one arm per error code")]
     pub const fn exit_code(self) -> u8 {
         match self {
             Self::ProviderCanceled | Self::ProcessCanceled => 130,
@@ -470,7 +483,9 @@ impl ErrorCode {
             | Self::SkillUnavailable
             | Self::SourceUnavailable
             | Self::EditNotFound
-            | Self::EditAmbiguous => 1,
+            | Self::EditAmbiguous
+            | Self::ResourceNotFound
+            | Self::AccessDenied => 1,
         }
     }
 }

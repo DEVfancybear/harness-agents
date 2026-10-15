@@ -337,7 +337,23 @@ impl WebHost {
 
     async fn search(&self, query: &str, results: usize) -> Result<String, HarnessError> {
         let body = match &self.inner.serper_key {
-            Some(key) => self.serper(query, key, results).await?,
+            Some(key) => match self.serper(query, key, results).await {
+                Ok(body) => body,
+                // Serper down, out of quota or refusing the key: the keyless
+                // provider still answers, and the note says why it was used.
+                Err(error) => {
+                    let hint = if error.code() == ErrorCode::AccessDenied {
+                        " Ask the user to run /login serper with a valid key."
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "(Google results via Serper failed: {}; these come from DuckDuckGo.{hint})\n\n{}",
+                        error.message(),
+                        self.fallback_search(query, results).await?
+                    )
+                }
+            },
             None => self.fallback_search(query, results).await?,
         };
         Ok(format!("Results for query \"{query}\":\n\n{body}"))
@@ -358,13 +374,11 @@ impl WebHost {
         let status = response.status();
         let bytes = read_bounded(response).await?;
         if !status.is_success() {
-            return Err(unavailable(format!(
-                "Serper answered {status}: {}",
-                String::from_utf8_lossy(&bytes)
-                    .chars()
-                    .take(300)
-                    .collect::<String>()
-            )));
+            let body = String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(300)
+                .collect::<String>();
+            return Err(http_error(&format!("Serper ({body})"), status));
         }
         let data: Value = serde_json::from_slice(&bytes)
             .map_err(|_| unavailable("Serper did not answer with JSON"))?;
@@ -438,7 +452,7 @@ impl WebHost {
             .to_ascii_lowercase();
         let bytes = read_bounded(response).await?;
         if !status.is_success() {
-            return Err(unavailable(format!("{final_url} answered {status}")));
+            return Err(http_error(final_url.as_str(), status));
         }
         let declared = charset_of(&content_type, &bytes);
         let looks_like_html = content_type.contains("html")
@@ -529,6 +543,35 @@ fn with_cause(error: &reqwest::Error) -> String {
 
 fn unavailable(message: impl Into<String>) -> HarnessError {
     HarnessError::new(ErrorCode::ServiceUnavailable, message)
+}
+
+/// What a non-success status tells the model, by what retrying can do. Every
+/// status used to be `service_unavailable` - transient - so a 404 or a 403 read
+/// as "try again later" and the model fetched dead or closed pages again.
+fn http_error(what: &str, status: reqwest::StatusCode) -> HarnessError {
+    let (code, advice) = match status.as_u16() {
+        404 | 410 => (
+            ErrorCode::ResourceNotFound,
+            "it does not exist; check the address or search for the page",
+        ),
+        401 | 403 | 407 | 451 => (
+            ErrorCode::AccessDenied,
+            "it refuses this reader (a login, a key, or automated access blocked); try another source",
+        ),
+        429 => (
+            ErrorCode::RateLimited,
+            "too many requests; wait before asking again, or try another source",
+        ),
+        408 | 500..=599 => (
+            ErrorCode::ServiceUnavailable,
+            "the server failed; it may answer later",
+        ),
+        _ => (
+            ErrorCode::InvalidPayload,
+            "the request was refused as it is; repeating it will not change that",
+        ),
+    };
+    HarnessError::new(code, format!("{what} answered {status}: {advice}"))
 }
 
 /// Read a response body, stopping at [`MAX_DOWNLOAD_BYTES`].
@@ -1285,7 +1328,19 @@ mod tests {
                     }
                     let text = String::from_utf8_lossy(&request).into_owned();
                     let path = text.split_whitespace().nth(1).unwrap_or("/").to_owned();
-                    let (kind, body): (&str, Vec<u8>) = if path.starts_with("/html/") {
+                    let mut status = "200 OK".to_owned();
+                    let (kind, body): (&str, Vec<u8>) = if let Some(code) =
+                        path.strip_prefix("/status/")
+                    {
+                        status = format!("{code} Status");
+                        ("text/plain", b"no".to_vec())
+                    } else if path.starts_with("/denied") {
+                        status = "403 Forbidden".to_owned();
+                        (
+                            "application/json",
+                            br#"{"message":"Unauthorized."}"#.to_vec(),
+                        )
+                    } else if path.starts_with("/html/") {
                         assert!(text.starts_with("POST "), "the form is posted: {text}");
                         assert!(text.contains("q=rust+book"), "{text}");
                         ("text/html; charset=utf-8", DUCK_PAGE.as_bytes().to_vec())
@@ -1305,7 +1360,7 @@ mod tests {
                         ("application/pdf", vec![0x25, 0x50, 0x44, 0x46, 0, 1, 2, 3])
                     };
                     let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
                     socket.write_all(head.as_bytes()).await.expect("headers");
@@ -1403,6 +1458,50 @@ mod tests {
             google.contains("Result 1: Rust\nURL: https://rust-lang.org\nFast."),
             "{google}"
         );
+    }
+
+    /// A failed page says what retrying can do: every status read as
+    /// `service_unavailable` (transient), so dead and closed pages were fetched
+    /// again. A Serper key it refuses falls back to the keyless search.
+    #[tokio::test]
+    async fn a_failed_page_says_whether_asking_again_can_help() {
+        let base = serve().await;
+        let host = WebHost::build(
+            Some("test-key".to_owned()),
+            format!("{base}/denied"),
+            format!("{base}/html/"),
+            true,
+        )
+        .expect("client");
+        for (status, code) in [
+            (404, super::ErrorCode::ResourceNotFound),
+            (410, super::ErrorCode::ResourceNotFound),
+            (403, super::ErrorCode::AccessDenied),
+            (401, super::ErrorCode::AccessDenied),
+            (429, super::ErrorCode::RateLimited),
+            (503, super::ErrorCode::ServiceUnavailable),
+            (400, super::ErrorCode::InvalidPayload),
+        ] {
+            let parsed = host
+                .parse(
+                    "web_fetch",
+                    &json!({"url": format!("{base}/status/{status}")}),
+                )
+                .expect("arguments");
+            let error = host.run(parsed).await.expect_err("a failed page");
+            assert_eq!(error.code(), code, "{status}: {}", error.message());
+            assert!(
+                error.message().contains(&status.to_string()),
+                "{}",
+                error.message()
+            );
+        }
+        let found = call(&host, "web_search", json!({"query": "rust book"}))
+            .await
+            .expect("the keyless search answers");
+        assert!(found.contains("Result 1: Learn Rust"), "{found}");
+        assert!(found.contains("Serper failed"), "{found}");
+        assert!(found.contains("/login serper"), "{found}");
     }
 
     /// A page on the web must not steer the agent into the user's own network.
