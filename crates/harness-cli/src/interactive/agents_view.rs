@@ -33,7 +33,6 @@ use crossterm::{execute, terminal};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -907,10 +906,43 @@ enum Item<'a> {
     Row(&'a Row),
 }
 
+/// The mark before a row: what the agent, subagent or saved session is doing.
+fn status_mark(row: &Row, theme: &Theme) -> (&'static str, ratatui::style::Style) {
+    match (&row.target, row.kind) {
+        (_, RowKind::Code | RowKind::SubagentSummary) => (" ", theme.dim),
+        (_, RowKind::Subagent) => {
+            let status = row.title.rsplit(" · ").next().unwrap_or_default();
+            match status {
+                "running" => ("●", theme.tool_ok),
+                "error" => ("✗", theme.error),
+                _ => ("✓", theme.dim),
+            }
+        }
+        (Target::Live(listed), _) => {
+            let status = listed.agent.status.as_str();
+            if status.starts_with("waiting") {
+                ("◐", theme.warning)
+            } else if row.section == Section::Running {
+                ("●", theme.tool_ok)
+            } else if status == "setup_required" {
+                ("!", theme.warning)
+            } else {
+                ("○", theme.muted)
+            }
+        }
+        (Target::Saved(_), _) => ("·", theme.dim),
+    }
+}
+
+/// The model without the endpoint it is reached through.
+fn short_model(model: &str) -> &str {
+    model.split(" via ").next().unwrap_or(model)
+}
+
 #[allow(clippy::too_many_lines)] // one frame, top to bottom
 fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
     let area = frame.area();
-    if area.height < 6 || area.width < 20 {
+    if area.height < 8 || area.width < 30 {
         return;
     }
     let width = usize::from(area.width);
@@ -920,12 +952,39 @@ fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
             Rect::new(area.x, area.y + y, area.width, 1),
         );
     };
-    line(0, Line::from(Span::styled(" Agents", theme.title)), frame);
-    // The prompt line: the search, or the reply / rename being written.
     let rows = view.rows();
     let selected = view.selection(&rows);
+    // The title bar: what the view holds.
+    let count = |section: Section| {
+        rows.iter()
+            .filter(|row| row.section == section && row.kind == RowKind::Agent)
+            .count()
+    };
+    let mut title = vec![
+        Span::styled(" ✦ Agents ".to_owned(), theme.badge_accent),
+        Span::raw("  "),
+    ];
+    for (index, (section, label, style)) in [
+        (Section::Running, "running", theme.tool_ok),
+        (Section::Idle, "idle", theme.muted),
+        (Section::Inactive, "saved", theme.dim),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            title.push(Span::styled(" · ".to_owned(), theme.dim));
+        }
+        title.push(Span::styled(format!("{} {label}", count(section)), style));
+    }
+    line(0, Line::from(title), frame);
+    // The prompt line: the search, or the reply / rename being written.
     let (prefix, text, placeholder) = match &view.composer {
-        Composer::Search => (" › ", view.query.as_str(), "Search sessions"),
+        Composer::Search => (
+            " ⌕ ",
+            view.query.as_str(),
+            "Search sessions, requests, models",
+        ),
         Composer::Reply(identity) => (
             " reply › ",
             view.draft.as_str(),
@@ -943,35 +1002,37 @@ fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
     } else {
         prompt.push(Span::raw(text.to_owned()));
     }
-    line(1, Line::from(prompt), frame);
-    let cursor_x =
-        area.x + u16::try_from(prefix.chars().count() + text.chars().count()).unwrap_or(0);
-    frame.set_cursor_position((cursor_x.min(area.x + area.width - 1), area.y + 1));
+    line(2, Line::from(prompt), frame);
+    let cursor_x = area.x
+        + u16::try_from(
+            super::tui::widgets::composer::display_width(prefix)
+                + super::tui::widgets::composer::display_width(text),
+        )
+        .unwrap_or(0);
+    frame.set_cursor_position((cursor_x.min(area.x + area.width - 1), area.y + 2));
+    line(
+        3,
+        Line::from(Span::styled("─".repeat(width), theme.rule)),
+        frame,
+    );
     // The list: a legend, then the sections (or the ranked hits).
-    let list_top = 3_u16;
+    let list_top = 4_u16;
     let list_bottom = area.height - 2;
     let model_width = rows
         .iter()
-        .map(|row| row.model.chars().count())
+        .map(|row| short_model(&row.model).chars().count())
         .max()
         .unwrap_or(0)
         .clamp(12, 32);
     let age_width = 5;
-    let name_width = width.saturating_sub(model_width + age_width + 8).max(10);
+    let name_width = width.saturating_sub(model_width + age_width + 10).max(10);
     let legend = format!(
-        "  {}  {}  {:>age_width$}",
-        cell("Session", name_width),
-        cell("Model", model_width),
-        "Age"
+        "      {}  {}  {:>age_width$}",
+        cell("SESSION", name_width),
+        cell("MODEL", model_width),
+        "AGE"
     );
-    line(
-        list_top,
-        Line::from(Span::styled(
-            legend,
-            theme.title.add_modifier(Modifier::BOLD),
-        )),
-        frame,
-    );
+    line(list_top, Line::from(Span::styled(legend, theme.dim)), frame);
     let mut items: Vec<Item> = Vec::new();
     if view.query.trim().is_empty() {
         for section in [Section::Running, Section::Idle, Section::Inactive] {
@@ -985,7 +1046,11 @@ fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
             if !items.is_empty() {
                 items.push(Item::Spacer);
             }
-            items.push(Item::Heading(section, members.len()));
+            let agents = members
+                .iter()
+                .filter(|row| row.kind == RowKind::Agent)
+                .count();
+            items.push(Item::Heading(section, agents));
             items.extend(members.into_iter().map(Item::Row));
         }
     } else {
@@ -994,13 +1059,13 @@ fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
     let visible = usize::from(list_bottom.saturating_sub(list_top + 1));
     if items.is_empty() {
         let empty = if view.query.trim().is_empty() {
-            "No sessions yet."
+            "No sessions yet. Ctrl+N starts one."
         } else {
             "No sessions match your search."
         };
         line(
             list_top + 2,
-            Line::from(Span::styled(format!("  {empty}"), theme.dim)),
+            Line::from(Span::styled(format!("   {empty}"), theme.dim)),
             frame,
         );
     } else {
@@ -1018,10 +1083,19 @@ fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
             let y = list_top + 1 + u16::try_from(offset).unwrap_or(0);
             let content = match item {
                 Item::Spacer => Line::default(),
-                Item::Heading(section, count) => Line::from(Span::styled(
-                    format!("{} ({count})", section.title()),
-                    theme.muted,
-                )),
+                Item::Heading(section, count) => {
+                    let label = format!(" {} ", section.title().to_uppercase());
+                    let tally = format!(" {count} ");
+                    let used = label.chars().count() + tally.chars().count() + 2;
+                    Line::from(vec![
+                        Span::styled(label, theme.md_heading),
+                        Span::styled(tally, theme.chip),
+                        Span::styled(
+                            format!(" {}", "─".repeat(width.saturating_sub(used))),
+                            theme.rule,
+                        ),
+                    ])
+                }
                 Item::Row(row) => {
                     if row.selectable() {
                         view.list_rows
@@ -1029,25 +1103,57 @@ fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
                             .push((area.y + y, row.identity.clone()));
                     }
                     let is_selected = Some(row.identity.as_str()) == selected_identity;
-                    let marker = if is_selected { "❯ " } else { "  " };
+                    let marker = if is_selected { " ❯ " } else { "   " };
+                    let (mark, mark_style) = status_mark(row, theme);
                     let indent = "  ".repeat(row.depth);
                     let title = format!("{indent}{}", row.title);
-                    let text = format!(
-                        "{marker}{}  {}  {:>age_width$}",
-                        cell(&title, name_width),
-                        cell(&row.model, model_width),
-                        row.age
-                    );
-                    let style = if is_selected {
+                    let base = if is_selected {
                         theme.selection
                     } else if row.kind == RowKind::Code {
                         theme.muted
                     } else if row.section == Section::Inactive || row.kind != RowKind::Agent {
                         theme.dim
                     } else {
-                        ratatui::style::Style::default()
+                        theme.strong
                     };
-                    Line::from(Span::styled(cell(&text, width), style))
+                    let rest = format!(
+                        "{}  {}  {:>age_width$}",
+                        cell(&title, name_width),
+                        cell(short_model(&row.model), model_width),
+                        row.age
+                    );
+                    let mut spans = vec![
+                        Span::styled(
+                            marker.to_owned(),
+                            if is_selected {
+                                theme.selection
+                            } else {
+                                theme.accent
+                            },
+                        ),
+                        Span::styled(
+                            format!("{mark} "),
+                            if is_selected {
+                                theme.selection
+                            } else {
+                                mark_style
+                            },
+                        ),
+                    ];
+                    let rest = cell(&rest, width.saturating_sub(5));
+                    if is_selected {
+                        spans.push(Span::styled(rest, base));
+                    } else {
+                        // The model and the age read quieter than the title.
+                        let split = rest
+                            .char_indices()
+                            .nth(name_width)
+                            .map_or(rest.len(), |(index, _)| index);
+                        let (name, tail) = rest.split_at(split);
+                        spans.push(Span::styled(name.to_owned(), base));
+                        spans.push(Span::styled(tail.to_owned(), theme.muted));
+                    }
+                    Line::from(spans)
                 }
             };
             line(y, content, frame);
@@ -1061,39 +1167,55 @@ fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
         );
     }
     // prime-agent's hint bar: the keys that act on the selected row.
-    let mut hints = vec!["↑/↓ navigate".to_owned(), "enter/→ open".to_owned()];
+    let mut hints = vec![("↑↓", "navigate"), ("enter", "open")];
     if view.query.is_empty()
         && let Some(row) = selected.map(|index| &rows[index])
     {
         let running = matches!(row.target, Target::Live(_));
         if running {
-            hints.push("ctrl+r rename".to_owned());
+            hints.push(("ctrl+r", "rename"));
         }
-        hints.push("space reply".to_owned());
-        hints.push(
-            if running {
-                "ctrl+x stop"
-            } else {
-                "ctrl+x delete"
-            }
-            .to_owned(),
-        );
+        hints.push(("space", "reply"));
+        hints.push(("ctrl+x", if running { "stop" } else { "delete" }));
         if running
             && rows
                 .iter()
                 .any(|other| other.kind == RowKind::SubagentSummary)
         {
-            hints.push("alt+→ subagents".to_owned());
-            hints.push("ctrl+o program".to_owned());
+            hints.push(("alt+→", "subagents"));
+            hints.push(("ctrl+o", "program"));
         }
     }
-    hints.push("ctrl+n new".to_owned());
-    hints.push("esc quit".to_owned());
-    line(
-        area.height - 1,
-        Line::from(Span::styled(format!(" {}", hints.join("   ")), theme.muted)),
-        frame,
-    );
+    hints.push(("ctrl+n", "new"));
+    hints.push((
+        "esc",
+        if view.came_from.is_some() {
+            "back"
+        } else {
+            "quit"
+        },
+    ));
+    // Too long for the width, the keys between the first two and the last
+    // two go first: Esc stays in view.
+    let length = |hints: &[(&str, &str)]| -> usize {
+        hints
+            .iter()
+            .map(|(key, action)| key.chars().count() + action.chars().count() + 3)
+            .sum::<usize>()
+            + 1
+    };
+    while length(&hints) > width && hints.len() > 4 {
+        hints.remove(2);
+    }
+    let mut bar = vec![Span::raw(" ")];
+    for (index, (key, action)) in hints.into_iter().enumerate() {
+        if index > 0 {
+            bar.push(Span::styled("  ".to_owned(), theme.dim));
+        }
+        bar.push(Span::styled(key.to_owned(), theme.accent));
+        bar.push(Span::styled(format!(" {action}"), theme.muted));
+    }
+    line(area.height - 1, Line::from(bar), frame);
 }
 
 #[cfg(test)]
@@ -1150,6 +1272,74 @@ mod tests {
 
     /// Seen: a conversation woken after a usage limit was listed as
     /// `[heartbeat: at ... run#1]`, "now" for days, its failed children unseen.
+    /// The frame names what each row is doing and the keys that act on it.
+    #[test]
+    fn the_view_draws_marks_sections_and_keys() {
+        let mut running = agent("a1", "running", "t1");
+        running.agent.busy = true;
+        running.agent.model = "deepseek-v4.1-flash via https://api.example/v1".to_owned();
+        running.agent.subagents = vec![super::super::agents::protocol::SubagentInfo {
+            name: "verifier-1".to_owned(),
+            status: "error".to_owned(),
+            model: "m".to_owned(),
+            depth: 1,
+            program: String::new(),
+        }];
+        let view = super::View {
+            registry: std::path::PathBuf::new(),
+            live: vec![running, agent("a2", "waiting_input", "t2")],
+            saved: vec![saved("t1", "ninja school"), saved("t3", "old work")],
+            query: String::new(),
+            draft: String::new(),
+            composer: super::Composer::Search,
+            selected: None,
+            status: None,
+            stop_armed: None,
+            forest: {
+                let mut forest = super::Forest::default();
+                forest.expanded.insert("live:a1".to_owned());
+                forest
+            },
+            list_rows: std::cell::RefCell::new(Vec::new()),
+            store_dir: std::path::PathBuf::new(),
+            came_from: Some("a1".to_owned()),
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 18)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                super::draw(
+                    frame,
+                    &view,
+                    &crate::interactive::tui::theme::Theme::plain(),
+                );
+            })
+            .expect("drawn");
+        let buffer = terminal.backend().buffer().clone();
+        let text = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("{text}");
+        for expected in [
+            "✦ Agents",
+            "2 running",
+            "RUNNING",
+            "● ninja school",
+            "◐ ",
+            "✗",
+            "deepseek-v4.1-flash ",
+            "esc back",
+        ] {
+            assert!(text.contains(expected), "{expected:?} in\n{text}");
+        }
+        assert!(!text.contains("via https"), "{text}");
+    }
+
     /// Seen: a session last answered "ok" was listed as "ok", and searching for
     /// its project found nothing.
     #[test]
