@@ -175,6 +175,24 @@ pub(crate) fn apply_edit_to_normalized_content(
         if let Some(applied) = apply_by_trimmed_lines(&base_content, &old_text, &new_text, path)? {
             return Ok(applied);
         }
+        // CowAgent's gutter retry: a model that copied read_file's `12: ` or
+        // `12#a3: ` prefixes into old_string matched nothing. With every line
+        // carrying one, they are dropped - from new_string too, when its lines
+        // carry them - and the edit is tried once more.
+        if let Some(old_text) = without_read_gutter(&old_text)
+            && !old_text.trim().is_empty()
+        {
+            let new_text = without_read_gutter(&new_text).unwrap_or_else(|| new_text.clone());
+            if let Ok(applied) = apply_edit_to_normalized_content(
+                normalized_content,
+                &old_text,
+                &new_text,
+                replace_all,
+                path,
+            ) {
+                return Ok(applied);
+            }
+        }
         // Measured: a model whose earlier results were shortened sent an edit it
         // had already made, and read only "could not find" - so it tried again.
         // When the replacement text is what the file holds, it is told so.
@@ -384,6 +402,45 @@ pub(crate) fn line_anchor(number: usize, line: &str) -> String {
         line
     };
     format!("{number}#{}", line_hash(line))
+}
+
+/// `text` without the `12: ` or `12#a3: ` prefix read_file puts on each line,
+/// or `None` when a line does not carry one.
+fn without_read_gutter(text: &str) -> Option<String> {
+    let lines = text.split('\n').collect::<Vec<_>>();
+    // A trailing newline leaves an empty last piece that carries no prefix.
+    let counted = if lines.last() == Some(&"") {
+        &lines[..lines.len() - 1]
+    } else {
+        &lines[..]
+    };
+    if counted.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    for line in counted {
+        let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits == 0 {
+            return None;
+        }
+        let mut rest = &line[digits..];
+        if let Some(anchor) = rest.strip_prefix('#') {
+            let hash = anchor.len()
+                - anchor
+                    .trim_start_matches(|c: char| c.is_ascii_alphanumeric())
+                    .len();
+            if hash == 0 {
+                return None;
+            }
+            rest = &anchor[hash..];
+        }
+        let rest = rest.strip_prefix(':')?;
+        out.push(rest.strip_prefix(' ').unwrap_or(rest));
+    }
+    if counted.len() < lines.len() {
+        out.push("");
+    }
+    Some(out.join("\n"))
 }
 
 /// `12#a3` as a line number and a hash.
@@ -712,6 +769,31 @@ mod tests {
 
     fn plan(current: &str, old: &str, new: &str) -> Result<PlannedEdit, HarnessError> {
         plan_edit(current, old, new, false, "f.txt")
+    }
+
+    /// Seen: a model copied read_file's `12: ` prefixes into old_string and
+    /// matched nothing. The prefixes are dropped and the edit tried again.
+    #[test]
+    fn read_file_line_prefixes_copied_into_an_edit_are_dropped() {
+        let current = "fn main() {\n    println!(\"hi\");\n}\n";
+        let planned = plan(
+            current,
+            "2:     println!(\"hi\");\n3: }",
+            "2:     println!(\"bye\");\n3: }",
+        )
+        .expect("numbered lines");
+        assert_eq!(planned.content, "fn main() {\n    println!(\"bye\");\n}\n");
+        // Hashline anchors too, with a new_string written plainly.
+        let planned = plan(current, "2#ab:     println!(\"hi\");\n", "    todo!();\n")
+            .expect("anchored line");
+        assert_eq!(planned.content, "fn main() {\n    todo!();\n}\n");
+        // Text that only looks numbered in places is not touched.
+        assert!(plan(current, "2: nothing\nplain", "x").is_err());
+        assert_eq!(
+            super::without_read_gutter("12: a\n13: b\n"),
+            Some("a\nb\n".to_owned())
+        );
+        assert_eq!(super::without_read_gutter("12: a\nb"), None);
     }
 
     #[test]
