@@ -1326,6 +1326,8 @@ impl Agent {
         let conversation = self.controller.conversation_id();
         let subagents = self.controller.subagents();
         let heartbeats = self.controller.heartbeat_count();
+        // `/model` changes it mid-session; the agents view read the launch's.
+        let model = self.controller.model_label();
         let mut moved = false;
         if let Ok(mut status) = self.status.lock() {
             moved = status.info.conversation != conversation;
@@ -1338,6 +1340,7 @@ impl Agent {
             status.info.last_request = state.last_request;
             status.info.title = self.controller.session_title();
             status.info.conversation = conversation;
+            status.info.model = model;
         }
         // The journal names the conversation a worker that dies brings the
         // agent back on. Written only on the supervisor's sweep, a worker that
@@ -1359,6 +1362,19 @@ impl Agent {
                 Effect::History(item) => Some(item.clone()),
                 Effect::Stream(text) => Some(HistoryItem::Assistant { text: text.clone() }),
                 Effect::Thinking(text) => Some(HistoryItem::Thinking { text: text.clone() }),
+                // The model or the level changed: the banner a terminal gets on
+                // attach names the one in use, not the one the agent started on.
+                Effect::Banner(lines) => {
+                    if let Some(HistoryItem::Banner { lines: banner }) = self
+                        .history
+                        .iter_mut()
+                        .find(|item| matches!(item, HistoryItem::Banner { .. }))
+                    {
+                        banner.clone_from(lines);
+                    }
+                    self.banner.clone_from(lines);
+                    None
+                }
                 Effect::Exit(_) => {
                     exit = true;
                     None
@@ -2210,6 +2226,81 @@ mod tests {
             worker.0.create(spec).is_ok(),
             "finishing releases admission"
         );
+    }
+
+    /// Seen: `/model` and `/effort` in an agent changed its status row, but the
+    /// agents view and the banner a terminal got on attach kept the launch's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_model_chosen_later_reaches_the_agents_view_and_the_banner() {
+        let (_temp, worker, mut spec) = resume_worker().await;
+        spec.resume = None;
+        // Launched with `--model`, as `ha chat --model ...` starts one.
+        spec.model = Some("deepseek/deepseek-v4-flash".to_owned());
+        spec.environment
+            .push(("DEEPSEEK_API_KEY".to_owned(), "test-key".to_owned()));
+        let created = {
+            let worker = Arc::clone(&worker.0);
+            tokio::task::spawn_blocking(move || worker.create(spec))
+                .await
+                .expect("join")
+                .expect("agent")
+        };
+        assert!(
+            !created.model.contains("deepseek-v4-pro"),
+            "{}",
+            created.model
+        );
+        for command in ["/model deepseek/deepseek-v4-pro", "/effort high"] {
+            worker
+                .0
+                .send(
+                    &created.id,
+                    command.to_owned(),
+                    super::SendMode::Auto,
+                    false,
+                )
+                .expect("sent");
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let listed = loop {
+            let model = worker.0.list().first().map(|agent| agent.model.clone());
+            if model
+                .as_deref()
+                .is_some_and(|model| model.contains("deepseek-v4-pro"))
+                || std::time::Instant::now() > deadline
+            {
+                break model.unwrap_or_default();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(listed.contains("deepseek-v4-pro"), "agents view: {listed}");
+
+        let (out, replies) = std::sync::mpsc::channel();
+        worker
+            .0
+            .inbox(&created.id)
+            .expect("inbox")
+            .send(super::Command::Attach {
+                connection: 99,
+                out,
+                columns: 100,
+            })
+            .expect("attach");
+        let Ok(super::Reply::Attached {
+            banner, history, ..
+        }) = replies.recv_timeout(Duration::from_secs(10))
+        else {
+            panic!("no attach reply");
+        };
+        eprintln!("LISTED {listed}\nHISTORY {history:#?}");
+        let banner = banner.join("\n");
+        assert!(banner.contains("deepseek-v4-pro"), "{banner}");
+        assert!(banner.contains("Thinking: high"), "{banner}");
+        let Some(crate::interactive::events::HistoryItem::Banner { lines }) = history.first()
+        else {
+            panic!("history starts with the banner");
+        };
+        assert!(lines.join("\n").contains("deepseek-v4-pro"), "{lines:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

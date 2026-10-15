@@ -9,7 +9,8 @@
 //! reply: sent to an agent, or the prompt a saved conversation resumes
 //! with in the background. Ctrl+R renames an agent, Ctrl+X stops a running
 //! one or deletes a saved one (press twice), Ctrl+N starts a new session, Esc
-//! leaves. The roster refreshes every second.
+//! goes back to the session the view was opened from (`ha agents` has none:
+//! there Esc leaves). The roster refreshes every second.
 //!
 //! prime-agent's subagent forest: an agent with subagents carries one
 //! `N subagents (M running)` line; Alt+Right expands it to the subagents
@@ -348,9 +349,27 @@ struct View {
     /// Where the list's first row was drawn, for the mouse.
     list_rows: std::cell::RefCell<Vec<(u16, String)>>,
     store_dir: PathBuf,
+    /// The agent whose session opened the view: Esc goes back to it.
+    came_from: Option<String>,
 }
 
 impl View {
+    /// Esc: back to the session the view was opened from while its agent
+    /// still runs on this build, else out of the view.
+    fn back(&self) -> Choice {
+        self.came_from
+            .as_ref()
+            .and_then(|id| {
+                self.live.iter().find(|listed| {
+                    listed.agent.id == *id
+                        && listed.descriptor.build == super::agents::registry::build_identity()
+                })
+            })
+            .map_or(Choice::Quit, |listed| {
+                Choice::Open(Box::new(listed.clone()))
+            })
+    }
+
     fn rows(&self) -> Vec<Row> {
         rows_with(
             &self.live,
@@ -445,6 +464,7 @@ pub fn run(
     context: &LaunchContext,
     environment: &LaunchEnvironment,
     notice: Option<String>,
+    came_from: Option<String>,
 ) -> Result<Choice, String> {
     let registry = client::user_registry()?;
     let mut view = View {
@@ -460,6 +480,7 @@ pub fn run(
         forest: Forest::default(),
         list_rows: std::cell::RefCell::new(Vec::new()),
         store_dir: context.project_store_dir(),
+        came_from,
     };
     let mut stdout = io::stdout();
     execute!(
@@ -564,7 +585,9 @@ fn handle_key(
     let empty = view.query.is_empty();
     match key.code {
         KeyCode::Esc if !empty => view.query.clear(),
-        KeyCode::Esc => return Some(Choice::Quit),
+        // Seen: Esc in a view opened from a session ended ha instead of going
+        // back to that session.
+        KeyCode::Esc => return Some(view.back()),
         KeyCode::Char('d') if control && empty => return Some(Choice::Quit),
         KeyCode::Up => view.move_selection(-1),
         KeyCode::Down => view.move_selection(1),
@@ -1054,6 +1077,41 @@ mod tests {
             model: None,
             updated_at: "2026-10-06 10:00:00".to_owned(),
             turns: 2,
+        }
+    }
+
+    /// Esc goes back to the agent the view was opened from while it runs on
+    /// this build; opened by `ha agents`, or with that agent gone, it leaves.
+    #[test]
+    fn esc_goes_back_to_the_session_the_view_was_opened_from() {
+        let mut current = agent("a1", "ready", "t1");
+        current.descriptor.build = super::super::agents::registry::build_identity();
+        let mut other_build = agent("a2", "ready", "t2");
+        other_build.descriptor.build = "older".to_owned();
+        let view = |came_from: Option<&str>| super::View {
+            registry: std::path::PathBuf::new(),
+            live: vec![current.clone(), other_build.clone()],
+            saved: Vec::new(),
+            query: String::new(),
+            draft: String::new(),
+            composer: super::Composer::Search,
+            selected: None,
+            status: None,
+            stop_armed: None,
+            forest: super::Forest::default(),
+            list_rows: std::cell::RefCell::new(Vec::new()),
+            store_dir: std::path::PathBuf::new(),
+            came_from: came_from.map(str::to_owned),
+        };
+        assert!(matches!(
+            view(Some("a1")).back(),
+            super::Choice::Open(listed) if listed.agent.id == "a1"
+        ));
+        for came_from in [None, Some("a2"), Some("gone")] {
+            assert!(
+                matches!(view(came_from).back(), super::Choice::Quit),
+                "{came_from:?}"
+            );
         }
     }
 

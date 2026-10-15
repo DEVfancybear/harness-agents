@@ -145,7 +145,8 @@ fn run_terminal(
             Ok(mut remote) => {
                 let code = run_remote(backend, &mut remote, prefs)?;
                 if code == super::agents_view::AGENTS_VIEW_EXIT {
-                    return agents_view_loop(context, environment, None);
+                    let came_from = Some(remote.agent().id.clone());
+                    return agents_view_loop(context, environment, None, came_from);
                 }
                 return Ok(code);
             }
@@ -205,11 +206,12 @@ pub fn agents_view_loop(
     context: &LaunchContext,
     environment: &LaunchEnvironment,
     mut notice: Option<String>,
+    mut came_from: Option<String>,
 ) -> Result<u8, HarnessError> {
     let refused = |message: String| HarnessError::new(ErrorCode::RuntimeBlocked, message);
     loop {
-        let choice =
-            super::agents_view::run(context, environment, notice.take()).map_err(refused)?;
+        let choice = super::agents_view::run(context, environment, notice.take(), came_from.take())
+            .map_err(refused)?;
         let backend = CrosstermBackend;
         let size = backend.size().unwrap_or((TUI_MIN_COLUMNS, TUI_MIN_ROWS));
         let prefs = super::tui::fullscreen::prefs(environment, &context.paths.config_file);
@@ -256,6 +258,7 @@ pub fn agents_view_loop(
         if code != super::agents_view::AGENTS_VIEW_EXIT {
             return Ok(code);
         }
+        came_from = Some(remote.agent().id.clone());
     }
 }
 
@@ -275,7 +278,7 @@ pub fn agents_view_command() -> Result<ExitCode, HarnessError> {
             format!("the agents view needs an interactive terminal ({error})"),
         )
     })?;
-    let code = agents_view_loop(&context, &environment, None)?;
+    let code = agents_view_loop(&context, &environment, None, None)?;
     Ok(ExitCode::from(code))
 }
 
@@ -328,7 +331,8 @@ pub fn attach(selector: &str) -> Result<ExitCode, HarnessError> {
     // project, then whatever it opens.
     if code == super::agents_view::AGENTS_VIEW_EXIT {
         let context = resolve_context(&AppLaunch::default(), &environment)?;
-        code = agents_view_loop(&context, &environment, None)?;
+        let came_from = Some(remote.agent().id.clone());
+        code = agents_view_loop(&context, &environment, None, came_from)?;
     }
     drop(guard);
     Ok(ExitCode::from(code))

@@ -69,6 +69,12 @@ impl TurnModelSelection {
         self.pending_model = Some(model);
     }
 
+    /// The model the next turn uses: one chosen for it, else the one in use.
+    /// What the header, `/config` and `/permissions` name.
+    fn chosen(&self) -> Option<&String> {
+        self.pending_model.as_ref().or(self.active_model.as_ref())
+    }
+
     fn begin_turn(&mut self) -> Option<String> {
         if let Some(model) = self.pending_model.take() {
             self.active_model = Some(model);
@@ -79,6 +85,16 @@ impl TurnModelSelection {
 
 #[cfg(test)]
 mod g03_model_selection_tests {
+
+    /// The header names a model chosen for the next turn at once, not after it.
+    #[test]
+    fn a_model_chosen_for_the_next_turn_is_the_one_named_now() {
+        let mut selection = super::TurnModelSelection::with_initial(Some("first".to_owned()));
+        selection.select_for_next_turn("second".to_owned());
+        assert_eq!(selection.chosen().map(String::as_str), Some("second"));
+        assert_eq!(selection.begin_turn().as_deref(), Some("second"));
+        assert_eq!(selection.chosen().map(String::as_str), Some("second"));
+    }
 
     /// prime-agent's `a_model_switch_updates_the_model_and_level_atomically`:
     /// every snapshot a model call takes carries a consistent (model, level)
@@ -3660,7 +3676,7 @@ impl AgentSessionService {
     fn configured(&self) -> Result<ProviderConfig, String> {
         let mut overrides = self.config_overrides.clone();
         if let Ok(selection) = self.model_selection.lock()
-            && let Some(model) = &selection.active_model
+            && let Some(model) = selection.chosen()
         {
             overrides.model = Some(model.clone());
         }
@@ -4205,7 +4221,7 @@ impl SessionPort for AgentSessionService {
     fn config_explain(&self) -> Vec<String> {
         let mut overrides = self.config_overrides.clone();
         if let Ok(selection) = self.model_selection.lock()
-            && let Some(model) = &selection.active_model
+            && let Some(model) = selection.chosen()
         {
             overrides.model = Some(model.clone());
         }
@@ -5000,6 +5016,10 @@ impl SessionPort for AgentSessionService {
             if let Ok(mut selection) = self.model_selection.lock() {
                 *selection = TurnModelSelection::default();
             }
+            // The launch's `--model` is a command-line layer above the saved
+            // selection: kept, it went on answering every turn after `/model`.
+            self.config_overrides.model = None;
+            self.config_overrides.model_selection = None;
             let ready = credentials::source_for(
                 &self.environment,
                 &self.data_dir,
@@ -5411,7 +5431,7 @@ impl SessionPort for AgentSessionService {
     fn permissions_summary(&mut self) -> Vec<String> {
         let mut overrides = self.config_overrides.clone();
         if let Ok(selection) = self.model_selection.lock()
-            && let Some(model) = &selection.active_model
+            && let Some(model) = selection.chosen()
         {
             overrides.model = Some(model.clone());
         }
