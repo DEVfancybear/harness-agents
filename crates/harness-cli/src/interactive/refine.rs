@@ -1445,8 +1445,30 @@ fn tail(conversation: &str, limit: usize) -> String {
     format!("[Earlier conversation omitted to fit the model context.]\n{kept}")
 }
 
-/// One model call, answered as text.
+/// The most output one refinement call may be given on its retry.
+const RETRY_MAX_OUTPUT_TOKENS: u32 = 65_536;
+
+/// One model call, answered as text. A reasoning model at a high level spends
+/// its output budget thinking: seen on `DeepSeek` at `max`, every auto refine
+/// ended "stopped before completing its JSON object". Cut off, the call is
+/// made once more with four times the budget.
 async fn complete(
+    provider: &Arc<dyn ModelProvider>,
+    model: &str,
+    system: &str,
+    user: String,
+    max_tokens: u32,
+) -> Result<String, String> {
+    match complete_once(provider, model, system, user.clone(), max_tokens).await {
+        Err(error) if error == TRUNCATED_JSON_ERROR && max_tokens < RETRY_MAX_OUTPUT_TOKENS => {
+            let larger = max_tokens.saturating_mul(4).min(RETRY_MAX_OUTPUT_TOKENS);
+            complete_once(provider, model, system, user, larger).await
+        }
+        result => result,
+    }
+}
+
+async fn complete_once(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
     system: &str,
@@ -2240,6 +2262,29 @@ mod tests {
             );
             self.answers[index].stream(request, cancellation)
         }
+    }
+
+    /// A reasoning model that spent the budget thinking is asked once more
+    /// with a larger one, rather than the refinement failing.
+    #[tokio::test]
+    async fn a_call_cut_off_by_its_budget_is_made_once_more() {
+        use harness_providers::{MockProvider, ProviderStreamEvent};
+        let cut = MockProvider::scripted(vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("{\"summary\": \"half"),
+            ProviderStreamEvent::completed("length"),
+        ]);
+        let provider = std::sync::Arc::new(Replies {
+            answers: vec![cut, MockProvider::text("{\"summary\": \"whole\"}")],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        });
+        let dynamic: std::sync::Arc<dyn harness_providers::ModelProvider> = provider.clone();
+        let text = super::complete(&dynamic, "m", "system", "user".to_owned(), 1024)
+            .await
+            .expect("the retry answers");
+        assert_eq!(text, "{\"summary\": \"whole\"}");
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// A lesson the promoter refused is not lost: the findings go back to the

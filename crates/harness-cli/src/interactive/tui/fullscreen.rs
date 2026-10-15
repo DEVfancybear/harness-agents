@@ -758,7 +758,7 @@ where
                     area.width,
                     area.height.saturating_sub(floor),
                 );
-                let plan = layout::plan(dock_area, state, &theme);
+                let mut plan = layout::plan(dock_area, state, &theme);
                 dock_top = [plan.live, plan.modal, plan.queue, plan.suggest]
                     .into_iter()
                     .flatten()
@@ -814,6 +814,14 @@ where
                     .cloned()
                     .collect::<Vec<_>>();
                 frame.render_widget(Paragraph::new(visible), window);
+                // The held room is the live block's tallest: a shorter block sat
+                // at its foot, by the composer, and left blank rows between it
+                // and the conversation. It starts below the spacer row instead.
+                if plan.modal.is_none()
+                    && let Some(live) = plan.live.as_mut()
+                {
+                    live.y = live.y.min(window_bottom);
+                }
                 if header > 0 {
                     frame.render_widget(
                         Paragraph::new(top_bar(state, area.width, &theme)),
@@ -826,17 +834,18 @@ where
                 if let Some((x, y)) = plan.cursor {
                     frame.set_cursor_position((x, y));
                 }
-                // prime-agent's follow hint, over the window's last row.
+                // prime-agent's follow hint, on the spacer row below the
+                // window: drawn over the window's last row, it hid that row.
                 if !viewport.is_following() && window.height > 0 {
+                    let hint_y = if window_rows > 1 {
+                        window.y + window.height
+                    } else {
+                        window.y + window.height - 1
+                    };
                     let label = format!(" {FOLLOW_KEY} to follow ");
                     let width = u16::try_from(label.width()).unwrap_or(u16::MAX);
                     if width <= area.width {
-                        let hint = Rect::new(
-                            area.x + (area.width - width) / 2,
-                            window.y + window.height - 1,
-                            width,
-                            1,
-                        );
+                        let hint = Rect::new(area.x + (area.width - width) / 2, hint_y, width, 1);
                         frame.render_widget(
                             Paragraph::new(Line::from(Span::styled(
                                 label,
@@ -1159,6 +1168,13 @@ mod tests {
             rows.iter().any(|row| row.contains("ctrl+end to follow")),
             "the follow hint: {rows:?}"
         );
+        // Seen: the hint was drawn over the window's last row and hid it.
+        let hint = rows
+            .iter()
+            .position(|row| row.contains("ctrl+end to follow"))
+            .expect("hint row");
+        assert!(!rows[hint].contains("line-"), "{rows:?}");
+        assert!(rows[hint - 1].contains("line-"), "{rows:?}");
         screen.follow();
         screen.draw(&state).expect("drawn");
         assert!(painted(&screen).iter().any(|row| row.contains("line-39")));
