@@ -682,6 +682,41 @@ pub(crate) fn tool_walk(
     cached_walk(root, &base, Some(Instant::now() + TOOL_WALK_DEADLINE))
 }
 
+/// The folders right under the searched path that `.gitignore` kept out of
+/// the walk (`node_modules/`, `target/`): `CowAgent`'s search names them when
+/// it finds nothing, so an empty result is not read as "it is nowhere".
+pub(crate) fn ignored_folders(root: &Path, requested: Option<&str>) -> Vec<String> {
+    let Ok(walk) = tool_walk(root, requested, "search_text") else {
+        return Vec::new();
+    };
+    let base = match requested {
+        Some(path) => match resolve_relative(root, path, true) {
+            Ok(base) => base,
+            Err(_) => return Vec::new(),
+        },
+        None => root.to_owned(),
+    };
+    let Ok(entries) = fs::read_dir(&base) else {
+        return Vec::new();
+    };
+    let mut ignored = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| !crate::walk::sensitive_component(&entry.file_name().to_string_lossy()))
+        .filter(|entry| !walk.directories.contains(&entry.path()))
+        .filter_map(|entry| root_relative_path(root, &entry.path()))
+        .map(|path| format!("{path}/"))
+        .collect::<Vec<_>>();
+    ignored.sort();
+    ignored
+}
+
+/// `path` relative to `root` with `/` separators, if it is under it.
+fn root_relative_path(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
 /// Most paths a "file not found" names in its place.
 const SIMILAR_PATHS: usize = 5;
 
@@ -821,7 +856,7 @@ pub(crate) fn glob_files(
         .collect::<Vec<_>>();
     // Newest first: the file just worked on comes first, and the cut keeps
     // the recent ones.
-    hits.sort_by(|left, right| right.modified.cmp(&left.modified));
+    hits.sort_by_key(|file| std::cmp::Reverse(file.modified));
     let truncated = !walk.complete || hits.len() > MAX_GLOB_MATCHES;
     let paths = hits
         .into_iter()
@@ -2049,6 +2084,35 @@ mod tests {
             "{}",
             &output.text[output.text.len() - 150..]
         );
+    }
+
+    /// An empty search names the folders `.gitignore` kept out, and searching
+    /// with `path` set to one - what the notice says to do - finds inside it.
+    #[test]
+    fn an_empty_search_names_the_ignored_folders_and_they_can_be_searched() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        fs::write(directory.path().join(".gitignore"), "vendor/\n").expect("ignore");
+        fs::create_dir_all(directory.path().join("vendor/lib")).expect("vendor");
+        fs::create_dir_all(directory.path().join("src")).expect("src");
+        fs::write(directory.path().join("vendor/lib/x.txt"), "needle here\n").expect("x");
+        fs::write(directory.path().join("src/a.txt"), "nothing\n").expect("a");
+        let root = fs::canonicalize(directory.path()).expect("root");
+        let output =
+            search_text(&root, "needle", None, false, false, None, 0, false).expect("search");
+        assert!(output.matches.is_empty());
+        assert_eq!(ignored_folders(&root, None), ["vendor/"]);
+        let inside = search_text(
+            &root,
+            "needle",
+            Some("vendor"),
+            false,
+            false,
+            None,
+            0,
+            false,
+        )
+        .expect("search inside");
+        assert_eq!(inside.matches.len(), 1, "the hint works");
     }
 
     /// A bare word finds the files whose name contains it (it matched nothing),

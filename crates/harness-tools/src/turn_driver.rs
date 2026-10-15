@@ -2921,8 +2921,19 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
         // the turn spends its bounds rediscovering what it already found. The
         // hits are already capped and redacted where they are produced, so the
         // rendering here is the same bound the tool applied.
-        ToolOutput::SearchText { matches, truncated } => {
+        ToolOutput::SearchText {
+            matches,
+            truncated,
+            ignored,
+        } => {
             let mut notices = String::new();
+            if matches.is_empty() && !ignored.is_empty() {
+                let _ = write!(
+                    notices,
+                    "\n\n[Not searched, kept out by .gitignore: {}. To look inside one, search again with path set to it.]",
+                    ignored.join(", ")
+                );
+            }
             if *truncated {
                 let _ = write!(
                     notices,
@@ -3437,6 +3448,7 @@ mod tool_output_render_tests {
                 anchor: None,
             }],
             truncated: false,
+            ignored: Vec::new(),
         };
         let rendered = render_tool_output("search_text", &output);
         assert!(
@@ -3458,6 +3470,7 @@ mod tool_output_render_tests {
                 anchor: None,
             }],
             truncated: true,
+            ignored: Vec::new(),
         };
         let rendered = render_tool_output("search_text", &output);
         assert!(

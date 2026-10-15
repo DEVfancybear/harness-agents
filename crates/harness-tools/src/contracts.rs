@@ -642,7 +642,7 @@ pub enum CodingToolAction {
         offset: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
-        /// The last lines of the file, from a negative `offset` (CowAgent's
+        /// The last lines of the file, from a negative `offset` (`CowAgent`'s
         /// read): a log's end no longer needs its length guessed first.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tail: Option<u64>,
@@ -1655,6 +1655,10 @@ pub enum ToolOutput {
     SearchText {
         matches: Vec<SearchMatch>,
         truncated: bool,
+        /// Folders under the searched path that `.gitignore` kept out, named
+        /// when nothing was found: an empty result read as "it is nowhere".
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ignored: Vec<String>,
     },
     Glob {
         paths: Vec<String>,

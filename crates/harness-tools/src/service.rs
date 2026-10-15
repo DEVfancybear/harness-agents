@@ -1607,9 +1607,15 @@ impl ToolExecutionService {
                     context_lines.unwrap_or(0),
                     self.hashline,
                 )?;
+                let ignored = if output.matches.is_empty() {
+                    crate::workspace::ignored_folders(root, path.as_deref())
+                } else {
+                    Vec::new()
+                };
                 Ok(Dispatched::plain(ToolOutput::SearchText {
                     matches: output.matches,
                     truncated: output.truncated,
+                    ignored,
                 }))
             }
             CodingToolAction::ApplyPatch {

@@ -290,6 +290,7 @@ async fn main() {
                         path: path.clone(),
                         offset: None,
                         limit: None,
+                        tail: None,
                     })
                     .collect(),
             )

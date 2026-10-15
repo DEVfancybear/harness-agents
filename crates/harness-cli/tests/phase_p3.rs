@@ -43,7 +43,8 @@ fn review_p3_policy_cannot_be_bypassed_by_path_spelling_or_ancestor() {
                 .denial_for(&CodingToolAction::ReadFile {
                     path: path.into(),
                     offset: None,
-                    limit: None
+                    limit: None,
+                    tail: None,
                 })
                 .is_some(),
             "policy bypass: {path}"
@@ -56,6 +57,7 @@ fn review_p3_policy_cannot_be_bypassed_by_path_spelling_or_ancestor() {
                 path: "SRC\\PRIVATE\\file.txt".into(),
                 offset: None,
                 limit: None,
+                tail: None,
             })
             .is_some()
     );
@@ -82,6 +84,7 @@ fn review_p3_policy_cannot_be_bypassed_by_path_spelling_or_ancestor() {
                 path: "src/private-other/file.txt".into(),
                 offset: None,
                 limit: None,
+                tail: None,
             })
             .is_none()
     );
@@ -133,6 +136,7 @@ async fn review_p3_large_invalid_utf8_is_not_silently_repaired() {
             path: "invalid.txt".into(),
             offset: None,
             limit: None,
+            tail: None,
         },
     )
     .await;
@@ -182,6 +186,7 @@ async fn handoff_file_is_writable_while_harness_configuration_stays_protected() 
             path: ".harness/progress.md".into(),
             offset: None,
             limit: None,
+            tail: None,
         },
     )
     .await;
@@ -283,6 +288,7 @@ async fn p3_a_folder_without_git_supports_the_coding_tools() {
             path: "game.js".to_owned(),
             offset: None,
             limit: None,
+            tail: None,
         },
         CodingToolAction::SearchText {
             query: "score".into(),
@@ -723,6 +729,7 @@ async fn p3_s01_tool_contracts_are_versioned_and_receipts_are_immutable() {
             path: "src/parser.txt".to_owned(),
             offset: None,
             limit: None,
+            tail: None,
         },
     )
     .await;
@@ -784,6 +791,7 @@ async fn p3_k08_parent_deny_cannot_be_overridden() {
                 path: "src/parser.txt".to_owned(),
                 offset: None,
                 limit: None,
+                tail: None,
             },
         ))
         .await
@@ -810,6 +818,10 @@ async fn p3_k08_parent_deny_cannot_be_overridden() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one action of every kind, each through the gate"
+)]
 async fn p3_s02_every_tool_path_uses_one_gate_and_approval_binds_final_action() {
     let temp = TempDir::new().expect("temporary store");
     let root = setup_workspace(&temp);
@@ -825,6 +837,7 @@ async fn p3_s02_every_tool_path_uses_one_gate_and_approval_binds_final_action() 
             path: "src/parser.txt".to_owned(),
             offset: None,
             limit: None,
+            tail: None,
         },
     )
     .await;
@@ -838,6 +851,7 @@ async fn p3_s02_every_tool_path_uses_one_gate_and_approval_binds_final_action() 
                 path: "src/parser.txt".to_owned(),
                 offset: None,
                 limit: None,
+                tail: None,
             },
         ))
         .await
@@ -871,6 +885,7 @@ async fn p3_s02_every_tool_path_uses_one_gate_and_approval_binds_final_action() 
             path: "src/parser.txt".to_owned(),
             offset: None,
             limit: None,
+            tail: None,
         },
     )
     .await;
@@ -899,6 +914,7 @@ async fn p3_s02_every_tool_path_uses_one_gate_and_approval_binds_final_action() 
             path: "src/parser.txt".to_owned(),
             offset: None,
             limit: None,
+            tail: None,
         },
     )
     .await;
@@ -1031,6 +1047,7 @@ async fn p3_s03_rooted_files_search_and_patch_handle_crlf_unicode_and_stale_edit
                 path: "../outside/outside.txt".to_owned(),
                 offset: None,
                 limit: None,
+                tail: None,
             },
         ))
         .await
@@ -1046,6 +1063,7 @@ async fn p3_s03_rooted_files_search_and_patch_handle_crlf_unicode_and_stale_edit
                 path: "src/escape/outside.txt".to_owned(),
                 offset: None,
                 limit: None,
+                tail: None,
             },
         ))
         .await
@@ -1061,6 +1079,7 @@ async fn p3_s03_rooted_files_search_and_patch_handle_crlf_unicode_and_stale_edit
                 path: ".env".to_owned(),
                 offset: None,
                 limit: None,
+                tail: None,
             },
         ))
         .await
@@ -1075,6 +1094,7 @@ async fn p3_s03_rooted_files_search_and_patch_handle_crlf_unicode_and_stale_edit
             path: "src/binary.bin".to_owned(),
             offset: None,
             limit: None,
+            tail: None,
         },
     )
     .await;
@@ -1403,6 +1423,7 @@ async fn p3_s05_git_identity_fingerprint_and_task_update_are_scoped() {
                 path: "src/parser.txt".to_owned(),
                 offset: None,
                 limit: None,
+                tail: None,
             },
         ))
         .await
@@ -1413,6 +1434,7 @@ async fn p3_s05_git_identity_fingerprint_and_task_update_are_scoped() {
             path: "src/parser.txt".to_owned(),
             offset: None,
             limit: None,
+            tail: None,
         }
     );
     drop(tools);
@@ -1447,6 +1469,7 @@ async fn p3_c23_project_identity_requires_explicit_reassociation() {
             path: "src/parser.txt".to_owned(),
             offset: None,
             limit: None,
+            tail: None,
         },
     )
     .await;
@@ -1464,6 +1487,7 @@ async fn p3_c23_project_identity_requires_explicit_reassociation() {
                 path: "src/parser.txt".to_owned(),
                 offset: None,
                 limit: None,
+                tail: None,
             },
         ))
         .await
@@ -1488,6 +1512,7 @@ async fn p3_c23_project_identity_requires_explicit_reassociation() {
                 path: "src/parser.txt".to_owned(),
                 offset: None,
                 limit: None,
+                tail: None,
             },
         ))
         .await
@@ -1568,6 +1593,7 @@ async fn p3_c23_a_host_issued_coder_worktree_belongs_to_its_project() {
         path: "src/parser.txt".to_owned(),
         offset: None,
         limit: None,
+        tail: None,
     };
     tools
         .prepare(request(
@@ -1625,6 +1651,7 @@ async fn p3_c29_secret_output_is_redacted_and_artifact_scope_is_enforced() {
             path: "notes.txt".to_owned(),
             offset: None,
             limit: None,
+            tail: None,
         },
     )
     .await;
@@ -1854,6 +1881,7 @@ async fn p3_k09_observer_failure_cannot_rewrite_receipt() {
                 path: "src/parser.txt".to_owned(),
                 offset: None,
                 limit: None,
+                tail: None,
             },
         ))
         .await
@@ -2047,6 +2075,7 @@ async fn a_root_that_becomes_a_repository_keeps_its_project() {
         path: "src/parser.txt".to_owned(),
         offset: None,
         limit: None,
+        tail: None,
     };
     let (prepared, approval) =
         prepared_and_approved(&tools, &session_id, &task_id, &root, read()).await;
@@ -2089,6 +2118,7 @@ async fn read_file_shows_the_hash_write_file_takes() {
             path: "page.ts".to_owned(),
             offset: None,
             limit: Some(1),
+            tail: None,
         },
     )
     .await;

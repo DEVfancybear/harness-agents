@@ -1331,6 +1331,7 @@ async fn a15_path_patch_safety() {
                     path: path.to_owned(),
                     offset: None,
                     limit: None,
+                    tail: None,
                 },
             ))
             .await
@@ -1355,6 +1356,7 @@ async fn a15_path_patch_safety() {
                 path: "linked/secret.txt".to_owned(),
                 offset: None,
                 limit: None,
+                tail: None,
             },
         ))
         .await
@@ -1377,6 +1379,7 @@ async fn a15_path_patch_safety() {
                 path: ".env".to_owned(),
                 offset: None,
                 limit: None,
+                tail: None,
             },
         ))
         .await
