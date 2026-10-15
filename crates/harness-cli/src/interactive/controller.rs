@@ -2613,6 +2613,15 @@ impl InteractiveController {
                     self.flush_stream(effects);
                 }
                 self.note_child_activity(&message);
+                // A child's calls are counted on its running card, whose last
+                // line is the latest call or failure. As rows too they buried
+                // the parent's conversation: dozens per researching verifier,
+                // its 404s in warning yellow. The plain transcript is a log and
+                // keeps them.
+                if !self.plain && message.starts_with("[child ") {
+                    effects.push(Effect::Redraw);
+                    return;
+                }
                 // An action that ran without a panel is announced before it runs. In
                 // the TUI that was one `[info] allowed by ...` row above every tool
                 // card - half the transcript of a read-heavy turn. The reason now rides

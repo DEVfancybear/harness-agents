@@ -225,6 +225,8 @@ pub fn live_rows(state: &UiState, width: u16) -> u16 {
         })
         .count();
     rows = rows.saturating_add(u16::try_from(progress).unwrap_or(u16::MAX));
+    let loose = super::widgets::composer::loose_child_activity(state).len();
+    rows = rows.saturating_add(u16::try_from(loose).unwrap_or(u16::MAX));
     rows = rows.saturating_add(u16::try_from(state.live_tool_output.len()).unwrap_or(u16::MAX));
     rows.min(MAX_LIVE_ROWS)
 }

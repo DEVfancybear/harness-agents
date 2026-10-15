@@ -331,6 +331,41 @@ pub fn delegate_activity<'a>(
         .find(|activity| activity.name == role || activity.name.starts_with(&format!("{role}-")))
 }
 
+/// How many children without a `delegate` card of their own the live block
+/// lists: the most recently active ones.
+const LOOSE_CHILDREN: usize = 3;
+
+/// The children working while a call runs that no running `delegate` card
+/// shows (`rlm.spawn` from the Python REPL): their progress is drawn under the
+/// running calls, since it is no longer a row of the conversation.
+#[must_use]
+pub fn loose_child_activity(state: &UiState) -> Vec<&crate::interactive::events::ChildActivity> {
+    if state.open_tools.is_empty() {
+        return Vec::new();
+    }
+    let carded: Vec<_> = state
+        .open_tools
+        .iter()
+        .filter_map(|(name, summary)| delegate_activity(name, summary, state))
+        .map(std::ptr::from_ref)
+        .collect();
+    let loose: Vec<_> = state
+        .child_activity
+        .iter()
+        .filter(|activity| !carded.contains(&std::ptr::from_ref(*activity)))
+        .collect();
+    loose[loose.len().saturating_sub(LOOSE_CHILDREN)..].to_vec()
+}
+
+fn activity_text(activity: &crate::interactive::events::ChildActivity) -> String {
+    format!(
+        "{} tool call{} · {}",
+        activity.tool_calls,
+        if activity.tool_calls == 1 { "" } else { "s" },
+        activity.latest
+    )
+}
+
 /// Draw the live block: model text that has not been committed yet.
 pub fn render_live(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
     if area.height == 0 || (state.live_text.is_empty() && state.open_tools.is_empty()) {
@@ -351,12 +386,7 @@ pub fn render_live(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme
         ));
         // A running delegate shows what its agent has done so far.
         if let Some(activity) = delegate_activity(name, summary, state) {
-            let text = format!(
-                "{} tool call{} · {}",
-                activity.tool_calls,
-                if activity.tool_calls == 1 { "" } else { "s" },
-                activity.latest
-            );
+            let text = activity_text(activity);
             let budget = usize::from(area.width.saturating_sub(6));
             lines.push(Line::from(vec![
                 ratatui::text::Span::styled("    └ ".to_owned(), theme.dim),
@@ -366,6 +396,14 @@ pub fn render_live(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme
                 ),
             ]));
         }
+    }
+    for activity in loose_child_activity(state) {
+        let text = format!("[{}] {}", activity.name, activity_text(activity));
+        let budget = usize::from(area.width.saturating_sub(6));
+        lines.push(Line::from(vec![
+            ratatui::text::Span::styled("    └ ".to_owned(), theme.dim),
+            ratatui::text::Span::styled(text.chars().take(budget).collect::<String>(), theme.dim),
+        ]));
     }
     // What the newest running call printed last, under its card.
     for line in &state.live_tool_output {
