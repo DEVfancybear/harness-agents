@@ -58,7 +58,10 @@ use super::events::SessionEvent;
 use super::repl::{HostReply, HostRequests};
 use super::store_lease::SharedStore;
 
-const MAX_BRIEF_BYTES: usize = 8 * 1024;
+/// The longest brief, in characters as the tool schema's `maxLength` counts them.
+/// Counted in bytes, a Vietnamese brief of 3 000 characters was refused while
+/// the schema allowed 8 192.
+const MAX_BRIEF_CHARS: usize = 16 * 1024;
 
 /// Longest child answer a notice, `rlm.collect` and `rlm.list_subagents` carry.
 /// prime-agent's notice keeps 160 characters and leaves the rest to `collect`; a
@@ -2454,7 +2457,7 @@ impl ExternalToolCatalog for DelegateCatalog {
                         "type": "object",
                         "properties": {
                             "role": {"type": "string", "enum": ["explorer", "coder", "verifier"]},
-                            "brief": {"type": "string", "minLength": 1, "maxLength": MAX_BRIEF_BYTES},
+                            "brief": {"type": "string", "minLength": 1, "maxLength": MAX_BRIEF_CHARS},
                             "wait": {"type": "boolean", "description": "Wait for the child's answer (default true)."}
                         },
                         "required": ["role", "brief"],
@@ -2639,11 +2642,11 @@ impl DelegateTool {
         let brief = object
             .get("brief")
             .and_then(Value::as_str)
-            .filter(|brief| !brief.trim().is_empty() && brief.len() <= MAX_BRIEF_BYTES)
+            .filter(|brief| !brief.trim().is_empty() && brief.chars().count() <= MAX_BRIEF_CHARS)
             .ok_or_else(|| {
                 HarnessError::new(
                     ErrorCode::InvalidPayload,
-                    format!("delegate brief must contain 1..={MAX_BRIEF_BYTES} UTF-8 bytes"),
+                    format!("delegate brief must contain 1..={MAX_BRIEF_CHARS} characters"),
                 )
             })?;
         let wait = match object.get("wait") {
@@ -3245,7 +3248,7 @@ impl ChildTools {
                     "type": "object",
                     "properties": {
                         "role": {"type": "string", "enum": ["explorer"]},
-                        "brief": {"type": "string", "minLength": 1, "maxLength": MAX_BRIEF_BYTES},
+                        "brief": {"type": "string", "minLength": 1, "maxLength": MAX_BRIEF_CHARS},
                         "wait": {"type": "boolean", "description": "Wait for the child's answer (default true)."}
                     },
                     "required": ["role", "brief"],
@@ -3617,8 +3620,8 @@ impl RlmChildren {
         let prompt = request["prompt"]
             .as_str()
             .map(str::trim)
-            .filter(|prompt| !prompt.is_empty() && prompt.len() <= MAX_BRIEF_BYTES)
-            .ok_or_else(|| format!("rlm.spawn needs a task of 1..={MAX_BRIEF_BYTES} bytes"))?;
+            .filter(|prompt| !prompt.is_empty() && prompt.chars().count() <= MAX_BRIEF_CHARS)
+            .ok_or_else(|| format!("rlm.spawn needs a task of 1..={MAX_BRIEF_CHARS} characters"))?;
         let kwargs = &request["kwargs"];
         let name = kwargs["name"]
             .as_str()
@@ -5843,6 +5846,24 @@ pub(super) mod tests {
         );
     }
 
+    /// The brief is bounded in characters, as the schema's `maxLength` counts:
+    /// a Vietnamese brief within it was refused for its bytes.
+    #[test]
+    fn a_brief_is_bounded_in_characters_not_bytes() {
+        let vietnamese = "Bạn là coder. Làm phần máy chủ cho cột mốc M2. ".repeat(250);
+        assert!(vietnamese.len() > 8192 && vietnamese.chars().count() <= 16_384);
+        let (_, brief, _) = super::DelegateTool::arguments(
+            &serde_json::json!({"role": "coder", "brief": vietnamese}),
+        )
+        .expect("a brief within the schema's maxLength");
+        assert_eq!(brief.chars().count(), vietnamese.chars().count());
+        let long = "ở".repeat(16_385);
+        assert!(
+            super::DelegateTool::arguments(&serde_json::json!({"role": "coder", "brief": long}))
+                .is_err()
+        );
+    }
+
     #[test]
     fn g12_delegate_tool_schema_is_bounded_and_only_offers_known_roles() {
         let tools = harness_tools::ExternalTools::new(Arc::new(DelegateCatalog));
@@ -5851,7 +5872,7 @@ pub(super) mod tests {
         assert_eq!(schema["name"], "delegate");
         assert_eq!(
             schema["parameters"]["properties"]["brief"]["maxLength"],
-            8192
+            16_384
         );
         assert_eq!(
             schema["parameters"]["properties"]["role"]["enum"],
