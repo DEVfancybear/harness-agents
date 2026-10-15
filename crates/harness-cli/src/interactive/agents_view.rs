@@ -190,10 +190,12 @@ pub fn rows_with(
                     | "waiting_mcp_input"
                     | "canceling"
             );
-        // The name the user gave, the session's title, the last request -
-        // unless that was a command (`/compact` named a row of its own) or a
-        // scheduled run's prompt (a conversation woken after a usage limit was
-        // titled `[heartbeat: at ... run#1]`) - then the saved conversation's.
+        // The name the user gave, the session's title, the saved
+        // conversation's, then the last request - unless that was a command
+        // (`/compact` named a row of its own) or a scheduled run's prompt (a
+        // conversation woken after a usage limit was titled
+        // `[heartbeat: at ... run#1]`). Seen: a session answered "ok" was
+        // listed, and searched, as "ok".
         let saved_title = agent.conversation.as_deref().and_then(|task| {
             saved
                 .iter()
@@ -204,6 +206,7 @@ pub fn rows_with(
             .name
             .clone()
             .or_else(|| agent.title.clone())
+            .or(saved_title)
             .or_else(|| {
                 agent
                     .last_request
@@ -214,7 +217,6 @@ pub fn rows_with(
                     })
                     .map(first_line)
             })
-            .or(saved_title)
             .filter(|title| !title.is_empty())
             .unwrap_or_else(|| agent.id.clone());
         // prime-agent's row heartbeat count.
@@ -342,12 +344,54 @@ pub fn rows_with(
         .into_iter()
         .filter(|row| row.kind == RowKind::Agent)
         .filter_map(|row| {
-            let haystack = format!("{} {} {}", row.title, row.model, row.identity);
-            super::commands::fuzzy_score(query, &haystack.to_lowercase()).map(|score| (score, row))
+            let haystack = search_text(&row, saved);
+            super::commands::fuzzy_score(&fold(query), &haystack).map(|score| (score, row))
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|(left, _), (right, _)| left.total_cmp(right));
     ranked.into_iter().map(|(_, row)| row).collect()
+}
+
+/// What a search reads of a row: its title, model and id, and for an agent
+/// its last request and its conversation's saved title, without accents
+/// (`du an` finds `dự án`).
+fn search_text(row: &Row, saved: &[SavedConversation]) -> String {
+    let mut text = format!("{} {} {}", row.title, row.model, row.identity);
+    if let Target::Live(listed) = &row.target {
+        let agent = &listed.agent;
+        for extra in [
+            &agent.last_request,
+            &agent.title,
+            &agent.name,
+            &agent.conversation,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            text.push(' ');
+            text.push_str(extra);
+        }
+        if let Some(title) = agent.conversation.as_deref().and_then(|task| {
+            saved
+                .iter()
+                .find(|conversation| conversation.task_id == task)
+                .and_then(|conversation| conversation.title.as_deref())
+        }) {
+            text.push(' ');
+            text.push_str(title);
+        }
+    }
+    fold(&text)
+}
+
+/// Lowercase without the accents of Latin letters (`đ` as `d`).
+fn fold(text: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    text.replace(['đ', 'Đ'], "d")
+        .nfd()
+        .filter(|character| !unicode_normalization::char::is_combining_mark(*character))
+        .collect::<String>()
+        .to_lowercase()
 }
 
 /// What the prompt line is doing.
@@ -1106,6 +1150,23 @@ mod tests {
 
     /// Seen: a conversation woken after a usage limit was listed as
     /// `[heartbeat: at ... run#1]`, "now" for days, its failed children unseen.
+    /// Seen: a session last answered "ok" was listed as "ok", and searching for
+    /// its project found nothing.
+    #[test]
+    fn a_running_session_is_named_and_found_by_its_conversation() {
+        let now = chrono::Utc::now();
+        let mut answered = agent("a1", "running", "t1");
+        answered.agent.last_request = Some("ok".to_owned());
+        let saved = [saved("t1", "tạo dự án game ninja school online")];
+        let listed = rows(std::slice::from_ref(&answered), &saved, "", now);
+        assert_eq!(listed[0].title, "tạo dự án game ninja school online");
+        for query in ["ninja", "du an", "Dự Án", "ok"] {
+            let hits = rows(std::slice::from_ref(&answered), &saved, query, now);
+            assert_eq!(hits.len(), 1, "{query}");
+        }
+        assert!(rows(std::slice::from_ref(&answered), &saved, "zzz", now).is_empty());
+    }
+
     #[test]
     fn a_woken_conversation_keeps_its_title_and_says_how_long_it_waited() {
         let now = chrono::Utc::now();
@@ -1199,13 +1260,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 (Section::Running, "fix the parser", "now"),
-                (Section::Idle, "fix the parser", "2m"),
+                (Section::Idle, "already live", "2m"),
                 (Section::Inactive, "old work", "2h"),
             ]
         );
         // A query is a flat ranked list.
-        let hits = rows(&live, &saved, "old", now);
-        assert_eq!(hits.len(), 1);
+        let hits = rows(&live, &saved, "old work", now);
         assert_eq!(hits[0].title, "old work");
     }
 
