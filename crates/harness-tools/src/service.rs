@@ -2772,6 +2772,20 @@ fn store_error(error: StoreError) -> HarnessError {
 
 /// Whether an action only reads, so the workspace need not be fingerprinted for it.
 fn is_read_only(action: &CodingToolAction) -> bool {
+    if let CodingToolAction::ExternalTool {
+        plugin_id,
+        tool_name,
+        arguments,
+        ..
+    } = action
+    {
+        return plugin_id == "knowledge"
+            && tool_name == "knowledge"
+            && matches!(
+                arguments.get("action").and_then(serde_json::Value::as_str),
+                Some("list" | "search" | "read" | "graph")
+            );
+    }
     crate::contracts::effect_class_for(action.kind().as_str())
         == crate::contracts::EffectClass::ReadOnly
 }
@@ -2786,6 +2800,33 @@ mod tests {
     use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
     use harness_types::{ContentHash, ErrorCode, HostId, InputId, ProjectId, SessionId, TaskId};
     use std::sync::Arc;
+
+    #[test]
+    fn native_knowledge_reads_do_not_fingerprint_the_workspace() {
+        for (plugin, tool, operation, expected) in [
+            ("knowledge", "knowledge", "read", true),
+            ("knowledge", "knowledge", "search", true),
+            ("knowledge", "knowledge", "list", true),
+            ("knowledge", "knowledge", "graph", true),
+            ("knowledge", "knowledge", "write", false),
+            ("knowledge", "knowledge", "delete", false),
+            ("mcp", "knowledge", "read", false),
+            ("knowledge", "other", "read", false),
+        ] {
+            let action = CodingToolAction::ExternalTool {
+                plugin_id: plugin.to_owned(),
+                tool_name: tool.to_owned(),
+                arguments: serde_json::json!({"action":operation}),
+                parent_invocation_id: None,
+                timeout_ms: 30_000,
+            };
+            assert_eq!(
+                super::is_read_only(&action),
+                expected,
+                "{plugin}/{tool}/{operation}"
+            );
+        }
+    }
 
     #[test]
     fn g09_hook_payload_truncates_large_action_arguments_to_eight_kibibytes() {

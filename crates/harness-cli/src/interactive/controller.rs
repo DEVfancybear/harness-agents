@@ -4349,6 +4349,10 @@ impl InteractiveController {
                 Ok(lines) => self.reference("/features", lines, &mut effects),
                 Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
             },
+            "/knowledge" => match self.service.knowledge(raw_argument.unwrap_or_default()) {
+                Ok(lines) => self.reference("/knowledge", lines, &mut effects),
+                Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+            },
             "/handoff" => {
                 if self.phase.has_active_run() {
                     self.push_history(&mut effects, HistoryItem::Notice {

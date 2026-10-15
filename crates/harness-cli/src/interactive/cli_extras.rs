@@ -17,6 +17,52 @@ fn data_dir(environment: &LaunchEnvironment) -> Result<PathBuf, HarnessError> {
     .map_err(|error| HarnessError::new(ErrorCode::StorageOpenFailed, error.to_string()))
 }
 
+/// Inspect knowledge without starting a provider or a background agent.
+pub fn knowledge(
+    cwd: Option<&Path>,
+    global: bool,
+    json: bool,
+    action: &str,
+    arguments: &[String],
+) -> Result<ExitCode, HarnessError> {
+    let workspace = cwd
+        .map_or_else(std::env::current_dir, |path| Ok(path.to_path_buf()))
+        .and_then(|path| path.canonicalize())
+        .map_err(|error| {
+            HarnessError::new(
+                ErrorCode::InvalidPayload,
+                format!("invalid project directory: {error}"),
+            )
+        })?;
+    if !workspace.is_dir() {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            "project directory must be a directory",
+        ));
+    }
+    let environment = LaunchEnvironment::capture();
+    let host = super::knowledge::KnowledgeHost::new(&workspace, &data_dir(&environment)?);
+    let mut words = vec![action.to_owned()];
+    words.extend(arguments.iter().cloned());
+    if global {
+        words.push("--global".to_owned());
+    }
+    let lines = host
+        .command(&words.join(" "))
+        .map_err(|message| HarnessError::new(ErrorCode::InvalidPayload, message))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"schema_version":1,"action":action,"lines":lines})
+        );
+    } else {
+        for line in lines {
+            println!("{line}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// prime-agent's `formatTokenCount`: `1M`/`1.5M`, `128K`/`163.8K`, plain
 /// below a thousand.
 fn token_count(count: Option<u64>) -> String {
@@ -217,6 +263,13 @@ pub fn prompt(cwd: Option<&Path>, json: bool) -> Result<ExitCode, HarnessError> 
         .collect::<Vec<_>>();
     if super::web::WebHost::from_environment(&environment, &data_dir(&environment)?).is_some() {
         names.extend(["web_search", "web_fetch"]);
+    }
+    if !super::knowledge::KnowledgeHost::new(&root, &data_dir(&environment)?)
+        .tools()
+        .schemas()
+        .is_empty()
+    {
+        names.push("knowledge");
     }
     let (git_branch, changed_files) = super::service::prompt_git_facts(&root);
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();

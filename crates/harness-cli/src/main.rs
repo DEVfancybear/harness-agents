@@ -198,6 +198,22 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect and control the scoped Markdown knowledge library.
+    Knowledge {
+        /// The project directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Operate on the global library.
+        #[arg(long)]
+        global: bool,
+        /// Print a versioned JSON result.
+        #[arg(long)]
+        json: bool,
+        #[arg(default_value = "status")]
+        action: String,
+        #[arg(value_name = "QUERY_OR_PATH")]
+        arguments: Vec<String>,
+    },
     /// Print the system prompt a run in this project is sent.
     Prompt {
         /// The project directory.
@@ -905,6 +921,7 @@ fn legacy_command(cli: &Cli) -> bool {
                 | Command::Model(_)
                 | Command::Prompt { .. }
                 | Command::Doctor { .. }
+                | Command::Knowledge { .. }
                 | Command::Attach { .. }
                 | Command::Send { .. }
                 | Command::Schedule(_)
@@ -1069,6 +1086,13 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
         Some(Command::Doctor { cwd, json }) => {
             interactive::cli_extras::doctor(cwd.as_deref(), json)
         }
+        Some(Command::Knowledge {
+            cwd,
+            global,
+            json,
+            action,
+            arguments,
+        }) => interactive::cli_extras::knowledge(cwd.as_deref(), global, json, &action, &arguments),
         Some(Command::Attach { agent }) => interactive::app::attach(&agent),
         Some(Command::Abort { agent, json }) => interactive::agents::abort_command(&agent, json),
         Some(Command::Schedule(command)) => match command {
@@ -1370,6 +1394,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
             | Command::Model(_)
             | Command::Prompt { .. }
             | Command::Doctor { .. }
+            | Command::Knowledge { .. }
             | Command::Attach { .. }
             | Command::Send { .. }
             | Command::Schedule(_)

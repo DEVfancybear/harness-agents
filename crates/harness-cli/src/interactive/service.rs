@@ -503,6 +503,10 @@ pub trait SessionPort: Send {
     fn features(&self) -> Result<Vec<String>, String> {
         Err("this backend has no workspace".to_owned())
     }
+    /// Topic knowledge persists independently of this conversation.
+    fn knowledge(&mut self, _argument: &str) -> Result<Vec<String>, String> {
+        Err("this backend has no knowledge store".to_owned())
+    }
     /// What leaving now would leave the next session to trip over.
     fn clean_state(&self) -> Vec<String> {
         Vec::new()
@@ -5144,6 +5148,10 @@ impl SessionPort for AgentSessionService {
         ))
     }
 
+    fn knowledge(&mut self, argument: &str) -> Result<Vec<String>, String> {
+        super::knowledge::KnowledgeHost::new(&self.workspace_root, &self.data_dir).command(argument)
+    }
+
     fn run_gates(&mut self, job: super::autonomous::GateJob) -> Result<(), String> {
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| "the application service needs an async runtime".to_owned())?;
@@ -7799,6 +7807,9 @@ async fn run_turn(
                 .as_ref()
                 .map(|host| (host.tools(), host.dispatcher())),
             checks: config.verify.checks.clone(),
+            knowledge: Some(
+                super::knowledge::KnowledgeHost::new(&workspace_root, &data_dir).readonly(),
+            ),
             context: child_context(
                 &data_dir,
                 task_id.as_str(),
@@ -7858,6 +7869,7 @@ async fn run_turn(
         ),
         _ => None,
     };
+    let knowledge_host = super::knowledge::KnowledgeHost::new(&workspace_root, &data_dir);
     // The project's feature list: the model works it, the harness verifies it.
     let feature_host = Some(super::features::FeatureHost::new(
         workspace_root.clone(),
@@ -7959,7 +7971,7 @@ async fn run_turn(
             task_id.as_str(),
             nested_instructions,
         )));
-    if let Some(dispatcher) = super::mcp::combined_dispatcher_with_delegate(
+    let dispatcher = super::mcp::combined_dispatcher_with_delegate(
         active_mcp.as_ref(),
         active_extensions.as_ref(),
         delegate_host.as_ref(),
@@ -7968,9 +7980,11 @@ async fn run_turn(
         goal_host.as_ref(),
         feature_host.as_ref(),
         repl_host.as_ref(),
-    ) {
-        tools = tools.with_external(dispatcher);
-    }
+    );
+    tools = tools.with_external(super::knowledge::with_dispatcher(
+        dispatcher,
+        &knowledge_host,
+    ));
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
     let external_tools = super::mcp::combined_tools_with_delegate(
         active_mcp.as_ref(),
@@ -7982,6 +7996,10 @@ async fn run_turn(
         feature_host.as_ref(),
         repl_host.as_ref(),
     );
+    let external_tools = Some(super::knowledge::with_tools(
+        external_tools,
+        &knowledge_host,
+    ));
     let driver = match &external_tools {
         Some(tools) => driver.with_external(tools.clone()),
         None => driver,
@@ -8234,6 +8252,9 @@ async fn run_turn(
             &super::harness::weighted_terms(goal_objective, &[request.text.as_str()]),
         ),
     ));
+    if let Some(block) = super::knowledge::context_block(&knowledge_host, &request.text) {
+        project_blocks.push(block);
+    }
     // The first turn of an imported conversation carries the imported messages;
     // later turns reach them through the conversation's first session.
     let imported = if source.is_none() && fork_history.is_none() {

@@ -325,6 +325,20 @@ impl ToolPolicy {
             };
         }
 
+        // Native knowledge reads consult local reference data. Identity and the
+        // exact action matter: a similarly named plugin or a mutation still
+        // follows the normal approval mode. Explicit deny rules above win.
+        if matches!(
+            action,
+            CodingToolAction::ExternalTool { plugin_id, tool_name, arguments, .. }
+                if plugin_id == "knowledge" && tool_name == "knowledge"
+                    && matches!(arguments["action"].as_str(), Some("list" | "search" | "read" | "graph"))
+        ) {
+            return Decision::Allow {
+                reason: "knowledge reference (read-only)".to_owned(),
+            };
+        }
+
         // Reading the trusted skill catalogue changes nothing: listing skills,
         // loading one's instructions and reading its own files. Asking before each of
         // them put an approval panel between the model and every skill, and full-auto
@@ -910,6 +924,59 @@ mod g05_policy_tests {
             denied.decide(&external("skill", "activate_skill")),
             Decision::Deny(_)
         ));
+    }
+
+    #[test]
+    fn native_knowledge_reads_allow_but_mutations_follow_the_mode() {
+        let knowledge =
+            |plugin: &str, tool: &str, action: serde_json::Value| CodingToolAction::ExternalTool {
+                plugin_id: plugin.to_owned(),
+                tool_name: tool.to_owned(),
+                arguments: serde_json::json!({"action": action}),
+                parent_invocation_id: None,
+                timeout_ms: 5_000,
+            };
+        for mode in [PolicyMode::Ask, PolicyMode::AutoEdit, PolicyMode::FullAuto] {
+            let policy = ToolPolicy::new(1, Vec::new()).with_mode(mode);
+            for action in ["list", "search", "read", "graph"] {
+                assert!(matches!(
+                    policy.decide(&knowledge("knowledge", "knowledge", action.into())),
+                    Decision::Allow { .. }
+                ));
+            }
+            for action in [
+                serde_json::json!("write"),
+                serde_json::json!("delete"),
+                serde_json::json!("refresh"),
+                serde_json::json!("READ"),
+                serde_json::json!(null),
+                serde_json::json!(["read"]),
+            ] {
+                let decision = policy.decide(&knowledge("knowledge", "knowledge", action));
+                if mode == PolicyMode::FullAuto {
+                    assert!(matches!(decision, Decision::Allow { .. }));
+                } else {
+                    assert_eq!(decision, Decision::Ask);
+                }
+            }
+            let denied = policy.clone().with_tool_rules(vec![ToolPatternRule::deny(
+                "knowledge()",
+                "no knowledge here",
+            )]);
+            for action in ["list", "search", "read", "graph", "write", "delete"] {
+                assert_eq!(
+                    denied.decide(&knowledge("knowledge", "knowledge", action.into())),
+                    Decision::Deny("no knowledge here".to_owned())
+                );
+            }
+        }
+        let policy = ToolPolicy::default();
+        for (plugin, tool) in [("mcp", "knowledge"), ("knowledge", "other")] {
+            assert_eq!(
+                policy.decide(&knowledge(plugin, tool, "read".into())),
+                Decision::Ask
+            );
+        }
     }
 
     /// A mode chosen while the turn runs decides its next action, and a new turn

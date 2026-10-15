@@ -325,10 +325,87 @@ mod tests {
             let mut probe = [0_u8; 1];
             match tokio::time::timeout(Duration::from_millis(250), candidate.read(&mut probe)).await
             {
-                Ok(Ok(count)) if count > 0 => return candidate,
+                Ok(Ok(count)) if count > 0 => {
+                    drain_fixture_request(&mut candidate, probe[0]).await;
+                    return candidate;
+                }
                 Err(_) | Ok(Err(_)) | Ok(Ok(_)) => {}
             }
         }
+    }
+
+    async fn drain_fixture_request(socket: &mut tokio::net::TcpStream, first_byte: u8) {
+        // Finish consuming the request before responding. Closing a socket with
+        // unread request bytes can reset the connection on Windows, truncating
+        // the response even when its last chunk has already been written.
+        let mut request = vec![first_byte];
+        let mut buffer = [0_u8; 4096];
+        let header_end = loop {
+            if let Some(offset) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                break offset + 4;
+            }
+            assert!(request.len() < 64 * 1024, "fixture request head is bounded");
+            let count = socket.read(&mut buffer).await.expect("fixture reads head");
+            assert!(count > 0, "fixture request head is complete");
+            request.extend_from_slice(&buffer[..count]);
+        };
+        let head = std::str::from_utf8(&request[..header_end]).expect("HTTP request head");
+        let content_length: usize = head
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .expect("fixture JSON request has a content length")
+            .1
+            .trim()
+            .parse()
+            .expect("fixture content length is numeric");
+        assert!(
+            content_length <= 1024 * 1024,
+            "fixture request body is bounded"
+        );
+        let mut remaining = (header_end + content_length).saturating_sub(request.len());
+        while remaining > 0 {
+            let limit = remaining.min(buffer.len());
+            let count = socket
+                .read(&mut buffer[..limit])
+                .await
+                .expect("fixture reads body");
+            assert!(count > 0, "fixture request body is complete");
+            remaining -= count;
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_fixture_consumes_a_fragmented_request_body_before_responding() {
+        let _fixture_lock = crate::LOOPBACK_FIXTURE_LOCK.lock().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("address");
+        let (accepted, mut received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let socket = accept_the_request(listener).await;
+            accepted.send(()).expect("request consumed signal");
+            socket
+        });
+        await_loopback_ready(address).await;
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("fixture client");
+        client
+            .write_all(b"POST / HTTP/1.1\r\nContent-Length: 6\r\n\r\nabc")
+            .await
+            .expect("first request fragment");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut received)
+                .await
+                .is_err(),
+            "the fixture must wait for the entire request body"
+        );
+        client.write_all(b"def").await.expect("last body fragment");
+        tokio::time::timeout(Duration::from_secs(10), received)
+            .await
+            .expect("fixture consumes the rest")
+            .expect("consumed signal");
+        server.await.expect("server finishes");
     }
 
     fn provider_request() -> ProviderRequest {
@@ -512,6 +589,7 @@ mod tests {
     }
     #[tokio::test]
     async fn g1_adapter_delivers_text_before_the_response_completes() {
+        let _fixture_lock = crate::LOOPBACK_FIXTURE_LOCK.lock().await;
         // Binding a port only puts the socket into listen; the accept loop is
         // scheduled by the task. Signalling readiness from inside the task, and
         // skipping a connection that closes without sending a request head, removes

@@ -537,7 +537,9 @@ pub async fn run_with(
         .with_hashline(hashline)
         .with_policy(tool_policy)
         .with_hooks(resolved_config.hooks.clone());
-    if let Some(dispatcher) = super::mcp::combined_dispatcher_with_delegate(
+    let knowledge_host =
+        super::knowledge::KnowledgeHost::new(&context.project.root, &context.paths.data_dir);
+    let dispatcher = super::mcp::combined_dispatcher_with_delegate(
         None,
         active_extensions.as_ref(),
         None,
@@ -546,9 +548,11 @@ pub async fn run_with(
         None,
         None,
         None,
-    ) {
-        tools = tools.with_external(dispatcher);
-    }
+    );
+    tools = tools.with_external(super::knowledge::with_dispatcher(
+        dispatcher,
+        &knowledge_host,
+    ));
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
     let external_tools = super::mcp::combined_tools_with_delegate(
         None,
@@ -560,6 +564,10 @@ pub async fn run_with(
         None,
         None,
     );
+    let external_tools = Some(super::knowledge::with_tools(
+        external_tools,
+        &knowledge_host,
+    ));
     let driver = match &external_tools {
         Some(external) => driver.with_external(external.clone()),
         None => driver,
@@ -686,13 +694,17 @@ pub async fn run_with(
         ),
     );
     let harness_entries = harness_state.total();
-    let run_request = run_request.with_project_rules(vec![super::harness::digest_block(
+    let mut project_blocks = vec![super::harness::digest_block(
         &super::harness::format_digest(
             &harness_state,
             super::harness::DigestOptions::default(),
             &super::harness::weighted_terms(None, &[request.prompt.as_str()]),
         ),
-    )]);
+    )];
+    if let Some(block) = super::knowledge::context_block(&knowledge_host, &request.prompt) {
+        project_blocks.push(block);
+    }
+    let run_request = run_request.with_project_rules(project_blocks);
     let run_request = if attached.is_empty() {
         run_request
     } else {

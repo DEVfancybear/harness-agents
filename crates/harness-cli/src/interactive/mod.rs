@@ -40,6 +40,7 @@ pub mod heartbeat;
 pub mod input;
 pub mod instructions;
 pub mod keybindings;
+pub mod knowledge;
 pub mod learned;
 pub mod lifecycle;
 pub mod mcp;

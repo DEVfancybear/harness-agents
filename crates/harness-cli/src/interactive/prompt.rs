@@ -102,6 +102,9 @@ impl SystemPromptBuilder {
         if has("delegate") {
             parts.push(SUBAGENT_GUIDANCE.to_owned());
         }
+        if has("knowledge") {
+            parts.push(super::knowledge::GUIDANCE.to_owned());
+        }
         let guidelines = additional_guidance(&has);
         if !guidelines.is_empty() {
             parts.push(format!(
@@ -420,6 +423,7 @@ mod tests {
         assert!(!bare.contains("Delegating to sub-agents"));
         assert!(!bare.contains("persistent CPython REPL"));
         assert!(!bare.contains("web_search"));
+        assert!(!bare.contains(super::super::knowledge::GUIDANCE));
         let full =
             SystemPromptBuilder::build(&environment(), &["delegate", "ipython", "web_search"]).text;
         assert!(full.contains("# Delegating to sub-agents"));
@@ -433,5 +437,10 @@ mod tests {
                 .contains("rlm.spawn")
         );
         assert!(full.contains("web_search"));
+        assert!(
+            SystemPromptBuilder::build(&environment(), &["knowledge"])
+                .text
+                .contains(super::super::knowledge::GUIDANCE)
+        );
     }
 }

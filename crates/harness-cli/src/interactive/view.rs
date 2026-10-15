@@ -237,6 +237,7 @@ pub fn help_card_lines() -> Vec<String> {
             "Tools",
             &[
                 "/skills",
+                "/knowledge",
                 "/skill:<name>",
                 "/mcp",
                 "/plugins",

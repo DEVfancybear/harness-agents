@@ -252,6 +252,9 @@ pub struct ChildLaunch {
     /// inherits its parent's tools: a research brief sent to an explorer without
     /// them could only be answered from the local files.
     pub web: Option<ChildWebTools>,
+    /// Reference knowledge stays anchored to the parent's original project,
+    /// including when a coder and its descendants work in isolated checkouts.
+    pub knowledge: Option<super::knowledge::KnowledgeHost>,
     /// Which models edit by hashline anchors; a child's own model decides.
     pub hashline: super::config::HashlineRule,
     /// The project's `[verify]` checks: `integrate_children` runs them on the
@@ -3219,6 +3222,7 @@ struct ChildTools {
     shared: Arc<AgentsShared>,
     task_id: TaskId,
     web: Option<ChildWebTools>,
+    knowledge: Option<super::knowledge::KnowledgeHost>,
     /// How this child starts children of its own; `None` at the depth limit.
     spawn: Option<ChildSpawn>,
 }
@@ -3347,6 +3351,9 @@ impl ExternalToolCatalog for ChildTools {
         if let Some((catalog, _)) = &self.web {
             schemas.extend(catalog.schemas());
         }
+        if let Some(knowledge) = &self.knowledge {
+            schemas.extend(knowledge.readonly().tools().schemas());
+        }
         schemas
     }
 
@@ -3369,6 +3376,12 @@ impl ExternalToolCatalog for ChildTools {
                 timeout_ms: 30_000,
             });
         }
+        if name == "knowledge" {
+            return self
+                .knowledge
+                .as_ref()
+                .and_then(|knowledge| knowledge.readonly().tools().resolve(name, arguments));
+        }
         self.web
             .as_ref()
             .and_then(|(catalog, _)| catalog.resolve(name, arguments))
@@ -3386,6 +3399,21 @@ impl ExternalToolDispatcher for ChildTools {
         Box::pin(async move {
             if plugin_id == "agent" {
                 return Ok(());
+            }
+            if plugin_id == "knowledge" {
+                return match &self.knowledge {
+                    Some(knowledge) => {
+                        knowledge
+                            .readonly()
+                            .dispatcher()
+                            .validate_external(plugin_id, tool_name, arguments)
+                            .await
+                    }
+                    None => Err(HarnessError::new(
+                        ErrorCode::PolicyDenied,
+                        "knowledge is not available to this child",
+                    )),
+                };
             }
             match &self.web {
                 Some((_, dispatcher)) => {
@@ -3412,6 +3440,27 @@ impl ExternalToolDispatcher for ChildTools {
         Box<dyn std::future::Future<Output = Result<ToolOutput, HarnessError>> + Send + 'a>,
     > {
         Box::pin(async move {
+            if plugin_id == "knowledge" {
+                return match &self.knowledge {
+                    Some(knowledge) => {
+                        knowledge
+                            .readonly()
+                            .dispatcher()
+                            .dispatch_external(
+                                authorization,
+                                plugin_id,
+                                tool_name,
+                                arguments,
+                                timeout_ms,
+                            )
+                            .await
+                    }
+                    None => Err(HarnessError::new(
+                        ErrorCode::PolicyDenied,
+                        "knowledge is not available to this child",
+                    )),
+                };
+            }
             if plugin_id != "agent" {
                 return match &self.web {
                     Some((_, dispatcher)) => {
@@ -4031,6 +4080,10 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     workspace_root: workspace_root.clone(),
                     workspace: request.brief.workspace.clone(),
                     parent_policy: policy.clone(),
+                    knowledge: launch
+                        .knowledge
+                        .as_ref()
+                        .map(super::knowledge::KnowledgeHost::readonly),
                     ..launch.clone()
                 },
                 cancellation: request.cancellation.clone(),
@@ -4039,6 +4092,10 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 shared: Arc::clone(&self.shared),
                 task_id: task_id.clone(),
                 web: launch.web.clone(),
+                knowledge: launch
+                    .knowledge
+                    .as_ref()
+                    .map(super::knowledge::KnowledgeHost::readonly),
                 spawn,
             });
             let tools = ToolExecutionService::new(Arc::clone(&store))
@@ -4132,6 +4189,13 @@ impl WorkerBackend for InteractiveWorkerBackend {
             let mut follow_up_error = None;
             let outcome = loop {
                 self.shared.update(&task_id, |child| child.in_turn = true);
+                let mut project_rules = launch.context.clone();
+                if let Some(knowledge) = &launch.knowledge
+                    && let Some(block) =
+                        super::knowledge::context_block(knowledge, &request.brief.objective)
+                {
+                    project_rules.push(block);
+                }
                 let run_request = RunRequest::new(
                     session_id.clone(),
                     task_id.clone(),
@@ -4144,7 +4208,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     request.brief.workspace.clone(),
                 )
                 .with_system_policy(system_policy.clone())
-                .with_project_rules(launch.context.clone())
+                .with_project_rules(project_rules)
                 .with_tool_schemas(schemas.clone())
                 .with_authority(SourceAuthority::ModelProposed)
                 .with_conversation(conversation.clone());
@@ -4612,6 +4676,79 @@ pub(super) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn child_knowledge_reads_are_available_but_forged_mutations_and_off_are_refused() {
+        use harness_tools::{ExternalToolCatalog, ExternalToolDispatcher};
+        use serde_json::json;
+
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let knowledge = crate::interactive::knowledge::KnowledgeHost::new(
+            &workspace,
+            &root.path().join("data"),
+        );
+        knowledge.command("on").expect("enable project knowledge");
+        let (sender, _events) = tokio::sync::mpsc::unbounded_channel();
+        let tools = ChildTools {
+            shared: shared(sender),
+            task_id: TaskId::generate(),
+            web: None,
+            // Deliberately pass the writable root host: the child boundary must
+            // enforce read-only even if a caller forgets to make it so.
+            knowledge: Some(knowledge.clone()),
+            spawn: None,
+        };
+        let schemas = tools.schemas();
+        let schema = schemas
+            .iter()
+            .find(|schema| schema["function"]["name"] == "knowledge")
+            .expect("knowledge schema");
+        assert_eq!(
+            schema["function"]["parameters"]["properties"]["action"]["enum"],
+            json!(["list", "search", "read", "graph"])
+        );
+        for action in ["list", "search", "read", "graph"] {
+            let args = json!({"action":action,"scope":"project","query":"architecture","path":"architecture.md"});
+            assert!(tools.resolve("knowledge", &args).is_some(), "{args}");
+            tools
+                .validate_external("knowledge", "knowledge", &args)
+                .await
+                .expect("read validation");
+        }
+        for action in ["write", "delete"] {
+            let args = json!({"action":action,"path":"architecture.md","title":"Architecture",
+                "summary":"Facts","content":"Do not write","expected_hash":"fake"});
+            assert!(tools.resolve("knowledge", &args).is_none());
+            let error = tools
+                .validate_external("knowledge", "knowledge", &args)
+                .await
+                .expect_err("forged mutation refused");
+            assert!(error.message().contains("read-only"), "{error}");
+        }
+        let args = json!({"action":"list","scope":"project"});
+        assert!(tools.resolve("knowledge", &args).is_some());
+        knowledge.command("off").expect("disable project knowledge");
+        assert!(tools.resolve("knowledge", &args).is_none());
+        assert!(
+            tools
+                .validate_external("knowledge", "knowledge", &args)
+                .await
+                .is_err()
+        );
+        assert!(
+            tools
+                .validate_external("knowledge", "other", &args)
+                .await
+                .is_err()
+        );
+        assert!(
+            !workspace
+                .join(".harness/knowledge/architecture.md")
+                .exists()
+        );
+    }
+
     /// Every message between agents is kept for `/agents messages` and shown
     /// as it is sent.
     #[test]
@@ -4957,6 +5094,7 @@ pub(super) mod tests {
                 .with_mode(harness_tools::PolicyMode::FullAuto),
             child_limits: harness_tools::TurnLimits::default(),
             web: None,
+            knowledge: None,
             hashline: super::super::config::HashlineRule::Off,
             checks: Vec::new(),
             context: Vec::new(),
