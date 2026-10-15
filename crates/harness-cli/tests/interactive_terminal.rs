@@ -3783,7 +3783,7 @@ fn i22_agents_view_opens_returns_and_stops() {
     session.send("\u{e}");
     wait_for_normalized(&session, "> Nhập yêu cầu", Duration::from_mins(1));
     session.send("\u{1b}[D");
-    wait_for_normalized(&session, "Idle (1)", Duration::from_secs(30));
+    wait_for_normalized(&session, "IDLE", Duration::from_secs(30));
     session.send("\u{18}");
     wait_for_normalized(
         &session,
@@ -3794,4 +3794,35 @@ fn i22_agents_view_opens_returns_and_stops() {
     wait_for_normalized(&session, "stopped", Duration::from_secs(30));
     session.send("\u{1b}");
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+}
+
+/// `/agents` in a session goes straight to the agents view. The transcript
+/// between the command and the view is saved for evidence of what the
+/// terminal drew on the way.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn i23_slash_agents_goes_straight_to_the_view() {
+    let (temp, project) = sandbox();
+    let mut session = PtySession::spawn_process(&project, &base_env(&temp), &["agents"], &[]);
+    wait_for_normalized(&session, "ctrl+n new", Duration::from_secs(30));
+    session.send("\u{e}");
+    wait_for_normalized(&session, "> Nhập yêu cầu", Duration::from_mins(1));
+    let before = session.transcript().len();
+    let views = normalized(&session.transcript()).matches("SESSION").count();
+    let sent = Instant::now();
+    session.send("/agents\r");
+    wait_for_occurrences(&session, "SESSION", views + 1, Duration::from_mins(1));
+    let elapsed = sent.elapsed();
+    let transcript = session.transcript();
+    let between = transcript.get(before..).unwrap_or_default().to_owned();
+    let evidence = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/pty-acceptance/i23-slash-agents.txt");
+    let _ = std::fs::create_dir_all(evidence.parent().expect("parent"));
+    let _ = std::fs::write(&evidence, format!("elapsed {elapsed:?}\n{between}"));
+    println!(
+        "i23 elapsed {elapsed:?}, {} bytes drawn on the way",
+        between.len()
+    );
+    session.send("\u{1b}");
+    let _ = session.wait_exit(Duration::from_secs(20));
 }

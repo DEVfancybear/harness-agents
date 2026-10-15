@@ -418,6 +418,8 @@ struct View {
     store_dir: PathBuf,
     /// The agent whose session opened the view: Esc goes back to it.
     came_from: Option<String>,
+    /// The roster and the saved conversations are still being read.
+    loading: bool,
 }
 
 impl View {
@@ -527,6 +529,10 @@ fn load_saved(context: &LaunchContext) -> Vec<SavedConversation> {
 ///
 /// # Errors
 /// The console refused the alternate screen.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the view's loop: load, draw, refresh and keys in one place"
+)]
 pub fn run(
     context: &LaunchContext,
     environment: &LaunchEnvironment,
@@ -534,10 +540,27 @@ pub fn run(
     came_from: Option<String>,
 ) -> Result<Choice, String> {
     let registry = client::user_registry()?;
+    // The view is drawn at once and filled when the roster and the saved
+    // conversations are read: reading them first (each ~0.4 s on a large
+    // store) left the session's last frame, spinner and all, on screen.
+    let (loaded_sender, arrived) = std::sync::mpsc::channel();
+    {
+        let loaded = loaded_sender.clone();
+        let registry = registry.clone();
+        let context = context.clone();
+        std::thread::spawn(move || {
+            let live = std::thread::spawn({
+                let registry = registry.clone();
+                move || client::list_all(&registry)
+            });
+            let saved = load_saved(&context);
+            let _ = loaded.send((live.join().unwrap_or_default(), Some(saved)));
+        });
+    }
     let mut view = View {
-        live: client::list_all(&registry),
+        live: Vec::new(),
         registry,
-        saved: load_saved(context),
+        saved: Vec::new(),
         query: String::new(),
         draft: String::new(),
         composer: Composer::Search,
@@ -548,6 +571,7 @@ pub fn run(
         list_rows: std::cell::RefCell::new(Vec::new()),
         store_dir: context.project_store_dir(),
         came_from,
+        loading: true,
     };
     let mut stdout = io::stdout();
     execute!(
@@ -561,13 +585,28 @@ pub fn run(
             .map_err(|error| error.to_string())?;
         let theme = Theme::detect();
         let mut refreshed = Instant::now();
+        // A roster read on the screen's own thread stalled every key for it.
+        let mut refreshing = true;
         loop {
+            if let Ok((live, saved)) = arrived.try_recv() {
+                view.live = live;
+                if let Some(saved) = saved {
+                    view.saved = saved;
+                }
+                view.loading = false;
+                refreshing = false;
+                refreshed = Instant::now();
+            }
             screen
                 .draw(|frame| draw(frame, &view, &theme))
                 .map_err(|error| error.to_string())?;
-            if refreshed.elapsed() >= REFRESH {
-                view.refresh();
-                refreshed = Instant::now();
+            if !refreshing && refreshed.elapsed() >= REFRESH {
+                refreshing = true;
+                let registry = view.registry.clone();
+                let loaded = loaded_sender.clone();
+                std::thread::spawn(move || {
+                    let _ = loaded.send((client::list_all(&registry), None));
+                });
             }
             if !event::poll(Duration::from_millis(250)).map_err(|error| error.to_string())? {
                 continue;
@@ -652,6 +691,8 @@ fn handle_key(
     let empty = view.query.is_empty();
     match key.code {
         KeyCode::Esc if !empty => view.query.clear(),
+        // Back needs the roster to find the session it came from.
+        KeyCode::Esc if view.loading && view.came_from.is_some() => {}
         // Seen: Esc in a view opened from a session ended ha instead of going
         // back to that session.
         KeyCode::Esc => return Some(view.back()),
@@ -1058,7 +1099,9 @@ fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
     }
     let visible = usize::from(list_bottom.saturating_sub(list_top + 1));
     if items.is_empty() {
-        let empty = if view.query.trim().is_empty() {
+        let empty = if view.loading {
+            "Loading sessions…"
+        } else if view.query.trim().is_empty() {
             "No sessions yet. Ctrl+N starts one."
         } else {
             "No sessions match your search."
@@ -1303,6 +1346,7 @@ mod tests {
             list_rows: std::cell::RefCell::new(Vec::new()),
             store_dir: std::path::PathBuf::new(),
             came_from: Some("a1".to_owned()),
+            loading: false,
         };
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 18)).expect("terminal");
@@ -1419,6 +1463,7 @@ mod tests {
             list_rows: std::cell::RefCell::new(Vec::new()),
             store_dir: std::path::PathBuf::new(),
             came_from: came_from.map(str::to_owned),
+            loading: false,
         };
         assert!(matches!(
             view(Some("a1")).back(),
