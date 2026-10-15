@@ -98,9 +98,7 @@
             "config_trust_required",
             "backup_manifest_invalid",
             "restore_target_conflict",
-            "retention_refused",
-            "resource_not_found",
-            "access_denied"
+            "retention_refused"
           ],
           "type": "string"
         },
@@ -122,6 +120,16 @@
         {
           "const": "source_unavailable",
           "description": "A referenced durable source is no longer available to read. Distinct\nfrom a scope refusal: the caller may read it in principle, but the bytes\nbehind the reference are gone.",
+          "type": "string"
+        },
+        {
+          "const": "resource_not_found",
+          "description": "A remote resource answered that it does not exist (HTTP 404, 410):\nasking again will not find it.",
+          "type": "string"
+        },
+        {
+          "const": "access_denied",
+          "description": "A remote resource refused this client (HTTP 401, 403): it needs a login\nor a key, or it turns automated readers away.",
           "type": "string"
         }
       ]
