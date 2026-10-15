@@ -2571,13 +2571,18 @@ fn announce_settled(
 struct UsageHold {
     held: Option<TurnProgress>,
     completed: bool,
+    /// The completed call's usage was passed on.
+    counted: bool,
 }
 
 impl UsageHold {
-    /// A usage report: held while the call streams, passed on after it completed.
+    /// A usage report: held while the call streams, passed on after it
+    /// completed - once. Seen: `OpenCode` reports the usage both before and after
+    /// the completion, and every call was counted twice (`--budget` ran out at
+    /// half its tokens).
     fn report(&mut self, report: TurnProgress) -> Option<TurnProgress> {
         if self.completed {
-            Some(report)
+            (!std::mem::replace(&mut self.counted, true)).then_some(report)
         } else {
             self.held = Some(report);
             None
@@ -2587,12 +2592,15 @@ impl UsageHold {
     /// The call completed: what it reported last.
     fn complete(&mut self) -> Option<TurnProgress> {
         self.completed = true;
-        self.held.take()
+        let held = self.held.take();
+        self.counted = held.is_some();
+        held
     }
 
     /// A new attempt starts: what the last one reported and never completed.
     fn restart(&mut self) -> Option<TurnProgress> {
         self.completed = false;
+        self.counted = false;
         self.held.take()
     }
 }
@@ -3684,6 +3692,12 @@ mod stream_restart_tests {
             vec![[1000, 25, 800, 0], [1200, 5, 1000, 0]],
             "one whole report per call"
         );
+        // OpenCode reports before the completion and again after it: once.
+        sink(ProviderStreamEvent::started());
+        sink(ProviderStreamEvent::usage(300, 7, 307));
+        sink(ProviderStreamEvent::completed("stop"));
+        sink(ProviderStreamEvent::usage(300, 7, 307));
+        assert_eq!(reports(&recorder).len(), 3, "{:?}", reports(&recorder));
     }
 
     /// A retried model call streams its answer again from the start: the
