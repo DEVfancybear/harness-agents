@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use harness_providers::{
-    CancellationToken, ModelProvider, ProviderError, ProviderEventStream, ProviderFuture,
-    ProviderRequest, ProviderStreamEvent, ThinkingLevel,
+    CancellationToken, ImageAttachment, MessageRole, ModelProvider, ProviderError,
+    ProviderEventStream, ProviderFuture, ProviderMessage, ProviderRequest, ProviderStreamEvent,
+    ThinkingLevel,
 };
 use harness_types::ErrorCode;
 use tokio::sync::mpsc::UnboundedSender;
@@ -388,12 +389,22 @@ impl Router {
             .any(|message| !message.attachments.is_empty());
         if has_images && !self.primary_takes_images {
             return match &self.image {
+                // CowAgent's vision tool: the image model describes each image
+                // once and the session model goes on reading the descriptions.
+                // Handing it the whole request ran the rest of the turn, every
+                // tool call included, on the image model.
                 Some(Ok((name, provider))) => {
-                    self.notice_once(format!(
-                        "{} does not accept images; this request goes to the image model {name}",
-                        self.primary
-                    ));
-                    provider.stream_events(request, cancellation)
+                    let router = Arc::clone(self);
+                    let name = name.clone();
+                    let image = Arc::clone(provider);
+                    Box::pin(
+                        futures_util::stream::once(async move {
+                            router
+                                .described(primary, image, name, request, cancellation)
+                                .await
+                        })
+                        .flatten(),
+                    )
                 }
                 Some(Err(reason)) => failed(ProviderError::new(
                     ErrorCode::IncompatibleService,
@@ -419,6 +430,56 @@ impl Router {
             )
             .flatten(),
         )
+    }
+
+    /// `request` with each image replaced by the image model's description of
+    /// it, sent on to the session model; handed to the image model whole when
+    /// an image cannot be described.
+    async fn described(
+        self: Arc<Self>,
+        primary: Arc<dyn ModelProvider>,
+        image: Arc<dyn ModelProvider>,
+        name: String,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> ProviderEventStream {
+        let context = request
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::User && !message.content.trim().is_empty())
+            .map(|message| message.content.chars().take(2000).collect::<String>())
+            .unwrap_or_default();
+        let mut described = request.clone();
+        for message in Arc::make_mut(&mut described.messages) {
+            if message.attachments.is_empty() {
+                continue;
+            }
+            let mut notes = Vec::new();
+            for attachment in std::mem::take(&mut message.attachments) {
+                match describe(&image, &attachment, &context, &cancellation).await {
+                    Ok(text) => notes.push(format!(
+                        "[image {}: described by {name}, since {} cannot see images]\n{text}",
+                        attachment.label, self.primary
+                    )),
+                    Err(error) => {
+                        self.notice_once(format!(
+                            "{name} could not describe an image ({error}); this request goes to it whole"
+                        ));
+                        return image.stream_events(request, cancellation);
+                    }
+                }
+            }
+            if !message.content.is_empty() {
+                message.content.push_str("\n\n");
+            }
+            message.content.push_str(&notes.join("\n\n"));
+        }
+        self.notice_once(format!(
+            "{} does not read images; {name} described them for it",
+            self.primary
+        ));
+        self.open(primary, described, cancellation).await
     }
 
     async fn open(
@@ -585,6 +646,58 @@ fn is_transient(error: &ProviderError) -> bool {
         error.code(),
         ErrorCode::RateLimited | ErrorCode::ServiceUnavailable
     )
+}
+
+/// What the image model is asked about one image.
+const DESCRIBE_IMAGE: &str = "You are the eyes of a coding assistant that cannot see images. Describe this image so it can act on it without seeing it: every piece of visible text verbatim (code, errors, labels, numbers), the layout and the position of each element (top, left, ...), colours or states that carry meaning, and anything that looks wrong. Be complete and factual; do not guess what is not visible. The assistant's latest message, for what matters:";
+
+/// The image model's description of `attachment`, written once per image.
+async fn describe(
+    image: &Arc<dyn ModelProvider>,
+    attachment: &ImageAttachment,
+    context: &str,
+    cancellation: &CancellationToken,
+) -> Result<String, ProviderError> {
+    static WRITTEN: std::sync::OnceLock<Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    let key = harness_types::ContentHash::from_bytes(attachment.source.url().as_bytes())
+        .as_str()
+        .to_owned();
+    let written = WRITTEN.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(text) = written
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).cloned())
+    {
+        return Ok(text);
+    }
+    let request = ProviderRequest::new(
+        harness_types::RequestId::generate(),
+        image.capabilities().model,
+        vec![
+            ProviderMessage::new(MessageRole::User, format!("{DESCRIBE_IMAGE}\n\n{context}"))
+                .with_attachments(vec![attachment.clone()]),
+        ],
+    );
+    let mut stream = image.stream_events(request, cancellation.clone());
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event?);
+    }
+    let text = harness_providers::assemble_stream(&events)?.text;
+    if text.trim().is_empty() {
+        return Err(ProviderError::new(
+            ErrorCode::ProviderProtocol,
+            "the description was empty",
+        ));
+    }
+    if let Ok(mut cache) = written.lock() {
+        if cache.len() > 256 {
+            cache.clear();
+        }
+        cache.insert(key, text.clone());
+    }
+    Ok(text)
 }
 
 fn failed(error: ProviderError) -> ProviderEventStream {
@@ -1032,13 +1145,16 @@ mod tests {
         );
     }
 
+    /// Seen: one screenshot ran the rest of a `DeepSeek` turn, every tool call
+    /// included, on the image model. The image model now describes the image
+    /// and the session model answers.
     #[tokio::test]
-    async fn q12_images_route_to_the_image_model() {
+    async fn q12_images_are_described_for_a_model_that_cannot_see_them() {
         let primary = Failing::new(&[]);
         let (turn, mut events) = router(
             false,
             None,
-            Some(answering("vision")),
+            Some(answering("a red error banner at the top")),
             None,
             std::sync::Arc::default(),
         );
@@ -1047,7 +1163,7 @@ mod tests {
             call(&turn, primary.clone(), request(true), token())
                 .await
                 .unwrap(),
-            "vision"
+            "primary-answer"
         );
         assert_eq!(
             call(&turn, primary.clone(), request(false), token())
@@ -1055,12 +1171,11 @@ mod tests {
                 .unwrap(),
             "primary-answer"
         );
-        assert_eq!(
-            primary.calls(),
-            1,
-            "only the text request reached the primary"
+        assert_eq!(primary.calls(), 2, "the session model answered both");
+        assert!(
+            said(&mut events)[0].contains("described them"),
+            "the user is told who looked at the image"
         );
-        assert!(said(&mut events)[0].contains("image model other/vision"));
         // A model that reads images keeps them.
         let (reads, _events) = router(
             true,
