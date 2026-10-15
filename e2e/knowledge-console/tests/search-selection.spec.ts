@@ -1,0 +1,32 @@
+import { test, expect } from '../fixture';
+import { KnowledgePage } from '../knowledge.page';
+
+test('search results can be selected, moved and deleted as one batch', async ({ page, console: app }) => {
+  const ui = new KnowledgePage(page);
+  await ui.open(app.url);
+  await ui.folder('archive');
+  await ui.create('one.md', '# First result\n\nORBIT-QUERY');
+  await ui.create('two.md', '# Second result\n\nORBIT-QUERY');
+  await page.getByRole('searchbox', { name: 'Search knowledge', exact: true }).fill('ORBIT-QUERY');
+  await expect(page.getByText('2 search results', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Select', exact: true }).click();
+  await page.getByRole('checkbox', { name: 'Select First result', exact: true }).check();
+  await page.getByRole('checkbox', { name: 'Select Second result', exact: true }).check();
+  await expect(page.getByText('2 selected', { exact: true })).toBeVisible();
+  await page.locator('#move-selected').click();
+  const move = page.getByRole('dialog', { name: 'Move 2 documents', exact: true });
+  await move.getByLabel('Destination folder', { exact: true }).selectOption('archive');
+  await move.getByRole('button', { name: 'Move', exact: true }).click();
+  await expect(move).toHaveCount(0);
+  const pages = await (await app.api.get('/api/pages?scope=project')).json();
+  expect(pages.pages.map((p: any) => p.path).sort()).toEqual(['archive/one.md', 'archive/two.md']);
+  await page.getByRole('button', { name: 'archive', exact: true }).click();
+  await page.getByRole('checkbox', { name: 'Select First result', exact: true }).check();
+  await page.getByRole('checkbox', { name: 'Select Second result', exact: true }).check();
+  await page.locator('#delete-selected').click();
+  const remove = page.getByRole('dialog', { name: 'Delete 2 documents?', exact: true });
+  await remove.getByLabel('Type delete to confirm', { exact: true }).fill('delete');
+  await remove.getByRole('button', { name: 'Delete', exact: true }).click();
+  await expect(remove).toHaveCount(0);
+  expect((await (await app.api.get('/api/pages?scope=project')).json()).pages).toEqual([]);
+});

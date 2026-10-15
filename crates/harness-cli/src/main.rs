@@ -209,6 +209,9 @@ enum Command {
         /// Print a versioned JSON result.
         #[arg(long)]
         json: bool,
+        /// Loopback port for `knowledge serve` (0 selects an available port).
+        #[arg(long)]
+        port: Option<u16>,
         #[arg(default_value = "status")]
         action: String,
         #[arg(value_name = "QUERY_OR_PATH")]
@@ -1090,9 +1093,17 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
             cwd,
             global,
             json,
+            port,
             action,
             arguments,
-        }) => interactive::cli_extras::knowledge(cwd.as_deref(), global, json, &action, &arguments),
+        }) => interactive::cli_extras::knowledge(
+            cwd.as_deref(),
+            global,
+            json,
+            port,
+            &action,
+            &arguments,
+        ),
         Some(Command::Attach { agent }) => interactive::app::attach(&agent),
         Some(Command::Abort { agent, json }) => interactive::agents::abort_command(&agent, json),
         Some(Command::Schedule(command)) => match command {

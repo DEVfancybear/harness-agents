@@ -1,0 +1,14 @@
+[
+  {
+    "name": "marked",
+    "version": "18.1.1",
+    "file": "marked.min.js",
+    "sha256": "b82b9334406d8bdd16b6236c08de1cb65b2a859873ca9503d9cc0b292ca3c12a"
+  },
+  {
+    "name": "DOMPurify",
+    "version": "3.4.17",
+    "file": "purify.min.js",
+    "sha256": "cd37898f9782adf54820c413191b5691803f0f137c799d6edcfd38523b4c2c31"
+  }
+]

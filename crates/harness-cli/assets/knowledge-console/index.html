@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Knowledge · HA</title>
+  <link rel="stylesheet" href="/app.css">
+  <script defer src="/vendor/marked.min.js"></script>
+  <script defer src="/vendor/purify.min.js"></script>
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <div id="import-drop-zone" class="import-drop-zone" aria-hidden="true" hidden><div><strong>Drop files to import</strong><span>Choose a folder and review import options before saving.</span></div></div>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="HA Knowledge home"><span class="brand-mark" aria-hidden="true">ha</span><span>Harness Agents<span class="brand-section">Knowledge</span></span></a>
+    <div class="topbar-end"><span class="local-badge"><span aria-hidden="true" class="status-dot"></span>Local workspace</span><button type="button" id="refresh" class="icon-button" aria-label="Refresh knowledge" title="Refresh knowledge"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.5-2L20 8M4 16l2.4 3a7 7 0 0 0 11.5-2"/></svg></button></div>
+  </header>
+  <div class="workspace">
+    <aside class="sidebar" aria-label="Knowledge navigation">
+      <div class="sidebar-top">
+        <div class="scope-field"><label for="scope">Library</label><select id="scope"><option value="project">Project knowledge</option><option value="global">Global knowledge</option></select></div>
+        <form id="search-form" class="search-field" role="search"><label class="sr-only" for="search">Search knowledge</label><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg><input id="search" type="search" placeholder="Search knowledge…" autocomplete="off" maxlength="512"><button type="submit" class="sr-only">Search</button></form>
+        <p id="library-count" class="muted library-count">Loading library…</p>
+        <div class="library-actions"><button type="button" id="new-document" class="text-button">New document</button><button type="button" id="import-documents" class="text-button">Import</button><button type="button" id="manage-categories" class="text-button">Folders</button><button type="button" id="select-documents" class="text-button" aria-pressed="false">Select</button></div>
+        <div id="selection-actions" class="selection-actions" hidden><span id="selection-count" class="small">0 selected</span><button type="button" id="move-selected" class="text-button">Move</button><button type="button" id="delete-selected" class="text-button danger-button">Delete</button></div>
+      </div>
+      <nav id="directory" class="directory" aria-label="Knowledge documents" aria-busy="true"></nav>
+      <div class="sidebar-footer"><div><span id="enabled-label">Knowledge</span><span id="enabled-detail" class="muted small">Available to your agents</span></div><button type="button" id="enabled" role="switch" aria-checked="true" aria-label="Enable knowledge" class="switch"><span></span></button></div>
+    </aside>
+    <main id="main-content" class="main" tabindex="-1">
+      <div class="main-header"><div><p class="eyebrow" id="scope-label">Project library</p><h1>Knowledge</h1><p class="muted intro">Explore what your agents have learned, and how it connects.</p></div><div class="stats" aria-label="Library statistics"><div><strong id="page-count">—</strong><span>Documents</span></div><div><strong id="link-count">—</strong><span>Connections</span></div></div></div>
+      <div class="view-bar"><div class="tabs" role="tablist" aria-label="Knowledge view"><button type="button" id="document-tab" role="tab" aria-selected="true" aria-controls="document-panel" tabindex="0"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H5v18h14V8Zm0 0v5h5M8 12h8M8 16h6"/></svg>Documents</button><button type="button" id="graph-tab" role="tab" aria-selected="false" aria-controls="graph-panel" tabindex="-1"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="8" r="3"/><circle cx="10" cy="19" r="3"/><path d="m9 6 6 1M7 9l2 7m7-5-4 6"/></svg>Graph</button></div><span id="retrieval-label" class="muted small"></span></div>
+      <div id="notice" class="notice" role="alert" hidden></div>
+      <div id="document-panel" role="tabpanel" aria-labelledby="document-tab" class="document-panel">
+        <div id="empty-state" class="empty-state"><div class="empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m3 5 9-2 9 2v16l-9-2-9 2Zm9-2v16M6 8l3-.7M6 12l3-.7M15 7.3l3 .7M15 11.3l3 .7"/></svg></div><h2>Your connected knowledge</h2><p>Choose a document from the library, or explore the graph to discover related ideas.</p></div>
+        <article id="document" hidden aria-busy="false"><div class="document-heading"><p id="document-path" class="muted breadcrumb"></p><h2 id="document-title"></h2><div class="document-actions"><button type="button" id="edit-document" class="text-button">Edit</button><button type="button" id="move-document" class="text-button">Move</button><button type="button" id="delete-document" class="text-button danger-button">Delete</button><button type="button" id="copy-link" class="text-button">Copy link</button><button type="button" id="show-connections" class="text-button">View connections</button></div></div><div id="markdown" class="markdown"></div><footer class="document-footer"><section><h3>Sources</h3><div id="sources" class="metadata-list"></div></section><section><h3>Related documents</h3><div id="related" class="metadata-list"></div></section><section><h3>Referenced by</h3><div id="backlinks" class="metadata-list"></div></section></footer></article>
+      </div>
+      <section id="graph-panel" role="tabpanel" aria-labelledby="graph-tab" class="graph-panel" hidden>
+        <div class="graph-toolbar"><p class="muted small">Select a node to open its document.</p><div class="graph-buttons"><button type="button" id="zoom-out" class="icon-button" aria-label="Zoom graph out" title="Zoom out"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg></button><span id="zoom-label" class="zoom-label">100%</span><button type="button" id="zoom-in" class="icon-button" aria-label="Zoom graph in" title="Zoom in"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M12 5v14"/></svg></button><button type="button" id="graph-fit" class="text-button">Fit graph</button></div></div>
+        <div class="graph-area"><canvas id="graph" tabindex="0" aria-label="Knowledge relationship graph. Arrow keys pan, plus and minus zoom. Select documents in the list below." aria-describedby="graph-help"></canvas><div id="graph-empty" class="graph-empty" hidden>No connections yet. Related documents will appear here.</div><div id="graph-selection" class="graph-selection" hidden><div><strong id="graph-selection-title"></strong><p id="graph-selection-path" class="muted small"></p></div><button type="button" id="graph-open" class="primary-button">Open document</button></div></div>
+        <p id="graph-help" class="muted small graph-help">Drag the canvas to pan or a node to move it. Use the controls to zoom. Every document is also available in the list below.</p>
+        <details class="graph-document-list"><summary>Documents in this graph <span id="graph-count"></span></summary><div id="graph-documents" class="graph-documents"></div></details>
+      </section>
+      <div id="live-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+    </main>
+  </div>
+</body>
+</html>
