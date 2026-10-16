@@ -48,7 +48,7 @@ when the queue is empty.
 **Status line.** Two ends. The left says what the app is doing: spinner, clock,
 `esc to interrupt`, counters, the model and thinking level, and anything that
 needs a decision (an approval's countdown, a selector's keys). The right carries
-telemetry only worth a glance: cost, `⚡ cache NN%` (the share of the session's
+telemetry only worth a glance: cost, `↯ cache NN%` (the share of the session's
 prompt served from the provider's cache), `◔ ctx NN%` (how full the context is)
 and the detail mode. A narrow console drops the right end piece by piece (detail
 mode first, then cost and cache), keeping the context gauge last, before it

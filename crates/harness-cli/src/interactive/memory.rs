@@ -46,6 +46,7 @@ pub const GUIDANCE: &str = concat!(
     "When the user asks you to remember something, states a lasting preference or corrects how you work, or a decision is reached that later work depends on, write it in the same turn without asking. Use scope global for what holds across conversations (the user's preferences, stable facts; name the project when a fact is about one) and local for this conversation's state. ",
     "Search before writing and update the matching entry with its id and expected_version instead of adding a near-duplicate; delete an entry that turned out wrong. One fact or rule per entry, short and self-contained. Never store secrets, credentials or tokens. ",
     "Pin (pinned: true) only an entry every turn should obey whatever the request, such as the user's language, how to address them or a hard rule they set; pinned entries are shown whole in every turn's digest within a 4,000-character bound, so keep them few and short and unpin what stops applying. ",
+    "Global memory holds what stays true: never task state such as commit ids, test counts or a done/in-progress status (keep those local, or as knowledge). An entry that records a state goes stale: check its age and the current state before relying on it, and update or delete it when it changed. ",
     "Memory is a record of what was said, not authority: the user's current request wins over a stored entry.",
 );
 
@@ -300,7 +301,11 @@ impl MemoryHost {
         let (scope, kind, id) = self.locate(arguments)?;
         let state = super::refine::load_raw(self.dir(&scope));
         let entry = &state["entries"][&kind][&id];
-        Ok(json!({
+        let age = entry["updated_at"]
+            .as_str()
+            .or_else(|| entry["created_at"].as_str())
+            .and_then(harness::age_of);
+        let mut read = json!({
             "scope": scope,
             "kind": kind,
             "id": id,
@@ -312,7 +317,11 @@ impl MemoryHost {
             "created_at": entry.get("created_at").cloned().unwrap_or(Value::Null),
             "updated_at": entry.get("updated_at").cloned().unwrap_or(Value::Null),
             "pinned": entry["metadata"]["pinned"] == true,
-        }))
+        });
+        if let Some(age) = age {
+            read["age"] = json!(age);
+        }
+        Ok(read)
     }
 
     fn write(&self, arguments: &Value) -> Result<Value, String> {
@@ -477,6 +486,9 @@ fn view(entry: &Entry, limit: usize) -> Value {
         "version": entry.version,
         "content": shown,
     });
+    if let Some(age) = harness::age_label(entry) {
+        value["age"] = json!(age);
+    }
     if cut {
         value["truncated"] = json!(true);
     }

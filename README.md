@@ -39,10 +39,10 @@ ha                      # then /login and start typing
 | **Persistent Python REPL** | prime-agent's kernel: variables survive across turns, `bash()` runs commands in the background, `rlm.spawn()` fans out explorer agents in parallel. |
 | **Verified work** | `[verify]` checks the harness runs itself, an independent `verifier` agent that cannot edit and reports its findings back to the running turn, goals that only complete when both pass, and a feature list only a real verification can mark passing. |
 | **Long-running work** | `/goal` keeps working across turns, `ha exec --autonomous` loops until your gates pass, and background agents keep running after the terminal closes. A recovered agent comes back with the approval mode, profile and effort it was launched with. |
-| **Memory that holds** | Earlier turns are replayed with their tool calls, results, steers and host messages, not just the question and answer. Compaction keeps one rolling summary that each pass extends, splits a turn too large to keep and summarises its start, anchors the latest state, and keeps the cumulative list of files read and modified. `/resume` brings all of it back. The model keeps what should outlast the conversation with the `memory` tool (your preferences and decisions globally, task state per conversation), with or without the Python REPL, and `history_search` with `scope: "project"` finds what was said in earlier conversations of the project. |
+| **Memory that holds** | Earlier turns are replayed with their tool calls, results, steers and host messages, not just the question and answer. Compaction keeps one rolling summary that each pass extends, splits a turn too large to keep and summarises its start, anchors the latest state, and keeps the cumulative list of files read and modified. `/resume` brings all of it back. The model keeps what should outlast the conversation with the `memory` tool (your preferences and decisions globally, task state per conversation), with or without the Python REPL, and `history_search` with `scope: "project"` finds what was said in earlier conversations of the project. Pinned entries are shown in every turn, every entry says how old it is, and a search takes up to four wordings at once, so a question in Vietnamese finds an entry written in English. A project knowledge library keeps researched notes, out of Git. |
 | **Session continuity** | Every session starts from a brief of recent commits, uncommitted files and the last `/handoff`; `/resume`, `/tree` and forks move around a conversation's history. |
-| **Learned skills** | `/learn` turns what a conversation taught (a corrected approach, a fix, a setup step, your preferences) into `SKILL.md` skills; `/refine` tunes the harness more broadly: memory, skills, checks, prompt addendums, with `--global`, `--curate` and `--rollback`. A background review does the same at checkpoints. Skills pass a lint, are counted when used together with whether your checks passed afterwards, and are handed to child agents too. A skill nobody uses is archived; moving it back gives it a new trial. |
-| **Prompt caching** | A follow-up request begins with the previous request word for word: tools are sorted, blocks already sent are not sent again, and history is replayed as it was sent. Each provider gets its cache key, breakpoints and retention, and the status line shows `⚡ cache NN%`. |
+| **Learned skills** | `/learn` turns what a conversation taught (a corrected approach, a fix, a setup step, your preferences) into `SKILL.md` skills; `/refine` tunes the harness more broadly: memory, skills, checks, prompt addendums, with `--global`, `--curate` and `--rollback`. A background review does the same at checkpoints, after a goal completes or coders' work is merged, and writes memory every conversation sees and new knowledge pages, as CowAgent's Self-Evolution does; a memory curator keeps the global memory to about 30 entries and out of task state, and `/refine --history` shows what every refinement changed and why. Skills pass a lint, are counted when used together with whether your checks passed afterwards, and are handed to child agents too. A skill nobody uses is archived; moving it back gives it a new trial. |
+| **Prompt caching** | A follow-up request begins with the previous request word for word: tools are sorted, blocks already sent are not sent again, and history is replayed as it was sent. Each provider gets its cache key, breakpoints and retention, and the status line shows `↯ cache NN%`. |
 | **Open ecosystem** | Agent Skills, MCP servers with OAuth sign-in and a service catalog (`/plugins`), prompt templates, hooks, `ha package` (npm, git, local), and `--mode rpc` / `--mode acp` for editors. |
 
 ### Install
@@ -90,14 +90,14 @@ ha                         open the app
 | Check the work | `/verify`, `/review`, `/features` |
 | Hand over to the next session | `/handoff`, `/handoff --reset` |
 | Keep a lesson as a skill | `/learn [focus]`, then `/skills` |
-| Tune memory, skills and checks | `/refine [instructions]`, `/refine --global`, `/refine --curate`, `/refine --rollback <id>` |
+| Tune memory, skills and checks | `/refine [instructions]`, `/refine --global`, `/refine --curate`, `/refine --history [N]`, `/refine --rollback <id>` |
 | Shrink a long conversation | `/compact [what to keep]` |
 | Connect services | `/plugins`, `/mcp add`, `/mcp login <service>`, `@server:uri` to attach a resource |
 | Trust this project's config, hooks and MCP | `/trust`, then `/trust yes` |
 | See cost, context, permissions | `/cost`, `/context`, `/permissions` |
 | Audit the repository for agents | `/doctor` or `ha doctor` |
 
-Keys: Enter sends, Shift+Enter / Alt+Enter / Ctrl-J add a line, Esc interrupts, Ctrl-C cancels (twice on an empty prompt exits), Ctrl-O cycles collapsed / details / expanded, Ctrl-S stashes the draft, Alt+M cycles models. See [docs/TUI.md](docs/TUI.md).
+Keys: Enter sends, Ctrl-J or `\` then Enter add a line (Windows Terminal keeps Alt+Enter for full screen; Shift+Enter works where the console reports it), Esc interrupts, Ctrl-C cancels (twice on an empty prompt exits), Ctrl-O cycles collapsed / details / expanded, Ctrl-S stashes the draft, Alt+M cycles models. See [docs/TUI.md](docs/TUI.md).
 
 ### Background agents and automation
 
@@ -133,6 +133,7 @@ hint = "Fix the failing test before finishing."
 | `HA_CACHE_RETENTION` | short | `long`: Anthropic's 1-hour cache, OpenAI's 24-hour retention |
 | `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` | no limit | Model and tool calls per turn before it pauses |
 | `HA_TURN_DEADLINE_SECONDS` | 900 | Time per turn |
+| `HA_COMPACT_AT` | 200000 | Tokens of context before it is compacted, however large the model's window (`0`: the window's own bound) |
 | `HA_SKILL_PATHS` | — | Extra skill directories (e.g. `~/.claude/skills`) |
 | `HA_AUTO_REFINE` / `HA_SKILL_LIFECYCLE` | on | `off` stops the background review / keeps unused learned skills |
 | `SERPER_API_KEY` | — | Google results for `web_search` (DuckDuckGo without it) |
@@ -179,10 +180,10 @@ CI runs the phase and milestone gates on Windows; a test that fails in the crowd
 | **Python REPL bền** | Kernel của prime-agent: biến được giữ qua các lượt, `bash()` chạy lệnh nền, `rlm.spawn()` chạy song song các agent khám phá. |
 | **Kiểm chứng thật** | Các check `[verify]` do harness tự chạy, agent `verifier` độc lập không được sửa file và báo phát hiện của nó về lượt đang chạy, goal chỉ hoàn thành khi cả hai qua, và feature list chỉ được đánh dấu passing bằng một lượt kiểm chứng thật. |
 | **Việc dài hơi** | `/goal` làm tiếp qua nhiều lượt, `ha exec --autonomous` lặp tới khi các gate qua, agent nền vẫn chạy sau khi đóng terminal. Agent được khôi phục giữ nguyên chế độ duyệt, profile và mức suy luận lúc khởi chạy. |
-| **Trí nhớ bền** | Các lượt trước được phát lại cùng tool call, kết quả, steer và tin nhắn của host, không chỉ câu hỏi và câu trả lời. Compaction giữ một bản tóm tắt cuốn chiếu được nối thêm mỗi lần, tách lượt quá lớn và tóm tắt phần đầu của nó, neo trạng thái mới nhất, và giữ danh sách cộng dồn các file đã đọc và đã sửa. `/resume` nạp lại tất cả. |
+| **Trí nhớ bền** | Các lượt trước được phát lại cùng tool call, kết quả, steer và tin nhắn của host, không chỉ câu hỏi và câu trả lời. Compaction giữ một bản tóm tắt cuốn chiếu được nối thêm mỗi lần, tách lượt quá lớn và tóm tắt phần đầu của nó, neo trạng thái mới nhất, và giữ danh sách cộng dồn các file đã đọc và đã sửa. `/resume` nạp lại tất cả. Model giữ điều cần nhớ lâu bằng tool `memory` (sở thích và quyết định của bạn ở global, trạng thái việc theo từng hội thoại), có hay không có Python REPL; mục ghim hiện ở mọi lượt, mỗi mục cho biết đã bao lâu, và một lần tìm nhận tới bốn cách diễn đạt, nên câu hỏi tiếng Việt tìm được mục viết tiếng Anh. `history_search` với `scope: "project"` tìm lại điều đã nói ở các hội thoại trước của project, và thư viện knowledge của project giữ các ghi chú nghiên cứu, đứng ngoài Git. |
 | **Liền mạch giữa các phiên** | Mỗi phiên bắt đầu với tóm tắt commit gần đây, file chưa commit và `/handoff` cuối; `/resume`, `/tree` và fork để đi lại trong lịch sử hội thoại. |
-| **Tự học skill** | `/learn` đúc điều hội thoại vừa dạy (cách làm đã được sửa, cách fix, bước setup, sở thích của bạn) thành skill `SKILL.md`; `/refine` tinh chỉnh harness rộng hơn: memory, skill, check, phần bổ sung prompt, với `--global`, `--curate` và `--rollback`. Lượt xem xét nền làm việc này ở các điểm dừng. Skill qua lint, được đếm mỗi khi dùng cùng việc check của bạn có qua sau đó hay không, và được chuyển cho cả agent con. Skill không ai dùng bị lưu trữ; chuyển lại thì được thử việc lại. |
-| **Prompt caching** | Request tiếp theo bắt đầu bằng đúng nguyên văn request trước: tool được sắp xếp, khối đã gửi không gửi lại, lịch sử được phát lại đúng như đã gửi. Mỗi provider nhận cache key, breakpoint và thời hạn riêng, thanh trạng thái hiện `⚡ cache NN%`. |
+| **Tự học skill** | `/learn` đúc điều hội thoại vừa dạy (cách làm đã được sửa, cách fix, bước setup, sở thích của bạn) thành skill `SKILL.md`; `/refine` tinh chỉnh harness rộng hơn: memory, skill, check, phần bổ sung prompt, với `--global`, `--curate` và `--rollback`. Lượt review nền làm việc này ở các điểm dừng, sau khi một goal hoàn thành hoặc việc của coder được gộp, và ghi memory dùng cho mọi hội thoại cùng trang knowledge mới, như Self-Evolution của CowAgent; curator giữ memory global khoảng 30 mục và không chứa trạng thái công việc, còn `/refine --history` cho xem mỗi lần refine đã đổi gì và vì sao. Skill qua lint, được đếm mỗi khi dùng cùng việc check của bạn có qua sau đó hay không, và được chuyển cho cả agent con. Skill không ai dùng bị lưu trữ; chuyển lại thì được thử việc lại. |
+| **Prompt caching** | Request tiếp theo bắt đầu bằng đúng nguyên văn request trước: tool được sắp xếp, khối đã gửi không gửi lại, lịch sử được phát lại đúng như đã gửi. Mỗi provider nhận cache key, breakpoint và thời hạn riêng, thanh trạng thái hiện `↯ cache NN%`. |
 | **Hệ sinh thái mở** | Agent Skills, MCP server có đăng nhập OAuth và danh mục dịch vụ (`/plugins`), prompt template, hook, `ha package` (npm, git, local), và `--mode rpc` / `--mode acp` cho editor. |
 
 ### Cài đặt
@@ -230,14 +231,14 @@ ha                         mở app
 | Kiểm tra kết quả | `/verify`, `/review`, `/features` |
 | Bàn giao cho phiên sau | `/handoff`, `/handoff --reset` |
 | Giữ bài học thành skill | `/learn [trọng tâm]`, rồi `/skills` |
-| Tinh chỉnh memory, skill và check | `/refine [chỉ dẫn]`, `/refine --global`, `/refine --curate`, `/refine --rollback <id>` |
+| Tinh chỉnh memory, skill và check | `/refine [chỉ dẫn]`, `/refine --global`, `/refine --curate`, `/refine --history [N]`, `/refine --rollback <id>` |
 | Rút gọn hội thoại dài | `/compact [điều cần giữ]` |
 | Kết nối dịch vụ | `/plugins`, `/mcp add`, `/mcp login <service>`, `@server:uri` để đính kèm resource |
 | Trust config, hook và MCP của project | `/trust`, rồi `/trust yes` |
 | Xem chi phí, context, quyền | `/cost`, `/context`, `/permissions` |
 | Audit repo cho agent | `/doctor` hoặc `ha doctor` |
 
-Phím: Enter gửi, Shift+Enter / Alt+Enter / Ctrl-J xuống dòng, Esc ngắt lượt, Ctrl-C hủy (bấm hai lần trên dòng trống để thoát), Ctrl-O đổi thu gọn / chi tiết / mở rộng, Ctrl-S cất bản nháp, Alt+M đổi model. Xem [docs/TUI.md](docs/TUI.md).
+Phím: Enter gửi, Ctrl-J hoặc `\` rồi Enter để xuống dòng (Windows Terminal giữ Alt+Enter cho chế độ toàn màn hình; Shift+Enter dùng được nơi console báo phím Shift), Esc ngắt lượt, Ctrl-C hủy (bấm hai lần trên dòng trống để thoát), Ctrl-O đổi thu gọn / chi tiết / mở rộng, Ctrl-S cất bản nháp, Alt+M đổi model. Xem [docs/TUI.md](docs/TUI.md).
 
 ### Agent nền và tự động hóa
 
@@ -273,6 +274,7 @@ hint = "Sửa test đang fail trước khi kết thúc."
 | `HA_CACHE_RETENTION` | short | `long`: cache 1 giờ của Anthropic, giữ 24 giờ của OpenAI |
 | `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` | không giới hạn | Số lời gọi model và tool mỗi lượt trước khi tạm dừng |
 | `HA_TURN_DEADLINE_SECONDS` | 900 | Thời gian mỗi lượt |
+| `HA_COMPACT_AT` | 200000 | Số token context trước khi compact, dù cửa sổ của model lớn đến đâu (`0`: theo giới hạn của chính cửa sổ) |
 | `HA_SKILL_PATHS` | — | Thư mục skill bổ sung (ví dụ `~/.claude/skills`) |
 | `HA_AUTO_REFINE` / `HA_SKILL_LIFECYCLE` | bật | `off` tắt lượt xem xét nền / giữ cả skill không dùng |
 | `SERPER_API_KEY` | — | Kết quả Google cho `web_search` (không có thì DuckDuckGo) |

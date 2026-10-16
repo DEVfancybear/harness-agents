@@ -298,7 +298,7 @@ JSON only with this exact shape:
 
 const AUTO_REFINE_REVIEW_SYSTEM_PROMPT: &str = r#"You are the automatic /refine review gate of ha, a coding agent.
 
-Decide whether this checkpoint should run /refine. Auto /refine writes local continual harness state by default, so approve when the trajectory contains evidence useful to this session's future turns. It also writes memory every conversation sees - approve when the user stated a lasting preference, corrected how the agent works or settled a stable fact that the current harness state does not hold yet - and new knowledge pages, when the conversation produced substantive reusable knowledge the agent did not save.
+Decide whether this checkpoint should run /refine. Auto /refine writes local continual harness state by default, so approve when the trajectory contains evidence useful to this session's future turns. It also writes memory every conversation sees - approve when the user stated a lasting preference, corrected how the agent works or settled a stable fact that the current harness state does not hold yet - and new knowledge pages, when the conversation produced substantive reusable knowledge the agent did not save. Approve as well when an entry in the harness state records a state the conversation shows has changed (a goal completed, work merged, a blocker resolved): it has to be updated or deleted before it misleads a later turn.
 Reject one-off noise, unsupported hypotheses, and transient tool outputs. When the conversation holds a line saying the turns above it were already reviewed, judge only the turns after it. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified lessons likely to be reused in future sessions.
 
 Return JSON only:
@@ -594,8 +594,10 @@ fn overview(scopes: &HarnessScopes) -> String {
                     arguments.chars().take(240).collect::<String>()
                 );
             }
+            let age =
+                super::harness::age_label(entry).map_or_else(String::new, |age| format!(", {age}"));
             lines.push(format!(
-                "- [{}:{}] {title} ({}, v{}){extra}: {content}",
+                "- [{}:{}] {title} ({}, v{}{age}){extra}: {content}",
                 entry.scope, entry.id, entry.path, entry.version
             ));
         }
@@ -1834,7 +1836,7 @@ async fn plan(
 
 /// The automatic review's scope: local by default, with memory that holds
 /// across conversations marked global.
-const AUTO_SCOPE_POLICY: &str = "Requested refinement scope: automatic review. Edits go to this conversation's local store unless marked otherwise. Mark a memory edit with \"scope\": \"global\" when it is a durable user preference, a correction of how the agent should work, or a stable fact about the user, their environment or a named project that future conversations need, and the main agent did not already save it: check the global entries in the overview, and update a global entry (with \"scope\": \"global\" and its bare id) when the conversation supersedes it instead of creating a duplicate. Never put task progress, temporary blockers or current-run coordination in global memory. Only memory edits may be global; every other kind stays local.";
+const AUTO_SCOPE_POLICY: &str = "Requested refinement scope: automatic review. Edits go to this conversation's local store unless marked otherwise. Mark a memory edit with \"scope\": \"global\" when it is a durable user preference, a correction of how the agent should work, or a stable fact about the user, their environment or a named project that future conversations need, and the main agent did not already save it: check the global entries in the overview, and update a global entry (with \"scope\": \"global\" and its bare id) when the conversation supersedes it instead of creating a duplicate. Never put task progress, temporary blockers or current-run coordination in global memory, nor task state such as commit ids, test counts or a done/in-progress status: keep those local, or as knowledge when worth keeping. Entries that record a state go stale (the overview shows each entry's age): when the conversation shows one changed - a goal completed, work merged, a blocker resolved, a count moved - update or delete it, a local one freely and a global one with \"scope\": \"global\". Only memory edits may be global; every other kind stays local.";
 
 /// What the automatic review may add to the knowledge library.
 const KNOWLEDGE_PROPOSALS: &str = "Knowledge (not an edit kind) is the user's library of topical Markdown pages shared across conversations. When the conversation produced substantive reusable knowledge the main agent did not save - a researched conclusion, a method or concept worked out, a source the user shared to study - propose it in a top-level `knowledge` array: {\"scope\": \"project\" or \"global\", \"path\": \"concepts/short-name.md\", \"title\": \"...\", \"summary\": \"one line\", \"content\": \"Markdown, in the material's language\", \"sources\": [\"URLs or documents it came from\"], \"reason\": \"why\"}. Use project scope unless the knowledge is explicitly shared across projects; use sources/, concepts/, entities/ or analysis/ for the path. Only new pages: never a page listed below. Skip trivial exchanges, task progress, secrets, personal facts (memory) and procedures (learned skills). Weigh this whatever the review's instructions focus on. Leave `knowledge` empty when nothing meets the bar.";
@@ -2156,7 +2158,7 @@ Rules:
 - Organize strictly from the entries given. Never invent, infer or add a fact that no entry states.
 - Merge entries about the same subject into one dense entry: update the clearest one with the merged content, then delete the others.
 - When entries conflict, the one with the later updated_at wins; drop or rewrite the older claim.
-- Delete what is stale or temporary: task progress, a one-off error, a blocker that was resolved, an entry superseded by a more precise one, an empty or garbled entry.
+- Delete what is stale or temporary: task progress, a one-off error, a blocker that was resolved, an entry superseded by a more precise one, an empty or garbled entry. Global memory never keeps task state - commit ids, test counts, a done, delivered or in-progress status - so delete such an entry, or rewrite it as the lasting fact it holds without the state.
 - Keep facts about one project named with that project; never generalize a project fact to every project.
 - Keep one fact or rule per entry, short and self-contained, in the language it was written in.
 - Aim for about 30 entries or fewer in all: every one of them reaches every conversation. The <size> block says how many there are; when they are over the target, merge harder (one entry per subject) and delete the ones least likely to matter in a future conversation until they are at or under it.

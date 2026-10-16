@@ -8662,6 +8662,21 @@ async fn run_turn(
     }
     // Whether this turn compacted the context: the review comes forward then.
     let compacted = runtime.compactions() > 0;
+    // So does a milestone - a goal completed, coders' work merged - since the
+    // memory that recorded the state before it is now stale: a review left
+    // "the goal is not complete" in memory long after it was.
+    let milestone = goal_host
+        .as_ref()
+        .is_some_and(super::goal::GoalHost::completed)
+        || outcome.as_ref().is_ok_and(|turn| {
+            turn.executions.iter().any(|execution| {
+                matches!(
+                    &execution.output,
+                    harness_tools::ToolOutput::ExternalTool { tool_name, .. }
+                        if tool_name == "integrate_children"
+                )
+            })
+        });
     if outcome.is_ok() && !cancellation.is_cancelled() {
         let requested = refine_request
             .lock()
@@ -8679,7 +8694,7 @@ async fn run_turn(
             .filter(|interval| *interval > 0)
             .unwrap_or(super::refine::AUTO_REFINE_TURN_INTERVAL);
         let review = if auto_refine {
-            refine_cadence.turn_finished_every(tool_calls, interval, compacted)
+            refine_cadence.turn_finished_every(tool_calls, interval, compacted || milestone)
         } else {
             None
         };

@@ -645,8 +645,13 @@ pub(crate) fn cached_walk(
         if let Some(cached) = cache.get(base).filter(|cached| cached.fresh()) {
             return Ok(Arc::clone(&cached.walk));
         }
+        // Only a folder the root walk went into: one `.gitignore` kept out
+        // (`vendor/`) is walked on its own, so searching inside it - what an
+        // empty search suggests - finds what is there instead of nothing.
         if base != root
-            && let Some(cached) = cache.get(root).filter(|cached| cached.fresh())
+            && let Some(cached) = cache
+                .get(root)
+                .filter(|cached| cached.fresh() && cached.walk.directories.contains(base))
         {
             return Ok(Arc::new(narrow(&cached.walk, base)));
         }

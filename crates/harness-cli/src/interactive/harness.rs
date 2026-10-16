@@ -62,6 +62,8 @@ pub struct Entry {
     pub arguments: Map<String, Value>,
     /// Shown whole in every digest (`metadata.pinned`).
     pub pinned: bool,
+    /// When it was last written (`@<seconds>` or RFC 3339), for its age.
+    pub updated_at: Option<String>,
 }
 
 /// The merged state of one turn.
@@ -126,6 +128,7 @@ pub fn load(dir: &Path, scope: &str) -> State {
                     .and_then(|metadata| metadata.get("pinned"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                updated_at: text("updated_at").or_else(|| text("created_at")),
             });
         }
     }
@@ -363,6 +366,39 @@ pub fn lock_state(dir: &Path) -> Result<std::fs::File, String> {
     }
 }
 
+/// How long ago an entry was written, as `updated 3d ago`: an entry that
+/// records a state (progress, a status, a count) goes stale, and its age is
+/// how a reader knows to check it before trusting it.
+#[must_use]
+pub fn age_label(entry: &Entry) -> Option<String> {
+    age_of(entry.updated_at.as_deref()?)
+}
+
+/// [`age_label`] of a written time (`@<seconds>` or RFC 3339).
+#[must_use]
+pub fn age_of(written: &str) -> Option<String> {
+    let seconds = match written.strip_prefix('@') {
+        Some(seconds) => seconds.parse::<i64>().ok()?,
+        None => chrono::DateTime::parse_from_rfc3339(written)
+            .ok()?
+            .timestamp(),
+    };
+    let age = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(seconds)
+        .max(0);
+    Some(match age {
+        0..3_600 => "updated <1h ago".to_owned(),
+        3_600..172_800 => format!("updated {}h ago", age / 3_600),
+        _ => format!("updated {}d ago", age / 86_400),
+    })
+}
+
+/// `, updated 3d ago` for a line that has room for it, or nothing.
+fn age_suffix(entry: &Entry) -> String {
+    age_label(entry).map_or_else(String::new, |age| format!(", {age}"))
+}
+
 fn identity(entry: &Entry) -> String {
     format!(
         "{}\0{}\0{}",
@@ -515,12 +551,13 @@ pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f6
                 );
             }
             lines.push(format!(
-                "- [{}:{}] {} ({}, v{}){extra}: {}",
+                "- [{}:{}] {} ({}, v{}{}){extra}: {}",
                 entry.scope,
                 entry.id,
                 title,
                 entry.path,
                 entry.version,
+                age_suffix(entry),
                 compact(content, DEFAULT_CONTENT_LIMIT)
             ));
         }
@@ -617,13 +654,14 @@ fn pinned_lines(state: &State, lines: &mut Vec<String>) {
             .collect::<Vec<_>>()
             .join(" ");
         let line = format!(
-            "- [{}:{}] {} ({}, {}, v{}): {content}",
+            "- [{}:{}] {} ({}, {}, v{}{}): {content}",
             entry.scope,
             entry.id,
             entry.title.as_deref().unwrap_or_default(),
             entry.kind,
             entry.path,
-            entry.version
+            entry.version,
+            age_suffix(entry)
         );
         let size = line.chars().count();
         if used + size > PINNED_BUDGET {
@@ -652,6 +690,39 @@ pub fn digest_block(digest: &str) -> ContextBlock {
             "[harness-digest]\n\nThe persistent memories produced across this session so far:\n\n<harness_state>\n{digest}\n</harness_state>"
         ),
     )
+}
+
+#[cfg(test)]
+mod age_tests {
+    use serde_json::json;
+
+    /// Every entry says how old it is, in the digest and to the memory tool,
+    /// so a reader checks a recorded state before trusting it.
+    #[test]
+    fn an_entry_says_how_old_it_is() {
+        let directory = tempfile::tempdir().expect("dir");
+        let now = chrono::Utc::now().timestamp();
+        let state = json!({"schema": 1, "entries": {"memory": {
+            "old": {"title": "Goal state", "content": "the goal is not complete", "updated_at": format!("@{}", now - 3 * 86_400)},
+            "new": {"title": "Fresh", "content": "written just now", "updated_at": chrono::Utc::now().to_rfc3339()},
+            "bare": {"title": "Undated", "content": "no time recorded"}
+        }, "prompt": {}, "skill": {}, "subagent": {}}, "refinements": []});
+        std::fs::write(
+            directory.path().join("harness_state.json"),
+            state.to_string(),
+        )
+        .expect("state");
+        let loaded = super::load(directory.path(), "global");
+        let entries = &loaded.entries["memory"];
+        let age = |id: &str| {
+            super::age_label(entries.iter().find(|entry| entry.id == id).expect("entry"))
+        };
+        assert_eq!(age("old").as_deref(), Some("updated 3d ago"));
+        assert_eq!(age("new").as_deref(), Some("updated <1h ago"));
+        assert_eq!(age("bare"), None);
+        let digest = super::format_digest(&loaded, super::DigestOptions::default(), &[]);
+        assert!(digest.contains("v1, updated 3d ago"), "{digest}");
+    }
 }
 
 #[cfg(test)]
