@@ -4542,6 +4542,11 @@ impl InteractiveController {
                     } else {
                         super::refine::RefineOptions::parse(&arguments)
                     };
+                    if let Some(limit) = options.history {
+                        let lines = self.service.refine_history(limit);
+                        self.reference("/refine --history", lines, &mut effects);
+                        return effects;
+                    }
                     self.continuations = 0;
                     self.fresh_run(Instant::now(), Some(text.clone()));
                     self.service.submit(SubmitRequest {
@@ -8456,6 +8461,11 @@ Command: \"npm run build\""
         assert!(help.contains("/hotkeys"), "{help}");
         let keys = effects_to_plain(&submit_text(&mut harness.controller, "/hotkeys")).join("\n");
         assert!(keys.contains("Ctrl-D"), "{keys}");
+        // `/refine --history` reads the record; it runs no refinement.
+        let history =
+            effects_to_plain(&submit_text(&mut harness.controller, "/refine --history")).join("\n");
+        assert!(history.contains("no refinement history"), "{history}");
+        assert!(!harness.controller.phase.has_active_run());
 
         let status = effects_to_plain(&submit_text(&mut harness.controller, "/status")).join("\n");
         assert!(status.contains("Phase:"), "{status}");

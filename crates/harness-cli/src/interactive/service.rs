@@ -452,6 +452,10 @@ pub trait SessionPort: Send {
     fn system_prompt(&self) -> Vec<String> {
         vec!["no turn has run in this session yet".to_owned()]
     }
+    /// `/refine --history [N]`.
+    fn refine_history(&self, _limit: usize) -> Vec<String> {
+        vec!["this backend keeps no refinement history".to_owned()]
+    }
     fn rename(&mut self, _title: &str) -> Result<String, String> {
         Err("this backend does not support session titles".to_owned())
     }
@@ -4943,6 +4947,16 @@ impl SessionPort for AgentSessionService {
         self.cost_tracker
             .lock()
             .map_or_else(|_| "n/a".to_owned(), |tracker| tracker.display())
+    }
+
+    fn refine_history(&self, limit: usize) -> Vec<String> {
+        super::refine::history_lines(
+            &super::refine::HarnessScopes {
+                global: super::harness::global_dir(&self.data_dir),
+                local: super::harness::local_dir(&self.data_dir, self.task_id.as_str()),
+            },
+            limit,
+        )
     }
 
     fn system_prompt(&self) -> Vec<String> {

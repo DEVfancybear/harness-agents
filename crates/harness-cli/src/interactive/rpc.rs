@@ -733,6 +733,7 @@ impl Rpc {
                                 .unwrap_or(false),
                             rollback: text("rollbackId"),
                             curate: false,
+                            history: None,
                         }),
                     });
                     return;

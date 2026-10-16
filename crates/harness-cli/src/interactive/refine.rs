@@ -319,6 +319,8 @@ pub struct RefineOptions {
     pub rollback: Option<String>,
     /// Consolidate the learned skill library instead of reading the conversation.
     pub curate: bool,
+    /// Show this many of the latest refinements instead of making one.
+    pub history: Option<usize>,
 }
 
 impl RefineOptions {
@@ -348,6 +350,14 @@ impl RefineOptions {
                 "--global" => options.global = true,
                 "--rollback" => options.rollback = words.next().map(str::to_owned),
                 "--curate" => options.curate = true,
+                "--history" => {
+                    let count = words.next_if(|next| next.parse::<usize>().is_ok());
+                    options.history = Some(
+                        count
+                            .and_then(|count| count.parse().ok())
+                            .unwrap_or(HISTORY_SHOWN),
+                    );
+                }
                 _ => rest.push(word),
             }
         }
@@ -611,6 +621,73 @@ fn history(scopes: &HarnessScopes) -> Vec<Value> {
     results
 }
 
+/// How many refinements `/refine --history` shows by default.
+const HISTORY_SHOWN: usize = 10;
+
+/// `/refine --history [N]`: the latest refinements of the global store and
+/// this conversation, newest first - what the automatic review, `/refine`,
+/// `/learn` and the memory curator changed, and why, with the ids
+/// `--rollback` takes. `CowAgent`'s dream diary, read on demand.
+#[must_use]
+pub fn history_lines(scopes: &HarnessScopes, limit: usize) -> Vec<String> {
+    let mut records = history(scopes);
+    let nanos = |record: &Value| {
+        record["id"]
+            .as_str()
+            .and_then(|id| id.strip_prefix("refine_"))
+            .and_then(|id| id.split('_').next())
+            .and_then(|nanos| nanos.parse::<i64>().ok())
+            .unwrap_or(0)
+    };
+    records.sort_by_key(|record| std::cmp::Reverse(nanos(record)));
+    if records.is_empty() {
+        return vec![
+            "No refinements yet. The automatic review, /refine, /learn and the memory curator record theirs here.".to_owned(),
+        ];
+    }
+    let total = records.len();
+    let mut lines = Vec::new();
+    for record in records.into_iter().take(limit.max(1)) {
+        let when = chrono::DateTime::from_timestamp_nanos(nanos(&record))
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M");
+        let refinement = Refinement { record };
+        lines.push(format!("{when} · {}", refinement.summary()));
+        if let Some(rationale) = refinement.record["rationale"]
+            .as_str()
+            .map(str::trim)
+            .filter(|rationale| !rationale.is_empty())
+        {
+            lines.push(format!("  Why: {}", clip(rationale, 300)));
+        }
+        lines.extend(
+            refinement
+                .details()
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        );
+        lines.push(String::new());
+    }
+    if total > limit {
+        lines.push(format!(
+            "{} older refinement(s) not shown: /refine --history {total}",
+            total - limit
+        ));
+    }
+    lines.push("Undo one with /refine --rollback <id>.".to_owned());
+    lines
+}
+
+/// `text` cut to `limit` characters, marked when cut.
+fn clip(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let mut cut = text.chars().take(limit).collect::<String>();
+    cut.push('…');
+    cut
+}
+
 /// `historyForPrompt`.
 fn history_for_prompt(history: &[Value]) -> String {
     if history.is_empty() {
@@ -818,6 +895,9 @@ struct Proposal {
     knowledge_records: Vec<Value>,
     /// Knowledge pages a rollback deletes, as the refinement recorded them.
     knowledge_restores: Vec<Value>,
+    /// Record how many global entries there were before and after: a
+    /// consolidation says it against the target.
+    count_entries: bool,
 }
 
 impl Proposal {
@@ -872,6 +952,7 @@ impl Proposal {
                 .unwrap_or_default(),
             knowledge_records: Vec::new(),
             knowledge_restores: Vec::new(),
+            count_entries: false,
         }
     }
 }
@@ -1039,6 +1120,14 @@ impl Refinement {
             first = format!("{first} · rollback of {target}");
         }
         let mut lines = vec![first];
+        if let (Some(before), Some(after)) = (
+            self.record["entries"]["before"].as_u64(),
+            self.record["entries"]["after"].as_u64(),
+        ) {
+            lines.push(format!(
+                "Global memory: {before} -> {after} entries (target {MEMORY_TARGET_ENTRIES} or fewer)"
+            ));
+        }
         for edit in self.superseded() {
             lines.push(format!(
                 "Refused learned skill `{}`, sent back for repair: {}",
@@ -1108,6 +1197,7 @@ fn apply(
     // the whole read, check and save holds the state's lock.
     let _lock = super::harness::lock_state(dir)?;
     let mut state = load_raw(dir);
+    let entries_before = memory_entries(&state).len();
     let mut applied_edits = Vec::new();
     let mut modified = std::collections::BTreeSet::new();
     for edit in &proposal.edits {
@@ -1230,7 +1320,7 @@ fn apply(
         }));
     }
     let path = save_raw(dir, &state)?;
-    let record = json!({
+    let mut record = json!({
         "id": id,
         "summary": proposal.summary,
         "rationale": proposal.rationale,
@@ -1240,6 +1330,10 @@ fn apply(
         "rollbackOf": rollback_of,
         "scope": scope,
     });
+    if proposal.count_entries {
+        record["entries"] =
+            json!({"before": entries_before, "after": memory_entries(&state).len()});
+    }
     // The history is what `--rollback` reads.
     let mut line = record.to_string();
     line.push('\n');
@@ -1492,6 +1586,7 @@ fn rollback_proposal(target: &Value) -> Proposal {
         knowledge: Vec::new(),
         knowledge_records: Vec::new(),
         knowledge_restores: knowledge,
+        count_entries: false,
     }
 }
 
@@ -1973,6 +2068,7 @@ pub async fn curate(
     let mut proposal = curate_skills(provider, model, learning, instructions).await?;
     if let Some(memory) = memory {
         proposal.edits = memory.edits;
+        proposal.count_entries = true;
         proposal.summary = format!("{} {}", memory.summary, proposal.summary);
         proposal.rationale = format!("{} {}", memory.rationale, proposal.rationale);
         proposal.expected_outcome =
@@ -2062,6 +2158,7 @@ Rules:
 - Delete what is stale or temporary: task progress, a one-off error, a blocker that was resolved, an entry superseded by a more precise one, an empty or garbled entry.
 - Keep facts about one project named with that project; never generalize a project fact to every project.
 - Keep one fact or rule per entry, short and self-contained, in the language it was written in.
+- Aim for about 30 entries or fewer in all: every one of them reaches every conversation. The <size> block says how many there are; when they are over the target, merge harder (one entry per subject) and delete the ones least likely to matter in a future conversation until they are at or under it.
 - A pinned entry (pinned: true) is shown in every turn: keep it pinned unless it is wrong or superseded. An update keeps an entry's metadata unless you set it; a merged entry that absorbs a pinned one sets "metadata": {"pinned": true}.
 - Only kinds memory and prompt exist for you. Never edit skills or subagents.
 - Every edit carries a `reason`. When nothing needs to change, return an empty edits array.
@@ -2147,7 +2244,18 @@ async fn memory_edits(
         .map(Value::to_string)
         .collect::<Vec<_>>()
         .join("\n");
-    let mut parts = vec![format!("<global_memory>\n{entries}\n</global_memory>")];
+    let count = memory_entries(baseline).len();
+    let over = if count > MEMORY_TARGET_ENTRIES {
+        " - over the target: merge harder and drop the least useful"
+    } else {
+        ""
+    };
+    let mut parts = vec![
+        format!("<global_memory>\n{entries}\n</global_memory>"),
+        format!(
+            "<size>\n{count} entries; the target is {MEMORY_TARGET_ENTRIES} or fewer{over}.\n</size>"
+        ),
+    ];
     if let Some(instructions) = instructions {
         parts.push(format!(
             "<user_curate_instructions>\n{instructions}\n</user_curate_instructions>"
@@ -2172,6 +2280,7 @@ async fn memory_edits(
         .retain(|edit| matches!(edit.text("kind"), Some("memory" | "prompt")));
     proposal.skill_files.clear();
     proposal.checks.clear();
+    proposal.count_entries = true;
     Ok(proposal)
 }
 
@@ -2205,6 +2314,11 @@ pub async fn consolidate_memory(
     mark_consolidated(&scopes.global);
     refinement
 }
+
+/// How many global entries (memory and prompt notes) the curator aims to keep:
+/// each one reaches every conversation, as `CowAgent`'s Deep Dream keeps
+/// `MEMORY.md` to about 30.
+pub const MEMORY_TARGET_ENTRIES: usize = 30;
 
 /// The automatic review's verdict (`AutoRefineReview`).
 #[derive(Clone, Debug)]
@@ -2292,8 +2406,11 @@ mod tests {
                 global: true,
                 rollback: None,
                 curate: false,
+                history: None,
             }
         );
+        assert_eq!(RefineOptions::parse("--history").history, Some(10));
+        assert_eq!(RefineOptions::parse("--history 3").history, Some(3));
         assert_eq!(
             RefineOptions::parse("--rollback refine_1")
                 .rollback
@@ -2454,6 +2571,26 @@ mod tests {
         .expect("reviewed");
         assert!(review.should_refine);
         assert_eq!(review.instructions.as_deref(), Some("record it"));
+        // `/refine --history`: what was changed, why, and the id to undo it.
+        let lines = super::history_lines(&scopes, 10);
+        assert!(lines[0].ends_with(" · keep the tab rule"), "{lines:?}");
+        assert!(
+            lines.contains(&"  Why: asked twice".to_owned()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains(result.id())
+                && line.contains("Harness refined · 1 memory created")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"  Created global memory `tabs`".to_owned()),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("Undo one with /refine --rollback <id>.")
+        );
     }
 
     /// autoharness's chain through `/refine`: the model proposes learned-skill
@@ -2747,10 +2884,23 @@ mod tests {
             ]
         })
         .to_string();
-        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = Replies::new(&[reply]);
+        let replies = Replies::new(&[reply]);
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = replies.clone();
         let result = super::consolidate_memory(&provider, "fixture-model", &scopes)
             .await
             .expect("consolidated");
+        assert!(
+            result
+                .details()
+                .contains(&"Global memory: 14 -> 12 entries (target 30 or fewer)".to_owned()),
+            "{:?}",
+            result.details()
+        );
+        assert!(
+            replies
+                .prompt(0)
+                .contains("14 entries; the target is 30 or fewer.")
+        );
         let state = load_raw(&scopes.global);
         assert_eq!(
             state["entries"]["memory"]["pm"]["content"],

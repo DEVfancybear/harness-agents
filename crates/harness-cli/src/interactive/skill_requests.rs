@@ -420,6 +420,7 @@ impl SkillRequests {
                         global: global || previous.global,
                         rollback: None,
                         curate: false,
+                        history: None,
                     });
                 }
                 Ok(json!({
