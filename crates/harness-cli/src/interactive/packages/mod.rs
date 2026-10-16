@@ -58,6 +58,14 @@ pub(crate) fn is_offline_mode_enabled() -> bool {
     OFFLINE.load(Ordering::Relaxed)
 }
 
+/// Offline mode keeps the package manager off the network: an install or
+/// update that would reach npm or git is refused, never half-done.
+pub(crate) fn offline_refusal(action: &str, source: &str) -> String {
+    format!(
+        "offline mode (--offline or HA_OFFLINE) keeps the package manager off the network; {action} {source} needs it, so nothing changed"
+    )
+}
+
 /// The user's home directory (`USERPROFILE` on Windows, `HOME` elsewhere).
 pub(crate) fn platform_home_dir() -> Option<PathBuf> {
     #[cfg(test)]

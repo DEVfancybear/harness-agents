@@ -47,6 +47,15 @@ impl PackageManager {
             }
         }
 
+        // Offline, an update that would reach npm or git is refused rather than
+        // reported done: local sources have nothing to update.
+        if super::is_offline_mode_enabled()
+            && let Some((remote, _)) = update_sources
+                .iter()
+                .find(|(source, _)| !matches!(parse_source(source), ParsedSource::Local(_)))
+        {
+            bail!("{}", super::offline_refusal("updating", remote));
+        }
         self.update_configured_sources(update_sources)
     }
 

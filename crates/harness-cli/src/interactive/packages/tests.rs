@@ -166,9 +166,12 @@ fn npm_install_list_remove_flow() {
         .expect("shim installs into its global root");
     assert!(installed.join("package.json").exists());
 
-    // Duplicate install is a settings no-op.
+    // The same package at another version takes the place of its entry.
+    assert!(manager.add_source_to_settings("npm:fake-pkg@2.0.0", UserOrProject::User));
     assert!(!manager.add_source_to_settings("npm:fake-pkg@2.0.0", UserOrProject::User));
-    assert_eq!(manager.list_configured_packages().len(), 1);
+    let configured = manager.list_configured_packages();
+    assert_eq!(configured.len(), 1);
+    assert_eq!(configured[0].source, "npm:fake-pkg@2.0.0");
 
     assert!(
         manager
@@ -339,4 +342,130 @@ fn git_ref_checkout_installs_the_pinned_revision() {
         .join("repo");
     assert!(installed.join("package.json").exists());
     assert!(!installed.join("skills.md").exists(), "pinned ref checkout");
+}
+
+#[test]
+fn git_install_moves_to_a_new_ref_and_a_failed_one_leaves_nothing() {
+    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
+    let sandbox = Sandbox::new("git-ref-change");
+    let (bare, work) = make_bare_repo(&sandbox.root);
+    run_git(&work, &["tag", "v1"]);
+    std::fs::write(work.join("skills.md"), "moved").unwrap();
+    run_git(&work, &["add", "."]);
+    run_git(&work, &["commit", "-qm", "moved"]);
+    run_git(&work, &["push", "-q", "origin", "main"]);
+    run_git(&work, &["push", "-q", "origin", "v1"]);
+    let source = |git_ref: Option<&str>| GitSource {
+        repo: bare.display().to_string(),
+        host: "localhost".to_string(),
+        path: "fixtures/repo".to_string(),
+        r#ref: git_ref.map(str::to_owned),
+        pinned: git_ref.is_some(),
+    };
+    let install = |source: &GitSource| {
+        super::git::install_git(
+            source,
+            SourceScope::User,
+            &sandbox.cwd,
+            &sandbox.agent_dir,
+            None,
+        )
+    };
+    let installed = sandbox
+        .agent_dir
+        .join("git")
+        .join("localhost")
+        .join("fixtures")
+        .join("repo");
+
+    install(&source(None)).unwrap();
+    assert!(installed.join("skills.md").exists());
+    // Installing the same repo at another ref checks that ref out, instead of
+    // keeping the old checkout under the new source.
+    install(&source(Some("v1"))).unwrap();
+    assert!(!installed.join("skills.md").exists(), "v1 checked out");
+
+    super::git::remove_git(
+        &source(None),
+        SourceScope::User,
+        &sandbox.cwd,
+        &sandbox.agent_dir,
+    )
+    .unwrap();
+    // An unknown ref fails and leaves no checkout that would pass for an
+    // installed package next time.
+    assert!(install(&source(Some("no-such-ref"))).is_err());
+    assert!(!installed.exists());
+    assert!(!installed.parent().unwrap().exists());
+}
+
+#[test]
+fn removing_an_unconfigured_package_runs_nothing() {
+    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
+    let sandbox = Sandbox::new("remove-unconfigured");
+    let mut manager = sandbox.manager();
+    // Not in settings: a global `fake-pkg` the user installed with npm
+    // themselves is not ha's to uninstall.
+    assert!(
+        !manager
+            .remove_and_persist("npm:fake-pkg", UserOrProject::User)
+            .expect("nothing to remove")
+    );
+    assert!(sandbox.log().is_empty(), "{}", sandbox.log());
+}
+
+#[test]
+fn installing_another_version_replaces_the_entry_and_keeps_filters() {
+    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
+    let sandbox = Sandbox::new("version-change");
+    std::fs::write(
+        sandbox.agent_dir.join("settings.json"),
+        r#"{"packages":[{"source":"npm:fake-pkg@1.0.0","skills":["a"]},"npm:other"]}"#,
+    )
+    .unwrap();
+    let mut manager = sandbox.manager();
+    assert!(manager.add_source_to_settings("npm:fake-pkg@2.0.0", UserOrProject::User));
+    assert!(!manager.add_source_to_settings("npm:fake-pkg@2.0.0", UserOrProject::User));
+    let packages = manager
+        .packages_for_scope(UserOrProject::User)
+        .unwrap_or_default();
+    assert_eq!(
+        packages,
+        vec![
+            serde_json::json!({"source": "npm:fake-pkg@2.0.0", "skills": ["a"]}),
+            serde_json::json!("npm:other"),
+        ]
+    );
+}
+
+#[test]
+fn offline_mode_keeps_install_and_update_off_the_network() {
+    let _guard = super::test_support::ENV_MUTEX.lock().unwrap();
+    let sandbox = Sandbox::new("offline");
+    std::fs::create_dir_all(sandbox.cwd.join("local-pkg")).unwrap();
+    std::fs::write(
+        sandbox.agent_dir.join("settings.json"),
+        r#"{"packages":["npm:fake-pkg"]}"#,
+    )
+    .unwrap();
+    let mut manager = sandbox.manager();
+    super::test_support::set_offline(true);
+    let install = manager.install_and_persist("npm:other-pkg", UserOrProject::User);
+    let git = manager.install_and_persist("git:github.com/user/repo", UserOrProject::User);
+    let update = manager.update(None);
+    let local = manager.install_and_persist("./local-pkg", UserOrProject::User);
+    super::test_support::set_offline(false);
+
+    for refused in [install, git, update] {
+        let message = refused.expect_err("refused offline").to_string();
+        assert!(message.contains("offline mode"), "{message}");
+    }
+    local.expect("a local package needs no network");
+    assert!(sandbox.log().is_empty(), "{}", sandbox.log());
+    let sources: Vec<String> = manager
+        .list_configured_packages()
+        .into_iter()
+        .map(|package| package.source)
+        .collect();
+    assert_eq!(sources, ["npm:fake-pkg", "../cwd/local-pkg"]);
 }

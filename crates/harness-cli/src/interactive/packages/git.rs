@@ -50,22 +50,39 @@ pub fn install_git(
 ) -> Result<()> {
     let target_dir = git_install_path(source, scope, cwd, agent_dir);
     if target_dir.exists() {
+        // Installed already: a new ref (`@v2` over `@v1`) is checked out, so
+        // the checkout matches the source settings will record.
+        if let Some(git_ref) = source.r#ref.as_deref() {
+            run_command("git", &["fetch", "--tags", "origin"], Some(&target_dir))?;
+            run_command("git", &["checkout", git_ref], Some(&target_dir))?;
+        }
         return Ok(());
     }
-    if let Some(git_root) = git_install_root(scope, cwd, agent_dir) {
-        npm::ensure_gitignore(&git_root)?;
+    let install_root = git_install_root(scope, cwd, agent_dir);
+    if let Some(git_root) = &install_root {
+        npm::ensure_gitignore(git_root)?;
     }
     if let Some(parent) = target_dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    run_command(
+    let cloned = run_command(
         "git",
         &["clone", &source.repo, &target_dir.display().to_string()],
         None,
-    )?;
-    if let Some(git_ref) = source.r#ref.as_deref() {
-        run_command("git", &["checkout", git_ref], Some(&target_dir))?;
+    )
+    .and_then(|()| match source.r#ref.as_deref() {
+        Some(git_ref) => run_command("git", &["checkout", git_ref], Some(&target_dir)),
+        None => Ok(()),
+    });
+    if let Err(error) = cloned {
+        // A failed clone or an unknown ref leaves nothing behind: a checkout
+        // left here would pass for an installed package the next time.
+        let _ = std::fs::remove_dir_all(&target_dir);
+        if let Some(git_root) = &install_root {
+            prune_empty_git_parents(&target_dir, git_root);
+        }
+        return Err(error);
     }
     let package_json = target_dir.join("package.json");
     if package_json.exists() {

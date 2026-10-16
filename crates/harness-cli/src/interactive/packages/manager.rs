@@ -258,6 +258,9 @@ impl PackageManager {
     /// source path does not exist.
     pub fn install(&mut self, source: &str, scope: UserOrProject) -> Result<()> {
         let parsed = parse_source(source);
+        if !matches!(parsed, ParsedSource::Local(_)) && super::is_offline_mode_enabled() {
+            bail!("{}", super::offline_refusal("installing", source));
+        }
         self.with_progress(
             ProgressAction::Install,
             source,
@@ -315,23 +318,45 @@ impl PackageManager {
     /// Returns an error when the removal fails; settings are only updated
     /// when it succeeds.
     pub fn remove_and_persist(&mut self, source: &str, scope: UserOrProject) -> Result<bool> {
+        // Only what settings name is removed: `npm:typescript` the user installed
+        // with npm themselves, or a package of the other scope, is not ha's to
+        // uninstall.
+        let configured = self
+            .packages_for_scope(scope)
+            .unwrap_or_default()
+            .iter()
+            .any(|existing| self.package_sources_match(existing, source, scope));
+        if !configured {
+            return Ok(false);
+        }
         self.remove(source, scope)?;
         Ok(self.remove_source_from_settings(source, scope))
     }
 
-    /// Add a source to settings; false when an equivalent source is already
-    /// configured.
+    /// Add a source to settings; false when the same source is already
+    /// configured. The same package under another version or ref
+    /// (`npm:pkg@2` over `npm:pkg@1`) takes the place of its entry, keeping
+    /// the entry's filters: the install just put that version on disk.
     pub fn add_source_to_settings(&mut self, source: &str, scope: UserOrProject) -> bool {
-        let current: Vec<serde_json::Value> = self.packages_for_scope(scope).unwrap_or_default();
+        let mut next: Vec<serde_json::Value> = self.packages_for_scope(scope).unwrap_or_default();
         let normalized = self.normalize_package_source_for_settings(source, scope);
-        let exists = current
+        let Some(index) = next
             .iter()
-            .any(|existing| self.package_sources_match(existing, source, scope));
-        if exists {
+            .position(|existing| self.package_sources_match(existing, source, scope))
+        else {
+            next.push(serde_json::Value::String(normalized));
+            self.set_packages_for_scope(scope, next);
+            return true;
+        };
+        if split_entry(&next[index]).0 == normalized {
             return false;
         }
-        let mut next = current;
-        next.push(serde_json::Value::String(normalized));
+        match &mut next[index] {
+            serde_json::Value::Object(entry) => {
+                entry.insert("source".to_owned(), serde_json::Value::String(normalized));
+            }
+            entry => *entry = serde_json::Value::String(normalized),
+        }
         self.set_packages_for_scope(scope, next);
         true
     }
