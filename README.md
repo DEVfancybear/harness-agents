@@ -105,7 +105,7 @@ Keys: Enter sends, Ctrl-J or `\` then Enter add a line (Windows Terminal keeps A
 ha agents                          # the agents still running for this project
 ha attach <name>                   # reattach this terminal
 ha send <name> "next step" --wait  # wake a saved conversation
-ha send <name> "/compact" --wait   # slash commands run as commands
+ha send <name> "/goal" --wait      # slash commands run as commands and print what they show
 ha stop <name>                     # stop it; the conversation stays
 ha chat --model openai-codex/gpt-5.6-terra --approval full-auto
 ha exec --autonomous --autonomous-gate "cargo test" "make the suite pass"
@@ -113,7 +113,7 @@ ha --mode rpc                      # JSON commands on stdin, events on stdout
 ha --mode acp                      # Agent Client Protocol over stdio
 ```
 
-A per-project worker keeps sessions alive after the terminal closes and recovers them from its journal with the settings they were launched with (`HA_DAEMON=off` disables it). `--model provider/id` picks a catalog model together with its provider.
+A per-project worker keeps sessions alive after the terminal closes and recovers them from its journal with the settings they were launched with (`HA_DAEMON=off` disables it). `--model provider/id` picks a catalog model together with its provider. In Git Bash, MSYS turns an argument starting with `/` into a Windows path (`/goal` becomes `C:/Program Files/Git/goal`); `ha send` reads such a command back and says so, and `MSYS_NO_PATHCONV=1` keeps it as typed.
 
 ### Configuration
 
@@ -246,7 +246,7 @@ Phím: Enter gửi, Ctrl-J hoặc `\` rồi Enter để xuống dòng (Windows T
 ha agents                          # các agent còn chạy của project
 ha attach <name>                   # gắn lại terminal này
 ha send <name> "bước tiếp" --wait  # đánh thức một hội thoại đã lưu
-ha send <name> "/compact" --wait   # lệnh slash được chạy như lệnh
+ha send <name> "/goal" --wait      # lệnh slash được chạy như lệnh và in ra nội dung
 ha stop <name>                     # dừng agent; hội thoại vẫn được giữ
 ha chat --model openai-codex/gpt-5.6-terra --approval full-auto
 ha exec --autonomous --autonomous-gate "cargo test" "làm cho bộ test qua"
@@ -254,7 +254,7 @@ ha --mode rpc                      # lệnh JSON qua stdin, sự kiện qua stdo
 ha --mode acp                      # Agent Client Protocol qua stdio
 ```
 
-Mỗi project có một worker giữ các phiên sống sau khi đóng terminal và khôi phục chúng từ journal cùng cấu hình lúc khởi chạy (`HA_DAEMON=off` để tắt). `--model provider/id` chọn model trong catalog cùng provider của nó.
+Mỗi project có một worker giữ các phiên sống sau khi đóng terminal và khôi phục chúng từ journal cùng cấu hình lúc khởi chạy (`HA_DAEMON=off` để tắt). `--model provider/id` chọn model trong catalog cùng provider của nó. Trong Git Bash, MSYS đổi tham số bắt đầu bằng `/` thành đường dẫn Windows (`/goal` thành `C:/Program Files/Git/goal`); `ha send` nhận ra và đọc lại thành lệnh, có báo, còn `MSYS_NO_PATHCONV=1` giữ nguyên như đã gõ.
 
 ### Cấu hình
 

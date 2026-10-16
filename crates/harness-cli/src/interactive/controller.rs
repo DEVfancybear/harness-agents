@@ -653,6 +653,10 @@ impl InteractiveController {
         }
         if !from_agent && steer && command.is_some() {
             let was_running = self.phase.has_active_run();
+            let panel_before = self
+                .editor
+                .overlay()
+                .map(|panel| (panel.title.clone(), panel.lines.len()));
             let produced = self.command(&text);
             if !was_running && self.phase.has_active_run() {
                 self.active_deliveries.push((receipt, text));
@@ -661,7 +665,18 @@ impl InteractiveController {
                     Effect::History(HistoryItem::Error { message }) => Some(message.clone()),
                     _ => None,
                 });
-                self.record_delivery_answer(receipt, error.map_or_else(|| Ok(String::new()), Err));
+                // What the command showed is its answer: `ha send --wait
+                // "/goal"` printed nothing, and the panel it opened stayed open
+                // for whoever attached next.
+                let panel = (self
+                    .editor
+                    .overlay()
+                    .map(|panel| (panel.title.clone(), panel.lines.len()))
+                    != panel_before)
+                    .then(|| self.editor.take_overlay())
+                    .flatten();
+                let answer = command_answer(&produced, panel.as_ref());
+                self.record_delivery_answer(receipt, error.map_or(Ok(answer), Err));
             }
             effects.extend(produced);
             return (receipt, "delivered");
@@ -672,6 +687,12 @@ impl InteractiveController {
             self.agent_messages_queued.push(text);
         }
         (receipt, outcome)
+    }
+
+    /// A terminal attached: a reference panel left open by an earlier one,
+    /// or by a command sent with `ha send`, is not what it came to see.
+    pub fn close_panels(&mut self) {
+        let _ = self.editor.take_overlay();
     }
 
     pub fn take_delivery_answer(&mut self, receipt: u64) -> Result<Option<String>, String> {
@@ -6142,6 +6163,25 @@ fn table_safe_cut(text: &str, cut: usize) -> usize {
     start
 }
 
+/// The text a command run for `ha send` produced: its notices and messages,
+/// then the panel it opened.
+fn command_answer(produced: &[Effect], panel: Option<&super::input::Overlay>) -> String {
+    let mut lines = produced
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::History(
+                HistoryItem::Notice { message } | HistoryItem::Message { text: message },
+            ) => Some(message.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if let Some(panel) = panel {
+        lines.push(panel.title.clone());
+        lines.extend(panel.lines.iter().cloned());
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_CONTINUATIONS, EXIT_SUCCESS, Effect, InteractiveController, TurnBounds};
@@ -6696,6 +6736,34 @@ mod tests {
         assert_eq!(activity[0].tool_calls, 2, "a failure is the same call");
         assert!(activity[0].latest.starts_with("run_process failed"));
         assert_eq!(activity[1].tool_calls, 1);
+    }
+
+    /// A command sent with `ha send` answers with what it showed, and the
+    /// panel it opened does not stay open for the next terminal; a terminal
+    /// that attaches finds no panel left open.
+    #[test]
+    fn a_sent_command_answers_with_its_panel_and_leaves_none_open() {
+        let mut h = bench(true);
+        let mut effects = Vec::new();
+        let (receipt, status) =
+            h.controller
+                .deliver_tracked("/hotkeys".into(), true, false, &mut effects);
+        assert_eq!(status, "delivered");
+        let answer = h
+            .controller
+            .take_delivery_answer(receipt)
+            .expect("answered")
+            .expect("an answer");
+        assert!(answer.contains("Ctrl-D"), "{answer}");
+        assert!(
+            h.controller.editor.overlay().is_none(),
+            "no panel left open"
+        );
+        h.controller
+            .editor
+            .open_overlay("/goal", vec!["Status: complete".to_owned()]);
+        h.controller.close_panels();
+        assert!(h.controller.editor.overlay().is_none());
     }
 
     #[test]
@@ -10688,13 +10756,13 @@ Command: \"npm run build\""
             harness.controller.goal.as_ref().expect("goal").status,
             super::GoalStatus::Paused
         );
-        assert_eq!(
-            harness
-                .controller
-                .take_delivery_answer(receipt)
-                .expect("receipt"),
-            Some(String::new())
-        );
+        // It finishes at once, with what the command said.
+        let answer = harness
+            .controller
+            .take_delivery_answer(receipt)
+            .expect("receipt")
+            .expect("answered at once");
+        assert!(answer.to_lowercase().contains("paus"), "{answer}");
         assert!(harness.controller.queue.is_empty());
         let _ = end_done(&mut harness);
         assert_eq!(

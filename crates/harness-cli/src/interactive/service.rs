@@ -6640,7 +6640,7 @@ impl AutoRefine {
 /// What a child cut off by its agent going away reports. It said the user
 /// had run `/agents stop`, so a resumed parent took the stop for the user's
 /// decision.
-const SHUTDOWN_STOP: &str = "Cut off because ha's background agent was shut down or restarted (`ha shutdown`, `ha stop`), not by the user's decision. Its conversation is kept: once the work goes on, send it a message with the agent_message tool to carry on; a coder's worktree does not survive the restart, so a coder's unfinished work is delegated again.";
+const SHUTDOWN_STOP: &str = "Cut off because ha's background agent was shut down or restarted (`ha shutdown`, `ha stop`), not by the user's decision. Its conversation is kept, and a coder keeps its worktree with the work in it: once the work goes on, send it a message with the agent_message tool to carry on where it stopped instead of redoing its work.";
 
 const CTRL_C_STOP: &str = "Stopped by the user with Ctrl-C. Its conversation and work so far are kept: when the user asks to continue, send it a message with the agent_message tool saying to carry on, and it resumes where it stopped instead of starting over.";
 

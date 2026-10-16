@@ -219,6 +219,31 @@ fn idle_label(seconds: u64) -> String {
 ///
 /// # Errors
 /// No such agent, or its worker refused the message.
+/// A slash command Git Bash rewrote into a path: MSYS turns an argument
+/// starting with `/` into a Windows path, so `ha send a "/goal resume"`
+/// arrived as `C:/Program Files/Git/goal resume` and reached the model as
+/// text. A first word that is a drive path ending in a known command's name
+/// is read as that command.
+fn msys_mangled_command(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 4 || !bytes[0].is_ascii_alphabetic() || &bytes[1..3] != b":/" {
+        return None;
+    }
+    // The install path may hold spaces (`C:/Program Files/Git/goal`): the
+    // command is the first word after a `/` that names one.
+    let (start, name) = text.match_indices('/').find_map(|(slash, _)| {
+        let name = text[slash + 1..].split_whitespace().next()?;
+        super::commands::builtin(&format!("/{name}")).map(|_| (slash + 1, name))
+    })?;
+    let command = format!("/{name}");
+    let rest = text[start + name.len()..].trim_start();
+    Some(if rest.is_empty() {
+        command
+    } else {
+        format!("{command} {rest}")
+    })
+}
+
 pub fn send_command(
     selector: &str,
     text: String,
@@ -227,6 +252,19 @@ pub fn send_command(
     json: bool,
     wait: bool,
 ) -> Result<ExitCode, HarnessError> {
+    let text = match msys_mangled_command(&text) {
+        Some(command) => {
+            let typed = command.split_whitespace().next().unwrap_or_default();
+            let mangled = text
+                .find(&typed[1..])
+                .map_or(text.as_str(), |end| &text[..end + typed.len() - 1]);
+            eprintln!(
+                "ha: read {mangled:?} as {typed:?}: Git Bash turned the command into a path (MSYS_NO_PATHCONV=1 keeps it as typed)"
+            );
+            command
+        }
+        None => text,
+    };
     let registry = client::user_registry().map_err(failure)?;
     let listed = match client::find(&registry, selector) {
         Ok(listed) => listed,
@@ -664,5 +702,28 @@ mod tests {
         assert_eq!(idle_label(5), "5s");
         assert_eq!(idle_label(125), "2m");
         assert_eq!(idle_label(3_725), "1h2m");
+    }
+}
+
+#[cfg(test)]
+mod msys_tests {
+    /// A slash command Git Bash turned into a path is read as the command;
+    /// a real path, or a path whose last part is no command, stays as typed.
+    #[test]
+    fn a_command_git_bash_turned_into_a_path_is_read_back() {
+        assert_eq!(
+            super::msys_mangled_command("C:/Program Files/Git/goal resume").as_deref(),
+            Some("/goal resume")
+        );
+        assert_eq!(
+            super::msys_mangled_command("C:/Program Files/Git/compact keep the API").as_deref(),
+            Some("/compact keep the API")
+        );
+        assert_eq!(
+            super::msys_mangled_command("C:/work/notes.txt please"),
+            None
+        );
+        assert_eq!(super::msys_mangled_command("/goal resume"), None);
+        assert_eq!(super::msys_mangled_command("fix the parser"), None);
     }
 }

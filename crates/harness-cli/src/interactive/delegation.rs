@@ -440,6 +440,14 @@ struct LedgerEntry {
     objective: String,
     /// The conversation, as `(role, text)`.
     history: Vec<(String, String)>,
+    /// A coder's worktree: it stays on disk when the worker stops, so a
+    /// coder cut off by a restart is woken in it and carries on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worktree: Option<WorktreeRecord>,
+    /// The commit a coder's work reached the user's checkout in, so a
+    /// restart never offers it to `integrate_children` again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    integrated: Option<String>,
 }
 
 /// How many messages of a child's conversation the ledger keeps.
@@ -488,6 +496,8 @@ impl ChildRecord {
                     )
                 })
                 .collect(),
+            worktree: self.worktree.clone(),
+            integrated: self.integrated.clone(),
         }
     }
 
@@ -555,7 +565,6 @@ impl ChildRecord {
             pending: Vec::new(),
             brief: None,
             run_id: None,
-            worktree: None,
             generation: 1,
             history: entry
                 .history
@@ -573,7 +582,11 @@ impl ChildRecord {
                 .collect(),
             wake: None,
             objective: entry.objective,
-            integrated: None,
+            // A worktree the user removed since is not brought back.
+            worktree: entry
+                .worktree
+                .filter(|worktree| std::path::Path::new(&worktree.path).is_dir()),
+            integrated: entry.integrated,
         })
     }
     fn elapsed_ms(&self) -> i64 {
@@ -1771,7 +1784,7 @@ impl SessionAgents {
         }
         let skipped = lines.len().saturating_sub(SHOWN);
         let mut text = String::from(
-            "Delegated agents of this conversation that ended without finishing their work. Do not claim one is still running. If its work is still needed, send it a message with the agent_message tool (receiver_name: its name) to resume where it stopped (it keeps its conversation; a coder whose worktree did not survive a restart has to be delegated again), or do the work yourself; otherwise leave it.\n",
+            "Delegated agents of this conversation that ended without finishing their work. Do not claim one is still running. If its work is still needed, send it a message with the agent_message tool (receiver_name: its name) to resume where it stopped: it keeps its conversation, and a coder keeps its worktree and the work in it, so do not redo that work yourself or delegate it again; otherwise leave it.\n",
         );
         text.push_str(&lines[skipped..].join("\n"));
         if skipped > 0 {
@@ -2034,7 +2047,18 @@ impl SessionAgents {
                 }
                 let brief = woken_brief(child, task_id, &launch)?;
                 child.brief = Some(brief.clone());
-                let run_id = child.run_id.clone().unwrap_or_else(AgentRunId::generate);
+                // A coder woken after a restart runs as the run its worktree
+                // was issued to: the grant check holds the two together.
+                let run_id = child
+                    .run_id
+                    .clone()
+                    .or_else(|| {
+                        child
+                            .worktree
+                            .as_ref()
+                            .map(|worktree| worktree.run_id.clone())
+                    })
+                    .unwrap_or_else(AgentRunId::generate);
                 child.run_id = Some(run_id.clone());
                 child.generation += 1;
                 child.state = ChildState::Running;
@@ -2349,8 +2373,51 @@ fn woken_brief(
                 ..explorer_brief(task_id, &child.objective, launch)
             })
         }
-        None => Err("a coder's worktree does not survive a restart; spawn a new coder".to_owned()),
+        // A coder's worktree outlives its worker: the coder goes on in it,
+        // with the brief it was given rebuilt over that worktree.
+        None => match &child.worktree {
+            Some(worktree) => coder_brief(task_id, &child.objective, worktree),
+            None => Err(
+                "this coder's worktree is gone (removed, or it ran before ha kept worktrees across restarts); delegate the work to a new coder"
+                    .to_owned(),
+            ),
+        },
     }
+}
+
+/// A coder's brief over the worktree it was given.
+fn coder_brief(
+    task_id: &TaskId,
+    objective: &str,
+    worktree: &WorktreeRecord,
+) -> Result<TaskBrief, String> {
+    let workspace = harness_tools::observe_workspace(worktree.project_id.clone(), &worktree.path)
+        .map_err(|error| format!("the coder's worktree cannot be observed: {error}"))?;
+    Ok(TaskBrief {
+        schema_version: harness_orchestrator::DELEGATION_CONTRACT_VERSION,
+        task_id: task_id.clone(),
+        title: objective.chars().take(80).collect(),
+        objective: objective.to_owned(),
+        acceptance_criteria: vec!["return a concise report answering the brief".to_owned()],
+        inputs: vec!["current workspace snapshot".to_owned()],
+        base_snapshot: worktree.input_fingerprint.as_str().to_owned(),
+        base_commit: worktree.base_commit.clone(),
+        workspace,
+        grants: DelegationGrants {
+            // The project the worktree was issued for, which a later session
+            // may name differently.
+            project_id: worktree.project_id.clone(),
+            task_id: task_id.clone(),
+            actions: vec![GrantAction::Read, GrantAction::Propose],
+            write_scope: worktree.write_scope.clone(),
+            edit_workspace: true,
+            max_depth: RLM_MAX_DEPTH_CAP,
+            budget: DelegationBudget::default(),
+        },
+        expected_artifacts: Vec::new(),
+        deadline_unix_ms: None,
+        role: AgentRole::Coder,
+    })
 }
 
 fn explorer_brief(task_id: &TaskId, objective: &str, launch: &ChildLaunch) -> TaskBrief {
@@ -7349,6 +7416,8 @@ mod real_worker_tests {
             tool_calls: 0,
             objective: "wait for messages".to_owned(),
             history: Vec::new(),
+            worktree: None,
+            integrated: None,
         })
         .expect("grandchild record");
         bench
@@ -7679,10 +7748,72 @@ mod real_worker_tests {
             tool_calls: 0,
             objective: "x".to_owned(),
             history: Vec::new(),
+            worktree: None,
+            integrated: None,
         };
         let record = ChildRecord::from_ledger(entry).expect("record");
         assert!(
             matches!(record.state, ChildState::Failed { ref error } if error.contains("interrupted"))
+        );
+    }
+
+    /// A coder's worktree outlives its worker: the ledger keeps it, a coder
+    /// read back after a restart has it (and the commit it was integrated in,
+    /// so it is never merged twice), and one whose worktree was removed since
+    /// does not.
+    #[test]
+    fn a_coder_keeps_its_worktree_across_a_restart() {
+        let directory = tempfile::tempdir().expect("dir");
+        let task = TaskId::generate();
+        let worktree = |path: &std::path::Path| {
+            serde_json::from_value::<super::WorktreeRecord>(json!({
+                "worktree_id": "wt-1", "task_id": task.as_str(), "run_id": harness_types::AgentRunId::generate().as_str(),
+                "project_id": harness_types::ProjectId::generate().as_str(), "base_commit": "abc", "base_branch": "harness/base/1",
+                "branch": "harness/p5/1", "path": path.display().to_string(), "write_scope": ["."],
+                "state": "ready", "input_fingerprint": harness_types::ContentHash::from_bytes(b"x").as_str(),
+                "result_fingerprint": null, "generation": 1
+            }))
+            .expect("worktree record")
+        };
+        let entry = |worktree: super::WorktreeRecord, integrated: Option<&str>| LedgerEntry {
+            task_id: task.as_str().to_owned(),
+            name: "coder-1".to_owned(),
+            role: "coder".to_owned(),
+            model: "m".to_owned(),
+            depth: 1,
+            max_depth: 2,
+            parent: None,
+            status: "cancelled".to_owned(),
+            answer: None,
+            error: Some("cut off".to_owned()),
+            duration_ms: Some(5),
+            tool_calls: 3,
+            objective: "write the parser".to_owned(),
+            history: Vec::new(),
+            worktree: Some(worktree),
+            integrated: integrated.map(str::to_owned),
+        };
+        let kept = ChildRecord::from_ledger(entry(worktree(directory.path()), Some("c0ffee")))
+            .expect("record");
+        assert_eq!(kept.role, super::AgentRole::Coder);
+        assert!(kept.worktree.is_some(), "the worktree comes back");
+        assert_eq!(kept.integrated.as_deref(), Some("c0ffee"));
+        let written = serde_json::to_value(kept.ledger_entry()).expect("entry");
+        assert_eq!(written["integrated"], "c0ffee");
+        assert_eq!(written["worktree"]["branch"], "harness/p5/1");
+        // The brief it is woken with passes the coder's grant check.
+        let issued = kept.worktree.as_ref().expect("worktree");
+        let brief = super::coder_brief(&task, &kept.objective, issued).expect("brief");
+        assert_eq!(brief.grants.project_id, issued.project_id);
+        assert_eq!(brief.grants.write_scope, issued.write_scope);
+        assert!(brief.grants.edit_workspace);
+        assert_eq!(brief.role, super::AgentRole::Coder);
+        let gone =
+            ChildRecord::from_ledger(entry(worktree(&directory.path().join("removed")), None))
+                .expect("record");
+        assert!(
+            gone.worktree.is_none(),
+            "a removed worktree is not brought back"
         );
     }
 

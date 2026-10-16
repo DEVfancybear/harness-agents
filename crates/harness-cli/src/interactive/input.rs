@@ -302,6 +302,11 @@ impl LineEditor {
         picker.selected = next.min(last);
     }
 
+    /// Close the reference panel and hand back what it showed.
+    pub fn take_overlay(&mut self) -> Option<Overlay> {
+        self.overlay.take()
+    }
+
     pub fn open_overlay(&mut self, title: &str, lines: Vec<String>) {
         self.overlay = Some(Overlay {
             title: title.to_owned(),

@@ -856,6 +856,33 @@ fn fit_tool_results(messages: &mut [ProviderMessage], budget: u64) -> usize {
     shortened
 }
 
+/// The turn with steps `[second, cut)` folded into the first step's results.
+fn fold_turn(
+    appended: &[ProviderMessage],
+    first: usize,
+    second: usize,
+    cut: usize,
+    summary: &str,
+) -> Vec<ProviderMessage> {
+    let mut folded = appended[..second].to_vec();
+    let mut placed = false;
+    for message in folded.iter_mut().skip(first + 1) {
+        if message.role != MessageRole::Tool {
+            continue;
+        }
+        if placed {
+            FITTED_RESULT.clone_into(&mut message.content);
+        } else {
+            message.content = format!(
+                "[The steps of this turn after this one, up to the most recent ones, are summarized here because the turn outgrew the model's window.]\n{summary}"
+            );
+            placed = true;
+        }
+    }
+    folded.extend_from_slice(&appended[cut..]);
+    folded
+}
+
 fn context_overflow(actual_tokens: u64, threshold_tokens: u64) -> RuntimeError {
     RuntimeError::new(
         ErrorCode::ContextOverflow,
@@ -910,6 +937,13 @@ pub struct RunRequest {
     /// Shared the same way: once a summary of the earlier turns failed, the
     /// turn's later steps do not wait on another that would fail the same way.
     earlier_summary_failed: Arc<AtomicBool>,
+    /// The summary of this turn's own earlier steps, once the turn outgrew the
+    /// window: how many of its messages it covers, and the text. Kept across
+    /// the turn's steps, so the cut moves - and a model call is made - only
+    /// when the steps kept whole have doubled.
+    turn_summary: Arc<Mutex<Option<(usize, String)>>>,
+    /// The summary of this turn's steps failed: the turn goes on without it.
+    turn_summary_failed: Arc<AtomicBool>,
 }
 
 impl RunRequest {
@@ -947,6 +981,8 @@ impl RunRequest {
             auto_compaction_attempted: Arc::new(AtomicBool::new(false)),
             earlier_compaction_noticed: Arc::new(AtomicBool::new(false)),
             earlier_summary_failed: Arc::new(AtomicBool::new(false)),
+            turn_summary: Arc::new(Mutex::new(None)),
+            turn_summary_failed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3144,6 +3180,39 @@ impl RuntimeService {
                 ));
             }
         }
+        // Still over, and this turn's own steps are what fills the window: a
+        // goal turn ran to 204k tokens of a 200k bound with only its old tool
+        // results shortened. Its earlier steps are summarized into its first
+        // step, and the newest ones kept whole.
+        if !fits(&attempt)
+            && messages_tokens(&appended) > threshold / 2
+            && !request.turn_summary_failed.load(Ordering::SeqCst)
+        {
+            let keep = KEEP_RECENT_TOKENS.min(threshold / 4);
+            match self.summarize_turn_steps(request, &appended, keep).await {
+                Ok(Some((folded, covered))) => {
+                    *appended.to_mut() = folded;
+                    attempt = self.build_context(
+                        request,
+                        continuation_context.as_deref(),
+                        &earlier,
+                        build_recovery.clone(),
+                        checkpoint_id.clone(),
+                        &appended,
+                    );
+                    notices.push(format!(
+                        "context: summarized {covered} earlier message(s) of this turn to stay within the model's window"
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    request.turn_summary_failed.store(true, Ordering::SeqCst);
+                    notices.push(format!(
+                        "context: this turn's earlier steps could not be summarised ({error})"
+                    ));
+                }
+            }
+        }
         if !fits(&attempt)
             && request
                 .auto_compaction_attempted
@@ -4113,6 +4182,88 @@ impl RuntimeService {
 
     /// prime-agent's split-turn summary: the start of a turn too large to keep
     /// whole, written so the part of it that is kept can be understood.
+    /// This turn's messages with its earlier steps folded into its first one:
+    /// the first step's call keeps its place (a tool result needs its call),
+    /// its first result holds the summary, the steps after it up to the cut
+    /// are dropped whole, and the steps from the cut on stay as they are.
+    /// `None` when there is nothing to fold. Returns how many messages the
+    /// summary covers.
+    async fn summarize_turn_steps(
+        &self,
+        request: &RunRequest,
+        appended: &[ProviderMessage],
+        keep: u64,
+    ) -> Result<Option<(Vec<ProviderMessage>, usize)>, RuntimeError> {
+        let starts = appended
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| {
+                message.role == MessageRole::Assistant && !message.tool_calls.is_empty()
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        // The first step and at least one more to fold, and one to keep.
+        let (Some(&first), Some(&second)) = (starts.first(), starts.get(1)) else {
+            return Ok(None);
+        };
+        let cached = request
+            .turn_summary
+            .lock()
+            .ok()
+            .and_then(|summary| summary.clone());
+        // The kept steps may grow to twice `keep` before the cut moves again.
+        if let Some((cut, summary)) = &cached
+            && *cut <= appended.len()
+            && messages_tokens(&appended[*cut..]) <= keep.saturating_mul(2)
+        {
+            return Ok(Some((
+                fold_turn(appended, first, second, *cut, summary),
+                *cut - second,
+            )));
+        }
+        let Some(&cut) = starts
+            .iter()
+            .skip(2)
+            .find(|&&start| messages_tokens(&appended[start..]) <= keep)
+            .or(starts.last().filter(|&&last| last > second))
+        else {
+            return Ok(None);
+        };
+        // Extend the kept summary with what came after it, or start one.
+        let (from, previous) = match &cached {
+            Some((covered, summary)) if *covered <= cut && *covered >= second => {
+                (*covered, Some(summary.clone()))
+            }
+            _ => (second, None),
+        };
+        let budget = MAX_SUMMARY_TOKENS / 2;
+        let entries = summary_entries(&appended[from..cut]);
+        let mut summary = previous;
+        for transcript in summary_chunks(&entries, self.summary_input_chars(budget)) {
+            summary = Some(
+                self.summary_call(
+                    &transcript,
+                    summary.as_deref(),
+                    None,
+                    None,
+                    budget,
+                    SummaryKind::TurnPrefix,
+                )
+                .await?,
+            );
+        }
+        let Some(summary) = summary else {
+            return Ok(None);
+        };
+        if let Ok(mut kept) = request.turn_summary.lock() {
+            *kept = Some((cut, summary.clone()));
+        }
+        Ok(Some((
+            fold_turn(appended, first, second, cut, &summary),
+            cut - second,
+        )))
+    }
+
     async fn turn_prefix_summary(
         &self,
         prefix: &[ProviderMessage],
@@ -5139,6 +5290,37 @@ mod compaction_cut_tests {
 
     /// prime-agent's `serializeConversation`: calls numbered, each result
     /// under its call's number and tool, long results cut to head and tail.
+    #[test]
+    fn a_turn_folds_its_earlier_steps_into_its_first_and_keeps_every_call_answered() {
+        let step = |id: &str, result: &str| {
+            vec![
+                ProviderMessage::assistant_with_calls(
+                    "",
+                    vec![ProviderToolCall::new(id, "read_file", "{}")],
+                ),
+                ProviderMessage::tool_result(id, result),
+            ]
+        };
+        let turn = [
+            step("a", "first"),
+            step("b", "second"),
+            step("c", "third"),
+            step("d", "fourth"),
+        ]
+        .concat();
+        let folded = super::fold_turn(&turn, 0, 2, 6, "read three files");
+        assert_eq!(folded.len(), 4, "the first step and the last are left");
+        assert_eq!(folded[0].tool_calls[0].call_id, "a");
+        assert!(
+            folded[1].content.contains("read three files"),
+            "{}",
+            folded[1].content
+        );
+        assert_eq!(folded[2].tool_calls[0].call_id, "d");
+        assert_eq!(folded[3].content, "fourth", "the newest step is kept whole");
+        assert_eq!(folded[1].role, MessageRole::Tool);
+    }
+
     #[test]
     fn summary_entries_number_calls_and_label_their_results() {
         let entries = summary_entries(&[

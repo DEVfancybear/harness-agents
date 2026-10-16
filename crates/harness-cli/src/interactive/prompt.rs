@@ -46,7 +46,7 @@ const USER_PROGRESS: &str = "As the user-facing root agent, when work follows a 
 
 /// prime-agent's `SIMPLIFIED_TECHNICAL_ENGLISH_PROMPT`. ha answers in the user's
 /// language, so the first line says so; the rest is verbatim.
-const SIMPLIFIED_TECHNICAL: &str = "Use simplified technical language by default for user-facing prose, in the user's language.\n\
+const SIMPLIFIED_TECHNICAL: &str = "Use simplified technical language by default for user-facing prose, in the user's language: the language of their latest message, for every line they see, the short notes written between tool calls included.\n\
 Prefer short sentences, common words, and concrete verbs. State one main action or fact per sentence when practical. Use lists for steps or conditions.\n\
 Keep necessary technical terms, names, commands, code, paths, and exact quoted text unchanged. State uncertainty directly.\n\
 Treat this as clarity guidance, not a claim of formal ASD-STE100 compliance. Preserve a user-requested format, tone, terminology, and necessary precision.";

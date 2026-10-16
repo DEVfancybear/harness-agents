@@ -1255,6 +1255,7 @@ impl Agent {
                 columns,
             } => {
                 self.controller.set_columns(columns);
+                self.controller.close_panels();
                 let mut state = self.controller.ui_state();
                 let (last_state, last_tick) = view_text(&mut state);
                 self.refresh_status();
