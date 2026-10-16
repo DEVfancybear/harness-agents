@@ -25,6 +25,15 @@ const DEFAULT_REFINEMENT_LIMIT: usize = 5;
 const DEFAULT_CONTENT_LIMIT: usize = 180;
 /// The most query terms one digest ranks by (prime-agent caps at 48).
 const MAX_QUERY_TERMS: usize = 48;
+/// The characters the pinned entries may take in every turn's digest.
+///
+/// A pinned entry (`metadata.pinned`) is shown whole on every turn, whatever
+/// the request: a preference such as "answer in Vietnamese" shares no word
+/// with most requests, so ranking left it out of the six shown, and the 180
+/// characters each shown entry keeps could cut its point off. `CowAgent` loads
+/// its whole `MEMORY.md` every turn; this keeps the same promise for the few
+/// entries that need it, within a bound.
+pub const PINNED_BUDGET: usize = 4_000;
 
 /// Where the global state lives: shared by every conversation.
 #[must_use]
@@ -51,6 +60,8 @@ pub struct Entry {
     pub version: i64,
     pub reference: Map<String, Value>,
     pub arguments: Map<String, Value>,
+    /// Shown whole in every digest (`metadata.pinned`).
+    pub pinned: bool,
 }
 
 /// The merged state of one turn.
@@ -110,6 +121,11 @@ pub fn load(dir: &Path, scope: &str) -> State {
                 version: entry.get("version").and_then(Value::as_i64).unwrap_or(1),
                 reference: object("reference"),
                 arguments: object("arguments"),
+                pinned: entry
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("pinned"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             });
         }
     }
@@ -424,9 +440,14 @@ pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f6
             ],
         );
     }
+    pinned_lines(state, &mut lines);
     let mut total = 0;
     for kind in KINDS {
         let mut entries = state.entries.get(kind).cloned().unwrap_or_default();
+        let kept = entries.len();
+        // A pinned entry is shown whole above; the ranked list is the rest.
+        entries.retain(|entry| !entry.pinned);
+        let pinned = kept - entries.len();
         let weights = if terms.is_empty() {
             BTreeMap::new()
         } else {
@@ -440,8 +461,10 @@ pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f6
                 .total_cmp(&score(a, terms, &weights))
                 .then_with(|| identity(a).cmp(&identity(b)))
         });
-        total += entries.len();
-        if kind == "subagent" && !entries.is_empty() && options.repl {
+        total += kept;
+        if pinned > 0 {
+            lines.push(format!("{kind}: {kept} ({pinned} pinned above)"));
+        } else if kind == "subagent" && !entries.is_empty() && options.repl {
             lines.push(format!(
                 "{kind}: {} (invoke a spec by turning it into a concise task prompt and spawning with `await rlm.spawn('<task>', name='<worker>')`; admission returns a child handle, never the answer)",
                 entries.len()
@@ -571,6 +594,53 @@ pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f6
     lines.join("\n").trim().to_owned()
 }
 
+/// The pinned entries, whole, within [`PINNED_BUDGET`]; what does not fit is
+/// counted so the model knows to search for it.
+fn pinned_lines(state: &State, lines: &mut Vec<String>) {
+    let pinned = KINDS
+        .iter()
+        .flat_map(|kind| state.entries.get(kind).into_iter().flatten())
+        .filter(|entry| entry.pinned && entry.title.is_some() && entry.content.is_some())
+        .collect::<Vec<_>>();
+    if pinned.is_empty() {
+        return;
+    }
+    lines.push("pinned (always shown in full; they hold whatever the request):".to_owned());
+    let mut used = 0;
+    let mut left_out = 0;
+    for entry in pinned {
+        let content = entry
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let line = format!(
+            "- [{}:{}] {} ({}, {}, v{}): {content}",
+            entry.scope,
+            entry.id,
+            entry.title.as_deref().unwrap_or_default(),
+            entry.kind,
+            entry.path,
+            entry.version
+        );
+        let size = line.chars().count();
+        if used + size > PINNED_BUDGET {
+            left_out += 1;
+            continue;
+        }
+        used += size;
+        lines.push(line);
+    }
+    if left_out > 0 {
+        lines.push(format!(
+            "- +{left_out} pinned entries past the {PINNED_BUDGET}-character bound: search memory for them, and unpin what no longer needs to be in every turn"
+        ));
+    }
+    lines.push(String::new());
+}
+
 /// The digest as the context block a turn carries, wrapped the way prime-agent's
 /// harness digest message is.
 #[must_use]
@@ -691,6 +761,57 @@ mod tests {
         );
         let without = format_digest(&retrieval_fixture(), DigestOptions::default(), &[]);
         assert!(!without.contains("Memory tool:"), "{without}");
+    }
+
+    /// A pinned preference shares no word with the request and would rank out
+    /// of the six shown; it is shown whole every turn instead.
+    #[test]
+    fn a_pinned_entry_is_shown_whole_whatever_the_request() {
+        let directory = tempfile::tempdir().expect("state");
+        let mut memories = serde_json::Map::new();
+        for number in 0..12 {
+            memories.insert(
+                format!("alpha-{number}"),
+                json!({"title": format!("Deploy step {number}"), "content": "deploy fixture"}),
+            );
+        }
+        let long = format!(
+            "Answer in Vietnamese and call the user anh Duong. {}",
+            "x".repeat(300)
+        );
+        memories.insert(
+            "language".to_owned(),
+            json!({"title": "Language", "content": long, "metadata": {"pinned": true}}),
+        );
+        write(directory.path(), &json!({"entries":{"memory":memories}}));
+        let digest = format_digest(
+            &load(directory.path(), "global"),
+            DigestOptions::default(),
+            &weighted_terms(None, &["how do deploys work"]),
+        );
+        assert!(digest.contains("pinned (always shown in full"), "{digest}");
+        assert!(digest.contains(&long), "the whole entry: {digest}");
+        assert!(digest.contains("memory: 13 (1 pinned above)"), "{digest}");
+        assert_eq!(digest.matches("[global:language]").count(), 1, "{digest}");
+    }
+
+    #[test]
+    fn pinned_entries_past_the_bound_are_counted_not_shown() {
+        let directory = tempfile::tempdir().expect("state");
+        let mut memories = serde_json::Map::new();
+        for number in 0..3 {
+            memories.insert(
+                format!("rule-{number}"),
+                json!({"title": format!("Rule {number}"), "content": "y".repeat(super::PINNED_BUDGET / 2), "metadata": {"pinned": true}}),
+            );
+        }
+        write(directory.path(), &json!({"entries":{"memory":memories}}));
+        let digest = format_digest(
+            &load(directory.path(), "global"),
+            DigestOptions::default(),
+            &[],
+        );
+        assert!(digest.contains("+2 pinned entries past the"), "{digest}");
     }
 
     #[test]

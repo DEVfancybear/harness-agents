@@ -63,16 +63,28 @@ impl Cadence {
     /// covers is returned. [`Cadence::release`] ends the claim.
     #[cfg(test)]
     pub fn turn_finished(&self, tool_calls: u32) -> Option<u32> {
-        self.turn_finished_every(tool_calls, AUTO_REFINE_TURN_INTERVAL)
+        self.turn_finished_every(tool_calls, AUTO_REFINE_TURN_INTERVAL, false)
     }
 
     /// [`Cadence::turn_finished`] with prime-agent's `autoRefine.turnInterval`
     /// in place of the default twenty-five turns.
-    pub fn turn_finished_every(&self, tool_calls: u32, turn_interval: u32) -> Option<u32> {
+    ///
+    /// A turn that compacted the context brings the review forward: what was
+    /// summarized away is still in the journal the review reads, but the session
+    /// itself now works from the summary. Reviewing at the compaction learns
+    /// from the detail while it is the freshest, as `CowAgent` writes what a trim
+    /// drops to memory. It still needs as much work as a session end does.
+    pub fn turn_finished_every(
+        &self,
+        tool_calls: u32,
+        turn_interval: u32,
+        compacted: bool,
+    ) -> Option<u32> {
         use std::sync::atomic::Ordering::SeqCst;
         let turns = self.turns.fetch_add(1, SeqCst) + 1;
         let calls = self.tool_calls.fetch_add(tool_calls, SeqCst) + tool_calls;
-        if turns < turn_interval && calls < AUTO_REFINE_TOOL_CALL_INTERVAL {
+        let at_compaction = compacted && (turns >= TAIL_MIN_TURNS || calls >= TAIL_MIN_TOOL_CALLS);
+        if turns < turn_interval && calls < AUTO_REFINE_TOOL_CALL_INTERVAL && !at_compaction {
             return None;
         }
         if self.running.swap(true, SeqCst) {
@@ -1532,7 +1544,6 @@ pub async fn refine(
     let history = history(scopes);
     let id = refinement_id();
     if options.curate && options.rollback.is_none() {
-        let learning = learning.ok_or("learned skills are unavailable in this session")?;
         return curate(
             provider,
             model,
@@ -1660,24 +1671,74 @@ Return JSON only:
   "skillFiles": [ ...intents in <learned_skill_format>... ]
 }"#;
 
-/// The curator: one model pass over the whole learned library that folds narrow
-/// skills into class-level ones, through the same promoter as a refinement. The
-/// library is snapshotted first. Recorded as a refinement in the global scope, so
-/// `/refine --rollback <id>` undoes it.
+/// The curator: the global memory consolidated ([`memory_edits`]) and the
+/// learned library folded into class-level skills, recorded as one refinement in
+/// the global scope, so `/refine --rollback <id>` undoes both. Either part runs
+/// when there is enough of it.
 pub async fn curate(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
     scopes: &HarnessScopes,
-    learning: &Learning,
+    learning: Option<&Learning>,
     instructions: Option<&str>,
 ) -> Result<Refinement, String> {
-    let skills = super::learned::library(&learning.layers);
-    if skills.len() < CURATE_MIN_SKILLS {
-        return Err(format!(
-            "there are {} learned skill(s); curation needs at least {CURATE_MIN_SKILLS}",
-            skills.len()
-        ));
+    let baseline = load_raw(&scopes.global);
+    let memory = if memory_entries(&baseline).len() >= CONSOLIDATE_MIN_ENTRIES {
+        Some(memory_edits(provider, model, &baseline, instructions).await?)
+    } else {
+        None
+    };
+    let skills = learning
+        .filter(|learning| super::learned::library(&learning.layers).len() >= CURATE_MIN_SKILLS);
+    let Some(learning) = skills else {
+        let Some(memory) = memory else {
+            return Err(format!(
+                "nothing to curate: fewer than {CONSOLIDATE_MIN_ENTRIES} global memory entries and fewer than {CURATE_MIN_SKILLS} learned skills"
+            ));
+        };
+        let refinement = apply(
+            scopes,
+            &memory,
+            &refinement_id(),
+            true,
+            None,
+            Some(&baseline),
+            None,
+        )?;
+        mark_consolidated(&scopes.global);
+        return Ok(refinement);
+    };
+    let mut proposal = curate_skills(provider, model, learning, instructions).await?;
+    if let Some(memory) = memory {
+        proposal.edits = memory.edits;
+        proposal.summary = format!("{} {}", memory.summary, proposal.summary);
+        proposal.rationale = format!("{} {}", memory.rationale, proposal.rationale);
+        proposal.expected_outcome =
+            format!("{} {}", memory.expected_outcome, proposal.expected_outcome);
     }
+    let refinement = apply(
+        scopes,
+        &proposal,
+        &refinement_id(),
+        true,
+        None,
+        Some(&baseline),
+        Some(learning),
+    )?;
+    mark_consolidated(&scopes.global);
+    record_learning_run(learning, &refinement, "curate");
+    Ok(refinement)
+}
+
+/// The learned-skill half of [`curate`]: the library snapshotted, then the
+/// curator's intents promoted, ready to apply.
+async fn curate_skills(
+    provider: &Arc<dyn ModelProvider>,
+    model: &str,
+    learning: &Learning,
+    instructions: Option<&str>,
+) -> Result<Proposal, String> {
+    let skills = super::learned::library(&learning.layers);
     let snapshot = super::learned::snapshot(&learning.layers)?;
     let mut parts = vec![
         format!(
@@ -1709,7 +1770,7 @@ pub async fn curate(
         return Err("the curator JSON must be an object".to_owned());
     }
     let mut proposal = Proposal::from_value(&value);
-    // The curator changes learned skills only.
+    // The skill curator changes learned skills only.
     proposal.edits.clear();
     proposal.skill_records =
         promote_with_repair(provider, model, learning, &proposal.skill_files).await;
@@ -1719,17 +1780,170 @@ pub async fn curate(
         proposal.rationale,
         snapshot.display()
     );
+    Ok(proposal)
+}
+
+/// The fewest global memory entries and prompt notes worth consolidating.
+pub const CONSOLIDATE_MIN_ENTRIES: usize = 12;
+/// How much the global memory must have changed (entries created, updated or
+/// deleted) since its last consolidation before the next automatic one.
+pub const CONSOLIDATE_AFTER_CHANGES: i64 = 15;
+const CONSOLIDATED_FILE: &str = "memory_consolidated";
+
+const MEMORY_CURATOR_SYSTEM_PROMPT: &str = r#"You are the memory curator of ha, a coding agent. After CowAgent's Deep Dream.
+
+The entries below are the global memory entries and prompt notes: they reach every future conversation, through a ranked digest and the memory tool. Conversations add entries one at a time, so the memory drifts toward duplicates, near-duplicates, outdated facts and leftovers of finished work. Your job is to keep it small, current and true.
+
+Rules:
+- Organize strictly from the entries given. Never invent, infer or add a fact that no entry states.
+- Merge entries about the same subject into one dense entry: update the clearest one with the merged content, then delete the others.
+- When entries conflict, the one with the later updated_at wins; drop or rewrite the older claim.
+- Delete what is stale or temporary: task progress, a one-off error, a blocker that was resolved, an entry superseded by a more precise one, an empty or garbled entry.
+- Keep facts about one project named with that project; never generalize a project fact to every project.
+- Keep one fact or rule per entry, short and self-contained, in the language it was written in.
+- A pinned entry (pinned: true) is shown in every turn: keep it pinned unless it is wrong or superseded. An update keeps an entry's metadata unless you set it; a merged entry that absorbs a pinned one sets "metadata": {"pinned": true}.
+- Only kinds memory and prompt exist for you. Never edit skills or subagents.
+- Every edit carries a `reason`. When nothing needs to change, return an empty edits array.
+
+Return JSON only:
+{
+  "summary": "one sentence",
+  "rationale": "what was merged, corrected or removed, and why",
+  "expectedOutcome": "what the memory looks like after",
+  "edits": [
+    {"action": "update", "kind": "memory", "id": "existing_id", "title": "...", "content": "...", "path": "...", "reason": "..."},
+    {"action": "delete", "kind": "memory", "id": "absorbed_id", "reason": "merged into existing_id"}
+  ]
+}"#;
+
+/// The memory entries and prompt notes of one raw state, as the curator sees them.
+fn memory_entries(state: &Value) -> Vec<Value> {
+    ["memory", "prompt"]
+        .iter()
+        .flat_map(|kind| {
+            state["entries"][kind]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(move |(id, entry)| {
+                    json!({
+                        "kind": kind,
+                        "id": id,
+                        "title": entry["title"],
+                        "content": entry["content"],
+                        "path": entry.get("path").cloned().unwrap_or_else(|| json!("general")),
+                        "version": entry["version"],
+                        "updated_at": entry.get("updated_at").cloned().unwrap_or(Value::Null),
+                        "pinned": entry["metadata"]["pinned"] == true,
+                    })
+                })
+        })
+        .collect()
+}
+
+/// How much the memory has changed: every create adds an entry and every
+/// update a version, so the sum grows with both (a delete lowers it, which
+/// still counts as a change against the mark).
+fn memory_fingerprint(state: &Value) -> i64 {
+    memory_entries(state)
+        .iter()
+        .map(|entry| entry["version"].as_i64().unwrap_or(1))
+        .sum::<i64>()
+}
+
+/// Whether the global memory is large enough and has changed enough since
+/// its last consolidation for an automatic one.
+#[must_use]
+pub fn memory_consolidation_due(global: &Path) -> bool {
+    let state = load_raw(global);
+    if memory_entries(&state).len() < CONSOLIDATE_MIN_ENTRIES {
+        return false;
+    }
+    let mark = std::fs::read_to_string(global.join(CONSOLIDATED_FILE))
+        .ok()
+        .and_then(|text| text.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    (memory_fingerprint(&state) - mark).abs() >= CONSOLIDATE_AFTER_CHANGES
+}
+
+/// Remember the memory as it was consolidated, so the next automatic pass
+/// waits for new changes.
+fn mark_consolidated(global: &Path) {
+    let fingerprint = memory_fingerprint(&load_raw(global));
+    let _ = std::fs::write(global.join(CONSOLIDATED_FILE), fingerprint.to_string());
+}
+
+/// The curator's edits to one scope's memory: merges, corrections and
+/// removals, as a proposal [`apply`] validates against `baseline`.
+async fn memory_edits(
+    provider: &Arc<dyn ModelProvider>,
+    model: &str,
+    baseline: &Value,
+    instructions: Option<&str>,
+) -> Result<Proposal, String> {
+    let entries = memory_entries(baseline)
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut parts = vec![format!("<global_memory>\n{entries}\n</global_memory>")];
+    if let Some(instructions) = instructions {
+        parts.push(format!(
+            "<user_curate_instructions>\n{instructions}\n</user_curate_instructions>"
+        ));
+    }
+    parts.push("Return only JSON. If nothing needs to change, return an empty edits array with a rationale.".to_owned());
+    let text = complete(
+        provider,
+        model,
+        MEMORY_CURATOR_SYSTEM_PROMPT,
+        parts.join("\n\n"),
+        CURATE_MAX_OUTPUT_TOKENS,
+    )
+    .await?;
+    let value = extract_json(&text)?;
+    if !value.is_object() {
+        return Err("the memory curator JSON must be an object".to_owned());
+    }
+    let mut proposal = Proposal::from_value(&value);
+    // Memory and prompt notes only: a skill or subagent edit is not its to make.
+    proposal
+        .edits
+        .retain(|edit| matches!(edit.text("kind"), Some("memory" | "prompt")));
+    proposal.skill_files.clear();
+    proposal.checks.clear();
+    Ok(proposal)
+}
+
+/// Consolidate the global memory alone: the automatic pass, when it has grown
+/// and changed enough ([`memory_consolidation_due`]).
+pub async fn consolidate_memory(
+    provider: &Arc<dyn ModelProvider>,
+    model: &str,
+    scopes: &HarnessScopes,
+) -> Result<Refinement, String> {
+    let baseline = load_raw(&scopes.global);
+    let proposal = memory_edits(provider, model, &baseline, None).await;
+    // Marked even when the pass failed or changed nothing: the next attempt
+    // waits for new changes instead of repeating every turn.
+    let proposal = match proposal {
+        Ok(proposal) => proposal,
+        Err(error) => {
+            mark_consolidated(&scopes.global);
+            return Err(error);
+        }
+    };
     let refinement = apply(
         scopes,
         &proposal,
         &refinement_id(),
         true,
         None,
+        Some(&baseline),
         None,
-        Some(learning),
-    )?;
-    record_learning_run(learning, &refinement, "curate");
-    Ok(refinement)
+    );
+    mark_consolidated(&scopes.global);
+    refinement
 }
 
 /// The automatic review's verdict (`AutoRefineReview`).
@@ -2226,10 +2440,105 @@ mod tests {
             alone.path(),
             None,
         );
-        let refused = super::curate(&provider, "fixture-model", &scopes, &empty, None)
+        let refused = super::curate(&provider, "fixture-model", &scopes, Some(&empty), None)
             .await
             .expect_err("nothing to fold");
-        assert!(refused.contains("at least 2"), "{refused}");
+        assert!(refused.contains("nothing to curate"), "{refused}");
+    }
+
+    /// The global memory, once large and changed enough, is consolidated: a
+    /// duplicate merged into the kept entry, a stale one removed, a pinned one
+    /// kept pinned, a skill edit refused as not the curator's to make - all
+    /// recorded as one refinement a rollback undoes.
+    #[tokio::test]
+    async fn the_global_memory_is_consolidated_validated_and_reversible() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let mut memory = serde_json::Map::new();
+        for number in 0..super::CONSOLIDATE_MIN_ENTRIES {
+            memory.insert(
+                format!("ui_{number}"),
+                json!({"id": format!("ui_{number}"), "kind": "memory", "title": format!("UI {number}"), "content": format!("UI fact {number}"), "version": 2}),
+            );
+        }
+        memory.insert(
+            "pm".to_owned(),
+            json!({"id": "pm", "kind": "memory", "title": "Package manager", "content": "shop uses pnpm", "version": 1, "metadata": {"pinned": true}}),
+        );
+        memory.insert(
+            "pm_again".to_owned(),
+            json!({"id": "pm_again", "kind": "memory", "title": "Package manager (bun)", "content": "shop switched to bun", "version": 1}),
+        );
+        std::fs::create_dir_all(&scopes.global).expect("dir");
+        super::save_raw(
+            &scopes.global,
+            &json!({"schema": 1, "entries": {"memory": memory, "prompt": {}, "skill": {}, "subagent": {}}, "refinements": []}),
+        )
+        .expect("state");
+        assert!(super::memory_consolidation_due(&scopes.global));
+        let reply = json!({
+            "summary": "merged the package manager entries",
+            "rationale": "pm_again supersedes pm",
+            "expectedOutcome": "one entry says bun",
+            "edits": [
+                {"action": "update", "kind": "memory", "id": "pm", "title": "Package manager", "content": "shop uses bun (was pnpm)", "reason": "newer wins"},
+                {"action": "delete", "kind": "memory", "id": "pm_again", "reason": "merged into pm"},
+                {"action": "delete", "kind": "memory", "id": "ui_0", "reason": "stale"},
+                {"action": "create", "kind": "skill", "title": "x", "content": "y", "reason": "not mine"}
+            ]
+        })
+        .to_string();
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = Replies::new(&[reply]);
+        let result = super::consolidate_memory(&provider, "fixture-model", &scopes)
+            .await
+            .expect("consolidated");
+        let state = load_raw(&scopes.global);
+        assert_eq!(
+            state["entries"]["memory"]["pm"]["content"],
+            "shop uses bun (was pnpm)"
+        );
+        assert_eq!(
+            state["entries"]["memory"]["pm"]["metadata"]["pinned"], true,
+            "kept pinned"
+        );
+        assert!(state["entries"]["memory"]["pm_again"].is_null());
+        assert!(state["entries"]["memory"]["ui_0"].is_null());
+        assert!(
+            state["entries"]["skill"]
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+        );
+        assert_eq!(
+            result.record["appliedEdits"].as_array().map(Vec::len),
+            Some(3)
+        );
+        // Marked: the next automatic pass waits for new changes.
+        assert!(!super::memory_consolidation_due(&scopes.global));
+
+        let none: std::sync::Arc<dyn harness_providers::ModelProvider> = Replies::new(&[]);
+        let undone = super::refine(
+            &none,
+            "fixture-model",
+            "",
+            &scopes,
+            &RefineOptions {
+                rollback: Some(result.id().to_owned()),
+                ..RefineOptions::default()
+            },
+            None,
+        )
+        .await
+        .expect("rolled back");
+        assert!(!undone.header().is_empty());
+        let state = load_raw(&scopes.global);
+        assert_eq!(
+            state["entries"]["memory"]["pm"]["content"],
+            "shop uses pnpm"
+        );
+        assert_eq!(
+            state["entries"]["memory"]["pm_again"]["content"],
+            "shop switched to bun"
+        );
     }
 
     /// A model that answers each call with the next reply, and keeps what it was
@@ -2406,6 +2715,25 @@ mod tests {
         assert_eq!(
             cadence.turn_finished(0),
             Some(super::AUTO_REFINE_TURN_INTERVAL + 1)
+        );
+    }
+
+    /// A turn that compacted brings the review forward, once there was as much
+    /// work as a session end needs; a compaction alone after one short turn waits.
+    #[test]
+    fn a_compaction_brings_the_review_forward() {
+        let cadence = super::Cadence::default();
+        let interval = super::AUTO_REFINE_TURN_INTERVAL;
+        assert_eq!(cadence.turn_finished_every(1, interval, true), None);
+        assert_eq!(
+            cadence.turn_finished_every(super::TAIL_MIN_TOOL_CALLS, interval, true),
+            Some(2)
+        );
+        cadence.release();
+        assert_eq!(
+            cadence.turn_finished_every(super::TAIL_MIN_TOOL_CALLS, interval, false),
+            None,
+            "without a compaction the usual interval holds"
         );
     }
 

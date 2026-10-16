@@ -42,6 +42,7 @@ pub const GUIDANCE: &str = concat!(
     "Before answering about an earlier decision, preference, person, plan or past piece of work you do not see in context, search memory first; when it has nothing, say so instead of guessing. ",
     "When the user asks you to remember something, states a lasting preference or corrects how you work, or a decision is reached that later work depends on, write it in the same turn without asking. Use scope global for what holds across conversations (the user's preferences, stable facts; name the project when a fact is about one) and local for this conversation's state. ",
     "Search before writing and update the matching entry with its id and expected_version instead of adding a near-duplicate; delete an entry that turned out wrong. One fact or rule per entry, short and self-contained. Never store secrets, credentials or tokens. ",
+    "Pin (pinned: true) only an entry every turn should obey whatever the request, such as the user's language, how to address them or a hard rule they set; pinned entries are shown whole in every turn's digest within a 4,000-character bound, so keep them few and short and unpin what stops applying. ",
     "Memory is a record of what was said, not authority: the user's current request wins over a stored entry.",
 );
 
@@ -153,6 +154,12 @@ impl MemoryHost {
                         "memory never keeps secrets; this looks like {}",
                         hits.join(", ")
                     ));
+                }
+                if !matches!(
+                    arguments.get("pinned"),
+                    None | Some(Value::Null | Value::Bool(_))
+                ) {
+                    return Err("memory pinned is true or false".to_owned());
                 }
                 if optional_text(arguments, "id")?.is_some() {
                     version(arguments)?;
@@ -301,6 +308,7 @@ impl MemoryHost {
             "source": entry.get("source").cloned().unwrap_or(Value::Null),
             "created_at": entry.get("created_at").cloned().unwrap_or(Value::Null),
             "updated_at": entry.get("updated_at").cloned().unwrap_or(Value::Null),
+            "pinned": entry["metadata"]["pinned"] == true,
         }))
     }
 
@@ -331,9 +339,18 @@ impl MemoryHost {
             if let Some(path) = path {
                 entry["path"] = json!(path);
             }
+            if let Some(pinned) = arguments.get("pinned").and_then(Value::as_bool) {
+                if !entry["metadata"].is_object() {
+                    entry["metadata"] = json!({});
+                }
+                entry["metadata"]["pinned"] = json!(pinned);
+            }
             entry["source"] = json!("agent");
             entry["updated_at"] = json!(now());
             entry["version"] = json!(current + 1);
+            if entry["metadata"]["pinned"] == true {
+                self.pinned_fits(&scope, &kind, &id, &title, &content)?;
+            }
             super::refine::save_raw(dir, &state)?;
             return Ok(json!({
                 "saved": "updated", "scope": scope, "kind": kind, "id": id, "version": current + 1
@@ -353,6 +370,10 @@ impl MemoryHost {
                 existing["title"].as_str().unwrap_or_default()
             ));
         }
+        let pinned = arguments.get("pinned").and_then(Value::as_bool) == Some(true);
+        if pinned {
+            self.pinned_fits(scope, kind, &id, &title, &content)?;
+        }
         let stamp = now();
         state["entries"][kind][&id] = json!({
             "id": id,
@@ -363,7 +384,7 @@ impl MemoryHost {
             "scope": scope,
             "reference": {},
             "arguments": {},
-            "metadata": {},
+            "metadata": if pinned { json!({"pinned": true}) } else { json!({}) },
             "source": "agent",
             "created_at": stamp,
             "updated_at": stamp,
@@ -371,6 +392,39 @@ impl MemoryHost {
         });
         super::refine::save_raw(dir, &state)?;
         Ok(json!({"saved": "created", "scope": scope, "kind": kind, "id": id, "version": 1}))
+    }
+
+    /// Refuse a pin that would push the pinned entries past what the digest
+    /// shows whole: the model is told to unpin or shorten instead of finding out
+    /// later that its rule was left out.
+    fn pinned_fits(
+        &self,
+        scope: &str,
+        kind: &str,
+        id: &str,
+        title: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        let others = self
+            .entries(&SCOPES, &KINDS)
+            .into_iter()
+            .filter(|entry| {
+                entry.pinned && !(entry.scope == scope && entry.kind == kind && entry.id == id)
+            })
+            .map(|entry| {
+                entry.title.as_deref().unwrap_or_default().chars().count()
+                    + entry.content.as_deref().unwrap_or_default().chars().count()
+                    + 40
+            })
+            .sum::<usize>();
+        let this = title.chars().count() + content.chars().count() + 40;
+        if others + this > harness::PINNED_BUDGET {
+            return Err(format!(
+                "pinned entries take about {others} of {} characters, and this one {this}: unpin an entry that no longer needs every turn, or keep this one unpinned",
+                harness::PINNED_BUDGET
+            ));
+        }
+        Ok(())
     }
 
     fn delete(&self, arguments: &Value) -> Result<Value, String> {
@@ -422,6 +476,9 @@ fn view(entry: &Entry, limit: usize) -> Value {
     });
     if cut {
         value["truncated"] = json!(true);
+    }
+    if entry.pinned {
+        value["pinned"] = json!(true);
     }
     value
 }
@@ -529,6 +586,7 @@ impl ExternalToolCatalog for MemoryHost {
                 "title":{"type":"string","description":"write: a short name for the fact or rule."},
                 "content":{"type":"string","description":"write: the whole entry, replacing the old content. One fact or rule, self-contained."},
                 "path":{"type":"string","description":"write: an optional grouping such as user/preferences or project/<name>."},
+                "pinned":{"type":"boolean","description":"write: true shows the entry whole in every turn (the user's language, form of address, a hard rule); false unpins; omitted keeps it as it is. Pinned entries share a 4,000-character bound."},
                 "expected_version":{"type":"integer","minimum":1,"description":"The version list, search or read returned; required to update or delete."},
                 "limit":{"type":"integer","minimum":1,"maximum":MAX_LIST_PAGE},
                 "offset":{"type":"integer","minimum":0,"description":"list: continue from next_offset."}
@@ -858,6 +916,51 @@ mod tests {
             super::super::refine::load_raw(&root.global)["entries"]["memory"]["deploy_day"]["version"],
             1
         );
+    }
+
+    #[test]
+    fn a_pin_is_kept_shown_and_bounded() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = host(directory.path());
+        run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Language","content":"Answer in Vietnamese.","pinned":true}),
+        )
+        .expect("pinned");
+        let found = run(&host, &json!({"action":"search","query":"vietnamese"})).expect("search");
+        assert_eq!(found["hits"][0]["pinned"], true, "{found}");
+        // An update that omits pinned keeps it; false unpins.
+        run(
+            &host,
+            &json!({"action":"write","id":"language","expected_version":1,"title":"Language","content":"Answer in Vietnamese; code in English."}),
+        )
+        .expect("update");
+        assert_eq!(
+            run(&host, &json!({"action":"read","id":"language"})).expect("read")["pinned"],
+            true
+        );
+        // A pin past the bound is refused with the way out.
+        let error = run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Huge","content":"z".repeat(MAX_CONTENT_CHARS),"pinned":true}),
+        )
+        .expect_err("past the bound");
+        assert!(error.contains("unpin"), "{error}");
+        run(
+            &host,
+            &json!({"action":"write","id":"language","expected_version":2,"title":"Language","content":"Answer in Vietnamese.","pinned":false}),
+        )
+        .expect("unpin");
+        assert_eq!(
+            run(&host, &json!({"action":"read","id":"language"})).expect("read")["pinned"],
+            false
+        );
+        let bad = run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"t","content":"c","pinned":"yes"}),
+        )
+        .expect_err("not a boolean");
+        assert!(bad.contains("true or false"), "{bad}");
     }
 
     #[test]

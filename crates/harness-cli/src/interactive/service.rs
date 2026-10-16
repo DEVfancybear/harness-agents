@@ -6599,6 +6599,10 @@ impl AutoRefine {
     }
 }
 
+/// One global memory consolidation at a time across the process's sessions.
+static MEMORY_CONSOLIDATING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// How many of the newest turns a refinement reads, tool calls and results
 /// included; the refiner keeps the tail of that within its own budget.
 const REFINE_TRANSCRIPT_TURNS: usize = 50;
@@ -8540,14 +8544,48 @@ async fn run_turn(
                     .to_owned(),
             });
             tokio::spawn(async move {
-                let event = match super::refine::curate(&provider, &model, &scopes, &learning, None)
-                    .await
-                {
-                    Ok(refinement) => refined_event(&refinement),
-                    Err(error) => SessionEvent::Notice {
-                        message: format!("skills: curation skipped: {error}"),
-                    },
-                };
+                let event =
+                    match super::refine::curate(&provider, &model, &scopes, Some(&learning), None)
+                        .await
+                    {
+                        Ok(refinement) => refined_event(&refinement),
+                        Err(error) => SessionEvent::Notice {
+                            message: format!("skills: curation skipped: {error}"),
+                        },
+                    };
+                let _ = sender.send(event);
+            });
+        }
+        // The global memory, once it has grown and changed enough, is
+        // consolidated beside the conversation: duplicates merged, the outdated
+        // and the temporary removed, as `CowAgent`'s Deep Dream does nightly -
+        // but through the same validated, recorded and reversible edits as a
+        // refinement, where Deep Dream overwrites `MEMORY.md` unchecked.
+        let global = super::harness::global_dir(&data_dir);
+        if auto_refine
+            && !cancellation.is_cancelled()
+            && super::refine::memory_consolidation_due(&global)
+            && !MEMORY_CONSOLIDATING.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let sender = sender.clone();
+            let provider = Arc::clone(&provider);
+            let model = config.model.clone();
+            let scopes = super::refine::HarnessScopes {
+                global,
+                local: super::harness::local_dir(&data_dir, goal_task.as_str()),
+            };
+            send(SessionEvent::Notice {
+                message: "memory: consolidating the global memory in the background".to_owned(),
+            });
+            tokio::spawn(async move {
+                let event =
+                    match super::refine::consolidate_memory(&provider, &model, &scopes).await {
+                        Ok(refinement) => refined_event(&refinement),
+                        Err(error) => SessionEvent::Notice {
+                            message: format!("memory: consolidation skipped: {error}"),
+                        },
+                    };
+                MEMORY_CONSOLIDATING.store(false, std::sync::atomic::Ordering::SeqCst);
                 let _ = sender.send(event);
             });
         }
@@ -8567,6 +8605,8 @@ async fn run_turn(
             }
         }
     }
+    // Whether this turn compacted the context: the review comes forward then.
+    let compacted = runtime.compactions() > 0;
     if outcome.is_ok() && !cancellation.is_cancelled() {
         let requested = refine_request
             .lock()
@@ -8584,7 +8624,7 @@ async fn run_turn(
             .filter(|interval| *interval > 0)
             .unwrap_or(super::refine::AUTO_REFINE_TURN_INTERVAL);
         let review = if auto_refine {
-            refine_cadence.turn_finished_every(tool_calls, interval)
+            refine_cadence.turn_finished_every(tool_calls, interval, compacted)
         } else {
             None
         };
