@@ -505,6 +505,66 @@ impl KnowledgeHost {
         Ok(payload)
     }
 
+    /// A page the automatic review adds beside the conversation, as `CowAgent`'s
+    /// Self-Evolution keeps knowledge the main agent left unsaved. Only a new
+    /// page, through the same checks as the tool: one already at the path is
+    /// the agent's to update after reading it. Returns the written page and the
+    /// library root a rollback deletes it from.
+    pub(crate) fn review_create(&self, page: &Value) -> Result<(Value, PathBuf), String> {
+        let mut arguments = serde_json::Map::new();
+        for key in [
+            "scope", "path", "title", "summary", "content", "sources", "related",
+        ] {
+            if let Some(value) = page.get(key).filter(|value| !value.is_null()) {
+                arguments.insert(key.to_owned(), value.clone());
+            }
+        }
+        arguments.insert("action".to_owned(), json!("write"));
+        let arguments = Value::Object(arguments);
+        let scope = Self::scopes(&arguments, false)?[0];
+        let path = text(&arguments, "path")?;
+        if self.store(scope).document(path).is_ok() {
+            return Err(format!(
+                "{} knowledge already has {path}; the agent updates a page after reading it",
+                scope.label()
+            ));
+        }
+        let mut payload = self.execute(&arguments)?;
+        let written = payload["results"]
+            .get_mut(0)
+            .map(Value::take)
+            .ok_or("the knowledge write returned no page")?;
+        Ok((written, self.root(scope).to_path_buf()))
+    }
+
+    /// The pages the review may not duplicate, by path and title.
+    pub(crate) fn review_catalog(&self) -> Option<String> {
+        if !self.store(Scope::Project).enabled().ok()? {
+            return None;
+        }
+        let mut lines = Vec::new();
+        for scope in [Scope::Project, Scope::Global] {
+            let store = self.store(scope);
+            if !store.enabled().unwrap_or(false) {
+                continue;
+            }
+            for page in store.list().unwrap_or_default().into_iter().take(80) {
+                lines.push(format!(
+                    "- {} {}: {} - {}",
+                    scope.label(),
+                    page.path,
+                    page.title,
+                    clipped(&page.summary, 160)
+                ));
+            }
+        }
+        Some(if lines.is_empty() {
+            "(no pages yet)".to_owned()
+        } else {
+            lines.join("\n")
+        })
+    }
+
     /// A small routing catalogue only; full pages are loaded with the tool.
     pub fn context(&self, query: &str) -> Result<String, String> {
         if !self.store(Scope::Project).enabled()? {

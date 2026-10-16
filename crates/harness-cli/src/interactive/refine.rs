@@ -25,6 +25,8 @@ const HISTORY_FILE: &str = "refinements.jsonl";
 const KINDS: [&str; 4] = ["prompt", "memory", "skill", "subagent"];
 /// How a learned-skill change is recorded among a refinement's edits.
 const SKILL_FILE_KIND: &str = "skill_file";
+/// The kind a knowledge page the automatic review wrote is recorded under.
+const KNOWLEDGE_KIND: &str = "knowledge";
 /// How many assistant turns pass between automatic reviews (prime-agent's default).
 pub const AUTO_REFINE_TURN_INTERVAL: u32 = 25;
 /// How many tool calls make a review due before twenty-five turns do. Work is
@@ -295,14 +297,14 @@ JSON only with this exact shape:
 
 const AUTO_REFINE_REVIEW_SYSTEM_PROMPT: &str = r#"You are the automatic /refine review gate of ha, a coding agent.
 
-Decide whether this checkpoint should run /refine. Auto /refine writes local continual harness state by default, so approve when the trajectory contains evidence useful to this session's future turns.
+Decide whether this checkpoint should run /refine. Auto /refine writes local continual harness state by default, so approve when the trajectory contains evidence useful to this session's future turns. It also writes memory every conversation sees - approve when the user stated a lasting preference, corrected how the agent works or settled a stable fact that the current harness state does not hold yet - and new knowledge pages, when the conversation produced substantive reusable knowledge the agent did not save.
 Reject one-off noise, unsupported hypotheses, and transient tool outputs. When the conversation holds a line saying the turns above it were already reviewed, judge only the turns after it. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified lessons likely to be reused in future sessions.
 
 Return JSON only:
 {
   "shouldRefine": true|false,
   "rationale": "short reason",
-  "instructions": "optional concise instructions for /refine if shouldRefine is true"
+  "instructions": "optional concise instructions for /refine if shouldRefine is true, naming everything worth keeping (local state, global memory, learned skills, knowledge pages)"
 }"#;
 
 /// What `/learn` asks of a refinement.
@@ -795,7 +797,7 @@ impl Edit {
 }
 
 /// A proposal the model made (`RefinementProposal`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct Proposal {
     summary: String,
     rationale: String,
@@ -810,6 +812,12 @@ struct Proposal {
     skill_records: Vec<Value>,
     /// Checks proposed for the user's review.
     checks: Vec<Value>,
+    /// New knowledge pages the automatic review proposed.
+    knowledge: Vec<Value>,
+    /// Knowledge pages already written (or refused), recorded as they are.
+    knowledge_records: Vec<Value>,
+    /// Knowledge pages a rollback deletes, as the refinement recorded them.
+    knowledge_restores: Vec<Value>,
 }
 
 impl Proposal {
@@ -852,6 +860,18 @@ impl Proposal {
                         .collect()
                 })
                 .unwrap_or_default(),
+            knowledge: value["knowledge"]
+                .as_array()
+                .map(|pages| {
+                    pages
+                        .iter()
+                        .filter(|page| page.is_object())
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            knowledge_records: Vec::new(),
+            knowledge_restores: Vec::new(),
         }
     }
 }
@@ -866,6 +886,12 @@ impl Refinement {
     #[must_use]
     pub fn id(&self) -> &str {
         self.record["id"].as_str().unwrap_or_default()
+    }
+
+    /// No edit was proposed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.edits().is_empty()
     }
 
     /// The edits that count: an intent refused and then handed to the repair
@@ -948,6 +974,8 @@ impl Refinement {
         {
             let noun = if kind == SKILL_FILE_KIND {
                 format!("learned skill{}", plural(applied.len()))
+            } else if kind == KNOWLEDGE_KIND {
+                format!("knowledge page{}", plural(applied.len()))
             } else if kind == "memory" {
                 if applied.len() == 1 {
                     "memory"
@@ -1168,6 +1196,8 @@ fn apply(
         applied_edits.push(record);
     }
     apply_skill_files(proposal, learning, &mut applied_edits);
+    applied_edits.extend(proposal.knowledge_records.iter().cloned());
+    applied_edits.extend(proposal.knowledge_restores.iter().map(delete_page));
     if let Some(learning) = learning
         && !proposal.checks.is_empty()
     {
@@ -1326,7 +1356,7 @@ async fn promote_with_repair(
         serde_json::to_string_pretty(&refused).unwrap_or_default()
     )];
     parts.extend(learning.prompt_parts());
-    let repaired = match complete(
+    let repaired = match complete_json(
         provider,
         model,
         REPAIR_SYSTEM_PROMPT,
@@ -1334,7 +1364,6 @@ async fn promote_with_repair(
         REFINEMENT_MAX_OUTPUT_TOKENS,
     )
     .await
-    .and_then(|text| extract_json(&text))
     {
         Ok(value) => value["skillFiles"].as_array().cloned().unwrap_or_default(),
         Err(_) => return records,
@@ -1400,6 +1429,7 @@ fn rollback_proposal(target: &Value) -> Proposal {
     let id = target["id"].as_str().unwrap_or("?");
     let mut edits = Vec::new();
     let mut skill_changes = Vec::new();
+    let mut knowledge = Vec::new();
     for edit in target["appliedEdits"]
         .as_array()
         .into_iter()
@@ -1411,6 +1441,10 @@ fn rollback_proposal(target: &Value) -> Proposal {
         }
         if edit["kind"] == SKILL_FILE_KIND {
             skill_changes.push(edit.clone());
+            continue;
+        }
+        if edit["kind"] == KNOWLEDGE_KIND {
+            knowledge.push(edit.clone());
             continue;
         }
         let before = &edit["before"];
@@ -1455,6 +1489,9 @@ fn rollback_proposal(target: &Value) -> Proposal {
         skill_restores: skill_changes,
         skill_records: Vec::new(),
         checks: Vec::new(),
+        knowledge: Vec::new(),
+        knowledge_records: Vec::new(),
+        knowledge_restores: knowledge,
     }
 }
 
@@ -1483,6 +1520,35 @@ const RETRY_MAX_OUTPUT_TOKENS: u32 = 65_536;
 /// its output budget thinking: seen on `DeepSeek` at `max`, every auto refine
 /// ended "stopped before completing its JSON object". Cut off, the call is
 /// made once more with four times the budget.
+/// A model call whose answer is a JSON object. A reply with no JSON in it -
+/// prose, or nothing once a thinking model spent its turn reasoning - is asked
+/// for once more with the reply shown: a review used to fail outright with
+/// "the refiner did not return a JSON object".
+async fn complete_json(
+    provider: &Arc<dyn ModelProvider>,
+    model: &str,
+    system: &str,
+    user: String,
+    max_tokens: u32,
+) -> Result<Value, String> {
+    let text = complete(provider, model, system, user.clone(), max_tokens).await?;
+    match extract_json(&text) {
+        Err(error) if error != TRUNCATED_JSON_ERROR => {
+            let shown = if text.trim().is_empty() {
+                "(an empty reply)".to_owned()
+            } else {
+                tail(&text, 2_000)
+            };
+            let again = format!(
+                "{user}\n\n<previous_reply>\n{shown}\n</previous_reply>\nThat reply was not the JSON object asked for ({error}). Answer again with the JSON object only, nothing before or after it."
+            );
+            let text = complete(provider, model, system, again, max_tokens).await?;
+            extract_json(&text)
+        }
+        result => result,
+    }
+}
+
 async fn complete(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
@@ -1577,50 +1643,18 @@ pub async fn refine(
         "Requested refinement scope: local. Prefer local continual harness edits for current task progress, temporary blockers, current-run coordination, and project facts that are not clearly reusable across conversations. Global entries in the overview are read-only context: do not propose update or delete edits for them; create a local entry instead if an override is needed."
     };
     let baseline = load_raw(scopes.dir(options.global));
-    let mut parts = vec![
-        format!(
-            "<current_harness_state>\n{}\n</current_harness_state>",
-            overview(scopes)
-        ),
-        format!(
-            "<refinement_history>\n{}\n</refinement_history>",
-            history_for_prompt(&history)
-        ),
-        format!(
-            "<conversation>\n{}\n</conversation>",
-            tail(conversation, CONVERSATION_CHARS)
-        ),
-        format!("<scope_policy>\n{scope_instruction}\n</scope_policy>"),
-    ];
-    if let Some(learning) = learning {
-        parts.extend(learning.prompt_parts());
-    }
-    if let Some(instructions) = &options.instructions {
-        parts.push(format!(
-            "<user_refine_instructions>\n{instructions}\n</user_refine_instructions>"
-        ));
-    }
-    parts.push("Return only JSON edits. If no useful edit is justified, return an empty edits array with a rationale.".to_owned());
-    let text = complete(
+    let proposal = plan(
         provider,
         model,
-        REFINEMENT_SYSTEM_PROMPT,
-        parts.join("\n\n"),
-        REFINEMENT_MAX_OUTPUT_TOKENS,
+        conversation,
+        scopes,
+        &history,
+        options,
+        learning,
+        scope_instruction,
+        Vec::new(),
     )
     .await?;
-    let value = extract_json(&text)?;
-    if !value.is_object() {
-        return Err("the refiner JSON must be an object".to_owned());
-    }
-    let mut proposal = Proposal::from_value(&value);
-    if let Some(learning) = learning
-        && !proposal.skill_files.is_empty()
-    {
-        proposal.skill_records =
-            promote_with_repair(provider, model, learning, &proposal.skill_files).await;
-        proposal.skill_files.clear();
-    }
     let refinement = apply(
         scopes,
         &proposal,
@@ -1636,6 +1670,234 @@ pub async fn refine(
         record_learning_run(learning, &refinement, "refine");
     }
     Ok(refinement)
+}
+
+/// Ask the refiner for a proposal under `scope_instruction`, with its learned
+/// skill intents promoted.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the refinement's inputs, shared by /refine and the automatic review"
+)]
+async fn plan(
+    provider: &Arc<dyn ModelProvider>,
+    model: &str,
+    conversation: &str,
+    scopes: &HarnessScopes,
+    history: &[Value],
+    options: &RefineOptions,
+    learning: Option<&Learning>,
+    scope_instruction: &str,
+    extra: Vec<String>,
+) -> Result<Proposal, String> {
+    let mut parts = vec![
+        format!(
+            "<current_harness_state>\n{}\n</current_harness_state>",
+            overview(scopes)
+        ),
+        format!(
+            "<refinement_history>\n{}\n</refinement_history>",
+            history_for_prompt(history)
+        ),
+        format!(
+            "<conversation>\n{}\n</conversation>",
+            tail(conversation, CONVERSATION_CHARS)
+        ),
+        format!("<scope_policy>\n{scope_instruction}\n</scope_policy>"),
+    ];
+    if let Some(learning) = learning {
+        parts.extend(learning.prompt_parts());
+    }
+    parts.extend(extra);
+    if let Some(instructions) = &options.instructions {
+        parts.push(format!(
+            "<user_refine_instructions>\n{instructions}\n</user_refine_instructions>"
+        ));
+    }
+    parts.push("Return only JSON edits. If no useful edit is justified, return an empty edits array with a rationale.".to_owned());
+    let value = complete_json(
+        provider,
+        model,
+        REFINEMENT_SYSTEM_PROMPT,
+        parts.join("\n\n"),
+        REFINEMENT_MAX_OUTPUT_TOKENS,
+    )
+    .await?;
+    if !value.is_object() {
+        return Err("the refiner JSON must be an object".to_owned());
+    }
+    let mut proposal = Proposal::from_value(&value);
+    if let Some(learning) = learning
+        && !proposal.skill_files.is_empty()
+    {
+        proposal.skill_records =
+            promote_with_repair(provider, model, learning, &proposal.skill_files).await;
+        proposal.skill_files.clear();
+    }
+    Ok(proposal)
+}
+
+/// The automatic review's scope: local by default, with memory that holds
+/// across conversations marked global.
+const AUTO_SCOPE_POLICY: &str = "Requested refinement scope: automatic review. Edits go to this conversation's local store unless marked otherwise. Mark a memory edit with \"scope\": \"global\" when it is a durable user preference, a correction of how the agent should work, or a stable fact about the user, their environment or a named project that future conversations need, and the main agent did not already save it: check the global entries in the overview, and update a global entry (with \"scope\": \"global\" and its bare id) when the conversation supersedes it instead of creating a duplicate. Never put task progress, temporary blockers or current-run coordination in global memory. Only memory edits may be global; every other kind stays local.";
+
+/// What the automatic review may add to the knowledge library.
+const KNOWLEDGE_PROPOSALS: &str = "Knowledge (not an edit kind) is the user's library of topical Markdown pages shared across conversations. When the conversation produced substantive reusable knowledge the main agent did not save - a researched conclusion, a method or concept worked out, a source the user shared to study - propose it in a top-level `knowledge` array: {\"scope\": \"project\" or \"global\", \"path\": \"concepts/short-name.md\", \"title\": \"...\", \"summary\": \"one line\", \"content\": \"Markdown, in the material's language\", \"sources\": [\"URLs or documents it came from\"], \"reason\": \"why\"}. Use project scope unless the knowledge is explicitly shared across projects; use sources/, concepts/, entities/ or analysis/ for the path. Only new pages: never a page listed below. Skip trivial exchanges, task progress, secrets, personal facts (memory) and procedures (learned skills). Weigh this whatever the review's instructions focus on. Leave `knowledge` empty when nothing meets the bar.";
+
+impl Edit {
+    /// An automatic review's memory edit meant for every conversation.
+    fn wants_global(&self) -> bool {
+        self.text("kind") == Some("memory")
+            && (self.text("scope") == Some("global")
+                || self
+                    .0
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("scope"))
+                    .and_then(Value::as_str)
+                    == Some("global"))
+    }
+}
+
+/// Write the proposal's knowledge pages, each recorded as an edit of the
+/// refinement so a rollback deletes it.
+fn create_pages(host: &super::knowledge::KnowledgeHost, pages: &[Value]) -> Vec<Value> {
+    pages
+        .iter()
+        .take(4)
+        .map(|page| {
+            let mut record = json!({
+                "action": "create",
+                "kind": KNOWLEDGE_KIND,
+                "id": page["path"].as_str().unwrap_or("?"),
+                "level": page["scope"].as_str().unwrap_or("project"),
+                "reason": page["reason"].clone(),
+            });
+            match host.review_create(page) {
+                Ok((written, root)) => {
+                    record["hash"] = written["hash"].clone();
+                    record["id"] = written["path"].clone();
+                    record["root"] = json!(root.display().to_string());
+                    record["applied"] = json!(true);
+                }
+                Err(error) => {
+                    record["applied"] = json!(false);
+                    record["error"] = json!(error);
+                }
+            }
+            record
+        })
+        .collect()
+}
+
+/// A rollback's delete of a knowledge page the review wrote: only while the
+/// page is as written, so a later edit by the agent or the user is kept.
+fn delete_page(created: &Value) -> Value {
+    let path = created["id"].as_str().unwrap_or_default();
+    let mut record = json!({
+        "action": "delete",
+        "kind": KNOWLEDGE_KIND,
+        "id": path,
+        "level": created["level"].clone(),
+    });
+    let result = match (created["root"].as_str(), created["hash"].as_str()) {
+        (Some(root), Some(hash)) => {
+            super::knowledge::store::Store::new(PathBuf::from(root)).delete(path, hash)
+        }
+        _ => Err("the refinement did not record where the page is".to_owned()),
+    };
+    match result {
+        Ok(()) => record["applied"] = json!(true),
+        Err(error) => {
+            record["applied"] = json!(false);
+            record["error"] = json!(error);
+        }
+    }
+    record
+}
+
+/// The automatic review's refinement. Beyond a local refinement it reaches
+/// what `CowAgent`'s Self-Evolution writes: memory edits marked global go to
+/// the global store - recorded there as a refinement of their own, so each
+/// part rolls back on its own - and new knowledge pages. Returns the local
+/// refinement, then the global one when there is one.
+pub async fn auto_refine(
+    provider: &Arc<dyn ModelProvider>,
+    model: &str,
+    conversation: &str,
+    scopes: &HarnessScopes,
+    instructions: Option<String>,
+    learning: Option<&Learning>,
+    knowledge: Option<&super::knowledge::KnowledgeHost>,
+) -> Result<Vec<Refinement>, String> {
+    let history = history(scopes);
+    let options = RefineOptions {
+        instructions,
+        ..RefineOptions::default()
+    };
+    let catalog = knowledge.and_then(super::knowledge::KnowledgeHost::review_catalog);
+    let extra = catalog
+        .iter()
+        .map(|catalog| {
+            format!(
+                "<knowledge_proposals>\n{KNOWLEDGE_PROPOSALS}\nExisting pages:\n{catalog}\n</knowledge_proposals>"
+            )
+        })
+        .collect();
+    let local_baseline = load_raw(&scopes.local);
+    let global_baseline = load_raw(&scopes.global);
+    let mut proposal = plan(
+        provider,
+        model,
+        conversation,
+        scopes,
+        &history,
+        &options,
+        learning,
+        AUTO_SCOPE_POLICY,
+        extra,
+    )
+    .await?;
+    let (global_edits, local_edits): (Vec<_>, Vec<_>) = std::mem::take(&mut proposal.edits)
+        .into_iter()
+        .partition(Edit::wants_global);
+    proposal.edits = local_edits;
+    if let Some(host) = knowledge.filter(|_| catalog.is_some()) {
+        proposal.knowledge_records = create_pages(host, &proposal.knowledge);
+    }
+    let id = refinement_id();
+    let local = apply(
+        scopes,
+        &proposal,
+        &id,
+        false,
+        None,
+        Some(&local_baseline),
+        learning,
+    )?;
+    if let Some(learning) = learning
+        && !proposal.skill_records.is_empty()
+    {
+        record_learning_run(learning, &local, "refine");
+    }
+    let mut refinements = vec![local];
+    if !global_edits.is_empty() {
+        let global = Proposal {
+            summary: format!("{} (global memory)", proposal.summary),
+            rationale: proposal.rationale.clone(),
+            expected_outcome: proposal.expected_outcome.clone(),
+            edits: global_edits,
+            ..Proposal::default()
+        };
+        refinements.push(apply(
+            scopes,
+            &global,
+            &format!("{id}_global"),
+            true,
+            None,
+            Some(&global_baseline),
+            None,
+        )?);
+    }
+    Ok(refinements)
 }
 
 /// How many requests in a layer pass between automatic curations: consolidation
@@ -1757,7 +2019,7 @@ async fn curate_skills(
         ));
     }
     parts.push("Return only JSON. If nothing is worth folding, return an empty skillFiles array with a rationale.".to_owned());
-    let text = complete(
+    let value = complete_json(
         provider,
         model,
         CURATOR_SYSTEM_PROMPT,
@@ -1765,7 +2027,6 @@ async fn curate_skills(
         CURATE_MAX_OUTPUT_TOKENS,
     )
     .await?;
-    let value = extract_json(&text)?;
     if !value.is_object() {
         return Err("the curator JSON must be an object".to_owned());
     }
@@ -1893,7 +2154,7 @@ async fn memory_edits(
         ));
     }
     parts.push("Return only JSON. If nothing needs to change, return an empty edits array with a rationale.".to_owned());
-    let text = complete(
+    let value = complete_json(
         provider,
         model,
         MEMORY_CURATOR_SYSTEM_PROMPT,
@@ -1901,7 +2162,6 @@ async fn memory_edits(
         CURATE_MAX_OUTPUT_TOKENS,
     )
     .await?;
-    let value = extract_json(&text)?;
     if !value.is_object() {
         return Err("the memory curator JSON must be an object".to_owned());
     }
@@ -1984,13 +2244,13 @@ pub async fn review(
         format!("<refinement_history>\n{}\n</refinement_history>", history_for_prompt(&history)),
         format!("<conversation>\n{}\n</conversation>", tail(conversation, REVIEW_CONVERSATION_CHARS)),
         learned,
-        "Return shouldRefine=true when the trajectory contains evidence useful to this session's future turns. Prefer local harness edits for current task progress, temporary blockers, and current-run coordination. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified facts likely to be reused in future sessions. A corrected approach or reusable technique that belongs in a learned skill (a new one, or a patch to one listed above) is also worth refining.".to_owned(),
+        "Return shouldRefine=true when the trajectory contains evidence useful to this session's future turns. Prefer local harness edits for current task progress, temporary blockers, and current-run coordination. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified facts likely to be reused in future sessions. A corrected approach or reusable technique that belongs in a learned skill (a new one, or a patch to one listed above) is also worth refining, and so is substantive reusable knowledge (a worked-out explanation, method or researched conclusion) that the agent did not save as a knowledge page.".to_owned(),
     ]
     .into_iter()
     .filter(|part| !part.is_empty())
     .collect::<Vec<_>>()
     .join("\n\n");
-    let text = complete(
+    let value = complete_json(
         provider,
         model,
         AUTO_REFINE_REVIEW_SYSTEM_PROMPT,
@@ -1998,7 +2258,6 @@ pub async fn review(
         REVIEW_MAX_OUTPUT_TOKENS,
     )
     .await?;
-    let value = extract_json(&text)?;
     Ok(Review {
         should_refine: value["shouldRefine"] == true,
         rationale: value["rationale"]
@@ -2538,6 +2797,173 @@ mod tests {
         assert_eq!(
             state["entries"]["memory"]["pm_again"]["content"],
             "shop switched to bun"
+        );
+    }
+
+    /// The automatic review reaches what `CowAgent`'s Self-Evolution writes: a
+    /// memory edit marked global lands in the global store as a refinement of
+    /// its own, other kinds stay local even when marked global, and a new
+    /// knowledge page is written once - never over an existing one - and each
+    /// part rolls back on its own.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "one review, then both rollbacks")]
+    async fn the_automatic_review_keeps_global_memory_and_new_knowledge() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let host = crate::interactive::knowledge::KnowledgeHost::new(
+            &workspace,
+            &directory.path().join("data"),
+        );
+        let existing = json!({
+            "scope": "project", "path": "concepts/existing.md", "title": "Existing",
+            "summary": "already here", "content": "kept"
+        });
+        host.review_create(&existing).expect("seed page");
+        let reply = json!({
+            "summary": "kept the user's language and the retry method",
+            "rationale": "the user said always answer in Vietnamese",
+            "expectedOutcome": "every conversation answers in Vietnamese",
+            "edits": [
+                {"action": "create", "kind": "memory", "title": "Reply language", "content": "Always answer in Vietnamese", "scope": "global", "reason": "a lasting preference"},
+                {"action": "create", "kind": "memory", "title": "Current step", "content": "porting the parser", "reason": "task progress"},
+                {"action": "create", "kind": "prompt", "title": "Tone", "content": "be brief", "scope": "global", "reason": "only memory goes global"}
+            ],
+            "knowledge": [
+                {"scope": "project", "path": "concepts/retry-backoff.md", "title": "Retry with backoff", "summary": "how the client retries", "content": "Double the wait, cap at 30 s.", "sources": ["https://example.com/retry"], "reason": "worked out in this conversation"},
+                {"scope": "project", "path": "concepts/existing.md", "title": "Existing", "summary": "overwrite", "content": "replaced", "reason": "a duplicate"}
+            ]
+        })
+        .to_string();
+        let replies = Replies::new(&[reply]);
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = replies.clone();
+        let refinements = super::auto_refine(
+            &provider,
+            "fixture-model",
+            "[User]: luôn trả lời bằng tiếng Việt\n\n[Assistant]: vâng",
+            &scopes,
+            Some("keep the preference".to_owned()),
+            None,
+            Some(&host),
+        )
+        .await
+        .expect("refined");
+        assert!(
+            replies.prompt(0).contains("concepts/existing.md: Existing"),
+            "the review sees the pages it may not duplicate"
+        );
+        assert_eq!(refinements.len(), 2);
+        let (local, global) = (&refinements[0], &refinements[1]);
+        assert_eq!(global.record["scope"], "global");
+        assert!(global.id().ends_with("_global"), "{}", global.id());
+        let global_state = load_raw(&scopes.global);
+        assert_eq!(
+            global_state["entries"]["memory"]["reply_language"]["content"],
+            "Always answer in Vietnamese"
+        );
+        assert!(global_state["entries"]["prompt"]["tone"].is_null());
+        let local_state = load_raw(&scopes.local);
+        assert_eq!(
+            local_state["entries"]["memory"]["current_step"]["content"],
+            "porting the parser"
+        );
+        assert_eq!(
+            local_state["entries"]["prompt"]["tone"]["content"],
+            "be brief"
+        );
+        assert!(local_state["entries"]["memory"]["reply_language"].is_null());
+        let pages = local.record["appliedEdits"]
+            .as_array()
+            .expect("edits")
+            .iter()
+            .filter(|edit| edit["kind"] == "knowledge")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0]["applied"], true, "{}", pages[0]);
+        assert_eq!(pages[1]["applied"], false, "never over an existing page");
+        let catalog = host.review_catalog().expect("catalog");
+        assert!(catalog.contains("concepts/retry-backoff.md"), "{catalog}");
+        assert!(
+            local
+                .details()
+                .iter()
+                .any(|line| line == "Created project knowledge `concepts/retry-backoff.md`")
+        );
+
+        super::refine(
+            &provider_after(),
+            "fixture-model",
+            "",
+            &scopes,
+            &RefineOptions::parse(&format!("--rollback {}", global.id())),
+            None,
+        )
+        .await
+        .expect("global rolled back");
+        assert!(load_raw(&scopes.global)["entries"]["memory"]["reply_language"].is_null());
+        assert!(
+            !load_raw(&scopes.local)["entries"]["memory"]["current_step"].is_null(),
+            "the local part stays"
+        );
+        let undone = super::refine(
+            &provider_after(),
+            "fixture-model",
+            "",
+            &scopes,
+            &RefineOptions::parse(&format!("--rollback {}", local.id())),
+            None,
+        )
+        .await
+        .expect("local rolled back");
+        assert!(load_raw(&scopes.local)["entries"]["memory"]["current_step"].is_null());
+        assert!(
+            !host
+                .review_catalog()
+                .expect("catalog")
+                .contains("retry-backoff"),
+            "{}",
+            undone.record
+        );
+        assert!(
+            host.review_catalog()
+                .expect("catalog")
+                .contains("concepts/existing.md"),
+            "the page the review did not write stays"
+        );
+    }
+
+    /// A model a rollback never calls.
+    fn provider_after() -> std::sync::Arc<dyn harness_providers::ModelProvider> {
+        std::sync::Arc::new(harness_providers::MockProvider::text("unused"))
+    }
+
+    /// A reply with no JSON in it is asked for once more, with the reply shown,
+    /// instead of failing the review.
+    #[tokio::test]
+    async fn a_reply_without_json_is_asked_for_again() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let replies = Replies::new(&[
+            "I think the user prefers tabs, so a refinement is worth it.".to_owned(),
+            "{\"shouldRefine\": true, \"rationale\": \"a lasting preference\"}".to_owned(),
+        ]);
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = replies.clone();
+        let review = super::review(
+            &provider,
+            "fixture-model",
+            "conversation",
+            &scopes,
+            25,
+            None,
+        )
+        .await
+        .expect("answered the second time");
+        assert!(review.should_refine);
+        assert!(
+            replies.prompt(1).contains("I think the user prefers tabs"),
+            "the second call shows the first reply"
         );
     }
 

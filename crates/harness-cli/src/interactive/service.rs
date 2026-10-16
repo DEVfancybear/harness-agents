@@ -6548,6 +6548,8 @@ struct AutoRefine {
     /// The newest session the review reads; once reviewed, the next review
     /// treats the conversation up to it as already learned from.
     reviewed: String,
+    /// The library the review adds the knowledge the agent left unsaved to.
+    knowledge: super::knowledge::KnowledgeHost,
 }
 
 impl AutoRefine {
@@ -6565,12 +6567,7 @@ impl AutoRefine {
         )
         .await
         {
-            Ok(review) if review.should_refine => super::refine::RefineOptions {
-                instructions: review.instructions,
-                global: false,
-                rollback: None,
-                curate: false,
-            },
+            Ok(review) if review.should_refine => review.instructions,
             Ok(review) => {
                 super::refine::mark_reviewed(&self.scopes.local, &self.reviewed);
                 send(SessionEvent::Notice {
@@ -6585,19 +6582,30 @@ impl AutoRefine {
                 return;
             }
         };
-        match super::refine::refine(
+        // Like `CowAgent`'s Self-Evolution, the review reaches past this
+        // conversation: memory for every conversation and new knowledge pages.
+        match super::refine::auto_refine(
             &self.provider,
             &self.model,
             &self.conversation,
             &self.scopes,
-            &options,
+            options,
             Some(&self.learning),
+            Some(&self.knowledge),
         )
         .await
         {
-            Ok(refinement) => {
+            Ok(refinements) => {
                 super::refine::mark_reviewed(&self.scopes.local, &self.reviewed);
-                send(refined_event(&refinement));
+                // A local part with nothing in it is not worth a row beside
+                // the global one.
+                let shown = refinements.len();
+                for (index, refinement) in refinements.iter().enumerate() {
+                    if shown > 1 && index == 0 && refinement.is_empty() {
+                        continue;
+                    }
+                    send(refined_event(refinement));
+                }
             }
             Err(error) => send(SessionEvent::Notice {
                 message: format!("refine failed: {error}"),
@@ -8699,6 +8707,7 @@ async fn run_turn(
                     learning,
                     turns,
                     reviewed: session_id.as_str().to_owned(),
+                    knowledge: knowledge_host.clone(),
                 };
                 let cadence = Arc::clone(&refine_cadence);
                 tokio::spawn(async move {
@@ -8736,6 +8745,7 @@ async fn run_turn(
                 learning: ended_learning,
                 turns: deferred.turns,
                 reviewed: deferred.session.clone(),
+                knowledge: knowledge_host.clone(),
             };
             send(SessionEvent::Notice {
                 message: format!(

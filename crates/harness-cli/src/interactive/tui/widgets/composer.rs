@@ -307,7 +307,7 @@ pub fn hint(state: &UiState) -> String {
             if state.phase.has_active_run() {
                 return " ĐANG CHẠY · Ctrl-C hủy · nhập để xếp hàng ".to_owned();
             }
-            " Enter gửi · Alt+Enter/Ctrl-J xuống dòng · / lệnh · @ file ".to_owned()
+            " Enter gửi · Ctrl-J hoặc \\ Enter xuống dòng · / lệnh · @ file ".to_owned()
         }
     }
 }

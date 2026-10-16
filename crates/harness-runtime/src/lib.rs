@@ -907,6 +907,9 @@ pub struct RunRequest {
     /// Shared the same way: every step of a turn sends the earlier turns, so
     /// each one summarises them again (from the cache) and the user is told once.
     earlier_compaction_noticed: Arc<AtomicBool>,
+    /// Shared the same way: once a summary of the earlier turns failed, the
+    /// turn's later steps do not wait on another that would fail the same way.
+    earlier_summary_failed: Arc<AtomicBool>,
 }
 
 impl RunRequest {
@@ -943,6 +946,7 @@ impl RunRequest {
             authority: SourceAuthority::User,
             auto_compaction_attempted: Arc::new(AtomicBool::new(false)),
             earlier_compaction_noticed: Arc::new(AtomicBool::new(false)),
+            earlier_summary_failed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1280,7 +1284,16 @@ pub trait SummaryProvider: Send + Sync {
     }
 }
 
-const SUMMARY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long one model summary may take: the whole summary is generated
+/// before it is used, and a long history is slow to read and to condense. A
+/// flat 30 seconds failed every summary of a long session (a thinking model on
+/// a 300k-token history), so the context was never compacted and every step
+/// carried all of it.
+fn summary_timeout(prompt: &str) -> Duration {
+    // About a second per 2,000 tokens read, on top of the time to write.
+    let reading = u64::try_from(prompt.len() / 8_000).unwrap_or(u64::MAX);
+    Duration::from_secs(90_u64.saturating_add(reading).min(300))
+}
 const SUMMARY_PROMPT: &str = "Summarize this coding session for a later continuation. Return concise facts under these headings: objective, work completed, files touched, decisions, remaining. Preserve exact constraints and unresolved work. Do not invent facts, propose permissions, or call tools.";
 
 /// Model-backed compaction that uses the same configured provider as chat.
@@ -1350,13 +1363,12 @@ impl SummaryProvider for ModelSummaryProvider {
                 "summary token budget must be positive",
             ));
         }
+        let prompt = summary_prompt(recovery, budget_tokens, guidance);
+        let timeout = summary_timeout(&prompt);
         let request = ProviderRequest::new(
             harness_types::RequestId::generate(),
             self.provider.capabilities().model,
-            vec![ProviderMessage::new(
-                MessageRole::User,
-                summary_prompt(recovery, budget_tokens, guidance),
-            )],
+            vec![ProviderMessage::new(MessageRole::User, prompt)],
         );
         let provider = Arc::clone(&self.provider);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1369,15 +1381,12 @@ impl SummaryProvider for ModelSummaryProvider {
                 )
             })?;
         let events = runtime.block_on(async move {
-            tokio::time::timeout(
-                SUMMARY_TIMEOUT,
-                provider.stream(request, CancellationToken::new()),
-            )
-            .await
-            .map_err(|_| {
-                RuntimeError::new(ErrorCode::ServiceUnavailable, "model summary timed out")
-            })?
-            .map_err(RuntimeError::from)
+            tokio::time::timeout(timeout, provider.stream(request, CancellationToken::new()))
+                .await
+                .map_err(|_| {
+                    RuntimeError::new(ErrorCode::ServiceUnavailable, "model summary timed out")
+                })?
+                .map_err(RuntimeError::from)
         })?;
         let response = assemble_stream(&events).map_err(RuntimeError::from)?;
         if response.finish_reason.is_none() || !response.tool_calls.is_empty() {
@@ -1408,6 +1417,7 @@ impl ModelSummaryProvider {
                 "model summaries are disabled for mock and fixture providers",
             ));
         }
+        let timeout = summary_timeout(&prompt);
         let request = ProviderRequest::new(
             harness_types::RequestId::generate(),
             self.provider.capabilities().model,
@@ -1424,15 +1434,12 @@ impl ModelSummaryProvider {
                 )
             })?;
         let events = runtime.block_on(async move {
-            tokio::time::timeout(
-                SUMMARY_TIMEOUT,
-                provider.stream(request, CancellationToken::new()),
-            )
-            .await
-            .map_err(|_| {
-                RuntimeError::new(ErrorCode::ServiceUnavailable, "model summary timed out")
-            })?
-            .map_err(RuntimeError::from)
+            tokio::time::timeout(timeout, provider.stream(request, CancellationToken::new()))
+                .await
+                .map_err(|_| {
+                    RuntimeError::new(ErrorCode::ServiceUnavailable, "model summary timed out")
+                })?
+                .map_err(RuntimeError::from)
         })?;
         let response = assemble_stream(&events).map_err(RuntimeError::from)?;
         if response.finish_reason.is_none() || !response.tool_calls.is_empty() {
@@ -3031,7 +3038,9 @@ impl RuntimeService {
                 },
                 (older, recent) => (older, recent, Vec::new()),
             };
-            if !older.is_empty() || !prefix.is_empty() {
+            if (!older.is_empty() || !prefix.is_empty())
+                && !request.earlier_summary_failed.load(Ordering::SeqCst)
+            {
                 let dropped = messages_tokens(&older) + messages_tokens(&prefix);
                 let budget = (config.compaction_reserve_tokens * 4 / 5)
                     .min(MAX_SUMMARY_TOKENS)
@@ -3102,9 +3111,12 @@ impl RuntimeService {
                         ));
                         }
                     }
-                    Err(error) => notices.push(format!(
-                        "context: the earlier conversation could not be summarised ({error})"
-                    )),
+                    Err(error) => {
+                        request.earlier_summary_failed.store(true, Ordering::SeqCst);
+                        notices.push(format!(
+                            "context: the earlier conversation could not be summarised ({error}); this turn goes on without a summary"
+                        ));
+                    }
                 }
             }
         }
@@ -5066,6 +5078,17 @@ mod context_fit_tests {
 #[cfg(test)]
 mod compaction_ceiling_tests {
     use super::{COMPACTION_CEILING_TOKENS, RuntimeConfig, compaction_threshold};
+
+    /// A summary of a long history gets the time to read it, within a bound.
+    #[test]
+    fn a_long_history_has_longer_to_be_summarised() {
+        use std::time::Duration;
+        assert_eq!(super::summary_timeout("short"), Duration::from_secs(90));
+        let long = "x".repeat(800_000);
+        assert_eq!(super::summary_timeout(&long), Duration::from_secs(190));
+        let huge = "x".repeat(8_000_000);
+        assert_eq!(super::summary_timeout(&huge), Duration::from_secs(300));
+    }
 
     /// A million-token window compacts at the ceiling, not near 950k; a small
     /// window keeps its own bound, and a ceiling of 0 leaves the window alone.

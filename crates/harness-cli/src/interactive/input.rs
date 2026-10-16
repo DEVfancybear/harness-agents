@@ -725,6 +725,22 @@ impl LineEditor {
                 }
                 self.recall(false)
             }
+            // A backslash before Enter is a line break, as in Claude Code: it
+            // works in every terminal, and Windows Terminal keeps Alt+Enter
+            // for its full-screen toggle, so that key never reaches the app.
+            Key::Enter
+                if !self.secret
+                    && self.cursor == self.char_len()
+                    && self.buffer.ends_with('\\')
+                    && self.buffer.trim() != "\\" =>
+            {
+                self.checkpoint(false);
+                self.buffer.pop();
+                self.cursor -= 1;
+                self.insert("\n");
+                self.suggestion.clear();
+                InputOutcome::Redraw
+            }
             Key::Enter => self.submit(),
             Key::Interrupt => InputOutcome::Interrupt,
             Key::EndOfInput => {
@@ -1143,6 +1159,32 @@ mod tests {
         type_text(&mut editor, "   ");
         assert_eq!(editor.handle(Key::Enter), InputOutcome::Unchanged);
         assert!(editor.history().is_empty(), "blank input is not a request");
+    }
+
+    /// `\` then Enter breaks the line where Alt+Enter cannot reach the app
+    /// (Windows Terminal's full-screen key); a backslash anywhere else, or
+    /// alone, is text.
+    #[test]
+    fn a_backslash_before_enter_breaks_the_line() {
+        let mut editor = LineEditor::new();
+        type_text(&mut editor, "first\\");
+        assert_eq!(editor.handle(Key::Enter), InputOutcome::Redraw);
+        assert_eq!(editor.buffer(), "first\n");
+        type_text(&mut editor, "second");
+        assert_eq!(
+            editor.handle(Key::Enter),
+            InputOutcome::Submit("first\nsecond".to_owned())
+        );
+        type_text(&mut editor, "C:\\dir\\ ok");
+        assert_eq!(
+            editor.handle(Key::Enter),
+            InputOutcome::Submit("C:\\dir\\ ok".to_owned())
+        );
+        type_text(&mut editor, "\\");
+        assert_eq!(
+            editor.handle(Key::Enter),
+            InputOutcome::Submit("\\".to_owned())
+        );
     }
 
     #[test]

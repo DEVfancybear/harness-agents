@@ -86,7 +86,7 @@ mode.
 | Key | Action |
 | --- | --- |
 | Enter | Send the draft or accept a menu selection |
-| Alt+Enter / Shift+Enter / Ctrl+J | Insert a newline (Shift+Enter only where the console reports the Shift; Ctrl+J and Alt+Enter always work) |
+| Ctrl+J / `\` then Enter / Alt+Enter / Shift+Enter | Insert a newline. Ctrl+J and a backslash before Enter work in every terminal; Windows Terminal keeps Alt+Enter for its full-screen toggle, and Shift+Enter works only where the console reports the Shift |
 | `/` / `@` | Commands / file picker |
 | Up / Down | Move between lines of a multiline draft, recall history, or move through a menu |
 | Tab | Complete a suggestion |

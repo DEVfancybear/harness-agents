@@ -278,7 +278,10 @@ pub fn hotkey_lines() -> Vec<String> {
     [
         ("Enter", "send; in the / menu, pick the highlighted row"),
         ("Tab", "complete the highlighted command or argument"),
-        ("Ctrl-J / Alt+Enter", "new line"),
+        (
+            "Ctrl-J / \\ Enter / Alt+Enter",
+            "new line (Windows Terminal keeps Alt+Enter for full screen)",
+        ),
         ("↑ ↓", "move in a menu, or recall earlier prompts"),
         ("Esc", "close a panel or menu; interrupt a run"),
         ("Ctrl-C", "cancel the run; twice on an empty prompt quits"),
