@@ -47,6 +47,8 @@ use super::terminal::TerminalBackend;
 ///
 /// The same interval as the plain renderer, so streaming feels identical in both.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// The most waiting mouse reports one frame applies.
+const MOUSE_BURST: usize = 64;
 
 /// How often the viewport is repainted while a run is active.
 ///
@@ -99,6 +101,12 @@ pub trait TuiRenderer {
     fn rows(&self) -> u16;
     /// Wait up to the timeout for a key, and take it.
     fn poll_key(&mut self, timeout: Duration) -> io::Result<Option<Key>>;
+    /// The next input when it is a mouse report already waiting; anything
+    /// else stays for the next [`Self::poll_key`]. Lets a burst of wheel
+    /// reports be drawn as one frame.
+    fn peek_mouse(&mut self) -> io::Result<Option<Key>> {
+        Ok(None)
+    }
     /// Paint one frame of the viewport.
     fn draw_state(&mut self, state: &UiState) -> io::Result<()>;
     /// Push one finished history entry into the scrollback above the viewport.
@@ -467,6 +475,8 @@ pub struct RuntimeRenderer<T: TerminalBackend> {
     screen: Screen,
     /// prime-agent's `fullscreenMouse`: fullscreen tracks the mouse.
     mouse: bool,
+    /// An input read while looking for more mouse reports, returned first.
+    held: Option<Key>,
 }
 
 impl<T: TerminalBackend> RuntimeRenderer<T> {
@@ -498,6 +508,7 @@ impl<T: TerminalBackend> RuntimeRenderer<T> {
                 ratatui::backend::CrosstermBackend::new(io::stdout()),
             )?)),
             mouse: prefs.mouse,
+            held: None,
         };
         if prefs.enabled {
             renderer.set_fullscreen(true)?;
@@ -525,9 +536,25 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
         // The injected backend fault (I08) is a property of the terminal, not of
         // one renderer: it must fail the TUI exactly like the plain renderer.
         super::terminal::injected_fault()?;
+        if let Some(key) = self.held.take() {
+            return Ok(Some(key));
+        }
         if self.backend.poll_key(timeout)? {
             Ok(Some(self.backend.read_key()?))
         } else {
+            Ok(None)
+        }
+    }
+
+    fn peek_mouse(&mut self) -> io::Result<Option<Key>> {
+        if self.held.is_some() || !self.backend.poll_key(Duration::ZERO)? {
+            return Ok(None);
+        }
+        let key = self.backend.read_key()?;
+        if matches!(key, Key::Mouse(_)) {
+            Ok(Some(key))
+        } else {
+            self.held = Some(key);
             Ok(None)
         }
     }
@@ -994,6 +1021,28 @@ fn run_loop_inner(
         {
             if let Some(handled) = fullscreen_input(renderer, controller, &key, &mut effects) {
                 redraw = handled;
+                // A spun wheel sends a burst of reports; each drew a whole frame,
+                // and on a long conversation the frames queued up behind the
+                // wheel (seen as lag while scrolling back). The reports already
+                // waiting are applied first and drawn once. Only mouse reports
+                // are taken: a key waits for its own turn of the loop.
+                if matches!(key, Key::Mouse(_)) {
+                    for _ in 0..MOUSE_BURST {
+                        match renderer
+                            .peek_mouse()
+                            .map_err(|error| terminal_error(&error))?
+                        {
+                            Some(next) => {
+                                if let Some(more) =
+                                    fullscreen_input(renderer, controller, &next, &mut effects)
+                                {
+                                    redraw = redraw || more;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                }
             } else if let Key::Resize { columns, .. } = key {
                 // The viewport height cannot change (T01). The terminal re-wraps
                 // what it shows at the new size, the last viewport included, so

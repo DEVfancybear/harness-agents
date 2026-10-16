@@ -491,6 +491,7 @@ pub async fn run_with(
             context_window_tokens: resolved_config.context_window_tokens,
             output_reservation_tokens: resolved_config.output_reservation_tokens,
             compaction_reserve_tokens: resolved_config.compaction_reserve_tokens,
+            compaction_ceiling_tokens: super::config::compaction_ceiling(environment),
             ..RuntimeConfig::default()
         },
     );

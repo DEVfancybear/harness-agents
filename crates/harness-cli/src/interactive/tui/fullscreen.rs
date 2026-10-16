@@ -1181,6 +1181,80 @@ mod tests {
         assert_eq!(state.phase, AppPhase::Ready);
     }
 
+    /// A long conversation at the entry cap, as a multi-session task leaves it:
+    /// how long the first draw and each wheel notch take.
+    /// `cargo test -p harness-cli --release --bin ha -- --ignored scroll_cost --nocapture`
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn scroll_cost_of_a_long_conversation() {
+        use crate::interactive::events::ToolState;
+        use std::time::{Duration, Instant};
+        let mut screen = screen(160, 45);
+        let mut state = crate::interactive::tui::tests::idle_state();
+        state.phase = AppPhase::Running;
+        let mut items = Vec::new();
+        for turn in 0..super::REPRINT_ENTRIES / 4 {
+            items.push(HistoryItem::Assistant {
+                text: format!(
+                    "## Step {turn}\n\nSome **bold** prose with `code` and a list:\n\n- one\n- two\n\n```rust\nfn main() {{\n    let x = {turn};\n    println!(\"{{x}}\");\n}}\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n"
+                ),
+            });
+            items.push(HistoryItem::Tool {
+                name: "read_file".to_owned(),
+                summary: format!("paths=[\"src/file{turn}.rs\"]"),
+                input: String::new(),
+                state: ToolState::Ok {
+                    elapsed: Duration::from_millis(12),
+                },
+            });
+            items.push(HistoryItem::ToolOutput {
+                name: "read_file".to_owned(),
+                text: (0..200)
+                    .map(|line| format!("{line}: let value_{line} = compute({line}, \"text\");"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                path: Some(format!("src/file{turn}.rs")),
+            });
+            items.push(HistoryItem::Notice {
+                message: "context: 1 older tool result(s) in this turn were shortened".to_owned(),
+            });
+        }
+        let started = Instant::now();
+        screen.restore(&items);
+        screen.draw(&state).expect("drawn");
+        eprintln!(
+            "first draw of {} entries: {:?}",
+            items.len(),
+            started.elapsed()
+        );
+        let wheel = MouseInput {
+            kind: MouseKind::WheelUp,
+            column: 5,
+            row: 5,
+            modified: false,
+        };
+        let started = Instant::now();
+        for _ in 0..100 {
+            let _ = screen.mouse(wheel, false);
+            screen.draw(&state).expect("drawn");
+        }
+        eprintln!(
+            "one wheel notch and its frame: {:?}",
+            started.elapsed() / 100
+        );
+        let started = Instant::now();
+        for turn in 0..50 {
+            screen.insert_history_batch(&[HistoryItem::Notice {
+                message: format!("row {turn}"),
+            }]);
+            screen.draw(&state).expect("drawn");
+        }
+        eprintln!(
+            "one new row at the cap and its frame: {:?}",
+            started.elapsed() / 50
+        );
+    }
+
     /// Seen while an agent wrote: a reader who had scrolled back saw the view
     /// jump up and down. A run is replayed frame by frame - streamed text
     /// growing, tool cards opening and closing, rows arriving, the banner

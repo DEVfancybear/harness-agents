@@ -3160,6 +3160,30 @@ impl InteractiveController {
     /// `automatic` marks a continuation the app started because a bound stopped the
     /// previous turn. It does not reset the budget, which is what makes the budget a
     /// budget rather than an infinite loop.
+    /// Appends the reports held since a Ctrl-C to the user's message and
+    /// lifts the hold; returns how many were folded in.
+    fn fold_held_notices(&mut self, sent: &mut String) -> usize {
+        let mut folded = 0;
+        if self.notices_held && !self.pending_notices.is_empty() {
+            let notices = self.pending_notices.drain(..).collect::<Vec<_>>();
+            folded = notices.len();
+            sent.push_str(
+                "
+
+[Reports of delegated agents that came in after the user stopped the work]
+
+",
+            );
+            sent.push_str(&notices.join(
+                "
+
+",
+            ));
+        }
+        self.notices_held = false;
+        folded
+    }
+
     fn dispatch(&mut self, text: String, automatic: bool) -> Vec<Effect> {
         if matches!(text.split_whitespace().next(), Some("/exit" | "/quit")) {
             return self.command(&text);
@@ -3227,14 +3251,20 @@ impl InteractiveController {
             return self.submit_prompt_as(expanded, text, Vec::new());
         }
         let text = self.attach_pending_shell_outputs(text);
-        if !automatic {
-            self.notices_held = false;
-        }
+        // The reports held back by a Ctrl-C ride with the user's next message.
+        // Each used to become a turn of its own after it: stopping nine
+        // verifiers queued nine more turns behind the user's "continue".
+        let mut sent = text.clone();
+        let folded = if automatic {
+            0
+        } else {
+            self.fold_held_notices(&mut sent)
+        };
         let input_id = InputId::generate();
         self.fresh_run(Instant::now(), Some(text.clone()));
         self.service.submit(SubmitRequest {
             input_id,
-            text: text.clone(),
+            text: sent,
             answer_question_id: None,
             shell_prefix: None,
             compact_guidance: None,
@@ -3247,6 +3277,16 @@ impl InteractiveController {
             HistoryItem::User { text }
         };
         self.push_history(&mut effects, item);
+        if folded > 0 {
+            self.push_history(
+                &mut effects,
+                HistoryItem::Notice {
+                    message: format!(
+                        "{folded} report(s) of delegated agents held since the stop go with this message"
+                    ),
+                },
+            );
+        }
         effects.push(Effect::Redraw);
         effects
     }
@@ -10223,6 +10263,39 @@ Command: \"npm run build\""
         effects_to_plain(&harness.controller.pump_events())
     }
 
+    /// After a stop, the children's reports wait and then go with the user's
+    /// next message, not as a turn each.
+    #[test]
+    fn reports_held_by_a_stop_ride_with_the_next_message() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        harness.controller.notices_held = true;
+        harness.controller.phase = AppPhase::Ready;
+        for name in ["verifier-a", "verifier-b"] {
+            let _ = child_settled(
+                &mut harness,
+                &format!(
+                    "[child-exited: cancelled child:{name}]\n\nStopped by the user with Ctrl-C"
+                ),
+            );
+        }
+        assert!(
+            submissions(&harness).is_empty(),
+            "held, no turn of their own"
+        );
+        let effects = submit_text(&mut harness.controller, "tiếp tục");
+        let sent = submissions(&harness);
+        assert_eq!(sent.len(), 1, "one turn, not one per report: {sent:?}");
+        assert!(sent[0].starts_with("tiếp tục"), "{}", sent[0]);
+        assert!(sent[0].contains("child:verifier-a") && sent[0].contains("child:verifier-b"));
+        assert!(harness.controller.pending_notices.is_empty());
+        let shown = effects_to_plain(&effects).join(
+            "
+",
+        );
+        assert!(shown.contains("2 report(s) of delegated agents"), "{shown}");
+    }
+
     /// Q02: an idle parent reads a child's notice in a turn of its own, at once.
     #[test]
     fn q02_a_notice_wakes_an_idle_parent() {
@@ -10269,12 +10342,17 @@ Command: \"npm run build\""
         assert_eq!(submissions(&harness), vec!["first".to_owned()], "held");
         let _ = submit_text(&mut harness.controller, "second");
         end_with(&mut harness, RunOutcome::Done);
+        // The held report goes with the next message, not as a turn after it.
         assert_eq!(
             submissions(&harness),
             vec![
                 "first".to_owned(),
-                "second".to_owned(),
-                "[child-exited: no-reply child:scout]".to_owned()
+                "second
+
+[Reports of delegated agents that came in after the user stopped the work]
+
+[child-exited: no-reply child:scout]"
+                    .to_owned(),
             ]
         );
     }
@@ -10318,14 +10396,18 @@ Command: \"npm run build\""
         );
     }
 
-    /// Q01: Ctrl+C stops the turn, not the children; `/agents stop` stops them.
+    /// Q01: Ctrl+C cancels the turn through the port (whose `cancel` also stops
+    /// the running children); `/agents stop` stops them by name or all.
     #[test]
-    fn q01_ctrl_c_cancels_the_turn_but_not_its_children() {
+    fn q01_ctrl_c_cancels_the_turn_and_agents_stop_names_children() {
         let mut harness = bench(true);
         let _ = harness.controller.boot_lines();
         let _ = submit_text(&mut harness.controller, "first");
         let _ = harness.controller.interrupt();
-        assert!(harness.port.stops.lock().expect("stops").is_empty());
+        assert!(
+            harness.port.stops.lock().expect("stops").is_empty(),
+            "the children stop inside the port's cancel, not as a named stop"
+        );
         end_with(&mut harness, RunOutcome::Canceled);
         let _ = submit_text(&mut harness.controller, "/agents stop scout");
         let _ = submit_text(&mut harness.controller, "/agents stop");

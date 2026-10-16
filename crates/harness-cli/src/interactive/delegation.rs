@@ -495,8 +495,12 @@ impl ChildRecord {
     /// went away failed, as prime-agent reports an interrupted child.
     fn from_ledger(entry: LedgerEntry) -> Option<Self> {
         let task_id = TaskId::parse(entry.task_id).ok()?;
+        // Every role comes back as itself: a verifier read back as an explorer
+        // lost the verifier's brief and grants when it was woken.
         let role = match entry.role.as_str() {
             "coder" => AgentRole::Coder,
+            "verifier" => AgentRole::Verifier,
+            "reviewer" => AgentRole::Reviewer,
             _ => AgentRole::Explorer,
         };
         let state = match entry.status.as_str() {
@@ -1729,6 +1733,53 @@ impl SessionAgents {
         lines
     }
 
+    /// The children that ended without finishing - stopped, failed, or cut
+    /// off when their worker went away - as the root agent's turn sees them.
+    ///
+    /// Seen after a resume: the parent's last answer said a verifier "is
+    /// checking and will report", the verifier had been stopped, and the
+    /// parent - told nothing - redid the check itself. A notice of a child that
+    /// settled in an earlier process is not delivered again, so the state is
+    /// said here, with the way to pick a child's work back up.
+    #[must_use]
+    pub fn unfinished_block(&self) -> Option<String> {
+        const SHOWN: usize = 8;
+        let lines = self
+            .shared
+            .children
+            .lock()
+            .ok()?
+            .iter()
+            .filter(|child| !child.deleted)
+            .filter_map(|child| {
+                let (what, why) = match &child.state {
+                    ChildState::Cancelled { reason } => ("stopped", reason.as_str()),
+                    ChildState::Failed { error } => ("failed", error.as_str()),
+                    ChildState::Partial { error, .. } => ("partial", error.as_str()),
+                    ChildState::Running | ChildState::Done { .. } => return None,
+                };
+                Some(format!(
+                    "- {} ({}, {what}): {}",
+                    child.name,
+                    child.role.as_str(),
+                    first_line(why).chars().take(160).collect::<String>()
+                ))
+            })
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            return None;
+        }
+        let skipped = lines.len().saturating_sub(SHOWN);
+        let mut text = String::from(
+            "Delegated agents of this conversation that ended without finishing their work. Do not claim one is still running. If its work is still needed, send it a message with the agent_message tool (receiver_name: its name) to resume where it stopped (it keeps its conversation; a coder whose worktree did not survive a restart has to be delegated again), or do the work yourself; otherwise leave it.\n",
+        );
+        text.push_str(&lines[skipped..].join("\n"));
+        if skipped > 0 {
+            let _ = write!(text, "\n- and {skipped} earlier ones (`/agents`)");
+        }
+        Some(text)
+    }
+
     /// `/agents`: one line per child, newest last.
     #[must_use]
     pub fn summary(&self) -> Vec<String> {
@@ -1981,21 +2032,7 @@ impl SessionAgents {
                 if text.is_none() && child.pending.is_empty() {
                     return Ok(None);
                 }
-                let brief = match child.brief.clone() {
-                    Some(brief) => brief,
-                    // A child that came back from the ledger: an explorer's
-                    // brief is rebuilt over the current workspace; a coder's
-                    // worktree does not come back.
-                    None if child.role == AgentRole::Explorer => {
-                        explorer_brief(task_id, &child.objective, &launch)
-                    }
-                    None => {
-                        return Err(
-                            "a coder's worktree does not survive a restart; spawn a new coder"
-                                .to_owned(),
-                        );
-                    }
-                };
+                let brief = woken_brief(child, task_id, &launch)?;
                 child.brief = Some(brief.clone());
                 let run_id = child.run_id.clone().unwrap_or_else(AgentRunId::generate);
                 child.run_id = Some(run_id.clone());
@@ -2292,6 +2329,30 @@ impl SessionAgents {
 
 /// An explorer's brief over `launch`'s workspace: what a child that came back
 /// from the spawn ledger is woken with.
+/// The brief a woken child runs under. A child that came back from the ledger
+/// has none: a read-only child's (explorer, verifier, reviewer) is rebuilt over
+/// the current workspace; a coder's worktree does not come back.
+fn woken_brief(
+    child: &ChildRecord,
+    task_id: &TaskId,
+    launch: &ChildLaunch,
+) -> Result<TaskBrief, String> {
+    match child.brief.clone() {
+        Some(brief) => Ok(brief),
+        None if matches!(
+            child.role,
+            AgentRole::Explorer | AgentRole::Verifier | AgentRole::Reviewer
+        ) =>
+        {
+            Ok(TaskBrief {
+                role: child.role,
+                ..explorer_brief(task_id, &child.objective, launch)
+            })
+        }
+        None => Err("a coder's worktree does not survive a restart; spawn a new coder".to_owned()),
+    }
+}
+
 fn explorer_brief(task_id: &TaskId, objective: &str, launch: &ChildLaunch) -> TaskBrief {
     TaskBrief {
         schema_version: harness_orchestrator::DELEGATION_CONTRACT_VERSION,
@@ -2491,22 +2552,46 @@ impl ExternalToolCatalog for DelegateCatalog {
                     }
                 }
             }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": ROOT_MESSAGE_TOOL,
+                    "description": "Send a message to one of your delegated agents by name (receiver_role \"child\", the default, with receiver_name) or to all of them (\"all\"). A running child reads it at its next step; a child that finished or was stopped wakes with it and continues its own conversation where it left off, instead of starting over.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message": {"type": "string", "minLength": 1, "maxLength": MAX_MESSAGE_CHARS},
+                            "receiver_role": {"type": "string", "enum": ["child", "all"]},
+                            "receiver_name": {"type": "string", "description": "The child's name, as `/agents` and its reports show it."}
+                        },
+                        "required": ["message"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
         ]
     }
 
     fn resolve(&self, name: &str, arguments: &Value) -> Option<CodingToolAction> {
-        matches!(name, "delegate" | INTEGRATE_TOOL).then(|| CodingToolAction::ExternalTool {
-            plugin_id: "delegate".to_owned(),
-            tool_name: name.to_owned(),
-            arguments: arguments.clone(),
-            parent_invocation_id: None,
-            timeout_ms: 120_000,
+        matches!(name, "delegate" | INTEGRATE_TOOL | ROOT_MESSAGE_TOOL).then(|| {
+            CodingToolAction::ExternalTool {
+                plugin_id: "delegate".to_owned(),
+                tool_name: name.to_owned(),
+                arguments: arguments.clone(),
+                parent_invocation_id: None,
+                timeout_ms: 120_000,
+            }
         })
     }
 }
 
 /// The root agent's tool that brings its coders' work back.
 const INTEGRATE_TOOL: &str = "integrate_children";
+
+/// The root agent's tool that messages its children - and wakes a settled
+/// one. Without it the root reached them only through the Python kernel, so
+/// with the kernel off a stopped child could not be resumed at all.
+const ROOT_MESSAGE_TOOL: &str = "agent_message";
 
 /// What `integrate_children` was asked for.
 struct IntegrateRequest {
@@ -3066,6 +3151,11 @@ impl ExternalToolDispatcher for DelegateTool {
             if plugin_id == "delegate" && tool_name == INTEGRATE_TOOL {
                 return IntegrateRequest::parse(arguments).map(|_| ());
             }
+            if plugin_id == "delegate" && tool_name == ROOT_MESSAGE_TOOL {
+                return root_message_request(arguments)
+                    .map(|_| ())
+                    .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error));
+            }
             if plugin_id != "delegate" || tool_name != "delegate" {
                 return Err(HarnessError::new(
                     ErrorCode::PolicyDenied,
@@ -3102,6 +3192,15 @@ impl ExternalToolDispatcher for DelegateTool {
             let payload = match (plugin_id, tool_name) {
                 ("delegate", "delegate") => self.run(arguments).await?,
                 ("delegate", INTEGRATE_TOOL) => self.integrate(arguments).await?,
+                ("delegate", ROOT_MESSAGE_TOOL) => {
+                    let request = root_message_request(arguments)
+                        .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error))?;
+                    self.agents
+                        .shared
+                        .send_from_parent(&request)
+                        .await
+                        .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error))?
+                }
                 _ => {
                     return Err(HarnessError::new(
                         ErrorCode::PolicyDenied,
@@ -3117,6 +3216,25 @@ impl ExternalToolDispatcher for DelegateTool {
             })
         })
     }
+}
+
+/// The root's `agent_message` arguments as [`AgentsShared::send_from_parent`]
+/// reads them: the receiver defaults to the named child.
+fn root_message_request(arguments: &Value) -> Result<Value, String> {
+    let (message, role, name) = message_arguments(arguments)?;
+    let role = match (arguments["receiver_role"].as_str(), &name) {
+        (None, _) => "child",
+        (Some("child" | "all"), _) => role.as_str(),
+        (Some(other), _) => {
+            return Err(format!(
+                "the root agent messages its children (\"child\" or \"all\"), not {other:?}"
+            ));
+        }
+    };
+    if role == "child" && name.is_none() {
+        return Err("receiver_name names the child to message".to_owned());
+    }
+    Ok(json!({"message": message, "receiver_role": role, "receiver_name": name}))
 }
 
 /// Why a child's turn ended without an answer, or `None` when it answered.
@@ -6571,6 +6689,47 @@ mod real_worker_tests {
         no_child_event(&mut bench.events, Duration::from_millis(500)).await;
     }
 
+    /// Ctrl-C stops every running child with the turn (`stop("all", ..)`), each
+    /// reported as stopped, none left running.
+    #[tokio::test]
+    async fn ctrl_c_stops_every_running_child() {
+        let mut bench = bench();
+        let slow = || Reply::Delay(5_000, Box::new(Reply::Text("never")));
+        let host = host(&bench, Scripted::new(vec![slow(), slow()]));
+        spawn(&host, "first", "wait").await;
+        spawn(&host, "second", "wait").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            bench
+                .agents
+                .stop("all", "Stopped by the user with Ctrl-C")
+                .expect("stop"),
+            2
+        );
+        for _ in 0..2 {
+            match next_child_event(&mut bench.events).await {
+                SessionEvent::ChildSettled { notice, .. } => {
+                    assert!(
+                        notice.contains("Stopped by the user with Ctrl-C"),
+                        "{notice}"
+                    );
+                }
+                other => panic!("expected a notice: {other:?}"),
+            }
+        }
+        assert!(
+            bench
+                .agents
+                .view_rows()
+                .iter()
+                .all(|row| row.status == "stopped"),
+            "{:?}",
+            bench.agents.view_rows()
+        );
+        // Nothing running: a second Ctrl-C finds nothing to stop, and that is fine.
+        assert_eq!(bench.agents.stop("all", "again").expect("stop"), 0);
+    }
+
     /// `/agents stop` stops a child and says so; `/new` stops them all quietly.
     #[tokio::test]
     async fn q01_stop_reports_cancelled_and_reset_is_quiet() {
@@ -7273,6 +7432,101 @@ mod real_worker_tests {
                 other => panic!("the stopped child failed to recover: {other:?}"),
             }
         }
+    }
+
+    /// The root's own `agent_message`: a child by name by default, every child
+    /// with "all", and never a parent or sibling it does not have.
+    #[test]
+    fn the_root_messages_its_children_by_name() {
+        let request = super::root_message_request(
+            &json!({"message": "carry on", "receiver_name": "verifier-1"}),
+        )
+        .expect("a child by name");
+        assert_eq!(request["receiver_role"], "child");
+        assert_eq!(request["receiver_name"], "verifier-1");
+        let all = super::root_message_request(&json!({"message": "stop", "receiver_role": "all"}))
+            .expect("every child");
+        assert_eq!(all["receiver_role"], "all");
+        assert!(super::root_message_request(&json!({"message": "carry on"})).is_err());
+        assert!(
+            super::root_message_request(&json!({"message": "x", "receiver_role": "parent"}))
+                .is_err()
+        );
+    }
+
+    /// A conversation resumed in a new process: each child comes back as its
+    /// own role, and the ones that ended unfinished are said to the parent -
+    /// a stopped verifier, a coder cut off by the worker - while a finished one
+    /// is not. A verifier comes back a verifier and can be woken read-only.
+    #[tokio::test]
+    async fn a_resumed_conversation_says_which_children_did_not_finish() {
+        let bench = bench();
+        let entry = |task: &str, name: &str, role: &str, status: &str, error: Option<&str>| {
+            json!({
+                "task_id": task,
+                "name": name, "role": role, "model": "fixture/model", "depth": 1, "max_depth": 2,
+                "parent": null, "status": status, "answer": null, "error": error,
+                "duration_ms": 10, "tool_calls": 3, "objective": format!("{name} objective"), "history": []
+            })
+        };
+        let verifier = TaskId::generate();
+        let coder = TaskId::generate();
+        let explorer = TaskId::generate();
+        let ledger = json!([
+            entry(
+                verifier.as_str(),
+                "verifier-e9c5",
+                "verifier",
+                "cancelled",
+                Some("Stopped by the user with Ctrl-C")
+            ),
+            entry(coder.as_str(), "coder-9ea6", "coder", "running", None),
+            entry(
+                explorer.as_str(),
+                "explorer-done",
+                "explorer",
+                "completed",
+                None
+            ),
+        ]);
+        let dir = bench
+            .agents
+            .shared
+            .ledger_dir
+            .get()
+            .expect("ledger dir")
+            .clone();
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("conversation-r.json"), ledger.to_string()).expect("ledger");
+        bench.agents.bind_ledger("conversation-r");
+
+        let role = |task: &TaskId| {
+            let mut role = None;
+            bench
+                .agents
+                .shared
+                .update(task, |child| role = Some(child.role));
+            role.expect("child")
+        };
+        assert_eq!(role(&verifier), super::AgentRole::Verifier);
+        assert_eq!(role(&coder), super::AgentRole::Coder);
+        let block = bench
+            .agents
+            .unfinished_block()
+            .expect("unfinished children");
+        assert!(
+            block.contains("Do not claim one is still running"),
+            "{block}"
+        );
+        assert!(
+            block.contains("- verifier-e9c5 (verifier, stopped): Stopped by the user with Ctrl-C"),
+            "{block}"
+        );
+        assert!(
+            block.contains("- coder-9ea6 (coder, failed): the child was interrupted"),
+            "{block}"
+        );
+        assert!(!block.contains("explorer-done"), "{block}");
     }
 
     /// prime-agent's spawn ledger: a conversation opened again lists its

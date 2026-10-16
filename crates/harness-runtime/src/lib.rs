@@ -222,7 +222,18 @@ pub struct RuntimeConfig {
     /// of it (`measured / estimated`) at the conversation's last response,
     /// carried from the previous turn. See [`RuntimeService::estimate_scale`].
     pub estimate_scale: Option<f64>,
+    /// The most context the session carries before it compacts, whatever the
+    /// window allows; `0` leaves the window alone. See [`COMPACTION_CEILING_TOKENS`].
+    pub compaction_ceiling_tokens: u64,
 }
+
+/// The default [`RuntimeConfig::compaction_ceiling_tokens`].
+///
+/// A model with a million-token window compacted only near 950k: seen, a long
+/// task carried 391k tokens into every request, each step slow, and the first
+/// request after a resume (its cache cold) sent all of it again. Past this the
+/// session compacts as it would at the end of a smaller window.
+pub const COMPACTION_CEILING_TOKENS: u64 = 200_000;
 
 /// The range a measured estimate scale is kept within: one odd response (an
 /// image, a cache quirk) must not make the next request look empty or full.
@@ -241,6 +252,7 @@ impl Default for RuntimeConfig {
             max_retry_after_seconds: 30,
             config_revision: 1,
             estimate_scale: None,
+            compaction_ceiling_tokens: COMPACTION_CEILING_TOKENS,
         }
     }
 }
@@ -472,10 +484,15 @@ fn strip_file_lists(summary: &str) -> String {
 fn compaction_threshold(config: &RuntimeConfig) -> u64 {
     let window = config.context_window_tokens;
     let effective_reserve = config.compaction_reserve_tokens.min(window / 4);
-    window
+    let threshold = window
         .saturating_sub(config.output_reservation_tokens)
         .saturating_sub(effective_reserve)
-        .min(window / 20 * 19)
+        .min(window / 20 * 19);
+    if config.compaction_ceiling_tokens == 0 {
+        threshold
+    } else {
+        threshold.min(config.compaction_ceiling_tokens)
+    }
 }
 
 /// The estimated tokens of messages as they are sent: their text and their calls.
@@ -5043,6 +5060,34 @@ mod context_fit_tests {
         assert_eq!(messages[5].content, big, "the newest result is kept whole");
         assert_eq!(messages[1].role, MessageRole::Tool);
         assert_eq!(messages[0].tool_calls.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod compaction_ceiling_tests {
+    use super::{COMPACTION_CEILING_TOKENS, RuntimeConfig, compaction_threshold};
+
+    /// A million-token window compacts at the ceiling, not near 950k; a small
+    /// window keeps its own bound, and a ceiling of 0 leaves the window alone.
+    #[test]
+    fn a_large_window_compacts_at_the_ceiling() {
+        let large = RuntimeConfig {
+            context_window_tokens: 1_000_000,
+            output_reservation_tokens: 32_768,
+            ..RuntimeConfig::default()
+        };
+        assert_eq!(compaction_threshold(&large), COMPACTION_CEILING_TOKENS);
+        let small = RuntimeConfig {
+            context_window_tokens: 128_000,
+            output_reservation_tokens: 8_192,
+            ..RuntimeConfig::default()
+        };
+        assert_eq!(compaction_threshold(&small), 128_000 - 8_192 - 16_384);
+        let unbounded = RuntimeConfig {
+            compaction_ceiling_tokens: 0,
+            ..large
+        };
+        assert_eq!(compaction_threshold(&unbounded), 1_000_000 / 20 * 19);
     }
 }
 

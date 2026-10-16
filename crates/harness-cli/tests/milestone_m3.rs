@@ -783,6 +783,7 @@ async fn m3_01_manifest_and_overflow() {
             max_retry_after_seconds: 30,
             config_revision: 1,
             estimate_scale: None,
+            compaction_ceiling_tokens: 0,
         },
     ));
     let session = SessionId::generate();

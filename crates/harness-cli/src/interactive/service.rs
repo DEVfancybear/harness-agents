@@ -5791,6 +5791,13 @@ impl SessionPort for AgentSessionService {
         if let Some(token) = self.cancellation.take() {
             token.cancel();
         }
+        // Ctrl-C stops the work, the delegated agents included. Seen: after a
+        // Ctrl-C the verifiers kept running for minutes and the session sat on
+        // "Canceling"; the user had to find `/agents stop` to end what they had
+        // already asked to stop.
+        // Its conversation is kept: told how, the model picks the work back up
+        // when the user says to continue, instead of starting it over.
+        let _ = self.agents.stop("all", CTRL_C_STOP);
         if let Some(repl) = &self.repl {
             repl.interrupt_current();
         }
@@ -6598,6 +6605,9 @@ impl AutoRefine {
         }
     }
 }
+
+/// What a child stopped by Ctrl-C reports to its parent.
+const CTRL_C_STOP: &str = "Stopped by the user with Ctrl-C. Its conversation and work so far are kept: when the user asks to continue, send it a message with the agent_message tool saying to carry on, and it resumes where it stopped instead of starting over.";
 
 /// One global memory consolidation at a time across the process's sessions.
 static MEMORY_CONSOLIDATING: std::sync::atomic::AtomicBool =
@@ -7506,6 +7516,7 @@ async fn run_turn(
             context_window_tokens: config.context_window_tokens,
             output_reservation_tokens: effective_output_tokens(&config, &data_dir, thinking_level),
             compaction_reserve_tokens: config.compaction_reserve_tokens,
+            compaction_ceiling_tokens: super::config::compaction_ceiling(&environment),
             max_retry_after_seconds: config.max_retry_after_seconds,
             estimate_scale: carried_scale,
             ..RuntimeConfig::default()
@@ -7829,6 +7840,7 @@ async fn run_turn(
                     thinking_level,
                 ),
                 compaction_reserve_tokens: config.compaction_reserve_tokens,
+                compaction_ceiling_tokens: super::config::compaction_ceiling(&environment),
                 max_retry_after_seconds: config.max_retry_after_seconds,
                 ..RuntimeConfig::default()
             },
@@ -8296,6 +8308,14 @@ async fn run_turn(
     ));
     if let Some(block) = super::knowledge::context_block(&knowledge_host, &request.text) {
         project_blocks.push(block);
+    }
+    if let Some(text) = agents.unfinished_block() {
+        project_blocks.push(harness_session::ContextBlock::optional(
+            "unfinished-agents",
+            harness_session::ContextBlockKind::Optional,
+            text,
+            60,
+        ));
     }
     // The first turn of an imported conversation carries the imported messages;
     // later turns reach them through the conversation's first session.

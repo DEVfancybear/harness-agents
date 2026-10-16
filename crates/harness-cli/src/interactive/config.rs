@@ -1666,6 +1666,21 @@ fn invalid(path: &Path, unknown_field: bool) -> HarnessError {
     )
 }
 
+/// The most context a session carries before it compacts: `HA_COMPACT_AT`
+/// (tokens; `0` keeps only the window's own bound), else
+/// [`harness_runtime::COMPACTION_CEILING_TOKENS`].
+#[must_use]
+pub fn compaction_ceiling(environment: &super::paths::LaunchEnvironment) -> u64 {
+    environment
+        .value("HA_COMPACT_AT")
+        .and_then(|value| {
+            value
+                .to_str()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(harness_runtime::COMPACTION_CEILING_TOKENS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ConfigOverrides, ConfigState, DEEPSEEK_MODEL, load, resolve_layers};

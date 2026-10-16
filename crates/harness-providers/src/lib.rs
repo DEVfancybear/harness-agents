@@ -1822,10 +1822,21 @@ impl SseDecoder {
             if let Some(usage) = usage {
                 return Ok(vec![usage]);
             }
-            return Err(ProviderError::new(
-                ErrorCode::ProviderProtocol,
-                "provider SSE frame has no choice",
-            ));
+            // An error reported inside the stream is that error, said as such.
+            if value.get("error").is_some_and(|error| !error.is_null()) {
+                return Err(ProviderError::new(
+                    ErrorCode::ProviderProtocol,
+                    format!(
+                        "the provider reported an error in the stream: {}",
+                        error_message(data).unwrap_or_else(|| value["error"].to_string())
+                    ),
+                ));
+            }
+            // Anything else without a choice carries nothing for the turn: a
+            // keep-alive or metadata frame (`"choices": []`, no usage), which
+            // OpenCode Go sends. Refusing it failed a whole `/refine` with
+            // "provider SSE frame has no choice".
+            return Ok(Vec::new());
         }
         events.extend(usage);
         for (choice_index, choice) in choices.iter().enumerate() {
@@ -2241,6 +2252,32 @@ mod sse_tool_call_tests {
         );
         assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
         assert!(response.is_dispatchable());
+    }
+
+    /// Seen on `OpenCode` Go: a frame with `"choices": []` and no usage in the
+    /// middle of a stream failed a whole `/refine` with "provider SSE frame has
+    /// no choice". It carries nothing and is passed over; an error frame is
+    /// still an error, named.
+    #[test]
+    fn an_empty_frame_is_passed_over_and_an_error_frame_is_named() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"choices\":[]}\n\n",
+            "data: {\"choices\":[],\"usage\":null}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut decoder = SseDecoder::new();
+        let mut events = decoder.feed(stream.as_bytes()).expect("frames decode");
+        events.extend(decoder.finish().expect("stream completes"));
+        let response = assemble_stream(&events).expect("assembled");
+        assert_eq!(response.text, "Hello");
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+
+        let error = SseDecoder::new()
+            .feed(b"data: {\"choices\":[],\"error\":{\"message\":\"upstream overloaded\"}}\n\n")
+            .expect_err("an error frame");
+        assert!(error.to_string().contains("upstream overloaded"), "{error}");
     }
 
     /// The measured wire shape of one call: this frame opens it, and the argument
