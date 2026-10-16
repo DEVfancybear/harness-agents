@@ -77,7 +77,11 @@ impl KnowledgeHost {
     }
 
     fn store(&self, scope: Scope) -> Store {
-        Store::new(self.root(scope).to_path_buf())
+        let store = Store::new(self.root(scope).to_path_buf());
+        match scope {
+            Scope::Project => store.self_ignoring(),
+            Scope::Global => store,
+        }
     }
 
     fn root(&self, scope: Scope) -> &Path {
@@ -1040,6 +1044,41 @@ mod tests {
     fn page(scope: &str, path: &str, content: &str) -> Value {
         json!({"action":"write","scope":scope,"path":path,"title":"Architecture",
             "summary":"Sourced design facts","content":content,"sources":["docs/design.md:12"],"related":[]})
+    }
+
+    /// A project library keeps itself out of Git: its pages left the checkout
+    /// dirty, and a coder could not be delegated until the user acted.
+    #[test]
+    fn a_project_library_leaves_the_checkout_clean() {
+        let directory = tempfile::tempdir().expect("dir");
+        let workspace = directory.path().join("repo");
+        std::fs::create_dir_all(&workspace).expect("repo");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q"]);
+        let host = KnowledgeHost::new(&workspace, &directory.path().join("data"));
+        host.review_create(&json!({
+            "scope": "project", "path": "concepts/fees.md", "title": "Fees",
+            "summary": "late fees", "content": "2,000 per day"
+        }))
+        .expect("written");
+        let status = git(&["status", "--porcelain", "--untracked-files=all"]);
+        assert_eq!(
+            String::from_utf8_lossy(&status.stdout),
+            "",
+            "nothing for Git to see"
+        );
+        assert!(
+            host.review_catalog()
+                .expect("catalog")
+                .contains("concepts/fees.md"),
+            "the page is still a page"
+        );
     }
 
     #[test]

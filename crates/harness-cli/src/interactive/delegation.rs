@@ -2964,14 +2964,33 @@ impl DelegateTool {
                 .agents
                 .shared
                 .update(&member.task_id, |child| {
-                    first_line(&child.objective)
-                        .chars()
-                        .take(60)
-                        .collect::<String>()
+                    // What the coder says it did, before the brief it was
+                    // given: a brief opens with "You are working on ...",
+                    // which told nothing about the commit.
+                    let answer = match &child.state {
+                        ChildState::Done { answer, .. } => commit_title(answer),
+                        _ => None,
+                    };
+                    answer
+                        .or_else(|| commit_title(&child.objective))
+                        .unwrap_or_default()
                 })
                 .unwrap_or_default();
+            // The files it changed say what the commit is; what the coder said
+            // it did goes in the body.
+            let files = changed_files(std::path::Path::new(&member.worktree.path));
+            let message = match (files, title.is_empty()) {
+                (Some(files), true) => format!("coder {}: {files}", member.name),
+                (Some(files), false) => format!(
+                    "coder {}: {files}
+
+{title}",
+                    member.name
+                ),
+                (None, _) => format!("coder {}: {title}", member.name),
+            };
             match manager
-                .commit_worker_changes(&member.worktree, &format!("coder {}: {title}", member.name))
+                .commit_worker_changes(&member.worktree, &message)
                 .await
             {
                 // Nothing left uncommitted: the coder committed its work itself.
@@ -3307,6 +3326,56 @@ fn dirty_reasons(reasons: &[DirtyReason]) -> String {
         ));
     }
     parts.join("; ")
+}
+
+/// What a coder's worktree changed, for its commit title: up to three paths
+/// and how many more, or `None` when Git cannot say.
+fn changed_files(worktree: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .current_dir(worktree)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let paths = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.get(3..))
+        .map(|path| {
+            path.rsplit(" -> ")
+                .next()
+                .unwrap_or(path)
+                .trim_matches('"')
+                .to_owned()
+        })
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return None;
+    }
+    let mut title = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    if paths.len() > 3 {
+        let _ = write!(title, " and {} more", paths.len() - 3);
+    }
+    Some(title)
+}
+
+/// A commit title from a coder's text: its first line with words, without
+/// Markdown heading or emphasis marks, at most 72 characters.
+fn commit_title(text: &str) -> Option<String> {
+    let line = text
+        .lines()
+        .map(|line| {
+            line.trim()
+                .trim_start_matches(['#', '*', '-', '>', ' '])
+                .trim()
+        })
+        .find(|line| line.chars().any(char::is_alphanumeric))?;
+    let line = line.replace("**", "").replace('`', "");
+    let mut title = line.chars().take(72).collect::<String>();
+    if line.chars().count() > 72 {
+        title.push('…');
+    }
+    Some(title)
 }
 
 async fn inspect_coder_input(
@@ -7432,6 +7501,41 @@ mod real_worker_tests {
                 other => panic!("the stopped child failed to recover: {other:?}"),
             }
         }
+    }
+
+    /// A coder's commit is titled by what it says it did, not by its brief.
+    #[test]
+    fn a_coder_commit_is_titled_by_its_answer() {
+        assert_eq!(
+            super::commit_title(
+                "## Xong
+
+**Đã thêm** `src/cli.js` với 9 lệnh"
+            )
+            .as_deref(),
+            Some("Xong")
+        );
+        assert_eq!(
+            super::commit_title(
+                "
+- Added the parser and its tests"
+            )
+            .as_deref(),
+            Some("Added the parser and its tests")
+        );
+        assert_eq!(
+            super::commit_title(
+                "---
+***
+"
+            ),
+            None
+        );
+        let long = "x".repeat(100);
+        assert_eq!(
+            super::commit_title(&long).map(|title| title.chars().count()),
+            Some(73)
+        );
     }
 
     /// The root's own `agent_message`: a child by name by default, every child

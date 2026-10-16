@@ -743,10 +743,12 @@ impl InteractiveController {
     /// Stop the agent's work before it goes away: the running turn and every
     /// child it delegated.
     pub fn shut_down(&mut self) {
+        // The children first, so they report the shutdown rather than a
+        // Ctrl-C the user never pressed.
+        self.service.stop_agents_for_shutdown();
         if self.phase.has_active_run() {
             self.service.cancel();
         }
-        let _ = self.service.stop_agents("all");
     }
 
     /// Record why the host is using the plain renderer instead of the TUI.

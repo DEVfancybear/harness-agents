@@ -673,6 +673,10 @@ pub trait SessionPort: Send {
     fn stop_agents(&mut self, _selector: &str) -> Result<String, String> {
         Err("this backend has no delegated children".to_owned())
     }
+    /// Stop every delegated child because the agent itself is going away.
+    fn stop_agents_for_shutdown(&mut self) {
+        let _ = self.stop_agents("all");
+    }
     /// prime-agent's `getFullscreen` / `getFullscreenMouse` for this launch.
     fn fullscreen_prefs(&self) -> super::tui::fullscreen::Prefs {
         super::tui::fullscreen::Prefs {
@@ -6401,6 +6405,10 @@ impl SessionPort for AgentSessionService {
         Ok(())
     }
 
+    fn stop_agents_for_shutdown(&mut self) {
+        let _ = self.agents.stop("all", SHUTDOWN_STOP);
+    }
+
     fn stop_agents(&mut self, selector: &str) -> Result<String, String> {
         let stopped = self
             .agents
@@ -6629,6 +6637,11 @@ impl AutoRefine {
 }
 
 /// What a child stopped by Ctrl-C reports to its parent.
+/// What a child cut off by its agent going away reports. It said the user
+/// had run `/agents stop`, so a resumed parent took the stop for the user's
+/// decision.
+const SHUTDOWN_STOP: &str = "Cut off because ha's background agent was shut down or restarted (`ha shutdown`, `ha stop`), not by the user's decision. Its conversation is kept: once the work goes on, send it a message with the agent_message tool to carry on; a coder's worktree does not survive the restart, so a coder's unfinished work is delegated again.";
+
 const CTRL_C_STOP: &str = "Stopped by the user with Ctrl-C. Its conversation and work so far are kept: when the user asks to continue, send it a message with the agent_message tool saying to carry on, and it resumes where it stopped instead of starting over.";
 
 /// One global memory consolidation at a time across the process's sessions.

@@ -127,8 +127,11 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
         let cost = cost_label(state).map(|cost| Span::styled(cost, theme.dim));
         // How much of the session's prompt came from the provider's cache: a
         // falling share is the first sign a prefix stopped holding still.
+        // `↯`, not `⚡`: an emoji is two cells in Windows Terminal but one in
+        // the console host behind it, so the row came out a cell too long,
+        // wrapped on the last line and scrolled the whole screen by one.
         let cache =
-            cache_label(state).map(|share| Span::styled(format!("⚡ cache {share}"), theme.dim));
+            cache_label(state).map(|share| Span::styled(format!("↯ cache {share}"), theme.dim));
         let context =
             context_label(state).map(|value| Span::styled(format!("◔ ctx {value}"), theme.dim));
         let detail = (matches!(state.phase, AppPhase::Ready | AppPhase::WaitingInput)
@@ -446,6 +449,25 @@ mod tests {
             thinking: None,
             service_tier: None,
             goal: None,
+        }
+    }
+
+    /// Every glyph of the status row is one cell in every console: a glyph
+    /// two cells wide in one and one in another (an emoji) made the row
+    /// overflow and scroll the screen.
+    #[test]
+    fn the_status_row_has_no_wide_glyph() {
+        let mut state = state(AppPhase::Ready);
+        state.header.push("Cache: 92%".to_owned());
+        state.header.push("Context: 20% · 204k/1M".to_owned());
+        state.header.push("Cost: $0.12".to_owned());
+        let text = plain_text(&[row(&state, &Theme::plain(), 160)]);
+        assert!(text.contains("cache 92%"), "{text}");
+        for glyph in text.chars() {
+            assert!(
+                crate::interactive::tui::widgets::composer::char_width(glyph) <= 1,
+                "{glyph:?} is wide: {text}"
+            );
         }
     }
 

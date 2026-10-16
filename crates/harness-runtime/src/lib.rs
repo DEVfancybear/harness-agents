@@ -5087,7 +5087,7 @@ mod compaction_ceiling_tests {
         let long = "x".repeat(800_000);
         assert_eq!(super::summary_timeout(&long), Duration::from_secs(190));
         let huge = "x".repeat(8_000_000);
-        assert_eq!(super::summary_timeout(&huge), Duration::from_secs(300));
+        assert_eq!(super::summary_timeout(&huge), Duration::from_mins(5));
     }
 
     /// A million-token window compacts at the ceiling, not near 950k; a small

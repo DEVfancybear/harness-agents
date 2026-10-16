@@ -153,6 +153,44 @@ pub fn write_journal(directory: &Path, key: &str, journal: &Journal) -> std::io:
     std::fs::rename(&staged, &path)
 }
 
+/// Where a project keeps the names its agents were given, by conversation.
+fn names_path(directory: &Path, key: &str) -> PathBuf {
+    directory.join(format!("{key}.names.json"))
+}
+
+/// Remember that the agent on `conversation` is called `name`, so the
+/// conversation keeps it when it is opened again after its agent stopped:
+/// `ha shutdown` and a resume used to bring it back nameless.
+pub fn remember_name(directory: &Path, key: &str, conversation: &str, name: &str) {
+    let path = names_path(directory, key);
+    let mut names = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| {
+            serde_json::from_str::<std::collections::BTreeMap<String, String>>(&text).ok()
+        })
+        .unwrap_or_default();
+    names.insert(conversation.to_owned(), name.to_owned());
+    if std::fs::create_dir_all(directory).is_ok()
+        && let Ok(text) = serde_json::to_string_pretty(&names)
+    {
+        let staged = path.with_extension("json.staged");
+        if std::fs::write(&staged, text).is_ok() {
+            let _ = std::fs::rename(&staged, &path);
+        }
+    }
+}
+
+/// The name the agent on `conversation` was last given, if any.
+#[must_use]
+pub fn remembered_name(directory: &Path, key: &str, conversation: &str) -> Option<String> {
+    std::fs::read_to_string(names_path(directory, key))
+        .ok()
+        .and_then(|text| {
+            serde_json::from_str::<std::collections::BTreeMap<String, String>>(&text).ok()
+        })
+        .and_then(|mut names| names.remove(conversation))
+}
+
 /// The journal a worker left, if any.
 #[must_use]
 pub fn read_journal(directory: &Path, key: &str) -> Option<Journal> {
@@ -371,6 +409,31 @@ fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
 #[allow(clippy::unnecessary_wraps, reason = "the Unix version can fail")]
 const fn restrict_to_owner(_path: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod name_tests {
+    /// A name given to an agent comes back with its conversation; another
+    /// conversation, or another project, has none.
+    #[test]
+    fn a_conversation_keeps_its_agent_name() {
+        let directory = tempfile::tempdir().expect("dir");
+        super::remember_name(directory.path(), "project-a", "task-1", "thu-vien");
+        super::remember_name(directory.path(), "project-a", "task-2", "other");
+        super::remember_name(directory.path(), "project-a", "task-1", "renamed");
+        assert_eq!(
+            super::remembered_name(directory.path(), "project-a", "task-1").as_deref(),
+            Some("renamed")
+        );
+        assert_eq!(
+            super::remembered_name(directory.path(), "project-a", "task-3"),
+            None
+        );
+        assert_eq!(
+            super::remembered_name(directory.path(), "project-b", "task-1"),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

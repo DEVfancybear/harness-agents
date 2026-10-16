@@ -803,6 +803,18 @@ impl Worker {
                 }
                 return Ok(Some(existing));
             }
+            // A conversation opened again keeps the name its agent had, when
+            // no running agent has taken it since.
+            if spec.name.is_none()
+                && let Some(name) =
+                    registry::remembered_name(&self.registry, &self.key, task.as_str())
+                && self
+                    .list()
+                    .iter()
+                    .all(|agent| agent.name.as_deref() != Some(name.as_str()) && agent.id != name)
+            {
+                spec.name = Some(name);
+            }
             // Pin latest/name selection while this creation owns admission.
             spec.resume = Some(session.as_str().to_owned());
         }
@@ -934,6 +946,9 @@ impl Worker {
         let info = status.info.clone();
         drop(status);
         drop(agents);
+        if let Some(conversation) = &info.conversation {
+            registry::remember_name(&self.registry, &self.key, conversation, name);
+        }
         self.keep_journal();
         Ok(info)
     }

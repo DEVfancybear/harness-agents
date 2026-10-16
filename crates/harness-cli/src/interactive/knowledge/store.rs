@@ -184,11 +184,25 @@ struct Page {
 
 pub(crate) struct Store {
     root: PathBuf,
+    /// The library lives in the user's checkout: it keeps itself out of Git.
+    self_ignoring: bool,
 }
 
 impl Store {
     pub(crate) fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            self_ignoring: false,
+        }
+    }
+
+    /// A library inside a project checkout (`.harness/knowledge`). Its pages
+    /// are ha's state, not the project's files: left untracked, they made the
+    /// checkout dirty, and a coder could not be delegated until the user
+    /// committed or ignored them.
+    pub(crate) fn self_ignoring(mut self) -> Self {
+        self.self_ignoring = true;
+        self
     }
 
     pub(crate) fn enabled(&self) -> Result<bool, String> {
@@ -617,7 +631,18 @@ impl Store {
         let _guard = lock(&root)?;
         validate_existing(&root)?;
         recover(&root)?;
-        action(&root)
+        let result = action(&root);
+        if self.self_ignoring && root.is_dir() {
+            let ignore = root.join(".gitignore");
+            if !ignore.exists() {
+                // `*` covers the file itself, so Git sees nothing here.
+                let _ = fs::write(
+                    ignore, "*
+",
+                );
+            }
+        }
+        result
     }
 }
 
