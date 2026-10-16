@@ -34,12 +34,15 @@ const SUMMARY_CHARS: usize = 160;
 const DEFAULT_RESULTS: usize = 10;
 const MAX_RESULTS: usize = 20;
 const LIST_PAGE: usize = 50;
+/// The most other wordings one search takes, as knowledge search does.
+const MAX_VARIANTS: usize = 4;
 const MAX_LIST_PAGE: usize = 100;
 
 pub const GUIDANCE: &str = concat!(
     "Memory is what you keep across turns and conversations: durable facts, the user's preferences and decisions (memory entries) and narrow behavioral rules (prompt notes). Manage it with the `memory` tool. ",
     "The harness digest each turn shows only the few entries that rank highest for the request, cut short; the rest are found with memory search. ",
     "Before answering about an earlier decision, preference, person, plan or past piece of work you do not see in context, search memory first; when it has nothing, say so instead of guessing. ",
+    "Search matches words, not meaning: when the wording or language may differ from the entries (the user writes Vietnamese, an entry may be in English), pass up to four variants in queries in the same search - synonyms and a translation - instead of searching again. ",
     "When the user asks you to remember something, states a lasting preference or corrects how you work, or a decision is reached that later work depends on, write it in the same turn without asking. Use scope global for what holds across conversations (the user's preferences, stable facts; name the project when a fact is about one) and local for this conversation's state. ",
     "Search before writing and update the matching entry with its id and expected_version instead of adding a near-duplicate; delete an entry that turned out wrong. One fact or rule per entry, short and self-contained. Never store secrets, credentials or tokens. ",
     "Pin (pinned: true) only an entry every turn should obey whatever the request, such as the user's language, how to address them or a hard rule they set; pinned entries are shown whole in every turn's digest within a 4,000-character bound, so keep them few and short and unpin what stops applying. ",
@@ -122,12 +125,7 @@ impl MemoryHost {
         kinds(arguments)?;
         match action {
             "list" => Ok(()),
-            "search" => {
-                if text(arguments, "query")?.trim().is_empty() {
-                    return Err("search needs a query".to_owned());
-                }
-                Ok(())
-            }
+            "search" => search_queries(arguments).map(|_| ()),
             "read" => text(arguments, "id").map(|_| ()),
             "write" => {
                 let title = text(arguments, "title")?.trim();
@@ -221,26 +219,31 @@ impl MemoryHost {
     }
 
     fn search(&self, arguments: &Value) -> Result<Value, String> {
-        let query = text(arguments, "query")?.trim();
+        let queries = search_queries(arguments)?;
         let entries = self.entries(&scopes(arguments)?, &kinds(arguments)?);
         // A query typed without accents finds accented entries, as knowledge
         // search does; one with accents still matches them exactly.
         let fold = super::knowledge::store::fold;
-        let plain = fold(query) == query;
-        let ranked = if plain {
-            let folded = entries
-                .iter()
-                .map(|entry| Entry {
-                    title: entry.title.as_deref().map(fold),
-                    content: entry.content.as_deref().map(fold),
-                    path: fold(&entry.path),
-                    ..entry.clone()
-                })
-                .collect::<Vec<_>>();
-            harness::rank(&folded, query)
-        } else {
-            harness::rank(&entries, query)
-        };
+        let folded = entries
+            .iter()
+            .map(|entry| Entry {
+                title: entry.title.as_deref().map(fold),
+                content: entry.content.as_deref().map(fold),
+                path: fold(&entry.path),
+                ..entry.clone()
+            })
+            .collect::<Vec<_>>();
+        let rankings = queries
+            .iter()
+            .map(|query| {
+                if fold(query) == *query {
+                    harness::rank(&folded, query)
+                } else {
+                    harness::rank(&entries, query)
+                }
+            })
+            .collect::<Vec<_>>();
+        let ranked = fuse(&rankings);
         let limit = integer(arguments, "limit", DEFAULT_RESULTS).clamp(1, MAX_RESULTS);
         let hits = ranked
             .iter()
@@ -255,7 +258,7 @@ impl MemoryHost {
             return Ok(json!({
                 "hits": [],
                 "total": entries.len(),
-                "note": "No memory matched. Memory holds only what was written before; if the answer matters, say it is not remembered, or try one other wording, instead of searching again."
+                "note": "No memory matched. Memory holds only what was written before; if the answer matters and you have not yet, search once more with variants in queries (synonyms, a translation); otherwise say it is not remembered."
             }));
         }
         Ok(json!({"hits": hits, "total": entries.len()}))
@@ -487,6 +490,66 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// A search's query and its variants, without repeats.
+fn search_queries(arguments: &Value) -> Result<Vec<String>, String> {
+    let mut candidates = Vec::new();
+    if let Some(query) = arguments.get("query").and_then(Value::as_str) {
+        candidates.push(query.trim().to_owned());
+    }
+    match arguments.get("queries") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(variants)) => {
+            if variants.len() > MAX_VARIANTS {
+                return Err(format!(
+                    "queries takes at most {MAX_VARIANTS} variants beside query"
+                ));
+            }
+            for variant in variants {
+                let variant = variant.as_str().ok_or("queries holds strings")?;
+                candidates.push(variant.trim().to_owned());
+            }
+        }
+        Some(_) => return Err("queries is a list of strings".to_owned()),
+    }
+    let mut queries: Vec<String> = Vec::new();
+    for query in candidates {
+        if !query.is_empty()
+            && !queries
+                .iter()
+                .any(|seen| seen.to_lowercase() == query.to_lowercase())
+        {
+            queries.push(query);
+        }
+    }
+    if queries.is_empty() {
+        return Err("search needs a query (or queries)".to_owned());
+    }
+    Ok(queries)
+}
+
+/// One ranking from several: reciprocal-rank fusion, so an entry any wording
+/// finds near the top ranks high, and one several find ranks higher. The
+/// score shown is the fused one.
+fn fuse(rankings: &[Vec<(usize, f64)>]) -> Vec<(usize, f64)> {
+    if let [only] = rankings {
+        return only.clone();
+    }
+    let mut fused = std::collections::BTreeMap::<usize, f64>::new();
+    for ranking in rankings {
+        for (position, (index, _)) in ranking.iter().enumerate() {
+            #[allow(clippy::cast_precision_loss, reason = "a rank position")]
+            let share = 1.0 / (60.0 + position as f64 + 1.0);
+            *fused.entry(*index).or_default() += share;
+        }
+    }
+    let mut ranked = fused
+        .into_iter()
+        .map(|(index, score)| (index, score * 60.0))
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+}
+
 fn text<'a>(arguments: &'a Value, key: &str) -> Result<&'a str, String> {
     arguments
         .get(key)
@@ -566,6 +629,7 @@ impl ExternalToolCatalog for MemoryHost {
                 "parameters":{"type":"object","properties":{
                     "action":{"type":"string","enum":["list","search","read"]},
                     "query":{"type":"string","description":"search: key words of what you are looking for."},
+                    "queries":{"type":"array","items":{"type":"string"},"maxItems":MAX_VARIANTS,"description":"search: up to four other wordings of the same need, such as synonyms and a translation into the language the entries may be in; all are searched at once."},
                     "kind":{"type":"string","enum":KINDS},
                     "scope":{"type":"string","enum":SCOPES},
                     "id":{"type":"string","description":"An entry id from list or search."},
@@ -580,6 +644,7 @@ impl ExternalToolCatalog for MemoryHost {
             "parameters":{"type":"object","properties":{
                 "action":{"type":"string","enum":["list","search","read","write","delete"]},
                 "query":{"type":"string","description":"search: key words of what you are looking for."},
+                "queries":{"type":"array","items":{"type":"string"},"maxItems":MAX_VARIANTS,"description":"search: up to four other wordings of the same need, such as synonyms and a translation into the language the entries may be in; all are searched at once."},
                 "kind":{"type":"string","enum":KINDS,"description":"memory (default for write) or prompt; list and search cover both when omitted."},
                 "scope":{"type":"string","enum":SCOPES,"description":"global: every conversation; local: this one. Required to create; list, search and read cover both when omitted."},
                 "id":{"type":"string","description":"An entry id from list or search (a global:/local: prefix picks the scope). With write, updates that entry."},
@@ -977,5 +1042,47 @@ mod tests {
                 .as_str()
                 .is_some_and(|note| note.contains("not remembered"))
         );
+    }
+    /// A Vietnamese request misses an English entry by its words; a variant
+    /// in `queries` - the translation - finds it in the same search, and an
+    /// entry several wordings find ranks first.
+    #[test]
+    fn variants_find_an_entry_written_in_another_language() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = host(directory.path());
+        for (title, content) in [
+            ("Package manager", "Project shop uses pnpm, not npm."),
+            ("Deploy target", "Project shop deploys to Fly.io."),
+            ("Reply language", "Answer the user in Vietnamese."),
+        ] {
+            run(
+                &host,
+                &json!({"action":"write","scope":"global","title":title,"content":content}),
+            )
+            .expect("write");
+        }
+        let alone = run(
+            &host,
+            &json!({"action":"search","query":"trình quản lý gói"}),
+        )
+        .expect("search");
+        assert_eq!(alone["hits"], json!([]), "{alone}");
+        let found = run(
+            &host,
+            &json!({"action":"search","query":"trình quản lý gói","queries":["package manager","pnpm npm"]}),
+        )
+        .expect("search");
+        assert_eq!(found["hits"][0]["title"], "Package manager", "{found}");
+        assert!(
+            run(
+                &host,
+                &json!({"action":"search","queries":["a","b","c","d","e"]})
+            )
+            .is_err(),
+            "at most four variants"
+        );
+        let only_variants =
+            run(&host, &json!({"action":"search","queries":["deploy"]})).expect("variants alone");
+        assert_eq!(only_variants["hits"][0]["title"], "Deploy target");
     }
 }
