@@ -258,6 +258,9 @@ pub struct ChildLaunch {
     /// Reference knowledge stays anchored to the parent's original project,
     /// including when a coder and its descendants work in isolated checkouts.
     pub knowledge: Option<super::knowledge::KnowledgeHost>,
+    /// The root's memory, read-only: a child recalls what the root kept in its
+    /// conversation and globally, and only the root keeps memory.
+    pub memory: Option<super::memory::MemoryHost>,
     /// Which models edit by hashline anchors; a child's own model decides.
     pub hashline: super::config::HashlineRule,
     /// The project's `[verify]` checks: `integrate_children` runs them on the
@@ -1880,9 +1883,12 @@ impl SessionAgents {
                         .filter(|child| !child.deleted)
                         .map(|child| super::agents::protocol::SubagentInfo {
                             name: child.name.clone(),
+                            // A child the user stopped did not fail: it was
+                            // drawn as a red "error" beside the ones that broke.
                             status: match child.state {
                                 ChildState::Running => "running",
                                 ChildState::Done { .. } => "completed",
+                                ChildState::Cancelled { .. } => "stopped",
                                 _ => "error",
                             }
                             .to_owned(),
@@ -3135,12 +3141,54 @@ fn coder_unavailable_error(reason: impl std::fmt::Display) -> HarnessError {
     )
 }
 
+/// The paths a dirty refusal names before it counts the rest.
+const DIRTY_NAMED: usize = 5;
+
+/// Why the checkout cannot seed a coder, and what to do about it.
+///
+/// Seen: a refusal that listed all thirty-three uncommitted files filled the
+/// screen and said nothing about the way out. A coder starts from the last
+/// commit, so it would not see uncommitted work and its merge could not
+/// carry it; the model is told to commit first (with the user's leave) or to
+/// do the edit itself.
 fn dirty_reasons(reasons: &[DirtyReason]) -> String {
-    reasons
+    let changes = reasons
         .iter()
+        .filter(|reason| {
+            matches!(
+                reason,
+                DirtyReason::TrackedModification { .. }
+                    | DirtyReason::StagedChange { .. }
+                    | DirtyReason::UntrackedFile { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut parts = reasons
+        .iter()
+        .filter(|reason| {
+            matches!(
+                reason,
+                DirtyReason::DetachedHead | DirtyReason::NotARepository
+            )
+        })
         .map(DirtyReason::describe)
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect::<Vec<_>>();
+    if !changes.is_empty() {
+        let mut named = changes
+            .iter()
+            .take(DIRTY_NAMED)
+            .map(|reason| reason.describe())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if changes.len() > DIRTY_NAMED {
+            let _ = write!(named, ", and {} more", changes.len() - DIRTY_NAMED);
+        }
+        parts.push(format!(
+            "the checkout has {} uncommitted change(s) ({named}). A coder starts from the last commit, so it would not see them; commit them first (ask the user), or make this edit yourself or with an explorer",
+            changes.len()
+        ));
+    }
+    parts.join("; ")
 }
 
 async fn inspect_coder_input(
@@ -3226,6 +3274,7 @@ struct ChildTools {
     task_id: TaskId,
     web: Option<ChildWebTools>,
     knowledge: Option<super::knowledge::KnowledgeHost>,
+    memory: Option<super::memory::MemoryHost>,
     /// How this child starts children of its own; `None` at the depth limit.
     spawn: Option<ChildSpawn>,
 }
@@ -3357,6 +3406,9 @@ impl ExternalToolCatalog for ChildTools {
         if let Some(knowledge) = &self.knowledge {
             schemas.extend(knowledge.readonly().tools().schemas());
         }
+        if let Some(memory) = &self.memory {
+            schemas.extend(memory.readonly().tools().schemas());
+        }
         schemas
     }
 
@@ -3384,6 +3436,12 @@ impl ExternalToolCatalog for ChildTools {
                 .knowledge
                 .as_ref()
                 .and_then(|knowledge| knowledge.readonly().tools().resolve(name, arguments));
+        }
+        if name == "memory" {
+            return self
+                .memory
+                .as_ref()
+                .and_then(|memory| memory.readonly().tools().resolve(name, arguments));
         }
         self.web
             .as_ref()
@@ -3415,6 +3473,21 @@ impl ExternalToolDispatcher for ChildTools {
                     None => Err(HarnessError::new(
                         ErrorCode::PolicyDenied,
                         "knowledge is not available to this child",
+                    )),
+                };
+            }
+            if plugin_id == "memory" {
+                return match &self.memory {
+                    Some(memory) => {
+                        memory
+                            .readonly()
+                            .dispatcher()
+                            .validate_external(plugin_id, tool_name, arguments)
+                            .await
+                    }
+                    None => Err(HarnessError::new(
+                        ErrorCode::PolicyDenied,
+                        "memory is not available to this child",
                     )),
                 };
             }
@@ -3461,6 +3534,27 @@ impl ExternalToolDispatcher for ChildTools {
                     None => Err(HarnessError::new(
                         ErrorCode::PolicyDenied,
                         "knowledge is not available to this child",
+                    )),
+                };
+            }
+            if plugin_id == "memory" {
+                return match &self.memory {
+                    Some(memory) => {
+                        memory
+                            .readonly()
+                            .dispatcher()
+                            .dispatch_external(
+                                authorization,
+                                plugin_id,
+                                tool_name,
+                                arguments,
+                                timeout_ms,
+                            )
+                            .await
+                    }
+                    None => Err(HarnessError::new(
+                        ErrorCode::PolicyDenied,
+                        "memory is not available to this child",
                     )),
                 };
             }
@@ -4099,6 +4193,10 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     .knowledge
                     .as_ref()
                     .map(super::knowledge::KnowledgeHost::readonly),
+                memory: launch
+                    .memory
+                    .as_ref()
+                    .map(super::memory::MemoryHost::readonly),
                 spawn,
             });
             let tools = ToolExecutionService::new(Arc::clone(&store))
@@ -4681,6 +4779,73 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn a_child_recalls_the_roots_memory_but_cannot_change_it() {
+        use harness_tools::{ExternalToolCatalog, ExternalToolDispatcher};
+        use serde_json::json;
+
+        let root = tempfile::tempdir().expect("root");
+        let data = root.path().join("data");
+        let conversation = TaskId::generate();
+        // The root keeps a preference in its own conversation.
+        let memory = crate::interactive::memory::MemoryHost::new(&data, conversation.as_str());
+        let local = crate::interactive::harness::local_dir(&data, conversation.as_str());
+        std::fs::create_dir_all(&local).expect("local");
+        std::fs::write(
+            local.join("harness_state.json"),
+            json!({"schema":1,"entries":{"memory":{"tabs":{"id":"tabs","kind":"memory","title":"Indentation","content":"This project indents with tabs","version":1}}}}).to_string(),
+        )
+        .expect("state");
+        let (sender, _events) = tokio::sync::mpsc::unbounded_channel();
+        let tools = ChildTools {
+            shared: shared(sender),
+            // The child's own task: memory still reads the root's conversation.
+            task_id: TaskId::generate(),
+            web: None,
+            knowledge: None,
+            // The writable root host: the boundary makes it read-only.
+            memory: Some(memory),
+            spawn: None,
+        };
+        let schema = tools
+            .schemas()
+            .into_iter()
+            .find(|schema| schema["function"]["name"] == "memory")
+            .expect("memory schema");
+        assert_eq!(
+            schema["function"]["parameters"]["properties"]["action"]["enum"],
+            json!(["list", "search", "read"])
+        );
+        let search = json!({"action":"search","query":"tabs indentation"});
+        let action = tools.resolve("memory", &search).expect("resolves");
+        let CodingToolAction::ExternalTool { plugin_id, .. } = &action else {
+            panic!("{action:?}");
+        };
+        assert_eq!(plugin_id, "memory");
+        tools
+            .validate_external("memory", "memory", &search)
+            .await
+            .expect("search validates");
+        // What the child's search reads: the root's conversation.
+        let found = tools
+            .memory
+            .as_ref()
+            .expect("memory")
+            .readonly()
+            .search_for_test(&search);
+        assert_eq!(found["hits"][0]["id"], "tabs", "{found}");
+        for forged in [
+            json!({"action":"write","scope":"global","title":"x","content":"y"}),
+            json!({"action":"delete","id":"tabs","expected_version":1}),
+        ] {
+            let error = tools
+                .validate_external("memory", "memory", &forged)
+                .await
+                .expect_err("a child cannot change memory");
+            assert!(error.message().contains("read-only"), "{error}");
+        }
+    }
+
+    #[tokio::test]
     async fn child_knowledge_reads_are_available_but_forged_mutations_and_off_are_refused() {
         use harness_tools::{ExternalToolCatalog, ExternalToolDispatcher};
         use serde_json::json;
@@ -4701,6 +4866,7 @@ pub(super) mod tests {
             // Deliberately pass the writable root host: the child boundary must
             // enforce read-only even if a caller forgets to make it so.
             knowledge: Some(knowledge.clone()),
+            memory: None,
             spawn: None,
         };
         let schemas = tools.schemas();
@@ -5099,6 +5265,7 @@ pub(super) mod tests {
             child_limits: harness_tools::TurnLimits::default(),
             web: None,
             knowledge: None,
+            memory: None,
             hashline: super::super::config::HashlineRule::Off,
             checks: Vec::new(),
             context: Vec::new(),
@@ -5156,6 +5323,26 @@ pub(super) mod tests {
         );
     }
 
+    #[test]
+    fn a_dirty_refusal_names_a_few_changes_and_the_way_out() {
+        let mut reasons = (0..33)
+            .map(|index| super::DirtyReason::TrackedModification {
+                path: format!("src/file{index}.ts"),
+            })
+            .collect::<Vec<_>>();
+        reasons.push(super::DirtyReason::DetachedHead);
+        let message = super::dirty_reasons(&reasons);
+        assert!(
+            message.starts_with("repository is in detached HEAD state"),
+            "{message}"
+        );
+        assert!(message.contains("33 uncommitted change(s)"), "{message}");
+        assert!(message.contains("src/file4.ts"), "{message}");
+        assert!(!message.contains("src/file5.ts"), "{message}");
+        assert!(message.contains("and 28 more"), "{message}");
+        assert!(message.contains("commit them first"), "{message}");
+    }
+
     #[tokio::test]
     async fn g12_coder_refuses_a_dirty_parent_without_losing_changes() {
         let temporary = tempfile::tempdir().expect("temporary directory");
@@ -5170,6 +5357,11 @@ pub(super) mod tests {
             .expect_err("dirty workspace is not silently copied or discarded");
         assert_eq!(error.code(), ErrorCode::RoleUnavailable);
         assert!(error.message().contains("untracked file uncommitted.txt"));
+        assert!(
+            error.message().contains("1 uncommitted change(s)"),
+            "{error}"
+        );
+        assert!(error.message().contains("commit them first"), "{error}");
         assert_eq!(
             std::fs::read_to_string(repo.join("uncommitted.txt")).expect("user change remains"),
             "preserve me\n"
@@ -6401,6 +6593,15 @@ mod real_worker_tests {
             ),
             other => panic!("expected a notice: {other:?}"),
         }
+        // The agents view shows it stopped, not failed.
+        let rows = bench.agents.view_rows();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.name.contains("slow"))
+                .map(|row| row.status.as_str()),
+            Some("stopped"),
+            "{rows:?}"
+        );
         assert!(bench.agents.stop("nobody", "x").is_err());
 
         spawn(&host, "other", "wait").await;

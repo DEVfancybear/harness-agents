@@ -102,6 +102,9 @@ impl SystemPromptBuilder {
         if has("delegate") {
             parts.push(SUBAGENT_GUIDANCE.to_owned());
         }
+        if has("memory") {
+            parts.push(super::memory::GUIDANCE.to_owned());
+        }
         if has("knowledge") {
             parts.push(super::knowledge::GUIDANCE.to_owned());
         }

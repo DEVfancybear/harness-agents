@@ -150,7 +150,11 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
         (Some(Modal::Approval { expires_at, .. }), _) => {
             let remaining = expires_at.saturating_duration_since(std::time::Instant::now());
             push(Span::styled(
-                format!(" approval · còn {}", view::clock_label(remaining)),
+                if remaining <= crate::interactive::controller::APPROVAL_COUNTDOWN {
+                    format!(" approval · còn {}", view::clock_label(remaining))
+                } else {
+                    " approval".to_owned()
+                },
                 theme.warning,
             ));
             push(Span::styled(" · y chạy · n từ chối".to_owned(), theme.dim));

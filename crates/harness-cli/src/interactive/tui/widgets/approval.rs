@@ -109,10 +109,13 @@ pub fn rows(request: &Proposal<'_>, theme: &Theme) -> Vec<Line<'static>> {
     if request.read_only {
         header.push(Span::styled(" · chỉ đọc".to_owned(), theme.dim));
     }
-    header.push(Span::styled(
-        format!("  (còn {})", view::clock_label(remaining)),
-        theme.dim,
-    ));
+    // A far deadline is no news; the countdown starts when it is near.
+    if remaining <= crate::interactive::controller::APPROVAL_COUNTDOWN {
+        header.push(Span::styled(
+            format!("  (còn {})", view::clock_label(remaining)),
+            theme.dim,
+        ));
+    }
     let mut lines = vec![Line::from(header)];
     lines.push(Line::from(vec![
         Span::styled("workspace: ".to_owned(), theme.dim),
@@ -244,6 +247,10 @@ mod tests {
             text.contains("còn 00:30") || text.contains("còn 00:29"),
             "the countdown reflects the reported deadline: {text}"
         );
+        // A far deadline (the gate waits a day) is not counted down.
+        let far = plain_text(&rows(&request(Duration::from_hours(23)), &Theme::plain()));
+        assert!(!far.contains("còn"), "{far}");
+        assert!(far.contains("[approval] apply_patch"), "{far}");
     }
 
     /// The panel distinguishes a grant for this turn from a persistent rule, and

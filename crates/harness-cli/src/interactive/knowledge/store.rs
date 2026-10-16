@@ -1107,7 +1107,7 @@ fn normalized(text: &str) -> String {
 
 /// `text` without the accents of Latin letters (`ộ` as `o`, `đ` as `d`):
 /// marks on other scripts' letters are part of their words and stay.
-fn fold(text: &str) -> String {
+pub(crate) fn fold(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut latin = false;
     for character in text.replace(['đ', 'Đ'], "d").nfd() {

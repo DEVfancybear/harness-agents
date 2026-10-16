@@ -47,7 +47,15 @@ const CONTINUATION_TEXT: &str = "continue: the previous turn stopped at a bound,
      finished — pick up where it left off and complete the task";
 
 /// How long the approval panel has before the gate refuses the request.
-pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_mins(5);
+///
+/// A day, as good as waiting for the user: Claude Code and Codex wait for the
+/// answer. Five minutes used to drop the action whenever the user stepped away
+/// (`approval_stale` on a `write_file` the model then had to redo), and a
+/// request nobody answers holds nothing but the paused turn.
+pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_hours(24);
+
+/// Below this, the panel and the status line count the approval down.
+pub const APPROVAL_COUNTDOWN: Duration = Duration::from_mins(10);
 
 /// One thing the host must do after a controller step.
 ///

@@ -355,29 +355,50 @@ impl Catalog {
     /// format, reasoning and level map of the catalog model of the same provider
     /// whose id it shares the longest start with - its predecessor in the family.
     fn add_listed(&mut self, provider: &str, ids: &[String]) {
+        for id in ids {
+            if let Some(model) = self.sibling(provider, id) {
+                self.models.push(model);
+            }
+        }
+    }
+
+    /// `id` as a model of `provider` the catalog does not know, from its
+    /// predecessor in the family; `None` when the catalog has it or no model of
+    /// the provider shares its start.
+    fn sibling(&self, provider: &str, id: &str) -> Option<Model> {
         let known = self
             .models
             .iter()
-            .filter(|model| model.provider == provider)
-            .cloned()
-            .collect::<Vec<_>>();
-        for id in ids {
-            if known.iter().any(|model| &model.id == id) {
-                continue;
-            }
-            let Some(sibling) = known
-                .iter()
-                .max_by_key(|model| common_prefix(&model.id, id))
-                .filter(|model| common_prefix(&model.id, id) >= 3)
-            else {
-                continue;
-            };
-            let mut model = sibling.clone();
-            model.id.clone_from(id);
-            model.name.clone_from(id);
-            model.cost = None;
-            self.models.push(model);
+            .filter(|model| model.provider == provider);
+        if known.clone().any(|model| model.id == id) {
+            return None;
         }
+        let sibling = known
+            .max_by_key(|model| common_prefix(&model.id, id))
+            .filter(|model| common_prefix(&model.id, id) >= 3)?;
+        let mut model = sibling.clone();
+        id.clone_into(&mut model.id);
+        id.clone_into(&mut model.name);
+        model.cost = None;
+        Some(model)
+    }
+
+    /// [`Catalog::find`], and a `provider/id` the catalog does not know yet for a
+    /// provider whose own model list runs ahead of it (its predecessor in the
+    /// family lends the transport). Seen on a fresh install: before the
+    /// provider's list was first downloaded, `--model
+    /// opencode-go/deepseek-v4.1-flash` was not found and went whole, as a model
+    /// id, to the configured provider, which answered "Model is unavailable".
+    #[must_use]
+    pub fn find_or_listed(&self, reference: &str) -> Option<Model> {
+        if let Some(model) = self.find(reference) {
+            return Some(model.clone());
+        }
+        let (provider, id) = reference.split_once('/')?;
+        if !LIVE_LISTS.iter().any(|(listed, _)| *listed == provider) {
+            return None;
+        }
+        self.sibling(provider, id)
     }
 
     /// Keep the downloaded models whose transport the snapshot already knows.
@@ -721,6 +742,37 @@ mod tests {
             Some("deepseek")
         );
         assert!(model.thinking_level_map.is_some());
+    }
+
+    #[test]
+    fn a_model_named_with_a_listing_provider_resolves_before_its_list_is_read() {
+        // A fresh install: no list of the provider's models downloaded yet.
+        let catalog = Catalog::bundled();
+        assert!(catalog.find("opencode-go/deepseek-v4.1-flash").is_none());
+        let model = catalog
+            .find_or_listed("opencode-go/deepseek-v4.1-flash")
+            .expect("the provider's family lends the transport");
+        assert_eq!(model.provider, "opencode-go");
+        assert_eq!(model.id, "deepseek-v4.1-flash");
+        assert_eq!(model.protocol(), Some("openai_chat"));
+        assert_eq!(
+            model.base_url,
+            catalog
+                .find("opencode-go/deepseek-v4-flash")
+                .expect("sibling")
+                .base_url
+        );
+        // A known model is itself; a provider without a live list, or a name
+        // sharing nothing with the family, is not guessed.
+        assert_eq!(
+            catalog
+                .find_or_listed("deepseek/deepseek-v4-flash")
+                .map(|model| model.id),
+            Some("deepseek-v4-flash".to_owned())
+        );
+        assert!(catalog.find_or_listed("anthropic/claude-new-9").is_none());
+        assert!(catalog.find_or_listed("opencode-go/zz").is_none());
+        assert!(catalog.find_or_listed("deepseek-v4.1-flash").is_none());
     }
 
     #[test]

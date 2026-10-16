@@ -136,7 +136,10 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
             .map(|line| Line::from(vec![Span::styled(line, theme.dim)]))
             .collect(),
         HistoryItem::ApprovalResolution { label, request_id } => {
-            let granted = label == "granted";
+            // Every grant, the turn-wide one included: only an exact `granted`
+            // used to count, so "granted (every action allowed for this turn)"
+            // was drawn as a red failure.
+            let granted = label.starts_with("granted");
             vec![Line::from(vec![
                 Span::styled(
                     if granted { "✓ " } else { "✗ " },
@@ -1583,6 +1586,32 @@ mod tests {
             "the turn closes on a row that names its outcome: {row}"
         );
         assert!(row.contains("14.2s") && row.contains('─'), "{row}");
+    }
+
+    /// Seen: "✗ approval granted (every action allowed for this turn)" in red.
+    #[test]
+    fn every_grant_is_drawn_as_a_grant() {
+        let theme = Theme::plain();
+        for (label, mark) in [
+            ("granted", "✓"),
+            ("granted (every action allowed for this turn)", "✓"),
+            ("denied", "✗"),
+        ] {
+            let rows = render(
+                &HistoryItem::ApprovalResolution {
+                    label: label.to_owned(),
+                    request_id: "approval-1".to_owned(),
+                },
+                120,
+                &theme,
+                Detail::Collapsed,
+            );
+            assert!(
+                plain_text(&rows).starts_with(mark),
+                "{label}: {}",
+                plain_text(&rows)
+            );
+        }
     }
 
     /// A sign-in notice keeps its lines, and the URL is its own, underlined row.

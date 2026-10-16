@@ -448,7 +448,7 @@ fn empty_state() -> Value {
 }
 
 /// The raw state of one scope; unknown fields are kept through a save.
-fn load_raw(dir: &Path) -> Value {
+pub(super) fn load_raw(dir: &Path) -> Value {
     let mut state = std::fs::read_to_string(dir.join(STATE_FILE))
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
@@ -467,17 +467,33 @@ fn load_raw(dir: &Path) -> Value {
 
 /// `saveHarnessState`: written to a temporary file and renamed, so a reader never
 /// sees half a file.
-fn save_raw(dir: &Path, state: &Value) -> Result<PathBuf, String> {
+pub(super) fn save_raw(dir: &Path, state: &Value) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|error| format!("harness state directory: {error}"))?;
     let path = dir.join(STATE_FILE);
     let temporary = dir.join(format!("{STATE_FILE}.tmp"));
     let text = serde_json::to_string_pretty(state).map_err(|error| error.to_string())? + "\n";
     std::fs::write(&temporary, text).map_err(|error| format!("harness state: {error}"))?;
-    std::fs::rename(&temporary, &path).map_err(|error| format!("harness state: {error}"))?;
-    Ok(path)
+    // A Windows reader that has the file open (the digest, a scanner) briefly
+    // refuses the replace; the Python kernel waits for it the same way.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match std::fs::rename(&temporary, &path) {
+            Ok(()) => return Ok(path),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(format!("harness state: {error}"));
+            }
+        }
+    }
 }
 
-fn now() -> String {
+pub(super) fn now() -> String {
     // RFC 3339 in UTC without a date crate: seconds since the epoch are enough to
     // order entries, and the digest never prints them.
     let seconds = std::time::SystemTime::now()
@@ -487,7 +503,7 @@ fn now() -> String {
 }
 
 /// `slug`: lowercase ASCII words joined by `_`, at most 80 characters.
-fn slug(raw: &str, fallback: &str) -> String {
+pub(super) fn slug(raw: &str, fallback: &str) -> String {
     use unicode_normalization::UnicodeNormalization as _;
     let mut out = String::new();
     let mut gap = false;
@@ -1048,6 +1064,9 @@ fn apply(
 ) -> Result<Refinement, String> {
     let dir = scopes.dir(global);
     let scope = if global { "global" } else { "local" };
+    // The model's `memory` tool and the Python kernel write the same file:
+    // the whole read, check and save holds the state's lock.
+    let _lock = super::harness::lock_state(dir)?;
     let mut state = load_raw(dir);
     let mut applied_edits = Vec::new();
     let mut modified = std::collections::BTreeSet::new();

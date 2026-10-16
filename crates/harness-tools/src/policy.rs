@@ -339,6 +339,19 @@ impl ToolPolicy {
             };
         }
 
+        // The model's memory is ha's own state, outside the workspace: what it
+        // keeps and drops is the model's call, as with `rlm.harness`, and asking
+        // before each note would make it stop keeping them. Deny rules above win.
+        if matches!(
+            action,
+            CodingToolAction::ExternalTool { plugin_id, tool_name, .. }
+                if plugin_id == "memory" && tool_name == "memory"
+        ) {
+            return Decision::Allow {
+                reason: "memory (ha's own state)".to_owned(),
+            };
+        }
+
         // Reading the trusted skill catalogue changes nothing: listing skills,
         // loading one's instructions and reading its own files. Asking before each of
         // them put an approval panel between the model and every skill, and full-auto
@@ -970,6 +983,27 @@ mod g05_policy_tests {
                 );
             }
         }
+        // The model's own memory is host state: every action is allowed in
+        // every mode, a deny rule still wins, and only the native tool counts.
+        for mode in [PolicyMode::Ask, PolicyMode::AutoEdit, PolicyMode::FullAuto] {
+            let policy = ToolPolicy::new(1, Vec::new()).with_mode(mode);
+            for action in ["list", "search", "read", "write", "delete"] {
+                assert!(matches!(
+                    policy.decide(&knowledge("memory", "memory", action.into())),
+                    Decision::Allow { .. }
+                ));
+            }
+            let denied =
+                policy.with_tool_rules(vec![ToolPatternRule::deny("memory()", "no memory here")]);
+            assert_eq!(
+                denied.decide(&knowledge("memory", "memory", "write".into())),
+                Decision::Deny("no memory here".to_owned())
+            );
+        }
+        assert_eq!(
+            ToolPolicy::default().decide(&knowledge("mcp", "memory", "write".into())),
+            Decision::Ask
+        );
         let policy = ToolPolicy::default();
         for (plugin, tool) in [("mcp", "knowledge"), ("knowledge", "other")] {
             assert_eq!(

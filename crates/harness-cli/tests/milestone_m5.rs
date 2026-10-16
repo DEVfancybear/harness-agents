@@ -1891,6 +1891,7 @@ async fn a20_source_scope_fork() {
                 source_id: foreign_ids[0].clone(),
                 offset: 0,
                 length: 256,
+                project: false,
             },
         ))
         .await
@@ -1911,6 +1912,54 @@ async fn a20_source_scope_fork() {
             .expect("intents")
             .is_empty(),
         "a refused read never creates an intent"
+    );
+
+    // Asked for the whole project, the same index answers from the other
+    // conversation too, says whose source it is, and lets it be read.
+    let project_scope = scope.clone().across_project();
+    let wide = store
+        .history_search(&project_scope, "XYZ-731", 10)
+        .await
+        .expect("project search");
+    let foreign_hit = wide
+        .iter()
+        .find(|hit| foreign_ids.contains(&hit.source_id))
+        .expect("the other conversation's source is found");
+    assert_eq!(foreign_hit.task_id, foreign_task.as_str());
+    assert!(!foreign_hit.started.is_empty(), "{foreign_hit:?}");
+    store
+        .history_read(&project_scope, &foreign_hit.source_id, 0, 64)
+        .await
+        .expect("a project-wide read reaches it");
+    let prepared = tools
+        .prepare(ToolRequest::new(
+            parent_session.clone(),
+            task.clone(),
+            "actor.a20",
+            &bench.workspace,
+            CodingToolAction::HistorySearch {
+                query: "XYZ-731".to_owned(),
+                limit: None,
+                project: true,
+            },
+        ))
+        .await
+        .expect("prepares");
+    let grant = tools.approve(&prepared).await.expect("approved");
+    let view = tools.execute(prepared, Some(grant)).await.expect("search");
+    let ToolOutput::HistorySearch { hits, .. } = &view.output else {
+        panic!("a project search returns hits: {:?}", view.output);
+    };
+    assert!(
+        hits.iter()
+            .any(|hit| hit.conversation.as_deref() == Some(foreign_task.as_str())),
+        "{hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .filter(|hit| !foreign_ids.contains(&hit.source_id))
+            .all(|hit| hit.conversation.is_none()),
+        "this conversation's own hits name no conversation: {hits:?}"
     );
     let _ = foreign_sequence;
 
@@ -1970,6 +2019,7 @@ async fn a20_source_scope_fork() {
                 source_id: child_grants[0].clone(),
                 offset: 0,
                 length: 64,
+                project: false,
             },
         ))
         .await
@@ -1994,6 +2044,7 @@ async fn a20_source_scope_fork() {
                 source_id: child_grants[0].clone(),
                 offset: 0,
                 length: 64,
+                project: false,
             },
         ))
         .await

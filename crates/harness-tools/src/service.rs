@@ -1444,11 +1444,14 @@ impl ToolExecutionService {
                 }
             }
             CodingToolAction::HistoryRead {
-                source_id, offset, ..
+                source_id,
+                offset,
+                project,
+                ..
             } => {
                 // A foreign or expired reference is a refusal, not an unknown
                 // outcome: the read can be decided before any intent exists.
-                let scope = self.history_scope(prepared).await?;
+                let scope = self.history_scope(prepared, *project).await?;
                 let page = self
                     .store
                     .history_read(&scope, source_id, *offset, 1)
@@ -1702,17 +1705,24 @@ impl ToolExecutionService {
                     .await?;
                 Ok(Dispatched::plain(page))
             }
-            CodingToolAction::HistorySearch { query, limit } => {
-                let hits = self.history_search(prepared, query, *limit).await?;
+            CodingToolAction::HistorySearch {
+                query,
+                limit,
+                project,
+            } => {
+                let hits = self
+                    .history_search(prepared, query, *limit, *project)
+                    .await?;
                 Ok(Dispatched::plain(hits))
             }
             CodingToolAction::HistoryRead {
                 source_id,
                 offset,
                 length,
+                project,
             } => {
                 let page = self
-                    .history_read(prepared, source_id, *offset, *length)
+                    .history_read(prepared, source_id, *offset, *length, *project)
                     .await?;
                 Ok(Dispatched::plain(page))
             }
@@ -1811,38 +1821,54 @@ impl ToolExecutionService {
     }
 
     /// The scope one history read runs under: this task, plus whatever lineage a
-    /// fork was explicitly allowed to keep reading.
+    /// fork was explicitly allowed to keep reading, or with `project` every
+    /// conversation of the project.
     pub async fn history_scope(
         &self,
         prepared: &PreparedToolRequest,
+        project: bool,
     ) -> Result<HistoryScope, HarnessError> {
         let grants = self
             .store
             .history_grants(&prepared.request.session_id)
             .await
             .map_err(store_error)?;
-        Ok(HistoryScope::new(
+        let scope = HistoryScope::new(
             prepared.project_id.clone(),
             prepared.request.task_id.clone(),
         )
-        .with_grants(grants))
+        .with_grants(grants);
+        Ok(if project {
+            scope.across_project()
+        } else {
+            scope
+        })
     }
 
-    /// Bring the journal index up to date and search it inside this task.
+    /// Bring the journal index up to date and search it inside this task, or
+    /// across the project.
     async fn history_search(
         &self,
         prepared: &PreparedToolRequest,
         query: &str,
         limit: Option<u32>,
+        project: bool,
     ) -> Result<ToolOutput, HarnessError> {
         // The read scope is the task, so the index has to cover every session
         // that worked on it; otherwise a continuation session could not find
-        // what its predecessor wrote.
-        self.store
-            .index_task_history(&prepared.request.task_id)
-            .await
-            .map_err(store_error)?;
-        let scope = self.history_scope(prepared).await?;
+        // what its predecessor wrote. A project search covers every task's.
+        if project {
+            self.store
+                .index_project_history()
+                .await
+                .map_err(store_error)?;
+        } else {
+            self.store
+                .index_task_history(&prepared.request.task_id)
+                .await
+                .map_err(store_error)?;
+        }
+        let scope = self.history_scope(prepared, project).await?;
         let wanted = limit.unwrap_or(HISTORY_SEARCH_DEFAULT_LIMIT);
         let hits = self
             .store
@@ -1860,6 +1886,10 @@ impl ToolExecutionService {
                     availability: hit.availability.as_str().to_owned(),
                     matched_terms: hit.matched_terms,
                     preview: hit.preview,
+                    conversation: (hit.task_id != prepared.request.task_id.as_str())
+                        .then(|| hit.task_id.clone()),
+                    started: (hit.task_id != prepared.request.task_id.as_str())
+                        .then(|| hit.started.clone()),
                 })
                 .collect(),
             truncated,
@@ -1873,8 +1903,9 @@ impl ToolExecutionService {
         source_id: &str,
         offset: u64,
         length: u32,
+        project: bool,
     ) -> Result<ToolOutput, HarnessError> {
-        let scope = self.history_scope(prepared).await?;
+        let scope = self.history_scope(prepared, project).await?;
         let page = self
             .store
             .history_read(

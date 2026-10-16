@@ -1157,6 +1157,7 @@ fn child_context(
             super::harness::DigestOptions {
                 repl: false,
                 refine: false,
+                memory_tool: false,
             },
             &[],
         ),
@@ -7840,6 +7841,7 @@ async fn run_turn(
             knowledge: Some(
                 super::knowledge::KnowledgeHost::new(&workspace_root, &data_dir).readonly(),
             ),
+            memory: Some(super::memory::MemoryHost::new(&data_dir, task_id.as_str()).readonly()),
             context: child_context(
                 &data_dir,
                 task_id.as_str(),
@@ -8011,9 +8013,11 @@ async fn run_turn(
         feature_host.as_ref(),
         repl_host.as_ref(),
     );
-    tools = tools.with_external(super::knowledge::with_dispatcher(
-        dispatcher,
-        &knowledge_host,
+    // The model keeps its memory with a native tool, with or without the REPL.
+    let memory_host = super::memory::MemoryHost::new(&data_dir, task_id.as_str());
+    tools = tools.with_external(super::memory::with_dispatcher(
+        super::knowledge::with_dispatcher(dispatcher, &knowledge_host),
+        &memory_host,
     ));
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
     let external_tools = super::mcp::combined_tools_with_delegate(
@@ -8026,9 +8030,12 @@ async fn run_turn(
         feature_host.as_ref(),
         repl_host.as_ref(),
     );
-    let external_tools = Some(super::knowledge::with_tools(
-        external_tools,
-        &knowledge_host,
+    let external_tools = Some(super::memory::with_tools(
+        Some(super::knowledge::with_tools(
+            external_tools,
+            &knowledge_host,
+        )),
+        &memory_host,
     ));
     let driver = match &external_tools {
         Some(tools) => driver.with_external(tools.clone()),
@@ -8278,6 +8285,7 @@ async fn run_turn(
                 repl: repl_host.is_some(),
                 refine: repl_host.is_some()
                     && kernel_skill_imports.iter().any(|name| name == "refine"),
+                memory_tool: true,
             },
             &super::harness::weighted_terms(goal_objective, &[request.text.as_str()]),
         ),

@@ -104,6 +104,9 @@ pub struct HistoryHit {
     pub preview: String,
     /// How many of the query's terms this source contains.
     pub matched_terms: u64,
+    /// The task the source belongs to, and when its session began.
+    pub task_id: String,
+    pub started: String,
 }
 
 /// One page of an exact source read.
@@ -127,6 +130,9 @@ pub struct HistoryScope {
     pub project_id: ProjectId,
     pub task_id: TaskId,
     pub granted_source_ids: Vec<String>,
+    /// Every task of the project is in scope, not only `task_id`: the user's
+    /// earlier conversations about the same project.
+    pub project_wide: bool,
 }
 
 impl HistoryScope {
@@ -136,7 +142,16 @@ impl HistoryScope {
             project_id,
             task_id,
             granted_source_ids: Vec::new(),
+            project_wide: false,
         }
+    }
+
+    /// Widen the scope to every conversation of the project; the project
+    /// itself stays a filter.
+    #[must_use]
+    pub const fn across_project(mut self) -> Self {
+        self.project_wide = true;
+        self
     }
 
     #[must_use]
@@ -391,6 +406,43 @@ impl SqliteStore {
         Ok(indexed)
     }
 
+    /// Index every session of the store that is behind, whatever its task:
+    /// what a project-wide search reads. A store holds one project, and the
+    /// project stays a filter of the search.
+    ///
+    /// The first call indexes the conversations no search reached before;
+    /// later ones skip every caught-up session in one query.
+    pub async fn index_project_history(&self) -> Result<u64, StoreError> {
+        let rows = sqlx::query(
+            "SELECT session_id FROM sessions
+             WHERE next_sequence - 1 > COALESCE(
+                   (SELECT MAX(h.sequence) FROM history_sources h
+                    WHERE h.session_id = sessions.session_id), 0)
+             ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "list project sessions",
+                error,
+            )
+        })?;
+        let mut indexed = 0_u64;
+        for row in rows {
+            let session_id = SessionId::parse(row_get::<String>(&row, "session_id")?)?;
+            // A session without an admitted task has nothing a search could
+            // attribute; it is skipped, not fatal to the others.
+            match self.index_history(&session_id).await {
+                Ok(count) => indexed += count,
+                Err(error) if error.code() == ErrorCode::InvalidPayload => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(indexed)
+    }
+
     /// Search the index within one scope.
     ///
     /// The scope is part of the query: a source from another task is never a
@@ -411,9 +463,11 @@ impl SqliteStore {
         let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(20);
         let mut sql = String::from(
             "SELECT s.source_id, s.sequence, s.kind, substr(s.content, 1, ?) AS head,
-                    s.content_hash, s.availability, COUNT(DISTINCT t.term) AS matched
+                    s.content_hash, s.availability, COUNT(DISTINCT t.term) AS matched,
+                    s.task_id, COALESCE(se.created_at, '') AS started
              FROM history_sources s JOIN history_terms t ON t.source_id = s.source_id
-             WHERE s.project_id = ? AND (s.task_id = ?",
+             LEFT JOIN sessions se ON se.session_id = s.session_id
+             WHERE s.project_id = ? AND (? OR s.task_id = ?",
         );
         for index in 0..scope.granted_source_ids.len() {
             let _ = index;
@@ -426,7 +480,13 @@ impl SqliteStore {
             }
             sql.push('?');
         }
-        sql.push_str(") GROUP BY s.source_id HAVING matched = ? ORDER BY s.sequence DESC LIMIT ?");
+        // Newest first: across conversations a sequence only orders one
+        // session, so the session's start orders them.
+        sql.push_str(if scope.project_wide {
+            ") GROUP BY s.source_id HAVING matched = ? ORDER BY started DESC, s.sequence DESC LIMIT ?"
+        } else {
+            ") GROUP BY s.source_id HAVING matched = ? ORDER BY s.sequence DESC LIMIT ?"
+        });
         // The statement is assembled from a fixed template: every caller value
         // is a bind parameter, and the only thing that varies is how many `?`
         // placeholders the scope grants and the query terms need.
@@ -435,6 +495,7 @@ impl SqliteStore {
         let mut statement = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(i64::try_from(PREVIEW_CHARS + 1).unwrap_or(i64::MAX))
             .bind(scope.project_id.as_str())
+            .bind(scope.project_wide)
             .bind(scope.task_id.as_str());
         for granted in &scope.granted_source_ids {
             statement = statement.bind(granted);
@@ -471,6 +532,8 @@ impl SqliteStore {
                     preview: preview_of(&head),
                     matched_terms: u64::try_from(row_get::<i64>(row, "matched")?)
                         .unwrap_or_default(),
+                    task_id: row_get(row, "task_id")?,
+                    started: row_get(row, "started")?,
                 })
             })
             .collect()
@@ -516,12 +579,16 @@ impl SqliteStore {
         let project_id = row_get::<String>(&row, "project_id")?;
         let task_id = row_get::<String>(&row, "task_id")?;
         let granted = scope.granted_source_ids.iter().any(|id| id == source_id);
-        if project_id != scope.project_id.as_str()
-            || (task_id != scope.task_id.as_str() && !granted)
-        {
+        if project_id != scope.project_id.as_str() {
             return Err(StoreError::new(
                 ErrorCode::ScopeAuthorityDenied,
-                "history source belongs to another task scope",
+                "history source belongs to another project",
+            ));
+        }
+        if task_id != scope.task_id.as_str() && !granted && !scope.project_wide {
+            return Err(StoreError::new(
+                ErrorCode::ScopeAuthorityDenied,
+                "history source belongs to another conversation of this project; read it with scope \"project\"",
             ));
         }
         let availability = SourceAvailability::parse(&row_get::<String>(&row, "availability")?)
@@ -572,9 +639,10 @@ impl SqliteStore {
         };
         let rows = sqlx::query(
             "SELECT source_id FROM history_sources
-             WHERE project_id = ? AND task_id = ? AND substr(source_id, 1, ?) = ?",
+             WHERE project_id = ? AND (? OR task_id = ?) AND substr(source_id, 1, ?) = ?",
         )
         .bind(scope.project_id.as_str())
+        .bind(scope.project_wide)
         .bind(scope.task_id.as_str())
         .bind(i64::try_from(HEAD_CHARS).unwrap_or(i64::MAX))
         .bind(head)

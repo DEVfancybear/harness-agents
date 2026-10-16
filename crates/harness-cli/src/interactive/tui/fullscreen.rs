@@ -1181,6 +1181,92 @@ mod tests {
         assert_eq!(state.phase, AppPhase::Ready);
     }
 
+    /// Seen while an agent wrote: a reader who had scrolled back saw the view
+    /// jump up and down. A run is replayed frame by frame - streamed text
+    /// growing, tool cards opening and closing, rows arriving, the banner
+    /// redrawn, the run pausing between autonomous turns - and the rows the
+    /// reader is looking at must stay where they are.
+    #[test]
+    fn a_reader_who_scrolled_back_keeps_their_rows_while_the_agent_works() {
+        let mut screen = screen(80, 30);
+        let mut state = crate::interactive::tui::tests::idle_state();
+        state.phase = AppPhase::Running;
+        state.header.push("Chat: ninja".to_owned());
+        let notice = |index: usize| HistoryItem::Notice {
+            message: format!("row-{index}"),
+        };
+        // Near the cap: the run goes on dropping the oldest entries.
+        let start = super::REPRINT_ENTRIES - 40;
+        screen.insert_history_batch(&(0..start).map(notice).collect::<Vec<_>>());
+        screen.draw(&state).expect("drawn");
+        // A few rows back, as one wheel notch takes the reader: close enough
+        // to the end that the window's height decides where it can stand.
+        let _ = screen.mouse(
+            MouseInput {
+                kind: MouseKind::WheelUp,
+                column: 5,
+                row: 5,
+                modified: false,
+            },
+            false,
+        );
+        screen.draw(&state).expect("drawn");
+        let anchor = |rows: &[String]| {
+            rows.iter()
+                .enumerate()
+                .find_map(|(y, row)| {
+                    row.trim()
+                        .strip_prefix("ℹ row-")
+                        .map(|rest| (y, rest.to_owned()))
+                })
+                .expect("a conversation row in view")
+        };
+        let first = anchor(&painted(&screen));
+        let mut next = start;
+        for frame in 0..120 {
+            match frame % 8 {
+                0 => {
+                    state.live_text.push_str("streaming words of the answer\n");
+                }
+                1 => state
+                    .open_tools
+                    .push(("ipython".to_owned(), format!("call {frame}"))),
+                2 => {
+                    state.live_tool_output = (0..frame % 5).map(|n| format!("out {n}")).collect();
+                }
+                3 => {
+                    state.open_tools.clear();
+                    state.live_tool_output.clear();
+                    screen.insert_history_batch(&[notice(next)]);
+                    next += 1;
+                }
+                4 => {
+                    // The text committed as it is flushed.
+                    state.live_text.clear();
+                    screen.insert_history_batch(&[HistoryItem::Assistant {
+                        text: format!("answer part {frame}\nsecond line"),
+                    }]);
+                }
+                // The banner redrawn with a row arriving in the same batch.
+                5 => {
+                    screen.retitle(&["ha".to_owned(), format!("model {frame}")]);
+                    screen.insert_history_batch(&[notice(next)]);
+                    next += 1;
+                }
+                6 => state.phase = AppPhase::Ready,
+                _ => state.phase = AppPhase::Running,
+            }
+            screen.draw(&state).expect("drawn");
+            let rows = painted(&screen);
+            assert_eq!(
+                anchor(&rows),
+                first,
+                "frame {frame}: the rows the reader looks at moved:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
     /// A long run with several agents fills the conversation to its cap, and
     /// from then on every row drops the oldest one. That drew all entries again
     /// per row (the lag) and slid the rows under a reader who had scrolled back.

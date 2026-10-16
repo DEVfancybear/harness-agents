@@ -299,6 +299,54 @@ fn score(entry: &Entry, terms: &[(String, f64)], idf: &BTreeMap<String, f64>) ->
         .sum()
 }
 
+/// Entries that match `query`, best first, as indexes into `entries`: the
+/// digest's ranking, for the `memory` tool's search.
+#[must_use]
+pub fn rank(entries: &[Entry], query: &str) -> Vec<(usize, f64)> {
+    let terms = weighted_terms(None, &[query]);
+    let weights = idf(entries, &terms);
+    let mut ranked = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (index, score(entry, &terms, &weights)))
+        .filter(|(_, score)| *score > 0.0)
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+}
+
+/// Hold a scope's state lock: the sidecar the Python kernel's `rlm.harness`
+/// locks (`harness_state.json.lock`), so a read-modify-write from the host
+/// never interleaves with one from the kernel.
+///
+/// # Errors
+/// The lock cannot be opened, or another writer kept it past 30 seconds.
+pub fn lock_state(dir: &Path) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(dir).map_err(|error| format!("harness state directory: {error}"))?;
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(format!("{STATE_FILE}.lock")))
+        .map_err(|error| format!("harness state lock: {error}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err("waiting for another memory write timed out".to_owned());
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(format!("harness state lock: {error}"));
+            }
+        }
+    }
+}
+
 fn identity(entry: &Entry) -> String {
     format!(
         "{}\0{}\0{}",
@@ -328,6 +376,9 @@ pub struct DigestOptions {
     pub repl: bool,
     /// The `refine` skill is available (`includeRefineExamples`).
     pub refine: bool,
+    /// The native `memory` tool is available: memories and prompt notes are
+    /// kept with it, with or without the REPL.
+    pub memory_tool: bool,
 }
 
 /// `formatHarnessStateForPrompt`.
@@ -360,6 +411,19 @@ pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f6
         .to_owned(),
         String::new(),
     ];
+    if options.memory_tool
+        && let Some(contract) = lines
+            .iter()
+            .position(|line| line.starts_with("Call contract"))
+    {
+        lines.splice(
+            contract..contract,
+            [
+                "Memory tool: keep memories and prompt notes with the `memory` tool (list, search, read, write, delete). Only the most relevant few entries of each kind appear below, cut short: search memory for the rest, and read an entry before relying on its detail.".to_owned(),
+                String::new(),
+            ],
+        );
+    }
     let mut total = 0;
     for kind in KINDS {
         let mut entries = state.entries.get(kind).cloned().unwrap_or_default();
@@ -386,9 +450,12 @@ pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f6
             lines.push(format!("{kind}: {}", entries.len()));
         }
         if !terms.is_empty() && entries.len() > DEFAULT_ENTRY_LIMIT {
-            lines.push(
-                "(entries ranked by relevance to the current task; see harness.search)".to_owned(),
-            );
+            lines.push(if options.memory_tool && matches!(kind, "memory" | "prompt") {
+                "(entries ranked by relevance to the current task; the memory tool searches the rest)"
+                    .to_owned()
+            } else {
+                "(entries ranked by relevance to the current task; see harness.search)".to_owned()
+            });
         }
         for entry in entries.iter().take(DEFAULT_ENTRY_LIMIT) {
             let (Some(title), Some(content)) = (&entry.title, &entry.content) else {
@@ -571,6 +638,7 @@ mod tests {
             DigestOptions {
                 repl: true,
                 refine: false,
+                memory_tool: false,
             },
             &weighted_terms(None, &["how do deploys work"]),
         );
@@ -600,6 +668,29 @@ mod tests {
             "{digest}"
         );
         assert!(digest.contains("rlm.harness"), "{digest}");
+    }
+
+    #[test]
+    fn with_the_memory_tool_the_digest_points_at_it() {
+        let digest = format_digest(
+            &retrieval_fixture(),
+            DigestOptions {
+                memory_tool: true,
+                ..DigestOptions::default()
+            },
+            &weighted_terms(None, &["máy in"]),
+        );
+        let tool = digest.find("Memory tool:").expect("memory tool line");
+        assert!(
+            tool < digest.find("Call contract").expect("contract"),
+            "{digest}"
+        );
+        assert!(
+            digest.contains("the memory tool searches the rest"),
+            "{digest}"
+        );
+        let without = format_digest(&retrieval_fixture(), DigestOptions::default(), &[]);
+        assert!(!without.contains("Memory tool:"), "{without}");
     }
 
     #[test]

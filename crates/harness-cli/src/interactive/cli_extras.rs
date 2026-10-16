@@ -289,6 +289,7 @@ pub fn prompt(cwd: Option<&Path>, json: bool) -> Result<ExitCode, HarnessError> 
     {
         names.push("knowledge");
     }
+    names.push("memory");
     let (git_branch, changed_files) = super::service::prompt_git_facts(&root);
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let prompt_environment = super::prompt::PromptEnvironment {

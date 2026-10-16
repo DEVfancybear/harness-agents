@@ -293,8 +293,8 @@ fn allowed_fields(name: &str) -> Option<&'static [&'static str]> {
         "run_shell" => &["command", "timeout_ms", "isolation", "env"],
         "git_status" => &[],
         "read_process_output" => &["artifact_id", "stream", "offset", "length"],
-        "history_search" => &["query", "limit"],
-        "history_read" => &["source_id", "offset", "length"],
+        "history_search" => &["query", "limit", "scope"],
+        "history_read" => &["source_id", "offset", "length", "scope"],
         "git_log" => &["path", "limit"],
         "task_update" => &["note"],
         _ => return None,
@@ -552,20 +552,22 @@ pub fn history_tool_schemas() -> Vec<Value> {
     vec![
         function_schema(
             "history_search",
-            "Search this task's journal for earlier sources by keyword, including exact identifiers.",
+            "Search this conversation's journal for earlier sources by keyword, including exact identifiers. With scope \"project\", search every earlier conversation in this project too (how something was done or decided before); hits from another conversation name it and when it started.",
             json!({
                 "query": string_schema(),
-                "limit": {"type": "integer", "minimum": 1, "maximum": HISTORY_SEARCH_MAX_LIMIT}
+                "limit": {"type": "integer", "minimum": 1, "maximum": HISTORY_SEARCH_MAX_LIMIT},
+                "scope": {"type": "string", "enum": ["task", "project"], "description": "task (default): this conversation; project: every conversation in this project."}
             }),
             &["query"],
         ),
         function_schema(
             "history_read",
-            "Read one exact page of an indexed journal source that belongs to this task.",
+            "Read one exact page of an indexed journal source. A source from another conversation of this project needs scope \"project\".",
             json!({
                 "source_id": string_schema(),
                 "offset": {"type": "integer", "minimum": 0},
-                "length": {"type": "integer", "minimum": 1, "maximum": HISTORY_READ_MAX_BYTES}
+                "length": {"type": "integer", "minimum": 1, "maximum": HISTORY_READ_MAX_BYTES},
+                "scope": {"type": "string", "enum": ["task", "project"]}
             }),
             &["source_id"],
         ),
@@ -719,10 +721,13 @@ pub enum CodingToolAction {
         #[serde(default = "default_page_length")]
         length: u32,
     },
-    /// Search this task's indexed journal.
+    /// Search this task's indexed journal, or with `project` every
+    /// conversation of the project.
     HistorySearch {
         query: String,
         limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        project: bool,
     },
     /// Read one exact page of an indexed journal source.
     HistoryRead {
@@ -731,6 +736,8 @@ pub enum CodingToolAction {
         offset: u64,
         #[serde(default = "default_history_page_length")]
         length: u32,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        project: bool,
     },
     GitStatus,
     GitDiff {
@@ -1034,7 +1041,11 @@ impl CodingToolAction {
                             })?,
                     ),
                 };
-                Ok(Self::HistorySearch { query, limit })
+                Ok(Self::HistorySearch {
+                    query,
+                    limit,
+                    project: parse_history_scope(object.get("scope"), "history_search")?,
+                })
             }
             "history_read" => {
                 let source_id = required_string(object, "source_id")?;
@@ -1072,6 +1083,7 @@ impl CodingToolAction {
                     source_id,
                     offset,
                     length,
+                    project: parse_history_scope(object.get("scope"), "history_read")?,
                 })
             }
             "git_status" => Ok(Self::GitStatus),
@@ -1395,6 +1407,23 @@ fn parse_env_bindings(
         });
     }
     normalize_env_bindings(&bindings)
+}
+
+/// `scope`: `task` (or none) is this conversation, `project` every
+/// conversation of the project.
+fn parse_history_scope(
+    value: Option<&Value>,
+    tool: &str,
+) -> Result<bool, harness_types::HarnessError> {
+    match value {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(scope)) if scope == "task" => Ok(false),
+        Some(Value::String(scope)) if scope == "project" => Ok(true),
+        Some(_) => Err(harness_types::HarnessError::new(
+            harness_types::ErrorCode::InvalidPayload,
+            format!("provider {tool} scope must be \"task\" or \"project\""),
+        )),
+    }
 }
 
 fn parse_isolation(value: Option<&Value>) -> Result<IsolationMode, harness_types::HarnessError> {
@@ -1807,6 +1836,11 @@ pub struct HistoryHitView {
     pub availability: String,
     pub matched_terms: u64,
     pub preview: String,
+    /// The conversation a hit from another one belongs to, and when it began.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started: Option<String>,
 }
 
 /// The immutable receipt plus a non-authoritative presentation projection.

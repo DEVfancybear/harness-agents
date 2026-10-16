@@ -2481,8 +2481,17 @@ fn summarize_action(action: &CodingToolAction) -> String {
             "read captured {} of {artifact_id} at {offset} ({length} bytes)",
             stream.as_str()
         ),
-        CodingToolAction::HistorySearch { query, limit } => format!(
-            "search history {query:?} (limit {})",
+        CodingToolAction::HistorySearch {
+            query,
+            limit,
+            project,
+        } => format!(
+            "search {} history {query:?} (limit {})",
+            if *project {
+                "project"
+            } else {
+                "this conversation's"
+            },
             limit.unwrap_or(HISTORY_SEARCH_DEFAULT_LIMIT)
         ),
         CodingToolAction::HistoryRead {
@@ -3099,12 +3108,18 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             hits.len(),
             hits.iter()
                 .map(|hit| format!(
-                    "{} seq={} kind={} availability={} matched={} :: {}",
+                    "{} seq={} kind={} availability={} matched={}{} :: {}",
                     hit.source_id,
                     hit.sequence,
                     hit.kind,
                     hit.availability,
                     hit.matched_terms,
+                    match (&hit.conversation, &hit.started) {
+                        (Some(conversation), Some(started)) =>
+                            format!(" conversation={conversation} started={started}"),
+                        (Some(conversation), None) => format!(" conversation={conversation}"),
+                        _ => String::new(),
+                    },
                     hit.preview
                 ))
                 .collect::<Vec<_>>()

@@ -549,9 +549,10 @@ pub async fn run_with(
         None,
         None,
     );
-    tools = tools.with_external(super::knowledge::with_dispatcher(
-        dispatcher,
-        &knowledge_host,
+    let memory_host = super::memory::MemoryHost::new(&context.paths.data_dir, task_id.as_str());
+    tools = tools.with_external(super::memory::with_dispatcher(
+        super::knowledge::with_dispatcher(dispatcher, &knowledge_host),
+        &memory_host,
     ));
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
     let external_tools = super::mcp::combined_tools_with_delegate(
@@ -564,9 +565,12 @@ pub async fn run_with(
         None,
         None,
     );
-    let external_tools = Some(super::knowledge::with_tools(
-        external_tools,
-        &knowledge_host,
+    let external_tools = Some(super::memory::with_tools(
+        Some(super::knowledge::with_tools(
+            external_tools,
+            &knowledge_host,
+        )),
+        &memory_host,
     ));
     let driver = match &external_tools {
         Some(external) => driver.with_external(external.clone()),
@@ -697,7 +701,10 @@ pub async fn run_with(
     let mut project_blocks = vec![super::harness::digest_block(
         &super::harness::format_digest(
             &harness_state,
-            super::harness::DigestOptions::default(),
+            super::harness::DigestOptions {
+                memory_tool: true,
+                ..super::harness::DigestOptions::default()
+            },
             &super::harness::weighted_terms(None, &[request.prompt.as_str()]),
         ),
     )];

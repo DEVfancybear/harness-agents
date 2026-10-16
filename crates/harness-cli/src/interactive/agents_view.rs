@@ -956,6 +956,7 @@ fn status_mark(row: &Row, theme: &Theme) -> (&'static str, ratatui::style::Style
             match status {
                 "running" => ("●", theme.tool_ok),
                 "error" => ("✗", theme.error),
+                "stopped" => ("■", theme.muted),
                 _ => ("✓", theme.dim),
             }
         }

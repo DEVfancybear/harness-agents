@@ -134,9 +134,9 @@ pub fn selection_for(entry: &super::providers::Model) -> Selection {
 pub fn with_catalog_model(mut overrides: ConfigOverrides, data_dir: &Path) -> ConfigOverrides {
     if overrides.model_selection.is_none()
         && let Some(model) = overrides.model.as_deref()
-        && let Some(entry) = super::providers::Catalog::load(data_dir).find(model)
+        && let Some(entry) = super::providers::Catalog::load(data_dir).find_or_listed(model)
     {
-        overrides.model_selection = Some(selection_for(entry));
+        overrides.model_selection = Some(selection_for(&entry));
     }
     overrides
 }
