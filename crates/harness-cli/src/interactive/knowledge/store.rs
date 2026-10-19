@@ -19,6 +19,9 @@ mod manage;
 
 const STATE: &str = ".ha-state.json";
 const PENDING: &str = ".ha-pending.json";
+/// An interrupted transaction set aside because a file it would write was
+/// changed since; kept for a look, never replayed.
+const ABANDONED: &str = ".ha-pending.abandoned.json";
 const INDEX: &str = "index.md";
 const LOG: &str = "log.md";
 const META: &str = "<!-- ha-knowledge: ";
@@ -56,6 +59,8 @@ pub(crate) struct WritePageUpdate {
     pub sources: Option<Vec<String>>,
     pub related: Option<Vec<String>>,
     pub expected_hash: Option<String>,
+    /// Who writes (see `Metadata::origin`); `None` keeps the page's.
+    pub origin: Option<String>,
 }
 
 #[cfg(test)]
@@ -69,6 +74,7 @@ impl From<WritePage> for WritePageUpdate {
             sources: Some(input.sources),
             related: Some(input.related),
             expected_hash: input.expected_hash,
+            origin: None,
         }
     }
 }
@@ -155,6 +161,10 @@ struct Metadata {
     sources: Vec<String>,
     #[serde(default)]
     related: Vec<String>,
+    /// Who wrote the page when it was not the agent at the user's word:
+    /// `review` for a page the automatic review proposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -401,6 +411,10 @@ impl Store {
         self.write_update(&input.into())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one locked read, check and write of a page and its index and log"
+    )]
     pub(crate) fn write_update(&self, input: &WritePageUpdate) -> Result<PageSummary, String> {
         let path = page_path(&input.path)?;
         self.with_lock(|root| {
@@ -460,6 +474,7 @@ impl Store {
                 summary: summary.clone(),
                 sources: sources.iter().cloned().collect(),
                 related: related.into_iter().collect(),
+                origin: input.origin.clone().or_else(|| declared.origin.clone()),
             };
             let text = render_page(&actual_path, &metadata, &input.content)?;
             if let Some(i) = existing {
@@ -503,7 +518,14 @@ impl Store {
                 after: Some(text),
             }];
             changes.push(change(root, INDEX, Some(render_index(&pages)?))?);
-            add_log(root, &mut changes, "write", &actual_path, &output.hash)?;
+            add_log(
+                root,
+                &mut changes,
+                "write",
+                &actual_path,
+                &output.hash,
+                input.origin.as_deref(),
+            )?;
             transact(root, changes)?;
             Ok(output)
         })
@@ -519,11 +541,12 @@ impl Store {
                 return Err("knowledge page changed; deletion requires its current hash".to_owned());
             }
             let path = page.summary.path.clone();
-            if !backlinks(&pages, &path).is_empty() {
-                return Err(
-                    "knowledge page has backlinks; update referring pages before deleting it"
-                        .to_owned(),
-                );
+            let referring = backlinks(&pages, &path);
+            if !referring.is_empty() {
+                return Err(format!(
+                    "knowledge page has backlinks; update the pages that link to it before deleting it: {}",
+                    referring.join(", ")
+                ));
             }
             pages.retain(|p| p.summary.path != path);
             let mut changes = vec![Change {
@@ -532,7 +555,7 @@ impl Store {
                 after: None,
             }];
             changes.push(change(root, INDEX, Some(render_index(&pages)?))?);
-            add_log(root, &mut changes, "delete", &path, expected_hash)?;
+            add_log(root, &mut changes, "delete", &path, expected_hash, None)?;
             transact(root, changes)
         })
     }
@@ -602,34 +625,8 @@ impl Store {
             if pages.is_empty() {
                 return Ok(String::new());
             }
-            let documents = search_documents(&pages);
-            let mut scores: BTreeMap<&str, f64> = BTreeMap::new();
-            for (query, weight) in queries {
-                for (rank, hit) in rank_pages(&pages, &documents, &normalized(query), 20)
-                    .into_iter()
-                    .enumerate()
-                {
-                    let Some(page) = pages.iter().find(|page| page.summary.path == hit.path) else {
-                        continue;
-                    };
-                    *scores.entry(page.summary.path.as_str()).or_default() +=
-                        weight / (61.0 + f64::from(u32::try_from(rank).unwrap_or(u32::MAX)));
-                }
-            }
-            let mut ranked = scores.into_iter().collect::<Vec<_>>();
-            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-            let mut ordered = ranked
-                .iter()
-                .filter_map(|(path, _)| pages.iter().find(|p| p.summary.path == *path))
-                .collect::<Vec<_>>();
-            for page in &pages {
-                if ordered.len() >= 40 {
-                    break;
-                }
-                if !ordered.iter().any(|p| p.summary.path == page.summary.path) {
-                    ordered.push(page);
-                }
-            }
+            let mut ordered = ranked(&pages, queries);
+            ordered.truncate(40);
             let limit = max_chars.min(20_000);
             let mut output = String::new();
             let mut shown = 0;
@@ -661,6 +658,73 @@ impl Store {
                 );
             }
             Ok(output)
+        })
+    }
+
+    /// The pages, the most relevant to `queries` first, then the rest by path:
+    /// the list the automatic review sees, so the page it would duplicate is
+    /// in it however large the library.
+    pub(crate) fn ranked_list(
+        &self,
+        queries: &[(&str, f64)],
+        limit: usize,
+    ) -> Result<Vec<PageSummary>, String> {
+        self.with_lock(|root| {
+            require_enabled(root)?;
+            let pages = scan(root)?;
+            Ok(ranked(&pages, queries)
+                .into_iter()
+                .take(limit)
+                .map(|page| page.summary.clone())
+                .collect())
+        })
+    }
+
+    /// The page this title and summary already describe, and how much of the
+    /// new one's words it holds (weighted by how rare each word is among the
+    /// pages), when that is most of them.
+    pub(crate) fn same_subject(
+        &self,
+        title: &str,
+        summary: &str,
+    ) -> Result<Option<(PageSummary, f64)>, String> {
+        self.with_lock(|root| {
+            if !enabled_at(root)? {
+                return Ok(None);
+            }
+            let pages = scan(root)?;
+            let words = |text: &str| {
+                crate::interactive::harness::query_terms(&fold(text))
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+            };
+            let new = words(&format!("{title} {summary}"));
+            if new.len() < 2 {
+                return Ok(None);
+            }
+            let kept = pages
+                .iter()
+                .map(|page| words(&format!("{} {}", page.summary.title, page.summary.summary)))
+                .collect::<Vec<_>>();
+            #[allow(clippy::cast_precision_loss, reason = "a page count")]
+            let total = pages.len() as f64;
+            let weight = |word: &String| {
+                #[allow(clippy::cast_precision_loss, reason = "a page count")]
+                let frequency = kept.iter().filter(|words| words.contains(word)).count() as f64;
+                ((total + 1.0) / (frequency + 1.0)).ln() + 1.0
+            };
+            let whole = new.iter().map(weight).sum::<f64>();
+            let best = pages
+                .iter()
+                .zip(&kept)
+                .map(|(page, words)| {
+                    let shared = new.intersection(words).map(weight).sum::<f64>();
+                    (page, shared / whole)
+                })
+                .max_by(|a, b| a.1.total_cmp(&b.1));
+            Ok(best
+                .filter(|(_, share)| *share >= SAME_SUBJECT_SHARE)
+                .map(|(page, share)| (page.summary.clone(), share)))
         })
     }
 
@@ -1138,6 +1202,41 @@ fn find_page<'a>(pages: &'a [Page], path: &str) -> Result<&'a Page, String> {
         .ok_or_else(|| format!("knowledge page not found: {path}"))
 }
 
+/// How much of a proposed page's title and summary an existing page must
+/// hold to be the same subject.
+const SAME_SUBJECT_SHARE: f64 = 0.7;
+
+/// `pages` ranked by each of `queries` by its weight (reciprocal rank
+/// fusion), then the rest by path.
+fn ranked<'a>(pages: &'a [Page], queries: &[(&str, f64)]) -> Vec<&'a Page> {
+    let documents = search_documents(pages);
+    let mut scores: BTreeMap<&str, f64> = BTreeMap::new();
+    for (query, weight) in queries {
+        for (rank, hit) in rank_pages(pages, &documents, &normalized(query), 20)
+            .into_iter()
+            .enumerate()
+        {
+            let Some(page) = pages.iter().find(|page| page.summary.path == hit.path) else {
+                continue;
+            };
+            *scores.entry(page.summary.path.as_str()).or_default() +=
+                weight / (61.0 + f64::from(u32::try_from(rank).unwrap_or(u32::MAX)));
+        }
+    }
+    let mut fused = scores.into_iter().collect::<Vec<_>>();
+    fused.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let mut ordered = fused
+        .iter()
+        .filter_map(|(path, _)| pages.iter().find(|p| p.summary.path == *path))
+        .collect::<Vec<_>>();
+    for page in pages {
+        if !ordered.iter().any(|p| p.summary.path == page.summary.path) {
+            ordered.push(page);
+        }
+    }
+    ordered
+}
+
 fn backlinks(pages: &[Page], path: &str) -> Vec<String> {
     pages
         .iter()
@@ -1534,19 +1633,29 @@ fn add_log(
     action: &str,
     path: &str,
     page_hash: &str,
+    by: Option<&str>,
 ) -> Result<(), String> {
     let mut log = read_bounded(&safe_file(root, LOG)?, MAX_HISTORY)?.unwrap_or_default();
     if !log.is_empty() && !log.ends_with('\n') {
         log.push('\n');
     }
-    let _ = writeln!(
+    let _ = write!(
         log,
         "- {} {action} {} {page_hash}",
         unique_id(),
         serde_json::to_string(path).map_err(error)?
     );
+    if let Some(by) = by {
+        let _ = write!(log, " by {by}");
+    }
+    log.push('\n');
+    // The oldest lines go: a full history refused every later write, for good.
     if log.len() > MAX_HISTORY {
-        return Err("knowledge history size limit reached".to_owned());
+        let keep_from = log.len() - MAX_HISTORY / 4 * 3;
+        let start = log[keep_from..]
+            .find('\n')
+            .map_or(keep_from, |offset| keep_from + offset + 1);
+        log.drain(..start);
     }
     changes.push(change(root, LOG, Some(log))?);
     Ok(())
@@ -1583,6 +1692,24 @@ fn recover(root: &Path) -> Result<(), String> {
     };
     let transaction: Transaction = serde_json::from_str(&journal)
         .map_err(|e| format!("invalid pending knowledge transaction: {e}"))?;
+    // A file changed by someone else since the transaction stopped: their
+    // version stands, and the interrupted write is set aside instead of
+    // refusing every later call - `/knowledge off` included - for good. The
+    // index is rebuilt from the pages as they are.
+    let conflicting = transaction.changes.iter().any(|change| {
+        safe_file(root, &change.path)
+            .and_then(|destination| read_bounded(&destination, file_limit(&change.path)))
+            .map(|current| current.map(|text| hash(&text)))
+            .is_ok_and(|current| {
+                current != change.after.as_deref().map(hash) && current != change.before
+            })
+    });
+    if conflicting {
+        fs::rename(safe_file(root, PENDING)?, root.join(ABANDONED)).map_err(error)?;
+        let pages = scan(root)?;
+        atomic_write(root, INDEX, &render_index(&pages)?)?;
+        return sync_directory(root);
+    }
     validate_transaction(root, &transaction)?;
     // Validate every input before touching any remaining file.
     for change in transaction.changes {
@@ -2326,6 +2453,9 @@ mod tests {
     }
 
     #[test]
+    /// An interrupted write whose file someone changed since: their version
+    /// stands, and the write is set aside rather than refusing every later
+    /// call - `/knowledge off` included - for good.
     fn recovery_preserves_conflicting_external_changes() {
         let (_dir, store) = store();
         let root = resolved_root(&store.root).unwrap();
@@ -2344,13 +2474,36 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("a.md"), "external edit").unwrap();
-        assert!(store.list().is_err());
+        store.list().expect("the store is usable again");
         assert_eq!(
             fs::read_to_string(root.join("a.md")).unwrap(),
             "external edit"
         );
-        assert!(!root.join(INDEX).exists());
-        assert!(root.join(PENDING).exists());
+        assert!(!root.join(PENDING).exists());
+        assert!(root.join(ABANDONED).exists(), "kept for a look");
+        assert!(
+            fs::read_to_string(root.join(INDEX))
+                .unwrap()
+                .contains("a.md"),
+            "the index is rebuilt from the pages as they are"
+        );
+    }
+
+    /// A full history no longer refuses every later write: its oldest lines go.
+    #[test]
+    fn a_full_history_drops_its_oldest_lines() {
+        let (_dir, store) = store();
+        store.write(input("a.md", "first\n")).unwrap();
+        let root = resolved_root(&store.root).unwrap();
+        let line = "- old write \"x.md\" sha256:0\n";
+        // Just under the limit, so the next line takes it over.
+        let old = line.repeat((MAX_HISTORY - 40) / line.len());
+        fs::write(root.join(LOG), &old).unwrap();
+        store.write(input("b.md", "second\n")).unwrap();
+        let log = fs::read_to_string(root.join(LOG)).unwrap();
+        assert!(log.len() <= MAX_HISTORY, "{}", log.len());
+        assert!(log.lines().last().unwrap().contains("\"b.md\""));
+        assert!(log.lines().next().unwrap().starts_with("- old write"));
     }
 
     #[cfg(unix)]

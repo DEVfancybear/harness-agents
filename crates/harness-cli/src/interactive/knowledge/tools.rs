@@ -40,6 +40,8 @@ pub struct KnowledgeHost {
     project: PathBuf,
     global: PathBuf,
     read_only: bool,
+    /// Who writes through this host when it is not the agent: the review.
+    origin: Option<String>,
 }
 
 impl KnowledgeHost {
@@ -51,6 +53,7 @@ impl KnowledgeHost {
                 .join("knowledge"),
             global: data_dir.join("knowledge"),
             read_only: false,
+            origin: None,
         }
     }
 
@@ -436,6 +439,7 @@ impl KnowledgeHost {
                             .get("expected_hash")
                             .and_then(Value::as_str)
                             .map(str::to_owned),
+                        origin: self.origin.clone(),
                     })?;
                     let mut value =
                         serde_json::to_value(page).map_err(|error| error.to_string())?;
@@ -517,7 +521,44 @@ impl KnowledgeHost {
     /// page, through the same checks as the tool: one already at the path is
     /// the agent's to update after reading it. Returns the written page and the
     /// library root a rollback deletes it from.
-    pub(crate) fn review_create(&self, page: &Value) -> Result<(Value, PathBuf), String> {
+    /// Write a page the automatic review proposed: only a new subject, only
+    /// with a verbatim quote from the conversation as its evidence, and
+    /// marked as the review's in its metadata and the library's log. Seen: a
+    /// review wrote `exponential-backoff.md` beside the `retry-backoff.md`
+    /// it could not see, with nothing saying where either came from.
+    pub(crate) fn review_create(
+        &self,
+        page: &Value,
+        conversation: &str,
+    ) -> Result<(Value, PathBuf), String> {
+        let evidence = page["evidence"].as_str().unwrap_or_default();
+        if !quoted_in(evidence, conversation) {
+            return Err(
+                "a review's page needs `evidence`: a verbatim quote from the conversation"
+                    .to_owned(),
+            );
+        }
+        let scope = Self::scopes(page, false)?[0];
+        if let Some((same, share)) = self.store(scope).same_subject(
+            page["title"].as_str().unwrap_or_default(),
+            page["summary"].as_str().unwrap_or_default(),
+        )? {
+            return Err(format!(
+                "{} knowledge already has this subject in {} ({:?}, {:.0}% of the title and summary): it is updated by the agent after reading it, not written again",
+                scope.label(),
+                same.path,
+                same.title,
+                share * 100.0
+            ));
+        }
+        let reviewer = Self {
+            origin: Some("review".to_owned()),
+            ..self.clone()
+        };
+        reviewer.write_reviewed(page)
+    }
+
+    fn write_reviewed(&self, page: &Value) -> Result<(Value, PathBuf), String> {
         let mut arguments = serde_json::Map::new();
         for key in [
             "scope", "path", "title", "summary", "content", "sources", "related",
@@ -544,8 +585,10 @@ impl KnowledgeHost {
         Ok((written, self.root(scope).to_path_buf()))
     }
 
-    /// The pages the review may not duplicate, by path and title.
-    pub(crate) fn review_catalog(&self) -> Option<String> {
+    /// The pages the review may not duplicate, by path and title, the most
+    /// relevant to the conversation first: the first eighty by path left out
+    /// the page it then wrote again.
+    pub(crate) fn review_catalog(&self, conversation: &str) -> Option<String> {
         if !self.store(Scope::Project).enabled().ok()? {
             return None;
         }
@@ -555,7 +598,10 @@ impl KnowledgeHost {
             if !store.enabled().unwrap_or(false) {
                 continue;
             }
-            for page in store.list().unwrap_or_default().into_iter().take(80) {
+            for page in store
+                .ranked_list(&[(conversation, 1.0)], 80)
+                .unwrap_or_default()
+            {
                 lines.push(format!(
                     "- {} {}: {} - {}",
                     scope.label(),
@@ -752,6 +798,23 @@ fn refuse_secret(arguments: &Value) -> Result<(), String> {
         "knowledge never keeps secrets; this looks like {}. Write the page without the value (name the variable or file that holds it)",
         hits.join(", ")
     ))
+}
+
+/// Whether `quote` is in `text`, whitespace and case aside: at least its
+/// first 60 characters, and it says something (8 characters or more).
+fn quoted_in(quote: &str, text: &str) -> bool {
+    let squeeze = |text: &str| {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let quote = squeeze(quote);
+    if quote.chars().count() < 8 {
+        return false;
+    }
+    let head = quote.chars().take(60).collect::<String>();
+    squeeze(text).contains(&head)
 }
 
 fn search_queries(arguments: &Value) -> Result<Vec<String>, String> {
@@ -1066,6 +1129,7 @@ mod tests {
             project: root.join("project"),
             global: root.join("global"),
             read_only: false,
+            origin: None,
         }
     }
 
@@ -1096,9 +1160,10 @@ mod tests {
             "a source is checked too"
         );
         let proposal = json!({"scope":"project","path":"ops/review.md","title":"Deploy",
-            "summary":"How deploys work","content":"Bearer FAKEtoken0123456789abcdef\n"});
+            "summary":"How deploys work","content":"Bearer FAKEtoken0123456789abcdef\n",
+            "evidence":"deploys go through the staging gate"});
         let refused = host
-            .review_create(&proposal)
+            .review_create(&proposal, "user: deploys go through the staging gate")
             .expect_err("a proposal is refused");
         assert!(refused.contains("never keeps secrets"), "{refused}");
         assert!(
@@ -1112,6 +1177,77 @@ mod tests {
         );
         host.execute(&clean)
             .expect("a page naming the variable is kept");
+    }
+
+    /// Seen: a review wrote `exponential-backoff.md` beside the
+    /// `retry-backoff.md` it could not see. A review's page needs a quote from
+    /// the conversation, is refused on a subject a page already has, and says
+    /// it is the review's in its metadata and the library's log.
+    #[test]
+    fn a_reviews_page_is_new_quoted_and_marked_as_the_reviews() {
+        let root = tempfile::tempdir().expect("root");
+        let host = host(root.path());
+        let mut existing = page(
+            "project",
+            "concepts/retry-backoff.md",
+            "Double the wait each time.\n",
+        );
+        existing["title"] = json!("Retry backoff");
+        existing["summary"] = json!("Exponential backoff for retries of the client");
+        host.execute(&existing).expect("an agent's page");
+        for index in 0..90 {
+            host.execute(&page(
+                "project",
+                &format!("analysis/a-{index:02}.md"),
+                "filler\n",
+            ))
+            .expect("filler");
+        }
+        let conversation = "user: so the client retries with exponential backoff, doubling the wait and capping it at 30 seconds";
+        let catalog = host.review_catalog(conversation).expect("catalog");
+        assert!(
+            catalog.contains("concepts/retry-backoff.md"),
+            "ranked into the review's view past the first 80 pages: {catalog}"
+        );
+        let same = json!({"scope": "project", "path": "concepts/exponential-backoff.md",
+            "title": "Exponential backoff", "summary": "Retries of the client with exponential backoff",
+            "content": "Double it.", "evidence": "doubling the wait and capping it at 30 seconds"});
+        let refused = host
+            .review_create(&same, conversation)
+            .expect_err("same subject");
+        assert!(refused.contains("concepts/retry-backoff.md"), "{refused}");
+        let unquoted = json!({"scope": "project", "path": "concepts/jitter.md",
+            "title": "Jitter", "summary": "Random spread of retry times",
+            "content": "Add jitter.", "evidence": "nobody said this"});
+        let refused = host
+            .review_create(&unquoted, conversation)
+            .expect_err("no quote");
+        assert!(refused.contains("verbatim quote"), "{refused}");
+        let mut quoted = unquoted.clone();
+        quoted["evidence"] = json!("capping it at 30 seconds");
+        host.review_create(&quoted, conversation)
+            .expect("a new subject, quoted");
+        let text =
+            std::fs::read_to_string(root.path().join("project/concepts/jitter.md")).expect("page");
+        assert!(
+            text.lines()
+                .next()
+                .unwrap()
+                .contains("\"origin\":\"review\""),
+            "{text}"
+        );
+        let log = std::fs::read_to_string(root.path().join("project/log.md")).expect("log");
+        assert!(log.lines().last().unwrap().ends_with(" by review"), "{log}");
+        // The agent updating it keeps where it came from.
+        let read = host
+            .execute(&json!({"action":"read","scope":"project","path":"concepts/jitter.md"}))
+            .expect("read");
+        let mut update = page("project", "concepts/jitter.md", "Add full jitter.\n");
+        update["expected_hash"] = read["results"][0]["hash"].clone();
+        host.execute(&update).expect("updated");
+        let text =
+            std::fs::read_to_string(root.path().join("project/concepts/jitter.md")).expect("page");
+        assert!(text.contains("\"origin\":\"review\""), "{text}");
     }
 
     /// A project library keeps itself out of Git: its pages left the checkout
@@ -1130,10 +1266,14 @@ mod tests {
         };
         git(&["init", "-q"]);
         let host = KnowledgeHost::new(&workspace, &directory.path().join("data"));
-        host.review_create(&json!({
-            "scope": "project", "path": "concepts/fees.md", "title": "Fees",
-            "summary": "late fees", "content": "2,000 per day"
-        }))
+        host.review_create(
+            &json!({
+                "scope": "project", "path": "concepts/fees.md", "title": "Fees",
+                "summary": "late fees", "content": "2,000 per day",
+                "evidence": "late fees are 2,000 per day"
+            }),
+            "user: late fees are 2,000 per day",
+        )
         .expect("written");
         let status = git(&["status", "--porcelain", "--untracked-files=all"]);
         assert_eq!(
@@ -1142,7 +1282,7 @@ mod tests {
             "nothing for Git to see"
         );
         assert!(
-            host.review_catalog()
+            host.review_catalog("fees")
                 .expect("catalog")
                 .contains("concepts/fees.md"),
             "the page is still a page"

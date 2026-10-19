@@ -581,6 +581,7 @@ fn commit(
         action,
         &affected.join(", "),
         &hash(&affected.join("\n")),
+        None,
     )?;
     transact(root, changes)?;
     Ok(affected)

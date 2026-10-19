@@ -2082,7 +2082,7 @@ fn record_skill_outcomes(learning: &Learning, outcomes: &[Value]) -> Vec<Value> 
         .collect()
 }
 
-const KNOWLEDGE_PROPOSALS: &str = "Knowledge (not an edit kind) is the user's library of topical Markdown pages shared across conversations. When the conversation produced substantive reusable knowledge the main agent did not save - a researched conclusion, a method or concept worked out, a source the user shared to study - propose it in a top-level `knowledge` array: {\"scope\": \"project\" or \"global\", \"path\": \"concepts/short-name.md\", \"title\": \"...\", \"summary\": \"one line\", \"content\": \"Markdown, in the material's language\", \"sources\": [\"URLs or documents it came from\"], \"reason\": \"why\"}. Use project scope unless the knowledge is explicitly shared across projects; use sources/, concepts/, entities/ or analysis/ for the path. Only new pages: never a page listed below. Skip trivial exchanges, task progress, secrets, personal facts (memory) and procedures (learned skills). Weigh this whatever the review's instructions focus on. Leave `knowledge` empty when nothing meets the bar.";
+const KNOWLEDGE_PROPOSALS: &str = "Knowledge (not an edit kind) is the user's library of topical Markdown pages shared across conversations. When the conversation produced substantive reusable knowledge the main agent did not save - a researched conclusion, a method or concept worked out, a source the user shared to study - propose it in a top-level `knowledge` array: {\"scope\": \"project\" or \"global\", \"path\": \"concepts/short-name.md\", \"title\": \"...\", \"summary\": \"one line\", \"content\": \"Markdown, in the material's language\", \"sources\": [\"URLs or documents it came from\"], \"evidence\": \"a verbatim quote from the conversation that the page rests on\", \"reason\": \"why\"}. Use project scope unless the knowledge is explicitly shared across projects; use sources/, concepts/, entities/ or analysis/ for the path. Only new subjects: never a page listed below, nor one on the same subject under another name - a page already there is the agent's to update. A page without a verbatim quote from the conversation as its evidence is refused. Skip trivial exchanges, task progress, secrets, personal facts (memory) and procedures (learned skills). Weigh this whatever the review's instructions focus on. Leave `knowledge` empty when nothing meets the bar.";
 
 impl Edit {
     /// An automatic review's memory edit meant for every conversation.
@@ -2100,7 +2100,11 @@ impl Edit {
 
 /// Write the proposal's knowledge pages, each recorded as an edit of the
 /// refinement so a rollback deletes it.
-fn create_pages(host: &super::knowledge::KnowledgeHost, pages: &[Value]) -> Vec<Value> {
+fn create_pages(
+    host: &super::knowledge::KnowledgeHost,
+    pages: &[Value],
+    conversation: &str,
+) -> Vec<Value> {
     pages
         .iter()
         .take(4)
@@ -2112,7 +2116,7 @@ fn create_pages(host: &super::knowledge::KnowledgeHost, pages: &[Value]) -> Vec<
                 "level": page["scope"].as_str().unwrap_or("project"),
                 "reason": page["reason"].clone(),
             });
-            match host.review_create(page) {
+            match host.review_create(page, conversation) {
                 Ok((written, root)) => {
                     record["hash"] = written["hash"].clone();
                     record["id"] = written["path"].clone();
@@ -2174,7 +2178,16 @@ pub async fn auto_refine(
         instructions,
         ..RefineOptions::default()
     };
-    let catalog = knowledge.and_then(super::knowledge::KnowledgeHost::review_catalog);
+    // Ranked by the conversation's end, where what was worked out is.
+    let tail = {
+        let start = conversation
+            .char_indices()
+            .rev()
+            .nth(6_000)
+            .map_or(0, |(index, _)| index);
+        &conversation[start..]
+    };
+    let catalog = knowledge.and_then(|host| host.review_catalog(tail));
     let mut extra = catalog
         .iter()
         .map(|catalog| {
@@ -2215,7 +2228,7 @@ pub async fn auto_refine(
         });
     proposal.edits = local_edits;
     if let Some(host) = knowledge.filter(|_| catalog.is_some()) {
-        proposal.knowledge_records = create_pages(host, &proposal.knowledge);
+        proposal.knowledge_records = create_pages(host, &proposal.knowledge, conversation);
     }
     if let Some(learning) = learning {
         proposal.skill_outcome_records = record_skill_outcomes(learning, &proposal.skill_outcomes);
@@ -3594,9 +3607,10 @@ mod tests {
         );
         let existing = json!({
             "scope": "project", "path": "concepts/existing.md", "title": "Existing",
-            "summary": "already here", "content": "kept"
+            "summary": "already here", "content": "kept", "evidence": "the existing page"
         });
-        host.review_create(&existing).expect("seed page");
+        host.review_create(&existing, "the existing page")
+            .expect("seed page");
         let reply = json!({
             "summary": "kept the user's language and the retry method",
             "rationale": "the user said always answer in Vietnamese",
@@ -3608,7 +3622,7 @@ mod tests {
                 {"action": "create", "kind": "prompt", "title": "Tone", "content": "be brief", "scope": "global", "reason": "only memory goes global"}
             ],
             "knowledge": [
-                {"scope": "project", "path": "concepts/retry-backoff.md", "title": "Retry with backoff", "summary": "how the client retries", "content": "Double the wait, cap at 30 s.", "sources": ["https://example.com/retry"], "reason": "worked out in this conversation"},
+                {"scope": "project", "path": "concepts/retry-backoff.md", "title": "Retry with backoff", "summary": "how the client retries", "content": "Double the wait, cap at 30 s.", "sources": ["https://example.com/retry"], "evidence": "double the wait, cap at 30 s", "reason": "worked out in this conversation"},
                 {"scope": "project", "path": "concepts/existing.md", "title": "Existing", "summary": "overwrite", "content": "replaced", "reason": "a duplicate"}
             ]
         })
@@ -3618,7 +3632,7 @@ mod tests {
         let refinements = super::auto_refine(
             &provider,
             "fixture-model",
-            "[User]: luôn trả lời bằng tiếng Việt\n\n[Assistant]: vâng",
+            "[User]: retry: double the wait, cap at 30 s. luôn trả lời bằng tiếng Việt\n\n[Assistant]: vâng",
             &scopes,
             Some("keep the preference".to_owned()),
             None,
@@ -3663,7 +3677,7 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0]["applied"], true, "{}", pages[0]);
         assert_eq!(pages[1]["applied"], false, "never over an existing page");
-        let catalog = host.review_catalog().expect("catalog");
+        let catalog = host.review_catalog("").expect("catalog");
         assert!(catalog.contains("concepts/retry-backoff.md"), "{catalog}");
         assert!(
             local
@@ -3700,14 +3714,14 @@ mod tests {
         assert!(load_raw(&scopes.local)["entries"]["memory"]["current_step"].is_null());
         assert!(
             !host
-                .review_catalog()
+                .review_catalog("")
                 .expect("catalog")
                 .contains("retry-backoff"),
             "{}",
             undone.record
         );
         assert!(
-            host.review_catalog()
+            host.review_catalog("")
                 .expect("catalog")
                 .contains("concepts/existing.md"),
             "the page the review did not write stays"
