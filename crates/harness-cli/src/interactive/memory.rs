@@ -54,8 +54,8 @@ const CONTAINED_SHARE: f64 = 0.85;
 const CONTAINED_MIN_WORDS: usize = 4;
 const RELATED_SIMILARITY: f64 = 0.3;
 /// An entry is a fact or a rule, not a document; a document is knowledge.
-const MAX_CONTENT_CHARS: usize = 4_000;
-const MAX_TITLE_CHARS: usize = 200;
+pub(crate) const MAX_CONTENT_CHARS: usize = 4_000;
+pub(crate) const MAX_TITLE_CHARS: usize = 200;
 const MAX_PATH_CHARS: usize = 120;
 const SNIPPET_CHARS: usize = 400;
 const SUMMARY_CHARS: usize = 160;
@@ -778,10 +778,26 @@ impl MemoryHost {
         content: &str,
         arguments: &Value,
     ) -> Result<(), String> {
+        self.refuse_duplicate_except(scope, kind, title, content, arguments, &[])
+    }
+
+    /// [`Self::refuse_duplicate`], not counting the entries named in `except`:
+    /// a refinement that deletes an entry and writes its fact anew is not a
+    /// duplicate of what it deletes.
+    pub(crate) fn refuse_duplicate_except(
+        &self,
+        scope: &str,
+        kind: &'static str,
+        title: &str,
+        content: &str,
+        arguments: &Value,
+        except: &[String],
+    ) -> Result<(), String> {
         if arguments.get("distinct").and_then(Value::as_bool) == Some(true) {
             return Ok(());
         }
-        let close = self.close_entries(scope, kind, title, content);
+        let mut close = self.close_entries(scope, kind, title, content);
+        close.retain(|(entry, _, _)| !except.contains(&entry.id));
         if let Some((same, likeness, _)) = close
             .iter()
             .find(|(_, likeness, _)| *likeness >= DUPLICATE_SIMILARITY)

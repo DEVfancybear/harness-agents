@@ -953,6 +953,77 @@ impl Edit {
     }
 }
 
+/// Why a refinement's memory or prompt write is refused: the checks the
+/// `memory` tool and the kernel make. A review, `/refine`, `/learn` and the
+/// memory consolidation write through here; without them a review saved a
+/// fact the tool would have refused as a duplicate, under another title, and
+/// the digest's few places filled with copies again.
+fn memory_refusal(
+    scopes: &HarnessScopes,
+    global: bool,
+    edit: &Edit,
+    before: &Value,
+    proposal: &Proposal,
+    rollback_of: Option<&str>,
+) -> Option<String> {
+    let action = edit.text("action").unwrap_or_default();
+    let kind: &'static str = match edit.text("kind").unwrap_or_default() {
+        "memory" => "memory",
+        "prompt" => "prompt",
+        _ => return None,
+    };
+    if action == "delete" {
+        return None;
+    }
+    let title = edit
+        .text("title")
+        .or_else(|| before["title"].as_str())
+        .unwrap_or_default();
+    let content = edit
+        .text("content")
+        .or_else(|| before["content"].as_str())
+        .unwrap_or_default();
+    let hits = super::learned::secret_hits(&format!("{title}\n{content}"));
+    if !hits.is_empty() {
+        return Some(format!(
+            "the harness never keeps secrets; this looks like {}",
+            hits.join(", ")
+        ));
+    }
+    if title.chars().count() > super::memory::MAX_TITLE_CHARS {
+        return Some(format!(
+            "a title is at most {} characters",
+            super::memory::MAX_TITLE_CHARS
+        ));
+    }
+    if content.chars().count() > super::memory::MAX_CONTENT_CHARS {
+        return Some(format!(
+            "content is at most {} characters: keep the fact, not its story",
+            super::memory::MAX_CONTENT_CHARS
+        ));
+    }
+    // A rollback puts back what was there; it duplicates nothing.
+    if action != "create" || rollback_of.is_some() {
+        return None;
+    }
+    let replaced = proposal
+        .edits
+        .iter()
+        .filter(|other| other.text("action") == Some("delete") && other.text("kind") == Some(kind))
+        .filter_map(|other| other.text("id").map(str::to_owned))
+        .collect::<Vec<_>>();
+    super::memory::MemoryHost::for_stores(&scopes.global, &scopes.local)
+        .refuse_duplicate_except(
+            if global { "global" } else { "local" },
+            kind,
+            title,
+            content,
+            &Value::Object(edit.0.clone()),
+            &replaced,
+        )
+        .err()
+}
+
 /// A proposal the model made (`RefinementProposal`).
 #[derive(Clone, Debug, Default)]
 struct Proposal {
@@ -1325,6 +1396,15 @@ fn apply(
             _ => None,
         };
         if let Some(error) = error {
+            if !before.is_null() {
+                record["before"] = before;
+            }
+            record["applied"] = json!(false);
+            record["error"] = json!(error);
+            applied_edits.push(record);
+            continue;
+        }
+        if let Some(error) = memory_refusal(scopes, global, edit, &before, proposal, rollback_of) {
             if !before.is_null() {
                 record["before"] = before;
             }
@@ -2620,6 +2700,65 @@ mod tests {
         );
         let cut = extract_json("{\"summary\": \"x\", \"edits\": [{\"action\"").expect_err("cut");
         assert!(cut.contains("stopped before completing"), "{cut}");
+    }
+
+    /// A review's memory write passes the `memory` tool's checks: the same fact
+    /// under another title, a secret and an over-long entry are refused, and a
+    /// fact written anew in place of the entry the same refinement deletes is
+    /// not a duplicate of it.
+    #[test]
+    fn a_refinement_passes_the_memory_tools_checks() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let seed = Proposal::from_value(&json!({"edits": [
+            {"action": "create", "kind": "memory", "title": "Trình quản lý gói",
+             "content": "Dự án này dùng pnpm làm trình quản lý gói, không dùng npm hay yarn"}
+        ]}));
+        apply(&scopes, &seed, "refine_seed", true, None, None, None).expect("seeded");
+        let proposal = Proposal::from_value(&json!({"edits": [
+            {"action": "create", "kind": "memory", "title": "Package manager: pnpm",
+             "content": "Dự án này dùng pnpm làm trình quản lý gói, không dùng npm hay yarn"},
+            {"action": "create", "kind": "memory", "title": "Deploy key",
+             "content": "The deploy key is api_key=FAKE0123456789abcdefTEST"},
+            {"action": "create", "kind": "memory", "title": "Long",
+             "content": "word ".repeat(1_000)}
+        ]}));
+        let result =
+            apply(&scopes, &proposal, "refine_2", true, None, None, None).expect("applied");
+        let edits = result.record["appliedEdits"].as_array().expect("edits");
+        assert!(
+            edits.iter().all(|edit| edit["applied"] == false),
+            "{edits:?}"
+        );
+        assert!(
+            edits[0]["error"].as_str().unwrap().contains("same fact"),
+            "{edits:?}"
+        );
+        assert!(
+            edits[1]["error"]
+                .as_str()
+                .unwrap()
+                .contains("never keeps secrets")
+        );
+        assert!(edits[2]["error"].as_str().unwrap().contains("at most"));
+        let seeded = load_raw(&scopes.global)["entries"]["memory"]
+            .as_object()
+            .expect("entries")
+            .keys()
+            .next()
+            .cloned()
+            .expect("one entry");
+        let rewrite = Proposal::from_value(&json!({"edits": [
+            {"action": "delete", "kind": "memory", "id": seeded},
+            {"action": "create", "kind": "memory", "title": "Package manager",
+             "content": "Dự án này dùng pnpm làm trình quản lý gói, không dùng npm hay yarn"}
+        ]}));
+        let result = apply(&scopes, &rewrite, "refine_3", true, None, None, None).expect("applied");
+        let edits = result.record["appliedEdits"].as_array().expect("edits");
+        assert!(
+            edits.iter().all(|edit| edit["applied"] == true),
+            "{edits:?}"
+        );
     }
 
     /// `applyRefinementProposal`: valid edits land in the requested scope with a

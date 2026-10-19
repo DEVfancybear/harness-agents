@@ -315,28 +315,8 @@ impl KnowledgeHost {
         if action == "search" {
             search_queries(arguments)?;
         }
-        // A page is read into later conversations and shown in the catalog and
-        // the console: like memory, it never keeps a secret. The review's
-        // proposals pass here too.
         if action == "write" {
-            let mut written = ["title", "summary", "content"]
-                .iter()
-                .filter_map(|key| arguments.get(*key).and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if let Some(sources) = arguments.get("sources").and_then(Value::as_array) {
-                for source in sources.iter().filter_map(Value::as_str) {
-                    written.push('\n');
-                    written.push_str(source);
-                }
-            }
-            let hits = crate::interactive::learned::secret_hits(&written);
-            if !hits.is_empty() {
-                return Err(format!(
-                    "knowledge never keeps secrets; this looks like {}. Write the page without the value (name the variable or file that holds it)",
-                    hits.join(", ")
-                ));
-            }
+            refuse_secret(arguments)?;
         }
         for key in ["start_line", "start_column", "max_lines", "limit", "offset"] {
             if arguments
@@ -747,6 +727,31 @@ fn text<'a>(arguments: &'a Value, key: &str) -> Result<&'a str, String> {
         .and_then(Value::as_str)
         .filter(|text| !text.trim().is_empty())
         .ok_or_else(|| format!("{key} must be a nonempty string"))
+}
+
+/// A page is read into later conversations and shown in the catalog and the
+/// console: like memory, it never keeps a secret. The review's proposals pass
+/// here too.
+fn refuse_secret(arguments: &Value) -> Result<(), String> {
+    let mut written = ["title", "summary", "content"]
+        .iter()
+        .filter_map(|key| arguments.get(*key).and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some(sources) = arguments.get("sources").and_then(Value::as_array) {
+        for source in sources.iter().filter_map(Value::as_str) {
+            written.push('\n');
+            written.push_str(source);
+        }
+    }
+    let hits = crate::interactive::learned::secret_hits(&written);
+    if hits.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "knowledge never keeps secrets; this looks like {}. Write the page without the value (name the variable or file that holds it)",
+        hits.join(", ")
+    ))
 }
 
 fn search_queries(arguments: &Value) -> Result<Vec<String>, String> {
