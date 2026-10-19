@@ -42,6 +42,9 @@ pub struct Cadence {
     running: std::sync::atomic::AtomicBool,
     /// Learned skills used since the last review.
     in_play: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Counts the turns started, so a review waiting for the session to go
+    /// quiet can tell whether one began meanwhile.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl Cadence {
@@ -94,6 +97,51 @@ impl Cadence {
         }
         self.turns.store(0, SeqCst);
         self.tool_calls.store(0, SeqCst);
+        Some(turns)
+    }
+
+    /// A turn starts.
+    pub fn turn_started(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many turns have started.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Claim a review now, whatever the counts say: a long turn compacted, and
+    /// what it learned is worth keeping before more of it is summarized. `None`
+    /// while a review runs.
+    pub fn claim_now(&self) -> Option<u32> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.running.swap(true, SeqCst) {
+            return None;
+        }
+        let turns = self.turns.swap(0, SeqCst);
+        self.tool_calls.store(0, SeqCst);
+        Some(turns.max(1))
+    }
+
+    /// Whether the work since the last review is enough for a session's end
+    /// to be reviewed, with none running.
+    pub fn has_tail(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let turns = self.turns.load(SeqCst);
+        let calls = self.tool_calls.load(SeqCst);
+        turns > 0
+            && (turns >= TAIL_MIN_TURNS || calls >= TAIL_MIN_TOOL_CALLS)
+            && !self.running.load(SeqCst)
+    }
+
+    /// [`Cadence::take_tail`] for a review that runs now, claimed until
+    /// [`Cadence::release`].
+    pub fn claim_tail(&self) -> Option<u32> {
+        let turns = self.take_tail()?;
+        if self.running.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
         Some(turns)
     }
 
@@ -539,7 +587,12 @@ pub(super) fn now() -> String {
     format!("@{seconds}")
 }
 
-/// `slug`: lowercase ASCII words joined by `_`, at most 80 characters.
+/// The longest an id made from a title is.
+const SLUG_MAX_CHARS: usize = 48;
+
+/// `slug`: lowercase ASCII words joined by `_`, at most [`SLUG_MAX_CHARS`]
+/// characters, cut at a word: an id is a handle, and one made from a long
+/// title was 80 characters cut mid-word.
 pub(super) fn slug(raw: &str, fallback: &str) -> String {
     use unicode_normalization::UnicodeNormalization as _;
     let mut out = String::new();
@@ -564,7 +617,13 @@ pub(super) fn slug(raw: &str, fallback: &str) -> String {
             gap = true;
         }
     }
-    out.truncate(80);
+    if out.len() > SLUG_MAX_CHARS {
+        let cut = out[..=SLUG_MAX_CHARS]
+            .rfind('_')
+            .filter(|cut| *cut >= SLUG_MAX_CHARS / 2)
+            .unwrap_or(SLUG_MAX_CHARS);
+        out.truncate(cut);
+    }
     if out.is_empty() {
         fallback.to_owned()
     } else {
@@ -3544,5 +3603,25 @@ mod tests {
             load_raw(&scopes.local)["entries"]["memory"]["note"]["content"],
             "two"
         );
+    }
+
+    /// A compaction claims a review at once; a quiet session's tail is
+    /// claimed only when there is enough of it, and a started turn shows.
+    #[test]
+    fn the_cadence_claims_a_review_at_a_compaction_and_a_quiet_tail() {
+        let cadence = super::Cadence::default();
+        assert_eq!(cadence.turn_finished(2), None);
+        assert!(!cadence.has_tail(), "one short turn is not worth a review");
+        assert_eq!(cadence.claim_now(), Some(1));
+        assert_eq!(cadence.claim_now(), None, "one at a time");
+        cadence.release();
+        let before = cadence.generation();
+        cadence.turn_started();
+        assert_eq!(cadence.generation(), before + 1);
+        assert_eq!(cadence.turn_finished(super::TAIL_MIN_TOOL_CALLS), None);
+        assert!(cadence.has_tail());
+        assert_eq!(cadence.claim_tail(), Some(1));
+        assert!(!cadence.has_tail(), "claimed");
+        cadence.release();
     }
 }

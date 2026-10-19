@@ -15,7 +15,8 @@
 set -u
 source "$(dirname "$0")/env.sh"
 fresh compaction
-export HA_AUTO_REFINE=off HA_PYTHON=${HA_PYTHON:-$PY}
+# The automatic review stays on: a long turn that compacts is reviewed as it goes.
+export HA_PYTHON=${HA_PYTHON:-$PY}
 export HA_COMPACT_AT=${HA_COMPACT_AT:-40000}
 P="$RX/p"
 project "$P"
@@ -113,6 +114,14 @@ STATE=$(store state)
 echo "   task_state: ${STATE:0:300}"
 ITEMS=$(store items)
 check "the task state holds the checklist ($ITEMS items)" "[ $ITEMS -ge 8 ]"
+REVIEW=$("$PY" - "$HA_HOME/data" <<'PYEOF'
+import glob, json, os, sqlite3, sys
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    for (value,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select setting_value from session_settings where setting_key='review_started'"):
+        print(json.loads(value).get("why", ""))
+PYEOF
+)
+check "a turn that compacted was reviewed while it went on ($REVIEW)" "echo '$REVIEW' | grep -q compaction"
 store summary > "$RX/summary.md"
 store kept-words > "$RX/kept-words.md"
 check "the summaries keep the user's words: the codeword" "grep -q 'BLUE-HERON' '$RX/kept-words.md'"

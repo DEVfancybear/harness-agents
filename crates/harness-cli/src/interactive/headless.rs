@@ -602,6 +602,16 @@ pub async fn run_with(
                         .readonly(),
                 ),
                 context: Vec::new(),
+                // `ha exec`'s children get the root's memory too, ranked for their brief.
+                digest: refinements.then(|| super::harness::DigestSource {
+                    data_dir: context.paths.data_dir.clone(),
+                    conversation: task_id.as_str().to_owned(),
+                    project: Some(
+                        super::bootstrap::project_key_of(&context.project.root)
+                            .as_str()
+                            .to_owned(),
+                    ),
+                }),
             },
             cancellation.clone(),
         )

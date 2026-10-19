@@ -599,3 +599,14 @@ A task of hundreds of steps passes through many compactions, and what a compacti
 - **Smaller.** A tool result shortened to fit the window keeps its first 400 characters, where an error says what failed. The summaries' file lists keep the most recently touched files, not the first ones by name. A new summary, a fold of a turn's steps and a checkpoint all count as compactions, so the memory review that a compaction brings forward runs after them too.
 
 `scripts/live-tests/compaction.sh` runs one task of eight modules through a 40k compaction point with a real model, adds a rule while it runs, and checks recall, the disk and what the host kept.
+
+### 12.11. Memory that reaches the work
+
+0.6.0 makes what is remembered reach the turns that need it, and keeps it clean on the way in.
+
+- **Ranking.** A turn's memory digest is ranked by the goal, what the user typed (not the prompt built around it), the task state's recap, the user's two previous messages and the feature in progress, so a "continue" no longer ranks by one word. A delegated child's digest is ranked by its brief (it used to be in name order), and `ha exec`'s children get one too.
+- **Constraints.** A memory or prompt note whose path is `constraints` or `constraints/<topic>` is shown in every turn ahead of the ranked entries (up to 12), whatever the request: a rule the user set no longer falls out of the six shown.
+- **The task an earlier conversation left.** A new conversation's first three turns carry the task state of the newest earlier conversation in the project when its checklist has open items, as context the model may adopt with `task_state` (or the user may `/resume`); one whose work is done shows nothing.
+- **Reviews.** A turn that compacts has its memory reviewed beside it as it goes on, not only after it ends (the task's `review_started` setting records when and why). A session that goes quiet - ten minutes without a turn (`HA_IDLE_REVIEW_SECONDS`) - has the work since its last review reviewed then; a background agent stays alive after its terminal closes, so the review runs even if nobody comes back, and an agent stopped sooner still leaves it to the next turn. A refinement the agent asks for judges the learned skills in play.
+- **Writes.** The `memory` tool refuses a new entry that a longer entry already holds (85% of its weighted words), not only one alike as a whole, and refuses a duplicate before the call runs, so it reads as a plain refusal. `rlm.harness` writes from the kernel pass the same checks: no secret, no duplicate memory or prompt note, and the `expected_version` an update names. An id made from a title is at most 48 characters, cut at a word; a title over 200 characters is refused with how to fix it.
+- **Prompt.** Commit messages go through `git commit -m` or a temp file, never a file in the checkout.

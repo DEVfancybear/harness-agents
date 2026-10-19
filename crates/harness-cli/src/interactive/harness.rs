@@ -25,6 +25,12 @@ const DEFAULT_REFINEMENT_LIMIT: usize = 5;
 const DEFAULT_CONTENT_LIMIT: usize = 180;
 /// The most query terms one digest ranks by (prime-agent caps at 48).
 const MAX_QUERY_TERMS: usize = 48;
+/// The grouping of an entry the user set as a rule for the work: `constraints`
+/// or `constraints/<topic>`. Such entries are shown before the ranked ones in
+/// every turn, whatever the request says.
+const CONSTRAINTS_PATH: &str = "constraints";
+/// The most constraint entries of one kind shown ahead of the ranked ones.
+const CONSTRAINT_LIMIT: usize = 12;
 /// The characters the pinned entries may take in every turn's digest.
 ///
 /// A pinned entry (`metadata.pinned`) is shown whole on every turn, whatever
@@ -293,11 +299,54 @@ pub fn weighted_terms(goal: Option<&str>, recent_newest_first: &[&str]) -> Vec<(
         add(goal, 3.0);
     }
     let mut weight: f64 = 2.0;
-    for text in recent_newest_first.iter().take(4) {
+    for text in recent_newest_first.iter().take(6) {
         add(text, weight);
         weight = (weight - 0.5).max(1.0);
     }
     terms
+}
+
+/// Whether `entry` is grouped as a constraint (see [`CONSTRAINTS_PATH`]).
+fn is_constraint(entry: &Entry) -> bool {
+    entry
+        .path
+        .split('/')
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case(CONSTRAINTS_PATH))
+}
+
+/// The root's memory for one conversation of one project: the digest a
+/// delegated child is sent, ranked for its brief.
+#[derive(Clone, Debug)]
+pub struct DigestSource {
+    pub data_dir: PathBuf,
+    pub conversation: String,
+    pub project: Option<String>,
+}
+
+impl DigestSource {
+    /// The digest for a child working on `brief`. A child's digest used to be
+    /// ranked by nothing (the entries in name order), so the six it saw were
+    /// the alphabetically first, not the ones its task needed.
+    #[must_use]
+    pub fn child_block(&self, brief: &str) -> ContextBlock {
+        let state = merge(
+            for_project(
+                load(&global_dir(&self.data_dir), "global"),
+                self.project.as_deref(),
+            ),
+            load(&local_dir(&self.data_dir, &self.conversation), "local"),
+        );
+        digest_block(&format_digest(
+            &state,
+            DigestOptions {
+                repl: false,
+                refine: false,
+                memory_tool: false,
+            },
+            &weighted_terms(None, &[brief]),
+        ))
+    }
 }
 
 fn normalized_search_text(text: &str) -> String {
@@ -535,14 +584,24 @@ pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f6
         } else {
             idf(&entries, terms)
         };
+        // A constraint the user set is in view in every turn, ahead of the
+        // ranked entries: ranked by the request, "never touch vendor/" fell
+        // out of the six shown whenever the request was about something else.
         entries.sort_by(|a, b| {
-            if terms.is_empty() {
-                return identity(a).cmp(&identity(b));
-            }
-            score(b, terms, &weights)
-                .total_cmp(&score(a, terms, &weights))
-                .then_with(|| identity(a).cmp(&identity(b)))
+            is_constraint(b).cmp(&is_constraint(a)).then_with(|| {
+                if terms.is_empty() {
+                    return identity(a).cmp(&identity(b));
+                }
+                score(b, terms, &weights)
+                    .total_cmp(&score(a, terms, &weights))
+                    .then_with(|| identity(a).cmp(&identity(b)))
+            })
         });
+        let shown = entries
+            .iter()
+            .filter(|entry| is_constraint(entry))
+            .count()
+            .clamp(DEFAULT_ENTRY_LIMIT, CONSTRAINT_LIMIT);
         total += kept;
         if pinned > 0 {
             lines.push(format!("{kind}: {kept} ({pinned} pinned above)"));
@@ -554,7 +613,7 @@ pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f6
         } else {
             lines.push(format!("{kind}: {}", entries.len()));
         }
-        if !terms.is_empty() && entries.len() > DEFAULT_ENTRY_LIMIT {
+        if !terms.is_empty() && entries.len() > shown {
             lines.push(if options.memory_tool && matches!(kind, "memory" | "prompt") {
                 "(entries ranked by relevance to the current task; the memory tool searches the rest)"
                     .to_owned()
@@ -562,7 +621,7 @@ pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f6
                 "(entries ranked by relevance to the current task; see harness.search)".to_owned()
             });
         }
-        for entry in entries.iter().take(DEFAULT_ENTRY_LIMIT) {
+        for entry in entries.iter().take(shown) {
             let (Some(title), Some(content)) = (&entry.title, &entry.content) else {
                 let reason = if entry.content.is_none() {
                     "content not a string"
@@ -607,11 +666,8 @@ pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f6
                 compact(content, DEFAULT_CONTENT_LIMIT)
             ));
         }
-        if entries.len() > DEFAULT_ENTRY_LIMIT {
-            lines.push(format!(
-                "- +{} more {kind} entries",
-                entries.len() - DEFAULT_ENTRY_LIMIT
-            ));
+        if entries.len() > shown {
+            lines.push(format!("- +{} more {kind} entries", entries.len() - shown));
         }
         lines.push(String::new());
     }
@@ -1053,5 +1109,61 @@ mod tests {
                 < digest.find("[local:alpha-").expect("alpha"),
             "{digest}"
         );
+    }
+
+    /// A rule the user set is shown in every turn, ahead of the ranked
+    /// entries, whatever the request is about.
+    #[test]
+    fn a_constraint_is_shown_whatever_the_request() {
+        let directory = tempfile::tempdir().expect("state");
+        let mut memories = serde_json::Map::new();
+        for number in 0..10 {
+            memories.insert(
+                format!("parser-{number}"),
+                json!({"title": format!("Parser note {number}"), "content": "the parser handles tokens"}),
+            );
+        }
+        memories.insert(
+            "vendor".to_owned(),
+            json!({"title": "Vendor rule", "content": "never touch vendor/", "path": "constraints/repo"}),
+        );
+        write(directory.path(), &json!({"entries":{"memory":memories}}));
+        let digest = format_digest(
+            &load(directory.path(), "local"),
+            DigestOptions::default(),
+            &weighted_terms(None, &["fix the parser tokens"]),
+        );
+        assert!(digest.contains("never touch vendor/"), "{digest}");
+        assert!(
+            digest.find("[local:vendor]").expect("constraint")
+                < digest.find("[local:parser-").expect("ranked"),
+            "{digest}"
+        );
+    }
+
+    /// A child's digest is ranked for its brief, not by name.
+    #[test]
+    fn a_childs_digest_is_ranked_for_its_brief() {
+        let directory = tempfile::tempdir().expect("data");
+        let local = super::local_dir(directory.path(), "task-1");
+        let mut memories = serde_json::Map::new();
+        for number in 0..10 {
+            memories.insert(
+                format!("a-note-{number}"),
+                json!({"title": format!("A note {number}"), "content": "about the release"}),
+            );
+        }
+        memories.insert(
+            "z-migrations".to_owned(),
+            json!({"title": "Migrations", "content": "run sqlx migrate before the tests"}),
+        );
+        write(&local, &json!({"entries":{"memory":memories}}));
+        let block = super::DigestSource {
+            data_dir: directory.path().to_path_buf(),
+            conversation: "task-1".to_owned(),
+            project: None,
+        }
+        .child_block("run the database migrations, then the tests");
+        assert!(block.text.contains("run sqlx migrate"), "{}", block.text);
     }
 }

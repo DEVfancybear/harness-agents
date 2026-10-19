@@ -41,6 +41,17 @@ const HISTORY_SHOWN: usize = 10;
 /// How alike a new entry may be to a kept one before it is refused as the same
 /// fact (weighted share of their words), and from when one is named as related.
 const DUPLICATE_SIMILARITY: f64 = 0.6;
+
+/// The share of a new entry's words (each weighed by how rare it is) that,
+/// found in one kept entry, makes it a fact that entry already holds: a short
+/// fact written again while a longer entry keeps it with others is no less a
+/// duplicate, yet it is too unlike the longer one as a whole to reach
+/// [`DUPLICATE_SIMILARITY`].
+const CONTAINED_SHARE: f64 = 0.85;
+
+/// The fewest words a new entry has before [`CONTAINED_SHARE`] applies: a
+/// two-word entry is found inside almost anything.
+const CONTAINED_MIN_WORDS: usize = 4;
 const RELATED_SIMILARITY: f64 = 0.3;
 /// An entry is a fact or a rule, not a document; a document is knowledge.
 const MAX_CONTENT_CHARS: usize = 4_000;
@@ -119,6 +130,20 @@ impl MemoryHost {
             local: harness::local_dir(data_dir, conversation),
             read_only: false,
             conversation: conversation.to_owned(),
+            project: None,
+            off: false,
+        }
+    }
+
+    /// The two stores the kernel's `rlm.harness` writes, for the checks a
+    /// write must pass whichever way it comes in.
+    #[must_use]
+    pub(crate) fn for_stores(global: &Path, local: &Path) -> Self {
+        Self {
+            global: global.to_path_buf(),
+            local: local.to_path_buf(),
+            read_only: false,
+            conversation: String::new(),
             project: None,
             off: false,
         }
@@ -279,7 +304,9 @@ impl MemoryHost {
                     return Err("write needs a non-empty title and content".to_owned());
                 }
                 if title.chars().count() > MAX_TITLE_CHARS {
-                    return Err(format!("a title is at most {MAX_TITLE_CHARS} characters"));
+                    return Err(format!(
+                        "a title is at most {MAX_TITLE_CHARS} characters: name the fact in a few words and put the detail in content"
+                    ));
                 }
                 if content.chars().count() > MAX_CONTENT_CHARS {
                     return Err(format!(
@@ -317,6 +344,17 @@ impl MemoryHost {
                         "a new entry needs scope: global for what holds across conversations and projects, project for a fact about this project, local for this conversation"
                             .to_owned(),
                     );
+                } else {
+                    // Refused before the call runs, a duplicate reads as the
+                    // refusal it is; refused while running, the model was told
+                    // the outcome was unknown and might have had side effects.
+                    self.refuse_duplicate(
+                        self.scopes(arguments)?[0],
+                        kinds(arguments)?[0],
+                        title,
+                        content,
+                        arguments,
+                    )?;
                 }
                 Ok(())
             }
@@ -606,21 +644,8 @@ impl MemoryHost {
         if pinned {
             self.pinned_fits(scope, kind, &id, &title, &content)?;
         }
+        self.refuse_duplicate(scope, kind, &title, &content, arguments)?;
         let close = self.close_entries(scope, kind, &title, &content);
-        if arguments.get("distinct").and_then(Value::as_bool) != Some(true)
-            && let Some((same, likeness)) = close
-                .first()
-                .filter(|(_, likeness)| *likeness >= DUPLICATE_SIMILARITY)
-        {
-            return Err(format!(
-                "this reads as the same fact as {}:{} (v{}, {:?}, {:.0}% alike): update that entry with its id and expected_version instead of adding another; pass distinct: true only when it is a different fact",
-                same.scope,
-                same.id,
-                same.version,
-                same.title.as_deref().unwrap_or_default(),
-                likeness * 100.0
-            ));
-        }
         let stamp = now();
         let mut record = json!({
             "id": id,
@@ -652,7 +677,7 @@ impl MemoryHost {
         let related = close
             .iter()
             .take(3)
-            .map(|(entry, likeness)| {
+            .map(|(entry, likeness, _)| {
                 let mut related = view(entry, SUMMARY_CHARS);
                 related["alike"] = json!((likeness * 100.0).round() / 100.0);
                 related
@@ -676,7 +701,7 @@ impl MemoryHost {
         kind: &'static str,
         title: &str,
         content: &str,
-    ) -> Vec<(Entry, f64)> {
+    ) -> Vec<(Entry, f64, f64)> {
         let compared = if scope == "local" {
             vec!["local"]
         } else {
@@ -710,6 +735,7 @@ impl MemoryHost {
                 + usize::from(new.contains(term))) as f64;
             ((documents - containing + 0.5) / (containing + 0.5)).ln_1p()
         };
+        let own = new.iter().map(weight).sum::<f64>();
         let mut close = entries
             .into_iter()
             .zip(&kept)
@@ -717,11 +743,62 @@ impl MemoryHost {
                 let shared = new.intersection(words).map(weight).sum::<f64>();
                 let all = new.union(words).map(weight).sum::<f64>();
                 let likeness = if all > 0.0 { shared / all } else { 0.0 };
-                (likeness >= RELATED_SIMILARITY).then_some((entry, likeness))
+                // How much of what the new entry says this one already says.
+                let contained = if own > 0.0 && new.len() >= CONTAINED_MIN_WORDS {
+                    shared / own
+                } else {
+                    0.0
+                };
+                (likeness >= RELATED_SIMILARITY || contained >= CONTAINED_SHARE)
+                    .then_some((entry, likeness, contained))
             })
             .collect::<Vec<_>>();
         close.sort_by(|a, b| b.1.total_cmp(&a.1));
         close
+    }
+
+    /// Refuse a new entry that repeats a kept one - alike as a whole, or held
+    /// whole inside a longer one - unless the call says it is `distinct`.
+    pub(crate) fn refuse_duplicate(
+        &self,
+        scope: &str,
+        kind: &'static str,
+        title: &str,
+        content: &str,
+        arguments: &Value,
+    ) -> Result<(), String> {
+        if arguments.get("distinct").and_then(Value::as_bool) == Some(true) {
+            return Ok(());
+        }
+        let close = self.close_entries(scope, kind, title, content);
+        if let Some((same, likeness, _)) = close
+            .iter()
+            .find(|(_, likeness, _)| *likeness >= DUPLICATE_SIMILARITY)
+        {
+            return Err(format!(
+                "this reads as the same fact as {}:{} (v{}, {:?}, {:.0}% alike): update that entry with its id and expected_version instead of adding another; pass distinct: true only when it is a different fact",
+                same.scope,
+                same.id,
+                same.version,
+                same.title.as_deref().unwrap_or_default(),
+                likeness * 100.0
+            ));
+        }
+        if let Some((same, _, contained)) = close
+            .iter()
+            .filter(|(_, _, contained)| *contained >= CONTAINED_SHARE)
+            .max_by(|a, b| a.2.total_cmp(&b.2))
+        {
+            return Err(format!(
+                "{}:{} (v{}, {:?}) already says this ({:.0}% of it): keep it there - update that entry with its id and expected_version if something changed - or, to keep it as an entry of its own, take it out of that one; pass distinct: true only when it is a different fact",
+                same.scope,
+                same.id,
+                same.version,
+                same.title.as_deref().unwrap_or_default(),
+                contained * 100.0
+            ));
+        }
+        Ok(())
     }
 
     /// `history`: an entry's earlier versions, newest first, from the journal;
@@ -1215,7 +1292,7 @@ impl ExternalToolCatalog for MemoryHost {
                 "id":{"type":"string","description":"An entry id from list, search or history (a global:/project:/local: prefix picks the scope). With write, updates that entry."},
                 "title":{"type":"string","description":"write: a short name for the fact or rule."},
                 "content":{"type":"string","description":"write: the whole entry, replacing the old content. One fact or rule, self-contained."},
-                "path":{"type":"string","description":"write: an optional grouping such as user/preferences or project/<name>."},
+                "path":{"type":"string","description":"write: an optional grouping such as user/preferences or project/<name>; constraints (or constraints/<topic>) for a rule the user set for the work, shown in every turn ahead of the ranked entries."},
                 "pinned":{"type":"boolean","description":"write: true shows the entry whole in every turn (the user's language, form of address, a hard rule); false unpins; omitted keeps it as it is. Pinned entries share a 4,000-character bound."},
                 "expected_version":{"type":"integer","minimum":1,"description":"The version list, search or read returned; required to update, delete, or restore over an entry that exists."},
                 "version":{"type":"integer","minimum":1,"description":"restore: the earlier version history showed; omitted, a deleted entry comes back as it was."},
@@ -1996,6 +2073,50 @@ mod tests {
             listed.as_array().map(Vec::len),
             Some(1),
             "saved state was kept"
+        );
+    }
+
+    /// A fact a longer entry already holds is refused - before the call runs,
+    /// so it reads as a plain refusal - unless it is said to be distinct.
+    #[test]
+    fn a_fact_held_inside_a_longer_entry_is_refused_at_validation() {
+        let root = tempfile::tempdir().expect("root");
+        let host = host(root.path());
+        run(
+            &host,
+            &json!({"action":"write","scope":"local","title":"Project tooling and deploys",
+                    "content":"The project uses pnpm as its package manager. It deploys to Fly.io every Friday. CI runs on GitHub Actions with Node 22."}),
+        )
+        .expect("the combined entry");
+        let repeat = json!({"action":"write","scope":"local","title":"Package manager",
+                            "content":"The project uses pnpm as its package manager."});
+        let refusal = host
+            .check(&repeat)
+            .expect_err("held inside the combined entry");
+        assert!(refusal.contains("already says this"), "{refusal}");
+        assert!(refusal.contains("project_tooling_and_deploys"), "{refusal}");
+        let mut distinct = repeat.clone();
+        distinct["distinct"] = json!(true);
+        host.check(&distinct).expect("distinct passes");
+        let other = json!({"action":"write","scope":"local","title":"Test runner",
+                           "content":"The project runs its tests with vitest in watch mode."});
+        host.check(&other).expect("a different fact passes");
+    }
+
+    /// An id made from a long title stays short and ends on a word.
+    #[test]
+    fn an_id_from_a_long_title_is_short_and_whole_words() {
+        let id = crate::interactive::refine::slug(
+            "ninja/phiên: dev server cổng bị dự án khác chiếm, lệnh e2e cổng 4210, mẹo API harness output",
+            "memory",
+        );
+        assert!(id.len() <= 48, "{id}");
+        assert!(id.starts_with("ninja_phien_dev_server"), "{id}");
+        assert!(!id.ends_with('_'), "{id}");
+        assert!(
+            "ninja_phien_dev_server_cong_bi_du_an_khac_chiem_lenh_e2e_cong_4210_meo_api_harness_output"
+                .starts_with(&format!("{id}_")),
+            "cut at a word: {id}"
         );
     }
 }

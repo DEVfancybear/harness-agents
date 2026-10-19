@@ -61,6 +61,7 @@ pub fn answer(dirs: &Dirs, request: &Value) -> Result<Value, String> {
     };
     let store = Store {
         dir,
+        stores: (dirs.global.clone(), dirs.local.clone()),
         scope: if global { "global" } else { "local" },
         // A conversation's local store is `sessions/<conversation>/harness`.
         origin: json!({
@@ -83,6 +84,8 @@ pub fn answer(dirs: &Dirs, request: &Value) -> Result<Value, String> {
 
 struct Store {
     dir: PathBuf,
+    /// The global and local stores, which a new entry is compared with.
+    stores: (PathBuf, PathBuf),
     scope: &'static str,
     /// Who writes, recorded on the entry and in the memory journal.
     origin: Value,
@@ -224,6 +227,7 @@ impl Store {
                 existing: existing.is_some(),
             },
         )?;
+        self.passes_memory_checks(kind, &entry_id, existing.as_ref(), request)?;
         let now = now();
         if existing.is_some() {
             super::memory::journal(
@@ -290,6 +294,46 @@ impl Store {
         }
         self.save(&state)?;
         Ok(entry)
+    }
+
+    /// The checks the `memory` tool makes, made for a kernel write too: a
+    /// secret is never kept, an update names the version it read when it says
+    /// one, and a new memory or prompt note that repeats a kept one is refused.
+    /// `rlm.harness` used to skip them all, and its duplicates crowded the six
+    /// entries a turn's digest shows.
+    fn passes_memory_checks(
+        &self,
+        kind: &'static str,
+        id: &str,
+        existing: Option<&Value>,
+        request: &Value,
+    ) -> Result<(), String> {
+        let title = request["title"].as_str().unwrap_or_default();
+        let content = request["content"].as_str().unwrap_or_default();
+        let hits = super::learned::secret_hits(&format!("{title}\n{content}"));
+        if !hits.is_empty() {
+            return Err(format!(
+                "the harness never keeps secrets; this looks like {}",
+                hits.join(", ")
+            ));
+        }
+        if let Some(expected) = present(request, "expected_version") {
+            let expected = expected
+                .as_i64()
+                .ok_or("expected_version is the version you read, a number")?;
+            let current = existing.map_or(0, |entry| entry["version"].as_i64().unwrap_or(1));
+            if current != expected {
+                return Err(format!(
+                    "{kind} entry {} is at version {current}, not {expected}: read it again before you update it",
+                    repr(id)
+                ));
+            }
+        }
+        if existing.is_none() && matches!(kind, "memory" | "prompt") {
+            super::memory::MemoryHost::for_stores(&self.stores.0, &self.stores.1)
+                .refuse_duplicate(self.scope, kind, title, content, request)?;
+        }
+        Ok(())
     }
 
     fn record_refinement(&self, request: &Value) -> Result<Value, String> {
@@ -1287,7 +1331,8 @@ mod tests {
                     for index in 0..10 {
                         call(
                             &dirs,
-                            json!({"op":"create","kind":"memory","title":format!("fact {writer} {index}"),"content":"c","global":true}),
+                            // Eighty different facts: alike ones would be refused as duplicates.
+                            json!({"op":"create","kind":"memory","title":format!("fact {writer} {index}"),"content":format!("writer{writer} recorded item{index} as w{writer}i{index}"),"global":true}),
                         )
                         .expect("create");
                     }
@@ -1319,5 +1364,44 @@ mod tests {
             "lịch_sử"
         );
         assert_eq!(title_id("memory", "Lịch sử", None), "lich_su");
+    }
+
+    /// `rlm.harness` passes the checks the memory tool makes: no secret, no
+    /// duplicate, and the version an update names.
+    #[test]
+    fn kernel_writes_pass_the_memory_checks() {
+        let root = tempfile::tempdir().expect("root");
+        let dirs = dirs(root.path());
+        call(
+            &dirs,
+            json!({"op":"create","kind":"memory","title":"Deploy day","content":"The project deploys to Fly.io every Friday afternoon."}),
+        )
+        .expect("create");
+        let duplicate = call(
+            &dirs,
+            json!({"op":"create","kind":"memory","title":"Deploys","content":"The project deploys to Fly.io every Friday afternoon."}),
+        )
+        .expect_err("the same fact");
+        assert!(
+            duplicate.contains("same fact") || duplicate.contains("already says"),
+            "{duplicate}"
+        );
+        let secret = call(
+            &dirs,
+            json!({"op":"create","kind":"memory","title":"Token","content":"the key is sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}),
+        )
+        .expect_err("a secret");
+        assert!(secret.contains("never keeps secrets"), "{secret}");
+        let stale = call(
+            &dirs,
+            json!({"op":"update","kind":"memory","id":"deploy_day","title":"Deploy day","content":"Deploys on Monday.","expected_version":3}),
+        )
+        .expect_err("a stale version");
+        assert!(stale.contains("version 1, not 3"), "{stale}");
+        call(
+            &dirs,
+            json!({"op":"update","kind":"memory","id":"deploy_day","title":"Deploy day","content":"Deploys on Monday.","expected_version":1}),
+        )
+        .expect("the version it read");
     }
 }

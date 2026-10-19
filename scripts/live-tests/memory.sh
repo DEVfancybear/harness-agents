@@ -126,4 +126,77 @@ check "the review judged the skill failed" "\"$PY\" -c \"import json,sys; s=json
 check "the failure keeps the false assumption" "\"$PY\" -c \"import json,sys; f=json.load(open(sys.argv[1],encoding='utf-8'))['skills']['build-check'].get('failures',[]); exit(0 if f and f[-1]['assumption'].strip() else 1)\" '$U'"
 "$HA" shutdown --force >/dev/null 2>&1
 
+# Sections 11-13 run without the automatic review; 14 is about it.
+rm -f "$HA_HOME/settings.json"
+export HA_AUTO_REFINE=off
+
+echo "################ 11. a fact a longer entry already holds is refused, by the tool and by the kernel"
+agent "$RX/p-blog" b11
+say b11 "Ghi vào memory (scope local) MỘT entry duy nhất, tiêu đề 'Hạ tầng blog', nội dung: 'Blog dùng Hugo để build, deploy lên Netlify mỗi tối, ảnh lưu trên Cloudinary.'" | tail -2
+say b11 "Kiểm thử: gọi tool memory action write ngay (không search trước, không truyền id), scope local, tiêu đề 'Công cụ build', nội dung 'Blog dùng Hugo để build, deploy lên Netlify mỗi tối.'. In nguyên văn thông báo tool trả về, không làm gì thêm." | tail -4
+check "the tool refuses a fact a longer entry already holds" "last | grep -qi 'already says\|same fact'"
+say b11 "Kiểm thử kernel: trong python_repl chạy đúng một cell: rlm.harness.create_memory(title='Hosting', content='Blog dùng Hugo để build, deploy lên Netlify mỗi tối, ảnh lưu trên Cloudinary.') rồi in nguyên văn kết quả hoặc lỗi, không làm gì thêm." | tail -4
+check "the kernel refuses the same fact too" "last | grep -qi 'already says\|same fact'"
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 12. a constraint reaches every turn, ahead of the ranked entries"
+# Ten notes whose grouping sorts before 'constraints': ranked by nothing (the
+# request names none of them), they would fill the six shown.
+"$PY" - "$D" <<'EOF'
+import json, os, sys
+path = os.path.join(sys.argv[1], "harness", "harness_state.json")
+state = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {"schema": 1, "entries": {}}
+topics = ["mercury", "venus", "earth", "mars", "jupiter", "saturn", "uranus", "neptune", "pluto", "ceres"]
+for index, topic in enumerate(topics):
+    state.setdefault("entries", {}).setdefault("memory", {})[f"agenda_{topic}"] = {
+        "id": f"agenda_{topic}", "kind": "memory", "title": f"Agenda {topic}",
+        "content": f"The {topic} meeting is in room {index + 10}.", "path": "agenda",
+        "scope": "global", "version": 1, "source": "agent",
+    }
+os.makedirs(os.path.dirname(path), exist_ok=True)
+json.dump(state, open(path, "w", encoding="utf-8"))
+EOF
+agent "$RX/p-blog" b12
+say b12 "Ghi vào memory (scope project) một quy tắc với path đúng là 'constraints': tiêu đề 'Quy tắc ảnh', nội dung 'Mọi ảnh mới của blog phải ở định dạng WebP.' Chỉ ghi, không làm gì khác." | tail -2
+check "the rule is kept under constraints" "entries | grep -a '^global|p-blog|memory|' | grep -qi 'webp'"
+"$HA" shutdown --force >/dev/null 2>&1
+agent "$RX/p-blog" b13
+say b13 "Viết một câu chào ngắn bằng tiếng Việt." | tail -2
+# The newest request this conversation sent: its digest.
+digest() { "$PY" - "$D" <<'EOF'
+import glob, json, os, sqlite3, sys
+sys.stdout.reconfigure(encoding="utf-8")
+newest = ""
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests order by rowid desc limit 1"):
+        newest = text
+print(newest)
+EOF
+}
+check "an unrelated turn's digest carries the constraint" "digest | grep -q 'WebP'"
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 13. a new conversation knows the task the last one left unfinished"
+agent "$RX/p-blog" b14
+say b14 "Dùng tool task_state ghi kế hoạch cho việc 'Chuyển blog sang Astro' gồm 3 mục: (1) dựng khung Astro - done, (2) chuyển các bài viết - in_progress, (3) đổi cấu hình deploy Netlify - pending. Chỉ ghi task_state, không làm gì khác." | tail -2
+"$HA" shutdown --force >/dev/null 2>&1
+agent "$RX/p-blog" b15
+say b15 "Không đọc file, không dùng history_search hay memory: ở dự án này tôi đang làm dở việc gì, và còn những bước nào?" | tail -8
+check "a new conversation knows the unfinished task" "last | grep -qi 'astro'"
+check "and the steps left" "last | grep -qi 'bài viết\|deploy'"
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 14. a session that goes quiet is reviewed"
+unset HA_AUTO_REFINE
+export HA_IDLE_REVIEW_SECONDS=20
+mkdir -p "$RX/p-shop/notes"
+for index in 01 02 03 04 05 06 07 08 09 10 11 12; do echo "note $index: the cart keeps item $index for a day" > "$RX/p-shop/notes/n$index.txt"; done
+agent "$RX/p-shop" q1
+touch "$RX/quiet.marker"
+say q1 "Đọc từng file trong thư mục notes bằng read_file, mỗi lần một file (12 lần gọi), rồi tóm tắt chúng trong một câu." | tail -2
+sleep 75
+check "the quiet session's work was reviewed" "find '$D/sessions' -name review_watermark -newer '$RX/quiet.marker' | grep -q ."
+"$HA" shutdown --force >/dev/null 2>&1
+unset HA_IDLE_REVIEW_SECONDS
+
 result

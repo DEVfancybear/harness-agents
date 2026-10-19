@@ -217,7 +217,15 @@ Python is not on PATH: run the tests with runpy in the kernel.
             &temp.path().join("workspace"),
             false,
         );
-        let blocks = super::child_context(&data_dir, "task-1", None, true, &layers);
+        let mut blocks = super::child_context(&data_dir, &layers);
+        blocks.push(
+            super::super::harness::DigestSource {
+                data_dir: data_dir.clone(),
+                conversation: "task-1".to_owned(),
+                project: None,
+            }
+            .child_block("add the license header"),
+        );
         let text = blocks
             .iter()
             .map(|block| block.text.as_str())
@@ -1159,38 +1167,46 @@ fn resolve_provider_with_config(
 /// The most learned-skill text a child is sent.
 const CHILD_LEARNED_SKILLS_CHARS: usize = 16_000;
 
-/// What a child is told besides its brief: the conversation's harness memory
-/// and the skills ha learned from this user, in full - a child has no skill
-/// tools to open them with.
+/// What the user typed in the newest `limit` turns of the conversation
+/// `source` ends, newest first: the typed words where they were kept, else
+/// the question; none of a turn the host started.
+async fn recent_user_texts(store: &SqliteStore, source: &SessionId, limit: usize) -> Vec<String> {
+    let Ok(turns) = harness_runtime::conversation_turns(store, source).await else {
+        return Vec::new();
+    };
+    let mut texts = Vec::new();
+    for (session, question) in turns.into_iter().rev() {
+        if texts.len() >= limit {
+            break;
+        }
+        let typed = match store.session_task(&session).await {
+            Ok(Some(task)) => store
+                .session_setting(
+                    &task,
+                    &format!("{}{session}", harness_runtime::TYPED_INPUT_SETTING),
+                )
+                .await
+                .ok()
+                .flatten(),
+            _ => None,
+        };
+        let text = typed.unwrap_or(question);
+        if !text.trim().is_empty() {
+            texts.push(text);
+        }
+    }
+    texts
+}
+
+/// What a child is told besides its brief and its memory digest (built at
+/// its spawn, ranked for its brief: [`super::harness::DigestSource`]): the
+/// skills ha learned from this user, in full - a child has no skill tools to
+/// open them with.
 fn child_context(
     data_dir: &Path,
-    conversation: &str,
-    project: Option<&str>,
-    refinements: bool,
     layers: &super::learned::Layers,
 ) -> Vec<harness_session::ContextBlock> {
-    let state = super::harness::merge(
-        super::harness::for_project(
-            super::harness::load(&super::harness::global_dir(data_dir), "global"),
-            project,
-        ),
-        super::harness::load(&super::harness::local_dir(data_dir, conversation), "local"),
-    );
-    // With harness refinements off, no saved entry reaches a child either.
     let mut blocks = Vec::new();
-    if refinements {
-        blocks.push(super::harness::digest_block(
-            &super::harness::format_digest(
-                &state,
-                super::harness::DigestOptions {
-                    repl: false,
-                    refine: false,
-                    memory_tool: false,
-                },
-                &[],
-            ),
-        ));
-    }
     // A child has no Python kernel; where the host has no `python` on PATH,
     // the kernel's interpreter is how it runs a script or the tests. A
     // verifier without it could only read the code and failed the work.
@@ -3034,6 +3050,45 @@ mod resume_list_tests {
 
 /// Newest first. `created_at` has one-second resolution, so turns taken in the same
 /// second tie on it; session ids are time-ordered and break the tie the right way.
+/// The task state the newest earlier conversation of this project keeps,
+/// with that conversation's title, when its checklist has open items: the
+/// newest conversation that kept a task state decides, and one whose work is
+/// done shows nothing.
+async fn earlier_task_state(
+    store: &SqliteStore,
+    data_dir: &Path,
+    current: &TaskId,
+) -> Option<(Option<String>, super::task_state::TaskState)> {
+    /// How many earlier conversations are looked through.
+    const LOOKED_AT: usize = 20;
+    let mut sessions = user_conversation_sessions(store, store.list_sessions().await.ok()?).await;
+    sort_newest_first(&mut sessions);
+    let mut seen = std::collections::HashSet::new();
+    for session in sessions {
+        if session.task_id == *current || !seen.insert(session.task_id.as_str().to_owned()) {
+            continue;
+        }
+        if seen.len() > LOOKED_AT {
+            break;
+        }
+        let state =
+            super::task_state::load(&super::task_state::path(data_dir, session.task_id.as_str()));
+        if state.is_empty() {
+            continue;
+        }
+        if state.unfinished().is_empty() {
+            return None;
+        }
+        let title = store
+            .session_setting(&session.task_id, "title")
+            .await
+            .ok()
+            .flatten();
+        return Some((title, state));
+    }
+    None
+}
+
 fn sort_newest_first(sessions: &mut [harness_store_sqlite::SessionSummary]) {
     sessions.sort_by(|left, right| {
         right
@@ -6660,6 +6715,14 @@ impl AgentSessionService {
     }
 }
 
+/// The task setting that says when the last review a long turn's compaction
+/// started began, and in which session.
+const REVIEW_STARTED_SETTING: &str = "review_started";
+
+/// How long a session is quiet before the work since its last review is
+/// reviewed (`HA_IDLE_REVIEW_SECONDS` sets it).
+const IDLE_REVIEW_AFTER: std::time::Duration = std::time::Duration::from_mins(10);
+
 /// One automatic refine review, and the refinement it approves, run off the turn.
 struct AutoRefine {
     sender: UnboundedSender<SessionEvent>,
@@ -8020,9 +8083,6 @@ async fn run_turn(
             ),
             context: child_context(
                 &data_dir,
-                task_id.as_str(),
-                Some(super::bootstrap::project_key_of(&workspace_root).as_str()),
-                refinements,
                 &super::learned::Layers::new(
                     &global_config_dir,
                     &data_dir,
@@ -8030,6 +8090,16 @@ async fn run_turn(
                     config.project_trusted,
                 ),
             ),
+            // With harness refinements off, no saved entry reaches a child either.
+            digest: refinements.then(|| super::harness::DigestSource {
+                data_dir: data_dir.clone(),
+                conversation: task_id.as_str().to_owned(),
+                project: Some(
+                    super::bootstrap::project_key_of(&workspace_root)
+                        .as_str()
+                        .to_owned(),
+                ),
+            }),
         },
         cancellation.clone(),
     ));
@@ -8488,6 +8558,20 @@ async fn run_turn(
     }
     if let Some(block) = super::task_state::context_block(task_state_host.path()) {
         project_blocks.push(block);
+    } else {
+        // A new conversation, in its first turns, hears of the task the last
+        // one left unfinished.
+        let turns = match &source {
+            Some(source) => harness_runtime::conversation_turns(&store, source)
+                .await
+                .map_or(0, |turns| turns.len()),
+            None => 0,
+        };
+        if turns < super::task_state::EARLIER_STATE_TURNS
+            && let Some((title, state)) = earlier_task_state(&store, &data_dir, &task_id).await
+        {
+            project_blocks.push(super::task_state::earlier_block(&state, title.as_deref()));
+        }
     }
     // Where the project's feature list stands, and its rules.
     if let Some(block) = super::features::context_block(&workspace_root) {
@@ -8515,6 +8599,28 @@ async fn run_turn(
         GoalRecord::Active(objective) => Some(objective.as_str()),
         _ => None,
     };
+    // What the digest is ranked by besides the goal, the most telling first:
+    // what the user typed, where the task stands, what they said before, the
+    // feature in progress. Ranked by the message alone, a "continue" or a
+    // short follow-up left a crucial entry out of the six shown.
+    let digest_context = {
+        let mut texts = Vec::new();
+        if typed.trim().is_empty() {
+            texts.push(request.text.clone());
+        } else {
+            texts.push(typed.clone());
+        }
+        if let Some(recap) = super::task_state::recap(task_state_host.path()) {
+            texts.push(recap);
+        }
+        if let Some(source) = &source {
+            texts.extend(recent_user_texts(&store, source, 2).await);
+        }
+        if let Ok(Some(features)) = super::features::load(&workspace_root) {
+            texts.push(features.summary());
+        }
+        texts
+    };
     // With harness refinements off, no saved entry reaches the model.
     if refinements {
         project_blocks.push(super::harness::digest_block(
@@ -8526,7 +8632,13 @@ async fn run_turn(
                         && kernel_skill_imports.iter().any(|name| name == "refine"),
                     memory_tool: true,
                 },
-                &super::harness::weighted_terms(goal_objective, &[request.text.as_str()]),
+                &super::harness::weighted_terms(
+                    goal_objective,
+                    &digest_context
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                ),
             ),
         ));
     }
@@ -8641,6 +8753,84 @@ async fn run_turn(
             == Some(super::queue::QueueMode::All),
     );
 
+    refine_cadence.turn_started();
+    // A long turn's memory is reviewed when it first compacts, beside the turn
+    // as it goes on: reviewed only once the turn ended, an autonomous goal of
+    // hours kept what it learned in the summaries alone until then.
+    let turn_running = Arc::new(AtomicBool::new(true));
+    if auto_refine && refinements {
+        let runtime = Arc::clone(&runtime);
+        let store = Arc::clone(&store);
+        let session = session_id.clone();
+        let task = goal_task.clone();
+        let cadence = Arc::clone(&refine_cadence);
+        let running = Arc::clone(&turn_running);
+        let sender = sender.clone();
+        let helper_provider = Arc::clone(&helper_provider);
+        let helper_model = helper_model.clone();
+        let provider = Arc::clone(&provider);
+        let model = config.model.clone();
+        let mut learning = learning.clone();
+        let knowledge = knowledge_host.clone();
+        let scopes = super::refine::HarnessScopes {
+            global: super::harness::global_dir(&data_dir),
+            local: super::harness::local_dir(&data_dir, goal_task.as_str()),
+        };
+        tokio::spawn(async move {
+            let start = runtime.compactions();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if !running.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                if runtime.compactions() > start {
+                    break;
+                }
+            }
+            let Some(turns) = cadence.claim_now() else {
+                return;
+            };
+            // Kept with the task, so it can be told when and why a review ran.
+            let _ = store
+                .set_session_setting(
+                    &task,
+                    REVIEW_STARTED_SETTING,
+                    &serde_json::json!({
+                        "why": "compaction",
+                        "session": session.as_str(),
+                        "at": chrono::Utc::now().to_rfc3339(),
+                    })
+                    .to_string(),
+                )
+                .await;
+            let conversation = refine_transcript(&store, &session, &scopes.local).await;
+            drop(store);
+            if conversation.is_empty() {
+                cadence.release();
+                return;
+            }
+            learning.in_play = cadence.take_in_play();
+            let _ = sender.send(SessionEvent::Notice {
+                message: "auto-refine: the context was summarized; reviewing what this turn learned so far in the background".to_owned(),
+            });
+            AutoRefine {
+                sender,
+                helper_provider,
+                helper_model,
+                provider,
+                model,
+                conversation,
+                scopes,
+                learning,
+                turns,
+                reviewed: session.as_str().to_owned(),
+                knowledge,
+            }
+            .run()
+            .await;
+            cadence.release();
+        });
+    }
     // A follow-up turn continues the previous session; the first turn starts one.
     let outcome = match &source {
         Some(source) => {
@@ -8655,6 +8845,7 @@ async fn run_turn(
         }
     };
 
+    turn_running.store(false, std::sync::atomic::Ordering::SeqCst);
     // The turn's children belong to the session: they keep running, and what they
     // find reaches the parent as a notice.
     drop(delegate_host);
@@ -8949,6 +9140,58 @@ async fn run_turn(
                     cadence.release();
                 });
             }
+        } else if auto_refine && refinements && refine_cadence.has_tail() {
+            // The session's end, reviewed when it goes quiet: a session that
+            // ended left its review for the next turn in the project, and
+            // with no next turn it never ran. A background agent lives on
+            // after its terminal closes, so the review runs then; an agent
+            // stopped sooner still leaves it to the next turn.
+            let scopes = super::refine::HarnessScopes {
+                global: super::harness::global_dir(&data_dir),
+                local: super::harness::local_dir(&data_dir, goal_task.as_str()),
+            };
+            let conversation = refine_transcript(&store, &session_id, &scopes.local).await;
+            let generation = refine_cadence.generation();
+            let cadence = Arc::clone(&refine_cadence);
+            let quiet = environment
+                .value("HA_IDLE_REVIEW_SECONDS")
+                .and_then(|value| {
+                    value
+                        .to_str()
+                        .and_then(|text| text.trim().parse::<u64>().ok())
+                })
+                .map_or(IDLE_REVIEW_AFTER, std::time::Duration::from_secs);
+            let mut background = AutoRefine {
+                sender: sender.clone(),
+                helper_provider: Arc::clone(&helper_provider),
+                helper_model: helper_model.clone(),
+                provider: Arc::clone(&provider),
+                model: config.model.clone(),
+                conversation,
+                scopes,
+                learning: learning.clone(),
+                turns: 0,
+                reviewed: session_id.as_str().to_owned(),
+                knowledge: knowledge_host.clone(),
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(quiet).await;
+                if cadence.generation() != generation || background.conversation.is_empty() {
+                    return;
+                }
+                let Some(turns) = cadence.claim_tail() else {
+                    return;
+                };
+                background.turns = turns;
+                background.learning.in_play = cadence.take_in_play();
+                let _ = background.sender.send(SessionEvent::Notice {
+                    message: format!(
+                        "auto-refine: the session is quiet; reviewing its last {turns} turn(s) in the background"
+                    ),
+                });
+                background.run().await;
+                cadence.release();
+            });
         }
     }
     // A session that ended with work not yet reviewed left the review here: it runs

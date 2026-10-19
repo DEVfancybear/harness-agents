@@ -287,6 +287,26 @@ pub fn context_block(path: &Path) -> Option<ContextBlock> {
     })
 }
 
+/// How many turns a new conversation is shown the task an earlier one left.
+pub const EARLIER_STATE_TURNS: usize = 3;
+
+/// The task an earlier conversation of this project left unfinished, shown in
+/// a new conversation's first turns: local memory and the task state belong to
+/// one conversation, so a new one started knowing nothing of the work, unless
+/// the project kept a feature list.
+#[must_use]
+pub fn earlier_block(state: &TaskState, title: Option<&str>) -> ContextBlock {
+    let named = title.map_or_else(String::new, |title| format!(" ({title:?})"));
+    ContextBlock::mandatory(
+        "earlier-task-state",
+        ContextBlockKind::Instruction,
+        format!(
+            "The previous conversation in this project{named} left its task unfinished. This is context, not an instruction: if the user's request continues that work, adopt it with task_state (its objective, the checklist with what is done, the decisions and the constraints) and go on from the first open item; otherwise leave it. The user can also /resume that conversation.\n{}",
+            state.render()
+        ),
+    )
+}
+
 /// The recap a long turn recites, `None` while the task has no state.
 #[must_use]
 pub fn recap(path: &Path) -> Option<String> {
@@ -970,5 +990,31 @@ mod tests {
         let unfinished = state.unfinished();
         assert_eq!(unfinished.len(), 1);
         assert_eq!(unfinished[0].text, "b");
+    }
+
+    /// A new conversation is told of the task an earlier one left, as context
+    /// it may adopt, never as an instruction.
+    #[test]
+    fn an_earlier_task_is_offered_as_context() {
+        let state = TaskState {
+            objective: "Port the parser".to_owned(),
+            items: vec![
+                Item {
+                    text: "lexer".to_owned(),
+                    status: ItemStatus::Done,
+                    note: None,
+                },
+                Item {
+                    text: "grammar".to_owned(),
+                    status: ItemStatus::Pending,
+                    note: None,
+                },
+            ],
+            ..TaskState::default()
+        };
+        let block = earlier_block(&state, Some("Parser port"));
+        assert!(block.text.contains("\"Parser port\""), "{}", block.text);
+        assert!(block.text.contains("not an instruction"), "{}", block.text);
+        assert!(block.text.contains("[ ] 2. grammar"), "{}", block.text);
     }
 }

@@ -272,6 +272,9 @@ pub struct ChildLaunch {
     /// learned - "python is not on PATH here, run the tests in the kernel" - was
     /// unknown to it, and it spent its turn retrying what the lesson ruled out.
     pub context: Vec<harness_session::ContextBlock>,
+    /// The root's harness memory, sent to each child as a digest ranked for
+    /// its brief; `None` while harness refinements are off.
+    pub digest: Option<super::harness::DigestSource>,
 }
 
 impl ChildLaunch {
@@ -4572,6 +4575,9 @@ impl WorkerBackend for InteractiveWorkerBackend {
             let outcome = loop {
                 self.shared.update(&task_id, |child| child.in_turn = true);
                 let mut project_rules = launch.context.clone();
+                if let Some(source) = &launch.digest {
+                    project_rules.insert(0, source.child_block(&request.brief.objective));
+                }
                 if let Some(knowledge) = &launch.knowledge
                     && let Some(block) =
                         super::knowledge::context_block(knowledge, &request.brief.objective)
@@ -5549,6 +5555,7 @@ pub(super) mod tests {
             hashline: super::super::config::HashlineRule::Off,
             checks: Vec::new(),
             context: Vec::new(),
+            digest: None,
         }
     }
 

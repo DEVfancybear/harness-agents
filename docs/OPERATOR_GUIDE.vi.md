@@ -598,3 +598,14 @@ Một task hàng trăm bước đi qua nhiều lần compaction, và thứ compa
 - **Nhỏ hơn.** Kết quả tool bị rút gọn cho vừa cửa sổ giữ lại 400 ký tự đầu, nơi lỗi nói cái gì hỏng. Danh sách file trong bản tóm tắt giữ các file được chạm gần nhất, không phải các file đứng đầu theo tên. Bản tóm tắt mới, lần gộp các bước của một lượt và checkpoint đều được tính là compaction, nên lần review memory mà compaction kéo lên sớm cũng chạy sau chúng.
 
 `scripts/live-tests/compaction.sh` chạy một task tám module qua điểm compaction 40k với model thật, thêm một quy tắc trong lúc chạy, rồi kiểm tra khả năng nhớ lại, đĩa và những gì host giữ.
+
+### 12.11. Memory đến đúng nơi cần
+
+Bản 0.6.0 đưa những gì đã nhớ tới đúng những lượt cần nó, và giữ memory sạch ngay từ lúc ghi.
+
+- **Xếp hạng.** Digest memory của mỗi lượt được xếp theo goal, những gì người dùng gõ (không phải prompt mà host ghép quanh nó), bản tóm tắt của trạng thái task, hai tin nhắn trước của người dùng và feature đang làm, nên một câu "tiếp tục" không còn bị xếp theo đúng một từ. Digest của agent con được xếp theo brief của nó (trước đây theo thứ tự tên), và agent con của `ha exec` cũng có digest.
+- **Ràng buộc.** Một memory hay prompt note có path là `constraints` hoặc `constraints/<chủ đề>` được hiện ở mọi lượt, trước các entry đã xếp hạng (tối đa 12), bất kể yêu cầu là gì: quy tắc người dùng đặt không còn rơi khỏi sáu entry được hiện.
+- **Việc mà hội thoại trước để lại.** Ba lượt đầu của một hội thoại mới mang theo trạng thái task của hội thoại gần nhất trong project nếu checklist của nó còn mục chưa xong, như ngữ cảnh mà model có thể nhận lại bằng `task_state` (hoặc người dùng `/resume`); hội thoại đã xong việc thì không hiện gì.
+- **Review.** Một lượt có compact được review memory ngay bên cạnh khi nó còn chạy, không chỉ sau khi kết thúc (setting `review_started` của task ghi lại lúc nào và vì sao). Một phiên lặng đi - mười phút không có lượt nào (`HA_IDLE_REVIEW_SECONDS`) - được review phần việc kể từ lần review trước ngay lúc đó; agent chạy nền vẫn sống sau khi đóng terminal, nên review vẫn chạy dù không ai quay lại, còn agent bị dừng sớm hơn thì để lại cho lượt sau. Một lần refine do agent yêu cầu cũng chấm các learned skill đang dùng.
+- **Ghi.** Tool `memory` từ chối một entry mới mà một entry dài hơn đã chứa (85% số từ có trọng số), không chỉ entry giống toàn bộ, và từ chối entry trùng trước khi lời gọi chạy, nên model đọc thấy một lời từ chối rõ ràng. Các lệnh ghi `rlm.harness` từ kernel qua cùng các bước kiểm tra: không giữ secret, không trùng memory hay prompt note, và đúng `expected_version` mà lệnh cập nhật nêu. Id tạo từ tiêu đề dài tối đa 48 ký tự, cắt ở ranh giới từ; tiêu đề quá 200 ký tự bị từ chối kèm hướng dẫn sửa.
+- **Prompt.** Commit message dùng `git commit -m` hoặc file tạm, không bao giờ là một file trong checkout.

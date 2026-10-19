@@ -277,6 +277,7 @@ fn additional_guidance(has: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
         "- Never repeat a tool call whose result you already have in this conversation.",
         "- When several tool calls do not depend on each other, request them together in one step.",
         "- Read before changing a file; use edit_file for localized changes; never guess paths.",
+        "- Keep scratch files out of the checkout: give a commit message with `git commit -m` (or a file in the system temp directory), never a file in the repository; a stray file there gets committed by mistake, and a change left uncommitted stops a coder child from taking the checkout.",
     ];
     if has("web_search") {
         lines.push("- For current or external information use web_search, then read the most relevant results with web_fetch; cite the URLs you used. Never claim you cannot access the internet when these tools are listed.");
