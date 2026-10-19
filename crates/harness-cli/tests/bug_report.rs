@@ -84,7 +84,7 @@ fn a_bug_report_holds_the_problems_and_no_secret() {
     let stamp = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     seed_worker_and_credentials(&home.join("data"), &stamp);
 
-    // A real process leaves its records: `ha diag path` at debug level.
+    // A process that only starts and exits leaves no file, as no state.
     let path = ha(home, &["diag", "path"]);
     assert!(
         path.status.success(),
@@ -93,7 +93,12 @@ fn a_bug_report_holds_the_problems_and_no_secret() {
     );
     let diagnostics = String::from_utf8(path.stdout).unwrap();
     assert!(diagnostics.trim().ends_with("diagnostics"), "{diagnostics}");
-    // And one that said a secret, the way an error message might.
+    assert!(
+        !Path::new(diagnostics.trim()).exists(),
+        "ha diag path wrote a log"
+    );
+    // A process that said a secret, the way an error message might.
+    std::fs::create_dir_all(diagnostics.trim()).unwrap();
     std::fs::write(
         Path::new(diagnostics.trim()).join("20260101-tui-7.jsonl"),
         format!(
