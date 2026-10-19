@@ -428,7 +428,8 @@ mod tests {
         assert!(!bare.contains("web_search"));
         assert!(!bare.contains(super::super::knowledge::GUIDANCE));
         let full =
-            SystemPromptBuilder::build(&environment(), &["delegate", "python_repl", "web_search"]).text;
+            SystemPromptBuilder::build(&environment(), &["delegate", "python_repl", "web_search"])
+                .text;
         assert!(full.contains("# Delegating to sub-agents"));
         assert!(full.contains("persistent CPython REPL"));
         assert!(full.contains("rlm.spawn"));

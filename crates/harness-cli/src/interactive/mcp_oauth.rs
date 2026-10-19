@@ -667,7 +667,10 @@ mod tests {
         let held = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a port");
         let port = held.local_addr().expect("address").port();
         let error = super::callback_listener(Some(port)).expect_err("taken");
-        assert!(error.contains(&port.to_string()) && error.contains("in use"), "{error}");
+        assert!(
+            error.contains(&port.to_string()) && error.contains("in use"),
+            "{error}"
+        );
         drop(held);
         let (_listener, bound) = super::callback_listener(Some(port)).expect("free again");
         assert_eq!(bound, port);

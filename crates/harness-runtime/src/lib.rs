@@ -4043,7 +4043,13 @@ impl RuntimeService {
                 let mut canceled = Map::new();
                 canceled.insert("reason".to_owned(), Value::String("canceled".to_owned()));
                 let _ = session
-                    .append_runtime_event(session_id, &task_id, "compaction.canceled", canceled, false)
+                    .append_runtime_event(
+                        session_id,
+                        &task_id,
+                        "compaction.canceled",
+                        canceled,
+                        false,
+                    )
                     .await;
                 return Err(RuntimeError::new(
                     ErrorCode::ProviderCanceled,
@@ -5862,7 +5868,11 @@ mod summary_cancellation_tests {
             }
         }
 
-        fn stream(&self, _request: ProviderRequest, _cancellation: CancellationToken) -> ProviderFuture {
+        fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancellation: CancellationToken,
+        ) -> ProviderFuture {
             Box::pin(async {
                 tokio::time::sleep(Duration::from_mins(10)).await;
                 Ok(Vec::new())
@@ -5893,4 +5903,3 @@ mod summary_cancellation_tests {
         );
     }
 }
-
