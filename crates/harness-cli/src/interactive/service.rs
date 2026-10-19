@@ -9873,7 +9873,7 @@ async fn latest_undo_action(
 
 /// The secrets an export must not contain: the credential variables and the
 /// saved credentials.
-fn export_secrets(
+pub(crate) fn export_secrets(
     environment: &LaunchEnvironment,
     data_dir: &Path,
     provider_key_variable: &str,

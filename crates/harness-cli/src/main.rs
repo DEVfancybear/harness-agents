@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::struct_excessive_bools, reason = "one flag per launch mode")]
 
+mod bug_report;
 mod delegation_cli;
 mod diagnostics;
 mod extension_cli;
@@ -297,6 +298,32 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Gather what ha recorded - every process's diagnostics, the workers'
+    /// logs, the stores' runs and provider attempts, the conversations'
+    /// harness files - into one zip with a SUMMARY.md, secrets redacted.
+    BugReport {
+        /// How far back: 30m, 2h, 3d.
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Only this conversation (`task_...`).
+        #[arg(long)]
+        task: Option<String>,
+        /// Only this session (`session_...`).
+        #[arg(long)]
+        session: Option<String>,
+        /// The zip to write (default `ha-bug-report-<time>.zip` here).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Also request bodies, checkpoints and every setting's value.
+        #[arg(long)]
+        include_content: bool,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// ha's own diagnostics log.
+    #[command(subcommand)]
+    Diag(DiagCommand),
     /// Run one project's background worker; `ha` starts it.
     #[command(hide = true)]
     Worker {
@@ -310,6 +337,46 @@ enum Command {
         #[arg(long)]
         serve: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum DiagCommand {
+    /// Print where the diagnostics log is written.
+    Path,
+    /// Print the merged timeline: diagnostics, worker logs and store points.
+    Timeline {
+        /// How far back: 30m, 2h, 3d.
+        #[arg(long, default_value = "2h")]
+        since: String,
+        /// Only this conversation (`task_...`).
+        #[arg(long)]
+        task: Option<String>,
+        /// Only this session (`session_...`).
+        #[arg(long)]
+        session: Option<String>,
+        /// Leave out points less important than this: error, warn, info, debug.
+        #[arg(long)]
+        level: Option<String>,
+        /// One JSON object a line.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+fn bug_report_options(
+    since: &str,
+    task: Option<String>,
+    session: Option<String>,
+    include_content: bool,
+) -> Result<bug_report::Options, HarnessError> {
+    let since = bug_report::parse_window(since)
+        .map_err(|message| HarnessError::new(ErrorCode::InvalidPayload, message))?;
+    Ok(bug_report::Options {
+        since,
+        task,
+        session,
+        include_content,
+    })
 }
 
 /// Options for the interactive entrypoint (`HA_LAUNCH` H01).
@@ -951,6 +1018,8 @@ fn legacy_command(cli: &Cli) -> bool {
                 | Command::Rename { .. }
                 | Command::Shutdown { .. }
                 | Command::Worker { .. }
+                | Command::BugReport { .. }
+                | Command::Diag(_)
         )
     )
 }
@@ -1097,6 +1166,37 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
         }
         Some(Command::Agents { json } | Command::List { json }) => {
             interactive::agents::list_command(json)
+        }
+        Some(Command::BugReport {
+            since,
+            task,
+            session,
+            out,
+            include_content,
+            json,
+        }) => {
+            let options = bug_report_options(&since, task, session, include_content)?;
+            bug_report::run(options, out, json).await
+        }
+        Some(Command::Diag(DiagCommand::Path)) => {
+            let data_dir = interactive::paths::resolve(&interactive::paths::PathRequest {
+                platform: interactive::paths::HostPlatform::current(),
+                environment: &interactive::paths::LaunchEnvironment::capture(),
+                explicit_data_dir: None,
+            })?
+            .data_dir;
+            println!("{}", diagnostics::location(&data_dir).display());
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Diag(DiagCommand::Timeline {
+            since,
+            task,
+            session,
+            level,
+            json,
+        })) => {
+            let options = bug_report_options(&since, task, session, false)?;
+            bug_report::print_timeline(options, level.as_deref(), json).await
         }
         Some(Command::Model(ModelCommand::List { search, json })) => {
             interactive::cli_extras::model_list(search.as_deref(), json)
@@ -1431,7 +1531,9 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
             | Command::Stop { .. }
             | Command::Rename { .. }
             | Command::Shutdown { .. }
-            | Command::Worker { .. },
+            | Command::Worker { .. }
+            | Command::BugReport { .. }
+            | Command::Diag(_),
         ) => Err(HarnessError::new(
             ErrorCode::InvalidStateTransition,
             "interactive chat must be routed by run()",

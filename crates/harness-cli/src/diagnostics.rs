@@ -415,6 +415,14 @@ fn install_panic_hook() {
     }));
 }
 
+/// Where the diagnostics log of a data directory is: `HA_DIAG_DIR` when set.
+#[must_use]
+pub fn location(data_dir: &Path) -> PathBuf {
+    std::env::var_os("HA_DIAG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map_or_else(|| data_dir.join(DIRECTORY), PathBuf::from)
+}
+
 /// The diagnostics directory this process writes to, when it has one.
 #[must_use]
 pub fn directory() -> Option<PathBuf> {

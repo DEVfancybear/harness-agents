@@ -52,6 +52,9 @@ globset.workspace = true
 # (TypeScript, TOML, Dockerfile, ...), which syntect's own defaults lack.
 syntect = { version = "=5.3.0", default-features = false, features = ["parsing", "regex-fancy", "dump-load"] }
 two-face = { version = "=0.5.2", default-features = false, features = ["syntect-fancy"] }
+# `ha bug-report` writes a zip; both were already in the tree (png, syntect).
+flate2 = "=1.1.10"
+crc32fast = "=1.5.2"
 harness-types = { path = "../harness-types" }
 harness-providers = { path = "../harness-providers" }
 harness-session = { path = "../harness-session" }

@@ -5443,6 +5443,158 @@ fn to_u64(value: i64, field: &str) -> Result<u64, StoreError> {
     })
 }
 
+/// The settings whose value is short and never the user's words: shown in a
+/// bug report whatever it is asked to include.
+const PLAIN_SETTINGS: &[&str] = &[
+    "title",
+    "model",
+    "thinking",
+    "service_tier",
+    "review_started",
+    "rlm_max_depth",
+    "forked_from",
+    "delegated_child",
+    "git_base",
+];
+
+/// What a bug report reads from a store: each table as `{columns, rows}`,
+/// every value as text. Without `include_content` no user text is read - a
+/// request, a checkpoint or a long setting shows its size only.
+const BUG_REPORT_TABLES: &[(&str, &str, &str)] = &[
+    (
+        "sessions",
+        "SELECT session_id, task_id, next_sequence - 1 AS events, created_at FROM sessions ORDER BY rowid DESC LIMIT 300",
+        "",
+    ),
+    (
+        "task_leases",
+        "SELECT task_id, session_id, host_id, generation, claimed_at FROM task_leases",
+        "",
+    ),
+    (
+        "runs",
+        "SELECT run_id, session_id, task_id, input_id, state, acceptance, stop_reason, awaiting_question_id FROM runs ORDER BY rowid DESC LIMIT 300",
+        "",
+    ),
+    (
+        "run_steps",
+        "SELECT step_id, run_id, step_index, request_id, state, stop_reason FROM run_steps ORDER BY rowid DESC LIMIT 600",
+        "",
+    ),
+    (
+        "provider_attempts",
+        "SELECT attempt_id, request_id, session_id, task_id, attempt_number, state, error FROM provider_attempts ORDER BY rowid DESC LIMIT 600",
+        "",
+    ),
+    (
+        "frozen_requests",
+        "SELECT request_id, session_id, task_id, provider_id, model, config_revision, length(request_json) AS request_bytes FROM frozen_requests ORDER BY rowid DESC LIMIT 300",
+        "SELECT request_id, session_id, task_id, provider_id, model, config_revision, length(request_json) AS request_bytes, request_json FROM frozen_requests ORDER BY rowid DESC LIMIT 40",
+    ),
+    (
+        "context_checkpoints",
+        "SELECT checkpoint_id, session_id, task_id, through_sequence, revision, length(content_json) AS content_bytes FROM context_checkpoints ORDER BY rowid DESC LIMIT 100",
+        "SELECT checkpoint_id, session_id, task_id, through_sequence, revision, length(content_json) AS content_bytes, content_json FROM context_checkpoints ORDER BY rowid DESC LIMIT 20",
+    ),
+    (
+        "context_packets",
+        "SELECT packet_id, session_id, task_id, degradation, length(packet_json) AS packet_bytes FROM context_packets WHERE degradation IS NOT NULL ORDER BY rowid DESC LIMIT 100",
+        "",
+    ),
+    (
+        "runtime_commands",
+        "SELECT command_id, session_id, task_id, state, attempts, last_error FROM runtime_commands WHERE last_error IS NOT NULL OR state NOT IN ('completed', 'succeeded') ORDER BY rowid DESC LIMIT 100",
+        "",
+    ),
+    (
+        "run_commands",
+        "SELECT command_id, run_id, task_id, kind, state, detail, created_at_unix_ms, applied_at_unix_ms FROM run_commands ORDER BY rowid DESC LIMIT 100",
+        "",
+    ),
+    (
+        "questions",
+        "SELECT question_id, task_id, run_id, kind, state, created_at_unix_ms, answered_at_unix_ms FROM questions ORDER BY rowid DESC LIMIT 100",
+        "",
+    ),
+    (
+        "tool_intents",
+        "SELECT tool_execution_id, session_id, task_id, tool_name, status, intent_sequence FROM tool_intents ORDER BY rowid DESC LIMIT 300",
+        "",
+    ),
+    (
+        "session_lineage",
+        "SELECT new_session_id, source_session_id, task_id FROM session_lineage ORDER BY rowid DESC LIMIT 300",
+        "",
+    ),
+];
+
+impl SqliteStore {
+    /// The rows a bug report needs, newest first: see [`BUG_REPORT_TABLES`].
+    /// A table this store does not have is reported as missing, not an error.
+    pub async fn bug_report_tables(&self, include_content: bool) -> Value {
+        let mut tables = serde_json::Map::new();
+        for (name, plain, content) in BUG_REPORT_TABLES {
+            let query = if include_content && !content.is_empty() {
+                content
+            } else {
+                plain
+            };
+            tables.insert((*name).to_owned(), self.text_rows(query).await);
+        }
+        let plain = PLAIN_SETTINGS
+            .iter()
+            .map(|key| format!("'{key}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let settings = if include_content {
+            "SELECT task_id, setting_key, length(setting_value) AS bytes, updated_at, setting_value FROM session_settings ORDER BY updated_at DESC LIMIT 1000".to_owned()
+        } else {
+            format!(
+                "SELECT task_id, setting_key, length(setting_value) AS bytes, updated_at, CASE WHEN setting_key IN ({plain}) THEN setting_value END AS setting_value FROM session_settings ORDER BY updated_at DESC LIMIT 1000"
+            )
+        };
+        tables.insert(
+            "session_settings".to_owned(),
+            self.text_rows(&settings).await,
+        );
+        Value::Object(tables)
+    }
+
+    async fn text_rows(&self, query: &str) -> Value {
+        // Every query is one of this file's constants.
+        let rows = match sqlx::query(sqlx::AssertSqlSafe(query.to_owned()))
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => return serde_json::json!({ "error": error.to_string() }),
+        };
+        let columns = rows.first().map_or_else(Vec::new, |row| {
+            row.columns()
+                .iter()
+                .map(|column| sqlx::Column::name(column).to_owned())
+                .collect::<Vec<_>>()
+        });
+        let rows = rows
+            .iter()
+            .map(|row| {
+                (0..row.columns().len())
+                    .map(|index| {
+                        row.try_get::<Option<String>, _>(index)
+                            .map(|value| value.map_or(Value::Null, Value::String))
+                            .or_else(|_| {
+                                row.try_get::<Option<i64>, _>(index)
+                                    .map(|value| value.map_or(Value::Null, Value::from))
+                            })
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({ "columns": columns, "rows": rows })
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn database_error(code: ErrorCode, operation: &str, error: sqlx::Error) -> StoreError {
     StoreError::new(code, format!("{operation}: {error}"))
