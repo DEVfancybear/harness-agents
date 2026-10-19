@@ -558,6 +558,52 @@ async fn p2_s04_request_is_committed_before_provider_and_replayed_exactly() {
     close_writer(store).await;
 }
 
+/// A continued turn that must compact in its first step summarizes the whole
+/// conversation, not just itself: the turn is linked to the one it continues
+/// as soon as it is admitted.
+#[tokio::test]
+async fn p2_c19_a_first_step_checkpoint_covers_the_earlier_turns() {
+    let temp = TempDir::new().unwrap();
+    let store = writer(&temp).await;
+    let provider = Arc::new(MockProvider::text("done"));
+    let runtime = RuntimeService::new(Arc::clone(&store), provider, RuntimeConfig::default())
+        .with_summarizer(Arc::new(FailingSummaryProvider));
+    let task_id = TaskId::generate();
+    let first = SessionId::generate();
+    runtime
+        .run(request(
+            first.clone(),
+            task_id.clone(),
+            "EARLIER_TURN_RULE: never touch vendor",
+        ))
+        .await
+        .unwrap();
+    // The next turn takes the task over, as each turn of the app does.
+    store.release_task_lease(&task_id).await.unwrap();
+    let second = SessionId::generate();
+    // A system prompt past the compaction point and within the window: the
+    // first step compacts.
+    let next = runtime
+        .prepare_continuation_request(
+            &first,
+            request(second.clone(), task_id, "go on").with_system_policy("policy ".repeat(4_000)),
+        )
+        .await
+        .unwrap();
+    let _ = runtime.run(next).await;
+    let checkpoint = store
+        .latest_context_checkpoint(&second)
+        .await
+        .unwrap()
+        .expect("the first step wrote a checkpoint");
+    assert!(
+        checkpoint.content.to_string().contains("EARLIER_TURN_RULE"),
+        "the checkpoint covers the turn before this one"
+    );
+    drop(runtime);
+    close_writer(store).await;
+}
+
 /// A `/compact` the user cancels stops: the deterministic fallback a failed
 /// summary falls back to is not published in its place.
 #[tokio::test]

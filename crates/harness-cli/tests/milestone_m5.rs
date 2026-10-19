@@ -705,7 +705,8 @@ async fn compact_fallback_keeps_prior_turns_and_refuses_to_drop_an_oversized_his
         Arc::clone(&store),
         provider,
         RuntimeConfig {
-            optional_token_budget: 64,
+            // A summary budget of 64 tokens: four fifths of the reserve.
+            compaction_reserve_tokens: 80,
             ..RuntimeConfig::default()
         },
     )
@@ -770,7 +771,8 @@ async fn compact_summary_cache_respects_guidance_and_budget() {
         Arc::clone(&store),
         provider.clone(),
         RuntimeConfig {
-            optional_token_budget: 64,
+            // A summary budget of 64 tokens: four fifths of the reserve.
+            compaction_reserve_tokens: 80,
             ..RuntimeConfig::default()
         },
     );

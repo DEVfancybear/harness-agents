@@ -9,6 +9,17 @@ use std::{
 use sha2::{Digest, Sha256};
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // `ha` polls a turn on its main thread, and a continued turn's futures
+    // nest deep (driver, runtime, compaction, summaries): a debug build's
+    // frames overflowed the 1 MiB main stack Windows gives by default. The
+    // main thread gets the 8 MiB Linux gives it.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        match env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+            Ok("msvc") => println!("cargo:rustc-link-arg-bin=ha=/STACK:8388608"),
+            Ok("gnu") => println!("cargo:rustc-link-arg-bin=ha=-Wl,--stack,8388608"),
+            _ => {}
+        }
+    }
     let repository = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("../..");
     let skills = repository.join(".agents/skills");
     let notices = repository.join(".agents");

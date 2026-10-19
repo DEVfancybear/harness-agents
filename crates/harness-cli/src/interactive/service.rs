@@ -8260,6 +8260,22 @@ async fn run_turn(
         });
         tool_schemas.extend(external);
     }
+    // What the user typed, kept with the turn: the admitted input is the prompt
+    // composed below (notices, attached files, hook context), and a summary of
+    // the conversation keeps the user's own words. A turn the host started - a
+    // goal's continuation - has none.
+    let typed = if super::goal::is_host_text(&request.text) {
+        String::new()
+    } else {
+        request.text.clone()
+    };
+    let _ = store
+        .set_session_setting(
+            &task_id,
+            &format!("{}{session_id}", harness_runtime::TYPED_INPUT_SETTING),
+            &typed,
+        )
+        .await;
     // Content the message names rides with it: images as blocks the model is shown, files
     // as text the model reads. A candidate that cannot be attached is said out loud: a
     // reader who is not told why cannot tell it from a bug.

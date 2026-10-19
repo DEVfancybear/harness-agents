@@ -502,9 +502,19 @@ fn strip_appended_blocks(summary: &str) -> String {
 /// The block of the user's own messages a summary ends with.
 const USER_MESSAGES_TAG: &str = "user-messages";
 
-/// How much of the user's own messages a summary keeps word for word, in
-/// characters (about 16k tokens; Codex keeps 20k tokens of them).
+/// The most of the user's own messages a summary keeps word for word, in
+/// characters (about 16k tokens; Codex keeps 20k tokens of them). A summary
+/// keeps at most two characters per token of its own budget - about half of
+/// it - so the words fit where the summary does (about 4k tokens at the
+/// default 8192).
 const USER_MESSAGES_MAX_CHARS: usize = 64_000;
+
+/// How many characters of the user's words a summary of `budget` tokens keeps.
+fn user_messages_limit(budget: u64) -> usize {
+    usize::try_from(budget.saturating_mul(2))
+        .unwrap_or(usize::MAX)
+        .min(USER_MESSAGES_MAX_CHARS)
+}
 
 /// The longest one kept user message may be.
 const USER_MESSAGE_MAX_CHARS: usize = 4_000;
@@ -521,19 +531,21 @@ const USER_MESSAGES_OMITTED: &str = "older message(s) left out";
 /// "Constraints & Preferences" bullet or not at all; after a few compactions a
 /// rule the user set at the start was a paraphrase of a paraphrase. Claude
 /// Code's and Codex's compactions keep the user's messages word for word.
-fn user_messages(previous: Option<&str>, added: &[String]) -> (Vec<String>, usize) {
+fn user_messages(
+    previous: Option<&str>,
+    added: &[String],
+    limit: usize,
+) -> (Vec<String>, usize) {
     let mut messages = previous.map(listed_user_messages).unwrap_or_default();
     let mut omitted = previous.map_or(0, omitted_user_messages);
+    let longest = USER_MESSAGE_MAX_CHARS.min(limit.max(1));
     for message in added {
         let message = message.trim();
         if message.is_empty() {
             continue;
         }
-        let message = if message.chars().count() > USER_MESSAGE_MAX_CHARS {
-            let mut cut = message
-                .chars()
-                .take(USER_MESSAGE_MAX_CHARS)
-                .collect::<String>();
+        let message = if message.chars().count() > longest {
+            let mut cut = message.chars().take(longest).collect::<String>();
             cut.push_str("\n[truncated]");
             cut
         } else {
@@ -543,7 +555,7 @@ fn user_messages(previous: Option<&str>, added: &[String]) -> (Vec<String>, usiz
         messages.push(message);
     }
     let mut total = messages.iter().map(String::len).sum::<usize>();
-    while total > USER_MESSAGES_MAX_CHARS && messages.len() > 1 {
+    while total > limit && !messages.is_empty() {
         total -= messages.remove(0).len();
         omitted += 1;
     }
@@ -787,7 +799,12 @@ const MAX_SUMMARY_TOKENS: u64 = 8_192;
 /// summary that stands for earlier work gets it: the rolling one, the fold of
 /// a long turn's steps and a checkpoint's.
 fn history_summary_budget(config: &RuntimeConfig) -> u64 {
-    (config.compaction_reserve_tokens * 4 / 5).min(MAX_SUMMARY_TOKENS)
+    // The reserve as the compaction threshold counts it: at most a quarter of
+    // the window, so a small window's summary stays small.
+    let reserve = config
+        .compaction_reserve_tokens
+        .min(config.context_window_tokens / 4);
+    (reserve * 4 / 5).min(MAX_SUMMARY_TOKENS)
 }
 
 /// How the summary that replaces the earlier turns introduces itself.
@@ -1223,6 +1240,9 @@ pub struct RunRequest {
     /// in it, where it carries the packet each turn sent (see
     /// [`ConversationHistory::bare_inputs`]): what a summary keeps word for word.
     pub bare_inputs: Vec<(usize, String)>,
+    /// The session this input continues, linked as soon as the input is
+    /// admitted (see [`RuntimeService::prepare_continuation_request`]).
+    continues: Option<SessionId>,
     /// Who the admitted input comes from: the user, or a model that proposed it
     /// (a delegated child's brief). The input is admitted once, by the run.
     pub authority: SourceAuthority,
@@ -1276,6 +1296,7 @@ impl RunRequest {
             recovered_messages: Vec::new(),
             conversation: Vec::new(),
             bare_inputs: Vec::new(),
+            continues: None,
             authority: SourceAuthority::User,
             auto_compaction_attempted: Arc::new(AtomicBool::new(false)),
             earlier_compaction_noticed: Arc::new(AtomicBool::new(false)),
@@ -1359,7 +1380,7 @@ impl RunRequest {
                     });
                 (index, text.to_owned())
             })
-            .filter(|(_, text)| !is_host_note(text))
+            .filter(|(_, text)| !text.trim().is_empty() && !is_host_note(text))
             .collect()
     }
 }
@@ -2081,6 +2102,9 @@ pub struct ConversationHistory {
     /// Where each turn's question is in `messages`, with the packet its first
     /// request sent in its place when that packet is known.
     pub turn_inputs: Vec<(usize, Option<String>)>,
+    /// What the user typed for each turn, by the place of its question in
+    /// `messages`, where it was recorded; empty for a turn the host started.
+    pub typed_inputs: Vec<(usize, String)>,
     /// The bytes the replayed turns take, measured against the replay bound.
     pub replayed_bytes: usize,
 }
@@ -2137,16 +2161,41 @@ impl ConversationHistory {
     /// that turn on, and nothing after it was read from the cache.
     /// The turns' questions as the user wrote them, by their place in
     /// `messages`, where [`Self::as_sent`] puts the packet that was sent.
+    /// The user's own words for a turn's question: what they typed when it
+    /// was recorded (empty for a turn the host started), else the question.
     #[must_use]
     pub fn bare_inputs(&self) -> Vec<(usize, String)> {
         self.turn_inputs
             .iter()
-            .filter(|(_, sent)| sent.is_some())
             .filter_map(|(index, _)| {
-                self.messages
-                    .get(*index)
-                    .map(|message| (*index, message.content.clone()))
+                let typed = self
+                    .typed_inputs
+                    .iter()
+                    .find(|(at, _)| at == index)
+                    .map(|(_, typed)| typed.clone());
+                typed
+                    .or_else(|| self.messages.get(*index).map(|message| message.content.clone()))
+                    .map(|text| (*index, text))
             })
+            .collect()
+    }
+
+    /// What the user said in the replayed turns, oldest first: each question
+    /// as typed and what they sent while a turn ran; the host's notes and the
+    /// turns the host started are not theirs.
+    #[must_use]
+    pub fn user_texts(&self) -> Vec<String> {
+        let bare = self.bare_inputs();
+        self.messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.role == MessageRole::User)
+            .map(|(index, message)| {
+                bare.iter()
+                    .find(|(at, _)| *at == index)
+                    .map_or_else(|| message.content.clone(), |(_, text)| text.clone())
+            })
+            .filter(|text| !text.trim().is_empty() && !is_host_note(text))
             .collect()
     }
 
@@ -2160,6 +2209,24 @@ impl ConversationHistory {
         }
         messages
     }
+}
+
+/// The task setting, per session (`typed_input:<session id>`), that keeps what
+/// the user typed for the turn: the admitted input is the prompt the host
+/// composed from it (notices, attached files, hook context), and only the
+/// typed words are the user's. Empty for a turn the host started (a goal's
+/// continuation), whose words are not the user's.
+pub const TYPED_INPUT_SETTING: &str = "typed_input:";
+
+/// What the user typed for the turn of `session`: `Some("")` for a turn the
+/// host started, `None` when nothing was recorded (an older store).
+async fn typed_input(store: &SqliteStore, session: &SessionId) -> Option<String> {
+    let task = store.session_task(session).await.ok().flatten()?;
+    store
+        .session_setting(&task, &format!("{TYPED_INPUT_SETTING}{session}"))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// The note that stands for the turns past the replay bound, after their count.
@@ -2344,15 +2411,16 @@ pub async fn conversation_history(
                 Some(body) => body,
                 None => TurnBody::Answer(final_answer_of(&attempts)),
             };
-            turns.push((question, sent, body));
+            let typed = typed_input(store, &session).await;
+            turns.push((question, sent, body, typed));
         }
         current = previous_in_conversation(store, &session).await?;
     }
     // `turns` is newest first; keep what fits, then restore speaking order.
-    let interrupted_replayed = matches!(turns.first(), Some((_, _, TurnBody::Steps(_))));
+    let interrupted_replayed = matches!(turns.first(), Some((_, _, TurnBody::Steps(_), _)));
     let mut kept = Vec::new();
     let mut used = 0_usize;
-    for (question, sent, body) in &turns {
+    for (question, sent, body, typed) in &turns {
         let question = clip_turn(question);
         let answer = match body {
             TurnBody::Answer(answer) => vec![ProviderMessage::new(
@@ -2371,7 +2439,7 @@ pub async fn conversation_history(
             break;
         }
         used += cost;
-        kept.push((question, sent.clone(), answer));
+        kept.push((question, sent.clone(), answer, typed.clone()));
     }
     let omitted = turns.len() - kept.len();
     let mut messages = Vec::new();
@@ -2395,7 +2463,11 @@ pub async fn conversation_history(
         ));
     }
     let mut turn_inputs = Vec::with_capacity(kept.len());
-    for (question, sent, answer) in kept.into_iter().rev() {
+    let mut typed_inputs = Vec::new();
+    for (question, sent, answer, typed) in kept.into_iter().rev() {
+        if let Some(typed) = typed {
+            typed_inputs.push((messages.len(), typed));
+        }
         turn_inputs.push((messages.len(), sent));
         messages.push(ProviderMessage::new(MessageRole::User, question));
         messages.extend(answer);
@@ -2406,6 +2478,7 @@ pub async fn conversation_history(
         omitted,
         interrupted_replayed,
         turn_inputs,
+        typed_inputs,
         replayed_bytes: used,
     })
 }
@@ -3405,6 +3478,16 @@ impl RuntimeService {
                     initial_plan_items: Vec::new(),
                 })
                 .await?;
+            // The turn joins its conversation as soon as it exists. A
+            // compaction in its first step summarizes the conversation the
+            // session ends, and before the link the session ended nothing but
+            // this turn: the checkpoint it wrote then stood for everything
+            // before it, and the earlier turns were gone.
+            if let Some(source) = &request.continues {
+                self.store
+                    .record_continuation_link(source, &request.session_id, &request.task_id)
+                    .await?;
+            }
         }
         // The run state machine is applied, never written directly, so terminal
         // states cannot be re-entered by a later notification. The durable run is
@@ -3557,7 +3640,10 @@ impl RuntimeService {
                     .into_iter()
                     .map(|(_, text)| text)
                     .collect::<Vec<_>>();
-                let summary = async {
+                // The summary passes run on the heap: inline, their futures made
+                // a step's future too large for the main thread's stack (a
+                // headless `--continue` overflowed it).
+                let summary = Box::pin(async {
                     let history = if older.is_empty() {
                         "No prior history.".to_owned()
                     } else {
@@ -3586,7 +3672,11 @@ impl RuntimeService {
                     // the whole summary once (prime-agent adds the prefix's file
                     // operations to the compaction's).
                     let (read, modified) = file_lists(&prefix, Some(&history));
-                    let (users, omitted) = user_messages(Some(&history), &prefix_users);
+                    let (users, omitted) = user_messages(
+                        Some(&history),
+                        &prefix_users,
+                        user_messages_limit(budget),
+                    );
                     Ok(format!(
                         "{}{SPLIT_TURN_SEPARATOR}{}{}{}",
                         strip_appended_blocks(&history),
@@ -3594,7 +3684,7 @@ impl RuntimeService {
                         format_file_lists(&read, &modified),
                         format_user_messages(&users, omitted)
                     ))
-                }
+                })
                 .await;
                 match summary {
                     Ok(summary) => {
@@ -3673,10 +3763,7 @@ impl RuntimeService {
         {
             let keep = KEEP_RECENT_TOKENS.min(threshold / 4);
             let budget = history_summary_budget(&config).max(256);
-            match self
-                .summarize_turn_steps(request, &appended, keep, budget)
-                .await
-            {
+            match Box::pin(self.summarize_turn_steps(request, &appended, keep, budget)).await {
                 Ok(Some((folded, covered, fresh))) => {
                     if fresh {
                         summarized = true;
@@ -4632,28 +4719,11 @@ impl RuntimeService {
         }
     }
 
-    /// The token budget one summary may occupy.
-    /// The model's summary of earlier messages, within `budget` tokens: prime-agent's
-    /// compaction summary, written so the work can go on from it.
-    async fn conversation_summary(
-        &self,
-        messages: &[ProviderMessage],
-        budget: u64,
-        guidance: Option<&str>,
-    ) -> Result<String, RuntimeError> {
-        // The history replays each question as the user wrote it.
-        let users = messages
-            .iter()
-            .filter(|message| message.role == MessageRole::User && !is_host_note(&message.content))
-            .map(|message| message.content.clone())
-            .collect::<Vec<_>>();
-        self.anchored_summary(messages, budget, guidance, None, &users)
-            .await
-    }
-
-    /// [`Self::conversation_summary`], told the newest assistant text the
-    /// conversation keeps after the summary (prime-agent's recent-state anchor),
-    /// so the summary does not describe a state the kept messages moved past.
+    /// The model's summary of earlier messages, within `budget` tokens:
+    /// prime-agent's compaction summary, written so the work can go on from
+    /// it, told the newest assistant text the conversation keeps after the
+    /// summary (prime-agent's recent-state anchor), so the summary does not
+    /// describe a state the kept messages moved past.
     ///
     /// A first message that is an earlier summary is updated, not summarised
     /// again (prime-agent's iterative update). Messages are written out as
@@ -4685,7 +4755,8 @@ impl RuntimeService {
             messages
         };
         let (read_files, modified_files) = file_lists(messages, previous_whole);
-        let (user_list, omitted_users) = user_messages(previous_whole, users);
+        let (user_list, omitted_users) =
+            user_messages(previous_whole, users, user_messages_limit(budget));
         let entries = summary_entries(messages);
         let mut previous = previous_whole.map(strip_appended_blocks);
         let earlier = previous.clone();
@@ -4824,9 +4895,14 @@ impl RuntimeService {
         }
         messages.extend_from_slice(&appended[from..cut]);
         let anchor = newest_assistant_text(&appended[cut..]).map(str::to_owned);
-        let summary = self
-            .anchored_summary(&messages, budget, None, anchor.as_deref(), &users)
-            .await?;
+        let summary = Box::pin(self.anchored_summary(
+            &messages,
+            budget,
+            None,
+            anchor.as_deref(),
+            &users,
+        ))
+        .await?;
         if summary.trim().is_empty() {
             return Ok(None);
         }
@@ -4924,9 +5000,8 @@ impl RuntimeService {
             }
             None => older.to_vec(),
         };
-        let summary = self
-            .anchored_summary(&messages, budget, None, anchor, &added)
-            .await?;
+        let summary =
+            Box::pin(self.anchored_summary(&messages, budget, None, anchor, &added)).await?;
         let record = RollingSummary {
             covers: older.len(),
             digest: messages_digest(older),
@@ -5047,6 +5122,7 @@ impl RuntimeService {
         guidance: Option<&str>,
     ) -> Result<Option<String>, RuntimeError> {
         let history = conversation_history(&self.store, session_id).await?;
+        let users = history.user_texts();
         let mut messages = Vec::new();
         if let Some(summary) = history.summary {
             messages.push(ProviderMessage::new(
@@ -5058,7 +5134,7 @@ impl RuntimeService {
         if messages.is_empty() {
             return Ok(None);
         }
-        self.conversation_summary(&messages, budget, guidance)
+        Box::pin(self.anchored_summary(&messages, budget, guidance, None, &users))
             .await
             .map(Some)
     }
@@ -5100,19 +5176,12 @@ impl RuntimeService {
     /// The budget of a checkpoint's summary: the one the rolling summary of
     /// the earlier turns gets. A checkpoint stands for everything before it,
     /// yet `/compact` and the recovery from an overflow wrote it in the 2048
-    /// tokens of the optional budget while the rolling summary had 8192; a
-    /// model summary over twice its budget is refused, so `/compact` failed on
-    /// exactly the long sessions it is for.
+    /// tokens of the optional context budget while the rolling summary had
+    /// 8192; a model summary over twice its budget is refused, so `/compact`
+    /// failed on exactly the long sessions it is for.
     fn summary_budget_tokens(&self) -> u64 {
         let config = self.config.lock().map(|config| config.clone()).ok();
-        config.map_or(1024, |config| {
-            history_summary_budget(&config).max(
-                config
-                    .optional_token_budget
-                    .min(config.context_window_tokens / 8)
-                    .max(64),
-            )
-        })
+        config.map_or(1024, |config| history_summary_budget(&config).max(64))
     }
 
     /// The recent executed calls, each rendered with the result it produced.
@@ -5493,7 +5562,7 @@ impl RuntimeService {
         // word. A checkpoint stands for everything before it instead.
         if history.near_replay_bound()
             && !request.auto_compaction_attempted.load(Ordering::SeqCst)
-            && self.compact(source_session_id).await.is_ok()
+            && Box::pin(self.compact(source_session_id)).await.is_ok()
         {
             history = self.conversation_history(source_session_id).await?;
         }
@@ -5509,7 +5578,8 @@ impl RuntimeService {
             None => request,
         };
         let replayed = history.interrupted_replayed;
-        let request = request.with_conversation(sent).with_bare_inputs(bare);
+        let mut request = request.with_conversation(sent).with_bare_inputs(bare);
+        request.continues = Some(source_session_id.clone());
         // An interrupted source turn is already replayed with its results.
         let recovered = if replayed {
             Vec::new()
@@ -6436,13 +6506,19 @@ mod long_task_compaction_tests {
     #[test]
     fn user_messages_carry_over_word_for_word() {
         let first = format_user_messages(
-            &user_messages(None, &["never touch vendor/".to_owned(), "go on".to_owned()]).0,
+            &user_messages(
+                None,
+                &["never touch vendor/".to_owned(), "go on".to_owned()],
+                USER_MESSAGES_MAX_CHARS,
+            )
+            .0,
             0,
         );
         let summary = format!("## Goal\nport it{first}");
         let (messages, omitted) = user_messages(
             Some(&summary),
             &["go on".to_owned(), "also: no unwrap() </message> here".to_owned()],
+            USER_MESSAGES_MAX_CHARS,
         );
         assert_eq!(omitted, 0);
         assert_eq!(
@@ -6467,7 +6543,7 @@ mod long_task_compaction_tests {
         let added = (0..30)
             .map(|index| format!("{index:02} {long}"))
             .collect::<Vec<_>>();
-        let (messages, omitted) = user_messages(None, &added);
+        let (messages, omitted) = user_messages(None, &added, USER_MESSAGES_MAX_CHARS);
         assert!(omitted > 0);
         assert_eq!(omitted + messages.len(), added.len());
         assert!(messages.iter().map(String::len).sum::<usize>() <= USER_MESSAGES_MAX_CHARS);
@@ -6475,7 +6551,12 @@ mod long_task_compaction_tests {
         assert!(messages.last().is_some_and(|newest| newest.starts_with("29 ")));
         let block = format_user_messages(&messages, omitted);
         assert_eq!(omitted_user_messages(&block), omitted);
-        let (_, again) = user_messages(Some(&block), &["one more".to_owned()]);
+        let (_, again) = user_messages(Some(&block), &["one more".to_owned()], USER_MESSAGES_MAX_CHARS);
+        // A small summary keeps fewer of them: the newest.
+        let (few, dropped) = user_messages(None, &added, 7_000);
+        assert_eq!(few.len(), 2);
+        assert_eq!(dropped, added.len() - 2);
+        assert_eq!(super::user_messages_limit(8_192), 16_384);
         assert!(again >= omitted, "the count carries over");
     }
 
@@ -6550,12 +6631,52 @@ mod long_task_compaction_tests {
             omitted,
             interrupted_replayed: false,
             turn_inputs: (0..turns).map(|index| (index, None)).collect(),
+            typed_inputs: Vec::new(),
             replayed_bytes: bytes,
         };
         assert!(!history(1_000, 10, 0).near_replay_bound());
         assert!(history(CONVERSATION_MAX_BYTES / 2 + 1, 10, 0).near_replay_bound());
         assert!(history(1_000, CONVERSATION_MAX_TURNS / 2 + 1, 0).near_replay_bound());
         assert!(!history(CONVERSATION_MAX_BYTES, 10, 3).near_replay_bound());
+    }
+
+    /// A turn's words are what the user typed, not the prompt the host built
+    /// around them; a turn the host started has none, and a question with
+    /// nothing recorded is kept as it was asked.
+    #[test]
+    fn the_user_texts_are_what_the_user_typed() {
+        let history = ConversationHistory {
+            messages: vec![
+                ProviderMessage::new(
+                    MessageRole::User,
+                    "[python-state]\n\nkeep BLUE-HERON\n\n---\n[attached file content follows]",
+                ),
+                ProviderMessage::new(MessageRole::Assistant, "ok"),
+                ProviderMessage::new(MessageRole::User, "Continue working toward the goal."),
+                ProviderMessage::new(MessageRole::Assistant, "working"),
+                ProviderMessage::new(MessageRole::User, "[steering correction from the user]\nno unwrap"),
+                ProviderMessage::new(MessageRole::User, "an older question"),
+            ],
+            summary: None,
+            omitted: 0,
+            interrupted_replayed: false,
+            turn_inputs: vec![(0, Some("packet".to_owned())), (2, None), (5, None)],
+            typed_inputs: vec![(0, "keep BLUE-HERON".to_owned()), (2, String::new())],
+            replayed_bytes: 0,
+        };
+        assert_eq!(
+            history.user_texts(),
+            vec![
+                "keep BLUE-HERON".to_owned(),
+                "[steering correction from the user]\nno unwrap".to_owned(),
+                "an older question".to_owned()
+            ]
+        );
+        assert_eq!(
+            history.bare_inputs()[0],
+            (0, "keep BLUE-HERON".to_owned()),
+            "the typed words stand for the packet that was sent"
+        );
     }
 }
 

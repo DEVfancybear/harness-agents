@@ -9,6 +9,7 @@ They cost model calls and take minutes, so CI does not run them; run them before
 | `kernel.sh` | `rlm.harness` kept by the Rust host, the `memory` tool and the kernel seeing each other's writes, `/factory`, prime-agent's newer `rlm` (`collect`'s `answer_text`, `rename`, `bash()`, `mcp`), a namespace surviving a restart, `/refinements off` |
 | `memory.sh` | After LongMemEval: extraction, project isolation, knowledge update and renamed ids, recall through history, abstention, duplicate refusal, delete and restore, provenance, `/refinements off`, judged skill outcomes |
 | `prime.sh` | What 0.5.8 ported from prime-agent: `python_repl`, the restore notice, background `bash()`, the Bash card, the prompt stash, cancelling a summary, children in `/session`'s cost, `/new --name`, per-model prompt additions, `compaction.thresholdPercent`, `ha exec` waiting for its children, ACP's `max_tokens`, extra CA certificates, an MCP server's registered OAuth client and callback port |
+| `compaction.sh` | A long task through many compactions (`HA_COMPACT_AT=40000`): rules, a decision and a codeword set at the start and a rule added mid-task are recalled at the end without reading anything and hold on disk; the task state, the summaries, the recaps and the request to save before a summary are checked in the store |
 
 ## Running
 
