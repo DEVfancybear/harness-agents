@@ -6876,6 +6876,7 @@ impl AutoRefine {
                 let shown = refinements.len();
                 for refinement in &refinements {
                     review_record("applied", &self.conversation, Ok(refinement)).emit();
+                    super::refine::note_review(&self.scopes.local, refinement);
                 }
                 for (index, refinement) in refinements.iter().enumerate() {
                     if shown > 1 && index == 0 && refinement.is_empty() {
@@ -8766,6 +8767,20 @@ async fn run_turn(
         .collect::<Vec<_>>();
     if let Some(block) = super::knowledge::context_block(&knowledge_host, &knowledge_queries) {
         project_blocks.push(block);
+    }
+    // What a review beside the conversation changed since the last turn.
+    if refinements
+        && let Some(text) = super::refine::take_review_notes(&super::harness::local_dir(
+            &data_dir,
+            task_id.as_str(),
+        ))
+    {
+        project_blocks.push(harness_session::ContextBlock::optional(
+            "harness-review",
+            harness_session::ContextBlockKind::Optional,
+            text,
+            45,
+        ));
     }
     if let Some(text) = agents.unfinished_block() {
         project_blocks.push(harness_session::ContextBlock::optional(

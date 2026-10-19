@@ -2802,6 +2802,57 @@ pub async fn consolidate_memory(
 /// `MEMORY.md` to about 30.
 pub const MEMORY_TARGET_ENTRIES: usize = 30;
 
+/// What background reviews changed, kept for the conversation's next turn.
+const REVIEW_NOTES_FILE: &str = "review_changes.json";
+
+/// Note what a review that ran beside the conversation changed, for the next
+/// turn to be told (after `CowAgent`'s `[EVOLUTION]` note): the model did not
+/// know a background review had saved, merged or removed anything, and only
+/// the user could see or undo it.
+pub fn note_review(local: &Path, refinement: &Refinement) {
+    if refinement.is_empty() {
+        return;
+    }
+    let path = local.join(REVIEW_NOTES_FILE);
+    let mut notes = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<Value>>(&text).ok())
+        .unwrap_or_default();
+    notes.push(json!({
+        "id": refinement.id(),
+        "summary": refinement.summary(),
+        "details": refinement.details().into_iter().skip(1).take(12).collect::<Vec<_>>(),
+    }));
+    let keep = notes.len().saturating_sub(4);
+    notes.drain(..keep);
+    let _ = std::fs::create_dir_all(local);
+    let _ = std::fs::write(&path, Value::Array(notes).to_string());
+}
+
+/// What background reviews changed since a turn was last told, said once.
+#[must_use]
+pub fn take_review_notes(local: &Path) -> Option<String> {
+    let path = local.join(REVIEW_NOTES_FILE);
+    let notes = serde_json::from_str::<Vec<Value>>(&std::fs::read_to_string(&path).ok()?).ok()?;
+    let _ = std::fs::remove_file(&path);
+    if notes.is_empty() {
+        return None;
+    }
+    let mut text = "Since the last turn, a review that ran beside the conversation changed the harness (memory, learned skills, knowledge). What it saved is already in the digest and the tools; say so when the user asks what was learned, and the user can undo one with `/refine --rollback <id>`:".to_owned();
+    for note in &notes {
+        let _ = write!(
+            text,
+            "\n- {} ({})",
+            note["summary"].as_str().unwrap_or_default(),
+            note["id"].as_str().unwrap_or_default()
+        );
+        for line in note["details"].as_array().into_iter().flatten() {
+            let _ = write!(text, "\n  {}", line.as_str().unwrap_or_default());
+        }
+    }
+    Some(text)
+}
+
 /// The automatic review's verdict (`AutoRefineReview`).
 #[derive(Clone, Debug)]
 pub struct Review {
@@ -2924,6 +2975,34 @@ mod tests {
         );
         let cut = extract_json("{\"summary\": \"x\", \"edits\": [{\"action\"").expect_err("cut");
         assert!(cut.contains("stopped before completing"), "{cut}");
+    }
+
+    /// What a background review changed reaches the next turn once, with the
+    /// id that undoes it; an empty review leaves nothing to say.
+    #[test]
+    fn the_next_turn_is_told_what_a_review_changed() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let nothing = Proposal::from_value(&json!({"edits": []}));
+        let empty = apply(&scopes, &nothing, "refine_0", false, None, None, None).expect("empty");
+        super::note_review(&scopes.local, &empty);
+        assert!(super::take_review_notes(&scopes.local).is_none());
+        let proposal = Proposal::from_value(&json!({"summary": "kept the tab rule", "edits": [
+            {"action": "create", "kind": "memory", "title": "Indentation", "content": "The user wants tabs"}
+        ]}));
+        let applied =
+            apply(&scopes, &proposal, "refine_7", false, None, None, None).expect("applied");
+        super::note_review(&scopes.local, &applied);
+        let told = super::take_review_notes(&scopes.local).expect("told");
+        assert!(told.contains("kept the tab rule (refine_7)"), "{told}");
+        assert!(told.contains("indentation"), "{told}");
+        assert!(told.contains("/refine --rollback"), "{told}");
+        assert!(super::take_review_notes(&scopes.local).is_none(), "once");
+        for _ in 0..6 {
+            super::note_review(&scopes.local, &applied);
+        }
+        let told = super::take_review_notes(&scopes.local).expect("told");
+        assert_eq!(told.matches("(refine_7)").count(), 4, "the newest four");
     }
 
     /// A review's memory write passes the `memory` tool's checks: the same fact
