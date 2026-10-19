@@ -20,7 +20,8 @@ use harness_providers::{
     ProviderToolCall,
 };
 use harness_runtime::{
-    AcceptanceState, AgentState, AskRequest, CheckObservation, GoalEvaluationInput, GoalEvidence,
+    AcceptanceState, AgentState, AskRequest, CheckObservation, ContextPressure, GoalEvaluationInput,
+    GoalEvidence,
     GoalSpec, GoalVerdict, HumanInputService, ProviderEventSink, RunCommand, RunInbox, RunRequest,
     RunResult, RuntimeService, now_unix_ms,
 };
@@ -515,6 +516,33 @@ pub trait QuestionHost: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<String, HarnessError>> + Send>>;
 }
 
+/// What the host adds to a long turn so its task survives compaction: a
+/// recap near the newest message, and a request to save what matters before
+/// the context is summarized.
+pub trait TurnContextHooks: Send + Sync {
+    /// Where the task stands - objective, checklist, constraints - recited
+    /// near the newest message after a summary and every
+    /// [`RECAP_EVERY_STEPS`] steps; `None` while there is nothing to recite.
+    fn recap(&self) -> Option<String>;
+
+    /// What to ask of the model when its context nears the point of being
+    /// summarized; `None` when the session has nowhere to save anything.
+    fn flush_note(&self) -> Option<String>;
+}
+
+/// How a recap introduces itself: the host's, never a new instruction.
+pub const RECAP_PREFIX: &str = "[task-recap from the host, not a new instruction: the context was summarized or the turn is long, so here is where the task stands]";
+
+/// How a request to save introduces itself.
+pub const FLUSH_PREFIX: &str = "[context-note from the host, not a new instruction: the context is close to being summarized]";
+
+/// Every how many steps a long turn recites its task with no summary between.
+///
+/// The objective and the plan sit in the turn's first message; after hundreds
+/// of steps they are far from where the model reads most closely. Manus keeps
+/// its agent on track by rewriting a todo list at the end of the context.
+pub const RECAP_EVERY_STEPS: u32 = 40;
+
 /// Bounded model -> tool -> model loop.
 #[derive(Clone)]
 pub struct TurnDriver {
@@ -537,6 +565,8 @@ pub struct TurnDriver {
     /// or written by a tool. It stands in for a `write_file` call that leaves
     /// `expected_hash` out.
     seen: Arc<std::sync::Mutex<std::collections::HashMap<String, harness_types::ContentHash>>>,
+    /// The recap and the request to save, when the host keeps a task state.
+    context_hooks: Option<Arc<dyn TurnContextHooks>>,
 }
 
 /// A workspace path as a key: one separator, no leading `./`.
@@ -650,7 +680,15 @@ impl TurnDriver {
             steer_all_at_once: false,
             stop_event: "stop",
             seen: Arc::default(),
+            context_hooks: None,
         }
+    }
+
+    /// Recite the task and ask for it to be saved as the context fills.
+    #[must_use]
+    pub fn with_context_hooks(mut self, hooks: Arc<dyn TurnContextHooks>) -> Self {
+        self.context_hooks = Some(hooks);
+        self
     }
 
     /// Advertise the external tools of trusted extensions to this driver.
@@ -831,6 +869,10 @@ impl TurnDriver {
         // Whether a stop hook already sent this turn on: Claude Code's
         // `stop_hook_active`, so a hook can let the second stop through.
         let mut stop_hook_active = false;
+        // The step the task was last recited at, and whether the model was
+        // already asked to save before a summary.
+        let mut recited_at = 1_u32;
+        let mut flush_asked = false;
         // Everything this turn has already said and executed. Each continuation
         // sends the whole transcript, not just the newest step: a model that is
         // handed back only the last tool result has no record of what it already
@@ -1718,6 +1760,37 @@ impl TurnDriver {
                 ));
                 self.record_host_message(&result.run_id, &warning).await;
                 appended.push(ProviderMessage::new(MessageRole::User, warning));
+            }
+            if let Some(hooks) = &self.context_hooks {
+                // After the context was summarized, and every few dozen steps,
+                // the task is restated where the model reads next.
+                if (result.context == ContextPressure::Summarized
+                    || steps.saturating_sub(recited_at) >= RECAP_EVERY_STEPS)
+                    && let Some(recap) = hooks.recap()
+                {
+                    recited_at = steps;
+                    appended.push(ProviderMessage::new(
+                        MessageRole::User,
+                        format!("{RECAP_PREFIX}\n{recap}"),
+                    ));
+                }
+                // Once per turn, before its first summary: what the model
+                // learned and decided is saved while it is still whole
+                // (OpenClaw's flush before compaction).
+                if result.context == ContextPressure::NearLimit
+                    && !flush_asked
+                    && let Some(note) = hooks.flush_note()
+                {
+                    flush_asked = true;
+                    observer.observe(TurnProgress::Notice(
+                        "context: nearly full; asking the model to save its task state and memory before it is summarized"
+                            .to_owned(),
+                    ));
+                    appended.push(ProviderMessage::new(
+                        MessageRole::User,
+                        format!("{FLUSH_PREFIX}\n{note}"),
+                    ));
+                }
             }
             transcript.extend(appended);
             let elided = trim_transcript(

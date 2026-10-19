@@ -8053,6 +8053,9 @@ async fn run_turn(
         skill_catalog.as_ref(),
     );
     learning.project_checks.clone_from(&config.verify.checks);
+    // The task's state - objective, checklist, decisions, constraints - kept by
+    // the host for this conversation and never summarized away.
+    let task_state_host = super::task_state::TaskStateHost::new(&data_dir, task_id.as_str());
     // The model's `goal_complete` is a request: the project's checks run, then an
     // independent verifier judges, before the goal completes.
     let goal_host = match &goal {
@@ -8066,6 +8069,7 @@ async fn run_turn(
                     .filter(|_| config.verify.judge)
                     .map(|host| (host.verifier(), config.routing.verifier.clone())),
                 cancellation: cancellation.clone(),
+                task_state: Some(task_state_host.path().to_path_buf()),
             }),
         ),
         _ => None,
@@ -8188,9 +8192,12 @@ async fn run_turn(
     let memory_host = super::memory::MemoryHost::new(&data_dir, task_id.as_str())
         .with_project(&workspace_root)
         .with_refinements(refinements);
-    tools = tools.with_external(super::memory::with_dispatcher(
-        super::knowledge::with_dispatcher(dispatcher, &knowledge_host),
-        &memory_host,
+    tools = tools.with_external(super::task_state::with_dispatcher(
+        super::memory::with_dispatcher(
+            super::knowledge::with_dispatcher(dispatcher, &knowledge_host),
+            &memory_host,
+        ),
+        &task_state_host,
     ));
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
     let external_tools = super::mcp::combined_tools_with_delegate(
@@ -8203,17 +8210,30 @@ async fn run_turn(
         feature_host.as_ref(),
         repl_host.as_ref(),
     );
-    let external_tools = Some(super::memory::with_tools(
-        Some(super::knowledge::with_tools(
-            external_tools,
-            &knowledge_host,
+    let external_tools = Some(super::task_state::with_tools(
+        Some(super::memory::with_tools(
+            Some(super::knowledge::with_tools(
+                external_tools,
+                &knowledge_host,
+            )),
+            &memory_host,
         )),
-        &memory_host,
+        &task_state_host,
     ));
     let driver = match &external_tools {
         Some(tools) => driver.with_external(tools.clone()),
         None => driver,
     };
+    // A long turn recites its task after a summary and saves it before one.
+    let driver = driver.with_context_hooks(Arc::new(super::task_state::TurnHooks::new(
+        task_state_host.path(),
+        match &goal {
+            GoalRecord::Active(objective) => Some(objective.clone()),
+            _ => None,
+        },
+        &workspace_root,
+        refinements,
+    )));
     let mut tool_schemas = harness_tools::coding_tool_schemas_for(hashline);
     if let Some(tools) = &external_tools {
         // The tool definitions lead every request, so their order is part of
@@ -8441,6 +8461,9 @@ async fn run_turn(
     if let GoalRecord::Active(objective) = &goal {
         project_blocks.push(super::goal::goal_block(objective));
     }
+    if let Some(block) = super::task_state::context_block(task_state_host.path()) {
+        project_blocks.push(block);
+    }
     // Where the project's feature list stands, and its rules.
     if let Some(block) = super::features::context_block(&workspace_root) {
         project_blocks.push(block);
@@ -8539,7 +8562,9 @@ async fn run_turn(
         if let Some(summary) = history.summary.clone() {
             run_request = run_request.with_continuation_context(summary);
         }
-        run_request = run_request.with_conversation(history.as_sent());
+        run_request = run_request
+            .with_conversation(history.as_sent())
+            .with_bare_inputs(history.bare_inputs());
     }
     if !attached.is_empty() {
         for notice in attachments::attachment_notices(&attached.images, &attached.files) {

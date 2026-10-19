@@ -90,8 +90,10 @@ pub fn goal_block(objective: &str) -> ContextBlock {
         ContextBlockKind::Instruction,
         format!(
             "Active goal (persistent across turns): {objective}\n\
-             Work toward it in every turn. The goal ends only when you call goal_complete, and only once \
-             the work is done and verified - say what is left instead of calling it early."
+             Work toward it in every turn. Keep its plan as a checklist with task_state and keep the \
+             checklist current: it is never summarized away, and the goal cannot complete while an item \
+             is open. The goal ends only when you call goal_complete, and only once the work is done and \
+             verified - say what is left instead of calling it early."
         ),
     )
 }
@@ -106,6 +108,8 @@ pub struct GoalCheck {
     pub judge: Option<(super::delegation::VerifierHandle, Option<String>)>,
     /// The turn's cancellation: stopping the turn stops its checks.
     pub cancellation: harness_providers::CancellationToken,
+    /// The task state whose checklist must be finished before the goal is.
+    pub task_state: Option<PathBuf>,
 }
 
 /// The `goal_complete` tool of one turn.
@@ -173,6 +177,27 @@ impl GoalHost {
         };
         if check.cancellation.is_cancelled() {
             return Err("The goal is NOT complete: verification was canceled.".to_owned());
+        }
+        // The plan the model kept is the first audit: a checklist with steps
+        // still open is not a finished goal, whatever the checks say.
+        if let Some(path) = &check.task_state {
+            let state = super::task_state::load(path);
+            let unfinished = state.unfinished();
+            if !unfinished.is_empty() {
+                self.notice(format!(
+                    "goal: {} checklist item(s) are not done; the goal stays active",
+                    unfinished.len()
+                ));
+                return Err(format!(
+                    "The goal is NOT complete: the task checklist still has {} unfinished item(s):\n{}\nFinish them, or update the checklist with task_state (mark an item done once it is, or remove one that is no longer needed), then call goal_complete again.",
+                    unfinished.len(),
+                    unfinished
+                        .iter()
+                        .map(|item| format!("- {}", item.text))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
         }
         let workspace = super::autonomous::snapshot(&check.root).await;
         let unchanged = workspace.is_some()
@@ -568,6 +593,7 @@ mod tests {
             }],
             judge: None,
             cancellation: harness_providers::CancellationToken::new(),
+            task_state: None,
         });
         (host, events)
     }
@@ -646,6 +672,7 @@ mod tests {
             checks: Vec::new(),
             judge: None,
             cancellation,
+            task_state: None,
         });
         let result = host
             .finish("done")
@@ -654,6 +681,39 @@ mod tests {
         assert!(result.contains("canceled"), "{result}");
         assert!(!host.completed());
         assert!(completions(&mut events).is_empty());
+    }
+
+    /// A checklist with open items holds the goal before any check runs; done,
+    /// the goal goes on to its checks.
+    #[tokio::test]
+    async fn an_open_checklist_item_keeps_the_goal_active() {
+        let root = tempfile::tempdir().expect("root");
+        let state = root.path().join("task_state.json");
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let host = GoalHost::new(sender).with_check(super::GoalCheck {
+            root: root.path().to_owned(),
+            objective: "ship".to_owned(),
+            checks: Vec::new(),
+            judge: None,
+            cancellation: harness_providers::CancellationToken::new(),
+            task_state: Some(state.clone()),
+        });
+        std::fs::write(
+            &state,
+            r#"{"items":[{"text":"write it","status":"done"},{"text":"test it","status":"in_progress"}]}"#,
+        )
+        .expect("state");
+        let left = host.finish("done").await.expect_err("an item is open");
+        assert!(left.contains("1 unfinished item"), "{left}");
+        assert!(left.contains("- test it") && !left.contains("write it"), "{left}");
+        assert!(!host.completed());
+        std::fs::write(
+            &state,
+            r#"{"items":[{"text":"write it","status":"done"},{"text":"test it","status":"done"}]}"#,
+        )
+        .expect("state");
+        host.finish("done").await.expect("every item is done");
+        assert_eq!(completions(&mut events).len(), 1);
     }
 
     /// Passing checks complete the goal, with their evidence in its summary.

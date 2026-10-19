@@ -369,6 +369,8 @@ impl ToolPolicy {
                 ))
                 // Marking the user's own goal complete changes only host state.
                 || (plugin_id == "goal" && tool_name == "goal_complete")
+                // So does the task's own checklist.
+                || (plugin_id == "task" && tool_name == "task_state")
                 // The feature list is host state too; a verification runs only the
                 // project's configured checks unless the feature names commands of
                 // its own, which the model wrote and the user approves.
