@@ -8758,9 +8758,14 @@ async fn run_turn(
     // as it goes on: reviewed only once the turn ended, an autonomous goal of
     // hours kept what it learned in the summaries alone until then.
     let turn_running = Arc::new(AtomicBool::new(true));
+    // The watcher reaches the turn's store only through this slot, and only
+    // while it holds the slot's lock; the turn empties it as it ends. Holding a
+    // handle of its own, the watcher kept the store open past the turn's
+    // lease, and the next turn could not open the project (`writer_locked`).
+    let watched_store = Arc::new(tokio::sync::Mutex::new(Some(Arc::clone(&store))));
     if auto_refine && refinements {
         let runtime = Arc::clone(&runtime);
-        let store = Arc::clone(&store);
+        let store_slot = Arc::clone(&watched_store);
         let session = session_id.clone();
         let task = goal_task.clone();
         let cadence = Arc::clone(&refine_cadence);
@@ -8787,6 +8792,10 @@ async fn run_turn(
                     break;
                 }
             }
+            let slot = store_slot.lock().await;
+            let Some(store) = slot.as_ref() else {
+                return;
+            };
             let Some(turns) = cadence.claim_now() else {
                 return;
             };
@@ -8803,8 +8812,8 @@ async fn run_turn(
                     .to_string(),
                 )
                 .await;
-            let conversation = refine_transcript(&store, &session, &scopes.local).await;
-            drop(store);
+            let conversation = refine_transcript(store, &session, &scopes.local).await;
+            drop(slot);
             if conversation.is_empty() {
                 cadence.release();
                 return;
@@ -8846,6 +8855,8 @@ async fn run_turn(
     };
 
     turn_running.store(false, std::sync::atomic::Ordering::SeqCst);
+    // The watcher's use of the store, if any, ends before the store can close.
+    watched_store.lock().await.take();
     // The turn's children belong to the session: they keep running, and what they
     // find reaches the parent as a notice.
     drop(delegate_host);
