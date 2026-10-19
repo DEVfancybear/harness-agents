@@ -158,5 +158,5 @@ check "nothing from private/ is in it" '! find "$RX/report" -path "*private*" | 
 "$HA" diag timeline --since 1h --level warn > "$RX/timeline.txt" 2>&1
 check "ha diag timeline prints the warnings" 'grep -q "worker.died\|open_failed" "$RX/timeline.txt"'
 
-"$HA" shutdown >/dev/null 2>&1
+(cd "$P" && "$HA" shutdown --force >/dev/null 2>&1)
 result
