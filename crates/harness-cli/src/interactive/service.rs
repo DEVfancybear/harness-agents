@@ -13132,13 +13132,15 @@ mod tests {
     fn logs_lists_every_log_under_the_data_directory() {
         let temp = tempfile::tempdir().expect("temp");
         let data = temp.path();
+        let lines = super::log_lines(data);
         assert_eq!(
-            super::log_lines(data),
+            lines[..2],
             [
                 format!("Directory: {}", data.display()),
                 "No logs written yet.".to_owned()
             ]
         );
+        assert!(lines[2].starts_with("/bug-report"), "{lines:?}");
         std::fs::create_dir_all(data.join("repl")).expect("repl");
         std::fs::write(
             data.join("repl").join("kernel-stderr.log"),
@@ -13169,7 +13171,7 @@ mod tests {
             .expect("a log in the venv");
         std::fs::write(data.join("notes.txt"), "x").expect("not a log");
         assert_eq!(
-            super::log_lines(data)[1..],
+            super::log_lines(data)[1..3],
             [
                 "• repl/kernel-stderr.log (2.0 KB)".to_owned(),
                 "• sessions/c1/kernel/kernel-stderr.log (0.0 KB)".to_owned(),

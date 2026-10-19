@@ -141,6 +141,29 @@ struct WriterLease {
     lock_file: File,
     fence: HostFence,
     checkpointer: checkpoint::Checkpointer,
+    /// The holder's note beside the lock and what it says, removed with the
+    /// lock - by `close` or, for a store dropped without it, by `drop`.
+    owner_note: Option<(std::path::PathBuf, String)>,
+}
+
+impl WriterLease {
+    /// Remove the holder's note while the lock is still held, and only if it
+    /// is still this holder's: after the lock goes, the next holder's may be
+    /// there.
+    fn forget_owner(&mut self) {
+        if let Some((path, text)) = self.owner_note.take()
+            && fs::read_to_string(&path).is_ok_and(|now| now == text)
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        // The body runs before the fields drop, so before the lock file closes.
+        self.forget_owner();
+    }
 }
 
 /// The P1 `SQLite` transaction coordinator.
@@ -217,19 +240,19 @@ fn acquire_writer_lock(paths: &StorePaths) -> Result<File, StoreError> {
             ),
         )
     })?;
-    write_writer_owner(&paths.writer_owner_path);
     Ok(lock_file)
 }
 
 /// Note who holds the writer lock: pid, what the process is, since when.
-fn write_writer_owner(path: &std::path::Path) {
+fn write_writer_owner(path: &std::path::Path) -> Option<String> {
     let owner = serde_json::json!({
         "pid": std::process::id(),
         "role": harness_types::diag::process(),
         "thread": std::thread::current().name().unwrap_or("unnamed"),
         "acquired_unix_ms": unix_ms(),
-    });
-    let _ = fs::write(path, owner.to_string());
+    })
+    .to_string();
+    fs::write(path, &owner).ok().map(|()| owner)
 }
 
 fn unix_ms() -> u64 {
@@ -361,6 +384,8 @@ impl SqliteStore {
     ) -> Self {
         let checkpointer =
             checkpoint::Checkpointer::start(&paths.database_path, BUSY_TIMEOUT, signal);
+        let owner_note = write_writer_owner(&paths.writer_owner_path)
+            .map(|text| (paths.writer_owner_path.clone(), text));
         Self {
             paths,
             pool,
@@ -368,6 +393,7 @@ impl SqliteStore {
                 lock_file,
                 fence,
                 checkpointer,
+                owner_note,
             }),
             fault_plan,
             last_frozen: std::sync::Arc::default(),
@@ -3076,10 +3102,8 @@ impl SqliteStore {
             writer.checkpointer.stop().await;
         }
         self.pool.close().await;
-        if let Some(writer) = self.writer.take() {
-            // Before the lock is let go: once it is, the next holder's note
-            // may already be there.
-            let _ = fs::remove_file(&self.paths.writer_owner_path);
+        if let Some(mut writer) = self.writer.take() {
+            writer.forget_owner();
             FileExt::unlock(&writer.lock_file).map_err(|error| {
                 StoreError::new(
                     ErrorCode::StorageWriteFailed,
@@ -5724,6 +5748,14 @@ mod writer_owner_tests {
         );
         first.close().await.expect("close");
         assert!(!owner.exists(), "the note goes with the lock");
+        // A store dropped without `close` (a run that ends) takes it too.
+        let dropped =
+            SqliteStore::open_writer(WriterOpenOptions::new(directory.path(), HostId::generate()))
+                .await
+                .expect("a writer again");
+        assert!(owner.is_file());
+        drop(dropped);
+        assert!(!owner.exists(), "a dropped store's note goes with its lock");
     }
 }
 
