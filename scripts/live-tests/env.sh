@@ -8,7 +8,8 @@
 #   LIVE_ROOT   where each test makes its own home and projects (default: $TEMP/ha-live)
 #   HA_CONFIG   the config.toml to copy into each test's home (default: the user's)
 #   HA_CREDENTIALS_DIR  the private directory holding the model's credentials (required)
-REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# A Windows path where there is one (Git Bash): ConPTY cannot start /f/... paths.
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && (pwd -W 2>/dev/null || pwd))
 export HA=${HA:-$REPO/target/release/ha.exe}
 export PROBE=${PROBE:-$REPO/target/debug/examples/pty_probe.exe}
 export PY=${PY:-python}
