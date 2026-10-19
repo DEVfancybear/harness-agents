@@ -315,6 +315,29 @@ impl KnowledgeHost {
         if action == "search" {
             search_queries(arguments)?;
         }
+        // A page is read into later conversations and shown in the catalog and
+        // the console: like memory, it never keeps a secret. The review's
+        // proposals pass here too.
+        if action == "write" {
+            let mut written = ["title", "summary", "content"]
+                .iter()
+                .filter_map(|key| arguments.get(*key).and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Some(sources) = arguments.get("sources").and_then(Value::as_array) {
+                for source in sources.iter().filter_map(Value::as_str) {
+                    written.push('\n');
+                    written.push_str(source);
+                }
+            }
+            let hits = crate::interactive::learned::secret_hits(&written);
+            if !hits.is_empty() {
+                return Err(format!(
+                    "knowledge never keeps secrets; this looks like {}. Write the page without the value (name the variable or file that holds it)",
+                    hits.join(", ")
+                ));
+            }
+        }
         for key in ["start_line", "start_column", "max_lines", "limit", "offset"] {
             if arguments
                 .get(key)
@@ -1044,6 +1067,46 @@ mod tests {
     fn page(scope: &str, path: &str, content: &str) -> Value {
         json!({"action":"write","scope":scope,"path":path,"title":"Architecture",
             "summary":"Sourced design facts","content":content,"sources":["docs/design.md:12"],"related":[]})
+    }
+
+    /// A pasted config's key was saved to a page the catalog and the console
+    /// show: knowledge refuses a secret as memory does, the review's
+    /// proposals included.
+    #[test]
+    fn a_page_holding_a_secret_is_refused_by_the_tool_and_the_review() {
+        let root = tempfile::tempdir().expect("root");
+        let host = host(root.path());
+        let pasted = page(
+            "project",
+            "ops/deploy.md",
+            "Deploy config:\napi_key=FAKE0123456789abcdefTEST\nregion = eu-west-1\n",
+        );
+        let refused = host.execute(&pasted).expect_err("a secret is refused");
+        assert!(refused.contains("never keeps secrets"), "{refused}");
+        assert!(refused.contains("api_key_assignment"), "{refused}");
+        let mut in_a_source = page("project", "ops/source.md", "Deploy notes\n");
+        in_a_source["sources"] = json!(["https://x.test/?token=FAKE0123456789abcdefTEST"]);
+        assert!(
+            host.execute(&in_a_source).is_err(),
+            "a source is checked too"
+        );
+        let proposal = json!({"scope":"project","path":"ops/review.md","title":"Deploy",
+            "summary":"How deploys work","content":"Bearer FAKEtoken0123456789abcdef\n"});
+        let refused = host
+            .review_create(&proposal)
+            .expect_err("a proposal is refused");
+        assert!(refused.contains("never keeps secrets"), "{refused}");
+        assert!(
+            !root.path().join("project").join("ops").exists(),
+            "nothing written"
+        );
+        let clean = page(
+            "project",
+            "ops/deploy.md",
+            "The key is in DEPLOY_API_KEY.\n",
+        );
+        host.execute(&clean)
+            .expect("a page naming the variable is kept");
     }
 
     /// A project library keeps itself out of Git: its pages left the checkout
