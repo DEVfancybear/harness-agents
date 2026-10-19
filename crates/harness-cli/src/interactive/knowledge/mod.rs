@@ -28,8 +28,10 @@ use harness_types::{ErrorCode, HarnessError};
 use serde_json::Value;
 
 /// Retrieved page titles and summaries are reference data, never instructions.
-pub fn context_block(host: &KnowledgeHost, query: &str) -> Option<ContextBlock> {
-    let text = match host.context(query) {
+/// The catalog block, ranked by `queries` - each a text and its weight, as
+/// the memory digest is ranked.
+pub fn context_block(host: &KnowledgeHost, queries: &[(&str, f64)]) -> Option<ContextBlock> {
+    let text = match host.context(queries) {
         Ok(text) if text.trim().is_empty() => return None,
         Ok(text) => text,
         Err(error) => format!("Knowledge catalog unavailable: {error}"),

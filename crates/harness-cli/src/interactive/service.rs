@@ -8756,7 +8756,19 @@ async fn run_turn(
             ),
         ));
     }
-    if let Some(block) = super::knowledge::context_block(&knowledge_host, &request.text) {
+    // Ranked like the digest: the goal, then what the user typed, the task's
+    // recap, what they said before, the feature in progress.
+    let knowledge_queries = goal_objective
+        .map(|goal| (goal, 3.0))
+        .into_iter()
+        .chain(
+            digest_context
+                .iter()
+                .zip([2.0, 1.5, 1.2, 1.0, 1.0, 1.0])
+                .map(|(text, weight)| (text.as_str(), weight)),
+        )
+        .collect::<Vec<_>>();
+    if let Some(block) = super::knowledge::context_block(&knowledge_host, &knowledge_queries) {
         project_blocks.push(block);
     }
     if let Some(text) = agents.unfinished_block() {

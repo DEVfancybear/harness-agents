@@ -4599,8 +4599,10 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     project_rules.insert(0, source.child_block(&request.brief.objective));
                 }
                 if let Some(knowledge) = &launch.knowledge
-                    && let Some(block) =
-                        super::knowledge::context_block(knowledge, &request.brief.objective)
+                    && let Some(block) = super::knowledge::context_block(
+                        knowledge,
+                        &[(&request.brief.objective, 1.0)],
+                    )
                 {
                     project_rules.push(block);
                 }

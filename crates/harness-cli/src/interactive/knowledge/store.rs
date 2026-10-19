@@ -583,7 +583,17 @@ impl Store {
         })
     }
 
-    pub(crate) fn catalog(&self, query: &str, max_chars: usize) -> Result<String, String> {
+    /// The pages a turn is shown, the most relevant first: ranked by each of
+    /// `queries` - the goal, what the user typed, where the task stands, what
+    /// they said before - by its weight. Ranked by the message alone, a
+    /// "continue" matched nothing and the page about the task in progress was
+    /// left out for the first pages by path. A catalog that leaves pages out
+    /// says how many.
+    pub(crate) fn catalog(
+        &self,
+        queries: &[(&str, f64)],
+        max_chars: usize,
+    ) -> Result<String, String> {
         self.with_lock(|root| {
             if !enabled_at(root)? || max_chars == 0 {
                 return Ok(String::new());
@@ -592,35 +602,63 @@ impl Store {
             if pages.is_empty() {
                 return Ok(String::new());
             }
-            let hits = search_pages(&pages, query, 20);
-            let mut ordered = hits
+            let documents = search_documents(&pages);
+            let mut scores: BTreeMap<&str, f64> = BTreeMap::new();
+            for (query, weight) in queries {
+                for (rank, hit) in rank_pages(&pages, &documents, &normalized(query), 20)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let Some(page) = pages.iter().find(|page| page.summary.path == hit.path) else {
+                        continue;
+                    };
+                    *scores.entry(page.summary.path.as_str()).or_default() +=
+                        weight / (61.0 + f64::from(u32::try_from(rank).unwrap_or(u32::MAX)));
+                }
+            }
+            let mut ranked = scores.into_iter().collect::<Vec<_>>();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            let mut ordered = ranked
                 .iter()
-                .filter_map(|hit| pages.iter().find(|p| p.summary.path == hit.path))
+                .filter_map(|(path, _)| pages.iter().find(|p| p.summary.path == *path))
                 .collect::<Vec<_>>();
             for page in &pages {
-                if !ordered.iter().any(|p| p.summary.path == page.summary.path) {
-                    ordered.push(page);
-                }
                 if ordered.len() >= 40 {
                     break;
+                }
+                if !ordered.iter().any(|p| p.summary.path == page.summary.path) {
+                    ordered.push(page);
                 }
             }
             let limit = max_chars.min(20_000);
             let mut output = String::new();
+            let mut shown = 0;
             for page in ordered {
-                // JSON escaping keeps titles from impersonating instructions or fences.
+                // JSON escaping keeps titles from impersonating instructions or
+                // fences. No hash: a page is read before it is changed, and the
+                // read gives it; in the catalog it was 40% of every line.
                 let line = serde_json::to_string(&serde_json::json!({
                     "path": page.summary.path,
                     "title": page.summary.title,
                     "summary": page.summary.summary,
-                    "hash": page.summary.hash,
                 }))
                 .map_err(error)?;
-                if output.chars().count() + line.chars().count() + 1 > limit {
+                if output.chars().count() + line.chars().count() + 1 > limit.saturating_sub(80) {
                     break;
                 }
                 output.push_str(&line);
                 output.push('\n');
+                shown += 1;
+            }
+            let more = pages.len() - shown;
+            if more > 0 {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut output,
+                    format_args!(
+                        "({more} more page(s) not listed: find them with knowledge search or list)
+"
+                    ),
+                );
             }
             Ok(output)
         })
@@ -1146,10 +1184,6 @@ pub(crate) fn fold(text: &str) -> String {
         out.push(character);
     }
     out.nfc().collect()
-}
-
-fn search_pages(pages: &[Page], query: &str, limit: usize) -> Vec<SearchHit> {
-    rank_pages(pages, &search_documents(pages), query, limit)
 }
 
 fn search_documents(pages: &[Page]) -> Vec<String> {
@@ -1872,7 +1906,7 @@ mod tests {
         assert!(store.delete("a.md", &a.hash).is_err());
         assert!(store.graph().is_err());
         assert_eq!(store.refresh().unwrap().pages, 0);
-        assert!(store.catalog("private", 2000).unwrap().is_empty());
+        assert!(store.catalog(&[("private", 1.0)], 2000).unwrap().is_empty());
         store.set_enabled(true).unwrap();
         assert_eq!(store.list().unwrap().len(), 1);
     }
@@ -2051,6 +2085,50 @@ mod tests {
         assert!(!store.root.exists());
     }
 
+    /// Seen: with sixty pages, a "continue" matched nothing and the catalog
+    /// showed the first pages by path, without the one about the task. Ranked
+    /// by the goal too, it leads; and a catalog that leaves pages out says so.
+    #[test]
+    fn the_catalog_is_ranked_by_the_goal_and_says_what_it_leaves_out() {
+        let (_dir, store) = store();
+        for index in 0..60 {
+            let mut filler = input(
+                &format!("analysis/a-{index:02}.md"),
+                "Báo cáo phân tích chung\n",
+            );
+            filler.title = format!("Phân tích {index}");
+            store.write(filler).unwrap();
+        }
+        let mut cart = input(
+            "concepts/cart-retention.md",
+            "Giỏ hàng giữ sản phẩm 24 giờ.\n",
+        );
+        cart.title = "Chính sách giỏ hàng".to_owned();
+        cart.summary = "Giỏ hàng giữ sản phẩm trong 24 giờ".to_owned();
+        store.write(cart).unwrap();
+        let by_message = store.catalog(&[("tiếp tục", 2.0)], 3_000).unwrap();
+        assert!(!by_message.contains("cart-retention"), "{by_message}");
+        let ranked = store
+            .catalog(
+                &[("Thiết kế chính sách giỏ hàng", 3.0), ("tiếp tục", 2.0)],
+                3_000,
+            )
+            .unwrap();
+        assert!(
+            ranked
+                .lines()
+                .next()
+                .unwrap()
+                .contains("concepts/cart-retention.md"),
+            "{ranked}"
+        );
+        assert!(ranked.contains("more page(s) not listed"), "{ranked}");
+        assert!(
+            !ranked.contains("sha256:"),
+            "no hash in the catalog: {ranked}"
+        );
+    }
+
     #[test]
     fn unicode_search_and_outputs_remain_bounded() {
         let (_dir, store) = store();
@@ -2063,7 +2141,7 @@ mod tests {
         assert!(read.content.len() <= MAX_READ);
         assert!(read.content.lines().count() <= MAX_LINES);
         assert!(read.truncated);
-        let catalog = store.catalog("học", 190).unwrap();
+        let catalog = store.catalog(&[("học", 1.0)], 190).unwrap();
         assert!(catalog.chars().count() <= 190);
         assert_eq!(store.search("", 10).unwrap().len(), 0);
     }

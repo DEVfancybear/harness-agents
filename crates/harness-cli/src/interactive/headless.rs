@@ -820,7 +820,8 @@ pub async fn run_with(
             ),
         ));
     }
-    if let Some(block) = super::knowledge::context_block(&knowledge_host, &request.prompt) {
+    if let Some(block) = super::knowledge::context_block(&knowledge_host, &[(&request.prompt, 1.0)])
+    {
         project_blocks.push(block);
     }
     let run_request = run_request.with_project_rules(project_blocks);

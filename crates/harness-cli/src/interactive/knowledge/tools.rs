@@ -570,7 +570,7 @@ impl KnowledgeHost {
     }
 
     /// A small routing catalogue only; full pages are loaded with the tool.
-    pub fn context(&self, query: &str) -> Result<String, String> {
+    pub fn context(&self, queries: &[(&str, f64)]) -> Result<String, String> {
         if !self.store(Scope::Project).enabled()? {
             return Ok(String::new());
         }
@@ -578,7 +578,7 @@ impl KnowledgeHost {
         for scope in [Scope::Project, Scope::Global] {
             let store = self.store(scope);
             if store.enabled()? {
-                let catalog = store.catalog(query, 3_000)?;
+                let catalog = store.catalog(queries, 3_000)?;
                 if !catalog.trim().is_empty() {
                     sections.push(format!("{} knowledge:\n{catalog}", scope.label()));
                 }
@@ -1297,7 +1297,7 @@ mod tests {
         assert!(host.resolve("knowledge", &args).is_none());
         assert!(host.schemas().is_empty());
         assert!(
-            host.context("Architecture")
+            host.context(&[("Architecture", 1.0)])
                 .expect("disabled context")
                 .is_empty()
         );
@@ -1315,7 +1315,11 @@ mod tests {
         assert!(host.resolve("knowledge", &read).is_some());
         host.command("off").expect("workspace off");
         assert!(host.schemas().is_empty());
-        assert!(host.context("Global").expect("context").is_empty());
+        assert!(
+            host.context(&[("Global", 1.0)])
+                .expect("context")
+                .is_empty()
+        );
         for args in [&read, &global, &json!({"action":"list"})] {
             assert!(host.resolve("knowledge", args).is_none());
             assert!(
