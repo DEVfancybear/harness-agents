@@ -6734,9 +6734,11 @@ struct AutoRefine {
     scopes: super::refine::HarnessScopes,
     learning: super::refine::Learning,
     turns: u32,
-    /// The newest session the review reads; once reviewed, the next review
-    /// treats the conversation up to it as already learned from.
-    reviewed: String,
+    /// The newest session the review reads whole; once reviewed, the next
+    /// review treats the conversation up to it as already learned from. `None`
+    /// for a review that read only part of a session (a turn still running)
+    /// and nothing before it.
+    reviewed: Option<String>,
     /// The library the review adds the knowledge the agent left unsaved to.
     knowledge: super::knowledge::KnowledgeHost,
 }
@@ -6767,7 +6769,9 @@ impl AutoRefine {
                 review.rationale
             )),
             Ok(review) => {
-                super::refine::mark_reviewed(&self.scopes.local, &self.reviewed);
+                if let Some(reviewed) = &self.reviewed {
+                    super::refine::mark_reviewed(&self.scopes.local, reviewed);
+                }
                 send(SessionEvent::Notice {
                     message: format!("auto-refine: nothing to refine ({})", review.rationale),
                 });
@@ -6794,7 +6798,9 @@ impl AutoRefine {
         .await
         {
             Ok(refinements) => {
-                super::refine::mark_reviewed(&self.scopes.local, &self.reviewed);
+                if let Some(reviewed) = &self.reviewed {
+                    super::refine::mark_reviewed(&self.scopes.local, reviewed);
+                }
                 // A local part with nothing in it is not worth a row beside
                 // the global one.
                 let shown = refinements.len();
@@ -8766,6 +8772,12 @@ async fn run_turn(
     if auto_refine && refinements {
         let runtime = Arc::clone(&runtime);
         let store_slot = Arc::clone(&watched_store);
+        // The turn is still running when this review reads it: the watermark
+        // goes no further than the turn before, so the end-of-turn review
+        // reads this one whole. Marked at this turn, the review at its end was
+        // told everything was already reviewed, and what the turn did after
+        // the compaction was never learned from.
+        let reviewed_before = source.as_ref().map(ToString::to_string);
         let session = session_id.clone();
         let task = goal_task.clone();
         let cadence = Arc::clone(&refine_cadence);
@@ -8832,7 +8844,7 @@ async fn run_turn(
                 scopes,
                 learning,
                 turns,
-                reviewed: session.as_str().to_owned(),
+                reviewed: reviewed_before,
                 knowledge,
             }
             .run()
@@ -8974,6 +8986,7 @@ async fn run_turn(
         // Every so many requests the curator folds the learned library into
         // class-level skills, beside the conversation like the review.
         if auto_refine
+            && refinements
             && !cancellation.is_cancelled()
             && requests > 0
             && requests.is_multiple_of(super::refine::CURATE_EVERY_REQUESTS)
@@ -9011,6 +9024,7 @@ async fn run_turn(
         // refinement, where Deep Dream overwrites `MEMORY.md` unchecked.
         let global = super::harness::global_dir(&data_dir);
         if auto_refine
+            && refinements
             && !cancellation.is_cancelled()
             && super::refine::memory_consolidation_due(&global)
             && !MEMORY_CONSOLIDATING.swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -9142,7 +9156,7 @@ async fn run_turn(
                     scopes,
                     learning,
                     turns,
-                    reviewed: session_id.as_str().to_owned(),
+                    reviewed: Some(session_id.as_str().to_owned()),
                     knowledge: knowledge_host.clone(),
                 };
                 let cadence = Arc::clone(&refine_cadence);
@@ -9182,7 +9196,7 @@ async fn run_turn(
                 scopes,
                 learning: learning.clone(),
                 turns: 0,
-                reviewed: session_id.as_str().to_owned(),
+                reviewed: Some(session_id.as_str().to_owned()),
                 knowledge: knowledge_host.clone(),
             };
             tokio::spawn(async move {
@@ -9232,7 +9246,7 @@ async fn run_turn(
                 },
                 learning: ended_learning,
                 turns: deferred.turns,
-                reviewed: deferred.session.clone(),
+                reviewed: Some(deferred.session.clone()),
                 knowledge: knowledge_host.clone(),
             };
             send(SessionEvent::Notice {
