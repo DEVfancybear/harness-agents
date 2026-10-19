@@ -392,8 +392,9 @@ impl KnowledgeHost {
                     if let Some(warning) = warning {
                         warnings.push(format!("{}: {}", scope.label(), clipped(&warning, 128)));
                     }
-                    for mut value in hits {
+                    for (rank, mut value) in hits.into_iter().enumerate() {
                         value["scope"] = json!(scope.label());
+                        value["rank"] = json!(rank);
                         results.push(value);
                     }
                 }
@@ -460,13 +461,17 @@ impl KnowledgeHost {
                 _ => unreachable!("validated knowledge action"),
             }
         }
+        // Each scope's hits by their rank in it: a keyword score (about 0.016
+        // a query) and a hybrid one (up to 1) are not comparable, and a
+        // library with embeddings outranked every hit of the other, however
+        // poor. The project's hit goes first at the same rank.
         if action == "search" {
-            results.sort_by(|a, b| {
-                b["score"]
-                    .as_f64()
-                    .unwrap_or_default()
-                    .total_cmp(&a["score"].as_f64().unwrap_or_default())
-            });
+            results.sort_by_key(|result| result["rank"].as_u64().unwrap_or(u64::MAX));
+            for result in &mut results {
+                if let Some(object) = result.as_object_mut() {
+                    object.remove("rank");
+                }
+            }
             results.truncate(limit);
         }
         let links = if results
