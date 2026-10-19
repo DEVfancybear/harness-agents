@@ -90,7 +90,9 @@ agent "$P" k3
 say k3 "/refine --global Lưu vào memory toàn cục (scope global, action create) đúng một entry mới tiêu đề 'Package manager: pnpm', nội dung 'Dự án shop dùng pnpm làm trình quản lý gói, không dùng npm hay yarn.' Đây là yêu cầu của chính người dùng." | tail -4
 sleep 5
 check "one global entry still says pnpm" '[ "$(entries | grep -ci pnpm)" -eq 1 ]'
-check "the refinement recorded the duplicate it refused" 'cat "$D"/harness/refinements.jsonl "$D"/sessions/*/harness/refinements.jsonl 2>/dev/null | grep -qi "same fact\|already says"'
+# The refiner sees the entry and updates it, or its create is refused as the
+# duplicate it is (the refusal itself is the unit test's to show).
+check "the refinement updated the entry or refused the duplicate" 'grep -qi "same fact\|already says" "$D"/harness/refinements.jsonl || grep "\"action\":\"update\"" "$D"/harness/refinements.jsonl | grep -q "\"id\":\"pm_shop\""'
 "$HA" shutdown --force >/dev/null 2>&1
 
 echo "################ 4. Deep Dream keeps its guard rails"
