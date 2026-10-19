@@ -718,6 +718,8 @@ impl MemoryHost {
                 .collect::<std::collections::BTreeSet<_>>()
         };
         let new = words(title, content);
+        // The fact itself is in the content; the title only names it.
+        let said = words("", content);
         let kept = entries
             .iter()
             .map(|entry| {
@@ -727,25 +729,34 @@ impl MemoryHost {
                 )
             })
             .collect::<Vec<_>>();
-        #[allow(clippy::cast_precision_loss, reason = "entry counts are small")]
-        let documents = (kept.len() + 1) as f64;
-        let weight = |term: &String| {
-            #[allow(clippy::cast_precision_loss, reason = "entry counts are small")]
-            let containing = (kept.iter().filter(|words| words.contains(term)).count()
-                + usize::from(new.contains(term))) as f64;
-            ((documents - containing + 0.5) / (containing + 0.5)).ln_1p()
-        };
-        let own = new.iter().map(weight).sum::<f64>();
         let mut close = entries
             .into_iter()
-            .zip(&kept)
-            .filter_map(|(entry, words)| {
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let words = &kept[index];
+                // A word weighs by how rare it is among the other entries: the
+                // pair compared is left out. Counted with the pair, a word the
+                // two shared was "common" to the corpus they made, and in a
+                // store of a few entries the same fact under another title
+                // scored half alike.
+                #[allow(clippy::cast_precision_loss, reason = "entry counts are small")]
+                let others = (kept.len() - 1) as f64;
+                let weight = |term: &String| {
+                    #[allow(clippy::cast_precision_loss, reason = "entry counts are small")]
+                    let containing = kept
+                        .iter()
+                        .enumerate()
+                        .filter(|(other, words)| *other != index && words.contains(term))
+                        .count() as f64;
+                    ((others - containing + 0.5) / (containing + 0.5)).ln_1p()
+                };
                 let shared = new.intersection(words).map(weight).sum::<f64>();
                 let all = new.union(words).map(weight).sum::<f64>();
                 let likeness = if all > 0.0 { shared / all } else { 0.0 };
                 // How much of what the new entry says this one already says.
-                let contained = if own > 0.0 && new.len() >= CONTAINED_MIN_WORDS {
-                    shared / own
+                let own = said.iter().map(weight).sum::<f64>();
+                let contained = if own > 0.0 && said.len() >= CONTAINED_MIN_WORDS {
+                    said.intersection(words).map(weight).sum::<f64>() / own
                 } else {
                     0.0
                 };
@@ -2101,6 +2112,35 @@ mod tests {
         let other = json!({"action":"write","scope":"local","title":"Test runner",
                            "content":"The project runs its tests with vitest in watch mode."});
         host.check(&other).expect("a different fact passes");
+    }
+
+    /// In a store of one entry, the same fact under another title is still
+    /// the same fact: a word the two share is not made common by them.
+    #[test]
+    fn the_same_fact_under_another_title_is_refused_in_a_small_store() {
+        let root = tempfile::tempdir().expect("root");
+        let host = host(root.path());
+        run(
+            &host,
+            &json!({"action":"write","scope":"local","title":"Hạ tầng blog",
+                    "content":"Blog dùng Hugo để build, deploy lên Netlify mỗi tối, ảnh lưu trên Cloudinary."}),
+        )
+        .expect("first");
+        let refusal = host
+            .check(&json!({"action":"write","scope":"local","title":"Hosting",
+                           "content":"Blog dùng Hugo để build, deploy lên Netlify mỗi tối, ảnh lưu trên Cloudinary."}))
+            .expect_err("the same fact");
+        assert!(
+            refusal.contains("same fact") || refusal.contains("already says"),
+            "{refusal}"
+        );
+        let part = host
+            .check(
+                &json!({"action":"write","scope":"local","title":"Công cụ build",
+                           "content":"Blog dùng Hugo để build, deploy lên Netlify mỗi tối."}),
+            )
+            .expect_err("held inside it");
+        assert!(part.contains("already says"), "{part}");
     }
 
     /// An id made from a long title stays short and ends on a word.

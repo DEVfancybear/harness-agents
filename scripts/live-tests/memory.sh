@@ -162,15 +162,15 @@ check "the rule is kept under constraints" "entries | grep -a '^global|p-blog|me
 "$HA" shutdown --force >/dev/null 2>&1
 agent "$RX/p-blog" b13
 say b13 "Viết một câu chào ngắn bằng tiếng Việt." | tail -2
-# The newest request this conversation sent: its digest.
+# The request that turn sent, found by its prompt: its digest.
 digest() { "$PY" - "$D" <<'EOF'
 import glob, json, os, sqlite3, sys
 sys.stdout.reconfigure(encoding="utf-8")
-newest = ""
 for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
-    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests order by rowid desc limit 1"):
-        newest = text
-print(newest)
+    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests order by rowid"):
+        if "Viết một câu chào ngắn" in text:
+            print(text)
+            raise SystemExit
 EOF
 }
 check "an unrelated turn's digest carries the constraint" "digest | grep -q 'WebP'"
