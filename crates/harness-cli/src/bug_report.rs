@@ -696,7 +696,12 @@ impl Report {
     /// The harness files of each conversation in scope, and the global ones.
     fn harness_files(&mut self) {
         let global = crate::interactive::harness::global_dir(&self.data_dir);
-        for name in ["harness_state.json", "memory_consolidated"] {
+        for name in [
+            "harness_state.json",
+            "memory_changes",
+            "memory_consolidated_changes",
+            "memory_consolidation_failed",
+        ] {
             self.copy_file(&global.join(name), &format!("harness/global/{name}"), false);
         }
         let usage = self.data_dir.join("skill-usage");

@@ -6902,10 +6902,6 @@ const SHUTDOWN_STOP: &str = "Cut off because ha's background agent was shut down
 
 const CTRL_C_STOP: &str = "Stopped by the user with Ctrl-C. Its conversation and work so far are kept: when the user asks to continue, send it a message with the agent_message tool saying to carry on, and it resumes where it stopped instead of starting over.";
 
-/// One global memory consolidation at a time across the process's sessions.
-static MEMORY_CONSOLIDATING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// How many of the newest turns a refinement reads, tool calls and results
 /// included; the refiner keeps the tail of that within its own budget.
 const REFINE_TRANSCRIPT_TURNS: usize = 50;
@@ -9158,7 +9154,7 @@ async fn run_turn(
             && refinements
             && !cancellation.is_cancelled()
             && super::refine::memory_consolidation_due(&global)
-            && !MEMORY_CONSOLIDATING.swap(true, std::sync::atomic::Ordering::SeqCst)
+            && let Some(consolidating) = super::refine::Consolidating::try_begin()
         {
             let sender = sender.clone();
             let provider = Arc::clone(&provider);
@@ -9186,7 +9182,7 @@ async fn run_turn(
                         }
                     }
                 };
-                MEMORY_CONSOLIDATING.store(false, std::sync::atomic::Ordering::SeqCst);
+                drop(consolidating);
                 let _ = sender.send(event);
             });
         }

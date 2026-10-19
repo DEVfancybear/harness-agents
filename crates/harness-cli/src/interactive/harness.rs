@@ -28,7 +28,7 @@ const MAX_QUERY_TERMS: usize = 48;
 /// The grouping of an entry the user set as a rule for the work: `constraints`
 /// or `constraints/<topic>`. Such entries are shown before the ranked ones in
 /// every turn, whatever the request says.
-const CONSTRAINTS_PATH: &str = "constraints";
+pub(crate) const CONSTRAINTS_PATH: &str = "constraints";
 /// The most constraint entries of one kind shown ahead of the ranked ones.
 const CONSTRAINT_LIMIT: usize = 12;
 /// The characters the pinned entries may take in every turn's digest.
