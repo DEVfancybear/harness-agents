@@ -105,7 +105,7 @@ print(max(starts)[1])
 EOF
 )
 echo "killing worker $worker_pid"
-taskkill //F //PID "$worker_pid" >/dev/null 2>&1 || kill -9 "$worker_pid"
+taskkill /F /PID "$worker_pid" >/dev/null 2>&1 || kill -9 "$worker_pid"
 for _ in $(seq 1 60); do
   [ "$(records supervisor "r[\"kind\"]==\"worker\" and r[\"event\"]==\"died\"")" -ge 1 ] && break
   sleep 0.5

@@ -8878,7 +8878,11 @@ async fn run_turn(
     // lease, and the next turn could not open the project (`writer_locked`).
     let watched_store = Arc::new(tokio::sync::Mutex::new(Some(Arc::clone(&store))));
     if auto_refine && refinements {
-        let runtime = Arc::clone(&runtime);
+        // The count alone: the runtime holds the store, and a watcher holding
+        // the runtime kept the store - and its writer lock - for as long as
+        // its review ran, past the turn; every turn in that time failed with
+        // `writer_locked` (seen in the 0.6.1 live run, named by its diagnostics).
+        let compactions = runtime.compaction_counter();
         let store_slot = Arc::clone(&watched_store);
         // The turn is still running when this review reads it: the watermark
         // goes no further than the turn before, so the end-of-turn review
@@ -8902,13 +8906,13 @@ async fn run_turn(
             local: super::harness::local_dir(&data_dir, goal_task.as_str()),
         };
         tokio::spawn(async move {
-            let start = runtime.compactions();
+            let start = compactions.load(std::sync::atomic::Ordering::SeqCst);
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 if !running.load(std::sync::atomic::Ordering::SeqCst) {
                     return;
                 }
-                if runtime.compactions() > start {
+                if compactions.load(std::sync::atomic::Ordering::SeqCst) > start {
                     break;
                 }
             }

@@ -3222,6 +3222,13 @@ impl RuntimeService {
         self.compactions.load(Ordering::SeqCst)
     }
 
+    /// The count [`Self::compactions`] reads, for a watcher that must not
+    /// keep the runtime - and through it the store - alive.
+    #[must_use]
+    pub fn compaction_counter(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.compactions)
+    }
+
     /// The provider's measured prompt over this host's estimate of it, at the
     /// last response that reported usage, for the host to carry into the next
     /// turn's [`RuntimeConfig::estimate_scale`].
