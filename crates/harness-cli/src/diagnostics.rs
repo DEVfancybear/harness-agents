@@ -148,6 +148,15 @@ impl FileSink {
             json!(clip(&redact(&record.message), MESSAGE_CHARS)),
         );
         let ids = &record.ids;
+        // An agent's thread is named after it: a record made there is the
+        // agent's even when its maker did not know the id.
+        if ids.agent.is_none()
+            && let Some(agent) = std::thread::current()
+                .name()
+                .and_then(|name| name.strip_prefix("agent-"))
+        {
+            object.insert("agent".to_owned(), json!(agent));
+        }
         for (name, value) in [
             ("agent", &ids.agent),
             ("task", &ids.task),
@@ -288,6 +297,7 @@ impl Sink for Forward {
 /// hook, and record the start. Nothing happens with `HA_DIAG=off` or without
 /// a data directory.
 pub fn init(role: Role) {
+    diag::set_process(role.as_str());
     let environment = crate::interactive::paths::LaunchEnvironment::capture();
     let level = match std::env::var("HA_DIAG") {
         Ok(value) if value.trim().eq_ignore_ascii_case("off") => return,
@@ -313,10 +323,14 @@ pub fn init(role: Role) {
         return;
     }
     install_panic_hook();
-    let mut arguments = std::env::args().skip(1);
-    // The subcommand only: what follows can be the user's prompt.
-    let command = arguments.next().unwrap_or_default();
-    let rest = arguments.count();
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    // The flags' names only: a value, or the first word, can be the user's
+    // prompt (`ha "fix the build"`).
+    let flags = arguments
+        .iter()
+        .filter_map(|argument| argument.strip_prefix("--"))
+        .map(|flag| flag.split('=').next().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
     diag::at(
         if role.long_lived() {
             Level::Info
@@ -326,8 +340,8 @@ pub fn init(role: Role) {
         "process",
         "start",
     )
-    .field("command", command)
-    .field("arguments", rest)
+    .field("flags", flags)
+    .field("arguments", arguments.len())
     .field(
         "cwd",
         std::env::current_dir()

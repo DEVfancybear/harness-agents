@@ -100,7 +100,15 @@ impl SharedStore {
             ))
             .await
             {
-                Ok(store) => return Ok(store),
+                Ok(store) => {
+                    if attempt > 0 {
+                        harness_types::diag::debug("store", "lease_waited")
+                            .field("store", self.dir.display().to_string())
+                            .field("retries", attempt)
+                            .emit();
+                    }
+                    return Ok(store);
+                }
                 // A store dropped a moment ago may still hold its lock while its
                 // last handle goes away; a short wait is what that takes.
                 Err(_) if attempt < OPEN_RETRIES => {
@@ -108,6 +116,12 @@ impl SharedStore {
                     tokio::time::sleep(OPEN_RETRY_DELAY).await;
                 }
                 Err(error) => {
+                    harness_types::diag::error("store", "open_failed")
+                        .msg(error.to_string())
+                        .field("store", self.dir.display().to_string())
+                        .field("code", error.code().as_str())
+                        .field("retries", attempt)
+                        .emit();
                     return Err(HarnessError::new(error.code(), error.to_string()));
                 }
             }

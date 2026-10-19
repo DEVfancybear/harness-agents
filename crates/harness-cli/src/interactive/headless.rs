@@ -108,6 +108,8 @@ struct HeadlessObserver {
     out: Arc<dyn Output>,
     /// Prompt and completion tokens so far: an autonomous run's token budget.
     tokens: AtomicU64,
+    /// The conversation, for the diagnostics log.
+    task: String,
 }
 
 impl HeadlessObserver {
@@ -121,6 +123,29 @@ impl HeadlessObserver {
 
 impl TurnObserver for HeadlessObserver {
     fn observe(&self, progress: TurnProgress) {
+        let record = match &progress {
+            TurnProgress::Notice(message) => {
+                Some(harness_types::diag::info("notice", "shown").msg(message.clone()))
+            }
+            TurnProgress::StreamRestarted => {
+                Some(harness_types::diag::warn("provider", "stream_restarted"))
+            }
+            TurnProgress::ToolSettled {
+                name,
+                call_id,
+                ok: false,
+                detail,
+            } => Some(
+                harness_types::diag::warn("tool", "failed")
+                    .msg(detail.clone().unwrap_or_default())
+                    .call(call_id)
+                    .field("tool", name.clone()),
+            ),
+            _ => None,
+        };
+        if let Some(record) = record {
+            record.task(&self.task).emit();
+        }
         match &progress {
             TurnProgress::TextDelta(text) => {
                 self.stream_event("text.delta", &serde_json::json!({"text": text}));
@@ -845,11 +870,17 @@ pub async fn run_with(
         approval_blocked: AtomicBool::new(false),
         out: Arc::clone(&out),
         tokens: AtomicU64::new(0),
+        task: task_id.as_str().to_owned(),
     });
     observer.stream_event(
         "turn.started",
         &serde_json::json!({"session_id": session_id, "task_id": task_id}),
     );
+    harness_types::diag::info("turn", "start")
+        .task(task_id.as_str())
+        .session(session_id.as_str())
+        .field("headless", true)
+        .emit();
     let turn_observer: Arc<dyn TurnObserver> = observer.clone();
     // prime-agent's headless autonomous run (`--autonomous*`): after a turn
     // that ends cleanly the gates run in the workspace, and the run goes on
@@ -1057,6 +1088,22 @@ pub async fn run_with(
         }
         None => serde_json::Value::Null,
     };
+    harness_types::diag::at(
+        if outcome.stop.as_str() == "final" {
+            harness_types::diag::Level::Info
+        } else {
+            harness_types::diag::Level::Warn
+        },
+        "turn",
+        "end",
+    )
+    .task(outcome.task_id.as_str())
+    .session(outcome.session_id.as_str())
+    .field("stop", outcome.stop.as_str())
+    .field("steps", outcome.steps)
+    .field("tool_calls", outcome.tool_calls)
+    .field("headless", true)
+    .emit();
     let mut output = serde_json::json!({
         "schema_version": 1,
         "session_id": outcome.session_id,

@@ -25,6 +25,9 @@ pub const STORE_SCHEMA_VERSION: i64 = 2;
 pub const DATABASE_FILE_NAME: &str = "harness.sqlite3";
 pub const ARTIFACT_DIRECTORY_NAME: &str = "artifacts";
 pub const WRITER_LOCK_FILE_NAME: &str = "writer.lock";
+/// Who holds the writer lock: written by the holder beside the lock, which
+/// another process cannot read while it is held on Windows.
+pub const WRITER_OWNER_FILE_NAME: &str = "writer.owner.json";
 /// The data directory marker: one file that names the directory and its format.
 pub const DATA_DIRECTORY_MARKER_FILE_NAME: &str = "harness-data.json";
 /// The only data directory format this host writes.
@@ -64,6 +67,7 @@ pub struct StorePaths {
     pub database_path: PathBuf,
     pub artifact_dir: PathBuf,
     pub writer_lock_path: PathBuf,
+    pub writer_owner_path: PathBuf,
 }
 
 impl StorePaths {
@@ -74,6 +78,7 @@ impl StorePaths {
             database_path: data_dir.join(DATABASE_FILE_NAME),
             artifact_dir: data_dir.join(ARTIFACT_DIRECTORY_NAME),
             writer_lock_path: data_dir.join(WRITER_LOCK_FILE_NAME),
+            writer_owner_path: data_dir.join(WRITER_OWNER_FILE_NAME),
             data_dir,
         }
     }

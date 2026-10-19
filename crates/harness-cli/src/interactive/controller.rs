@@ -2195,6 +2195,17 @@ impl InteractiveController {
 
     #[allow(clippy::too_many_lines, reason = "one arm per session event")]
     fn apply_event(&mut self, event: SessionEvent, effects: &mut Vec<Effect>) {
+        if let Some(mut record) = event.diagnostic() {
+            if let Some(task) = self.service.conversation_id() {
+                record = record.task(&task);
+            }
+            if matches!(event, SessionEvent::RunTerminal { .. }) {
+                record = record
+                    .field("steps", self.steps)
+                    .field("tool_calls", self.tool_calls);
+            }
+            record.emit();
+        }
         match event {
             SessionEvent::Accepted { input_id } => {
                 self.flush_stream(effects);

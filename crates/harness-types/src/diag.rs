@@ -85,6 +85,20 @@ pub trait Sink: Send + Sync {
 
 static SINK: OnceLock<Box<dyn Sink>> = OnceLock::new();
 
+static PROCESS: OnceLock<&'static str> = OnceLock::new();
+
+/// Name what this process is (`tui`, `worker`, `exec`...), once: a lock
+/// holder's note says it, so a conflict names who holds the store.
+pub fn set_process(role: &'static str) {
+    let _ = PROCESS.set(role);
+}
+
+/// What this process is, as [`set_process`] named it; `unknown` before.
+#[must_use]
+pub fn process() -> &'static str {
+    PROCESS.get().copied().unwrap_or("unknown")
+}
+
 thread_local! {
     /// Records captured on this thread instead of reaching the sink: tests.
     static CAPTURED: RefCell<Option<Vec<Record>>> = const { RefCell::new(None) };

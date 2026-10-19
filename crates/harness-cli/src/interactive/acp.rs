@@ -876,6 +876,7 @@ impl Acp {
     }
 
     fn event(&mut self, event: SessionEvent) {
+        event.record();
         match event {
             SessionEvent::TextDelta { text } => self.chunk("agent_message_chunk", &text),
             SessionEvent::ThinkingDelta { text } => self.chunk("agent_thought_chunk", &text),

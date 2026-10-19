@@ -22,8 +22,8 @@ pub use models::{
     StoreDiagnostics, StoreFaultPlan, StoreFaultPoint, StorePaths, StoredDelegatedResultRecord,
     StoredTaskNodeRecord, TOOLS_SCHEMA_VERSION, TaskOwnerRecord, TombstoneRow, ToolApprovalBinding,
     ToolApprovalRecord, ToolApprovalState, ToolIntentCommit, ToolIntentRecord, ToolIntentStatus,
-    ToolSettlementCommit, ToolTaskUpdateCommit, WRITER_LOCK_FILE_NAME, WorktreeRecordRow,
-    WriterOpenOptions,
+    ToolSettlementCommit, ToolTaskUpdateCommit, WRITER_LOCK_FILE_NAME, WRITER_OWNER_FILE_NAME,
+    WorktreeRecordRow, WriterOpenOptions,
 };
 pub use store::SqliteStore;
 pub use store::backend_leases::{LEASE_STATES, StoredBackendLease};

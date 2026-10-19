@@ -117,6 +117,16 @@ pub fn supervise_process(args: &WorkerArgs) -> Result<(), String> {
         if started.elapsed() >= STABLE_AFTER {
             failures = 0;
         }
+        let cause = exit_cause(status.code());
+        harness_types::diag::error("worker", "died")
+            .msg(format!("the worker ended ({status}): {cause}"))
+            .field("code", status.code())
+            .field("cause", cause)
+            .field(
+                "ran_ms",
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            )
+            .emit();
         let Some(delay) = RESTART_DELAYS.get(failures) else {
             log("the worker keeps dying; the supervisor stops");
             return Err(format!("the worker died {failures} times in a row"));
@@ -743,6 +753,13 @@ impl Worker {
         self.note_empty(&agents);
         drop(agents);
         log(&format!("agent {} started", info.id));
+        let mut started = harness_types::diag::info("agent", "started")
+            .agent(&info.id)
+            .field("name", info.name.clone());
+        if let Some(task) = &info.conversation {
+            started = started.task(task);
+        }
+        started.emit();
         self.keep_journal();
         Ok(info)
     }
@@ -970,9 +987,16 @@ impl Worker {
         // not reopen what the user stopped.
         let data_dir = self.registry.parent().map(std::path::Path::to_path_buf);
         let conversation = info.conversation.clone();
+        let stopped = id.clone();
         std::thread::spawn(move || {
-            if let Some(thread) = thread {
-                let _ = thread.join();
+            if let Some(thread) = thread
+                && thread.join().is_err()
+            {
+                // The panic hook wrote where; this says the agent was lost.
+                harness_types::diag::error("agent", "panicked")
+                    .msg("the agent's thread panicked")
+                    .agent(&stopped)
+                    .emit();
             }
             if let (Some(data_dir), Some(task)) = (data_dir, conversation) {
                 let cancelled = super::super::schedules::cancel_conversation(
@@ -2069,9 +2093,34 @@ fn new_token() -> String {
     )
 }
 
+/// What a worker's exit code says about how it ended: a panic exits with 101,
+/// and on Windows a crash exits with its exception code, which no hook sees.
+fn exit_cause(code: Option<i32>) -> &'static str {
+    // The NTSTATUS codes, as the signed exit codes Windows reports.
+    const STACK_OVERFLOW: u32 = 0xC000_00FD;
+    const ACCESS_VIOLATION: u32 = 0xC000_0005;
+    const HEAP_CORRUPTION: u32 = 0xC000_0374;
+    const ABORTED: u32 = 0xC000_0409;
+    match code {
+        None => "killed by a signal",
+        Some(101) => "a panic",
+        Some(1) => "an error",
+        Some(code) => match code.cast_unsigned() {
+            STACK_OVERFLOW => "a stack overflow",
+            ACCESS_VIOLATION => "an access violation",
+            HEAP_CORRUPTION => "heap corruption",
+            ABORTED => "an abort",
+            _ => "an unexpected exit",
+        },
+    }
+}
+
 /// A line in the worker's log (its stderr, which the client points at a file
 /// beside its descriptor). Lifecycle only: never a request, never a token.
 fn log(message: &str) {
+    harness_types::diag::info("worker", "log")
+        .msg(message)
+        .emit();
     let mut stderr = std::io::stderr().lock();
     let _ = writeln!(
         stderr,
@@ -2082,6 +2131,7 @@ fn log(message: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::exit_cause;
     use super::{AgentInfo, idle_eviction_from, resolve_selector, same_token};
     use super::{CreateAgent, ResumeOwners, SessionHost, Worker, WorkerSessionHost};
     use serde_json::json;
@@ -2089,6 +2139,17 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn an_exit_code_names_how_the_worker_ended() {
+        assert_eq!(exit_cause(Some(101)), "a panic");
+        assert_eq!(
+            exit_cause(Some(0xC000_00FD_u32.cast_signed())),
+            "a stack overflow"
+        );
+        assert_eq!(exit_cause(Some(7)), "an unexpected exit");
+        assert_eq!(exit_cause(None), "killed by a signal");
+    }
 
     struct TestWorker(Arc<Worker>);
 

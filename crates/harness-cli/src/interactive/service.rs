@@ -6785,12 +6785,17 @@ impl AutoRefine {
                 if let Some(reviewed) = &self.reviewed {
                     super::refine::mark_reviewed(&self.scopes.local, reviewed);
                 }
+                harness_types::diag::info("review", "nothing")
+                    .task(&self.conversation)
+                    .msg(review.rationale.clone())
+                    .emit();
                 send(SessionEvent::Notice {
                     message: format!("auto-refine: nothing to refine ({})", review.rationale),
                 });
                 return;
             }
             Err(error) => {
+                review_record("skipped", &self.conversation, Err(error.as_str())).emit();
                 send(SessionEvent::Notice {
                     message: format!("auto-refine review skipped: {error}"),
                 });
@@ -6817,6 +6822,9 @@ impl AutoRefine {
                 // A local part with nothing in it is not worth a row beside
                 // the global one.
                 let shown = refinements.len();
+                for refinement in &refinements {
+                    review_record("applied", &self.conversation, Ok(refinement)).emit();
+                }
                 for (index, refinement) in refinements.iter().enumerate() {
                     if shown > 1 && index == 0 && refinement.is_empty() {
                         continue;
@@ -6824,9 +6832,12 @@ impl AutoRefine {
                     send(refined_event(refinement));
                 }
             }
-            Err(error) => send(SessionEvent::Notice {
-                message: format!("refine failed: {error}"),
-            }),
+            Err(error) => {
+                review_record("failed", &self.conversation, Err(error.as_str())).emit();
+                send(SessionEvent::Notice {
+                    message: format!("refine failed: {error}"),
+                });
+            }
         }
     }
 }
@@ -7083,6 +7094,27 @@ fn refine_learning(
 }
 
 /// prime-agent's refinement outcome row, from what `/refine` applied.
+/// The diagnostic record of a background review's, curation's or
+/// consolidation's outcome: written whether or not a terminal still listens,
+/// since the notice that reports it is lost when none does.
+fn review_record(
+    event: &'static str,
+    conversation: &str,
+    outcome: Result<&super::refine::Refinement, &str>,
+) -> harness_types::diag::Builder {
+    match outcome {
+        Ok(refinement) => harness_types::diag::info("review", event)
+            .task(conversation)
+            .msg(refinement.summary())
+            .field("refinement", refinement.id())
+            .field("edits", refinement.details().len()),
+        Err(error) => harness_types::diag::warn("review", event)
+            .task(conversation)
+            .msg(error.to_owned())
+            .field("failed", true),
+    }
+}
+
 fn refined_event(refinement: &super::refine::Refinement) -> SessionEvent {
     SessionEvent::Refined {
         header: refinement.header(),
@@ -7236,9 +7268,20 @@ async fn run_turn(
     // The store is the session's, shared with the children that outlive this
     // turn; the lease keeps it open for the turn and lets it close when nobody
     // holds it.
+    harness_types::diag::info("turn", "start")
+        .task(task_id.as_str())
+        .session(session_id.as_str())
+        .field("input", request.input_id.as_str())
+        .field("model", selected_model.clone())
+        .emit();
     let lease = match agents.store().lease().await {
         Ok(lease) => lease,
         Err(error) => {
+            harness_types::diag::error("store", "lease_failed")
+                .task(task_id.as_str())
+                .msg(error.to_string())
+                .field("store", store_dir.display().to_string())
+                .emit();
             send(SessionEvent::RecoverableError {
                 message: format!(
                     "cannot open the project store at {}: {error}. Another terminal may be writing this project.",
@@ -9013,6 +9056,7 @@ async fn run_turn(
                 local: super::harness::local_dir(&data_dir, goal_task.as_str()),
             };
             let learning = learning.clone();
+            let conversation = goal_task.as_str().to_owned();
             send(SessionEvent::Notice {
                 message: "skills: consolidating the learned skill library in the background"
                     .to_owned(),
@@ -9022,10 +9066,16 @@ async fn run_turn(
                     match super::refine::curate(&provider, &model, &scopes, Some(&learning), None)
                         .await
                     {
-                        Ok(refinement) => refined_event(&refinement),
-                        Err(error) => SessionEvent::Notice {
-                            message: format!("skills: curation skipped: {error}"),
-                        },
+                        Ok(refinement) => {
+                            review_record("curated", &conversation, Ok(&refinement)).emit();
+                            refined_event(&refinement)
+                        }
+                        Err(error) => {
+                            review_record("curated", &conversation, Err(error.as_str())).emit();
+                            SessionEvent::Notice {
+                                message: format!("skills: curation skipped: {error}"),
+                            }
+                        }
                     };
                 let _ = sender.send(event);
             });
@@ -9049,17 +9099,25 @@ async fn run_turn(
                 global,
                 local: super::harness::local_dir(&data_dir, goal_task.as_str()),
             };
+            let conversation = goal_task.as_str().to_owned();
             send(SessionEvent::Notice {
                 message: "memory: consolidating the global memory in the background".to_owned(),
             });
             tokio::spawn(async move {
-                let event =
-                    match super::refine::consolidate_memory(&provider, &model, &scopes).await {
-                        Ok(refinement) => refined_event(&refinement),
-                        Err(error) => SessionEvent::Notice {
+                let event = match super::refine::consolidate_memory(&provider, &model, &scopes)
+                    .await
+                {
+                    Ok(refinement) => {
+                        review_record("consolidated", &conversation, Ok(&refinement)).emit();
+                        refined_event(&refinement)
+                    }
+                    Err(error) => {
+                        review_record("consolidated", &conversation, Err(error.as_str())).emit();
+                        SessionEvent::Notice {
                             message: format!("memory: consolidation skipped: {error}"),
-                        },
-                    };
+                        }
+                    }
+                };
                 MEMORY_CONSOLIDATING.store(false, std::sync::atomic::Ordering::SeqCst);
                 let _ = sender.send(event);
             });

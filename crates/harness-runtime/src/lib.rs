@@ -3636,6 +3636,15 @@ impl RuntimeService {
                     .into_iter()
                     .map(|(_, text)| text)
                     .collect::<Vec<_>>();
+                // The last record before a summary: a process that dies in it
+                // (a stack overflow leaves no panic) ends on this line.
+                harness_types::diag::debug("compaction", "start")
+                    .task(request.task_id.as_str())
+                    .session(request.session_id.as_str())
+                    .field("before", before)
+                    .field("older", older.len())
+                    .field("prefix", prefix.len())
+                    .emit();
                 // The summary passes run on the heap: inline, their futures made
                 // a step's future too large for the main thread's stack (a
                 // headless `--continue` overflowed it).
@@ -3695,6 +3704,25 @@ impl RuntimeService {
                             checkpoint_id.clone(),
                             &appended,
                         );
+                        harness_types::diag::info("compaction", "earlier_summarized")
+                            .task(request.task_id.as_str())
+                            .session(request.session_id.as_str())
+                            .field("window", window)
+                            .field("threshold", threshold)
+                            .field("before", before)
+                            .field(
+                                "after",
+                                attempt
+                                    .as_ref()
+                                    .ok()
+                                    .map(|built| built.packet.token_estimate),
+                            )
+                            .field("older", older.len())
+                            .field("prefix", prefix.len())
+                            .field("keep", keep)
+                            .field("dropped", dropped)
+                            .field("budget", budget)
+                            .emit();
                         if !request
                             .earlier_compaction_noticed
                             .swap(true, Ordering::SeqCst)
@@ -3714,6 +3742,14 @@ impl RuntimeService {
                         }
                     }
                     Err(error) => {
+                        harness_types::diag::error("compaction", "earlier_summary_failed")
+                            .task(request.task_id.as_str())
+                            .session(request.session_id.as_str())
+                            .msg(error.to_string())
+                            .field("before", before)
+                            .field("older", older.len())
+                            .field("prefix", prefix.len())
+                            .emit();
                         request.earlier_summary_failed.store(true, Ordering::SeqCst);
                         notices.push(format!(
                             "context: the earlier conversation could not be summarised ({error}); this turn goes on without a summary"
@@ -3733,6 +3769,13 @@ impl RuntimeService {
             let budget = messages_tokens(&appended).saturating_sub(over.max(1));
             let shortened = fit_tool_results(appended.to_mut(), budget);
             if shortened > 0 {
+                harness_types::diag::info("compaction", "tool_results_shortened")
+                    .task(request.task_id.as_str())
+                    .session(request.session_id.as_str())
+                    .field("shortened", shortened)
+                    .field("budget", budget)
+                    .field("over", over)
+                    .emit();
                 attempt = self.build_context(
                     request,
                     continuation_context.as_deref(),
@@ -3762,6 +3805,13 @@ impl RuntimeService {
                         summarized = true;
                         self.compactions.fetch_add(1, Ordering::SeqCst);
                     }
+                    harness_types::diag::info("compaction", "turn_steps_summarized")
+                        .task(request.task_id.as_str())
+                        .session(request.session_id.as_str())
+                        .field("covered", covered)
+                        .field("fresh", fresh)
+                        .field("budget", budget)
+                        .emit();
                     *appended.to_mut() = folded;
                     attempt = self.build_context(
                         request,
@@ -3777,6 +3827,11 @@ impl RuntimeService {
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    harness_types::diag::error("compaction", "turn_summary_failed")
+                        .task(request.task_id.as_str())
+                        .session(request.session_id.as_str())
+                        .msg(error.to_string())
+                        .emit();
                     request.turn_summary_failed.store(true, Ordering::SeqCst);
                     notices.push(format!(
                         "context: this turn's earlier steps could not be summarised ({error})"
@@ -3791,6 +3846,11 @@ impl RuntimeService {
                 .is_ok()
         {
             let compacted = self.compact(&request.session_id).await?;
+            harness_types::diag::info("compaction", "auto")
+                .task(request.task_id.as_str())
+                .session(request.session_id.as_str())
+                .field("after", compacted.packet.token_estimate)
+                .emit();
             summarized = true;
             continuation_context = Some(std::borrow::Cow::Owned(compacted.packet.content));
             let mut compacted_recovery = self.recover_step(&session, &request.session_id).await?;
@@ -4207,6 +4267,28 @@ impl RuntimeService {
                         .await?;
                     let retryable = error.is_retryable();
                     let retry_after = error.retry_after();
+                    harness_types::diag::at(
+                        if canceled {
+                            harness_types::diag::Level::Info
+                        } else {
+                            harness_types::diag::Level::Warn
+                        },
+                        "provider",
+                        "attempt_failed",
+                    )
+                    .task(request.task_id.as_str())
+                    .session(request.session_id.as_str())
+                    .request(&provider_request.request_id)
+                    .msg(error.to_string())
+                    .field("code", error.code().as_str())
+                    .field("attempt", attempt_number)
+                    .field("max_attempts", config.max_attempts)
+                    .field("retryable", retryable)
+                    .field(
+                        "retry_after_ms",
+                        retry_after.map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
+                    )
+                    .emit();
                     last_error = Some(RuntimeError::from(error));
                     attempts = attempt_number;
                     if canceled {

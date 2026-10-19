@@ -255,6 +255,91 @@ pub enum PauseReason {
     BudgetExhausted,
 }
 
+impl SessionEvent {
+    /// Write this event's diagnostic record, if it leaves one.
+    pub fn record(&self) {
+        if let Some(record) = self.diagnostic() {
+            record.emit();
+        }
+    }
+
+    /// The diagnostic record this event leaves, if it is one worth keeping:
+    /// what the user was shown as a notice or an error, a failed tool, how a
+    /// turn ended, a provider wait. Streamed text and progress are not.
+    #[must_use]
+    pub fn diagnostic(&self) -> Option<harness_types::diag::Builder> {
+        use harness_types::diag::{self, Level};
+        let record = match self {
+            Self::Notice { message } => {
+                // A delegated child's progress line is the child's tool call.
+                let level = if message.starts_with("[child ") {
+                    Level::Debug
+                } else {
+                    Level::Info
+                };
+                diag::at(level, "notice", "shown").msg(message.clone())
+            }
+            Self::RecoverableError { message } => {
+                diag::error("error", "recoverable").msg(message.clone())
+            }
+            Self::RunTerminal { outcome } => {
+                let (level, state, reason) = match outcome {
+                    RunOutcome::Done => (Level::Info, "done", String::new()),
+                    RunOutcome::Paused(reason) => {
+                        (Level::Warn, "paused", reason.label().to_owned())
+                    }
+                    RunOutcome::WaitingInput { question_id } => (
+                        Level::Info,
+                        "waiting_input",
+                        question_id.clone().unwrap_or_default(),
+                    ),
+                    RunOutcome::ExternalWait => (Level::Info, "external_wait", String::new()),
+                    RunOutcome::Blocked(reason) => (Level::Warn, "blocked", reason.clone()),
+                    RunOutcome::Failed(reason) => (Level::Error, "failed", reason.clone()),
+                    RunOutcome::Canceled => (Level::Warn, "canceled", String::new()),
+                };
+                diag::at(level, "turn", "terminal")
+                    .msg(reason)
+                    .field("outcome", state)
+            }
+            Self::ToolSettled {
+                name,
+                call_id,
+                ok: false,
+                elapsed,
+                detail,
+            } => diag::warn("tool", "failed")
+                .msg(detail.clone())
+                .call(call_id)
+                .field("tool", name.clone())
+                .field(
+                    "elapsed_ms",
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                ),
+            Self::ProviderWaiting { line: Some(line) } => {
+                diag::info("provider", "waiting").msg(line.clone())
+            }
+            Self::QuotaParked { until } => {
+                diag::warn("provider", "quota_parked").field("until", until.to_rfc3339())
+            }
+            Self::ApprovalExpired { request_id } => {
+                diag::warn("approval", "expired").request(request_id)
+            }
+            Self::StreamRestarted => diag::warn("provider", "stream_restarted"),
+            Self::ChildSettled { name, notice } => diag::info("child", "settled")
+                .msg(notice.clone())
+                .field("child", name.clone()),
+            Self::Refined {
+                header, summary, ..
+            } => diag::info("review", "applied")
+                .msg(summary.clone())
+                .field("header", header.clone()),
+            _ => return None,
+        };
+        Some(record)
+    }
+}
+
 impl PauseReason {
     #[must_use]
     pub fn label(self) -> &'static str {
@@ -1084,6 +1169,58 @@ mod tests {
     use super::{AppPhase, RunOutcome, SessionEvent};
     use harness_types::InputId;
     use std::time::Duration;
+
+    #[test]
+    fn what_the_user_is_shown_leaves_a_diagnostic_record() {
+        use harness_types::diag::{Level, capture};
+        let records = capture(|| {
+            for event in [
+                SessionEvent::Notice {
+                    message: "context: compacted 3 earlier message(s)".to_owned(),
+                },
+                SessionEvent::RecoverableError {
+                    message: "cannot open the project store".to_owned(),
+                },
+                SessionEvent::ToolSettled {
+                    name: "bash".to_owned(),
+                    call_id: "call_1".to_owned(),
+                    ok: false,
+                    elapsed: Duration::from_millis(40),
+                    detail: "exit 2".to_owned(),
+                },
+                SessionEvent::ToolSettled {
+                    name: "bash".to_owned(),
+                    call_id: "call_2".to_owned(),
+                    ok: true,
+                    elapsed: Duration::from_millis(40),
+                    detail: String::new(),
+                },
+                SessionEvent::RunTerminal {
+                    outcome: RunOutcome::Failed("provider refused".to_owned()),
+                },
+                SessionEvent::TextDelta {
+                    text: "streamed text is not recorded".to_owned(),
+                },
+            ] {
+                event.record();
+            }
+        });
+        let seen = records
+            .iter()
+            .map(|record| (record.kind, record.event, record.level))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            seen,
+            [
+                ("notice", "shown", Level::Info),
+                ("error", "recoverable", Level::Error),
+                ("tool", "failed", Level::Warn),
+                ("turn", "terminal", Level::Error),
+            ]
+        );
+        assert_eq!(records[2].ids.call.as_deref(), Some("call_1"));
+        assert_eq!(records[3].fields["outcome"], "failed");
+    }
 
     #[test]
     fn h03_phase_labels_and_active_run_are_explicit() {

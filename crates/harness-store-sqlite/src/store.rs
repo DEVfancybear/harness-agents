@@ -186,6 +186,75 @@ impl std::fmt::Debug for SqliteStore {
     }
 }
 
+/// Take the data directory's writer lock and note who holds it.
+fn acquire_writer_lock(paths: &StorePaths) -> Result<File, StoreError> {
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&paths.writer_lock_path)
+        .map_err(|error| {
+            StoreError::new(
+                ErrorCode::StorageOpenFailed,
+                format!("cannot open writer lock: {error}"),
+            )
+        })?;
+    lock_file.try_lock_exclusive().map_err(|_| {
+        let holder = writer_owner(&paths.writer_owner_path);
+        harness_types::diag::debug("store", "writer_locked")
+            .msg(format!(
+                "the store is held{}",
+                holder.clone().unwrap_or_default()
+            ))
+            .field("store", paths.data_dir.display().to_string())
+            .emit();
+        StoreError::new(
+            ErrorCode::WriterLocked,
+            format!(
+                "another writable host owns this data directory{}",
+                holder.unwrap_or_default()
+            ),
+        )
+    })?;
+    write_writer_owner(&paths.writer_owner_path);
+    Ok(lock_file)
+}
+
+/// Note who holds the writer lock: pid, what the process is, since when.
+fn write_writer_owner(path: &std::path::Path) {
+    let owner = serde_json::json!({
+        "pid": std::process::id(),
+        "role": harness_types::diag::process(),
+        "thread": std::thread::current().name().unwrap_or("unnamed"),
+        "acquired_unix_ms": unix_ms(),
+    });
+    let _ = fs::write(path, owner.to_string());
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Who the lock holder's note says holds the lock, as ` (held by worker pid
+/// 5678 for 42s)`; `None` with no readable note.
+fn writer_owner(path: &std::path::Path) -> Option<String> {
+    let owner: serde_json::Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let since = owner["acquired_unix_ms"]
+        .as_u64()
+        .map(|acquired| format!(" for {}s", unix_ms().saturating_sub(acquired) / 1000))
+        .unwrap_or_default();
+    Some(format!(
+        " (held by {} pid {}{since})",
+        owner["role"].as_str().unwrap_or("unknown"),
+        owner["pid"].as_u64()?,
+    ))
+}
+
 impl SqliteStore {
     /// Open a writable, migrated store and acquire a new fenced host generation.
     pub async fn open_writer(options: WriterOpenOptions) -> Result<Self, StoreError> {
@@ -196,24 +265,7 @@ impl SqliteStore {
                 format!("cannot create data directory: {error}"),
             )
         })?;
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&paths.writer_lock_path)
-            .map_err(|error| {
-                StoreError::new(
-                    ErrorCode::StorageOpenFailed,
-                    format!("cannot open writer lock: {error}"),
-                )
-            })?;
-        lock_file.try_lock_exclusive().map_err(|_| {
-            StoreError::new(
-                ErrorCode::WriterLocked,
-                "another writable host owns this data directory",
-            )
-        })?;
+        let lock_file = acquire_writer_lock(&paths)?;
 
         // The marker is validated before anything else touches the directory: a
         // data directory from a newer host must not be migrated or rewritten.
@@ -3025,6 +3077,9 @@ impl SqliteStore {
         }
         self.pool.close().await;
         if let Some(writer) = self.writer.take() {
+            // Before the lock is let go: once it is, the next holder's note
+            // may already be there.
+            let _ = fs::remove_file(&self.paths.writer_owner_path);
             FileExt::unlock(&writer.lock_file).map_err(|error| {
                 StoreError::new(
                     ErrorCode::StorageWriteFailed,
@@ -5484,6 +5539,39 @@ mod g03_session_setting_tests {
             Some("next-model")
         );
         reopened.close().await.expect("close reopened store");
+    }
+}
+
+#[cfg(test)]
+mod writer_owner_tests {
+    use harness_types::{ErrorCode, HostId};
+
+    use super::{SqliteStore, WriterOpenOptions};
+
+    /// Seen: children failed with `writer_locked` and nothing said who held
+    /// the store. The holder notes itself, and a second writer is told.
+    #[tokio::test]
+    async fn a_second_writer_is_told_who_holds_the_store() {
+        let directory = tempfile::tempdir().expect("temporary store");
+        let first =
+            SqliteStore::open_writer(WriterOpenOptions::new(directory.path(), HostId::generate()))
+                .await
+                .expect("first writer");
+        let owner = directory.path().join(crate::WRITER_OWNER_FILE_NAME);
+        assert!(owner.is_file(), "the holder notes itself");
+        let error =
+            SqliteStore::open_writer(WriterOpenOptions::new(directory.path(), HostId::generate()))
+                .await
+                .expect_err("the lock is held");
+        assert_eq!(error.code(), ErrorCode::WriterLocked);
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("pid {}", std::process::id())),
+            "{error}"
+        );
+        first.close().await.expect("close");
+        assert!(!owner.exists(), "the note goes with the lock");
     }
 }
 

@@ -270,6 +270,7 @@ impl Rpc {
     }
 
     fn event(&mut self, event: SessionEvent) {
+        event.record();
         match event {
             SessionEvent::TextDelta { text } => self.delta("text_delta", &text),
             SessionEvent::ThinkingDelta { text } => self.delta("thinking_delta", &text),

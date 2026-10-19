@@ -968,6 +968,26 @@ impl AgentsShared {
                 } else {
                     outcome_state(child.role, outcome)
                 };
+                // What the parent model reads as `[child-failed ...]`, kept where
+                // a bug report finds it: a child's `writer_locked` was seen only
+                // in the parent's answer.
+                let failure = match &child.state {
+                    ChildState::Failed { error } => Some(("failed", error)),
+                    ChildState::Partial { error, .. } => Some(("partial", error)),
+                    _ => None,
+                };
+                if let Some((event, error)) = failure {
+                    let mut record = harness_types::diag::warn("child", event)
+                        .task(child.task_id.as_str())
+                        .msg(error.clone())
+                        .field("child", child.name.clone())
+                        .field("role", child.role.as_str())
+                        .field("duration_ms", child.duration_ms);
+                    if let Some(parent) = &child.parent {
+                        record = record.field("parent", parent.as_str());
+                    }
+                    record.emit();
+                }
                 if let ChildState::Done { detail, .. } | ChildState::Partial { detail, .. } =
                     &child.state
                     && let Some(count) = detail["tool_calls"].as_u64()
