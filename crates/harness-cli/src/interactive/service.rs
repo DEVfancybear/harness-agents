@@ -427,6 +427,11 @@ pub trait SessionPort: Send {
     fn logs(&self) -> Vec<String> {
         vec!["No logs written yet.".to_owned()]
     }
+    /// `/bug-report`: this conversation's bug report, written as a zip; the
+    /// lines say where and what it holds.
+    fn bug_report(&self) -> Vec<String> {
+        vec!["This backend keeps no diagnostics.".to_owned()]
+    }
     /// Skills and prompt commands, for the slash-command menu.
     fn menu_commands(&self) -> Vec<super::commands::MenuCommand> {
         Vec::new()
@@ -3164,6 +3169,10 @@ fn log_lines(data_dir: &Path) -> Vec<String> {
             format!("• {name} ({kib:.1} KB)")
         }));
     }
+    lines.push(
+        "/bug-report (or `ha bug-report`) puts them, with what the stores recorded, in one zip to send."
+            .to_owned(),
+    );
     lines
 }
 
@@ -4601,6 +4610,49 @@ impl SessionPort for AgentSessionService {
 
     fn logs(&self) -> Vec<String> {
         log_lines(&self.data_dir)
+    }
+
+    fn bug_report(&self) -> Vec<String> {
+        let conversation = self.conversation_id();
+        let out = self.data_dir.join("bug-reports").join(format!(
+            "ha-bug-report-{}.zip",
+            chrono::Local::now().format("%Y%m%d-%H%M%S")
+        ));
+        let options = crate::bug_report::Options {
+            since: std::time::Duration::from_hours(24),
+            task: conversation,
+            session: None,
+            include_content: false,
+        };
+        // On a thread with a runtime of its own: this one may be inside the
+        // session's, and the report reads the stores asynchronously.
+        let written = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| error.to_string())?
+                        .block_on(crate::bug_report::write(options, &out))
+                        .map_err(|error| error.to_string())
+                })
+                .join()
+                .unwrap_or_else(|_| Err("the report panicked".to_owned()))
+        });
+        match written {
+            Ok(summary) => vec![
+                format!("Written: {}", out.display()),
+                format!(
+                    "{} file(s), {} problem(s) recorded, {} secret(s) redacted, the last 24 hours of this conversation",
+                    summary["files"], summary["problems"], summary["redactions"]
+                ),
+                "SUMMARY.md inside lists the problems and a timeline; send the zip as it is."
+                    .to_owned(),
+                "`ha bug-report --since 3d` (or --task, --include-content) makes a wider one."
+                    .to_owned(),
+            ],
+            Err(error) => vec![format!("The bug report could not be written: {error}")],
+        }
     }
 
     fn plan_branch_summary(&mut self, focus: Option<String>) -> Result<(), String> {

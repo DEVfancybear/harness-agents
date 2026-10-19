@@ -253,6 +253,8 @@ platform is green.
 | `ha maintenance gc` | Collect unreferenced, unpinned, old artifacts | Never; it reports what it retained and why |
 | `ha maintenance migrate-copy` | Migrate a store on a copy | The destination is occupied; the source has no store |
 | `ha maintenance release-matrix` | Report platforms, capabilities and benchmark honesty | Never; it reports what is unverified |
+| `ha bug-report` | Gather the diagnostics, workers' logs, store records and harness files of a window into one zip with a `SUMMARY.md`, secrets redacted ([12.12](#1212-diagnostics-and-bug-reports)). Use this bundle to debug | The window is not a number followed by `s`, `m`, `h` or `d` |
+| `ha diag path`, `ha diag timeline` | Show where the diagnostics log is; print the merged timeline | Never |
 | `ha maintenance support-bundle` | Write a bounded, redacted bundle (metadata, counts, schema revisions, correlation references; with `--config <FILE>` the redacted config) for a host you cannot reach; every redaction is counted in its manifest | The `--into` directory already holds files |
 
 Other top-level commands are covered where they belong: `ha`/`ha chat`/`ha exec`
@@ -427,7 +429,7 @@ As in prime-agent, children nest up to `RLM_MAX_DEPTH`, 2 by default: a child of
 
 | Group | Commands |
 | --- | --- |
-| Help and state | `/help`, `/hotkeys`, `/fullscreen`, `/session` (`/status`), `/config`, `/model [search]`, `/effort [level]` (`/thinking`), `/cost`, `/context` (`/usage`), `/system-prompt`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/subagent-model`, `/subagent-effort`, `/subagent-login`, `/subagent-logout`, `/rlm-max-depth`, `/skills`, `/logs` (where the logs are: every `*.log` under the data directory) |
+| Help and state | `/help`, `/hotkeys`, `/fullscreen`, `/session` (`/status`), `/config`, `/model [search]`, `/effort [level]` (`/thinking`), `/cost`, `/context` (`/usage`), `/system-prompt`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/subagent-model`, `/subagent-effort`, `/subagent-login`, `/subagent-logout`, `/rlm-max-depth`, `/skills`, `/logs` (where the logs are: every `*.log` under the data directory and the diagnostics files), `/bug-report` (this conversation's diagnostics in one zip, [12.12](#1212-diagnostics-and-bug-reports)) |
 | Session and answer | `/new [--name <name>] [[--] prompt]` (`/clear` also clears the viewport), `/resume [id]`, `/name [name]` (`/rename`), `/more`, `/compact [instructions]`, `/export [path]` (an HTML page by default; `.md`, `.html` for one self-contained page, or `.jsonl` for ha's session file - prime-agent's JSONL shape, a header then one line per message - holding what the model is sent for this conversation, secrets redacted), `/import <path.jsonl>` (a new conversation that continues an exported one, or a prime-agent session file; the file is copied under `<data>/imports`), `/share`, `/new [prompt]`, `/heartbeat <instruction>`, `/heartbeats`, `/copy`, `/fork [n]`, `/clone`, `/tree [n]`, `/btw <question>` (`/side`), `/quit` (`/exit`) |
 | Workspace and control | `/undo`, `/trust [yes]`, `/init`, `/permissions [ask|auto-edit|full-auto]` (`/permission`, `/mode`), `/steer <text>`, `/queue [text|list|edit n text|drop n|up n|down n]` (`/followup`), `/stash`, `/goal <objective>|status|pause|resume|clear`, `/handoff [--reset] [focus]`, `/verify`, `/review [focus]`, `/features`, `/doctor`, `/checks [list|accept|reject <name>]`, `/autonomous [status|off|on ...]`, `/schedule [list|add <when> -- <prompt>|pause|resume|cancel <id>]` |
 
@@ -610,3 +612,49 @@ A task of hundreds of steps passes through many compactions, and what a compacti
 - **Reviews.** A turn that compacts has its memory reviewed beside it as it goes on, not only after it ends (the task's `review_started` setting records when and why). A session that goes quiet - ten minutes without a turn (`HA_IDLE_REVIEW_SECONDS`) - has the work since its last review reviewed then; a background agent stays alive after its terminal closes, so the review runs even if nobody comes back, and an agent stopped sooner still leaves it to the next turn. A refinement the agent asks for judges the learned skills in play.
 - **Writes.** The `memory` tool refuses a new entry that a longer entry already holds (85% of its weighted words), not only one alike as a whole, and refuses a duplicate before the call runs, so it reads as a plain refusal. `rlm.harness` writes from the kernel pass the same checks: no secret, no duplicate memory or prompt note, and the `expected_version` an update names. An id made from a title is at most 48 characters, cut at a word; a title over 200 characters is refused with how to fix it.
 - **Prompt.** Commit messages go through `git commit -m` or a temp file, never a file in the checkout.
+
+### 12.12. Diagnostics and bug reports
+
+0.6.1 records what happened, so a bug can be found from one file instead of a screenshot.
+
+- **The diagnostics log.** Every `ha` process writes one JSON object per line to `<data dir>/diagnostics/<YYYYMMDD>-<role>-<pid>.jsonl`. `ha diag path` prints the directory, and `HA_DIAG_DIR` moves it. The role is `tui`, `exec`, `worker`, `supervisor`, `rpc`, `acp` or `cli`.
+  - **Each record has:** its time, process, thread and level; a `kind.event`; a message; the ids it is about (`agent`, `task`, `session`, `request`, `call`); and its numbers.
+  - **What is recorded:**
+    - the process's start and exit, and panics with their place and backtrace;
+    - how a worker died: a panic, a stack overflow or an access violation;
+    - agents that started and agents that were lost;
+    - every notice and error the user is shown, every failed tool call, and how each turn ended;
+    - provider attempts that failed, and how long each retry waits;
+    - each compaction, with its window, threshold, and token counts before and after, and any summary that failed;
+    - a delegated child that failed. Before 0.6.1 only the parent model saw this;
+    - the outcome of each background review, curation and consolidation, even when no terminal is listening;
+    - who holds a project's store when another process cannot open it.
+  - **Not recorded:** streamed text, tool output and prompts.
+- **Level and size.**
+  - `HA_DIAG=off|error|warn|info|debug` sets the level (default `info`).
+  - A plain `ha` command (`ha list`, `ha doctor`) writes a file only for a warning or an error.
+  - A file rolls over at 8 MiB, and a process past 24 MiB keeps only errors and warnings.
+  - At start, files older than 14 days are deleted, then the oldest files until all of them fit in 128 MiB.
+  - Secrets are redacted as each record is written, and any field named like a key, token, secret or password is withheld.
+- **Who holds the store.** The process that holds a project's writer lock writes a note about itself to `writer.owner.json`, beside `writer.lock`. A `writer_locked` error now says, for example, `held by worker pid 5678 for 42s`.
+- **`ha bug-report`.** Writes `ha-bug-report-<time>.zip` in the current directory, or to `--out FILE`. The zip holds:
+  - every process's diagnostics within the window (`--since 24h` by default; also `30m`, `3d`);
+  - the workers' logs, journals and descriptors, without their token;
+  - from each project store: runs, steps, provider attempts, failed commands, leases, checkpoints and settings;
+  - each conversation's harness files: task state, memory history, applied refinements, the review watermark and kernel stderr;
+  - `env.json` (version, platform, `HA_*` variables), and the configuration with its secret lines withheld.
+
+  `SUMMARY.md` comes first. It lists:
+  - crashes, with each worker log's panics placed in time and grouped;
+  - processes that started and never recorded an exit. They are still running, or were killed; a stack overflow leaves no panic;
+  - the errors and warnings recorded, grouped by `kind.event`;
+  - what the stores show went wrong, with alike problems grouped;
+  - one merged timeline.
+
+  Options and limits:
+  - `--task` and `--session` narrow the report to one conversation.
+  - Without `--include-content`, no request body, checkpoint or long setting is read, only its size.
+  - `private/`, the kernel's pickled state, attachments and artifacts are never read.
+  - Known secret values are redacted (the provider keys in the environment and in the credential file), and so are secret patterns. `manifest.json` has the count.
+- **`/bug-report`** writes the same zip for the last 24 hours of the open conversation, into `<data dir>/bug-reports/`. `/logs` also lists the diagnostics files.
+- **`ha diag timeline`** prints the merged timeline. It takes `--since 2h`, `--task`, `--session`, `--level warn` and `--json`.

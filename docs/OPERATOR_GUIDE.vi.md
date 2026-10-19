@@ -247,6 +247,8 @@ benchmark chưa đo vẫn được nêu là chưa đo ngay cả khi mọi nền 
 | `ha maintenance gc` | Thu gom artifact không tham chiếu, không pin, đã cũ | Không bao giờ; nó báo những gì được giữ và vì sao |
 | `ha maintenance migrate-copy` | Chuyển đổi store trên một bản sao | Đích đã có dữ liệu; nguồn không có store |
 | `ha maintenance release-matrix` | Báo cáo nền tảng, capability và tính trung thực của benchmark | Không bao giờ; nó báo những gì chưa kiểm chứng |
+| `ha bug-report` | Gom log chẩn đoán, log worker, bản ghi store và file harness trong một khoảng thời gian vào một file zip có `SUMMARY.md`, đã che secret ([12.12](#1212-chẩn-đoán-và-báo-lỗi)). Dùng gói này để dò bug | Khoảng thời gian không phải một số theo sau là `s`, `m`, `h` hoặc `d` |
+| `ha diag path`, `ha diag timeline` | Cho biết log chẩn đoán nằm ở đâu; in timeline gộp | Không bao giờ |
 | `ha maintenance support-bundle` | Ghi một bundle có giới hạn, đã che (metadata, số lượng, revision schema, tham chiếu tương quan; với `--config <FILE>` có thêm config đã che) cho host bạn không với tới được; mỗi lần che được đếm trong manifest | Thư mục `--into` đã có file |
 
 Các lệnh cấp cao nhất khác được mô tả ở đúng chỗ của chúng: `ha`/`ha chat`/`ha exec`
@@ -426,7 +428,7 @@ Như prime-agent, child lồng nhau tới `RLM_MAX_DEPTH`, mặc định 2: chil
 
 | Nhóm | Lệnh |
 | --- | --- |
-| Trợ giúp và trạng thái | `/help`, `/hotkeys`, `/fullscreen`, `/session` (`/status`), `/config`, `/model [search]`, `/effort [level]` (`/thinking`), `/cost`, `/context` (`/usage`), `/system-prompt`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/subagent-model`, `/subagent-effort`, `/subagent-login`, `/subagent-logout`, `/rlm-max-depth`, `/skills`, `/logs` (nơi ghi log: mọi file `*.log` trong thư mục data) |
+| Trợ giúp và trạng thái | `/help`, `/hotkeys`, `/fullscreen`, `/session` (`/status`), `/config`, `/model [search]`, `/effort [level]` (`/thinking`), `/cost`, `/context` (`/usage`), `/system-prompt`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/subagent-model`, `/subagent-effort`, `/subagent-login`, `/subagent-logout`, `/rlm-max-depth`, `/skills`, `/logs` (nơi ghi log: mọi file `*.log` trong thư mục data và các file chẩn đoán), `/bug-report` (chẩn đoán của hội thoại này trong một file zip, [12.12](#1212-chẩn-đoán-và-báo-lỗi)) |
 | Phiên và câu trả lời | `/new [--name <tên>] [[--] prompt]` (`/clear` xóa cả viewport), `/resume [id]`, `/name [name]` (`/rename`), `/more`, `/compact [instructions]`, `/export [path]` (mặc định là trang HTML; `.md`, `.html` cho một trang tự chứa, hoặc `.jsonl` cho file phiên của ha - dạng JSONL của prime-agent, một dòng header rồi mỗi dòng một message - chứa những gì model được gửi cho hội thoại này, đã che secret), `/import <path.jsonl>` (hội thoại mới tiếp nối hội thoại đã export, hoặc file phiên của prime-agent; file được chép vào `<data>/imports`), `/share`, `/new [prompt]`, `/heartbeat <chỉ dẫn>`, `/heartbeats`, `/copy`, `/fork [n]`, `/clone`, `/tree [n]`, `/btw <câu hỏi>` (`/side`), `/quit` (`/exit`) |
 | Workspace và điều khiển | `/undo`, `/trust [yes]`, `/init`, `/permissions [ask|auto-edit|full-auto]` (`/permission`, `/mode`), `/steer <text>`, `/queue [text|list|edit n text|drop n|up n|down n]` (`/followup`), `/stash`, `/goal <objective>|status|pause|resume|clear`, `/handoff [--reset] [trọng tâm]`, `/verify`, `/review [trọng tâm]`, `/features`, `/doctor`, `/checks [list|accept|reject <tên>]`, `/autonomous [status|off|on ...]`, `/schedule [list|add <khi nào> -- <prompt>|pause|resume|cancel <id>]` |
 
@@ -609,3 +611,49 @@ Bản 0.6.0 đưa những gì đã nhớ tới đúng những lượt cần nó,
 - **Review.** Một lượt có compact được review memory ngay bên cạnh khi nó còn chạy, không chỉ sau khi kết thúc (setting `review_started` của task ghi lại lúc nào và vì sao). Một phiên lặng đi - mười phút không có lượt nào (`HA_IDLE_REVIEW_SECONDS`) - được review phần việc kể từ lần review trước ngay lúc đó; agent chạy nền vẫn sống sau khi đóng terminal, nên review vẫn chạy dù không ai quay lại, còn agent bị dừng sớm hơn thì để lại cho lượt sau. Một lần refine do agent yêu cầu cũng chấm các learned skill đang dùng.
 - **Ghi.** Tool `memory` từ chối một entry mới mà một entry dài hơn đã chứa (85% số từ có trọng số), không chỉ entry giống toàn bộ, và từ chối entry trùng trước khi lời gọi chạy, nên model đọc thấy một lời từ chối rõ ràng. Các lệnh ghi `rlm.harness` từ kernel qua cùng các bước kiểm tra: không giữ secret, không trùng memory hay prompt note, và đúng `expected_version` mà lệnh cập nhật nêu. Id tạo từ tiêu đề dài tối đa 48 ký tự, cắt ở ranh giới từ; tiêu đề quá 200 ký tự bị từ chối kèm hướng dẫn sửa.
 - **Prompt.** Commit message dùng `git commit -m` hoặc file tạm, không bao giờ là một file trong checkout.
+
+### 12.12. Chẩn đoán và báo lỗi
+
+Bản 0.6.1 ghi lại những gì đã xảy ra, để tìm bug từ một file thay vì một ảnh chụp màn hình.
+
+- **Log chẩn đoán.** Mỗi process `ha` ghi mỗi dòng một object JSON vào `<data dir>/diagnostics/<YYYYMMDD>-<role>-<pid>.jsonl`. `ha diag path` in ra thư mục này, và `HA_DIAG_DIR` chuyển nó sang chỗ khác. Role là `tui`, `exec`, `worker`, `supervisor`, `rpc`, `acp` hoặc `cli`.
+  - **Mỗi bản ghi có:** thời gian, process, thread, mức; `kind.event`; thông điệp; các id liên quan (`agent`, `task`, `session`, `request`, `call`); và các con số.
+  - **Những gì được ghi:**
+    - lúc process bắt đầu và kết thúc, cùng panic kèm vị trí và backtrace;
+    - worker chết vì sao: panic, tràn stack hay access violation;
+    - agent đã khởi động và agent bị mất;
+    - mọi notice và lỗi người dùng được thấy, mọi tool call thất bại, và mỗi lượt kết thúc thế nào;
+    - lần gọi provider thất bại, và mỗi lần retry chờ bao lâu;
+    - mỗi lần compact, kèm window, ngưỡng, số token trước và sau, và lần tóm tắt nào thất bại;
+    - agent con thất bại. Trước 0.6.1, chỉ model cha thấy điều này;
+    - kết quả của mỗi lần review, curation và consolidation chạy nền, kể cả khi không còn terminal nào nghe;
+    - process nào đang giữ store của project khi một process khác không mở được.
+  - **Không ghi:** text stream, output của tool và prompt.
+- **Mức và dung lượng.**
+  - `HA_DIAG=off|error|warn|info|debug` chọn mức (mặc định `info`).
+  - Một lệnh `ha` thường (`ha list`, `ha doctor`) chỉ tạo file khi có cảnh báo hoặc lỗi.
+  - Mỗi file sang file mới khi tới 8 MiB, và process vượt 24 MiB chỉ còn ghi lỗi và cảnh báo.
+  - Khi khởi động, file cũ hơn 14 ngày bị xoá, rồi đến các file cũ nhất cho tới khi tổng dung lượng không quá 128 MiB.
+  - Secret được che ngay lúc ghi từng bản ghi, và field nào có tên như key, token, secret hay password thì bị bỏ ra.
+- **Ai đang giữ store.** Process giữ writer lock của project ghi một ghi chú về chính nó vào `writer.owner.json`, cạnh `writer.lock`. Lỗi `writer_locked` giờ nói rõ, ví dụ `held by worker pid 5678 for 42s`.
+- **`ha bug-report`.** Ghi `ha-bug-report-<time>.zip` vào thư mục hiện tại, hoặc vào `--out FILE`. File zip gồm:
+  - log chẩn đoán của mọi process trong khoảng thời gian (`--since 24h` mặc định; hoặc `30m`, `3d`);
+  - log, journal và descriptor của các worker, không có token;
+  - từ store của mỗi project: run, step, lần gọi provider, command lỗi, lease, checkpoint và setting;
+  - các file harness của từng hội thoại: trạng thái task, lịch sử memory, refinement đã áp dụng, watermark review và stderr của kernel;
+  - `env.json` (phiên bản, nền tảng, biến `HA_*`), và file cấu hình với các dòng chứa secret bị bỏ ra.
+
+  `SUMMARY.md` đứng đầu. Nó liệt kê:
+  - crash, với panic trong log của từng worker được đặt đúng thời điểm và gộp lại;
+  - process đã bắt đầu mà không ghi lần kết thúc. Nó vẫn đang chạy, hoặc đã bị kill; tràn stack thì không để lại panic;
+  - lỗi và cảnh báo đã ghi, gộp theo `kind.event`;
+  - những gì store cho thấy đã hỏng, các lỗi giống nhau được gộp lại;
+  - một timeline gộp.
+
+  Tuỳ chọn và giới hạn:
+  - `--task` và `--session` thu hẹp báo cáo về một hội thoại.
+  - Không có `--include-content` thì không đọc nội dung request, checkpoint hay setting dài, chỉ đọc kích thước.
+  - Không bao giờ đọc `private/`, trạng thái pickle của kernel, attachment và artifact.
+  - Giá trị secret đã biết bị che (key provider trong môi trường và trong file credential), và các mẫu secret cũng vậy. `manifest.json` ghi số lần che.
+- **`/bug-report`** ghi cùng gói zip đó cho 24 giờ gần nhất của hội thoại đang mở, vào `<data dir>/bug-reports/`. `/logs` cũng liệt kê các file chẩn đoán.
+- **`ha diag timeline`** in timeline gộp. Lệnh nhận `--since 2h`, `--task`, `--session`, `--level warn` và `--json`.

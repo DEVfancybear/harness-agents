@@ -4331,6 +4331,10 @@ impl InteractiveController {
             }
             // prime-agent's `/logs`.
             "/logs" => self.reference("Logs", self.service.logs(), &mut effects),
+            "/bug-report" => {
+                let lines = self.service.bug_report();
+                self.reference("Bug report", lines, &mut effects);
+            }
             "/skills" => {
                 let rows = self.service.skills_rows();
                 self.reference_rows("/skills", rows, &mut effects);

@@ -45,14 +45,9 @@ fn entries(bytes: &[u8]) -> Vec<(String, String)> {
     entries
 }
 
-#[test]
-fn a_bug_report_holds_the_problems_and_no_secret() {
-    let fixture = tempfile::tempdir().unwrap();
-    let home = fixture.path();
-    let data = home.join("data");
-    let now = chrono::Utc::now();
-    let stamp = now.format("%Y-%m-%dT%H:%M:%S%.3fZ");
-
+/// A worker log with a panic as the default hook reports it (no time), a
+/// worker descriptor with its token, and a credential file.
+fn seed_worker_and_credentials(data: &Path, stamp: &str) {
     // A worker that panicked, as the default hook reports it: no time.
     let workers = data.join("workers");
     std::fs::create_dir_all(&workers).unwrap();
@@ -79,6 +74,15 @@ fn a_bug_report_holds_the_problems_and_no_secret() {
         r#"{"deepseek":"private-file-value"}"#,
     )
     .unwrap();
+}
+
+#[test]
+fn a_bug_report_holds_the_problems_and_no_secret() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path();
+    let now = chrono::Utc::now();
+    let stamp = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    seed_worker_and_credentials(&home.join("data"), &stamp);
 
     // A real process leaves its records: `ha diag path` at debug level.
     let path = ha(home, &["diag", "path"]);
@@ -94,8 +98,8 @@ fn a_bug_report_holds_the_problems_and_no_secret() {
         Path::new(diagnostics.trim()).join("20260101-tui-7.jsonl"),
         format!(
             "{}\n{}\n",
-            serde_json::json!({"v":1,"ms":now.timestamp_millis(),"ts":stamp.to_string(),"pid":7,"role":"tui","level":"info","kind":"process","event":"start"}),
-            serde_json::json!({"v":1,"ms":now.timestamp_millis(),"ts":stamp.to_string(),"pid":7,"role":"tui","level":"error","kind":"store","event":"open_failed","msg":format!("refused with {SECRET}"),"task":"task_01a13d6f-385f-7390-a32a-c2a3326523b3"}),
+            serde_json::json!({"v":1,"ms":now.timestamp_millis(),"ts":stamp,"pid":7,"role":"tui","level":"info","kind":"process","event":"start"}),
+            serde_json::json!({"v":1,"ms":now.timestamp_millis(),"ts":stamp,"pid":7,"role":"tui","level":"error","kind":"store","event":"open_failed","msg":format!("refused with {SECRET}"),"task":"task_01a13d6f-385f-7390-a32a-c2a3326523b3"}),
         ),
     )
     .unwrap();
