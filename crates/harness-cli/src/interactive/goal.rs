@@ -719,7 +719,10 @@ mod tests {
         .expect("state");
         let left = host.finish("done").await.expect_err("an item is open");
         assert!(left.contains("1 unfinished item"), "{left}");
-        assert!(left.contains("- test it") && !left.contains("write it"), "{left}");
+        assert!(
+            left.contains("- test it") && !left.contains("write it"),
+            "{left}"
+        );
         assert!(!host.completed());
         std::fs::write(
             &state,

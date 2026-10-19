@@ -20,10 +20,9 @@ use harness_providers::{
     ProviderToolCall,
 };
 use harness_runtime::{
-    AcceptanceState, AgentState, AskRequest, CheckObservation, ContextPressure, GoalEvaluationInput,
-    GoalEvidence,
-    GoalSpec, GoalVerdict, HumanInputService, ProviderEventSink, RunCommand, RunInbox, RunRequest,
-    RunResult, RuntimeService, now_unix_ms,
+    AcceptanceState, AgentState, AskRequest, CheckObservation, ContextPressure,
+    GoalEvaluationInput, GoalEvidence, GoalSpec, GoalVerdict, HumanInputService, ProviderEventSink,
+    RunCommand, RunInbox, RunRequest, RunResult, RuntimeService, now_unix_ms,
 };
 use harness_store_sqlite::{RunCommandKind, RunState};
 use harness_types::{ErrorCode, HarnessError, QuestionId};
@@ -534,7 +533,8 @@ pub trait TurnContextHooks: Send + Sync {
 pub const RECAP_PREFIX: &str = "[task-recap from the host, not a new instruction: the context was summarized or the turn is long, so here is where the task stands]";
 
 /// How a request to save introduces itself.
-pub const FLUSH_PREFIX: &str = "[context-note from the host, not a new instruction: the context is close to being summarized]";
+pub const FLUSH_PREFIX: &str =
+    "[context-note from the host, not a new instruction: the context is close to being summarized]";
 
 /// Every how many steps a long turn recites its task with no summary between.
 ///

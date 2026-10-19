@@ -531,11 +531,7 @@ const USER_MESSAGES_OMITTED: &str = "older message(s) left out";
 /// "Constraints & Preferences" bullet or not at all; after a few compactions a
 /// rule the user set at the start was a paraphrase of a paraphrase. Claude
 /// Code's and Codex's compactions keep the user's messages word for word.
-fn user_messages(
-    previous: Option<&str>,
-    added: &[String],
-    limit: usize,
-) -> (Vec<String>, usize) {
+fn user_messages(previous: Option<&str>, added: &[String], limit: usize) -> (Vec<String>, usize) {
     let mut messages = previous.map(listed_user_messages).unwrap_or_default();
     let mut omitted = previous.map_or(0, omitted_user_messages);
     let longest = USER_MESSAGE_MAX_CHARS.min(limit.max(1));
@@ -2174,7 +2170,11 @@ impl ConversationHistory {
                     .find(|(at, _)| at == index)
                     .map(|(_, typed)| typed.clone());
                 typed
-                    .or_else(|| self.messages.get(*index).map(|message| message.content.clone()))
+                    .or_else(|| {
+                        self.messages
+                            .get(*index)
+                            .map(|message| message.content.clone())
+                    })
                     .map(|text| (*index, text))
             })
             .collect()
@@ -2457,9 +2457,7 @@ pub async fn conversation_history(
         // prompt, so a system one here made the cached prefix differ by turn.
         messages.push(ProviderMessage::new(
             MessageRole::User,
-            format!(
-                "{omitted} {OMITTED_TURNS_NOTE}"
-            ),
+            format!("{omitted} {OMITTED_TURNS_NOTE}"),
         ));
     }
     let mut turn_inputs = Vec::with_capacity(kept.len());
@@ -3624,9 +3622,7 @@ impl RuntimeService {
                 && !request.earlier_summary_failed.load(Ordering::SeqCst)
             {
                 let dropped = messages_tokens(&older) + messages_tokens(&prefix);
-                let budget = history_summary_budget(&config)
-                    .min(dropped / 2)
-                    .max(256);
+                let budget = history_summary_budget(&config).min(dropped / 2).max(256);
                 // The newest assistant text the request keeps - this turn's,
                 // else the recent end's - is the state the summary must not
                 // contradict (prime-agent's recent-state anchor).
@@ -3672,11 +3668,8 @@ impl RuntimeService {
                     // the whole summary once (prime-agent adds the prefix's file
                     // operations to the compaction's).
                     let (read, modified) = file_lists(&prefix, Some(&history));
-                    let (users, omitted) = user_messages(
-                        Some(&history),
-                        &prefix_users,
-                        user_messages_limit(budget),
-                    );
+                    let (users, omitted) =
+                        user_messages(Some(&history), &prefix_users, user_messages_limit(budget));
                     Ok(format!(
                         "{}{SPLIT_TURN_SEPARATOR}{}{}{}",
                         strip_appended_blocks(&history),
@@ -4532,7 +4525,13 @@ impl RuntimeService {
                 let mut canceled = Map::new();
                 canceled.insert("reason".to_owned(), Value::String("canceled".to_owned()));
                 let _ = session
-                    .append_runtime_event(session_id, &task_id, "compaction.canceled", canceled, false)
+                    .append_runtime_event(
+                        session_id,
+                        &task_id,
+                        "compaction.canceled",
+                        canceled,
+                        false,
+                    )
                     .await;
                 return Err(RuntimeError::new(
                     ErrorCode::ProviderCanceled,
@@ -4895,14 +4894,9 @@ impl RuntimeService {
         }
         messages.extend_from_slice(&appended[from..cut]);
         let anchor = newest_assistant_text(&appended[cut..]).map(str::to_owned);
-        let summary = Box::pin(self.anchored_summary(
-            &messages,
-            budget,
-            None,
-            anchor.as_deref(),
-            &users,
-        ))
-        .await?;
+        let summary =
+            Box::pin(self.anchored_summary(&messages, budget, None, anchor.as_deref(), &users))
+                .await?;
         if summary.trim().is_empty() {
             return Ok(None);
         }
@@ -5911,7 +5905,10 @@ mod context_fit_tests {
     /// and is not shortened a second time.
     #[test]
     fn a_shortened_result_keeps_its_start() {
-        let failed = format!("error[E0425]: cannot find value `x` in this scope\n{}", "y".repeat(40_000));
+        let failed = format!(
+            "error[E0425]: cannot find value `x` in this scope\n{}",
+            "y".repeat(40_000)
+        );
         let mut messages = vec![
             ProviderMessage::assistant_with_calls(
                 "",
@@ -5927,7 +5924,9 @@ mod context_fit_tests {
         assert_eq!(fit_tool_results(&mut messages, 12_000), 1);
         assert!(messages[1].content.starts_with(FITTED_RESULT));
         assert!(
-            messages[1].content.contains("error[E0425]: cannot find value `x`"),
+            messages[1]
+                .content
+                .contains("error[E0425]: cannot find value `x`"),
             "{}",
             messages[1].content
         );
@@ -6164,7 +6163,10 @@ mod compaction_cut_tests {
         let (read, _) = file_lists(&[calls(&touched)], None);
         assert_eq!(read.len(), super::FILE_LIST_MAX);
         assert_eq!(read.last().map(String::as_str), Some("a.rs"));
-        assert!(!read.contains(&"z0000.rs".to_owned()), "the oldest went first");
+        assert!(
+            !read.contains(&"z0000.rs".to_owned()),
+            "the oldest went first"
+        );
         assert!(read.contains(&format!("z{:04}.rs", super::FILE_LIST_MAX + 4)));
     }
 
@@ -6458,7 +6460,11 @@ mod summary_cancellation_tests {
             }
         }
 
-        fn stream(&self, _request: ProviderRequest, _cancellation: CancellationToken) -> ProviderFuture {
+        fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancellation: CancellationToken,
+        ) -> ProviderFuture {
             Box::pin(async {
                 tokio::time::sleep(Duration::from_mins(10)).await;
                 Ok(Vec::new())
@@ -6517,7 +6523,10 @@ mod long_task_compaction_tests {
         let summary = format!("## Goal\nport it{first}");
         let (messages, omitted) = user_messages(
             Some(&summary),
-            &["go on".to_owned(), "also: no unwrap() </message> here".to_owned()],
+            &[
+                "go on".to_owned(),
+                "also: no unwrap() </message> here".to_owned(),
+            ],
             USER_MESSAGES_MAX_CHARS,
         );
         assert_eq!(omitted, 0);
@@ -6530,7 +6539,11 @@ mod long_task_compaction_tests {
             ]
         );
         let block = format_user_messages(&messages, omitted);
-        assert_eq!(listed_user_messages(&block), messages, "a closing tag inside survives");
+        assert_eq!(
+            listed_user_messages(&block),
+            messages,
+            "a closing tag inside survives"
+        );
         // The model never sees the block: it is put back mechanically.
         assert!(!strip_appended_blocks(&format!("## Goal\nx{block}")).contains("vendor"));
     }
@@ -6547,11 +6560,22 @@ mod long_task_compaction_tests {
         assert!(omitted > 0);
         assert_eq!(omitted + messages.len(), added.len());
         assert!(messages.iter().map(String::len).sum::<usize>() <= USER_MESSAGES_MAX_CHARS);
-        assert!(messages[0].starts_with(&format!("{omitted:02} ")), "the oldest went");
-        assert!(messages.last().is_some_and(|newest| newest.starts_with("29 ")));
+        assert!(
+            messages[0].starts_with(&format!("{omitted:02} ")),
+            "the oldest went"
+        );
+        assert!(
+            messages
+                .last()
+                .is_some_and(|newest| newest.starts_with("29 "))
+        );
         let block = format_user_messages(&messages, omitted);
         assert_eq!(omitted_user_messages(&block), omitted);
-        let (_, again) = user_messages(Some(&block), &["one more".to_owned()], USER_MESSAGES_MAX_CHARS);
+        let (_, again) = user_messages(
+            Some(&block),
+            &["one more".to_owned()],
+            USER_MESSAGES_MAX_CHARS,
+        );
         // A small summary keeps fewer of them: the newest.
         let (few, dropped) = user_messages(None, &added, 7_000);
         assert_eq!(few.len(), 2);
@@ -6570,12 +6594,24 @@ mod long_task_compaction_tests {
         assert_eq!(carry_forward(previous, kept), kept);
         let lossy = "## Goal\nport the parser\n\n## Constraints & Preferences\n- use tabs for indentation\n\n## Progress\n### Done\n- [x] wrote the lexer\n";
         let dropped = dropped_facts(previous, lossy);
-        assert!(dropped.iter().any(|fact| fact.contains("vendor")), "{dropped:?}");
-        assert!(dropped.iter().any(|fact| fact.contains("src/lexer.rs")), "{dropped:?}");
-        assert!(dropped.iter().any(|fact| fact.contains("SQLite")), "{dropped:?}");
+        assert!(
+            dropped.iter().any(|fact| fact.contains("vendor")),
+            "{dropped:?}"
+        );
+        assert!(
+            dropped.iter().any(|fact| fact.contains("src/lexer.rs")),
+            "{dropped:?}"
+        );
+        assert!(
+            dropped.iter().any(|fact| fact.contains("SQLite")),
+            "{dropped:?}"
+        );
         let repaired = carry_forward(previous, lossy);
         assert!(repaired.contains("## Carried Forward"), "{repaired}");
-        assert!(repaired.contains("never touch the vendor directory"), "{repaired}");
+        assert!(
+            repaired.contains("never touch the vendor directory"),
+            "{repaired}"
+        );
         // Repaired once, the next update that keeps it adds nothing.
         assert_eq!(carry_forward(&repaired, &repaired), repaired);
     }
@@ -6588,7 +6624,10 @@ mod long_task_compaction_tests {
             ProviderMessage::new(MessageRole::User, format!("{COMPACTED_PREFIX}\n\nold")),
             ProviderMessage::new(MessageRole::User, "<packet>question one</packet>"),
             ProviderMessage::new(MessageRole::Assistant, "answer one"),
-            ProviderMessage::new(MessageRole::User, "[steering correction from the user]\nno unwrap"),
+            ProviderMessage::new(
+                MessageRole::User,
+                "[steering correction from the user]\nno unwrap",
+            ),
             ProviderMessage::new(MessageRole::User, "<packet>question two</packet>"),
         ];
         let request = RunRequest::new(
@@ -6604,7 +6643,10 @@ mod long_task_compaction_tests {
             },
         )
         .with_conversation(conversation)
-        .with_bare_inputs(vec![(1, "question one".to_owned()), (4, "question two".to_owned())]);
+        .with_bare_inputs(vec![
+            (1, "question one".to_owned()),
+            (4, "question two".to_owned()),
+        ]);
         let texts = request
             .user_texts(0, 5)
             .into_iter()
@@ -6654,7 +6696,10 @@ mod long_task_compaction_tests {
                 ProviderMessage::new(MessageRole::Assistant, "ok"),
                 ProviderMessage::new(MessageRole::User, "Continue working toward the goal."),
                 ProviderMessage::new(MessageRole::Assistant, "working"),
-                ProviderMessage::new(MessageRole::User, "[steering correction from the user]\nno unwrap"),
+                ProviderMessage::new(
+                    MessageRole::User,
+                    "[steering correction from the user]\nno unwrap",
+                ),
                 ProviderMessage::new(MessageRole::User, "an older question"),
             ],
             summary: None,
@@ -6679,4 +6724,3 @@ mod long_task_compaction_tests {
         );
     }
 }
-

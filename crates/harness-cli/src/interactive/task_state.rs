@@ -145,7 +145,13 @@ impl TaskState {
                 self.items.len()
             );
             for (index, item) in self.items.iter().enumerate() {
-                let _ = write!(text, "\n  {} {}. {}", item.status.mark(), index + 1, item.text);
+                let _ = write!(
+                    text,
+                    "\n  {} {}. {}",
+                    item.status.mark(),
+                    index + 1,
+                    item.text
+                );
                 if let Some(note) = item.note.as_deref().filter(|note| !note.trim().is_empty()) {
                     let _ = write!(text, " - {note}");
                 }
@@ -277,11 +283,7 @@ fn save(path: &Path, state: &TaskState) -> Result<(), String> {
 pub fn context_block(path: &Path) -> Option<ContextBlock> {
     let state = load(path);
     (!state.is_empty()).then(|| {
-        ContextBlock::mandatory(
-            "task-state",
-            ContextBlockKind::Instruction,
-            state.render(),
-        )
+        ContextBlock::mandatory("task-state", ContextBlockKind::Instruction, state.render())
     })
 }
 
@@ -413,7 +415,9 @@ fn strings(arguments: &Value, key: &str) -> Result<Option<Vec<String>>, HarnessE
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Some),
-        Some(_) => Err(refused(format!("task_state: {key} takes a list of strings"))),
+        Some(_) => Err(refused(format!(
+            "task_state: {key} takes a list of strings"
+        ))),
     }
 }
 
@@ -456,7 +460,10 @@ fn items(arguments: &Value) -> Result<Option<Vec<Item>>, HarnessError> {
 }
 
 fn decisions(arguments: &Value) -> Result<Vec<Decision>, HarnessError> {
-    let Some(values) = arguments.get("add_decisions").filter(|value| !value.is_null()) else {
+    let Some(values) = arguments
+        .get("add_decisions")
+        .filter(|value| !value.is_null())
+    else {
         return Ok(Vec::new());
     };
     values
@@ -626,7 +633,9 @@ impl TaskStateHost {
     /// The arguments are invalid, the revision is stale, or the file cannot be written.
     pub fn execute(&self, arguments: &Value) -> Result<Value, HarnessError> {
         let action = Self::check(arguments)?;
-        let _guard = file_lock().lock().map_err(|_| refused("task state lock is poisoned"))?;
+        let _guard = file_lock()
+            .lock()
+            .map_err(|_| refused("task state lock is poisoned"))?;
         let mut state = load(&self.path);
         if action == "view" {
             return Ok(json!({"revision": state.revision, "state": state.render()}));
@@ -893,7 +902,12 @@ mod tests {
         assert_eq!(state.constraints, vec!["tabs only", "no unwrap()"]);
         host.execute(&json!({"action":"update","remove":["tabs only","missing"]}))
             .map(|payload| {
-                assert!(payload["notes"][0].as_str().unwrap_or_default().contains("missing"));
+                assert!(
+                    payload["notes"][0]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("missing")
+                );
             })
             .expect("remove");
         assert_eq!(load(host.path()).constraints, vec!["no unwrap()"]);
@@ -903,13 +917,18 @@ mod tests {
     fn dropping_an_unfinished_item_is_said_and_a_stale_revision_is_refused() {
         let root = tempfile::tempdir().expect("temp dir");
         let host = host(root.path());
-        host.execute(&json!({"action":"update","items":[{"text":"alpha"},{"text":"beta","status":"done"}]}))
-            .expect("first");
+        host.execute(
+            &json!({"action":"update","items":[{"text":"alpha"},{"text":"beta","status":"done"}]}),
+        )
+        .expect("first");
         let payload = host
             .execute(&json!({"action":"update","items":[{"text":"gamma"}]}))
             .expect("second");
         let notes = payload["notes"][0].as_str().unwrap_or_default();
-        assert!(notes.contains("alpha") && !notes.contains("beta"), "{notes}");
+        assert!(
+            notes.contains("alpha") && !notes.contains("beta"),
+            "{notes}"
+        );
         let error = host
             .execute(&json!({"action":"update","expected_revision":1,"objective":"x"}))
             .expect_err("stale");
@@ -922,9 +941,10 @@ mod tests {
         let host = host(root.path());
         assert!(host.execute(&json!({"action":"erase"})).is_err());
         assert!(host.execute(&json!({"action":"update","extra":1})).is_err());
-        assert!(host
-            .execute(&json!({"action":"update","items":[{"text":"a","status":"later"}]}))
-            .is_err());
+        assert!(
+            host.execute(&json!({"action":"update","items":[{"text":"a","status":"later"}]}))
+                .is_err()
+        );
         assert!(!host.path().exists());
         assert!(context_block(host.path()).is_none());
         assert!(recap(host.path()).is_none());
