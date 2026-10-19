@@ -1018,6 +1018,20 @@ impl AgentsShared {
                         )
                     })
                     .flatten();
+                // A top-level child's notice is sent while its state turns
+                // settled, under the same lock: sent after, a run that saw no
+                // child running (`ha exec`'s wait) could gather the notices
+                // before this one, and answered without the second child's.
+                let notice = match (&child.parent, notice) {
+                    (None, Some(notice)) => {
+                        let _ = self.sender.send(SessionEvent::ChildSettled {
+                            name: child.name.clone(),
+                            notice,
+                        });
+                        None
+                    }
+                    (_, notice) => notice,
+                };
                 (
                     child.parent.clone(),
                     notice.map(|notice| (child.name.clone(), notice)),
@@ -1031,11 +1045,6 @@ impl AgentsShared {
             // the notice when its turn ends (prime-agent's `waitForRlmQuiescence`).
             Some((Some(parent), Some((_, notice)), _)) => {
                 self.update(&parent, |parent| parent.pending.push(notice));
-            }
-            Some((None, Some((name, notice)), _)) => {
-                let _ = self
-                    .sender
-                    .send(SessionEvent::ChildSettled { name, notice });
             }
             Some((_, _, true)) => {
                 // Leave pending attached until wake claims it under the same

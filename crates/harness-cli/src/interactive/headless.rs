@@ -927,6 +927,12 @@ pub async fn run_with(
             let notices = settle_children(agents, &mut child_inbox, &cancellation).await;
             if !notices.is_empty() {
                 child_turns += 1;
+                harness_types::diag::info("turn", "children_settled")
+                    .task(next_request.task_id.as_str())
+                    .session(outcome.session_id.as_str())
+                    .field("notices", notices.len())
+                    .field("turn", child_turns)
+                    .emit();
                 observer.stream_event(
                     "children.settled",
                     &serde_json::json!({"notices": notices.len()}),
