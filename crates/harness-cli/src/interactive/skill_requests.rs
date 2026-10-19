@@ -259,6 +259,8 @@ pub struct SkillRequests {
     compact_scheduled: AtomicBool,
     /// The session's usage, for what the context holds now.
     usage: Option<Arc<std::sync::Mutex<super::cost::CostTracker>>>,
+    /// Harness refinements are off: `refine.run` refuses.
+    refinements_off: bool,
     /// The token budget of a goal this turn created.
     token_budget: std::sync::Mutex<Option<u64>>,
 }
@@ -285,7 +287,15 @@ impl SkillRequests {
             compact_scheduled: AtomicBool::new(false),
             usage: None,
             token_budget: std::sync::Mutex::new(None),
+            refinements_off: false,
         }
+    }
+
+    /// Refuse `refine.run` while harness refinements are off.
+    #[must_use]
+    pub fn with_refinements(mut self, enabled: bool) -> Self {
+        self.refinements_off = !enabled;
+        self
     }
 
     /// Read the context's size from the session's usage, for `compact.status`.
@@ -398,6 +408,9 @@ impl SkillRequests {
                 "pending": self.refine.lock().is_ok_and(|pending| pending.is_some()),
                 "in_flight": false,
             })),
+            "refine.run" if self.refinements_off => {
+                Err(super::config::REFINEMENTS_DISABLED.to_owned())
+            }
             "refine.run" => {
                 let instructions = match &request["instructions"] {
                     Value::Null => None,

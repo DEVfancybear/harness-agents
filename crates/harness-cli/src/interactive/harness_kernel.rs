@@ -33,6 +33,9 @@ const OVERVIEW_SUMMARY: usize = 120;
 pub struct Dirs {
     pub global: PathBuf,
     pub local: PathBuf,
+    /// ha's `settings.json`, where `harnessRefinements` can turn the harness
+    /// off.
+    pub settings: Option<PathBuf>,
 }
 
 /// Answer one `harness` request.
@@ -44,6 +47,12 @@ pub fn answer(dirs: &Dirs, request: &Value) -> Result<Value, String> {
     let op = request["op"]
         .as_str()
         .ok_or("harness request needs an op")?;
+    // prime-agent's master switch, read on every call as its kernel does.
+    if let Some(settings) = &dirs.settings
+        && !super::config::harness_refinements(settings)
+    {
+        return Err(super::config::REFINEMENTS_DISABLED.to_owned());
+    }
     let global = request["global"].as_bool().unwrap_or(false);
     let dir = match request.get("state_dir").and_then(Value::as_str) {
         Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
@@ -1000,6 +1009,7 @@ mod tests {
         Dirs {
             global: root.join("global"),
             local: root.join("local"),
+            settings: None,
         }
     }
 

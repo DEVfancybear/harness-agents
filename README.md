@@ -90,7 +90,8 @@ ha                         open the app
 | Check the work | `/verify`, `/review`, `/features` |
 | Hand over to the next session | `/handoff`, `/handoff --reset` |
 | Keep a lesson as a skill | `/learn [focus]`, then `/skills` |
-| Tune memory, skills and checks | `/refine [instructions]`, `/refine --global`, `/refine --curate`, `/refine --history [N]`, `/refine --rollback <id>` |
+| Tune memory, skills and checks | `/refine [instructions]`, `/refine --global`, `/refine --curate`, `/refine --history [N]`, `/refine --rollback <id>`; `/refinements off` turns the whole harness off (saved state is kept) |
+| prime-agent's factories (state machines of child agents) | `/factory on`, `/factory off`, `/factory status` |
 | Shrink a long conversation | `/compact [what to keep]` |
 | Connect services | `/plugins`, `/mcp add`, `/mcp login <service>`, `@server:uri` to attach a resource |
 | Trust this project's config, hooks and MCP | `/trust`, then `/trust yes` |
@@ -231,7 +232,8 @@ ha                         mở app
 | Kiểm tra kết quả | `/verify`, `/review`, `/features` |
 | Bàn giao cho phiên sau | `/handoff`, `/handoff --reset` |
 | Giữ bài học thành skill | `/learn [trọng tâm]`, rồi `/skills` |
-| Tinh chỉnh memory, skill và check | `/refine [chỉ dẫn]`, `/refine --global`, `/refine --curate`, `/refine --history [N]`, `/refine --rollback <id>` |
+| Tinh chỉnh memory, skill và check | `/refine [chỉ dẫn]`, `/refine --global`, `/refine --curate`, `/refine --history [N]`, `/refine --rollback <id>`; `/refinements off` tắt toàn bộ harness (state đã lưu được giữ) |
+| Factory của prime-agent (máy trạng thái gồm các agent con) | `/factory on`, `/factory off`, `/factory status` |
 | Rút gọn hội thoại dài | `/compact [điều cần giữ]` |
 | Kết nối dịch vụ | `/plugins`, `/mcp add`, `/mcp login <service>`, `@server:uri` để đính kèm resource |
 | Trust config, hook và MCP của project | `/trust`, rồi `/trust yes` |

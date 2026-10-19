@@ -550,8 +550,10 @@ pub async fn run_with(
         None,
         None,
     );
+    let refinements = super::config::harness_refinements(&context.paths.config_file);
     let memory_host = super::memory::MemoryHost::new(&context.paths.data_dir, task_id.as_str())
-        .with_project(&context.project.root);
+        .with_project(&context.project.root)
+        .with_refinements(refinements);
     tools = tools.with_external(super::memory::with_dispatcher(
         super::knowledge::with_dispatcher(dispatcher, &knowledge_host),
         &memory_host,
@@ -703,16 +705,20 @@ pub async fn run_with(
         ),
     );
     let harness_entries = harness_state.total();
-    let mut project_blocks = vec![super::harness::digest_block(
-        &super::harness::format_digest(
-            &harness_state,
-            super::harness::DigestOptions {
-                memory_tool: true,
-                ..super::harness::DigestOptions::default()
-            },
-            &super::harness::weighted_terms(None, &[request.prompt.as_str()]),
-        ),
-    )];
+    // With harness refinements off, no saved entry reaches the model.
+    let mut project_blocks = Vec::new();
+    if refinements {
+        project_blocks.push(super::harness::digest_block(
+            &super::harness::format_digest(
+                &harness_state,
+                super::harness::DigestOptions {
+                    memory_tool: true,
+                    ..super::harness::DigestOptions::default()
+                },
+                &super::harness::weighted_terms(None, &[request.prompt.as_str()]),
+            ),
+        ));
+    }
     if let Some(block) = super::knowledge::context_block(&knowledge_host, &request.prompt) {
         project_blocks.push(block);
     }

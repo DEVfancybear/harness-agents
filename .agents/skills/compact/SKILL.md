@@ -1,6 +1,6 @@
 ---
 name: compact
-version: e260085
+version: 8d58e5b
 description: Check context usage and compact the conversation from the Python REPL. Use when context is filling up and substantial work remains, so the session is summarized and you keep working instead of stopping early.
 ---
 

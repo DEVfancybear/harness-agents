@@ -1,6 +1,6 @@
 ---
 name: mcp
-version: e260085
+version: 8d58e5b
 description: Use external MCP services generically from Python - search the supported-service catalog, inspect the user's connections, discover live tool schemas, and call tools on any connection (Notion, Linear, Slack, and the rest of the catalog) without per-service packages.
 ---
 

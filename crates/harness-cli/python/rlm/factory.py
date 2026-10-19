@@ -3744,10 +3744,7 @@ class FactoryExecutor:
 
 #: The single refusal every gated factory call raises while the setting is
 #: off. One exact message, so agents and tests can pin the refusal.
-# ha: there is no /factory command; the setting lives in ha's settings.json.
-FACTORY_DISABLED_MESSAGE = (
-    'the factory is disabled; set "factory": {"enabled": true} in the ha settings.json to enable it'
-)
+FACTORY_DISABLED_MESSAGE = "the factory is disabled; run /factory on to enable it"
 
 _SETTINGS_FILE_NAME = "settings.json"
 

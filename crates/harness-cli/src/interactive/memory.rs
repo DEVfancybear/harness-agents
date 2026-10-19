@@ -81,6 +81,8 @@ pub struct MemoryHost {
     conversation: String,
     /// The project this conversation works in, for `scope: project`.
     project: Option<ProjectTag>,
+    /// Harness refinements are off: the tool is not offered.
+    off: bool,
 }
 
 /// The project a global entry holds for: ha's project key, and its folder's
@@ -118,7 +120,15 @@ impl MemoryHost {
             read_only: false,
             conversation: conversation.to_owned(),
             project: None,
+            off: false,
         }
+    }
+
+    /// The same host, offered only while harness refinements are on.
+    #[must_use]
+    pub fn with_refinements(mut self, enabled: bool) -> Self {
+        self.off = !enabled;
+        self
     }
 
     /// The same host, keeping `scope: project` for the project at `root`.
@@ -436,10 +446,16 @@ impl MemoryHost {
         let found = self
             .entries(&wanted_scopes, &kinds(arguments)?)
             .into_iter()
-            .filter(|entry| entry.id == id)
+            .filter(|entry| entry.id == id || entry.aliases.iter().any(|alias| alias == id))
             .collect::<Vec<_>>();
+        // The entry itself before one an earlier title renamed.
+        let found = if found.len() > 1 && found.iter().any(|entry| entry.id == id) {
+            found.into_iter().filter(|entry| entry.id == id).collect()
+        } else {
+            found
+        };
         match found.as_slice() {
-            [entry] => Ok((entry.scope.clone(), entry.kind.clone(), id.to_owned())),
+            [entry] => Ok((entry.scope.clone(), entry.kind.clone(), entry.id.clone())),
             [] => Err(format!(
                 "no memory entry {id:?}; take ids from a memory list or search result"
             )),
@@ -536,10 +552,33 @@ impl MemoryHost {
             if entry["metadata"]["pinned"] == true {
                 self.pinned_fits(&scope, &kind, &id, &title, &content)?;
             }
+            // An id is made from the title: a new title gets its own id, so
+            // the id never keeps saying what the entry no longer says. The old
+            // id still finds the entry, and its history follows it.
+            let renamed = super::refine::slug(&title, &kind);
+            let mut saved_id = id.clone();
+            if renamed != id
+                && !state["entries"][&kind][&renamed].is_object()
+                && let Some(records) = state["entries"][&kind].as_object_mut()
+                && let Some(mut moved) = records.remove(&id)
+            {
+                let mut aliases = moved["aliases"].as_array().cloned().unwrap_or_default();
+                if !aliases.contains(&json!(id)) {
+                    aliases.push(json!(id));
+                }
+                moved["aliases"] = json!(aliases);
+                moved["id"] = json!(renamed);
+                records.insert(renamed.clone(), moved);
+                saved_id = renamed;
+            }
             super::refine::save_raw(dir, &state)?;
-            return Ok(json!({
-                "saved": "updated", "scope": scope, "kind": kind, "id": id, "version": current + 1
-            }));
+            let mut saved = json!({
+                "saved": "updated", "scope": scope, "kind": kind, "id": saved_id, "version": current + 1
+            });
+            if saved_id != id {
+                saved["renamed_from"] = json!(id);
+            }
+            return Ok(saved);
         }
         let scope = self.scopes(arguments)?[0];
         let kind = kinds(arguments)?[0];
@@ -694,6 +733,8 @@ impl MemoryHost {
         for scope in wanted {
             for kind in &kinds {
                 let state = super::refine::load_raw(self.dir(scope));
+                let id = current_id(&state, kind, id);
+                let id = id.as_str();
                 let current = &state["entries"][*kind][id];
                 let current = (current.is_object() && self.holds(scope, current)).then(|| {
                     json!({
@@ -760,6 +801,8 @@ impl MemoryHost {
                 }
                 let _lock = harness::lock_state(dir)?;
                 let mut state = super::refine::load_raw(dir);
+                let id = current_id(&state, kind, id);
+                let id = id.as_str();
                 let live = &state["entries"][kind][id];
                 let exists = live.is_object() && self.holds(scope, live);
                 let source = match wanted_version {
@@ -798,10 +841,17 @@ impl MemoryHost {
                 entry["version"] = json!(next);
                 entry["updated_at"] = json!(now());
                 entry["origin"] = json!({"conversation": self.conversation, "via": "memory tool", "restored_from": from});
-                state["entries"][kind][id] = entry;
+                // A deleted entry comes back under the id it had when it went.
+                let target = if exists {
+                    id.to_owned()
+                } else {
+                    source["id"].as_str().unwrap_or(id).to_owned()
+                };
+                entry["id"] = json!(target);
+                state["entries"][kind][&target] = entry;
                 super::refine::save_raw(dir, &state)?;
                 return Ok(json!({
-                    "saved": "restored", "scope": scope, "kind": kind, "id": id, "version": next, "from_version": from
+                    "saved": "restored", "scope": scope, "kind": kind, "id": target, "version": next, "from_version": from
                 }));
             }
         }
@@ -915,16 +965,57 @@ pub(super) fn journal(
     Ok(())
 }
 
+/// The id an entry has now: `id` itself, or the entry a new title renamed
+/// from it.
+fn current_id(state: &Value, kind: &str, id: &str) -> String {
+    if state["entries"][kind][id].is_object() {
+        return id.to_owned();
+    }
+    state["entries"][kind]
+        .as_object()
+        .and_then(|records| {
+            records.iter().find(|(_, record)| {
+                record["aliases"]
+                    .as_array()
+                    .is_some_and(|aliases| aliases.iter().any(|alias| alias == id))
+            })
+        })
+        .map_or_else(|| id.to_owned(), |(current, _)| current.clone())
+}
+
 /// The journal's records of one entry, newest first.
 fn journal_records(dir: &Path, kind: &str, id: &str) -> Vec<Value> {
     let Ok(text) = std::fs::read_to_string(dir.join(JOURNAL_FILE)) else {
         return Vec::new();
     };
+    // The entry under every id it had: the one asked, the one it has now and
+    // the ones earlier titles gave it.
+    let state = super::refine::load_raw(dir);
+    let current = current_id(&state, kind, id);
+    let mut ids = vec![id.to_owned(), current.clone()];
+    ids.extend(
+        state["entries"][kind][&current]["aliases"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned),
+    );
+    let named = |value: &Value| {
+        value
+            .as_str()
+            .is_some_and(|value| ids.iter().any(|id| id == value))
+    };
     let mut records = text
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
         .filter(|record| {
-            record["kind"] == kind && record["id"] == id && record["entry"].is_object()
+            record["kind"] == kind
+                && record["entry"].is_object()
+                && (named(&record["id"])
+                    || record["entry"]["aliases"]
+                        .as_array()
+                        .is_some_and(|aliases| aliases.iter().any(named)))
         })
         .collect::<Vec<_>>();
     records.reverse();
@@ -1092,6 +1183,9 @@ fn refused(message: String) -> HarnessError {
 
 impl ExternalToolCatalog for MemoryHost {
     fn schemas(&self) -> Vec<Value> {
+        if self.off {
+            return Vec::new();
+        }
         let scopes = self.all_scopes();
         if self.read_only {
             return vec![json!({"type":"function","function":{
@@ -1135,7 +1229,7 @@ impl ExternalToolCatalog for MemoryHost {
     fn resolve(&self, name: &str, arguments: &Value) -> Option<CodingToolAction> {
         // A read-only host keeps a forged write resolvable, so validation
         // tells the model why instead of claiming the tool does not exist.
-        (name == "memory").then(|| CodingToolAction::ExternalTool {
+        (name == "memory" && !self.off).then(|| CodingToolAction::ExternalTool {
             plugin_id: "memory".to_owned(),
             tool_name: "memory".to_owned(),
             arguments: arguments.clone(),
@@ -1302,6 +1396,7 @@ mod tests {
             read_only: false,
             conversation: "test-conversation".to_owned(),
             project: None,
+            off: false,
         }
     }
 
@@ -1635,6 +1730,7 @@ mod tests {
         let dirs = super::super::harness_kernel::Dirs {
             global: host.global.clone(),
             local: host.local.clone(),
+            settings: None,
         };
         super::super::harness_kernel::answer(
             &dirs,
@@ -1795,5 +1891,111 @@ mod tests {
         )
         .expect("write");
         assert!(alone["related"].is_null(), "{alone}");
+    }
+
+    /// An id is made from the title: a new title renames it, the old id
+    /// still finds the entry, and the history follows it.
+    #[test]
+    fn a_new_title_renames_the_id_and_the_old_one_still_finds_it() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = host(directory.path());
+        run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Deploy on Thursday","content":"Deploys happen on Thursdays."}),
+        )
+        .expect("create");
+        let updated = run(
+            &host,
+            &json!({"action":"write","id":"deploy_on_thursday","expected_version":1,"title":"Deploy on Friday","content":"Deploys happen on Fridays."}),
+        )
+        .expect("update");
+        assert_eq!(updated["id"], "deploy_on_friday");
+        assert_eq!(updated["renamed_from"], "deploy_on_thursday");
+        let raw = super::super::refine::load_raw(&host.global);
+        assert!(raw["entries"]["memory"]["deploy_on_thursday"].is_null());
+        assert_eq!(
+            raw["entries"]["memory"]["deploy_on_friday"]["aliases"],
+            json!(["deploy_on_thursday"])
+        );
+        // The old id reads, updates and lists the history of the same entry.
+        let read = run(&host, &json!({"action":"read","id":"deploy_on_thursday"})).expect("read");
+        assert_eq!(read["id"], "deploy_on_friday");
+        assert_eq!(read["content"], "Deploys happen on Fridays.");
+        let history =
+            run(&host, &json!({"action":"history","id":"deploy_on_friday"})).expect("history");
+        assert_eq!(
+            history["earlier"][0]["content"],
+            "Deploys happen on Thursdays."
+        );
+        let by_old = run(
+            &host,
+            &json!({"action":"history","id":"deploy_on_thursday"}),
+        )
+        .expect("history");
+        assert_eq!(by_old["id"], "deploy_on_friday");
+        // A title whose id is taken keeps the entry's id.
+        run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Release day","content":"Releases go out on Mondays.","distinct":true}),
+        )
+        .expect("create");
+        let kept = run(
+            &host,
+            &json!({"action":"write","id":"deploy_on_friday","expected_version":2,"title":"Release day","content":"Deploys happen on Fridays at noon."}),
+        )
+        .expect("update");
+        assert_eq!(kept["id"], "deploy_on_friday");
+        assert!(kept["renamed_from"].is_null());
+        // Deleted, it comes back by its old id too.
+        run(
+            &host,
+            &json!({"action":"delete","id":"deploy_on_friday","expected_version":3}),
+        )
+        .expect("delete");
+        let back = run(
+            &host,
+            &json!({"action":"restore","id":"deploy_on_thursday"}),
+        )
+        .expect("restore");
+        assert_eq!(back["id"], "deploy_on_friday");
+    }
+
+    /// prime-agent's `harnessRefinements` off: the tool is not offered and the
+    /// kernel's `rlm.harness` refuses; what is saved is kept.
+    #[test]
+    fn harness_refinements_off_hide_the_tool_and_refuse_the_kernel() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = host(directory.path());
+        run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Language","content":"Answer in Vietnamese."}),
+        )
+        .expect("create");
+        let off = host.clone().with_refinements(false);
+        assert!(off.schemas().is_empty());
+        assert!(off.resolve("memory", &json!({"action":"list"})).is_none());
+        assert!(off.readonly().schemas().is_empty());
+        let settings = directory.path().join("settings.json");
+        std::fs::write(&settings, r#"{"harnessRefinements": false}"#).expect("settings");
+        assert!(!super::super::config::harness_refinements(&settings));
+        let dirs = super::super::harness_kernel::Dirs {
+            global: host.global.clone(),
+            local: host.local.clone(),
+            settings: Some(settings.clone()),
+        };
+        let refused =
+            super::super::harness_kernel::answer(&dirs, &json!({"op":"list","global":true}))
+                .expect_err("off");
+        assert!(refused.contains("/refinements on"), "{refused}");
+        std::fs::write(&settings, "{}").expect("settings");
+        assert!(super::super::config::harness_refinements(&settings));
+        let listed =
+            super::super::harness_kernel::answer(&dirs, &json!({"op":"list","global":true}))
+                .expect("on again");
+        assert_eq!(
+            listed.as_array().map(Vec::len),
+            Some(1),
+            "saved state was kept"
+        );
     }
 }

@@ -1,6 +1,6 @@
 ---
 name: edit
-version: e260085
+version: 8d58e5b
 description: Replace an exact, unique string in an existing file. Use for targeted single-occurrence edits to files from the Python kernel instead of rewriting the whole file.
 ---
 

@@ -1,6 +1,6 @@
 ---
 name: websearch
-version: e260085
+version: 8d58e5b
 description: Search Google via the Serper API from Python (needs a Serper key from /login serper or SERPER_API_KEY; without it use the web_search tool). Takes one query and returns titles, URLs, snippets, and knowledge-graph data.
 ---
 

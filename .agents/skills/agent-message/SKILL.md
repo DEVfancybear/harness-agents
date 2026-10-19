@@ -1,6 +1,6 @@
 ---
 name: agent-message
-version: e260085
+version: 8d58e5b
 description: Message an agent's parent, siblings, or direct children through the daemon. Discover reachable agents with agent_observe.list_agents, then send direct text without spoofing sender identity.
 ---
 

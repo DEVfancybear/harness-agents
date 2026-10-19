@@ -1,6 +1,6 @@
 ---
 name: refine
-version: e260085
+version: 8d58e5b
 description: Trigger continual harness refinement from the Python REPL. Use when you notice a repeated failure, reusable tactic, delegation role, or behavior policy that should be persisted as a harness entry. Returns immediately; refinement runs when the current turn ends.
 ---
 

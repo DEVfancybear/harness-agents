@@ -4546,6 +4546,34 @@ impl InteractiveController {
                     self.push_history(&mut effects, HistoryItem::User { text });
                 }
             }
+            name @ ("/refinements" | "/factory") => {
+                let enable = match argument {
+                    None | Some("status") => Ok(None),
+                    Some("on") => Ok(Some(true)),
+                    Some("off") => Ok(Some(false)),
+                    Some(_) => Err(format!("Usage: {name} [on|off|status]")),
+                };
+                let outcome = enable.and_then(|enable| {
+                    if name == "/factory" {
+                        self.service.factory(enable)
+                    } else {
+                        self.service.refinements(enable)
+                    }
+                });
+                match outcome {
+                    Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
+                    Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                }
+                effects.push(Effect::Redraw);
+            }
+            name @ ("/refine" | "/learn")
+                if !self.service.refinements_enabled()
+                    && !raw_argument.is_some_and(|argument| argument.trim_start().starts_with("--history")) =>
+            {
+                self.push_history(&mut effects, HistoryItem::Error {
+                    message: format!("{name}: {}", super::config::REFINEMENTS_DISABLED),
+                });
+            }
             name @ ("/refine" | "/learn") => {
                 if self.phase.has_active_run() {
                     self.push_history(&mut effects, HistoryItem::Notice {

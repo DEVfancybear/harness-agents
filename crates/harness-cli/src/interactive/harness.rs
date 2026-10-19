@@ -67,6 +67,8 @@ pub struct Entry {
     /// The project a global entry holds for (`project.key`), when it holds
     /// for one project only.
     pub project: Option<String>,
+    /// The ids the entry had before a new title renamed it.
+    pub aliases: Vec<String>,
 }
 
 /// The merged state of one turn.
@@ -133,6 +135,17 @@ pub fn load(dir: &Path, scope: &str) -> State {
                     .unwrap_or(false),
                 updated_at: text("updated_at").or_else(|| text("created_at")),
                 project: project_key(entry.get("project")),
+                aliases: entry
+                    .get("aliases")
+                    .and_then(Value::as_array)
+                    .map(|aliases| {
+                        aliases
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             });
         }
     }

@@ -217,7 +217,7 @@ Python is not on PATH: run the tests with runpy in the kernel.
             &temp.path().join("workspace"),
             false,
         );
-        let blocks = super::child_context(&data_dir, "task-1", None, &layers);
+        let blocks = super::child_context(&data_dir, "task-1", None, true, &layers);
         let text = blocks
             .iter()
             .map(|block| block.text.as_str())
@@ -693,6 +693,18 @@ pub trait SessionPort: Send {
     fn subagent_effort(&mut self, _change: SubagentSetting) -> Result<String, String> {
         Err("this backend has no delegated children".to_owned())
     }
+    /// prime-agent's `/factory on|off|status`: the opt-in `factory.enabled`.
+    fn factory(&mut self, _enable: Option<bool>) -> Result<String, String> {
+        Err("this backend has no Python kernel".to_owned())
+    }
+    /// prime-agent's global `harnessRefinements` switch: report or set it.
+    fn refinements(&mut self, _enable: Option<bool>) -> Result<String, String> {
+        Err("this backend keeps no harness".to_owned())
+    }
+    /// Whether harness refinements are on (`/refine` and `/learn` refuse otherwise).
+    fn refinements_enabled(&self) -> bool {
+        true
+    }
     /// `/subagent-model`: report the model children run on and where it comes
     /// from, save prime-agent's `subagentDefaultModel`, or remove it so children
     /// run on this agent's model.
@@ -1154,6 +1166,7 @@ fn child_context(
     data_dir: &Path,
     conversation: &str,
     project: Option<&str>,
+    refinements: bool,
     layers: &super::learned::Layers,
 ) -> Vec<harness_session::ContextBlock> {
     let state = super::harness::merge(
@@ -1163,17 +1176,21 @@ fn child_context(
         ),
         super::harness::load(&super::harness::local_dir(data_dir, conversation), "local"),
     );
-    let mut blocks = vec![super::harness::digest_block(
-        &super::harness::format_digest(
-            &state,
-            super::harness::DigestOptions {
-                repl: false,
-                refine: false,
-                memory_tool: false,
-            },
-            &[],
-        ),
-    )];
+    // With harness refinements off, no saved entry reaches a child either.
+    let mut blocks = Vec::new();
+    if refinements {
+        blocks.push(super::harness::digest_block(
+            &super::harness::format_digest(
+                &state,
+                super::harness::DigestOptions {
+                    repl: false,
+                    refine: false,
+                    memory_tool: false,
+                },
+                &[],
+            ),
+        ));
+    }
     // A child has no Python kernel; where the host has no `python` on PATH,
     // the kernel's interpreter is how it runs a script or the tests. A
     // verifier without it could only read the code and failed the work.
@@ -6264,6 +6281,41 @@ impl SessionPort for AgentSessionService {
         super::tui::fullscreen::save(&self.config_file, enabled)
     }
 
+    fn factory(&mut self, enable: Option<bool>) -> Result<String, String> {
+        let mut setting = super::config::load_setting(&self.config_file, "factory")
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(enable) = enable {
+            setting["enabled"] = serde_json::json!(enable);
+            super::config::save_setting(&self.config_file, "factory", Some(setting.clone()))?;
+        }
+        Ok(if setting["enabled"] == true {
+            "Factory: on (settings.json factory.enabled). The Python kernel's rlm.factory runs stored machines; /factory off turns it off, and a running factory can still be stopped.".to_owned()
+        } else {
+            "Factory: off (the default). /factory on lets the Python kernel store and run state machines of child agents (rlm.factory).".to_owned()
+        })
+    }
+
+    fn refinements(&mut self, enable: Option<bool>) -> Result<String, String> {
+        if let Some(enable) = enable {
+            // On is the default: the key is kept only to say off.
+            super::config::save_setting(
+                &self.config_file,
+                "harnessRefinements",
+                (!enable).then_some(serde_json::json!(false)),
+            )?;
+        }
+        Ok(if super::config::harness_refinements(&self.config_file) {
+            "Harness refinements: on. Turns carry the memory digest and the memory tool, and the review, /refine and /learn keep improving the harness; /refinements off stops all of it (saved state is kept).".to_owned()
+        } else {
+            "Harness refinements: off (settings.json harnessRefinements). No saved memory, prompt note or skill entry reaches a turn, and nothing is refined; what is saved is kept. /refinements on turns them back on.".to_owned()
+        })
+    }
+
+    fn refinements_enabled(&self) -> bool {
+        super::config::harness_refinements(&self.config_file)
+    }
+
     fn subagent_effort(&mut self, change: SubagentSetting) -> Result<String, String> {
         match change {
             SubagentSetting::Show => Ok(match subagent_default_thinking(&self.config_file) {
@@ -7851,6 +7903,9 @@ async fn run_turn(
     // The depth children of this turn may spawn to, read for this conversation.
     let hashline_rule =
         super::config::HashlineRule::load(&config_file, environment.value("HA_HASHLINE"));
+    // prime-agent's `harnessRefinements`: off, no saved harness entry reaches
+    // this turn and nothing is refined after it.
+    let refinements = super::config::harness_refinements(&config_file);
     let hashline = hashline_rule.applies(&format!("{}/{}", config.provider_id, config.model));
     let (max_depth, depth_source) =
         resolve_rlm_max_depth(&store, &task_id, &config_file, &environment).await;
@@ -7900,12 +7955,14 @@ async fn run_turn(
             memory: Some(
                 super::memory::MemoryHost::new(&data_dir, task_id.as_str())
                     .with_project(&workspace_root)
+                    .with_refinements(refinements)
                     .readonly(),
             ),
             context: child_context(
                 &data_dir,
                 task_id.as_str(),
                 Some(super::bootstrap::project_key_of(&workspace_root).as_str()),
+                refinements,
                 &super::learned::Layers::new(
                     &global_config_dir,
                     &data_dir,
@@ -8014,7 +8071,8 @@ async fn run_turn(
                     },
                     goal_host.clone(),
                 )
-                .with_usage(Arc::clone(&cost_tracker)),
+                .with_usage(Arc::clone(&cost_tracker))
+                .with_refinements(refinements),
             );
             let mut chain: Vec<Arc<dyn super::repl::HostRequests>> = vec![
                 skills,
@@ -8074,9 +8132,11 @@ async fn run_turn(
         feature_host.as_ref(),
         repl_host.as_ref(),
     );
-    // The model keeps its memory with a native tool, with or without the REPL.
-    let memory_host =
-        super::memory::MemoryHost::new(&data_dir, task_id.as_str()).with_project(&workspace_root);
+    // The model keeps its memory with a native tool, with or without the REPL,
+    // while harness refinements are on.
+    let memory_host = super::memory::MemoryHost::new(&data_dir, task_id.as_str())
+        .with_project(&workspace_root)
+        .with_refinements(refinements);
     tools = tools.with_external(super::memory::with_dispatcher(
         super::knowledge::with_dispatcher(dispatcher, &knowledge_host),
         &memory_host,
@@ -8343,18 +8403,21 @@ async fn run_turn(
         GoalRecord::Active(objective) => Some(objective.as_str()),
         _ => None,
     };
-    project_blocks.push(super::harness::digest_block(
-        &super::harness::format_digest(
-            &harness_state,
-            super::harness::DigestOptions {
-                repl: repl_host.is_some(),
-                refine: repl_host.is_some()
-                    && kernel_skill_imports.iter().any(|name| name == "refine"),
-                memory_tool: true,
-            },
-            &super::harness::weighted_terms(goal_objective, &[request.text.as_str()]),
-        ),
-    ));
+    // With harness refinements off, no saved entry reaches the model.
+    if refinements {
+        project_blocks.push(super::harness::digest_block(
+            &super::harness::format_digest(
+                &harness_state,
+                super::harness::DigestOptions {
+                    repl: repl_host.is_some(),
+                    refine: repl_host.is_some()
+                        && kernel_skill_imports.iter().any(|name| name == "refine"),
+                    memory_tool: true,
+                },
+                &super::harness::weighted_terms(goal_objective, &[request.text.as_str()]),
+            ),
+        ));
+    }
     if let Some(block) = super::knowledge::context_block(&knowledge_host, &request.text) {
         project_blocks.push(block);
     }
@@ -8695,7 +8758,8 @@ async fn run_turn(
         let requested = refine_request
             .lock()
             .ok()
-            .and_then(|mut pending| pending.take());
+            .and_then(|mut pending| pending.take())
+            .filter(|_| refinements);
         let tool_calls = outcome.as_ref().map_or(0, |turn| turn.tool_calls);
         // prime-agent's `autoRefine.turnInterval`, 25 by default.
         let interval = super::config::load_setting(&config_file, "autoRefine")
@@ -8707,7 +8771,7 @@ async fn run_turn(
             .and_then(|interval| u32::try_from(interval).ok())
             .filter(|interval| *interval > 0)
             .unwrap_or(super::refine::AUTO_REFINE_TURN_INTERVAL);
-        let review = if auto_refine {
+        let review = if auto_refine && refinements {
             refine_cadence.turn_finished_every(tool_calls, interval, compacted || milestone)
         } else {
             None
@@ -8775,7 +8839,7 @@ async fn run_turn(
     }
     // A session that ended with work not yet reviewed left the review here: it runs
     // beside this conversation, on the ended one's turns and harness scope.
-    if auto_refine && outcome.is_ok() && !cancellation.is_cancelled() {
+    if auto_refine && refinements && outcome.is_ok() && !cancellation.is_cancelled() {
         for deferred in super::refine::take_deferred_reviews(&store_dir) {
             let Ok(ended) = SessionId::parse(deferred.session.clone()) else {
                 continue;

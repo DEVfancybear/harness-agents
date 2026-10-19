@@ -1,6 +1,6 @@
 ---
 name: rlm-heartbeat
-version: e260085
+version: 8d58e5b
 description: Manage agent-owned RLM heartbeats from the Python REPL. Use when the user asks the agent to start, create, schedule, or manage a heartbeat, unless they explicitly request the user's /heartbeat.
 ---
 

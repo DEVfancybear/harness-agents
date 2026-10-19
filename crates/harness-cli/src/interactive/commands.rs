@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 64] = [
+pub const SLASH_COMMANDS: [SlashCommand; 66] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -146,6 +146,16 @@ pub const SLASH_COMMANDS: [SlashCommand; 64] = [
         "/learn",
         "[focus]",
         "Distill what this conversation taught into learned skills now",
+    ),
+    command(
+        "/refinements",
+        "[on|off]",
+        "Show or set harness refinements: the memory digest, the memory tool, refine and learn (global)",
+    ),
+    command(
+        "/factory",
+        "[on|off|status]",
+        "Show or set prime-agent's opt-in factory: state machines of child agents in the Python kernel",
     ),
     SlashCommand {
         options: &[

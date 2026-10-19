@@ -1,6 +1,6 @@
 ---
 name: agent-observe
-version: e260085
+version: 8d58e5b
 description: Read-only roster and observation of an agent's parent, siblings, and direct children. Use to discover reachable agents and to inspect family status and bounded recent-message previews without mutating sessions.
 ---
 

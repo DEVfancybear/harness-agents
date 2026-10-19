@@ -260,6 +260,20 @@ impl HashlineRule {
     }
 }
 
+/// What a turn is told while harness refinements are off.
+pub const REFINEMENTS_DISABLED: &str =
+    "Harness refinements are disabled: /refinements on turns them back on";
+
+/// prime-agent's global `harnessRefinements` switch, on unless set to `false`:
+/// off, no refinement is generated (the automatic review, `/refine`, `/learn`,
+/// `refine.run()`) and no saved harness entry reaches a model request (the
+/// digest, the `memory` tool, the kernel's `rlm.harness`); what is saved is
+/// kept.
+#[must_use]
+pub fn harness_refinements(user_path: &Path) -> bool {
+    load_setting(user_path, "harnessRefinements").and_then(|value| value.as_bool()) != Some(false)
+}
+
 /// One global setting; a missing or unreadable file has none.
 #[must_use]
 pub fn load_setting(user_path: &Path, key: &str) -> Option<serde_json::Value> {

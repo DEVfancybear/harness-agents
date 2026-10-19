@@ -1634,6 +1634,8 @@ struct Kernel {
     pending_restore: bool,
     journal: Option<PathBuf>,
     stderr_task: Option<JoinHandle<()>>,
+    /// ha's `settings.json`, for the kernel's `rlm.harness` switch.
+    settings: Option<PathBuf>,
 }
 
 /// One request's events up to its `done`.
@@ -1665,6 +1667,7 @@ impl Kernel {
                 pending_restore: false,
                 journal: None,
                 stderr_task: None,
+                settings: None,
             },
             ready,
         )
@@ -1723,6 +1726,7 @@ impl Kernel {
         let stderr_pipe = child.stderr.take();
         let pid = child.id();
         let (mut kernel, ready) = Self::attach(stdout, stdin, snapshot);
+        kernel.settings = settings.map(Path::to_path_buf);
         kernel.child = Some(child);
         kernel.pid = pid;
         kernel.journal = Some(journal_path.clone());
@@ -1838,6 +1842,7 @@ impl Kernel {
         self.link.state().harness = Some(Arc::new(super::harness_kernel::Dirs {
             global: context.global.clone(),
             local: context.local.clone(),
+            settings: self.settings.clone(),
         }));
         let (output, _) = self
             .execute(&context.setup_code(), READY_TIMEOUT, false)
