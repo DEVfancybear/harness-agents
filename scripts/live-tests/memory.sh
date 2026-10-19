@@ -62,7 +62,8 @@ echo "################ 5. abstention: what was never said is not invented"
 agent "$RX/p-shop" s5
 say s5 "Theo memory, dự án này dùng database gì? Nếu memory không có thì nói rõ là không biết." | tail -4
 check "it says it does not know" "last | grep -qi 'không có\|không biết\|chưa có\|không tìm thấy\|không nhớ\|chưa được ghi\|không ghi'"
-check "it names no database" "! last | grep -qi 'postgres\|mysql\|sqlite\|mongo\|redis'"
+# Naming a database it searched for is not claiming the project uses it.
+check "it names no database" "! last | grep -qiE '(dùng|uses|using|sử dụng) (postgres|mysql|sqlite|mongo|redis)'"
 
 echo "################ 6. duplicates: the same fact written again is refused by the tool"
 say s5 "Kiểm thử: gọi tool memory action write ngay (không search trước, không truyền id), scope project, tiêu đề 'Trình quản lý gói', nội dung 'Dự án này dùng pnpm làm trình quản lý gói.'. In nguyên văn thông báo tool trả về, rồi làm theo hướng dẫn của nó." | tail -5
@@ -90,7 +91,8 @@ say s8 "/refinements off" | tail -2
 "$HA" shutdown --force >/dev/null 2>&1
 agent "$RX/p-shop" s9
 say s9 "Không đọc file. Bạn có nhớ gì về package manager hay lịch deploy của dự án này không? Có tool memory không?" | tail -4
-check "with refinements off the facts are not recalled" "! last | grep -qi 'pnpm'"
+# pnpm-lock.yaml is a file name any answer may cite; the deploy facts are not.
+check "with refinements off the facts are not recalled" "! last | grep -qi 'fly\.io\|thứ sáu\|friday'"
 check "the saved state is kept" "entries | grep -qi 'pnpm'"
 say s9 "/refinements on" | tail -2
 "$HA" shutdown --force >/dev/null 2>&1

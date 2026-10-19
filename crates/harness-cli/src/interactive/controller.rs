@@ -3952,6 +3952,13 @@ impl InteractiveController {
             }
             "/session" => {
                 let mut lines = self.header.clone();
+                // The session's spend counts its children's (prime-agent
+                // d592d5e7); the header's line is this agent's own.
+                let cost = format!("Cost: {}", self.service.cost_summary());
+                match lines.iter_mut().find(|line| line.starts_with("Cost:")) {
+                    Some(line) => *line = cost,
+                    None => lines.push(cost),
+                }
                 lines.push(format!("Phase:   {}", self.phase.label()));
                 // The project id names this workspace's store, and the app shows it
                 // nowhere else: the projects directory is named after a digest, so

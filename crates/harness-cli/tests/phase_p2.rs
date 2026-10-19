@@ -558,6 +558,43 @@ async fn p2_s04_request_is_committed_before_provider_and_replayed_exactly() {
     close_writer(store).await;
 }
 
+/// A `/compact` the user cancels stops: the deterministic fallback a failed
+/// summary falls back to is not published in its place.
+#[tokio::test]
+async fn p2_s05b_a_cancelled_compaction_keeps_the_checkpoint() {
+    let temp = TempDir::new().unwrap();
+    let store = writer(&temp).await;
+    let provider = Arc::new(MockProvider::text("done"));
+    let runtime = RuntimeService::new(Arc::clone(&store), provider, RuntimeConfig::default())
+        .with_summarizer(Arc::new(FailingSummaryProvider));
+    let session_id = SessionId::generate();
+    runtime
+        .run(request(
+            session_id.clone(),
+            TaskId::generate(),
+            "preserve the parser objective",
+        ))
+        .await
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let error = runtime
+        .compact_with_cancellation(&session_id, None, cancellation)
+        .await
+        .expect_err("a cancelled compaction does not complete");
+    assert_eq!(error.code(), ErrorCode::ProviderCanceled);
+    assert!(
+        store
+            .latest_context_checkpoint(&session_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "no fallback checkpoint stands in for the cancelled summary"
+    );
+    drop(runtime);
+    close_writer(store).await;
+}
+
 #[tokio::test]
 async fn p2_s05_summary_failure_uses_deterministic_working_state_fallback() {
     let temp = TempDir::new().unwrap();

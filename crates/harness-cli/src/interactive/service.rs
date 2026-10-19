@@ -6694,6 +6694,15 @@ impl AutoRefine {
         .await
         {
             Ok(review) if review.should_refine => review.instructions,
+            // A learned skill that was followed is judged whatever the gate
+            // found: its outcome - worked, or failed and on what false
+            // assumption - is the library's record of whether it works. Seen:
+            // the agent repaired a broken skill itself, the gate saw nothing
+            // left to refine, and the failure was never recorded.
+            Ok(review) if !self.learning.in_play.is_empty() => Some(format!(
+                "Nothing else needs refining ({}). Judge the learned skills in play from the conversation and report their outcomes; propose no other edit unless the conversation clearly needs it.",
+                review.rationale
+            )),
             Ok(review) => {
                 super::refine::mark_reviewed(&self.scopes.local, &self.reviewed);
                 send(SessionEvent::Notice {
