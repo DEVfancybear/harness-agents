@@ -657,3 +657,32 @@ Bản 0.6.1 ghi lại những gì đã xảy ra, để tìm bug từ một file 
   - Giá trị secret đã biết bị che (key provider trong môi trường và trong file credential), và các mẫu secret cũng vậy. `manifest.json` ghi số lần che.
 - **`/bug-report`** ghi cùng gói zip đó cho 24 giờ gần nhất của hội thoại đang mở, vào `<data dir>/bug-reports/`. `/logs` cũng liệt kê các file chẩn đoán.
 - **`ha diag timeline`** in timeline gộp. Lệnh nhận `--since 2h`, `--task`, `--session`, `--level warn` và `--json`.
+
+### 12.13. Knowledge, Self-Evolution và Deep Dream
+
+Bản 0.6.2 siết lại ba phần: thư viện knowledge, review tự động (Self-Evolution) và việc gom gọn memory toàn cục (Deep Dream).
+
+- **Catalog knowledge.** Catalog được xếp hạng giống digest memory: theo goal, những gì người dùng gõ, bản tóm tắt trạng thái task, các tin nhắn trước của người dùng và feature đang làm. Trước đây nó chỉ xếp theo tin nhắn hiện tại, nên một câu "tiếp tục" chỉ liệt kê các trang đầu tiên theo đường dẫn. Khi bỏ bớt trang, catalog ghi ở cuối số trang bị bỏ. Mỗi dòng không còn mang hash của trang nữa; lệnh đọc trang sẽ trả về hash.
+- **Secret.** Trang knowledge không bao giờ chứa secret, dù do agent ghi hay do review đề xuất; lời từ chối nói rõ nội dung đó trông giống loại secret nào. Các lệnh ghi memory và prompt note của một refinement qua cùng các bước kiểm tra như tool `memory`: không có secret, đúng giới hạn độ dài, không trùng. Các bước này áp dụng cho review tự động, `/refine`, `/learn` và Deep Dream. Một fact được ghi lại để thay một entry mà chính refinement đó xoá thì không bị tính là trùng.
+- **Trang do review tạo.** Review thấy thư viện được xếp hạng theo hội thoại, nên dù thư viện lớn đến đâu nó vẫn thấy trang mà nó có thể ghi trùng.
+  - Trang đề xuất về một chủ đề đã có trang thì bị từ chối, kèm tên trang đã có.
+  - Trang đề xuất phải có evidence là một câu trích nguyên văn từ hội thoại.
+  - Trang do review ghi được đánh dấu trong metadata (`origin: review`), và dấu đó giữ nguyên qua các lần sửa sau. `log.md` ghi ai đã thực hiện từng thay đổi.
+- **Lượt sau được báo.** Những gì một review chạy song song với hội thoại đã thay đổi sẽ được báo một lần cho lượt kế tiếp, kèm id refinement để `/refine --rollback` hoàn tác.
+- **Deep Dream** (gom gọn memory toàn cục):
+  - Chỉ sắp xếp lại, không tạo entry mới.
+  - Entry nằm dưới `constraints` giữ nguyên path, và entry đã ghim vẫn được ghim.
+  - Hai loại entry này chỉ bị xoá khi có một entry còn lại giữ đúng vai trò của chúng.
+  - Mỗi lượt xoá tối đa một nửa số entry. Những đề xuất của model bị gạt bỏ được ghi rõ trong rationale.
+  - Nó chạy khi đã lưu đủ số thay đổi (`memory_changes` đếm mọi lần tạo, cập nhật và xoá). Cách cũ cộng các version, mà tổng này giảm mỗi lần xoá nên có thể bỏ sót thay đổi.
+  - Một lượt thất bại được thử lại sau một giờ, thay vì phải chờ thêm mười lăm thay đổi.
+  - Nó không bao giờ chạy cùng lúc với phần memory của skill curator.
+- **Những gì không bao giờ được học.** Review, refinement và Deep Dream không ghi lại:
+  - lỗi môi trường, như thiếu binary hay interpreter, thiếu credential, lỗi mạng;
+  - nhận định rằng một tool không dùng được;
+  - lỗi đã tự hết khi thử lại.
+- **Bảo trì thư viện.**
+  - Khi `log.md` đầy, các dòng cũ nhất bị bỏ; trước đây mọi lần ghi sau đó đều bị từ chối.
+  - Một lần ghi bị gián đoạn mà file đã bị người khác sửa kể từ đó sẽ được cất sang `.ha-pending.abandoned.json`, và index được dựng lại. Trước đây thư viện từ chối mọi lệnh, kể cả `/knowledge off`.
+  - Lệnh xoá bị backlink chặn sẽ nêu tên các trang đang trỏ tới.
+  - Tìm kiếm trên cả hai thư viện (project và global) gộp kết quả theo thứ hạng, vì điểm keyword và điểm hybrid không so sánh được với nhau.

@@ -658,3 +658,32 @@ A task of hundreds of steps passes through many compactions, and what a compacti
   - Known secret values are redacted (the provider keys in the environment and in the credential file), and so are secret patterns. `manifest.json` has the count.
 - **`/bug-report`** writes the same zip for the last 24 hours of the open conversation, into `<data dir>/bug-reports/`. `/logs` also lists the diagnostics files.
 - **`ha diag timeline`** prints the merged timeline. It takes `--since 2h`, `--task`, `--session`, `--level warn` and `--json`.
+
+### 12.13. Knowledge, Self-Evolution and Deep Dream
+
+0.6.2 tightens the knowledge library, the automatic review (Self-Evolution) and the global memory consolidation (Deep Dream).
+
+- **The knowledge catalog.** It is ranked the way the memory digest is: by the goal, what the user typed, the task state's recap, the user's previous messages and the feature in progress. Before, it was ranked by the message alone, so a "continue" listed the first pages by path. A catalog that leaves pages out ends with how many it left out, and its lines no longer carry the page hash (a read gives it).
+- **Secrets.** A knowledge page never keeps a secret, whether the agent writes it or the review proposes it; the refusal names what it looks like. A refinement's memory and prompt-note writes pass the same checks as the `memory` tool: no secret, the length limits, and no duplicate. Covered by these checks are the automatic review, `/refine`, `/learn` and Deep Dream. A fact written anew in place of an entry that the same refinement deletes is not counted as a duplicate.
+- **A review's pages.** The review sees the library ranked by the conversation, so it sees the page it would duplicate however large the library is.
+  - A proposed page on a subject that a page already has is refused, and the refusal names that page.
+  - A proposed page needs a verbatim quote from the conversation as its evidence.
+  - A page the review wrote says so in its metadata (`origin: review`), and keeps that through later edits. `log.md` says who wrote each change.
+- **The next turn is told.** What a review running beside the conversation changed reaches the next turn once, with the refinement id that `/refine --rollback` undoes.
+- **Deep Dream** (the global memory consolidation):
+  - It only organizes: it creates no entry.
+  - An entry under `constraints` keeps that path, and a pinned entry stays pinned.
+  - Neither is deleted unless a surviving entry keeps what it was.
+  - One pass deletes at most half the entries. What the pass dropped from the model's edits is stated in its rationale.
+  - It runs once enough changes have been saved (`memory_changes` counts every create, update and delete). The old sum of versions fell with every delete, so it could miss changes.
+  - A pass that fails is tried again after an hour, instead of waiting for fifteen more changes.
+  - It never runs at the same time as the skill curator's memory pass.
+- **What is never learned.** The review, the refinement and the consolidation do not record:
+  - an environment failure, such as a missing binary or interpreter, a credential or a network error;
+  - a claim that a tool does not work;
+  - an error that went away on retry.
+- **Library upkeep.**
+  - A full `log.md` drops its oldest lines; it used to refuse every later write.
+  - An interrupted write whose file someone changed since is set aside as `.ha-pending.abandoned.json`, and the index is rebuilt. Before, the library refused every call, `/knowledge off` included.
+  - A delete that backlinks block names the pages that link to the page.
+  - A search across the project and global libraries merges them by rank. A keyword score and a hybrid score cannot be compared.
