@@ -6,6 +6,7 @@
 
 pub mod acceptance;
 mod contracts;
+pub mod diag;
 mod error;
 mod fixture;
 mod hash;

@@ -2,6 +2,7 @@
 #![allow(clippy::struct_excessive_bools, reason = "one flag per launch mode")]
 
 mod delegation_cli;
+mod diagnostics;
 mod extension_cli;
 mod interactive;
 mod maintenance_cli;
@@ -882,8 +883,11 @@ async fn main() -> ExitCode {
         reason = "one boxed dispatch future at the entry point"
     )]
     let cli = Cli::parse();
+    let role = process_role(&cli);
+    diagnostics::init(role);
     let json_error_envelope = json_requested() && legacy_command(&cli);
     let outcome = Box::pin(run(cli)).await;
+    diagnostics::finish(outcome.as_ref().err(), role);
     match outcome {
         Ok(code) => code,
         Err(error) => {
@@ -899,6 +903,20 @@ async fn main() -> ExitCode {
             }
             ExitCode::from(error.exit_code())
         }
+    }
+}
+
+/// What this process is, for its diagnostic log.
+fn process_role(cli: &Cli) -> diagnostics::Role {
+    use diagnostics::Role;
+    match (&cli.command, cli.mode.as_deref()) {
+        (_, Some("rpc")) => Role::Rpc,
+        (_, Some("acp")) => Role::Acp,
+        (None | Some(Command::Chat(_)), _) => Role::Tui,
+        (Some(Command::Exec(_)), _) => Role::Exec,
+        (Some(Command::Worker { serve: true, .. }), _) => Role::Worker,
+        (Some(Command::Worker { serve: false, .. }), _) => Role::Supervisor,
+        _ => Role::Cli,
     }
 }
 

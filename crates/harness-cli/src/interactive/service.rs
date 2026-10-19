@@ -3122,7 +3122,14 @@ fn log_lines(data_dir: &Path) -> Vec<String> {
             };
             if kind.is_dir() && depth > 0 {
                 walk(&path, depth - 1, found, root);
-            } else if kind.is_file() && path.extension().is_some_and(|extension| extension == "log")
+            } else if kind.is_file()
+                && path.extension().is_some_and(|extension| {
+                    extension == "log"
+                        || (extension == "jsonl"
+                            && dir
+                                .file_name()
+                                .is_some_and(|name| name == crate::diagnostics::DIRECTORY))
+                })
             {
                 let size = entry.metadata().map_or(0, |metadata| metadata.len());
                 if size == 0 {
@@ -3142,6 +3149,12 @@ fn log_lines(data_dir: &Path) -> Vec<String> {
     walk(data_dir, 4, &mut found, data_dir);
     found.sort();
     let mut lines = vec![format!("Directory: {}", data_dir.display())];
+    // `HA_DIAG_DIR` can put the diagnostic log elsewhere.
+    if let Some(diagnostics) = crate::diagnostics::directory()
+        && !diagnostics.starts_with(data_dir)
+    {
+        lines.push(format!("Diagnostics: {}", diagnostics.display()));
+    }
     if found.is_empty() {
         lines.push("No logs written yet.".to_owned());
     } else {
