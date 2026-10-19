@@ -81,6 +81,10 @@ struct Output {
     file_bytes: u64,
     process_bytes: u64,
     budget_said: bool,
+    /// The process's start record, written with the first record after it:
+    /// a process that only starts and exits - a refused launch, `ha list` -
+    /// leaves no file, as it leaves no other state.
+    held: Option<String>,
 }
 
 /// The file sink of one process.
@@ -115,6 +119,7 @@ impl FileSink {
                 file_bytes: 0,
                 process_bytes: 0,
                 budget_said: false,
+                held: None,
             }),
         }
     }
@@ -226,6 +231,9 @@ impl FileSink {
     fn write_panic(&self, record: &Record) {
         let line = self.line(record);
         if let Ok(mut output) = self.output.try_lock() {
+            if let Some(held) = output.held.take() {
+                self.append(&mut output, &held);
+            }
             self.append(&mut output, &line);
             return;
         }
@@ -254,6 +262,19 @@ impl Sink for FileSink {
         let Ok(mut output) = self.output.lock() else {
             return;
         };
+        match (record.kind, record.event) {
+            ("process", "start") => {
+                output.held = Some(line);
+                return;
+            }
+            // A process that ended - even failing - having done nothing
+            // else: its error was printed, and it touched no state.
+            ("process", "exit" | "failed") if output.held.take().is_some() => return,
+            _ => {}
+        }
+        if let Some(held) = output.held.take() {
+            self.append(&mut output, &held);
+        }
         if output.process_bytes >= PROCESS_HARD_BYTES {
             return;
         }
@@ -568,6 +589,30 @@ mod tests {
         );
         assert_eq!(line["fields"]["api_key"], "[withheld]");
         assert_eq!(line["fields"]["holder"], "worker 42");
+    }
+
+    /// A refused launch must leave no state: a process that only starts and
+    /// exits writes no file, and one that does more writes its start first.
+    #[test]
+    fn a_process_that_only_starts_and_exits_leaves_no_file() {
+        let event = |kind, event| Record {
+            event,
+            ..record(Level::Info, kind, "")
+        };
+        let dir = tempfile::tempdir().expect("dir");
+        let quiet = FileSink::new(dir.path().join("quiet"), Role::Tui, Level::Info);
+        quiet.write(event("process", "start"));
+        quiet.write(event("process", "failed"));
+        assert!(!dir.path().join("quiet").exists(), "no file, no directory");
+        let busy = FileSink::new(dir.path().join("busy"), Role::Tui, Level::Info);
+        busy.write(event("process", "start"));
+        busy.write(event("store", "writer_locked"));
+        busy.write(event("process", "exit"));
+        let events = lines(&dir.path().join("busy"))
+            .iter()
+            .map(|line| line["event"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(events, ["start", "writer_locked", "exit"]);
     }
 
     #[test]

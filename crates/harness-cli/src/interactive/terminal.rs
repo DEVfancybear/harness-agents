@@ -200,15 +200,21 @@ pub fn install_panic_hook() {
     INSTALL.call_once(|| {
         let default = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |information| {
-            let _ = execute!(
-                io::stdout(),
-                event::DisableBracketedPaste,
-                event::DisableMouseCapture,
-                terminal::LeaveAlternateScreen,
-                crossterm::style::Print("\u{1b}[?1007l"),
-                cursor::Show
-            );
-            let _ = terminal::disable_raw_mode();
+            // The terminal is drawn from the main thread. A panic on another one
+            // - a background task's, which the runtime survives - left the app
+            // running on a terminal no longer in raw mode; the diagnostics log
+            // still records it.
+            if std::thread::current().name() == Some("main") {
+                let _ = execute!(
+                    io::stdout(),
+                    event::DisableBracketedPaste,
+                    event::DisableMouseCapture,
+                    terminal::LeaveAlternateScreen,
+                    crossterm::style::Print("\u{1b}[?1007l"),
+                    cursor::Show
+                );
+                let _ = terminal::disable_raw_mode();
+            }
             default(information);
         }));
     });
