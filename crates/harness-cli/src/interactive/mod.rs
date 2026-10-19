@@ -35,6 +35,7 @@ pub mod features;
 pub mod frontend;
 pub mod goal;
 pub mod harness;
+pub mod harness_kernel;
 pub mod headless;
 pub mod heartbeat;
 pub mod input;

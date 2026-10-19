@@ -122,7 +122,7 @@ const PROTOCOL_EVENT_KINDS: [&str; 8] = [
 ];
 
 /// The vendored runtime, embedded so a single binary carries it.
-const RUNTIME_FILES: [(&str, &str); 7] = [
+const RUNTIME_FILES: [(&str, &str); 11] = [
     ("__init__.py", include_str!("../../python/rlm/__init__.py")),
     ("repl.py", include_str!("../../python/rlm/repl.py")),
     ("bash.py", include_str!("../../python/rlm/bash.py")),
@@ -130,6 +130,19 @@ const RUNTIME_FILES: [(&str, &str); 7] = [
     ("harness.py", include_str!("../../python/rlm/harness.py")),
     ("mcp.py", include_str!("../../python/rlm/mcp.py")),
     ("mcp_base.py", include_str!("../../python/rlm/mcp_base.py")),
+    ("factory.py", include_str!("../../python/rlm/factory.py")),
+    (
+        "machines/builder/MACHINE.md",
+        include_str!("../../python/rlm/machines/builder/MACHINE.md"),
+    ),
+    (
+        "machines/pr-manager/MACHINE.md",
+        include_str!("../../python/rlm/machines/pr-manager/MACHINE.md"),
+    ),
+    (
+        "machines/review-sweep/MACHINE.md",
+        include_str!("../../python/rlm/machines/review-sweep/MACHINE.md"),
+    ),
 ];
 
 /// prime-agent's `ATTACHMENT_DISPLAY_MIME`: `{mime_type, data, path}` for one image.
@@ -565,6 +578,9 @@ pub struct ReplShared {
     compaction_notice: std::sync::Mutex<Option<String>>,
     /// Whether a turn starts the kernel ahead of its first cell.
     prewarm: bool,
+    /// ha's `settings.json`, where the kernel reads the opt-in
+    /// `factory.enabled` (prime-agent reads it from its agent dir).
+    settings_file: std::sync::Mutex<Option<PathBuf>>,
     /// The background start [`Self::prewarm`] spawned, aborted by disposing.
     prewarming: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
@@ -634,7 +650,16 @@ impl ReplShared {
             compaction_notice: std::sync::Mutex::new(None),
             prewarm: false,
             prewarming: std::sync::Mutex::new(None),
+            settings_file: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Where ha's global settings live, for the kernel's opt-in factory.
+    pub fn set_settings_file(&self, path: PathBuf) {
+        *self
+            .settings_file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
     }
 
     /// Bind the session's own handlers ([`LinkState::session`]).
@@ -873,12 +898,17 @@ impl ReplShared {
         self.reap_stale_journals();
         let runtime = write_runtime(&self.data_dir)
             .map_err(|error| HarnessError::new(ErrorCode::StorageWriteFailed, error))?;
+        let settings = self
+            .settings_file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let mut kernel = Kernel::start(
             python,
             &runtime,
             &self.workspace,
             &self.data_dir,
-            self.shell.as_deref(),
+            (self.shell.as_deref(), settings.as_deref()),
             target,
             self.journal(),
         )
@@ -1174,6 +1204,9 @@ struct LinkState {
     stderr: stderr::Tail,
     /// Why the protocol stream ended, once it has.
     closed: Option<String>,
+    /// The memory directories `rlm.harness` reads and writes, once the
+    /// kernel was pointed at a conversation.
+    harness: Option<Arc<super::harness_kernel::Dirs>>,
 }
 
 impl LinkState {
@@ -1502,17 +1535,21 @@ fn start_host_request(link: &Arc<Link>, event: &Value) {
     let Some(id) = event["id"].as_str().map(str::to_owned) else {
         return;
     };
-    let (host, session) = {
+    let (host, session, harness) = {
         let mut state = link.state();
         if !state.remember(&id) {
             return;
         }
-        (state.host.clone(), state.session.clone())
+        (state.host.clone(), state.session.clone(), state.harness.clone())
     };
     let data = event.get("data").cloned().unwrap_or(Value::Null);
     let task = HostTask::new(Arc::clone(link));
     tokio::spawn(async move {
-        let reply = answer_host_request(host.as_deref(), session.as_deref(), &data).await;
+        let reply = if data["type"] == super::harness_kernel::REQUEST {
+            answer_harness(harness, data).await
+        } else {
+            answer_host_request(host.as_deref(), session.as_deref(), &data).await
+        };
         if let Err(error) = task
             .link
             .write(&json!({"type": "host_reply", "id": id, "data": reply}))
@@ -1524,6 +1561,19 @@ fn start_host_request(link: &Arc<Link>, event: &Value) {
         }
         drop(task);
     });
+}
+
+/// `rlm.harness`: the host keeps the harness state, under the lock the
+/// `memory` tool and `/refine` take, so the kernel never writes the file.
+async fn answer_harness(harness: Option<Arc<super::harness_kernel::Dirs>>, data: Value) -> Value {
+    let Some(dirs) = harness else {
+        return json!({"status": "error", "error": "rlm.harness is not pointed at a conversation yet"});
+    };
+    match tokio::task::spawn_blocking(move || super::harness_kernel::answer(&dirs, &data)).await {
+        Ok(Ok(result)) => json!({"status": "ok", "result": result}),
+        Ok(Err(error)) => json!({"status": "error", "error": error}),
+        Err(error) => json!({"status": "error", "error": format!("harness request failed: {error}")}),
+    }
 }
 
 async fn answer_host_request(
@@ -1619,11 +1669,14 @@ impl Kernel {
         runtime: &Path,
         workspace: &Path,
         data_dir: &Path,
-        shell: Option<&Path>,
+        (shell, settings): (Option<&Path>, Option<&Path>),
         snapshot: Option<SnapshotTarget>,
         journal_path: PathBuf,
     ) -> Result<Self, String> {
         let mut command = Command::new(python);
+        if let Some(settings) = settings {
+            command.env("HA_SETTINGS_FILE", settings);
+        }
         command
             .args(["-u", "-m", "rlm.repl"])
             .current_dir(workspace)
@@ -1776,6 +1829,10 @@ impl Kernel {
     /// Point the kernel at a conversation's memory and import its skills; the
     /// note names the skills that could not be imported.
     async fn apply_harness(&mut self, context: &KernelContext) -> Option<String> {
+        self.link.state().harness = Some(Arc::new(super::harness_kernel::Dirs {
+            global: context.global.clone(),
+            local: context.local.clone(),
+        }));
         let (output, _) = self
             .execute(&context.setup_code(), READY_TIMEOUT, false)
             .await
@@ -2168,6 +2225,10 @@ fn write_runtime(data_dir: &Path) -> Result<PathBuf, String> {
         let path = package.join(name);
         if std::fs::read_to_string(&path).is_ok_and(|current| current == body) {
             continue;
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("the REPL runtime could not be written: {error}"))?;
         }
         std::fs::write(&path, body)
             .map_err(|error| format!("the REPL runtime could not be written: {error}"))?;
@@ -3199,6 +3260,55 @@ mod tests {
         let memories = state.entries.get("memory").expect("new memories");
         assert_eq!(memories.len(), 1, "reset entries must not be resurrected");
         assert_eq!(memories[0].title.as_deref(), Some("Formatting"));
+        // The host answers every `rlm.harness` call: the global store, a
+        // `global:` id, search, the overview, rejections and the factory gate.
+        let global = run(
+            "e = rlm.harness.create_memory('Language', 'Answer in Vietnamese', global_=True)\n\
+             u = rlm.harness.update_memory('global:' + e.id, 'Language', 'Answer in Vietnamese, briefly')\n\
+             (u.scope, u.version, [x.id for x in rlm.harness.search('vietnamese', global_=True)])",
+            60,
+            dirs.clone(),
+        )
+        .await;
+        assert_eq!(global, "('global', 2, ['language'])");
+        let state = crate::interactive::harness::load(&dirs.global, "global");
+        assert_eq!(
+            state.entries["memory"][0].content.as_deref(),
+            Some("Answer in Vietnamese, briefly")
+        );
+        let overview = run(
+            "rlm.harness.overview().splitlines()[0].startswith('Harness state (local): ')",
+            60,
+            dirs.clone(),
+        )
+        .await;
+        assert_eq!(overview, "True");
+        let refused = run(
+            "try:\n    rlm.harness.create_memory('t', ['not', 'text'])\nexcept ValueError as e:\n    r = str(e)\nr",
+            60,
+            dirs.clone(),
+        )
+        .await;
+        assert_eq!(
+            refused,
+            "\"memory entry 't' rejected: content must be a non-empty string, got a list\""
+        );
+        let gated = run(
+            "try:\n    rlm.harness.create_factory('f', 'c', dag={})\nexcept ValueError as e:\n    r = str(e)\n'factory' in r and 'disabled' in r.lower()",
+            60,
+            dirs.clone(),
+        )
+        .await;
+        assert_eq!(gated, "True");
+        // `import rlm` rebinds the name to the module, which has the factory too.
+        let module = run(
+            "import rlm
+type(rlm.factory).__name__",
+            60,
+            dirs.clone(),
+        )
+        .await;
+        assert_eq!(module, "'_RLMFactoryNamespace'");
         if super::default_shell().is_some() {
             let bash = run(
                 "(await bash('echo from-bash')).output.strip()",

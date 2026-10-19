@@ -3466,6 +3466,7 @@ impl AgentSessionService {
             &context.project.root,
         );
         if let Some(repl) = &repl {
+            repl.set_settings_file(super::config::settings_path(&context.paths.config_file));
             repl.set_session_host(Arc::new(super::skill_requests::BashCompletions {
                 sender: sender.clone(),
             }));

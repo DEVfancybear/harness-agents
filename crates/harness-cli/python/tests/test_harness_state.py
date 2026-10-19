@@ -1,301 +1,162 @@
-"""Persistence regressions for the exact harness module embedded by ha (stdlib only)."""
+"""The kernel side of ``rlm.harness``: a shim over the ha host (stdlib only).
 
-import importlib.util
-from concurrent.futures import ThreadPoolExecutor
+The host keeps the harness state (``harness_kernel.rs``, with its own tests);
+these check what the shim decides before a request leaves the kernel: the
+scope a call targets, Python's argument errors, the factory gate and dry run,
+and how a reply becomes entries or an exception.
+"""
+
+import json
 import os
 from pathlib import Path
-import random
-import subprocess
 import sys
 import tempfile
-import threading
-import time
 import unittest
-import unicodedata
 from unittest.mock import patch
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "rlm" / "harness.py"
-SPEC = importlib.util.spec_from_file_location("ha_harness_under_test", MODULE_PATH)
-harness = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = harness
-SPEC.loader.exec_module(harness)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import rlm  # noqa: E402,F401
+
+# `rlm.harness` is the namespace proxy; the module is the one under test.
+harness = sys.modules["rlm.harness"]
+repl = sys.modules.get("rlm.repl") or __import__("rlm.repl").repl
 
 
-class HarnessPersistenceTests(unittest.TestCase):
+class FakeHost:
+    def __init__(self, result=None, error=None):
+        self.requests = []
+        self.result = result
+        self.error = error
+
+    def __call__(self, data, timeout=60.0):
+        self.requests.append(dict(data))
+        if self.error is not None:
+            return {"status": "error", "error": self.error}
+        return {"status": "ok", "result": self.result}
+
+
+ENTRY = {
+    "id": "language",
+    "kind": "memory",
+    "title": "Language",
+    "content": "Answer in Vietnamese",
+    "path": "general",
+    "scope": "global",
+    "reference": {},
+    "arguments": {},
+    "metadata": {},
+    "source": "agent",
+    "created_at": "2026-10-19T00:00:00+00:00",
+    "updated_at": "2026-10-19T00:00:00+00:00",
+    "version": 1,
+    "history": ["a field the shim does not know"],
+}
+
+
+class HarnessShimTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="ha-memory-test-")
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.path = self.root / "harness_state.json"
         harness._state_cache.clear()
+        self.state = harness.get_harness_state()
 
-    def state(self):
-        return harness.HarnessState(self.path)
+    def host(self, **kwargs):
+        fake = FakeHost(**kwargs)
+        patcher = patch.object(repl, "host_request_blocking", fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return fake
 
-    def test_concurrent_writers_preserve_every_successful_memory(self):
-        start = threading.Barrier(2)
+    def test_a_scope_prefix_or_flag_routes_to_the_global_store(self):
+        fake = self.host(result=ENTRY)
+        entry = self.state.update_memory("global:language", "Language", "Answer in Vietnamese")
+        self.assertEqual(entry.id, "language")
+        self.assertEqual(entry.scope, "global")
+        sent = fake.requests[-1]
+        self.assertEqual(sent["type"], "harness")
+        self.assertEqual(sent["op"], "update")
+        self.assertEqual(sent["id"], "language")
+        self.assertTrue(sent["global"])
+        self.state.create_memory("Language", "x", **{"global": True})
+        self.assertTrue(fake.requests[-1]["global"])
+        self.state.create_memory("Branch", "feature/x")
+        self.assertFalse(fake.requests[-1]["global"])
+        self.assertIsNone(fake.requests[-1]["id"])
+        harness.get_harness_state(global_=True).list()
+        self.assertTrue(fake.requests[-1]["global"])
 
-        def write(side):
-            state = self.state()
-            start.wait(timeout=10)
-            for number in range(24):
-                state.create_memory(side, str(number), id=f"{side}-{number}")
+    def test_a_payload_type_cannot_reroute_the_request(self):
+        fake = self.host(result=[])
+        self.state.list(kind="memory")
+        self.assertEqual(fake.requests[-1]["type"], "harness")
+        self.assertEqual(fake.requests[-1]["kind"], "memory")
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            list(pool.map(write, ("a", "b")))
-        self.assertEqual(
-            {entry.id for entry in self.state().list("memory")},
-            {f"{side}-{number}" for side in ("a", "b") for number in range(24)},
-        )
+    def test_python_argument_errors_stay_python_errors(self):
+        fake = self.host(result=[])
+        with self.assertRaises(TypeError):
+            self.state.create_memory("t", "c", bogus=1)
+        with self.assertRaises(TypeError):
+            self.state.list(**{"global": "yes"})
+        with self.assertRaises(TypeError):
+            self.state.search(5)
+        with self.assertRaises(TypeError):
+            self.state.search("x", limit=True)
+        self.assertEqual(fake.requests, [])
 
-    def test_replaced_state_with_same_mtime_preserves_external_writes(self):
-        cached = self.state()
-        cached.create_memory("First", "First memory", id="first")
-        previous_stat = self.path.stat()
-        self.state().create_memory("External", "External memory", id="external")
-        os.utime(self.path, ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns))
-        cached.create_memory("Next", "Next memory", id="next")
-        self.assertEqual(
-            {entry.id for entry in self.state().list("memory")},
-            {"first", "external", "next"},
-        )
+    def test_a_host_rejection_is_a_value_error(self):
+        self.host(error="memory entry 't' rejected: content must be a non-empty string, got a list")
+        with self.assertRaisesRegex(ValueError, "content must be a non-empty string"):
+            self.state.create_memory("t", ["a"])
 
-    def test_replaced_state_with_same_mtime_and_size_reloads_on_read(self):
-        cached = self.state()
-        cached.create_memory("First", "Before edit", id="first")
-        previous_stat = self.path.stat()
-        self.state().update_memory("first", "First", "After edits")
-        self.assertEqual(self.path.stat().st_size, previous_stat.st_size)
-        os.utime(self.path, ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns))
-        self.assertEqual(cached.get("memory", "first").content, "After edits")
+    def test_replies_become_entries_and_events(self):
+        self.host(result={"file_path": "x/harness_state.json", "scope": "local",
+                          "entries": {"memory": {"language": ENTRY}}, "refinements": [
+                              {"id": "refine_0001", "trigger": "t", "changes": ["c"], "evidence": "",
+                               "outcome": "", "created_at": ""}]})
+        self.assertEqual(self.state.entries["memory"]["language"].content, "Answer in Vietnamese")
+        self.assertEqual(self.state.entries["factory"], {})
+        self.assertEqual(self.state.refinements[0].id, "refine_0001")
+        self.assertEqual(self.state.file_path, Path("x/harness_state.json"))
 
-    def test_separate_kernels_preserve_concurrent_global_writes(self):
-        code = """
-import importlib.util, pathlib, sys, time
-spec = importlib.util.spec_from_file_location('harness_worker', sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-spec.loader.exec_module(module)
-state = module.HarnessState(sys.argv[2], scope='global')
-start, side = pathlib.Path(sys.argv[3]), sys.argv[4]
-start.with_name(side + '.ready').touch()
-deadline = time.monotonic() + 10
-while not start.exists():
-    if time.monotonic() >= deadline: raise TimeoutError('start barrier')
-    time.sleep(0.005)
-for number in range(24):
-    state.create_memory(side, str(number), id=f'{side}-{number}')
-"""
-        start = self.root / "start"
-        workers = [
-            subprocess.Popen(
-                [sys.executable, "-c", code, str(MODULE_PATH), str(self.path), str(start), side],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
-            for side in ("a", "b")
-        ]
-        try:
-            deadline = time.monotonic() + 10
-            while not all((self.root / (side + ".ready")).exists() for side in ("a", "b")):
-                self.assertLess(time.monotonic(), deadline, "both kernels start")
-                time.sleep(0.005)
-            start.touch()
-            for worker in workers:
-                _, error = worker.communicate(timeout=20)
-                self.assertEqual(worker.returncode, 0, error.decode(errors="replace"))
-        finally:
-            for worker in workers:
-                if worker.poll() is None:
-                    worker.kill()
-                    worker.communicate()
-        self.assertEqual(
-            {entry.id for entry in self.state().list("memory")},
-            {f"{side}-{number}" for side in ("a", "b") for number in range(24)},
-        )
+    def test_a_skill_needs_a_python_reference_before_any_request(self):
+        fake = self.host(result=ENTRY)
+        with self.assertRaisesRegex(ValueError, "skill reference.type must be 'python'"):
+            self.state.create_skill("s", "c", reference={"type": "shell"})
+        self.assertEqual(fake.requests, [])
 
-    def test_crud_survives_reopen_and_preserves_unicode_and_version(self):
-        state = self.state()
-        entry = state.create_memory("Ngôn ngữ", "Trả lời bằng tiếng Việt", id="language")
-        self.assertEqual(entry.version, 1)
-        reopened = self.state()
-        self.assertEqual(reopened.get("memory", "language").content, "Trả lời bằng tiếng Việt")
-        reopened.update_memory("language", "Ngôn ngữ", "Giữ nguyên tên hàm")
-        self.assertEqual(self.state().get("memory", "language").version, 2)
-        self.assertTrue(reopened.delete_memory("language"))
-        self.assertEqual(self.state().list("memory"), [])
-        self.assertFalse(reopened.delete_memory("language"))
+    def test_the_factory_is_off_until_ha_settings_turn_it_on(self):
+        fake = self.host(result={**ENTRY, "kind": "factory"})
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Path(directory) / "settings.json"
+            with patch.dict(os.environ, {"HA_SETTINGS_FILE": str(settings)}):
+                with self.assertRaisesRegex(ValueError, "the factory is disabled"):
+                    self.state.create_factory("f", "c", dag={})
+                with self.assertRaisesRegex(ValueError, "the factory is disabled"):
+                    self.state.create("factory", "f", "c", arguments={"dag": {}})
+                self.assertEqual(fake.requests, [])
+                settings.write_text(json.dumps({"factory": {"enabled": True}}), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    self.state.create_factory("f", "c", dag={"nodes": "not a list"})
+                self.assertEqual(fake.requests, [], "an invalid spec never reaches the host")
+                spec = {"nodes": [{"id": "a", "prompt": "do a"}]}
+                if not harness.validate_factory_spec(spec):
+                    self.state.create_factory("f", "c", dag=spec)
+                    sent = fake.requests[-1]
+                    self.assertEqual(sent["kind"], "factory")
+                    self.assertEqual(sent["arguments"], {"dag": spec})
+                    self.assertIsNot(sent["arguments"]["dag"], spec, "the spec is copied")
 
-    def test_a_titled_id_is_ascii_whole_words_and_finds_its_earlier_form(self):
-        state = self.state()
-        title = "Monorepo: script cần gói phụ thuộc phải build gói đó trước, và phải kiểm trên checkout sạch"
-        entry = state.create_memory(title, "x")
-        self.assertEqual(entry.id, "monorepo_script_can_goi_phu_thuoc_phai_build_goi_do_truoc_va")
-        self.assertTrue(len(entry.id) <= 60 and entry.id.isascii())
-        # Words of other scripts stay whole: a mark there is part of the word.
-        self.assertEqual(harness._slug("गति 登录", "memory"), "गति_登录")
-        # An entry kept under the earlier, accented id is updated, not doubled.
-        older = "Ninja: M0 đã xong"
-        state.create_memory(older, "v1", id=harness._legacy_slug(older, "memory"))
-        state.upsert("memory", older, "v2")
-        self.assertEqual(
-            [entry.content for entry in self.state().list("memory") if entry.title == older],
-            ["v2"],
-        )
+    def test_a_kernel_without_a_host_says_so(self):
+        with patch.object(repl, "_loop", None):
+            with self.assertRaisesRegex(RuntimeError, "not serving"):
+                self.state.create_memory("t", "c")
 
-    @unittest.skipUnless(os.name == "nt", "Windows readers can deny atomic replacement")
-    def test_brief_external_reader_does_not_fail_memory_save(self):
-        state = self.state()
-        state.create_memory("Existing", "Keep this memory", id="existing")
-        ready = threading.Event()
-
-        def read():
-            with self.path.open("rb"):
-                ready.set()
-                time.sleep(0.25)
-
-        reader = threading.Thread(target=read)
-        reader.start()
-        try:
-            self.assertTrue(ready.wait(5))
-            state.create_memory("Next", "Saved after the reader closes", id="next")
-        finally:
-            reader.join(timeout=5)
-        self.assertEqual(
-            {entry.id for entry in self.state().list("memory")},
-            {"existing", "next"},
-        )
-        self.assertEqual(list(self.root.glob("*.tmp")), [])
-
-    def test_failed_save_restores_cache_to_persisted_memory(self):
-        state = self.state()
-        state.create_memory("Existing", "Original", id="existing")
-        operations = (
-            lambda: state.create_memory("New", "Not saved", id="new"),
-            lambda: state.update_memory("existing", "Changed", "Not saved"),
-            lambda: state.delete_memory("existing"),
-        )
-        for operation in operations:
-            with self.subTest(operation=operation):
-                with patch.object(harness.os, "replace", side_effect=PermissionError("permanent denial")):
-                    with self.assertRaises(PermissionError):
-                        operation()
-                self.assertEqual(state.get("memory", "existing").content, "Original")
-                self.assertEqual(state.get("memory", "existing").version, 1)
-                self.assertIsNone(state.get("memory", "new"))
-                self.assertEqual(list(self.root.glob("*.tmp")), [])
-
-    def test_removed_state_file_clears_cached_memories(self):
-        state = self.state()
-        state.create_memory("Removed", "This entry was removed", id="removed")
-        self.path.unlink()
-        self.assertEqual(state.list("memory"), [])
-
-    def test_removed_state_file_clears_refinement_history(self):
-        state = self.state()
-        state.refinements.append(harness.RefinementEvent(id="review-1", trigger="test", changes=["memory"]))
-        state.save()
-        self.path.unlink()
-        state.load()
-        self.assertEqual(state.refinements, [])
-
-    def test_new_write_does_not_resurrect_removed_memories(self):
-        state = self.state()
-        state.create_memory("Old", "Old memory", id="old")
-        self.path.unlink()
-        state.create_memory("New", "New memory", id="new")
-        self.assertEqual([entry.id for entry in self.state().list("memory")], ["new"])
-
-    def test_in_memory_reload_preserves_entries_and_history(self):
-        state = harness.HarnessState(in_memory=True)
-        state.create_memory("Volatile", "Keep until the kernel stops", id="kept")
-        state.refinements.append(harness.RefinementEvent(id="review-1", trigger="test", changes=[]))
-        state.load()
-        self.assertEqual(state.get("memory", "kept").content, "Keep until the kernel stops")
-        self.assertEqual(len(state.refinements), 1)
-
-    def test_cached_writer_keeps_external_edits(self):
-        cached = self.state()
-        cached.create_memory("First", "First memory", id="first")
-        previous_mtime = self.path.stat().st_mtime_ns
-        other = self.state()
-        other.create_memory("External", "Written by another process", id="external")
-        stat = self.path.stat()
-        os.utime(self.path, ns=(stat.st_atime_ns, previous_mtime + 1_000_000_000))
-        self.assertIsNotNone(cached.get("memory", "external"))
-        cached.create_memory("Third", "Written by the cached state", id="third")
-        self.assertEqual({entry.id for entry in self.state().list("memory")}, {"first", "external", "third"})
-
-    def test_local_and_global_state_remain_separate(self):
-        local_dir, global_dir = self.root / "local", self.root / "global"
-        with patch.dict(os.environ, {"RLM_HARNESS_STATE_DIR": str(local_dir), "RLM_GLOBAL_HARNESS_STATE_DIR": str(global_dir)}):
-            state = harness.get_harness_state()
-            state.create_memory("Local", "Only this conversation", id="same")
-            state.create_memory("Global", "Every conversation", id="same", global_=True)
-            self.assertEqual(state.get("memory", "same").content, "Only this conversation")
-            self.assertEqual(state.get("memory", "same", global_=True).content, "Every conversation")
-            self.assertEqual(harness.HarnessState(local_dir / "harness_state.json").get("memory", "same").scope, "local")
-            self.assertEqual(harness.HarnessState(global_dir / "harness_state.json", scope="global").get("memory", "same").scope, "global")
-
-    def test_search_matches_canonically_equivalent_unicode(self):
-        state = self.state()
-        state.create_memory("Cấu hình", "Keep this configuration", id="config")
-        state.create_memory(unicodedata.normalize("NFD", "Độ trễ"), "Keep this latency", id="latency")
-        for query in ["cấu hình", unicodedata.normalize("NFD", "cấu hình")]:
-            self.assertEqual([entry.id for entry in state.search(query)], ["config"])
-        for query in ["độ trễ", unicodedata.normalize("NFD", "độ trễ")]:
-            self.assertEqual([entry.id for entry in state.search(query)], ["latency"])
-
-    def test_search_keeps_short_words_across_scripts(self):
-        state = self.state()
-        queries = ["go ui", "máy in", "le thé", "миф", "خط", "गति", "登录"]
-        for number, query in enumerate(queries):
-            state.create_memory(query, "CANARY", id=f"language-{number}")
-        for number, query in enumerate(queries):
-            with self.subTest(query=query):
-                self.assertEqual(
-                    [entry.id for entry in state.search(query)],
-                    [f"language-{number}"],
-                )
-
-    def test_search_discounts_common_terms_without_stopwords(self):
-        state = self.state()
-        for number in range(24):
-            state.create_memory(f"Alpha we can use {number}", "we can use", id=f"alpha-{number}")
-        for number in range(12):
-            state.create_memory(f"Other {number}", "Unrelated", id=f"other-{number}")
-        state.create_memory("Zebra UI", "RESULT=42", id="target")
-        self.assertEqual(state.search("we can use ui", limit=1)[0].id, "target")
-
-    def test_corrupt_and_non_object_state_are_empty(self):
-        for raw in ["{broken", "null", "[]", '"text"', '{"entries": {"memory": {"broken": {"title": 5}}}}']:
-            with self.subTest(raw=raw):
-                self.path.write_text(raw, encoding="utf-8")
-                self.assertEqual(self.state().list(), [])
-
-    def test_randomized_persistence_matches_dictionary_model(self):
-        for seed in range(8):
-            with self.subTest(seed=seed):
-                self.path.unlink(missing_ok=True)
-                state, expected = self.state(), {}
-                randomizer = random.Random(seed)
-                for step in range(60):
-                    key = f"memory-{randomizer.randrange(6)}"
-                    action = randomizer.choice(["write", "delete", "reset", "reopen"])
-                    if action == "write":
-                        value = f"Tiếng Việt {seed}/{step}"
-                        state.upsert("memory", key, value, id=key)
-                        expected[key] = value
-                    elif action == "delete":
-                        self.assertEqual(state.delete_memory(key), key in expected)
-                        expected.pop(key, None)
-                    elif action == "reset":
-                        self.path.unlink(missing_ok=True)
-                        expected.clear()
-                    else:
-                        state = self.state()
-                    actual = {entry.id: entry.content for entry in state.list("memory")}
-                    self.assertEqual(actual, expected, f"seed={seed}, step={step}, action={action}")
-                    self.assertEqual({entry.id: entry.content for entry in self.state().list("memory")}, expected)
+    def test_an_unpersisted_local_store_refuses_local_writes_only(self):
+        fake = self.host(result=ENTRY)
+        state = harness.HarnessState(local_write_error="no local store")
+        with self.assertRaisesRegex(RuntimeError, "no local store"):
+            state.create_memory("t", "c")
+        state.create_memory("t", "c", global_=True)
+        self.assertTrue(fake.requests[-1]["global"])
 
 
 if __name__ == "__main__":

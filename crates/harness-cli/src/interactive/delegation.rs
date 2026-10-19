@@ -605,7 +605,9 @@ impl ChildRecord {
             ChildState::Partial { answer, .. } => {
                 ("error", Some(clip(answer, self.answer_file.as_deref())))
             }
-            ChildState::Failed { .. } | ChildState::Cancelled { .. } => ("error", None),
+            ChildState::Failed { .. } => ("error", None),
+            // prime-agent keeps a cancelled child's status verbatim in its row.
+            ChildState::Cancelled { .. } => ("cancelled", None),
         };
         json!({
             "rlm_child_id": self.task_id.as_str(),
@@ -684,6 +686,9 @@ impl ChildRecord {
             "status": status,
             "settled": self.state.settled(),
             "partial": matches!(self.state, ChildState::Partial { .. }),
+            // prime-agent's settle-binding lane: the whole answer (bounded, the
+            // rest in its file), beside the roster's preview.
+            "answer_text": answer,
             "answer_preview": answer,
             "error": error,
             "duration_ms": self.state.settled().then(|| self.elapsed_ms()),
@@ -6100,6 +6105,7 @@ pub(super) mod tests {
         assert_eq!(result["status"], "done", "{collected}");
         assert_eq!(result["settled"], true);
         assert_eq!(result["answer_preview"], "answer: slow survey");
+        assert_eq!(result["answer_text"], "answer: slow survey");
         assert_eq!(result["tool_use_count"], 2);
         let collected = ask(json!({"type": "rlm.collect", "targets": ["quick"], "timeout_ms": 0}))
             .await
