@@ -816,6 +816,9 @@ struct AgentsShared {
     /// the ledger runs with.
     default_launch: Mutex<Option<ChildLaunch>>,
     root_identity: Mutex<(Option<String>, Option<String>)>,
+    /// What every child of the session spent, deleted ones included, at
+    /// every depth (prime-agent d592d5e7): `(dollars, some usage had no price)`.
+    spend: Mutex<(f64, bool)>,
 }
 
 /// One message between two agents of the family.
@@ -869,6 +872,17 @@ impl AgentsShared {
             ledger_path: Mutex::new(None),
             default_launch: Mutex::new(None),
             root_identity: Mutex::new((None, None)),
+            spend: Mutex::new((0.0, false)),
+        }
+    }
+
+    /// Count one child response toward the session's spend.
+    fn charge(&self, price: Option<ModelPrice>, usage: CostUsage) {
+        if let Ok(mut spend) = self.spend.lock() {
+            match super::cost::calculate_cost(price, usage) {
+                Some(cost) => spend.0 += cost,
+                None => spend.1 = true,
+            }
         }
     }
 
@@ -1617,6 +1631,14 @@ pub struct SessionAgents {
 }
 
 impl SessionAgents {
+    /// What the session's children spent so far, deleted ones included;
+    /// `None` while there is none, or when some of it had no price.
+    #[must_use]
+    pub fn children_spend(&self) -> Option<f64> {
+        let (dollars, unpriced) = *self.shared.spend.lock().ok()?;
+        (!unpriced && dollars > 0.0).then_some(dollars)
+    }
+
     /// # Errors
     /// The worker scheduler cannot be created.
     pub fn new(
@@ -4160,7 +4182,7 @@ impl RlmChildren {
             "sessionName": self.host().and_then(|host| host.agent_name()).or(name),
             "status": "running",
             "isSessionActive": true,
-            "activity": {"kind": "executing", "tool_name": "ipython"},
+            "activity": {"kind": "executing", "tool_name": super::repl::TOOL_NAME},
         })
     }
 
@@ -4848,16 +4870,15 @@ impl TurnObserver for ExplorerObserver {
                     usage.0 = usage.0.saturating_add(prompt_tokens);
                     usage.1 = usage.1.saturating_add(completion_tokens);
                 }
+                let usage = CostUsage {
+                    input_tokens: prompt_tokens,
+                    output_tokens: completion_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                };
+                self.shared.charge(self.model_price, usage);
                 if let Ok(mut tracker) = self.cost_tracker.lock() {
-                    tracker.record(
-                        self.model_price,
-                        CostUsage {
-                            input_tokens: prompt_tokens,
-                            output_tokens: completion_tokens,
-                            cache_read_tokens,
-                            cache_write_tokens,
-                        },
-                    );
+                    tracker.record(self.model_price, usage);
                     let cost = tracker.display();
                     self.shared.update(&self.task_id, |child| child.cost = cost);
                 }

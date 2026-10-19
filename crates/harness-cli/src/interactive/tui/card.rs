@@ -173,7 +173,18 @@ pub fn header(
                 ..Arguments::default()
             },
         )
-    } else if name == "ipython" {
+    } else if super::super::repl::is_repl_tool(name)
+        && let Some(command) = summary.strip_prefix("$ ")
+    {
+        // A cell of `bash()` calls, shown as the commands it runs.
+        (
+            "Bash".to_owned(),
+            Arguments {
+                target: Some(command.to_owned()),
+                ..Arguments::default()
+            },
+        )
+    } else if super::super::repl::is_repl_tool(name) {
         ("Python".to_owned(), split_summary(summary))
     } else {
         (label(name), split_summary(summary))

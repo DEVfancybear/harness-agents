@@ -130,7 +130,11 @@ pub const SLASH_COMMANDS: [SlashCommand; 66] = [
     ),
     SlashCommand {
         aliases: &["/clear"],
-        ..command("/new", "[prompt]", "Start a new session")
+        ..command(
+            "/new",
+            "[--name <name>] [[--] prompt]",
+            "Start a new session, optionally named and with a first prompt",
+        )
     },
     command(
         "/compact",

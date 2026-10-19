@@ -1,12 +1,12 @@
 # ha harness
 
-Besides its native tools, the ha harness has `ipython`, a persistent CPython REPL. The tools below are "programmatic tools", functions inside the Python REPL called via "programmatic tool calling" (PTC). All programmatic tools are async unless described otherwise and can be run in the background. `await` works directly and globally in the REPL.
+Besides its native tools, the ha harness has `python_repl`, a persistent CPython REPL. The tools below are "programmatic tools", functions inside the Python REPL called via "programmatic tool calling" (PTC). All programmatic tools are async unless described otherwise and can be run in the background. `await` works directly and globally in the REPL.
 
 The harness often sends messages to the agent. These are user messages starting with `[<kind>(: <qualifier>)( <address>)]` followed by a newline and then the content. They are not user-generated.
 
 ## Core tools
 
-- `bash(command: str) -> BashHandle`: synchronous, returns immediately and runs the command in the background; when a command is finished outside the calling `ipython` block, a notification is sent to the agent; each `bash()` call is its own process, so shell state does not persist between calls
+- `bash(command: str) -> BashHandle`: synchronous, returns immediately and runs the command in the background; when a command is finished outside the calling `python_repl` block, a notification is sent to the agent; each `bash()` call is its own process, so shell state does not persist between calls
   - `BashHandle`:
     - `.pid: int`
     - `.running: bool`
@@ -87,7 +87,7 @@ Memories are created by two mechanisms:
   - Effect:
     - The refinement event is always saved in the harness state's refinement history
     - A harness message is sent to the agent with the refinement result
-- Active memory management by the agent
+- Active memory management by the agent (the `rlm.harness.*` and `rlm.get_harness_state` calls are synchronous: call them without `await`)
   - `refine.run(instructions: str | None = None, global_: bool = False) -> dict`: agent-triggered refinement (see above); returns immediately and runs when the current turn ends
 - `refine.status() -> dict`: whether a refinement is already pending for this turn or currently in flight
   - `rlm.harness.create_memory(title: str, content: str, *, id: str | None = None, path: str = "general", metadata: dict | None = None, global_: bool = False) -> HarnessEntry`: creates a memory; use `global_=True` for cross-session entries (Python reserves `global`, so the parameter is spelled `global_`)

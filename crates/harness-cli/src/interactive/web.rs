@@ -146,7 +146,7 @@ impl WebHost {
             reqwest::header::ACCEPT_LANGUAGE,
             reqwest::header::HeaderValue::from_static("en-US,en;q=0.9"),
         );
-        let client = reqwest::Client::builder()
+        let client = harness_providers::with_extra_roots(reqwest::Client::builder())
             .user_agent(USER_AGENT)
             .default_headers(headers)
             .timeout(REQUEST_TIMEOUT)

@@ -249,6 +249,11 @@ pub(crate) fn adapter_stream(
                         return;
                     }
                 }
+                // Nothing follows `[DONE]`: a connection held open after it
+                // must not hold the turn.
+                if decoder.saw_done() {
+                    break;
+                }
             }
             match decoder.finish() {
                 Ok(events) => {

@@ -298,6 +298,9 @@ pub struct TurnOutcome {
     pub goal: Option<GoalReport>,
     /// The durable question this run paused on, when it did.
     pub pending_question: Option<harness_types::QuestionId>,
+    /// Why the last model response ended (`stop`, `length`, ...), as the
+    /// provider said.
+    pub final_finish_reason: Option<String>,
 }
 
 /// What one goal evaluation run reported, in words the CLI can print.
@@ -1857,6 +1860,7 @@ impl TurnDriver {
             acceptance,
             goal: goal_report,
             pending_question,
+            final_finish_reason: result.finish_reason.clone(),
         })
     }
 

@@ -2315,6 +2315,13 @@ impl TurnObserver for ChannelObserver {
                 if let Ok(mut started) = self.tool_started.lock() {
                     started.push((call_id.clone(), name.clone(), Instant::now()));
                 }
+                // A cell that is mostly `bash()` calls reads as the commands it
+                // runs (prime-agent d38bcb56).
+                let summary = if super::repl::is_repl_tool(&name) {
+                    super::repl::bash_summary(&input).unwrap_or(summary)
+                } else {
+                    summary
+                };
                 Some(SessionEvent::ToolStarted {
                     name,
                     call_id,
@@ -4410,7 +4417,11 @@ impl SessionPort for AgentSessionService {
                     // `/plugins` connects it.
                     None => return self.connect_plugin(name).map(|line| vec![line]),
                 };
-                self.start_mcp_login(name, &url);
+                let (client_id, port) = configured
+                    .get(name.as_str())
+                    .map(|server| (server.oauth_client_id.clone(), server.oauth_callback_port))
+                    .unwrap_or_default();
+                self.start_mcp_login_with(name, &url, client_id, port);
                 return Ok(vec![format!("Signing in to MCP server {name}...")]);
             }
             (Some("logout"), Some(name)) => {
@@ -4970,9 +4981,27 @@ impl SessionPort for AgentSessionService {
     }
 
     fn cost_summary(&self) -> String {
-        self.cost_tracker
+        let own = self
+            .cost_tracker
             .lock()
-            .map_or_else(|_| "n/a".to_owned(), |tracker| tracker.display())
+            .map_or_else(|_| "n/a".to_owned(), |tracker| tracker.display());
+        // The session's spend includes its children's (prime-agent d592d5e7).
+        match (
+            self.agents.children_spend(),
+            own.strip_prefix('$')
+                .and_then(|own| own.parse::<f64>().ok()),
+        ) {
+            (Some(children), Some(own)) => format!(
+                "{} (children {})",
+                super::cost::display_cost(Some(own + children)),
+                super::cost::display_cost(Some(children))
+            ),
+            (Some(children), None) => format!(
+                "{} children; this agent n/a",
+                super::cost::display_cost(Some(children))
+            ),
+            (None, _) => own,
+        }
     }
 
     fn refine_history(&self, limit: usize) -> Vec<String> {
@@ -6521,6 +6550,18 @@ impl AgentSessionService {
     /// Run prime-agent's MCP sign-in for `server` at `url` off the UI thread;
     /// each step arrives as a notice.
     fn start_mcp_login(&self, server: &str, url: &str) {
+        self.start_mcp_login_with(server, url, None, None);
+    }
+
+    /// [`Self::start_mcp_login`] with the server's configured OAuth client and
+    /// callback port (prime-agent ee1e531e).
+    fn start_mcp_login_with(
+        &self,
+        server: &str,
+        url: &str,
+        client_id: Option<String>,
+        callback_port: Option<u16>,
+    ) {
         let sender = self.sender.clone();
         let auth_path = super::credentials::resolve_path(&self.environment, &self.data_dir);
         let server = server.to_owned();
@@ -6533,12 +6574,18 @@ impl AgentSessionService {
                         message: message.to_owned(),
                     });
                 };
-                let message =
-                    match super::mcp_oauth::login(&server, &url, None, None, &auth_path, &progress)
-                    {
-                        Ok(()) => format!("Signed in to MCP server {server}"),
-                        Err(error) => format!("MCP sign-in for {server} failed: {error}"),
-                    };
+                let message = match super::mcp_oauth::login(
+                    &server,
+                    &url,
+                    client_id.as_deref(),
+                    callback_port,
+                    None,
+                    &auth_path,
+                    &progress,
+                ) {
+                    Ok(()) => format!("Signed in to MCP server {server}"),
+                    Err(error) => format!("MCP sign-in for {server} failed: {error}"),
+                };
                 progress(&message);
             });
     }
@@ -7609,6 +7656,7 @@ async fn run_turn(
             output_reservation_tokens: effective_output_tokens(&config, &data_dir, thinking_level),
             compaction_reserve_tokens: config.compaction_reserve_tokens,
             compaction_ceiling_tokens: super::config::compaction_ceiling(&environment),
+            compaction_threshold_percent: super::config::compaction_threshold_percent(&config_file),
             max_retry_after_seconds: config.max_retry_after_seconds,
             estimate_scale: carried_scale,
             ..RuntimeConfig::default()
@@ -7630,7 +7678,7 @@ async fn run_turn(
     if let Some(guidance) = request.compact_guidance.as_deref() {
         let result = match source.as_ref() {
             Some(source_session) => runtime
-                .compact_with_guidance(source_session, Some(guidance))
+                .compact_with_cancellation(source_session, Some(guidance), cancellation.clone())
                 .await
                 .map(|compacted| {
                     send(SessionEvent::Notice {
@@ -7936,6 +7984,9 @@ async fn run_turn(
                 ),
                 compaction_reserve_tokens: config.compaction_reserve_tokens,
                 compaction_ceiling_tokens: super::config::compaction_ceiling(&environment),
+                compaction_threshold_percent: super::config::compaction_threshold_percent(
+                    &config_file,
+                ),
                 max_retry_after_seconds: config.max_retry_after_seconds,
                 ..RuntimeConfig::default()
             },
@@ -8334,6 +8385,19 @@ async fn run_turn(
             built_prompt.text.push_str("\n\n");
             built_prompt.text.push_str(&note);
         }
+    }
+    // prime-agent's per-model additions: the last stable segment, before the
+    // session tail, so it stays cached with the rest.
+    let model_prompts = super::model_prompts::resolve(
+        &format!("{}/{}", config.provider_id, config.model),
+        &global_config_dir,
+    );
+    if let Some(message) = super::model_prompts::error_notice(&model_prompts.errors) {
+        send(SessionEvent::Notice { message });
+    }
+    if let Some(extras) = model_prompts.extras {
+        built_prompt.text.push_str("\n\n");
+        built_prompt.text.push_str(&extras);
     }
     // The session-specific tail last, after everything that is stable for the
     // session. What changes between turns - the date, the branch, the changed
@@ -8936,6 +9000,14 @@ async fn run_turn(
         Ok(outcome) => {
             if let Ok(mut guard) = previous_session.lock() {
                 *guard = Some(outcome.session_id.clone());
+            }
+            if outcome.stop == TurnStop::Final
+                && outcome
+                    .final_finish_reason
+                    .as_deref()
+                    .is_some_and(|reason| matches!(reason, "length" | "max_tokens"))
+            {
+                send(SessionEvent::OutputCapped);
             }
             match outcome.stop {
                 TurnStop::Final => RunOutcome::Done,

@@ -54,7 +54,7 @@ Treat this as clarity guidance, not a claim of formal ASD-STE100 compliance. Pre
 /// prime-agent's static layers (`prompts/layers/*.md`): the programmatic-tool
 /// reference, the mandatory usage rules and the opinionated defaults. `core.md`
 /// is prime's with the product name and its first sentence fitted to ha, whose
-/// model has native tools besides `ipython`; the other two are verbatim.
+/// model has native tools besides `python_repl`; the other two are verbatim.
 const CORE_LAYER: &str = include_str!("prompts/core.md");
 const USAGE_LAYER: &str = include_str!("prompts/usage.md");
 const OPINIONATED_LAYER: &str = include_str!("prompts/opinionated.md");
@@ -85,7 +85,7 @@ impl SystemPromptBuilder {
             "When you are done, stop calling tools and state your final answer.",
         ]
         .join("\n")];
-        if has("ipython") {
+        if has(super::repl::TOOL_NAME) {
             parts.push(CORE_LAYER.trim().to_owned());
             parts.push(USAGE_LAYER.trim().to_owned());
             parts.push(OPINIONATED_LAYER.trim().to_owned());
@@ -428,14 +428,14 @@ mod tests {
         assert!(!bare.contains("web_search"));
         assert!(!bare.contains(super::super::knowledge::GUIDANCE));
         let full =
-            SystemPromptBuilder::build(&environment(), &["delegate", "ipython", "web_search"]).text;
+            SystemPromptBuilder::build(&environment(), &["delegate", "python_repl", "web_search"]).text;
         assert!(full.contains("# Delegating to sub-agents"));
         assert!(full.contains("persistent CPython REPL"));
         assert!(full.contains("rlm.spawn"));
         // prime-agent's core layer describes `rlm.spawn` with the REPL, as
         // prime-agent's prompt does; the tail says how deep the agent is.
         assert!(
-            SystemPromptBuilder::build(&environment(), &["ipython"])
+            SystemPromptBuilder::build(&environment(), &["python_repl"])
                 .text
                 .contains("rlm.spawn")
         );

@@ -11,7 +11,7 @@ You are an Orchestrator for subagents. Parse plan files and delegate tasks to pa
 
 ## Subagents in ha
 
-Launch subagents from the `ipython` tool with `rlm` (read [references/ha-subagents.md](references/ha-subagents.md) with `read_skill_file` before the first launch):
+Launch subagents from the `python_repl` tool with `rlm` (read [references/ha-subagents.md](references/ha-subagents.md) with `read_skill_file` before the first launch):
 
 ```python
 sparky = "<the gpt-6-luna selector from await rlm.find_models('gpt-6-luna')>"
@@ -90,7 +90,7 @@ Validation:
 ## Instructions
 1. Read the working plan and fully understand this task before coding.
 2. Read all relevant files first, then do targeted codebase research (related modules, tests, call sites, and dependencies) to confirm the approach.
-3. Default to TDD RED phase first using a test-writer subagent: from the `ipython` tool, `await rlm.spawn(brief, name="[ID]-tdd")` with the TDD test writer brief below followed by the task, then `await rlm.collect(["[ID]-tdd"], timeout_ms=1200000)`.
+3. Default to TDD RED phase first using a test-writer subagent: from the `python_repl` tool, `await rlm.spawn(brief, name="[ID]-tdd")` with the TDD test writer brief below followed by the task, then `await rlm.collect(["[ID]-tdd"], timeout_ms=1200000)`.
    - Pass task context and acceptance criteria.
    - Require tests-only edits.
    - Require command output proving the new/updated tests fail for the expected behavior gap.

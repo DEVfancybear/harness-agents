@@ -1680,6 +1680,20 @@ fn invalid(path: &Path, unknown_field: bool) -> HarnessError {
     )
 }
 
+/// prime-agent's `compaction.thresholdPercent` (a498cbd4): the share of the
+/// window at which the session compacts, 1 to 100, 95 when unset or invalid.
+#[must_use]
+pub fn compaction_threshold_percent(user_path: &Path) -> f64 {
+    load_setting(user_path, "compaction")
+        .and_then(|setting| {
+            setting
+                .get("thresholdPercent")
+                .and_then(serde_json::Value::as_f64)
+        })
+        .filter(|percent| percent.is_finite() && (1.0..=100.0).contains(percent))
+        .unwrap_or(harness_runtime::COMPACTION_THRESHOLD_PERCENT)
+}
+
 /// The most context a session carries before it compacts: `HA_COMPACT_AT`
 /// (tokens; `0` keeps only the window's own bound), else
 /// [`harness_runtime::COMPACTION_CEILING_TOKENS`].

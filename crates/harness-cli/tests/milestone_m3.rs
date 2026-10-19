@@ -784,6 +784,7 @@ async fn m3_01_manifest_and_overflow() {
             config_revision: 1,
             estimate_scale: None,
             compaction_ceiling_tokens: 0,
+            compaction_threshold_percent: harness_runtime::COMPACTION_THRESHOLD_PERCENT,
         },
     ));
     let session = SessionId::generate();

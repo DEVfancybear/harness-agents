@@ -441,6 +441,11 @@ impl AnthropicMessagesAdapter {
                 if !flush(&mut events).await {
                     return Ok(());
                 }
+                // `message_stop` is the last event: a connection held open
+                // after it must not hold the turn.
+                if decoder.saw_message_stop {
+                    break;
+                }
             }
             decoder.finish(&mut events, &request.request_id)?;
             flush(&mut events).await;

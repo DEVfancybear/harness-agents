@@ -22,7 +22,7 @@ Primary orchestration goals:
 
 ## Subagents in ha
 
-Launch subagents from the `ipython` tool with `rlm`; read [references/ha-subagents.md](references/ha-subagents.md) with `read_skill_file` before the first launch:
+Launch subagents from the `python_repl` tool with `rlm`; read [references/ha-subagents.md](references/ha-subagents.md) with `read_skill_file` before the first launch:
 
 ```python
 sparky = "<the gpt-6-luna selector from await rlm.find_models('gpt-6-luna')>"

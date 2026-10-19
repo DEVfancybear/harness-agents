@@ -1,4 +1,5 @@
-//! The `ipython` tool: prime-agent's persistent Python REPL.
+//! The `python_repl` tool: prime-agent's persistent Python REPL (named
+//! `ipython` before prime-agent 3e089326; that name and `python` still reach it).
 //!
 //! prime-agent runs its agent through one long-lived Python kernel: the model writes
 //! cells, variables persist across cells and turns, `bash()` starts commands in the
@@ -8,7 +9,7 @@
 //! this module is the host side of its JSON-lines protocol (prime-agent's
 //! `kernel/repl-manager.ts`, protocol described in its `repl.md`):
 //!
-//! - the kernel starts on the first `ipython` call and lives for the whole app
+//! - the kernel starts on the first `python_repl` call and lives for the whole app
 //!   session, so state carries from turn to turn; a kernel that dies is restarted
 //!   on the next call, and the result says the old state is gone;
 //! - one cell runs at a time; a cell that outlives its time is interrupted, and a
@@ -339,8 +340,14 @@ fn start_notice(lost: bool, revival: &Revival) -> Option<String> {
                 .join(", ")
         ));
     }
+    // A snapshot keeps names, not the process: the working directory and the
+    // environment are the session's again (prime-agent e69265e7).
+    lines.push(RESTORE_RESET_NOTICE.to_owned());
     Some(format!("[python-state-restored] {}", lines.join(" ")))
 }
+
+/// What a revived or fresh kernel no longer has.
+const RESTORE_RESET_NOTICE: &str = "The working directory and environment variables were reset to the session defaults; re-apply any os.chdir(...) or os.environ[...] changes you still need.";
 
 /// A skill that ships a Python package, imported into the kernel by its name.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -2666,7 +2673,7 @@ fn default_shell() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-/// The `ipython` tool of one turn.
+/// The `python_repl` tool of one turn.
 #[derive(Clone)]
 pub struct ReplHost {
     shared: Arc<ReplShared>,
@@ -2708,20 +2715,79 @@ impl ReplHost {
 
     fn code(arguments: &Value) -> Result<&str, HarnessError> {
         let object = arguments.as_object().ok_or_else(|| {
-            HarnessError::new(ErrorCode::InvalidPayload, "ipython takes an object")
+            HarnessError::new(ErrorCode::InvalidPayload, "python_repl takes an object")
         })?;
         if object.keys().any(|key| key != "code") {
             return Err(HarnessError::new(
                 ErrorCode::InvalidPayload,
-                "ipython accepts only code",
+                "python_repl accepts only code",
             ));
         }
         object
             .get("code")
             .and_then(Value::as_str)
             .filter(|code| !code.trim().is_empty())
-            .ok_or_else(|| HarnessError::new(ErrorCode::InvalidPayload, "ipython needs code"))
+            .ok_or_else(|| HarnessError::new(ErrorCode::InvalidPayload, "python_repl needs code"))
     }
+}
+
+/// The card text of a cell that is mostly shell (prime-agent d38bcb56):
+/// `$ <first command> +N more`, when the lines calling `bash(...)` are at least
+/// half of the cell's non-blank lines; `None` for a Python cell. `arguments`
+/// is the call's input (`{"code": ...}`).
+#[must_use]
+pub fn bash_summary(arguments: &str) -> Option<String> {
+    const COMMAND_CHARS: usize = 80;
+    let code = serde_json::from_str::<Value>(arguments).ok()?;
+    let code = code["code"].as_str()?;
+    let lines = code.lines().filter(|line| !line.trim().is_empty()).count();
+    let calls = code.matches("bash(").count();
+    let bash_lines = code.lines().filter(|line| line.contains("bash(")).count();
+    if calls == 0 || bash_lines * 2 < lines {
+        return None;
+    }
+    let after = &code[code.find("bash(")? + "bash(".len()..];
+    let literal = after
+        .trim_start()
+        .trim_start_matches(['f', 'r', 'b', 'F', 'R', 'B']);
+    let command = ["\"\"\"", "'''", "\"", "'"]
+        .iter()
+        .find_map(|quote| {
+            let rest = literal.strip_prefix(quote)?;
+            Some(rest[..rest.find(quote)?].to_owned())
+        })
+        .unwrap_or_else(|| {
+            after
+                .split(')')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        });
+    let command = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let command = if command.chars().count() > COMMAND_CHARS {
+        format!(
+            "{}…",
+            command.chars().take(COMMAND_CHARS).collect::<String>()
+        )
+    } else {
+        command
+    };
+    Some(if calls > 1 {
+        format!("$ {command} +{} more", calls - 1)
+    } else {
+        format!("$ {command}")
+    })
+}
+
+/// The model's name for the REPL tool (prime-agent 3e089326).
+pub const TOOL_NAME: &str = "python_repl";
+
+/// The REPL tool under its name or the names it had: `python_repl` before the
+/// rename, and `python`, which models reach for.
+#[must_use]
+pub fn is_repl_tool(name: &str) -> bool {
+    matches!(name, "python_repl" | "ipython" | "python")
 }
 
 struct ReplCatalog;
@@ -2731,7 +2797,7 @@ impl ExternalToolCatalog for ReplCatalog {
         vec![json!({
             "type": "function",
             "function": {
-                "name": "ipython",
+                "name": TOOL_NAME,
                 "description": "Execute Python code in a persistent Python REPL. Top-level `await` is supported. Variables, imports, and loaded data persist across calls. Run shell commands with `bash('cmd')` / `await bash('cmd')`; quote Python strings for the shell with `shlex.quote(...)`, never `json.dumps` (it turns non-ASCII text into \\uXXXX escapes), or write long text to a UTF-8 file (`git commit -F msg.txt`). Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment.",
                 "parameters": {
                     "type": "object",
@@ -2749,9 +2815,10 @@ impl ExternalToolCatalog for ReplCatalog {
     }
 
     fn resolve(&self, name: &str, arguments: &Value) -> Option<CodingToolAction> {
-        (name == "ipython").then(|| CodingToolAction::ExternalTool {
+        // A conversation from before the rename calls it by its old names.
+        is_repl_tool(name).then(|| CodingToolAction::ExternalTool {
             plugin_id: "repl".to_owned(),
-            tool_name: name.to_owned(),
+            tool_name: TOOL_NAME.to_owned(),
             arguments: arguments.clone(),
             parent_invocation_id: None,
             timeout_ms: CELL_TIMEOUT_MS + 2 * INTERRUPT_GRACE_MS,
@@ -2767,7 +2834,7 @@ impl ExternalToolDispatcher for ReplHost {
         arguments: &'a Value,
     ) -> Pin<Box<dyn Future<Output = Result<(), HarnessError>> + Send + 'a>> {
         Box::pin(async move {
-            if plugin_id != "repl" || tool_name != "ipython" {
+            if plugin_id != "repl" || !is_repl_tool(tool_name) {
                 return Err(HarnessError::new(
                     ErrorCode::PolicyDenied,
                     "REPL tool target is unavailable",
@@ -2786,7 +2853,7 @@ impl ExternalToolDispatcher for ReplHost {
         _timeout_ms: u64,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, HarnessError>> + Send + 'a>> {
         Box::pin(async move {
-            if plugin_id != "repl" || tool_name != "ipython" {
+            if plugin_id != "repl" || !is_repl_tool(tool_name) {
                 return Err(HarnessError::new(
                     ErrorCode::PolicyDenied,
                     "REPL tool target is unavailable",
@@ -2804,7 +2871,7 @@ impl ExternalToolDispatcher for ReplHost {
                 .await?;
             Ok(ToolOutput::ExternalTool {
                 plugin_id: "repl".to_owned(),
-                tool_name: "ipython".to_owned(),
+                tool_name: TOOL_NAME.to_owned(),
                 payload: {
                     let mut payload = json!({ "text": if text.is_empty() { "(no output)".to_owned() } else { text } });
                     if !images.is_empty() {
@@ -2820,6 +2887,34 @@ impl ExternalToolDispatcher for ReplHost {
 
 #[cfg(test)]
 mod tests {
+    /// prime-agent d38bcb56: a cell of `bash()` calls reads as its commands; a
+    /// Python cell with one shell call does not.
+    #[test]
+    fn a_shell_heavy_cell_is_summarised_as_its_commands() {
+        let summary =
+            |code: &str| super::bash_summary(&serde_json::json!({ "code": code }).to_string());
+        assert_eq!(
+            summary("h = bash('cargo test --workspace')"),
+            Some("$ cargo test --workspace".to_owned())
+        );
+        assert_eq!(
+            summary("a = bash(\"git status\")\nb = bash('git diff --stat')\nprint(a, b)"),
+            Some("$ git status +1 more".to_owned())
+        );
+        assert_eq!(
+            summary("r = await bash(f\"\"\"ls -la\n  {path}\"\"\")"),
+            Some("$ ls -la {path}".to_owned())
+        );
+        assert_eq!(
+            summary(
+                "import json\nrows = json.load(open('a.json'))\ntotal = sum(rows)\nprint(total)\nbash('echo done')"
+            ),
+            None
+        );
+        assert_eq!(summary("print(1)"), None);
+        assert_eq!(super::bash_summary("not json"), None);
+    }
+
     /// The kernel log is created by the first byte written to it, never empty.
     fn assert_no_empty_log(kernel_dir: &std::path::Path) {
         let log = kernel_dir.join("kernel-stderr.log");
@@ -3823,7 +3918,7 @@ type(rlm.factory).__name__",
         assert_eq!(
             super::start_notice(false, &Revival::Restored(revived.clone())).as_deref(),
             Some(
-                "[python-state-restored] Your Python kernel state was revived from your previous session. These names are available again: df, x. These could not be restored and must be recreated if needed: sock."
+                "[python-state-restored] Your Python kernel state was revived from your previous session. These names are available again: df, x. These could not be restored and must be recreated if needed: sock. The working directory and environment variables were reset to the session defaults; re-apply any os.chdir(...) or os.environ[...] changes you still need."
             )
         );
         assert!(

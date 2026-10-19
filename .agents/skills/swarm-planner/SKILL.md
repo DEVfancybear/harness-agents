@@ -69,7 +69,7 @@ Save to `<topic>-plan.md` in the working directory with `write_file`.
 
 ### 6. Subagent Review
 
-After saving, start one reviewer child from the `ipython` tool and wait for its answer:
+After saving, start one reviewer child from the `python_repl` tool and wait for its answer:
 
 ```python
 await rlm.spawn("""Review this implementation plan for:

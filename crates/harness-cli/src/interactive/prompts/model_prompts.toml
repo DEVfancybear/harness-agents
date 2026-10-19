@@ -1,0 +1,12 @@
+# Per-model system-prompt additions (after prime-agent's model_prompts.toml).
+#
+# Each rule's `match` globs are tried against the model selector's final
+# segments (`provider/model`), case-insensitive; the `files` of every matching
+# rule join into one segment of the system prompt. File names resolve inside
+# ha's config directory (beside config.toml), then among the shipped files;
+# absolute paths and ".." are refused. The user's own rules go in
+# `model-prompts.toml` beside config.toml and run after these.
+
+[[rule]]
+match = ["glm-5.3*"]
+files = ["bash-over-subprocess.md"]

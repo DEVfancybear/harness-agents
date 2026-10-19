@@ -2993,6 +2993,16 @@ impl InteractiveController {
                 );
                 self.goal = Some(goal);
             }
+            SessionEvent::OutputCapped => {
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message:
+                            "the answer stopped at the output limit; ask to continue for the rest"
+                                .to_owned(),
+                    },
+                );
+            }
             SessionEvent::RunTerminal { outcome } => {
                 self.provider_wait = None;
                 self.turn_activity = None;
@@ -3293,6 +3303,9 @@ impl InteractiveController {
             compact_guidance: None,
             refine: None,
         });
+        if !automatic {
+            self.unstash_after_send();
+        }
         let mut effects = Vec::new();
         let item = if automatic {
             HistoryItem::Automatic { text }
@@ -4677,6 +4690,16 @@ impl InteractiveController {
                 self.credential_scope(super::credentials::Scope::Main);
             }
             "/new" => {
+                // prime-agent's `/new [--name <name>] [-- <prompt>]`.
+                let parsed = match parse_new_command(raw_argument.unwrap_or_default()) {
+                    Ok(parsed) => parsed,
+                    Err(message) => {
+                        return vec![
+                            Effect::History(HistoryItem::Error { message }),
+                            Effect::Redraw,
+                        ];
+                    }
+                };
                 // A new conversation never abandons a running one: the run is
                 // settled first, exactly like Ctrl-C.
                 if self.phase.has_active_run() {
@@ -4714,10 +4737,22 @@ impl InteractiveController {
                             message: message.to_owned(),
                         },
                     );
+                    if let Some(name) = parsed.name {
+                        match self.service.rename(&name) {
+                            Ok(message) => {
+                                self.chat_title =
+                                    Some(name.split_whitespace().collect::<Vec<_>>().join(" "));
+                                self.push_history(&mut effects, HistoryItem::Notice { message });
+                            }
+                            Err(message) => {
+                                self.push_history(&mut effects, HistoryItem::Error { message });
+                            }
+                        }
+                    }
                     // prime-agent's `/new [prompt]`: the new conversation starts
                     // with that prompt.
-                    if let Some(prompt) = raw_argument.map(str::trim).filter(|prompt| !prompt.is_empty()) {
-                        effects.extend(self.dispatch(prompt.to_owned(), false));
+                    if let Some(prompt) = parsed.prompt.filter(|prompt| !prompt.trim().is_empty()) {
+                        effects.extend(self.dispatch(prompt.trim().to_owned(), false));
                     }
                 }
             }
@@ -4902,9 +4937,20 @@ impl InteractiveController {
             compact_guidance: None,
             refine: None,
         });
+        self.unstash_after_send();
         self.push_history(&mut effects, HistoryItem::User { text: shown });
         effects.push(Effect::Redraw);
         effects
+    }
+
+    /// prime-agent 8a459cba: a draft put aside with Ctrl-S comes back to the
+    /// emptied editor once another prompt is sent.
+    fn unstash_after_send(&mut self) {
+        if self.editor.text().trim().is_empty()
+            && let Some(stashed) = self.stash.take()
+        {
+            self.editor.set_text(&stashed);
+        }
     }
 
     /// Deliver reference output: as an overlay in the TUI, as history in plain
@@ -6210,6 +6256,98 @@ fn command_answer(produced: &[Effect], panel: Option<&super::input::Overlay>) ->
     lines.join("\n")
 }
 
+/// What `/new` was given: a name for the new conversation and its first
+/// prompt.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NewCommand {
+    name: Option<String>,
+    prompt: Option<String>,
+}
+
+/// prime-agent's `parseNewSessionCommand` (d5908876): `/new [prompt]`,
+/// `/new --name <name>`, `/new --name "a name" -- <prompt>`, `/new -- <prompt>`.
+fn parse_new_command(raw: &str) -> Result<NewCommand, String> {
+    let args = raw.trim_start();
+    if args.is_empty() {
+        return Ok(NewCommand::default());
+    }
+    if !args.starts_with('-') {
+        return Ok(NewCommand {
+            name: None,
+            prompt: Some(args.to_owned()),
+        });
+    }
+    let new_prompt = |rest: &str| {
+        let prompt = rest.trim_start();
+        if prompt.trim().is_empty() {
+            Err("Missing prompt after /new \"--\"".to_owned())
+        } else {
+            Ok(prompt.to_owned())
+        }
+    };
+    if starts_with_token(args, "--") {
+        return Ok(NewCommand {
+            name: None,
+            prompt: Some(new_prompt(&args[2..])?),
+        });
+    }
+    if !starts_with_token(args, "--name") {
+        return Err(format!("Unknown /new option: {}", first_word(args)));
+    }
+    let rest = args["--name".len()..].trim_start();
+    if starts_with_token(rest, "--name") {
+        return Err("Duplicate /new option: \"--name\"".to_owned());
+    }
+    if rest.is_empty() || rest.starts_with('-') {
+        return Err("Missing value for /new option \"--name\"".to_owned());
+    }
+    let (name, rest) = if let Some(quote @ ('"' | '\'')) = rest.chars().next() {
+        let Some(closing) = rest[1..].find(quote) else {
+            return Err("Unterminated quote in /new --name".to_owned());
+        };
+        (rest[1..=closing].to_owned(), &rest[closing + 2..])
+    } else {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        (rest[..end].to_owned(), &rest[end..])
+    };
+    if name.trim().is_empty() {
+        return Err("/new option \"--name\" cannot be empty".to_owned());
+    }
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return Ok(NewCommand {
+            name: Some(name),
+            prompt: None,
+        });
+    }
+    if starts_with_token(rest, "--name") {
+        return Err("Duplicate /new option: \"--name\"".to_owned());
+    }
+    if !starts_with_token(rest, "--") {
+        if rest.starts_with('-') {
+            return Err(format!("Unknown /new option: {}", first_word(rest)));
+        }
+        return Err("Expected \"--\" before the /new prompt".to_owned());
+    }
+    Ok(NewCommand {
+        name: Some(name),
+        prompt: Some(new_prompt(&rest[2..])?),
+    })
+}
+
+/// The token starts `value` and whitespace or the end follows it.
+fn starts_with_token(value: &str, token: &str) -> bool {
+    value
+        .strip_prefix(token)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
+fn first_word(value: &str) -> &str {
+    value
+        .find(char::is_whitespace)
+        .map_or(value, |end| &value[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_CONTINUATIONS, EXIT_SUCCESS, Effect, InteractiveController, TurnBounds};
@@ -7284,6 +7422,58 @@ mod tests {
                 .any(|line| line.contains("waits for the active run")),
             "{plain:#?}"
         );
+    }
+
+    /// prime-agent 8a459cba: the stashed draft comes back once another
+    /// prompt is sent.
+    #[test]
+    fn a_stashed_draft_returns_after_sending_another_prompt() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        type_text(&mut harness.controller, "half a thought");
+        let _ = harness.controller.handle_key(Key::Stash);
+        assert_eq!(harness.controller.editor.text(), "");
+        let _ = submit_text(&mut harness.controller, "a quick question");
+        assert_eq!(harness.controller.editor.text(), "half a thought");
+        assert!(harness.controller.stash.is_none());
+    }
+
+    /// prime-agent d5908876: `/new --name` names the new conversation, and
+    /// `--` separates its first prompt.
+    #[test]
+    fn new_takes_a_name_and_a_prompt() {
+        let parse = super::parse_new_command;
+        assert_eq!(parse("").expect("empty"), super::NewCommand::default());
+        assert_eq!(
+            parse("fix the build").expect("prompt").prompt.as_deref(),
+            Some("fix the build")
+        );
+        let named = parse("--name \"my session\" -- do something").expect("named");
+        assert_eq!(named.name.as_deref(), Some("my session"));
+        assert_eq!(named.prompt.as_deref(), Some("do something"));
+        assert_eq!(
+            parse("--name solo").expect("solo").name.as_deref(),
+            Some("solo")
+        );
+        assert_eq!(
+            parse("-- just a prompt").expect("dashes").prompt.as_deref(),
+            Some("just a prompt")
+        );
+        for (raw, error) in [
+            ("--name", "Missing value"),
+            ("--name \"one\" --name \"two\"", "Duplicate"),
+            ("--name x do it", "Expected \"--\""),
+            ("--color red", "Unknown /new option: --color"),
+            ("--name \"open", "Unterminated quote"),
+            ("--", "Missing prompt"),
+        ] {
+            assert!(parse(raw).expect_err(raw).contains(error), "{raw}");
+        }
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let said =
+            effects_to_plain(&submit_text(&mut harness.controller, "/new --color red")).join("\n");
+        assert!(said.contains("Unknown /new option"), "{said}");
     }
 
     /// Q06: prime-agent's prompt stash, with its messages.

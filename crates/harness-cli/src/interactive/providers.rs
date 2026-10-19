@@ -109,7 +109,9 @@ pub async fn fetch_balance(
     credential: &dyn harness_providers::CredentialResolver,
 ) -> Result<Vec<String>, String> {
     let token = credential.resolve().map_err(|error| error.to_string())?;
-    let response = reqwest::Client::new()
+    let response = harness_providers::with_extra_roots(reqwest::Client::builder())
+        .build()
+        .map_err(|error| error.to_string())?
         .get(url)
         .bearer_auth(token)
         .timeout(Duration::from_secs(15))
@@ -604,7 +606,7 @@ fn download_with_key(url: &str, key: &str) -> Option<String> {
         .build()
         .ok()?;
     runtime.block_on(async {
-        let client = reqwest::Client::builder()
+        let client = harness_providers::with_extra_roots(reqwest::Client::builder())
             .timeout(Duration::from_secs(20))
             .build()
             .ok()?;
@@ -664,7 +666,7 @@ pub(super) fn download(url: &str) -> Option<String> {
         .build()
         .ok()?;
     runtime.block_on(async {
-        let client = reqwest::Client::builder()
+        let client = harness_providers::with_extra_roots(reqwest::Client::builder())
             .timeout(Duration::from_secs(20))
             .build()
             .ok()?;

@@ -178,7 +178,7 @@ fn prompt_text(prompt: &[Value]) -> String {
 /// prime-agent's tool kind map, over ha's tool names.
 fn tool_kind(name: &str) -> &'static str {
     match name {
-        "ipython" | "bash" | "run_shell" | "run_process" => "execute",
+        "python_repl" | "ipython" | "python" | "bash" | "run_shell" | "run_process" => "execute",
         "read_file" | "read" => "read",
         "edit_file" | "write_file" | "apply_patch" | "edit" | "write" => "edit",
         "search_text" | "glob" | "list_files" => "search",
@@ -461,6 +461,8 @@ struct Session {
     messages: u64,
     tool_output: Option<String>,
     last_error: Option<String>,
+    /// The running prompt's answer stopped at the output cap.
+    capped: bool,
 }
 
 struct Acp {
@@ -630,6 +632,7 @@ impl Acp {
             messages: 0,
             tool_output: None,
             last_error: None,
+            capped: false,
         });
     }
 
@@ -886,7 +889,7 @@ impl Acp {
                     session.message = None;
                 }
                 let args = serde_json::from_str::<Value>(&input).unwrap_or(json!(input));
-                let (title, raw_input) = if name == "ipython" {
+                let (title, raw_input) = if super::repl::is_repl_tool(&name) {
                     let code = args.get("code").cloned().unwrap_or(Value::Null);
                     ("Python cell".to_owned(), json!({ "code": code }))
                 } else {
@@ -962,6 +965,11 @@ impl Acp {
             SessionEvent::RecoverableError { message } => {
                 self.finish(&RunOutcome::Failed(message));
             }
+            SessionEvent::OutputCapped => {
+                if let Some(session) = &mut self.session {
+                    session.capped = true;
+                }
+            }
             SessionEvent::RunTerminal { outcome } => {
                 self.finish(&outcome);
                 // A turn can change the model (the backup) or its levels.
@@ -979,7 +987,10 @@ impl Acp {
         let Some(id) = session.prompt.take() else {
             return;
         };
+        let capped = std::mem::take(&mut session.capped);
         let frame = match stop_reason(outcome) {
+            // A final answer cut at the output cap is not a finished turn.
+            Ok("end_turn") if capped => response(&id, &json!({ "stopReason": "max_tokens" })),
             Ok(reason) => response(&id, &json!({ "stopReason": reason })),
             Err(reason) => {
                 let message = session.last_error.take().unwrap_or(reason);

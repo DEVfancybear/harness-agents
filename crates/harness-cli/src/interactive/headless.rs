@@ -13,6 +13,8 @@ use std::sync::{
 };
 
 use harness_providers::{CancellationToken, MockProvider, ModelCapabilities, ModelProvider};
+
+use super::events::SessionEvent;
 use harness_runtime::{
     BudgetLedger, EvidenceKind, GoalCriterion, GoalSpec, HumanInputService, RunInbox, RunRequest,
     RuntimeConfig, RuntimeService,
@@ -379,6 +381,7 @@ pub async fn run_with(
         &resolved_config.deny_rules,
         None,
     )?;
+    let child_policy = tool_policy.clone();
     let provider_config = if request.options.mock {
         None
     } else {
@@ -492,6 +495,9 @@ pub async fn run_with(
             output_reservation_tokens: resolved_config.output_reservation_tokens,
             compaction_reserve_tokens: resolved_config.compaction_reserve_tokens,
             compaction_ceiling_tokens: super::config::compaction_ceiling(environment),
+            compaction_threshold_percent: super::config::compaction_threshold_percent(
+                &context.paths.config_file,
+            ),
             ..RuntimeConfig::default()
         },
     );
@@ -540,10 +546,71 @@ pub async fn run_with(
         .with_hooks(resolved_config.hooks.clone());
     let knowledge_host =
         super::knowledge::KnowledgeHost::new(&context.project.root, &context.paths.data_dir);
+    // prime-agent 9eec445a: `ha exec` delegates as the app does, and the run
+    // waits for its children. Nobody can answer an approval here, so a gated
+    // action a child asks for is refused, as the root's is.
+    let (child_events, mut child_inbox) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+    let agents = provider_config.as_ref().and_then(|config| {
+        let agents = super::delegation::SessionAgents::new(
+            super::store_lease::SharedStore::for_dir(context.project_store_dir()),
+            child_events,
+            Arc::new(RefusingApprovals) as Arc<dyn harness_tools::ApprovalGate>,
+            context.paths.data_dir.join("delegation"),
+        )
+        .ok()?;
+        agents.bind_ledger(task_id.as_str());
+        Some((agents, config))
+    });
+    let delegate_host = agents.as_ref().map(|(agents, config)| {
+        let refinements = super::config::harness_refinements(&context.paths.config_file);
+        super::delegation::DelegateHost::new(
+            agents,
+            super::delegation::ChildLaunch {
+                model: super::delegation::ChildModel {
+                    provider: Arc::clone(&provider),
+                    reference: format!("{}/{}", config.provider_id, config.model),
+                    price: config.model_price,
+                },
+                models: None,
+                runtime_config: RuntimeConfig {
+                    context_window_tokens: resolved_config.context_window_tokens,
+                    output_reservation_tokens: resolved_config.output_reservation_tokens,
+                    compaction_reserve_tokens: resolved_config.compaction_reserve_tokens,
+                    compaction_ceiling_tokens: super::config::compaction_ceiling(environment),
+                    compaction_threshold_percent: super::config::compaction_threshold_percent(
+                        &context.paths.config_file,
+                    ),
+                    ..RuntimeConfig::default()
+                },
+                workspace_root: context.project.root.clone(),
+                workspace: observation.clone(),
+                hooks: resolved_config.hooks.clone(),
+                parent_policy: child_policy.clone(),
+                child_limits: bounds::limits_from_environment(environment),
+                hashline: super::config::HashlineRule::load(
+                    &context.paths.config_file,
+                    environment.value("HA_HASHLINE"),
+                ),
+                web: web_host
+                    .as_ref()
+                    .map(|host| (host.tools(), host.dispatcher())),
+                checks: resolved_config.verify.checks.clone(),
+                knowledge: Some(knowledge_host.readonly()),
+                memory: Some(
+                    super::memory::MemoryHost::new(&context.paths.data_dir, task_id.as_str())
+                        .with_project(&context.project.root)
+                        .with_refinements(refinements)
+                        .readonly(),
+                ),
+                context: Vec::new(),
+            },
+            cancellation.clone(),
+        )
+    });
     let dispatcher = super::mcp::combined_dispatcher_with_delegate(
         None,
         active_extensions.as_ref(),
-        None,
+        delegate_host.as_ref(),
         None,
         web_host.as_ref(),
         None,
@@ -562,7 +629,7 @@ pub async fn run_with(
     let external_tools = super::mcp::combined_tools_with_delegate(
         None,
         active_extensions.as_ref(),
-        None,
+        delegate_host.as_ref(),
         None,
         web_host.as_ref(),
         None,
@@ -784,6 +851,7 @@ pub async fn run_with(
     }
     let mut continuing_from = resumed_from.as_ref().map(|(source, _)| source.clone());
     let mut next_request = run_request;
+    let mut child_turns = 0;
     let outcome = loop {
         let tokens_before = observer.tokens.load(Ordering::SeqCst);
         let outcome = match &continuing_from {
@@ -809,6 +877,33 @@ pub async fn run_with(
                     .await?
             }
         };
+        // Children started with `wait: false` report when they settle; their
+        // notices open one more turn, as they do in the app.
+        if let Some((agents, _)) = &agents
+            && outcome.stop == harness_tools::TurnStop::Final
+            && child_turns < CHILD_TURNS
+        {
+            let notices = settle_children(agents, &mut child_inbox, &cancellation).await;
+            if !notices.is_empty() {
+                child_turns += 1;
+                observer.stream_event(
+                    "children.settled",
+                    &serde_json::json!({"notices": notices.len()}),
+                );
+                continuing_from = Some(outcome.session_id.clone());
+                next_request = RunRequest::new(
+                    SessionId::generate(),
+                    next_request.task_id.clone(),
+                    InputId::generate(),
+                    notices.join("\n\n"),
+                    observe_workspace(project_id.clone(), &context.project.root)?,
+                )
+                .with_tool_schemas(next_request.tool_schemas.clone())
+                .with_system_policy(next_request.system_policy.clone())
+                .with_project_rules(next_request.project_rules.clone());
+                continue;
+            }
+        }
         if !autonomous.enabled {
             break outcome;
         }
@@ -1131,6 +1226,60 @@ fn accepted_criteria(
 }
 
 /// An absent user cannot answer a gate, so every `Ask` decision must refuse.
+/// The most turns the children's reports may open after the first.
+const CHILD_TURNS: u32 = 8;
+
+/// The longest a run waits for its children to settle.
+const CHILD_WAIT: std::time::Duration = std::time::Duration::from_mins(30);
+
+/// Wait until no child of the run is working, and return the notices of those
+/// that settled with nobody waiting for them (prime-agent's quiescence wait).
+async fn settle_children(
+    agents: &Arc<super::delegation::SessionAgents>,
+    inbox: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
+    cancellation: &CancellationToken,
+) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + CHILD_WAIT;
+    let mut notices = Vec::new();
+    loop {
+        while let Ok(event) = inbox.try_recv() {
+            if let SessionEvent::ChildSettled { notice, .. } = event {
+                notices.push(notice);
+            }
+        }
+        if agents.running() == 0 || cancellation.is_cancelled() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = agents.stop("all", "the run stopped waiting for it");
+            break;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+            () = cancellation.cancelled() => {}
+        }
+    }
+    while let Ok(event) = inbox.try_recv() {
+        if let SessionEvent::ChildSettled { notice, .. } = event {
+            notices.push(notice);
+        }
+    }
+    notices
+}
+
+/// A run with nobody to ask refuses what needs approval.
+struct RefusingApprovals;
+
+impl harness_tools::ApprovalGate for RefusingApprovals {
+    fn request(
+        &self,
+        _proposal: harness_tools::ApprovalProposal,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = harness_tools::ApprovalAnswer> + Send>>
+    {
+        Box::pin(async { harness_tools::ApprovalAnswer::Denied })
+    }
+}
+
 pub(super) fn headless_approval_mode() -> ApprovalMode {
     ApprovalMode::None
 }

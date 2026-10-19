@@ -212,6 +212,25 @@
           "description": "prime-agent's `headers`, for a Streamable HTTP server: static values\nthat are not secrets. A secret header is named in `header_env`.",
           "type": "object"
         },
+        "oauth_callback_port": {
+          "default": null,
+          "description": "prime-agent's `callbackPort`: the one local port the client's redirect\nwas registered with; sign-in fails when it is taken instead of\nredirecting to an unregistered port.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "oauth_client_id": {
+          "default": null,
+          "description": "prime-agent's `clientId`: a pre-registered OAuth client, for a server\nwithout dynamic client registration (ee1e531e).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "required": {
           "default": false,
           "type": "boolean"

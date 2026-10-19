@@ -261,7 +261,7 @@ fn token_request(form: &[(&str, &str)]) -> Result<Credential, String> {
         .build()
         .map_err(|error| format!("the sign-in could not start: {error}"))?;
     let text = runtime.block_on(async {
-        let client = reqwest::Client::builder()
+        let client = harness_providers::with_extra_roots(reqwest::Client::builder())
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|error| error.to_string())?;

@@ -49,6 +49,7 @@ pub mod mcp_catalog;
 pub mod mcp_config;
 pub mod mcp_oauth;
 pub mod memory;
+pub mod model_prompts;
 pub mod oauth;
 pub mod offline;
 #[allow(

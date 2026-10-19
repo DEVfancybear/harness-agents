@@ -225,7 +225,14 @@ pub struct RuntimeConfig {
     /// The most context the session carries before it compacts, whatever the
     /// window allows; `0` leaves the window alone. See [`COMPACTION_CEILING_TOKENS`].
     pub compaction_ceiling_tokens: u64,
+    /// The share of the window at which the session compacts
+    /// (prime-agent's `compaction.thresholdPercent`, 1 to 100; 95 by
+    /// default). The output and the reserve can make it compact earlier.
+    pub compaction_threshold_percent: f64,
 }
+
+/// The default [`RuntimeConfig::compaction_threshold_percent`].
+pub const COMPACTION_THRESHOLD_PERCENT: f64 = 95.0;
 
 /// The default [`RuntimeConfig::compaction_ceiling_tokens`].
 ///
@@ -253,6 +260,7 @@ impl Default for RuntimeConfig {
             config_revision: 1,
             estimate_scale: None,
             compaction_ceiling_tokens: COMPACTION_CEILING_TOKENS,
+            compaction_threshold_percent: COMPACTION_THRESHOLD_PERCENT,
         }
     }
 }
@@ -484,10 +492,27 @@ fn strip_file_lists(summary: &str) -> String {
 fn compaction_threshold(config: &RuntimeConfig) -> u64 {
     let window = config.context_window_tokens;
     let effective_reserve = config.compaction_reserve_tokens.min(window / 4);
+    let percent = if config.compaction_threshold_percent.is_finite()
+        && (1.0..=100.0).contains(&config.compaction_threshold_percent)
+    {
+        config.compaction_threshold_percent
+    } else {
+        COMPACTION_THRESHOLD_PERCENT
+    };
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a share of a token count"
+    )]
+    let requested = (window as f64 * percent / 100.0) as u64;
+    // The summary passes must fit below the trigger, or a low percentage
+    // summarises the same context again on every step (prime-agent a498cbd4).
+    let floor = effective_reserve.saturating_mul(2).saturating_add(1);
     let threshold = window
         .saturating_sub(config.output_reservation_tokens)
         .saturating_sub(effective_reserve)
-        .min(window / 20 * 19);
+        .min(requested.max(floor));
     if config.compaction_ceiling_tokens == 0 {
         threshold
     } else {
@@ -1330,6 +1355,44 @@ fn summary_timeout(prompt: &str) -> Duration {
     let reading = u64::try_from(prompt.len() / 8_000).unwrap_or(u64::MAX);
     Duration::from_secs(90_u64.saturating_add(reading).min(300))
 }
+tokio::task_local! {
+    /// The cancellation of the turn being run, for the summaries it asks for.
+    static TURN_CANCELLATION: CancellationToken;
+}
+
+std::thread_local! {
+    /// The cancellation of the summary this blocking thread writes.
+    static SUMMARY_CANCELLATION: std::cell::RefCell<Option<CancellationToken>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The running turn's cancellation, or one nothing cancels outside a turn.
+fn turn_cancellation() -> CancellationToken {
+    TURN_CANCELLATION
+        .try_with(CancellationToken::clone)
+        .unwrap_or_default()
+}
+
+/// Run a summarizer call on this (blocking) thread under `cancellation`: the
+/// summarizer port is synchronous, so the token travels with the thread.
+fn with_summary_cancellation<T>(cancellation: CancellationToken, call: impl FnOnce() -> T) -> T {
+    SUMMARY_CANCELLATION.with(|slot| *slot.borrow_mut() = Some(cancellation));
+    let result = call();
+    SUMMARY_CANCELLATION.with(|slot| *slot.borrow_mut() = None);
+    result
+}
+
+/// The cancellation of the summary being written on this thread.
+fn summary_cancellation() -> CancellationToken {
+    SUMMARY_CANCELLATION
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_default()
+}
+
+fn summary_cancelled() -> RuntimeError {
+    RuntimeError::new(ErrorCode::ProviderCanceled, "the summary was cancelled")
+}
+
 const SUMMARY_PROMPT: &str = "Summarize this coding session for a later continuation. Return concise facts under these headings: objective, work completed, files touched, decisions, remaining. Preserve exact constraints and unresolved work. Do not invent facts, propose permissions, or call tools.";
 
 /// Model-backed compaction that uses the same configured provider as chat.
@@ -1416,13 +1479,19 @@ impl SummaryProvider for ModelSummaryProvider {
                     format!("summary runtime could not start: {error}"),
                 )
             })?;
+        let cancellation = summary_cancellation();
         let events = runtime.block_on(async move {
-            tokio::time::timeout(timeout, provider.stream(request, CancellationToken::new()))
-                .await
-                .map_err(|_| {
-                    RuntimeError::new(ErrorCode::ServiceUnavailable, "model summary timed out")
-                })?
-                .map_err(RuntimeError::from)
+            // Ctrl-C on the turn stops the summary too (prime-agent 7e86390e):
+            // it used to run on for up to five minutes a request.
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(summary_cancelled()),
+                result = tokio::time::timeout(timeout, provider.stream(request, cancellation.clone())) => result
+                    .map_err(|_| {
+                        RuntimeError::new(ErrorCode::ServiceUnavailable, "model summary timed out")
+                    })?
+                    .map_err(RuntimeError::from),
+            }
         })?;
         let response = assemble_stream(&events).map_err(RuntimeError::from)?;
         if response.finish_reason.is_none() || !response.tool_calls.is_empty() {
@@ -1469,13 +1538,19 @@ impl ModelSummaryProvider {
                     format!("summary runtime could not start: {error}"),
                 )
             })?;
+        let cancellation = summary_cancellation();
         let events = runtime.block_on(async move {
-            tokio::time::timeout(timeout, provider.stream(request, CancellationToken::new()))
-                .await
-                .map_err(|_| {
-                    RuntimeError::new(ErrorCode::ServiceUnavailable, "model summary timed out")
-                })?
-                .map_err(RuntimeError::from)
+            // Ctrl-C on the turn stops the summary too (prime-agent 7e86390e):
+            // it used to run on for up to five minutes a request.
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(summary_cancelled()),
+                result = tokio::time::timeout(timeout, provider.stream(request, cancellation.clone())) => result
+                    .map_err(|_| {
+                        RuntimeError::new(ErrorCode::ServiceUnavailable, "model summary timed out")
+                    })?
+                    .map_err(RuntimeError::from),
+            }
         })?;
         let response = assemble_stream(&events).map_err(RuntimeError::from)?;
         if response.finish_reason.is_none() || !response.tool_calls.is_empty() {
@@ -2860,6 +2935,28 @@ impl RuntimeService {
         admit_input: bool,
         appended: &[ProviderMessage],
     ) -> Result<RunResult, RuntimeError> {
+        TURN_CANCELLATION
+            .scope(
+                cancellation.clone(),
+                self.run_recovering_overflow_scoped(
+                    request,
+                    cancellation,
+                    sink,
+                    admit_input,
+                    appended,
+                ),
+            )
+            .await
+    }
+
+    async fn run_recovering_overflow_scoped(
+        &self,
+        request: &RunRequest,
+        cancellation: CancellationToken,
+        sink: Option<ProviderEventSink>,
+        admit_input: bool,
+        appended: &[ProviderMessage],
+    ) -> Result<RunResult, RuntimeError> {
         let first = self
             .run_inner(
                 request,
@@ -3883,6 +3980,22 @@ impl RuntimeService {
         self.compact_with_guidance(session_id, None).await
     }
 
+    /// [`Self::compact_with_guidance`] that `cancellation` stops: `/compact`
+    /// asked by the user is cancelled by Ctrl-C like the turn it runs in.
+    pub async fn compact_with_cancellation(
+        &self,
+        session_id: &SessionId,
+        guidance: Option<&str>,
+        cancellation: CancellationToken,
+    ) -> Result<CompactionResult, RuntimeError> {
+        TURN_CANCELLATION
+            .scope(
+                cancellation,
+                self.compact_with_guidance(session_id, guidance),
+            )
+            .await
+    }
+
     #[allow(clippy::too_many_lines)] // one generation barrier, told in order
     pub async fn compact_with_guidance(
         &self,
@@ -3945,12 +4058,15 @@ impl RuntimeService {
                 let summarizer = Arc::clone(&self.summarizer);
                 let recovery_for_summary = recovery.clone();
                 let guidance = guidance.clone();
+                let cancellation = turn_cancellation();
                 tokio::task::spawn_blocking(move || {
-                    summarizer.summarize_with_guidance(
-                        &recovery_for_summary,
-                        budget,
-                        guidance.as_deref(),
-                    )
+                    with_summary_cancellation(cancellation, || {
+                        summarizer.summarize_with_guidance(
+                            &recovery_for_summary,
+                            budget,
+                            guidance.as_deref(),
+                        )
+                    })
                 })
                 .await
                 .map_err(|_| {
@@ -4427,15 +4543,19 @@ impl RuntimeService {
         // The summarizer's call is synchronous and does real I/O; it runs on a
         // blocking thread, as the session-state summary does.
         let summarizer = Arc::clone(&self.summarizer);
-        let summary =
-            tokio::task::spawn_blocking(move || summarizer.summarize_conversation(&prompt, budget))
-                .await
-                .map_err(|_| {
-                    RuntimeError::new(
-                        ErrorCode::RuntimeBlocked,
-                        "the summarizer task did not complete",
-                    )
-                })??;
+        let cancellation = turn_cancellation();
+        let summary = tokio::task::spawn_blocking(move || {
+            with_summary_cancellation(cancellation, || {
+                summarizer.summarize_conversation(&prompt, budget)
+            })
+        })
+        .await
+        .map_err(|_| {
+            RuntimeError::new(
+                ErrorCode::RuntimeBlocked,
+                "the summarizer task did not complete",
+            )
+        })??;
         let summary = summary.trim_end().to_owned();
         if let Ok(mut cache) = summary_cache().lock() {
             if cache.len() > 64 {
@@ -5262,6 +5382,22 @@ mod compaction_ceiling_tests {
             ..large
         };
         assert_eq!(compaction_threshold(&unbounded), 1_000_000 / 20 * 19);
+        // A lower share compacts earlier, never below what the summaries need.
+        let sixty = RuntimeConfig {
+            compaction_threshold_percent: 60.0,
+            ..unbounded.clone()
+        };
+        assert_eq!(compaction_threshold(&sixty), 600_000);
+        let one = RuntimeConfig {
+            compaction_threshold_percent: 1.0,
+            ..unbounded.clone()
+        };
+        assert_eq!(compaction_threshold(&one), 16_384 * 2 + 1);
+        let invalid = RuntimeConfig {
+            compaction_threshold_percent: 150.0,
+            ..unbounded.clone()
+        };
+        assert_eq!(compaction_threshold(&invalid), 1_000_000 / 20 * 19);
     }
 }
 
@@ -5687,3 +5823,61 @@ mod durable_events_tests {
         assert_eq!(joined, expected);
     }
 }
+
+#[cfg(test)]
+mod summary_cancellation_tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use harness_providers::{
+        CancellationToken, ModelCapabilities, ModelProvider, ProviderFuture, ProviderRequest,
+    };
+
+    use super::{ModelSummaryProvider, SummaryProvider, with_summary_cancellation};
+
+    /// A model that never answers.
+    struct Silent;
+
+    impl ModelProvider for Silent {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities {
+                provider_id: "silent".to_owned(),
+                model: "silent".to_owned(),
+                supports_streaming: true,
+                supports_tools: false,
+                fixture: false,
+            }
+        }
+
+        fn stream(&self, _request: ProviderRequest, _cancellation: CancellationToken) -> ProviderFuture {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_mins(10)).await;
+                Ok(Vec::new())
+            })
+        }
+    }
+
+    /// prime-agent 7e86390e: Ctrl-C on the turn stops its summary, instead of
+    /// the summary running on for minutes.
+    #[test]
+    fn a_cancelled_turn_stops_its_summary_at_once() {
+        let provider = ModelSummaryProvider::new(Arc::new(Silent));
+        let cancellation = CancellationToken::new();
+        let trigger = cancellation.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let result = with_summary_cancellation(cancellation, || {
+            provider.summarize_conversation("summarize this", 1024)
+        });
+        assert!(result.is_err(), "a cancelled summary is no summary");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+}
+

@@ -4,7 +4,8 @@
 //! `cargo run -p harness-cli --example pty_probe -- <out.bin> <ha.exe> <steps> -- <args...>`
 //!
 //! `steps` is a comma list run in order: `wait:<ms>`, `wheelup:<n>` (mouse wheel
-//! notches at the window's middle), `pgup`, `end`, `key:<text>`. The raw bytes
+//! notches at the window's middle), `pgup`, `end`, `key:<text>`, `enter`, `ctrlc`, `ctrls`,
+//! `altenter`, `shiftenter`, `ctrlj`. The raw bytes
 //! the app wrote go to `out.bin`; `out.bin.marks` lists the byte offset at which
 //! each step began.
 
@@ -87,6 +88,7 @@ fn main() {
             "key" => send(value.as_bytes()),
             "enter" => send(&[13]),
             "ctrlc" => send(&[3]),
+            "ctrls" => send(&[19]),
             "altenter" => send(&[27, 13]),
             "shiftenter" => send(&[27, b'[', b'1', b'3', b';', b'2', b'u']),
             "ctrlj" => send(&[10]),

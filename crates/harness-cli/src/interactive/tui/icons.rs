@@ -64,7 +64,7 @@ impl ToolKind {
             "web_search" | "web_fetch" => Self::Web,
             "delegate" | "list_subagents" | "agent_message" | "stop_subagent"
             | "integrate_children" => Self::Agent,
-            "ipython" => Self::Python,
+            "python_repl" | "ipython" | "python" => Self::Python,
             "activate_skill" | "list_skills" | "read_skill_file" => Self::Skill,
             "ask_user" => Self::Ask,
             other if other.starts_with("mcp") || other.contains("__") => Self::Mcp,

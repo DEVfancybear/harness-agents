@@ -519,7 +519,7 @@ async fn request_vectors(
     if inputs.is_empty() || inputs.len() > MAX_BATCH {
         return Err("invalid embedding batch size".to_owned());
     }
-    let client = Client::builder()
+    let client = harness_providers::with_extra_roots(Client::builder())
         .timeout(Duration::from_secs(20))
         .connect_timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())

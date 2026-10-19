@@ -1268,7 +1268,7 @@ fn shared_client(connect_timeout: Duration, read_timeout: Duration) -> Result<Cl
     if let Some(client) = clients.get(&(connect_timeout, read_timeout)) {
         return Ok(client.clone());
     }
-    let client = Client::builder()
+    let client = with_extra_roots(Client::builder())
         .connect_timeout(connect_timeout)
         // prime-agent bounds the wait for an answer, never the answer: a
         // whole-request timeout cut every stream longer than it (a long
@@ -1582,10 +1582,43 @@ impl ModelProvider for OpenAiChatAdapter {
                     )
                 })?;
                 events.extend(decoder.feed(&chunk)?);
+                if decoder.saw_done() {
+                    break;
+                }
             }
             events.extend(decoder.finish()?);
             Ok(events)
         })
+    }
+}
+
+/// Certificate authorities trusted besides the system's (prime-agent 8fd44c25):
+/// the PEM bundles `HA_EXTRA_CA_CERTS`, `NODE_EXTRA_CA_CERTS` and
+/// `SSL_CERT_FILE` name, read once. The system store is trusted already
+/// (rustls' platform verifier); these reach a CA a TLS-inspecting proxy uses
+/// that exists only as a file. A file that cannot be read or parsed is skipped.
+#[must_use]
+pub fn extra_root_certificates() -> &'static [reqwest::Certificate] {
+    static ROOTS: std::sync::OnceLock<Vec<reqwest::Certificate>> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| {
+        ["HA_EXTRA_CA_CERTS", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE"]
+            .iter()
+            .filter_map(std::env::var_os)
+            .filter(|path| !path.is_empty())
+            .filter_map(|path| std::fs::read(path).ok())
+            .filter_map(|pem| reqwest::Certificate::from_pem_bundle(&pem).ok())
+            .flatten()
+            .collect()
+    })
+}
+
+/// `builder` trusting [`extra_root_certificates`] too.
+pub fn with_extra_roots(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let roots = extra_root_certificates();
+    if roots.is_empty() {
+        builder
+    } else {
+        builder.tls_certs_merge(roots.iter().cloned())
     }
 }
 
@@ -1650,6 +1683,9 @@ pub struct SseDecoder {
     last_tool_call_id: Option<String>,
     /// Whether a terminal marker (`[DONE]` or a `finish_reason`) was observed.
     saw_terminal: bool,
+    /// Whether the transport's `[DONE]` arrived: nothing follows it, so the
+    /// reader stops there instead of waiting for the connection to close.
+    saw_done: bool,
     limits: SseLimits,
 }
 
@@ -1671,6 +1707,14 @@ impl SseDecoder {
     #[must_use]
     pub const fn saw_terminal(&self) -> bool {
         self.saw_terminal
+    }
+
+    /// Whether the stream's `[DONE]` arrived (prime-agent ebc07508): a proxy or
+    /// gateway may hold the connection open after it, and a reader waiting
+    /// for the end of the body stalled the turn.
+    #[must_use]
+    pub const fn saw_done(&self) -> bool {
+        self.saw_done
     }
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
         self.buffer.extend_from_slice(bytes);
@@ -1741,6 +1785,7 @@ impl SseDecoder {
                 continue;
             }
             if data == "[DONE]" {
+                self.saw_done = true;
                 // The transport marker says the body ended; it does not overwrite a
                 // finish reason the provider already named (a `tool_calls` turn ends
                 // with both, and the reason is the provider's, not the marker's).
@@ -2716,6 +2761,82 @@ mod g03_openai_wire_snapshot_tests {
             String::from_utf8(body).expect("UTF-8 body"),
             r#"{"messages":[{"content":"hello","role":"user"}],"model":"fixture-model","stream":true,"stream_options":{"include_usage":true},"thinking":{"type":"disabled"}}"#
         );
+    }
+}
+
+#[cfg(test)]
+mod done_marker_tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    use super::{
+        MessageRole, ModelCapabilities, ModelProvider, OpenAiChatAdapter, ProviderMessage,
+        ProviderRequest, StaticCredentialResolver,
+    };
+    use harness_types::RequestId;
+
+    /// prime-agent ebc07508: a gateway that keeps the connection open after
+    /// `[DONE]` must not hold the turn until it closes.
+    #[tokio::test]
+    async fn the_stream_ends_at_done_even_when_the_connection_stays_open() {
+        let _fixture_lock = crate::LOOPBACK_FIXTURE_LOCK.lock().await;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let fixture = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("adapter connection");
+            let mut buffer = vec![0_u8; 65_536];
+            let _ = stream.read(&mut buffer);
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            // Chunked, and never closed until the test is done: only `[DONE]`
+            // says the answer is over.
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n",
+                body.len()
+            )
+            .expect("fixture response");
+            stream.flush().expect("flush");
+            let _ = released.recv_timeout(std::time::Duration::from_secs(30));
+        });
+        let provider = OpenAiChatAdapter::with_options(
+            format!("http://{address}/chat/completions"),
+            Arc::new(StaticCredentialResolver::new("fixture-token")),
+            ModelCapabilities {
+                provider_id: "generic-openai".to_owned(),
+                model: "fixture-model".to_owned(),
+                supports_streaming: true,
+                supports_tools: true,
+                fixture: false,
+            },
+            super::OpenAiChatOptions {
+                thinking: None,
+                headers: Vec::new(),
+                prompt_cache_key: None,
+            },
+        )
+        .expect("adapter");
+        let request = ProviderRequest::new(
+            RequestId::generate(),
+            "fixture-model",
+            vec![ProviderMessage::new(MessageRole::User, "hello")],
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.stream(request, super::CancellationToken::new()),
+        )
+        .await;
+        let _ = release.send(());
+        fixture.join().expect("fixture thread");
+        let events = result
+            .expect("the stream ended at [DONE], not at the connection's close")
+            .expect("events");
+        assert!(!events.is_empty());
     }
 }
 

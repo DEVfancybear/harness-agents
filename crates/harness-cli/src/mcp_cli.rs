@@ -70,6 +70,9 @@ enum McpSubcommand {
         /// client registration.
         #[arg(long)]
         client_id: Option<String>,
+        /// The local port the client's redirect is registered with.
+        #[arg(long)]
+        callback_port: Option<u16>,
         /// The scopes to ask for; the server's advertised ones by default.
         #[arg(long)]
         scope: Option<String>,
@@ -197,10 +200,22 @@ pub fn run(command: McpCommand) -> Result<(), HarnessError> {
         McpSubcommand::Login {
             name,
             client_id,
+            callback_port,
             scope,
             project,
         } => {
             let table = read_servers(project)?;
+            // The configured client and port, unless the command names others.
+            let client_id = client_id.or_else(|| {
+                table
+                    .get(&name)
+                    .and_then(|config| config.oauth_client_id.clone())
+            });
+            let callback_port = callback_port.or_else(|| {
+                table
+                    .get(&name)
+                    .and_then(|config| config.oauth_callback_port)
+            });
             let url = table
                 .get(&name)
                 .filter(|config| config.transport.as_deref() == Some("streamable_http"))
@@ -216,6 +231,7 @@ pub fn run(command: McpCommand) -> Result<(), HarnessError> {
                 &name,
                 &url,
                 client_id.as_deref(),
+                callback_port,
                 scope.as_deref(),
                 &auth,
                 &|message| println!("{message}"),

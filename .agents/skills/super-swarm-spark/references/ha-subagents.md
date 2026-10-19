@@ -1,6 +1,6 @@
 # Subagents in ha
 
-The upstream skill (am-will/swarms) is written for Codex and Claude Code subagents. In Harness Agents (`ha`) a subagent is a child started from the `ipython` tool with the `rlm` object.
+The upstream skill (am-will/swarms) is written for Codex and Claude Code subagents. In Harness Agents (`ha`) a subagent is a child started from the `python_repl` tool with the `rlm` object.
 
 | Upstream action | ha |
 | --- | --- |

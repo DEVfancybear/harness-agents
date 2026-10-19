@@ -172,7 +172,7 @@ fn http(
         .build()
         .map_err(|error| error.to_string())?;
     runtime.block_on(async {
-        let client = reqwest::Client::builder()
+        let client = harness_providers::with_extra_roots(reqwest::Client::builder())
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|error| error.to_string())?;
@@ -379,7 +379,20 @@ fn code_from(target: &str, state: &str) -> Result<String, String> {
 }
 
 /// The first free callback port of prime-agent's range.
-fn callback_listener() -> Result<(TcpListener, u16), String> {
+fn callback_listener(fixed: Option<u16>) -> Result<(TcpListener, u16), String> {
+    if let Some(port) = fixed {
+        // The client's redirect was registered with this port only.
+        return TcpListener::bind(("127.0.0.1", port))
+            .map(|listener| {
+                let _ = listener.set_nonblocking(true);
+                (listener, port)
+            })
+            .map_err(|error| {
+                format!(
+                    "the OAuth callback port {port} the server's client is registered with is in use ({error}); finish or close the other sign-in and retry"
+                )
+            });
+    }
     for offset in 0..CALLBACK_PORT_COUNT {
         let port = CALLBACK_PORT_BASE + offset;
         if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
@@ -460,6 +473,7 @@ pub fn login(
     server: &str,
     url: &str,
     client_id: Option<&str>,
+    callback_port: Option<u16>,
     scopes: Option<&str>,
     auth_path: &Path,
     progress: &dyn Fn(&str),
@@ -480,7 +494,7 @@ pub fn login(
     let verifier = base64url(&super::oauth::random_bytes());
     let challenge = base64url(&sha2::Sha256::digest(verifier.as_bytes()));
     let state = base64url(&super::oauth::random_bytes());
-    let (listener, port) = callback_listener()?;
+    let (listener, port) = callback_listener(callback_port)?;
     let redirect = redirect_uri(port);
     let scope = scopes
         .map(str::to_owned)
@@ -613,6 +627,20 @@ pub fn bearer(auth_path: &Path, server: &str, url: &str) -> Result<Option<String
 
 #[cfg(test)]
 mod tests {
+
+    /// prime-agent ee1e531e: the client's registered callback port, or an
+    /// error naming it when another program holds it.
+    #[test]
+    fn a_registered_callback_port_is_used_or_reported_taken() {
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a port");
+        let port = held.local_addr().expect("address").port();
+        let error = super::callback_listener(Some(port)).expect_err("taken");
+        assert!(error.contains(&port.to_string()) && error.contains("in use"), "{error}");
+        drop(held);
+        let (_listener, bound) = super::callback_listener(Some(port)).expect("free again");
+        assert_eq!(bound, port);
+    }
+
     use super::{
         authorization_server_metadata_urls, canonical_resource, code_from,
         header_resource_metadata, resource_metadata_url, server_metadata, validated_url,

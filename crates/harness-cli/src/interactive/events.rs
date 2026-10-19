@@ -1057,6 +1057,9 @@ pub enum SessionEvent {
         pid: u64,
         command: String,
     },
+    /// The turn's final answer stopped at the output cap: an ACP client is
+    /// told `max_tokens` instead of `end_turn` (prime-agent 9981e925).
+    OutputCapped,
     RunTerminal {
         outcome: RunOutcome,
     },

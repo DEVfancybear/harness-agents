@@ -22,7 +22,7 @@ Primary orchestration goals:
 
 ## Subagents in ha
 
-Launch subagents from the `ipython` tool with `rlm`; read [references/ha-subagents.md](references/ha-subagents.md) with `read_skill_file` before the first launch:
+Launch subagents from the `python_repl` tool with `rlm`; read [references/ha-subagents.md](references/ha-subagents.md) with `read_skill_file` before the first launch:
 
 ```python
 await rlm.spawn(task_prompt, name="T1")          # returns at admission, never waits
@@ -113,7 +113,7 @@ Validation:
 1. Read the working plan and fully understand this task before coding.
 2. Examine the plan and all listed canonical paths before editing.
 3. Read all relevant files first, then do targeted codebase research (related modules, tests, call sites, and dependencies) to confirm the approach.
-4. Default to TDD RED phase first using a test-writer subagent: from the `ipython` tool, `await rlm.spawn(brief, name="[ID]-tdd")` with the TDD test writer brief below followed by the task, then `await rlm.collect(["[ID]-tdd"], timeout_ms=1200000)`.
+4. Default to TDD RED phase first using a test-writer subagent: from the `python_repl` tool, `await rlm.spawn(brief, name="[ID]-tdd")` with the TDD test writer brief below followed by the task, then `await rlm.collect(["[ID]-tdd"], timeout_ms=1200000)`.
    - Pass task context, canonical paths, and acceptance criteria.
    - Require tests-only edits.
    - Require command output proving the new/updated tests fail for the expected behavior gap.

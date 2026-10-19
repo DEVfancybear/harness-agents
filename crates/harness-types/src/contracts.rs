@@ -767,6 +767,15 @@ pub struct McpServerConfigV2 {
     /// take to start and answer the handshake.
     #[serde(default)]
     pub startup_timeout_seconds: Option<u64>,
+    /// prime-agent's `clientId`: a pre-registered OAuth client, for a server
+    /// without dynamic client registration (ee1e531e).
+    #[serde(default)]
+    pub oauth_client_id: Option<String>,
+    /// prime-agent's `callbackPort`: the one local port the client's redirect
+    /// was registered with; sign-in fails when it is taken instead of
+    /// redirecting to an unregistered port.
+    #[serde(default)]
+    pub oauth_callback_port: Option<u16>,
 }
 
 impl McpServerConfigV2 {

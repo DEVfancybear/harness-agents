@@ -324,7 +324,10 @@ impl CustomModels {
             if change.context_window.is_some() {
                 model.context_window = change.context_window;
             }
+            // A limit the user wrote is theirs: it is not cut to the default cap
+            // (prime-agent 767cb53d).
             if change.max_tokens.is_some() {
+                model.max_tokens_explicit = true;
                 model.max_tokens = change.max_tokens;
             }
             if change.compat.is_some() {
@@ -461,6 +464,30 @@ mod tests {
         assert_eq!(after.max_tokens, before.max_tokens);
         assert_eq!(after.base_url, before.base_url);
         assert_eq!(after.thinking_level_map, before.thinking_level_map);
+    }
+
+    /// prime-agent 767cb53d: a `maxTokens` the user wrote in an override is
+    /// asked for as written, not cut to the default request cap.
+    #[test]
+    fn an_overridden_max_tokens_is_not_capped() {
+        let custom = parse(
+            r#"{"providers": {"deepseek": {"modelOverrides": {"deepseek-v4-flash": {"maxTokens": 65536}}}}}"#,
+            &builtin(),
+        )
+        .expect("the file is valid");
+        let mut models = builtin();
+        let before = models
+            .iter()
+            .find(|model| model.reference() == "deepseek/deepseek-v4-flash")
+            .expect("a built-in model")
+            .request_max_tokens();
+        custom.apply(&mut models);
+        let after = models
+            .iter()
+            .find(|model| model.reference() == "deepseek/deepseek-v4-flash")
+            .expect("still there");
+        assert_eq!(after.request_max_tokens(), Some(65_536));
+        assert_ne!(before, Some(65_536));
     }
 
     #[test]
