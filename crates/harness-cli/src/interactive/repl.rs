@@ -1540,7 +1540,11 @@ fn start_host_request(link: &Arc<Link>, event: &Value) {
         if !state.remember(&id) {
             return;
         }
-        (state.host.clone(), state.session.clone(), state.harness.clone())
+        (
+            state.host.clone(),
+            state.session.clone(),
+            state.harness.clone(),
+        )
     };
     let data = event.get("data").cloned().unwrap_or(Value::Null);
     let task = HostTask::new(Arc::clone(link));
@@ -1572,7 +1576,9 @@ async fn answer_harness(harness: Option<Arc<super::harness_kernel::Dirs>>, data:
     match tokio::task::spawn_blocking(move || super::harness_kernel::answer(&dirs, &data)).await {
         Ok(Ok(result)) => json!({"status": "ok", "result": result}),
         Ok(Err(error)) => json!({"status": "error", "error": error}),
-        Err(error) => json!({"status": "error", "error": format!("harness request failed: {error}")}),
+        Err(error) => {
+            json!({"status": "error", "error": format!("harness request failed: {error}")})
+        }
     }
 }
 

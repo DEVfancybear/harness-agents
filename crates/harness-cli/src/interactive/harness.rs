@@ -64,6 +64,9 @@ pub struct Entry {
     pub pinned: bool,
     /// When it was last written (`@<seconds>` or RFC 3339), for its age.
     pub updated_at: Option<String>,
+    /// The project a global entry holds for (`project.key`), when it holds
+    /// for one project only.
+    pub project: Option<String>,
 }
 
 /// The merged state of one turn.
@@ -129,11 +132,41 @@ pub fn load(dir: &Path, scope: &str) -> State {
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 updated_at: text("updated_at").or_else(|| text("created_at")),
+                project: project_key(entry.get("project")),
             });
         }
     }
     if let Some(refinements) = parsed["refinements"].as_array() {
         state.refinements.clone_from(refinements);
+    }
+    state
+}
+
+/// The project key a stored `project` field names: `{"key": ...}`, or the key
+/// itself.
+#[must_use]
+pub fn project_key(field: Option<&Value>) -> Option<String> {
+    let field = field?;
+    field
+        .get("key")
+        .and_then(Value::as_str)
+        .or_else(|| field.as_str())
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+}
+
+/// The global entries one project sees: those for every project, and those for
+/// this one, labelled `project`; another project's entries are left out, so a
+/// fact about one project never reaches a turn in another.
+#[must_use]
+pub fn for_project(mut state: State, project: Option<&str>) -> State {
+    for entries in state.entries.values_mut() {
+        entries.retain(|entry| entry.project.is_none() || entry.project.as_deref() == project);
+        for entry in entries.iter_mut() {
+            if entry.project.is_some() {
+                "project".clone_into(&mut entry.scope);
+            }
+        }
     }
     state
 }
@@ -146,7 +179,7 @@ pub fn merge(global: State, local: State) -> State {
     for kind in KINDS {
         let mut entries = global.entries.get(kind).cloned().unwrap_or_default();
         for entry in &mut entries {
-            if entry.scope != "local" {
+            if entry.scope != "local" && entry.scope != "project" {
                 "global".clone_into(&mut entry.scope);
             }
         }

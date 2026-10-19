@@ -550,7 +550,8 @@ pub async fn run_with(
         None,
         None,
     );
-    let memory_host = super::memory::MemoryHost::new(&context.paths.data_dir, task_id.as_str());
+    let memory_host = super::memory::MemoryHost::new(&context.paths.data_dir, task_id.as_str())
+        .with_project(&context.project.root);
     tools = tools.with_external(super::memory::with_dispatcher(
         super::knowledge::with_dispatcher(dispatcher, &knowledge_host),
         &memory_host,
@@ -689,9 +690,12 @@ pub async fn run_with(
     // Memory is prime-agent's continual harness state, as in the app: this run reads
     // the digest of what the model has kept, ranked for this prompt.
     let harness_state = super::harness::merge(
-        super::harness::load(
-            &super::harness::global_dir(&context.paths.data_dir),
-            "global",
+        super::harness::for_project(
+            super::harness::load(
+                &super::harness::global_dir(&context.paths.data_dir),
+                "global",
+            ),
+            Some(super::bootstrap::project_key_of(&context.project.root).as_str()),
         ),
         super::harness::load(
             &super::harness::local_dir(&context.paths.data_dir, task_id.as_str()),

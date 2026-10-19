@@ -5072,7 +5072,7 @@ pub(super) mod tests {
             .expect("memory schema");
         assert_eq!(
             schema["function"]["parameters"]["properties"]["action"]["enum"],
-            json!(["list", "search", "read"])
+            json!(["list", "search", "read", "history"])
         );
         let search = json!({"action":"search","query":"tabs indentation"});
         let action = tools.resolve("memory", &search).expect("resolves");

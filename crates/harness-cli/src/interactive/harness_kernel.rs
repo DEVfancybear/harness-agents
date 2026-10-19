@@ -53,6 +53,11 @@ pub fn answer(dirs: &Dirs, request: &Value) -> Result<Value, String> {
     let store = Store {
         dir,
         scope: if global { "global" } else { "local" },
+        // A conversation's local store is `sessions/<conversation>/harness`.
+        origin: json!({
+            "conversation": dirs.local.parent().and_then(|dir| dir.file_name()).map(|name| name.to_string_lossy().into_owned()),
+            "via": "rlm.harness",
+        }),
     };
     match op {
         "list" => Ok(Value::Array(store.list(optional_kind(request)?)?)),
@@ -70,6 +75,8 @@ pub fn answer(dirs: &Dirs, request: &Value) -> Result<Value, String> {
 struct Store {
     dir: PathBuf,
     scope: &'static str,
+    /// Who writes, recorded on the entry and in the memory journal.
+    origin: Value,
 }
 
 impl Store {
@@ -121,7 +128,8 @@ impl Store {
             .collect::<Vec<_>>();
         records.sort_by(|a, b| {
             let key = |entry: &Value| {
-                ["kind", "path", "title", "id"].map(|field| entry[field].as_str().unwrap_or("").to_owned())
+                ["kind", "path", "title", "id"]
+                    .map(|field| entry[field].as_str().unwrap_or("").to_owned())
             };
             key(a).cmp(&key(b))
         });
@@ -140,6 +148,15 @@ impl Store {
         if self.find(&state, kind, id).is_none() {
             return Ok(json!(false));
         }
+        // What was removed stays in the memory journal (`memory` history).
+        super::memory::journal(
+            &self.dir,
+            "delete",
+            kind,
+            id,
+            &state["entries"][kind][id],
+            &self.origin,
+        )?;
         if let Some(records) = state["entries"][kind].as_object_mut() {
             records.remove(id);
         }
@@ -148,6 +165,10 @@ impl Store {
     }
 
     /// `create`, `update` and `upsert`: `_upsert` behind each one's own check.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "_upsert behind each operation's own check, as the kernel told it"
+    )]
     fn write(&self, op: &str, request: &Value) -> Result<Value, String> {
         let kind = known_kind(&kind(request)?)?;
         let title = &request["title"];
@@ -195,6 +216,16 @@ impl Store {
             },
         )?;
         let now = now();
+        if existing.is_some() {
+            super::memory::journal(
+                &self.dir,
+                "update",
+                kind,
+                &entry_id,
+                &state["entries"][kind][&entry_id],
+                &self.origin,
+            )?;
+        }
         let entry = match existing {
             Some(mut entry) => {
                 entry["title"] = title.clone();
@@ -246,6 +277,7 @@ impl Store {
             for (field, value) in fields {
                 stored.insert(field.clone(), value.clone());
             }
+            stored.insert("origin".to_owned(), self.origin.clone());
         }
         self.save(&state)?;
         Ok(entry)
@@ -401,17 +433,18 @@ impl Store {
             let records = self.list(Some(kind.to_owned()))?;
             lines.push(format!("{kind}: {}", records.len()));
             for entry in records.iter().take(most) {
-                let summary = cut(
-                    &entry["content"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .trim()
-                        .replace('\n', " "),
-                );
+                let summary = cut(&entry["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .replace('\n', " "));
                 let mut extra = String::new();
                 if kind == "skill" {
                     for (field, label) in [("reference", "ref"), ("arguments", "args")] {
-                        if entry[field].as_object().is_some_and(|value| !value.is_empty()) {
+                        if entry[field]
+                            .as_object()
+                            .is_some_and(|value| !value.is_empty())
+                        {
                             let _ = write!(extra, " {label}={}", cut(&python_json(&entry[field])));
                         }
                     }
@@ -533,7 +566,11 @@ fn refinements(state: &Value) -> Vec<Value> {
                         Value::String(change) => vec![change.clone()],
                         Value::Array(changes) => changes
                             .iter()
-                            .map(|change| change.as_str().map_or_else(|| change.to_string(), str::to_owned))
+                            .map(|change| {
+                                change
+                                    .as_str()
+                                    .map_or_else(|| change.to_string(), str::to_owned)
+                            })
                             .collect(),
                         _ => return None,
                     };
@@ -583,21 +620,33 @@ fn known_kind(kind: &str) -> Result<&'static str, String> {
         .iter()
         .find(|known| **known == kind)
         .copied()
-        .ok_or_else(|| format!("unknown harness kind {}; expected one of {}", repr(kind), kinds_tuple()))
+        .ok_or_else(|| {
+            format!(
+                "unknown harness kind {}; expected one of {}",
+                repr(kind),
+                kinds_tuple()
+            )
+        })
 }
 
 fn kinds_tuple() -> String {
     format!(
         "({})",
-        KINDS.iter().map(|kind| repr(kind)).collect::<Vec<_>>().join(", ")
+        KINDS
+            .iter()
+            .map(|kind| repr(kind))
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
 fn text_field(request: &Value, field: &str) -> Result<String, String> {
-    request[field]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| format!("{field} must be a string, got {}", type_name(&request[field])))
+    request[field].as_str().map(str::to_owned).ok_or_else(|| {
+        format!(
+            "{field} must be a string, got {}",
+            type_name(&request[field])
+        )
+    })
 }
 
 /// Python's `repr` of a string, as the kernel's messages always quoted it.
@@ -727,8 +776,11 @@ fn validate_shape(
 fn skill_reference(reference: &Value, name: &str) -> Result<(), String> {
     let reject = |message: &str| Err(format!("skill entry {} rejected: {message}", repr(name)));
     let filled = |keys: [&str; 2]| {
-        keys.iter()
-            .any(|key| reference[*key].as_str().is_some_and(|text| !text.is_empty()))
+        keys.iter().any(|key| {
+            reference[*key]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        })
     };
     if reference["type"] != "python" {
         return reject("skill reference.type must be 'python'");
@@ -798,7 +850,11 @@ fn title_id(kind: &str, title: &str, records: Option<&Map<String, Value>>) -> St
     let id = slug(title, kind);
     let legacy = legacy_slug(title, kind);
     let has = |id: &str| records.is_some_and(|records| records.contains_key(id));
-    if !has(&id) && has(&legacy) { legacy } else { id }
+    if !has(&id) && has(&legacy) {
+        legacy
+    } else {
+        id
+    }
 }
 
 /// Drop the accents of Latin letters (Vietnamese `ở` is `o`, `đ` is `d`); a
@@ -858,7 +914,11 @@ fn slug(raw: &str, fallback: &str) -> String {
     {
         slug = first.chars().take(SLUG_MAX).collect();
     }
-    if slug.is_empty() { fallback.to_owned() } else { slug }
+    if slug.is_empty() {
+        fallback.to_owned()
+    } else {
+        slug
+    }
 }
 
 /// The id a title got before ids were folded and cut on words.
@@ -908,7 +968,11 @@ fn python_json(value: &Value) -> String {
             format!(
                 "{{{}}}",
                 keys.into_iter()
-                    .map(|key| format!("{}: {}", Value::String(key.clone()), python_json(&map[key])))
+                    .map(|key| format!(
+                        "{}: {}",
+                        Value::String(key.clone()),
+                        python_json(&map[key])
+                    ))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -939,7 +1003,10 @@ mod tests {
         }
     }
 
-    #[allow(clippy::needless_pass_by_value, reason = "the cases are written as literals")]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the cases are written as literals"
+    )]
     fn call(dirs: &Dirs, request: Value) -> Result<Value, String> {
         answer(dirs, &request)
     }
@@ -979,7 +1046,11 @@ mod tests {
         .expect_err("missing");
         assert_eq!(missing, "memory entry 'nothing' does not exist");
 
-        let got = call(&dirs, json!({"op":"get","kind":"memory","id":"lich_su_trien_khai"})).expect("get");
+        let got = call(
+            &dirs,
+            json!({"op":"get","kind":"memory","id":"lich_su_trien_khai"}),
+        )
+        .expect("get");
         assert_eq!(got["content"], "Deploys on Friday.");
         assert_eq!(
             call(&dirs, json!({"op":"get","kind":"memory","id":"nothing"})).expect("get"),
@@ -988,11 +1059,19 @@ mod tests {
         let listed = call(&dirs, json!({"op":"list"})).expect("list");
         assert_eq!(listed.as_array().map(Vec::len), Some(1));
         assert_eq!(
-            call(&dirs, json!({"op":"delete","kind":"memory","id":"lich_su_trien_khai"})).expect("delete"),
+            call(
+                &dirs,
+                json!({"op":"delete","kind":"memory","id":"lich_su_trien_khai"})
+            )
+            .expect("delete"),
             json!(true)
         );
         assert_eq!(
-            call(&dirs, json!({"op":"delete","kind":"memory","id":"lich_su_trien_khai"})).expect("delete"),
+            call(
+                &dirs,
+                json!({"op":"delete","kind":"memory","id":"lich_su_trien_khai"})
+            )
+            .expect("delete"),
             json!(false)
         );
     }
@@ -1017,7 +1096,10 @@ mod tests {
         assert!(!state_file(&dirs.local).exists());
         // The host's digest reads what the kernel wrote.
         let state = super::super::harness::load(&dirs.global, "global");
-        assert_eq!(state.entries["prompt"][0].content.as_deref(), Some("Always, briefly."));
+        assert_eq!(
+            state.entries["prompt"][0].content.as_deref(),
+            Some("Always, briefly.")
+        );
     }
 
     #[test]
@@ -1036,8 +1118,9 @@ mod tests {
         )
         .expect("update");
         assert_eq!(updated["path"], "old", "a topic is read as the path");
-        let raw: Value = serde_json::from_str(&std::fs::read_to_string(state_file(&dirs.local)).expect("read"))
-            .expect("json");
+        let raw: Value =
+            serde_json::from_str(&std::fs::read_to_string(state_file(&dirs.local)).expect("read"))
+                .expect("json");
         assert_eq!(raw["entries"]["memory"]["m"]["history"], json!([1]));
         assert_eq!(raw["entries"]["memory"]["m"]["content"], "C2");
     }
@@ -1095,8 +1178,11 @@ mod tests {
             json!({"op":"create","kind":"skill","title":"s","content":"c","reference":{"type":"python","import":"x","callable":"run"}}),
         )
         .expect("skill");
-        let updated = call(&dirs, json!({"op":"update","kind":"skill","id":"s","title":"s","content":"c2"}))
-            .expect("update");
+        let updated = call(
+            &dirs,
+            json!({"op":"update","kind":"skill","id":"s","title":"s","content":"c2"}),
+        )
+        .expect("update");
         assert_eq!(updated["reference"]["callable"], "run");
     }
 
@@ -1118,7 +1204,11 @@ mod tests {
         .expect("record");
         assert_eq!(second["id"], "refine_0002");
         let overview = call(&dirs, json!({"op":"overview"})).expect("overview");
-        assert!(overview.as_str().is_some_and(|text| text.contains("refinements: 2\n  - [refine_0001] repeated failure: added a note")), "{overview}");
+        assert!(
+            overview.as_str().is_some_and(|text| text
+                .contains("refinements: 2\n  - [refine_0001] repeated failure: added a note")),
+            "{overview}"
+        );
     }
 
     #[test]
@@ -1130,12 +1220,21 @@ mod tests {
             ("Release notes", "Write notes for every release."),
             ("Release checklist", "Tag, build, publish the release."),
         ] {
-            call(&dirs, json!({"op":"create","kind":"memory","title":title,"content":content})).expect("create");
+            call(
+                &dirs,
+                json!({"op":"create","kind":"memory","title":title,"content":content}),
+            )
+            .expect("create");
         }
-        let hits = call(&dirs, json!({"op":"search","query":"worktree?","limit":5})).expect("search");
+        let hits =
+            call(&dirs, json!({"op":"search","query":"worktree?","limit":5})).expect("search");
         assert_eq!(hits[0]["id"], "worktree_cleanup");
         assert_eq!(hits.as_array().map(Vec::len), Some(1));
-        let release = call(&dirs, json!({"op":"search","query":"release","kind":"memory"})).expect("search");
+        let release = call(
+            &dirs,
+            json!({"op":"search","query":"release","kind":"memory"}),
+        )
+        .expect("search");
         assert_eq!(release.as_array().map(Vec::len), Some(2));
         assert_eq!(
             call(&dirs, json!({"op":"search","query":"release","limit":0})).expect_err("limit"),
@@ -1146,9 +1245,13 @@ mod tests {
             json!({"op":"create","kind":"skill","title":"Deploy","content":"Run it.","reference":{"type":"python","import":"deploy","callable":"run"},"arguments":{"b":1,"a":[1,2]}}),
         )
         .expect("skill");
-        let overview = call(&dirs, json!({"op":"overview","max_entries_per_kind":2})).expect("overview");
+        let overview =
+            call(&dirs, json!({"op":"overview","max_entries_per_kind":2})).expect("overview");
         let overview = overview.as_str().unwrap_or_default();
-        assert!(overview.starts_with("Harness state (local): "), "{overview}");
+        assert!(
+            overview.starts_with("Harness state (local): "),
+            "{overview}"
+        );
         assert!(overview.contains("memory: 3\n  - [local:release_checklist] Release checklist (general, v1): Tag, build, publish the release."), "{overview}");
         assert!(overview.contains("  - +1 more"), "{overview}");
         assert!(
@@ -1156,7 +1259,10 @@ mod tests {
             "{overview}"
         );
         let snapshot = call(&dirs, json!({"op":"snapshot"})).expect("snapshot");
-        assert_eq!(snapshot["entries"]["memory"].as_object().map(Map::len), Some(3));
+        assert_eq!(
+            snapshot["entries"]["memory"].as_object().map(Map::len),
+            Some(3)
+        );
         assert!(snapshot["entries"]["factory"].is_object());
     }
 
@@ -1187,7 +1293,10 @@ mod tests {
 
     #[test]
     fn ids_fold_latin_accents_and_keep_other_scripts() {
-        assert_eq!(slug("Lịch sử: triển khai đúng giờ!", "memory"), "lich_su_trien_khai_dung_gio");
+        assert_eq!(
+            slug("Lịch sử: triển khai đúng giờ!", "memory"),
+            "lich_su_trien_khai_dung_gio"
+        );
         assert_eq!(slug("修复登录", "memory"), "修复登录");
         assert_eq!(slug("!!!", "memory"), "memory");
         let long = "word ".repeat(30);
@@ -1195,7 +1304,10 @@ mod tests {
         assert!(!slug(&long, "memory").ends_with('_'));
         // An entry kept under the earlier id is found by its title.
         let records = json!({"lịch_sử": {"title": "Lịch sử", "content": "c"}});
-        assert_eq!(title_id("memory", "Lịch sử", records.as_object()), "lịch_sử");
+        assert_eq!(
+            title_id("memory", "Lịch sử", records.as_object()),
+            "lịch_sử"
+        );
         assert_eq!(title_id("memory", "Lịch sử", None), "lich_su");
     }
 }

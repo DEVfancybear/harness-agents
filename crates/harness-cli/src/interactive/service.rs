@@ -217,7 +217,7 @@ Python is not on PATH: run the tests with runpy in the kernel.
             &temp.path().join("workspace"),
             false,
         );
-        let blocks = super::child_context(&data_dir, "task-1", &layers);
+        let blocks = super::child_context(&data_dir, "task-1", None, &layers);
         let text = blocks
             .iter()
             .map(|block| block.text.as_str())
@@ -1153,10 +1153,14 @@ const CHILD_LEARNED_SKILLS_CHARS: usize = 16_000;
 fn child_context(
     data_dir: &Path,
     conversation: &str,
+    project: Option<&str>,
     layers: &super::learned::Layers,
 ) -> Vec<harness_session::ContextBlock> {
     let state = super::harness::merge(
-        super::harness::load(&super::harness::global_dir(data_dir), "global"),
+        super::harness::for_project(
+            super::harness::load(&super::harness::global_dir(data_dir), "global"),
+            project,
+        ),
         super::harness::load(&super::harness::local_dir(data_dir, conversation), "local"),
     );
     let mut blocks = vec![super::harness::digest_block(
@@ -7893,10 +7897,15 @@ async fn run_turn(
             knowledge: Some(
                 super::knowledge::KnowledgeHost::new(&workspace_root, &data_dir).readonly(),
             ),
-            memory: Some(super::memory::MemoryHost::new(&data_dir, task_id.as_str()).readonly()),
+            memory: Some(
+                super::memory::MemoryHost::new(&data_dir, task_id.as_str())
+                    .with_project(&workspace_root)
+                    .readonly(),
+            ),
             context: child_context(
                 &data_dir,
                 task_id.as_str(),
+                Some(super::bootstrap::project_key_of(&workspace_root).as_str()),
                 &super::learned::Layers::new(
                     &global_config_dir,
                     &data_dir,
@@ -8066,7 +8075,8 @@ async fn run_turn(
         repl_host.as_ref(),
     );
     // The model keeps its memory with a native tool, with or without the REPL.
-    let memory_host = super::memory::MemoryHost::new(&data_dir, task_id.as_str());
+    let memory_host =
+        super::memory::MemoryHost::new(&data_dir, task_id.as_str()).with_project(&workspace_root);
     tools = tools.with_external(super::memory::with_dispatcher(
         super::knowledge::with_dispatcher(dispatcher, &knowledge_host),
         &memory_host,
@@ -8320,7 +8330,10 @@ async fn run_turn(
     // Memory is prime-agent's continual harness state: the model keeps it through
     // `rlm.harness`, and every turn carries a digest of it ranked for this task.
     let harness_state = super::harness::merge(
-        super::harness::load(&super::harness::global_dir(&data_dir), "global"),
+        super::harness::for_project(
+            super::harness::load(&super::harness::global_dir(&data_dir), "global"),
+            memory_host.project_key(),
+        ),
         super::harness::load(
             &super::harness::local_dir(&data_dir, task_id.as_str()),
             "local",

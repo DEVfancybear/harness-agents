@@ -273,6 +273,10 @@ pub struct Usage {
     /// turn that ran no check counts in neither.
     pub checked_pass: u64,
     pub checked_fail: u64,
+    /// Turns that followed the skill, by how the automatic review judged they
+    /// went from the conversation (Mengram's procedure outcomes).
+    pub worked: u64,
+    pub failed: u64,
     /// The skill was archived. Seen on a live skill, it means the skill was
     /// moved back since - by hand or by a rollback.
     pub archived: bool,
@@ -288,6 +292,8 @@ impl Usage {
             anchor: count("anchor"),
             checked_pass: count("checked_pass"),
             checked_fail: count("checked_fail"),
+            worked: count("worked"),
+            failed: count("failed"),
             archived: value["archived"].as_bool().unwrap_or(false),
         }
     }
@@ -475,6 +481,43 @@ pub fn library_documents(layers: &Layers) -> String {
         }
     }
     parts.join("\n\n")
+}
+
+/// The latest failures a skill keeps, for the curator.
+const FAILURES_KEPT: usize = 5;
+
+/// Record how following the learned skill `name` went, as the automatic review
+/// judged it from the conversation (after Mengram, whose procedures evolve
+/// from their failures): a failure keeps what the skill took for granted that
+/// turned out false, the latest five, so the curator can patch the skill with
+/// a check for it. `false` when `name` is not a learned skill.
+pub fn record_outcome(
+    layers: &Layers,
+    name: &str,
+    worked: bool,
+    assumption: &str,
+    evidence: &str,
+) -> bool {
+    let Some(layer) = layers.find(name) else {
+        return false;
+    };
+    let root = layers.root(layer).expect("found layer is present");
+    let clip = |text: &str| text.trim().chars().take(300).collect::<String>();
+    update_usage(&layers.usage_file(layer, root), |usage| {
+        bump(usage, name, if worked { "worked" } else { "failed" });
+        if !worked && !assumption.trim().is_empty() {
+            let failures = &mut usage["skills"][name]["failures"];
+            if !failures.is_array() {
+                *failures = json!([]);
+            }
+            if let Some(failures) = failures.as_array_mut() {
+                failures.push(json!({"at": now(), "assumption": clip(assumption), "evidence": clip(evidence)}));
+                let excess = failures.len().saturating_sub(FAILURES_KEPT);
+                failures.drain(..excess);
+            }
+        }
+    });
+    true
 }
 
 /// Count a use of `name`, when it is a learned skill.
@@ -723,6 +766,8 @@ pub struct LearnedSkill {
     pub category: String,
     pub usage: Usage,
     pub requests: u64,
+    /// What the skill took for granted in the turns it failed, newest last.
+    pub failures: Vec<String>,
 }
 
 /// Every live learned skill, global first.
@@ -731,6 +776,7 @@ pub fn library(layers: &Layers) -> Vec<LearnedSkill> {
     let mut skills = Vec::new();
     for (layer, root) in layers.present() {
         let (requests, counters) = usage(layers, layer);
+        let raw = load_usage(&layers.usage_file(layer, root));
         for name in learned_names(root) {
             let document =
                 std::fs::read_to_string(root.join(&name).join("SKILL.md")).unwrap_or_default();
@@ -747,6 +793,12 @@ pub fn library(layers: &Layers) -> Vec<LearnedSkill> {
                     .unwrap_or_else(|| "general".to_owned()),
                 usage: counters.get(&name).copied().unwrap_or_default(),
                 requests,
+                failures: raw["skills"][&name]["failures"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|failure| failure["assumption"].as_str().map(str::to_owned))
+                    .collect(),
                 name,
             });
         }
@@ -776,6 +828,21 @@ pub fn library_overview(skills: &[LearnedSkill]) -> String {
         } else {
             String::new()
         };
+        let judged = if skill.usage.worked + skill.usage.failed > 0 {
+            let last = skill
+                .failures
+                .last()
+                .map_or_else(String::new, |assumption| {
+                    format!("; last failure: {assumption}")
+                });
+            format!(
+                "; judged after use: {} worked, {} failed{last}",
+                skill.usage.worked, skill.usage.failed
+            )
+        } else {
+            String::new()
+        };
+        let checks = checks + &judged;
         groups
             .entry(skill.category.as_str())
             .or_default()
@@ -1772,8 +1839,9 @@ Format, enforced:
 #[cfg(test)]
 mod tests {
     use super::{
-        BODY_MAX_LINES, Intent, Layer, Layers, Member, PromoteContext, Usage, UseKind, evaluate,
-        is_learned, library, promote, record_use, redact, restore, run_lifecycle, usage,
+        BODY_MAX_LINES, FAILURES_KEPT, Intent, Layer, Layers, Member, PromoteContext, Usage,
+        UseKind, evaluate, is_learned, library, library_overview, promote, record_outcome,
+        record_use, redact, restore, run_lifecycle, usage,
     };
     use serde_json::json;
 
@@ -2055,6 +2123,8 @@ mod tests {
                 anchor,
                 checked_pass: 0,
                 checked_fail: 0,
+                worked: 0,
+                failed: 0,
                 archived: false,
             },
         };
@@ -2107,6 +2177,63 @@ mod tests {
         let root = layers.project.clone().expect("project");
         assert!(is_learned(&root, "kept"));
         assert!(root.join(".archive/idle/SKILL.md").is_file());
+    }
+
+    /// After Mengram: how following a skill went is kept, with what a failure
+    /// took for granted, and the refiner sees both in the library overview.
+    #[test]
+    fn judged_outcomes_and_failed_assumptions_reach_the_library_overview() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        assert!(
+            promote(
+                &layers,
+                &create("deploy", "Deploy."),
+                &PromoteContext::default()
+            )
+            .ok
+        );
+        assert!(record_outcome(&layers, "deploy", true, "", "it shipped"));
+        assert!(record_outcome(
+            &layers,
+            "deploy",
+            false,
+            "the build container had enough memory",
+            "error: out of memory"
+        ));
+        assert!(
+            !record_outcome(&layers, "websearch", false, "x", "y"),
+            "only learned skills"
+        );
+        for index in 0..7 {
+            record_outcome(
+                &layers,
+                "deploy",
+                false,
+                &format!("assumption {index}"),
+                "e",
+            );
+        }
+        let skills = library(&layers);
+        let deploy = skills
+            .iter()
+            .find(|skill| skill.name == "deploy")
+            .expect("deploy");
+        assert_eq!((deploy.usage.worked, deploy.usage.failed), (1, 8));
+        assert_eq!(
+            deploy.failures.len(),
+            FAILURES_KEPT,
+            "the latest five are kept"
+        );
+        assert_eq!(
+            deploy.failures.last().map(String::as_str),
+            Some("assumption 6")
+        );
+        let overview = library_overview(&skills);
+        assert!(
+            overview.contains("judged after use: 1 worked, 8 failed; last failure: assumption 6"),
+            "{overview}"
+        );
     }
 
     /// The spec holds every skill to 200 description characters and 30 body

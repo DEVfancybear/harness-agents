@@ -608,8 +608,14 @@ fn overview(scopes: &HarnessScopes) -> String {
             }
             let age =
                 super::harness::age_label(entry).map_or_else(String::new, |age| format!(", {age}"));
+            // A project's entry is named so: it never merges with another
+            // project's, nor moves into one.
+            let project = entry
+                .project
+                .as_deref()
+                .map_or_else(String::new, |key| format!(", project {key}"));
             lines.push(format!(
-                "- [{}:{}] {title} ({}, v{}{age}){extra}: {content}",
+                "- [{}:{}] {title} ({}, v{}{age}{project}){extra}: {content}",
                 entry.scope, entry.id, entry.path, entry.version
             ));
         }
@@ -913,6 +919,10 @@ struct Proposal {
     /// Record how many global entries there were before and after: a
     /// consolidation says it against the target.
     count_entries: bool,
+    /// How following the learned skills in play went, as the review judged.
+    skill_outcomes: Vec<Value>,
+    /// The outcomes recorded against a learned skill, kept with the refinement.
+    skill_outcome_records: Vec<Value>,
 }
 
 impl Proposal {
@@ -968,6 +978,11 @@ impl Proposal {
             knowledge_records: Vec::new(),
             knowledge_restores: Vec::new(),
             count_entries: false,
+            skill_outcomes: value["skillOutcomes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+            skill_outcome_records: Vec::new(),
         }
     }
 }
@@ -1259,7 +1274,11 @@ fn apply(
             applied_edits.push(record);
             continue;
         }
+        // What a refinement replaces or removes stays in the memory journal,
+        // so the `memory` tool's history and restore reach it too.
+        let by = json!({"via": "refine", "refinement": id});
         if action == "delete" {
+            super::memory::journal(dir, "delete", &kind, &computed, &before, &by)?;
             if let Some(records) = state["entries"][&kind].as_object_mut() {
                 records.remove(&computed);
             }
@@ -1291,6 +1310,15 @@ fn apply(
             "updated_at": now(),
             "version": before["version"].as_i64().map_or(1, |version| version + 1),
         });
+        let mut after = after;
+        // A project's entry stays that project's.
+        if let Some(project) = before.get("project").filter(|project| !project.is_null()) {
+            after["project"] = project.clone();
+        }
+        after["origin"] = by.clone();
+        if !before.is_null() {
+            super::memory::journal(dir, "update", &kind, &computed, &before, &by)?;
+        }
         state["entries"][&kind][&computed] = after.clone();
         modified.insert(key);
         if !before.is_null() {
@@ -1345,6 +1373,9 @@ fn apply(
         "rollbackOf": rollback_of,
         "scope": scope,
     });
+    if !proposal.skill_outcome_records.is_empty() {
+        record["skillOutcomes"] = json!(proposal.skill_outcome_records);
+    }
     if proposal.count_entries {
         record["entries"] =
             json!({"before": entries_before, "after": memory_entries(&state).len()});
@@ -1604,6 +1635,8 @@ fn rollback_proposal(target: &Value) -> Proposal {
         knowledge_records: Vec::new(),
         knowledge_restores: knowledge,
         count_entries: false,
+        skill_outcomes: Vec::new(),
+        skill_outcome_records: Vec::new(),
     }
 }
 
@@ -1853,6 +1886,34 @@ async fn plan(
 const AUTO_SCOPE_POLICY: &str = "Requested refinement scope: automatic review. Edits go to this conversation's local store unless marked otherwise. Mark a memory edit with \"scope\": \"global\" when it is a durable user preference, a correction of how the agent should work, or a stable fact about the user, their environment or a named project that future conversations need, and the main agent did not already save it: check the global entries in the overview, and update a global entry (with \"scope\": \"global\" and its bare id) when the conversation supersedes it instead of creating a duplicate. Never put task progress, temporary blockers or current-run coordination in global memory, nor task state such as commit ids, test counts or a done/in-progress status: keep those local, or as knowledge when worth keeping. Entries that record a state go stale (the overview shows each entry's age): when the conversation shows one changed - a goal completed, work merged, a blocker resolved, a count moved - update or delete it, a local one freely and a global one with \"scope\": \"global\". Only memory edits may be global; every other kind stays local.";
 
 /// What the automatic review may add to the knowledge library.
+const SKILL_OUTCOMES: &str = "For each learned skill in play that the conversation shows being followed, say how it went in a top-level `skillOutcomes` array: {\"skill\": \"its name\", \"outcome\": \"worked\" or \"failed\", \"evidence\": \"a verbatim quote from the conversation\", \"assumption\": \"for a failure: what the skill took for granted that turned out false\"}. Judge only from what the conversation shows - a check that passed or failed, a command that broke, the user confirming or correcting - and leave the array empty when it shows neither. A failure whose cause the skill could have checked first is also worth a patch to the skill that adds that check.";
+
+/// Keep the review's judgement of each learned skill in play: only a skill in
+/// play, only `worked` or `failed`, and a failure only with its assumption.
+fn record_skill_outcomes(learning: &Learning, outcomes: &[Value]) -> Vec<Value> {
+    outcomes
+        .iter()
+        .filter_map(|outcome| {
+            let skill = outcome["skill"].as_str()?;
+            let worked = match outcome["outcome"].as_str()? {
+                "worked" => true,
+                "failed" => false,
+                _ => return None,
+            };
+            let assumption = outcome["assumption"].as_str().unwrap_or_default();
+            let evidence = outcome["evidence"].as_str().unwrap_or_default();
+            if !learning.in_play.iter().any(|name| name == skill)
+                || evidence.trim().is_empty()
+                || (!worked && assumption.trim().is_empty())
+            {
+                return None;
+            }
+            super::learned::record_outcome(&learning.layers, skill, worked, assumption, evidence)
+                .then(|| json!({"skill": skill, "outcome": if worked { "worked" } else { "failed" }, "assumption": assumption, "evidence": evidence}))
+        })
+        .collect()
+}
+
 const KNOWLEDGE_PROPOSALS: &str = "Knowledge (not an edit kind) is the user's library of topical Markdown pages shared across conversations. When the conversation produced substantive reusable knowledge the main agent did not save - a researched conclusion, a method or concept worked out, a source the user shared to study - propose it in a top-level `knowledge` array: {\"scope\": \"project\" or \"global\", \"path\": \"concepts/short-name.md\", \"title\": \"...\", \"summary\": \"one line\", \"content\": \"Markdown, in the material's language\", \"sources\": [\"URLs or documents it came from\"], \"reason\": \"why\"}. Use project scope unless the knowledge is explicitly shared across projects; use sources/, concepts/, entities/ or analysis/ for the path. Only new pages: never a page listed below. Skip trivial exchanges, task progress, secrets, personal facts (memory) and procedures (learned skills). Weigh this whatever the review's instructions focus on. Leave `knowledge` empty when nothing meets the bar.";
 
 impl Edit {
@@ -1946,14 +2007,20 @@ pub async fn auto_refine(
         ..RefineOptions::default()
     };
     let catalog = knowledge.and_then(super::knowledge::KnowledgeHost::review_catalog);
-    let extra = catalog
+    let mut extra = catalog
         .iter()
         .map(|catalog| {
             format!(
                 "<knowledge_proposals>\n{KNOWLEDGE_PROPOSALS}\nExisting pages:\n{catalog}\n</knowledge_proposals>"
             )
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if let Some(learning) = learning.filter(|learning| !learning.in_play.is_empty()) {
+        extra.push(format!(
+            "<skill_outcomes>\n{SKILL_OUTCOMES}\nLearned skills in play: {}\n</skill_outcomes>",
+            learning.in_play.join(", ")
+        ));
+    }
     let local_baseline = load_raw(&scopes.local);
     let global_baseline = load_raw(&scopes.global);
     let mut proposal = plan(
@@ -1981,6 +2048,9 @@ pub async fn auto_refine(
     proposal.edits = local_edits;
     if let Some(host) = knowledge.filter(|_| catalog.is_some()) {
         proposal.knowledge_records = create_pages(host, &proposal.knowledge);
+    }
+    if let Some(learning) = learning {
+        proposal.skill_outcome_records = record_skill_outcomes(learning, &proposal.skill_outcomes);
     }
     let id = refinement_id();
     let local = apply(
@@ -2037,6 +2107,7 @@ Rules:
 - Only the learned skills listed below exist for you. Never name, absorb into, or recreate any other skill.
 - Judge overlap on content, never on usage counts: retiring unused skills is the lifecycle's job, and a count of zero is no evidence of a bad skill. The one use for the counts: a skill past probation that was never used likely has a description that does not name what the user types - patch its description.
 - "checks after use" is no reason to merge or delete either. A skill whose checks repeatedly fail after use is a candidate for a patch, or for a split into conditional variants, as <learned_skill_format> says; never delete or absorb a skill only because checks failed after it.
+- "judged after use" counts the turns that followed a skill by how they went, and "last failure" says what the skill took for granted that turned out false. Patch such a skill so it checks that first (a precondition step in SKILL.md), keeping its lesson; a skill that fails far more often than it works is a candidate for a rewrite.
 - Do not ask whether two skills are distinct. Ask whether a maintainer would write them as N separate skills or as one skill with N subsections. When the answer is one, merge.
 - Consolidate a cluster in one of three ways: patch the broadest member to add a labeled subsection for each sibling's unique content, then delete each sibling with absorbed_into set to it; or create a new umbrella skill and delete the absorbed siblings with absorbed_into set to it; or move narrow but valuable detail into the umbrella's references/<topic>.md (carried in `files`, pointed at from SKILL.md) and delete the sibling.
 - Order matters: the umbrella's create/patch/update comes before the deletes that name it.
@@ -2184,7 +2255,7 @@ Rules:
 - Merge entries about the same subject into one dense entry: update the clearest one with the merged content, then delete the others.
 - When entries conflict, the one with the later updated_at wins; drop or rewrite the older claim.
 - Delete what is stale or temporary: task progress, a one-off error, a blocker that was resolved, an entry superseded by a more precise one, an empty or garbled entry. Global memory never keeps task state - commit ids, test counts, a done, delivered or in-progress status - so delete such an entry, or rewrite it as the lasting fact it holds without the state.
-- Keep facts about one project named with that project; never generalize a project fact to every project.
+- Keep facts about one project named with that project; never generalize a project fact to every project. An entry with a `project` holds for that project only: merge it only with entries of the same project, and never into an entry without one.
 - Keep one fact or rule per entry, short and self-contained, in the language it was written in.
 - Aim for about 30 entries or fewer in all: every one of them reaches every conversation. The <size> block says how many there are; when they are over the target, merge harder (one entry per subject) and delete the ones least likely to matter in a future conversation until they are at or under it.
 - A pinned entry (pinned: true) is shown in every turn: keep it pinned unless it is wrong or superseded. An update keeps an entry's metadata unless you set it; a merged entry that absorbs a pinned one sets "metadata": {"pinned": true}.
@@ -2221,6 +2292,7 @@ fn memory_entries(state: &Value) -> Vec<Value> {
                         "version": entry["version"],
                         "updated_at": entry.get("updated_at").cloned().unwrap_or(Value::Null),
                         "pinned": entry["metadata"]["pinned"] == true,
+                        "project": entry["project"]["name"].as_str().or_else(|| entry["project"].as_str()),
                     })
                 })
         })

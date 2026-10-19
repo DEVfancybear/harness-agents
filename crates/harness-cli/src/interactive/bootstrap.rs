@@ -281,6 +281,12 @@ pub fn resolve(request: LaunchRequest) -> Result<LaunchContext, HarnessError> {
     })
 }
 
+/// The key of the project rooted at `root` (as the launch resolved it).
+#[must_use]
+pub fn project_key_of(root: &Path) -> String {
+    project_key(ContentHash::from_bytes(root.to_string_lossy().as_bytes()).as_str())
+}
+
 /// Short, filesystem-safe project key derived from the identity digest.
 fn project_key(digest: &str) -> String {
     let hexadecimal = digest.strip_prefix("sha256:").unwrap_or(digest);
