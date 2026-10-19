@@ -49,7 +49,24 @@ check "its output came back through the notice" "last | grep -q 'XONG-NEN'"
 echo "################ 4. a cell of bash() calls shows as a Bash card"
 (cd "$RX/p" && "$PROBE" "$RX/card.bin" "$HA" "wait:4000,key:Trong python_repl chạy đúng một cell gồm hai dòng: a = await bash('git status') và b = await bash('git log --oneline -1'); rồi trả lời OK.,enter,wait:60000" -- attach r1 >/dev/null)
 screen "$RX/card.bin" > "$RX/card.txt"
-check "the card reads Bash with its first command" "grep -q 'Bash.*git status' '$RX/card.txt'"
+# The cell the model ran, from the store: prime's rule makes it a Bash card when
+# at least half of its lines call bash(), else a Python card (a model that adds
+# print lines gets one).
+CARD=$("$PY" - "$HA_HOME/data/projects" <<'EOF'
+import glob, json, os, sqlite3, sys
+for db in glob.glob(os.path.join(sys.argv[1], "*", "harness.sqlite3")):
+    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests order by rowid"):
+        for message in json.loads(text).get("messages", []):
+            for call in message.get("tool_calls") or []:
+                code = json.loads(call.get("arguments") or "{}").get("code", "")
+                if "git log --oneline -1" in code:
+                    lines = [line for line in code.splitlines() if line.strip()]
+                    print("Bash" if 2 * sum("bash(" in line for line in lines) >= len(lines) else "Python")
+                    raise SystemExit
+EOF
+)
+echo "   the cell makes a $CARD card"
+check "the card follows the rule: $CARD" "grep -q '$CARD.*git status' '$RX/card.txt'"
 
 echo "################ 5. a stashed draft returns after another prompt is sent"
 (cd "$RX/p" && "$PROBE" "$RX/stash.bin" "$HA" "wait:4000,key:ban nhap do dang,wait:300,ctrls,wait:500,key:Tra loi dung mot tu: OK,enter,wait:40000" -- attach r1 >/dev/null)

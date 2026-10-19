@@ -1788,7 +1788,23 @@ pub async fn refine(
         "Requested refinement scope: local. Prefer local continual harness edits for current task progress, temporary blockers, current-run coordination, and project facts that are not clearly reusable across conversations. Global entries in the overview are read-only context: do not propose update or delete edits for them; create a local entry instead if an override is needed."
     };
     let baseline = load_raw(scopes.dir(options.global));
-    let proposal = plan(
+    // A refinement the model or the user asked for stands in for the review
+    // that came due with it, so it judges the learned skills in play too: a
+    // skill the agent asked to have repaired was never recorded as failed.
+    let outcomes = learning
+        .filter(|learning| !learning.in_play.is_empty())
+        .map(|learning| {
+            format!(
+                "<skill_outcomes>
+{SKILL_OUTCOMES}
+Learned skills in play: {}
+</skill_outcomes>",
+                learning.in_play.join(", ")
+            )
+        })
+        .into_iter()
+        .collect();
+    let mut proposal = plan(
         provider,
         model,
         conversation,
@@ -1797,9 +1813,12 @@ pub async fn refine(
         options,
         learning,
         scope_instruction,
-        Vec::new(),
+        outcomes,
     )
     .await?;
+    if let Some(learning) = learning {
+        proposal.skill_outcome_records = record_skill_outcomes(learning, &proposal.skill_outcomes);
+    }
     let refinement = apply(
         scopes,
         &proposal,
@@ -3444,6 +3463,58 @@ mod tests {
         assert!(
             super::take_deferred_reviews(directory.path()).is_empty(),
             "a deferred review is taken by one turn only"
+        );
+    }
+
+    /// A refinement the agent asks for stands in for the review that came due,
+    /// so the learned skill it was following is judged there too.
+    #[tokio::test]
+    async fn a_requested_refinement_judges_the_learned_skill_in_play() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let config = directory.path().join("config");
+        let skill = config.join("skills").join("build-check");
+        std::fs::create_dir_all(&skill).expect("skill dir");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: build-check\ndescription: Use to check the build.\n---\nRun `node scripts/build.js`.\n",
+        )
+        .expect("skill");
+        std::fs::write(skill.join(".ha-learned.json"), r#"{"created_by": "ha"}"#).expect("marker");
+        let data = directory.path().join("data");
+        let workspace = directory.path().join("workspace");
+        let layers = crate::interactive::learned::Layers::new(&config, &data, &workspace, true);
+        let mut learning = super::Learning::new(layers, &workspace, None);
+        learning.in_play = vec!["build-check".to_owned()];
+        let provider = Replies::new(&[json!({
+            "summary": "the build entry point was wrong",
+            "skillOutcomes": [{
+                "skill": "build-check",
+                "outcome": "failed",
+                "evidence": "Cannot find module scripts/build.js",
+                "assumption": "the project builds with node scripts/build.js"
+            }]
+        })
+        .to_string()]);
+        let dynamic: std::sync::Arc<dyn harness_providers::ModelProvider> = provider.clone();
+        super::refine(
+            &dynamic,
+            "fixture-model",
+            "[User]: check the build",
+            &scopes,
+            &RefineOptions::default(),
+            Some(&learning),
+        )
+        .await
+        .expect("refined");
+        let usage: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(data.join("skill-usage").join("global.json")).expect("usage"),
+        )
+        .expect("json");
+        assert_eq!(usage["skills"]["build-check"]["failed"], 1, "{usage}");
+        assert_eq!(
+            usage["skills"]["build-check"]["failures"][0]["assumption"],
+            "the project builds with node scripts/build.js"
         );
     }
 

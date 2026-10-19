@@ -29,7 +29,7 @@ show() { echo "-- global memory on disk:"; entries | sed 's/^/   /'; }
 
 echo "################ 1. extraction: a project fact and a global preference"
 agent "$RX/p-shop" s1
-say s1 "Ghi nhớ giúp tôi hai điều. (1) Riêng cho dự án này: dự án dùng pnpm làm trình quản lý gói, và deploy lên Fly.io vào thứ Năm hằng tuần. (2) Ở mọi dự án: tôi muốn bạn luôn trả lời bằng tiếng Việt, ngắn gọn." | tail -6
+say s1 "Ghi nhớ giúp tôi, mỗi điều một entry memory riêng. (1) Riêng cho dự án này: dự án dùng pnpm làm trình quản lý gói. (2) Riêng cho dự án này: deploy lên Fly.io vào thứ Năm hằng tuần. (3) Ở mọi dự án: tôi muốn bạn luôn trả lời bằng tiếng Việt, ngắn gọn." | tail -6
 show
 check "the pnpm fact is kept for project p-shop" "entries | grep -a '^global|p-shop|memory|' | grep -qi 'pnpm'"
 check "the deploy fact is kept for project p-shop" "entries | grep -a '^global|p-shop|' | grep -qi 'fly'"
@@ -90,7 +90,7 @@ echo "################ 9. /refinements off: no saved entry reaches a turn"
 say s8 "/refinements off" | tail -2
 "$HA" shutdown --force >/dev/null 2>&1
 agent "$RX/p-shop" s9
-say s9 "Không đọc file. Bạn có nhớ gì về package manager hay lịch deploy của dự án này không? Có tool memory không?" | tail -4
+say s9 "Không đọc file, không tìm trong lịch sử hội thoại (history_search). Chỉ từ memory: bạn có nhớ gì về package manager hay lịch deploy của dự án này không? Có tool memory không?" | tail -4
 # pnpm-lock.yaml is a file name any answer may cite; the deploy facts are not.
 check "with refinements off the facts are not recalled" "! last | grep -qi 'fly\.io\|thứ sáu\|friday'"
 check "the saved state is kept" "entries | grep -qi 'pnpm'"
