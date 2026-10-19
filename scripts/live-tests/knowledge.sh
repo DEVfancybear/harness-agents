@@ -40,12 +40,12 @@ for kind in ("memory", "prompt"):
         print("|".join([k, str(e.get("path", "general")), str((e.get("metadata") or {}).get("pinned", False)), str(e.get("content")).replace("\n", " ")]))
 EOF
 }
-# Seed global memory entries from "id|title|content|path|pinned" lines on stdin.
-seed() { "$PY" - "$D" <<'EOF'
+# Seed global memory entries, each argument "id|title|content|path|pinned".
+seed() { "$PY" - "$D" "$@" <<'EOF'
 import json, os, sys
 path = os.path.join(sys.argv[1], "harness", "harness_state.json")
 state = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {"schema": 1, "entries": {}, "refinements": []}
-for line in sys.stdin.read().splitlines():
+for line in sys.argv[2:]:
     if not line.strip():
         continue
     key, title, content, where, pinned = line.split("|")
@@ -84,7 +84,8 @@ check "no page holds the key" '! grep -rq FAKE0123456789 "$K"'
 "$HA" shutdown --force >/dev/null 2>&1
 
 echo "################ 3. a refinement's memory write passes the memory tool's checks"
-printf '%s\n' 'pm_shop|Trình quản lý gói|Dự án shop dùng pnpm làm trình quản lý gói, không dùng npm hay yarn.|general|0' | seed
+seed 'pm_shop|Trình quản lý gói|Dự án shop dùng pnpm làm trình quản lý gói, không dùng npm hay yarn.|general|0'
+check "the seeded entry is there" '[ "$(entries | grep -c "^pm_shop|")" -eq 1 ]'
 agent "$P" k3
 say k3 "/refine --global Lưu vào memory toàn cục (scope global, action create) đúng một entry mới tiêu đề 'Package manager: pnpm', nội dung 'Dự án shop dùng pnpm làm trình quản lý gói, không dùng npm hay yarn.' Đây là yêu cầu của chính người dùng." | tail -4
 sleep 5
@@ -93,15 +94,12 @@ check "the refinement recorded the duplicate it refused" 'cat "$D"/harness/refin
 "$HA" shutdown --force >/dev/null 2>&1
 
 echo "################ 4. Deep Dream keeps its guard rails"
-{
-  echo 'img_rule|Quy tắc ảnh|Mọi ảnh mới phải là WebP.|constraints|0'
-  echo 'reply_lang|Ngôn ngữ trả lời|Luôn trả lời bằng tiếng Việt, ngắn gọn.|general|1'
-  for pair in "font|Font chữ của blog là Inter" "color|Màu chủ đạo của blog là xanh navy" "host|Blog được host trên Netlify" "cms|Bài viết blog soạn bằng Markdown trong thư mục content" "seo|Mỗi bài blog cần thẻ meta description" "rss|Blog có RSS feed ở /rss.xml"; do
-    key=${pair%%|*}; fact=${pair#*|}
-    echo "${key}_a|${key} (1)|${fact}.|blog|0"
-    echo "${key}_b|${key} (2)|${fact} - ghi lại lần nữa.|blog|0"
-  done
-} | seed
+lines=('img_rule|Quy tắc ảnh|Mọi ảnh mới phải là WebP.|constraints|0' 'reply_lang|Ngôn ngữ trả lời|Luôn trả lời bằng tiếng Việt, ngắn gọn.|general|1')
+for pair in "font|Font chữ của blog là Inter" "color|Màu chủ đạo của blog là xanh navy" "host|Blog được host trên Netlify" "cms|Bài viết blog soạn bằng Markdown trong thư mục content" "seo|Mỗi bài blog cần thẻ meta description" "rss|Blog có RSS feed ở /rss.xml"; do
+  key=${pair%%|*}; fact=${pair#*|}
+  lines+=("${key}_a|${key} (1)|${fact}.|blog|0" "${key}_b|${key} (2)|${fact} - ghi lại lần nữa.|blog|0")
+done
+seed "${lines[@]}"
 echo 20 > "$D/harness/memory_changes"
 before=$(entries | wc -l)
 unset HA_AUTO_REFINE
@@ -128,7 +126,7 @@ echo '{"autoRefine": {"turnInterval": 1}}' > "$HA_HOME/settings.json"
 unset HA_AUTO_REFINE
 agent "$P" k5
 touch "$RX/review5.marker"
-say k5 "Đừng lưu memory hay knowledge, chỉ trả lời. Client API của mình gọi lại khi lỗi 503: mình chốt là chờ 1 giây, rồi gấp đôi mỗi lần (exponential backoff), tối đa 30 giây và 6 lần thử. Giải thích ngắn vì sao nên thêm jitter ngẫu nhiên vào thời gian chờ." | tail -4
+say k5 "Lượt này bạn đừng tự gọi tool memory hay knowledge, chỉ trả lời. Một quy ước lâu dài của dự án này mà mình muốn được nhớ ở các lần sau: tên nhánh git luôn theo dạng feat/<mô-tả-ngắn>. Client API của mình gọi lại khi lỗi 503: mình chốt là chờ 1 giây, rồi gấp đôi mỗi lần (exponential backoff), tối đa 30 giây và 6 lần thử. Giải thích ngắn vì sao nên thêm jitter ngẫu nhiên vào thời gian chờ." | tail -4
 for _ in $(seq 1 18); do find "$D/sessions" -name review_watermark -newer "$RX/review5.marker" | grep -q . && break; sleep 10; done
 sleep 5
 check "the review ran" 'find "$D/sessions" -name review_watermark -newer "$RX/review5.marker" | grep -q .'
