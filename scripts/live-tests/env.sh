@@ -45,9 +45,10 @@ say() {
 }
 
 # What the agents answered, without the prompts (which name the values checked).
-ans() { grep -av '^> ' "$LOG"; }
+# A prompt is the first `> ` line after its heading; a quote in an answer stays.
+ans() { awk '/^## [0-9]/{p=1} p && /^> /{p=0; next} {print}' "$LOG"; }
 # The answer to the latest message only.
-last() { awk '/^## [0-9]/{block=""} {block=block"\n"$0} END{print block}' "$LOG" | grep -av '^> '; }
+last() { awk '/^## [0-9]/{block=""; p=1} p && /^> /{p=0; next} {block=block"\n"$0} END{print block}' "$LOG"; }
 
 pass=0; fail=0
 check() { if eval "$2"; then echo "PASS  $1"; pass=$((pass+1)); else echo "FAIL  $1"; fail=$((fail+1)); fi; }

@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
-use harness_types::{HarnessError, HostId};
+use harness_store_sqlite::{SqliteStore, StoreError, WriterOpenOptions};
+use harness_types::{ErrorCode, HarnessError, HostId};
 
 /// How long a lease waits for a store another holder is still closing.
 const OPEN_RETRIES: u32 = 30;
@@ -81,6 +81,7 @@ impl SharedStore {
         Ok(StoreLease {
             store,
             owner: Arc::clone(self),
+            ended: false,
         })
     }
 
@@ -134,6 +135,8 @@ impl SharedStore {
 pub struct StoreLease {
     store: Option<Arc<SqliteStore>>,
     owner: Arc<SharedStore>,
+    /// Ended by [`StoreLease::end`]: the drop has nothing left to release.
+    ended: bool,
 }
 
 impl StoreLease {
@@ -145,10 +148,43 @@ impl StoreLease {
     pub fn store(&self) -> Arc<SqliteStore> {
         Arc::clone(self.store.as_ref().expect("a live lease holds the store"))
     }
+
+    /// End the lease now and, when it was the last, close the store before
+    /// returning: a run that owns the project store releases its writer lock
+    /// before it exits, not in a task that may never run.
+    ///
+    /// # Errors
+    /// It was the last lease, but another handle to the store is still held, or
+    /// the store did not close cleanly.
+    pub async fn end(mut self) -> Result<(), HarnessError> {
+        self.ended = true;
+        drop(self.store.take());
+        let mut slot = self.owner.slot.lock().await;
+        slot.leases = slot.leases.saturating_sub(1);
+        if slot.leases > 0 {
+            return Ok(());
+        }
+        let Some(store) = slot.store.take() else {
+            return Ok(());
+        };
+        Arc::try_unwrap(store)
+            .map_err(|_| {
+                HarnessError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "the project store's consumers were not released",
+                )
+            })?
+            .close()
+            .await
+            .map_err(StoreError::into_harness_error)
+    }
 }
 
 impl Drop for StoreLease {
     fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
         // The lease's own handle goes first, so the release can close the store.
         drop(self.store.take());
         let owner = Arc::clone(&self.owner);

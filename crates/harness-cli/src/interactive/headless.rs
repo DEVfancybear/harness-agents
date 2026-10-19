@@ -19,14 +19,14 @@ use harness_runtime::{
     BudgetLedger, EvidenceKind, GoalCriterion, GoalSpec, HumanInputService, RunInbox, RunRequest,
     RuntimeConfig, RuntimeService,
 };
-use harness_store_sqlite::{SqliteStore, StoreError, WriterOpenOptions};
+use harness_store_sqlite::{SqliteStore, StoreError};
 use harness_tools::{
     ApprovalMode, ToolExecutionService, ToolOutput, TurnDriver, TurnObserver, TurnOptions,
     TurnOutcome, TurnProgress, observe_workspace,
 };
 use harness_types::{
     AcceptanceCommand, AcceptanceRecord, BudgetId, ContentHash, CriterionEvidence, CriterionState,
-    CriterionStatus, ErrorCode, HarnessError, HostId, InputId, RuntimeCommandId, SessionId, TaskId,
+    CriterionStatus, ErrorCode, HarnessError, InputId, RuntimeCommandId, SessionId, TaskId,
     ToolOutcomeState,
 };
 
@@ -412,13 +412,13 @@ pub async fn run_with(
     let store_dir = context.project_store_dir();
     // A worker's run leases the store its agents share; the lease is held until
     // the run is done.
+    // A run of its own opens the project's shared store, the one its delegated
+    // children lease: each child opening a writer of its own failed with
+    // `writer_locked` while the run held the lock.
     let (store, lease) = match &run_store {
-        RunStore::Own => (
-            Arc::new(
-                SqliteStore::open_writer(WriterOpenOptions::new(
-                    store_dir.clone(),
-                    HostId::generate(),
-                ))
+        RunStore::Own => {
+            let lease = super::store_lease::SharedStore::for_dir(store_dir.clone())
+                .lease()
                 .await
                 .map_err(|error| {
                     HarnessError::new(
@@ -428,13 +428,12 @@ pub async fn run_with(
                             store_dir.display()
                         ),
                     )
-                })?,
-            ),
-            None,
-        ),
+                })?;
+            (lease.store(), lease)
+        }
         RunStore::Shared(shared) => {
             let lease = shared.lease().await?;
-            (lease.store(), Some(lease))
+            (lease.store(), lease)
         }
     };
     acceptance_trace("writer_opened");
@@ -891,6 +890,9 @@ pub async fn run_with(
                     &serde_json::json!({"notices": notices.len()}),
                 );
                 continuing_from = Some(outcome.session_id.clone());
+                // The finished turn still holds the task; the next one takes it
+                // over, as each turn of the app does.
+                release_task(&store, &next_request.task_id, &observer).await;
                 next_request = RunRequest::new(
                     SessionId::generate(),
                     next_request.task_id.clone(),
@@ -933,6 +935,7 @@ pub async fn run_with(
                     }),
                 );
                 continuing_from = Some(outcome.session_id.clone());
+                release_task(&store, &next_request.task_id, &observer).await;
                 next_request = RunRequest::new(
                     SessionId::generate(),
                     next_request.task_id.clone(),
@@ -1083,19 +1086,12 @@ pub async fn run_with(
         active.shutdown().await;
     }
     drop(runtime);
-    if lease.is_none() {
-        Arc::try_unwrap(store)
-            .map_err(|_| {
-                HarnessError::new(
-                    ErrorCode::StorageWriteFailed,
-                    "headless store consumers were not released",
-                )
-            })?
-            .close()
-            .await
-            .map_err(StoreError::into_harness_error)?;
+    drop(store);
+    // A run of its own closes the store before it returns; a worker's agents
+    // share theirs and keep it open for the next turn.
+    if matches!(run_store, RunStore::Own) {
+        lease.end().await?;
     } else {
-        drop(store);
         drop(lease);
     }
     acceptance_trace("writer_closed");
@@ -1228,6 +1224,22 @@ fn accepted_criteria(
 /// An absent user cannot answer a gate, so every `Ask` decision must refuse.
 /// The most turns the children's reports may open after the first.
 const CHILD_TURNS: u32 = 8;
+
+/// Let the next turn of a run take its task over from the turn that finished.
+///
+/// A finished turn's session keeps the task's lease in the open store, and a
+/// new session of the same host could not claim it: `ha exec`'s turn for its
+/// children's reports failed with `task_lease_conflict`.
+async fn release_task(store: &SqliteStore, task_id: &TaskId, observer: &HeadlessObserver) {
+    if let Err(error) = store.release_task_lease(task_id).await {
+        observer.stream_event(
+            "notice",
+            &serde_json::json!({
+                "message": format!("the previous turn's hold on the task was kept: {error}")
+            }),
+        );
+    }
+}
 
 /// The longest a run waits for its children to settle.
 const CHILD_WAIT: std::time::Duration = std::time::Duration::from_mins(30);

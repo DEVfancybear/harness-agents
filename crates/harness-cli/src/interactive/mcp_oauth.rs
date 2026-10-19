@@ -161,7 +161,25 @@ fn server_metadata(value: &serde_json::Value, issuer: &str) -> Result<ServerMeta
 
 /// One HTTP exchange on a private runtime: status, `WWW-Authenticate`,
 /// content type and body. Errors name the host only.
+///
+/// The runtime runs on a thread of its own: `ha mcp login` is called from
+/// inside the CLI's runtime, where blocking on another one panics ("Cannot
+/// start a runtime from within a runtime").
 fn http(
+    method: &str,
+    url: &str,
+    content_type: Option<&str>,
+    body: Option<String>,
+) -> Result<(u16, Option<String>, Option<String>, String), String> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| http_exchange(method, url, content_type, body))
+            .join()
+            .unwrap_or_else(|_| Err(format!("{method} to the authorization server failed")))
+    })
+}
+
+fn http_exchange(
     method: &str,
     url: &str,
     content_type: Option<&str>,
@@ -627,6 +645,20 @@ pub fn bearer(auth_path: &Path, server: &str, url: &str) -> Result<Option<String
 
 #[cfg(test)]
 mod tests {
+
+    /// `ha mcp login` runs inside the CLI's runtime: an exchange there is an
+    /// answer or an error, never the panic of a runtime started in a runtime.
+    #[tokio::test]
+    async fn an_exchange_inside_a_runtime_does_not_panic() {
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("a port")
+            .local_addr()
+            .expect("address")
+            .port();
+        let error = super::http("GET", &format!("http://127.0.0.1:{port}/x"), None, None)
+            .expect_err("nothing listens there");
+        assert!(error.contains("127.0.0.1"), "{error}");
+    }
 
     /// prime-agent ee1e531e: the client's registered callback port, or an
     /// error naming it when another program holds it.

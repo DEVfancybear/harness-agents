@@ -4037,6 +4037,19 @@ impl RuntimeService {
             let whole = self
                 .whole_conversation_summary(session_id, budget, guidance.as_deref())
                 .await;
+            // A summary the user cancelled is no reason to publish the
+            // fallback: the compaction stops, and the checkpoint stays as it was.
+            if turn_cancellation().is_cancelled() {
+                let mut canceled = Map::new();
+                canceled.insert("reason".to_owned(), Value::String("canceled".to_owned()));
+                let _ = session
+                    .append_runtime_event(session_id, &task_id, "compaction.canceled", canceled, false)
+                    .await;
+                return Err(RuntimeError::new(
+                    ErrorCode::ProviderCanceled,
+                    "the compaction was canceled; the checkpoint was kept unchanged",
+                ));
+            }
             let summary = if let Ok(Some(text)) = whole {
                 Ok(text)
             } else if previous_in_conversation(&self.store, session_id)

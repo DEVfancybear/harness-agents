@@ -13,7 +13,8 @@ set -u
 source "$(dirname "$0")/env.sh"
 fresh prime
 export HA_AUTO_REFINE=off HA_PYTHON=${HA_PYTHON:-$PY}
-HERE=$(cd "$(dirname "$0")" && pwd)
+# A Windows path where there is one: Python cannot open /f/... paths.
+HERE=$(cd "$(dirname "$0")" && (pwd -W 2>/dev/null || pwd))
 project "$RX/p"
 screen() { "$PY" "$HERE/screen.py" "$1"; }
 seconds() { awk '/^## [0-9]/{s=""} /^_\([0-9]+s\)_$/{gsub(/[_()s]/,""); s=$0} END{print s}' "$LOG"; }
@@ -56,9 +57,20 @@ screen "$RX/stash.bin" > "$RX/stash.txt"
 check "the draft is back in the editor" "grep -q 'ban nhap do dang' '$RX/stash.txt'"
 
 echo "################ 6. Ctrl-C stops a running summary"
-(cd "$RX/p" && "$PROBE" "$RX/compact.bin" "$HA" "wait:4000,key:/compact,enter,wait:2500,ctrlc,wait:5000" -- attach r1 >/dev/null)
-screen "$RX/compact.bin" > "$RX/compact.txt"
-check "the summary was cancelled, not finished" "! grep -qi 'compacted through' '$RX/compact.txt' && grep -qi 'cancel' '$RX/compact.txt'"
+# The checkpoints the store holds: a finished /compact writes one.
+checkpoints() { "$PY" - "$HA_HOME/data/projects" <<'EOF'
+import glob, os, sqlite3, sys
+print(sum(sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select count(*) from context_checkpoints").fetchone()[0]
+          for db in glob.glob(os.path.join(sys.argv[1], "*", "harness.sqlite3"))))
+EOF
+}
+before=$(checkpoints)
+"$HA" send r1 "/compact" >/dev/null 2>&1
+sleep 3
+"$HA" abort r1 > "$RX/abort.txt" 2>&1
+sleep 30
+cat "$RX/abort.txt"
+check "the summary was cancelled, not finished" "[ \"\$(checkpoints)\" -eq $before ]"
 started=$(date +%s)
 say r1 "Trả lời đúng một từ: PONG" | tail -1
 check "the agent is free again at once ($(( $(date +%s) - started ))s)" "[ $(( $(date +%s) - started )) -lt 60 ] && last | grep -q 'PONG'"
@@ -95,14 +107,30 @@ cat > "$HA_HOME/models.json" <<EOF
 EOF
 echo '{"compaction": {"thresholdPercent": 20}}' > "$HA_HOME/settings.json"
 agent "$RX/p" r10
-(cd "$RX/p" && "$PROBE" "$RX/threshold.bin" "$HA" "wait:4000,key:Doc toan bo file big.txt bang read_file (doc het moi phan) roi cho biet dong cuoi cung.,enter,wait:240000" -- attach r10 >/dev/null)
-check "the session compacted at 20% of the window" "grep -a -q 'context:' '$RX/threshold.bin'"
+# Six turns of about 7.5k tokens each (an earlier turn replays a result up to
+# 32,000 characters): past 20% of the 200k window (40k), far below the default
+# 95%. The summary of the earlier turns is kept in the store.
+for i in 0 1 2 3 4 5; do
+  say r10 "Trong python_repl chạy đúng một cell: print(open('big.txt', encoding='utf-8').read()[$((i * 30000)):$(((i + 1) * 30000))]) rồi trả lời đúng một từ: XONG$i" | tail -1
+done
+say r10 "Trả lời đúng một từ: PONG" | tail -1
+summaries() { "$PY" - "$HA_HOME/data/projects" <<'EOF'
+import glob, os, sqlite3, sys
+count = 0
+for db in glob.glob(os.path.join(sys.argv[1], "*", "harness.sqlite3")):
+    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    count += c.execute("select count(*) from session_settings where setting_key='rolling_summary'").fetchone()[0]
+print(count)
+EOF
+}
+check "the session compacted at 20% of the window" "[ \"\$(summaries)\" -gt 0 ]"
+check "it still answers after compacting" "last | grep -q 'PONG'"
 "$HA" shutdown --force >/dev/null 2>&1
 rm -f "$HA_HOME/settings.json"
 
 echo "################ 11. ha exec delegates and waits for its children"
 mkdir -p "$RX/p/a" "$RX/p/b"; for i in 1 2 3; do echo x > "$RX/p/a/$i.txt"; done; for i in 1 2; do echo x > "$RX/p/b/$i.txt"; done
-(cd "$RX/p" && "$HA" exec "Dùng tool delegate với wait=false để khởi chạy hai explorer song song: một đếm số file .txt trong thư mục a, một đếm trong thư mục b; mỗi explorer chỉ trả lời bằng một con số. Không tự đếm, không chờ chúng trong lượt này: kết thúc lượt ngay. Khi nhận được kết quả của cả hai thì trả lời đúng dạng A=<số> B=<số>." --model "$MODEL" --output-format text > "$RX/exec.txt" 2>&1)
+(cd "$RX/p" && "$HA" exec "Dùng tool delegate với wait=false để khởi chạy hai explorer song song: một đếm số file .txt trong thư mục a, một đếm trong thư mục b; mỗi explorer chỉ trả lời bằng một con số. Không tự đếm, không chờ chúng trong lượt này: kết thúc lượt ngay. Khi nhận được kết quả của cả hai thì trả lời đúng dạng A=<số> B=<số>." --model "$MODEL" --approval full-auto --output-format text > "$RX/exec.txt" 2>&1)
 tail -5 "$RX/exec.txt"
 check "the run waited and reported both children" "grep -q 'A=3' '$RX/exec.txt' && grep -q 'B=2' '$RX/exec.txt'"
 
