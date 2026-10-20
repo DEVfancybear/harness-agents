@@ -46,7 +46,7 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
 /// fits beside the left end rather than a half-written number.
 fn compose(
     left: Vec<Span<'static>>,
-    tails: &[Vec<Span<'static>>],
+    tails: &[Vec<Vec<Span<'static>>>],
     width: u16,
     theme: &Theme,
 ) -> Line<'static> {
@@ -89,11 +89,12 @@ fn compose(
         push(span);
     }
 
-    let fits = |tail: &[Span<'static>]| -> Option<usize> {
+    let fits = |tail: &[Vec<Span<'static>>]| -> Option<usize> {
         // A kept readout costs its own cells plus the ` · ` that joins it to the
         // one before it.
         let cells: usize = tail
             .iter()
+            .flatten()
             .map(|span| super::composer::display_width(&span.content))
             .sum::<usize>()
             + tail.len().saturating_sub(1) * 3;
@@ -102,20 +103,24 @@ fn compose(
     if let Some(tail) = tails.iter().find(|tail| fits(tail).is_some()) {
         let gap = fits(tail).unwrap_or(0);
         spans.push(Span::raw(" ".repeat(gap)));
-        for (index, span) in tail.iter().enumerate() {
+        for (index, readout) in tail.iter().enumerate() {
             if index > 0 {
                 spans.push(Span::styled(" · ", theme.dim));
             }
-            spans.push(span.clone());
+            spans.extend(readout.iter().cloned());
         }
     }
     Line::from(spans)
 }
 
+/// The right end's choices, richest first: each a list of readouts, each
+/// readout its spans.
+type Readouts = Vec<Vec<Vec<Span<'static>>>>;
+
 /// The two ends of the status row, before the width decides what fits.
 #[must_use]
 #[allow(clippy::too_many_lines, reason = "one arm per phase and panel")]
-fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'static>>>) {
+fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Readouts) {
     let mut spans: Vec<Span<'static>> = Vec::new();
     // What the session has spent and how full its context is are readouts, not
     // activities: they belong at the right edge, where they can be found without
@@ -123,7 +128,7 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
     // what the app is doing with them.
     // The readouts, richest set first. What a narrow console keeps is the context
     // gauge, because it is the one number nothing else on the screen repeats.
-    let telemetry = |theme: &Theme| -> Vec<Vec<Span<'static>>> {
+    let telemetry = |theme: &Theme| -> Readouts {
         let cost = cost_label(state).map(|cost| Span::styled(cost, theme.dim));
         // How much of the session's prompt came from the provider's cache: a
         // falling share is the first sign a prefix stopped holding still.
@@ -132,18 +137,24 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
         // wrapped on the last line and scrolled the whole screen by one.
         let cache =
             cache_label(state).map(|share| Span::styled(format!("↯ cache {share}"), theme.dim));
-        let context =
-            context_label(state).map(|value| Span::styled(format!("◔ ctx {value}"), theme.dim));
+        // herdr's gauge where there is room for it, the bare number where not.
+        let gauge = context_label(state).map(|value| context_gauge(&value, theme));
+        let context = context_label(state)
+            .map(|value| vec![Span::styled(format!("◔ ctx {value}"), theme.dim)]);
         let detail = (matches!(state.phase, AppPhase::Ready | AppPhase::WaitingInput)
             && state.modal.is_none())
         .then(|| Span::styled(state.detail.hint(), theme.dim));
-        let joined = |parts: Vec<Option<Span<'static>>>| -> Vec<Span<'static>> {
+        let one = |span: Option<Span<'static>>| span.map(|span| vec![span]);
+        let joined = |parts: Vec<Option<Vec<Span<'static>>>>| -> Vec<Vec<Span<'static>>> {
             parts.into_iter().flatten().collect()
         };
+        let (cost, cache, detail) = (one(cost), one(cache), one(detail));
         vec![
-            joined(vec![cost.clone(), cache.clone(), context.clone(), detail]),
+            joined(vec![cost.clone(), cache.clone(), gauge.clone(), detail]),
+            joined(vec![cost.clone(), cache.clone(), gauge.clone()]),
             joined(vec![cost.clone(), cache, context.clone()]),
             joined(vec![cost, context.clone()]),
+            joined(vec![gauge]),
             joined(vec![context]),
             Vec::new(),
         ]
@@ -351,6 +362,39 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
     (spans, telemetry(theme))
 }
 
+/// herdr's context gauge: `ctx ━━━━━─── 42% of 200k`, the bar in green, yellow
+/// or red as the context fills.
+fn context_gauge(label: &str, theme: &Theme) -> Vec<Span<'static>> {
+    const CELLS: usize = 8;
+    let percent = label
+        .split('%')
+        .next()
+        .and_then(|number| number.trim().parse::<f64>().ok());
+    let Some(percent) = percent else {
+        return vec![Span::styled(format!("ctx {label}"), theme.dim)];
+    };
+    let share = (percent / 100.0).clamp(0.0, 1.0);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a share of eight cells"
+    )]
+    let filled = ((share * 8.0).round() as usize).min(CELLS);
+    let fill = if percent >= 85.0 {
+        theme.error
+    } else if percent >= 60.0 {
+        theme.warning
+    } else {
+        theme.tool_ok
+    };
+    vec![
+        Span::styled("ctx ", theme.dim),
+        Span::styled("━".repeat(filled), fill),
+        Span::styled("─".repeat(CELLS - filled), theme.border),
+        Span::styled(format!(" {label}"), theme.dim),
+    ]
+}
+
 /// How full the context is, once a response has said.
 fn context_label(state: &UiState) -> Option<String> {
     state
@@ -376,7 +420,7 @@ fn cost_label(state: &UiState) -> Option<String> {
 }
 
 /// The model name without the endpoint it is reached through.
-fn short_model(state: &UiState) -> Option<String> {
+pub fn short_model(state: &UiState) -> Option<String> {
     let model = model_label(state)?;
     Some(
         model

@@ -91,7 +91,7 @@ impl LaunchContext {
         )
         .files
         .len();
-        vec![
+        let mut lines = vec![
             format!("Harness Agents {}", env!("CARGO_PKG_VERSION")),
             format!(
                 "Project: {}    Provider: {provider}",
@@ -99,6 +99,11 @@ impl LaunchContext {
             ),
             "Session: new    Mode: trusted host".to_owned(),
             format!("Git:     {git}"),
+        ];
+        if let Some(branch) = self.git_root.as_deref().and_then(git_branch) {
+            lines.push(format!("Branch: {branch}"));
+        }
+        lines.extend([
             format!("AGENTS.md: {instruction_count} files"),
             format!(
                 "Config:  {} [{}]",
@@ -111,7 +116,8 @@ impl LaunchContext {
                 self.paths.data_origin.label()
             ),
             format!("Store:   {}", self.project_store_dir().display()),
-        ]
+        ]);
+        lines
     }
 
     /// Setup instructions when the app cannot dispatch work yet.
@@ -315,6 +321,35 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The branch checked out at `root`, read from its `HEAD` without running Git:
+/// the name after `refs/heads/`, or the commit's first seven characters when
+/// the head is detached. A worktree's `.git` is a file naming its git directory.
+#[must_use]
+pub fn git_branch(root: &Path) -> Option<String> {
+    let dot_git = root.join(".git");
+    let git_dir = if dot_git.is_file() {
+        let pointer = std::fs::read_to_string(&dot_git).ok()?;
+        let target = pointer.trim().strip_prefix("gitdir:")?.trim();
+        root.join(target)
+    } else {
+        dot_git
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    match head.strip_prefix("ref:") {
+        Some(reference) => {
+            let reference = reference.trim();
+            Some(
+                reference
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(reference)
+                    .to_owned(),
+            )
+        }
+        None => (head.len() >= 7).then(|| head.chars().take(7).collect()),
+    }
+}
+
 /// Drop the Windows verbatim prefix so paths stay readable in the header.
 fn displayable(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
@@ -337,11 +372,51 @@ fn displayable(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{CREDENTIAL_VARIABLES, LaunchRequest, ProviderState, displayable, resolve};
+    use super::{
+        CREDENTIAL_VARIABLES, LaunchRequest, ProviderState, displayable, git_branch, resolve,
+    };
     use crate::interactive::credentials::{self, CredentialSource};
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
     use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
     use harness_types::{ErrorCode, HostId};
+
+    #[test]
+    fn the_branch_is_read_from_head_in_a_repository_and_a_worktree() {
+        let temp = tempfile::tempdir().expect("temp");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::write(
+            repo.join(".git/HEAD"),
+            "ref: refs/heads/feat/sidebar
+",
+        )
+        .expect("head");
+        assert_eq!(git_branch(&repo).as_deref(), Some("feat/sidebar"));
+
+        // A worktree's `.git` is a file naming its git directory.
+        let tree = temp.path().join("tree");
+        let git_dir = repo.join(".git/worktrees/tree");
+        std::fs::create_dir_all(&git_dir).expect("worktree git dir");
+        std::fs::create_dir_all(&tree).expect("worktree");
+        std::fs::write(
+            git_dir.join("HEAD"),
+            "0123456789abcdef
+",
+        )
+        .expect("head");
+        std::fs::write(
+            tree.join(".git"),
+            format!(
+                "gitdir: {}
+",
+                git_dir.display()
+            ),
+        )
+        .expect("pointer");
+        assert_eq!(git_branch(&tree).as_deref(), Some("0123456"), "detached");
+
+        assert_eq!(git_branch(temp.path()), None, "not a repository");
+    }
 
     struct Fixture {
         temp: tempfile::TempDir,

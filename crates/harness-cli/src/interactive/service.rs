@@ -691,6 +691,7 @@ pub trait SessionPort: Send {
         super::tui::fullscreen::Prefs {
             enabled: false,
             mouse: false,
+            sidebar: false,
         }
     }
     /// prime-agent's `setFullscreen`: keep the choice for later launches.

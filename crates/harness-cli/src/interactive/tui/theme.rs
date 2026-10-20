@@ -1,9 +1,10 @@
-//! Palette and glyphs for the TUI: the app's own `aurora` theme.
+//! Palette and glyphs for the TUI: Catppuccin Mocha, as herdr draws it.
 //!
 //! The token names are prime-agent's (`prime.json` "vars", so a style keeps its
-//! meaning: `toolPanelBg` is still the panel behind a tool), but the values are the
-//! app's own: a graphite surface with an indigo accent and a cyan rail for the
-//! operator's own turns. A dark palette in true colour, quantised to the 256-colour
+//! meaning: `toolPanelBg` is still the panel behind a tool), but the values are
+//! herdr's default palette: soft text on a mantle surface, a blue accent for what
+//! has the focus, mauve for branches, and yellow, green and red for an agent that
+//! is working, done or blocked. A dark palette in true colour, quantised to the 256-colour
 //! cube when the terminal does not say it renders true colour (`COLORTERM=truecolor|24bit`, Windows
 //! Terminal's `WT_SESSION`, and the terminals that set `TERM_PROGRAM`). `NO_COLOR` or
 //! `TERM=dumb` selects [`Theme::plain`], which keeps every glyph and the layout but
@@ -11,61 +12,63 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
-/// prime-agent's base colours (`prime.json` "vars").
+/// prime-agent's base colours (`prime.json` "vars"), valued as Catppuccin Mocha.
 mod palette {
-    pub const FG: u32 = 0xe8_ea_f2;
-    pub const MUTED: u32 = 0x9c_a4_b8;
-    pub const DIM: u32 = 0x6b_73_85;
-    pub const GRID: u32 = 0x2c_33_42;
-    pub const SURFACE: u32 = 0x0e_11_17;
-    pub const SELECTED_BG: u32 = 0x1e_24_31;
-    pub const USER_MSG_BG: u32 = 0x14_19_23;
-    pub const PRIMARY: u32 = 0x2d_d4_bf;
-    pub const PRIMARY_SOFT: u32 = 0x99_f6_e4;
-    pub const SUCCESS: u32 = 0x4a_de_80;
-    pub const WARNING: u32 = 0xfb_bf_24;
-    pub const ERROR: u32 = 0xf8_71_71;
-    pub const INFO: u32 = 0x38_bd_f8;
-    pub const STRING_MINT: u32 = 0x7d_d3_a8;
-    pub const MD_BODY: u32 = 0xd6_da_e4;
-    pub const MD_CODE: u32 = 0xc8_ce_da;
-    pub const DIFF_ADDED: u32 = 0x4a_de_80;
-    pub const DIFF_REMOVED: u32 = 0xf8_71_71;
-    pub const REFINEMENT: u32 = 0x7d_d3_fc;
-    pub const NEUTRAL: u32 = 0xd6_da_e4;
+    pub const FG: u32 = 0xcd_d6_f4;
+    pub const MUTED: u32 = 0xa6_ad_c8;
+    pub const DIM: u32 = 0x6c_70_86;
+    pub const GRID: u32 = 0x45_47_5a;
+    pub const SURFACE: u32 = 0x18_18_25;
+    pub const SELECTED_BG: u32 = 0x31_32_44;
+    pub const USER_MSG_BG: u32 = 0x1e_1e_2e;
+    pub const PRIMARY: u32 = 0x89_b4_fa;
+    pub const PRIMARY_SOFT: u32 = 0xb4_be_fe;
+    pub const SUCCESS: u32 = 0xa6_e3_a1;
+    pub const WARNING: u32 = 0xf9_e2_af;
+    pub const ERROR: u32 = 0xf3_8b_a8;
+    pub const INFO: u32 = 0x74_c7_ec;
+    pub const STRING_MINT: u32 = 0xa6_e3_a1;
+    pub const MD_BODY: u32 = 0xcd_d6_f4;
+    pub const MD_CODE: u32 = 0xba_c2_de;
+    pub const DIFF_ADDED: u32 = 0xa6_e3_a1;
+    pub const DIFF_REMOVED: u32 = 0xf3_8b_a8;
+    pub const REFINEMENT: u32 = 0x89_dc_eb;
+    pub const NEUTRAL: u32 = 0xcd_d6_f4;
     /// A changed line's block behind it: a tint dark enough to read text on.
-    pub const DIFF_ADDED_BG: u32 = 0x11_2e_1c;
-    pub const DIFF_REMOVED_BG: u32 = 0x30_16_1a;
+    pub const DIFF_ADDED_BG: u32 = 0x1d_33_26;
+    pub const DIFF_REMOVED_BG: u32 = 0x3a_1e_2a;
     /// The rail before a user turn, and the one before an answer.
-    pub const USER_RAIL: u32 = 0x38_bd_f8;
-    pub const ASSISTANT_RAIL: u32 = 0x2d_d4_bf;
+    pub const USER_RAIL: u32 = 0x89_b4_fa;
+    pub const ASSISTANT_RAIL: u32 = 0xcb_a6_f7;
     /// The border of an idle input box: the accent, quieter.
-    pub const COMPOSER: u32 = 0x2f_8f_86;
+    pub const COMPOSER: u32 = 0x5b_6f_a6;
     /// A pill's background: one step above the panel.
-    pub const CHIP_BG: u32 = 0x1c_22_2e;
+    pub const CHIP_BG: u32 = 0x31_32_44;
     /// The rule that closes a turn, and the one under the banner.
-    pub const RULE: u32 = 0x23_29_36;
+    pub const RULE: u32 = 0x31_32_44;
+    /// A branch name, as herdr's sidebar draws it.
+    pub const BRANCH: u32 = 0xcb_a6_f7;
     /// One colour per family of tool, chosen to stay apart from each other and
     /// from the status colours: a call is recognised by its colour before its words.
-    pub const KIND_READ: u32 = 0x60_a5_fa;
-    pub const KIND_LIST: u32 = 0x22_d3_ee;
-    pub const KIND_SEARCH: u32 = 0xfb_bf_24;
-    pub const KIND_EDIT: u32 = 0xfb_92_3c;
-    pub const KIND_WRITE: u32 = 0xfb_71_85;
-    pub const KIND_SHELL: u32 = 0xf4_72_b6;
-    pub const KIND_GIT: u32 = 0xa3_e6_35;
-    pub const KIND_WEB: u32 = 0x5e_ea_d4;
-    pub const KIND_AGENT: u32 = 0xcb_d5_e1;
-    pub const KIND_PYTHON: u32 = 0xfd_e0_47;
-    pub const KIND_MCP: u32 = 0xfd_a4_af;
-    pub const KIND_SKILL: u32 = 0x86_ef_ac;
-    pub const KIND_ASK: u32 = 0xfd_ba_74;
+    pub const KIND_READ: u32 = 0x89_b4_fa;
+    pub const KIND_LIST: u32 = 0x89_dc_eb;
+    pub const KIND_SEARCH: u32 = 0xf9_e2_af;
+    pub const KIND_EDIT: u32 = 0xfa_b3_87;
+    pub const KIND_WRITE: u32 = 0xeb_a0_ac;
+    pub const KIND_SHELL: u32 = 0xf5_c2_e7;
+    pub const KIND_GIT: u32 = 0xa6_e3_a1;
+    pub const KIND_WEB: u32 = 0x94_e2_d5;
+    pub const KIND_AGENT: u32 = 0xb4_be_fe;
+    pub const KIND_PYTHON: u32 = 0xcb_a6_f7;
+    pub const KIND_MCP: u32 = 0xf2_cd_cd;
+    pub const KIND_SKILL: u32 = 0x74_c7_ec;
+    pub const KIND_ASK: u32 = 0xf5_e0_dc;
     /// The background behind a badge, one tint per meaning.
-    pub const BADGE_OK_BG: u32 = 0x14_3d_24;
-    pub const BADGE_ACCENT_BG: u32 = 0x0f_3f_3b;
-    pub const BADGE_WARN_BG: u32 = 0x45_35_0f;
-    pub const BADGE_ERROR_BG: u32 = 0x4a_1d_22;
-    pub const BADGE_INFO_BG: u32 = 0x0c_33_46;
+    pub const BADGE_OK_BG: u32 = 0x1f_33_29;
+    pub const BADGE_ACCENT_BG: u32 = 0x26_2f_4a;
+    pub const BADGE_WARN_BG: u32 = 0x3b_34_26;
+    pub const BADGE_ERROR_BG: u32 = 0x3d_22_2f;
+    pub const BADGE_INFO_BG: u32 = 0x1f_33_42;
 }
 
 /// prime-agent's `syntax*` tokens: how highlighted code is coloured.
@@ -222,7 +225,7 @@ pub struct Theme {
     pub kinds: [Style; super::icons::ToolKind::COUNT],
     /// A short label on a green tint: active, done.
     pub badge_ok: Style,
-    /// A short label on an indigo tint: where something comes from.
+    /// A short label on a blue tint: where something comes from.
     pub badge_accent: Style,
     /// A short label on an amber tint: something to watch.
     pub badge_warn: Style,
@@ -232,6 +235,8 @@ pub struct Theme {
     pub badge_info: Style,
     /// Bold body text: names and headings inside a panel.
     pub strong: Style,
+    /// A git branch's name (herdr's mauve).
+    pub branch: Style,
 }
 
 impl Theme {
@@ -276,16 +281,16 @@ impl Theme {
                 Depth::TrueColor => bg(palette::DIFF_REMOVED_BG),
                 Depth::Ansi256 => Style::new(),
             },
-            // prime.json: comment muted, keyword and function info, string mint,
-            // number and type warning, the rest neutral.
+            // Catppuccin's code colours: comment dim, keyword mauve, function
+            // blue, string green, number peach, type yellow, the rest neutral.
             syntax: SyntaxStyles {
                 plain: fg(palette::NEUTRAL),
-                comment: fg(palette::MUTED),
-                keyword: fg(palette::INFO),
-                function: fg(palette::INFO),
+                comment: fg(palette::DIM),
+                keyword: fg(palette::BRANCH),
+                function: fg(palette::PRIMARY),
                 variable: fg(palette::NEUTRAL),
                 string: fg(palette::STRING_MINT),
-                number: fg(palette::WARNING),
+                number: fg(palette::KIND_EDIT),
                 kind: fg(palette::WARNING),
                 operator: fg(palette::NEUTRAL),
                 punctuation: fg(palette::NEUTRAL),
@@ -328,6 +333,7 @@ impl Theme {
                 .bg(color(palette::BADGE_INFO_BG, depth))
                 .add_modifier(Modifier::BOLD),
             strong: fg(palette::FG).add_modifier(Modifier::BOLD),
+            branch: fg(palette::BRANCH),
         }
     }
 
@@ -410,6 +416,7 @@ impl Theme {
             badge_error: Style::new().add_modifier(Modifier::BOLD),
             badge_info: Style::new().add_modifier(Modifier::BOLD),
             strong: Style::new().add_modifier(Modifier::BOLD),
+            branch: none,
         }
     }
 

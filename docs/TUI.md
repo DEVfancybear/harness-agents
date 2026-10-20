@@ -18,9 +18,11 @@ under it as warnings. While the card is still on screen, `/model` and `/effort`
 it has scrolled away, the status line is the current source.
 
 **Turns.** Each turn sits on a colored rail: the operator's message on a blue
-rail over a shaded background, the assistant's answer on a teal rail. The palette
-is a teal-accented dark theme (true color where the terminal says it supports it,
-the 256-color cube otherwise). A tool call is one card: a glyph and name in the
+rail over a shaded background, the assistant's answer on a mauve rail. The palette
+is herdr's default, Catppuccin Mocha: soft text, a blue accent for what has the
+focus, mauve for branches, and yellow, green and red for working, done and
+blocked (true color where the terminal says it supports it, the 256-color cube
+otherwise). A tool call is one card: a glyph and name in the
 color of the tool's family (read, list, search, edit, write, shell, git, web,
 agent, Python, MCP), its target in bright text, and the outcome with the duration
 at the right edge. Its output hangs from a rail below, and a diff keeps added and
@@ -45,14 +47,26 @@ after eight rows. Messages queued while a turn runs appear as dim preview rows
 above the box with the hint `/queue to edit queued messages`; the strip is gone
 when the queue is empty.
 
+**Sidebar.** In fullscreen on a console at least 112 columns wide, a sidebar in
+herdr's style sits at the left. `workspace` names the project (with a status dot
+while its agent works or waits), the checked-out branch, the model and thinking
+level, the permission mode, the chat's name and the goal. `agents` lists the
+session's own agent (`main`) and every agent the turn delegated to, each with
+herdr's glyph and word: a spinner and `working`, `◉ blocked` when an approval or a
+question waits for you, `✓ done` for a delegate whose turn ended, `○ idle`; a
+delegate's second row says how many tools it called and the latest. The last row
+points to the agents view (Left on an empty prompt). `terminal.sidebar: false` in
+`settings.json` turns it off; a narrower console never shows it.
+
 **Status line.** Two ends. The left says what the app is doing: spinner, clock,
 `esc to interrupt`, counters, the model and thinking level, and anything that
 needs a decision (an approval's countdown, a selector's keys). The right carries
 telemetry only worth a glance: cost, `↯ cache NN%` (the share of the session's
-prompt served from the provider's cache), `◔ ctx NN%` (how full the context is)
-and the detail mode. A narrow console drops the right end piece by piece (detail
-mode first, then cost and cache), keeping the context gauge last, before it
-truncates the left.
+prompt served from the provider's cache), herdr's context gauge `ctx ━━━━──── NN%`
+(green, then yellow from 60% and red from 85%) and the detail mode. A narrow
+console drops the right end piece by piece (detail mode first, then the gauge for
+the bare `◔ ctx NN%`, then cost and cache), keeping the context readout last,
+before it truncates the left.
 
 **Toasts.** Short confirmations such as a clipboard copy appear as pills over the
 top right for three seconds. A repeat coalesces (`(x3)`), and at most three stack.
@@ -145,7 +159,8 @@ come into view are written, about a tenth of what drawing the whole window again
 sent through a Windows console.
 
 - `/fullscreen` toggles it and saves `terminal.fullscreen` in `settings.json`;
-  `terminal.fullscreenMouse` turns mouse tracking off.
+  `terminal.fullscreenMouse` turns mouse tracking off, and `terminal.sidebar:
+  false` hides the sidebar.
 - `HA_FULLSCREEN=1` forces it on and any other value forces it off, overriding
   the setting.
 

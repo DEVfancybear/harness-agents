@@ -49,12 +49,15 @@ pub const FOLLOW_KEY: &str = "ctrl+end";
 pub struct Prefs {
     pub enabled: bool,
     pub mouse: bool,
+    /// herdr's sidebar: `terminal.sidebar`, on by default.
+    pub sidebar: bool,
 }
 
 /// prime-agent's `getFullscreen` and `getFullscreenMouse`: `HA_FULLSCREEN`
 /// (prime-agent's `PI_FULLSCREEN`: on only for `1`) wins, else
 /// `terminal.fullscreen` in `settings.json`, on by default; the mouse is
-/// `terminal.fullscreenMouse`, on by default.
+/// `terminal.fullscreenMouse`, on by default; the sidebar is `terminal.sidebar`,
+/// on by default.
 #[must_use]
 pub fn prefs(environment: &LaunchEnvironment, config_file: &Path) -> Prefs {
     let terminal = super::super::config::load_setting(config_file, "terminal");
@@ -74,6 +77,7 @@ pub fn prefs(environment: &LaunchEnvironment, config_file: &Path) -> Prefs {
     Prefs {
         enabled,
         mouse: setting("fullscreenMouse").unwrap_or(true),
+        sidebar: setting("sidebar").unwrap_or(true),
     }
 }
 
@@ -126,6 +130,8 @@ pub struct Viewport {
     /// The first frame row a frame selection may start on (the dock's top),
     /// or every row while a panel is open.
     selectable_from: u16,
+    /// The first column of the conversation: the sidebar's width beside it.
+    left: u16,
 }
 
 impl Default for Viewport {
@@ -142,6 +148,7 @@ impl Default for Viewport {
             frame: Buffer::empty(Rect::default()),
             frame_snapshot: None,
             selectable_from: 0,
+            left: 0,
         }
     }
 }
@@ -222,9 +229,13 @@ impl Viewport {
             self.clear_selection();
             return false;
         };
+        if col < self.left {
+            self.clear_selection();
+            return false;
+        }
         let point = Point {
             line,
-            col: usize::from(col),
+            col: usize::from(col - self.left),
         };
         self.anchor = Some(point);
         self.head = Some(point);
@@ -254,6 +265,11 @@ impl Viewport {
         if self.anchor.is_none() {
             return;
         }
+        let col = if self.mode == Some(Mode::Transcript) {
+            col.saturating_sub(self.left)
+        } else {
+            col
+        };
         let line = match self.mode {
             Some(Mode::Transcript) => self.transcript_line(row, true),
             Some(Mode::Frame) => {
@@ -415,9 +431,15 @@ impl Viewport {
             return Vec::new();
         };
         let mut rects = Vec::new();
+        // A transcript selection counts columns from the conversation's edge.
+        let left = if self.mode == Some(Mode::Transcript) {
+            self.left.min(width)
+        } else {
+            0
+        };
         let mut push = |row: u16, (from, to): (usize, usize)| {
-            let from = u16::try_from(from).unwrap_or(u16::MAX).min(width);
-            let to = u16::try_from(to).unwrap_or(u16::MAX).min(width);
+            let from = u16::try_from(from).unwrap_or(u16::MAX).min(width - left) + left;
+            let to = u16::try_from(to).unwrap_or(u16::MAX).min(width - left) + left;
             if to > from {
                 rects.push(Rect::new(from, row, to - from, 1));
             }
@@ -552,6 +574,8 @@ pub struct FullscreenScreen<B: Backend> {
     last_window: Option<(Rect, Rect, usize)>,
     /// How many frames moved the window's rows with the terminal.
     scrolled_frames: u64,
+    /// herdr's sidebar, shown when the console is wide enough for it.
+    sidebar: bool,
 }
 
 impl<B: Backend> FullscreenScreen<B>
@@ -593,7 +617,20 @@ where
             dropped_rows: 0,
             last_window: None,
             scrolled_frames: 0,
+            sidebar: false,
         })
+    }
+
+    /// Show herdr's sidebar beside the conversation on a wide enough console.
+    #[must_use]
+    pub fn with_sidebar(mut self, on: bool) -> Self {
+        self.sidebar = on;
+        self
+    }
+
+    /// The sidebar's columns on a console `columns` wide.
+    fn sidebar_columns(&self, columns: u16) -> u16 {
+        super::sidebar::width(columns, self.sidebar)
     }
 
     /// The conversation it shows, and how many of those entries arrived while
@@ -608,8 +645,11 @@ where
         self.terminal.backend()
     }
 
+    /// The conversation's columns: the console's, less the sidebar's.
     pub fn columns(&self) -> u16 {
-        self.terminal.size().map_or(0, |size| size.width)
+        self.terminal
+            .size()
+            .map_or(0, |size| size.width - self.sidebar_columns(size.width))
     }
 
     pub fn rows_count(&self) -> u16 {
@@ -747,7 +787,9 @@ where
     pub fn draw(&mut self, state: &UiState) -> io::Result<()> {
         self.detail = state.detail;
         let size = self.terminal.size().map_err(to_io)?;
-        self.ensure_rows(size.width);
+        let left = self.sidebar_columns(size.width);
+        self.ensure_rows(size.width - left);
+        self.viewport.left = left;
         let theme = self.theme;
         let rows = &self.rows;
         let viewport = &mut self.viewport;
@@ -767,7 +809,23 @@ where
             let mut frame = self.terminal.get_frame();
             let frame = &mut frame;
             {
-                let area = frame.area();
+                let screen = frame.area();
+                // herdr's sidebar takes the left columns; everything else is
+                // laid out in the rest, as it would be without it.
+                let area = Rect::new(
+                    screen.x + left,
+                    screen.y,
+                    screen.width - left,
+                    screen.height,
+                );
+                if left > 0 {
+                    super::sidebar::render(
+                        frame,
+                        Rect::new(screen.x, screen.y, left, screen.height),
+                        state,
+                        &theme,
+                    );
+                }
                 // prime-agent's top bar is taken from the window, never from the
                 // dock, and goes first when the screen is short.
                 let header = u16::from(area.height > MIN_TRANSCRIPT_ROWS + 8);
@@ -878,7 +936,7 @@ where
                     }
                 }
                 let buffer = frame.buffer_mut();
-                for rect in viewport.highlighted(area.width) {
+                for rect in viewport.highlighted(screen.width) {
                     buffer.set_style(rect, Style::new().add_modifier(Modifier::REVERSED));
                 }
             }

@@ -52,6 +52,50 @@ fn preview_dump() {
             println!("wrote {}", path.display());
         }
     }
+    // The fullscreen app on a wide console, herdr's sidebar beside it: the
+    // finished run with its delegate done, and the same run still working.
+    let mut working = busy();
+    working.name = "11-sidebar-running";
+    working.state.phase = AppPhase::Running;
+    working.state.run_started_at = started(48);
+    working.state.steps = 4;
+    working.state.tool_calls = 9;
+    working.state.open_tools = vec![("run_shell".to_owned(), "npm test".to_owned())];
+    working.state.child_activity = vec![
+        crate::interactive::events::ChildActivity {
+            name: "explorer-3fa1".to_owned(),
+            tool_calls: 7,
+            latest: "read_file src/app/api/orders/route.ts".to_owned(),
+        },
+        crate::interactive::events::ChildActivity {
+            name: "verifier-eac4".to_owned(),
+            tool_calls: 3,
+            latest: "run_process npm test".to_owned(),
+        },
+    ];
+    let mut finished = busy();
+    finished.name = "12-sidebar-done";
+    finished.state.child_activity = working.state.child_activity.clone();
+    for scene in [working, finished] {
+        let path = directory.join(format!("{}.ansi", scene.name));
+        std::fs::write(&path, paint_fullscreen(&scene, 132, 40, &theme)).expect("write the frame");
+        println!("wrote {}", path.display());
+    }
+}
+
+/// Paint one scene through the fullscreen screen, sidebar on.
+fn paint_fullscreen(scene: &Scene, width: u16, height: u16, theme: &Theme) -> String {
+    let mut screen = super::fullscreen::FullscreenScreen::open(
+        TestBackend::new(width, height),
+        theme,
+        scene.state.detail,
+        std::collections::VecDeque::new(),
+    )
+    .expect("open the screen")
+    .with_sidebar(true);
+    screen.insert_history_batch(&scene.items);
+    screen.draw(&scene.state).expect("draw the frame");
+    ansi(screen.backend().buffer())
 }
 
 fn output_directory() -> PathBuf {
@@ -655,7 +699,7 @@ fn banner() -> HistoryItem {
             "Project: C:/work/demo-shop".to_owned(),
             "Service: deepseek-v4-flash via https://api.deepseek.com".to_owned(),
             "Permissions: ask".to_owned(),
-            "Git: master".to_owned(),
+            "Branch: master".to_owned(),
             "Thinking: high".to_owned(),
             "Nhập yêu cầu.".to_owned(),
         ],
@@ -673,6 +717,7 @@ fn state(phase: AppPhase) -> UiState {
         setup_hint: None,
         header: vec![
             "Project: C:/work/demo-shop".to_owned(),
+            "Branch: master".to_owned(),
             "Service: deepseek-v4-flash via https://api.deepseek.com".to_owned(),
             "Permissions: ask".to_owned(),
             "Context: 42% of 200k".to_owned(),

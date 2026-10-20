@@ -323,6 +323,7 @@ pub fn attach(selector: &str) -> Result<ExitCode, HarnessError> {
         super::tui::fullscreen::Prefs {
             enabled: false,
             mouse: false,
+            sidebar: false,
         },
         |paths| super::tui::fullscreen::prefs(&environment, &paths.config_file),
     );

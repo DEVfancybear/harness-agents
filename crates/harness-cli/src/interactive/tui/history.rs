@@ -1071,12 +1071,15 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
             spans.push(Span::raw(" "));
             spans.push(Span::styled(format!(" ✧ {level} "), theme.badge_info));
         }
-        if let Some(git) = lines.iter().find_map(|line| line.strip_prefix("Git: "))
-            && !git.trim().is_empty()
+        if let Some(branch) = lines.iter().find_map(|line| line.strip_prefix("Branch: "))
+            && !branch.trim().is_empty()
         {
-            let git: String = git.trim().chars().take(28).collect();
+            let branch: String = branch.trim().chars().take(28).collect();
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(format!(" ⎇ {git} "), theme.chip));
+            spans.push(Span::styled(
+                format!(" ⎇ {branch} "),
+                theme.branch.patch(theme.chip),
+            ));
         }
         rows.push(row(spans));
     }
@@ -1116,6 +1119,7 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
                 "Project:",
                 "Session:",
                 "Git:",
+                "Branch:",
                 "AGENTS.md:",
                 "Config:",
                 "Data:",

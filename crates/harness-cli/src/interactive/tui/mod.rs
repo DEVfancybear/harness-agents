@@ -23,6 +23,7 @@ mod markdown_table;
 #[cfg(test)]
 mod preview;
 pub mod prompt_highlight;
+pub mod sidebar;
 pub mod theme;
 pub mod toast;
 pub mod widgets;
@@ -481,6 +482,8 @@ pub struct RuntimeRenderer<T: TerminalBackend> {
     screen: Screen,
     /// prime-agent's `fullscreenMouse`: fullscreen tracks the mouse.
     mouse: bool,
+    /// herdr's sidebar beside the conversation (`terminal.sidebar`).
+    sidebar: bool,
     /// An input read while looking for more mouse reports, returned first.
     held: Option<Key>,
 }
@@ -497,6 +500,7 @@ impl<T: TerminalBackend> RuntimeRenderer<T> {
             fullscreen::Prefs {
                 enabled: false,
                 mouse: false,
+                sidebar: false,
             },
         )
     }
@@ -514,6 +518,7 @@ impl<T: TerminalBackend> RuntimeRenderer<T> {
                 ratatui::backend::CrosstermBackend::new(io::stdout()),
             )?)),
             mouse: prefs.mouse,
+            sidebar: prefs.sidebar,
             held: None,
         };
         if prefs.enabled {
@@ -678,7 +683,8 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
                 inline.shown = shown;
                 return Err(error);
             }
-            let screen = fullscreen::FullscreenScreen::open(backend(), &theme, detail, shown)?;
+            let screen = fullscreen::FullscreenScreen::open(backend(), &theme, detail, shown)?
+                .with_sidebar(self.sidebar);
             self.screen = Screen::Fullscreen(Box::new(screen));
         } else {
             let placeholder = Screen::Inline(Box::new(RealRenderer::open(backend())?));
@@ -1062,12 +1068,14 @@ fn run_loop_inner(
                         }
                     }
                 }
-            } else if let Key::Resize { columns, .. } = key {
+            } else if let Key::Resize { .. } = key {
                 // The viewport height cannot change (T01). The terminal re-wraps
                 // what it shows at the new size, the last viewport included, so
                 // the screen is drawn again as prime-agent does on a resize; the
                 // draft is untouched.
-                controller.set_columns(columns);
+                // The conversation's columns, not the console's: the
+                // sidebar keeps its own beside it.
+                controller.set_columns(renderer.columns());
                 effects.push(Effect::Reprint(controller.ui_state().detail));
                 redraw = true;
                 resized_at = Some(Instant::now());

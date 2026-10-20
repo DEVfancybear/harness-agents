@@ -6055,6 +6055,7 @@ impl InteractiveController {
         self.pending_mcp_elicitation = None;
         self.open_tools.clear();
         self.tool_progress.clear();
+        self.refresh_branch();
         self.phase = if self.pending_question.is_some() {
             AppPhase::WaitingInput
         } else if self.setup_required {
@@ -6062,6 +6063,25 @@ impl InteractiveController {
         } else {
             AppPhase::Ready
         };
+    }
+
+    /// Read the checked-out branch again: a turn may have switched it, and the
+    /// sidebar and the banner name it.
+    fn refresh_branch(&mut self) {
+        let branch = self
+            .context
+            .git_root
+            .as_deref()
+            .and_then(super::bootstrap::git_branch);
+        self.header.retain(|line| !line.starts_with("Branch: "));
+        if let Some(branch) = branch {
+            let at = self
+                .header
+                .iter()
+                .position(|line| line.starts_with("Git:"))
+                .map_or(self.header.len(), |index| index + 1);
+            self.header.insert(at, format!("Branch: {branch}"));
+        }
     }
 
     /// Close the turn-wide grant, and tell the port.
