@@ -829,7 +829,7 @@
       "unit_tests": [],
       "fixtures": [
         "crates/harness-cli/src/bin/m12_probe_child.rs",
-        "crates/harness-cli/src/sandbox_cli.rs",
+        "crates/harness-cli/src/commands/sandbox_cli.rs",
         "crates/harness-cli/tests/milestone_m12.rs",
         "crates/harness-store-sqlite/src/store/backend_leases.rs",
         "crates/harness-tools/src/execution/capability.rs",
