@@ -1467,9 +1467,12 @@ mod tests {
             rows.iter()
                 .enumerate()
                 .find_map(|(y, row)| {
+                    // The row's id only: a toast another test pushed (the
+                    // queue is the process's) may be drawn beside it.
                     row.trim()
                         .strip_prefix("ℹ row-")
-                        .map(|rest| (y, rest.to_owned()))
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .map(|id| (y, id.to_owned()))
                 })
                 .expect("a conversation row in view")
         };
