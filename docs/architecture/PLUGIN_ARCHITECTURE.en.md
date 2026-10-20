@@ -52,6 +52,8 @@ The adapter bounds frame size, discovery pages, call arguments, result capture, 
 
 ## 4. Capability model
 
+The table spans protocol responsibilities, not a single manifest enum. Local manifests declare `tools`, `model_provider`, `memory_extractor` or `skills`; MCP separately negotiates tools, resources, prompts and its other protocol features. A capability name alone does not activate an implementation or grant authority.
+
 | Capability | Host requirement | Extension responsibility |
 |---|---|---|
 | Tool | Host policy and approval before execution | Declare input schema and return bounded result/error |
@@ -59,7 +61,7 @@ The adapter bounds frame size, discovery pages, call arguments, result capture, 
 | Prompt/template | Host selects context and provider budget | Declare variables and render deterministic content |
 | Task | Host owns lifecycle, cancellation and receipt | Report progress/result without claiming host acceptance |
 | Skill | Host pins source/version and applies skill policy | Provide bounded instructions/resources; no implicit authority |
-| Transport | Host selects allowed local/loopback transport | Respect frame, timeout and cancellation limits |
+| Transport | Local extensions use stdio; MCP uses stdio or Streamable HTTP; use TLS remotely and reserve cleartext for local fixtures | Respect frame, timeout and cancellation limits; transport is not a sandbox |
 
 A role, skill name, server name or tool name is not an approval. Nested calls re-enter the same host gate and keep the original scope and correlation identifiers.
 
@@ -73,35 +75,10 @@ Extension results are evidence only when the host has persisted the correspondin
 
 ## 6. Configuration and local operation
 
-Configuration resolves before composition. The CLI can mount local extension processes (NDJSON over stdio) and MCP servers over stdio or Streamable HTTP. HTTP MCP requires TLS (cleartext only on loopback) and reads bearer credentials from the environment or from an OAuth sign-in (section 7). The current release matrix is authoritative for platform support. Native-code isolation and OS sandbox claims require separate evidence and are not implied by this contract.
+Configuration resolves before composition. The CLI can mount local extension processes (NDJSON over stdio) and MCP servers over stdio or Streamable HTTP. Use TLS for remote MCP endpoints and reserve cleartext HTTP for local fixtures; the native URL-prefix checks are not a hostname or network-isolation boundary. MCP reads bearer credentials from the environment or from an OAuth sign-in (see the operator guide). The current release matrix is authoritative for platform support. Native-code isolation and OS sandbox claims require separate evidence and are not implied by this contract.
 
-Useful checks include:
+## 7. CLI host composition
 
-```powershell
-cargo test -p harness-kernel --locked
-cargo test -p harness-extensions --locked
-cargo test -p harness-cli --test phase_p6 --locked
-pwsh -NoProfile -File scripts/verify/Verify-Docs.ps1 -SelfTest
-```
+Native CLI hosts such as memory, knowledge, task state and web use the `ExternalTools` catalog/dispatcher seam; they are not automatically subprocess extensions or MCP servers. Every exposed tool still enters the same host policy and approval path.
 
-## 7. What the CLI composes on top
-
-These surfaces live in `harness-cli`; every tool they expose still goes through the host policy gate and approval path described above.
-
-- **MCP servers.** `ha mcp add|list|get|remove|login|logout` and `/mcp` manage user-configured servers (`crates/harness-cli/src/commands/mcp_cli.rs`, `host/integrations/mcp*.rs`). MCP calls are dispatched through `McpToolDispatcher`; the raw client call is not reachable from other crates.
-- **MCP OAuth.** `ha mcp login <name>` signs in to a Streamable HTTP server: protected-resource and authorization-server metadata discovery (RFC 9728 / 8414), dynamic client registration (RFC 7591) unless a client id is configured, and a PKCE authorization-code flow against a loopback callback on ports 53700-53709 (or a pasted redirect URL). Tokens are stored in `auth.json` under `mcp:<server>`, bound to the server URL and token endpoint, and refreshed before expiry. `ha mcp logout` forgets them.
-- **MCP service catalog and `/plugins`.** `/plugins [search]` browses and connects external services. The catalog resolves per id: compiled built-ins, the user's `mcp-services.json`, then a public catalog refreshed daily (a bundled snapshot serves until then). Cards show connection state and never a secret.
-- **Skills.** Skill roots are bundled skills, the user config directory, `~/.agents/skills`, `HA_SKILL_PATHS` and, only for a trusted project, `.harness/skills` and `.agents/skills` up to the repository root. Each source carries a trust level; a skill is instructions, not authority. Skills ha learned itself (`/refine`, `host/memory/learned.rs`) are plain `SKILL.md` folders with a `.ha-learned.json` marker; the model never writes them directly, and a single promotion path lints and lands them.
-- **Packages.** `ha package install|remove|update|list` installs packages of skills, prompt templates and themes from `npm:`, `git:`/URL or local-path sources into user or project (`--local`) settings (`host/integrations/packages/`).
-- **Prompt templates.** Prompt commands load from the `prompts` settings arrays, `.harness/prompts`, the config directory's `prompts/` and package prompts, limited to 256 files and 256 KiB each.
-- **Hooks.** Configured command hooks run for `pre_tool_use`, `post_tool_use`, `stop`, `subagent_stop`, `notification`, `user_prompt_submit`, `session_start`, `session_end` and `pre_compact`; any other event name is a config error.
-
-## 8. Review checklist
-
-- Are required services validated before input admission?
-- Does each registration carry a scope and generation?
-- Are duplicate, stale-generation and cycle cases rejected?
-- Does every extension call have bounded input, output, timeout and cancellation?
-- Do nested tool calls re-enter policy instead of inheriting an unchecked grant?
-- Are shutdown order and uncertain outcomes recorded?
-- Is any isolation claim backed by a platform-specific capability result?
+Skill roots include bundled and user skills, `~/.agents/skills`, `HA_SKILL_PATHS`, and project roots only after project trust. A source's trust level does not grant authority. Prompt contributions are bounded to 256 files of 256 KiB each. For MCP login, skills, packages, templates and hooks, see the [operator guide](../guides/OPERATOR_GUIDE.en.md); for checks, see [build and release](../guides/BUILD_AND_RELEASE.md).

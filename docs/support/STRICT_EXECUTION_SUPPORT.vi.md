@@ -105,21 +105,14 @@ verdict ở trên với lần probe mới trên chính runner đang chạy.
   đọc bộ nhớ của process khác.
 - Một descendant thừa hưởng handle stdio *inheritable* của cha (hành vi Windows). Đó là lý do runner **giết cây
   trước khi drain output**; probe `P-CONT` ghi lại điều này.
-- `tree_cleanup = reaped_on_exit` **không** chứng minh job rỗng khi direct child thoát trước descendant — xem SPEC M12
-  §4b. Không rò rỉ orphan (đã đo), nhưng nhãn thì mạnh hơn bằng chứng.
+- `tree_cleanup = reaped_on_exit` **không** chứng minh job rỗng khi direct child thoát trước descendant. Không rò rỉ orphan (đã đo), nhưng nhãn thì mạnh hơn bằng chứng.
 - Windows và Linux đã được đo trong CI; chưa có E2E trong browser/CI hoặc connector/thông báo ra ngoài.
 
-## 5. Điều gì sẽ đổi ma trận này
+## 5. Lease, artifact và thay đổi capability
 
-Một backend confinement **thật**, với probe xanh **trên host đang chạy**:
+Recovery chỉ dọn backend lease khi **đồng thời** qua ngưỡng tuổi/grace và acquire được ownership lock do OS giữ. Lock còn được giữ trả `still_owned`, không cleanup; thiếu PID hoặc không thấy process cục bộ không phải bằng chứng mất owner. Artifact export bị giới hạn theo root, quota và digest; byte cùng metadata bền trước khi bỏ handle. Backend/capability provenance nằm trong `backend_leases`, không suy từ receipt hay PID.
 
-1. **AppContainer** (`CreateAppContainerProfile` + `STARTUPINFOEX` + capability SID, bỏ `internetClient` để chặn
-   egress): cần một crate **opt-out** khỏi `unsafe_code = "forbid"`, ACL grant cho workspace, và probe chứng minh con
-   **không** đọc được canary ngoài grant.
-2. **WSL / container / VM** (`bubblewrap`, `nsjail`, OCI): chỉ khi host có chúng và version được đo thật.
-
-Cả hai **ngoài quyền của lượt M12** (SPEC §12) và không có trên máy này. Việc đổi ma trận là việc của một ADR kế tiếp
-lật D1/D9 của ADR-N12, kèm probe mới — không phải việc sửa một dòng trong tài liệu này.
+Chỉ thay đổi verdict khi có backend confinement thật và probe chứng minh capability trên chính host đang chạy. Sửa tài liệu hay hạ cấp âm thầm sang containment không phải bằng chứng enforcement.
 
 ## 6. Cách tái tạo
 

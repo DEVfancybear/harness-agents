@@ -10,7 +10,7 @@
 - [Rust](https://rustup.rs). The pinned toolchain in [`rust-toolchain.toml`](../../rust-toolchain.toml) (1.97.1, with `clippy` and `rustfmt`) is installed automatically by the first `cargo` command.
 - PowerShell 7 (`pwsh`) for the scripts, and Git.
 - The MSVC build tools that `rustup` asks for (Visual Studio Build Tools, "Desktop development with C++").
-- [`uv`](https://docs.astral.sh/uv/) for the Python kernel's environment. You do not need to install it yourself: the installer and the release bundle place a pinned, checksum-verified `uv.exe` (0.12.19) next to `ha.exe`, and `ha` looks there first, then `HA_UV`, then `PATH`. On a machine without network access, install uv (`winget install astral-sh.uv`) or copy `uv.exe` next to `ha.exe`.
+- [`uv`](https://docs.astral.sh/uv/) for the Python kernel's environment. You do not need to install it yourself: the installer and the release bundle place a pinned `uv.exe` (0.12.19; downloaded archives are checksum-verified, existing matching-version executables are reused) next to `ha.exe`, and `ha` looks there first, then `HA_UV`, then `PATH`. On a machine without network access, install uv (`winget install astral-sh.uv`) or copy `uv.exe` next to `ha.exe`.
 
 ### 2. Build
 
@@ -52,14 +52,18 @@ Close every running `ha` before installing: Windows does not let a running execu
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+# Prepare and manually verify the candidate in section 5 before this unskipped suite:
+cargo test --workspace --all-targets --locked
+python -m unittest discover -s crates/harness-cli/python/tests -v
 ```
 
-`cargo test` skips the `#[ignore]`d terminal (PTY) cases because they need a real console. Run that suite from a local console with `pwsh -NoProfile -File scripts/testing/Invoke-HaPtyAcceptance.ps1` (see [TUI.md](TUI.md)); `-Filter <name>` runs a subset.
+The Python regressions include mock desktop tests and do not send GUI input. `cargo test` skips the `#[ignore]`d terminal (PTY) cases because they need a real console. Run that opt-in suite from a local console with `pwsh -NoProfile -File scripts/testing/Invoke-HaPtyAcceptance.ps1` (see [TUI.md](TUI.md)); `-Filter <name>` runs a subset. Live provider and desktop probes also remain opt-in.
 
-[`ci.yml`](../../.github/workflows/ci.yml) runs the `scripts/verify/Verify-Phase.ps1` (P0, P3, P5, P6, P7), `scripts/verify/Verify-Milestone.ps1` and `scripts/verify/Verify-HaLaunch.ps1` gates on Windows (the Ubuntu job is non-blocking), and [`docs.yml`](../../.github/workflows/docs.yml) runs `scripts/verify/Verify-Docs.ps1 -SelfTest`. These gates run the whole workspace suite; a test that fails in that crowded run is re-run alone, and the gate fails only when it also fails alone (`GATE_TEST_FAILED`, `GATE_TEST_RETRIED` in the log).
+[`ci.yml`](../../.github/workflows/ci.yml) runs the `scripts/verify/Verify-Phase.ps1` (P0, P3, P5, P6, P7), `scripts/verify/Verify-Milestone.ps1` and `scripts/verify/Verify-HaLaunch.ps1` gates on Windows (the Ubuntu job is non-blocking), and [`docs.yml`](../../.github/workflows/docs.yml) runs `scripts/verify/Verify-Docs.ps1 -SelfTest`. P7 runs broad workspace tests but explicitly skips `m9_04_release_candidate_has_checksums_and_is_not_published`; it then checks required discovery/cases and documentation self-tests, not the candidate. CI's M9 job builds a candidate before its gate. Attributed failures in the broad suite are retried alone up to twice; compile/crash/unattributed failures or failures that persist alone still fail the gate. Inspect `GATE_TEST_FAILED` and `GATE_TEST_RETRIED` rather than treating a retry as a clean first pass.
 
 ### 5. Build a release candidate
+
+For a new `X.Y.Z`, bump `[workspace.package].version` in `Cargo.toml` and all 11 workspace packages in `Cargo.lock`. Leave `npm/harness-agents/package.json` at its source placeholder `0.1.0`: the packer derives the published version from the bundle. Review and commit source/docs/version changes, then require a clean worktree **before** building. The script records `HEAD`, not uncommitted changes, and does not enforce cleanliness itself. Do not use `-SkipBuild` for a new release.
 
 ```powershell
 pwsh -NoProfile -File scripts/release/New-HaRelease.ps1                  # release build + bundle
@@ -71,27 +75,30 @@ It writes `target\release-candidate\ha-<version>-windows-x64\` and a `.zip` of i
 | File | Content |
 | --- | --- |
 | `ha.exe` | The release executable of the revision you built |
-| `uv.exe` | The pinned `uv` the Python kernel builds its environment with (checksum-verified at packaging) |
+| `uv.exe` | The pinned `uv` used by the Python kernel (downloaded archives checksum-verified; existing matching-version executables reused) |
 | `ha.release.json` | Target, version, rustc, source revision and the executable's digest |
 | `checksums.txt` | SHA-256 of every other file in the bundle |
 
-Verify a bundle by hand:
+Verify the intended `target/release-candidate/ha-X.Y.Z-windows-x64` directory and its ZIP by hand. Require exactly the four files above. The bundled `ha.exe --version` and manifest `version` must both read `ha X.Y.Z`; require `profile: Release`, `target: x86_64-pc-windows-msvc`, `build_commit` equal to the clean `git rev-parse HEAD`, and `published: false`. Compare every `checksums.txt` entry with the actual file SHA-256 and the manifest's `sha256` with `ha.exe`. Record the ZIP digest printed by the script and compare it with the downloaded release.
+
+Before the unskipped workspace suite or M9 gate, move aside **all other immediate directories** under `target/release-candidate`, including stale candidates and the script's `uv-cache`; leave only the intended candidate directory. M9 picks the first directory, not the newest/requested version. It checks hashes and some metadata but does not assert intended version, `Release` profile or equality of commit to HEAD; manual checks remain necessary. Then run section 4's unskipped suite and, for candidate acceptance:
 
 ```powershell
-Get-FileHash .\target\release-candidate\ha-*-windows-x64\ha.exe -Algorithm SHA256
-Get-Content  .\target\release-candidate\ha-*-windows-x64\checksums.txt
+pwsh -NoProfile -File scripts/verify/Verify-Milestone.ps1 -Milestone M9
 ```
+
+If reviewed source or version changes, commit, rebuild, isolate and check the new candidate. `published: false` remains candidate provenance, not a live registry-status flag.
 
 Options: `-Profile Debug` for a quick local candidate, `-OutputDirectory <dir>`, `-SkipBuild` to package the binary that already exists.
 
 ### 6. Publish
 
-`New-HaRelease.ps1` never publishes; the GitHub release is created by hand, and publishing to npm then follows automatically (section 7). The flow used for 0.2.2 and 0.2.3:
+`New-HaRelease.ps1` never publishes; the GitHub release is created by hand, and npm publication follows its published-release event (section 7):
 
-1. Bump `version` under `[workspace.package]` in `Cargo.toml` and update the workspace crates' versions in `Cargo.lock` (a plain `cargo build` rewrites them), then commit `chore(release): ha X.Y.Z`.
-2. Run the checks of section 4, then `pwsh -NoProfile -File scripts/release/New-HaRelease.ps1`. It writes `target\release-candidate\ha-X.Y.Z-windows-x64.zip`.
-3. Tag and push: `git tag -a ha-vX.Y.Z -m "ha X.Y.Z"` and `git push origin ha-vX.Y.Z`.
-4. Create the GitHub release with the zip and the bundle's `checksums.txt` plus your notes: `gh release create ha-vX.Y.Z <zip> <checksums.txt> --title "ha X.Y.Z" --notes-file <release-notes.md>`.
+1. Complete the version/clean-commit preparation and candidate build/manual checks in section 5, then the unskipped suite in section 4 and candidate acceptance. Do not publish a stale binary.
+2. Tag that exact commit and push: `git tag -a ha-vX.Y.Z -m "ha X.Y.Z"` and `git push origin ha-vX.Y.Z`.
+3. Publish the GitHub release with the intended ZIP, bundle `checksums.txt` and notes: `gh release create ha-vX.Y.Z <zip> <checksums.txt> --title "ha X.Y.Z" --notes-file <release-notes.md>`.
+4. Let the OIDC npm workflow download and package that ZIP; it does not rebuild Rust. Tag creation alone does not publish npm. Keep tag, bundle and npm versions aligned for a normal release; do not manually publish unrelated bytes under the same version.
 
 `-PublishDryRun` prints the tag, the archive's SHA-256 and the `git tag`, `git push` and `gh release create` commands it would suggest, and whether `gh` or `GH_TOKEN` is available. Publishing the release triggers [`npm-publish.yml`](../../.github/workflows/npm-publish.yml).
 
@@ -126,7 +133,7 @@ The script prints the exact command. The package takes the bundle's version; `-P
 - [Rust](https://rustup.rs). Toolchain được pin trong [`rust-toolchain.toml`](../../rust-toolchain.toml) (1.97.1, kèm `clippy` và `rustfmt`) được cài tự động ở lệnh `cargo` đầu tiên.
 - PowerShell 7 (`pwsh`) để chạy script, và Git.
 - MSVC build tools mà `rustup` yêu cầu (Visual Studio Build Tools, mục "Desktop development with C++").
-- [`uv`](https://docs.astral.sh/uv/) để dựng môi trường cho Python kernel. Bạn không cần tự cài: installer và gói release đặt sẵn một `uv.exe` (0.12.19) đã pin phiên bản và kiểm checksum cạnh `ha.exe`; `ha` tìm uv ở đó trước, rồi tới `HA_UV`, rồi `PATH`. Máy không có mạng thì cài uv (`winget install astral-sh.uv`) hoặc chép `uv.exe` vào cạnh `ha.exe`.
+- [`uv`](https://docs.astral.sh/uv/) để dựng môi trường cho Python kernel. Bạn không cần tự cài: installer và gói release đặt sẵn một `uv.exe` (0.12.19) đã pin phiên bản (archive tải mới được kiểm checksum, executable có sẵn đúng version được dùng lại) cạnh `ha.exe`; `ha` tìm uv ở đó trước, rồi tới `HA_UV`, rồi `PATH`. Máy không có mạng thì cài uv (`winget install astral-sh.uv`) hoặc chép `uv.exe` vào cạnh `ha.exe`.
 
 ### 2. Build
 
@@ -168,14 +175,18 @@ ha --version
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+# Chuẩn bị và kiểm thủ công candidate ở mục 5 trước suite không skip này:
+cargo test --workspace --all-targets --locked
+python -m unittest discover -s crates/harness-cli/python/tests -v
 ```
 
-`cargo test` bỏ qua các ca terminal (PTY) đánh dấu `#[ignore]` vì chúng cần console thật. Chạy bộ này từ một console cục bộ bằng `pwsh -NoProfile -File scripts/testing/Invoke-HaPtyAcceptance.ps1` (xem [TUI.md](TUI.md)); `-Filter <tên>` chạy một phần.
+Regression Python có test desktop mock, không gửi GUI input. `cargo test` bỏ qua các ca terminal (PTY) đánh dấu `#[ignore]` vì chúng cần console thật. Chạy bộ opt-in này từ console cục bộ bằng `pwsh -NoProfile -File scripts/testing/Invoke-HaPtyAcceptance.ps1` (xem [TUI.md](TUI.md)); `-Filter <tên>` chạy một phần. Probe provider live và desktop cũng vẫn cần opt-in.
 
-[`ci.yml`](../../.github/workflows/ci.yml) chạy các gate `scripts/verify/Verify-Phase.ps1` (P0, P3, P5, P6, P7), `scripts/verify/Verify-Milestone.ps1` và `scripts/verify/Verify-HaLaunch.ps1` trên Windows (job Ubuntu không chặn), còn [`docs.yml`](../../.github/workflows/docs.yml) chạy `scripts/verify/Verify-Docs.ps1 -SelfTest`. Các gate này chạy toàn bộ test workspace; test nào fail trong lượt chạy đông đúc đó sẽ được chạy lại riêng, và gate chỉ đỏ khi test cũng fail lúc chạy riêng (`GATE_TEST_FAILED`, `GATE_TEST_RETRIED` trong log).
+[`ci.yml`](../../.github/workflows/ci.yml) chạy các gate `scripts/verify/Verify-Phase.ps1` (P0, P3, P5, P6, P7), `scripts/verify/Verify-Milestone.ps1` và `scripts/verify/Verify-HaLaunch.ps1` trên Windows (job Ubuntu không chặn), còn [`docs.yml`](../../.github/workflows/docs.yml) chạy `scripts/verify/Verify-Docs.ps1 -SelfTest`. P7 chạy test workspace diện rộng nhưng skip rõ `m9_04_release_candidate_has_checksums_and_is_not_published`; sau đó kiểm discovery/case bắt buộc và self-test docs, không chứng nhận candidate. Job M9 của CI build candidate trước khi chạy gate. Test lỗi xác định được trong suite diện rộng được retry riêng tối đa hai lần; lỗi compile/crash/không xác định được test hoặc lỗi vẫn còn khi chạy riêng vẫn làm gate đỏ. Đọc cả `GATE_TEST_FAILED` và `GATE_TEST_RETRIED`, không coi retry là lượt chạy đầu sạch lỗi.
 
 ### 5. Build bản release candidate
+
+Với bản `X.Y.Z` mới, nâng `[workspace.package].version` trong `Cargo.toml` và version của cả 11 package workspace trong `Cargo.lock`. Giữ `npm/harness-agents/package.json` ở placeholder nguồn `0.1.0`: packer lấy version phát hành từ bundle. Review và commit thay đổi source/docs/version, rồi yêu cầu worktree sạch **trước khi** build. Script ghi `HEAD`, không ghi thay đổi chưa commit và không tự kiểm worktree sạch. Không dùng `-SkipBuild` cho release mới.
 
 ```powershell
 pwsh -NoProfile -File scripts/release/New-HaRelease.ps1                  # build release + đóng gói
@@ -187,27 +198,30 @@ Script ghi ra `target\release-candidate\ha-<version>-windows-x64\` và một fil
 | File | Nội dung |
 | --- | --- |
 | `ha.exe` | File thực thi release của revision bạn đã build |
-| `uv.exe` | Bản `uv` đã pin mà Python kernel dùng để dựng môi trường (kiểm checksum khi đóng gói) |
+| `uv.exe` | Bản `uv` đã pin cho Python kernel (archive tải mới được kiểm checksum; executable có sẵn đúng version được dùng lại) |
 | `ha.release.json` | Target, version, rustc, source revision và digest của file thực thi |
 | `checksums.txt` | SHA-256 của mọi file khác trong gói |
 
-Tự kiểm tra một gói:
+Kiểm thủ công đúng thư mục `target/release-candidate/ha-X.Y.Z-windows-x64` và ZIP của nó. Chỉ được có đúng bốn file trên. `ha.exe --version` trong bundle và trường `version` của manifest đều phải là `ha X.Y.Z`; yêu cầu `profile: Release`, `target: x86_64-pc-windows-msvc`, `build_commit` bằng commit sạch từ `git rev-parse HEAD`, và `published: false`. Đối chiếu mọi entry trong `checksums.txt` với SHA-256 file thực và trường `sha256` của manifest với `ha.exe`. Ghi digest ZIP script in ra và đối chiếu với bản tải từ release.
+
+Trước suite workspace không skip hoặc gate M9, chuyển **mọi thư mục con trực tiếp khác** ra ngoài `target/release-candidate`, kể cả candidate cũ và `uv-cache` do script tạo; chỉ để lại đúng thư mục candidate cần kiểm. M9 chọn thư mục đầu tiên, không chọn version mới nhất hay được yêu cầu. Nó kiểm hash và một phần metadata nhưng không assert version dự định, profile `Release` hoặc commit bằng HEAD; vẫn phải kiểm thủ công. Sau đó chạy suite không skip ở mục 4 và, để nghiệm thu candidate:
 
 ```powershell
-Get-FileHash .\target\release-candidate\ha-*-windows-x64\ha.exe -Algorithm SHA256
-Get-Content  .\target\release-candidate\ha-*-windows-x64\checksums.txt
+pwsh -NoProfile -File scripts/verify/Verify-Milestone.ps1 -Milestone M9
 ```
+
+Nếu source đã review hoặc version thay đổi, commit rồi build, cô lập và kiểm lại candidate mới. `published: false` vẫn là provenance của candidate, không phải cờ trạng thái registry trực tiếp.
 
 Tùy chọn: `-Profile Debug` cho bản thử nhanh, `-OutputDirectory <dir>`, `-SkipBuild` để đóng gói bản đã build sẵn.
 
 ### 6. Phát hành
 
-`New-HaRelease.ps1` không bao giờ tự phát hành; GitHub release được tạo bằng tay, rồi việc phát hành lên npm chạy tự động (mục 7). Quy trình đã dùng cho 0.2.2 và 0.2.3:
+`New-HaRelease.ps1` không tự phát hành; GitHub release được tạo bằng tay, rồi sự kiện publish release kích hoạt npm (mục 7):
 
-1. Nâng `version` trong `[workspace.package]` của `Cargo.toml` và cập nhật version các crate workspace trong `Cargo.lock` (một lệnh `cargo build` thường sẽ ghi lại), rồi commit `chore(release): ha X.Y.Z`.
-2. Chạy các kiểm tra ở mục 4, rồi `pwsh -NoProfile -File scripts/release/New-HaRelease.ps1`. Script ghi `target\release-candidate\ha-X.Y.Z-windows-x64.zip`.
-3. Tạo tag và push: `git tag -a ha-vX.Y.Z -m "ha X.Y.Z"` và `git push origin ha-vX.Y.Z`.
-4. Tạo GitHub release kèm zip, `checksums.txt` của bundle và ghi chú: `gh release create ha-vX.Y.Z <zip> <checksums.txt> --title "ha X.Y.Z" --notes-file <release-notes.md>`.
+1. Hoàn tất chuẩn bị version/commit sạch, build và kiểm thủ công candidate ở mục 5, rồi suite không skip ở mục 4 và nghiệm thu candidate. Không publish binary cũ.
+2. Tạo tag tại đúng commit đó và push: `git tag -a ha-vX.Y.Z -m "ha X.Y.Z"` và `git push origin ha-vX.Y.Z`.
+3. Publish GitHub release kèm đúng ZIP, `checksums.txt` của bundle và ghi chú: `gh release create ha-vX.Y.Z <zip> <checksums.txt> --title "ha X.Y.Z" --notes-file <release-notes.md>`.
+4. Để workflow npm OIDC tải và đóng gói ZIP đó; nó không build lại Rust. Chỉ tạo tag chưa publish npm. Release thông thường phải giữ tag, bundle và npm version khớp nhau; không publish thủ công binary không liên quan dưới cùng version.
 
 `-PublishDryRun` in ra tag, SHA-256 của file zip, các lệnh `git tag`, `git push`, `gh release create` mà nó gợi ý, và cho biết `gh` hoặc `GH_TOKEN` có sẵn không. Việc publish release sẽ kích hoạt [`npm-publish.yml`](../../.github/workflows/npm-publish.yml).
 

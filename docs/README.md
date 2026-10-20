@@ -1,54 +1,27 @@
 # Documentation index
 
-Everything an operator, contributor or reviewer reads lives under this folder. The
-restructure that produced this layout moved files only: no contract, constant or
-behaviour changed, and every reference was rewritten to the new path.
+Start with the [project README](../README.md) for installation and a feature
+summary. These guides describe the implemented CLI and host; the workspace layout
+prepares for future app work, but no separate app is shipped.
 
-## Index
+Bắt đầu từ [README của dự án](../README.md) để cài đặt và xem tính năng. Các hướng
+dẫn mô tả CLI và host hiện có; bố cục workspace chuẩn bị cho app sau này, chưa có
+app riêng được phát hành.
 
-| Folder | Documents |
+## Find by task / Tra theo việc cần làm
+
+| Task / Nhu cầu | Read / Tài liệu |
 | --- | --- |
-| `architecture/` | [Workspace folder layout](architecture/WORKSPACE_LAYOUT.md) · [Architecture overview](architecture/ARCHITECTURE_OVERVIEW.en.md) · [Tổng quan kiến trúc](architecture/ARCHITECTURE_OVERVIEW.vi.md) · [Plugin architecture](architecture/PLUGIN_ARCHITECTURE.en.md) · [Kiến trúc plugin](architecture/PLUGIN_ARCHITECTURE.vi.md) |
-| `guides/` | [Operator guide](guides/OPERATOR_GUIDE.en.md) · [Hướng dẫn vận hành](guides/OPERATOR_GUIDE.vi.md) · [Terminal interface](guides/TUI.md) · [Computer use](guides/COMPUTER_USE.md) · [Build and release](guides/BUILD_AND_RELEASE.md) |
-| `adr/` | Decision records ADR-N01 to ADR-N12 |
-| `support/` | [Strict execution support matrix](support/STRICT_EXECUTION_SUPPORT.vi.md) |
-| `assets/` | Screenshots the README and the guides embed |
+| Commands, configuration, memory, knowledge and automation / Lệnh, cấu hình, trí nhớ và tự động hóa | [Operator guide (EN)](guides/OPERATOR_GUIDE.en.md) · [Hướng dẫn vận hành (VI)](guides/OPERATOR_GUIDE.vi.md) |
+| Agent sidebar, child panes and keyboard controls / Sidebar agent, khung agent con và phím tắt | [Terminal interface](guides/TUI.md) |
+| Screenshots, mouse and keyboard on Windows / Chụp màn hình, chuột và bàn phím Windows | [Computer use](guides/COMPUTER_USE.md) |
+| Build, test, package and publish / Build, kiểm thử, đóng gói và phát hành | [Build and release](guides/BUILD_AND_RELEASE.md) |
+| Source ownership, dependencies and folder layout / Trách nhiệm source, dependency và bố cục | [Architecture (EN)](architecture/ARCHITECTURE_OVERVIEW.en.md) · [Kiến trúc (VI)](architecture/ARCHITECTURE_OVERVIEW.vi.md) |
+| Skills, extensions and MCP / Skill, extension và MCP | [Plugin architecture (EN)](architecture/PLUGIN_ARCHITECTURE.en.md) · [Kiến trúc plugin (VI)](architecture/PLUGIN_ARCHITECTURE.vi.md) |
+| Isolation limits and measured support / Giới hạn cô lập và hỗ trợ đã đo | [Strict execution support](support/STRICT_EXECUTION_SUPPORT.vi.md) |
 
-The scripts those documents name live under `scripts/`, grouped by what they do:
-`common/` (shared helpers), `install/`, `release/`, `testing/` (pseudo-terminal
-acceptance, provider smoke test and the live tests) and `verify/` (the phase,
-milestone, launch and documentation gates).
+## Source and test tools / Công cụ source và kiểm thử
 
-## Migration map
-
-Every row is a rename; content changed only where a path was written down.
-
-| Before | After |
-| --- | --- |
-| `scripts/GateTestIsolation.ps1` | `scripts/common/GateTestIsolation.ps1` |
-| `scripts/Get-HaUv.ps1` | `scripts/common/Get-HaUv.ps1` |
-| `scripts/Install-Ha.ps1` | `scripts/install/Install-Ha.ps1` |
-| `scripts/New-HaNpmPackages.ps1` | `scripts/release/New-HaNpmPackages.ps1` |
-| `scripts/New-HaRelease.ps1` | `scripts/release/New-HaRelease.ps1` |
-| `scripts/Invoke-HaPtyAcceptance.ps1` | `scripts/testing/Invoke-HaPtyAcceptance.ps1` |
-| `scripts/Smoke-HaProvider.ps1` | `scripts/testing/Smoke-HaProvider.ps1` |
-| `scripts/Read-HaTranscript.mjs` | `scripts/testing/Read-HaTranscript.mjs` |
-| `scripts/smoke_computer_use.py` | `scripts/testing/smoke_computer_use.py` |
-| `scripts/live-tests/` (twelve files) | `scripts/testing/live-tests/` |
-| `scripts/Verify-Docs.ps1` | `scripts/verify/Verify-Docs.ps1` |
-| `scripts/Verify-HaLaunch.ps1` | `scripts/verify/Verify-HaLaunch.ps1` |
-| `scripts/Verify-Milestone.ps1` | `scripts/verify/Verify-Milestone.ps1` |
-| `scripts/Verify-Phase.ps1` | `scripts/verify/Verify-Phase.ps1` |
-| `docs/ARCHITECTURE_OVERVIEW.en.md` | `docs/architecture/ARCHITECTURE_OVERVIEW.en.md` |
-| `docs/ARCHITECTURE_OVERVIEW.vi.md` | `docs/architecture/ARCHITECTURE_OVERVIEW.vi.md` |
-| `docs/PLUGIN_ARCHITECTURE.en.md` | `docs/architecture/PLUGIN_ARCHITECTURE.en.md` |
-| `docs/PLUGIN_ARCHITECTURE.vi.md` | `docs/architecture/PLUGIN_ARCHITECTURE.vi.md` |
-| `docs/OPERATOR_GUIDE.en.md` | `docs/guides/OPERATOR_GUIDE.en.md` |
-| `docs/OPERATOR_GUIDE.vi.md` | `docs/guides/OPERATOR_GUIDE.vi.md` |
-| `docs/BUILD_AND_RELEASE.md` | `docs/guides/BUILD_AND_RELEASE.md` |
-| `docs/COMPUTER_USE.md` | `docs/guides/COMPUTER_USE.md` |
-| `docs/TUI.md` | `docs/guides/TUI.md` |
-
-## References
-
-- The crate layout this workspace's split was reviewed against: [Prime Agent crates](https://github.com/PrimeIntellect-ai/prime-agent/tree/main/crates).
+Scripts are grouped in `scripts/common/`, `install/`, `release/`, `testing/` and
+`verify/`. See the build guide and live-test README above for current commands.
+/ Script được nhóm theo trách nhiệm; xem hướng dẫn build và README live-test ở trên.

@@ -141,7 +141,8 @@ commands.
 Keys can be rebound in `keybindings.json` next to `settings.json`, using
 prime-agent's binding ids (`tui.editor.*`, `tui.input.*`, `tui.viewport.*`,
 `app.*`). A binding answers only to the keys given, and an empty list turns it
-off. Ids that ha has no action for are ignored.
+off. Ids that ha has no action for are ignored. Restart `ha` after changing the
+file: bindings are loaded once per process.
 
 Hints change when a menu or approval panel owns the keyboard. Approval choices
 are `y` (once), `a` (the rest of this turn) and `n` (refuse).
@@ -201,6 +202,11 @@ Complex joined emoji can still differ in width between terminal emulators.
 
 ## Development and checks
 
+The unskipped workspace suite below needs a prepared release candidate. Build,
+isolate and manually verify the intended candidate first as described in
+[Build and release](BUILD_AND_RELEASE.md#5-build-a-release-candidate); P7 skips
+that artifact check and is not a substitute for candidate acceptance.
+
 ```powershell
 cargo fmt --all -- --check
 cargo test -p harness-cli --bin ha interactive::tui
@@ -216,7 +222,9 @@ cargo test -p harness-cli --bin ha preview_dump -- --ignored --nocapture
 That writes `target/tui-preview/<scene>.ansi` (the screen, with colors) and
 `<scene>.txt` (the whole transcript, unclipped) for a fresh session, a finished
 turn, a streaming turn, an approval, the command menu, an expanded tool, a diff,
-and a failed turn, each at 100x44 and at 80x24.
+and a failed turn, each at 100x44 and at 80x24. Fullscreen sidebar scenes with a
+running agent, a completed agent and an open child pane are also rendered at
+132x40.
 
 Real console checks live in `crates/harness-cli/tests/interactive_terminal.rs`.
 They drive `ha` through a pseudo-console (ConPTY) and cover launch, paste, resize,

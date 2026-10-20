@@ -2,7 +2,7 @@
 
 English | [Tiếng Việt](ARCHITECTURE_OVERVIEW.vi.md)
 
-**Status:** current source-tree guide, 7 October 2026 (`ha` 0.2.3). This document explains the boundaries that are present in the Rust workspace. It is an overview of boundaries, invariants and data flow, not a changelog; when it and the source disagree, the source and its executable tests win.
+**Status:** current source-tree guide. This document explains the boundaries that are present in the Rust workspace. It is an overview of boundaries, invariants and data flow, not a changelog; when it and the source disagree, the source and its executable tests win.
 
 ## 1. Purpose and scope
 
@@ -15,7 +15,7 @@ This overview covers:
 - the authority and security boundaries between those crates;
 - what the architecture does **not** claim to provide.
 
-It does not replace the detailed contracts in [the operator guide](../guides/OPERATOR_GUIDE.en.md), [the plugin architecture](PLUGIN_ARCHITECTURE.en.md), [the terminal interface notes](../guides/TUI.md), or the decision records [ADR-N01](../adr/ADR-N01-DOMAIN-IDENTITY-STATE.en.md), [ADR-N02](../adr/ADR-N02-STORE-OWNERSHIP-DURABILITY.en.md), [ADR-N03](../adr/ADR-N03-EXECUTION-BINDING.en.md) and [ADR-N04](../adr/ADR-N04-PROVIDER-PROTOCOL.en.md).
+It does not replace the detailed contracts in [the operator guide](../guides/OPERATOR_GUIDE.en.md), [the plugin architecture](PLUGIN_ARCHITECTURE.en.md), [the terminal interface notes](../guides/TUI.md).
 
 ## 2. Design in one sentence
 
@@ -97,6 +97,24 @@ harness-cli         -> every crate above
 
 Higher-level crates depend on more than one sibling because they compose a use case. That is different from giving them ownership of the sibling's records. A domain record has one authoritative writer; adding a facade or a crate must not create a second database authority.
 
+### 4.2 Source layout
+
+The eleven crates remain flat peers under `crates/`, with their public module paths and dependency graph unchanged. The CLI entrypoint is `src/main.rs`; handlers live in `src/commands/`, diagnostics in `src/support/`, and interactive/background host code in `src/host/`:
+
+| Host folder | Responsibility |
+|---|---|
+| `application/` | Startup, controller, session service, lifecycle and verification |
+| `configuration/` | Configuration, permissions, paths and resources |
+| `coordination/` | Agents, delegation, goals and scheduling |
+| `integrations/` | Extensions, MCP, packages, Python REPL, skills and web |
+| `memory/` | Continual harness, knowledge, task state and learned skills |
+| `models/` | Catalog, credentials, routing and service tiers |
+| `presentation/` | TUI, terminal input, views, attachments and rendering |
+| `prompting/` | Instructions and bundled prompt assets |
+| `protocols/` | CLI routing, headless mode, RPC and ACP |
+
+Explicit `#[path]` declarations preserve the logical `crate::interactive::*` namespace and test selectors. Libraries group source by responsibility under `src/lib.rs` without adding Rust namespaces. Root manifests, `.agents/skills`, `e2e/`, `npm/`, `schemas/` and `tests/fixtures` retain their paths. Scripts are grouped in `scripts/{common,install,release,testing,verify}`. This layout does not extract an app API.
+
 ## 5. The main request path
 
 ### 5.1 Startup
@@ -106,6 +124,8 @@ Higher-level crates depend on more than one sibling because they compose a use c
 3. The CLI creates the application services it needs: session, runtime, tools, orchestrator, extensions and maintenance.
 4. The kernel validates required service contracts before work is admitted. A missing required provider or incompatible generation is a composition error, not a degraded successful run.
 5. The interactive UI, a headless command, or an RPC/ACP server starts the selected run mode.
+
+Interactive sessions normally attach to a background worker: closing the terminal detaches rather than stopping its turn, children or schedules. `ha agents`, `attach`, `send`, `stop` and `shutdown` manage those workers; `HA_DAEMON=off` or `"daemon": false` keeps the session in the terminal.
 
 An unconfigured provider fails before any state is left behind; a production launch never falls back to a fixture provider.
 
@@ -183,7 +203,7 @@ In an interactive session the model delegates with the `delegate` tool. Children
 
 ### Extensions and MCP
 
-`harness-extensions` supports local extension processes (off unless `HA_EXTENSIONS=on`, started only after the executable digest matches the manifest and the trust grant) and an MCP client built on the `rmcp` SDK. The handshake negotiates protocol versions and capabilities, validates schemas and bounds frames, calls, discovery pages, tasks and cancellation grace periods. MCP over stdio and over Streamable HTTP is supported; HTTP requires TLS (cleartext only on loopback) and reads bearer credentials from the environment or from an OAuth login (`ha mcp login`, PKCE with a loopback callback; tokens are stored in `auth.json` bound to the server). `/plugins` and `/mcp` offer a service catalog (built-ins, the user's `mcp-services.json`, a daily-refreshed public catalog). Discovery is not permission: an MCP or extension tool call is dispatched through the same `harness-tools` policy, approval and receipt path. Skills are composed as bounded, version-pinned contributions; a skill name does not bypass host policy.
+`harness-extensions` supports local extension processes (off unless `HA_EXTENSIONS=on`, started only after the executable digest matches the manifest and the trust grant) and an MCP client built on the `rmcp` SDK. The handshake negotiates protocol versions and capabilities, validates schemas and bounds frames, calls, discovery pages, tasks and cancellation grace periods. MCP over stdio and over Streamable HTTP is supported; Use TLS for remote MCP endpoints and reserve cleartext HTTP for local fixtures; the native URL-prefix checks are not a hostname or network-isolation boundary. MCP reads bearer credentials from the environment or from an OAuth login (`ha mcp login`, PKCE with a loopback callback; tokens are stored in `auth.json` bound to the server). `/plugins` and `/mcp` offer a service catalog (built-ins, the user's `mcp-services.json`, a daily-refreshed public catalog). Discovery is not permission: an MCP or extension tool call is dispatched through the same `harness-tools` policy, approval and receipt path. Skills are composed as bounded, version-pinned contributions; a skill name does not bypass host policy.
 
 Stdio or a child process is a transport boundary, not proof that hostile native code is isolated, and native same-process plugins are trusted code.
 
@@ -195,9 +215,12 @@ These live in `harness-cli` as application-layer features over the services abov
 - **Verification, not self-report.** `[verify]` checks in the project config are run by the harness (when the model calls `goal_complete`, when a feature asks to become passing, as gates of `/autonomous`, and on `/verify`); a failure goes back to the agent with its output and a fix hint. After the checks pass, an independent verifier child (fresh context, read-only tools) judges a goal before it completes. The feature list `.harness/features.json` records each feature's state and evidence; the model can add, start or block a feature but only a passing run of the harness's own commands moves it to `passing`.
 - **Session lifecycle.** The first prompt of a session carries a brief the harness gathers (recent commits, uncommitted changes, the handoff in `.harness/progress.md`). `/handoff` has the agent write that file and `/handoff --reset` starts a fresh conversation from it. `/doctor` and `ha doctor` score a repository on instructions, tools, environment, state and feedback with structural checks only.
 - **Learned state.** `/refine` has a model propose edits to memories, prompt notes, skills and subagent specs, and the host validates and applies them (host-side, no keyword classifier); it can also propose checks, which join `[[verify.checks]]` only after the user accepts them (`/checks accept`). Learned skills are plain `SKILL.md` folders in a global or a trusted-project layer, written only by one promotion function, with a ledger, use counting and archiving.
+- **Task state, memory and knowledge.** The native `task_state` tool keeps the objective, checklist, decisions and constraints outside compaction summaries. `memory` keeps versioned memory/prompt entries in local, project and global scopes; delegated agents receive read-only recall. `knowledge` manages project/global Markdown pages with provenance, hash-checked updates, search and page-link graphs. Delegated agents can only list/search/read/graph; semantic retrieval is used only when embeddings are explicitly configured.
 - **Goals, schedules and autonomy.** Persistent goals (only `goal_complete` finishes one), `/autonomous` continuation within budgets and shell-command gates, steering and follow-up queues, heartbeats and schedules kept under the data directory. Schedules and heartbeats run while a worker keeps the agent alive.
 - **Conversation tree.** Turns form branches; `/tree` navigates them with optional branch summaries, and `/fork` starts a new conversation before one of the user's messages and `/clone` starts one with the whole history.
-- **Python REPL.** The `ipython` tool is a persistent Python kernel (vendored `rlm` runtime under `crates/harness-cli/python`) offered only when Python 3.11+ is found; `HA_REPL=off` removes it. Its host requests are answered by the controller, and orphan kernels from a crashed `ha` are reaped through a journal.
+- **Python REPL.** The `python_repl` tool (`ipython` and `python` remain compatibility aliases) is a persistent Python kernel (vendored `rlm` runtime under `crates/harness-cli/python`) offered only when Python 3.11+ is found; `HA_REPL=off` removes it. Its host requests are answered by the controller, and orphan kernels from a crashed `ha` are reaped through a journal.
+- **Factory execution.** The opt-in `rlm.factory` executor runs validated state machines (or DAG input compiled to machines) through the existing subagent supervisor. It is off by default (`/factory on` enables it); run state is kernel-local and does not survive a kernel restart, even though supervisor-owned children remain discoverable. Wait/watch states are not implemented and are rejected at write time.
+- **Computer use.** The bundled skill uses approval-gated `python_repl` for authorized tasks on the primary unlocked Windows desktop, not a separate GUI application or sandbox. Kernel approval is not per-click permission; consequential actions still require appropriate user confirmation.
 - **Package manager.** `ha package install | remove | update | list` manages `npm:`, git and local-directory sources; a package carries skills, prompts and themes only, and ha executes nothing in it.
 - **Providers and models.** OpenAI Chat, OpenAI Responses, the ChatGPT Codex backend (browser sign-in), Anthropic Messages, plus DeepSeek, OpenCode Zen and OpenCode Go over those wire formats, and user-defined models. The model list is a snapshot in the binary, refreshed at most daily, and a refreshed catalog can only select transports the snapshot already knows, so it cannot redirect where a credential is sent. Credentials live in a separate `auth.json` written by `/login`, never in the strict configuration file.
 
@@ -217,6 +240,13 @@ These live in `harness-cli` as application-layer features over the services abov
 | UI projections | `harness-cli` views over services | Presentation cannot become a second writer |
 
 The core identity chain is project → task → session → run, with typed IDs and workspace observations attached at the boundaries that need them. A new session is not permission to duplicate a task, and a model-visible label is not an authority grant.
+
+### 9.1 Core library contracts
+
+- **Identity and acceptance:** `SessionId`, `TaskId`, `AgentRunId` and `StepId` identify conversation, acceptance unit, execution and model/tool cycle. Session order follows committed sequence, not IDs or timestamps. Worker completion is not task acceptance: required criteria need typed evidence and no pending effects; human acceptance records an override, not a fabricated check pass. Host-created scope cannot be widened by tool arguments.
+- **Store durability:** `writer.lock` protects a data directory and writes check a durable generation fence. The `harness-data.json` marker and schema versions refuse incompatible writes before migration; the marker is first created after successful migration. Read-only opens create and migrate nothing. Writers use WAL with `synchronous=NORMAL`; ACK follows commit. A process crash preserves commits, but an OS crash or power loss may lose recent commits while leaving the database consistent. Artifact bytes are flushed and hashed before committing their reference; collection follows reachability and retention pins.
+- **Execution and delivery:** approval consumption and intent creation are atomic. Grants bind actor, task/session/invocation, action/workspace, policy/tool revisions and expiry; changed bindings refuse dispatch. Host path checks are policy, not OS confinement, and TOCTOU is not eliminated. A possible side effect without confirmed settlement remains unknown and is not automatically rerun. Task settlement and parent delivery commit together; consumption deduplicates by message ID. Branch checks do not prove a merged result: final checks identify the integrated revision.
+- **Provider boundary:** canonical messages retain tool-call/result identities, validated before endpoint-specific wire encoding. Capability claims are `Supported`, `Unsupported` or `Unknown`; unknown may be sent but is not compatibility evidence. Missing terminals and incomplete tool calls are not dispatchable. A transport marker does not overwrite an explicit provider finish reason; limits bound untrusted frames and arguments.
 
 ## 10. Configuration and UI composition
 
@@ -252,7 +282,7 @@ Current limits to preserve in code and docs:
 
 - a background agent lives in its project's worker process: a supervised worker is restarted and its agents come back from the journal, but after a reboot (or if the supervisor is gone) agents return only when `ha agents`/`ha list` runs, and a child that was mid-run comes back as failed;
 - one writable host per data directory;
-- no OS-level sandbox: containment is a process tree, not confinement, unless `ha sandbox` measures otherwise;
+- Windows process-tree containment is not full filesystem/network confinement: `isolation: strict` requests `StrictProfile::Full`, which fails closed with `StrictIsolationUnavailable` when unsupported; explicitly chosen best-effort execution is not strict isolation (see the [support matrix](../support/STRICT_EXECUTION_SUPPORT.vi.md));
 - no guarantee of perfect model reasoning or unlimited context retention;
 - no signed or published release artifact unless the release evidence explicitly says otherwise;
 - provider authentication and paid remote API behavior are not proven by offline/unit gates;
@@ -276,4 +306,3 @@ Tests marked `#[ignore]` (the pseudo-terminal acceptance cases) are skipped by `
 - [Plugin architecture](PLUGIN_ARCHITECTURE.en.md)
 - [Terminal interface](../guides/TUI.md)
 - [Build and release](../guides/BUILD_AND_RELEASE.md)
-- Decision records: [ADR-N01 domain identity and state](../adr/ADR-N01-DOMAIN-IDENTITY-STATE.en.md), [ADR-N02 store ownership and durability](../adr/ADR-N02-STORE-OWNERSHIP-DURABILITY.en.md), [ADR-N03 execution binding](../adr/ADR-N03-EXECUTION-BINDING.en.md), [ADR-N04 provider protocol](../adr/ADR-N04-PROVIDER-PROTOCOL.en.md)

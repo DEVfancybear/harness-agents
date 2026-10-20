@@ -92,6 +92,7 @@ ha                         open the app
 | Keep a lesson as a skill | `/learn [focus]`, then `/skills` |
 | Tune memory, skills and checks | `/refine [instructions]`, `/refine --global`, `/refine --curate`, `/refine --history [N]`, `/refine --rollback <id>`; `/refinements off` turns the whole harness off (saved state is kept) |
 | prime-agent's factories (state machines of child agents) | `/factory on`, `/factory off`, `/factory status` |
+| Search or manage saved research | `/knowledge`, `/knowledge search <query>`, `/knowledge read <path>`; `ha knowledge serve` opens the local console |
 | Shrink a long conversation | `/compact [what to keep]` |
 | Connect services | `/plugins`, `/mcp add`, `/mcp login <service>`, `@server:uri` to attach a resource |
 | Trust this project's config, hooks and MCP | `/trust`, then `/trust yes` |
@@ -165,7 +166,7 @@ CI runs the phase and milestone gates on Windows; a test that fails in the crowd
 ### Documentation
 
 - [Operator guide](docs/guides/OPERATOR_GUIDE.en.md): every command, setting and workflow
-- [Workspace folder layout](docs/architecture/WORKSPACE_LAYOUT.md) · [Documentation index](docs/README.md)
+- [Documentation index](docs/README.md)
 - [Architecture overview](docs/architecture/ARCHITECTURE_OVERVIEW.en.md) · [Terminal interface](docs/guides/TUI.md) · [Plugin architecture](docs/architecture/PLUGIN_ARCHITECTURE.en.md)
 - [Desktop computer use](docs/guides/COMPUTER_USE.md): real screenshots, mouse and keyboard on Windows
 - [Build and release](docs/guides/BUILD_AND_RELEASE.md) · [Changelog](https://github.com/DEVfancybear/harness-agents/releases)
@@ -235,6 +236,7 @@ ha                         mở app
 | Giữ bài học thành skill | `/learn [trọng tâm]`, rồi `/skills` |
 | Tinh chỉnh memory, skill và check | `/refine [chỉ dẫn]`, `/refine --global`, `/refine --curate`, `/refine --history [N]`, `/refine --rollback <id>`; `/refinements off` tắt toàn bộ harness (state đã lưu được giữ) |
 | Factory của prime-agent (máy trạng thái gồm các agent con) | `/factory on`, `/factory off`, `/factory status` |
+| Tìm hoặc quản lý nghiên cứu đã lưu | `/knowledge`, `/knowledge search <query>`, `/knowledge read <path>`; `ha knowledge serve` mở console cục bộ |
 | Rút gọn hội thoại dài | `/compact [điều cần giữ]` |
 | Kết nối dịch vụ | `/plugins`, `/mcp add`, `/mcp login <service>`, `@server:uri` để đính kèm resource |
 | Trust config, hook và MCP của project | `/trust`, rồi `/trust yes` |
@@ -308,7 +310,7 @@ CI chạy các gate phase và milestone trên Windows; test fail trong lượt c
 ### Tài liệu
 
 - [Hướng dẫn vận hành](docs/guides/OPERATOR_GUIDE.vi.md): mọi lệnh, cấu hình và quy trình
-- [Bố cục thư mục workspace](docs/architecture/WORKSPACE_LAYOUT.md) · [Mục lục tài liệu](docs/README.md)
+- [Mục lục tài liệu](docs/README.md)
 - [Tổng quan kiến trúc](docs/architecture/ARCHITECTURE_OVERVIEW.vi.md) · [Giao diện terminal](docs/guides/TUI.md) · [Kiến trúc plugin](docs/architecture/PLUGIN_ARCHITECTURE.vi.md)
 - [Điều khiển máy tính](docs/guides/COMPUTER_USE.md): chụp màn hình, chuột và bàn phím thật trên Windows
 - [Build và release](docs/guides/BUILD_AND_RELEASE.md) · [Changelog](https://github.com/DEVfancybear/harness-agents/releases)

@@ -2,7 +2,7 @@
 
 [English](ARCHITECTURE_OVERVIEW.en.md) | Tiếng Việt
 
-**Trạng thái:** tài liệu hướng dẫn theo source tree hiện tại, ngày 07/10/2026 (`ha` 0.2.3). Tài liệu này giải thích các ranh giới đang có trong workspace Rust. Đây là tổng quan về ranh giới, bất biến và luồng dữ liệu, không phải changelog; khi tài liệu và source khác nhau, source cùng các executable tests là nguồn đúng.
+**Trạng thái:** hướng dẫn source tree hiện tại. Tài liệu này giải thích các ranh giới đang có trong workspace Rust. Đây là tổng quan về ranh giới, bất biến và luồng dữ liệu, không phải changelog; khi tài liệu và source khác nhau, source cùng các executable tests là nguồn đúng.
 
 ## 1. Mục đích và phạm vi
 
@@ -15,7 +15,7 @@ Tổng quan này bao quát:
 - ranh giới authority và bảo mật giữa các crate;
 - những điều kiến trúc **không** tuyên bố cung cấp.
 
-Tài liệu không thay thế các contract chi tiết trong [operator guide](../guides/OPERATOR_GUIDE.vi.md), [plugin architecture](PLUGIN_ARCHITECTURE.vi.md), [ghi chú giao diện terminal](../guides/TUI.md), hay các decision record [ADR-N01](../adr/ADR-N01-DOMAIN-IDENTITY-STATE.vi.md), [ADR-N02](../adr/ADR-N02-STORE-OWNERSHIP-DURABILITY.vi.md), [ADR-N03](../adr/ADR-N03-EXECUTION-BINDING.vi.md) và [ADR-N04](../adr/ADR-N04-PROVIDER-PROTOCOL.vi.md).
+Tài liệu không thay thế các contract chi tiết trong [operator guide](../guides/OPERATOR_GUIDE.vi.md), [plugin architecture](PLUGIN_ARCHITECTURE.vi.md), [ghi chú giao diện terminal](../guides/TUI.md).
 
 ## 2. Kiến trúc trong một câu
 
@@ -97,6 +97,24 @@ harness-cli         -> mọi crate ở trên
 
 Các crate tầng trên phụ thuộc nhiều sibling để compose một use case. Điều đó không trao quyền sở hữu records của sibling cho chúng. Mỗi domain record có một authoritative writer; thêm facade hoặc crate không được tạo database authority thứ hai.
 
+### 4.2 Bố cục source
+
+Mười một crate vẫn nằm ngang hàng trong `crates/`, giữ public module path và dependency graph. Entrypoint CLI là `src/main.rs`; handler nằm trong `src/commands/`, diagnostics trong `src/support/`, code host tương tác/chạy nền trong `src/host/`:
+
+| Folder host | Trách nhiệm |
+|---|---|
+| `application/` | Startup, controller, session service, lifecycle và verification |
+| `configuration/` | Configuration, permissions, paths và resources |
+| `coordination/` | Agents, delegation, goals và scheduling |
+| `integrations/` | Extensions, MCP, packages, Python REPL, skills và web |
+| `memory/` | Continual harness, knowledge, task state và learned skills |
+| `models/` | Catalog, credentials, routing và service tiers |
+| `presentation/` | TUI, terminal input, views, attachments và rendering |
+| `prompting/` | Instructions và prompt assets đóng gói |
+| `protocols/` | CLI routing, headless mode, RPC và ACP |
+
+Khai báo `#[path]` giữ namespace logic `crate::interactive::*` và test selector. Thư viện nhóm source theo trách nhiệm dưới `src/lib.rs` mà không thêm Rust namespace. Root manifest, `.agents/skills`, `e2e/`, `npm/`, `schemas/` và `tests/fixtures` giữ đường dẫn. Script được nhóm trong `scripts/{common,install,release,testing,verify}`. Bố cục này không tách API cho app.
+
 ## 5. Luồng request chính
 
 ### 5.1 Khởi động
@@ -106,6 +124,8 @@ Các crate tầng trên phụ thuộc nhiều sibling để compose một use ca
 3. CLI tạo các application service cần dùng: session, runtime, tools, orchestrator, extensions và maintenance.
 4. Kernel validate required service contracts trước khi nhận việc. Provider bắt buộc bị thiếu hoặc generation không tương thích là composition error, không phải một run thành công ở chế độ degraded.
 5. UI tương tác, command headless hoặc server RPC/ACP khởi động mode được chọn.
+
+Phiên interactive thường attach vào worker nền: đóng terminal là detach, không dừng turn, child hay schedule. `ha agents`, `attach`, `send`, `stop` và `shutdown` quản lý các worker; `HA_DAEMON=off` hoặc `"daemon": false` giữ phiên trong terminal.
 
 Provider chưa cấu hình sẽ lỗi trước khi để lại bất kỳ state nào; launch production không bao giờ lùi về fixture provider.
 
@@ -183,7 +203,7 @@ Trong phiên tương tác, model giao việc bằng tool `delegate`. Child thu�
 
 ### Extensions và MCP
 
-`harness-extensions` hỗ trợ local extension process (tắt trừ khi `HA_EXTENSIONS=on`, chỉ khởi chạy khi digest của executable khớp manifest và trust grant) và MCP client xây trên SDK `rmcp`. Handshake negotiate protocol versions và capabilities, validate schema và giới hạn frame, call, discovery page, task cùng cancellation grace period. MCP qua stdio và qua Streamable HTTP đều được hỗ trợ; HTTP yêu cầu TLS (cleartext chỉ trên loopback) và lấy bearer credential từ môi trường hoặc từ đăng nhập OAuth (`ha mcp login`, PKCE với callback loopback; token lưu trong `auth.json`, gắn với server). `/plugins` và `/mcp` cung cấp service catalog (built-in, `mcp-services.json` của người dùng, catalog công khai làm mới hằng ngày). Discovery không phải permission: một call tới tool MCP hay extension đi qua cùng đường policy, approval và receipt của `harness-tools`. Skill được compose như đóng góp có giới hạn và pin version; tên skill không bypass host policy.
+`harness-extensions` hỗ trợ local extension process (tắt trừ khi `HA_EXTENSIONS=on`, chỉ khởi chạy khi digest của executable khớp manifest và trust grant) và MCP client xây trên SDK `rmcp`. Handshake negotiate protocol versions và capabilities, validate schema và giới hạn frame, call, discovery page, task cùng cancellation grace period. MCP qua stdio và qua Streamable HTTP đều được hỗ trợ; Dùng TLS cho endpoint MCP từ xa và dành HTTP cleartext cho fixture cục bộ; kiểm tra tiền tố URL của native không phải ranh giới xác thực hostname hay cô lập mạng. MCP lấy bearer credential từ môi trường hoặc từ đăng nhập OAuth (`ha mcp login`, PKCE với callback loopback; token lưu trong `auth.json`, gắn với server). `/plugins` và `/mcp` cung cấp service catalog (built-in, `mcp-services.json` của người dùng, catalog công khai làm mới hằng ngày). Discovery không phải permission: một call tới tool MCP hay extension đi qua cùng đường policy, approval và receipt của `harness-tools`. Skill được compose như đóng góp có giới hạn và pin version; tên skill không bypass host policy.
 
 Stdio hay child process là transport boundary, không phải bằng chứng native code độc hại đã được cô lập, và native same-process plugin là trusted code.
 
@@ -195,9 +215,12 @@ Các tính năng này nằm trong `harness-cli` như tính năng tầng ứng d�
 - **Verification thay vì tự báo cáo.** Các check `[verify]` trong config project do harness tự chạy (khi model gọi `goal_complete`, khi một feature xin chuyển sang passing, làm gate của `/autonomous`, và khi `/verify`); check lỗi được gửi lại cho agent cùng output và gợi ý sửa. Sau khi các check qua, một verifier độc lập (child với context mới, tool chỉ đọc) đánh giá goal trước khi nó hoàn tất. Feature list `.harness/features.json` ghi state và evidence của từng feature; model có thể thêm, bắt đầu hoặc block feature nhưng chỉ một lần chạy pass các command do harness thực thi mới chuyển nó sang `passing`.
 - **Session lifecycle.** Prompt đầu tiên của phiên mang một brief do harness tự thu thập (commit gần nhất, thay đổi chưa commit, handoff trong `.harness/progress.md`). `/handoff` bảo agent ghi file đó và `/handoff --reset` mở hội thoại mới bắt đầu từ nó. `/doctor` và `ha doctor` chấm điểm repository theo instructions, tools, environment, state và feedback, chỉ bằng check cấu trúc.
 - **Learned state.** `/refine` để model đề xuất sửa memory, prompt note, skill và subagent spec, còn host validate và áp dụng (phía host, không có keyword classifier); nó cũng có thể đề xuất check, chỉ gia nhập `[[verify.checks]]` sau khi người dùng chấp nhận (`/checks accept`). Learned skill là thư mục `SKILL.md` thường ở tầng global hoặc tầng project đã trust, chỉ do một hàm promotion ghi, kèm ledger, đếm lượt dùng và archive.
+- **Task state, memory và knowledge.** Native tool `task_state` giữ objective, checklist, quyết định và constraint ngoài bản tóm tắt compaction. `memory` giữ entry memory/prompt có version ở scope local, project và global; delegated agent chỉ được recall read-only. `knowledge` quản lý trang Markdown project/global với provenance, update có kiểm hash, search và graph liên kết trang. Delegated agent chỉ được list/search/read/graph; semantic retrieval chỉ dùng khi embedding được cấu hình tường minh.
 - **Goal, schedule và autonomy.** Goal bền vững (chỉ `goal_complete` mới kết thúc), `/autonomous` tiếp tục trong giới hạn budget và gate là shell command, hàng đợi steering và follow-up, heartbeat và schedule lưu dưới data directory. Schedule và heartbeat chạy khi có worker giữ agent sống.
 - **Cây hội thoại.** Các turn tạo thành nhánh; `/tree` điều hướng chúng kèm tóm tắt nhánh tùy chọn, `/fork` bắt đầu hội thoại mới trước một tin nhắn của người dùng và `/clone` bắt đầu hội thoại mới với toàn bộ lịch sử.
-- **Python REPL.** Tool `ipython` là kernel Python bền vững (runtime `rlm` vendored trong `crates/harness-cli/python`), chỉ được cung cấp khi tìm thấy Python 3.11+; `HA_REPL=off` gỡ nó. Host request của kernel do controller trả lời, và kernel mồ côi do `ha` crash để lại được dọn qua journal.
+- **Python REPL.** Tool `python_repl` (`ipython` và `python` vẫn là alias tương thích) là kernel Python bền vững (runtime `rlm` vendored trong `crates/harness-cli/python`), chỉ được cung cấp khi tìm thấy Python 3.11+; `HA_REPL=off` gỡ nó. Host request của kernel do controller trả lời, và kernel mồ côi do `ha` crash để lại được dọn qua journal.
+- **Factory execution.** Executor `rlm.factory` opt-in chạy state machine đã validate (hoặc DAG được compile thành machine) qua supervisor subagent hiện có. Mặc định tắt (`/factory on` để bật); run state ở kernel và không sống qua kernel restart, dù child do supervisor sở hữu vẫn có thể được tìm thấy. Wait/watch state chưa được triển khai và bị từ chối ngay khi ghi.
+- **Computer use.** Skill đi kèm dùng `python_repl` có approval gate cho tác vụ được cho phép trên desktop Windows chính đang mở khóa, không phải GUI app riêng hay sandbox. Approval kernel không cấp phép từng click; hành động có hệ quả vẫn cần xác nhận người dùng phù hợp.
 - **Package manager.** `ha package install | remove | update | list` quản lý nguồn `npm:`, git và thư mục local; package chỉ mang skill, prompt và theme, và ha không thực thi gì trong đó.
 - **Provider và model.** OpenAI Chat, OpenAI Responses, backend ChatGPT Codex (đăng nhập qua trình duyệt), Anthropic Messages, cộng DeepSeek, OpenCode Zen và OpenCode Go trên các wire format đó, và model do người dùng định nghĩa. Danh sách model là snapshot trong binary, làm mới tối đa mỗi ngày, và catalog đã làm mới chỉ chọn được transport mà snapshot đã biết, nên không thể chuyển hướng nơi credential được gửi đi. Credential nằm trong `auth.json` riêng do `/login` ghi, không bao giờ nằm trong file cấu hình strict.
 
@@ -217,6 +240,13 @@ Các tính năng này nằm trong `harness-cli` như tính năng tầng ứng d�
 | UI projections | `harness-cli` views trên services | Presentation không thành writer thứ hai |
 
 Chuỗi identity lõi là project → task → session → run, với typed IDs và workspace observations gắn ở boundary cần chúng. Session mới không phải quyền duplicate task, và label hiển thị cho model không phải authority grant.
+
+### 9.1 Contract thư viện lõi
+
+- **Identity và acceptance:** `SessionId`, `TaskId`, `AgentRunId` và `StepId` định danh hội thoại, đơn vị nghiệm thu, lần thực thi và chu kỳ model/tool. Thứ tự session theo sequence đã commit, không theo ID hay timestamp. Worker hoàn tất không đồng nghĩa task được nghiệm thu: required criteria cần evidence có kiểu và không còn pending effect; human acceptance ghi override, không tạo check-pass giả. Tool argument không thể mở rộng scope do host tạo.
+- **Store durability:** `writer.lock` bảo vệ data directory; write kiểm tra generation fence bền. Marker `harness-data.json` và schema version từ chối ghi không tương thích trước migration; marker được tạo lần đầu sau khi migration thành công. Read-only open không tạo hay migrate dữ liệu. Writer dùng WAL với `synchronous=NORMAL`; ACK theo sau commit. Process crash giữ commit, nhưng lỗi OS hoặc mất điện có thể làm mất commit gần nhất trong khi database vẫn nhất quán. Byte artifact được flush và hash trước khi commit reference; thu hồi theo reachability và retention pin.
+- **Execution và delivery:** consume approval và tạo intent là atomic. Grant bind actor, task/session/invocation, action/workspace, policy/tool revision và expiry; binding thay đổi từ chối dispatch. Path check của host là policy, không phải OS confinement, và TOCTOU không bị loại bỏ. Side effect có thể đã xảy ra nhưng chưa xác nhận settlement vẫn là unknown, không tự rerun. Task settlement và parent delivery commit cùng nhau; consumption dedupe theo message ID. Check trên branch không chứng minh kết quả merge: check cuối chỉ ra integrated revision.
+- **Boundary provider:** message canonical giữ tool-call/result identity, được validate trước wire encoding riêng của endpoint. Capability claim là `Supported`, `Unsupported` hoặc `Unknown`; unknown có thể được gửi nhưng không chứng minh tương thích. Thiếu terminal hoặc tool call chưa hoàn chỉnh thì không dispatch. Transport marker không ghi đè finish reason tường minh; limit giới hạn frame và argument không đáng tin.
 
 ## 10. Composition của configuration và UI
 
@@ -252,7 +282,7 @@ Các giới hạn phải được giữ nhất quán trong code và docs:
 
 - agent chạy nền sống trong worker của project nó: worker được giám sát sẽ được khởi động lại và agent quay về từ journal, nhưng sau khi máy khởi động lại (hoặc khi supervisor không còn) agent chỉ quay lại khi chạy `ha agents`/`ha list`, và child đang chạy dở quay lại với trạng thái failed;
 - một writable host cho mỗi data directory;
-- không có OS-level sandbox: containment là process tree, không phải confinement, trừ khi `ha sandbox` đo được điều ngược lại;
+- Containment cây tiến trình Windows không phải confinement filesystem/network đầy đủ: `isolation: strict` yêu cầu `StrictProfile::Full`, fail-closed với `StrictIsolationUnavailable` khi không được hỗ trợ; best-effort được chọn tường minh không phải strict isolation (xem [ma trận hỗ trợ](../support/STRICT_EXECUTION_SUPPORT.vi.md));
 - không bảo đảm model reasoning hoàn hảo hoặc giữ context không giới hạn;
 - không có signed/published release artifact nếu evidence release chưa nói rõ điều đó;
 - provider authentication và hành vi gọi remote API trả phí không được chứng minh bằng offline/unit gates;
@@ -276,4 +306,3 @@ Các test đánh dấu `#[ignore]` (ca acceptance dùng pseudo-terminal) bị `c
 - [Plugin architecture](PLUGIN_ARCHITECTURE.vi.md)
 - [Giao diện terminal](../guides/TUI.md)
 - [Build and release](../guides/BUILD_AND_RELEASE.md)
-- Decision record: [ADR-N01 domain identity và state](../adr/ADR-N01-DOMAIN-IDENTITY-STATE.vi.md), [ADR-N02 store ownership và durability](../adr/ADR-N02-STORE-OWNERSHIP-DURABILITY.vi.md), [ADR-N03 execution binding](../adr/ADR-N03-EXECUTION-BINDING.vi.md), [ADR-N04 provider protocol](../adr/ADR-N04-PROVIDER-PROTOCOL.vi.md)
