@@ -99,7 +99,7 @@
       "test_names": [
         "p0_f07_phase_gate_self_test_exercises_negative_controls"
       ],
-      "fixture": "scripts/Verify-Phase.ps1",
+      "fixture": "scripts/verify/Verify-Phase.ps1",
       "platforms": [
         "windows",
         "linux"

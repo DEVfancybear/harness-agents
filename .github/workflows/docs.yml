@@ -4,12 +4,12 @@ on:
   push:
     paths:
       - '**.md'
-      - 'scripts/Verify-Docs.ps1'
+      - 'scripts/verify/Verify-Docs.ps1'
       - '.github/workflows/docs.yml'
   pull_request:
     paths:
       - '**.md'
-      - 'scripts/Verify-Docs.ps1'
+      - 'scripts/verify/Verify-Docs.ps1'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -29,4 +29,4 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
       - name: Validate bilingual documents and checker negative controls
         shell: pwsh
-        run: ./scripts/Verify-Docs.ps1 -SelfTest
+        run: ./scripts/verify/Verify-Docs.ps1 -SelfTest

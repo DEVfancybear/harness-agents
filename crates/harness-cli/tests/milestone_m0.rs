@@ -430,7 +430,7 @@ fn m0_02_store_port_is_declared_and_implemented_by_sqlite() {
 
     // The declared method surface matches CONTRACTS §3.
     let ports_source =
-        fs::read_to_string(repository_root().join("crates/harness-types/src/ports.rs"))
+        fs::read_to_string(repository_root().join("crates/harness-types/src/contracts/ports.rs"))
             .expect("ports source");
     for method in [
         "admit_input",
@@ -470,7 +470,7 @@ fn m0_02_store_port_is_declared_and_implemented_by_sqlite() {
         implementations,
         vec![
             PathBuf::from("harness-store-sqlite/src/store/port.rs"),
-            PathBuf::from("harness-types/src/ports.rs"),
+            PathBuf::from("harness-types/src/contracts/ports.rs"),
         ],
         "production StorePort implementations must remain explicit and singular"
     );
@@ -873,7 +873,7 @@ fn m0_04_milestone_registry_and_gate_self_test() {
         .args([
             "-NoProfile",
             "-File",
-            "scripts/Verify-Milestone.ps1",
+            "scripts/verify/Verify-Milestone.ps1",
             "-Milestone",
             "M0",
             "-SelfTest",

@@ -627,7 +627,7 @@ fn install_ha(destination: &std::path::Path, extra: &[&str]) -> std::process::Ou
     let mut arguments = vec![
         "-NoProfile".to_owned(),
         "-File".to_owned(),
-        root.join("scripts/Install-Ha.ps1")
+        root.join("scripts/install/Install-Ha.ps1")
             .to_string_lossy()
             .into_owned(),
         "-Destination".to_owned(),
@@ -775,7 +775,7 @@ async fn m9_04_release_candidate_has_checksums_and_is_not_published() {
     }) else {
         panic!(
             "no release candidate under {}; build one with \
-             `pwsh -NoProfile -File scripts/New-HaRelease.ps1 -PublishDryRun` before this test",
+             `pwsh -NoProfile -File scripts/release/New-HaRelease.ps1 -PublishDryRun` before this test",
             candidate_root.display()
         );
     };
