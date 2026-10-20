@@ -33,10 +33,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
+#[path = "control/budget.rs"]
 pub mod budget;
+#[path = "control/goal.rs"]
 pub mod goal;
+#[path = "control/human_input.rs"]
 pub mod human_input;
+#[path = "control/inbox.rs"]
 pub mod inbox;
+#[path = "persistence/session_file.rs"]
 pub mod session_file;
 
 pub use budget::{BudgetLedger, BudgetView, Usage};

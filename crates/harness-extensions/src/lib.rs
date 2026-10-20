@@ -22,13 +22,19 @@
 //! }
 //! ```
 
+#[path = "protocols/bridges.rs"]
 pub mod bridges;
+#[path = "registry/catalog.rs"]
 pub mod catalog;
 pub mod config;
+#[path = "registry/contracts.rs"]
 pub mod contracts;
 pub mod host;
+#[path = "protocols/mcp.rs"]
 pub mod mcp;
+#[path = "composition/skills.rs"]
 pub mod skills;
+#[path = "protocols/transport.rs"]
 pub mod transport;
 
 /// RMCP request types used by the host callback integration.

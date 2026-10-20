@@ -6,24 +6,41 @@
 //! are proposals; they become a side effect only after canonicalization,
 //! policy, final-action approval, a durable intent, and a durable receipt.
 
+#[path = "processes/capture.rs"]
 mod capture;
 mod contracts;
+#[path = "filesystem/edit_diff.rs"]
 mod edit_diff;
 mod execution;
+#[path = "security/git_guard.rs"]
 mod git_guard;
+#[path = "runtime/hooks.rs"]
 mod hooks;
+#[path = "filesystem/index.rs"]
 mod index;
+#[path = "security/policy.rs"]
 mod policy;
+#[path = "filesystem/prefetch.rs"]
 mod prefetch;
+#[path = "processes/process.rs"]
 mod process;
+#[path = "filesystem/search.rs"]
 mod search;
+#[path = "security/secrets.rs"]
 mod secrets;
+#[path = "runtime/service.rs"]
 mod service;
+#[path = "filesystem/syntax_check.rs"]
 mod syntax_check;
+#[path = "processes/truncate.rs"]
 mod truncate;
+#[path = "runtime/turn_driver.rs"]
 mod turn_driver;
+#[path = "runtime/validation.rs"]
 mod validation;
+#[path = "filesystem/walk.rs"]
 mod walk;
+#[path = "filesystem/workspace.rs"]
 mod workspace;
 
 pub use capture::{

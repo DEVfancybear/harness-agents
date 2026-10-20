@@ -3,6 +3,7 @@
 //! SQLite-backed transaction coordination for P1 durable continuation.
 
 mod error;
+#[path = "records/models.rs"]
 mod models;
 mod store;
 
