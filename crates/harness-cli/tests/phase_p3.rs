@@ -1910,66 +1910,10 @@ async fn p3_k09_observer_failure_cannot_rewrite_receipt() {
     close_writer(store).await;
 }
 
-#[tokio::test]
-async fn p3_s07_cli_fixture_reuses_the_workspace_project_identity() {
-    let temp = TempDir::new().expect("temporary fixture");
-    let root = setup_workspace(&temp);
-    let data_dir = temp.path().join("cli-data");
-    let data_dir_text = data_dir.to_str().expect("data directory Unicode");
-    let root_text = root.to_str().expect("workspace Unicode");
-
-    let mut project_ids = Vec::new();
-    for replacement in ["FIXED first run", "FIXED second run"] {
-        let fixture = run_ha(&[
-            "code",
-            "fixture",
-            "--data-dir",
-            data_dir_text,
-            "--workspace",
-            root_text,
-            "--path",
-            "src/parser.txt",
-            "--find",
-            "BUG",
-            "--replace",
-            replacement,
-            "--approve",
-            "--json",
-        ]);
-        assert!(
-            fixture.status.success(),
-            "{}",
-            String::from_utf8_lossy(&fixture.stderr)
-        );
-        let output: Value = serde_json::from_slice(&fixture.stdout).expect("fixture JSON");
-        let task_id =
-            TaskId::parse(output["task_id"].as_str().expect("task ID").to_owned()).expect("task");
-        let store = SqliteStore::open_read_only(&data_dir)
-            .await
-            .expect("fixture store opens for reading");
-        let state = store
-            .current_projection(&task_id)
-            .await
-            .expect("projection read")
-            .expect("the fixture committed a working state");
-        store.close().await.expect("reader closes");
-        project_ids.push(state.workspace.project_id);
-    }
-
-    assert_eq!(
-        project_ids[0], project_ids[1],
-        "a second fixture run on the same workspace and data directory must resolve the same \
-         project identity, not invent another one"
-    );
-}
-
-#[tokio::test]
-async fn p3_s07_cli_fixture_runs_p2_response_through_p3_tools_and_recovers_after_restart() {
-    let temp = TempDir::new().expect("temporary fixture");
-    let root = setup_workspace(&temp);
-    let data_dir = temp.path().join("cli-data");
-    let data_dir_text = data_dir.to_str().expect("data directory Unicode");
-    let root_text = root.to_str().expect("workspace Unicode");
+/// `ha code capabilities` reports the tool contract and the schemas this host
+/// advertises.
+#[test]
+fn p3_s07_code_capabilities_reports_the_tool_contract() {
     let capability = run_ha(&["code", "capabilities", "--json"]);
     assert!(
         capability.status.success(),
@@ -1982,86 +1926,8 @@ async fn p3_s07_cli_fixture_runs_p2_response_through_p3_tools_and_recovers_after
     // M4/M5 tools and the CP-B write/edit/glob/ask_user tools are advertised
     // additively without changing the tool contract version.
     assert_eq!(capabilities["tool_schema_count"], 17);
-
-    let fixture = run_ha(&[
-        "code",
-        "fixture",
-        "--data-dir",
-        data_dir_text,
-        "--workspace",
-        root_text,
-        "--path",
-        "src/parser.txt",
-        "--find",
-        "BUG",
-        "--replace",
-        "FIXED parser",
-        "--approve",
-        "--json",
-    ]);
-    assert!(
-        fixture.status.success(),
-        "{}",
-        String::from_utf8_lossy(&fixture.stderr)
-    );
-    let output: Value = serde_json::from_slice(&fixture.stdout).expect("fixture JSON");
-    assert_eq!(output["provider_tool_call_count"], 3);
-    assert_eq!(output["executions"].as_array().map_or(0, Vec::len), 3);
-    assert_eq!(
-        fs::read_to_string(root.join("src/parser.txt")).unwrap(),
-        "FIXED parser"
-    );
-    let session_id = output["session_id"].as_str().expect("fixture session ID");
-    let resume = run_ha(&[
-        "resume",
-        "--data-dir",
-        data_dir_text,
-        "--session-id",
-        session_id,
-        "--json",
-    ]);
-    assert!(
-        resume.status.success(),
-        "{}",
-        String::from_utf8_lossy(&resume.stderr)
-    );
-    let status = run_ha(&[
-        "status",
-        "--data-dir",
-        data_dir_text,
-        "--session-id",
-        session_id,
-        "--json",
-    ]);
-    assert!(
-        status.status.success(),
-        "{}",
-        String::from_utf8_lossy(&status.stderr)
-    );
-    let status_json: Value = serde_json::from_slice(&status.stdout).expect("status JSON");
-    assert_eq!(status_json["recovery"]["receipt_count"], 3);
-    let replay = run_ha(&[
-        "session",
-        "replay",
-        "--data-dir",
-        data_dir_text,
-        "--session-id",
-        session_id,
-        "--offline",
-        "--json",
-    ]);
-    assert!(
-        replay.status.success(),
-        "{}",
-        String::from_utf8_lossy(&replay.stderr)
-    );
-    let replay_json: Value = serde_json::from_slice(&replay.stdout).expect("replay JSON");
-    assert_eq!(replay_json["dispatch_count"], 0);
 }
 
-/// A folder that becomes a repository after the first turn (`git init`, as an
-/// agent may run) is still the same project: its registration follows the new
-/// Git state instead of every later tool call failing with an identity conflict.
 #[tokio::test]
 async fn a_root_that_becomes_a_repository_keeps_its_project() {
     let temp = TempDir::new().expect("temporary store");

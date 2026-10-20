@@ -14,14 +14,11 @@ mod sandbox_cli;
 use std::{io::Read, path::PathBuf, process::ExitCode, sync::Arc};
 
 use clap::{Args, Parser, Subcommand};
-use harness_providers::{MockProvider, ProviderStreamEvent};
+use harness_providers::MockProvider;
 use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
 use harness_session::SessionService;
 use harness_store_sqlite::{SqliteStore, StoreDiagnostics, StoreError, WriterOpenOptions};
-use harness_tools::{
-    CodingLoopService, ToolExecutionService, coding_tool_schemas, observe_workspace,
-    observed_file_hash,
-};
+use harness_tools::{ToolExecutionService, coding_tool_schemas};
 use harness_types::{
     AgentRunId, ContentHash, ErrorCode, HarnessError, HostId, InputId, PluginInstanceId,
     PluginManifest, ProjectId, ScopeId, ServiceContract, SessionId, TaskId, WorkspaceObservation,
@@ -757,30 +754,6 @@ enum CodingSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Run a keyless parser-fix fixture through P2 normalization and the P3 gate.
-    Fixture {
-        /// Local `SQLite` data directory owned by this harness.
-        #[arg(long)]
-        data_dir: PathBuf,
-        /// Existing workspace root containing the fixture file.
-        #[arg(long)]
-        workspace: PathBuf,
-        /// Relative UTF-8 file path rooted in --workspace.
-        #[arg(long)]
-        path: String,
-        /// Text searched before the approved edit.
-        #[arg(long)]
-        find: String,
-        /// Complete replacement content for the fixture file.
-        #[arg(long)]
-        replace: String,
-        /// Issue one explicit approval for every proposed fixture action.
-        #[arg(long)]
-        approve: bool,
-        /// Emit a versioned JSON result to stdout.
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 #[derive(Debug, Args)]
@@ -1495,20 +1468,6 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
             show_coding_capabilities(json);
             Ok(())
         }
-        Some(Command::Code(CodingCommand {
-            command:
-                CodingSubcommand::Fixture {
-                    data_dir,
-                    workspace,
-                    path,
-                    find,
-                    replace,
-                    approve,
-                    json,
-                },
-        })) => {
-            run_coding_fixture(&data_dir, &workspace, &path, &find, &replace, approve, json).await
-        }
         Some(Command::Sandbox(command)) => sandbox_cli::run(command).await,
         Some(Command::Tasks(command)) => delegation_cli::run(command).await,
         Some(Command::Extensions(command)) => extension_cli::run(command).await,
@@ -1560,117 +1519,6 @@ fn show_coding_capabilities(json_output: bool) {
             output["capabilities"]["strict_isolation"]
         );
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_coding_fixture(
-    data_dir: &PathBuf,
-    workspace: &PathBuf,
-    path: &str,
-    find: &str,
-    replacement: &str,
-    approve: bool,
-    json_output: bool,
-) -> Result<(), HarnessError> {
-    // The fixture belongs to the same project as every other run in this data directory:
-    // the identity is resolved rather than invented, so the receipts and artifacts one
-    // invocation writes stay addressable by the next one.
-    let store = Arc::new(
-        SqliteStore::open_writer(WriterOpenOptions::new(data_dir, HostId::generate()))
-            .await
-            .map_err(store_error)?,
-    );
-    let project_id = interactive::project::resolve_project_id(&store, workspace).await?;
-    let workspace_observation = observe_workspace(project_id, workspace)?;
-    let expected_hash = observed_file_hash(workspace, path)?;
-    let patch_arguments = serde_json::to_string(&serde_json::json!({
-        "path": path,
-        "expected_hash": expected_hash,
-        "replacement": replacement,
-    }))
-    .map_err(|_| HarnessError::new(ErrorCode::InvalidPayload, "fixture patch is invalid"))?;
-    let initial_search_arguments = serde_json::to_string(&serde_json::json!({
-        "query": find,
-        "path": path,
-    }))
-    .map_err(|_| HarnessError::new(ErrorCode::InvalidPayload, "fixture search is invalid"))?;
-    let final_search_arguments = serde_json::to_string(&serde_json::json!({
-        "query": replacement,
-        "path": path,
-    }))
-    .map_err(|_| HarnessError::new(ErrorCode::InvalidPayload, "fixture verification is invalid"))?;
-    let provider = Arc::new(MockProvider::scripted(vec![
-        ProviderStreamEvent::started(),
-        ProviderStreamEvent::text("deterministic parser fixture"),
-        ProviderStreamEvent::tool_delta(
-            "fixture-search-before",
-            "search_text",
-            initial_search_arguments,
-        ),
-        ProviderStreamEvent::tool_delta("fixture-patch", "apply_patch", patch_arguments),
-        ProviderStreamEvent::tool_delta(
-            "fixture-search-after",
-            "search_text",
-            final_search_arguments,
-        ),
-        ProviderStreamEvent::completed("tool_calls"),
-    ]));
-    let runtime = Arc::new(RuntimeService::new(
-        Arc::clone(&store),
-        provider,
-        RuntimeConfig::default(),
-    ));
-    let request = RunRequest::new(
-        SessionId::generate(),
-        TaskId::generate(),
-        InputId::generate(),
-        "repair the parser fixture",
-        workspace_observation,
-    )
-    .with_tool_schemas(coding_tool_schemas());
-    let loop_service = CodingLoopService::new(
-        Arc::clone(&runtime),
-        ToolExecutionService::new(Arc::clone(&store)),
-    );
-    let result = loop_service
-        .run_once(request, workspace, "cli.fixture", approve)
-        .await;
-    drop(loop_service);
-    drop(runtime);
-    Arc::try_unwrap(store)
-        .map_err(|_| {
-            HarnessError::new(
-                ErrorCode::StorageWriteFailed,
-                "coding fixture store consumers were not released",
-            )
-        })?
-        .close()
-        .await
-        .map_err(store_error)?;
-    let result = result?;
-    let output = serde_json::json!({
-        "schema_version": 1,
-        "tool_contract_version": ToolExecutionService::contract_version(),
-        "session_id": result.runtime.session_id,
-        "task_id": result.runtime.task_id,
-        "request_id": result.runtime.request_id,
-        "packet_id": result.runtime.packet_id,
-        "response": result.runtime.response,
-        "provider_tool_call_count": result.runtime.tool_calls.len(),
-        "approved": approve,
-        "executions": result.executions,
-        "capabilities": ToolExecutionService::capabilities(),
-    });
-    if json_output {
-        println!("{output}");
-    } else {
-        println!(
-            "coding fixture {} executed {} gated actions",
-            output["session_id"],
-            output["executions"].as_array().map_or(0, Vec::len)
-        );
-    }
-    Ok(())
 }
 
 /// Synthetic workspace observation for the keyless runtime demo flows.

@@ -13,7 +13,6 @@ mod execution;
 mod git_guard;
 mod hooks;
 mod index;
-mod loop_service;
 mod policy;
 mod prefetch;
 mod process;
@@ -43,7 +42,6 @@ pub use contracts::{
     coding_tool_names, coding_tool_schemas, coding_tool_schemas_for, effect_class_for,
     normalize_env_bindings,
 };
-pub use loop_service::{CodingLoopResult, CodingLoopService};
 // M12: the measured capability set, the probe that produces it, and the profile
 // a strict request is answered against. The vocabulary is exported because an
 // operator has to be able to read the evidence, not just the verdict.
