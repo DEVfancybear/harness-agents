@@ -135,7 +135,14 @@ conversation; the scroll position belongs to the app, not the terminal. The mous
 wheel scrolls three rows, a drag selects text (anchored to the conversation's
 rows, scrolling by itself at an edge) and releasing copies it, with a toast. Hold
 Shift, Alt or Ctrl for the terminal's own selection. Leaving fullscreen prints
-what it showed into the normal scrollback.
+what it showed into the normal scrollback; leaving a session for the agents view
+(`/agents`, a bare `/resume`, Left on an empty prompt) does not, since the session
+draws its conversation again when it is opened.
+
+A wheel notch or rows arriving at the end move the rows already on screen with
+the terminal's own scroll (a scroll region over the window): only the rows that
+come into view are written, about a tenth of what drawing the whole window again
+sent through a Windows console.
 
 - `/fullscreen` toggles it and saves `terminal.fullscreen` in `settings.json`;
   `terminal.fullscreenMouse` turns mouse tracking off.

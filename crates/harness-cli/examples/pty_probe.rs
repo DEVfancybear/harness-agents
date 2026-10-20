@@ -5,17 +5,22 @@
 //!
 //! `steps` is a comma list run in order: `wait:<ms>`, `wheelup:<n>` (mouse wheel
 //! notches at the window's middle), `pgup`, `end`, `key:<text>`, `enter`, `ctrlc`, `ctrls`,
-//! `altenter`, `shiftenter`, `ctrlj`. The raw bytes
+//! `altenter`, `shiftenter`, `ctrlj`, `settle:<ms>` (wait for the screen to go
+//! quiet and mark how long the output went on). The raw bytes
 //! the app wrote go to `out.bin`; `out.bin.marks` lists the byte offset at which
 //! each step began.
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one driver: the console, the reader, and every step it takes"
+)]
 fn main() {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let split = arguments.iter().position(|argument| argument == "--");
@@ -47,9 +52,15 @@ fn main() {
     let mut reader = master.try_clone_reader().expect("reader");
     let writer = Arc::new(Mutex::new(master.take_writer().expect("writer")));
     let transcript = Arc::new(Mutex::new(Vec::<u8>::new()));
+    // When output last arrived and input was last sent: how far the screen
+    // lags behind the input.
+    let started = Instant::now();
+    let last_output = Arc::new(Mutex::new(started));
+    let last_input = Arc::new(Mutex::new(started));
     {
         let sink = Arc::clone(&transcript);
         let answer = Arc::clone(&writer);
+        let arrived = Arc::clone(&last_output);
         std::thread::spawn(move || {
             let mut chunk = [0_u8; 8192];
             while let Ok(read) = reader.read(&mut chunk) {
@@ -58,6 +69,7 @@ fn main() {
                 }
                 let bytes = &chunk[..read];
                 sink.lock().expect("sink").extend_from_slice(bytes);
+                *arrived.lock().expect("arrived") = Instant::now();
                 if bytes.windows(4).any(|window| window == b"\x1b[6n") {
                     let _ = answer.lock().expect("w").write_all(b"\x1b[1;1R");
                 }
@@ -68,6 +80,7 @@ fn main() {
         let mut writer = writer.lock().expect("writer");
         let _ = writer.write_all(bytes);
         let _ = writer.flush();
+        *last_input.lock().expect("input") = Instant::now();
     };
     let mut marks = String::new();
     for step in steps.split(',') {
@@ -76,12 +89,37 @@ fn main() {
         let (name, value) = step.split_once(':').unwrap_or((step, ""));
         match name {
             "wait" => std::thread::sleep(Duration::from_millis(value.parse().unwrap_or(1000))),
-            "wheelup" | "wheeldown" => {
-                let button = if name == "wheelup" { 64 } else { 65 };
+            // Wheel notches 30 ms apart, or (`spinup`, `spindown`) 4 ms apart:
+            // a wheel spun hard.
+            "wheelup" | "wheeldown" | "spinup" | "spindown" => {
+                let button = if name.ends_with("up") { 64 } else { 65 };
+                let gap = if name.starts_with("spin") { 4 } else { 30 };
                 for _ in 0..value.parse::<u32>().unwrap_or(1) {
                     send(format!("\x1b[<{button};{};{}M", cols / 2, rows / 2).as_bytes());
-                    std::thread::sleep(Duration::from_millis(30));
+                    std::thread::sleep(Duration::from_millis(gap));
                 }
+            }
+            // Wait until the screen has been quiet for 300 ms (at most the
+            // value, in ms), and mark how long it went on painting after the
+            // last input: how far the screen lags behind the wheel.
+            "settle" => {
+                let limit = Duration::from_millis(value.parse().unwrap_or(10_000));
+                let begun = Instant::now();
+                while begun.elapsed() < limit
+                    && (begun.elapsed() < Duration::from_millis(500)
+                        || last_output.lock().expect("output").elapsed()
+                            < Duration::from_millis(300))
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let output = *last_output.lock().expect("output");
+                let input = *last_input.lock().expect("input");
+                let _ = writeln!(
+                    marks,
+                    "{} settled {} ms after the input",
+                    transcript.lock().expect("t").len(),
+                    output.saturating_duration_since(input).as_millis()
+                );
             }
             "pgup" => send(b"\x1b[5~"),
             "end" => send(b"\x1b[1;5F"),
