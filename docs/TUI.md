@@ -54,9 +54,17 @@ level, the permission mode, the chat's name and the goal. `agents` lists the
 session's own agent (`main`) and every agent the turn delegated to, each with
 herdr's glyph and word: a spinner and `working`, `◉ blocked` when an approval or a
 question waits for you, `✓ done` for a delegate whose turn ended, `○ idle`; a
-delegate's second row says how many tools it called and the latest. The last row
-points to the agents view (Left on an empty prompt). `terminal.sidebar: false` in
-`settings.json` turns it off; a narrower console never shows it.
+delegate's second row says how many tools it called and the latest. A terminal
+attached to a background agent also lists the project's `other agents` (read
+every second). Every agent row is numbered: Alt and its number, or a click,
+opens it. `main` brings the conversation back to the front; a delegate opens
+its pane beside the conversation, herdr's split in the accent's border, with
+the calls it starts, the first lines each tool returns and its answer as it
+writes it (the newest at the bottom; a new turn closes it); another agent
+switches the terminal to that agent, as the agents view's Enter does. The row
+in front is on the selected background. The last row points to the agents view
+(Left on an empty prompt). `terminal.sidebar: false` in `settings.json` turns
+the sidebar off; a narrower console never shows it.
 
 **Status line.** Two ends. The left says what the app is doing: spinner, clock,
 `esc to interrupt`, counters, the model and thinking level, and anything that
@@ -109,6 +117,7 @@ mode.
 | Ctrl+D | Exit on an empty prompt; deletes forward while there is text. A background agent keeps running: `ha attach` brings it back |
 | Left (empty prompt) | Hand the terminal to the agents view (agent keeps running) |
 | Ctrl+O | Cycle tool detail (collapsed, details, expanded) |
+| Alt+1..9 | The sidebar's numbered row: the conversation, a delegate's pane, or another agent of the project (fullscreen). Ctrl+Alt is left alone, since AltGr arrives as it |
 | Ctrl+L | Repaint the screen |
 | Ctrl+G | Edit the draft in `$VISUAL` / `$EDITOR`; the saved text replaces the prompt |
 | Ctrl+S | Stash the draft, or bring it back |
