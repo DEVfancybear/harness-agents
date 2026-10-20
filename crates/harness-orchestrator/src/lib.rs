@@ -8,10 +8,15 @@
 //! second agent engine and never opens a second database authority: every
 //! durable write goes through the P1 transaction coordinator and host fence.
 
+#[path = "coordination/contracts.rs"]
 pub mod contracts;
+#[path = "coordination/coordinator.rs"]
 pub mod coordinator;
+#[path = "workspaces/integration.rs"]
 pub mod integration;
+#[path = "coordination/scheduler.rs"]
 pub mod scheduler;
+#[path = "workspaces/workspace.rs"]
 pub mod workspace;
 
 pub use contracts::{
