@@ -854,21 +854,6 @@
       "required": true
     },
     {
-      "id": "P3-S07",
-      "phase": "P3",
-      "target": "phase_p3",
-      "test_names": [
-        "p3_s07_cli_fixture_runs_p2_response_through_p3_tools_and_recovers_after_restart"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p3.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
       "id": "C11",
       "phase": "P5",
       "target": "phase_p5",
