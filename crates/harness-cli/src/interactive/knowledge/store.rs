@@ -87,6 +87,10 @@ pub(crate) struct PageSummary {
     pub hash: String,
     pub sources: Vec<String>,
     pub related: Vec<String>,
+    /// When the page was last written (RFC 3339): the store's own record, else
+    /// the file's modification time for a page written by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -165,6 +169,11 @@ struct Metadata {
     /// `review` for a page the automatic review proposed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     origin: Option<String>,
+    /// When the store last wrote the page (RFC 3339), for its age in the
+    /// catalog: a page that records a state goes stale like a memory entry.
+    /// Absent on pages written before 0.6.3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -469,19 +478,25 @@ impl Store {
                 }
                 related.insert(find_page(&pages, &target)?.summary.path.clone());
             }
-            let metadata = Metadata {
+            let mut metadata = Metadata {
                 title: title.clone(),
                 summary: summary.clone(),
                 sources: sources.iter().cloned().collect(),
                 related: related.into_iter().collect(),
                 origin: input.origin.clone().or_else(|| declared.origin.clone()),
+                updated_at: declared.updated_at.clone(),
             };
-            let text = render_page(&actual_path, &metadata, &input.content)?;
             if let Some(i) = existing {
-                // Retrying a completed operation is a no-op, including its log.
-                if pages[i].text == text {
+                // Retrying a completed operation is a no-op, including its log
+                // and its time.
+                if pages[i].text == render_page(&actual_path, &metadata, &input.content)? {
                     return Ok(pages[i].summary.clone());
                 }
+            }
+            metadata.updated_at =
+                Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+            let text = render_page(&actual_path, &metadata, &input.content)?;
+            if let Some(i) = existing {
                 if input.expected_hash.as_deref() != Some(pages[i].summary.hash.as_str()) {
                     return Err(
                         "knowledge page changed; read it again and supply its current hash"
@@ -634,12 +649,16 @@ impl Store {
                 // JSON escaping keeps titles from impersonating instructions or
                 // fences. No hash: a page is read before it is changed, and the
                 // read gives it; in the catalog it was 40% of every line.
-                let line = serde_json::to_string(&serde_json::json!({
+                // Its age is: a page that records a state goes stale.
+                let mut entry = serde_json::json!({
                     "path": page.summary.path,
                     "title": page.summary.title,
                     "summary": page.summary.summary,
-                }))
-                .map_err(error)?;
+                });
+                if let Some(age) = page_age(&page.summary) {
+                    entry["updated"] = serde_json::json!(age);
+                }
+                let line = serde_json::to_string(&entry).map_err(error)?;
                 if output.chars().count() + line.chars().count() + 1 > limit.saturating_sub(80) {
                     break;
                 }
@@ -746,6 +765,12 @@ impl Store {
         }
         result
     }
+}
+
+/// How long ago a page was written, as `3d ago`.
+pub(crate) fn page_age(page: &PageSummary) -> Option<String> {
+    crate::interactive::harness::age_of(page.updated_at.as_deref()?)
+        .map(|age| age.trim_start_matches("updated ").to_owned())
 }
 
 fn error(error: impl std::fmt::Display) -> String {
@@ -1018,7 +1043,16 @@ fn scan_reporting(root: &Path) -> Result<(Vec<Page>, Vec<String>), String> {
                 return Err("knowledge scan size limit exceeded".to_owned());
             }
             match parse_page(&relative, text) {
-                Ok(page) => pages.push(page),
+                Ok(mut page) => {
+                    // A page written by hand is as old as its file.
+                    if page.summary.updated_at.is_none() {
+                        page.summary.updated_at = metadata.modified().ok().map(|modified| {
+                            chrono::DateTime::<chrono::Utc>::from(modified)
+                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                        });
+                    }
+                    pages.push(page);
+                }
                 Err(reason) => skipped.push(format!("{relative}: {reason}")),
             }
         }
@@ -1113,6 +1147,7 @@ fn parse_page(path: &str, text: String) -> Result<Page, String> {
             hash: hash(&text),
             sources: metadata.sources,
             related: metadata.related,
+            updated_at: metadata.updated_at,
         },
         text,
     })
@@ -2254,6 +2289,50 @@ mod tests {
             !ranked.contains("sha256:"),
             "no hash in the catalog: {ranked}"
         );
+    }
+
+    /// A page carries when the store last wrote it, and the catalog says how
+    /// old it is: a page that records a state goes stale. A retry that changes
+    /// nothing keeps the time; a page written by hand, or before 0.6.3, is as
+    /// old as its file.
+    #[test]
+    fn a_page_knows_its_age_and_the_catalog_shows_it() {
+        let (_dir, store) = store();
+        let written = store
+            .write(input("ops/deploy.md", "Deploy on Fridays.\n"))
+            .unwrap();
+        let stamp = written
+            .updated_at
+            .clone()
+            .expect("a written page has a time");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&stamp).is_ok(),
+            "{stamp}"
+        );
+        let catalog = store.catalog(&[("deploy", 1.0)], 3_000).unwrap();
+        assert!(catalog.contains("\"updated\":\"<1h ago\""), "{catalog}");
+        // The same write again is a no-op, time included.
+        let again = store
+            .write(input("ops/deploy.md", "Deploy on Fridays.\n"))
+            .unwrap();
+        assert_eq!(again.updated_at.as_deref(), Some(stamp.as_str()));
+        assert_eq!(again.hash, written.hash);
+        // An old page: metadata without a time, written long ago.
+        let old = store.root.join("ops/old.md");
+        fs::write(
+            &old,
+            format!("{META}{{\"title\":\"Old\",\"summary\":\"from 0.6.2\"}} -->\n# Old\n\nkept\n"),
+        )
+        .unwrap();
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_hours(9 * 24);
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        let catalog = store.catalog(&[("old", 1.0)], 3_000).unwrap();
+        assert!(catalog.contains("\"updated\":\"9d ago\""), "{catalog}");
     }
 
     #[test]

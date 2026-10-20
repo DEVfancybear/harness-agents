@@ -188,10 +188,11 @@ impl KnowledgeHost {
                 content: content.clone(),
             })
             .collect::<Vec<_>>();
+        // Every variant is embedded, as every one is searched by keyword.
         let vectors = match super::embedding::search_sync(
             self.root(scope),
             &documents,
-            &queries[0],
+            queries,
             limit.saturating_mul(2),
         ) {
             Ok(hits) => hits,
@@ -221,7 +222,6 @@ impl KnowledgeHost {
                         .find(|(page, _)| page.path == hit.path)
                         .map(|(page, _)| &page.sources)
                 );
-                value["matched_queries"] = json!([0]);
                 values.push(value);
             }
         }
@@ -607,8 +607,11 @@ impl KnowledgeHost {
                 .ranked_list(&[(conversation, 1.0)], 80)
                 .unwrap_or_default()
             {
+                let age = super::store::page_age(&page)
+                    .map(|age| format!(" (updated {age})"))
+                    .unwrap_or_default();
                 lines.push(format!(
-                    "- {} {}: {} - {}",
+                    "- {} {}: {}{age} - {}",
                     scope.label(),
                     page.path,
                     page.title,

@@ -429,6 +429,22 @@ pub fn rank(entries: &[Entry], query: &str) -> Vec<(usize, f64)> {
     ranked
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's shorter wait for [`lock_state`], on this thread.
+    pub static LOCK_WAIT: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// How long a write waits for another to release the state.
+fn lock_wait() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(wait) = LOCK_WAIT.with(std::cell::Cell::get) {
+        return wait;
+    }
+    std::time::Duration::from_secs(30)
+}
+
 /// Hold a scope's state lock: the sidecar the Python kernel's `rlm.harness`
 /// locks (`harness_state.json.lock`), so a read-modify-write from the host
 /// never interleaves with one from the kernel.
@@ -444,7 +460,7 @@ pub fn lock_state(dir: &Path) -> Result<std::fs::File, String> {
         .truncate(false)
         .open(dir.join(format!("{STATE_FILE}.lock")))
         .map_err(|error| format!("harness state lock: {error}"))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + lock_wait();
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(file),

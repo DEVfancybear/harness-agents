@@ -132,6 +132,8 @@ pub(crate) struct VectorHit {
     pub start_column: usize,
     pub end_line: usize,
     pub score: f64,
+    /// The query variants that ranked the page, by index.
+    pub matched_queries: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -242,14 +244,34 @@ pub(crate) async fn index(
     Ok(index_inner(root, documents, &config).await?.stats)
 }
 
+/// One query's vector search; see [`search_variants`].
+#[cfg(test)]
 pub(crate) async fn search(
     root: &Path,
     documents: &[EmbeddingDocument],
     query: &str,
     limit: usize,
 ) -> Result<Vec<VectorHit>, String> {
+    search_variants(root, documents, &[query.to_owned()], limit).await
+}
+
+/// The pages nearest every query variant, fused by rank across the variants as
+/// keyword search fuses them. Every variant is embedded - those not cached in
+/// one request: only the first was, and a variant worded the way a page is
+/// written found nothing the keyword channel had not.
+pub(crate) async fn search_variants(
+    root: &Path,
+    documents: &[EmbeddingDocument],
+    queries: &[String],
+    limit: usize,
+) -> Result<Vec<VectorHit>, String> {
     let config = active_config(root)?;
-    if query.trim().is_empty() || query.len() > 512 || query.chars().any(char::is_control) {
+    if queries.is_empty()
+        || queries.len() > MAX_BATCH
+        || queries.iter().any(|query| {
+            query.trim().is_empty() || query.len() > 512 || query.chars().any(char::is_control)
+        })
+    {
         return Err(
             "embedding query must be a nonempty single line of at most 512 bytes".to_owned(),
         );
@@ -259,55 +281,147 @@ pub(crate) async fn search(
     }
     let _lock = operation_lock(root).await?;
     let mut indexed = index_inner(root, documents, &config).await?;
-    let query_hash = hash(query.as_bytes());
-    let cached = indexed
-        .cache
-        .query(&indexed.namespace, &query_hash, indexed.stats.dimensions)
-        .await?;
-    let query_vector = if let Some(vector) = cached {
-        vector
-    } else {
-        let mut vectors = request_vectors(&config, &[query.to_owned()]).await?;
-        let vector = vectors.remove(0);
-        if vector.len() != indexed.stats.dimensions {
-            indexed.cache.clear(&indexed.namespace).await?;
-            indexed = index_inner(root, documents, &config).await?;
-            if vector.len() != indexed.stats.dimensions {
-                return Err(
-                    "embedding provider returned inconsistent query and document dimensions"
-                        .to_owned(),
-                );
+    let mut vectors = Vec::with_capacity(queries.len());
+    for query in queries {
+        vectors.push(
+            indexed
+                .cache
+                .query(
+                    &indexed.namespace,
+                    &hash(query.as_bytes()),
+                    indexed.stats.dimensions,
+                )
+                .await?,
+        );
+    }
+    let mut fetched = request_missing(&config, queries, &mut vectors).await?;
+    if vectors
+        .iter()
+        .flatten()
+        .any(|vector| vector.len() != indexed.stats.dimensions)
+    {
+        // The model changed: the documents are embedded again, and so is every
+        // variant whose vector is of the old size.
+        indexed.cache.clear(&indexed.namespace).await?;
+        indexed = index_inner(root, documents, &config).await?;
+        for vector in &mut vectors {
+            if vector
+                .as_ref()
+                .is_some_and(|vector| vector.len() != indexed.stats.dimensions)
+            {
+                *vector = None;
             }
         }
-        indexed
-            .cache
-            .put_query(&indexed.namespace, &query_hash, &vector)
-            .await?;
-        vector
-    };
-    let mut hits = BTreeMap::<String, VectorHit>::new();
-    for chunk in &indexed.chunks {
-        let vector = indexed
-            .vectors
-            .get(&chunk.key)
-            .ok_or("embedding cache is incomplete")?;
-        let mut hit = chunk.hit.clone();
-        hit.score = cosine(&query_vector, vector)?;
-        if hits
-            .get(&hit.path)
-            .is_none_or(|existing| hit.score > existing.score)
+        fetched.extend(request_missing(&config, queries, &mut vectors).await?);
+        if vectors
+            .iter()
+            .flatten()
+            .any(|vector| vector.len() != indexed.stats.dimensions)
         {
-            hits.insert(hit.path.clone(), hit);
+            return Err(
+                "embedding provider returned inconsistent query and document dimensions".to_owned(),
+            );
         }
     }
-    let mut hits = hits.into_values().collect::<Vec<_>>();
+    for index in fetched {
+        if let Some(vector) = &vectors[index] {
+            indexed
+                .cache
+                .put_query(&indexed.namespace, &hash(queries[index].as_bytes()), vector)
+                .await?;
+        }
+    }
+    let vectors = vectors.into_iter().flatten().collect::<Vec<_>>();
+    fuse_variants(&indexed, &vectors, limit.min(MAX_DOCUMENTS))
+}
+
+/// Each variant's nearest pages, fused by their rank in each (reciprocal rank,
+/// as keyword search fuses its variants), each page shown at the passage
+/// nearest any variant.
+fn fuse_variants(
+    indexed: &Indexed,
+    vectors: &[Vec<f32>],
+    ranked: usize,
+) -> Result<Vec<VectorHit>, String> {
+    let mut fused = BTreeMap::<String, (f64, VectorHit)>::new();
+    for (variant, query_vector) in vectors.iter().enumerate() {
+        let mut hits = BTreeMap::<String, VectorHit>::new();
+        for chunk in &indexed.chunks {
+            let vector = indexed
+                .vectors
+                .get(&chunk.key)
+                .ok_or("embedding cache is incomplete")?;
+            let mut hit = chunk.hit.clone();
+            hit.score = cosine(query_vector, vector)?;
+            if hits
+                .get(&hit.path)
+                .is_none_or(|existing| hit.score > existing.score)
+            {
+                hits.insert(hit.path.clone(), hit);
+            }
+        }
+        let mut hits = hits.into_values().collect::<Vec<_>>();
+        hits.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        hits.truncate(ranked);
+        for (rank, mut hit) in hits.into_iter().enumerate() {
+            let vote = 1.0 / (61.0 + f64::from(u32::try_from(rank).unwrap_or(u32::MAX)));
+            hit.matched_queries = vec![variant];
+            match fused.get_mut(&hit.path) {
+                Some((score, existing)) => {
+                    *score += vote;
+                    existing.matched_queries.push(variant);
+                    // The passage nearest any variant is the one shown.
+                    if hit.score > existing.score {
+                        hit.matched_queries = std::mem::take(&mut existing.matched_queries);
+                        *existing = hit;
+                    }
+                }
+                None => {
+                    fused.insert(hit.path.clone(), (vote, hit));
+                }
+            }
+        }
+    }
+    let mut hits = fused.into_values().collect::<Vec<_>>();
     hits.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.path.cmp(&b.path))
+        b.0.total_cmp(&a.0)
+            .then_with(|| b.1.score.total_cmp(&a.1.score))
+            .then_with(|| a.1.path.cmp(&b.1.path))
     });
-    hits.truncate(limit.min(MAX_DOCUMENTS));
-    Ok(hits)
+    Ok(hits.into_iter().take(ranked).map(|(_, hit)| hit).collect())
+}
+
+/// Embed the variants without a vector, in one request; returns their indexes.
+async fn request_missing(
+    config: &EmbeddingConfig,
+    queries: &[String],
+    vectors: &mut [Option<Vec<f32>>],
+) -> Result<Vec<usize>, String> {
+    let missing = vectors
+        .iter()
+        .enumerate()
+        .filter(|(_, vector)| vector.is_none())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(missing);
+    }
+    let inputs = missing
+        .iter()
+        .map(|index| queries[*index].clone())
+        .collect::<Vec<_>>();
+    let answered = request_vectors(config, &inputs).await?;
+    if answered.len() != missing.len() {
+        return Err("embedding provider returned the wrong number of vectors".to_owned());
+    }
+    for (index, vector) in missing.iter().zip(answered) {
+        vectors[*index] = Some(vector);
+    }
+    Ok(missing)
 }
 
 pub(crate) fn index_sync(
@@ -320,13 +434,13 @@ pub(crate) fn index_sync(
 pub(crate) fn search_sync(
     root: &Path,
     documents: &[EmbeddingDocument],
-    query: &str,
+    queries: &[String],
     limit: usize,
 ) -> Result<Vec<VectorHit>, String> {
     sync_bridge(|| async {
         tokio::time::timeout(
             Duration::from_secs(25),
-            search(root, documents, query, limit),
+            search_variants(root, documents, queries, limit),
         )
         .await
         .map_err(|_| {
@@ -708,6 +822,7 @@ fn chunk_document(document: &EmbeddingDocument) -> Vec<Chunk> {
                     start_column: positions[start].2,
                     end_line: positions[end.saturating_sub(1)].1,
                     score: 0.0,
+                    matched_queries: Vec::new(),
                 },
             });
         }
@@ -1249,7 +1364,57 @@ mod tests {
         let fixture = Fixture::new(good_response);
         let root = tempfile::tempdir().unwrap();
         fixture.configure(root.path());
-        let hits = search_sync(root.path(), &[document("a.md", "orchard")], "orchard", 10).unwrap();
+        let hits = search_sync(
+            root.path(),
+            &[document("a.md", "orchard")],
+            &["orchard".to_owned()],
+            10,
+        )
+        .unwrap();
         assert_eq!(hits[0].path, "a.md");
+    }
+
+    /// Every query variant is embedded: a page only the second variant is near
+    /// is found, with the variant that found it, and the variants not cached
+    /// are embedded in one request.
+    #[tokio::test]
+    async fn every_query_variant_is_embedded_and_fused() {
+        let fixture = Fixture::new(good_response);
+        let root = tempfile::tempdir().unwrap();
+        fixture.configure(root.path());
+        let documents = [
+            document("a.md", "orchard"),
+            document("b.md", "other"),
+            document("c.md", "other too"),
+            document("z.md", "network"),
+        ];
+        let first = search(root.path(), &documents, "orchard", 2).await.unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|hit| hit.path.as_str())
+                .collect::<Vec<_>>(),
+            ["a.md", "b.md"]
+        );
+        let requests = fixture.calls.lock().unwrap().len();
+        let hits = search_variants(
+            root.path(),
+            &documents,
+            &["orchard".to_owned(), "network".to_owned()],
+            2,
+        )
+        .await
+        .unwrap();
+        let found = hits
+            .iter()
+            .map(|hit| (hit.path.as_str(), hit.matched_queries.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(found, [("a.md", vec![0, 1]), ("z.md", vec![1])]);
+        let calls = fixture.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls[requests..],
+            [vec!["network".to_owned()]],
+            "the cached variant is not asked for again"
+        );
     }
 }

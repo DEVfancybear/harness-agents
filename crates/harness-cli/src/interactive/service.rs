@@ -3551,20 +3551,7 @@ impl AgentSessionService {
             config_overrides.model.clone(),
         )));
         let writer_gate = Arc::new(tokio::sync::Mutex::new(()));
-        // prime-agent's `autoRefine.enabled` setting, which HA_AUTO_REFINE=off
-        // still overrides.
-        let auto_refine = super::config::load_setting(&context.paths.config_file, "autoRefine")
-            .and_then(|setting| setting.get("enabled").and_then(serde_json::Value::as_bool))
-            .unwrap_or(true)
-            && !environment
-                .value("HA_AUTO_REFINE")
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| {
-                    matches!(
-                        value.trim().to_ascii_lowercase().as_str(),
-                        "off" | "0" | "false" | "no"
-                    )
-                });
+        let auto_refine = auto_refine_enabled(&context.paths.config_file, &environment);
         let repl = super::repl::ReplShared::from_environment(
             &environment,
             &context.paths.data_dir,
@@ -6867,10 +6854,13 @@ impl AutoRefine {
         )
         .await
         {
-            Ok(refinements) => {
+            Ok(refined) => {
+                // The local refinement is recorded whether or not the global
+                // part was: the conversation it read is reviewed.
                 if let Some(reviewed) = &self.reviewed {
                     super::refine::mark_reviewed(&self.scopes.local, reviewed);
                 }
+                let refinements = refined.refinements;
                 // A local part with nothing in it is not worth a row beside
                 // the global one.
                 let shown = refinements.len();
@@ -6884,6 +6874,13 @@ impl AutoRefine {
                     }
                     send(refined_event(refinement));
                 }
+                if let Some(error) = refined.global_error {
+                    let error = format!("the global memory part failed: {error}");
+                    review_record("failed", &self.conversation, Err(error.as_str())).emit();
+                    send(SessionEvent::Notice {
+                        message: format!("auto-refine: {error}; the local refinement stands"),
+                    });
+                }
             }
             Err(error) => {
                 review_record("failed", &self.conversation, Err(error.as_str())).emit();
@@ -6893,6 +6890,75 @@ impl AutoRefine {
             }
         }
     }
+}
+
+/// prime-agent's `autoRefine.enabled` setting, which `HA_AUTO_REFINE=off` still
+/// overrides.
+pub(super) fn auto_refine_enabled(config_file: &Path, environment: &LaunchEnvironment) -> bool {
+    super::config::load_setting(config_file, "autoRefine")
+        .and_then(|setting| setting.get("enabled").and_then(serde_json::Value::as_bool))
+        .unwrap_or(true)
+        && !environment
+            .value("HA_AUTO_REFINE")
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "off" | "0" | "false" | "no"
+                )
+            })
+}
+
+/// prime-agent's `autoRefine.turnInterval`, 25 by default.
+pub(super) fn auto_refine_interval(config_file: &Path) -> u32 {
+    super::config::load_setting(config_file, "autoRefine")
+        .and_then(|setting| {
+            setting
+                .get("turnInterval")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .and_then(|interval| u32::try_from(interval).ok())
+        .filter(|interval| *interval > 0)
+        .unwrap_or(super::refine::AUTO_REFINE_TURN_INTERVAL)
+}
+
+/// The automatic review as `ha exec` runs it: the app's review, run to its end
+/// before the process exits, with what it said returned instead of shown.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "what one review reads, as the app's AutoRefine holds it"
+)]
+pub(super) async fn review_now(
+    provider: Arc<dyn ModelProvider>,
+    model: String,
+    conversation: String,
+    scopes: super::refine::HarnessScopes,
+    learning: super::refine::Learning,
+    turns: u32,
+    reviewed: Option<String>,
+    knowledge: super::knowledge::KnowledgeHost,
+) -> Vec<SessionEvent> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    AutoRefine {
+        sender,
+        helper_provider: Arc::clone(&provider),
+        helper_model: model.clone(),
+        provider,
+        model,
+        conversation,
+        scopes,
+        learning,
+        turns,
+        reviewed,
+        knowledge,
+    }
+    .run()
+    .await;
+    let mut events = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        events.push(event);
+    }
+    events
 }
 
 /// What a child stopped by Ctrl-C reports to its parent.
@@ -7113,7 +7179,11 @@ mod compacted_title_tests {
     }
 }
 
-async fn refine_transcript(store: &SqliteStore, session: &SessionId, local: &Path) -> String {
+pub(super) async fn refine_transcript(
+    store: &SqliteStore,
+    session: &SessionId,
+    local: &Path,
+) -> String {
     let reviewed = super::refine::reviewed_through(local).and_then(|id| SessionId::parse(id).ok());
     harness_runtime::conversation_transcript(
         store,
@@ -7126,7 +7196,7 @@ async fn refine_transcript(store: &SqliteStore, session: &SessionId, local: &Pat
 }
 
 /// What `/refine` needs to write learned skills in this workspace.
-fn refine_learning(
+pub(super) fn refine_learning(
     global_config_dir: &Path,
     data_dir: &Path,
     workspace_root: &Path,
@@ -7164,7 +7234,29 @@ fn review_record(
     }
 }
 
-fn refined_event(refinement: &super::refine::Refinement) -> SessionEvent {
+/// Consolidate a conversation's local store, recorded and said as the global
+/// consolidation is.
+pub(super) async fn consolidate_local_event(
+    provider: &Arc<dyn ModelProvider>,
+    model: &str,
+    scopes: &super::refine::HarnessScopes,
+    conversation: &str,
+) -> SessionEvent {
+    match super::refine::consolidate_local(provider, model, scopes).await {
+        Ok(refinement) => {
+            review_record("consolidated", conversation, Ok(&refinement)).emit();
+            refined_event(&refinement)
+        }
+        Err(error) => {
+            review_record("consolidated", conversation, Err(error.as_str())).emit();
+            SessionEvent::Notice {
+                message: format!("memory: this conversation's consolidation skipped: {error}"),
+            }
+        }
+    }
+}
+
+pub(super) fn refined_event(refinement: &super::refine::Refinement) -> SessionEvent {
     SessionEvent::Refined {
         header: refinement.header(),
         summary: refinement.summary(),
@@ -9201,6 +9293,34 @@ async fn run_turn(
                 let _ = sender.send(event);
             });
         }
+        // So is this conversation's own store once it outgrows forty entries:
+        // every review of a long conversation adds to it.
+        let local = super::harness::local_dir(&data_dir, goal_task.as_str());
+        if auto_refine
+            && refinements
+            && !cancellation.is_cancelled()
+            && super::refine::local_consolidation_due(&local)
+            && let Some(consolidating) = super::refine::Consolidating::try_begin()
+        {
+            let sender = sender.clone();
+            let provider = Arc::clone(&provider);
+            let model = config.model.clone();
+            let scopes = super::refine::HarnessScopes {
+                global: super::harness::global_dir(&data_dir),
+                local,
+            };
+            let conversation = goal_task.as_str().to_owned();
+            send(SessionEvent::Notice {
+                message: "memory: consolidating this conversation's memory in the background"
+                    .to_owned(),
+            });
+            tokio::spawn(async move {
+                let event =
+                    consolidate_local_event(&provider, &model, &scopes, &conversation).await;
+                drop(consolidating);
+                let _ = sender.send(event);
+            });
+        }
         refine_cadence.note_in_play(super::learned::record_turn(
             &learning.layers,
             &learning.context.workspace,
@@ -9241,16 +9361,7 @@ async fn run_turn(
             .and_then(|mut pending| pending.take())
             .filter(|_| refinements);
         let tool_calls = outcome.as_ref().map_or(0, |turn| turn.tool_calls);
-        // prime-agent's `autoRefine.turnInterval`, 25 by default.
-        let interval = super::config::load_setting(&config_file, "autoRefine")
-            .and_then(|setting| {
-                setting
-                    .get("turnInterval")
-                    .and_then(serde_json::Value::as_u64)
-            })
-            .and_then(|interval| u32::try_from(interval).ok())
-            .filter(|interval| *interval > 0)
-            .unwrap_or(super::refine::AUTO_REFINE_TURN_INTERVAL);
+        let interval = auto_refine_interval(&config_file);
         let review = if auto_refine && refinements {
             refine_cadence.turn_finished_every(tool_calls, interval, compacted || milestone)
         } else {

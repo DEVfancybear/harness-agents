@@ -893,6 +893,9 @@ pub async fn run_with(
     let mut continuing_from = resumed_from.as_ref().map(|(source, _)| source.clone());
     let mut next_request = run_request;
     let mut child_turns = 0;
+    // What the run did, toward the conversation's automatic review.
+    let mut turns_run = 0_u32;
+    let mut tool_calls_run = 0_u32;
     let outcome = loop {
         let tokens_before = observer.tokens.load(Ordering::SeqCst);
         let outcome = match &continuing_from {
@@ -918,6 +921,8 @@ pub async fn run_with(
                     .await?
             }
         };
+        turns_run = turns_run.saturating_add(1);
+        tool_calls_run = tool_calls_run.saturating_add(outcome.tool_calls);
         // Children started with `wait: false` report when they settle; their
         // notices open one more turn, as they do in the app.
         if let Some((agents, _)) = &agents
@@ -1144,6 +1149,35 @@ pub async fn run_with(
         });
     }
 
+    // The automatic review, as the app runs one at a session's end: what the
+    // conversation's runs did since its last review is counted, and when it is
+    // enough the review reads the conversation while the store is still open.
+    // A run that answered nothing (a mock, a cancel) is not reviewed.
+    let review = if provider_config.is_some()
+        && refinements
+        && super::service::auto_refine_enabled(&context.paths.config_file, environment)
+        && !cancellation.is_cancelled()
+        && outcome.stop != harness_tools::TurnStop::Canceled
+    {
+        let local = super::harness::local_dir(&context.paths.data_dir, outcome.task_id.as_str());
+        match super::refine::exec_review_due(
+            &local,
+            turns_run,
+            tool_calls_run,
+            runtime.compactions() > 0,
+            super::service::auto_refine_interval(&context.paths.config_file),
+        ) {
+            Some(turns) => {
+                let conversation =
+                    super::service::refine_transcript(&store, &outcome.session_id, &local).await;
+                (!conversation.is_empty()).then_some((turns, conversation, local))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     drop(driver);
     // Stop the extension processes this turn started, before the writer is released.
     if let Some(active) = active_extensions {
@@ -1173,6 +1207,73 @@ pub async fn run_with(
         }
         out.stdout(output["response"].as_str().unwrap_or_default());
     }
+    // The answer is out; the review runs before the process exits, since no
+    // process is left to run it beside the conversation. What it says goes to
+    // stderr, and Ctrl-C cuts it off (whatever it wrote is undone).
+    if let Some((turns, conversation, local)) = review {
+        out.stderr(&format!(
+            "auto-refine: reviewing the last {turns} turn(s) of this conversation before exiting (HA_AUTO_REFINE=off skips it)"
+        ));
+        let config_dir = context
+            .paths
+            .config_file
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let learning = super::service::refine_learning(
+            config_dir,
+            &context.paths.data_dir,
+            &context.project.root,
+            environment,
+            resolved_config.project_trusted,
+        );
+        let scopes = super::refine::HarnessScopes {
+            global: super::harness::global_dir(&context.paths.data_dir),
+            local,
+        };
+        let model = provider_config
+            .as_ref()
+            .map(|config| config.model.clone())
+            .unwrap_or_default();
+        let reviewed = async {
+            let mut events = super::service::review_now(
+                Arc::clone(&provider),
+                model.clone(),
+                conversation,
+                scopes.clone(),
+                learning,
+                turns,
+                Some(outcome.session_id.as_str().to_owned()),
+                knowledge_host.clone(),
+            )
+            .await;
+            // A conversation's store that outgrew forty entries is
+            // consolidated too, as the app does after a turn.
+            if super::refine::local_consolidation_due(&scopes.local)
+                && let Some(_consolidating) = super::refine::Consolidating::try_begin()
+            {
+                events.push(
+                    super::service::consolidate_local_event(
+                        &provider,
+                        &model,
+                        &scopes,
+                        outcome.task_id.as_str(),
+                    )
+                    .await,
+                );
+            }
+            events
+        };
+        tokio::select! {
+            events = reviewed => {
+                for event in events {
+                    report_review(out.as_ref(), &event);
+                }
+            }
+            () = cancellation.cancelled() => {
+                out.stderr("auto-refine: the review was cut off");
+            }
+        }
+    }
     // prime-agent's print-mode autonomous contract applies to every output.
     if let Some(line) = autonomous.exit_stderr(std::time::Instant::now()) {
         out.stderr(&line);
@@ -1193,6 +1294,24 @@ pub async fn run_with(
         _ => 4,
     };
     Ok(exit)
+}
+
+/// Say on stderr what the automatic review did.
+fn report_review(out: &dyn Output, event: &SessionEvent) {
+    match event {
+        SessionEvent::Notice { message } => out.stderr(message),
+        SessionEvent::Refined {
+            header,
+            summary,
+            details,
+        } => {
+            out.stderr(&format!("{header}: {summary}"));
+            for line in details {
+                out.stderr(&format!("  {line}"));
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Convert the goal evaluator's proven evidence into M0's durable command input.

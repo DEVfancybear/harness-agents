@@ -213,6 +213,56 @@ pub fn mark_reviewed(local: &Path, session: &str) {
     }
 }
 
+/// The work `ha exec` runs did in a conversation since its last review, kept
+/// in the conversation's local scope: each run is a process of its own, so the
+/// count the app keeps in memory would start from nothing every time.
+const EXEC_CADENCE_FILE: &str = "review_cadence.json";
+
+/// Count a headless run's turns and tool calls toward the conversation's next
+/// review. When what it did since the last one is enough for a session's end to
+/// be reviewed in the app ([`TAIL_MIN_TURNS`] or [`TAIL_MIN_TOOL_CALLS`]), or
+/// reaches `autoRefine.turnInterval` (`turn_interval`), or the run compacted its
+/// context after doing anything, the review is claimed: the count restarts and
+/// the turns it covers are returned.
+#[must_use]
+pub fn exec_review_due(
+    local: &Path,
+    turns: u32,
+    tool_calls: u32,
+    compacted: bool,
+    turn_interval: u32,
+) -> Option<u32> {
+    let path = local.join(EXEC_CADENCE_FILE);
+    let earlier = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or(Value::Null);
+    let count = |field: &str| {
+        earlier[field]
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(0)
+    };
+    let turns = count("turns").saturating_add(turns);
+    let calls = count("tool_calls").saturating_add(tool_calls);
+    let due = turns > 0
+        && (turns >= TAIL_MIN_TURNS.min(turn_interval.max(1))
+            || calls >= TAIL_MIN_TOOL_CALLS
+            || compacted);
+    let kept = if due {
+        json!({"turns": 0, "tool_calls": 0, "reviewed_at": now()})
+    } else {
+        json!({"turns": turns, "tool_calls": calls})
+    };
+    if std::fs::create_dir_all(local).is_ok() {
+        let temporary = local.join(format!("{EXEC_CADENCE_FILE}.tmp"));
+        if std::fs::write(&temporary, kept.to_string()).is_ok() {
+            let _ = std::fs::rename(&temporary, &path);
+        }
+    }
+    due.then_some(turns)
+}
+
 /// Leave a review for the next turn in this project.
 pub fn defer_review(project_dir: &Path, review: &DeferredReview) -> Result<(), String> {
     let dir = project_dir.join(DEFERRED_DIR);
@@ -1294,8 +1344,13 @@ impl Refinement {
             self.record["entries"]["before"].as_u64(),
             self.record["entries"]["after"].as_u64(),
         ) {
+            let memory = if scope == "global" {
+                "Global memory"
+            } else {
+                "This conversation's memory"
+            };
             lines.push(format!(
-                "Global memory: {before} -> {after} entries (target {MEMORY_TARGET_ENTRIES} or fewer)"
+                "{memory}: {before} -> {after} entries (target {MEMORY_TARGET_ENTRIES} or fewer)"
             ));
         }
         for edit in self.superseded() {
@@ -1628,10 +1683,15 @@ async fn promote_with_repair(
     model: &str,
     learning: &Learning,
     intents: &[Value],
+    pending: &mut Pending,
 ) -> Vec<Value> {
     let mut records = intents
         .iter()
-        .map(|intent| promote_one(intent, Some(learning)))
+        .map(|intent| {
+            let record = promote_one(intent, Some(learning));
+            pending.note(&record);
+            record
+        })
         .collect::<Vec<_>>();
     let refused = intents
         .iter()
@@ -1666,6 +1726,7 @@ async fn promote_with_repair(
     }
     for intent in repaired.iter().filter(|intent| intent.is_object()) {
         let mut record = promote_one(intent, Some(learning));
+        pending.note(&record);
         record["repaired"] = json!(true);
         records.push(record);
     }
@@ -1965,10 +2026,12 @@ Learned skills in play: {}
         outcomes,
     )
     .await?;
+    let mut pending = Pending::begin(scopes.dir(options.global), &id, learning)?;
+    stage_skills(provider, model, learning, &mut proposal, &mut pending).await;
     if let Some(learning) = learning {
         proposal.skill_outcome_records = record_skill_outcomes(learning, &proposal.skill_outcomes);
     }
-    let refinement = apply(
+    let refinement = match apply(
         scopes,
         &proposal,
         &id,
@@ -1976,7 +2039,13 @@ Learned skills in play: {}
         None,
         Some(&baseline),
         learning,
-    )?;
+    ) {
+        Ok(refinement) => {
+            pending.complete();
+            refinement
+        }
+        Err(error) => return Err(failed_with(&error, pending)),
+    };
     if let Some(learning) = learning
         && !proposal.skill_records.is_empty()
     {
@@ -1985,8 +2054,8 @@ Learned skills in play: {}
     Ok(refinement)
 }
 
-/// Ask the refiner for a proposal under `scope_instruction`, with its learned
-/// skill intents promoted.
+/// Ask the refiner for a proposal under `scope_instruction`; its learned skill
+/// intents are promoted by the caller, under the refinement's pending record.
 #[allow(
     clippy::too_many_arguments,
     reason = "the refinement's inputs, shared by /refine and the automatic review"
@@ -2038,15 +2107,7 @@ async fn plan(
     if !value.is_object() {
         return Err("the refiner JSON must be an object".to_owned());
     }
-    let mut proposal = Proposal::from_value(&value);
-    if let Some(learning) = learning
-        && !proposal.skill_files.is_empty()
-    {
-        proposal.skill_records =
-            promote_with_repair(provider, model, learning, &proposal.skill_files).await;
-        proposal.skill_files.clear();
-    }
-    Ok(proposal)
+    Ok(Proposal::from_value(&value))
 }
 
 /// The automatic review's scope: local by default, with memory that holds
@@ -2104,6 +2165,7 @@ fn create_pages(
     host: &super::knowledge::KnowledgeHost,
     pages: &[Value],
     conversation: &str,
+    pending: &mut Pending,
 ) -> Vec<Value> {
     pages
         .iter()
@@ -2128,6 +2190,7 @@ fn create_pages(
                     record["error"] = json!(error);
                 }
             }
+            pending.note(&record);
             record
         })
         .collect()
@@ -2159,11 +2222,255 @@ fn delete_page(created: &Value) -> Value {
     record
 }
 
+/// Where a refinement in progress records what it wrote outside the harness
+/// state, in the directory of the scope it is recorded in.
+const PENDING_DIR: &str = "pending_refinements";
+
+/// A refinement in progress: the knowledge pages and learned skills it wrote
+/// before [`apply`] recorded it. Each write is noted on disk as it lands, under
+/// a lock held for as long as the refinement runs. Completed, the record is the
+/// refinement's; dropped without that - [`apply`] failed (the state's lock
+/// timed out, a save or the history failed) or the review was cut off - the
+/// writes are undone. A process that died mid-way leaves the record unlocked,
+/// and the next refinement in the scope undoes it. Seen: a review whose apply
+/// timed out on the lock left its pages and skills behind with no refinement
+/// to roll them back.
+struct Pending {
+    dir: PathBuf,
+    id: String,
+    layers: Option<super::learned::Layers>,
+    writes: Vec<Value>,
+    lock: Option<std::fs::File>,
+}
+
+impl Pending {
+    /// Record a refinement before it writes anything, undoing first what one
+    /// that died left behind.
+    fn begin(dir: &Path, id: &str, learning: Option<&Learning>) -> Result<Self, String> {
+        let layers = learning.map(|learning| learning.layers.clone());
+        recover_pending(dir, layers.as_ref());
+        let pending_dir = dir.join(PENDING_DIR);
+        std::fs::create_dir_all(&pending_dir)
+            .map_err(|error| format!("pending refinement: {error}"))?;
+        let lock = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(pending_dir.join(format!("{id}.lock")))
+            .map_err(|error| format!("pending refinement: {error}"))?;
+        lock.try_lock()
+            .map_err(|error| format!("pending refinement lock: {error}"))?;
+        let pending = Self {
+            dir: dir.to_path_buf(),
+            id: id.to_owned(),
+            layers,
+            writes: Vec::new(),
+            lock: Some(lock),
+        };
+        pending.save()?;
+        Ok(pending)
+    }
+
+    fn save(&self) -> Result<(), String> {
+        let path = self.dir.join(PENDING_DIR).join(format!("{}.json", self.id));
+        let temporary = path.with_extension("json.tmp");
+        let text = json!({"id": self.id, "at": now(), "writes": self.writes}).to_string();
+        std::fs::write(&temporary, text)
+            .and_then(|()| std::fs::rename(&temporary, &path))
+            .map_err(|error| format!("pending refinement: {error}"))
+    }
+
+    /// Note a write that landed, so it is undone if the refinement is not
+    /// recorded.
+    fn note(&mut self, record: &Value) {
+        if record["applied"] == true {
+            self.writes.push(record.clone());
+            let _ = self.save();
+        }
+    }
+
+    /// The refinement was recorded: its writes are the record's to roll back.
+    fn complete(mut self) {
+        self.finish();
+    }
+
+    /// The refinement was not recorded: undo its writes, newest first, and say
+    /// what was undone.
+    fn undo(mut self) -> String {
+        let undone = undo_writes(&std::mem::take(&mut self.writes), self.layers.as_ref());
+        self.finish();
+        undone
+    }
+
+    fn finish(&mut self) {
+        self.writes.clear();
+        drop(self.lock.take());
+        let pending_dir = self.dir.join(PENDING_DIR);
+        let _ = std::fs::remove_file(pending_dir.join(format!("{}.json", self.id)));
+        let _ = std::fs::remove_file(pending_dir.join(format!("{}.lock", self.id)));
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if self.lock.is_some() {
+            let undone = undo_writes(&std::mem::take(&mut self.writes), self.layers.as_ref());
+            if !undone.is_empty() {
+                harness_types::diag::warn("review", "undone")
+                    .msg(undone)
+                    .field("refinement", self.id.as_str())
+                    .emit();
+            }
+            self.finish();
+        }
+    }
+}
+
+/// Undo a refinement's writes outside the harness state, newest first: a page
+/// deleted while it is as written, a learned skill restored from its undo.
+fn undo_writes(writes: &[Value], layers: Option<&super::learned::Layers>) -> String {
+    let mut undone = Vec::new();
+    let mut failed = Vec::new();
+    for write in writes.iter().rev() {
+        let id = write["id"].as_str().unwrap_or("?");
+        let result = if write["kind"] == KNOWLEDGE_KIND {
+            let deleted = delete_page(write);
+            if deleted["applied"] == true {
+                Ok(())
+            } else {
+                Err(deleted["error"].as_str().unwrap_or_default().to_owned())
+            }
+        } else if write["kind"] == SKILL_FILE_KIND {
+            layers
+                .ok_or_else(|| "learned skills are unavailable".to_owned())
+                .and_then(|layers| {
+                    super::learned::restore(
+                        layers,
+                        write["action"].as_str().unwrap_or_default(),
+                        id,
+                        write["level"].as_str().unwrap_or_default(),
+                        &write["undo"],
+                    )
+                })
+        } else {
+            continue;
+        };
+        let kind = if write["kind"] == KNOWLEDGE_KIND {
+            "knowledge page"
+        } else {
+            "learned skill"
+        };
+        match result {
+            Ok(()) => undone.push(format!("{kind} `{id}`")),
+            Err(error) => failed.push(format!("{kind} `{id}` ({error})")),
+        }
+    }
+    let mut text = String::new();
+    if !undone.is_empty() {
+        let _ = write!(text, "undone: {}", undone.join(", "));
+    }
+    if !failed.is_empty() {
+        if !text.is_empty() {
+            text.push_str("; ");
+        }
+        let _ = write!(text, "could not undo: {}", failed.join(", "));
+    }
+    text
+}
+
+/// Undo what refinements that died before they were recorded wrote. One still
+/// running holds its lock and is left alone; one whose record reached the
+/// history was recorded after all, and only its note is removed.
+fn recover_pending(dir: &Path, layers: Option<&super::learned::Layers>) {
+    let pending_dir = dir.join(PENDING_DIR);
+    let Ok(entries) = std::fs::read_dir(&pending_dir) else {
+        return;
+    };
+    let history = std::fs::read_to_string(dir.join(HISTORY_FILE)).unwrap_or_default();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let lock_path = path.with_extension("lock");
+        let Ok(lock) = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+        else {
+            continue;
+        };
+        if lock.try_lock().is_err() {
+            continue;
+        }
+        let record = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .unwrap_or(Value::Null);
+        let id = record["id"].as_str().unwrap_or_default();
+        let recorded = !id.is_empty() && history.contains(&format!("\"id\":\"{id}\""));
+        if !recorded {
+            let writes = record["writes"].as_array().cloned().unwrap_or_default();
+            let undone = undo_writes(&writes, layers);
+            harness_types::diag::warn("review", "recovered")
+                .msg(if undone.is_empty() {
+                    "nothing to undo".to_owned()
+                } else {
+                    undone
+                })
+                .field("refinement", id)
+                .emit();
+        }
+        drop(lock);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+}
+
+/// Promote the proposal's learned-skill intents (with their repair) as the
+/// refinement's pending writes.
+async fn stage_skills(
+    provider: &Arc<dyn ModelProvider>,
+    model: &str,
+    learning: Option<&Learning>,
+    proposal: &mut Proposal,
+    pending: &mut Pending,
+) {
+    if let Some(learning) = learning
+        && !proposal.skill_files.is_empty()
+    {
+        proposal.skill_records =
+            promote_with_repair(provider, model, learning, &proposal.skill_files, pending).await;
+        proposal.skill_files.clear();
+    }
+}
+
+/// What the automatic review recorded: the local refinement, then the global
+/// one when there is one. A global part that failed is reported beside the
+/// local one, which stands: it was applied and recorded.
+#[derive(Debug)]
+pub struct AutoRefined {
+    pub refinements: Vec<Refinement>,
+    pub global_error: Option<String>,
+}
+
 /// The automatic review's refinement. Beyond a local refinement it reaches
 /// what `CowAgent`'s Self-Evolution writes: memory edits marked global go to
 /// the global store - recorded there as a refinement of their own, so each
-/// part rolls back on its own - and new knowledge pages. Returns the local
-/// refinement, then the global one when there is one.
+/// part rolls back on its own - and new knowledge pages.
+///
+/// The pages and learned skills are written before the local refinement is
+/// applied, under a pending record ([`Pending`]): when the apply fails they are
+/// undone, so nothing the review wrote is left without a refinement to roll it
+/// back. A global part that fails leaves the local refinement standing, and it
+/// is returned with the error.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one review: plan, stage, apply locally, then globally"
+)]
 pub async fn auto_refine(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
@@ -2172,7 +2479,7 @@ pub async fn auto_refine(
     instructions: Option<String>,
     learning: Option<&Learning>,
     knowledge: Option<&super::knowledge::KnowledgeHost>,
-) -> Result<Vec<Refinement>, String> {
+) -> Result<AutoRefined, String> {
     let history = history(scopes);
     let options = RefineOptions {
         instructions,
@@ -2227,14 +2534,17 @@ pub async fn auto_refine(
                     .is_some_and(|evidence| !evidence.trim().is_empty())
         });
     proposal.edits = local_edits;
+    let id = refinement_id();
+    let mut pending = Pending::begin(&scopes.local, &id, learning)?;
+    stage_skills(provider, model, learning, &mut proposal, &mut pending).await;
     if let Some(host) = knowledge.filter(|_| catalog.is_some()) {
-        proposal.knowledge_records = create_pages(host, &proposal.knowledge, conversation);
+        proposal.knowledge_records =
+            create_pages(host, &proposal.knowledge, conversation, &mut pending);
     }
     if let Some(learning) = learning {
         proposal.skill_outcome_records = record_skill_outcomes(learning, &proposal.skill_outcomes);
     }
-    let id = refinement_id();
-    let local = apply(
+    let local = match apply(
         scopes,
         &proposal,
         &id,
@@ -2242,13 +2552,22 @@ pub async fn auto_refine(
         None,
         Some(&local_baseline),
         learning,
-    )?;
+    ) {
+        Ok(local) => {
+            pending.complete();
+            local
+        }
+        Err(error) => return Err(failed_with(&error, pending)),
+    };
     if let Some(learning) = learning
         && !proposal.skill_records.is_empty()
     {
         record_learning_run(learning, &local, "refine");
     }
-    let mut refinements = vec![local];
+    let mut refined = AutoRefined {
+        refinements: vec![local],
+        global_error: None,
+    };
     if !global_edits.is_empty() {
         let global = Proposal {
             summary: format!("{} (global memory)", proposal.summary),
@@ -2257,7 +2576,7 @@ pub async fn auto_refine(
             edits: global_edits,
             ..Proposal::default()
         };
-        refinements.push(apply(
+        match apply(
             scopes,
             &global,
             &format!("{id}_global"),
@@ -2265,9 +2584,23 @@ pub async fn auto_refine(
             None,
             Some(&global_baseline),
             None,
-        )?);
+        ) {
+            Ok(global) => refined.refinements.push(global),
+            Err(error) => refined.global_error = Some(error),
+        }
     }
-    Ok(refinements)
+    Ok(refined)
+}
+
+/// The error of a refinement that was not recorded, with what of its pending
+/// writes was undone.
+fn failed_with(error: &str, pending: Pending) -> String {
+    let undone = pending.undo();
+    if undone.is_empty() {
+        error.to_owned()
+    } else {
+        format!("{error} ({undone})")
+    }
 }
 
 /// How many requests in a layer pass between automatic curations: consolidation
@@ -2322,7 +2655,7 @@ pub async fn curate(
     let consolidating = Consolidating::try_begin();
     let memory =
         if consolidating.is_some() && memory_entries(&baseline).len() >= CONSOLIDATE_MIN_ENTRIES {
-            Some(memory_edits(provider, model, &baseline, instructions).await?)
+            Some(memory_edits(provider, model, &baseline, instructions, true).await?)
         } else {
             None
         };
@@ -2347,6 +2680,9 @@ pub async fn curate(
         return Ok(refinement);
     };
     let mut proposal = curate_skills(provider, model, learning, instructions).await?;
+    let id = refinement_id();
+    let mut pending = Pending::begin(&scopes.global, &id, Some(learning))?;
+    stage_skills(provider, model, Some(learning), &mut proposal, &mut pending).await;
     if let Some(memory) = memory {
         proposal.edits = memory.edits;
         proposal.count_entries = true;
@@ -2355,22 +2691,28 @@ pub async fn curate(
         proposal.expected_outcome =
             format!("{} {}", memory.expected_outcome, proposal.expected_outcome);
     }
-    let refinement = apply(
+    let refinement = match apply(
         scopes,
         &proposal,
-        &refinement_id(),
+        &id,
         true,
         None,
         Some(&baseline),
         Some(learning),
-    )?;
+    ) {
+        Ok(refinement) => {
+            pending.complete();
+            refinement
+        }
+        Err(error) => return Err(failed_with(&error, pending)),
+    };
     mark_consolidated(&scopes.global);
     record_learning_run(learning, &refinement, "curate");
     Ok(refinement)
 }
 
 /// The learned-skill half of [`curate`]: the library snapshotted, then the
-/// curator's intents promoted, ready to apply.
+/// curator's intents, for [`curate`] to promote under its pending record.
 async fn curate_skills(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
@@ -2410,9 +2752,6 @@ async fn curate_skills(
     let mut proposal = Proposal::from_value(&value);
     // The skill curator changes learned skills only.
     proposal.edits.clear();
-    proposal.skill_records =
-        promote_with_repair(provider, model, learning, &proposal.skill_files).await;
-    proposal.skill_files.clear();
     proposal.rationale = format!(
         "{} (library snapshot: {})",
         proposal.rationale,
@@ -2719,6 +3058,7 @@ async fn memory_edits(
     model: &str,
     baseline: &Value,
     instructions: Option<&str>,
+    global: bool,
 ) -> Result<Proposal, String> {
     let entries = memory_entries(baseline)
         .iter()
@@ -2731,12 +3071,17 @@ async fn memory_edits(
     } else {
         ""
     };
-    let mut parts = vec![
-        format!("<global_memory>\n{entries}\n</global_memory>"),
-        format!(
-            "<size>\n{count} entries; the target is {MEMORY_TARGET_ENTRIES} or fewer{over}.\n</size>"
-        ),
-    ];
+    let mut parts = if global {
+        vec![format!("<global_memory>\n{entries}\n</global_memory>")]
+    } else {
+        vec![
+            format!("<conversation_memory>\n{entries}\n</conversation_memory>"),
+            format!("<scope>\n{LOCAL_SCOPE_NOTE}\n</scope>"),
+        ]
+    };
+    parts.push(format!(
+        "<size>\n{count} entries; the target is {MEMORY_TARGET_ENTRIES} or fewer{over}.\n</size>"
+    ));
     if let Some(instructions) = instructions {
         parts.push(format!(
             "<user_curate_instructions>\n{instructions}\n</user_curate_instructions>"
@@ -2774,7 +3119,7 @@ pub async fn consolidate_memory(
     scopes: &HarnessScopes,
 ) -> Result<Refinement, String> {
     let baseline = load_raw(&scopes.global);
-    let proposal = memory_edits(provider, model, &baseline, None).await;
+    let proposal = memory_edits(provider, model, &baseline, None, true).await;
     // A failed pass is tried again after a while; marked as done, one
     // timeout put it off until fifteen more changes.
     let proposal = match proposal {
@@ -2794,6 +3139,66 @@ pub async fn consolidate_memory(
         None,
     );
     mark_consolidated(&scopes.global);
+    refinement
+}
+
+/// How many memory entries and prompt notes a conversation's local store holds
+/// before it is consolidated. Every review of a long conversation adds to it,
+/// and nothing took any away: the digest of a conversation hours long ranked
+/// among dozens of progress notes, most of them superseded.
+pub const LOCAL_CONSOLIDATE_ENTRIES: usize = 40;
+
+/// What the curator is told about a conversation's local store.
+const LOCAL_SCOPE_NOTE: &str = "These are the entries of one conversation's local store, not the global memory: they reach only this conversation's turns. Every rule above holds, with one change: the state of the task in progress (where it stands, what is next, a blocker still open) may stay - one entry per subject, the latest - while the states it superseded and the leftovers of finished work are deleted.";
+
+/// Whether a conversation's local store has outgrown
+/// [`LOCAL_CONSOLIDATE_ENTRIES`] and changed since its last consolidation, and
+/// no failed pass is waiting out its retry.
+#[must_use]
+pub fn local_consolidation_due(local: &Path) -> bool {
+    if memory_entries(&load_raw(local)).len() <= LOCAL_CONSOLIDATE_ENTRIES {
+        return false;
+    }
+    let failed_recently = std::fs::read_to_string(local.join(CONSOLIDATE_FAILED_FILE))
+        .ok()
+        .and_then(|text| text.trim().parse::<i64>().ok())
+        .is_some_and(|at| chrono::Utc::now().timestamp() - at < CONSOLIDATE_RETRY_SECONDS);
+    if failed_recently {
+        return false;
+    }
+    // A pass that kept more than the threshold waits for new changes.
+    std::fs::read_to_string(local.join(CONSOLIDATED_FILE))
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .is_none_or(|mark| memory_changes(local).saturating_sub(mark) >= CONSOLIDATE_AFTER_CHANGES)
+}
+
+/// Consolidate a conversation's local store, as [`consolidate_memory`] does
+/// the global one: the same curator and guard rails, recorded as a local
+/// refinement that rolls back like any other.
+pub async fn consolidate_local(
+    provider: &Arc<dyn ModelProvider>,
+    model: &str,
+    scopes: &HarnessScopes,
+) -> Result<Refinement, String> {
+    let baseline = load_raw(&scopes.local);
+    let proposal = match memory_edits(provider, model, &baseline, None, false).await {
+        Ok(proposal) => proposal,
+        Err(error) => {
+            mark_consolidation_failed(&scopes.local);
+            return Err(error);
+        }
+    };
+    let refinement = apply(
+        scopes,
+        &proposal,
+        &refinement_id(),
+        false,
+        None,
+        Some(&baseline),
+        None,
+    );
+    mark_consolidated(&scopes.local);
     refinement
 }
 
@@ -3560,6 +3965,74 @@ mod tests {
         assert_eq!(super::memory_changes(&scopes.global), before + 2);
     }
 
+    /// A conversation's local store past forty entries is consolidated by the
+    /// same curator, told the task's current state may stay, as a local
+    /// refinement that rolls back; still over forty, it waits for new changes.
+    #[tokio::test]
+    async fn a_conversations_local_memory_is_consolidated_past_forty_entries() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let mut memory = serde_json::Map::new();
+        for number in 0..=super::LOCAL_CONSOLIDATE_ENTRIES {
+            memory.insert(
+                format!("step_{number}"),
+                json!({"id": format!("step_{number}"), "kind": "memory", "title": format!("Step {number}"), "content": format!("porting step {number} done"), "version": 1, "path": "progress"}),
+            );
+        }
+        std::fs::create_dir_all(&scopes.local).expect("dir");
+        let state = json!({"schema": 1, "entries": {"memory": memory, "prompt": {}, "skill": {}, "subagent": {}}, "refinements": []});
+        super::save_raw(&scopes.local, &state).expect("state");
+        assert!(super::local_consolidation_due(&scopes.local));
+        // Global memory this size is not the local store's concern.
+        assert!(!super::local_consolidation_due(&scopes.global));
+        let reply = json!({
+            "summary": "kept the latest step",
+            "rationale": "each step superseded the one before",
+            "edits": [
+                {"action": "update", "kind": "memory", "id": "step_40", "title": "Where the port stands", "content": "porting: steps 0-40 done", "reason": "the latest state"},
+                {"action": "delete", "kind": "memory", "id": "step_0", "reason": "superseded"},
+                {"action": "delete", "kind": "memory", "id": "step_1", "reason": "superseded"}
+            ]
+        })
+        .to_string();
+        let replies = Replies::new(&[reply]);
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = replies.clone();
+        let result = super::consolidate_local(&provider, "fixture-model", &scopes)
+            .await
+            .expect("consolidated");
+        assert_eq!(result.record["scope"], "local");
+        assert!(
+            result.details().contains(
+                &"This conversation's memory: 41 -> 39 entries (target 30 or fewer)".to_owned()
+            ),
+            "{:?}",
+            result.details()
+        );
+        let prompt = replies.prompt(0);
+        assert!(prompt.contains("<conversation_memory>"), "{prompt}");
+        assert!(prompt.contains("the state of the task in progress"));
+        let state = load_raw(&scopes.local);
+        assert!(state["entries"]["memory"]["step_0"].is_null());
+        assert_eq!(
+            state["entries"]["memory"]["step_40"]["content"],
+            "porting: steps 0-40 done"
+        );
+        // Marked: still over forty, it waits for new changes.
+        assert!(!super::local_consolidation_due(&scopes.local));
+        // It rolls back like any refinement.
+        super::refine(
+            &provider_after(),
+            "fixture-model",
+            "",
+            &scopes,
+            &RefineOptions::parse(&format!("--rollback {}", result.id())),
+            None,
+        )
+        .await
+        .expect("rolled back");
+        assert!(!load_raw(&scopes.local)["entries"]["memory"]["step_0"].is_null());
+    }
+
     /// The global memory, once large and changed enough, is consolidated: a
     /// duplicate merged into the kept entry, a stale one removed, a pinned one
     /// kept pinned, a skill edit refused as not the curator's to make - all
@@ -3708,7 +4181,7 @@ mod tests {
         .to_string();
         let replies = Replies::new(&[reply]);
         let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = replies.clone();
-        let refinements = super::auto_refine(
+        let refined = super::auto_refine(
             &provider,
             "fixture-model",
             "[User]: retry: double the wait, cap at 30 s. luôn trả lời bằng tiếng Việt\n\n[Assistant]: vâng",
@@ -3719,9 +4192,13 @@ mod tests {
         )
         .await
         .expect("refined");
+        assert!(refined.global_error.is_none());
+        let refinements = refined.refinements;
         assert!(
-            replies.prompt(0).contains("concepts/existing.md: Existing"),
-            "the review sees the pages it may not duplicate"
+            replies
+                .prompt(0)
+                .contains("concepts/existing.md: Existing (updated <1h ago) - already here"),
+            "the review sees the pages it may not duplicate, and how old each is"
         );
         assert_eq!(refinements.len(), 2);
         let (local, global) = (&refinements[0], &refinements[1]);
@@ -3805,6 +4282,193 @@ mod tests {
                 .contains("concepts/existing.md"),
             "the page the review did not write stays"
         );
+    }
+
+    /// The automatic review is one transaction. Its knowledge pages and learned
+    /// skills are written under a pending record before the refinement is
+    /// applied: when the apply cannot take the state's lock (held past its
+    /// timeout), none of them is left behind, nor any entry. A global part that
+    /// fails leaves the local refinement recorded and returned. What a review
+    /// that died mid-way wrote is undone by the next one.
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a failed review, a half-failed one, then a recovery"
+    )]
+    async fn a_review_that_cannot_apply_leaves_no_page_or_skill_behind() {
+        use crate::interactive::harness::{LOCK_WAIT, lock_state};
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let host = crate::interactive::knowledge::KnowledgeHost::new(
+            &workspace,
+            &directory.path().join("data"),
+        );
+        let layers = crate::interactive::learned::Layers::new(
+            &directory.path().join("config"),
+            &directory.path().join("data"),
+            &workspace,
+            true,
+        );
+        let learning = super::Learning::new(layers.clone(), &workspace, None);
+        let skills = layers.project.clone().expect("trusted project");
+        let conversation = "[User]: retry: double the wait, cap at 30 s. luôn trả lời bằng tiếng Việt. Use --locked on CI.\n\n[Assistant]: vâng";
+        let reply = |skill: &str, page: &str| {
+            json!({
+                "summary": "kept the retry method",
+                "edits": [
+                    {"action": "create", "kind": "memory", "title": "Current step", "content": "porting the parser", "reason": "task progress"},
+                    {"action": "create", "kind": "memory", "title": "Reply language", "content": "Always answer in Vietnamese", "scope": "global", "reason": "a lasting preference", "evidence": "luôn trả lời bằng tiếng Việt"}
+                ],
+                "skillFiles": [{
+                    "action": "create", "name": skill, "level": "project",
+                    "body": format!("---\nname: {skill}\ndescription: Use when a Rust test fails only on CI.\ncategory: testing\n---\nRun the failing test alone with --locked first.\n"),
+                    "reason": "the user said so", "evidence": "Use --locked on CI."
+                }],
+                "knowledge": [{
+                    "scope": "project", "path": page, "title": "Retry with backoff",
+                    "summary": "how the client retries", "content": "Double the wait, cap at 30 s.",
+                    "evidence": "double the wait, cap at 30 s", "reason": "worked out here"
+                }]
+            })
+            .to_string()
+        };
+        let pending = |dir: &std::path::Path| {
+            std::fs::read_dir(dir.join(super::PENDING_DIR)).map_or(0, Iterator::count)
+        };
+        LOCK_WAIT.with(|wait| wait.set(Some(std::time::Duration::from_millis(200))));
+
+        // The local state is held past the lock's timeout: nothing stays.
+        let held = lock_state(&scopes.local).expect("held");
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> =
+            Replies::new(&[reply("ci-test-debugging", "concepts/retry-backoff.md")]);
+        let error = super::auto_refine(
+            &provider,
+            "fixture-model",
+            conversation,
+            &scopes,
+            None,
+            Some(&learning),
+            Some(&host),
+        )
+        .await
+        .expect_err("the apply cannot take the lock");
+        drop(held);
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            error.contains("undone: knowledge page `concepts/retry-backoff.md`, learned skill `ci-test-debugging`"),
+            "{error}"
+        );
+        assert!(!crate::interactive::learned::is_learned(
+            &skills,
+            "ci-test-debugging"
+        ));
+        assert!(
+            !host
+                .review_catalog("")
+                .expect("catalog")
+                .contains("retry-backoff"),
+            "the page is deleted"
+        );
+        assert!(load_raw(&scopes.local)["entries"]["memory"]["current_step"].is_null());
+        assert!(load_raw(&scopes.global)["entries"]["memory"]["reply_language"].is_null());
+        assert!(!scopes.local.join(super::HISTORY_FILE).exists());
+        assert_eq!(pending(&scopes.local), 0, "the pending record is gone");
+
+        // The global state is held: the local refinement stands and is returned.
+        let held = lock_state(&scopes.global).expect("held");
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> =
+            Replies::new(&[reply("ci-locked-builds", "concepts/retry-policy.md")]);
+        let refined = super::auto_refine(
+            &provider,
+            "fixture-model",
+            conversation,
+            &scopes,
+            None,
+            Some(&learning),
+            Some(&host),
+        )
+        .await
+        .expect("the local part applies");
+        drop(held);
+        assert!(
+            refined
+                .global_error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out")),
+            "{:?}",
+            refined.global_error
+        );
+        assert_eq!(refined.refinements.len(), 1);
+        let local = &refined.refinements[0];
+        assert_eq!(local.record["scope"], "local");
+        assert!(
+            std::fs::read_to_string(scopes.local.join(super::HISTORY_FILE))
+                .expect("history")
+                .contains(local.id())
+        );
+        assert!(crate::interactive::learned::is_learned(
+            &skills,
+            "ci-locked-builds"
+        ));
+        assert!(
+            host.review_catalog("")
+                .expect("catalog")
+                .contains("concepts/retry-policy.md")
+        );
+        assert_eq!(
+            load_raw(&scopes.local)["entries"]["memory"]["current_step"]["content"],
+            "porting the parser"
+        );
+        assert!(load_raw(&scopes.global)["entries"]["memory"]["reply_language"].is_null());
+        assert_eq!(pending(&scopes.local), 0);
+
+        // A review that died after writing a page left its record unlocked:
+        // the next refinement in the scope deletes the page.
+        let (written, root) = host
+            .review_create(
+                &json!({
+                    "scope": "project", "path": "analysis/orphan.md", "title": "Orphan page",
+                    "summary": "written by a review that died", "content": "left behind",
+                    "evidence": "double the wait"
+                }),
+                conversation,
+            )
+            .expect("orphan page");
+        let record = json!({
+            "action": "create", "kind": "knowledge", "id": written["path"], "level": "project",
+            "hash": written["hash"], "root": root.display().to_string(), "applied": true
+        });
+        let dead = scopes.local.join(super::PENDING_DIR);
+        std::fs::create_dir_all(&dead).expect("pending dir");
+        std::fs::write(
+            dead.join("refine_dead.json"),
+            json!({"id": "refine_dead", "writes": [record]}).to_string(),
+        )
+        .expect("pending record");
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> =
+            Replies::new(&[json!({"summary": "nothing", "edits": []}).to_string()]);
+        super::auto_refine(
+            &provider,
+            "fixture-model",
+            conversation,
+            &scopes,
+            None,
+            Some(&learning),
+            Some(&host),
+        )
+        .await
+        .expect("refined");
+        assert!(
+            !host
+                .review_catalog("")
+                .expect("catalog")
+                .contains("analysis/orphan.md"),
+            "the dead review's page is undone"
+        );
+        assert_eq!(pending(&scopes.local), 0);
+        LOCK_WAIT.with(|wait| wait.set(None));
     }
 
     /// A model a rollback never calls.
@@ -4019,6 +4683,33 @@ mod tests {
 
     /// A turn that compacted brings the review forward, once there was as much
     /// work as a session end needs; a compaction alone after one short turn waits.
+    #[test]
+    fn a_headless_conversation_counts_its_runs_toward_a_review() {
+        let directory = tempfile::tempdir().expect("dir");
+        let local = directory.path().join("local");
+        let due = |turns, calls, compacted| {
+            super::exec_review_due(
+                &local,
+                turns,
+                calls,
+                compacted,
+                super::AUTO_REFINE_TURN_INTERVAL,
+            )
+        };
+        // Short runs add up across `ha exec --resume`.
+        assert_eq!(due(1, 3, false), None);
+        assert_eq!(due(1, 3, false), None);
+        assert_eq!(due(1, 4, false), Some(3));
+        // Claimed: the count restarts.
+        assert_eq!(due(4, 0, false), None);
+        assert_eq!(due(1, 0, false), Some(5));
+        // A run that compacted is reviewed after any work; one that did none is not.
+        assert_eq!(due(0, 0, true), None);
+        assert_eq!(due(1, 1, true), Some(1));
+        // `autoRefine.turnInterval: 1` reviews every run.
+        assert_eq!(super::exec_review_due(&local, 1, 0, false, 1), Some(1));
+    }
+
     #[test]
     fn a_compaction_brings_the_review_forward() {
         let cadence = super::Cadence::default();
