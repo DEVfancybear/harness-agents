@@ -12,12 +12,20 @@
 //!    ⚙ full-auto             │
 //! ───────────────────────────│
 //!  agents                  2 │
-//!  ⣾ main           working  │
-//!  ✓ verifier          done  │
+//!  1 ⣾ main         working  │  on the selected background: in front
+//!  2 ✓ verifier        done  │
 //!      12 tools · read_file  │
 //!                            │
-//!  ← agents view             │
+//!  other agents            1 │
+//!  3 ○ fix-tests       idle  │
+//!                            │
+//!  ← agents view    alt+1-9  │
 //! ```
+//!
+//! Every agent row carries the number Alt reaches it with: the session's own
+//! closes a delegate's pane, a delegate's opens it ([`super::pane`]), and the
+//! project's other agents (read by [`super::roster`]) switch the terminal.
+//! A click on a row does the same.
 //!
 //! It is shown only on a console wide enough to keep the conversation at
 //! [`MIN_CONTENT_COLUMNS`] or more beside it, and `terminal.sidebar: false` in
@@ -60,7 +68,8 @@ pub enum Status {
 }
 
 impl Status {
-    const fn word(self) -> &'static str {
+    #[must_use]
+    pub const fn word(self) -> &'static str {
         match self {
             Self::Working => "working",
             Self::Blocked => "blocked",
@@ -78,7 +87,8 @@ impl Status {
         }
     }
 
-    fn style(self, theme: &Theme) -> Style {
+    #[must_use]
+    pub const fn style(self, theme: &Theme) -> Style {
         match self {
             Self::Working => theme.warning,
             Self::Blocked => theme.error,
@@ -107,13 +117,60 @@ pub fn main_status(state: &UiState) -> Status {
     }
 }
 
-/// Draw the sidebar into `area`: its rows, then the divider, then a blank column.
-pub fn render(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
+/// What a numbered row of the sidebar opens (Alt+its number, or a click).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Target {
+    /// The session's own conversation: closes a delegate's pane.
+    Main,
+    /// A delegate of the run: opens its pane beside the conversation.
+    Child(String),
+    /// Another agent of the project: the terminal switches to it.
+    Agent(String),
+}
+
+/// What the sidebar shows beyond the session's own state: the project's other
+/// agents and the delegate whose pane is open.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Extra<'a> {
+    pub others: &'a [super::roster::Entry],
+    pub focus: Option<&'a str>,
+}
+
+/// The rows Alt+1..9 reach, in their order: the session, its delegates, then
+/// the project's other agents.
+#[must_use]
+pub fn targets(state: &UiState, others: &[super::roster::Entry]) -> Vec<Target> {
+    std::iter::once(Target::Main)
+        .chain(
+            state
+                .child_activity
+                .iter()
+                .map(|activity| Target::Child(activity.name.clone())),
+        )
+        .chain(others.iter().map(|entry| Target::Agent(entry.id.clone())))
+        .collect()
+}
+
+/// Draw the sidebar into `area`: its rows, then the divider, then a blank
+/// column. Returns the screen row of every agent row and what it opens.
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    state: &UiState,
+    extra: Extra<'_>,
+    theme: &Theme,
+) -> Vec<(u16, Target)> {
     if area.width < 3 || area.height == 0 {
-        return;
+        return Vec::new();
     }
     let inner = area.width - 2;
-    let mut rows = lines(state, theme, usize::from(inner), usize::from(area.height));
+    let (mut rows, hits) = lines(
+        state,
+        extra,
+        theme,
+        usize::from(inner),
+        usize::from(area.height),
+    );
     rows.truncate(usize::from(area.height));
     frame.render_widget(
         Paragraph::new(rows),
@@ -124,19 +181,36 @@ pub fn render(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
         Paragraph::new(divider),
         Rect::new(area.x + inner, area.y, 1, area.height),
     );
+    hits.into_iter()
+        .filter(|(row, _)| *row < usize::from(area.height))
+        .map(|(row, target)| (area.y + u16::try_from(row).unwrap_or(u16::MAX), target))
+        .collect()
 }
 
-/// The sidebar's rows, `width` cells each, at most `height` of them.
+/// The sidebar's rows, `width` cells each, at most `height` of them, and the
+/// row of every agent with what it opens.
 #[allow(clippy::too_many_lines, reason = "one panel, top to bottom")]
-fn lines(state: &UiState, theme: &Theme, width: usize, height: usize) -> Vec<Line<'static>> {
-    let header = |text: &str| -> Line<'static> {
-        Line::from(Span::styled(
-            format!(" {text}"),
-            theme.dim.add_modifier(Modifier::BOLD),
-        ))
+fn lines(
+    state: &UiState,
+    extra: Extra<'_>,
+    theme: &Theme,
+    width: usize,
+    height: usize,
+) -> (Vec<Line<'static>>, Vec<(usize, Target)>) {
+    let header = |text: &str, count: usize| -> Line<'static> {
+        let label = count.to_string();
+        Line::from(vec![
+            Span::styled(format!(" {text}"), theme.dim.add_modifier(Modifier::BOLD)),
+            Span::raw(" ".repeat(width.saturating_sub(1 + display_width(text) + label.len() + 1))),
+            Span::styled(label, theme.dim),
+        ])
     };
     let main = main_status(state);
-    let mut rows = vec![header("workspace")];
+    let mut rows = vec![Line::from(Span::styled(
+        " workspace",
+        theme.dim.add_modifier(Modifier::BOLD),
+    ))];
+    let mut hits = Vec::new();
 
     // The workspace: its name on the active row's background, with the dot
     // herdr puts beside a space whose agents are busy or waiting.
@@ -208,22 +282,27 @@ fn lines(state: &UiState, theme: &Theme, width: usize, height: usize) -> Vec<Lin
         )]));
     }
 
-    // The agents: the session's own, then each agent it delegated to.
+    // The agents: the session's own, then each agent it delegated to. Each
+    // row carries the number Alt reaches it with; the one whose conversation
+    // is in front is on the selected row's background.
     rows.push(Line::default());
     rows.push(Line::from(Span::styled("─".repeat(width), theme.border)));
-    let count = 1 + state.child_activity.len();
-    let label = count.to_string();
-    rows.push(Line::from(vec![
-        Span::styled(" agents", theme.dim.add_modifier(Modifier::BOLD)),
-        Span::raw(" ".repeat(width.saturating_sub(8 + label.len() + 1))),
-        Span::styled(label, theme.dim),
-    ]));
-    let agent = |status: Status, name: &str| -> Line<'static> {
+    rows.push(header("agents", 1 + state.child_activity.len()));
+    let mut number = 0_usize;
+    let mut agent = |status: Status, name: &str, active: bool| -> Line<'static> {
+        number += 1;
         let word = status.word();
-        let name = truncate(name, width.saturating_sub(5 + word.len() + 1));
-        let gap = width.saturating_sub(3 + display_width(&name) + word.len() + 1);
-        Line::from(vec![
-            Span::raw(" "),
+        let name = truncate(name, width.saturating_sub(7 + word.len() + 1));
+        let gap = width.saturating_sub(5 + display_width(&name) + word.len() + 1);
+        let line = Line::from(vec![
+            Span::styled(
+                if number <= 9 {
+                    format!(" {number} ")
+                } else {
+                    "   ".to_owned()
+                },
+                theme.dim,
+            ),
             Span::styled(status.glyph(state.tick), status.style(theme)),
             Span::raw(" "),
             Span::styled(
@@ -237,23 +316,34 @@ fn lines(state: &UiState, theme: &Theme, width: usize, height: usize) -> Vec<Lin
             Span::raw(" ".repeat(gap)),
             Span::styled(word, status.style(theme)),
             Span::raw(" "),
-        ])
+        ]);
+        if active {
+            line.style(theme.selection)
+        } else {
+            line
+        }
     };
-    rows.push(agent(main, "main"));
+    hits.push((rows.len(), Target::Main));
+    rows.push(agent(main, "main", extra.focus.is_none()));
     let child = if state.phase.has_active_run() {
         Status::Working
     } else {
         Status::Done
     };
-    // Room left above the footer: an agent takes two rows while there is room
-    // for what it last did, one row otherwise.
-    let footer_rows = 2;
+    // Room left above the footer and the other agents: a delegate takes two
+    // rows while there is room for what it last did, one row otherwise.
+    let footer_rows = 2 + usize::from(!extra.others.is_empty()) * (2 + extra.others.len().min(3));
     for activity in &state.child_activity {
         let left = height.saturating_sub(rows.len() + footer_rows);
         if left == 0 {
             break;
         }
-        rows.push(agent(child, &activity.name));
+        hits.push((rows.len(), Target::Child(activity.name.clone())));
+        rows.push(agent(
+            child,
+            &activity.name,
+            extra.focus == Some(activity.name.as_str()),
+        ));
         if left >= 2 {
             let mut spans = vec![Span::styled(
                 format!(
@@ -272,15 +362,31 @@ fn lines(state: &UiState, theme: &Theme, width: usize, height: usize) -> Vec<Lin
         }
     }
 
+    // The project's other agents: a number or a click switches to one.
+    if !extra.others.is_empty() && height > rows.len() + 4 {
+        rows.push(Line::default());
+        rows.push(header("other agents", extra.others.len()));
+        for entry in extra.others {
+            if height <= rows.len() + 2 {
+                break;
+            }
+            hits.push((rows.len(), Target::Agent(entry.id.clone())));
+            rows.push(agent(entry.status, &entry.name, false));
+        }
+    }
+
     // The way to every agent, on the last row.
     if height > rows.len() {
         rows.resize(height - 1, Line::default());
+        let keys = "alt+1-9 ";
         rows.push(Line::from(vec![
             Span::styled(" ←", theme.accent),
             Span::styled(" agents view", theme.dim),
+            Span::raw(" ".repeat(width.saturating_sub(14 + keys.len()))),
+            Span::styled(keys, theme.dim),
         ]));
     }
-    rows
+    (rows, hits)
 }
 
 fn find<'a>(state: &'a UiState, prefix: &str) -> Option<&'a str> {
@@ -333,8 +439,11 @@ fn fit(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MIN_CONTENT_COLUMNS, Status, WIDTH, main_status, render, width};
+    use super::{
+        Extra, MIN_CONTENT_COLUMNS, Status, Target, WIDTH, main_status, render, targets, width,
+    };
     use crate::interactive::events::{AppPhase, ChildActivity, UiState};
+    use crate::interactive::tui::roster::Entry;
     use crate::interactive::tui::theme::Theme;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -385,25 +494,94 @@ mod tests {
     }
 
     fn screen(state: &UiState, height: u16) -> Vec<String> {
+        screen_with(state, height, Extra::default()).0
+    }
+
+    fn screen_with(
+        state: &UiState,
+        height: u16,
+        extra: Extra<'_>,
+    ) -> (Vec<String>, Vec<(u16, Target)>) {
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, height)).expect("terminal");
+        let mut hits = Vec::new();
         terminal
             .draw(|frame| {
-                render(
+                hits = render(
                     frame,
                     Rect::new(0, 0, WIDTH, height),
                     state,
+                    extra,
                     &Theme::plain(),
                 );
             })
             .expect("draw");
         let buffer = terminal.backend().buffer().clone();
-        (0..height)
+        let rows = (0..height)
             .map(|row| {
                 (0..WIDTH)
                     .map(|col| buffer[(col, row)].symbol().to_owned())
                     .collect::<String>()
             })
-            .collect()
+            .collect();
+        (rows, hits)
+    }
+
+    #[test]
+    fn every_agent_row_is_numbered_and_its_row_opens_it() {
+        let mut running = state(AppPhase::Running);
+        running.child_activity = vec![ChildActivity {
+            name: "verifier".to_owned(),
+            ..ChildActivity::default()
+        }];
+        let others = vec![Entry {
+            id: "a7".to_owned(),
+            name: "fix-tests".to_owned(),
+            status: Status::Idle,
+        }];
+        assert_eq!(
+            targets(&running, &others),
+            vec![
+                Target::Main,
+                Target::Child("verifier".to_owned()),
+                Target::Agent("a7".to_owned()),
+            ]
+        );
+        let (rows, hits) = screen_with(
+            &running,
+            24,
+            Extra {
+                others: &others,
+                focus: Some("verifier"),
+            },
+        );
+        let text = rows.join("\n");
+        let row_of = |needle: &str| {
+            u16::try_from(
+                rows.iter()
+                    .position(|row| row.contains(needle))
+                    .expect(needle),
+            )
+            .expect("row")
+        };
+        assert!(rows[usize::from(row_of("main"))].contains(" 1 "), "{text}");
+        assert!(
+            rows[usize::from(row_of("verifier"))].contains(" 2 "),
+            "{text}"
+        );
+        assert!(text.contains("other agents"), "{text}");
+        assert!(
+            rows[usize::from(row_of("fix-tests"))].contains(" 3 ○ fix-tests"),
+            "{text}"
+        );
+        assert_eq!(
+            hits,
+            vec![
+                (row_of("main"), Target::Main),
+                (row_of("verifier"), Target::Child("verifier".to_owned())),
+                (row_of("fix-tests"), Target::Agent("a7".to_owned())),
+            ]
+        );
+        assert!(text.contains("alt+1-9"), "{text}");
     }
 
     #[test]
@@ -431,6 +609,7 @@ mod tests {
             name: "verifier".to_owned(),
             tool_calls: 12,
             latest: "read_file".to_owned(),
+            ..ChildActivity::default()
         }];
         let rows = screen(&running, 20);
         let text = rows.join("\n");
@@ -469,7 +648,7 @@ mod tests {
             .map(|index| ChildActivity {
                 name: format!("coder-{index}"),
                 tool_calls: index,
-                latest: String::new(),
+                ..ChildActivity::default()
             })
             .collect();
         let rows = screen(&busy, 12);

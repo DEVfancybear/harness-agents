@@ -4587,6 +4587,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 sender: self.shared.sender.clone(),
                 token_usage: Mutex::new((0_u64, 0_u64)),
                 cost_tracker: Mutex::new(CostTracker::default()),
+                text: Mutex::new(String::new()),
             });
             let approval: Arc<dyn ApprovalGate> = Arc::new(ChildApprovalGate {
                 role: role_name.clone(),
@@ -4877,12 +4878,54 @@ struct ExplorerObserver {
     sender: UnboundedSender<SessionEvent>,
     token_usage: Mutex<(u64, u64)>,
     cost_tracker: Mutex<CostTracker>,
+    /// The answer's text since its last whole line, for the child's pane.
+    text: Mutex<String>,
+}
+
+/// How many lines of a tool's output a child's pane is sent.
+const CHILD_OUTPUT_LINES: usize = 8;
+
+impl ExplorerObserver {
+    /// Send the child's pane some lines.
+    fn pane(&self, kind: super::events::ChildLineKind, lines: Vec<String>) {
+        if lines.is_empty() {
+            return;
+        }
+        let _ = self.sender.send(SessionEvent::ChildOutput {
+            name: self.role_name.clone(),
+            kind,
+            lines,
+        });
+    }
+
+    /// Send the answer's whole lines; with `all`, the unfinished one too.
+    fn flush_text(&self, all: bool) {
+        let lines = {
+            let Ok(mut text) = self.text.lock() else {
+                return;
+            };
+            let cut = if all {
+                text.len()
+            } else {
+                text.rfind('\n').map_or(0, |at| at + 1)
+            };
+            let whole: String = text.drain(..cut).collect();
+            whole
+                .lines()
+                .map(str::trim_end)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        self.pane(super::events::ChildLineKind::Text, lines);
+    }
 }
 
 impl TurnObserver for ExplorerObserver {
     fn observe(&self, progress: TurnProgress) {
         match progress {
             TurnProgress::StepStarted { step } => {
+                self.flush_text(true);
                 if step > 1
                     && let Some(ledger) = &self.ledger
                     && let Err(error) = ledger.charge_request()
@@ -4921,6 +4964,7 @@ impl TurnObserver for ExplorerObserver {
                 }
             }
             TurnProgress::ToolStarted { name, summary, .. } => {
+                self.flush_text(true);
                 self.shared.update(&self.task_id, |child| {
                     child.tool_calls += 1;
                     child.activity = format!("{name}: {summary}");
@@ -4946,13 +4990,32 @@ impl TurnObserver for ExplorerObserver {
                     message: format!("[child {}] {message}", self.role_name),
                 });
             }
-            TurnProgress::TextDelta(_)
-            | TurnProgress::ThinkingDelta(_)
+            TurnProgress::TextDelta(delta) => {
+                let whole_line = delta.contains('\n');
+                if let Ok(mut text) = self.text.lock() {
+                    text.push_str(&delta);
+                }
+                if whole_line {
+                    self.flush_text(false);
+                }
+            }
+            TurnProgress::ToolOutput { text, .. } => {
+                let lines = text.lines().filter(|line| !line.trim().is_empty());
+                let total = lines.clone().count();
+                let mut shown = lines
+                    .take(CHILD_OUTPUT_LINES)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                if total > CHILD_OUTPUT_LINES {
+                    shown.push(format!("… {} more lines", total - CHILD_OUTPUT_LINES));
+                }
+                self.pane(super::events::ChildLineKind::Output, shown);
+            }
+            TurnProgress::ThinkingDelta(_)
             | TurnProgress::StreamRestarted
             | TurnProgress::ToolCallStreaming { .. }
             | TurnProgress::ToolProgress { .. }
             | TurnProgress::ToolSettled { .. }
-            | TurnProgress::ToolOutput { .. }
             | TurnProgress::Info(_) => {}
         }
     }
@@ -5365,6 +5428,65 @@ pub(super) mod tests {
         ))
     }
 
+    /// A delegate's pane gets what the transcript does not: the first lines
+    /// of each tool's output and its answer's whole lines as they are written.
+    #[test]
+    fn a_childs_output_and_answer_reach_its_pane() {
+        use super::CHILD_OUTPUT_LINES;
+        use crate::interactive::events::{ChildLineKind, SessionEvent};
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let observer = ExplorerObserver {
+            task_id: TaskId::generate(),
+            role_name: "explorer".to_owned(),
+            shared: shared(sender.clone()),
+            ledger: None,
+            model_price: None,
+            cancellation: CancellationToken::new(),
+            budget_error: std::sync::Mutex::new(None),
+            sender,
+            token_usage: std::sync::Mutex::new((0, 0)),
+            cost_tracker: std::sync::Mutex::new(CostTracker::default()),
+            text: std::sync::Mutex::new(String::new()),
+        };
+        let output = (1..=10)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        observer.observe(TurnProgress::ToolOutput {
+            name: "read_file".to_owned(),
+            call_id: "c1".to_owned(),
+            text: output,
+        });
+        observer.observe(TurnProgress::TextDelta("The flow ".to_owned()));
+        observer.observe(TurnProgress::TextDelta("is safe.\nIt sa".to_owned()));
+        observer.observe(TurnProgress::TextDelta("ves orders.".to_owned()));
+        observer.observe(TurnProgress::StepStarted { step: 1 });
+        let mut panes = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let SessionEvent::ChildOutput { name, kind, lines } = event {
+                assert_eq!(name, "explorer");
+                panes.push((kind, lines));
+            }
+        }
+        assert_eq!(panes.len(), 3, "{panes:?}");
+        assert_eq!(panes[0].0, ChildLineKind::Output);
+        assert_eq!(panes[0].1.len(), CHILD_OUTPUT_LINES + 1);
+        assert_eq!(
+            panes[0].1.last().map(String::as_str),
+            Some("… 2 more lines")
+        );
+        assert_eq!(
+            panes[1],
+            (ChildLineKind::Text, vec!["The flow is safe.".to_owned()]),
+            "a whole line goes as soon as it ends"
+        );
+        assert_eq!(
+            panes[2],
+            (ChildLineKind::Text, vec!["It saves orders.".to_owned()]),
+            "the rest goes when the next step starts"
+        );
+    }
+
     #[test]
     fn g12_child_budget_is_charged_to_the_parent_ledger() {
         let mut config = SchedulerConfig::default();
@@ -5383,6 +5505,7 @@ pub(super) mod tests {
             sender,
             token_usage: std::sync::Mutex::new((0, 0)),
             cost_tracker: std::sync::Mutex::new(CostTracker::default()),
+            text: std::sync::Mutex::new(String::new()),
         };
         observer.observe(TurnProgress::StepStarted { step: 2 });
         assert_eq!(ledger.requests_used(), 2);

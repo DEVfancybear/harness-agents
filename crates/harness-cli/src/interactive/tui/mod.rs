@@ -20,9 +20,11 @@ pub mod icons;
 pub mod layout;
 pub mod markdown;
 mod markdown_table;
+pub mod pane;
 #[cfg(test)]
 mod preview;
 pub mod prompt_highlight;
+pub mod roster;
 pub mod sidebar;
 pub mod theme;
 pub mod toast;
@@ -187,6 +189,11 @@ pub trait TuiRenderer {
     /// Let a drag held at an edge scroll on; true when the frame changed.
     fn tick_viewport(&mut self) -> bool {
         false
+    }
+    /// Alt+`number`: the sidebar's row of that number. Whether the frame
+    /// changed, and the agent the terminal should switch to.
+    fn agent_key(&mut self, _number: u8, _state: &UiState) -> (bool, Option<String>) {
+        (false, None)
     }
     /// Erase the viewport footprint and leave the cursor on a fresh line.
     fn finish(&mut self) -> io::Result<()>;
@@ -484,6 +491,9 @@ pub struct RuntimeRenderer<T: TerminalBackend> {
     mouse: bool,
     /// herdr's sidebar beside the conversation (`terminal.sidebar`).
     sidebar: bool,
+    /// The agent this terminal draws, whose project's other agents the
+    /// sidebar lists; none for a session that runs in this process.
+    roster: Option<roster::Scope>,
     /// An input read while looking for more mouse reports, returned first.
     held: Option<Key>,
 }
@@ -512,6 +522,19 @@ impl<T: TerminalBackend> RuntimeRenderer<T> {
     /// # Errors
     /// Fails when the console cannot be reached or measured.
     pub fn open_with(backend: T, prefs: fullscreen::Prefs) -> io::Result<Self> {
+        Self::open_with_roster(backend, prefs, None)
+    }
+
+    /// As [`Self::open_with`], for a terminal attached to a background agent:
+    /// the sidebar also lists the other agents of its project.
+    ///
+    /// # Errors
+    /// Fails when the console cannot be reached or measured.
+    pub fn open_with_roster(
+        backend: T,
+        prefs: fullscreen::Prefs,
+        roster: Option<roster::Scope>,
+    ) -> io::Result<Self> {
         let mut renderer = Self {
             backend,
             screen: Screen::Inline(Box::new(RealRenderer::open(
@@ -519,6 +542,7 @@ impl<T: TerminalBackend> RuntimeRenderer<T> {
             )?)),
             mouse: prefs.mouse,
             sidebar: prefs.sidebar,
+            roster,
             held: None,
         };
         if prefs.enabled {
@@ -684,7 +708,8 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
                 return Err(error);
             }
             let screen = fullscreen::FullscreenScreen::open(backend(), &theme, detail, shown)?
-                .with_sidebar(self.sidebar);
+                .with_sidebar(self.sidebar)
+                .with_roster(self.roster.clone());
             self.screen = Screen::Fullscreen(Box::new(screen));
         } else {
             let placeholder = Screen::Inline(Box::new(RealRenderer::open(backend())?));
@@ -732,6 +757,13 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
         match &mut self.screen {
             Screen::Fullscreen(screen) => screen.tick(),
             Screen::Inline(_) => false,
+        }
+    }
+
+    fn agent_key(&mut self, number: u8, state: &UiState) -> (bool, Option<String>) {
+        match &mut self.screen {
+            Screen::Fullscreen(screen) => screen.agent_key(number, state),
+            Screen::Inline(_) => (false, None),
         }
     }
 
@@ -974,8 +1006,8 @@ pub fn run(
     notice: Option<&str>,
     prefs: fullscreen::Prefs,
 ) -> Result<u8, HarnessError> {
-    let renderer =
-        RuntimeRenderer::open_with(backend, prefs).map_err(|error| terminal_error(&error))?;
+    let renderer = RuntimeRenderer::open_with_roster(backend, prefs, controller.roster_scope())
+        .map_err(|error| terminal_error(&error))?;
     if Theme::detect().color {
         highlight::warm_up();
     }
@@ -1190,9 +1222,20 @@ fn fullscreen_input(
     key: &Key,
     effects: &mut Vec<Effect>,
 ) -> Option<bool> {
+    // herdr's sidebar keys: a delegate's pane, or another agent.
+    if let Key::Agent(number) = key {
+        let (redraw, switch_to) = renderer.agent_key(*number, &controller.ui_state());
+        if let Some(id) = switch_to {
+            switch_agent(id, effects);
+        }
+        return Some(redraw);
+    }
     if let Key::Mouse(input) = key {
         let panel_open = controller.ui_state().modal.is_some();
         let outcome = renderer.mouse(*input, panel_open);
+        if let Some(id) = outcome.switch_to {
+            switch_agent(id, effects);
+        }
         if let Some(text) = outcome.copied {
             match renderer.copy_text(&text) {
                 Ok(()) => {
@@ -1219,6 +1262,13 @@ fn fullscreen_input(
         return None;
     }
     Some(renderer.viewport_key(key))
+}
+
+/// Leave this agent for another of the project, as the agents view would open
+/// it: the terminal is handed over and the launch attaches to `id`.
+fn switch_agent(id: String, effects: &mut Vec<Effect>) {
+    super::agents_view::request_open(id);
+    effects.push(Effect::Exit(super::agents_view::AGENTS_VIEW_EXIT));
 }
 
 /// Apply one batch of effects. Consecutive history rows go into the scrollback

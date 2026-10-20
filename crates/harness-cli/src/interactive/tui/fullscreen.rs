@@ -132,6 +132,8 @@ pub struct Viewport {
     selectable_from: u16,
     /// The first column of the conversation: the sidebar's width beside it.
     left: u16,
+    /// The column past the conversation: a delegate's pane starts there.
+    right: u16,
 }
 
 impl Default for Viewport {
@@ -149,6 +151,7 @@ impl Default for Viewport {
             frame_snapshot: None,
             selectable_from: 0,
             left: 0,
+            right: 0,
         }
     }
 }
@@ -431,15 +434,21 @@ impl Viewport {
             return Vec::new();
         };
         let mut rects = Vec::new();
-        // A transcript selection counts columns from the conversation's edge.
-        let left = if self.mode == Some(Mode::Transcript) {
-            self.left.min(width)
+        // A transcript selection counts columns from the conversation's edge,
+        // and stops at a delegate's pane.
+        let (left, limit) = if self.mode == Some(Mode::Transcript) {
+            let limit = if self.right > 0 {
+                self.right.min(width)
+            } else {
+                width
+            };
+            (self.left.min(limit), limit)
         } else {
-            0
+            (0, width)
         };
         let mut push = |row: u16, (from, to): (usize, usize)| {
-            let from = u16::try_from(from).unwrap_or(u16::MAX).min(width - left) + left;
-            let to = u16::try_from(to).unwrap_or(u16::MAX).min(width - left) + left;
+            let from = u16::try_from(from).unwrap_or(u16::MAX).min(limit - left) + left;
+            let to = u16::try_from(to).unwrap_or(u16::MAX).min(limit - left) + left;
             if to > from {
                 rects.push(Rect::new(from, row, to - from, 1));
             }
@@ -538,6 +547,8 @@ pub struct MouseOutcome {
     pub redraw: bool,
     /// A selection ended: copy this text.
     pub copied: Option<String>,
+    /// A sidebar row asked for another agent: switch the terminal to it.
+    pub switch_to: Option<String>,
 }
 
 /// The fullscreen screen: the conversation rows, the viewport over them, and
@@ -576,6 +587,12 @@ pub struct FullscreenScreen<B: Backend> {
     scrolled_frames: u64,
     /// herdr's sidebar, shown when the console is wide enough for it.
     sidebar: bool,
+    /// The project's other agents, read on a thread of their own.
+    roster: Option<super::roster::Poller>,
+    /// The delegate whose pane is open beside the conversation.
+    focus: Option<String>,
+    /// The sidebar's agent rows as last drawn, for a click.
+    hits: Vec<(u16, super::sidebar::Target)>,
 }
 
 impl<B: Backend> FullscreenScreen<B>
@@ -618,6 +635,9 @@ where
             last_window: None,
             scrolled_frames: 0,
             sidebar: false,
+            roster: None,
+            focus: None,
+            hits: Vec::new(),
         })
     }
 
@@ -628,9 +648,74 @@ where
         self
     }
 
+    /// List the project's other agents in the sidebar (a terminal attached to
+    /// a background agent knows which project and which agent it is).
+    #[must_use]
+    pub fn with_roster(mut self, scope: Option<super::roster::Scope>) -> Self {
+        self.roster = scope.map(super::roster::Poller::start);
+        self
+    }
+
+    /// List these agents as the project's others: the preview frames.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_roster_entries(mut self, entries: Vec<super::roster::Entry>) -> Self {
+        self.roster = Some(super::roster::Poller::fixed(entries));
+        self
+    }
+
     /// The sidebar's columns on a console `columns` wide.
     fn sidebar_columns(&self, columns: u16) -> u16 {
         super::sidebar::width(columns, self.sidebar)
+    }
+
+    /// A delegate's pane's columns beside a conversation `content` wide.
+    fn pane_columns(&self, content: u16) -> u16 {
+        if self.focus.is_some() {
+            super::pane::width(content)
+        } else {
+            0
+        }
+    }
+
+    /// The columns the conversation's rows are drawn at: the conversation's,
+    /// less a delegate's pane.
+    fn rows_width(&self) -> u16 {
+        let content = self.columns();
+        content - self.pane_columns(content)
+    }
+
+    /// What a sidebar row opens: the main conversation, a delegate's pane
+    /// (again: closed), or another agent. Returns whether the frame changed
+    /// and the agent to switch to.
+    fn open_target(&mut self, target: super::sidebar::Target) -> (bool, Option<String>) {
+        match target {
+            super::sidebar::Target::Main => (self.focus.take().is_some(), None),
+            super::sidebar::Target::Child(name) => {
+                if self.focus.as_deref() == Some(name.as_str()) {
+                    self.focus = None;
+                } else {
+                    self.focus = Some(name);
+                }
+                (true, None)
+            }
+            super::sidebar::Target::Agent(id) => (false, Some(id)),
+        }
+    }
+
+    /// Alt+`number`: the sidebar's row of that number.
+    pub fn agent_key(&mut self, number: u8, state: &UiState) -> (bool, Option<String>) {
+        let others = self
+            .roster
+            .as_ref()
+            .map_or(&[][..], super::roster::Poller::entries);
+        let target = super::sidebar::targets(state, others)
+            .into_iter()
+            .nth(usize::from(number).saturating_sub(1));
+        match target {
+            Some(target) if number > 0 => self.open_target(target),
+            _ => (false, None),
+        }
     }
 
     /// The conversation it shows, and how many of those entries arrived while
@@ -678,7 +763,7 @@ where
     }
 
     pub fn insert_history_batch(&mut self, items: &[HistoryItem]) {
-        let width = self.columns();
+        let width = self.rows_width();
         let drawn = self.rows_key == Some((width, self.detail));
         for item in items {
             if self.shown.len() == REPRINT_ENTRIES {
@@ -787,9 +872,23 @@ where
     pub fn draw(&mut self, state: &UiState) -> io::Result<()> {
         self.detail = state.detail;
         let size = self.terminal.size().map_err(to_io)?;
+        // A pane whose delegate is gone (a new turn began) closes.
+        if let Some(name) = &self.focus
+            && !state.child_activity.iter().any(|child| &child.name == name)
+        {
+            self.focus = None;
+        }
         let left = self.sidebar_columns(size.width);
-        self.ensure_rows(size.width - left);
+        let pane = self.pane_columns(size.width - left);
+        self.ensure_rows(size.width - left - pane);
         self.viewport.left = left;
+        self.viewport.right = size.width - pane;
+        let others = self
+            .roster
+            .as_ref()
+            .map_or(&[][..], super::roster::Poller::entries);
+        let focus = self.focus.as_deref();
+        let mut hits = Vec::new();
         let theme = self.theme;
         let rows = &self.rows;
         let viewport = &mut self.viewport;
@@ -819,10 +918,11 @@ where
                     screen.height,
                 );
                 if left > 0 {
-                    super::sidebar::render(
+                    hits = super::sidebar::render(
                         frame,
                         Rect::new(screen.x, screen.y, left, screen.height),
                         state,
+                        super::sidebar::Extra { others, focus },
                         &theme,
                     );
                 }
@@ -877,13 +977,36 @@ where
                 let window = Rect::new(
                     area.x,
                     area.y + header,
-                    area.width,
+                    area.width - pane,
                     if window_rows > 1 {
                         window_rows - 1
                     } else {
                         window_rows
                     },
                 );
+                // herdr's split: the delegate's pane beside the conversation,
+                // as tall as the window and the row below it.
+                if pane > 0
+                    && let Some(name) = focus
+                    && let Some(index) = state
+                        .child_activity
+                        .iter()
+                        .position(|child| child.name == name)
+                {
+                    let status = if running {
+                        super::sidebar::Status::Working
+                    } else {
+                        super::sidebar::Status::Done
+                    };
+                    super::pane::render(
+                        frame,
+                        Rect::new(window.x + window.width, window.y, pane, window_rows),
+                        &state.child_activity[index],
+                        status,
+                        index + 2,
+                        &theme,
+                    );
+                }
                 let top = viewport.compose(rows.len(), window.y, window.height);
                 (drawn_window, drawn_top) = (window, top);
                 let visible = rows
@@ -948,6 +1071,7 @@ where
             .apply_buffer_with_cursor(cursor)
             .map_err(to_io)?;
         self.viewport.frame = completed.buffer.clone();
+        self.hits = hits;
         self.viewport.selectable_from = if state.modal.is_some() { 0 } else { dock_top };
         Ok(())
     }
@@ -999,6 +1123,15 @@ where
     pub fn mouse(&mut self, input: MouseInput, panel_open: bool) -> MouseOutcome {
         let (row, col) = (input.row, input.column);
         let mut outcome = MouseOutcome::default();
+        // A click on the sidebar opens the agent row under it.
+        if col < self.viewport.left {
+            if input.kind == MouseKind::Press
+                && let Some((_, target)) = self.hits.iter().find(|(at, _)| *at == row)
+            {
+                (outcome.redraw, outcome.switch_to) = self.open_target(target.clone());
+            }
+            return outcome;
+        }
         if !panel_open {
             match input.kind {
                 MouseKind::WheelUp | MouseKind::WheelDown => {
@@ -1053,8 +1186,17 @@ where
         outcome
     }
 
-    /// A drag held at an edge scrolls on its own; true when it did.
+    /// A drag held at an edge scrolls on its own, and the roster may have
+    /// changed; true when the frame should be drawn again.
     pub fn tick(&mut self) -> bool {
+        let roster = self
+            .roster
+            .as_mut()
+            .is_some_and(super::roster::Poller::poll);
+        roster || self.scroll_tick()
+    }
+
+    fn scroll_tick(&mut self) -> bool {
         let Some((direction, row, col, at)) = self.auto_scroll else {
             return false;
         };
@@ -1253,6 +1395,70 @@ mod tests {
     fn a_wide_character_is_copied_once() {
         let cells = ["日", " ", "a", "b"].map(str::to_owned);
         assert_eq!(slice_cells(&cells, 0, 4), "日ab");
+    }
+
+    /// herdr's split: Alt+2 opens the first delegate's pane beside the
+    /// conversation, which is drawn narrower; Alt+1 closes it, a click on the
+    /// delegate's sidebar row opens it again, and a turn without that
+    /// delegate closes it.
+    #[test]
+    fn a_delegates_pane_opens_from_its_sidebar_row() {
+        use crate::interactive::events::{ChildActivity, ChildLine, ChildLineKind};
+        let mut screen = screen(140, 30).with_sidebar(true);
+        let mut state = crate::interactive::tui::tests::idle_state();
+        state.child_activity = vec![ChildActivity {
+            name: "explorer".to_owned(),
+            tool_calls: 1,
+            latest: "read_file: path=a.rs".to_owned(),
+            recent: vec![ChildLine {
+                kind: ChildLineKind::Call,
+                text: "read_file: path=pane-marker.rs".to_owned(),
+            }],
+        }];
+        screen.insert_history_batch(&[HistoryItem::User {
+            text: "x".repeat(200),
+        }]);
+        screen.draw(&state).expect("drawn");
+        let wide = screen.rows_width();
+        assert!(!painted(&screen).join("\n").contains("pane-marker"));
+
+        assert_eq!(screen.agent_key(2, &state), (true, None));
+        screen.draw(&state).expect("drawn");
+        let text = painted(&screen).join("\n");
+        assert!(text.contains("pane-marker"), "{text}");
+        assert!(screen.rows_width() < wide, "the conversation makes room");
+
+        assert_eq!(screen.agent_key(1, &state), (true, None));
+        screen.draw(&state).expect("drawn");
+        assert!(!painted(&screen).join("\n").contains("pane-marker"));
+        assert_eq!(screen.agent_key(9, &state), (false, None), "no such row");
+
+        // A click on the delegate's row in the sidebar.
+        let row = painted(&screen)
+            .iter()
+            .position(|row| row.contains("explorer"))
+            .expect("its row");
+        let outcome = screen.mouse(
+            MouseInput {
+                kind: MouseKind::Press,
+                column: 3,
+                row: u16::try_from(row).expect("row"),
+                modified: false,
+            },
+            false,
+        );
+        assert!(outcome.redraw);
+        assert_eq!(outcome.switch_to, None);
+        screen.draw(&state).expect("drawn");
+        assert!(painted(&screen).join("\n").contains("pane-marker"));
+
+        state.child_activity.clear();
+        screen.draw(&state).expect("drawn");
+        assert_eq!(
+            screen.rows_width(),
+            wide,
+            "the pane closed with its delegate"
+        );
     }
 
     fn screen(columns: u16, rows: u16) -> FullscreenScreen<ratatui::backend::TestBackend> {

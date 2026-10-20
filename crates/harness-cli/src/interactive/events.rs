@@ -94,6 +94,9 @@ pub enum Key {
     Yank,
     /// Alt+D / Alt+Delete: delete the word after the cursor.
     EraseWordForward,
+    /// Alt+1..9: the sidebar's numbered row - open a delegate's pane, or
+    /// switch the terminal to another agent of the project.
+    Agent(u8),
     /// Ctrl+- / Ctrl+Z: undo the last edit of the prompt.
     Undo,
     /// Ctrl+Shift+Z: redo what undo took back.
@@ -712,7 +715,34 @@ pub struct ChildActivity {
     pub name: String,
     pub tool_calls: u32,
     pub latest: String,
+    /// What it did and printed, newest last, at most [`CHILD_RECENT_LINES`]:
+    /// what its pane shows.
+    #[serde(default)]
+    pub recent: Vec<ChildLine>,
 }
+
+/// One line of a delegated agent's pane.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ChildLine {
+    pub kind: ChildLineKind,
+    pub text: String,
+}
+
+/// What a line of a delegated agent's pane is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ChildLineKind {
+    /// A call it started: `read_file: path=a.rs`.
+    Call,
+    /// A call that failed, or a notice it raised.
+    Failed,
+    /// A line a tool returned.
+    Output,
+    /// A line of its own answer.
+    Text,
+}
+
+/// How many lines of a delegated agent's notices its pane keeps.
+pub const CHILD_RECENT_LINES: usize = 60;
 
 /// Pure data: the renderer never reaches back into the controller, so a frame is
 /// a function of this snapshot plus the theme.
@@ -1101,6 +1131,13 @@ pub enum SessionEvent {
     ChildSettled {
         name: String,
         notice: String,
+    },
+    /// What a delegated agent printed - a tool's output or its answer's text -
+    /// for its pane; the transcript does not keep it.
+    ChildOutput {
+        name: String,
+        kind: ChildLineKind,
+        lines: Vec<String>,
     },
     /// The turns of this conversation, oldest first: each turn's session id and
     /// the input that opened it.

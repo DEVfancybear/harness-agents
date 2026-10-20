@@ -52,8 +52,19 @@ fn preview_dump() {
             println!("wrote {}", path.display());
         }
     }
-    // The fullscreen app on a wide console, herdr's sidebar beside it: the
-    // finished run with its delegate done, and the same run still working.
+    fullscreen_dump(&directory, &theme);
+}
+
+/// The fullscreen app on a wide console, herdr's sidebar beside it: the
+/// finished run with its delegates done, the same run still working with the
+/// project's other agents listed, and a delegate's pane open.
+fn fullscreen_dump(directory: &std::path::Path, theme: &Theme) {
+    use crate::interactive::events::{ChildActivity, ChildLine, ChildLineKind};
+    let theme = *theme;
+    let line = |kind, text: &str| ChildLine {
+        kind,
+        text: text.to_owned(),
+    };
     let mut working = busy();
     working.name = "11-sidebar-running";
     working.state.phase = AppPhase::Running;
@@ -62,29 +73,104 @@ fn preview_dump() {
     working.state.tool_calls = 9;
     working.state.open_tools = vec![("run_shell".to_owned(), "npm test".to_owned())];
     working.state.child_activity = vec![
-        crate::interactive::events::ChildActivity {
-            name: "explorer-3fa1".to_owned(),
-            tool_calls: 7,
-            latest: "read_file src/app/api/orders/route.ts".to_owned(),
-        },
-        crate::interactive::events::ChildActivity {
-            name: "verifier-eac4".to_owned(),
+        ChildActivity {
+            name: "explorer".to_owned(),
             tool_calls: 3,
-            latest: "run_process npm test".to_owned(),
+            latest: "read_file: path=src/lib/orders.ts".to_owned(),
+            recent: vec![
+                line(
+                    ChildLineKind::Call,
+                    "read_file: path=src/app/api/orders/route.ts",
+                ),
+                line(
+                    ChildLineKind::Output,
+                    "import { saveOrder } from '@/lib/orders';",
+                ),
+                line(
+                    ChildLineKind::Output,
+                    "export async function POST(request: Request) {",
+                ),
+                line(
+                    ChildLineKind::Output,
+                    "  const cart = await request.json();",
+                ),
+                line(ChildLineKind::Output, "… 41 more lines"),
+                line(ChildLineKind::Call, "search_text: query=saveOrder path=src"),
+                line(
+                    ChildLineKind::Output,
+                    "src/lib/orders.ts:12: export function saveOrder(",
+                ),
+                line(ChildLineKind::Call, "read_file: path=src/lib/orders.ts"),
+                line(
+                    ChildLineKind::Failed,
+                    "read_file failed: limit must be at most 2000",
+                ),
+                line(
+                    ChildLineKind::Text,
+                    "The order flow: POST /api/orders validates the cart,",
+                ),
+                line(
+                    ChildLineKind::Text,
+                    "then saveOrder() keeps it in globalThis.__shopHaOrders,",
+                ),
+                line(ChildLineKind::Text, "which a restart loses."),
+            ],
+        },
+        ChildActivity {
+            name: "verifier".to_owned(),
+            tool_calls: 1,
+            latest: "run_process: args=[\"npm\",\"test\"]".to_owned(),
+            recent: vec![line(
+                ChildLineKind::Call,
+                "run_process: args=[\"npm\",\"test\"]",
+            )],
+        },
+    ];
+    let others = vec![
+        super::roster::Entry {
+            id: "a1".to_owned(),
+            name: "seo-sitemap".to_owned(),
+            status: super::sidebar::Status::Working,
+        },
+        super::roster::Entry {
+            id: "a2".to_owned(),
+            name: "fix-voucher".to_owned(),
+            status: super::sidebar::Status::Blocked,
+        },
+        super::roster::Entry {
+            id: "a3".to_owned(),
+            name: "docs".to_owned(),
+            status: super::sidebar::Status::Idle,
         },
     ];
     let mut finished = busy();
     finished.name = "12-sidebar-done";
     finished.state.child_activity = working.state.child_activity.clone();
-    for scene in [working, finished] {
+    let mut pane = busy();
+    pane.name = "13-pane";
+    pane.state = working.state.clone();
+    for (scene, others, key) in [
+        (working, others.clone(), None),
+        (finished, Vec::new(), None),
+        (pane, others, Some(2)),
+    ] {
         let path = directory.join(format!("{}.ansi", scene.name));
-        std::fs::write(&path, paint_fullscreen(&scene, 132, 40, &theme)).expect("write the frame");
+        let frame = paint_fullscreen(&scene, 132, 40, &theme, others, key);
+        std::fs::write(&path, frame).expect("write the frame");
         println!("wrote {}", path.display());
     }
 }
 
-/// Paint one scene through the fullscreen screen, sidebar on.
-fn paint_fullscreen(scene: &Scene, width: u16, height: u16, theme: &Theme) -> String {
+/// Paint one scene through the fullscreen screen, sidebar on, with `others`
+/// as the project's other agents and Alt+`key` pressed first.
+fn paint_fullscreen(
+    scene: &Scene,
+    width: u16,
+    height: u16,
+    theme: &Theme,
+    others: Vec<super::roster::Entry>,
+    key: Option<u8>,
+) -> String {
     let mut screen = super::fullscreen::FullscreenScreen::open(
         TestBackend::new(width, height),
         theme,
@@ -92,12 +178,15 @@ fn paint_fullscreen(scene: &Scene, width: u16, height: u16, theme: &Theme) -> St
         std::collections::VecDeque::new(),
     )
     .expect("open the screen")
-    .with_sidebar(true);
+    .with_sidebar(true)
+    .with_roster_entries(others);
+    if let Some(key) = key {
+        screen.agent_key(key, &scene.state);
+    }
     screen.insert_history_batch(&scene.items);
     screen.draw(&scene.state).expect("draw the frame");
     ansi(screen.backend().buffer())
 }
-
 fn output_directory() -> PathBuf {
     // `CARGO_TARGET_TMPDIR` is set for integration tests; a unit test inside the
     // binary gets nothing, so fall back to the workspace's own target directory -

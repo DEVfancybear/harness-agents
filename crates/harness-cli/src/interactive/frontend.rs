@@ -25,6 +25,11 @@ pub trait Frontend {
     fn pump_events(&mut self) -> Vec<Effect>;
     /// The spinner and the clocks.
     fn tick(&mut self) -> Vec<Effect>;
+    /// The background agent this terminal draws, whose project's other agents
+    /// the sidebar lists; none for a session that runs in this process.
+    fn roster_scope(&self) -> Option<super::tui::roster::Scope> {
+        None
+    }
 }
 
 impl Frontend for InteractiveController {

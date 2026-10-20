@@ -5,8 +5,10 @@
 //!
 //! `steps` is a comma list run in order: `wait:<ms>`, `wheelup:<n>` (mouse wheel
 //! notches at the window's middle), `pgup`, `end`, `key:<text>`, `enter`, `ctrlc`, `ctrls`,
-//! `altenter`, `shiftenter`, `ctrlj`, `settle:<ms>` (wait for the screen to go
-//! quiet and mark how long the output went on). The raw bytes
+//! `altenter`, `shiftenter`, `ctrlj`, `alt:<key>` (Alt and a key, as ESC then the
+//! key), `settle:<ms>` (wait for the screen to go quiet and mark how long the
+//! output went on), `until:<text>:<ms>` (wait until the app has written
+//! `text` since the step began, at most `ms`; the mark says whether it did). The raw bytes
 //! the app wrote go to `out.bin`; `out.bin.marks` lists the byte offset at which
 //! each step began.
 
@@ -130,6 +132,38 @@ fn main() {
             "altenter" => send(&[27, 13]),
             "shiftenter" => send(&[27, b'[', b'1', b'3', b';', b'2', b'u']),
             "ctrlj" => send(&[10]),
+            "alt" => {
+                let mut bytes = vec![27_u8];
+                bytes.extend_from_slice(value.as_bytes());
+                send(&bytes);
+            }
+            "until" => {
+                let (text, limit) = value.rsplit_once(':').unwrap_or((value, "60000"));
+                let limit = Duration::from_millis(limit.parse().unwrap_or(60_000));
+                let begun = Instant::now();
+                let found = loop {
+                    let seen = transcript
+                        .lock()
+                        .expect("t")
+                        .get(offset..)
+                        .is_some_and(|written| {
+                            written
+                                .windows(text.len().max(1))
+                                .any(|window| window == text.as_bytes())
+                        });
+                    if seen || begun.elapsed() >= limit {
+                        break seen;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                };
+                let _ = writeln!(
+                    marks,
+                    "{} until {} {text} after {} ms",
+                    transcript.lock().expect("t").len(),
+                    if found { "found" } else { "missed" },
+                    begun.elapsed().as_millis()
+                );
+            }
             _ => eprintln!("unknown step {step}"),
         }
     }

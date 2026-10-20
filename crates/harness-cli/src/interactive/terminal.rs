@@ -330,6 +330,11 @@ fn map_key(key: KeyEvent) -> Key {
             Key::Redo
         }
         KeyCode::Char('z' | '-' | '_') if control => Key::Undo,
+        // Alt+1..9: the sidebar's rows. Not with Ctrl: AltGr arrives as
+        // Ctrl+Alt and types characters on many layouts.
+        KeyCode::Char(digit @ '1'..='9') if alt && !control => {
+            Key::Agent(u8::try_from(u32::from(digit) - u32::from('0')).unwrap_or(0))
+        }
         KeyCode::Char('b') if alt => Key::WordLeft,
         KeyCode::Char('f') if alt => Key::WordRight,
         KeyCode::Char('d') | KeyCode::Delete if alt => Key::EraseWordForward,
@@ -510,6 +515,27 @@ impl TerminalBackend for ScriptedBackend {
 mod tests {
     use super::{Key, KeyEventKind, map_event, map_key};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventState, KeyModifiers};
+
+    #[test]
+    fn alt_and_a_digit_is_a_sidebar_row_but_altgr_still_types() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        assert_eq!(
+            map_key(key(KeyCode::Char('3'), KeyModifiers::ALT)),
+            Key::Agent(3)
+        );
+        assert_eq!(
+            map_key(key(
+                KeyCode::Char('7'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL
+            )),
+            Key::Char('7'),
+            "AltGr"
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('0'), KeyModifiers::ALT)),
+            Key::Char('0')
+        );
+    }
 
     #[test]
     fn h03_keys_are_mapped_from_real_crossterm_events() {

@@ -696,6 +696,13 @@ impl Frontend for RemoteFrontend {
         Err("a background agent resumes when it is started".to_owned())
     }
 
+    fn roster_scope(&self) -> Option<crate::interactive::tui::roster::Scope> {
+        Some(crate::interactive::tui::roster::Scope {
+            agent_id: self.agent.id.clone(),
+            project_root: self.agent.project_root.clone(),
+        })
+    }
+
     fn set_columns(&mut self, columns: u16) {
         let _ = self.send(&Request::Columns { columns });
     }

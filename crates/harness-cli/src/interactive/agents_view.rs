@@ -122,6 +122,32 @@ pub struct Forest {
     pub programs: std::collections::HashSet<String>,
 }
 
+/// The agent a session's sidebar asked to switch to, for the launch to open
+/// without showing the view (`request_open`, then `AGENTS_VIEW_EXIT`).
+static OPEN_NEXT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Ask the launch to open agent `id` once this terminal hands over.
+pub fn request_open(id: String) {
+    if let Ok(mut next) = OPEN_NEXT.lock() {
+        *next = Some(id);
+    }
+}
+
+/// The agent a session asked to switch to, if it is still running on this
+/// build: what the view's Enter would open for it.
+#[must_use]
+pub fn take_requested() -> Option<Choice> {
+    let id = OPEN_NEXT.lock().ok()?.take()?;
+    let directory = client::user_registry().ok()?;
+    client::list_all(&directory)
+        .into_iter()
+        .find(|listed| {
+            listed.agent.id == id
+                && listed.descriptor.build == super::agents::registry::build_identity()
+        })
+        .map(|listed| Choice::Open(Box::new(listed)))
+}
+
 /// What the user chose.
 #[derive(Debug)]
 pub enum Choice {

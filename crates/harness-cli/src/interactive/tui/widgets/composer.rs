@@ -550,6 +550,7 @@ mod tests {
             name: "verifier".to_owned(),
             tool_calls: 14,
             latest: "read_file: path=game.js".to_owned(),
+            ..Default::default()
         }];
         let activity = super::delegate_activity("delegate", &running.open_tools[0].1, &running)
             .expect("the verifier's progress");

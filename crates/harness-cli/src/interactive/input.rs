@@ -776,6 +776,8 @@ impl LineEditor {
             | Key::Char(_)
             | Key::PageUp
             | Key::Mouse(_)
+            // The sidebar's keys belong to the terminal that draws it.
+            | Key::Agent(_)
             | Key::ViewportTop
             | Key::ViewportFollow
             | Key::PageDown

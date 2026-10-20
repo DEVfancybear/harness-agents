@@ -210,8 +210,16 @@ pub fn agents_view_loop(
 ) -> Result<u8, HarnessError> {
     let refused = |message: String| HarnessError::new(ErrorCode::RuntimeBlocked, message);
     loop {
-        let choice = super::agents_view::run(context, environment, notice.take(), came_from.take())
-            .map_err(refused)?;
+        // A session's sidebar may have named the agent to open: it opens
+        // without the view in between.
+        let choice = match super::agents_view::take_requested() {
+            Some(choice) => {
+                came_from = None;
+                choice
+            }
+            None => super::agents_view::run(context, environment, notice.take(), came_from.take())
+                .map_err(refused)?,
+        };
         let backend = CrosstermBackend;
         let size = backend.size().unwrap_or((TUI_MIN_COLUMNS, TUI_MIN_ROWS));
         let prefs = super::tui::fullscreen::prefs(environment, &context.paths.config_file);

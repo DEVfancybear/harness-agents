@@ -581,6 +581,56 @@ impl InteractiveController {
             entry.tool_calls = entry.tool_calls.saturating_add(1);
         }
         entry.latest = latest;
+        let kind = if starts_call {
+            super::events::ChildLineKind::Call
+        } else {
+            super::events::ChildLineKind::Failed
+        };
+        Self::keep_child_lines(&mut entry.recent, kind, text.lines());
+    }
+
+    /// A delegated agent's output or answer, for its pane.
+    fn note_child_output(
+        &mut self,
+        name: &str,
+        kind: super::events::ChildLineKind,
+        lines: &[String],
+    ) {
+        let index = if let Some(index) = self
+            .child_activity
+            .iter()
+            .position(|entry| entry.name == name)
+        {
+            index
+        } else {
+            self.child_activity.push(super::events::ChildActivity {
+                name: name.to_owned(),
+                ..Default::default()
+            });
+            self.child_activity.len() - 1
+        };
+        Self::keep_child_lines(
+            &mut self.child_activity[index].recent,
+            kind,
+            lines.iter().map(String::as_str),
+        );
+    }
+
+    /// Append lines to a pane's, keeping the newest
+    /// [`super::events::CHILD_RECENT_LINES`].
+    fn keep_child_lines<'a>(
+        recent: &mut Vec<super::events::ChildLine>,
+        kind: super::events::ChildLineKind,
+        lines: impl Iterator<Item = &'a str>,
+    ) {
+        recent.extend(lines.map(|line| super::events::ChildLine {
+            kind,
+            text: line.chars().take(400).collect(),
+        }));
+        let excess = recent
+            .len()
+            .saturating_sub(super::events::CHILD_RECENT_LINES);
+        recent.drain(..excess);
     }
 
     /// The session's title, once it has one (`/name`, or after `/compact`).
@@ -2911,6 +2961,12 @@ impl InteractiveController {
                     ),
                 }
                 effects.push(Effect::Redraw);
+            }
+            SessionEvent::ChildOutput { name, kind, lines } => {
+                if !self.plain {
+                    self.note_child_output(&name, kind, &lines);
+                    effects.push(Effect::Redraw);
+                }
             }
             SessionEvent::ChildSettled { name, notice } => {
                 self.deliver_notice(&name, notice, effects);
@@ -6907,6 +6963,58 @@ mod tests {
             .expect("done");
         let _ = h.controller.pump_events();
         assert_eq!(h.controller.ui_state().activity, None);
+    }
+
+    /// A delegate's pane keeps its calls, its tools' output and its answer,
+    /// in order and at most `CHILD_RECENT_LINES` of them; the plain renderer
+    /// has no pane and keeps none of the output.
+    #[test]
+    fn a_delegates_pane_keeps_its_calls_output_and_answer() {
+        use super::super::events::{CHILD_RECENT_LINES, ChildLineKind};
+        let mut h = tui_bench(true);
+        h.controller.boot_lines();
+        h.events
+            .send(SessionEvent::Notice {
+                message: "[child explorer] read_file: path=a.rs".to_owned(),
+            })
+            .expect("notice");
+        h.events
+            .send(SessionEvent::ChildOutput {
+                name: "explorer".to_owned(),
+                kind: ChildLineKind::Output,
+                lines: vec!["fn main() {}".to_owned()],
+            })
+            .expect("output");
+        h.events
+            .send(SessionEvent::ChildOutput {
+                name: "explorer".to_owned(),
+                kind: ChildLineKind::Text,
+                lines: (0..CHILD_RECENT_LINES)
+                    .map(|n| format!("answer {n}"))
+                    .collect(),
+            })
+            .expect("text");
+        let _ = h.controller.pump_events();
+        let activity = h.controller.ui_state().child_activity;
+        assert_eq!(activity.len(), 1);
+        let recent = &activity[0].recent;
+        assert_eq!(recent.len(), CHILD_RECENT_LINES, "the oldest lines went");
+        assert_eq!(recent[0].kind, ChildLineKind::Text);
+        assert_eq!(recent[0].text, "answer 0");
+        assert_eq!(activity[0].tool_calls, 1);
+
+        let mut plain = bench(true);
+        plain.controller.boot_lines();
+        plain
+            .events
+            .send(SessionEvent::ChildOutput {
+                name: "explorer".to_owned(),
+                kind: ChildLineKind::Output,
+                lines: vec!["fn main() {}".to_owned()],
+            })
+            .expect("output");
+        let _ = plain.controller.pump_events();
+        assert!(plain.controller.ui_state().child_activity.is_empty());
     }
 
     #[test]
