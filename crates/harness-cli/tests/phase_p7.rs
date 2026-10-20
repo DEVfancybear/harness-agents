@@ -221,7 +221,7 @@ fn crate_tests_dir() -> std::path::PathBuf {
 fn assert_install_is_documented(root: &std::path::Path, bodies: &[(&str, String)]) {
     for (name, text) in bodies {
         for required in [
-            "scripts/Install-Ha.ps1",
+            "scripts/install/Install-Ha.ps1",
             "cargo install --path crates/harness-cli",
             "ha --version",
         ] {
@@ -231,7 +231,7 @@ fn assert_install_is_documented(root: &std::path::Path, bodies: &[(&str, String)
             );
         }
     }
-    let installer = std::fs::read_to_string(root.join("scripts/Install-Ha.ps1"))
+    let installer = std::fs::read_to_string(root.join("scripts/install/Install-Ha.ps1"))
         .expect("the installer script exists");
     for required in [
         "[ValidateSet('Release', 'Debug')]",
@@ -1456,7 +1456,7 @@ async fn p7_s07_operator_docs_and_release_record_are_consistent() {
     let root = repository_root();
     let mut bodies = Vec::new();
     for name in ["OPERATOR_GUIDE.en.md", "OPERATOR_GUIDE.vi.md"] {
-        let path = root.join("docs").join(name);
+        let path = root.join("docs").join("guides").join(name);
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("{name} must exist at {}: {error}", path.display()));
         bodies.push((name, text));
@@ -1625,7 +1625,7 @@ async fn p7_doctor_accepts_an_uninitialized_data_directory() {
 #[test]
 fn p7_install_script_installs_a_working_binary() {
     let root = repository_root();
-    let script = root.join("scripts/Install-Ha.ps1");
+    let script = root.join("scripts/install/Install-Ha.ps1");
     assert!(script.is_file(), "the installer script must exist");
 
     let destination = tempfile::tempdir().expect("tempdir");

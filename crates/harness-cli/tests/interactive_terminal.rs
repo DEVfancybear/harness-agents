@@ -645,7 +645,7 @@ fn tool_call_stream() -> String {
     .concat()
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/testing/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
 #[test]
 fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     let (temp, project) = sandbox();
@@ -680,7 +680,7 @@ fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     );
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn t01_tui_opens_with_status_and_composer() {
     let (temp, project) = sandbox();
@@ -697,7 +697,7 @@ fn t01_tui_opens_with_status_and_composer() {
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn t03_pty_paste_keeps_newlines() {
     let (temp, project) = sandbox();
@@ -735,7 +735,7 @@ fn t03_pty_paste_keeps_newlines() {
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn t06_pty_approval_y_key() {
     let (temp, project) = sandbox();
@@ -759,7 +759,7 @@ fn t06_pty_approval_y_key() {
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn g06_pty_at_picker() {
     let (temp, project) = sandbox();
@@ -774,7 +774,7 @@ fn g06_pty_at_picker() {
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn g06_pty_bang_prefix_needs_approval() {
     let (temp, project) = sandbox();
@@ -789,7 +789,7 @@ fn g06_pty_bang_prefix_needs_approval() {
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn t_key_pty_key_with_spaces() {
     let (temp, project) = sandbox();
@@ -826,7 +826,7 @@ fn t_key_pty_key_with_spaces() {
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn t_more_pty_scroll_keys() {
     let (temp, project) = sandbox();
@@ -843,7 +843,7 @@ fn t_more_pty_scroll_keys() {
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn h05_pty_approval_denial_is_fail_closed() {
     let (temp, project) = sandbox();
@@ -899,7 +899,7 @@ fn h05_pty_approval_denial_is_fail_closed() {
     server.join().expect("the denial fixture completes");
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn g05_pty_always_allow_writes_local_rule() {
     let (temp, project) = sandbox();
@@ -929,7 +929,7 @@ fn g05_pty_always_allow_writes_local_rule() {
     server.join().expect("fixture completes");
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn g06_pty_ask_user_panel() {
     let (temp, project) = sandbox();
@@ -949,7 +949,7 @@ fn g06_pty_ask_user_panel() {
     server.join().expect("fixture completes");
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn g08_pty_undo_panel() {
     let (temp, project) = sandbox();
@@ -986,7 +986,7 @@ fn g08_pty_undo_panel() {
     server.join().expect("fixture completes");
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn t07_pty_plain_flag() {
     let (temp, project) = sandbox();
@@ -1003,7 +1003,7 @@ fn t07_pty_plain_flag() {
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn t07_pty_no_color() {
     let (temp, project) = sandbox();
@@ -1019,7 +1019,7 @@ fn t07_pty_no_color() {
     );
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn t07_pty_resize_keeps_the_draft() {
     let (temp, project) = sandbox();
@@ -1048,7 +1048,7 @@ fn t07_pty_resize_keeps_the_draft() {
 /// path with spaces and Vietnamese diacritics, started from a project directory
 /// that is neither the install directory nor a Git repository, with PATH and the
 /// profile variables rebuilt so no toolchain or developer state is reachable.
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/testing/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
 #[test]
 fn i14_the_installed_artifact_opens_the_app_in_a_real_terminal() {
     let (temp, project) = sandbox();
@@ -1163,7 +1163,7 @@ fn i14_the_installed_artifact_opens_the_app_in_a_real_terminal() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/testing/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
 #[test]
 fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     let (temp, project) = sandbox();
@@ -1231,7 +1231,7 @@ fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/testing/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
 #[test]
 fn i21_pty_survives_a_multiline_draft_and_keeps_the_prompt_usable() {
     let (temp, project) = sandbox();
@@ -1291,7 +1291,7 @@ fn i21_pty_survives_a_multiline_draft_and_keeps_the_prompt_usable() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/testing/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
 #[test]
 fn i07a_ctrl_c_clears_an_idle_prompt() {
     let provider = ScriptedSse::start(|_| Reply::Text("idle-clear-audit-done".to_owned()));
@@ -1326,7 +1326,7 @@ fn i07a_ctrl_c_clears_an_idle_prompt() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/testing/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
 #[test]
 fn i07b_ctrl_c_cancels_a_running_turn() {
     let (temp, project) = sandbox();
@@ -1395,7 +1395,7 @@ fn i07b_ctrl_c_cancels_a_running_turn() {
     let _ = hold.join();
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/testing/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
 #[test]
 fn i08_a_backend_fault_after_init_restores_the_terminal_and_is_not_swallowed() {
     // I08: inject a render/backend failure *after* the terminal is initialized and
@@ -1680,7 +1680,7 @@ fn ask_user_endpoint() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>)
     (format!("http://{address}/chat/completions"), stop, server)
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/testing/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
 #[test]
 #[allow(clippy::too_many_lines)] // One kill-then-resume sequence; splitting it hides the order.
 fn i13_a_settled_tool_receipt_survives_a_hard_kill_mid_turn() {
@@ -1887,7 +1887,7 @@ fn stalling_provider() -> (
     )
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/testing/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
 #[test]
 #[allow(clippy::too_many_lines)] // One kill-then-reopen sequence; splitting it hides the order.
 fn i05_exit_during_an_active_run_releases_the_store_for_the_next_host() {
@@ -2059,7 +2059,7 @@ fn sse_answer(text: &str) -> (String, Arc<AtomicBool>, std::thread::JoinHandle<(
 // I12 - a configured but unreachable provider (the offline path)
 // ---------------------------------------------------------------------------
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/testing/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
 #[test]
 fn i12_a_prompt_with_an_unreachable_provider_is_reported_and_the_app_stays_alive() {
     // The offline path: the environment is configured, but nothing answers. The app
@@ -2105,7 +2105,7 @@ fn i12_a_prompt_with_an_unreachable_provider_is_reported_and_the_app_stays_alive
 /// were broken. A bound stops a loop that has gone wrong, not a task that is still
 /// moving, so the app sends the next request itself, says so, and stops doing that once
 /// the budget the environment set is spent.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn g4_a_step_bound_continues_the_turn_by_itself() {
     let (temp, project) = sandbox();
@@ -2383,7 +2383,7 @@ fn finish(mut session: PtySession) {
 }
 
 /// Q00: the scripted provider serves a tool call and then an answer.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn q00_scripted_sse_serves_text_and_tool_calls() {
     let provider = ScriptedSse::start(|request| {
@@ -2404,7 +2404,7 @@ fn q00_scripted_sse_serves_text_and_tool_calls() {
 
 /// Q01+Q02: the parent starts a child without waiting and ends its turn; the
 /// child's stream breaks later, and the parent is woken with the failure.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn q02_pty_parent_is_woken_when_its_child_fails() {
     let provider = ScriptedSse::start(|request| {
@@ -2433,7 +2433,7 @@ fn q02_pty_parent_is_woken_when_its_child_fails() {
 }
 
 /// Q03: the child reports to its parent with `agent_message`.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn q03_pty_child_reports_to_its_parent() {
     let provider = ScriptedSse::start(|request| {
@@ -2477,7 +2477,7 @@ fn q03_pty_child_reports_to_its_parent() {
 /// call is already running is not lost with the turn: the next turn reads it.
 /// (Measured in the full PTY run: the message "reached the running turn" after
 /// its last step and was never read.)
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn q03b_pty_a_message_after_the_last_step_is_read_next() {
     let provider = ScriptedSse::start(|request| {
@@ -2519,7 +2519,7 @@ fn q03b_pty_a_message_after_the_last_step_is_read_next() {
 
 /// Q01+Q04: a child keeps running after its parent's turn; `/agents` lists it and
 /// `/agents stop` stops it, and the parent hears it was cancelled.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn q04_pty_agents_stop_cancels_a_running_child() {
     let provider = ScriptedSse::start(|request| {
@@ -2573,7 +2573,7 @@ fn last_user_text(request: &serde_json::Value) -> String {
 }
 
 /// Q05: a follow-up queued while the agent works runs after the turn.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn q05_pty_follow_up_runs_after_the_turn() {
     let provider = ScriptedSse::start(|request| {
@@ -2598,7 +2598,7 @@ fn q05_pty_follow_up_runs_after_the_turn() {
 
 /// Q07: /btw answers in a panel from the conversation, and the conversation
 /// never sees it.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn q07_pty_btw_answers_in_a_panel() {
     let provider = ScriptedSse::start(|request| {
@@ -2645,7 +2645,7 @@ fn q07_pty_btw_answers_in_a_panel() {
 
 /// Q08: /fork starts a new conversation before the chosen message; the model
 /// sees what came before it and nothing after.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn q08_pty_fork_then_answer() {
     let provider = ScriptedSse::start(|request| {
@@ -2706,7 +2706,7 @@ fn q08_pty_fork_then_answer() {
 }
 
 /// Q10: a model `models.json` adds is offered by `/model` and answers turns.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn q10_pty_custom_model_is_selectable() {
     let provider = ScriptedSse::start(|request| {
@@ -2791,7 +2791,7 @@ fn custom_models_session(
 }
 
 /// Q11: Alt+M moves to the next scoped model, and the next turn runs on it.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn q11_pty_cycle_changes_the_footer_model() {
     let provider = ScriptedSse::start(|request| {
@@ -2834,7 +2834,7 @@ fn q11_pty_cycle_changes_the_footer_model() {
 
 /// Q13: a rate-limited provider is waited out with prime-agent's line, and the
 /// answer arrives after it recovers.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn q13_pty_waiting_line_is_shown() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2859,7 +2859,7 @@ fn q13_pty_waiting_line_is_shown() {
 /// Ctrl+O expanded, with DeepSeek-style reasoning frames (`"content": ""` next to
 /// every token). Measured by the user: the trace printed one token per row and
 /// the input box was gone. The trace must be one paragraph and the box stays.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn u01_pty_expanded_reasoning_is_one_paragraph() {
     let provider = ScriptedSse::start(|request| {
@@ -2909,7 +2909,7 @@ fn u01_pty_expanded_reasoning_is_one_paragraph() {
 /// A stream cut short fails the turn with its error code named once (the user
 /// saw `provider_protocol: provider_protocol: provider_protocol: provider
 /// stream failed: error decoding response body`).
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn e01_pty_a_broken_stream_names_its_code_once() {
     let provider = ScriptedSse::start(|_| Reply::Truncated);
@@ -2934,7 +2934,7 @@ fn e01_pty_a_broken_stream_names_its_code_once() {
 
 /// Q14: a quality gate that fails carries the run on with prime-agent's gate
 /// prompt; the model fixes it, the gate passes, and the run stops there.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn q14_pty_gate_passes_after_one_fix() {
     let provider = ScriptedSse::start(|request| {
@@ -2986,7 +2986,7 @@ fn q14_pty_gate_passes_after_one_fix() {
 
 /// Q15: a scheduled job runs on its own while the app is open, and it is kept
 /// on disk for the conversation.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn q15_pty_scheduled_job_fires() {
     let provider = ScriptedSse::start(|request| {
@@ -3018,7 +3018,7 @@ fn q15_pty_scheduled_job_fires() {
 /// prime-agent's `/import`: a conversation exported with `/export <file>.jsonl`
 /// is imported into a new conversation, and the model is sent the imported
 /// turns - on the first message after the import and on the ones after it.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn m01_pty_import_continues_an_exported_conversation() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3068,7 +3068,7 @@ fn m01_pty_import_continues_an_exported_conversation() {
 /// hours is not polled for fifteen minutes. The turn ends saying the session is
 /// parked, and one durable one-shot job - kept with the conversation, so it
 /// outlives the app - will wake it with prime-agent's resume prompt.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn q13b_pty_a_far_reset_parks_the_session() {
     let provider = ScriptedSse::start(|_| Reply::RateLimited(7200));
@@ -3097,7 +3097,7 @@ fn q13b_pty_a_far_reset_parks_the_session() {
 /// `[label] `; going back with `--summarize` has the model summarise the turns
 /// left behind (prime-agent's branch prompt), and the next message is read with
 /// that summary ahead of it, while the abandoned turns themselves are gone.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn q08b_pty_tree_labels_and_summarizes_the_branch_it_leaves() {
     let provider = ScriptedSse::start(|request| {
@@ -3198,7 +3198,7 @@ fn wait_for_idle_agent(
 /// running finishes in the background. `ha agents` lists the agent, `ha send`
 /// starts its next turn, and `ha attach` brings the whole conversation back to a
 /// new terminal, which can go on typing; `ha stop` ends it.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn d01_pty_a_closed_terminal_leaves_the_agent_running() {
     let provider = ScriptedSse::start(|request| {
@@ -3266,7 +3266,7 @@ fn d01_pty_a_closed_terminal_leaves_the_agent_running() {
 /// prime-agent's `rlm.create_session`: code in the agent's Python REPL starts a
 /// separate top-level agent in the same worker; it gets its own conversation,
 /// runs the prompt it was given, and is listed, named, beside its creator.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn d02_pty_create_session_starts_a_top_level_agent() {
     let provider = ScriptedSse::start(|request| {
@@ -3328,7 +3328,7 @@ fn d02_pty_create_session_starts_a_top_level_agent() {
 
 /// A resident agent can create a session in a project whose worker has never
 /// been started. The new worker must survive detaching its creator's terminal.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn d08_pty_create_session_starts_another_projects_worker() {
     let (temp, project) = sandbox();
@@ -3381,7 +3381,7 @@ fn d08_pty_create_session_starts_another_projects_worker() {
     run_cli_json(&temp, &project, &["shutdown", "--force", "--json"]);
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn d09_pty_send_wait_returns_each_follow_ups_answer() {
     let provider = ScriptedSse::start(|request| {
@@ -3435,7 +3435,7 @@ fn d09_pty_send_wait_returns_each_follow_ups_answer() {
     finish(terminal);
 }
 
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn d10_pty_abort_interrupts_a_running_python_cell() {
     let provider = ScriptedSse::start(|request| {
@@ -3481,7 +3481,7 @@ fn d10_pty_abort_interrupts_a_running_python_cell() {
 /// screen holds the conversation, the wheel scrolls it (the follow hint shows),
 /// and `/fullscreen off` returns to the inline viewport and keeps the choice
 /// for the next launch.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn f01_pty_fullscreen_scrolls_with_the_wheel_and_can_be_turned_off() {
     let provider = ScriptedSse::start(|_| {
@@ -3515,7 +3515,7 @@ fn f01_pty_fullscreen_scrolls_with_the_wheel_and_can_be_turned_off() {
 /// sessions run through its daemon: while an agent is in the middle of a turn -
 /// the project's store open for its writer - `ha exec` no longer waits for the
 /// writer and fails with `writer_locked`; it runs in the worker beside the agent.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn d03_pty_exec_runs_beside_an_agent_in_the_middle_of_a_turn() {
     let provider = ScriptedSse::start(|request| {
@@ -3627,7 +3627,7 @@ fn detached_agent(
 
 /// D04: prime-agent's supervisor starts a worker that died again, and the
 /// agent comes back on its id and its conversation.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn d04_pty_a_worker_that_dies_comes_back_with_its_agents() {
     let provider = ScriptedSse::start(|_| Reply::Text("answer-d04".to_owned()));
@@ -3648,7 +3648,7 @@ fn d04_pty_a_worker_that_dies_comes_back_with_its_agents() {
 /// D05: prime-agent's no-auto-resume contract: a conversation with a
 /// scheduled job stays dormant when the project's worker starts again - the
 /// job fires only while its conversation runs.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn d05_pty_a_scheduled_conversation_stays_dormant_when_the_worker_starts() {
     let provider = ScriptedSse::start(|_| Reply::Text("answer-d05".to_owned()));
@@ -3692,7 +3692,7 @@ fn d05_pty_a_scheduled_conversation_stays_dormant_when_the_worker_starts() {
 /// D06: an update: a terminal of the new build finds the old build's worker
 /// idle, has it stop with its journal kept, and the new worker brings the
 /// agent back on its id.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn d06_pty_an_idle_worker_of_an_old_build_is_replaced() {
     let provider = ScriptedSse::start(|_| Reply::Text("answer-d06".to_owned()));
@@ -3731,7 +3731,7 @@ fn d06_pty_an_idle_worker_of_an_old_build_is_replaced() {
 /// D07: prime-agent's clients view one session: a second terminal attaches
 /// beside the first, both draw what the agent does, and `/quit` in one leaves
 /// the other attached.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn d07_pty_two_terminals_share_one_agent() {
     let provider = ScriptedSse::start(|request| {
@@ -3773,7 +3773,7 @@ fn d07_pty_two_terminals_share_one_agent() {
 /// prime-agent's agents view: `ha agents` lists every session; Ctrl+N starts
 /// one, Left on its empty prompt comes back to the view with the agent listed
 /// as idle, Ctrl+X twice stops it, and Esc leaves.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn i22_agents_view_opens_returns_and_stops() {
     let (temp, project) = sandbox();
@@ -3799,7 +3799,7 @@ fn i22_agents_view_opens_returns_and_stops() {
 /// `/agents` in a session goes straight to the agents view. The transcript
 /// between the command and the view is saved for evidence of what the
 /// terminal drew on the way.
-#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn i23_slash_agents_goes_straight_to_the_view() {
     let (temp, project) = sandbox();

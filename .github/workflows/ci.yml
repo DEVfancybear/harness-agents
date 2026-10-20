@@ -51,7 +51,7 @@ jobs:
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
       - name: Run P0 gate without credentials
         shell: pwsh
-        run: ./scripts/Verify-Phase.ps1 -Phase P0
+        run: ./scripts/verify/Verify-Phase.ps1 -Phase P0
 
   verify-p3:
     name: P3 (${{ matrix.os }})
@@ -68,7 +68,7 @@ jobs:
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
       - name: Run P3 gate without credentials
         shell: pwsh
-        run: ./scripts/Verify-Phase.ps1 -Phase P3
+        run: ./scripts/verify/Verify-Phase.ps1 -Phase P3
 
   verify-p5:
     name: P5 (${{ matrix.os }})
@@ -85,7 +85,7 @@ jobs:
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
       - name: Run P5 gate, delegation fixtures and predecessor regressions without credentials
         shell: pwsh
-        run: ./scripts/Verify-Phase.ps1 -Phase P5
+        run: ./scripts/verify/Verify-Phase.ps1 -Phase P5
   verify-p6:
     name: P6 (${{ matrix.os }})
     strategy:
@@ -101,7 +101,7 @@ jobs:
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
       - name: Run P6 gate, extension fixtures and predecessor regressions without credentials
         shell: pwsh
-        run: ./scripts/Verify-Phase.ps1 -Phase P6
+        run: ./scripts/verify/Verify-Phase.ps1 -Phase P6
   verify-p7:
     name: P7 (${{ matrix.os }})
     strategy:
@@ -117,7 +117,7 @@ jobs:
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
       - name: Run P7 release gate, backup/restore fixtures and every predecessor regression
         shell: pwsh
-        run: ./scripts/Verify-Phase.ps1 -Phase P7
+        run: ./scripts/verify/Verify-Phase.ps1 -Phase P7
 
   # This project currently targets Windows in CI. Linux jobs can be added when
   # Linux support and its platform-specific M12 probe results are in scope.
@@ -144,10 +144,10 @@ jobs:
       - name: Build the local release candidate for the M9 closure
         if: matrix.milestone == 'M9'
         shell: pwsh
-        run: ./scripts/New-HaRelease.ps1 -Profile Release -PublishDryRun -OutputDirectory target/release-candidate
+        run: ./scripts/release/New-HaRelease.ps1 -Profile Release -PublishDryRun -OutputDirectory target/release-candidate
       - name: Run the ${{ matrix.milestone }} milestone gate
         shell: pwsh
-        run: ./scripts/Verify-Milestone.ps1 -Milestone ${{ matrix.milestone }}
+        run: ./scripts/verify/Verify-Milestone.ps1 -Milestone ${{ matrix.milestone }}
 
   verify-ha-agent:
     name: HA_AGENT CP-E (${{ matrix.os }})
@@ -176,10 +176,10 @@ jobs:
           New-Item -ItemType Directory -Path target/ha-agent-ci -Force | Out-Null
           $failed = $false
           foreach ($milestone in @('M4', 'M5', 'M6')) {
-            & ./scripts/Verify-Milestone.ps1 -Milestone $milestone -Json *>&1 | Tee-Object -FilePath "target/ha-agent-ci/$milestone.log"
+            & ./scripts/verify/Verify-Milestone.ps1 -Milestone $milestone -Json *>&1 | Tee-Object -FilePath "target/ha-agent-ci/$milestone.log"
             if ($LASTEXITCODE -ne 0) { $failed = $true }
           }
-          & ./scripts/Verify-HaLaunch.ps1 -Json *>&1 | Tee-Object -FilePath target/ha-agent-ci/HA_LAUNCH.log
+          & ./scripts/verify/Verify-HaLaunch.ps1 -Json *>&1 | Tee-Object -FilePath target/ha-agent-ci/HA_LAUNCH.log
           if ($LASTEXITCODE -ne 0) { $failed = $true }
           if ($failed) { exit 1 }
       - name: Upload gate logs

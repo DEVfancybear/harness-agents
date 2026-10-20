@@ -9,7 +9,7 @@ name: Publish to npm
 # workflow filename `npm-publish.yml`.
 #
 # The package is packed from the release's own zip, never from a fresh build, so
-# npm ships the bytes the release checksums cover (scripts/New-HaNpmPackages.ps1
+# npm ships the bytes the release checksums cover (scripts/release/New-HaNpmPackages.ps1
 # refuses a file that does not match checksums.txt).
 
 on:
@@ -77,7 +77,7 @@ jobs:
         run: |
           $arguments = @{ BundleDirectory = $env:BUNDLE; OutputDirectory = "$env:RUNNER_TEMP/npm" }
           if ($env:PACKAGE_VERSION) { $arguments.PackageVersion = $env:PACKAGE_VERSION }
-          ./scripts/New-HaNpmPackages.ps1 @arguments
+          ./scripts/release/New-HaNpmPackages.ps1 @arguments
 
       - name: Publish
         if: env.SKIP != '1'

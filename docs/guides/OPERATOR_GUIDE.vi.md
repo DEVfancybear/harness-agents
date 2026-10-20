@@ -1,0 +1,708 @@
+# Hướng dẫn vận hành — chạy và phục hồi harness
+
+Ngôn ngữ: [English](OPERATOR_GUIDE.en.md)
+
+Tài liệu này dành cho người phải chạy, sao lưu, phục hồi, chuyển đổi và thanh lý
+một thư mục dữ liệu harness. Nó nêu đúng những lệnh có trong bản phát hành này,
+mỗi lệnh từ chối làm gì, và những giới hạn mà người vận hành không được phát hiện
+muộn. Về cách các phần khớp nhau, xem
+[ARCHITECTURE_OVERVIEW.vi.md](../architecture/ARCHITECTURE_OVERVIEW.vi.md) và
+[PLUGIN_ARCHITECTURE.vi.md](../architecture/PLUGIN_ARCHITECTURE.vi.md); về TUI, xem
+[TUI.md](TUI.md).
+
+## 1. Bản phát hành này là gì
+
+Harness là runtime agent lập trình chạy nền trước, trên một host duy nhất. Mỗi
+thời điểm chỉ một host được ghi vào một thư mục dữ liệu; quyền sở hữu là khóa
+file của hệ điều hành cộng với một thế hệ fencing ghi trong cơ sở dữ liệu, không
+phải một dịch vụ mạng.
+
+Điều đó nghĩa là:
+
+- **Bảo trì không có daemon.** Mọi thao tác bảo trì dưới đây là lệnh chạy nền
+  trước do người vận hành gọi; không gì tự thử lại hay tự thu gom. Còn phiên
+  tương tác thì chạy trong worker nền ([12.7](#127-agent-chạy-nền)).
+- **Không có server để kết nối.** Endpoint MCP từ xa và sandbox cấp hệ điều hành
+  được công bố là không hỗ trợ trong ma trận phát hành; cô lập transport không
+  phải là sandbox.
+- **Artifact phát hành do script release tạo ra.** Bản dựng Windows được các gate
+  kiểm thử chạy; `scripts/release/New-HaRelease.ps1` build một bundle candidate kèm
+  checksum ([BUILD_AND_RELEASE.md](BUILD_AND_RELEASE.md)). Ma trận phát hành vẫn báo
+  artifact đã công bố là chưa kiểm chứng, và không có gì được ký code.
+- **Linux đang chờ hỗ trợ.** Job CI của Linux vẫn chạy để theo dõi nhưng không chặn
+  push; ma trận phát hành báo Linux là `unverified`.
+- **Thông tin xác thực provider không được kiểm chứng.** Các gate không gọi API
+  mô hình trả phí, nên không có tuyên bố phát hành nào phụ thuộc vào nó.
+
+Phát biểu đọc được bằng máy về trạng thái kiểm chứng là
+`ha maintenance release-matrix --json`.
+
+## 2. Chẩn đoán một thư mục dữ liệu
+
+```console
+ha maintenance doctor --data-dir <DATA_DIR> --json
+ha maintenance doctor --cwd <PROJECT> --json
+```
+
+Mọi lệnh con `maintenance` nhận `--data-dir` đều có thể dùng `--cwd <PROJECT>` thay
+thế (đặt trước hoặc sau lệnh con); nó tìm store của project như `ha chat` làm. Lệnh
+này không phải `ha doctor` ([12.1](#121-công-cụ-của-agent)), lệnh audit mức sẵn sàng
+của một repository cho agent, không phải một thư mục dữ liệu.
+
+`doctor` mở store ở chế độ ghi, báo cáo các revision schema tìm thấy, thiết lập
+`SQLite` đang áp dụng, số lượng session, task được giao, artifact và retention, và
+quan trọng nhất là danh sách `not_verified` nêu rõ những gì nó **không** kiểm tra.
+Nó không bao giờ báo "khỏe" cho thứ nó chưa soi.
+
+Hai trường cần đọc trước tiên:
+
+- `writable` — binary này có được ghi vào thư mục hay không. Store do binary **mới
+  hơn** ghi sẽ báo `false`: schema đi trước bản dựng này, ghi bị từ chối, và việc
+  đọc chỉ vẫn hoạt động để có thể chẩn đoán thay vì phá dữ liệu.
+- `compatibility` — câu mô tả cùng sự thật đó bằng ngôn ngữ thường.
+
+## 3. Sao lưu
+
+```console
+ha maintenance backup --data-dir <DATA_DIR> --into <NEW_BACKUP_DIR> --json
+ha maintenance verify-backup --backup <BACKUP_DIR> --json
+```
+
+Một bản sao lưu là ảnh chụp trọn vẹn một thư mục dữ liệu vào một thư mục chưa tồn
+tại:
+
+- Ảnh chụp cơ sở dữ liệu do chính `SQLite` tạo sau khi gộp write-ahead log, nên là
+  một cơ sở dữ liệu độc lập nhất quán chứ không phải một bộ WAL sao chép dở.
+- Mọi artifact mà store tham chiếu đều được sao chép và băm. Manifest ghi lại định
+  danh, đường dẫn tương đối, hash nội dung và độ dài byte của từng artifact.
+- Revision schema của ảnh chụp, các retention pin còn hiệu lực và các tombstone
+  đang hoạt động đều được ghi vào manifest.
+- Manifest mang một digest trên chính nội dung của nó, nên sửa đổi sau đó là phát
+  hiện được.
+
+Một thư mục sao lưu chứa ảnh chụp `harness.sqlite3`, các artifact đã sao chép, và
+`backup-manifest.json` — tệp nêu tên mọi artifact, hash và revision mà ảnh chụp chứa.
+
+`verify-backup` đọc lại manifest, kiểm tra digest của nó, kiểm tra hash cơ sở dữ
+liệu và kiểm tra hash của từng artifact. Hãy dùng nó trước khi tin một bản sao lưu,
+và dùng lại sau khi chuyển bản sao lưu sang phương tiện khác.
+
+Những gì sao lưu từ chối:
+
+- **Không bao giờ ghi đè hay gộp.** Thư mục sao lưu đã tồn tại sẽ bị từ chối, nên
+  một bản sao lưu không thể âm thầm trộn hai ảnh chụp. Mỗi lần sao lưu hãy dùng
+  một thư mục mới.
+- **Không sao lưu store chưa có gì.** Thư mục không có cơ sở dữ liệu bị từ chối
+  (`backup_manifest_invalid`) thay vì tạo ra một bản sao lưu rỗng.
+- **Không động vào nguồn.** Thư mục nguồn chỉ được đọc, ngoại trừ bước checkpoint
+  write-ahead log để ảnh chụp nhất quán.
+
+Thư mục sao lưu là khép kín. Sao chép nó đi nơi khác là đủ; không có catalog hay
+chỉ mục nào cần đồng bộ.
+
+## 4. Phục hồi
+
+```console
+ha maintenance restore --backup <BACKUP_DIR> --into <NEW_DATA_DIR> --json
+```
+
+Phục hồi sẽ kiểm tra bản sao lưu, sao chép ảnh chụp cùng mọi artifact, rồi chứng
+minh kết quả trước khi trả về:
+
+- `database_verified` — kiểm tra toàn vẹn của chính `SQLite` đã đạt trên bản phục hồi.
+- `artifacts_verified`, `artifacts_missing`, `artifacts_corrupt` — mọi artifact được
+  băm lại sau khi ghi.
+- `tombstones_restored` — nguồn đã bị quên vẫn bị quên qua một lần phục hồi.
+
+**Phục hồi không tự kích hoạt.** Nó ghi vào một thư mục mới, ghi `restore.json` với
+`"activated": false`, rồi dừng. Không có gì trỏ vào bản phục hồi cho tới khi người
+vận hành quyết định chuyển sang. Sự tách bạch đó chính là mục đích: một bản phục
+hồi hỏng không thể thay thế thư mục đang chạy, vì phục hồi không thay thế bất cứ thứ gì.
+
+Những gì phục hồi từ chối:
+
+- **Đích đã có store.** `restore_target_conflict`. Bao gồm cả việc phục hồi đè lên
+  thư mục đang chạy và phục hồi vào chính thư mục sao lưu.
+- **Đích đã được đánh dấu active.** Thư mục có `.active` bị từ chối.
+- **Ảnh chụp thiếu hoặc hỏng.** Manifest không khớp nội dung của chính nó, cơ sở dữ
+  liệu không đạt kiểm tra toàn vẹn, hay artifact có byte không còn khớp đều bị từ
+  chối với `backup_manifest_invalid`. Phục hồi dở dang là lỗi, không phải cảnh báo.
+
+Kích hoạt là bước riêng, tường minh, do công cụ của người vận hành thực hiện, không
+phải bởi lệnh này. Chỉ sau khi bản phục hồi đã được kiểm tra mới nên mở nó ở chế độ
+ghi và đánh dấu active.
+
+## 5. Nâng cấp và hạ cấp
+
+```console
+ha maintenance migrate-copy --data-dir <DATA_DIR> --into <NEW_DATA_DIR> --json
+```
+
+Chuyển đổi luôn chạy trên một **bản sao**:
+
+- Thư mục nguồn được sao chép sang một đích mới, và bản sao được mở ở chế độ ghi để
+  đường chuyển đổi thông thường chạy trên nó.
+- Nguồn được giữ nguyên từng byte. Một lần chuyển đổi bị ngắt để lại nguồn đọc được
+  và không đổi, còn bản sao dở dang chỉ cần xóa.
+- Khóa writer là trạng thái tiến trình, không phải dữ liệu. Nó không bao giờ được
+  sao chép; lần mở chuyển đổi tự lấy khóa riêng.
+
+Những gì chuyển đổi từ chối:
+
+- **Đích đã có dữ liệu.** `restore_target_conflict`, nên chuyển đổi không bao giờ
+  gộp vào một store đang tồn tại.
+- **Nguồn không có store.** `migration_failed`.
+
+Hạ cấp bị từ chối chứ không được thử. Nếu store ghi revision schema mới hơn bản
+dựng đang chạy, `doctor` báo `writable: false`, ghi thất bại với lỗi có kiểu, và
+việc đọc chỉ vẫn hoạt động. Cách khắc phục là binary mới hơn, không bao giờ là sửa
+tay một dòng schema.
+
+## 6. Tombstone
+
+```console
+ha maintenance tombstones --data-dir <DATA_DIR> --json
+```
+
+`tombstone` là bản ghi bền vững rằng một nguồn đã bị cố ý quên, kèm mọi bản sao bên
+ngoài hoặc bản sao lưu có thể còn chứa dữ liệu của nó. Các thao tác retention theo
+nguồn `invalidate`/`archive`/`forget` không thuộc command surface hiện tại, nên bản này
+không ghi tombstone mới; record mà store cũ đang giữ vẫn tồn tại nguyên vẹn qua sao lưu
+và phục hồi, và `ha maintenance tombstones` liệt kê chúng.
+
+## 7. Thu gom rác
+
+```console
+ha maintenance gc --data-dir <DATA_DIR> --grace-seconds 604800 --dry-run --json
+ha maintenance gc --data-dir <DATA_DIR> --grace-seconds 604800 --json
+```
+
+Thu gom rác xóa byte của artifact, và chỉ xóa artifact đồng thời:
+
+1. **không được tham chiếu** — không receipt hay tool artifact scope nào trỏ tới;
+2. **không bị pin** — không bản sao lưu hay task dở dang nào giữ retention pin trên nó; và
+3. **cũ hơn thời gian ân hạn** — mặc định là 604800 giây (7 ngày).
+
+Báo cáo nêu đúng lý do từng artifact sống sót: `retained_pinned`,
+`retained_referenced` hay `retained_young`. Hãy chạy `--dry-run` trước; nó phân tích
+y hệt và không xóa gì.
+
+Pin tồn tại để bịt một cuộc đua cụ thể: bản sao lưu hứa giữ artifact trong khi lượt
+thu gom muốn xóa. Candidate list chỉ là snapshot; trước khi quarantine, store kiểm
+tra lại pin, reference và mtime trong writer transaction. Nếu mtime không đọc được,
+artifact được giữ trong grace period. `pin_artifacts` chỉ chấp nhận ID có artifact
+row hiện hữu, và cả batch bị từ chối nếu thiếu dù chỉ một ID. Bản sao lưu ghi lại
+pin của nó trong manifest để có thể kiểm toán về sau.
+
+## 8. Ma trận phát hành
+
+```console
+ha maintenance release-matrix --json
+ha maintenance release-matrix --json --retrieval-p95-ms 900 --restore-ms 1200
+```
+
+Ma trận báo cáo bốn thứ riêng biệt và từ chối làm mờ chúng:
+
+- **platforms** — từng target triple được hỗ trợ với `verified`, `unverified` hay
+  `failing`, kèm bằng chứng cho trạng thái đó. Nền tảng chưa từng được chạy là
+  `unverified`, không bao giờ bị bỏ qua.
+- **capabilities** — `supported`, `component_only` (đã hiện thực nhưng chưa chạy
+  đầu-cuối) hay `unsupported`. Bề mặt không hỗ trợ được nêu kèm lý do.
+- **benchmarks** — một `target` đã nêu với giá trị `measured` là `null` cho tới khi
+  có lượt chạy thật. `met` là `null` khi `measured` là `null`. Mục tiêu là mục tiêu;
+  nó không bao giờ được báo là đạt chỉ vì đã được viết ra.
+- **verified_cases**, **unverified_checks**, **out_of_scope** — 32 ca liên tục và
+  plugin mà bản phát hành này chạy, những kiểm tra chưa chạy cùng lý do, và những gì
+  bản phát hành này dứt khoát không làm.
+
+`verdict` là câu tóm tắt trung thực một dòng: một nền tảng lỗi khiến bản phát hành
+"not release-ready", một nền tảng chưa chạy khiến nó "partially verified", và một
+benchmark chưa đo vẫn được nêu là chưa đo ngay cả khi mọi nền tảng đều xanh.
+
+## 9. Những gì người vận hành không được giả định
+
+- Không tiến trình nền nào giữ store gọn gàng. Nếu bạn không chạy `gc`, không gì
+  được thu gom; nếu bạn không chạy `backup`, không gì được bảo vệ.
+- Phục hồi không phải một công tắc. Nó tạo ra một thư mục ứng viên; kích hoạt nó là
+  quyết định của người vận hành với hệ quả riêng.
+- Tombstone là cục bộ và bền vững, không phải toàn cầu. Hãy đọc `surviving_copies` trước
+  khi nói với ai rằng dữ liệu đã biến mất.
+- Một bản sao lưu chỉ được coi là đã kiểm chứng khi `verify-backup` nói vậy trên đúng
+  phương tiện bạn đang giữ.
+- Artifact còn trong thời gian ân hạn, đang bị pin, hoặc đang được tham chiếu sẽ không
+  bị thu gom, và đó là hành vi đúng chứ không phải lỗi.
+- Các gate chứng minh đúng hành vi chúng đã chạy. Nền tảng, capability và benchmark
+  chúng chưa chạy đều được báo là như vậy; hãy coi mọi tuyên bố không có trong ma trận
+  là chưa kiểm chứng.
+
+## 10. Tóm tắt lệnh
+
+| Lệnh | Mục đích | Từ chối khi |
+| --- | --- | --- |
+| `ha maintenance doctor` | Chẩn đoán một thư mục dữ liệu | Không bao giờ; thay vào đó báo `writable: false` |
+| `ha maintenance backup` | Ảnh chụp vào một thư mục mới | Thư mục sao lưu đã tồn tại; nguồn không có store |
+| `ha maintenance verify-backup` | Kiểm tra một bản sao lưu và các artifact của nó | Manifest, cơ sở dữ liệu hay bất kỳ artifact nào sai hash |
+| `ha maintenance restore` | Phục hồi vào thư mục mới, không kích hoạt | Đích đã có store hoặc đang active; ảnh chụp không đầy đủ |
+| `ha maintenance tombstones` | Liệt kê nguồn đã quên và các bản sao còn lại | Không bao giờ |
+| `ha maintenance gc` | Thu gom artifact không tham chiếu, không pin, đã cũ | Không bao giờ; nó báo những gì được giữ và vì sao |
+| `ha maintenance migrate-copy` | Chuyển đổi store trên một bản sao | Đích đã có dữ liệu; nguồn không có store |
+| `ha maintenance release-matrix` | Báo cáo nền tảng, capability và tính trung thực của benchmark | Không bao giờ; nó báo những gì chưa kiểm chứng |
+| `ha bug-report` | Gom log chẩn đoán, log worker, bản ghi store và file harness trong một khoảng thời gian vào một file zip có `SUMMARY.md`, đã che secret ([12.12](#1212-chẩn-đoán-và-báo-lỗi)). Dùng gói này để dò bug | Khoảng thời gian không phải một số theo sau là `s`, `m`, `h` hoặc `d` |
+| `ha diag path`, `ha diag timeline` | Cho biết log chẩn đoán nằm ở đâu; in timeline gộp | Không bao giờ |
+| `ha maintenance support-bundle` | Ghi một bundle có giới hạn, đã che (metadata, số lượng, revision schema, tham chiếu tương quan; với `--config <FILE>` có thêm config đã che) cho host bạn không với tới được; mỗi lần che được đếm trong manifest | Thư mục `--into` đã có file |
+
+Các lệnh cấp cao nhất khác được mô tả ở đúng chỗ của chúng: `ha`/`ha chat`/`ha exec`
+([12](#12-sử-dụng-ha-tương-tác-và-headless), [12.4](#124-automation)), `ha agents|list|attach|send|abort|stop|rename|shutdown|schedule`
+([12.7](#127-agent-chạy-nền), [12.8](#128-thêm-từ-prime-agent)), `ha mcp` ([12.3](#123-config-v2-quyền-và-hook)),
+`ha package` và `ha config` ([12.9](#129-gói-tài-nguyên-và-phần-còn-lại-của-prime-agent)), `ha model` và `ha prompt` ([12.8](#128-thêm-từ-prime-agent)), `ha doctor` ([12.1](#121-công-cụ-của-agent)).
+Các nhóm còn lại - `init`, `sessions`, `status`, `input`, `plugins`, `run`, `resume`, `continue`,
+`context`, `session`, `code`, `sandbox`, `tasks` và `extensions` - là lệnh kiểm tra và fixture mức thấp
+cho phát triển và các gate (`ha <nhóm> --help` liệt kê chúng); người vận hành không cần đến.
+
+## 11. Đưa CLI vào terminal
+
+```console
+pwsh -NoProfile -File scripts/install/Install-Ha.ps1
+ha --version
+ha maintenance doctor --data-dir <DATA_DIR>
+```
+
+`ha` là một executable bình thường, nên "cài" nghĩa là đưa executable đó vào
+`PATH`. Repo có sẵn một script làm việc đó, theo hai đường:
+
+| Đường | Lệnh | Việc nó làm |
+| --- | --- | --- |
+| Copy (mặc định) | `scripts/install/Install-Ha.ps1` | Build `ha` bằng `cargo build --release -p harness-cli --bin ha --locked` rồi copy artifact đã biên dịch vào `$HOME/.cargo/bin`, thư mục mà trình cài Rust đã đặt sẵn trong `PATH` |
+| Cargo | `scripts/install/Install-Ha.ps1 -UseCargoInstall` | Chạy `cargo install --path crates/harness-cli --locked --root $HOME/.cargo`, để sau này `cargo uninstall harness-cli` gỡ được |
+
+Vài biến thể hữu ích:
+
+```console
+pwsh -NoProfile -File scripts/install/Install-Ha.ps1 -Profile Debug        # build nhanh hơn, cho vòng lặp cục bộ
+pwsh -NoProfile -File scripts/install/Install-Ha.ps1 -Force                # build lại kể cả khi binary có vẻ còn mới
+pwsh -NoProfile -File scripts/install/Install-Ha.ps1 -Destination <DIR>    # cài vào chỗ khác
+pwsh -NoProfile -File scripts/install/Install-Ha.ps1 -SkipBuild            # cài binary đã build sẵn
+```
+
+Những gì script **không** làm, một cách có chủ ý: không tải gì về, không publish gì
+lên package registry, và không tự sửa `PATH` của bạn trừ khi bạn yêu cầu rõ bằng
+`-ModifyUserPath`. Khi thư mục cài chưa có trong `PATH`, nó in ra đúng thư mục cần
+thêm thay vì âm thầm sửa profile; khi bạn truyền `-ModifyUserPath`, nó chỉ sửa
+**User PATH** (thêm một lần, không nhân bản, giữ nguyên các entry khác và không bao giờ
+ghi Machine PATH hay PATH tổng hợp của process) và nói rõ terminal mới mới thấy thay đổi.
+
+Từ bản này script còn:
+
+- cài **đúng artifact Cargo báo**, kiểm tra digest và `--version` của bản staged trước
+  khi thay thế, giữ file cũ làm backup để rollback nếu bước cuối thất bại;
+- ghi manifest `ha.install.json` cạnh binary (version, sha256, source, build commit,
+  danh sách file sở hữu) để update/uninstall chỉ đụng file của mình;
+- phân loại lỗi khi thay thế: file đang chạy là `in_use` (đóng app rồi chạy lại — script
+  **không** kill process nào), thiếu quyền là `access_denied`;
+- cảnh báo nếu một `ha` khác đứng trước trên `PATH`; nó **không** xóa command đó.
+
+Chạy `pwsh -NoProfile -File scripts/install/Install-Ha.ps1 -SelfTest` để tự kiểm chứng các luật
+trên mà không cài vào đâu thật.
+
+Cả hai đường đều build từ cùng một cây source; chỉ khác cargo profile.
+Nếu bạn muốn đúng artifact mà các test đã chạy, hãy dùng profile release mặc định.
+
+Gỡ lại:
+
+```console
+Remove-Item "$HOME/.cargo/bin/ha.exe"     # đường copy
+cargo uninstall harness-cli               # đường cargo
+```
+
+Nếu bạn cài từ **bundle release** (`-FromBundle <dir>`, đường end-user), nên gỡ bằng
+chính installer để nó chỉ xóa thứ nó đã ghi:
+
+```console
+pwsh -NoProfile -File scripts/install/Install-Ha.ps1 -Uninstall -Destination <DIR>
+pwsh -NoProfile -File scripts/install/Install-Ha.ps1 -Uninstall -Destination <DIR> -RemoveUserPathEntry
+```
+
+- Lệnh đầu gỡ **đúng các file trong manifest** và **giữ nguyên** entry `PATH` mà lần cài đã
+  thêm (nó in ra entry đó kèm cách gỡ). Lệnh thứ hai xóa luôn entry — cần cờ riêng vì lần
+  cài cũng cần `-ModifyUserPath` mới được ghi vào User PATH.
+- Cả hai đều **không** đụng config và session data của bạn. Hiện **chưa** có lệnh nào xóa dữ
+  liệu người dùng (không có đường `purge`); muốn xóa config và thư mục dữ liệu thì tự
+  xóa tay.
+
+Hai điều cần biết sau khi cài:
+
+- **Bảo trì chạy nền trước.** Không daemon nào chạy nó: backup, thu gom hay thao tác
+  retention xảy ra đúng lúc bạn gọi và không lúc nào khác. (Phiên tương tác thì vẫn
+  chạy trong worker nền sau khi terminal đóng; xem [12.7](#127-agent-chạy-nền).)
+- **Thư mục mới là đích hợp lệ.** `ha maintenance doctor --data-dir <DIR>` chạy được
+  trên thư mục chưa có store và báo nó là chưa khởi tạo — đúng trạng thái mà binary
+  này được phép tạo store trong đó. Nó không giả vờ rằng store đã tồn tại, và việc
+  sao lưu một thư mục như vậy vẫn bị từ chối.
+
+Build từ source vẫn dùng được cho phát triển:
+`cargo build -p harness-cli --bin ha --locked` ghi ra `target/debug/ha`, và
+`cargo run -p harness-cli --bin ha -- <args>` chạy nó mà không cài gì.
+
+
+## 12. Sử dụng `ha` tương tác và headless
+
+`ha` hoặc `ha chat` mở chat ở terminal. `ha chat --cwd <project>` chọn workspace; khi stdin/stdout không phải terminal, lệnh tương tác thoát mã 2 thay vì chờ. `ha chat --plain` dùng giao diện dòng; `ha chat --fixture` dùng fixture cục bộ. `/session` (hoặc `/status`) cho biết project, provider, dữ liệu và trạng thái thiết lập. `/login` theo prime-agent: DeepSeek, OpenAI, Anthropic, OpenCode Zen và OpenCode Go nhận API key qua ô nhập có che ký tự; ChatGPT Plus/Pro đăng nhập bằng trình duyệt (OAuth với PKCE trên `localhost:1455`; nếu trình duyệt ở máy khác, dán URL chuyển hướng cuối cùng vào). Credential được lưu theo từng provider trong `auth.json` ở thư mục dữ liệu riêng và được ưu tiên hơn biến môi trường của provider (`DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENCODE_API_KEY`); `/logout <provider>` xóa một mục. Giá trị không bao giờ xuất hiện trong status hay transcript. `/model` liệt kê model của các provider đã đăng nhập, lấy từ model catalog của prime-agent (bản chụp đi kèm app, làm mới mỗi ngày) cùng danh sách model mà DeepSeek và OpenCode tự công bố, nên model mới hơn catalog cũng có mặt; các mức thinking của từng model lấy từ catalog, và `/effort` chỉ gợi ý các mức đó; lựa chọn được lưu trong `selection.json` cạnh config người dùng. Không có đăng nhập Claude Pro/Max của Anthropic: cách đó chỉ chạy khi app tự nhận là Claude Code, nên Anthropic dùng API key.
+
+### 12.1. Công cụ của agent
+
+18 công cụ cốt lõi đi qua host, policy và receipt. Các tool skill (`list_skills`, `activate_skill`, `read_skill_file`), tool web (`web_search`, `web_fetch`), Python REPL (`python_repl`) và, khi không có REPL, `mcp__<server>__<tool>` được thêm khi khả dụng.
+
+**Knowledge.** Tool `knowledge` lưu kiến thức theo chủ đề ở `.harness/knowledge` của checkout chính; scope `global` nằm ở `<data-dir>/knowledge`. Agent tự chắt lọc tài liệu được chia sẻ và kết luận có thể tái sử dụng trong cùng lượt trả lời, kiểm tra chủ đề cũ trước khi ghi, giữ nguồn và ngôn ngữ tài liệu. Trang Markdown có nguồn, liên kết Markdown tương đối, backlinks, index và log; cập nhật/xóa cần hash hiện tại. `/knowledge [status|list [offset]|search QUERY|read PATH|graph|refresh|on|off] [--global]` quản lý kho; terminal dùng `ha knowledge ... --cwd DIR --json`. `ha knowledge serve --cwd DIR --port 0` mở server console tại địa chỉ loopback được in ra: duyệt/sửa tài liệu, tạo/đổi tên/xóa thư mục, di chuyển và chọn nhiều tài liệu, import hoặc kéo thả `.md`/`.txt` UTF-8 với lựa chọn skip/rename/overwrite, xem graph và mở tài liệu từ liên kết. Tắt project chặn cả truy xuất global trong project đó. Agent con dùng chung kho nhưng tool chỉ cho đọc.
+
+Search mặc định miễn phí, dùng BM25 và gộp thứ hạng RRF: model gửi `query` cùng tối đa bốn biến thể từ đồng nghĩa/bản dịch trong `queries`, rồi đọc đoạn có dòng/cột trả về; kết quả bị cắt có `next_line`, `next_column` để đọc tiếp. Không tự tải model hay gọi API embedding. Khi chủ động muốn dùng semantic search, tạo JSON chứa `enabled:false`, `endpoint` của API embedding tương thích OpenAI, `model`, và tùy chọn `api_key_env` (tên biến môi trường, không ghi key vào JSON); chạy `ha knowledge semantic configure FILE --cwd DIR`, rồi `semantic on` và `semantic index` với cùng `--cwd`. `semantic status|off` kiểm tra/tắt. Chế độ này có cache vector/query, gộp thứ hạng semantic/keyword theo trọng số mặc định 0.7/0.3, tự bỏ cache khi tài liệu/model thay đổi và quay về keyword khi provider lỗi; phí phụ thuộc provider do bạn cấu hình. Đăng nhập chat không tự bật embedding.
+
+**MCP theo cách của prime-agent.** Khi có Python REPL, MCP server không còn là tool native: object `mcp` được import sẵn trong kernel (`rlm.mcp` của prime-agent, đã vendor) tự mở server đã cấu hình - `await mcp.list_tools("<server>")`, `await mcp.call_tool("<server>", "<tool>", arguments)`, `await mcp.list_connections()` - và prompt liệt kê các server đang bật. Server là những server `ha mcp add` đã cấu hình; host đưa cấu hình từng server cho kernel theo định dạng của prime-agent (`secret://NAME` thành tham chiếu `{"env": "NAME"}`; `streamable_http` thành `http` kèm `bearerTokenEnvVar`). Package Python `mcp` có sẵn trong kernel venv. Catalog dịch vụ có qua `mcp.list_plugins` và `mcp.search_plugins` ([12.9](#129-gói-tài-nguyên-và-phần-còn-lại-của-prime-agent)); đăng nhập OAuth bằng `ha mcp login`. Khi không có REPL, hoặc khi tin nhắn đính kèm resource của server bằng `@server:uri`, server được kết nối native như trước; `/mcp` cho biết mỗi server đi theo đường nào.
+
+**Web.** `web_search` tìm kiếm trên web: dùng Google qua Serper khi có `SERPER_API_KEY` hoặc key đã lưu bằng `/login serper` (key miễn phí tại serper.dev), nếu không thì dùng DuckDuckGo, không cần key. `web_fetch` mở một trang http(s) và trả về văn bản đọc được kèm danh sách link, chia theo từng đoạn và đọc tiếp bằng `start_index`. Địa chỉ local và mạng nội bộ bị từ chối, kể cả khi bị redirect tới; file nhị phân bị từ chối. `web_search` chạy không cần bảng phê duyệt (chỉ gửi câu truy vấn); `web_fetch` phải hỏi, vì URL có thể mang dữ liệu ra ngoài - trả lời `a` để cho phép cả lượt, hoặc dùng `full-auto`. `HA_WEB=off` gỡ cả hai tool.
+
+**Python REPL.** Tool `python_repl` (trước đây tên là `ipython`, như prime-agent; gọi bằng tên đó hay `python` vẫn tới được nó) chạy cell trong một kernel Python bền - chính runtime của prime-agent, được vendor tại `crates/harness-cli/python` và ghi ra `<data-dir>/runtime` ở lần dùng đầu. Dùng được `await` ở top-level; biến và import được giữ qua các cell và các lượt; kernel chết thì được khởi động lại ở lần gọi sau và kết quả báo rằng state cũ đã mất. `bash('cmd')` chạy lệnh nền và trả về handle (`tail`, `output`, `poll`, `kill`, `await`); lệnh chạy nền mà xong khi không ai đọc kết quả sẽ được báo bằng `[bash-done pid:... exit:...]` của prime-agent - đưa vào lượt đang chạy, hoặc thành một lượt riêng khi rảnh; trên Windows lệnh chạy trong Git Bash, tìm ở vị trí cài mặc định hoặc đặt bằng `HA_REPL_SHELL`. Một cell chạy tối đa 10 phút rồi bị ngắt; trên Windows chỉ ngắt được cell đang chờ ở `await`, cell kẹt trong code đồng bộ sẽ khiến kernel khởi động lại. Chạy Python là chạy code, nên mỗi cell hỏi phê duyệt như `run_shell`, trừ chế độ `full-auto`. Kernel dùng project root làm thư mục làm việc và dùng môi trường của người dùng. Cần Python 3.11+ (`HA_PYTHON`, nếu không thì `python3`, `python`, `py -3`); không có thì tool không được đưa ra. `HA_REPL=off` gỡ tool.
+
+Khi có delegation, object `rlm` trong kernel chạy agent con như prime-agent: `await rlm.spawn('task', name='worker')` khởi động một agent con và trả về ngay khi được nhận; `await rlm.collect([...], timeout_ms=...)` chờ câu trả lời; `rlm.list_subagents()`, `rlm.delete_subagent(...)` và `rlm.find_models()` hoạt động như ở prime-agent. Agent con thuộc session chứ không thuộc lượt đã khởi động nó: lượt có thể kết thúc trong khi agent con vẫn làm việc. Khi agent con xong mà không ai đang chờ kết quả, agent cha được báo bằng thông báo của prime-agent - `[child-failed child:<tên>]`, `[child-exited: cancelled child:<tên>]` hoặc `[child-exited: no-reply child:<tên>]` kèm câu trả lời cuối - trong một lượt riêng nếu cha đang rảnh, hoặc sau khi lượt đang chạy kết thúc (không chen vào lượt đang chạy). Ctrl-C dừng lượt của cha, không dừng agent con; `/agents stop <tên>` (hoặc `/agents stop` cho tất cả) dừng chúng, còn `/new` hay resume sang hội thoại khác dừng chúng mà không báo. Agent con chạy trên model của cha trừ khi `rlm.spawn(..., model='provider/id')` chỉ một model khác trong catalog có credential, nếu không thì `subagentDefaultModel` của prime-agent trong `settings.json`, rồi đến `[agents] default_model`; model không dùng được thì spawn thất bại. `/subagent-model` cho xem model đó và nguồn của nó; `/subagent-model <provider/model>` (Tab hoặc Enter mở danh sách model) lưu `subagentDefaultModel` cho child tiếp theo, còn `/subagent-model inherit` xoá nó. `/subagent-login <provider>` đăng nhập cho các agent con bằng tài khoản riêng của chúng - API key, hoặc đăng nhập ChatGPT qua trình duyệt - lưu trong `subagent-auth.json` cạnh `auth.json`: agent con dùng tài khoản riêng cho provider đó nếu có, không thì dùng tài khoản của model chính, còn model chính không bao giờ dùng tài khoản của agent con. `/subagent-logout <provider>` xoá tài khoản riêng đó. Agent con chạy ở mức thinking của cha trừ khi `rlm.spawn(..., thinking='high')` chỉ định - như prime-agent, mức mà model của agent con không có thì spawn thất bại - hoặc `/subagent-effort <level>` đã lưu `subagentDefaultThinking` trong `settings.json` (kẹp về mức gần nhất model của agent con có; `/subagent-effort inherit` xoá nó). Mọi tin nhắn các agent trong phiên gửi cho nhau (`agent_message`, nhắn tin qua `rlm`) hiện trong hội thoại theo dòng của prime-agent, `◆ agent message · <người gửi> → <người nhận> · <đoạn đầu>`, toàn văn hiện ở chế độ chi tiết và mở rộng (Ctrl-O); `/agents messages` liệt kê mọi lượt trao đổi của phiên, đầy đủ và theo thứ tự. `rlm.create_session` khởi động một agent top-level riêng ([12.7](#127-agent-chạy-nền)).
+
+**Factory (`rlm.factory`, phải bật).** Factory của prime-agent, đi kèm kernel: một máy trạng thái gồm các agent con được lưu lại - trạng thái bắt đầu, chuyển tiếp có điều kiện, điểm chờ nhiều nhánh, vòng lặp có giới hạn, `foreach` và ngân sách - mà kernel chạy bằng `rlm.spawn` và `rlm.collect`. Model tạo một factory bằng `rlm.harness.create_factory(title, content, dag=... hoặc machine=...)`, spec được kiểm tra trước khi lưu, rồi `await rlm.factory.run('<id>')` khởi chạy và trả về ngay; `status`, `stop`, `resume`, `graph` và `watch` theo dõi nó, còn `rlm.factory.help()` là hướng dẫn soạn đầy đủ. Có sẵn ba machine (`builder`, `pr-manager`, `review-sweep`), chạy được bằng tên. Một lần chạy nằm trong bộ nhớ kernel nên không qua được một lần khởi động lại kernel; các agent con của nó thì vẫn còn. Mặc định tắt, như prime-agent: `/factory on` để bật (`factory.enabled` trong `settings.json` cạnh user config), `/factory off` để tắt và `/factory status` cho biết đang thế nào; trước khi bật, mọi lệnh trừ `help()` đều báo đang tắt.
+
+**Python skill.** Các skill của prime-agent đi kèm ứng dụng (`.agents/skills`, MIT; xem `.agents/PRIME-AGENT-SOURCE.md`): `edit`, `websearch`, `attach_image`, `goal`, `compact`, `refine`, `agent_message`, `agent_observe`, `rlm_heartbeat`, cùng các hướng dẫn `mcp` và `skill-creator`. Skill có package Python được import vào kernel theo tên khi kernel khởi động - `await edit(path=..., old_str=..., new_str=...)`, `await goal.complete()`, `await compact.run()` - và được liệt kê trong prompt kèm `python_import`. Skill import lỗi được thay bằng một stub nói rõ lý do, và cell đầu tiên báo điều đó. Host trả lời các yêu cầu của skill: `goal.*` điều khiển `/goal` (mục tiêu model tạo được xử lý như mục tiêu bạn đặt, kèm token budget của nó), `compact.run` hẹn `/compact` chạy khi lượt kết thúc, `model.info` cho biết model, `agent_observe` đọc các agent con của session, `rlm_heartbeat` giữ các lời nhắc lặp lại cho session (mặc định `every 5m`; loại `steer` chen vào lượt đang chạy qua hộp `/steer`, loại `follow_up` đợi lượt kết thúc), và ảnh mà `attach_image` nạp được gửi cho model cùng kết quả tool. `agent_message.send(message, receiver_role='child', receiver_name=...)` (hoặc `'all'`) nhắn cho agent con đang chạy; agent con nhắn cho cha hoặc anh em bằng tool `agent_message` của nó, và để lại một dòng `progress_note` mà cha đọc trong `list_subagents` và `/agents`. Như prime-agent, một tin tối đa 16 384 ký tự, mỗi người gửi được ba tin liền rồi thêm một tin mỗi giây, và tin tới dưới dạng `[agent-message from <quan hệ>:<tên>]` ở bước kế tiếp của người nhận - hoặc, với cha đang rảnh, thành một lượt riêng. Tin gửi cho agent con đã xong bị từ chối (agent con đã xong không được đánh thức lại).
+
+**Kernel venv.** Giống prime-agent, kernel chạy trong một venv ở `<data-dir>/kernel-venv`, dựng bằng `uv` ở lần dùng đầu - Python 3.11, `dill`, bộ package mặc định của prime-agent (requests, httpx, pyyaml, tomli, python-dotenv, pandas, numpy, scipy, beautifulsoup4, lxml, pydantic, tyro) và `pillow` - và dựng lại khi danh sách đó đổi. ha không tự cài `uv`: không có nó hoặc dựng thất bại thì thử `venv` và `pip` của Python hệ thống; nếu cả hai cách đều thất bại thì dùng Python hệ thống, cell đầu tiên báo điều đó, và skill thiếu package (`websearch` cần httpx, `attach_image` cần pillow) được báo là không khả dụng. `HA_PYTHON` chỉ định một trình thông dịch dùng nguyên như vậy.
+
+**Skill** theo cấu trúc Agent Skills (một thư mục có `SKILL.md` cùng các file đi kèm). Skill được tìm trong bộ tích hợp sẵn, `<config-dir>/skills`, `~/.agents/skills`, mọi thư mục liệt kê trong `HA_SKILL_PATHS` (phân tách như `PATH`, ví dụ `~/.claude/skills`), và - với project đã trust - `.harness/skills` cùng `.agents/skills` ở workspace và từng thư mục cha tới Git root. System prompt liệt kê tên, mô tả và vị trí từng skill trong khối `<available_skills>`, giống prime-agent; model kích hoạt skill theo tên (digest từ `list_skills` là tùy chọn để ghim phiên bản, chấp nhận có hoặc không có `sha256:`). Khi kích hoạt, model nhận hướng dẫn cùng thư mục và danh sách file của skill, và `read_skill_file` đọc các file đó - chỉ trong phạm vi skill. Ba tool skill chỉ đọc catalogue đã trust nên chạy không cần bảng phê duyệt; deny rule vẫn chặn được. `disable-model-invocation: true` trong front matter ẩn skill khỏi model; `/skill:<name>` vẫn chạy được. Đặt ở đầu tin nhắn, `/skill:<name> [args]` gửi skill kèm phần còn lại làm yêu cầu, như prime-agent; đặt giữa tin nhắn (`... dùng /skill:<name>`), nó gửi skill đó kèm toàn bộ tin nhắn làm yêu cầu.
+
+**Skill tự học (theo tigerless-labs/autoharness).** Ngoài prompt note, memory, Python skill và subagent spec, một lần refine có thể đề xuất `skillFiles`: `create`, `update`, `patch` (một `old_string` xuất hiện đúng một lần), `remove_file` hoặc `delete` một skill `SKILL.md` do ha tự viết, mỗi đề xuất kèm `reason` và trích dẫn nguyên văn `evidence`. Model không bao giờ tự ghi các file đó: host lint từng đề xuất trong bộ nhớ và chỉ ghi đề xuất sạch, file phụ trước, `SKILL.md` sau cùng, mỗi file qua file tạm rồi đổi tên. Lint từ chối: front matter có `name` khác tên skill, mô tả quá 200 ký tự, thân quá 30 dòng không trống, file phụ nằm ngoài `references/`, `templates/`, `scripts/`, `assets/` hoặc không được `SKILL.md` nhắc tới, file được nhắc tới mà không tồn tại, `TODO`/`FIXME`/`TBD`, secret, nội dung nguy hại rõ ràng (tải về rồi pipe vào shell, "ignore previous instructions", lệnh phá hủy hay tự cài thường trú), skill global nhắc tới đường dẫn của workspace, tên trùng skill khác, và mọi thay đổi vào skill không do ha viết. `delete` có `absorbed_into` phải trỏ tới một skill tự học khác đang sống. Đề xuất bị từ chối được liệt kê cùng lý do trong dòng kết quả refine. Skill project nằm ở `.harness/skills/<name>` (chỉ với project đã trust), skill global ở `<config-dir>/skills/<name>`; skill do ha viết có `.ha-learned.json` và sổ `.ledger.jsonl` chỉ ghi thêm (lý do và bằng chứng đã che secret cho mỗi thay đổi). `/refine --rollback <id>` hoàn tác cả các thay đổi skill. Lượt dùng được đếm trong `<data-dir>/skill-usage`: activate hoặc `/skill:<name>` là một lần dùng, `read_skill_file` hay `read_file` trong thư mục skill là một lần xem. Skill mới thử việc trong 100 request của project (300 với skill global); hết thử việc mà chưa được dùng hay xem lần nào thì bị archive, và khi quá 20 skill global hoặc 50 skill project đã qua thử việc thì skill ít dùng nhất bị archive trước. Archive là chuyển thư mục vào `.archive/` của layer đó; chuyển lại là khôi phục. `HA_SKILL_LIFECYCLE=off` giữ lại tất cả. Lượt tự xem xét đến hạn sau 25 lượt hoặc 50 lần gọi tool, tùy cái nào tới trước, và chạy song song với hội thoại thay vì ở cuối lượt. Session kết thúc khi còn ít nhất 5 lượt hoặc 10 lần gọi tool chưa được xem xét sẽ không bắt bạn chờ lúc thoát: nó để lại yêu cầu xem xét trong thư mục dữ liệu của project (`refine-pending/`), và lượt kế tiếp trong project sẽ chạy nền phần xem xét đó trên hội thoại của session cũ (`auto-refine: reviewing the last N turn(s) of an earlier session`). Refine đọc hội thoại theo cách prime-agent serialize: câu hỏi của mỗi lượt, lời của model, các lần gọi tool đánh số `#N` kèm tham số, và kết quả của từng lần gọi (tối đa 2.000 ký tự: 500 ký tự cuối và phần đầu chiếm chỗ còn lại, kèm một dòng ghi số ký tự bị lược), nên bài học đến cả từ những gì tool đã làm chứ không chỉ từ lời nói. Trong một Git worktree phụ, skill project được ghi vào và đọc từ `.harness/skills` của checkout chính, nên những gì học được ở đó không mất khi xóa worktree và mọi worktree dùng chung một thư viện. Cứ mỗi 250 request trong project (hoặc `/refine --curate [chỉ dẫn]`), curator đọc toàn bộ thư viện skill tự học và gộp các skill hẹp thành skill tổng: nó patch hoặc tạo một skill tổng rồi xóa các skill đã được gộp với `absorbed_into`, qua cùng bộ kiểm tra. Thư viện được sao lưu vào `<data-dir>/skill-snapshots/<thời điểm>/` trước (giữ 5 bản mới nhất), và lượt gộp được ghi thành một refinement global mà `/refine --rollback <id>` hoàn tác được. `/learn [trọng tâm]` yêu cầu học ngay: một lần refine được dặn giữ lại những gì hội thoại dạy thành skill tự học (cách làm đã được sửa, kỹ thuật, cách khắc phục, bước cài đặt, cách bạn muốn một loại việc được làm), so sánh trước và patch skill đã có. Đề xuất bị bộ kiểm tra từ chối không bị bỏ đi: lý do từ chối được gửi lại cho model một lần, và đề xuất đã sửa đi qua cùng bộ kiểm tra (dòng kết quả ghi `Refused learned skill ..., sent back for repair`). Mỗi lượt review nhớ session cuối nó đã đọc (`review_watermark` trong thư mục harness local của hội thoại) và đánh dấu các lượt trước đó là đã review, để lần sau học từ lượt mới thay vì học lại các lượt cũ. Các skill tự học mà một lượt đã activate hoặc đọc được chuyển cho lần review và refine kế tiếp như skill đang được dùng, để sửa trước tiên nếu hội thoại cho thấy chúng sai; refiner và curator cũng thấy số lượt dùng của từng skill (`used N, viewed M in R requests, on probation`), mà curator chỉ được dùng để viết lại mô tả của skill không ai gọi tới. Khi một lượt đã dùng skill tự học rồi chạy các check kiểm chứng của harness (`goal_complete`, `verify` của một feature), kết quả của lần chạy cuối được đếm cho skill đó (`checked_pass`, `checked_fail` trong `skill-usage`) và hiện thành `checks after use: N pass, M fail`; fail lặp lại khiến skill thành ứng viên để patch hoặc tách thành biến thể có điều kiện, không bao giờ là lý do để xoá, và vòng đời archive không dùng các con số này. Theo Mengram, nơi quy trình tiến hoá từ thất bại, lượt review tự động còn đánh giá từng skill tự học đang dùng dựa trên hội thoại - `worked` hay `failed`, kèm trích dẫn nguyên văn, và với lần thất bại là điều skill đã mặc định mà hoá ra sai - rồi đếm lại (`worked`, `failed`, năm `failures` gần nhất); refiner và curator thấy `judged after use: N worked, M failed; last failure: ...` và patch skill để kiểm tra điều đó trước. Lượt không chạy check nào thì không đếm gì. System prompt liệt kê các skill tự học ngay dưới danh sách skill để model xem chúng trước, và `/skills` hiện các lượt học gần đây - cái gì được ghi, cái gì bị từ chối - kể cả các lượt chạy nền.
+
+**Định nghĩa "xong": check, verifier độc lập và feature list (theo walkinglabs/learn-harness-engineering).** Project khai báo "xong" nghĩa là gì bằng lệnh, trong `.harness/config.toml` hoặc config người dùng - giống hook, không bao giờ lấy từ project chưa trust hay `config.local.toml`:
+
+```toml
+[verify]
+timeout_seconds = 300   # cho mỗi check, trừ khi check tự đặt
+judge = true            # một verifier độc lập chấm goal (mặc định)
+[[verify.checks]]
+name = "types"
+command = "cargo check --workspace"
+[[verify.checks]]
+name = "tests"
+command = "cargo test --workspace"
+hint = "Sửa test hỏng hoặc sửa code; không bao giờ xóa hay nới test."
+```
+
+Harness tự chạy các check, theo thứ tự, dừng ở check hỏng đầu tiên, trong shell và môi trường đã lọc giống tool shell của model. Lỗi được gửi cho agent gồm: check nào hỏng, output của lệnh (1.500 ký tự đầu và 4.500 ký tự cuối) và cách sửa (`hint`, nếu không có thì "sửa nguyên nhân, không nới check"). Các check chạy khi model gọi `goal_complete`, khi một feature được verify, làm gate của `/autonomous on` khi không truyền `--gate`, và khi gõ `/verify` (hiện kết quả từng check). Tool `delegate` có thêm vai trò thứ ba, `verifier`: một child với context mới, chạy trong workspace của parent, không được đưa và không được phép dùng `write_file`, `edit_file`, `apply_patch` (ở mọi chế độ), không delegate được, và kết thúc câu trả lời bằng `VERDICT: PASS` hoặc `VERDICT: FAIL` sau các phát hiện kèm file và dòng; `[routing] verifier = "provider/id"` chọn model cho nó (nếu không thì dùng model mặc định của child). `/review [trọng tâm]` yêu cầu model nhờ một verifier chấm phần việc trong workspace và báo lại verdict nguyên văn. Feature list là `.harness/features.json`, thao tác qua tool `feature`: `add` (tiêu đề, hành vi, các lệnh shell kiểm chứng nó), `start` (mỗi lúc chỉ một feature active; bắt đầu feature khác khi đang có feature active sẽ bị từ chối), `block` (kèm lý do), `update` (không áp dụng cho feature đã passing, vì nó giữ nguyên định nghĩa đã được kiểm chứng), `list` và `verify`. Chỉ `verify` mới chuyển feature sang passing: harness chạy lệnh của feature - hoặc check của project nếu feature không có lệnh - và khi pass thì ghi bằng chứng (`at`, `commit`, các check đã chạy, `verified_by: "ha"`, `definition`). Bằng chứng ghim định nghĩa feature: sửa định nghĩa hoặc verify lại mà hỏng làm pass cũ không còn hợp lệ; bằng chứng cũ chưa có `definition` cần verify lại. Feature mà file ghi passing nhưng không có bằng chứng đó được hiện là `passing?` và tính là chưa kiểm chứng, nên sửa file không làm xong việc. Lệnh do model viết cho feature đi kèm trong request và phải được duyệt như một lệnh shell (danh sách bị đổi sau khi duyệt sẽ bị từ chối); check của project chạy không cần hỏi. Mỗi lượt mang theo tình trạng feature list (số lượng, feature đang active, quy tắc), và `/features` hiện nó kèm tỉ lệ hoàn thành đã kiểm chứng.
+
+**Vòng đời phiên, instruction lồng nhau, audit repo và check học được.** Prompt đầu tiên của một phiên (khi mở app, `/resume`, `/new`, sau `/compact`) mang theo phần tóm tắt do harness tự thu thập: 5 commit gần nhất, những gì chưa commit, và bản handoff phiên trước để lại trong `.harness/progress.md` (6 KB đầu). Phần tóm tắt chỉ yêu cầu agent kiểm tra baseline (các check của dự án pass) trước khi làm việc mới khi prompt liên quan tới dự án: một term của prompt, tách theo cách tìm kiếm memory tách, khớp một đường dẫn được git theo dõi, một trong 50 tiêu đề commit gần nhất, một thay đổi chưa commit hoặc một dòng handoff, và xuất hiện trong không quá một nửa số đó. Nếu không, phần tóm tắt để model tự quyết: nếu yêu cầu là sửa dự án thì kiểm tra baseline trước; nếu là lời chào hay câu hỏi thì trả lời thẳng. Cách này bao cả tác vụ viết bằng từ mà dự án không dùng, ví dụ một ngôn ngữ khác. Không có ngôn ngữ hay danh sách từ nào quyết định. `/handoff [trọng tâm]` yêu cầu agent ghi file đó theo khung cố định - trạng thái hiện tại, kiểm chứng, đã xong, đang làm, bị chặn, quyết định và lý do, bước tiếp theo, các lệnh - còn `/handoff --reset [trọng tâm]` sau đó mở một hội thoại mới tiếp tục từ file này, tức là "context reset" nên dùng khi hội thoại dài sắp hết chỗ. Khi thoát (`/quit`, Ctrl-D), harness nêu những gì sẽ làm phiên sau vấp: file chưa commit, feature còn active, handoff thiếu hoặc cũ hơn các thay đổi mới nhất. File instruction vẫn được nạp từ gốc project xuống thư mục làm việc như trước; `AGENTS.local.md` (hoặc `CLAUDE.local.md`) của mỗi thư mục được nạp sau file dùng chung của thư mục đó, nên luật cá nhân đến sau và thắng. `AGENTS.md` nằm dưới thư mục làm việc được gắn vào kết quả của lời gọi đầu tiên chạm tới thư mục của nó - đọc, sửa, liệt kê - một lần mỗi hội thoại và tối đa 16 KB mỗi lượt, hiện dưới kết quả chứ không phải dưới dạng phản hồi của hook. `/doctor` (và `ha doctor [--cwd DIR] [--json]` ngoài app) audit repo theo 5 hệ thống con: có file entry, file không quá 200 dòng và link trong đó không gãy; project đã trust cùng skill, hook, MCP server của nó; Git, lockfile cạnh mỗi manifest và file ghim phiên bản toolchain; handoff và việc nó có cũ hơn commit cuối không, feature list, nhiều hơn một feature active, feature passing mà không có bằng chứng; check `[verify]`, judge và CI. Mỗi thiếu sót đều kèm cách sửa, và hệ thống con yếu nhất được nêu tên làm chỗ bắt đầu - chỉ những lần chạy thất bại mới cho thấy nút thắt thật. Một lần refine (`/refine`, `/learn` và lượt tự xem xét) cũng có thể đề xuất `checks`: một lỗi mà hội thoại cho thấy và một lệnh có thể phát hiện, dưới dạng một dòng shell thoát khác 0 khi lỗi còn đó, kèm gợi ý agent đọc khi check hỏng. Đề xuất được lint (tên kebab-case, một dòng lệnh tối đa 300 ký tự, gợi ý 20-400 ký tự, trích dẫn bằng chứng nguyên văn, không secret, không thuộc các dạng nguy hại mà skill tự học bị từ chối, không trùng check của project hay đề xuất đang chờ) và chờ trong `.harness/proposed-checks.json` của checkout chính - chỉ với project đã trust. Không đề xuất nào tự chạy: `/checks` liệt kê, `/checks accept <tên>` thêm một check vào `[[verify.checks]]` trong `.harness/config.toml` (bị từ chối nếu file sẽ không còn nạp được) và `/checks reject <tên>` bỏ nó.
+
+**Tốc độ của các tool file.** Đọc, liệt kê, glob và tìm kiếm dùng chung một lần duyệt workspace: chạy trên mọi lõi, không bao giờ mở `.git` hay các thư mục được bảo vệ khác, và được giữ lại cho tới khi có thay đổi - các lần ghi của chính tiến trình này, một process hay hook nó chạy, và (qua bộ theo dõi file, tắt bằng `HA_FILE_WATCH=off`) mọi nguồn ghi khác; không có bộ theo dõi thì một lần duyệt chỉ được tin trong một giây. Lần duyệt dừng ở 200.000 file hoặc sau 10 giây và các tool trả về những gì đã thấy, đánh dấu bị cắt, thay vì báo lỗi. `search_text` tìm trên cả file bằng bộ lọc chuỗi của regex, chạy trên mọi lõi, kết quả và điểm cắt ở 512 kết quả hoặc 50 KB như trước; `context_lines` được hiện quanh mỗi kết quả (`path-LINE- text`). Workspace từ 5.000 file trở lên có chỉ mục n-gram, dựng ở nền khi tìm lần đầu, để chỉ đọc những file có thể chứa kết quả (`HA_SEARCH_INDEX=always` hoặc `off`). Dấu vân tay workspace của một lần ghi đọc `HEAD` và index trong `.git` thay vì chạy `git`, và kết quả của một lần đọc không bị flush xuống đĩa. Trong lúc model đang stream câu trả lời, mỗi lệnh đọc đã viết xong được bắt đầu trước khi câu trả lời kết thúc (`HA_PREFETCH=off` để tắt); gate vẫn chạy từng lệnh theo đúng thứ tự. Một lô chạy theo đoạn: các lệnh nằm giữa hai lệnh phải chạy riêng (ghi, process, câu hỏi) chạy song song, và các lệnh đọc sau một lần ghi thấy nội dung đã ghi. `read_file` nhận `paths` (tối đa 10 file, đọc song song, trả về một kết quả); `edit_file` nhận `edits` (tối đa 50, áp dụng theo thứ tự và ghi cùng một lần), và sau khi khớp chính xác và khớp đã chuẩn hóa không thấy, nó tìm các dòng nguyên vẹn bị sai thụt lề và thụt lề lại phần thay thế. Khi bật hashline - `"hashline": true` trong `settings.json` toàn cục, hoặc danh sách mẫu model như `allowedModels`, hoặc `HA_HASHLINE=1|0` - `read_file` và `search_text` hiện mỗi dòng dạng `LINE#HASH: text` và một edit có thể chỉ tên các dòng cần thay (`start`, `end`) thay vì chép lại chúng; dòng nào đã đổi kể từ lúc đọc thì edit bị từ chối và hiện anchor hiện tại. `cargo run --release -p harness-tools --example file_tools_bench` đo thời gian từng tool file qua toàn bộ gate.
+
+**Tốc độ của store.** Mỗi lần gọi tool ghi khoảng mười commit nhỏ vào write-ahead log của store dự án, và việc chép log đó trở lại cơ sở dữ liệu (checkpoint) là việc tốn kém nhất mà store làm: trên ổ đĩa Windows có phần mềm diệt virus quét, mỗi lần mất từ 0,4 đến 1,4 s. Một kết nối thứ hai làm việc chép đó khi đã gom được vài trăm commit và writer đã yên - trong một lượt, tức là lúc model đang suy nghĩ - còn bản thân writer chỉ checkpoint khi log vượt 16 MiB. Một lần chạy mà model trả lời ngay lập tức thì để việc chép lại cho lúc đóng store. Sau mỗi lượt của app, journal của task được đánh chỉ mục ở nền, nên lần `history_search` kế tiếp không phải trả giá cho các mục của lượt đó. `ha exec` đọc thông tin Git của prompt trong lúc store đang mở. `cargo run --release -p harness-cli --example turn_bench -- --model-ms 600` đo phần thời gian host thêm vào một lượt; `--ha` để so với một bản build khác.
+
+**Tốc độ của các tool lịch sử.** `history_search` cập nhật chỉ mục journal của task trước khi tìm, và một phiên mà mục cuối đã được đánh chỉ mục thì không tốn gì: nó bị bỏ qua ngay trong câu truy vấn liệt kê các phiên của task. Các mục mới được đánh chỉ mục theo từng phiên, tối đa 128 mục mỗi transaction, và các term được ghi nhiều dòng trong một câu lệnh. Mỗi kết quả chỉ lấy phần đầu của nguồn để làm bản xem trước, và `history_read` chỉ lấy đúng trang được yêu cầu ra khỏi cơ sở dữ liệu. `cargo run --release -p harness-tools --example history_bench -- --sessions 100` đo thời gian đánh chỉ mục, tìm và đọc. Lần tìm với `scope: "project"` đầu tiên đánh chỉ mục mọi hội thoại của dự án mà chỉ mục chưa tới; sau đó nó tốn như tìm trong một task.
+
+**Memory (`memory`).** Model giữ các dữ kiện lâu dài, sở thích và quyết định của người dùng (memory) và các quy tắc hẹp (prompt note) trong continual harness state: `<data-dir>/harness/harness_state.json` cho mọi hội thoại, `<data-dir>/sessions/<task>/harness/harness_state.json` cho một hội thoại. Một dữ kiện về một project (`scope: project`) được giữ trong file global, gắn thẻ project đó, và chỉ tới các hội thoại của project đó: lượt, digest và lần tìm của project khác không bao giờ thấy nó. Mỗi lượt mang một bản tóm tắt gồm vài mục xếp hạng cao nhất cho yêu cầu, bị cắt ngắn; tool `memory` tìm phần còn lại (câu tìm không dấu vẫn ra mục có dấu), đọc trọn một mục, và ghi: mục mới cần `scope` (`global` hoặc `local`), sửa hay xoá cần `expected_version` mà lần đọc trả về, tiêu đề đã có thì bị từ chối kèm cách cập nhật, mỗi mục tối đa 4.000 ký tự và không bao giờ chứa secret. Một mục mới đọc như một mục đã có - tỷ lệ từ chung, mỗi từ có trọng số theo độ hiếm trong các mục, từ 60% - bị từ chối kèm id và version của mục đó, trừ khi `distinct: true` nói đây là một dữ kiện khác; mục chung ít hơn nhưng vẫn nhiều được trả về cùng các mục đó trong `related`, để mục bị thay thế hoặc mâu thuẫn được cập nhật. Mỗi lần ghi lưu nguồn gốc (`origin`: hội thoại, và tool memory, `rlm.harness` hay một lần refine). Sửa hoặc xoá đều giữ bản cũ trong `memory_history.jsonl` cạnh state (500 thay đổi gần nhất): `history` liệt kê các bản trước của một mục, kể cả mục đã xoá, và `restore` đưa một bản trở lại thành version kế tiếp, hoặc đưa mục đã xoá về như cũ. Id được tạo từ tiêu đề: cập nhật với tiêu đề mới thì mục nhận id của tiêu đề mới (trừ khi mục khác đã giữ id đó), id cũ vẫn tìm ra nó, và lịch sử đi theo nó.
+
+**Tắt harness refinements (`/refinements off`).** Công tắc tổng của prime-agent, `harnessRefinements` trong `settings.json`, mặc định bật. Khi tắt, không memory, prompt note hay skill đã lưu nào tới một lượt (không digest, không tool `memory`, kể cả agent con), `rlm.harness` của kernel từ chối (kéo theo `rlm.factory`), và không gì được refine: không có review tự động, `/refine` và `/learn` từ chối (`/refine --history` vẫn xem được), và `refine.run()` báo như vậy. State đã lưu được giữ nguyên; `/refinements on` bật lại tất cả, và `/refinements` cho biết đang bật hay tắt. `rlm.harness` của Python kernel không còn tự ghi file: mỗi lệnh của nó là một yêu cầu host trả lời, dưới cùng khoá (`harness_state.json.lock`) mà tool và `/refine` giữ, nên không bên nào ghi đè bên kia và mọi entry đi qua một bộ kiểm tra. Tool được phép ở mọi chế độ quyền vì nó chỉ đổi trạng thái của chính ha; một luật deny `memory()` sẽ tắt nó. Skill và subagent spec vẫn do `rlm.harness` quản lý.
+
+**Memory ghim, dọn memory, compact.** Mục ghi với `pinned: true` (ngôn ngữ của người dùng, cách xưng hô, một quy tắc cứng) luôn hiện trọn ở đầu bản tóm tắt mỗi lượt, bất kể yêu cầu là gì; các mục ghim dùng chung 4.000 ký tự, ghim vượt mức bị từ chối kèm cách xử lý, và `pinned: false` bỏ ghim. Khi memory global có từ 12 mục và đã thay đổi 15 lần (tạo, sửa, xoá) kể từ lần dọn trước, một lượt chạy nền sau lượt chat sẽ gộp mục trùng, để mục mới hơn thắng khi mâu thuẫn, bỏ mục cũ và mục tạm thời, giữ nguyên các mục ghim (theo Deep Dream của CowAgent); các thay đổi đi qua cùng bước kiểm tra như một lần refine và được ghi lại như một lần refine, nên `/refine --rollback <id>` hoàn tác được. `/refine --curate` chạy ngay việc này, cùng với bộ gộp learned skill. Một lượt mà chính các bước của nó vượt cửa sổ - một lượt goal dài đọc nhiều file - được tóm tắt các bước đầu vào bước đầu tiên, các bước mới nhất giữ nguyên; bản tóm tắt được giữ cho các bước sau của lượt và chỉ được nối thêm khi phần giữ nguyên tăng gấp đôi, nên thỉnh thoảng mới tốn một lời gọi model chứ không phải mỗi bước. Một lượt có compact sẽ kéo lần review tự động lên sớm, khi từ lần review trước đã có đủ lượng việc của một lần đóng session (5 lượt hoặc 10 lần gọi tool).
+
+**Tự cải tiến: lượt review tự động, lịch sử của nó, và trạng thái cũ.** Sau một lượt, review tự động đọc hội thoại và refine khi có điều đáng giữ: cứ 25 lượt hoặc 50 lần gọi tool (`autoRefine.turnInterval`), khi một phiên kết thúc với phần việc chưa được review, và sớm hơn sau một lượt có compact hoặc đạt một mốc - goal hoàn thành, việc của coder được gộp bằng `integrate_children` - miễn là từ lần review trước đã có 5 lượt hoặc 10 lần gọi tool. Giống Self-Evolution của CowAgent, nó vươn ra ngoài hội thoại: một sửa đổi memory mà nó đánh dấu global được ghi vào kho global thành một refinement riêng (id kết thúc bằng `_global`), nên mỗi phần rollback độc lập; kiến thức đáng giữ mà agent chưa lưu thành một trang knowledge mới (phạm vi project trừ khi dùng chung; không bao giờ ghi đè trang có sẵn; rollback chỉ xoá trang khi nó còn nguyên như lúc ghi). Câu trả lời không có JSON được hỏi lại một lần. Như Harness2 của Google Research, những gì review đọc (hội thoại, kết quả tool, file, trang web đã tải) là dữ liệu, không phải chỉ thị: một chỉ thị cài vào đó không bao giờ thành memory, skill hay trang knowledge trừ khi chính bạn nói; mỗi sửa đổi kèm một câu trích nguyên văn làm bằng chứng và một mức tin cậy, sửa đổi global thiếu câu trích thì giữ lại trong hội thoại, và bài học mới thấy một lần thì giữ ở local; sự thật đã kiểm chứng được ghi thành sự thật kèm nơi nó đúng, quy trình được viết cho cả loại việc, còn việc lặp lại tất định thì thành script do learned skill mang theo. `/refine --history [N]` liệt kê các refinement gần nhất của kho global và hội thoại này - khi nào, đổi gì và vì sao, từng thay đổi kèm lý do, và id mà `/refine --rollback` nhận - không gọi model. Curator dọn memory nhắm khoảng 30 mục global, vì mỗi mục đều tới mọi hội thoại, và ghi lại số mục trước và sau. Mỗi mục cho biết đã bao lâu (`updated 3d ago`) trong bản tóm tắt, kết quả tìm và khi đọc: mục ghi một trạng thái (tiến độ, tình trạng, một con số) sẽ cũ đi, và review cập nhật hoặc xoá nó khi hội thoại cho thấy trạng thái đã đổi. Memory global không bao giờ giữ trạng thái công việc như id commit, số test hay tình trạng xong/đang làm; những thứ đó ở local, hoặc thành knowledge. Tìm memory nhận `queries`, tối đa bốn cách diễn đạt khác bên cạnh `query` (từ đồng nghĩa, bản dịch), gộp theo thứ hạng, nên yêu cầu viết bằng một ngôn ngữ vẫn tìm thấy mục viết bằng ngôn ngữ khác. Thư viện knowledge của project (`.harness/knowledge`) tự đứng ngoài Git bằng `.gitignore` riêng, nên không bao giờ làm checkout bẩn khi giao việc cho coder.
+
+**Tốc độ của một lượt.** Một HTTP client cho mỗi cặp timeout phục vụ mọi lần gọi model của tiến trình, nên lần gọi đầu của một lượt dùng lại kết nối đã mở. Các MCP server được khởi động cùng lúc và giữ giữa các lượt khi cấu hình, workspace và danh sách tool của chúng không đổi; một lượt lỗi, cấu hình đổi hoặc phiên kết thúc sẽ dừng chúng, và thông báo của server được giữ có thể đến giữa hai lượt. Catalog model, `settings.json` và các skill đi kèm chỉ được đọc lại khi file của chúng đổi; tên nhánh được đọc từ `.git`, và thông tin Git của prompt được lấy ngoài luồng của lượt. Các lượt cũ của hội thoại được giải mã một lần và giữ lại, và store có index theo từng phiên. Kernel Python khởi động ở nền khi một lượt bắt đầu (`HA_REPL_PREWARM=off` để tắt). Các tiến trình nội bộ ngắn (đọc Git, hook, kiểm tra của guard) chạy tối đa bốn cái cùng lúc thay vì chờ nhau; output của một tiến trình nằm trong bộ nhớ tới 64 KiB và không để lại file. Khi đang chạy, worker gửi cho terminal đang gắn vào tối đa khoảng 30 khung hình mỗi giây, và chỉ gửi đồng hồ khi không có gì khác đổi. Các lần gọi model dùng HTTP/2 qua TLS. Một process hay hook chạy xong không còn làm mất lần duyệt đã cache: ha ghi một file đánh dấu vào `.harness` (hoặc `.git`) và chờ tối đa 200 ms để bộ theo dõi báo về, nhờ đó mọi thay đổi process đã làm đều được thấy trước. Một lần ghi flush file xuống đĩa trước khi thay thế, nên mất điện không thể để file rỗng hay hỏng dở; `HA_WRITE_SYNC=off` bỏ bước flush đó (khoảng 70 ms mỗi lần ghi trên Windows) cho ai muốn nhanh hơn - ha tự crash thì vẫn không mất gì.
+
+| Nhóm | Tool | Mục đích |
+| --- | --- | --- |
+| Workspace | `read_file`, `list_files`, `search_text`, `glob` | Đọc và tìm kiếm có giới hạn trong workspace |
+| Sửa file | `apply_patch`, `write_file`, `edit_file` | Ghi với hash/điều kiện match và phê duyệt; `write_file` tự tạo thư mục còn thiếu bên trong workspace |
+| Process | `run_process`, `run_shell`, `read_process_output` | Chạy lệnh và đọc output artifact có giới hạn |
+| Git | `git_status`, `git_diff`, `git_log` | Quan sát repository |
+| Task | `task_update`, `delegate`, `integrate_children`, `feature` | Ghi next action; giao explorer, coder hoặc verifier; đưa việc của coder về checkout; thao tác feature list |
+| Lịch sử | `history_search`, `history_read` | Tìm và đọc journal của hội thoại; với `scope: "project"`, cả mọi hội thoại trước của dự án (kết quả từ hội thoại khác ghi rõ hội thoại đó và lúc nó bắt đầu) |
+| Memory | `memory` | Liệt kê, tìm (với tối đa bốn cách diễn đạt trong `queries`), đọc, ghi và xoá memory và prompt note của model, global hoặc cho hội thoại này, có hay không có Python REPL; mỗi mục cho biết đã bao lâu |
+| Người dùng | `ask_user` | Tạm dừng và hỏi, không cấp quyền tool. Các lựa chọn là một menu (mũi tên và Enter, hoặc số của lựa chọn khi ô nhập trống); gõ chữ thì trả lời bằng ô nhập. Câu hỏi của agent con hiện kèm tên agent đó và agent chờ câu trả lời; câu hỏi và yêu cầu duyệt quyền từ nhiều agent mở lần lượt từng cái |
+
+Như prime-agent, child lồng nhau tới `RLM_MAX_DEPTH`, mặc định 2: child của agent gốc có tool `delegate` riêng để tạo explorer (coder chỉ do agent gốc tạo), và một child chỉ xong khi các child của nó đã xong - thông báo của chúng mở thêm một lượt cho child đó rồi nó mới báo lên cha. Child nhắn được cho cha, anh em và child của chính nó (`agent_message` với `receiver_role` `parent`, `sibling`, `child` hoặc `all`); cháu không nhắn thẳng lên agent gốc. `/rlm-max-depth` cho xem giá trị và nguồn (chat, global, env hoặc default); `/rlm-max-depth <n>` đặt cho hội thoại này, thêm `--global` thì lưu `rlmMaxDepth` vào `settings.json` cạnh config người dùng; sau đó mới đến `RLM_MAX_DEPTH`. ha chạy tối đa 2 tầng (giới hạn của hợp đồng delegation); child giữ giá trị lúc nó được tạo. Mỗi tầng chạy tối đa ba child cùng lúc. Như child của prime-agent, child có đủ tool và quyền của cha - permission mode, luật allow/deny và những gì người dùng đã cho phép trong lượt: explorer (và child của `rlm.spawn`) làm việc ngay trong workspace của cha, coder làm việc trên worktree Git sạch do host cấp. Nếu không thể cấp worktree, tool trả `role_unavailable`; `/agents` mở agents view (mọi phiên, agent con lồng bên dưới) khi app chạy trong worker nền, giống `/resume` trống và phím Left khi ô nhập trống; ở nơi khác nó liệt kê mọi child thành bảng gồm trạng thái, thời gian, số tool call, chi phí, model và ghi chú mới nhất. Thẻ `delegate` đang chạy ghi role và brief của agent, kèm một dòng tiến độ (số tool call đến giờ và lần gần nhất) bên dưới (`/agents messages`: các agent đã nói gì với nhau); `/agents stop [tên]` dừng chúng, và Ctrl-C khi lượt đang chạy dừng tất cả cùng lượt đó; hội thoại của chúng được giữ, và tool `agent_message` của agent gốc (`receiver_name`, hoặc `receiver_role: "all"`) đánh thức một child đã dừng để làm tiếp từ chỗ dở, có hay không có Python REPL. Hội thoại được resume cho agent gốc biết child nào kết thúc dở dang. Child bị cắt vì agent của nó tắt (`ha shutdown`, `ha stop`) nói đúng như vậy, chứ không nói là người dùng dừng nó. `delegate` mặc định chờ câu trả lời của child; với `wait: false` nó trả về ngay và kết quả tới sau dưới dạng thông báo. Nhiều lời gọi `delegate` trong một phản hồi chạy song song. Child thừa hưởng tool web của cha (`web_search`, `web_fetch`). Child gặp sự cố - lỗi provider, vòng lặp, phản hồi rỗng - được trả về cho cha dưới dạng kết quả thất bại mà cha có thể xử lý, `[child-failed explorer] <code>: <lý do>`, không bao giờ báo là đã xong. Mọi lượt, của cha hay của child, dừng với `loop_detected` khi đọc cùng một thứ (cùng tool, cùng tham số) ba lần mà ở giữa không có gì thay đổi, kể cả khi các lần lặp bị xen bởi lời gọi khác.
+
+**Đưa việc của coder về checkout của bạn (`integrate_children`).** Coder chỉ sửa trong worktree và nhánh riêng của nó; không gì tự chép sang checkout của bạn. Agent gốc gọi `integrate_children` (mặc định mọi coder đã xong mà chưa được tích hợp, theo thứ tự tạo; `children` để chọn và xếp thứ tự). Host commit phần còn lại trong worktree của từng coder, gộp đúng revision đã ghi nhận của các nhánh theo thứ tự đó trong một worktree tích hợp riêng (`<data-dir>/delegation/integration/worktree`), rồi chạy các check `[verify]` của project trên revision đã gộp - cùng shell và giới hạn thời gian như `/verify`. Check đổi revision hoặc file đầu vào sẽ bị từ chối (`checks_failed`); artifact đã được Git ignore vẫn được tạo. Worktree tích hợp cũng được kiểm lại ngay trước khi áp. Kết quả là `ready` (kèm commit cuối), `conflicted` (kèm file xung đột và coder không gộp được), `checks_failed` (kèm check hỏng và output) hoặc `refused` khi checkout của bạn đã đổi (commit, sửa file, file mới) kể từ lúc coder bắt đầu. Không có `apply: true` thì checkout của bạn không đổi. Với `apply: true`, một kết quả `ready` fast-forward nhánh hiện tại của bạn tới commit cuối - không bao giờ reset, stash hay ghi đè thay đổi chưa commit; fingerprint của checkout được kiểm lại ngay lúc áp, và kết quả ghi lệnh hoàn tác (`git reset --keep <head cũ>`). Lời gọi đi qua phê duyệt như mọi tool ghi khác. Commit gộp mang tên `harness-p5`; commit riêng của một coder lấy tiêu đề là các file nó đã đổi, phần tóm tắt của coder nằm trong thân commit. Coder giữ worktree của nó qua một lần agent khởi động lại: ledger ghi lại worktree, coder bị cắt ngang vì `ha shutdown` được đánh thức bằng `agent_message` ngay trong worktree đó và làm tiếp phần việc đã có, còn coder đã được tích hợp thì không bao giờ được đưa ra tích hợp lần nữa; chỉ coder mà worktree đã bị xoá mới phải giao lại từ đầu.
+
+### 12.2. Lệnh trong chat và bàn phím
+
+| Nhóm | Lệnh |
+| --- | --- |
+| Trợ giúp và trạng thái | `/help`, `/hotkeys`, `/fullscreen`, `/session` (`/status`), `/config`, `/model [search]`, `/effort [level]` (`/thinking`), `/cost`, `/context` (`/usage`), `/system-prompt`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/subagent-model`, `/subagent-effort`, `/subagent-login`, `/subagent-logout`, `/rlm-max-depth`, `/skills`, `/bug-report` (chẩn đoán của hội thoại này trong một file zip, [12.12](#1212-chẩn-đoán-và-báo-lỗi)) |
+| Phiên và câu trả lời | `/new [--name <tên>] [[--] prompt]` (`/clear` xóa cả viewport), `/resume [id]`, `/name [name]` (`/rename`), `/more`, `/compact [instructions]`, `/export [path]` (mặc định là trang HTML; `.md`, `.html` cho một trang tự chứa, hoặc `.jsonl` cho file phiên của ha - dạng JSONL của prime-agent, một dòng header rồi mỗi dòng một message - chứa những gì model được gửi cho hội thoại này, đã che secret), `/import <path.jsonl>` (hội thoại mới tiếp nối hội thoại đã export, hoặc file phiên của prime-agent; file được chép vào `<data>/imports`), `/share`, `/new [prompt]`, `/heartbeat <chỉ dẫn>`, `/heartbeats`, `/copy`, `/fork [n]`, `/clone`, `/tree [n]`, `/btw <câu hỏi>` (`/side`), `/quit` (`/exit`) |
+| Workspace và điều khiển | `/undo`, `/trust [yes]`, `/init`, `/permissions [ask|auto-edit|full-auto]` (`/permission`, `/mode`), `/steer <text>`, `/queue [text|list|edit n text|drop n|up n|down n]` (`/followup`), `/stash`, `/goal <objective>|status|pause|resume|clear`, `/handoff [--reset] [trọng tâm]`, `/verify`, `/review [trọng tâm]`, `/features`, `/doctor`, `/checks [list|accept|reject <tên>]`, `/autonomous [status|off|on ...]`, `/schedule [list|add <khi nào> -- <prompt>|pause|resume|cancel <id>]` |
+
+**Hàng đợi, cất nháp, câu hỏi bên lề và rẽ nhánh (như prime-agent).** Enter khi agent đang làm sẽ chen vào lượt đang chạy; tin nào lượt chưa nhận được thì chờ ở lane steer. `/queue <text>` thêm một follow-up chạy thành lượt riêng sau lượt đang chạy; `/queue` liệt kê hàng đợi và `/queue edit|drop|up|down <n>` sửa nó. Những gì đang chờ được gửi sau lượt - steer trước, follow-up sau - mỗi lượt một tin, hoặc cả lane một lần với `[queue] steering_mode = "all"` / `follow_up_mode = "all"`. Trong một lượt đang chạy, steer cũng theo chế độ này như vòng lặp của prime-agent: mỗi lần gọi model nhận một tin, đặt sau kết quả tool của bước mà tin đó đến. Sau Ctrl-C, hàng đợi (và báo cáo của agent con) chờ lượt tiếp theo của bạn. Ctrl-S (hoặc `/stash`) cất bản nháp và, trên dòng trống, lấy lại nó. `/btw <câu hỏi>` hỏi model về cuộc hội thoại, không dùng tool và không thêm gì vào hội thoại; câu trả lời mở trong một bảng, `/btw` tiếp theo hỏi tiếp. `/fork` liệt kê các tin bạn đã gửi và `/fork <n>` mở một hội thoại mới ngay trước tin n, đưa tin đó lại vào ô soạn; `/clone` mở hội thoại mới với toàn bộ lịch sử; cả hai hiện riêng trong `/resume`. `/tree` liệt kê các lượt của hội thoại và `/tree <n>` tiếp tục sau lượt n; `/tree <n> --summarize [trọng tâm]` còn cho model tóm tắt các lượt bị bỏ lại bằng prompt tóm tắt nhánh của prime-agent (dùng model phụ nếu có), và tin nhắn kế tiếp được đọc kèm `[branch-summary]` đó ở trước. `/tree label <n> [text]` gắn nhãn cho một lượt, hiện dạng `[nhãn] ` trong danh sách; để trống thì xoá nhãn.
+
+**Model tự thêm, đổi nhanh trong phạm vi và định tuyến model (như prime-agent).** File `models.json` cạnh config người dùng (`<HA_HOME>/models.json`) thêm model theo schema của prime-agent - `{"providers": {"<id>": {"baseUrl", "api", "apiKey", "models": [{"id", "name", "reasoning", "input", "cost", "contextWindow", "maxTokens"}], "modelOverrides": {"<model id>": {...}}}}}`, cho phép chú thích `//`. `api` là `openai-completions`, `anthropic-messages`, `openai-responses` hoặc `openai-codex-responses`; provider mới cần `baseUrl` và `apiKey`; trường thiếu lấy mặc định của prime-agent (`contextWindow` 128000, `maxTokens` 16384, input chữ). `apiKey` là **tên biến môi trường** chứa key, không bao giờ là key. Model trùng provider và id có sẵn sẽ thay nó, còn `modelOverrides` chỉ đổi các trường được ghi. File không dùng được sẽ được báo một lần lúc khởi động (`models.json: <lỗi> - using built-in models only`). Model hiện trong `/model` khi đã có key.
+
+`[routing]` trong config: `scoped = ["deepseek/*", "openai/gpt-5*:high"]` (glob trên `provider/id` hoặc `id`, không phân biệt hoa thường, hậu tố `:level` tuỳ chọn) là các model mà `/model next`, `/model prev`, Alt+M và Shift+Alt+M đi qua - những model có credential, cần ít nhất hai. `/scoped-models <pattern>...` lưu phạm vi cho lần này và các lần sau (đứng trên config, như `/model`), `/scoped-models` hiện nó, `/scoped-models clear` bỏ nó. `auxiliary = "provider/id"` viết tóm tắt khi compact và đánh giá của `/refine` (không làm được thì model phiên làm, có thông báo). `backup = "provider/id"` nhận lượt khi model phiên lỗi giới hạn tần suất hoặc dịch vụ không sẵn sàng ở mọi lần thử lại (`Primary model unavailable (...) — retrying on backup model ...`); lượt sau quay về model phiên (`Primary provider recovered — back on ...`). `image = "provider/id"` nhìn ảnh thay cho model phiên mà catalog ghi chỉ nhận chữ: mô tả mỗi ảnh một lần (chữ trong ảnh nguyên văn, bố cục, chỗ trông sai) và model phiên đọc mô tả, nên lượt vẫn chạy trên model phiên (theo tool vision của CowAgent); ảnh không mô tả được thì request đó gửi nguyên cho model ảnh; không có thì request đó lỗi `This model does not accept images; set [routing] image in config` thay vì gửi ảnh cho model chữ. Provider bị giới hạn (HTTP 429, hoặc mã quota có cấu trúc như `insufficient_quota`; mã lỗi `rate_limited`) được chờ như prime-agent - 1 giây, gấp đôi tới 5 phút mỗi lần kiểm tra, tối đa 30 lần và 15 phút, ưu tiên `Retry-After` của server - với dòng `Waiting for provider usage to recover (n/30), next check in Ns... (esc to cancel)` ở thanh trạng thái; Esc để huỷ. `wait_for_usage = false` tắt việc chờ. Khi provider báo thời điểm reset hạn mức vượt giới hạn đó - qua `Retry-After`, hoặc qua khoảng thời gian ghi trong lỗi như "Try again in ~7272 min" - phiên được park như prime-agent: lượt kết thúc với `Session parked until <thời điểm> and will resume automatically`, và một job chạy một lần lưu theo hội thoại (`/schedule` liệt kê, `/schedule cancel <id>` huỷ) gửi prompt tiếp tục của prime-agent 30 giây sau thời điểm reset, chậm nhất một ngày. Job vẫn còn sau khi thoát `ha`: nó chạy khi hội thoại được mở lại. `/tier` cho xem service tier đang dùng và các tier model nhận; `/tier default|flex|priority|auto` đặt tier, `/fast` bật/tắt `priority`, như prime-agent. Tier được gửi trong trường `service_tier` của request tới OpenAI (API key: `auto` cho mọi model; `priority` và `flex` cho gpt-5.4, gpt-5.5, gpt-5.6, gpt-5.6-* và gpt-6-astra) và tới đăng nhập ChatGPT (như trên, không có `flex`); provider khác chỉ nhận default, và tier model không nhận được gửi thành `default`. Tier được giữ theo hội thoại và lưu thành `defaultServiceTier` trong `settings.json` cạnh config người dùng cho hội thoại mới; thanh trạng thái hiện `fast` cho priority và tên tier cho tier khác.
+
+**Chế độ tự chủ và lịch chạy (như prime-agent).** `/autonomous on` giữ phiên tiếp tục làm sau khi model dừng: mỗi lượt kết thúc bình thường được nối bằng một lượt khác với câu nhắc tiếp tục của prime-agent, tới khi hết ngân sách - mặc định 3 lần tiếp tục, 12 lượt, 80.000 token và 30 phút, xét theo đúng thứ tự đó (`--max-continuations`, `--max-turns`, `--max-tokens`, `--timeout-ms`; nêu một cái thì các cái không nêu thành không giới hạn; nhận `unlimited`). `--gate "<lệnh>"` (lặp được) thêm cổng kiểm tra: sau mỗi lượt các cổng chạy trong workspace, cùng shell và môi trường đã lọc như shell tool của model (mỗi cổng 5 phút, `--gate-timeout-ms`); tất cả qua thì dừng (`autonomous: quality gates passed`), một cổng hỏng thì tiếp tục kèm mã thoát và output (`[autonomous-continuation: gate-failed] ...`), hỏng quá `--gate-retries` (3) lần thì dừng. Cổng đã hỏng không chạy lại khi git worktree chưa đổi; vẫn tính là một lần thử. Khi agent con đang chạy, phiên chờ báo cáo của chúng. `/autonomous` hiện `[autonomous-status: ...]`; `/autonomous off` tắt (và dừng cổng đang chạy). Goal và chế độ tự chủ không chạy cùng lúc: bật cái này thì cái kia tắt, có thông báo. `/schedule add <khi nào> -- <prompt>` hẹn một prompt cho hội thoại này: `in 10m` / `in 2h` / `in 1d` (một lần), `every 30s` / `every 1h` (tối thiểu 10 giây), `at 2030-01-01T09:00:00`, cron 5 trường theo giờ máy (`0 9 * * 1-5`) hoặc `@hourly|@daily|@weekly|@monthly`; `--steer` đưa nó vào lượt đang chạy thay vì chờ lượt xong. Job lưu ở `<data dir>/schedules/<task>.json` và quay lại khi bạn resume hội thoại; chúng chỉ chạy khi `ha` đang mở, các lần lỡ lúc đóng app chạy bù một lần, lần sau tính từ lúc đó. `/schedule` liệt kê, `/schedule pause|resume|cancel <id>` đổi một job. Job tới giờ đến dưới dạng `[heartbeat: <khi nào> run#N]` rồi tới prompt.
+| Nội dung và mở rộng | `/login`, `/logout`, `/image`, `/attach <path>`, `/skill:<name> [args]`, `/reload`; các template trong `.harness/commands` hoặc `<config-dir>/commands` chạy bằng `/name` |
+
+Bảng lệnh, thứ tự, mô tả và alias theo `slash-commands.ts` của prime-agent, menu cũng vậy: gõ `/` liệt kê mọi lệnh, gõ thêm chữ sẽ lọc bằng tìm mờ của prime-agent (`/skil` gợi ý `/skills` và mọi `/skill:<name>`; prompt command cũng có mặt), và lệnh nhận tham số sẽ mở menu tham số khi Tab hoặc Enter - `/effort` gợi ý các mức, `/model` các model, `/login` các provider - Enter trên một giá trị là áp dụng luôn. Gõ sai lệnh sẽ được gợi ý lệnh gần nhất. `/effort <level>` (alias `/thinking`) chọn mức suy luận của model, từ `off` qua `minimal`, `low`, `medium`, `high`, `xhigh` tới `max`, giống prime-agent; `/effort` không kèm tham số cho xem mức đang dùng và các mức model hỗ trợ. Mức model không có sẽ được kẹp về mức gần nhất (DeepSeek V4 có `off`, `high` và `xhigh`, gửi đi là `max`). Lựa chọn được lưu cùng hội thoại và, như `setThinkingLevel` của prime-agent, lưu thành `defaultThinkingLevel` trong `settings.json` cho hội thoại mới (trừ `off` trên model không suy luận); sau đó mới đến `provider.thinking` / `HA_PROVIDER_THINKING`. Khi bật thinking, DeepSeek nhận lại `reasoning_content` của từng tin assistant và Claude nhận lại block thinking có chữ ký, trong phạm vi một lượt; reasoning không bao giờ được lưu. Model không có trong bảng dựng sẵn được coi là không suy luận.
+
+**Trong lúc agent đang làm việc**, giống prime-agent và Claude Code: tin nhắn gửi bằng Enter được đưa vào lượt đang chạy - model đọc nó ở bước kế tiếp, hoặc ngay sau câu trả lời đang viết, và lượt tiếp tục - thay vì chờ xong việc (chỉ xếp hàng khi lượt chưa nhận được). `/effort`, `/model` và `/permissions` áp dụng từ lần gọi model hoặc thao tác kế tiếp của lượt đang chạy, không bị từ chối.
+
+`/goal <mục tiêu>` đặt một mục tiêu bền. Mỗi lượt mang mục tiêu trong context, và model có tool `goal_complete` (được phép không cần hỏi). Lời gọi này chỉ là yêu cầu: các check `[verify]` của project chạy trước, rồi một verifier độc lập chấm phần việc (`[verify] judge = false` bỏ bước này), và chỉ khi cả hai đều qua thì mục tiêu mới hoàn thành, kèm `[verified: ...]` trong tóm tắt; nếu không, lời gọi trả về cái gì hỏng và cách sửa, mục tiêu vẫn active. Gọi lại khi Git worktree chưa thay đổi gì kể từ lần kiểm chứng hỏng sẽ không chạy gì. Lượt kết thúc mà mục tiêu chưa hoàn thành sẽ được tự động tiếp tục, không giới hạn số lượt: mục tiêu chạy tới khi hoàn thành, hết token budget, hoặc khi bạn dừng nó. Ctrl-C và `/goal pause` tạm dừng; `/goal resume` tiếp tục; `/goal clear` xoá. Mục tiêu được lưu cùng hội thoại: `/resume` khôi phục nó ở trạng thái tạm dừng, `/new` bỏ nó. Trong một lượt, khi transcript của chính lượt đó vượt khoảng 200 KB, các kết quả tool cũ nhất (trừ 6 kết quả mới nhất) được thay bằng một dòng ghi chú; model có thể gọi lại tool nếu cần.
+
+`@` mở bộ chọn file; `@<server>:<uri>` đính kèm MCP text resource. `!cmd` chạy shell qua cổng phê duyệt; `!!cmd` chỉ hiển thị output. Enter gửi, Ctrl-J xuống dòng, ↑↓ chọn menu hoặc lịch sử, PgUp/PgDn và Home/End cuộn panel `/more`, Esc đóng panel hoặc ngắt lượt, Ctrl-C hủy lượt (bấm hai lần trong 2 giây trên dòng rỗng để thoát), Ctrl-O đổi chế độ chi tiết như prime-agent: thu gọn ẩn reasoning và cắt mọi output tool còn ba dòng, chi tiết hiện reasoning và toàn bộ diff của các lần sửa file, mở rộng hiện toàn bộ output; thẻ của mỗi lời gọi tool giống nhau ở cả ba chế độ. Ctrl-D trên dòng rỗng thoát. Như prime-agent, TUI mặc định chạy **fullscreen**: alternate screen chứa một cửa sổ cuộn được trên hội thoại, ô nhập, gợi ý phím và thanh trạng thái ghim ở đáy, tên chat (tên đặt bằng `/name`, nếu không thì tên thư mục workspace) và chi phí ghim ở trên cùng. Con lăn chuột cuộn ba dòng, PgUp/PgDn cuộn một trang (panel hoặc menu đang mở vẫn giữ PgUp/PgDn của nó), Shift+Alt+↑ lên đầu và Ctrl+End hoặc Ctrl+Shift+↓ về cuối rồi bám theo output (khi đang đọc lại thì hiện `ctrl+end to follow`; Windows Terminal giữ Ctrl+Shift+↓ cho việc cuộn scrollback của nó). Kéo chuột để bôi đen - vùng chọn bám theo các dòng đã chọn dù câu trả lời vẫn đang chạy, và giữ chuột ở mép thì tự cuộn tiếp - thả ra là chép vào clipboard (`Copied selection to clipboard`). Khi rời fullscreen, những gì nó hiển thị được in vào scrollback của terminal; mở danh sách agents (`/agents`, `/resume` không kèm tham số) thì không in, vì phiên sẽ vẽ lại hội thoại khi được mở lại. Mỗi nấc con lăn dùng chính lệnh cuộn của terminal để dời các dòng đang hiện, và chỉ ghi các dòng mới lộ ra. `/fullscreen [on|off]` đổi ngay và lưu lựa chọn thành `terminal.fullscreen` trong `settings.json`; `terminal.fullscreenMouse: false` để chuột cho terminal xử lý, `terminal.sidebar: false` ẩn sidebar kiểu herdr (workspace, nhánh, model và mọi agent cùng trạng thái working, blocked, done hoặc idle, hiện bên trái khi terminal rộng từ 112 cột; Alt+1..9 hoặc bấm chuột vào một hàng có số sẽ đưa hội thoại trở lại, mở pane xem trực tiếp agent con bên cạnh, hoặc chuyển sang agent khác của dự án), còn `HA_FULLSCREEN` (tương ứng `PI_FULLSCREEN` của prime-agent: chỉ bật khi bằng `1`) được ưu tiên hơn cả hai. Ở chế độ inline, bản ghi cũ ở scrollback của terminal; plain mode in theo dòng. Như Codex, lúc khởi động ha báo `Update available! <bản này> -> <bản mới nhất>` khi npm registry có bản `harness-agents` mới hơn (hỏi ngầm ở mỗi lần mở, lưu ở `<data-dir>/cache/version.json`, nên thông báo hiện từ lần mở sau khi có bản mới); `HA_NO_UPDATE_CHECK=1` hoặc `"checkForUpdates": false` trong `settings.json` tắt nó.
+
+### 12.3. Config v2, quyền và hook
+
+Config v2 hợp nhất default → user (`<config-dir>/config.toml`) → project đã trust (`.harness/config.toml`, rồi `.harness/config.local.toml` cho permission local) → env → CLI. `/config` chỉ ra nguồn của giá trị; project chưa trust không nạp config, hook hoặc skill của project. `/trust` yêu cầu xác nhận. Profile và model có thể chọn cho lượt tiếp theo.
+
+`[permissions]` hỗ trợ `mode = "ask" | "auto-edit" | "full-auto"`, `allow` và `deny`; deny và protected path luôn thắng allow. Panel có `y` (một action), `a` (cả lượt), `n` (từ chối); `A` đề xuất rule lâu dài nhưng chỉ ghi vào `.harness/config.local.toml` sau xác nhận riêng. Headless không tự duyệt khi chưa cấp quyền. `--allowed-tools`, `--disallowed-tools` và `--approval` dùng cùng policy. `[hooks]` theo mô hình hook của Claude Code; hook chỉ nạp từ lớp đã trust, có timeout (tối đa 60 giây) và không thể biến quyết định ask thành allow. `/hooks` xem hook có hiệu lực.
+
+```toml
+[[hooks.pre_tool_use]]
+matcher = "write_file|edit_file"   # `*`, các tên nối bằng `|`, hoặc regex như `git_.*`
+command = "python"                 # một file thực thi, không phải lệnh shell
+args = ["scripts/guard.py"]
+timeout_seconds = 10
+```
+
+| Event | Khi nào | Hook làm được gì |
+|---|---|---|
+| `pre_tool_use` | trước một lần gọi tool, sau policy | chặn (exit 2, `decision: "block"` hoặc `permissionDecision: "deny"`); hỏi người dùng cả khi policy cho phép (`"ask"`); sửa tham số (`updatedInput`, policy xét lại); thêm `additionalContext` |
+| `post_tool_use` | sau một lần gọi đã chạy | đọc `tool_input` và `tool_response`; gửi phản hồi cho model (`decision: "block"` + `reason`, `additionalContext`) |
+| `stop` / `subagent_stop` | agent chính / agent con kết thúc | `decision: "block"` + `reason` cho lượt chạy tiếp với lý do đó; lần dừng thứ hai có `stop_hook_active` là `true` |
+| `user_prompt_submit` | trước khi gửi prompt | chặn prompt; stdout hoặc `additionalContext` được thêm vào prompt |
+| `session_start` | trước prompt đầu tiên của một phiên; `source` là `startup`, `resume` (`/resume`, `/fork`, `/clone`), `clear` (`/new`) hoặc `compact` (sau `/compact`) | stdout hoặc `additionalContext` được thêm vào prompt |
+| `session_end` | app đóng | chỉ quan sát |
+| `pre_compact` | trước `/compact` | chỉ quan sát |
+| `notification` | có câu hỏi hoặc yêu cầu duyệt đang chờ | chỉ quan sát |
+
+Hook nhận một object JSON qua stdin (`hook_event_name`, `session_id`, `cwd`, và tùy event: `tool_name`, `tool_input`, `tool_response`, `prompt`, `last_assistant_message`, `stop_hook_active`), tối đa 8 KiB, tham số giống bí mật bị che. Exit 0 là đi tiếp; exit 2 là chặn, lý do là dòng đầu stdout (không có thì stderr). Exit 0 kèm object JSON trên stdout được đọc các trường `continue: false` + `stopReason` (kết thúc lượt, `hook_stopped`), `systemMessage` (hiện cho người dùng), `decision`/`reason` và `hookSpecificOutput`. Exit khác hoặc quá thời gian thì chặn lần gọi ở `pre_tool_use`, còn ở event khác chỉ báo lại. `permissionDecision: "allow"` không được áp dụng: hook không thể trả lời thay một yêu cầu duyệt.
+
+`[mcp_servers.<name>]` cấu hình stdio hoặc Streamable HTTP. Stdio dùng `command`, `args`, `cwd`, `env` dạng secret ref; HTTP bearer đọc từ env. `enabled_tools`, `disabled_tools`, `tool_timeout` (tối đa 120 giây), `required` giới hạn server. Server được khởi động khi cần. Trong chat, lệnh của prime-agent `/mcp add <name> [--env KEY=VALUE] [--cwd DIR] [--force] -- <command> [args...]` (hoặc `--url <https-url> [--bearer-token-env-var VAR]`), `/mcp list`, `/mcp get <name>` và `/mcp remove <name>` quản lý server trong `mcp-servers.json` cạnh config người dùng, được đọc ở tầng user và có hiệu lực từ lượt sau, không viết lại `config.toml`; `/mcp` không kèm tham số cho xem trạng thái từng server. `ha mcp add|list|get|remove` sửa `config.toml` từ dòng lệnh. Tool MCP đi qua cùng policy/approval và có receipt. Skills tìm ở `<config-dir>/skills`, `~/.agents/skills` và project đã trust (`.agents/skills`, `.harness/skills`); prompt ban đầu chỉ chứa tên và mô tả, nội dung nạp theo digest khi kích hoạt.
+
+### 12.4. Automation
+
+```text
+ha exec "Summarize the changed files" --output-format text
+ha exec --prompt - --output-format json < prompt.txt
+ha exec "Continue the task" --continue --goal "Task complete" --max-turns 4 --output-format stream-json
+```
+
+`--prompt -` đọc tối đa 10 MiB từ stdin; `-` ở vị trí prompt là chữ thường. `text` in câu trả lời, `json` in envelope schema 1 với trường mới additive (khi `--goal` satisfied: `acceptance.command_id`), `stream-json` in mỗi event trên một dòng NDJSON, không ANSI. `--continue` chọn session mới nhất của project. Các mã thoát: 0 hoàn tất, 2 usage, 3 chờ câu hỏi hoặc approval, 4 thất bại, 5 xung đột ownership, 130 hủy. `ha chat --headless --json` vẫn tương thích cách gọi cũ. Chỉ dùng `--mock` hoặc `--fixture` cho thử nghiệm cục bộ; gọi provider thật có thể phát sinh chi phí.
+
+### 12.5. Giới hạn và kiểm tra
+
+Khi model gọi nhiều tool một lúc, chúng chạy song song như prime-agent; một lô có `python_repl`, tool ghi file, `run_process`, `run_shell` hoặc `ask_user` thì chạy lần lượt từng lệnh. Phê duyệt, intent và receipt vẫn theo đúng thứ tự gọi. Tool chỉ đọc không còn lấy fingerprint workspace, và fingerprint chỉ hash lại những file đổi kích thước hoặc thời gian sửa. `run_shell` dùng `pwsh` trên Windows và `powershell.exe` khi thiếu `pwsh`; receipt ghi shell được chọn. Strict isolation chỉ được báo khi backend đã đo hỗ trợ. `/status` và `/config` là điểm bắt đầu khi provider hoặc quyền không như dự kiến. Giống prime-agent, một lượt không bị giới hạn số bước, số tool call hay thời gian: lượt chạy tới khi model xong, bạn dừng, hoặc hết token; `HA_TURN_MAX_STEPS`, `HA_TURN_MAX_TOOL_CALLS` và `HA_TURN_DEADLINE_SECONDS` đặt giới hạn nếu cần, và lượt chạm giới hạn được tự tiếp tục tối đa hai lần (`HA_TURN_CONTINUATIONS`). Toàn bộ hội thoại được giữ như pi và prime-agent: một lượt cũ được gửi lại kèm các tool call, kết quả của chúng (tối đa 32000 ký tự mỗi kết quả) và những gì bạn gửi khi lượt đang chạy, không chỉ câu trả lời, nên model nhớ mình đã đọc, chạy và sửa gì. Khi một yêu cầu gần đầy cửa sổ của model (cửa sổ trừ phần dành cho câu trả lời và phần dự trữ tối đa 16384 token) thì được compact như prime-agent: các lượt cũ thành bản tóm tắt do model viết, phần gần nhất (khoảng 20000 token) giữ nguyên văn, sau đó các kết quả tool cũ của lượt được rút gọn, rồi lượt chạy tiếp. `/compact` và checkpoint tự động tóm tắt toàn bộ hội thoại, không chỉ lượt cuối, và danh sách file đã đọc, đã sửa được giữ từ bản tóm tắt này sang bản sau. Như prime-agent, bản tóm tắt phần cũ được lưu cùng hội thoại và chỉ được cập nhật thêm phần mới thay vì viết lại từ đầu, được cho biết câu trả lời gần nhất còn giữ lại (recent-state anchor), một transcript quá dài cho một lần tóm tắt được tóm tắt theo từng phần, và một lượt quá lớn để giữ nguyên được cắt tại một tin của assistant, phần đầu của nó được tóm tắt riêng (split turn). Những gì model được nói trong một lượt - steering của bạn, lời nhắc tiếp tục goal, phản hồi của stop hook, cảnh báo đọc lặp - được giữ cùng lượt đó. Agent con được giao việc (explorer, coder, verifier) cũng nhận memory của harness và các skill ha đã học từ bạn, nên bài học agent cha vừa rút ra cũng áp dụng cho agent con. Chỉ yêu cầu vẫn không vừa cửa sổ mới báo lỗi. Nếu `ha` chạy như bản cũ, `Get-Command ha -All` cho biết file thực thi nào đang chạy; cài lại bằng `scripts/install/Install-Ha.ps1`. Các gate Bộ unit, integration và PTY có evidence riêng (`scripts/testing/Invoke-HaPtyAcceptance.ps1` chạy các ca PTY mà `cargo test` bỏ qua). Linux đang chờ hỗ trợ: job CI của Linux không chặn push, và không có tuyên bố nào về Linux được suy ra từ nó.
+
+### 12.6. `/resume`
+
+`/resume` phát lại các lượt durable của hội thoại được chọn cho model và hiện chúng trên màn hình. Nó không suy luận hoặc tạo thêm data source cross-session.
+
+`/resume <id|tên|latest>` chọn trực tiếp, không cần mở danh sách trước; số thứ tự vẫn chọn từ danh sách gần nhất. Tên có thể chứa dấu cách, ID rút gọn cần ít nhất 6 ký tự và khớp duy nhất (đầu hoặc cuối ID). Tên, ID hội thoại và ID rút gọn mở lượt mới nhất của hội thoại; ID phiên đầy đủ giữ đúng vị trí đã chọn. Tên hoặc ID trùng bị từ chối, giữ nguyên phiên hiện tại. `/resume --compact [lựa chọn]` mở rồi tóm tắt hội thoại trước khi bạn tiếp tục, mặc định chọn `latest`. Nếu model không tạo được summary, HA chỉ giữ transcript dự phòng khi còn vừa giới hạn; nếu không, compact báo lỗi và giữ nguyên checkpoint. `ha chat --resume <lựa chọn>`, `ha exec --resume <lựa chọn>` và `--continue` dùng cùng cách chọn phiên; `latest` bỏ qua agent con. Nếu hội thoại đang có agent nền giữ, CLI resume gắn vào agent đó tại vị trí hiện tại. Override lúc launch bị từ chối; đổi setting trong phiên đã gắn hoặc stop agent trước. Chuyển phiên bên trong agent sang hội thoại của agent khác và headless resume đồng thời bị từ chối, kèm cách liên hệ agent đang giữ phiên. Sau crash, kết quả tool đã lưu được phát lại; tool chưa có kết quả phải được kiểm tra xem đã có tác dụng chưa trước khi chạy lại. Goal được khôi phục ở trạng thái paused; `/goal resume` tiếp tục nó. Từ client khác, `ha send <agent> "/goal pause" --wait` tạm dừng goal đang bận ngay.
+
+### 12.7. Agent chạy nền
+
+Như daemon của prime-agent, một phiên tương tác chạy trong một worker nền và terminal gắn vào nó. Đóng terminal - `/quit`, ctrl+d, đóng cửa sổ - chỉ tách terminal ra: lượt đang chạy vẫn chạy xong, còn goal, các cổng autonomous, tin nhắn đang xếp hàng, heartbeat, job `/schedule` và agent con vẫn tiếp tục. Terminal báo điều đó khi thoát (`agent <id> keeps running in the background`).
+
+| Lệnh | Tác dụng |
+| --- | --- |
+| `ha agents` | Agents view của prime-agent, trong terminal: mọi agent đang chạy và các hội thoại đã lưu của project này, chia nhóm Running / Idle / Inactive và làm mới mỗi giây. Gõ chữ để tìm (danh sách xếp theo độ khớp); ↑/↓ chọn; Enter hoặc → mở - gắn vào agent đang chạy, hoặc mở lại hội thoại đã lưu thành agent; Space viết trả lời (gửi cho agent, hoặc là prompt để mở lại hội thoại đã lưu ở chế độ nền); Ctrl+R đổi tên agent; Ctrl+X hai lần dừng agent; Ctrl+N tạo phiên mới; Esc thoát. Trong phiên do worker chạy, ← ở ô nhập trống hoặc `/resume` không tham số quay về view. Khi không phải terminal, hoặc có `--json`, lệnh in danh sách như `ha list`. |
+| `ha list` | Mọi agent đang chạy: id, tên, trạng thái, thời gian rảnh, project và yêu cầu gần nhất; `*` đánh dấu agent đang có terminal gắn vào. `--json` cho script. Các agent còn nằm trong journal sau khi khởi động lại máy hoặc worker chết sẽ được khởi động lại trước. |
+| `ha attach <agent>` | Đưa agent về terminal này: hội thoại đến giờ được vẽ lại và bạn gõ tiếp. Nhiều terminal có thể cùng gắn vào một agent, như các client của prime-agent cùng xem một phiên: terminal nào cũng thấy agent làm gì, phím nào được trả lời về đúng terminal đã gõ, và `/quit` chỉ tách terminal đó. |
+| `ha send <agent> "<tin nhắn>"` | `send` của prime-agent: agent rảnh bắt đầu một lượt với tin nhắn; agent đang bận đọc nó ở bước kế tiếp (`--steer`, mặc định) hoặc sau lượt (`--follow-up`). `--from <agent>` ghi tên người gửi. |
+| `ha rename <agent> <tên>` | Đặt tên để `attach`, `send` và `stop` dùng. |
+| `ha stop <agent>` | Dừng agent: lượt và agent con của nó bị hủy. Hội thoại vẫn nằm trong store. |
+| `ha shutdown [--force]` | Dừng mọi agent và worker; không có `--force` thì hỏi trước. |
+
+`<agent>` là id, tên hoặc tiền tố id mà không agent nào khác trùng.
+
+Mỗi project có một worker, và các agent của project dùng chung store của nó, nên hai agent cùng project chạy song song thay vì chờ writer lock của store. Trong Python REPL của agent, `await rlm.create_session('<prompt>', name=..., model=..., thinking=..., cwd=...)` khởi động một agent top-level riêng (API của prime-agent): trong cùng worker, hoặc trong worker của project mà `cwd` thuộc về.
+
+Agent không có terminal, không có việc đang chạy và không có lịch sẽ dừng sau `idleEvictionMinutes` của prime-agent (mặc định 90; đặt một số hoặc `"off"` trong `settings.json`). Worker thoát khi agent cuối cùng không còn. Descriptor của nó (port và token, chỉ chủ sở hữu đọc được) và log nằm trong `<data-dir>/workers/`; kết nối phải trình token, còn môi trường của client - nơi lấy credential - đi qua socket loopback và không bao giờ được ghi ra file.
+
+`ha exec` cũng chạy lượt của nó trong worker của project, như prime-agent chạy phiên headless qua daemon: lượt ghi qua store mà các agent dùng chung, nên một agent đang chạy lượt không còn làm `ha exec` lỗi `writer_locked`. Output, JSON và exit code giữ nguyên như trước; Ctrl-C hủy lượt. Với `HA_DAEMON=off`, hoặc khi không có worker cùng bản build đang chạy, lượt chạy ngay trong tiến trình gọi. Worker chỉ được khởi động từ terminal: worker do một lệnh có output bị chuyển hướng khởi động sẽ giữ output đó mở suốt thời gian nó chạy (trên Windows tiến trình con kế thừa handle), khiến `ha exec ... | tool` không bao giờ kết thúc.
+
+Như supervisor của prime-agent, worker chạy dưới một tiến trình supervisor, và supervisor khởi động lại worker khi nó chết - sau 250 ms, 1 s và 5 s; worker cứ chết mãi thì dừng hẳn. Worker giữ một journal các agent của nó (`<data-dir>/workers/<project>.journal`: id, tên và hội thoại - không bao giờ ghi môi trường), và worker vừa khởi động sẽ đưa chúng trở lại với đúng id và hội thoại; lịch và quota park của các agent được khôi phục tiếp tục hoạt động dù không có terminal nào mở. Hội thoại đã dừng không tự mở lại chỉ vì còn lịch cũ. Sau khi khởi động lại máy, lần `ha` kế tiếp trong project, hoặc `ha agents` chạy trong terminal, sẽ khởi động worker và các agent quay lại; chúng chạy với môi trường của terminal đã khởi động worker. Khi `ha` được cập nhật, terminal của bản mới thấy worker của bản cũ đang rảnh thì yêu cầu nó dừng nhưng giữ journal, rồi khởi động worker mới để đưa các agent trở lại; worker có agent đang làm việc thì để nguyên, terminal báo điều đó và tự chạy phiên.
+
+Khác prime-agent ở chỗ: mỗi project một worker thay vì mỗi session, và lượt bị crash cắt ngang không được chạy tiếp - agent được khôi phục tiếp tục hội thoại, còn lượt bị cắt được phát lại là đã bị gián đoạn. `HA_DAEMON=off` hoặc `"daemon": false` trong `settings.json` chạy phiên ngay trong terminal như trước; renderer plain luôn chạy như vậy.
+
+### 12.8. Thêm từ prime-agent
+
+**Từ prime-agent 8d58e5b (0.5.8).** Các bản sửa và tính năng port từ các commit của prime-agent sau khi nó chuyển sang Rust:
+
+- Ctrl-C dừng được cả lượt tóm tắt ngữ cảnh: compaction (tự động, `/compact`, hay một lượt dài tự gộp các bước của nó) trước đây chạy hết lời gọi model, tới năm phút.
+- Stream Chat Completions kết thúc ở `[DONE]` và stream Anthropic ở `message_stop`, kể cả khi proxy giữ kết nối mở.
+- `maxTokens` đặt trong `modelOverrides` của `models.json` được dùng đúng như ghi, không bị cắt về mức trần mặc định.
+- Ở chế độ ACP, câu trả lời cuối bị cắt ở giới hạn output kết thúc prompt bằng `max_tokens` thay vì `end_turn`; app báo câu trả lời đã dừng ở giới hạn output.
+- Kernel được khôi phục hay khởi động mới nói rõ thư mục làm việc và biến môi trường đã về mặc định của phiên, để model áp dụng lại `os.chdir` hay `os.environ` còn cần.
+- Prompt dặn: không trả lời notice không cần làm gì; không `await` một `bash()` chạy nền mà nhận kết quả khi notice tới; các lệnh `rlm.harness` là đồng bộ.
+- **Prompt bổ sung theo model.** Các luật nối selector của model với file markdown; chúng được ghép vào system prompt trước session tail, nơi vẫn được cache. ha kèm luật của prime-agent (GLM 5.3: `bash()` thay vì `subprocess`); `model-prompts.toml` cạnh user config thêm luật của bạn, file tìm trong thư mục đó:
+
+  ```toml
+  [[rule]]
+  match = ["deepseek-*"]
+  files = ["deepseek.md"]
+  ```
+
+  Mỗi glob được thử với mọi đoạn cuối của selector (`provider/model`), không phân biệt hoa thường. Bản luật hỏng (TOML sai, khoá lạ, thiếu file, đường dẫn ra ngoài thư mục) tắt phần bổ sung và được báo một lần; nó không bao giờ chặn model.
+- **Ngưỡng compaction.** `"compaction": {"thresholdPercent": 60}` trong `settings.json` compact ở tỷ lệ đó của cửa sổ ngữ cảnh (1 tới 100; mặc định 95); phần output và reserve có thể khiến nó sớm hơn, và nó không bao giờ thấp hơn mức các lượt tóm tắt cần.
+- Prompt cất bằng Ctrl-S quay lại ô nhập đã trống sau khi gửi một prompt khác.
+- Một cell Python chủ yếu là lệnh `bash()` hiện thành card **Bash** với lệnh đầu tiên (`+N more`).
+- Chi phí trong `/session` gồm cả phần các agent con của phiên đã tiêu, kể cả con đã xoá: `$0.0123 (children $0.0040)`.
+- CA trong file PEM - `HA_EXTRA_CA_CERTS`, `NODE_EXTRA_CA_CERTS` hay `SSL_CERT_FILE` - được tin thêm ngoài CA của hệ thống, cho proxy kiểm tra TLS.
+- `ha exec` giao việc như app, và run chờ các agent con của nó: con chạy với `wait: false` báo khi xong và notice của nó mở thêm một lượt (tối đa tám), như trong app. Không có ai để duyệt, nên thao tác cần duyệt của con bị từ chối như của agent gốc.
+- Tool REPL tên là `python_repl`; gọi bằng `ipython` hay `python` vẫn tới được.
+- `/new --name <tên> [-- <prompt>]` đặt tên cho hội thoại mới (tên trong ngoặc kép có thể có dấu cách).
+- `oauth_client_id` và `oauth_callback_port` của một MCP server trong `[mcp_servers.<tên>]` (hay `ha mcp login --client-id --callback-port`) đăng nhập bằng client đã đăng ký trước, cho server không hỗ trợ đăng ký client động; cổng callback bị chiếm được báo thay vì chuyển sang cổng client không biết.
+
+**Cách mở.** `ha "sửa parser"` mở app và gửi luôn tin nhắn; khi có input được pipe vào (`cat log | ha "vì sao?"`) input được nối sau tin nhắn và câu trả lời được in ra như `ha exec`. `ha exec` (và `ha chat --headless`) nhận `--model`, `--thinking`, `--system-prompt` và `--append-system-prompt`. `ha model list [search] [--json]` liệt kê model trong catalog đã có credential, `ha prompt [--cwd] [--json]` in system prompt mà một phiên sẽ nhận. `--offline` (hoặc `HA_OFFLINE=1`) bỏ mọi lần tải lúc khởi động - model catalog, danh sách model của provider đã đăng nhập và kiểm tra cập nhật.
+
+**RPC và ACP.** `ha --mode rpc [--model M]` phục vụ chế độ RPC của prime-agent: lệnh JSON qua stdin (`prompt` kèm `streamingBehavior` `steer` hoặc `followUp` khi đang có lượt chạy, `steer`, `follow_up`, `abort`, `new_session`, `get_state`, `set_model`, `cycle_model`, `get_available_models`, `set_thinking_level`, `compact`, `get_last_assistant_text`, `set_session_name`), phản hồi `{id, type: "response", command, success, data | error}` và các session event của prime-agent (`agent_start`, `message_start` / `message_update` / `message_end`, `tool_execution_start` / `_update` / `_end`, `compaction_start` / `_end`, `agent_end`) qua stdout. `ha --mode acp` phục vụ Agent Client Protocol cho editor qua stdio: `initialize`, `session/new` (mỗi kết nối một phiên, mở ở `cwd` được nêu), `session/prompt` stream các `session/update` (chữ, tool call) và trả về `stopReason`, `session/cancel` và `session/close`. Ở cả hai chế độ không ai trả lời được bảng phê duyệt, nên hành động cần duyệt bị từ chối, như `ha exec`.
+
+**Agent chạy nền.** `ha send --wait` in câu trả lời của lượt mà tin nhắn khởi động; `ha abort <agent>` dừng lượt đang chạy, agent vẫn còn. `ha send <session id> "<tin>"` tới một hội thoại đã lưu mà không agent nào đang chạy sẽ mở lại nó thành agent mới với tin đó là prompt đầu. `ha schedule list [--all] [agent] [--json]`, `ha schedule add <agent> <when> -- <tin>` và `ha schedule cancel [agent] <job-id>` quản lý prompt hẹn giờ của agent qua worker của nó. Heartbeat (`/heartbeat <chỉ dẫn>`, `/heartbeats`) được lưu cùng hội thoại như job `/schedule`, và dừng agent thì hủy lịch của nó.
+
+**Ô nhập và màn hình.** Ô nhập sửa như prime-agent: nhảy theo từ (Ctrl/Alt+←/→, Alt+B/F), Ctrl+K và Ctrl+Y (kill ring), Alt+D, Ctrl+T, Ctrl+Z / Ctrl+- hoàn tác và Ctrl+Shift+Z làm lại, Ctrl+D xóa về phía trước, và đoạn dán lớn hiện thành `[paste #N +L lines]`, gửi đi đúng nội dung nó đại diện. Ctrl+G sửa tin nhắn bằng `$VISUAL` / `$EDITOR`. Esc lần hai trong nửa giây xóa bản nháp, hoặc mở cây phiên khi ô nhập trống. `/model` không tham số mở menu model; `/tree` và `/fork` mở bộ chọn (mũi tên, Enter, Esc). Lệnh ở đầu dòng, token `@path` và `--flag` được tô màu như prime-agent. Khi có tin đang chờ, dải hàng đợi phía trên ô nhập hiện từng tin (`Steering:` / `Follow-up:`). Khi tham số của một tool call đang stream, dòng trạng thái ghi `Writing code`. Lỗi nhiều dòng chỉ hiện dòng tóm tắt cho tới khi Ctrl+O mở rộng. Việc chép được báo bằng một toast ngắn, và chép được qua OSC 52 trên SSH và tmux. Bảng và link markdown hiển thị như prime-agent. `keybindings.json` cạnh `settings.json` gán lại phím theo id của prime-agent - `{"app.editor.external": "ctrl+e", "tui.editor.yank": []}`: binding đã cấu hình chỉ nhận đúng các phím đó, danh sách rỗng thì tắt nó.
+
+**Model và provider.** `allowedModels` trong `settings.json` toàn cục (`provider/id` chính xác, id trần hoặc glob) giới hạn model mà lượt chạy, `/model` và agent con được dùng; model ngoài danh sách bị từ chối theo thông báo của prime-agent và không bao giờ tự chuyển sang model khác. Anthropic dùng `cache_control` của prime-agent (`HA_CACHE_RETENTION=long` để giữ một giờ), fine-grained tool streaming và interleaved thinking; token prompt được cache đếm và tính giá riêng. Yêu cầu bị provider báo quá dài được compact rồi gửi lại; compaction viết bản tóm tắt có cấu trúc của prime-agent và cập nhật nó ở lần sau thay vì tóm tắt lại từ đầu, và sau compaction prompt kế tiếp mở đầu bằng ghi chú `[python-state]` của prime-agent nêu những tên kernel vẫn còn. `/login serper` lưu key Serper cho `web_search`.
+
+**Prompt caching.** Mọi provider mà ha gọi đều cache một yêu cầu theo phần đầu (prefix) của nó - tool, rồi system prompt, rồi các tin nhắn theo thứ tự - và tính token prompt đã cache bằng một phần nhỏ giá (khoảng một phần mười ở Anthropic và OpenAI, một phần năm mươi ở DeepSeek), nên ha giữ phần đầu đó nguyên từng byte lâu nhất có thể, như Claude Code, Codex và pi. System prompt chỉ chứa những gì cố định trong phiên; ngày, nhánh Git và số file đã đổi đi theo đầu vào của từng lượt. Một lượt chỉ nối thêm, không viết lại: mỗi bước gửi lại nguyên gói đầu vào của bước đầu, phần tiếp tục goal và ghi chú "các lượt trước không được hiện" là tin nhắn user chứ không phải system, kết quả tool cũ được rút gọn chừa một phần tư khoảng trống để các bước sau không phải rút gọn thêm, và điểm cắt của compaction chỉ dịch mỗi tám lượt hỏi nên bản tóm tắt giữ nguyên qua nhiều lượt. Giữa các lượt cũng vậy: một lượt cũ được gửi lại với đúng gói đầu vào nó đã gửi chứ không chỉ câu hỏi, nên yêu cầu của lượt sau bắt đầu bằng nguyên văn yêu cầu cuối của lượt trước; một khối lượt trước đã gửi (skill đã kích hoạt, project rule, bản tóm tắt, trạng thái không đổi) không bị lặp lại trong gói mới; và định nghĩa tool được sắp theo tên. Theo từng provider: Anthropic có breakpoint trên system prompt, tool cuối, tin nhắn user cuối và tin nhắn user trước đó (kết quả của một loạt lời gọi được gửi lại trong một tin nhắn); Responses và Chat Completions của OpenAI có `prompt_cache_key` (là cuộc hội thoại, `<cuộc hội thoại>:agents` cho các agent con); DeepSeek tự cache. `HA_CACHE_RETENTION=long` giữ cache một giờ ở Anthropic và một ngày ở Responses API của OpenAI (`prompt_cache_retention: "24h"`; backend ChatGPT tự giữ theo cách của nó). Thanh trạng thái hiện `↯ cache NN%`, tỉ lệ token prompt của phiên được đọc từ cache (`prompt_cache_hit_tokens` của DeepSeek, `cached_tokens` của OpenAI, `cache_read_input_tokens` của Anthropic); tỉ lệ tụt xuống nghĩa là có thứ đã làm đổi phần đầu. Usage của mỗi lần gọi model chỉ được tính một lần, kể cả khi endpoint lặp lại nó ở mọi frame.
+
+**MCP server.** `ha mcp login <server> [--client-id] [--scope]` đăng nhập vào server Streamable HTTP yêu cầu OAuth (khám phá RFC 9728 / RFC 8414, đăng ký client động, PKCE trên `localhost:53700-53709` hoặc dán URL chuyển hướng); token được lưu trong `auth.json` dưới `mcp:<server>`, làm mới trước khi hết hạn và chỉ gửi tới đúng URL của server đó, `ha mcp logout <server>` xóa nó. Server nhận `enabled = false`, `headers`, `header_env` (header lấy từ biến môi trường) và `startup_timeout_seconds`.
+
+**Hội thoại.** Goal có token budget (`goal.create(..., token_budget=...)`) và tạm dừng ở trạng thái budget-limited khi dùng hết. `/share` đăng hội thoại thành GitHub gist bí mật (qua `gh`); `/new <prompt>` mở hội thoại mới với prompt đó; `/export` mặc định ghi trang HTML. `/import` đọc được cả file phiên của prime-agent. `/btw` khai báo tool của phiên nhưng từ chối mọi lời gọi, như câu hỏi bên lề của prime-agent. `autoRefine.enabled` và `autoRefine.turnInterval` trong `settings.json` điều khiển việc tự review. `run_shell` từ chối lệnh git làm mất thay đổi chưa commit (`git checkout -- .`, `git reset --hard`, `git clean -f`, ...) trừ khi `HA_ALLOW_DESTRUCTIVE_GIT=1`. `rlm.rename(...)` đổi tên phiên hoặc một agent con trực tiếp.
+
+Chưa port: đăng nhập Claude Pro/Max, Copilot và xAI (chúng giả danh client khác), các phần riêng của nền tảng Prime (inference, traces, telemetry, cloud), activity dock, `/settings`, theme trong TUI của prime-agent, và cột chi phí của agents view.
+
+### 12.9. Gói, tài nguyên và phần còn lại của prime-agent
+
+**Gói.** prime-agent đã bỏ extension TS/JS; thứ nó giữ lại là trình quản lý gói, và ha có đúng phần đó. `ha package install <source> [--local]` cài một gói gồm skill, mẫu prompt và theme từ npm (`npm:@scope/name[@version]`), git (`git:github.com/user/repo[@ref]`, `https://...`, `ssh://...`) hoặc thư mục local, rồi ghi vào `settings.json` của người dùng (`--local`: `.harness/settings.json` của project); `ha package remove|uninstall <source> [--local]`, `ha package update [source]` và `ha package list` quản lý chúng. Gói khai báo tài nguyên trong manifest `pi` của `package.json`, hoặc để trong `skills/`, `prompts/` và `themes/`; mục settings dạng `{"source": "...", "skills": [...], "prompts": [...]}` lọc những gì nó thêm vào. Không có gì trong gói được chạy: skill và prompt được đọc như của người dùng, và gói của project chỉ có hiệu lực trong project đã trust. Trong một phiên, gói chưa được cài sẽ bị bỏ qua (cài lúc đó sẽ ghi đè lên TUI); `ha package install` / `update` cài nó. `--offline` giữ trình quản lý gói không dùng mạng.
+
+**Tài nguyên.** `ha config` mở bộ chọn tài nguyên của prime-agent trên mọi skill, mẫu prompt và theme (có sẵn, của người dùng, của project và của gói): gõ để lọc, Space bật/tắt và ghi thay đổi vào settings (mảng `skills` / `prompts` / `themes` với mẫu `+path` / `-path` của prime, hoặc bộ lọc của mục gói), Esc để đóng. `ha config validate` và `ha config explain` giữ nguyên. Mẫu prompt được nạp từ `prompts/` trong thư mục config và `.harness/prompts/`, từ mảng `prompts` trong settings và từ gói, rồi đến các thư mục `commands/` cũ; chúng nhận `$1`..`$N`, `$@`, `$ARGUMENTS` và `${@:N[:L]}` như prime. `SYSTEM.md` (`.harness/SYSTEM.md` của project đã trust, nếu không thì trong thư mục config) thay các lớp tĩnh của system prompt, và `APPEND_SYSTEM.md` được nối vào cuối; `--system-prompt` và `--append-system-prompt` thay thế chúng.
+
+**Cờ khi mở.** `--thinking`, `--goal`, `--system-prompt` và `--append-system-prompt` dùng được cả cho app tương tác (`ha`, `ha "tin"`, `ha chat`) và được chuyển tới worker nền (bản thân prime chỉ đọc ba cờ sau ở print mode). `ha exec` nhận `--autonomous`, `--autonomous-gate <lệnh>` (lặp lại được), `--autonomous-gate-retries`, `--autonomous-gate-timeout-ms`, `--autonomous-max-continuations`, `--autonomous-max-turns`, `--autonomous-max-tokens` và `--autonomous-timeout-ms` của prime: sau mỗi lượt kết thúc bình thường, các gate chạy trong workspace và lượt chạy tiếp tục cho tới khi gate qua hoặc hết ngân sách; gate vẫn hỏng (hoặc lượt không có gate bị giới hạn dừng) thì thoát mã 1 kèm dòng stderr của prime.
+
+**RPC và ACP, tiếp.** `--mode rpc` phục vụ thêm `cycle_thinking_level`, `set_steering_mode`, `set_follow_up_mode`, `refine`, `set_auto_compaction`, `set_auto_retry`, `abort_retry`, `switch_session`, `fork`, `clone`, `get_fork_messages`, `get_messages`, `export_html`, `get_session_stats` và `get_commands`, và trả lời các lệnh hẹn lịch, nhắn tin, `observe` và `bash` như transport in-process của prime. Các công tắc được giữ dưới dạng settings của prime (`compaction.enabled`, `retry.enabled`, `steeringMode`, `followUpMode`). `--mode acp` khai báo nhận ảnh trong prompt và MCP server HTTP: `session/new` nhận `mcpServers` của client (chỉ giữ trong bộ nhớ cho phiên đó) và trả `configOptions` của prime, `session/set_config_option` đổi bộ chọn `model` và `thought_level`, khối ảnh trong prompt được đính kèm, và goal cùng refinement được báo qua `session_info_update`.
+
+**Catalog MCP.** `/plugins [search]` mở catalog dịch vụ của prime - Linear và Notion có sẵn, `mcp-services.json` của người dùng cạnh config, và catalog công khai của prime (làm mới hằng ngày, có kèm một bản trong binary) - dịch vụ đã kết nối lên đầu; Enter (hoặc `/plugins connect <id>`) thêm dịch vụ OAuth thành MCP server và mở đăng nhập trên trình duyệt. `/mcp login <dịch vụ>` và `/mcp logout <dịch vụ>` dùng được trong app. `mcp.list_plugins` / `mcp.search_plugins` của skill `mcp` trả lời từ cùng các thẻ đó.
+
+**Agent.** Các agent gốc là anh em của nhau như trong prime: `agent_observe.list_agents` liệt kê các agent khác đang chạy và `agent_message.send(..., receiver_role="sibling", receiver_name=...)` gửi tới một agent. `/agents messages status|pause|resume|clear` là điều khiển nhận tin của prime: agent đang tạm dừng từ chối tin của agent khác ("Agent messaging is paused"), pause và clear bỏ các tin đang chờ (không bao giờ đụng hàng đợi của người dùng). Tin nhắn tới một agent con đã xong sẽ đánh thức nó để chạy thêm một lượt, và sổ agent con của mỗi hội thoại (`<data>/delegation/ledger/`) mang các agent con trở lại khi mở lại hội thoại - agent con đang chạy lúc worker dừng sẽ trở lại ở trạng thái lỗi do bị ngắt. Trong agents view, agent có agent con mang một dòng `N subagents (M running)`: Alt+Right (hoặc Enter trên dòng đó) mở ra, Ctrl+O hiện chương trình đã tạo từng agent con, mỗi dòng hiện số heartbeat dạng `◷N`, Ctrl+X hai lần xóa phiên đã lưu khỏi danh sách (store vẫn giữ), và chuột dùng để chọn và cuộn.
+
+**/tree.** `/tree` mở bộ chọn cây của prime trên mọi lượt của hội thoại, kể cả các nhánh: đường nối `├─`/`└─`, dấu `•` trên đường hiện tại, Ctrl/Alt+Left gập một nhánh (⊞) và Ctrl/Alt+Right mở ra, gõ để lọc, Ctrl+D/U/L/A/T đổi bộ lọc của prime và Ctrl+O xoay vòng, Shift+L sửa nhãn của một lượt và Shift+T hiện thời gian nhãn. Enter hỏi "Summarize branch?" của prime (`branchSummary.skipPrompt` bỏ qua câu hỏi) rồi tiếp tục từ câu trả lời đã chọn, hoặc đưa tin nhắn đã chọn trở lại ô nhập.
+
+### 12.10. Task dài và compaction
+
+Một task hàng trăm bước đi qua nhiều lần compaction, và thứ compaction giữ lại là bản tóm tắt do model viết. Bản 0.5.9 đưa những phần của task không được phép thành lời kể lại ra khỏi bản tóm tắt, và kiểm tra bản tóm tắt mà model viết.
+
+- **Trạng thái task.** Tool `task_state` giữ mục tiêu của task, checklist kèm trạng thái từng mục, các quyết định và lý do, ràng buộc của người dùng, câu hỏi còn mở và vướng mắc, cùng các file chính. Nó được lưu theo hội thoại (`sessions/<task>/harness/task_state.json` trong thư mục dữ liệu), mọi lượt đều mang nó nguyên vẹn, và không bản tóm tắt nào thay thế nó. Khi có goal đang chạy, model được dặn giữ kế hoạch ở đây, và `goal_complete` từ chối khi checklist còn mục chưa xong. Nó chỉ đổi trạng thái của host nên không cần phê duyệt.
+- **Lời của người dùng.** Bản tóm tắt phần hội thoại trước kết thúc bằng những gì người dùng đã nói trong phần nó thay thế, giữ nguyên văn: mỗi câu hỏi đúng như người dùng đã gõ (không phải prompt mà host ghép quanh nó, kèm thông báo và file đính kèm) và mọi tin nhắn steer, cũ nhất trước, tin lặp lại chỉ giữ một lần, bỏ qua các lượt tự tiếp tục của goal, tối đa khoảng nửa ngân sách của chính bản tóm tắt (chừng 4k token với mặc định 8192), vượt thì bỏ tin cũ nhất trước và có đếm số tin đã bỏ. Khối này được chuyển từ bản tóm tắt này sang bản sau một cách máy móc, như danh sách file, và khi khác với bản tóm tắt thì khối này đúng.
+- **Các bước của một lượt dài.** Khi một lượt vượt cửa sổ, các bước đầu của nó được tóm tắt theo cùng định dạng checkpoint, cùng quy tắc giữ thông tin, anchor trạng thái gần nhất, danh sách file và ngân sách như các lượt trước, và những gì người dùng gửi trong lúc nó chạy được giữ nguyên văn (trước đây dùng prompt split-turn, dặn viết ngắn gọn, với nửa ngân sách).
+- **Kiểm tra bản tóm tắt.** Khi bản tóm tắt được cập nhật, các ràng buộc, việc đã xong, quyết định, ngữ cảnh quan trọng và tên chính xác (đường dẫn, định danh trong backtick) của bản trước được tìm lại trong bản mới; phần nào bị rơi được đưa trở lại dưới `## Carried Forward`.
+- **Nhắc lại và lưu trước.** Sau mỗi lần tóm tắt, và cứ 40 bước của một lượt dài, host thêm một ghi chú `[task-recap]` gần tin nhắn mới nhất: goal, tiến độ checklist và mục kế tiếp, các ràng buộc, các quyết định, và các file mà `git status` thấy đã đổi (đọc lại trước khi sửa). Mỗi lượt một lần, khi ngữ cảnh chạm 80% điểm compaction, một `[context-note]` yêu cầu model lưu trạng thái task và memory trước. Cả hai là của host, không phải chỉ dẫn của người dùng, và không cái nào sửa tin nhắn cũ nên cache vẫn giữ.
+- **Checkpoint.** `/compact` và lần khôi phục khi tràn ngữ cảnh tóm tắt với cùng ngân sách như bản tóm tắt cuốn chiếu (8192 token, không phải 2048; bốn phần năm phần dự trữ compaction, phần dự trữ tối đa một phần tư cửa sổ). Khi hội thoại được phát lại chạm nửa giới hạn (4 MiB hoặc 1000 lượt), nó được chốt thành checkpoint trước khi lượt nào có thể bị bỏ ra ngoài; trước đây, vượt giới hạn thì các lượt cũ nhất biến mất cùng bản tóm tắt đại diện cho chúng. Một lượt tiếp nối được gắn vào hội thoại ngay khi được nhận, nên checkpoint mà bước đầu của nó phải ghi cũng tóm tắt các lượt trước (trước đây nó chỉ phủ chính lượt đó, rồi lại đại diện cho mọi thứ trước nó).
+- **Nhỏ hơn.** Kết quả tool bị rút gọn cho vừa cửa sổ giữ lại 400 ký tự đầu, nơi lỗi nói cái gì hỏng. Danh sách file trong bản tóm tắt giữ các file được chạm gần nhất, không phải các file đứng đầu theo tên. Bản tóm tắt mới, lần gộp các bước của một lượt và checkpoint đều được tính là compaction, nên lần review memory mà compaction kéo lên sớm cũng chạy sau chúng.
+
+`scripts/testing/live-tests/compaction.sh` chạy một task tám module qua điểm compaction 40k với model thật, thêm một quy tắc trong lúc chạy, rồi kiểm tra khả năng nhớ lại, đĩa và những gì host giữ.
+
+### 12.11. Memory đến đúng nơi cần
+
+Bản 0.6.0 đưa những gì đã nhớ tới đúng những lượt cần nó, và giữ memory sạch ngay từ lúc ghi.
+
+- **Xếp hạng.** Digest memory của mỗi lượt được xếp theo goal, những gì người dùng gõ (không phải prompt mà host ghép quanh nó), bản tóm tắt của trạng thái task, hai tin nhắn trước của người dùng và feature đang làm, nên một câu "tiếp tục" không còn bị xếp theo đúng một từ. Digest của agent con được xếp theo brief của nó (trước đây theo thứ tự tên), và agent con của `ha exec` cũng có digest.
+- **Ràng buộc.** Một memory hay prompt note có path là `constraints` hoặc `constraints/<chủ đề>` được hiện ở mọi lượt, trước các entry đã xếp hạng (tối đa 12), bất kể yêu cầu là gì: quy tắc người dùng đặt không còn rơi khỏi sáu entry được hiện.
+- **Việc mà hội thoại trước để lại.** Ba lượt đầu của một hội thoại mới mang theo trạng thái task của hội thoại gần nhất trong project nếu checklist của nó còn mục chưa xong, như ngữ cảnh mà model có thể nhận lại bằng `task_state` (hoặc người dùng `/resume`); hội thoại đã xong việc thì không hiện gì.
+- **Review.** Một lượt có compact được review memory ngay bên cạnh khi nó còn chạy, không chỉ sau khi kết thúc (setting `review_started` của task ghi lại lúc nào và vì sao). Một phiên lặng đi - mười phút không có lượt nào (`HA_IDLE_REVIEW_SECONDS`) - được review phần việc kể từ lần review trước ngay lúc đó; agent chạy nền vẫn sống sau khi đóng terminal, nên review vẫn chạy dù không ai quay lại, còn agent bị dừng sớm hơn thì để lại cho lượt sau. Một lần refine do agent yêu cầu cũng chấm các learned skill đang dùng.
+- **Ghi.** Tool `memory` từ chối một entry mới mà một entry dài hơn đã chứa (85% số từ có trọng số), không chỉ entry giống toàn bộ, và từ chối entry trùng trước khi lời gọi chạy, nên model đọc thấy một lời từ chối rõ ràng. Các lệnh ghi `rlm.harness` từ kernel qua cùng các bước kiểm tra: không giữ secret, không trùng memory hay prompt note, và đúng `expected_version` mà lệnh cập nhật nêu. Id tạo từ tiêu đề dài tối đa 48 ký tự, cắt ở ranh giới từ; tiêu đề quá 200 ký tự bị từ chối kèm hướng dẫn sửa.
+- **Prompt.** Commit message dùng `git commit -m` hoặc file tạm, không bao giờ là một file trong checkout.
+
+### 12.12. Chẩn đoán và báo lỗi
+
+Bản 0.6.1 ghi lại những gì đã xảy ra, để tìm bug từ một file thay vì một ảnh chụp màn hình.
+
+- **Log chẩn đoán.** Mỗi process `ha` ghi mỗi dòng một object JSON vào `<data dir>/diagnostics/<YYYYMMDD>-<role>-<pid>.jsonl`. `ha diag path` in ra thư mục này, và `HA_DIAG_DIR` chuyển nó sang chỗ khác. Role là `tui`, `exec`, `worker`, `supervisor`, `rpc`, `acp` hoặc `cli`.
+  - **Mỗi bản ghi có:** thời gian, process, thread, mức; `kind.event`; thông điệp; các id liên quan (`agent`, `task`, `session`, `request`, `call`); và các con số.
+  - **Những gì được ghi:**
+    - lúc process bắt đầu và kết thúc, cùng panic kèm vị trí và backtrace;
+    - worker chết vì sao: panic, tràn stack hay access violation;
+    - agent đã khởi động và agent bị mất;
+    - mọi notice và lỗi người dùng được thấy, mọi tool call thất bại, và mỗi lượt kết thúc thế nào;
+    - lần gọi provider thất bại, và mỗi lần retry chờ bao lâu;
+    - mỗi lần compact, kèm window, ngưỡng, số token trước và sau, và lần tóm tắt nào thất bại;
+    - agent con thất bại. Trước 0.6.1, chỉ model cha thấy điều này;
+    - kết quả của mỗi lần review, curation và consolidation chạy nền, kể cả khi không còn terminal nào nghe;
+    - process nào đang giữ store của project khi một process khác không mở được.
+  - **Không ghi:** text stream, output của tool và prompt.
+- **Mức và dung lượng.**
+  - `HA_DIAG=off|error|warn|info|debug` chọn mức (mặc định `info`).
+  - Một lệnh `ha` thường (`ha list`, `ha doctor`) chỉ tạo file khi có cảnh báo hoặc lỗi.
+  - Mỗi file sang file mới khi tới 8 MiB, và process vượt 24 MiB chỉ còn ghi lỗi và cảnh báo.
+  - Khi khởi động, file cũ hơn 14 ngày bị xoá, rồi đến các file cũ nhất cho tới khi tổng dung lượng không quá 128 MiB.
+  - Secret được che ngay lúc ghi từng bản ghi, và field nào có tên như key, token, secret hay password thì bị bỏ ra.
+- **Ai đang giữ store.** Process giữ writer lock của project ghi một ghi chú về chính nó vào `writer.owner.json`, cạnh `writer.lock`. Lỗi `writer_locked` giờ nói rõ, ví dụ `held by worker pid 5678 for 42s`.
+- **`ha bug-report`.** Ghi `ha-bug-report-<time>.zip` vào thư mục hiện tại, hoặc vào `--out FILE`. File zip gồm:
+  - log chẩn đoán của mọi process trong khoảng thời gian (`--since 24h` mặc định; hoặc `30m`, `3d`);
+  - log, journal và descriptor của các worker, không có token;
+  - từ store của mỗi project: run, step, lần gọi provider, command lỗi, lease, checkpoint và setting;
+  - các file harness của từng hội thoại: trạng thái task, lịch sử memory, refinement đã áp dụng, watermark review và stderr của kernel;
+  - `env.json` (phiên bản, nền tảng, terminal, biến `HA_*`), file cấu hình, `settings.json` và `models.json`, mọi secret đều bị bỏ ra;
+  - log của REPL dùng chung, và danh sách thư mục của các agent con (tên và dung lượng).
+
+  Log chẩn đoán ghi một dòng cho mỗi lần gọi model (model, token vào, token từ cache, token ra, thời gian, số tool call), mỗi lần gọi tool (tên, thời gian, có lỗi hay không), mỗi lượt, và mỗi lần compact (có gọi model hay không). Thông báo phê duyệt của từng lần gọi tool là bản ghi debug.
+
+  `SUMMARY.md` đứng đầu. Nó liệt kê:
+  - crash, với panic trong log của từng worker được đặt đúng thời điểm và gộp lại;
+  - process đã bắt đầu mà không ghi lần kết thúc. Nó vẫn đang chạy, hoặc đã bị kill; tràn stack thì không để lại panic;
+  - lỗi và cảnh báo đã ghi, gộp theo `kind.event`;
+  - những gì store cho thấy đã hỏng, các lỗi giống nhau được gộp lại;
+  - các lượt, kèm kết quả, số bước và số tool call;
+  - các lần gọi model: token, thời gian trung vị, phân vị 95 và lâu nhất, các lần gọi chậm nhất;
+  - các lần compact: bao nhiêu lần phải gọi model, bao nhiêu lần đọc lại bản tóm tắt đã lưu;
+  - các tool, theo số lần gọi, số lần lỗi và thời gian;
+  - một timeline gộp.
+
+  Tuỳ chọn và giới hạn:
+  - `--task` và `--session` thu hẹp báo cáo về một hội thoại. Khi đó báo cáo chỉ giữ log chẩn đoán của các process đã làm việc với hội thoại ấy, và ghi rõ đã bỏ bao nhiêu process khác.
+  - Không có `--include-content` thì không đọc nội dung request, checkpoint hay setting dài, chỉ đọc kích thước.
+  - Không bao giờ đọc `private/`, trạng thái pickle của kernel, attachment và artifact.
+  - Giá trị secret đã biết bị che (key provider trong môi trường và trong file credential), và các mẫu secret cũng vậy. `manifest.json` ghi số lần che.
+- **`/bug-report`** ghi cùng gói zip đó cho 24 giờ gần nhất của hội thoại đang mở, vào `<data dir>/bug-reports/`.
+- **`ha diag timeline`** in timeline gộp. Lệnh nhận `--since 2h`, `--task`, `--session`, `--level warn` và `--json`.
+
+### 12.13. Knowledge, Self-Evolution và Deep Dream
+
+Bản 0.6.2 siết lại ba phần: thư viện knowledge, review tự động (Self-Evolution) và việc gom gọn memory toàn cục (Deep Dream).
+
+- **Catalog knowledge.** Catalog được xếp hạng giống digest memory: theo goal, những gì người dùng gõ, bản tóm tắt trạng thái task, các tin nhắn trước của người dùng và feature đang làm. Trước đây nó chỉ xếp theo tin nhắn hiện tại, nên một câu "tiếp tục" chỉ liệt kê các trang đầu tiên theo đường dẫn. Khi bỏ bớt trang, catalog ghi ở cuối số trang bị bỏ. Mỗi dòng không còn mang hash của trang nữa; lệnh đọc trang sẽ trả về hash.
+- **Secret.** Trang knowledge không bao giờ chứa secret, dù do agent ghi hay do review đề xuất; lời từ chối nói rõ nội dung đó trông giống loại secret nào. Các lệnh ghi memory và prompt note của một refinement qua cùng các bước kiểm tra như tool `memory`: không có secret, đúng giới hạn độ dài, không trùng. Các bước này áp dụng cho review tự động, `/refine`, `/learn` và Deep Dream. Một fact được ghi lại để thay một entry mà chính refinement đó xoá thì không bị tính là trùng.
+- **Trang do review tạo.** Review thấy thư viện được xếp hạng theo hội thoại, nên dù thư viện lớn đến đâu nó vẫn thấy trang mà nó có thể ghi trùng.
+  - Trang đề xuất về một chủ đề đã có trang thì bị từ chối, kèm tên trang đã có.
+  - Trang đề xuất phải có evidence là một câu trích nguyên văn từ hội thoại.
+  - Trang do review ghi được đánh dấu trong metadata (`origin: review`), và dấu đó giữ nguyên qua các lần sửa sau. `log.md` ghi ai đã thực hiện từng thay đổi.
+- **Lượt sau được báo.** Những gì một review chạy song song với hội thoại đã thay đổi sẽ được báo một lần cho lượt kế tiếp, kèm id refinement để `/refine --rollback` hoàn tác.
+- **Deep Dream** (gom gọn memory toàn cục):
+  - Chỉ sắp xếp lại, không tạo entry mới.
+  - Entry nằm dưới `constraints` giữ nguyên path, và entry đã ghim vẫn được ghim.
+  - Hai loại entry này chỉ bị xoá khi có một entry còn lại giữ đúng vai trò của chúng.
+  - Mỗi lượt xoá tối đa một nửa số entry. Những đề xuất của model bị gạt bỏ được ghi rõ trong rationale.
+  - Nó chạy khi đã lưu đủ số thay đổi (`memory_changes` đếm mọi lần tạo, cập nhật và xoá). Cách cũ cộng các version, mà tổng này giảm mỗi lần xoá nên có thể bỏ sót thay đổi.
+  - Một lượt thất bại được thử lại sau một giờ, thay vì phải chờ thêm mười lăm thay đổi.
+  - Nó không bao giờ chạy cùng lúc với phần memory của skill curator.
+- **Những gì không bao giờ được học.** Review, refinement và Deep Dream không ghi lại:
+  - lỗi môi trường, như thiếu binary hay interpreter, thiếu credential, lỗi mạng;
+  - nhận định rằng một tool không dùng được;
+  - lỗi đã tự hết khi thử lại.
+- **Bảo trì thư viện.**
+  - Khi `log.md` đầy, các dòng cũ nhất bị bỏ; trước đây mọi lần ghi sau đó đều bị từ chối.
+  - Một lần ghi bị gián đoạn mà file đã bị người khác sửa kể từ đó sẽ được cất sang `.ha-pending.abandoned.json`, và index được dựng lại. Trước đây thư viện từ chối mọi lệnh, kể cả `/knowledge off`.
+  - Lệnh xoá bị backlink chặn sẽ nêu tên các trang đang trỏ tới.
+  - Tìm kiếm trên cả hai thư viện (project và global) gộp kết quả theo thứ hạng, vì điểm keyword và điểm hybrid không so sánh được với nhau.
+
+### 12.14. Review là một giao dịch, tuổi của trang, và review trong `ha exec`
+
+Bản 0.6.3 hoàn tất phần knowledge và Self-Evolution của 0.6.2.
+
+- **Review là một giao dịch.** Review tự động, `/refine`, `/learn` và skill curator ghi trang knowledge và learned skill trước khi refinement ghi nhận chúng được áp dụng. Giờ mỗi lần ghi được ghi chú vào một bản ghi đang chờ (`pending_refinements/` trong thư mục harness của scope) ngay khi xong:
+  - Khi bước áp dụng thất bại (lock của state bị giữ quá 30 giây, lưu state hoặc ghi history lỗi), các lần ghi được hoàn tác: trang bị xoá nếu vẫn y như lúc ghi, learned skill được khôi phục. Thông báo lỗi nói rõ những gì đã hoàn tác. Trước đây trang và skill ở lại mà không có refinement nào để rollback.
+  - Review bị cắt ngang (Ctrl-C trong `ha exec`, tiến trình bị dừng) cũng được hoàn tác như vậy. Tiến trình chết giữa chừng để lại bản ghi, và refinement kế tiếp trong scope đó sẽ hoàn tác nó; một refinement còn đang chạy giữ lock trên bản ghi của nó nên không bị đụng tới.
+  - Khi phần local của review đã áp dụng nhưng phần memory toàn cục thất bại, refinement local vẫn giữ nguyên: nó được hiển thị, được báo cho lượt sau và hội thoại được đánh dấu đã review; lỗi phần toàn cục được báo kèm (`auto-refine: the global memory part failed: ...`).
+- **Tuổi của trang.** Trang knowledge ghi lại lần cuối store ghi nó (`updated_at` trong metadata; lần ghi lặp lại không đổi gì thì giữ nguyên thời điểm). Trang viết tay, hoặc ghi trước 0.6.3, lấy tuổi theo file. Catalog hiển thị tuổi (`"updated":"3d ago"`), danh sách mà review thấy cũng vậy, để một trang ghi lại trạng thái được kiểm tra trước khi tin.
+- **Memory riêng của hội thoại được gom gọn.** Store local của một hội thoại vượt 40 entry memory và prompt note sẽ được gom gọn sau một lượt, bởi curator của Deep Dream với cùng các rào chắn, kèm lưu ý rằng trạng thái hiện tại của task đang làm được giữ lại (mỗi chủ đề một entry, bản mới nhất). Nó được ghi thành một refinement local mà `/refine --rollback` hoàn tác được, và chỉ chạy lại sau thêm 15 thay đổi. Thông báo: `memory: consolidating this conversation's memory in the background`.
+- **`ha exec` review hội thoại của nó.** Một lần chạy headless cộng số lượt và số lần gọi tool vào lần review kế tiếp của hội thoại, qua các lần `ha exec --resume` (`review_cadence.json` trong thư mục harness của hội thoại). Khi phần việc kể từ lần review trước đủ cho một lần kết thúc phiên trong app (5 lượt hoặc 10 lần gọi tool, hoặc số lượt `autoRefine.turnInterval` nếu ít hơn), hoặc lần chạy đã compaction sau khi làm bất cứ việc gì, review chạy sau khi câu trả lời được in và trước khi tiến trình thoát; kết quả in ra stderr. Nó theo `autoRefine.enabled` và `HA_AUTO_REFINE=off`, cần bật harness refinements, và bỏ qua khi chạy `--mock` hoặc bị huỷ. Store local vượt 40 entry cũng được gom gọn ở đây.
+- **Hybrid search embed mọi biến thể truy vấn.** Khi bật semantic search, mỗi biến thể `query`/`queries` của một lần tìm đều được embed (những biến thể chưa có trong cache được gửi trong một request), và mỗi trang được xếp theo độ tương đồng cao nhất của nó với một biến thể bất kỳ; `matched_queries` của mỗi kết quả nêu các biến thể mà trang đó gần. Trước đây chỉ biến thể đầu tiên được embed.

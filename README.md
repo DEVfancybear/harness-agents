@@ -61,7 +61,7 @@ npm puts `ha` in its global directory (`npm prefix -g`), which Node's installer 
 ```powershell
 git clone https://github.com/DEVfancybear/harness-agents.git
 cd harness-agents
-pwsh -NoProfile -File scripts/Install-Ha.ps1        # release build into %USERPROFILE%\.cargo\bin
+pwsh -NoProfile -File scripts/install/Install-Ha.ps1        # release build into %USERPROFILE%\.cargo\bin
 ```
 
 To update a source install, pull and run `Install-Ha.ps1` again; `cargo build` alone does not replace the `ha` on your PATH (`Get-Command ha -All` shows which one runs). No key yet? `ha chat --fixture` opens the interface against a scripted provider.
@@ -98,7 +98,7 @@ ha                         open the app
 | See cost, context, permissions | `/cost`, `/context`, `/permissions` |
 | Audit the repository for agents | `/doctor` or `ha doctor` |
 
-Keys: Enter sends, Ctrl-J or `\` then Enter add a line (Windows Terminal keeps Alt+Enter for full screen; Shift+Enter works where the console reports it), Esc interrupts, Ctrl-C cancels (twice on an empty prompt exits), Ctrl-O cycles collapsed / details / expanded, Ctrl-S stashes the draft, Alt+M cycles models. See [docs/TUI.md](docs/TUI.md).
+Keys: Enter sends, Ctrl-J or `\` then Enter add a line (Windows Terminal keeps Alt+Enter for full screen; Shift+Enter works where the console reports it), Esc interrupts, Ctrl-C cancels (twice on an empty prompt exits), Ctrl-O cycles collapsed / details / expanded, Ctrl-S stashes the draft, Alt+M cycles models. See [docs/guides/TUI.md](docs/guides/TUI.md).
 
 ### Background agents and automation
 
@@ -156,18 +156,18 @@ hint = "Fix the failing test before finishing."
 cargo build -p harness-cli --bin ha --locked
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-pwsh -NoProfile -File scripts/Verify-Docs.ps1
-pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1   # the terminal-driven suite
+pwsh -NoProfile -File scripts/verify/Verify-Docs.ps1
+pwsh -NoProfile -File scripts/testing/Invoke-HaPtyAcceptance.ps1   # the terminal-driven suite
 ```
 
 CI runs the phase and milestone gates on Windows; a test that fails in the crowded full run is re-run alone before the gate fails.
 
 ### Documentation
 
-- [Operator guide](docs/OPERATOR_GUIDE.en.md): every command, setting and workflow
-- [Architecture overview](docs/ARCHITECTURE_OVERVIEW.en.md) · [Terminal interface](docs/TUI.md) · [Plugin architecture](docs/PLUGIN_ARCHITECTURE.en.md)
-- [Desktop computer use](docs/COMPUTER_USE.md): real screenshots, mouse and keyboard on Windows
-- [Build and release](docs/BUILD_AND_RELEASE.md) · [Changelog](https://github.com/DEVfancybear/harness-agents/releases)
+- [Operator guide](docs/guides/OPERATOR_GUIDE.en.md): every command, setting and workflow
+- [Architecture overview](docs/architecture/ARCHITECTURE_OVERVIEW.en.md) · [Terminal interface](docs/guides/TUI.md) · [Plugin architecture](docs/architecture/PLUGIN_ARCHITECTURE.en.md)
+- [Desktop computer use](docs/guides/COMPUTER_USE.md): real screenshots, mouse and keyboard on Windows
+- [Build and release](docs/guides/BUILD_AND_RELEASE.md) · [Changelog](https://github.com/DEVfancybear/harness-agents/releases)
 
 ---
 
@@ -203,7 +203,7 @@ npm đặt `ha` vào thư mục global của nó (`npm prefix -g`), thư mục m
 ```powershell
 git clone https://github.com/DEVfancybear/harness-agents.git
 cd harness-agents
-pwsh -NoProfile -File scripts/Install-Ha.ps1        # build release vào %USERPROFILE%\.cargo\bin
+pwsh -NoProfile -File scripts/install/Install-Ha.ps1        # build release vào %USERPROFILE%\.cargo\bin
 ```
 
 Cập nhật bản build từ nguồn: `git pull` rồi chạy lại `Install-Ha.ps1`; chỉ `cargo build` thì không thay `ha` trong PATH (`Get-Command ha -All` cho biết bản nào đang chạy). Chưa có key? `ha chat --fixture` mở giao diện với provider giả lập.
@@ -240,7 +240,7 @@ ha                         mở app
 | Xem chi phí, context, quyền | `/cost`, `/context`, `/permissions` |
 | Audit repo cho agent | `/doctor` hoặc `ha doctor` |
 
-Phím: Enter gửi, Ctrl-J hoặc `\` rồi Enter để xuống dòng (Windows Terminal giữ Alt+Enter cho chế độ toàn màn hình; Shift+Enter dùng được nơi console báo phím Shift), Esc ngắt lượt, Ctrl-C hủy (bấm hai lần trên dòng trống để thoát), Ctrl-O đổi thu gọn / chi tiết / mở rộng, Ctrl-S cất bản nháp, Alt+M đổi model. Xem [docs/TUI.md](docs/TUI.md).
+Phím: Enter gửi, Ctrl-J hoặc `\` rồi Enter để xuống dòng (Windows Terminal giữ Alt+Enter cho chế độ toàn màn hình; Shift+Enter dùng được nơi console báo phím Shift), Esc ngắt lượt, Ctrl-C hủy (bấm hai lần trên dòng trống để thoát), Ctrl-O đổi thu gọn / chi tiết / mở rộng, Ctrl-S cất bản nháp, Alt+M đổi model. Xem [docs/guides/TUI.md](docs/guides/TUI.md).
 
 ### Agent nền và tự động hóa
 
@@ -298,18 +298,18 @@ hint = "Sửa test đang fail trước khi kết thúc."
 cargo build -p harness-cli --bin ha --locked
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-pwsh -NoProfile -File scripts/Verify-Docs.ps1
-pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1   # bộ test điều khiển qua terminal
+pwsh -NoProfile -File scripts/verify/Verify-Docs.ps1
+pwsh -NoProfile -File scripts/testing/Invoke-HaPtyAcceptance.ps1   # bộ test điều khiển qua terminal
 ```
 
 CI chạy các gate phase và milestone trên Windows; test fail trong lượt chạy toàn bộ được chạy lại riêng trước khi gate báo đỏ.
 
 ### Tài liệu
 
-- [Hướng dẫn vận hành](docs/OPERATOR_GUIDE.vi.md): mọi lệnh, cấu hình và quy trình
-- [Tổng quan kiến trúc](docs/ARCHITECTURE_OVERVIEW.vi.md) · [Giao diện terminal](docs/TUI.md) · [Kiến trúc plugin](docs/PLUGIN_ARCHITECTURE.vi.md)
-- [Điều khiển máy tính](docs/COMPUTER_USE.md): chụp màn hình, chuột và bàn phím thật trên Windows
-- [Build và release](docs/BUILD_AND_RELEASE.md) · [Changelog](https://github.com/DEVfancybear/harness-agents/releases)
+- [Hướng dẫn vận hành](docs/guides/OPERATOR_GUIDE.vi.md): mọi lệnh, cấu hình và quy trình
+- [Tổng quan kiến trúc](docs/architecture/ARCHITECTURE_OVERVIEW.vi.md) · [Giao diện terminal](docs/guides/TUI.md) · [Kiến trúc plugin](docs/architecture/PLUGIN_ARCHITECTURE.vi.md)
+- [Điều khiển máy tính](docs/guides/COMPUTER_USE.md): chụp màn hình, chuột và bàn phím thật trên Windows
+- [Build và release](docs/guides/BUILD_AND_RELEASE.md) · [Changelog](https://github.com/DEVfancybear/harness-agents/releases)
 
 ---
 
