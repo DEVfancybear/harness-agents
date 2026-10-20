@@ -255,10 +255,10 @@ pub(crate) async fn search(
     search_variants(root, documents, &[query.to_owned()], limit).await
 }
 
-/// The pages nearest every query variant, fused by rank across the variants as
-/// keyword search fuses them. Every variant is embedded - those not cached in
-/// one request: only the first was, and a variant worded the way a page is
-/// written found nothing the keyword channel had not.
+/// The pages nearest any query variant, each at its best similarity to one.
+/// Every variant is searched, as keyword search searches them, and embedded -
+/// the ones not cached in one request: only the first was, and a variant worded
+/// the way a page is written found nothing the keyword channel had not.
 pub(crate) async fn search_variants(
     root: &Path,
     documents: &[EmbeddingDocument],
@@ -335,15 +335,17 @@ pub(crate) async fn search_variants(
     fuse_variants(&indexed, &vectors, limit.min(MAX_DOCUMENTS))
 }
 
-/// Each variant's nearest pages, fused by their rank in each (reciprocal rank,
-/// as keyword search fuses its variants), each page shown at the passage
-/// nearest any variant.
+/// Each page at the passage nearest any variant, the nearest first.
+/// `matched_queries` names the variants the page is among the nearest pages of,
+/// with a positive similarity. Vector search ranks every page, so a rank alone
+/// says nothing: fused by rank, pages no variant was near outranked the one
+/// page a variant was (seen with 150 pages in the 0.6.3 live run).
 fn fuse_variants(
     indexed: &Indexed,
     vectors: &[Vec<f32>],
     ranked: usize,
 ) -> Result<Vec<VectorHit>, String> {
-    let mut fused = BTreeMap::<String, (f64, VectorHit)>::new();
+    let mut best = BTreeMap::<String, VectorHit>::new();
     for (variant, query_vector) in vectors.iter().enumerate() {
         let mut hits = BTreeMap::<String, VectorHit>::new();
         for chunk in &indexed.chunks {
@@ -360,39 +362,41 @@ fn fuse_variants(
                 hits.insert(hit.path.clone(), hit);
             }
         }
-        let mut hits = hits.into_values().collect::<Vec<_>>();
-        hits.sort_by(|a, b| {
+        let mut near = hits
+            .values()
+            .filter(|hit| hit.score > 0.0)
+            .collect::<Vec<_>>();
+        near.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
                 .then_with(|| a.path.cmp(&b.path))
         });
-        hits.truncate(ranked);
-        for (rank, mut hit) in hits.into_iter().enumerate() {
-            let vote = 1.0 / (61.0 + f64::from(u32::try_from(rank).unwrap_or(u32::MAX)));
-            hit.matched_queries = vec![variant];
-            match fused.get_mut(&hit.path) {
-                Some((score, existing)) => {
-                    *score += vote;
-                    existing.matched_queries.push(variant);
-                    // The passage nearest any variant is the one shown.
-                    if hit.score > existing.score {
-                        hit.matched_queries = std::mem::take(&mut existing.matched_queries);
-                        *existing = hit;
-                    }
-                }
-                None => {
-                    fused.insert(hit.path.clone(), (vote, hit));
-                }
+        near.truncate(ranked);
+        let near = near
+            .into_iter()
+            .map(|hit| hit.path.clone())
+            .collect::<BTreeSet<_>>();
+        for hit in hits.into_values() {
+            let found = near.contains(&hit.path);
+            let entry = best.entry(hit.path.clone()).or_insert_with(|| hit.clone());
+            if hit.score > entry.score {
+                let matched = std::mem::take(&mut entry.matched_queries);
+                *entry = hit;
+                entry.matched_queries = matched;
+            }
+            if found {
+                entry.matched_queries.push(variant);
             }
         }
     }
-    let mut hits = fused.into_values().collect::<Vec<_>>();
+    let mut hits = best.into_values().collect::<Vec<_>>();
     hits.sort_by(|a, b| {
-        b.0.total_cmp(&a.0)
-            .then_with(|| b.1.score.total_cmp(&a.1.score))
-            .then_with(|| a.1.path.cmp(&b.1.path))
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.path.cmp(&b.path))
     });
-    Ok(hits.into_iter().take(ranked).map(|(_, hit)| hit).collect())
+    hits.truncate(ranked);
+    Ok(hits)
 }
 
 /// Embed the variants without a vector, in one request; returns their indexes.
@@ -1409,7 +1413,8 @@ mod tests {
             .iter()
             .map(|hit| (hit.path.as_str(), hit.matched_queries.clone()))
             .collect::<Vec<_>>();
-        assert_eq!(found, [("a.md", vec![0, 1]), ("z.md", vec![1])]);
+        // Each page found by the variant it is near, and only that one.
+        assert_eq!(found, [("a.md", vec![0]), ("z.md", vec![1])]);
         let calls = fixture.calls.lock().unwrap().clone();
         assert_eq!(
             calls[requests..],
