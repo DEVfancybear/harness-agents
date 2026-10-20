@@ -8,10 +8,14 @@
 //! database authority: every durable write still goes through the P1
 //! transaction coordinator and host fence.
 
+#[path = "data/backup.rs"]
 pub mod backup;
 pub mod contracts;
+#[path = "reporting/diagnostics.rs"]
 pub mod diagnostics;
+#[path = "data/migration.rs"]
 pub mod migration;
+#[path = "data/retention.rs"]
 pub mod retention;
 
 pub use backup::{BackupOutcome, RestoreOutcome, create_backup, restore_backup, verify_backup};

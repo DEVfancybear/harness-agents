@@ -12,7 +12,7 @@ bundled `machines/` library (`rlm.factory`), and `mcp.py` / `mcp_base.py` (the k
 Where ha differs from prime-agent:
 
 - `harness.py` is a shim. prime-agent's kernel keeps the harness state itself; in ha the
-  host keeps it (`src/interactive/harness_kernel.rs`), beside the `memory` tool and
+  host keeps it (`src/host/memory/harness_kernel.rs`), beside the `memory` tool and
   `/refine` that write the same `harness_state.json`. Each `rlm.harness` call is one
   blocking `harness` host request (`repl.host_request_blocking`, answered on the reader
   thread because the loop thread is the one waiting). The API is prime-agent's; the factory

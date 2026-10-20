@@ -235,7 +235,7 @@ fn p0_f07_phase_gate_self_test_exercises_negative_controls() {
         .args([
             "-NoProfile",
             "-File",
-            "scripts/Verify-Phase.ps1",
+            "scripts/verify/Verify-Phase.ps1",
             "-Phase",
             "P0",
             "-SelfTest",
@@ -351,9 +351,9 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
     assert!(
         ci.contains("rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt")
     );
-    assert!(ci.contains("scripts/Verify-Phase.ps1 -Phase P0"));
-    assert!(!ci.contains("scripts/Verify-Phase.ps1 -Phase P4"));
-    assert!(ci.contains("scripts/Verify-Phase.ps1 -Phase P5"));
+    assert!(ci.contains("scripts/verify/Verify-Phase.ps1 -Phase P0"));
+    assert!(!ci.contains("scripts/verify/Verify-Phase.ps1 -Phase P4"));
+    assert!(ci.contains("scripts/verify/Verify-Phase.ps1 -Phase P5"));
     // P4 was the scoped-memory phase; its cases were retired with the subsystem.
     assert!(cases.iter().all(|case| case["phase"] != "P4"));
     // P5 owns two continuity cases; its seven steps and its strengthening cases
@@ -385,7 +385,7 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
                 .is_empty()
     }));
     // P6 owns three continuity cases and seven steps, all real and required.
-    assert!(ci.contains("scripts/Verify-Phase.ps1 -Phase P6"));
+    assert!(ci.contains("scripts/verify/Verify-Phase.ps1 -Phase P6"));
     let p6_cases = future_cases
         .iter()
         .filter(|case| case["phase"] == "P6")
@@ -414,7 +414,7 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
     }));
     // P7 is the release gate: it owns the last continuity case and seven
     // steps, and it retains every earlier case as a regression.
-    assert!(ci.contains("scripts/Verify-Phase.ps1 -Phase P7"));
+    assert!(ci.contains("scripts/verify/Verify-Phase.ps1 -Phase P7"));
     let p7_cases = future_cases
         .iter()
         .filter(|case| case["phase"] == "P7")

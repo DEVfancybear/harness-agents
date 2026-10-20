@@ -4,7 +4,7 @@
 `crates/harness-tools/src/execution/probe.rs`), không phải một tuyên bố thiết kế. Mỗi verdict có `probe_id` và
 `observation` đi kèm trong `CapabilityMatrix`; ở đây chỉ in lại verdict.
 
-[Architecture overview](../ARCHITECTURE_OVERVIEW.vi.md) · [Plugin architecture](../PLUGIN_ARCHITECTURE.vi.md) · [Operator guide](../OPERATOR_GUIDE.vi.md)
+[Architecture overview](../architecture/ARCHITECTURE_OVERVIEW.vi.md) · [Plugin architecture](../architecture/PLUGIN_ARCHITECTURE.vi.md) · [Operator guide](../guides/OPERATOR_GUIDE.vi.md)
 
 ## 1. Host đã đo
 

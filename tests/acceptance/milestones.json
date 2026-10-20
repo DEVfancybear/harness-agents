@@ -101,7 +101,7 @@
         "schemas/dependency-allowlist.v1.json"
       ],
       "gate": {
-        "script": "scripts/Verify-Milestone.ps1",
+        "script": "scripts/verify/Verify-Milestone.ps1",
         "dependency_check_bin": "dependency_check",
         "steps": [
           "format",
@@ -180,7 +180,7 @@
         "tests/fixtures/m1/marker/corrupt.json"
       ],
       "gate": {
-        "script": "scripts/Verify-Milestone.ps1",
+        "script": "scripts/verify/Verify-Milestone.ps1",
         "dependency_check_bin": "dependency_check",
         "steps": [
           "format",
@@ -270,7 +270,7 @@
       ],
       "fixtures": ["crates/harness-cli/tests/milestone_m2.rs"],
       "gate": {
-        "script": "scripts/Verify-Milestone.ps1",
+        "script": "scripts/verify/Verify-Milestone.ps1",
         "dependency_check_bin": "dependency_check",
         "steps": [
           "format",
@@ -365,7 +365,7 @@
       "unit_tests": [],
       "fixtures": ["crates/harness-cli/tests/milestone_m3.rs"],
       "gate": {
-        "script": "scripts/Verify-Milestone.ps1",
+        "script": "scripts/verify/Verify-Milestone.ps1",
         "dependency_check_bin": "dependency_check",
         "steps": [
           "format",
@@ -438,7 +438,7 @@
       "unit_tests": [],
       "fixtures": ["crates/harness-cli/tests/milestone_m4.rs"],
       "gate": {
-        "script": "scripts/Verify-Milestone.ps1",
+        "script": "scripts/verify/Verify-Milestone.ps1",
         "dependency_check_bin": "dependency_check",
         "steps": [
           "format",
@@ -526,7 +526,7 @@
         "crates/harness-cli/src/bin/m5_fixture_host.rs"
       ],
       "gate": {
-        "script": "scripts/Verify-Milestone.ps1",
+        "script": "scripts/verify/Verify-Milestone.ps1",
         "dependency_check_bin": "dependency_check",
         "steps": [
           "format",
@@ -608,7 +608,7 @@
         "crates/harness-extensions/fixtures/skills/observe-source.md"
       ],
       "gate": {
-        "script": "scripts/Verify-Milestone.ps1",
+        "script": "scripts/verify/Verify-Milestone.ps1",
         "dependency_check_bin": "dependency_check",
         "steps": [
           "format",
@@ -675,7 +675,7 @@
         "crates/harness-cli/tests/milestone_m8.rs"
       ],
       "gate": {
-        "script": "scripts/Verify-Milestone.ps1",
+        "script": "scripts/verify/Verify-Milestone.ps1",
         "dependency_check_bin": "dependency_check",
         "steps": [
           "format",
@@ -744,7 +744,7 @@
         "crates/harness-cli/tests/milestone_m9.rs"
       ],
       "gate": {
-        "script": "scripts/Verify-Milestone.ps1",
+        "script": "scripts/verify/Verify-Milestone.ps1",
         "dependency_check_bin": "dependency_check",
         "steps": [
           "format",
@@ -829,7 +829,7 @@
       "unit_tests": [],
       "fixtures": [
         "crates/harness-cli/src/bin/m12_probe_child.rs",
-        "crates/harness-cli/src/sandbox_cli.rs",
+        "crates/harness-cli/src/commands/sandbox_cli.rs",
         "crates/harness-cli/tests/milestone_m12.rs",
         "crates/harness-store-sqlite/src/store/backend_leases.rs",
         "crates/harness-tools/src/execution/capability.rs",
@@ -838,11 +838,11 @@
         "crates/harness-tools/src/execution/plan.rs",
         "crates/harness-tools/src/execution/probe.rs",
         "crates/harness-tools/src/execution/probe_control.rs",
-        "docs/PLUGIN_ARCHITECTURE.vi.md",
+        "docs/architecture/PLUGIN_ARCHITECTURE.vi.md",
         "docs/support/STRICT_EXECUTION_SUPPORT.vi.md"
       ],
       "gate": {
-        "script": "scripts/Verify-Milestone.ps1",
+        "script": "scripts/verify/Verify-Milestone.ps1",
         "dependency_check_bin": "dependency_check",
         "steps": [
           "format",

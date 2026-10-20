@@ -26,11 +26,17 @@ pub use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 pub(crate) static LOOPBACK_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[path = "protocols/anthropic.rs"]
 pub mod anthropic;
+#[path = "support/json_repair.rs"]
 pub mod json_repair;
+#[path = "support/limits.rs"]
 pub mod limits;
+#[path = "protocols/responses.rs"]
 pub mod responses;
+#[path = "protocols/streaming.rs"]
 mod streaming;
+#[path = "support/thinking.rs"]
 pub mod thinking;
 pub use responses::{OpenAiResponsesAdapter, ResponsesFlavor, ResponsesOptions};
 pub use streaming::{ProviderEventStream, collect_events};

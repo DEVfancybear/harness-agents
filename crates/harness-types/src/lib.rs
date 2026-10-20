@@ -4,17 +4,26 @@
 //!
 //! P0 deliberately contains no persistence, policy, model, or agent runtime.
 
+#[path = "validation/acceptance.rs"]
 pub mod acceptance;
 mod contracts;
 pub mod diag;
 mod error;
+#[path = "validation/fixture.rs"]
 mod fixture;
+#[path = "domain/hash.rs"]
 mod hash;
+#[path = "domain/ids.rs"]
 mod ids;
+#[path = "contracts/ports.rs"]
 mod ports;
+#[path = "validation/schema.rs"]
 mod schema;
+#[path = "domain/scope.rs"]
 mod scope;
+#[path = "contracts/store_transactions.rs"]
 mod store_transactions;
+#[path = "domain/version.rs"]
 mod version;
 
 pub use acceptance::{

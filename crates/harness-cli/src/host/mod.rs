@@ -1,0 +1,756 @@
+//! Interactive `ha` launch surface.
+//!
+//! Owner: `HA_LAUNCH` H01 — dispatch contract, terminal detection and the
+//! non-terminal guard. H02 adds the resolved launch context and H03 replaces the
+//! minimal boot shell with the controller/renderer pair. Nothing here starts a
+//! provider, a store writer or a network call.
+
+#[path = "protocols/acp.rs"]
+pub mod acp;
+#[path = "coordination/agents/mod.rs"]
+pub mod agents;
+#[path = "presentation/agents_view.rs"]
+pub mod agents_view;
+#[path = "models/allowlist.rs"]
+pub mod allowlist;
+#[path = "application/app.rs"]
+pub mod app;
+#[path = "presentation/attachments.rs"]
+pub mod attachments;
+#[path = "coordination/autonomous.rs"]
+pub mod autonomous;
+#[path = "application/bootstrap.rs"]
+pub mod bootstrap;
+#[path = "application/bounds.rs"]
+pub mod bounds;
+#[path = "memory/branch_summary.rs"]
+pub mod branch_summary;
+#[path = "memory/checks.rs"]
+pub mod checks;
+#[path = "protocols/cli_extras.rs"]
+pub mod cli_extras;
+#[path = "protocols/commands.rs"]
+pub mod commands;
+#[path = "configuration/config.rs"]
+pub mod config;
+#[path = "configuration/config_selector.rs"]
+pub mod config_selector;
+#[path = "application/controller.rs"]
+pub mod controller;
+#[path = "presentation/cost.rs"]
+pub mod cost;
+#[path = "models/credentials.rs"]
+pub mod credentials;
+#[path = "models/custom_models.rs"]
+pub mod custom_models;
+#[path = "coordination/delegation.rs"]
+pub mod delegation;
+#[path = "presentation/detector.rs"]
+pub mod detector;
+#[path = "application/doctor.rs"]
+pub mod doctor;
+#[path = "application/events.rs"]
+pub mod events;
+#[path = "presentation/export_html.rs"]
+pub mod export_html;
+#[path = "integrations/extensions.rs"]
+pub mod extensions;
+#[path = "presentation/external_editor.rs"]
+pub mod external_editor;
+#[path = "memory/features.rs"]
+pub mod features;
+#[path = "application/frontend.rs"]
+pub mod frontend;
+#[path = "coordination/goal.rs"]
+pub mod goal;
+#[path = "memory/harness.rs"]
+pub mod harness;
+#[path = "memory/harness_kernel.rs"]
+pub mod harness_kernel;
+#[path = "protocols/headless.rs"]
+pub mod headless;
+#[path = "coordination/heartbeat.rs"]
+pub mod heartbeat;
+#[path = "presentation/input.rs"]
+pub mod input;
+#[path = "prompting/instructions.rs"]
+pub mod instructions;
+#[path = "presentation/keybindings.rs"]
+pub mod keybindings;
+#[path = "memory/knowledge/mod.rs"]
+pub mod knowledge;
+#[path = "memory/learned.rs"]
+pub mod learned;
+#[path = "application/lifecycle.rs"]
+pub mod lifecycle;
+#[path = "integrations/mcp.rs"]
+pub mod mcp;
+#[path = "integrations/mcp_catalog.rs"]
+pub mod mcp_catalog;
+#[path = "integrations/mcp_config.rs"]
+pub mod mcp_config;
+#[path = "integrations/mcp_oauth.rs"]
+pub mod mcp_oauth;
+#[path = "memory/memory.rs"]
+pub mod memory;
+#[path = "prompting/model_prompts.rs"]
+pub mod model_prompts;
+#[path = "models/oauth.rs"]
+pub mod oauth;
+#[path = "configuration/offline.rs"]
+pub mod offline;
+#[allow(
+    dead_code,
+    unused_imports,
+    clippy::collapsible_if,
+    clippy::items_after_statements,
+    clippy::type_complexity,
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    clippy::unused_self,
+    reason = "prime-agent's package manager is ported whole, as prime wrote it; ha calls part of its API"
+)]
+#[path = "integrations/packages/mod.rs"]
+pub mod packages;
+#[path = "configuration/paths.rs"]
+pub mod paths;
+#[path = "configuration/permissions.rs"]
+pub mod permissions;
+#[path = "configuration/project.rs"]
+pub mod project;
+#[path = "prompting/prompt.rs"]
+pub mod prompt;
+#[path = "models/providers.rs"]
+pub mod providers;
+#[path = "application/queue.rs"]
+pub mod queue;
+#[path = "memory/refine.rs"]
+pub mod refine;
+#[path = "integrations/repl.rs"]
+pub mod repl;
+#[path = "configuration/resources.rs"]
+pub mod resources;
+#[path = "application/routing.rs"]
+pub mod routing;
+#[path = "protocols/rpc.rs"]
+pub mod rpc;
+#[path = "coordination/schedules.rs"]
+pub mod schedules;
+#[path = "application/service.rs"]
+pub mod service;
+#[path = "models/service_tier.rs"]
+pub mod service_tier;
+#[path = "application/side_question.rs"]
+pub mod side_question;
+#[path = "integrations/skill_requests.rs"]
+pub mod skill_requests;
+#[path = "integrations/skills.rs"]
+pub mod skills;
+#[path = "application/store_lease.rs"]
+pub mod store_lease;
+#[path = "memory/task_state.rs"]
+pub mod task_state;
+#[path = "presentation/terminal.rs"]
+pub mod terminal;
+#[path = "presentation/tree_view.rs"]
+pub mod tree_view;
+#[path = "presentation/tui/mod.rs"]
+pub mod tui;
+#[path = "configuration/update_check.rs"]
+pub mod update_check;
+#[path = "application/verify.rs"]
+pub mod verify;
+#[path = "presentation/view.rs"]
+pub mod view;
+#[path = "integrations/web.rs"]
+pub mod web;
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use harness_types::HarnessError;
+
+/// Exit code reserved for usage violations and the non-terminal guard; it is the
+/// same code clap uses for parser errors.
+pub const USAGE_EXIT_CODE: u8 = 2;
+
+/// A launch request that the parser accepted but the launch contract rejects.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageError {
+    message: String,
+}
+
+impl UsageError {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "ha: {}", self.message)
+    }
+}
+
+/// The launch shape selected by the dispatch layer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LaunchMode {
+    /// Open the interactive app on a real terminal.
+    Interactive {
+        cwd: Option<PathBuf>,
+        resume: Option<String>,
+        /// Explicit opt-in to the labelled fixture backend; never a default and
+        /// never a silent production fallback.
+        fixture: bool,
+        /// Force the plain renderer instead of the TUI.
+        ///
+        /// Set by `ha chat --plain` or by `HA_UI=plain`; the TUI is the default on
+        /// a console that can hold it.
+        plain: bool,
+        config_overrides: config::ConfigOverrides,
+    },
+    /// Run exactly one turn without a terminal.
+    Headless {
+        prompt: String,
+        json: bool,
+        cwd: Option<PathBuf>,
+        resume: Option<String>,
+        options: HeadlessOptions,
+    },
+}
+
+/// Optional headless-run inputs that shape the goal, budget and backend.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HeadlessOptions {
+    /// Output protocol for automation. `None` keeps the original --json behavior.
+    pub output_format: Option<headless::OutputFormat>,
+    /// Explicit deterministic mock backend; never a default and never a silent
+    /// production fallback. The JSON result labels it.
+    pub mock: bool,
+    /// Goal objective. Without it the turn is one bounded pass.
+    pub goal: Option<String>,
+    /// Evidence kinds the goal requires: `response`, `tool_execution`,
+    /// `file_change`, `check`, `artifact`.
+    pub criteria: Vec<String>,
+    /// Host continuations one run may spend on the goal.
+    pub max_continuations: Option<u32>,
+    /// Token budget for the run, when the caller wants one.
+    pub budget_tokens: Option<u64>,
+    /// Approval mode; omission remains fail-closed `ask`.
+    pub approval: Option<String>,
+    /// Temporary tool allow patterns for this one run.
+    pub allowed_tools: Vec<String>,
+    /// Temporary tool deny patterns for this one run.
+    pub disallowed_tools: Vec<String>,
+    /// prime-agent's `--model`: the model of this one run, `provider/id` or an id.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// prime-agent's `--thinking`: the thinking level of this one run.
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// prime-agent's `--system-prompt`: replaces the static prompt layers.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// prime-agent's `--append-system-prompt`, repeatable: added at the end.
+    #[serde(default)]
+    pub append_system_prompt: Vec<String>,
+    /// prime-agent's `--autonomous*` flags: the run continues after each turn
+    /// until its gates pass or a budget runs out.
+    #[serde(default)]
+    pub autonomous: Option<self::autonomous::Options>,
+}
+
+/// Validate parser output into a launch mode.
+///
+/// Clap already enforces the flag conflicts, so this is the typed backstop that
+/// keeps the contract testable without spawning a process, and that keeps a
+/// missing prompt from ever being treated as free text.
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    reason = "one flag per launch mode"
+)]
+pub fn mode_from_args(
+    cwd: Option<PathBuf>,
+    resume: Option<String>,
+    fixture: bool,
+    headless: bool,
+    prompt: Option<String>,
+    json: bool,
+    plain: bool,
+    options: HeadlessOptions,
+) -> Result<LaunchMode, UsageError> {
+    if !headless {
+        if prompt.is_some() {
+            return Err(UsageError::new(
+                "--prompt is only valid with --headless; run ha chat --headless --prompt <text>",
+            ));
+        }
+        if json {
+            return Err(UsageError::new(
+                "--json is only valid with --headless; run ha chat --headless --prompt <text> --json",
+            ));
+        }
+        // `--approval`, `--goal` and the tool lists set up the app too (`ha chat`
+        // passes them on as its launch overrides); refusing them here made
+        // `ha chat --approval full-auto`, which `--help` offers, fail to start.
+        if options.mock
+            || !options.criteria.is_empty()
+            || options.max_continuations.is_some()
+            || options.budget_tokens.is_some()
+        {
+            return Err(UsageError::new(
+                "--mock, --criteria, --max-continuations and --budget are only valid with --headless",
+            ));
+        }
+        return Ok(LaunchMode::Interactive {
+            cwd,
+            resume,
+            fixture,
+            // Clap already rejects `--plain --headless`; the typed backstop keeps
+            // a headless run from ever being routed through the TUI.
+            plain,
+            config_overrides: config::ConfigOverrides::default(),
+        });
+    }
+    if fixture {
+        return Err(UsageError::new(
+            "--fixture is only valid for the interactive app; a headless turn uses --mock for its explicit deterministic profile",
+        ));
+    }
+    if plain {
+        return Err(UsageError::new(
+            "--plain is only valid for the interactive app; a headless turn never draws a viewport",
+        ));
+    }
+    let Some(prompt) = prompt else {
+        return Err(UsageError::new(
+            "--headless requires --prompt <text>; the prompt is never read from stdin",
+        ));
+    };
+    if prompt.trim().is_empty() {
+        return Err(UsageError::new("--prompt must not be empty"));
+    }
+    Ok(LaunchMode::Headless {
+        prompt,
+        json,
+        cwd,
+        resume,
+        options,
+    })
+}
+
+/// The store a registered workspace root resolves to.
+pub struct ResolvedProject {
+    /// The directory that holds this project's store.
+    ///
+    /// Commands that take `--cwd` open this project store directly, not the data
+    /// root.
+    pub store_dir: PathBuf,
+}
+
+/// The project store a workspace root is registered under.
+///
+/// This resolves the store the chat registered for that root and proves the root
+/// has a registered identity, which is what lets `--cwd` commands inspect what a
+/// turn stored.
+///
+/// The store directory is derived by running the launch's own resolution rather than
+/// re-deriving the key here: the key hashes a *displayable* path (the Windows
+/// `\\?\` verbatim prefix removed), so a second, look-alike implementation produced
+/// a different directory for the same root. Measured: that mistake pointed the lookup
+/// at a store the chat never wrote.
+///
+/// # Errors
+/// Fails when the root cannot be resolved or its store cannot be opened: an
+/// unregistered root has no identity yet, and saying so is better than inventing one.
+pub async fn registered_project(root: &std::path::Path) -> Result<ResolvedProject, HarnessError> {
+    let environment = paths::LaunchEnvironment::capture();
+    let context = bootstrap::resolve(bootstrap::LaunchRequest {
+        cwd: Some(root.to_path_buf()),
+        caller_dir: std::env::current_dir().map_err(|error| {
+            HarnessError::new(
+                harness_types::ErrorCode::StorageOpenFailed,
+                format!("the current directory could not be resolved: {error}"),
+            )
+        })?,
+        platform: paths::HostPlatform::current(),
+        environment,
+        explicit_data_dir: None,
+    })?;
+    let store_dir = context.project_store_dir();
+    let store = harness_store_sqlite::SqliteStore::open_read_only(store_dir.clone())
+        .await
+        .map_err(|error| {
+            HarnessError::new(
+                error.code(),
+                format!(
+                    "no project is registered for {}: {error}",
+                    context.project.root.display()
+                ),
+            )
+        })?;
+    project::resolve_project_id(&store, &context.project.root).await?;
+    store
+        .close()
+        .await
+        .map_err(|error| HarnessError::new(error.code(), format!("store close failed: {error}")))?;
+    Ok(ResolvedProject { store_dir })
+}
+
+/// Environment variable that selects the renderer explicitly.
+pub const UI_VARIABLE: &str = "HA_UI";
+
+/// Whether the environment asks for the plain renderer.
+///
+/// Only the exact value `plain` counts: an unknown `HA_UI` value is not a silent
+/// opt-in to anything, and the TUI stays the default.
+#[must_use]
+pub fn plain_requested(ui: Option<&str>) -> bool {
+    matches!(ui, Some(value) if value.eq_ignore_ascii_case("plain"))
+}
+
+/// Read [`UI_VARIABLE`] from the process environment.
+#[must_use]
+pub fn plain_requested_from_environment() -> bool {
+    plain_requested(std::env::var(UI_VARIABLE).ok().as_deref())
+}
+
+/// Run one launch request. Usage problems return exit code 2; real failures
+/// return a typed error that the binary maps to exit code 1.
+pub async fn launch(mode: LaunchMode) -> Result<ExitCode, HarnessError> {
+    match mode {
+        LaunchMode::Headless {
+            prompt,
+            json,
+            cwd,
+            resume,
+            options,
+        } => {
+            Box::pin(headless::run(headless::HeadlessRequest {
+                prompt,
+                json,
+                cwd,
+                resume,
+                options,
+            }))
+            .await
+        }
+        LaunchMode::Interactive {
+            cwd,
+            resume,
+            fixture,
+            plain,
+            config_overrides,
+        } => {
+            launch_interactive_with(
+                &detector::SystemTerminalDetector,
+                cwd,
+                resume,
+                fixture,
+                plain,
+                config_overrides,
+            )
+            .await
+        }
+    }
+}
+
+/// Interactive launch with an injected detector so tests do not need a terminal.
+pub async fn launch_interactive_with(
+    detector: &dyn detector::TerminalDetector,
+    cwd: Option<PathBuf>,
+    resume: Option<String>,
+    fixture: bool,
+    plain: bool,
+    config_overrides: config::ConfigOverrides,
+) -> Result<ExitCode, HarnessError> {
+    let capability = detector.capability();
+    if !capability.is_interactive() {
+        eprint!("{}", non_terminal_guidance(capability));
+        return Ok(ExitCode::from(USAGE_EXIT_CODE));
+    }
+    app::run(app::AppLaunch {
+        cwd,
+        resume,
+        fixture,
+        plain,
+        config_overrides,
+    })
+    .await
+}
+
+/// Guidance printed to stderr when the interactive app cannot own a terminal.
+#[must_use]
+pub fn non_terminal_guidance(capability: detector::TerminalCapability) -> String {
+    format!(
+        "ha: no interactive terminal (stdin tty: {}, stdout tty: {}).\n\
+         The interactive app needs a terminal it can own, so it was not started and stdin was not read.\n\
+         Run one turn explicitly instead:\n  ha chat --headless --prompt \"<your request>\" [--json]\n",
+        capability.stdin_is_terminal, capability.stdout_is_terminal
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        HeadlessOptions, LaunchMode, USAGE_EXIT_CODE, mode_from_args, non_terminal_guidance,
+    };
+    use crate::interactive::bootstrap;
+    use crate::interactive::detector::TerminalCapability;
+    use crate::interactive::paths::{self, LaunchEnvironment};
+    use harness_tools::{ApprovalMode, CodingToolAction, Decision, ToolPolicy};
+    use std::path::PathBuf;
+
+    #[test]
+    fn h01_mode_from_args_accepts_bare_and_optioned_interactive_launch() {
+        assert_eq!(
+            mode_from_args(
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+                false,
+                HeadlessOptions::default()
+            )
+            .expect("bare launch is valid"),
+            LaunchMode::Interactive {
+                cwd: None,
+                resume: None,
+                fixture: false,
+                plain: false,
+                config_overrides: super::config::ConfigOverrides::default(),
+            }
+        );
+        assert_eq!(
+            mode_from_args(
+                Some(PathBuf::from("C:/work/project")),
+                Some("session_1".to_owned()),
+                true,
+                false,
+                None,
+                false,
+                true,
+                HeadlessOptions::default(),
+            )
+            .expect("interactive launch with options is valid"),
+            LaunchMode::Interactive {
+                cwd: Some(PathBuf::from("C:/work/project")),
+                resume: Some("session_1".to_owned()),
+                fixture: true,
+                plain: true,
+                config_overrides: super::config::ConfigOverrides::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn g05_headless_default_still_fails_closed() {
+        let options = HeadlessOptions::default();
+        assert_eq!(options.approval, None, "omission preserves ask mode");
+        assert!(matches!(
+            super::headless::headless_approval_mode(),
+            ApprovalMode::None
+        ));
+        let action = CodingToolAction::WriteFile {
+            path: "src/main.rs".to_owned(),
+            content: "fn main() {}\n".to_owned(),
+            expected_hash: None,
+        };
+        assert_eq!(
+            ToolPolicy::default().decide(&action),
+            Decision::Ask,
+            "headless has no gate to answer, so a default action is never auto-approved"
+        );
+    }
+
+    #[test]
+    fn t07_plain_is_rejected_for_a_headless_turn() {
+        let error = mode_from_args(
+            None,
+            None,
+            false,
+            true,
+            Some("hi".to_owned()),
+            false,
+            true,
+            HeadlessOptions::default(),
+        )
+        .expect_err("a headless turn never draws a viewport");
+        assert!(error.to_string().contains("--plain is only valid"));
+    }
+
+    #[test]
+    fn t07_plain_requested_only_honours_the_exact_value() {
+        assert!(super::plain_requested(Some("plain")));
+        assert!(super::plain_requested(Some("PLAIN")));
+        assert!(!super::plain_requested(Some("tui")));
+        assert!(!super::plain_requested(Some("")));
+        assert!(!super::plain_requested(None));
+    }
+
+    #[test]
+    fn h01_mode_from_args_requires_prompt_for_headless() {
+        let error = mode_from_args(
+            None,
+            None,
+            false,
+            true,
+            None,
+            false,
+            false,
+            HeadlessOptions::default(),
+        )
+        .expect_err("headless needs a prompt");
+        assert!(error.to_string().contains("--headless requires --prompt"));
+
+        let error = mode_from_args(
+            None,
+            None,
+            false,
+            true,
+            Some("   ".to_owned()),
+            false,
+            false,
+            HeadlessOptions::default(),
+        )
+        .expect_err("blank prompt is rejected");
+        assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn h01_mode_from_args_rejects_headless_only_flags_without_headless() {
+        let error = mode_from_args(
+            None,
+            None,
+            false,
+            false,
+            Some("hello".to_owned()),
+            false,
+            false,
+            HeadlessOptions::default(),
+        )
+        .expect_err("prompt without headless is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("--prompt is only valid with --headless")
+        );
+
+        let error = mode_from_args(
+            None,
+            None,
+            false,
+            false,
+            None,
+            true,
+            false,
+            HeadlessOptions::default(),
+        )
+        .expect_err("json without headless is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("--json is only valid with --headless")
+        );
+    }
+
+    #[test]
+    fn h03_fixture_is_rejected_for_a_headless_turn() {
+        let error = mode_from_args(
+            None,
+            None,
+            true,
+            true,
+            Some("fix the parser".to_owned()),
+            false,
+            false,
+            HeadlessOptions::default(),
+        )
+        .expect_err("a headless turn must not silently use the fixture");
+        assert!(error.to_string().contains("--fixture is only valid"));
+    }
+
+    #[test]
+    fn h01_headless_mode_carries_prompt_and_json_flag() {
+        let mode = mode_from_args(
+            None,
+            None,
+            false,
+            true,
+            Some("fix the parser".to_owned()),
+            true,
+            false,
+            HeadlessOptions::default(),
+        )
+        .expect("headless launch is valid");
+        assert_eq!(
+            mode,
+            LaunchMode::Headless {
+                prompt: "fix the parser".to_owned(),
+                json: true,
+                cwd: None,
+                resume: None,
+                options: HeadlessOptions::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn h01_non_terminal_guidance_points_at_the_explicit_headless_command() {
+        let guidance = non_terminal_guidance(TerminalCapability::piped());
+        assert!(guidance.contains("stdin tty: false"));
+        assert!(guidance.contains("stdout tty: false"));
+        assert!(guidance.contains("ha chat --headless --prompt"));
+        assert_eq!(USAGE_EXIT_CODE, 2);
+    }
+
+    /// K05: the key a launch computes must not depend on how the root was named.
+    ///
+    /// `ha maintenance --cwd <root>` looks the store up by this key, so if a chat that
+    /// started *in* the directory and a command that *names* the directory disagree,
+    /// the lookup opens a store the chat never wrote. That is exactly the bug this
+    /// guards: it was written once with a second, look-alike key derivation and the
+    /// measured result was "no project is registered" for a root that had just been
+    /// written.
+    #[test]
+    fn k05_a_root_names_the_same_project_either_way_it_is_reached() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).expect("workspace");
+        let environment = LaunchEnvironment::from_pairs([(
+            "HA_HOME",
+            temp.path().join("home").to_string_lossy().into_owned(),
+        )]);
+        let base = |cwd: Option<std::path::PathBuf>, caller: std::path::PathBuf| {
+            bootstrap::resolve(bootstrap::LaunchRequest {
+                cwd,
+                caller_dir: caller,
+                platform: paths::HostPlatform::current(),
+                environment: environment.clone(),
+                explicit_data_dir: None,
+            })
+            .expect("context resolves")
+        };
+        let named = base(Some(root.clone()), temp.path().to_path_buf());
+        let started_in = base(None, root.clone());
+        assert_eq!(
+            named.project.key, started_in.project.key,
+            "naming a directory and starting in it must resolve one project"
+        );
+        assert_eq!(named.project_store_dir(), started_in.project_store_dir());
+        // And the temporary-directory spelling must not change it either: a canonical
+        // path and the path the caller typed are the same workspace.
+        let canonical = std::fs::canonicalize(&root).expect("canonical root");
+        let via_canonical = base(Some(canonical), temp.path().to_path_buf());
+        assert_eq!(
+            named.project.key, via_canonical.project.key,
+            "a canonical spelling must resolve the same project as the typed one"
+        );
+    }
+}
