@@ -33,9 +33,6 @@ use super::events::SessionEvent;
 /// The session setting a task's goal is stored under.
 pub const GOAL_SETTING: &str = "goal";
 
-/// How many turns the app continues a goal by itself before it pauses.
-pub const DEFAULT_GOAL_CONTINUATIONS: u32 = 10;
-
 fn escape_xml_text(input: &str) -> String {
     input
         .replace('&', "&amp;")
@@ -456,9 +453,10 @@ impl GoalStatus {
 pub struct GoalState {
     pub objective: String,
     pub status: GoalStatus,
-    /// Turns the app has continued by itself for this goal.
+    /// Turns the app has continued by itself for this goal. There is no cap:
+    /// the goal goes on until `goal_complete`, its token budget, Ctrl-C or
+    /// `/goal pause`.
     pub continuations: u32,
-    pub max_continuations: u32,
     /// What `goal_complete` said, once it was called.
     pub summary: Option<String>,
     /// When it was set, for the time the status line shows it has been pursued.
@@ -489,7 +487,6 @@ impl GoalState {
             objective: objective.into(),
             status: GoalStatus::Active,
             continuations: 0,
-            max_continuations: DEFAULT_GOAL_CONTINUATIONS,
             summary: None,
             started: std::time::Instant::now(),
             token_budget: None,
@@ -526,10 +523,7 @@ impl GoalState {
         let mut lines = vec![
             format!("Goal:     {}", self.objective),
             format!("Status:   {}", self.status.label()),
-            format!(
-                "Continued: {} of {} automatic turn(s)",
-                self.continuations, self.max_continuations
-            ),
+            format!("Continued: {} automatic turn(s)", self.continuations),
         ];
         lines.push(format!(
             "Tokens:   {}{}",

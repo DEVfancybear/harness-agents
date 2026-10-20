@@ -3495,8 +3495,8 @@ impl InteractiveController {
     /// Carry an active goal into another turn once a turn finished without it.
     ///
     /// prime-agent's persistent goals: the model stopping is not the goal being done -
-    /// only `goal_complete` is. Each carried turn spends the goal's own budget, and a
-    /// spent budget pauses the goal instead of looping.
+    /// only `goal_complete` is. No count of turns ends it: its token budget, when it
+    /// has one, Ctrl-C and `/goal pause` do.
     fn continue_goal(&mut self, outcome: &RunOutcome) -> Vec<Effect> {
         let Some(goal) = &mut self.goal else {
             return Vec::new();
@@ -3504,21 +3504,12 @@ impl InteractiveController {
         if goal.status != GoalStatus::Active || !matches!(outcome, RunOutcome::Done) {
             return Vec::new();
         }
-        if goal.continuations >= goal.max_continuations {
-            goal.status = GoalStatus::Paused;
-            let message = format!(
-                "goal paused after {} automatic turn(s) without being completed; /goal resume continues it",
-                goal.continuations
-            );
-            self.service.set_goal(None);
-            return vec![Effect::History(HistoryItem::Notice { message })];
-        }
         goal.continuations += 1;
         let text = super::goal::continuation_text(goal);
         let mut effects = vec![Effect::History(HistoryItem::Notice {
             message: format!(
-                "goal not complete yet; continuing ({} of {}) - Ctrl-C or /goal pause stops this",
-                goal.continuations, goal.max_continuations
+                "goal not complete yet; continuing (turn {}) - Ctrl-C or /goal pause stops this",
+                goal.continuations
             ),
         })];
         self.continuations = 0;
@@ -10926,27 +10917,25 @@ Command: \"npm run build\""
         assert_eq!(last_goal(&harness), Some(None));
     }
 
-    /// The goal's own budget bounds it: a model that never finishes pauses, it does
-    /// not loop forever.
+    /// No count of turns pauses a goal: it goes on until the model completes it, and
+    /// Ctrl-C stops it whenever the user wants.
     #[test]
-    fn a_goal_pauses_when_its_budget_is_spent() {
+    fn a_goal_is_not_capped_by_a_count_of_turns() {
         let mut harness = bench(true);
         let _ = harness.controller.boot_lines();
         let _ = submit_text(&mut harness.controller, "/goal never done");
-        for _ in 0..super::super::goal::DEFAULT_GOAL_CONTINUATIONS {
-            let _ = end_done(&mut harness);
+        for turn in 1..=25 {
+            let plain = end_done(&mut harness);
+            assert!(
+                plain
+                    .iter()
+                    .any(|line| line.contains(&format!("continuing (turn {turn})"))),
+                "{plain:#?}"
+            );
         }
-        let sent = submissions(&harness).len();
-        assert_eq!(
-            sent,
-            1 + super::super::goal::DEFAULT_GOAL_CONTINUATIONS as usize
-        );
-        let plain = end_done(&mut harness);
-        assert!(
-            plain.iter().any(|line| line.contains("goal paused after")),
-            "{plain:#?}"
-        );
-        assert_eq!(submissions(&harness).len(), sent);
+        assert_eq!(submissions(&harness).len(), 26);
+        let _ = harness.controller.handle_key(Key::Interrupt);
+        assert_eq!(last_goal(&harness), Some(None), "Ctrl-C pauses the goal");
     }
 
     /// Ctrl-C and `/goal pause` stop the goal; `/goal resume` picks it up; `/goal clear`

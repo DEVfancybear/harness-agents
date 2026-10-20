@@ -535,7 +535,7 @@ pub(crate) fn resolve_relative(
     {
         return Err(HarnessError::new(
             ErrorCode::WorkspaceEscape,
-            "absolute paths and parent traversal are not permitted",
+            "absolute paths and parent traversal are not permitted: these tools read and write only inside the workspace, by a path relative to its root; for a file elsewhere, such as a temporary script, use bash or python_repl",
         ));
     }
     let mut candidate = root.to_owned();
