@@ -1,14 +1,23 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::struct_excessive_bools, reason = "one flag per launch mode")]
 
+#[path = "support/bug_report.rs"]
 mod bug_report;
+#[path = "commands/delegation_cli.rs"]
 mod delegation_cli;
+#[path = "support/diagnostics.rs"]
 mod diagnostics;
+#[path = "commands/extension_cli.rs"]
 mod extension_cli;
+#[path = "host/mod.rs"]
 mod interactive;
+#[path = "commands/maintenance_cli.rs"]
 mod maintenance_cli;
+#[path = "commands/mcp_cli.rs"]
 mod mcp_cli;
+#[path = "commands/package_cli.rs"]
 mod package_cli;
+#[path = "commands/sandbox_cli.rs"]
 mod sandbox_cli;
 
 use std::{io::Read, path::PathBuf, process::ExitCode, sync::Arc};
