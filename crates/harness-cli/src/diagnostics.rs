@@ -325,12 +325,15 @@ pub fn init(role: Role) {
         Ok(value) => Level::parse(&value).unwrap_or(Level::Info),
         Err(_) => Level::Info,
     };
+    let data_dir = data_dir_argument();
     let dir = match std::env::var_os("HA_DIAG_DIR").filter(|dir| !dir.is_empty()) {
         Some(dir) => PathBuf::from(dir),
+        // `--data-dir` is the process's data directory: a run given one (the
+        // tests' runs are) logged into the default directory instead.
         None => match crate::interactive::paths::resolve(&crate::interactive::paths::PathRequest {
             platform: crate::interactive::paths::HostPlatform::current(),
             environment: &environment,
-            explicit_data_dir: None,
+            explicit_data_dir: data_dir.as_deref(),
         }) {
             Ok(paths) => paths.data_dir.join(DIRECTORY),
             Err(_) => return,
@@ -434,6 +437,21 @@ fn install_panic_hook() {
         }
         previous(info);
     }));
+}
+
+/// The `--data-dir` this process was started with, when it was.
+fn data_dir_argument() -> Option<PathBuf> {
+    let mut arguments = std::env::args_os().skip(1);
+    while let Some(argument) = arguments.next() {
+        let text = argument.to_string_lossy();
+        if text == "--data-dir" {
+            return arguments.next().map(PathBuf::from);
+        }
+        if let Some(value) = text.strip_prefix("--data-dir=") {
+            return Some(PathBuf::from(value));
+        }
+    }
+    None
 }
 
 /// Where the diagnostics log of a data directory is: `HA_DIAG_DIR` when set.

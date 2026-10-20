@@ -271,8 +271,11 @@ impl SessionEvent {
         use harness_types::diag::{self, Level};
         let record = match self {
             Self::Notice { message } => {
-                // A delegated child's progress line is the child's tool call.
-                let level = if message.starts_with("[child ") {
+                // A delegated child's progress line is the child's tool call,
+                // and "allowed by ..." is a tool call's approval: one per call,
+                // they were most of a long turn's log and filled its budget.
+                let level = if message.starts_with("[child ") || message.starts_with("allowed by ")
+                {
                     Level::Debug
                 } else {
                     Level::Info
@@ -302,6 +305,20 @@ impl SessionEvent {
                     .msg(reason)
                     .field("outcome", state)
             }
+            // Every call, with how long it took: the report's tool table.
+            Self::ToolSettled {
+                name,
+                call_id,
+                ok: true,
+                elapsed,
+                ..
+            } => diag::info("tool", "ok")
+                .call(call_id)
+                .field("tool", name.clone())
+                .field(
+                    "elapsed_ms",
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                ),
             Self::ToolSettled {
                 name,
                 call_id,
@@ -1178,6 +1195,10 @@ mod tests {
                 SessionEvent::Notice {
                     message: "context: compacted 3 earlier message(s)".to_owned(),
                 },
+                // One per tool call: kept out of the log's info records.
+                SessionEvent::Notice {
+                    message: "allowed by mode full-auto: read src/main.rs".to_owned(),
+                },
                 SessionEvent::RecoverableError {
                     message: "cannot open the project store".to_owned(),
                 },
@@ -1213,13 +1234,16 @@ mod tests {
             seen,
             [
                 ("notice", "shown", Level::Info),
+                ("notice", "shown", Level::Debug),
                 ("error", "recoverable", Level::Error),
                 ("tool", "failed", Level::Warn),
+                ("tool", "ok", Level::Info),
                 ("turn", "terminal", Level::Error),
             ]
         );
-        assert_eq!(records[2].ids.call.as_deref(), Some("call_1"));
-        assert_eq!(records[3].fields["outcome"], "failed");
+        assert_eq!(records[3].ids.call.as_deref(), Some("call_1"));
+        assert_eq!(records[4].fields["elapsed_ms"], 40);
+        assert_eq!(records[5].fields["outcome"], "failed");
     }
 
     #[test]

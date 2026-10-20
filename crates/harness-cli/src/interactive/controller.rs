@@ -10894,7 +10894,7 @@ Command: \"npm run build\""
         assert!(
             plain
                 .iter()
-                .any(|line| line.contains("goal not complete yet; continuing (1 of")),
+                .any(|line| line.contains("goal not complete yet; continuing (turn 1)")),
             "{plain:#?}"
         );
         assert_eq!(submissions(&harness).len(), 2);

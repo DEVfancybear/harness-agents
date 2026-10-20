@@ -3061,6 +3061,10 @@ pub struct RuntimeService {
     /// How many compactions this runtime has published, so a host can follow
     /// one that ran inside a turn (prime-agent's kernel-state sync).
     compactions: Arc<AtomicU32>,
+    /// The last summary of a split turn's start, keyed by what it summarized
+    /// and its budget. Every later step of the turn cuts the same start, and
+    /// summarizing it again cost a model call per step.
+    prefix_summary: Arc<Mutex<Option<(String, String)>>>,
     /// The input packet each running turn sent at its first step, by
     /// `session|input`. See the packet note where the request is assembled.
     turn_packets: Arc<Mutex<std::collections::HashMap<String, String>>>,
@@ -3209,6 +3213,7 @@ impl RuntimeService {
             budget: None,
             evaluator: default_evaluator(),
             compactions: Arc::new(AtomicU32::new(0)),
+            prefix_summary: Arc::new(Mutex::new(None)),
             turn_packets: Arc::new(Mutex::new(std::collections::HashMap::new())),
             tool_schema_facts: Arc::new(Mutex::new(None)),
             stored_packet: Arc::new(Mutex::new(None)),
@@ -3655,6 +3660,9 @@ impl RuntimeService {
                 // The summary passes run on the heap: inline, their futures made
                 // a step's future too large for the main thread's stack (a
                 // headless `--continue` overflowed it).
+                // Whether a summary was written now, by a model call, rather
+                // than read back as it was kept.
+                let mut wrote = false;
                 let summary = Box::pin(async {
                     let history = if older.is_empty() {
                         "No prior history.".to_owned()
@@ -3670,6 +3678,7 @@ impl RuntimeService {
                             .await?;
                         if fresh {
                             self.compactions.fetch_add(1, Ordering::SeqCst);
+                            wrote = true;
                         }
                         history
                     };
@@ -3679,7 +3688,8 @@ impl RuntimeService {
                     // prime-agent gives the prefix half the reserve the history gets.
                     let prefix_budget =
                         (config.compaction_reserve_tokens / 2).clamp(256, MAX_SUMMARY_TOKENS);
-                    let turn = self.turn_prefix_summary(&prefix, prefix_budget).await?;
+                    let (turn, fresh) = self.turn_prefix_summary(&prefix, prefix_budget).await?;
+                    wrote |= fresh;
                     // The prefix's files belong in the lists too, which follow
                     // the whole summary once (prime-agent adds the prefix's file
                     // operations to the compaction's).
@@ -3711,25 +3721,37 @@ impl RuntimeService {
                             checkpoint_id.clone(),
                             &appended,
                         );
-                        harness_types::diag::info("compaction", "earlier_summarized")
-                            .task(request.task_id.as_str())
-                            .session(request.session_id.as_str())
-                            .field("window", window)
-                            .field("threshold", threshold)
-                            .field("before", before)
-                            .field(
-                                "after",
-                                attempt
-                                    .as_ref()
-                                    .ok()
-                                    .map(|built| built.packet.token_estimate),
-                            )
-                            .field("older", older.len())
-                            .field("prefix", prefix.len())
-                            .field("keep", keep)
-                            .field("dropped", dropped)
-                            .field("budget", budget)
-                            .emit();
+                        // A summary read back is the same compaction again: it is
+                        // a debug record, so a long turn's steps do not fill the
+                        // log with it.
+                        harness_types::diag::at(
+                            if wrote {
+                                harness_types::diag::Level::Info
+                            } else {
+                                harness_types::diag::Level::Debug
+                            },
+                            "compaction",
+                            "earlier_summarized",
+                        )
+                        .field("model_call", wrote)
+                        .task(request.task_id.as_str())
+                        .session(request.session_id.as_str())
+                        .field("window", window)
+                        .field("threshold", threshold)
+                        .field("before", before)
+                        .field(
+                            "after",
+                            attempt
+                                .as_ref()
+                                .ok()
+                                .map(|built| built.packet.token_estimate),
+                        )
+                        .field("older", older.len())
+                        .field("prefix", prefix.len())
+                        .field("keep", keep)
+                        .field("dropped", dropped)
+                        .field("budget", budget)
+                        .emit();
                         if !request
                             .earlier_compaction_noticed
                             .swap(true, Ordering::SeqCst)
@@ -4112,6 +4134,7 @@ impl RuntimeService {
                 break;
             }
             let attempt_number = attempts.max(1);
+            let attempt_started = std::time::Instant::now();
             if attempt_number > 1
                 && let Some((ledger, budget_id)) = &self.budget
             {
@@ -4238,6 +4261,35 @@ impl RuntimeService {
                             error: None,
                         })
                         .await?;
+                    // One line per model call: what it cost and how long it
+                    // took, for the bug report's model table.
+                    let usage = events.iter().rev().find_map(|event| match event {
+                        ProviderStreamEvent::Usage {
+                            prompt_tokens,
+                            completion_tokens,
+                            cache_read_tokens,
+                            ..
+                        } => Some((*prompt_tokens, *completion_tokens, *cache_read_tokens)),
+                        _ => None,
+                    });
+                    harness_types::diag::info("provider", "call")
+                        .task(request.task_id.as_str())
+                        .session(request.session_id.as_str())
+                        .request(&provider_request.request_id)
+                        .field("model", provider_request.model.clone())
+                        .field("attempt", attempt_number)
+                        .field(
+                            "duration_ms",
+                            u64::try_from(attempt_started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                        )
+                        .field("estimated", built.packet.token_estimate)
+                        .field("input", usage.map(|usage| usage.0))
+                        .field("output", usage.map(|usage| usage.1))
+                        .field("cached", usage.map(|usage| usage.2))
+                        .field("tool_calls", assembled.tool_calls.len())
+                        .field("finish", assembled.finish_reason.clone())
+                        .emit();
                     final_response = Some(assembled);
                     attempts = attempt_number;
                     break;
@@ -4999,11 +5051,21 @@ impl RuntimeService {
         )))
     }
 
+    /// The summary of a split turn's start, and whether it is new: the start a
+    /// step cut before is read back as it was summarized.
     async fn turn_prefix_summary(
         &self,
         prefix: &[ProviderMessage],
         budget: u64,
-    ) -> Result<String, RuntimeError> {
+    ) -> Result<(String, bool), RuntimeError> {
+        let key = format!("{}:{budget}", messages_digest(prefix));
+        if let Some(kept) = self.prefix_summary.lock().ok().and_then(|kept| {
+            kept.as_ref()
+                .filter(|(kept_key, _)| *kept_key == key)
+                .map(|(_, summary)| summary.clone())
+        }) {
+            return Ok((kept, false));
+        }
         let entries = summary_entries(prefix);
         let mut summary: Option<String> = None;
         for transcript in summary_chunks(&entries, self.summary_input_chars(budget)) {
@@ -5019,7 +5081,11 @@ impl RuntimeService {
                 .await?,
             );
         }
-        Ok(summary.unwrap_or_default())
+        let summary = summary.unwrap_or_default();
+        if let Ok(mut kept) = self.prefix_summary.lock() {
+            *kept = Some((key, summary.clone()));
+        }
+        Ok((summary, true))
     }
 
     /// The summary of `older`, the earlier part of a conversation, kept with the
