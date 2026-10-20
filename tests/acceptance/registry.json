@@ -858,7 +858,7 @@
       "phase": "P3",
       "target": "phase_p3",
       "test_names": [
-        "p3_s07_cli_fixture_runs_p2_response_through_p3_tools_and_recovers_after_restart"
+        "p3_s07_code_capabilities_reports_the_tool_contract"
       ],
       "fixture": "crates/harness-cli/tests/phase_p3.rs",
       "platforms": [
