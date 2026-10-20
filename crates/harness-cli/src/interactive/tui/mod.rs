@@ -189,6 +189,12 @@ pub trait TuiRenderer {
     }
     /// Erase the viewport footprint and leave the cursor on a fresh line.
     fn finish(&mut self) -> io::Result<()>;
+    /// Give the console to the agents view, which takes the alternate screen
+    /// at once: as [`Self::finish`], but what fullscreen showed is not printed
+    /// into the primary screen's scrollback.
+    fn hand_over(&mut self) -> io::Result<()> {
+        self.finish()
+    }
 }
 
 /// How many history entries a renderer keeps for ctrl+o to draw again.
@@ -760,6 +766,19 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
         self.backend.write("\r\n")?;
         self.backend.flush()
     }
+
+    fn hand_over(&mut self) -> io::Result<()> {
+        // An attached session's replay counts as arriving after fullscreen
+        // opened, so printing it on the way out scrolled the whole conversation
+        // past before the view came up, and left one more copy of it in the
+        // scrollback on every `/resume`. The session draws it again when it
+        // is opened.
+        if !self.fullscreen() {
+            return self.finish();
+        }
+        super::terminal::leave_fullscreen(self.mouse)?;
+        self.backend.flush()
+    }
 }
 
 /// prime-agent's OSC 52 clipboard write (`osc52.rs`): the text base64-encoded
@@ -1250,7 +1269,12 @@ fn apply(renderer: &mut impl TuiRenderer, effects: Vec<Effect>) -> Result<Step, 
             | Effect::Redraw
             | Effect::EditExternally(_) => {}
             Effect::Exit(code) => {
-                renderer.finish().map_err(|error| terminal_error(&error))?;
+                if code == super::agents_view::AGENTS_VIEW_EXIT {
+                    renderer.hand_over()
+                } else {
+                    renderer.finish()
+                }
+                .map_err(|error| terminal_error(&error))?;
                 return Ok(Step::Exit(code));
             }
         }
@@ -2132,6 +2156,97 @@ pub(crate) mod tests {
             "only the initial frame is painted while ready"
         );
         assert!(outcome.renderer.finished);
+    }
+
+    /// Leaving for the agents view hands the console over instead of finishing
+    /// the session's screen: finishing a fullscreen session printed every
+    /// replayed entry into the primary screen before the view came up. Any
+    /// other way out still finishes it.
+    #[test]
+    fn leaving_for_the_agents_view_hands_the_console_over() {
+        use crate::interactive::frontend::Frontend;
+
+        #[derive(Default)]
+        struct LeavingRenderer {
+            finished: bool,
+            handed_over: bool,
+        }
+
+        impl TuiRenderer for LeavingRenderer {
+            fn columns(&self) -> u16 {
+                100
+            }
+
+            fn rows(&self) -> u16 {
+                30
+            }
+
+            fn poll_key(&mut self, _timeout: Duration) -> io::Result<Option<Key>> {
+                Ok(Some(Key::Left))
+            }
+
+            fn draw_state(&mut self, _state: &UiState) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn insert_history(&mut self, _item: &HistoryItem) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn finish(&mut self) -> io::Result<()> {
+                self.finished = true;
+                Ok(())
+            }
+
+            fn hand_over(&mut self) -> io::Result<()> {
+                self.handed_over = true;
+                Ok(())
+            }
+        }
+
+        /// A session whose first key leaves with `code`.
+        struct Leaving(u8);
+
+        impl Frontend for Leaving {
+            fn resume_source(&mut self, _session_id: &str) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn set_columns(&mut self, _columns: u16) {}
+
+            fn boot_lines(&mut self) -> Vec<String> {
+                Vec::new()
+            }
+
+            fn ui_state(&self) -> UiState {
+                idle_state()
+            }
+
+            fn handle_key(&mut self, _key: Key) -> Vec<Effect> {
+                vec![Effect::Exit(self.0)]
+            }
+
+            fn pump_events(&mut self) -> Vec<Effect> {
+                Vec::new()
+            }
+
+            fn tick(&mut self) -> Vec<Effect> {
+                Vec::new()
+            }
+        }
+
+        let view = super::super::agents_view::AGENTS_VIEW_EXIT;
+        let outcome = super::run_loop(LeavingRenderer::default(), &mut Leaving(view), None)
+            .expect("the loop leaves for the view");
+        assert_eq!(outcome.code, view);
+        assert!(outcome.renderer.handed_over);
+        assert!(!outcome.renderer.finished);
+
+        let outcome = super::run_loop(LeavingRenderer::default(), &mut Leaving(0), None)
+            .expect("the loop ends");
+        assert_eq!(outcome.code, 0);
+        assert!(outcome.renderer.finished);
+        assert!(!outcome.renderer.handed_over);
     }
 
     fn screen(renderer: &super::RealRenderer<ratatui::backend::TestBackend>) -> Vec<String> {
