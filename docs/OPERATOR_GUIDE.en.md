@@ -642,17 +642,24 @@ A task of hundreds of steps passes through many compactions, and what a compacti
   - the workers' logs, journals and descriptors, without their token;
   - from each project store: runs, steps, provider attempts, failed commands, leases, checkpoints and settings;
   - each conversation's harness files: task state, memory history, applied refinements, the review watermark and kernel stderr;
-  - `env.json` (version, platform, `HA_*` variables), and the configuration with its secret lines withheld.
+  - `env.json` (version, platform, terminal, `HA_*` variables), the configuration, `settings.json` and `models.json` with every secret withheld;
+  - the shared REPL's logs, and the delegated children's directories (names and sizes).
+
+  The diagnostics hold one line per model call (model, input, cached and output tokens, duration, tool calls), per tool call (name, duration, failed or not), per turn, and per compaction (whether it took a model call). A tool call's approval notice is a debug record.
 
   `SUMMARY.md` comes first. It lists:
   - crashes, with each worker log's panics placed in time and grouped;
   - processes that started and never recorded an exit. They are still running, or were killed; a stack overflow leaves no panic;
   - the errors and warnings recorded, grouped by `kind.event`;
   - what the stores show went wrong, with alike problems grouped;
+  - the turns, with their outcome, steps and tool calls;
+  - the model calls: tokens, median, 95th percentile and longest duration, the slowest calls;
+  - the compactions: how many took a model call and how many read a kept summary back;
+  - the tools, by calls, failures and time;
   - one merged timeline.
 
   Options and limits:
-  - `--task` and `--session` narrow the report to one conversation.
+  - `--task` and `--session` narrow the report to one conversation. Such a report keeps the diagnostics of the processes that worked on that conversation, and says how many others it left out.
   - Without `--include-content`, no request body, checkpoint or long setting is read, only its size.
   - `private/`, the kernel's pickled state, attachments and artifacts are never read.
   - Known secret values are redacted (the provider keys in the environment and in the credential file), and so are secret patterns. `manifest.json` has the count.

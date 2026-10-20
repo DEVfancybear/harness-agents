@@ -641,17 +641,24 @@ Bản 0.6.1 ghi lại những gì đã xảy ra, để tìm bug từ một file 
   - log, journal và descriptor của các worker, không có token;
   - từ store của mỗi project: run, step, lần gọi provider, command lỗi, lease, checkpoint và setting;
   - các file harness của từng hội thoại: trạng thái task, lịch sử memory, refinement đã áp dụng, watermark review và stderr của kernel;
-  - `env.json` (phiên bản, nền tảng, biến `HA_*`), và file cấu hình với các dòng chứa secret bị bỏ ra.
+  - `env.json` (phiên bản, nền tảng, terminal, biến `HA_*`), file cấu hình, `settings.json` và `models.json`, mọi secret đều bị bỏ ra;
+  - log của REPL dùng chung, và danh sách thư mục của các agent con (tên và dung lượng).
+
+  Log chẩn đoán ghi một dòng cho mỗi lần gọi model (model, token vào, token từ cache, token ra, thời gian, số tool call), mỗi lần gọi tool (tên, thời gian, có lỗi hay không), mỗi lượt, và mỗi lần compact (có gọi model hay không). Thông báo phê duyệt của từng lần gọi tool là bản ghi debug.
 
   `SUMMARY.md` đứng đầu. Nó liệt kê:
   - crash, với panic trong log của từng worker được đặt đúng thời điểm và gộp lại;
   - process đã bắt đầu mà không ghi lần kết thúc. Nó vẫn đang chạy, hoặc đã bị kill; tràn stack thì không để lại panic;
   - lỗi và cảnh báo đã ghi, gộp theo `kind.event`;
   - những gì store cho thấy đã hỏng, các lỗi giống nhau được gộp lại;
+  - các lượt, kèm kết quả, số bước và số tool call;
+  - các lần gọi model: token, thời gian trung vị, phân vị 95 và lâu nhất, các lần gọi chậm nhất;
+  - các lần compact: bao nhiêu lần phải gọi model, bao nhiêu lần đọc lại bản tóm tắt đã lưu;
+  - các tool, theo số lần gọi, số lần lỗi và thời gian;
   - một timeline gộp.
 
   Tuỳ chọn và giới hạn:
-  - `--task` và `--session` thu hẹp báo cáo về một hội thoại.
+  - `--task` và `--session` thu hẹp báo cáo về một hội thoại. Khi đó báo cáo chỉ giữ log chẩn đoán của các process đã làm việc với hội thoại ấy, và ghi rõ đã bỏ bao nhiêu process khác.
   - Không có `--include-content` thì không đọc nội dung request, checkpoint hay setting dài, chỉ đọc kích thước.
   - Không bao giờ đọc `private/`, trạng thái pickle của kernel, attachment và artifact.
   - Giá trị secret đã biết bị che (key provider trong môi trường và trong file credential), và các mẫu secret cũng vậy. `manifest.json` ghi số lần che.

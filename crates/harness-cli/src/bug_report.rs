@@ -181,6 +181,7 @@ async fn gather(options: Options) -> Result<Report, HarnessError> {
     report.workers();
     report.stores().await;
     report.harness_files();
+    report.other_logs();
     Ok(report)
 }
 
@@ -211,6 +212,19 @@ impl Report {
                 .saturating_sub(text.matches("[REDACTED").count());
         }
         redacted
+    }
+
+    /// Redact every text of a record and leave its numbers alone: redacting
+    /// the line took a millisecond timestamp for a card number.
+    fn redact_value(&mut self, value: &mut Value) {
+        match value {
+            Value::String(text) => *text = self.redact(text),
+            Value::Array(items) => items.iter_mut().for_each(|item| self.redact_value(item)),
+            Value::Object(fields) => fields
+                .values_mut()
+                .for_each(|field| self.redact_value(field)),
+            _ => {}
+        }
     }
 
     fn add_text(&mut self, path: &str, text: &str) {
@@ -291,14 +305,38 @@ impl Report {
             "session": self.options.session,
             "include_content": self.options.include_content,
             "variables": variables,
+            "terminal": {
+                "TERM": std::env::var("TERM").ok(),
+                "TERM_PROGRAM": std::env::var("TERM_PROGRAM").ok(),
+                "COLORTERM": std::env::var("COLORTERM").ok(),
+                "windows_terminal": std::env::var_os("WT_SESSION").is_some(),
+                "ssh": std::env::var_os("SSH_CONNECTION").is_some(),
+            },
             "data_dir_listing": listing,
         });
         self.add_text("env.json", &pretty(&env));
-        if let Some(config) = config
-            && let Ok(text) = std::fs::read_to_string(&config)
+        if let Some(config) = &config
+            && let Ok(text) = std::fs::read_to_string(config)
         {
             let text = withhold_secret_lines(&text);
             self.add_text("config/config.toml", &text);
+        }
+        // The settings and custom models beside it, every secret-named value
+        // withheld.
+        if let Some(dir) = config.as_ref().and_then(|config| config.parent()) {
+            for name in ["settings.json", "models.json"] {
+                let Ok(text) = std::fs::read_to_string(dir.join(name)) else {
+                    continue;
+                };
+                let shown = match serde_json::from_str::<Value>(&text) {
+                    Ok(mut value) => {
+                        withhold_secret_values(&mut value);
+                        pretty(&value)
+                    }
+                    Err(_) => withhold_secret_lines(&text),
+                };
+                self.add_text(&format!("config/{name}"), &shown);
+            }
         }
     }
 
@@ -317,30 +355,34 @@ impl Report {
             .filter(|path| modified_ms(path).is_none_or(|ms| ms >= self.since_ms))
             .collect::<Vec<_>>();
         files.sort();
+        let mut left_out = 0;
         for path in files {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
             let mut kept = String::new();
+            let mut points = Vec::new();
+            let mut records = Vec::new();
+            let mut tasks = BTreeSet::new();
             for line in text.lines() {
-                let Ok(record) = serde_json::from_str::<Value>(line) else {
+                let Ok(mut record) = serde_json::from_str::<Value>(line) else {
                     continue;
                 };
                 if record["ms"].as_i64().is_some_and(|ms| ms < self.since_ms) {
                     continue;
                 }
-                let task = record["task"].as_str();
-                if !self.wanted(task, record["session"].as_str()) {
+                let task = record["task"].as_str().map(str::to_owned);
+                if !self.wanted(task.as_deref(), record["session"].as_str()) {
                     continue;
                 }
-                kept.push_str(line);
+                self.redact_value(&mut record);
+                kept.push_str(&record.to_string());
                 kept.push('\n');
-                if let Some(task) = task
-                    && self.options.task.is_none()
-                {
-                    self.conversations.insert(task.to_owned());
+                if let Some(task) = &task {
+                    tasks.insert(task.clone());
                 }
-                self.points.push(Point {
+                let task = task.as_deref();
+                points.push(Point {
                     ms: record["ms"].as_i64().unwrap_or_default(),
                     source: format!(
                         "{}:{}",
@@ -356,11 +398,72 @@ impl Report {
                     text: record_text(&record),
                     task: task.map(str::to_owned),
                 });
-                self.records.push(record);
+                records.push(record);
             }
+            // A conversation's report keeps the processes that worked on it: the
+            // others' records carry no conversation, and every other process of
+            // the window - another project, a test run - came along with them.
+            if let Some(wanted) = &self.options.task
+                && !tasks.contains(wanted)
+            {
+                if !kept.is_empty() {
+                    left_out += 1;
+                }
+                continue;
+            }
+            if self.options.task.is_none() {
+                self.conversations.extend(tasks);
+            }
+            self.points.extend(points);
+            self.records.extend(records);
             if !kept.is_empty() {
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
-                self.add_text(&format!("diagnostics/{name}"), &kept);
+                self.add_bytes(&format!("diagnostics/{name}"), kept.into_bytes());
+            }
+        }
+        if left_out > 0 {
+            self.notes.push(format!(
+                "{left_out} process log(s) with no record of this conversation left out (`ha bug-report` without a conversation keeps them)"
+            ));
+        }
+    }
+
+    /// Logs no conversation owns: the shared REPL's, and what the delegated
+    /// children left (names and sizes only).
+    fn other_logs(&mut self) {
+        let repl = self.data_dir.join("repl");
+        if let Ok(entries) = std::fs::read_dir(&repl) {
+            let mut paths = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+                .filter(|path| modified_ms(path).is_none_or(|ms| ms >= self.since_ms))
+                .collect::<Vec<_>>();
+            paths.sort();
+            for path in paths {
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                self.copy_file(&path, &format!("repl/{name}"), true);
+            }
+        }
+        let delegation = self.data_dir.join("delegation");
+        if let Ok(entries) = std::fs::read_dir(&delegation) {
+            let listing = entries
+                .filter_map(Result::ok)
+                .filter(|entry| modified_ms(&entry.path()).is_none_or(|ms| ms >= self.since_ms))
+                .map(|entry| {
+                    json!({
+                        "name": entry.file_name().to_string_lossy(),
+                        "bytes": directory_bytes(&entry.path(), 3),
+                        "modified": modified_ms(&entry.path()).map(ms_text),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !listing.is_empty() {
+                self.add_text("delegation.json", &pretty(&Value::Array(listing)));
             }
         }
     }
@@ -832,8 +935,171 @@ impl Report {
         let mut out = String::new();
         self.summary_header(&mut out);
         self.summary_problems(&mut out);
+        self.summary_activity(&mut out);
         self.summary_timeline(&mut out);
         out
+    }
+
+    /// The records of one `kind.event`, oldest first.
+    fn recorded(&self, kind: &str, event: &str) -> Vec<&Value> {
+        let mut found = self
+            .records
+            .iter()
+            .filter(|record| record["kind"] == kind && record["event"] == event)
+            .collect::<Vec<_>>();
+        found.sort_by_key(|record| record["ms"].as_i64().unwrap_or_default());
+        found
+    }
+
+    /// What the window's work was: its turns, its model calls, its compactions
+    /// and its tools, from the records.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "four tables of one section, each a few lines"
+    )]
+    fn summary_activity(&self, out: &mut String) {
+        let field = |record: &Value, name: &str| record["fields"][name].as_u64();
+        let turns = self.recorded("turn", "terminal");
+        if !turns.is_empty() {
+            let _ = writeln!(out, "## Turns\n");
+            let _ = writeln!(
+                out,
+                "| ended | conversation | outcome | steps | tool calls |"
+            );
+            let _ = writeln!(out, "|---|---|---|---|---|");
+            for record in turns.iter().rev().take(30).rev() {
+                let _ = writeln!(
+                    out,
+                    "| {} | `{}` | {} | {} | {} |",
+                    ms_text(record["ms"].as_i64().unwrap_or_default()),
+                    short_id(record["task"].as_str().unwrap_or("-")),
+                    record["fields"]["outcome"].as_str().unwrap_or("?"),
+                    field(record, "steps").map_or_else(|| "-".to_owned(), |n| n.to_string()),
+                    field(record, "tool_calls").map_or_else(|| "-".to_owned(), |n| n.to_string()),
+                );
+            }
+            if turns.len() > 30 {
+                let _ = writeln!(
+                    out,
+                    "\n{} older turn(s) in `timeline.jsonl`.",
+                    turns.len() - 30
+                );
+            }
+            let _ = writeln!(out);
+        }
+        let calls = self.recorded("provider", "call");
+        if !calls.is_empty() {
+            let mut durations = calls
+                .iter()
+                .filter_map(|record| field(record, "duration_ms"))
+                .collect::<Vec<_>>();
+            durations.sort_unstable();
+            let at = |share: usize| {
+                durations
+                    .get((durations.len().saturating_sub(1)) * share / 100)
+                    .copied()
+                    .unwrap_or_default()
+            };
+            let sum = |name: &str| {
+                calls
+                    .iter()
+                    .filter_map(|record| field(record, name))
+                    .sum::<u64>()
+            };
+            let _ = writeln!(out, "## Model calls\n");
+            let _ = writeln!(
+                out,
+                "- {} call(s): {} input token(s) ({} from the cache), {} output token(s)",
+                calls.len(),
+                sum("input"),
+                sum("cached"),
+                sum("output")
+            );
+            let _ = writeln!(
+                out,
+                "- duration: median {:.1}s, 95th percentile {:.1}s, longest {:.1}s",
+                seconds(at(50)),
+                seconds(at(95)),
+                seconds(durations.last().copied().unwrap_or_default())
+            );
+            let mut slowest = calls.clone();
+            slowest.sort_by_key(|record| std::cmp::Reverse(field(record, "duration_ms")));
+            let _ = writeln!(
+                out,
+                "\n| slowest | model | duration | input | output | tool calls |"
+            );
+            let _ = writeln!(out, "|---|---|---|---|---|---|");
+            for record in slowest.iter().take(5) {
+                let _ = writeln!(
+                    out,
+                    "| {} | {} | {:.1}s | {} | {} | {} |",
+                    ms_text(record["ms"].as_i64().unwrap_or_default()),
+                    record["fields"]["model"].as_str().unwrap_or("?"),
+                    seconds(field(record, "duration_ms").unwrap_or_default()),
+                    field(record, "input").map_or_else(|| "-".to_owned(), |n| n.to_string()),
+                    field(record, "output").map_or_else(|| "-".to_owned(), |n| n.to_string()),
+                    field(record, "tool_calls").unwrap_or_default(),
+                );
+            }
+            let _ = writeln!(out);
+        }
+        let summarized = self.recorded("compaction", "earlier_summarized");
+        let steps = self.recorded("compaction", "turn_steps_summarized").len();
+        let shortened = self.recorded("compaction", "tool_results_shortened").len();
+        let failed = self.recorded("compaction", "earlier_summary_failed").len()
+            + self.recorded("compaction", "turn_summary_failed").len();
+        if !summarized.is_empty() || steps + shortened + failed > 0 {
+            let written = summarized
+                .iter()
+                .filter(|record| record["fields"]["model_call"] == true)
+                .count();
+            let read_back = summarized
+                .iter()
+                .filter(|record| record["fields"]["model_call"] == false)
+                .count();
+            let _ = writeln!(out, "## Compaction\n");
+            let _ = writeln!(
+                out,
+                "- earlier conversation summarized: {} time(s) - {written} by a model call, {read_back} read back as kept{}",
+                summarized.len(),
+                if written + read_back < summarized.len() {
+                    ", the rest by a build that did not say"
+                } else {
+                    ""
+                }
+            );
+            let _ = writeln!(out, "- a turn's own steps summarized: {steps}");
+            let _ = writeln!(out, "- tool results shortened: {shortened}");
+            let _ = writeln!(out, "- summaries that failed: {failed}\n");
+        }
+        let mut tools: BTreeMap<String, (usize, usize, u64, u64)> = BTreeMap::new();
+        for (event, failed) in [("ok", false), ("failed", true)] {
+            for record in self.recorded("tool", event) {
+                let name = record["fields"]["tool"].as_str().unwrap_or("?").to_owned();
+                let elapsed = field(record, "elapsed_ms").unwrap_or_default();
+                let entry = tools.entry(name).or_default();
+                entry.0 += 1;
+                entry.1 += usize::from(failed);
+                entry.2 += elapsed;
+                entry.3 = entry.3.max(elapsed);
+            }
+        }
+        if !tools.is_empty() {
+            let mut tools = tools.into_iter().collect::<Vec<_>>();
+            tools.sort_by_key(|(_, (calls, ..))| std::cmp::Reverse(*calls));
+            let _ = writeln!(out, "## Tools\n");
+            let _ = writeln!(out, "| tool | calls | failed | total time | longest |");
+            let _ = writeln!(out, "|---|---|---|---|---|");
+            for (name, (calls, failed, total, longest)) in tools.iter().take(20) {
+                let _ = writeln!(
+                    out,
+                    "| `{name}` | {calls} | {failed} | {:.1}s | {:.1}s |",
+                    seconds(*total),
+                    seconds(*longest)
+                );
+            }
+            let _ = writeln!(out);
+        }
     }
 
     fn summary_header(&self, out: &mut String) {
@@ -1112,6 +1378,31 @@ fn record_text(record: &Value) -> String {
         (true, _) => fields,
         (false, true) => message.to_owned(),
         (false, false) => format!("{message} ({fields})"),
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a duration shown to a tenth of a second"
+)]
+fn seconds(ms: u64) -> f64 {
+    ms as f64 / 1000.0
+}
+
+/// Withhold the value of every secret-named key of a settings file.
+fn withhold_secret_values(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for (name, field) in fields.iter_mut() {
+                if secret_name(name) && !field.is_object() && !field.is_array() {
+                    *field = Value::String("[withheld]".to_owned());
+                } else {
+                    withhold_secret_values(field);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(withhold_secret_values),
+        _ => {}
     }
 }
 
