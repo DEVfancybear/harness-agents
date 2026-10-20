@@ -27,7 +27,7 @@ import types
 from pathlib import Path
 from typing import Any
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 ARTIFACTS = REPO / ".harness" / "artifacts" / "computer-use-smoke"
 ATTACHMENT_MIME = "application/vnd.prime-agent.attachment+json"
 MARKER_COLOR = (20, 120, 200)
