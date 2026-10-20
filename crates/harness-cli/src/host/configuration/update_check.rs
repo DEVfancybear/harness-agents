@@ -84,7 +84,7 @@ fn install_hint() -> &'static str {
     if from_npm {
         "`npm install -g harness-agents@latest`"
     } else {
-        "`npm install -g harness-agents@latest` (or `scripts/Install-Ha.ps1` in a checkout)"
+        "`npm install -g harness-agents@latest` (or `scripts/install/Install-Ha.ps1` in a checkout)"
     }
 }
 

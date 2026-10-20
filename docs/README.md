@@ -8,7 +8,7 @@ behaviour changed, and every reference was rewritten to the new path.
 
 | Folder | Documents |
 | --- | --- |
-| `architecture/` | [Architecture overview](architecture/ARCHITECTURE_OVERVIEW.en.md) · [Tổng quan kiến trúc](architecture/ARCHITECTURE_OVERVIEW.vi.md) · [Plugin architecture](architecture/PLUGIN_ARCHITECTURE.en.md) · [Kiến trúc plugin](architecture/PLUGIN_ARCHITECTURE.vi.md) |
+| `architecture/` | [Workspace folder layout](architecture/WORKSPACE_LAYOUT.md) · [Architecture overview](architecture/ARCHITECTURE_OVERVIEW.en.md) · [Tổng quan kiến trúc](architecture/ARCHITECTURE_OVERVIEW.vi.md) · [Plugin architecture](architecture/PLUGIN_ARCHITECTURE.en.md) · [Kiến trúc plugin](architecture/PLUGIN_ARCHITECTURE.vi.md) |
 | `guides/` | [Operator guide](guides/OPERATOR_GUIDE.en.md) · [Hướng dẫn vận hành](guides/OPERATOR_GUIDE.vi.md) · [Terminal interface](guides/TUI.md) · [Computer use](guides/COMPUTER_USE.md) · [Build and release](guides/BUILD_AND_RELEASE.md) |
 | `adr/` | Decision records ADR-N01 to ADR-N12 |
 | `support/` | [Strict execution support matrix](support/STRICT_EXECUTION_SUPPORT.vi.md) |
