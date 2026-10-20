@@ -428,7 +428,7 @@ Như prime-agent, child lồng nhau tới `RLM_MAX_DEPTH`, mặc định 2: chil
 
 | Nhóm | Lệnh |
 | --- | --- |
-| Trợ giúp và trạng thái | `/help`, `/hotkeys`, `/fullscreen`, `/session` (`/status`), `/config`, `/model [search]`, `/effort [level]` (`/thinking`), `/cost`, `/context` (`/usage`), `/system-prompt`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/subagent-model`, `/subagent-effort`, `/subagent-login`, `/subagent-logout`, `/rlm-max-depth`, `/skills`, `/logs` (nơi ghi log: mọi file `*.log` trong thư mục data và các file chẩn đoán), `/bug-report` (chẩn đoán của hội thoại này trong một file zip, [12.12](#1212-chẩn-đoán-và-báo-lỗi)) |
+| Trợ giúp và trạng thái | `/help`, `/hotkeys`, `/fullscreen`, `/session` (`/status`), `/config`, `/model [search]`, `/effort [level]` (`/thinking`), `/cost`, `/context` (`/usage`), `/system-prompt`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/subagent-model`, `/subagent-effort`, `/subagent-login`, `/subagent-logout`, `/rlm-max-depth`, `/skills`, `/bug-report` (chẩn đoán của hội thoại này trong một file zip, [12.12](#1212-chẩn-đoán-và-báo-lỗi)) |
 | Phiên và câu trả lời | `/new [--name <tên>] [[--] prompt]` (`/clear` xóa cả viewport), `/resume [id]`, `/name [name]` (`/rename`), `/more`, `/compact [instructions]`, `/export [path]` (mặc định là trang HTML; `.md`, `.html` cho một trang tự chứa, hoặc `.jsonl` cho file phiên của ha - dạng JSONL của prime-agent, một dòng header rồi mỗi dòng một message - chứa những gì model được gửi cho hội thoại này, đã che secret), `/import <path.jsonl>` (hội thoại mới tiếp nối hội thoại đã export, hoặc file phiên của prime-agent; file được chép vào `<data>/imports`), `/share`, `/new [prompt]`, `/heartbeat <chỉ dẫn>`, `/heartbeats`, `/copy`, `/fork [n]`, `/clone`, `/tree [n]`, `/btw <câu hỏi>` (`/side`), `/quit` (`/exit`) |
 | Workspace và điều khiển | `/undo`, `/trust [yes]`, `/init`, `/permissions [ask|auto-edit|full-auto]` (`/permission`, `/mode`), `/steer <text>`, `/queue [text|list|edit n text|drop n|up n|down n]` (`/followup`), `/stash`, `/goal <objective>|status|pause|resume|clear`, `/handoff [--reset] [trọng tâm]`, `/verify`, `/review [trọng tâm]`, `/features`, `/doctor`, `/checks [list|accept|reject <tên>]`, `/autonomous [status|off|on ...]`, `/schedule [list|add <khi nào> -- <prompt>|pause|resume|cancel <id>]` |
 
@@ -655,7 +655,7 @@ Bản 0.6.1 ghi lại những gì đã xảy ra, để tìm bug từ một file 
   - Không có `--include-content` thì không đọc nội dung request, checkpoint hay setting dài, chỉ đọc kích thước.
   - Không bao giờ đọc `private/`, trạng thái pickle của kernel, attachment và artifact.
   - Giá trị secret đã biết bị che (key provider trong môi trường và trong file credential), và các mẫu secret cũng vậy. `manifest.json` ghi số lần che.
-- **`/bug-report`** ghi cùng gói zip đó cho 24 giờ gần nhất của hội thoại đang mở, vào `<data dir>/bug-reports/`. `/logs` cũng liệt kê các file chẩn đoán.
+- **`/bug-report`** ghi cùng gói zip đó cho 24 giờ gần nhất của hội thoại đang mở, vào `<data dir>/bug-reports/`.
 - **`ha diag timeline`** in timeline gộp. Lệnh nhận `--since 2h`, `--task`, `--session`, `--level warn` và `--json`.
 
 ### 12.13. Knowledge, Self-Evolution và Deep Dream

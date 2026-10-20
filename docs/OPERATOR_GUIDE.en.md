@@ -429,7 +429,7 @@ As in prime-agent, children nest up to `RLM_MAX_DEPTH`, 2 by default: a child of
 
 | Group | Commands |
 | --- | --- |
-| Help and state | `/help`, `/hotkeys`, `/fullscreen`, `/session` (`/status`), `/config`, `/model [search]`, `/effort [level]` (`/thinking`), `/cost`, `/context` (`/usage`), `/system-prompt`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/subagent-model`, `/subagent-effort`, `/subagent-login`, `/subagent-logout`, `/rlm-max-depth`, `/skills`, `/logs` (where the logs are: every `*.log` under the data directory and the diagnostics files), `/bug-report` (this conversation's diagnostics in one zip, [12.12](#1212-diagnostics-and-bug-reports)) |
+| Help and state | `/help`, `/hotkeys`, `/fullscreen`, `/session` (`/status`), `/config`, `/model [search]`, `/effort [level]` (`/thinking`), `/cost`, `/context` (`/usage`), `/system-prompt`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/subagent-model`, `/subagent-effort`, `/subagent-login`, `/subagent-logout`, `/rlm-max-depth`, `/skills`, `/bug-report` (this conversation's diagnostics in one zip, [12.12](#1212-diagnostics-and-bug-reports)) |
 | Session and answer | `/new [--name <name>] [[--] prompt]` (`/clear` also clears the viewport), `/resume [id]`, `/name [name]` (`/rename`), `/more`, `/compact [instructions]`, `/export [path]` (an HTML page by default; `.md`, `.html` for one self-contained page, or `.jsonl` for ha's session file - prime-agent's JSONL shape, a header then one line per message - holding what the model is sent for this conversation, secrets redacted), `/import <path.jsonl>` (a new conversation that continues an exported one, or a prime-agent session file; the file is copied under `<data>/imports`), `/share`, `/new [prompt]`, `/heartbeat <instruction>`, `/heartbeats`, `/copy`, `/fork [n]`, `/clone`, `/tree [n]`, `/btw <question>` (`/side`), `/quit` (`/exit`) |
 | Workspace and control | `/undo`, `/trust [yes]`, `/init`, `/permissions [ask|auto-edit|full-auto]` (`/permission`, `/mode`), `/steer <text>`, `/queue [text|list|edit n text|drop n|up n|down n]` (`/followup`), `/stash`, `/goal <objective>|status|pause|resume|clear`, `/handoff [--reset] [focus]`, `/verify`, `/review [focus]`, `/features`, `/doctor`, `/checks [list|accept|reject <name>]`, `/autonomous [status|off|on ...]`, `/schedule [list|add <when> -- <prompt>|pause|resume|cancel <id>]` |
 
@@ -656,7 +656,7 @@ A task of hundreds of steps passes through many compactions, and what a compacti
   - Without `--include-content`, no request body, checkpoint or long setting is read, only its size.
   - `private/`, the kernel's pickled state, attachments and artifacts are never read.
   - Known secret values are redacted (the provider keys in the environment and in the credential file), and so are secret patterns. `manifest.json` has the count.
-- **`/bug-report`** writes the same zip for the last 24 hours of the open conversation, into `<data dir>/bug-reports/`. `/logs` also lists the diagnostics files.
+- **`/bug-report`** writes the same zip for the last 24 hours of the open conversation, into `<data dir>/bug-reports/`.
 - **`ha diag timeline`** prints the merged timeline. It takes `--since 2h`, `--task`, `--session`, `--level warn` and `--json`.
 
 ### 12.13. Knowledge, Self-Evolution and Deep Dream

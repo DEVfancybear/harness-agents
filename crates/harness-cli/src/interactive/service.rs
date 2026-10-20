@@ -423,10 +423,6 @@ pub trait SessionPort: Send {
     fn label_turn(&mut self, _session: &str, _label: &str) -> Result<(), String> {
         Err("this backend keeps no conversation".to_owned())
     }
-    /// prime-agent's `/logs`: where the app writes its logs and what is there.
-    fn logs(&self) -> Vec<String> {
-        vec!["No logs written yet.".to_owned()]
-    }
     /// `/bug-report`: this conversation's bug report, written as a zip; the
     /// lines say where and what it holds.
     fn bug_report(&self) -> Vec<String> {
@@ -3103,79 +3099,6 @@ fn sort_newest_first(sessions: &mut [harness_store_sqlite::SessionSummary]) {
     });
 }
 
-/// prime-agent's `/logs` listing over ha's data directory: every `*.log` the
-/// app wrote there (the kernel's stderr logs, the workers' logs), as
-/// `• name (N.N KB)`, sorted. prime-agent keeps its logs in one directory; ha
-/// writes them next to what they log, so the names are paths under the data
-/// directory. An empty log says nothing and is not listed (older builds left
-/// one per kernel), and the directories that never hold a log - the kernel's
-/// virtual environment, the project stores - are not walked.
-fn log_lines(data_dir: &Path) -> Vec<String> {
-    const NO_LOGS: &[&str] = &["kernel-venv", "projects", "cache", "attachments"];
-    fn walk(dir: &Path, depth: usize, found: &mut Vec<(String, u64)>, root: &Path) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || (dir == root && NO_LOGS.contains(&name.as_str())) {
-                continue;
-            }
-            let path = entry.path();
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_dir() && depth > 0 {
-                walk(&path, depth - 1, found, root);
-            } else if kind.is_file()
-                && path.extension().is_some_and(|extension| {
-                    extension == "log"
-                        || (extension == "jsonl"
-                            && dir
-                                .file_name()
-                                .is_some_and(|name| name == crate::diagnostics::DIRECTORY))
-                })
-            {
-                let size = entry.metadata().map_or(0, |metadata| metadata.len());
-                if size == 0 {
-                    continue;
-                }
-                let shown = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .display()
-                    .to_string()
-                    .replace('\\', "/");
-                found.push((shown, size));
-            }
-        }
-    }
-    let mut found = Vec::new();
-    walk(data_dir, 4, &mut found, data_dir);
-    found.sort();
-    let mut lines = vec![format!("Directory: {}", data_dir.display())];
-    // `HA_DIAG_DIR` can put the diagnostic log elsewhere.
-    if let Some(diagnostics) = crate::diagnostics::directory()
-        && !diagnostics.starts_with(data_dir)
-    {
-        lines.push(format!("Diagnostics: {}", diagnostics.display()));
-    }
-    if found.is_empty() {
-        lines.push("No logs written yet.".to_owned());
-    } else {
-        lines.extend(found.into_iter().map(|(name, size)| {
-            #[allow(clippy::cast_precision_loss, reason = "a size shown to one decimal")]
-            let kib = size as f64 / 1024.0;
-            format!("• {name} ({kib:.1} KB)")
-        }));
-    }
-    lines.push(
-        "/bug-report (or `ha bug-report`) puts them, with what the stores recorded, in one zip to send."
-            .to_owned(),
-    );
-    lines
-}
-
 /// The session setting a turn's tree label is kept in, followed by its session id.
 const TURN_LABEL_PREFIX: &str = "label:";
 
@@ -4593,10 +4516,6 @@ impl SessionPort for AgentSessionService {
             );
         }
         commands
-    }
-
-    fn logs(&self) -> Vec<String> {
-        log_lines(&self.data_dir)
     }
 
     fn bug_report(&self) -> Vec<String> {
@@ -6442,9 +6361,9 @@ impl SessionPort for AgentSessionService {
             )?;
         }
         Ok(if super::config::harness_refinements(&self.config_file) {
-            "Harness refinements: on. Turns carry the memory digest and the memory tool, and the review, /refine and /learn keep improving the harness; /refinements off stops all of it (saved state is kept).".to_owned()
+            "Harness refinements are ON. Turns carry the memory digest and the memory tool, and the review, /refine and /learn keep improving the harness. To turn them off: /refinements off (what is saved is kept).".to_owned()
         } else {
-            "Harness refinements: off (settings.json harnessRefinements). No saved memory, prompt note or skill entry reaches a turn, and nothing is refined; what is saved is kept. /refinements on turns them back on.".to_owned()
+            "Harness refinements are OFF (settings.json harnessRefinements). No saved memory, prompt note or skill entry reaches a turn, and nothing is refined; what is saved is kept. To turn them on: /refinements on.".to_owned()
         })
     }
 
@@ -13262,58 +13181,5 @@ mod tests {
             std::fs::write(home.path().join("settings.json"), unset).expect("settings");
             assert_eq!(super::subagent_default_model(&config), None, "{unset}");
         }
-    }
-
-    /// prime-agent's `/logs` shows the directory and each log as
-    /// `• name (N.N KB)`; ha's logs sit under the data directory.
-    #[test]
-    fn logs_lists_every_log_under_the_data_directory() {
-        let temp = tempfile::tempdir().expect("temp");
-        let data = temp.path();
-        let lines = super::log_lines(data);
-        assert_eq!(
-            lines[..2],
-            [
-                format!("Directory: {}", data.display()),
-                "No logs written yet.".to_owned()
-            ]
-        );
-        assert!(lines[2].starts_with("/bug-report"), "{lines:?}");
-        std::fs::create_dir_all(data.join("repl")).expect("repl");
-        std::fs::write(
-            data.join("repl").join("kernel-stderr.log"),
-            vec![b'x'; 2048],
-        )
-        .expect("log");
-        std::fs::create_dir_all(data.join("sessions").join("c1").join("kernel")).expect("kernel");
-        std::fs::write(
-            data.join("sessions")
-                .join("c1")
-                .join("kernel")
-                .join("kernel-stderr.log"),
-            "boom",
-        )
-        .expect("log");
-        std::fs::write(data.join(".hidden.log"), "x").expect("hidden");
-        std::fs::create_dir_all(data.join("sessions").join("c2").join("kernel")).expect("kernel");
-        std::fs::write(
-            data.join("sessions")
-                .join("c2")
-                .join("kernel")
-                .join("kernel-stderr.log"),
-            "",
-        )
-        .expect("an empty log");
-        std::fs::create_dir_all(data.join("kernel-venv").join("Lib")).expect("venv");
-        std::fs::write(data.join("kernel-venv").join("Lib").join("pip.log"), "x")
-            .expect("a log in the venv");
-        std::fs::write(data.join("notes.txt"), "x").expect("not a log");
-        assert_eq!(
-            super::log_lines(data)[1..3],
-            [
-                "• repl/kernel-stderr.log (2.0 KB)".to_owned(),
-                "• sessions/c1/kernel/kernel-stderr.log (0.0 KB)".to_owned(),
-            ]
-        );
     }
 }

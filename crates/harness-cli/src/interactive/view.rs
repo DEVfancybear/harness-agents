@@ -273,7 +273,6 @@ pub fn help_card_lines() -> Vec<String> {
                 "!command",
                 "/hotkeys",
                 "/fullscreen",
-                "/logs",
                 "/bug-report",
                 "/quit",
             ],

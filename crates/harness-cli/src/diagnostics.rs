@@ -444,12 +444,6 @@ pub fn location(data_dir: &Path) -> PathBuf {
         .map_or_else(|| data_dir.join(DIRECTORY), PathBuf::from)
 }
 
-/// The diagnostics directory this process writes to, when it has one.
-#[must_use]
-pub fn directory() -> Option<PathBuf> {
-    SINK.get().map(|sink| sink.dir.clone())
-}
-
 /// Delete files older than [`KEEP_DAYS`] days, then the oldest until the
 /// directory holds at most [`DIRECTORY_BYTES`].
 fn prune(dir: &Path, now: std::time::SystemTime) {

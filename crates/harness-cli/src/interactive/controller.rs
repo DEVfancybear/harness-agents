@@ -3199,11 +3199,6 @@ impl InteractiveController {
         ]
     }
 
-    /// Send one request to the service.
-    ///
-    /// `automatic` marks a continuation the app started because a bound stopped the
-    /// previous turn. It does not reset the budget, which is what makes the budget a
-    /// budget rather than an infinite loop.
     /// Appends the reports held since a Ctrl-C to the user's message and
     /// lifts the hold; returns how many were folded in.
     fn fold_held_notices(&mut self, sent: &mut String) -> usize {
@@ -3228,6 +3223,11 @@ impl InteractiveController {
         folded
     }
 
+    /// Send one request to the service.
+    ///
+    /// `automatic` marks a continuation the app started because a bound stopped the
+    /// previous turn. It does not reset the budget, which is what makes the budget a
+    /// budget rather than an infinite loop.
     fn dispatch(&mut self, text: String, automatic: bool) -> Vec<Effect> {
         if matches!(text.split_whitespace().next(), Some("/exit" | "/quit")) {
             return self.command(&text);
@@ -3329,7 +3329,7 @@ impl InteractiveController {
                 &mut effects,
                 HistoryItem::Notice {
                     message: format!(
-                        "{folded} report(s) of delegated agents held since the stop go with this message"
+                        "{folded} delegated agent report(s) that arrived after you stopped the run were sent along with this message"
                     ),
                 },
             );
@@ -4329,8 +4329,6 @@ impl InteractiveController {
                 }
                 effects.push(Effect::Redraw);
             }
-            // prime-agent's `/logs`.
-            "/logs" => self.reference("Logs", self.service.logs(), &mut effects),
             "/bug-report" => {
                 let lines = self.service.bug_report();
                 self.reference("Bug report", lines, &mut effects);
@@ -10613,7 +10611,10 @@ Command: \"npm run build\""
             "
 ",
         );
-        assert!(shown.contains("2 report(s) of delegated agents"), "{shown}");
+        assert!(
+            shown.contains("2 delegated agent report(s) that arrived after you stopped"),
+            "{shown}"
+        );
     }
 
     /// Q02: an idle parent reads a child's notice in a turn of its own, at once.
