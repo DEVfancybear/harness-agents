@@ -131,6 +131,9 @@ check "it names the store another run held" 'grep -q "store.open_failed" "$S"'
 check "it names the refused provider" 'grep -Eqi "provider|no-such-model" "$S"'
 check "its timeline has the turns and the compaction" 'grep -q "turn.start" "$RX/report/timeline.jsonl" && grep -q "compaction\." "$RX/report/timeline.jsonl"'
 check "it holds the stores and the workers' logs" 'ls "$RX"/report/store/project-*.json >/dev/null && ls "$RX"/report/workers/*.log >/dev/null'
+check "its summary has the turns, the model calls and the tools" 'grep -q "^## Turns" "$S" && grep -q "^## Model calls" "$S" && grep -q "^## Tools" "$S"'
+check "the model calls carry their tokens and duration" 'grep -q "\"event\":\"call\"" "$RX"/report/diagnostics/*.jsonl && grep -q "duration_ms" "$RX"/report/diagnostics/*.jsonl'
+check "no record's time was redacted" '! grep -q "\"ms\":\"\[REDACTED" "$RX"/report/diagnostics/*.jsonl'
 check "it holds no credential" '"$PY" - "$HA_CREDENTIALS_DIR" "$RX/report" <<'"'"'EOF'"'"'
 import json, os, sys
 values = set()
