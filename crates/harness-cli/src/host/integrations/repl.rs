@@ -33,7 +33,9 @@
 //! `run_shell`. It is offered only when a Python 3.11+ interpreter is found
 //! (`HA_PYTHON`, else `python3`/`python`/`py -3` on `PATH`); `HA_REPL=off` removes it.
 
+#[path = "repl/journal.rs"]
 mod journal;
+#[path = "repl/stderr.rs"]
 mod stderr;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -124,25 +126,31 @@ const PROTOCOL_EVENT_KINDS: [&str; 8] = [
 
 /// The vendored runtime, embedded so a single binary carries it.
 const RUNTIME_FILES: [(&str, &str); 11] = [
-    ("__init__.py", include_str!("../../python/rlm/__init__.py")),
-    ("repl.py", include_str!("../../python/rlm/repl.py")),
-    ("bash.py", include_str!("../../python/rlm/bash.py")),
-    ("_winjob.py", include_str!("../../python/rlm/_winjob.py")),
-    ("harness.py", include_str!("../../python/rlm/harness.py")),
-    ("mcp.py", include_str!("../../python/rlm/mcp.py")),
-    ("mcp_base.py", include_str!("../../python/rlm/mcp_base.py")),
-    ("factory.py", include_str!("../../python/rlm/factory.py")),
+    (
+        "__init__.py",
+        include_str!("../../../python/rlm/__init__.py"),
+    ),
+    ("repl.py", include_str!("../../../python/rlm/repl.py")),
+    ("bash.py", include_str!("../../../python/rlm/bash.py")),
+    ("_winjob.py", include_str!("../../../python/rlm/_winjob.py")),
+    ("harness.py", include_str!("../../../python/rlm/harness.py")),
+    ("mcp.py", include_str!("../../../python/rlm/mcp.py")),
+    (
+        "mcp_base.py",
+        include_str!("../../../python/rlm/mcp_base.py"),
+    ),
+    ("factory.py", include_str!("../../../python/rlm/factory.py")),
     (
         "machines/builder/MACHINE.md",
-        include_str!("../../python/rlm/machines/builder/MACHINE.md"),
+        include_str!("../../../python/rlm/machines/builder/MACHINE.md"),
     ),
     (
         "machines/pr-manager/MACHINE.md",
-        include_str!("../../python/rlm/machines/pr-manager/MACHINE.md"),
+        include_str!("../../../python/rlm/machines/pr-manager/MACHINE.md"),
     ),
     (
         "machines/review-sweep/MACHINE.md",
-        include_str!("../../python/rlm/machines/review-sweep/MACHINE.md"),
+        include_str!("../../../python/rlm/machines/review-sweep/MACHINE.md"),
     ),
 ];
 

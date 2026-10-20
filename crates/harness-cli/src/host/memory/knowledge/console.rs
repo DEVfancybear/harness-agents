@@ -475,28 +475,28 @@ async fn respond(
 }
 
 fn asset(path: &str) -> Option<(&'static str, &'static str)> {
-    const ROOT: &str = include_str!("../../../assets/knowledge-console/index.html");
-    const JS: &str = include_str!("../../../assets/knowledge-console/app.js");
-    const CSS: &str = include_str!("../../../assets/knowledge-console/app.css");
+    const ROOT: &str = include_str!("../../../../assets/knowledge-console/index.html");
+    const JS: &str = include_str!("../../../../assets/knowledge-console/app.js");
+    const CSS: &str = include_str!("../../../../assets/knowledge-console/app.css");
     match path {
         "/" => Some(("text/html; charset=utf-8", ROOT)),
         "/app.js" => Some((ASSETS, JS)),
         "/app.css" => Some(("text/css; charset=utf-8", CSS)),
         "/vendor/marked.min.js" => Some((
             ASSETS,
-            include_str!("../../../assets/knowledge-console/vendor/marked.min.js"),
+            include_str!("../../../../assets/knowledge-console/vendor/marked.min.js"),
         )),
         "/vendor/purify.min.js" => Some((
             ASSETS,
-            include_str!("../../../assets/knowledge-console/vendor/purify.min.js"),
+            include_str!("../../../../assets/knowledge-console/vendor/purify.min.js"),
         )),
         "/vendor/LICENSE-marked.txt" => Some((
             "text/plain; charset=utf-8",
-            include_str!("../../../assets/knowledge-console/vendor/LICENSE-marked.txt"),
+            include_str!("../../../../assets/knowledge-console/vendor/LICENSE-marked.txt"),
         )),
         "/vendor/LICENSE-DOMPurify.txt" => Some((
             "text/plain; charset=utf-8",
-            include_str!("../../../assets/knowledge-console/vendor/LICENSE-DOMPurify.txt"),
+            include_str!("../../../../assets/knowledge-console/vendor/LICENSE-DOMPurify.txt"),
         )),
         _ => None,
     }
