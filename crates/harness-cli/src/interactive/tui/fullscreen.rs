@@ -19,8 +19,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ratatui::backend::Backend;
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::buffer::{Buffer, Cell};
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -544,6 +544,14 @@ pub struct FullscreenScreen<B: Backend> {
     viewport: Viewport,
     /// A drag held at an edge: its direction, cell and last scroll.
     auto_scroll: Option<(isize, u16, u16, Instant)>,
+    /// How many rows the oldest entries took that were dropped: a row's
+    /// place counted from the conversation's start, across drops.
+    dropped_rows: usize,
+    /// The screen, the window and the window's first row (counted with
+    /// `dropped_rows`) of the last frame, while the screen still shows it.
+    last_window: Option<(Rect, Rect, usize)>,
+    /// How many frames moved the window's rows with the terminal.
+    scrolled_frames: u64,
 }
 
 impl<B: Backend> FullscreenScreen<B>
@@ -582,6 +590,9 @@ where
             assistant_continuing,
             viewport: Viewport::default(),
             auto_scroll: None,
+            dropped_rows: 0,
+            last_window: None,
+            scrolled_frames: 0,
         })
     }
 
@@ -680,6 +691,7 @@ where
             *count = new;
             shift = (dropped + old).saturating_sub(new);
         }
+        self.dropped_rows += shift;
         self.viewport.rows_removed(shift);
     }
 
@@ -720,6 +732,7 @@ where
     /// # Errors
     /// The terminal cannot be cleared.
     pub fn clear(&mut self) -> io::Result<()> {
+        self.last_window = None;
         self.terminal.clear().map_err(to_io)
     }
 
@@ -743,10 +756,17 @@ where
             self.dock_floor = 0;
         }
         let dock_floor = &mut self.dock_floor;
-        let mut dock_top = 0;
-        let completed = self
-            .terminal
-            .draw(|frame| {
+        let dock_top;
+        let (drawn_window, drawn_top);
+        let mut cursor = None;
+        // Drawn by hand rather than with `Terminal::draw`, so that rows the
+        // window only moved are moved by the terminal (`scroll_window`)
+        // before the frame is written.
+        self.terminal.autoresize().map_err(to_io)?;
+        let area = {
+            let mut frame = self.terminal.get_frame();
+            let frame = &mut frame;
+            {
                 let area = frame.area();
                 // prime-agent's top bar is taken from the window, never from the
                 // dock, and goes first when the screen is short.
@@ -807,6 +827,7 @@ where
                     },
                 );
                 let top = viewport.compose(rows.len(), window.y, window.height);
+                (drawn_window, drawn_top) = (window, top);
                 let visible = rows
                     .iter()
                     .skip(top)
@@ -833,6 +854,7 @@ where
                 super::toast::render(frame, window, &theme);
                 if let Some((x, y)) = plan.cursor {
                     frame.set_cursor_position((x, y));
+                    cursor = Some(Position::new(x, y));
                 }
                 // prime-agent's follow hint, on the spacer row below the
                 // window: drawn over the window's last row, it hid that row.
@@ -859,10 +881,57 @@ where
                 for rect in viewport.highlighted(area.width) {
                     buffer.set_style(rect, Style::new().add_modifier(Modifier::REVERSED));
                 }
-            })
+            }
+            frame.area()
+        };
+        self.scroll_window(area, drawn_window, drawn_top)?;
+        let completed = self
+            .terminal
+            .apply_buffer_with_cursor(cursor)
             .map_err(to_io)?;
         self.viewport.frame = completed.buffer.clone();
         self.viewport.selectable_from = if state.modal.is_some() { 0 } else { dock_top };
+        Ok(())
+    }
+
+    /// Move the rows the window only moved with the terminal. A wheel notch
+    /// changed every row of the window, and writing them all through the
+    /// Windows console was what lagged behind the wheel on a long
+    /// conversation. The terminal scrolls the window's region, ratatui is
+    /// told the screen now shows the last frame shifted, and only the rows
+    /// that came into view - and whatever else changed - are written.
+    fn scroll_window(&mut self, area: Rect, window: Rect, top: usize) -> io::Result<()> {
+        let top = top + self.dropped_rows;
+        let Some((last_area, last_window, last_top)) =
+            self.last_window.replace((area, window, top))
+        else {
+            return Ok(());
+        };
+        let up = top > last_top;
+        let amount = top.abs_diff(last_top);
+        if last_area != area
+            || last_window != window
+            || self.viewport.frame.area != area
+            || amount == 0
+            || amount >= usize::from(window.height)
+        {
+            return Ok(());
+        }
+        let shown = shifted(&self.viewport.frame, window, up, amount);
+        let drawn = std::mem::take(self.terminal.current_buffer_mut());
+        *self.terminal.current_buffer_mut() = shown;
+        self.terminal.swap_buffers();
+        *self.terminal.current_buffer_mut() = drawn;
+        let region = window.y..window.y + window.height;
+        let amount = u16::try_from(amount).unwrap_or(u16::MAX);
+        let backend = self.terminal.backend_mut();
+        if up {
+            backend.scroll_region_up(region, amount)
+        } else {
+            backend.scroll_region_down(region, amount)
+        }
+        .map_err(to_io)?;
+        self.scrolled_frames += 1;
         Ok(())
     }
 
@@ -957,6 +1026,27 @@ where
     pub fn follow(&mut self) {
         self.viewport.scroll_to_bottom();
     }
+}
+
+/// `frame` as the screen shows it once the terminal scrolled `window` by
+/// `amount` rows (`up`: its rows moved up): the rows that left are gone and
+/// the rows that came in are blank.
+fn shifted(frame: &Buffer, window: Rect, up: bool, amount: usize) -> Buffer {
+    let mut shown = frame.clone();
+    let width = usize::from(frame.area.width);
+    let start = usize::from(window.y.saturating_sub(frame.area.y)) * width;
+    let end = (start + usize::from(window.height) * width).min(shown.content.len());
+    let region = &mut shown.content[start.min(end)..end];
+    let cells = (amount * width).min(region.len());
+    if up {
+        region.rotate_left(cells);
+        let kept = region.len() - cells;
+        region[kept..].fill_with(Cell::default);
+    } else {
+        region.rotate_right(cells);
+        region[..cells].fill_with(Cell::default);
+    }
+    shown
 }
 
 /// prime-agent's `TopBar`: the chat's name centered in plain text, its spend
@@ -1128,6 +1218,94 @@ mod tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    /// A wheel notch moves the window's rows with the terminal and writes only
+    /// the rows that came in; whatever happens between frames - the wheel
+    /// either way, a page, rows arriving while following or scrolled back,
+    /// the oldest entries dropped at the cap - the screen shows exactly the
+    /// frame that was drawn.
+    #[test]
+    fn rows_the_window_only_moved_are_moved_by_the_terminal() {
+        let mut screen = screen(70, 24);
+        let mut state = crate::interactive::tui::tests::idle_state();
+        let items = (0..super::REPRINT_ENTRIES)
+            .map(|index| {
+                if index % 7 == 0 {
+                    HistoryItem::Assistant {
+                        text: format!("**Step {index}**\n\n- one\n- two `code`\n"),
+                    }
+                } else {
+                    HistoryItem::Notice {
+                        message: format!("row {index} {}", "x".repeat(index % 50)),
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        screen.restore(&items);
+        screen.draw(&state).expect("drawn");
+        let wheel = |kind| MouseInput {
+            kind,
+            column: 5,
+            row: 5,
+            modified: false,
+        };
+        let check = |screen: &FullscreenScreen<ratatui::backend::TestBackend>, step: &str| {
+            assert!(
+                screen.backend().buffer() == &screen.viewport.frame,
+                "after {step} the screen is not the frame drawn:\n{}",
+                painted(screen).join("\n")
+            );
+        };
+        for step in 0..12 {
+            let _ = screen.mouse(wheel(MouseKind::WheelUp), false);
+            screen.draw(&state).expect("drawn");
+            check(&screen, &format!("wheel up {step}"));
+        }
+        assert!(
+            screen.scrolled_frames >= 12,
+            "each notch moved the rows: {}",
+            screen.scrolled_frames
+        );
+        let rows = painted(&screen);
+        assert!(
+            rows.iter().any(|row| row.contains("ctrl+end to follow")),
+            "{rows:?}"
+        );
+        // Rows arriving at the cap while the reader is scrolled back: the
+        // oldest are dropped and the view holds still.
+        for index in 0..5 {
+            screen.insert_history_batch(&[HistoryItem::Notice {
+                message: format!("late {index}"),
+            }]);
+            screen.draw(&state).expect("drawn");
+            check(&screen, &format!("late row {index}"));
+        }
+        for step in 0..5 {
+            let _ = screen.mouse(wheel(MouseKind::WheelDown), false);
+            screen.draw(&state).expect("drawn");
+            check(&screen, &format!("wheel down {step}"));
+        }
+        screen.page(false);
+        screen.draw(&state).expect("drawn");
+        check(&screen, "a page up");
+        screen.follow();
+        screen.draw(&state).expect("drawn");
+        check(&screen, "following again");
+        // Following, new rows move the window by as many rows.
+        for index in 0..4 {
+            screen.insert_history_batch(&[HistoryItem::Notice {
+                message: format!("new {index}"),
+            }]);
+            state.tick += 1;
+            screen.draw(&state).expect("drawn");
+            check(&screen, &format!("new row {index}"));
+        }
+        assert!(painted(&screen).iter().any(|row| row.contains("new 3")));
+        // A changed screen size is drawn whole.
+        screen.terminal.backend_mut().resize(80, 26);
+        screen.draw(&state).expect("drawn");
+        check(&screen, "a resize");
     }
 
     #[test]
