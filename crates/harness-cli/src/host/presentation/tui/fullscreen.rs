@@ -2327,7 +2327,10 @@ mod tests {
     /// --ignored frame_cost --nocapture` prints the costs; nothing is asserted.
     #[test]
     #[ignore = "a measurement, run by hand"]
-    #[allow(clippy::too_many_lines, reason = "one heavy screen, timed step by step")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one heavy screen, timed step by step"
+    )]
     fn frame_cost() {
         use crate::interactive::events::{
             AppPhase, ChildActivity, ChildLine, ChildLineKind, ChildRunState, ToolState,
