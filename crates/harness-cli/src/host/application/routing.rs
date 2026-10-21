@@ -322,6 +322,11 @@ pub struct Router {
     failures: AtomicU32,
     on_backup: AtomicBool,
     gave_up: AtomicBool,
+    /// The error that parked this turn until the provider's reset. The
+    /// runtime's later attempts end with it at once: they used to call the
+    /// provider again, fail on the same limit, and end the turn with that bare
+    /// error instead of the one saying when the session resumes.
+    parked: Mutex<Option<ProviderError>>,
     told: Mutex<Vec<String>>,
 }
 
@@ -353,6 +358,7 @@ impl Router {
             failures: AtomicU32::new(0),
             on_backup: AtomicBool::new(false),
             gave_up: AtomicBool::new(false),
+            parked: Mutex::new(None),
             told: Mutex::new(Vec::new()),
         }
     }
@@ -383,6 +389,9 @@ impl Router {
         request: ProviderRequest,
         cancellation: CancellationToken,
     ) -> ProviderEventStream {
+        if let Some(parked) = self.parked.lock().ok().and_then(|parked| parked.clone()) {
+            return failed(parked);
+        }
         let has_images = request
             .messages
             .iter()
@@ -629,14 +638,18 @@ impl Router {
             + chrono::Duration::from_std(pause).unwrap_or(chrono::Duration::zero());
         let at = until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let _ = self.sender.send(SessionEvent::QuotaParked { until });
-        ProviderError::new(
+        let parked = ProviderError::new(
             ErrorCode::RateLimited,
             format!(
                 "Retry failed after {attempts} attempts: provider reported recovery in {}s, beyond the wait bound of {}s. Session parked until {at} and will resume automatically: {error}",
                 reset.as_secs(),
                 wait.max_total.as_secs()
             ),
-        )
+        );
+        if let Ok(mut kept) = self.parked.lock() {
+            *kept = Some(parked.clone());
+        }
+        parked
     }
 }
 
@@ -1275,6 +1288,38 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(primary.calls(), 4);
+    }
+
+    /// A reset beyond the wait parks the session. The runtime's next attempts
+    /// of the call end with that park, calling the provider no more: they used
+    /// to fail on the same limit and end the turn with its bare error, which
+    /// did not say when the session resumes.
+    #[tokio::test]
+    async fn q13_a_parked_turn_ends_with_the_park_and_calls_no_more() {
+        let primary = std::sync::Arc::new(Failing {
+            errors: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            forever: Some(harness_providers::ProviderError::new(
+                harness_types::ErrorCode::RateLimited,
+                "You have hit your usage limit (plus plan). Try again in ~204 min.",
+            )),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (turn, _events) = router(true, None, None, Some(quick(30)), std::sync::Arc::default());
+        let token = harness_providers::CancellationToken::new;
+        for _ in 0..3 {
+            let error = call(&turn, primary.clone(), request(false), token())
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("will resume automatically"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            primary.calls(),
+            1,
+            "the parked turn asked the provider once"
+        );
     }
 
     #[tokio::test]
