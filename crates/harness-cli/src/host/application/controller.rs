@@ -3604,12 +3604,29 @@ impl InteractiveController {
     /// only `goal_complete` is. No count of turns ends it: its token budget, when it
     /// has one, Ctrl-C and `/goal pause` do.
     fn continue_goal(&mut self, outcome: &RunOutcome) -> Vec<Effect> {
+        if self
+            .goal
+            .as_ref()
+            .is_none_or(|goal| goal.status != GoalStatus::Active)
+            || !matches!(outcome, RunOutcome::Done)
+        {
+            return Vec::new();
+        }
+        // A turn that ends while its children work is not the goal stalling:
+        // their reports start the next turn, as the autonomous run waits for
+        // them. Continuing anyway sent the model over its whole conversation
+        // again, compacting it, to nudge coders that were still busy.
+        let running = self.service.running_children();
+        if running > 0 {
+            return vec![Effect::History(HistoryItem::Notice {
+                message: format!(
+                    "goal: {running} child(ren) still working; their reports carry the goal on"
+                ),
+            })];
+        }
         let Some(goal) = &mut self.goal else {
             return Vec::new();
         };
-        if goal.status != GoalStatus::Active || !matches!(outcome, RunOutcome::Done) {
-            return Vec::new();
-        }
         goal.continuations += 1;
         let text = super::goal::continuation_text(goal);
         let mut effects = vec![Effect::History(HistoryItem::Notice {
@@ -6612,11 +6629,18 @@ mod tests {
         child_answers: Arc<Mutex<Vec<(String, String)>>>,
         /// The project's `[verify]` checks.
         verify_checks: Arc<Mutex<Vec<crate::interactive::verify::Check>>>,
+        /// How many delegated children the port says are still working.
+        running_children: Arc<std::sync::atomic::AtomicUsize>,
         /// Whether each submission was the host's own (`automatic`).
         automatics: Arc<Mutex<Vec<bool>>>,
     }
 
     impl SessionPort for RecordingPort {
+        fn running_children(&self) -> usize {
+            self.running_children
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
         fn park_until(&mut self, until: chrono::DateTime<chrono::Utc>) -> Result<String, String> {
             Ok(format!("Session parked until {until}"))
         }
@@ -11251,6 +11275,41 @@ Command: \"npm run build\""
     )]
     fn last_goal(harness: &Bench) -> Option<Option<String>> {
         harness.port.goals.lock().expect("goal log").last().cloned()
+    }
+
+    /// A goal's turn that ends while children work waits for their reports: it
+    /// continued at once, sending the model over its whole conversation to nudge
+    /// coders that were still busy. Once none run, the goal carries on.
+    #[test]
+    fn a_goal_waits_for_its_children_before_it_continues() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "/goal ship the parser fix");
+        harness
+            .port
+            .running_children
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        let plain = end_done(&mut harness);
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("goal: 2 child(ren) still working")),
+            "{plain:#?}"
+        );
+        assert_eq!(submissions(&harness).len(), 1, "no turn while they work");
+
+        harness
+            .port
+            .running_children
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let plain = end_done(&mut harness);
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("goal not complete yet; continuing (turn 1)")),
+            "{plain:#?}"
+        );
+        assert_eq!(submissions(&harness).len(), 2);
     }
 
     /// prime-agent's persistent goals: a turn that ends is not a goal that is done. The

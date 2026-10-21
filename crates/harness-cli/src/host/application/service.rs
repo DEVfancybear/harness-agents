@@ -888,9 +888,10 @@ impl ChannelApprovalGate {
         self.turn_rules.clone()
     }
 
-    /// Clear ephemeral confirmations at the start of a new user input.
-    pub fn clear_turn_rules(&self) {
-        self.turn_rules.clear();
+    /// Clear ephemeral confirmations at the start of a new user input; the
+    /// mode the session chose stays, for the children of earlier turns.
+    pub fn clear_turn_rules(&self, session_mode: Option<PolicyMode>) {
+        self.turn_rules.clear_to(session_mode);
         if let Ok(mut rules) = self.confirmed_rules.lock() {
             rules.clear();
         }
@@ -3138,6 +3139,21 @@ pub enum SubagentSetting {
     Inherit,
 }
 
+/// Move the running children that follow the session's defaults, and say
+/// which moved, for a default change's notice.
+fn moved_children(agents: &super::delegation::SessionAgents) -> String {
+    let moved = agents.follow_defaults();
+    if moved.is_empty() {
+        return String::new();
+    }
+    let moved = moved
+        .iter()
+        .map(|(name, label)| format!("{name} -> {label}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("; running children switch at their next model call: {moved}")
+}
+
 /// prime-agent's `subagentDefaultModel` from `settings.json`: the model a child
 /// runs on when its spawn names none. A value that is not a non-blank string is
 /// unset, as prime-agent's `getSubagentDefaultModel` reads it; ha's own
@@ -4081,7 +4097,8 @@ impl SessionPort for AgentSessionService {
         reason = "one clone per piece of session state the turn shares, handed over in one place"
     )]
     fn submit(&mut self, request: SubmitRequest) {
-        self.gate.clear_turn_rules();
+        self.gate
+            .clear_turn_rules(self.session_mode.lock().ok().and_then(|mode| *mode));
         let cancellation = CancellationToken::new();
         self.cancellation = Some(cancellation.clone());
         // A turn must run on an async runtime. In the app it always does; this
@@ -6371,7 +6388,10 @@ impl SessionPort for AgentSessionService {
             }),
             SubagentSetting::Inherit => {
                 super::config::save_setting(&self.config_file, "subagentDefaultThinking", None)?;
-                Ok("Subagent thinking cleared: children run at this agent's level".to_owned())
+                Ok(format!(
+                    "Subagent thinking cleared: children run at this agent's level{}",
+                    moved_children(&self.agents)
+                ))
             }
             SubagentSetting::Set(level) => {
                 let parsed = harness_providers::ThinkingLevel::parse(&level).ok_or_else(|| {
@@ -6385,8 +6405,9 @@ impl SessionPort for AgentSessionService {
                     Some(serde_json::json!(parsed.as_str())),
                 )?;
                 Ok(format!(
-                    "Subagent thinking set: {} (saved as subagentDefaultThinking); a child's model that lacks it uses the nearest level it offers",
-                    parsed.as_str()
+                    "Subagent thinking set: {} (saved as subagentDefaultThinking); a child's model that lacks it uses the nearest level it offers{}",
+                    parsed.as_str(),
+                    moved_children(&self.agents)
                 ))
             }
         }
@@ -6414,7 +6435,10 @@ impl SessionPort for AgentSessionService {
             }
             SubagentSetting::Inherit => {
                 super::config::save_setting(&self.config_file, "subagentDefaultModel", None)?;
-                Ok("Subagent model cleared: children run on this agent's model".to_owned())
+                Ok(format!(
+                    "Subagent model cleared: children run on this agent's model{}",
+                    moved_children(&self.agents)
+                ))
             }
             SubagentSetting::Set(reference) => {
                 let base = self.configured()?;
@@ -6440,7 +6464,8 @@ impl SessionPort for AgentSessionService {
                     Some(serde_json::json!(model)),
                 )?;
                 Ok(format!(
-                    "Subagent model set: {model} (saved as subagentDefaultModel); the next child runs on it"
+                    "Subagent model set: {model} (saved as subagentDefaultModel); children that named no model run on it from their next call{}",
+                    moved_children(&self.agents)
                 ))
             }
         }
@@ -6763,6 +6788,9 @@ struct AutoRefine {
     provider: Arc<dyn ModelProvider>,
     model: String,
     conversation: String,
+    /// The conversation's task, which its diagnostic records name: the
+    /// transcript once went there, five megabytes a record.
+    task: String,
     scopes: super::refine::HarnessScopes,
     learning: super::refine::Learning,
     turns: u32,
@@ -6805,7 +6833,7 @@ impl AutoRefine {
                     super::refine::mark_reviewed(&self.scopes.local, reviewed);
                 }
                 harness_types::diag::info("review", "nothing")
-                    .task(&self.conversation)
+                    .task(&self.task)
                     .msg(review.rationale.clone())
                     .emit();
                 send(SessionEvent::Notice {
@@ -6814,7 +6842,7 @@ impl AutoRefine {
                 return;
             }
             Err(error) => {
-                review_record("skipped", &self.conversation, Err(error.as_str())).emit();
+                review_record("skipped", &self.task, Err(error.as_str())).emit();
                 send(SessionEvent::Notice {
                     message: format!("auto-refine review skipped: {error}"),
                 });
@@ -6845,7 +6873,7 @@ impl AutoRefine {
                 // the global one.
                 let shown = refinements.len();
                 for refinement in &refinements {
-                    review_record("applied", &self.conversation, Ok(refinement)).emit();
+                    review_record("applied", &self.task, Ok(refinement)).emit();
                     super::refine::note_review(&self.scopes.local, refinement);
                 }
                 for (index, refinement) in refinements.iter().enumerate() {
@@ -6856,14 +6884,14 @@ impl AutoRefine {
                 }
                 if let Some(error) = refined.global_error {
                     let error = format!("the global memory part failed: {error}");
-                    review_record("failed", &self.conversation, Err(error.as_str())).emit();
+                    review_record("failed", &self.task, Err(error.as_str())).emit();
                     send(SessionEvent::Notice {
                         message: format!("auto-refine: {error}; the local refinement stands"),
                     });
                 }
             }
             Err(error) => {
-                review_record("failed", &self.conversation, Err(error.as_str())).emit();
+                review_record("failed", &self.task, Err(error.as_str())).emit();
                 send(SessionEvent::Notice {
                     message: format!("refine failed: {error}"),
                 });
@@ -6912,6 +6940,7 @@ pub(super) async fn review_now(
     provider: Arc<dyn ModelProvider>,
     model: String,
     conversation: String,
+    task: String,
     scopes: super::refine::HarnessScopes,
     learning: super::refine::Learning,
     turns: u32,
@@ -6926,6 +6955,7 @@ pub(super) async fn review_now(
         provider,
         model,
         conversation,
+        task,
         scopes,
         learning,
         turns,
@@ -7136,6 +7166,62 @@ fn compacted_title(summary: &str) -> Option<String> {
         .take(60)
         .collect::<String>();
     (!title.is_empty()).then_some(title)
+}
+
+#[cfg(test)]
+mod review_record_tests {
+    /// A review's diagnostic record names the conversation's task. It once
+    /// carried the whole transcript there - five megabytes a record - and three
+    /// reviews filled the process's diagnostics budget, after which only errors
+    /// were kept.
+    #[test]
+    fn a_review_record_names_the_task_not_the_transcript() {
+        let directory = tempfile::tempdir().expect("directory");
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let layers = crate::interactive::learned::Layers::new(
+            &directory.path().join("config"),
+            &directory.path().join("data"),
+            &workspace,
+            true,
+        );
+        let learning = crate::interactive::refine::Learning::new(layers, &workspace, None);
+        let scopes = crate::interactive::refine::HarnessScopes {
+            global: directory.path().join("global"),
+            local: directory.path().join("local"),
+        };
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> =
+            std::sync::Arc::new(harness_providers::MockProvider::text(
+                r#"{"shouldRefine": false, "rationale": "nothing new"}"#,
+            ));
+        let transcript = "[User]: build the parser\n".repeat(2_000);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let records = harness_types::diag::capture(|| {
+            runtime.block_on(super::review_now(
+                provider,
+                "fixture-model".to_owned(),
+                transcript.clone(),
+                "task_01review".to_owned(),
+                scopes,
+                learning,
+                1,
+                None,
+                crate::interactive::knowledge::KnowledgeHost::new(
+                    &workspace,
+                    &directory.path().join("data"),
+                ),
+            ));
+        });
+        let review = records
+            .iter()
+            .find(|record| record.kind == "review")
+            .expect("the review is recorded");
+        assert_eq!(review.event, "nothing", "{review:?}");
+        assert_eq!(review.ids.task.as_deref(), Some("task_01review"));
+    }
 }
 
 #[cfg(test)]
@@ -8297,6 +8383,7 @@ async fn run_turn(
                         .to_owned(),
                 ),
             }),
+            follows: None,
         },
         cancellation.clone(),
     ));
@@ -8447,6 +8534,7 @@ async fn run_turn(
         .with_hashline(hashline)
         .with_policy(tool_policy)
         .with_hooks(config.hooks.clone())
+        .with_elsewhere(Arc::clone(&agents) as Arc<dyn harness_tools::PathElsewhere>)
         .with_result_context(Arc::new(super::instructions::NestedInstructions::new(
             &workspace_root,
             &caller_dir,
@@ -9068,6 +9156,7 @@ async fn run_turn(
                 provider,
                 model,
                 conversation,
+                task: task.as_str().to_owned(),
                 scopes,
                 learning,
                 turns,
@@ -9414,6 +9503,7 @@ async fn run_turn(
                     provider: Arc::clone(&provider),
                     model: config.model.clone(),
                     conversation,
+                    task: goal_task.as_str().to_owned(),
                     scopes,
                     learning,
                     turns,
@@ -9454,6 +9544,7 @@ async fn run_turn(
                 provider: Arc::clone(&provider),
                 model: config.model.clone(),
                 conversation,
+                task: goal_task.as_str().to_owned(),
                 scopes,
                 learning: learning.clone(),
                 turns: 0,
@@ -9501,6 +9592,7 @@ async fn run_turn(
                 provider: Arc::clone(&provider),
                 model: config.model.clone(),
                 conversation,
+                task: deferred.task.clone(),
                 scopes: super::refine::HarnessScopes {
                     global: super::harness::global_dir(&data_dir),
                     local,

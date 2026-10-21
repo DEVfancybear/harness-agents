@@ -255,6 +255,36 @@ fn write_writer_owner(path: &std::path::Path) -> Option<String> {
     fs::write(path, &owner).ok().map(|()| owner)
 }
 
+/// Rename `from` to `to`, waiting out another process that holds `from` open.
+///
+/// On Windows a file just written is opened at once by a virus scanner or the
+/// search indexer, and while they read it a rename fails with a sharing
+/// violation (32), a lock violation (33) or access denied (5). Seen: tool
+/// calls failed one after another with "cannot publish artifact bytes: The
+/// process cannot access the file because it is being used by another
+/// process", though nothing of ha's had the file open. The scan ends within
+/// milliseconds, so the rename is tried again for about two seconds.
+fn rename_when_released(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    const WAITS_MS: [u64; 9] = [5, 10, 20, 40, 80, 160, 320, 500, 800];
+    let mut waits = WAITS_MS.iter();
+    loop {
+        match fs::rename(from, to) {
+            Err(error) if held_by_another_process(&error) => match waits.next() {
+                Some(wait) => std::thread::sleep(std::time::Duration::from_millis(*wait)),
+                None => return Err(error),
+            },
+            result => return result,
+        }
+    }
+}
+
+/// Whether an I/O failure is another process holding the file: Windows'
+/// sharing and lock violations and the access denied a pending scan gives a
+/// rename. POSIX renames do not wait on readers.
+fn held_by_another_process(error: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32 | 33))
+}
+
 fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1718,7 +1748,8 @@ impl SqliteStore {
             })?;
         }
         drop(file);
-        fs::rename(&temporary_path, &final_path).map_err(|error| {
+        rename_when_released(&temporary_path, &final_path).map_err(|error| {
+            let _ = fs::remove_file(&temporary_path);
             StoreError::new(
                 ErrorCode::ArtifactWriteFailed,
                 format!("cannot publish artifact bytes: {error}"),
@@ -6081,5 +6112,36 @@ mod one_commit_step_tests {
             0
         );
         store.close().await.expect("close store");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod rename_tests {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    /// A scanner holding a just-written artifact made its rename fail with a
+    /// sharing violation; the rename now waits for the file to be let go.
+    #[test]
+    fn a_rename_waits_for_another_holder_to_let_go() {
+        let dir = tempfile::tempdir().expect("dir");
+        let from = dir.path().join("artifact.tmp");
+        let to = dir.path().join("artifact.bin");
+        std::fs::write(&from, b"bytes").expect("write");
+        // Shared for reading only, as a scanner opens it: no rename meanwhile.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&from)
+            .expect("hold");
+        let refused = std::fs::rename(&from, &to).expect_err("held: the rename is refused");
+        assert!(super::held_by_another_process(&refused), "{refused:?}");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+        });
+        super::rename_when_released(&from, &to).expect("renamed once let go");
+        release.join().expect("release");
+        assert_eq!(std::fs::read(&to).expect("read"), b"bytes");
+        assert!(!from.exists());
     }
 }

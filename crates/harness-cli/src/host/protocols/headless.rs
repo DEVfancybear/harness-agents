@@ -638,6 +638,7 @@ pub async fn run_with(
                             .to_owned(),
                     ),
                 }),
+                follows: None,
             },
             cancellation.clone(),
         )
@@ -656,6 +657,9 @@ pub async fn run_with(
     let memory_host = super::memory::MemoryHost::new(&context.paths.data_dir, task_id.as_str())
         .with_project(&context.project.root)
         .with_refinements(refinements);
+    if let Some((agents, _)) = &agents {
+        tools = tools.with_elsewhere(Arc::clone(agents) as Arc<dyn harness_tools::PathElsewhere>);
+    }
     tools = tools.with_external(super::memory::with_dispatcher(
         super::knowledge::with_dispatcher(dispatcher, &knowledge_host),
         &memory_host,
@@ -1240,6 +1244,7 @@ pub async fn run_with(
                 Arc::clone(&provider),
                 model.clone(),
                 conversation,
+                outcome.task_id.as_str().to_owned(),
                 scopes.clone(),
                 learning,
                 turns,

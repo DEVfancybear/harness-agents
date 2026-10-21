@@ -208,6 +208,13 @@ pub struct ConfiguredToolHook {
     pub source: String,
 }
 
+/// Where a workspace path that does not exist is instead, as sentences for the
+/// model: a delegated coder's worktree holds the files it made until its work
+/// is integrated.
+pub trait PathElsewhere: Send + Sync {
+    fn elsewhere(&self, path: &str) -> Vec<String>;
+}
+
 /// Text the host adds to a call's result for the model once the call ran: what
 /// applies where the call reached, such as the instructions of a directory the
 /// session had not loaded yet.
@@ -236,6 +243,8 @@ pub struct ToolExecutionService {
     /// Hashline anchors in `read_file` and `search_text` results; the schemas
     /// the model is shown say the same (`coding_tool_schemas_for`).
     hashline: bool,
+    /// Where a missing path may be instead (a coder's worktree).
+    elsewhere: Option<Arc<dyn PathElsewhere>>,
 }
 
 impl ToolExecutionService {
@@ -252,6 +261,7 @@ impl ToolExecutionService {
             capabilities: None,
             result_context: None,
             hashline: false,
+            elsewhere: None,
         }
     }
 
@@ -268,6 +278,13 @@ impl ToolExecutionService {
     #[must_use]
     pub const fn hashline(&self) -> bool {
         self.hashline
+    }
+
+    /// Say where a `read_file` path this workspace lacks is instead.
+    #[must_use]
+    pub fn with_elsewhere(mut self, elsewhere: Arc<dyn PathElsewhere>) -> Self {
+        self.elsewhere = Some(elsewhere);
+        self
     }
 
     /// Add host context to the results of calls that ran.
@@ -1341,16 +1358,29 @@ impl ToolExecutionService {
                     // A guessed path: name the files that do have its name,
                     // so the next call reads one instead of guessing again.
                     let found = crate::workspace::files_named_like(root, path);
-                    if !found.is_empty() {
+                    // A file a delegated coder made is in its worktree until
+                    // it is integrated: the parent read the paths its coders
+                    // reported, one failure after another.
+                    let elsewhere = self
+                        .elsewhere
+                        .as_ref()
+                        .map(|elsewhere| elsewhere.elsewhere(path))
+                        .unwrap_or_default();
+                    if !found.is_empty() || !elsewhere.is_empty() {
                         let shown = target.to_string_lossy();
-                        return Err(HarnessError::new(
-                            ErrorCode::InvalidPayload,
-                            format!(
-                                "File not found: {}; the workspace has: {}",
-                                shown.strip_prefix(r"\\?\").unwrap_or(&shown),
-                                found.join(", ")
-                            ),
-                        ));
+                        let mut message = format!(
+                            "File not found: {}",
+                            shown.strip_prefix(r"\\?\").unwrap_or(&shown)
+                        );
+                        for place in &elsewhere {
+                            message.push_str("; ");
+                            message.push_str(place);
+                        }
+                        if !found.is_empty() {
+                            message.push_str("; the workspace has: ");
+                            message.push_str(&found.join(", "));
+                        }
+                        return Err(HarnessError::new(ErrorCode::InvalidPayload, message));
                     }
                 }
                 let _ = read_text(&target)?;

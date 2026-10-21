@@ -129,6 +129,70 @@ pub struct ChildModel {
     pub thinking: Option<String>,
 }
 
+/// What a child's model was resolved from, when part of it came from the
+/// session's defaults (`subagentDefaultModel`, `subagentDefaultThinking`):
+/// changing a default moves the running child too, as the user expects of
+/// children that never named a model of their own.
+#[derive(Clone)]
+pub struct FollowedDefaults {
+    /// The model it falls back to: its parent's.
+    parent: ChildModel,
+    /// The model its spawn named (a verifier's is its parent's), if any.
+    model: Option<String>,
+    /// The thinking level its spawn named, if any.
+    thinking: Option<String>,
+}
+
+/// A running child's model, which the runtime asks for at every call: a
+/// change of the session's defaults takes effect at the child's next call.
+struct LiveModel {
+    current: std::sync::RwLock<ChildModel>,
+}
+
+impl LiveModel {
+    fn new(model: ChildModel) -> Self {
+        Self {
+            current: std::sync::RwLock::new(model),
+        }
+    }
+
+    fn get(&self) -> ChildModel {
+        match self.current.read() {
+            Ok(current) => current.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn set(&self, model: ChildModel) {
+        match self.current.write() {
+            Ok(mut current) => *current = model,
+            Err(poisoned) => *poisoned.into_inner() = model,
+        }
+    }
+}
+
+impl ModelProvider for LiveModel {
+    fn capabilities(&self) -> harness_providers::ModelCapabilities {
+        self.get().provider.capabilities()
+    }
+
+    fn stream(
+        &self,
+        request: harness_providers::ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> harness_providers::ProviderFuture {
+        self.get().provider.stream(request, cancellation)
+    }
+
+    fn stream_events(
+        &self,
+        request: harness_providers::ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> harness_providers::ProviderEventStream {
+        self.get().provider.stream_events(request, cancellation)
+    }
+}
+
 /// One model `rlm.find_models` may offer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchableModel {
@@ -278,6 +342,9 @@ pub struct ChildLaunch {
     /// The root's harness memory, sent to each child as a digest ranked for
     /// its brief; `None` while harness refinements are off.
     pub digest: Option<super::harness::DigestSource>,
+    /// What the child's model took from the session's defaults; `None` for
+    /// a parent's own launch and for a spawn that named both.
+    pub follows: Option<FollowedDefaults>,
 }
 
 impl ChildLaunch {
@@ -302,49 +369,59 @@ impl ChildLaunch {
     /// prime-agent's `rlm.spawn(model=..., thinking=...)`: the thinking level
     /// asked for, else `subagentDefaultThinking`, else the parent's.
     fn for_request(&self, requested: Option<&str>, thinking: Option<&str>) -> Result<Self, String> {
-        let explicit = thinking
+        let requested = requested
             .map(str::trim)
-            .filter(|thinking| !thinking.is_empty())
-            .map(|thinking| {
-                harness_providers::ThinkingLevel::parse(thinking).ok_or_else(|| {
-                    format!(
-                        "rlm.spawn thinking must be one of: off, minimal, low, medium, high, xhigh, max (got {thinking:?})"
-                    )
-                })
-            })
-            .transpose()?;
-        let level = explicit.or_else(|| {
-            self.models
-                .as_ref()
-                .and_then(|models| models.default_thinking())
+            .filter(|reference| !reference.is_empty());
+        let thinking = thinking
+            .map(str::trim)
+            .filter(|thinking| !thinking.is_empty());
+        let model = resolve_child_model(&self.model, self.models.as_ref(), requested, thinking)?;
+        let follows = (requested.is_none() || thinking.is_none()).then(|| FollowedDefaults {
+            parent: self.model.clone(),
+            model: requested.map(str::to_owned),
+            thinking: thinking.map(str::to_owned),
         });
-        let reference = requested
-            .map(str::trim)
-            .filter(|reference| !reference.is_empty())
-            .map(str::to_owned)
-            .or_else(|| {
-                self.models
-                    .as_ref()
-                    .and_then(|models| models.default_model())
-            });
-        if level.is_none()
-            && reference
-                .as_ref()
-                .is_none_or(|reference| reference.eq_ignore_ascii_case(&self.model.reference))
-        {
-            return Ok(self.clone());
-        }
-        let reference = reference.unwrap_or_else(|| self.model.reference.clone());
-        let models = self
-            .models
-            .as_ref()
-            .ok_or_else(|| format!("Requested subagent model \"{reference}\" is not available"))?;
-        let model = models.resolve_at(&reference, level, explicit.is_some())?;
         Ok(Self {
             model,
+            follows,
             ..self.clone()
         })
     }
+}
+
+/// The model a child runs on: the one asked for, else the configured default,
+/// else its parent's; at the thinking level asked for, else
+/// `subagentDefaultThinking`, else its parent's.
+fn resolve_child_model(
+    parent: &ChildModel,
+    models: Option<&Arc<dyn ChildModels>>,
+    requested: Option<&str>,
+    thinking: Option<&str>,
+) -> Result<ChildModel, String> {
+    let explicit = thinking
+        .map(|thinking| {
+            harness_providers::ThinkingLevel::parse(thinking).ok_or_else(|| {
+                format!(
+                    "rlm.spawn thinking must be one of: off, minimal, low, medium, high, xhigh, max (got {thinking:?})"
+                )
+            })
+        })
+        .transpose()?;
+    let level = explicit.or_else(|| models.and_then(|models| models.default_thinking()));
+    let reference = requested
+        .map(str::to_owned)
+        .or_else(|| models.and_then(|models| models.default_model()));
+    if level.is_none()
+        && reference
+            .as_ref()
+            .is_none_or(|reference| reference.eq_ignore_ascii_case(&parent.reference))
+    {
+        return Ok(parent.clone());
+    }
+    let reference = reference.unwrap_or_else(|| parent.reference.clone());
+    let models = models
+        .ok_or_else(|| format!("Requested subagent model \"{reference}\" is not available"))?;
+    models.resolve_at(&reference, level, explicit.is_some())
 }
 
 /// How a child stands.
@@ -815,6 +892,9 @@ struct AgentsShared {
     approval_gate: Arc<dyn ApprovalGate>,
     ledger: Mutex<Option<Arc<BudgetLedger>>>,
     launches: Mutex<HashMap<TaskId, ChildLaunch>>,
+    /// The model each running child calls, which a change of the session's
+    /// defaults replaces between two of its calls.
+    live: Mutex<HashMap<TaskId, Arc<LiveModel>>>,
     children: Mutex<Vec<ChildRecord>>,
     changed: tokio::sync::Notify,
     buckets: Mutex<HashMap<String, (f64, Instant)>>,
@@ -882,6 +962,7 @@ impl AgentsShared {
             approval_gate,
             ledger: Mutex::new(None),
             launches: Mutex::new(HashMap::new()),
+            live: Mutex::new(HashMap::new()),
             children: Mutex::new(Vec::new()),
             changed: tokio::sync::Notify::new(),
             buckets: Mutex::new(HashMap::new()),
@@ -1727,6 +1808,84 @@ impl SessionAgents {
         self.shared.max_depth()
     }
 
+    /// Move each running child whose model or thinking level came from the
+    /// session's defaults to what the defaults give now, from its next model
+    /// call; its row and its later runs follow. A child whose spawn named
+    /// both keeps them. Returns each moved child's name and model label.
+    ///
+    /// `/subagent-model` changed only the next child: the user switched a
+    /// quota-bound model away and the children already running stayed on it.
+    pub fn follow_defaults(&self) -> Vec<(String, String)> {
+        let launches: Vec<(TaskId, ChildLaunch)> = self
+            .shared
+            .launches
+            .lock()
+            .map(|launches| {
+                launches
+                    .iter()
+                    .map(|(task_id, launch)| (task_id.clone(), launch.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut moved = Vec::new();
+        for (task_id, launch) in launches {
+            let Some(follows) = &launch.follows else {
+                continue;
+            };
+            let running = self
+                .shared
+                .update(&task_id, |child| {
+                    (matches!(child.state, ChildState::Running) && !child.deleted)
+                        .then(|| child.name.clone())
+                })
+                .flatten();
+            let Some(name) = running else {
+                continue;
+            };
+            // A model the defaults name but cannot reach leaves the child
+            // where it is: `/subagent-model` checked the one it saved.
+            let Ok(model) = resolve_child_model(
+                &follows.parent,
+                launch.models.as_ref(),
+                follows.model.as_deref(),
+                follows.thinking.as_deref(),
+            ) else {
+                continue;
+            };
+            if model.reference == launch.model.reference && model.thinking == launch.model.thinking
+            {
+                continue;
+            }
+            if let Ok(mut launches) = self.shared.launches.lock()
+                && let Some(stored) = launches.get_mut(&task_id)
+            {
+                stored.model = model.clone();
+            }
+            if let Some(live) = self
+                .shared
+                .live
+                .lock()
+                .ok()
+                .and_then(|live| live.get(&task_id).cloned())
+            {
+                live.set(model.clone());
+            }
+            self.shared.update(&task_id, |child| {
+                child.model.clone_from(&model.reference);
+                child.thinking.clone_from(&model.thinking);
+            });
+            let label = model.thinking.as_ref().map_or_else(
+                || model.reference.clone(),
+                |thinking| format!("{} {thinking}", model.reference),
+            );
+            moved.push((name, label));
+        }
+        if !moved.is_empty() {
+            self.shared.persist_ledger();
+        }
+        moved
+    }
+
     fn scheduler(&self) -> &Arc<WorkerScheduler> {
         &self.schedulers[0]
     }
@@ -2534,6 +2693,41 @@ fn explorer_brief(task_id: &TaskId, objective: &str, launch: &ChildLaunch) -> Ta
         expected_artifacts: Vec::new(),
         deadline_unix_ms: None,
         role: AgentRole::Explorer,
+    }
+}
+
+impl harness_tools::PathElsewhere for SessionAgents {
+    /// A coder's files stay in its worktree until `integrate_children` merges
+    /// them: the parent read the paths a running coder reported in its own
+    /// checkout, and each read failed with nothing saying where they were.
+    fn elsewhere(&self, path: &str) -> Vec<String> {
+        let relative = Path::new(path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Vec::new();
+        }
+        let Ok(children) = self.shared.children.lock() else {
+            return Vec::new();
+        };
+        children
+            .iter()
+            .filter(|child| !child.deleted && child.integrated.is_none())
+            .filter_map(|child| {
+                let worktree = child.worktree.as_ref()?;
+                let found = Path::new(&worktree.path).join(relative);
+                found.is_file().then(|| {
+                    format!(
+                        "{} made it in its worktree ({}); it is not in this checkout until integrate_children merges {}'s work",
+                        child.name,
+                        found.display(),
+                        child.name
+                    )
+                })
+            })
+            .collect()
     }
 }
 
@@ -4551,9 +4745,25 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 .with_external(Arc::clone(&child_tools) as Arc<dyn ExternalToolDispatcher>);
             let mut schemas = schemas;
             schemas.extend(child_tools.schemas());
+            // The model the child calls, which `/subagent-model` can move from
+            // its next call. Registered before the launch is read again, so a
+            // change made in between reaches this run one way or the other.
+            let live = Arc::new(LiveModel::new(launch.model.clone()));
+            if let Ok(mut models) = self.shared.live.lock() {
+                models.insert(task_id.clone(), Arc::clone(&live));
+            }
+            if let Some(current) = self
+                .shared
+                .launches
+                .lock()
+                .ok()
+                .and_then(|launches| launches.get(&task_id).map(|launch| launch.model.clone()))
+            {
+                live.set(current);
+            }
             let runtime = Arc::new(RuntimeService::new(
                 Arc::clone(&store),
-                Arc::clone(&launch.model.provider),
+                Arc::clone(&live) as Arc<dyn ModelProvider>,
                 launch.runtime_config.clone(),
             ));
             // The child's task is the parent's work, not a conversation of the
@@ -4616,7 +4826,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     .lock()
                     .ok()
                     .and_then(|ledger| ledger.clone()),
-                model_price: launch.model.price,
+                live: Some(Arc::clone(&live)),
                 cancellation: request.cancellation.clone(),
                 budget_error: Mutex::new(None),
                 sender: self.shared.sender.clone(),
@@ -4910,7 +5120,8 @@ struct ExplorerObserver {
     child_name: String,
     shared: Arc<AgentsShared>,
     ledger: Option<Arc<BudgetLedger>>,
-    model_price: Option<ModelPrice>,
+    /// The model the child runs on now, for the price of each call.
+    live: Option<Arc<LiveModel>>,
     cancellation: CancellationToken,
     budget_error: Mutex<Option<OrchestratorError>>,
     sender: UnboundedSender<SessionEvent>,
@@ -4998,9 +5209,10 @@ impl TurnObserver for ExplorerObserver {
                     cache_read_tokens,
                     cache_write_tokens,
                 };
-                self.shared.charge(self.model_price, usage);
+                let price = self.live.as_ref().and_then(|live| live.get().price);
+                self.shared.charge(price, usage);
                 if let Ok(mut tracker) = self.cost_tracker.lock() {
-                    tracker.record(self.model_price, usage);
+                    tracker.record(price, usage);
                     let cost = tracker.display();
                     self.shared.update(&self.task_id, |child| child.cost = cost);
                 }
@@ -5514,7 +5726,7 @@ pub(super) mod tests {
             child_name: "explorer".to_owned(),
             shared: shared(sender.clone()),
             ledger: None,
-            model_price: None,
+            live: None,
             cancellation: CancellationToken::new(),
             budget_error: std::sync::Mutex::new(None),
             sender,
@@ -5577,7 +5789,7 @@ pub(super) mod tests {
             child_name: "explorer".to_owned(),
             shared: shared(sender.clone()),
             ledger: Some(Arc::clone(&ledger)),
-            model_price: None,
+            live: None,
             cancellation: CancellationToken::new(),
             budget_error: std::sync::Mutex::new(None),
             sender,
@@ -5816,6 +6028,7 @@ pub(super) mod tests {
             checks: Vec::new(),
             context: Vec::new(),
             digest: None,
+            follows: None,
         }
     }
 
@@ -6068,6 +6281,35 @@ pub(super) mod tests {
         }
     }
 
+    /// The parent read the paths its coders reported in its own checkout and
+    /// was told only "File not found": the files were in the coders'
+    /// worktrees, waiting for `integrate_children`.
+    #[tokio::test]
+    async fn a_file_a_coder_made_is_found_in_its_worktree_until_integrated() {
+        use harness_tools::PathElsewhere as _;
+        let bench = IntegrationBench::new();
+        let coder = bench.coder("made.txt=from the coder").await;
+        let name = coder["name"].as_str().unwrap_or_default().to_owned();
+        let agents = &bench.tool.agents;
+        let places = agents.elsewhere("made.txt");
+        assert_eq!(places.len(), 1, "{places:?}");
+        assert!(
+            places[0].contains("made.txt")
+                && places[0].contains("integrate_children")
+                && (name.is_empty() || places[0].starts_with(&name)),
+            "{places:?} ({coder})"
+        );
+        for elsewhere in ["missing.txt", "../made.txt", "/made.txt"] {
+            assert!(agents.elsewhere(elsewhere).is_empty(), "{elsewhere}");
+        }
+        let applied = bench.integrate(serde_json::json!({"apply": true})).await;
+        assert_eq!(applied["status"], "applied", "{applied}");
+        assert!(
+            agents.elsewhere("made.txt").is_empty(),
+            "an integrated coder's files are in the checkout"
+        );
+    }
+
     /// Two coders that changed different files merge, the project's check runs
     /// on the merged revision - it needs both files, which neither branch has
     /// alone - and only `apply` moves the user's branch, by a fast-forward.
@@ -6244,6 +6486,159 @@ pub(super) mod tests {
         ] {
             assert!(IntegrateRequest::parse(&wrong).is_err(), "{wrong}");
         }
+    }
+
+    /// `/subagent-model` and `/subagent-thinking` moved only the next child:
+    /// the user switched a quota-bound model away and the running children
+    /// stayed on it, their rows still naming it. A child that named its model
+    /// keeps it; what it left to the defaults follows them.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "one scenario, told in order")]
+    async fn running_children_follow_a_change_of_the_defaults() {
+        use super::RlmChildren;
+        use crate::interactive::repl::HostRequests;
+        use serde_json::json;
+
+        struct Defaults {
+            model: std::sync::Mutex<String>,
+            thinking: std::sync::Mutex<Option<harness_providers::ThinkingLevel>>,
+        }
+        impl ChildModels for Defaults {
+            fn default_model(&self) -> Option<String> {
+                self.model.lock().ok().map(|model| model.clone())
+            }
+            fn default_thinking(&self) -> Option<harness_providers::ThinkingLevel> {
+                self.thinking.lock().ok().and_then(|thinking| *thinking)
+            }
+            fn resolve(&self, reference: &str) -> Result<ChildModel, String> {
+                self.resolve_at(reference, None, false)
+            }
+            fn resolve_at(
+                &self,
+                reference: &str,
+                level: Option<harness_providers::ThinkingLevel>,
+                _strict: bool,
+            ) -> Result<ChildModel, String> {
+                Ok(ChildModel {
+                    provider: Arc::new(harness_providers::MockProvider::text(reference)),
+                    reference: reference.to_owned(),
+                    price: None,
+                    thinking: level.map(|level| level.as_str().to_owned()),
+                })
+            }
+        }
+
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let repo = temporary.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo directory");
+        clean_repository(&repo);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(crate::interactive::service::ChannelApprovalGate::new(
+            sender.clone(),
+            Duration::from_secs(5),
+        ));
+        let agents = SessionAgents::with_backend(
+            SharedStore::new(temporary.path().join("store")),
+            sender,
+            gate,
+            temporary.path().join("delegation"),
+            &(Arc::new(ScriptedBackend) as Arc<dyn harness_orchestrator::WorkerBackend>),
+        );
+        let defaults = Arc::new(Defaults {
+            model: std::sync::Mutex::new("deepseek/flash".to_owned()),
+            thinking: std::sync::Mutex::new(None),
+        });
+        let mut launch = launch_for(
+            &repo,
+            Arc::new(harness_providers::MockProvider::scripted(Vec::new())),
+        );
+        launch.models = Some(Arc::clone(&defaults) as Arc<dyn ChildModels>);
+        let children = RlmChildren {
+            agents: Arc::clone(&agents),
+            launch,
+        };
+        for kwargs in [
+            json!({"name": "follower"}),
+            json!({"name": "named", "model": "fixed/model"}),
+            json!({"name": "pinned", "model": "fixed/model", "thinking": "high"}),
+        ] {
+            children
+                .handle(&json!({"type": "rlm.run", "prompt": "slow survey", "kwargs": kwargs}))
+                .await
+                .expect("a known request type")
+                .expect("spawn");
+        }
+        let row = |name: &str| {
+            agents
+                .view_rows()
+                .into_iter()
+                .find(|row| row.name == name)
+                .map(|row| (row.model, row.thinking))
+                .expect("the child's row")
+        };
+        assert_eq!(row("follower"), ("deepseek/flash".to_owned(), None));
+
+        *defaults.model.lock().expect("model") = "openai-codex/luna".to_owned();
+        *defaults.thinking.lock().expect("thinking") =
+            Some(harness_providers::ThinkingLevel::Xhigh);
+        let mut moved = agents.follow_defaults();
+        moved.sort();
+        assert_eq!(
+            moved,
+            vec![
+                ("follower".to_owned(), "openai-codex/luna xhigh".to_owned()),
+                ("named".to_owned(), "fixed/model xhigh".to_owned()),
+            ],
+            "the pinned child named both"
+        );
+        assert_eq!(
+            row("follower"),
+            ("openai-codex/luna".to_owned(), Some("xhigh".to_owned()))
+        );
+        assert_eq!(
+            row("named"),
+            ("fixed/model".to_owned(), Some("xhigh".to_owned()))
+        );
+        assert_eq!(
+            row("pinned"),
+            ("fixed/model".to_owned(), Some("high".to_owned()))
+        );
+        assert!(
+            agents.follow_defaults().is_empty(),
+            "nothing moves twice for one change"
+        );
+    }
+
+    /// A running child's model is asked for at every call, so a swap reaches
+    /// the next call of the turn already under way.
+    #[tokio::test]
+    async fn a_live_model_answers_with_the_model_set_last() {
+        use harness_providers::ModelProvider as _;
+        let model = |text: &str| ChildModel {
+            provider: Arc::new(harness_providers::MockProvider::text(text)),
+            reference: text.to_owned(),
+            price: None,
+            thinking: None,
+        };
+        let live = super::LiveModel::new(model("deepseek"));
+        let answer = |live: &super::LiveModel| {
+            live.stream(
+                harness_providers::ProviderRequest::new(
+                    harness_types::RequestId::generate(),
+                    "m",
+                    Vec::new(),
+                ),
+                CancellationToken::new(),
+            )
+        };
+        let text = |events: Vec<harness_providers::ProviderStreamEvent>| format!("{events:?}");
+        assert!(text(answer(&live).await.expect("first")).contains("deepseek"));
+        live.set(model("luna"));
+        let second = text(answer(&live).await.expect("second"));
+        assert!(
+            second.contains("luna") && !second.contains("deepseek"),
+            "{second}"
+        );
     }
 
     /// Reports each brief back as its answer; "slow" briefs take a moment, "fail"

@@ -93,13 +93,20 @@ struct ToolPolicyRulesState {
 impl ToolPolicyRules {
     /// Clear turn-scoped rules before a new user input is admitted.
     pub fn clear(&self) {
+        self.clear_to(None);
+    }
+
+    /// [`Self::clear`], keeping `mode` as the one every policy sharing these
+    /// rules follows. A delegated child keeps the policy of the turn that
+    /// started it, so it reads the session's mode from here: a child started
+    /// before the user chose full-auto went back to asking once the parent's
+    /// next turn cleared the mode the switch had set.
+    pub fn clear_to(&self, mode: Option<PolicyMode>) {
         if let Ok(mut state) = self.state.write()
-            && (!state.rules.is_empty() || state.mode.is_some())
+            && (!state.rules.is_empty() || state.mode != mode)
         {
             state.rules.clear();
-            // A new turn builds its policy from the session's mode, which a
-            // mid-turn change also set.
-            state.mode = None;
+            state.mode = mode;
             state.revision = state.revision.saturating_add(1);
         }
     }
@@ -1042,6 +1049,35 @@ mod g05_policy_tests {
         );
         shared.clear();
         assert_eq!(policy.decide(&external), Decision::Ask);
+    }
+
+    /// A policy kept from an earlier turn (a delegated child's) follows the
+    /// mode the session chose after the rules are cleared for a new turn.
+    #[test]
+    fn a_policy_from_an_earlier_turn_keeps_the_sessions_mode() {
+        let shared = ToolPolicyRules::default();
+        let earlier = ToolPolicy::new(1, Vec::new())
+            .with_mode(PolicyMode::Ask)
+            .with_turn_rules(shared.clone());
+        let external = CodingToolAction::ExternalTool {
+            plugin_id: "mcp".to_owned(),
+            tool_name: "search".to_owned(),
+            arguments: serde_json::json!({}),
+            parent_invocation_id: None,
+            timeout_ms: 30_000,
+        };
+        shared.set_mode(PolicyMode::FullAuto);
+        shared
+            .add(ToolPatternRule::allow("run_process(cargo *)", "this turn"))
+            .expect("valid");
+        let before = earlier.revision();
+        shared.clear_to(Some(PolicyMode::FullAuto));
+        assert!(matches!(earlier.decide(&external), Decision::Allow { .. }));
+        assert!(
+            earlier.tool_rules().is_empty(),
+            "the turn's own rules are still cleared"
+        );
+        assert_ne!(earlier.revision(), before);
     }
 
     #[test]
