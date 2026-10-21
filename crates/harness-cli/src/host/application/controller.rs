@@ -2156,9 +2156,8 @@ impl InteractiveController {
 
     /// When a parked session resumes, as the notices say it (`14:05 UTC`).
     fn resumes_at(&self) -> String {
-        self.parked_until.map_or_else(String::new, |until| {
-            until.format("%H:%M UTC").to_string()
-        })
+        self.parked_until
+            .map_or_else(String::new, |until| until.format("%H:%M UTC").to_string())
     }
 
     /// A child's terminal notice: a turn of its own when the parent is free,
@@ -3014,7 +3013,8 @@ impl InteractiveController {
             SessionEvent::QuotaParked { until } => {
                 let item = match self.service.park_until(until) {
                     Ok(message) => {
-                        self.parked_until = Some(self.parked_until.map_or(until, |at| at.max(until)));
+                        self.parked_until =
+                            Some(self.parked_until.map_or(until, |at| at.max(until)));
                         HistoryItem::Notice { message }
                     }
                     Err(message) => HistoryItem::Error { message },
@@ -10857,7 +10857,7 @@ Command: \"npm run build\""
         effects_to_plain(&harness.controller.pump_events())
     }
 
-    /// Seen when a ChatGPT plan's usage limit parked a session: each of six
+    /// Seen when a `ChatGPT` plan's usage limit parked a session: each of six
     /// children's reports started a turn of its own as the parked turn ended,
     /// called the provider, failed on the same limit and parked the session
     /// again - and each report attached the README.md it named. While the
@@ -10879,7 +10879,10 @@ Command: \"npm run build\""
             &mut harness,
             RunOutcome::Failed("rate_limited: usage limit".to_owned()),
         );
-        let said = child_settled(&mut harness, "[child-done child:scout]\n\nREADME.md says # p");
+        let said = child_settled(
+            &mut harness,
+            "[child-done child:scout]\n\nREADME.md says # p",
+        );
         harness
             .events
             .send(SessionEvent::AgentMessage {
@@ -10903,13 +10906,13 @@ Command: \"npm run build\""
         );
         assert_eq!(harness.controller.pending_notices.len(), 2);
         assert!(
-            said.iter().any(|line| line.contains("read when the session resumes")),
+            said.iter()
+                .any(|line| line.contains("read when the session resumes")),
             "{said:?}"
         );
 
         // The park ends: its resume comes due and runs; what waited follows.
-        harness.controller.parked_until =
-            Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        harness.controller.parked_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
         harness
             .port
             .heartbeats_due
@@ -10923,13 +10926,22 @@ Command: \"npm run build\""
         end_with(&mut harness, RunOutcome::Done);
         let sent = submissions(&harness);
         assert!(sent.len() >= 3, "{sent:?}");
-        assert!(sent[1].contains("check") || sent[1].contains("usage limit has reset"), "{sent:?}");
         assert!(
-            sent.iter().any(|text| text.contains("[child-done child:scout]")),
+            sent[1].contains("check") || sent[1].contains("usage limit has reset"),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|text| text.contains("[child-done child:scout]")),
             "the report runs once the session resumed: {sent:?}"
         );
-        let automatics = harness.port.automatics.lock().expect("automatic log").clone();
-        assert_eq!(automatics[0], false, "the user's message may attach files");
+        let automatics = harness
+            .port
+            .automatics
+            .lock()
+            .expect("automatic log")
+            .clone();
+        assert!(!automatics[0], "the user's message may attach files");
         assert!(
             automatics[1..].iter().all(|automatic| *automatic),
             "the host's own input attaches nothing: {automatics:?}"

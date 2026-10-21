@@ -85,8 +85,8 @@ pub fn render(frame: &mut Frame, area: Rect, pane: View<'_>, theme: &Theme) {
         Span::styled(format!(" · {calls} "), theme.dim),
     ];
     // A narrow pane keeps the name and the state; the sidebar counts the tools.
-    let cells: usize = title.iter().map(|span| display_width(&span.content)).sum();
-    if cells + 2 > usize::from(area.width) {
+    let title_cells: usize = title.iter().map(|span| display_width(&span.content)).sum();
+    if title_cells + 2 > usize::from(area.width) {
         title.pop();
         title.push(Span::raw(" "));
     }
