@@ -1222,9 +1222,7 @@ impl TurnDriver {
             }
             // Loop detection: the same tool call repeated inside the window is a
             // loop, not progress. Different arguments or a changed batch are not.
-            for call in &result.tool_calls {
-                loop_signatures.push(call_signature(call));
-            }
+            push_batch(&mut loop_signatures, &result.tool_calls);
             if loop_signatures.len() > LOOP_WINDOW {
                 let drain = loop_signatures.len() - LOOP_WINDOW;
                 loop_signatures.drain(0..drain);
@@ -2869,7 +2867,12 @@ fn repeated_read<'a>(
     counts: &mut std::collections::HashMap<String, usize>,
     calls: &'a [NormalizedToolCall],
 ) -> Option<&'a NormalizedToolCall> {
+    // A read made twice in one batch is one read, as in [`push_batch`].
+    let mut seen = std::collections::HashSet::new();
     for call in calls {
+        if !seen.insert(call_signature(call)) {
+            continue;
+        }
         let pure_read = matches!(
             crate::contracts::effect_class_for(&call.name),
             crate::contracts::EffectClass::ReadOnly
@@ -2885,6 +2888,21 @@ fn repeated_read<'a>(
         }
     }
     None
+}
+
+/// A batch's calls onto the loop window, each distinct call once. A batch
+/// that makes the same call several times at once is a fan-out, not a loop:
+/// six explorers given one brief were six identical `delegate` calls in one
+/// response, read as a call repeated six times, and the model was told to stop
+/// and answer - it answered the brief's question instead of the user's.
+fn push_batch(signatures: &mut Vec<String>, calls: &[NormalizedToolCall]) {
+    let mut seen = std::collections::HashSet::new();
+    for call in calls {
+        let signature = call_signature(call);
+        if seen.insert(signature.clone()) {
+            signatures.push(signature);
+        }
+    }
 }
 
 /// Whether the tail of the window is one signature repeated to the limit.
@@ -3662,7 +3680,30 @@ mod repeated_read_tests {
 
     use harness_providers::NormalizedToolCall;
 
-    use super::repeated_read;
+    use super::{push_batch, repeated_read, repeated_tail};
+
+    /// Six explorers given one brief: one response, six identical calls. That
+    /// is a fan-out; the same call in three responses running is the loop.
+    #[test]
+    fn identical_calls_in_one_batch_are_a_fan_out_not_a_loop() {
+        let brief = call("delegate", r#"{"role":"explorer","task":"read README.md"}"#);
+        let mut window = Vec::new();
+        push_batch(&mut window, &vec![brief.clone(); 6]);
+        assert!(!repeated_tail(&window), "{window:?}");
+        push_batch(&mut window, std::slice::from_ref(&brief));
+        assert!(!repeated_tail(&window));
+        push_batch(&mut window, std::slice::from_ref(&brief));
+        assert!(
+            repeated_tail(&window),
+            "three responses making the same call"
+        );
+
+        let read = call("read_file", r#"{"path":"a.txt"}"#);
+        let mut counts = HashMap::new();
+        assert!(repeated_read(&mut counts, &vec![read.clone(); 5]).is_none());
+        assert!(repeated_read(&mut counts, std::slice::from_ref(&read)).is_none());
+        assert!(repeated_read(&mut counts, std::slice::from_ref(&read)).is_some());
+    }
 
     fn call(name: &str, arguments: &str) -> NormalizedToolCall {
         NormalizedToolCall {
