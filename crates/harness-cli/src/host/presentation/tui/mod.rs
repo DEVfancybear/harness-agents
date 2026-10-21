@@ -507,6 +507,24 @@ pub struct RuntimeRenderer<T: TerminalBackend> {
 }
 
 impl<T: TerminalBackend> RuntimeRenderer<T> {
+    /// The next input the app reads, past the reports it does not: the
+    /// pointer moving with no button held, a key's release, a focus change.
+    /// Windows' console reports every cell the pointer crosses, and each was a
+    /// turn of the loop; between two wheel notches one ended the burst of
+    /// notches drawn as one frame, so a hand that drifted while it scrolled
+    /// drew every notch. `None` when only such reports were waiting.
+    fn read_known(&mut self) -> io::Result<Option<Key>> {
+        loop {
+            let key = self.backend.read_key()?;
+            if key != Key::Unknown {
+                return Ok(Some(key));
+            }
+            if !self.backend.poll_key(Duration::ZERO)? {
+                return Ok(None);
+            }
+        }
+    }
+
     /// Open the viewport on the real console.
     ///
     /// # Errors
@@ -582,18 +600,19 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
         if let Some(key) = self.held.take() {
             return Ok(Some(key));
         }
-        if self.backend.poll_key(timeout)? {
-            Ok(Some(self.backend.read_key()?))
-        } else {
-            Ok(None)
+        if !self.backend.poll_key(timeout)? {
+            return Ok(None);
         }
+        self.read_known()
     }
 
     fn peek_mouse(&mut self) -> io::Result<Option<Key>> {
         if self.held.is_some() || !self.backend.poll_key(Duration::ZERO)? {
             return Ok(None);
         }
-        let key = self.backend.read_key()?;
+        let Some(key) = self.read_known()? else {
+            return Ok(None);
+        };
         if matches!(key, Key::Mouse(_)) {
             Ok(Some(key))
         } else {
@@ -1082,6 +1101,7 @@ fn run_loop_inner(
         .draw_state(&controller.ui_state())
         .map_err(|error| terminal_error(&error))?;
 
+    let mut frames = FrameLog::open();
     let mut last_tick = Instant::now();
     // When the console was last resized. A terminal keeps re-wrapping for a moment
     // after the size event, so once no further resize has come the screen is
@@ -1089,6 +1109,7 @@ fn run_loop_inner(
     let mut resized_at: Option<Instant> = None;
     loop {
         let mut redraw = false;
+        let mut timing = Timing::default();
         // Everything one step produced is gathered first and painted as one
         // frame: rows pushed into the scrollback erase the viewport, and the draw
         // that repaints it must reach the screen with them (no flash).
@@ -1097,6 +1118,7 @@ fn run_loop_inner(
             .poll_key(POLL_INTERVAL)
             .map_err(|error| terminal_error(&error))?
         {
+            timing.input = Some(Instant::now());
             if let Some(handled) = fullscreen_input(renderer, controller, &key, &mut effects) {
                 redraw = handled;
                 // A spun wheel sends a burst of reports; each drew a whole frame,
@@ -1133,7 +1155,9 @@ fn run_loop_inner(
                 redraw = true;
                 resized_at = Some(Instant::now());
             } else {
+                let asked = Instant::now();
                 let from_key = controller.handle_key(key);
+                timing.key = asked.elapsed();
                 redraw = !from_key.is_empty();
                 effects.extend(from_key);
             }
@@ -1151,7 +1175,9 @@ fn run_loop_inner(
             .iter()
             .any(|effect| matches!(effect, Effect::Exit(_)));
         if !exiting {
+            let pumping = Instant::now();
             let pumped = controller.pump_events();
+            timing.pump = pumping.elapsed();
             redraw = redraw || !pumped.is_empty();
             effects.extend(pumped);
             // The spinner and the clock only need repainting while something runs:
@@ -1170,19 +1196,30 @@ fn run_loop_inner(
             Effect::EditExternally(draft) => Some(draft.clone()),
             _ => None,
         });
+        let begun = Instant::now();
         renderer
             .begin_update()
             .map_err(|error| terminal_error(&error))?;
         let step = apply(renderer, effects);
+        let mut built = Duration::ZERO;
         let drawn = match step {
-            Ok(Step::Continue) if redraw => renderer
-                .draw_state(&controller.ui_state())
-                .map_err(|error| terminal_error(&error)),
+            Ok(Step::Continue) if redraw => {
+                let state = controller.ui_state();
+                built = begun.elapsed();
+                renderer
+                    .draw_state(&state)
+                    .map_err(|error| terminal_error(&error))
+            }
             _ => Ok(()),
         };
         renderer
             .end_update()
             .map_err(|error| terminal_error(&error))?;
+        if let Some(log) = &mut frames {
+            timing.built = built;
+            timing.frame = begun.elapsed();
+            log.frame(&timing);
+        }
         drawn?;
         if let Step::Exit(code) = step? {
             return Ok(code);
@@ -1204,6 +1241,62 @@ fn run_loop_inner(
                 return Ok(code);
             }
         }
+    }
+}
+
+/// Where one turn of the loop spent its time, for [`FrameLog`].
+#[derive(Default)]
+struct Timing {
+    /// When the input the frame answers was read.
+    input: Option<Instant>,
+    /// Handing a key to the controller: for an attached terminal, the round
+    /// trip to the background agent and back.
+    key: Duration,
+    /// Taking the session's events (an attached terminal's frames).
+    pump: Duration,
+    built: Duration,
+    frame: Duration,
+}
+
+/// `HA_FRAME_LOG=<file>`: one line per frame, for finding what makes the
+/// screen lag: when the frame ended (ms since the app started), then in
+/// microseconds the key's round trip, taking the events, building the
+/// state, the whole frame, and the input's latency to the painted frame
+/// (`-` when no input caused it): `1520 0 40 180 2410 2650`.
+struct FrameLog {
+    file: std::io::BufWriter<std::fs::File>,
+    started: Instant,
+}
+
+impl FrameLog {
+    fn open() -> Option<Self> {
+        let path = std::env::var_os("HA_FRAME_LOG")?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        Some(Self {
+            file: std::io::BufWriter::new(file),
+            started: Instant::now(),
+        })
+    }
+
+    fn frame(&mut self, timing: &Timing) {
+        use std::io::Write as _;
+        let latency = timing
+            .input
+            .map_or_else(|| "-".to_owned(), |at| at.elapsed().as_micros().to_string());
+        let _ = writeln!(
+            self.file,
+            "{} {} {} {} {} {latency}",
+            self.started.elapsed().as_millis(),
+            timing.key.as_micros(),
+            timing.pump.as_micros(),
+            timing.built.as_micros(),
+            timing.frame.as_micros(),
+        );
+        let _ = self.file.flush();
     }
 }
 

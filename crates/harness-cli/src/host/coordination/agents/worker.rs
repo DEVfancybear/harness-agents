@@ -181,6 +181,24 @@ enum Command {
     Stop,
 }
 
+impl Command {
+    /// What the command is, for the slow-step log.
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Attach { .. } => "attach",
+            Self::Detach { .. } => "detach",
+            Self::Key { .. } => "key",
+            Self::Columns { .. } => "columns",
+            Self::Send { .. } => "send",
+            Self::Abort { .. } => "abort",
+            Self::LastAnswer { .. } => "last-answer",
+            Self::DeliveryAnswer { .. } => "delivery-answer",
+            Self::Schedule { .. } => "schedule",
+            Self::Stop => "stop",
+        }
+    }
+}
+
 struct Status {
     info: AgentInfo,
     last_activity: Instant,
@@ -1214,14 +1232,24 @@ impl Agent {
 
     fn run(&mut self, commands: &Receiver<Command>) {
         let mut last_tick = Instant::now();
+        let mut slow = SlowLog::open();
         loop {
             let mut stop = match commands.recv_timeout(POLL) {
-                Ok(command) => self.handle(command),
+                Ok(command) => {
+                    let begun = Instant::now();
+                    let what = command.label();
+                    let stop = self.handle(command);
+                    slow.note(what, begun);
+                    stop
+                }
                 Err(RecvTimeoutError::Timeout) => false,
                 Err(RecvTimeoutError::Disconnected) => true,
             };
             while !stop && let Ok(command) = commands.try_recv() {
+                let begun = Instant::now();
+                let what = command.label();
                 stop = self.handle(command);
+                slow.note(what, begun);
             }
             if stop {
                 for client in self.clients.drain(..) {
@@ -1231,13 +1259,19 @@ impl Agent {
                 }
                 return;
             }
+            let begun = Instant::now();
             let pumped = self.controller.pump_events();
+            slow.note("events", begun);
             let ticked = if last_tick.elapsed() >= TICK {
                 last_tick = Instant::now();
-                self.controller.tick()
+                let begun = Instant::now();
+                let ticked = self.controller.tick();
+                slow.note("tick", begun);
+                ticked
             } else {
                 Vec::new()
             };
+            let begun = Instant::now();
             if !pumped.is_empty() || !ticked.is_empty() {
                 self.touch();
             }
@@ -1261,8 +1295,11 @@ impl Agent {
             if self.redraw_due && self.last_full.elapsed() >= FRAME_EVERY {
                 self.forward(&[Effect::Redraw], None);
             }
+            slow.note("frames", begun);
             if self.last_status.elapsed() >= STATUS_EVERY {
+                let begun = Instant::now();
                 self.refresh_status();
+                slow.note("status", begun);
             }
         }
     }
@@ -1543,6 +1580,46 @@ impl Agent {
             self.clients
                 .retain(|client| !gone.contains(&client.connection));
             self.refresh_status();
+        }
+    }
+}
+
+/// `HA_WORKER_LOG=<file>`: each step of a background agent's loop that kept
+/// it from a terminal's key for 5 ms or more, as `<ms since start> <step>
+/// <us>`: a key waits for the step before it, and the terminal for the key.
+struct SlowLog {
+    file: Option<std::io::BufWriter<std::fs::File>>,
+    started: Instant,
+}
+
+impl SlowLog {
+    fn open() -> Self {
+        let file = std::env::var_os("HA_WORKER_LOG").and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+        });
+        Self {
+            file: file.map(std::io::BufWriter::new),
+            started: Instant::now(),
+        }
+    }
+
+    fn note(&mut self, step: &str, begun: Instant) {
+        use std::io::Write as _;
+        let took = begun.elapsed();
+        if let Some(file) = &mut self.file
+            && took >= Duration::from_millis(5)
+        {
+            let _ = writeln!(
+                file,
+                "{} {step} {}",
+                self.started.elapsed().as_millis(),
+                took.as_micros()
+            );
+            let _ = file.flush();
         }
     }
 }

@@ -2143,7 +2143,7 @@ fn g4_a_step_bound_continues_the_turn_by_itself() {
     assert!(
         continued.contains("paused: step limit reached")
             && continued.contains("⟳ 2 steps")
-            && continued.contains("⚙ 1 tool call"),
+            && continued.contains("◈ 1 tool call"),
         "the pause is still on the record before the continuation:\n{continued}"
     );
 

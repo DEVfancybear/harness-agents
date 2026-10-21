@@ -191,6 +191,20 @@ the terminal's own scroll (a scroll region over the window): only the rows that
 come into view are written, about a tenth of what drawing the whole window again
 sent through a Windows console.
 
+When the conversation's width or detail mode changes (a subagent's pane opens or
+closes, Ctrl+O, attaching to a background agent), only the newest entries are
+drawn again at once, enough for a few screens; the older ones follow a few
+milliseconds at a time between frames. A window scrolled back keeps the entry it
+showed at its top. Ctrl+F and the first row (Home) wait for every entry. The
+pointer moving with no button held is read and dropped, so it never holds up a
+key or splits a burst of wheel notches into a frame each.
+
+To see where a frame's time goes, set `HA_FRAME_LOG=<file>` for the terminal (one
+line per frame: when it ended in ms, then in microseconds the key's round trip to
+a background agent, taking its events, building the state, the whole frame, and
+the input's latency to the painted frame) and `HA_WORKER_LOG=<file>` for a
+background agent (each step of its loop that took 5 ms or more).
+
 - `/fullscreen` toggles it and saves `terminal.fullscreen` in `settings.json`;
   `terminal.fullscreenMouse` turns mouse tracking off, and `terminal.sidebar:
   false` hides the sidebar.

@@ -41,6 +41,14 @@ pub const WHEEL_SCROLL_LINES: isize = 3;
 /// How often a drag held at an edge scrolls the selection one row further.
 const AUTO_SCROLL_EVERY: Duration = Duration::from_millis(50);
 
+/// How many screens of the newest rows are drawn at once after the width or
+/// the detail mode changed; the older entries follow between frames.
+const FIRST_WINDOWS: usize = 4;
+
+/// How long one turn of the loop may spend drawing older entries: well under
+/// a frame, so keys and the wheel are not held up behind it.
+const OLDER_BUDGET: Duration = Duration::from_millis(6);
+
 /// The follow key prime-agent's hint names (`tui.viewport.follow`).
 pub const FOLLOW_KEY: &str = "ctrl+end";
 
@@ -389,6 +397,26 @@ impl Viewport {
 
     /// The first `count` conversation rows were dropped: what is on screen keeps
     /// its place instead of sliding up under a reader who scrolled back.
+    /// Put the window's first row at `top`, not following the end.
+    fn place(&mut self, top: usize) {
+        self.scroll_top = top;
+        self.following = false;
+    }
+
+    /// Rows were drawn above the ones there were (older entries, drawn after
+    /// the newest): the window and a selection stay on the rows they were on.
+    fn rows_added(&mut self, count: usize) {
+        if !self.following {
+            self.scroll_top += count;
+        }
+        self.max_scroll += count;
+        if self.mode == Some(Mode::Transcript) {
+            for point in [&mut self.anchor, &mut self.head].into_iter().flatten() {
+                point.line += count;
+            }
+        }
+    }
+
     fn rows_removed(&mut self, count: usize) {
         if !self.following {
             self.scroll_top = self.scroll_top.saturating_sub(count);
@@ -591,6 +619,10 @@ pub struct FullscreenScreen<B: Backend> {
     /// entry again.
     row_counts: VecDeque<usize>,
     rows_key: Option<(u16, Detail)>,
+    /// The first entry of `shown` that `rows` holds: after a change of width
+    /// or detail mode the newest entries are drawn first, the older ones a
+    /// few at a time between frames.
+    built_from: usize,
     /// The live block's tallest height in the current run (never more than
     /// its cap). It grows and shrinks with every tool card and output line;
     /// holding its room keeps the conversation from jumping each frame.
@@ -651,6 +683,7 @@ where
             rows: Vec::new(),
             row_counts: VecDeque::new(),
             rows_key: None,
+            built_from: 0,
             dock_floor: 0,
             assistant_continuing,
             viewport: Viewport::default(),
@@ -766,25 +799,116 @@ where
         self.terminal.size().map_or(0, |size| size.height)
     }
 
-    /// Draw every entry again at this width and detail mode, when either changed.
+    /// Draw the entries again at this width and detail mode, when either
+    /// changed: the newest first, as many as fill a few windows, and the
+    /// older ones a few at a time between frames ([`Self::draw_older`]).
+    /// Drawing all of a long run's entries (4000, with their markdown and
+    /// highlighted code) in the frame that opened a subagent's pane was the
+    /// lag of picking one, and of Ctrl+O and of attaching. A window scrolled
+    /// back keeps the entry it showed at its top: the entries from there
+    /// down are drawn now. The find bar counts rows from the start, so with
+    /// it open every entry is.
     fn ensure_rows(&mut self, width: u16) {
         if self.rows_key == Some((width, self.detail)) {
             return;
         }
-        let mut rows = Vec::new();
-        let mut counts = VecDeque::with_capacity(self.shown.len());
-        for (index, item) in self.shown.iter().enumerate() {
-            let continuing =
-                index > 0 && matches!(self.shown[index - 1], HistoryItem::Assistant { .. });
-            let drawn = history::render_fragment(item, width, &self.theme, self.detail, continuing);
-            counts.push_back(drawn.len());
-            rows.extend(drawn);
-        }
-        self.rows = rows;
-        self.row_counts = counts;
+        // The old rows still say where the window is, while they match the
+        // entries (a reprint keeps them; a restore does not).
+        let anchor = if self.viewport.is_following()
+            || self.row_counts.len() != self.shown.len().saturating_sub(self.built_from)
+        {
+            None
+        } else {
+            self.top_entry()
+        };
+        self.rows = Vec::new();
+        self.row_counts = VecDeque::new();
+        self.built_from = self.shown.len();
         self.rows_key = Some((width, self.detail));
         // Rows were re-wrapped: a selection anchored to the old ones is gone.
         self.viewport.clear_selection();
+        let height = self
+            .terminal
+            .size()
+            .map_or(50, |size| usize::from(size.height));
+        if self.find.is_some() {
+            self.draw_older(usize::MAX, None, 0);
+        } else if let Some((entry, offset)) = anchor {
+            self.draw_older(usize::MAX, None, entry);
+            let first = self.row_counts.front().copied().unwrap_or(0);
+            self.viewport.place(offset.min(first.saturating_sub(1)));
+            self.draw_older(height * FIRST_WINDOWS, None, 0);
+        } else {
+            self.draw_older(height * FIRST_WINDOWS, None, 0);
+        }
+    }
+
+    /// The entry the window's first row belongs to, and that row's place in
+    /// the entry's rows.
+    fn top_entry(&self) -> Option<(usize, usize)> {
+        let top = self.viewport.top();
+        let mut start = 0;
+        for (index, count) in self.row_counts.iter().enumerate() {
+            if top < start + count {
+                return Some((self.built_from + index, top - start));
+            }
+            start += count;
+        }
+        None
+    }
+
+    /// Draw entries older than the ones `rows` holds, newest first, until
+    /// `rows_wanted` more rows are drawn, `budget` is spent, or the entry
+    /// `floor` is drawn; they go above the rows there were. How many rows
+    /// were added.
+    fn draw_older(&mut self, rows_wanted: usize, budget: Option<Duration>, floor: usize) -> usize {
+        let Some((width, detail)) = self.rows_key else {
+            return 0;
+        };
+        let begun = Instant::now();
+        let mut fragments = Vec::new();
+        let mut added = 0;
+        while self.built_from > floor
+            && added < rows_wanted
+            && budget.is_none_or(|budget| begun.elapsed() < budget)
+        {
+            let index = self.built_from - 1;
+            let continuing =
+                index > 0 && matches!(self.shown[index - 1], HistoryItem::Assistant { .. });
+            let drawn = history::render_fragment(
+                &self.shown[index],
+                width,
+                &self.theme,
+                detail,
+                continuing,
+            );
+            added += drawn.len();
+            fragments.push(drawn);
+            self.built_from = index;
+        }
+        if fragments.is_empty() {
+            return 0;
+        }
+        for fragment in &fragments {
+            self.row_counts.push_front(fragment.len());
+        }
+        let older: Vec<Line<'static>> = fragments.into_iter().rev().flatten().collect();
+        self.rows.splice(0..0, older);
+        self.viewport.rows_added(added);
+        // The last frame's top, counted from the start, moved with its rows:
+        // the window did not.
+        if let Some((_, _, top)) = &mut self.last_window {
+            *top += added;
+        }
+        added
+    }
+
+    /// Every entry drawn: for a search over the whole conversation, or the
+    /// window's first row.
+    fn draw_all(&mut self) {
+        if self.rows_key.is_some() {
+            self.draw_older(usize::MAX, None, 0);
+        }
     }
 
     pub fn insert_history_batch(&mut self, items: &[HistoryItem]) {
@@ -819,6 +943,11 @@ where
     /// window and any selection move with the rows.
     fn drop_oldest(&mut self, drawn: bool) {
         self.shown.pop_front();
+        if drawn && self.built_from > 0 {
+            // Not drawn yet, so there are no rows to remove.
+            self.built_from -= 1;
+            return;
+        }
         if !drawn || self.row_counts.len() != self.shown.len() + 1 {
             self.rows_key = None;
             self.row_counts.clear();
@@ -874,6 +1003,7 @@ where
         self.assistant_continuing =
             matches!(self.shown.back(), Some(HistoryItem::Assistant { .. }));
         self.rows_key = None;
+        self.row_counts.clear();
         self.viewport.scroll_to_bottom();
     }
 
@@ -906,6 +1036,13 @@ where
         let left = self.sidebar_columns(size.width);
         let pane = self.pane_columns(size.width - left);
         self.ensure_rows(size.width - left - pane);
+        // Scrolled back to near the first row drawn: draw the entries above
+        // it now, so the wheel never stops at a top that is not the start.
+        let height = usize::from(size.height);
+        if self.built_from > 0 && !self.viewport.is_following() && self.viewport.top() < height * 2
+        {
+            self.draw_older(height * FIRST_WINDOWS, None, 0);
+        }
         self.viewport.left = left;
         self.viewport.right = size.width - pane;
         let others = self
@@ -1235,7 +1372,13 @@ where
             .roster
             .as_mut()
             .is_some_and(super::roster::Poller::poll);
-        roster || self.scroll_tick()
+        let scrolled = self.scroll_tick();
+        // The older entries, a few at a time. Only a window scrolled back
+        // sees them arrive (its rows stay put, its place in the whole moves).
+        let older = self.built_from > 0
+            && self.draw_older(usize::MAX, Some(OLDER_BUDGET), 0) > 0
+            && !self.viewport.is_following();
+        roster || scrolled || older
     }
 
     fn scroll_tick(&mut self) -> bool {
@@ -1262,6 +1405,7 @@ where
     }
 
     pub fn scroll_to_top(&mut self) {
+        self.draw_all();
         self.viewport.scroll_to_top();
     }
 
@@ -1271,6 +1415,7 @@ where
 
     /// Ctrl+F: open the find bar (it stays open, with its query, when it is).
     pub fn open_find(&mut self) {
+        self.draw_all();
         if self.find.is_none() {
             self.find = Some(super::find::Find::default());
         }
@@ -1913,7 +2058,7 @@ mod tests {
                     // The row's id only: a toast another test pushed (the
                     // queue is the process's) may be drawn beside it.
                     row.trim()
-                        .strip_prefix("ℹ row-")
+                        .strip_prefix("• row-")
                         .and_then(|rest| rest.split_whitespace().next())
                         .map(|id| (y, id.to_owned()))
                 })
@@ -2000,10 +2145,80 @@ mod tests {
         assert_eq!(painted(&screen), before, "the reader's view did not move");
         assert_eq!(screen.shown.len(), super::REPRINT_ENTRIES);
         assert_eq!(screen.rows.len(), screen.row_counts.iter().sum::<usize>());
+        // The older entries, drawn between frames, complete the same rows.
+        screen.draw_all();
+        assert_eq!(screen.built_from, 0);
+        assert_eq!(screen.row_counts.len(), screen.shown.len());
         let kept = screen.rows.clone();
         screen.rows_key = None;
         screen.ensure_rows(60);
+        screen.draw_all();
         assert_eq!(screen.rows, kept, "the same rows a full redraw gives");
+    }
+
+    /// Opening a subagent's pane narrows the conversation: only the newest
+    /// entries are drawn again at once, the older ones between frames, and a
+    /// reader scrolled back keeps the entry at the window's top.
+    #[test]
+    fn a_new_width_draws_the_newest_entries_first_and_keeps_the_readers_place() {
+        let mut screen = screen(100, 20);
+        let state = crate::interactive::tui::tests::idle_state();
+        let notices = (0..2000)
+            .map(|index| HistoryItem::Notice {
+                message: format!("entry-{index}"),
+            })
+            .collect::<Vec<_>>();
+        screen.insert_history_batch(&notices);
+        screen.draw(&state).expect("drawn");
+        assert!(
+            screen.built_from > 1500,
+            "only the newest are drawn: {}",
+            screen.built_from
+        );
+        assert!(
+            painted(&screen)
+                .join(
+                    "
+"
+                )
+                .contains("entry-1999")
+        );
+        // Between frames the rest arrive, a little at a time.
+        while screen.built_from > 0 {
+            assert!(screen.draw_older(usize::MAX, Some(super::OLDER_BUDGET), 0) > 0);
+        }
+        assert_eq!(screen.row_counts.len(), 2000);
+
+        // Scrolled back to entry 1200, then the width changes.
+        let at = screen.rows.iter().position(|row| {
+            row.spans
+                .iter()
+                .any(|span| span.content.contains("entry-1200"))
+        });
+        screen.viewport.place(at.expect("a row of entry 1200"));
+        screen.draw(&state).expect("drawn");
+        let top = |screen: &FullscreenScreen<ratatui::backend::TestBackend>| {
+            screen.rows[screen.viewport.top()]
+                .spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        };
+        assert!(top(&screen).contains("entry-1200"), "{}", top(&screen));
+        // Ctrl+O: the next frame draws in the new mode.
+        let mut details = state.clone();
+        details.detail = Detail::Details;
+        screen.reprint(Detail::Details);
+        screen.draw(&details).expect("drawn");
+        assert!(top(&screen).contains("entry-1200"), "{}", top(&screen));
+        assert!(
+            screen.built_from > 0,
+            "the older entries are left for later"
+        );
+        while screen.built_from > 0 {
+            screen.tick();
+        }
+        assert!(top(&screen).contains("entry-1200"), "{}", top(&screen));
     }
 
     /// Tool cards and output lines come and go in the live block while a run
@@ -2105,5 +2320,187 @@ mod tests {
         screen.draw(&state).expect("drawn");
         let copied = screen.mouse(at(MouseKind::Release, column + 7), false);
         assert_eq!(copied.copied.as_deref(), Some("copy-me"));
+    }
+
+    /// How long a frame takes on a heavy screen: a long run's conversation,
+    /// six delegates, one of them 193 calls in. `cargo test --release ... --
+    /// --ignored frame_cost --nocapture` prints the costs; nothing is asserted.
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    #[allow(clippy::too_many_lines, reason = "one heavy screen, timed step by step")]
+    fn frame_cost() {
+        use crate::interactive::events::{
+            AppPhase, ChildActivity, ChildLine, ChildLineKind, ChildRunState, ToolState,
+        };
+        use std::time::{Duration, Instant};
+        let mut screen = screen(200, 50).with_sidebar(true);
+        let mut items = Vec::new();
+        for turn in 0..400 {
+            items.push(HistoryItem::User {
+                text: format!("turn {turn}: làm game full chức năng"),
+            });
+            for call in 0..4 {
+                items.push(HistoryItem::Tool {
+                    name: "read_file".to_owned(),
+                    summary: format!("read_file: path=src/modules/arena/service{call}.ts"),
+                    input: String::new(),
+                    state: ToolState::Ok {
+                        elapsed: Duration::from_millis(20),
+                    },
+                });
+                items.push(HistoryItem::ToolOutput {
+                    name: "read_file".to_owned(),
+                    text: (0..30)
+                        .map(|line| {
+                            format!("{line}: const value = this.rejectNotInWorld(session, rows);")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    path: Some("src/a.ts".to_owned()),
+                });
+            }
+            items.push(HistoryItem::Assistant {
+                text: "## Kết quả\n\n- **arena**: `service.ts` sửa xong, chạy `npm test` qua.\n- bảng:\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```ts\nconst x = 1;\n```\n".repeat(2),
+            });
+        }
+        screen.insert_history_batch(&items);
+        let mut state = crate::interactive::tui::tests::idle_state();
+        state.phase = AppPhase::Running;
+        state.child_activity = (0..6)
+            .map(|child| ChildActivity {
+                name: format!("coder-cd19609{child}"),
+                tool_calls: if child == 0 { 193 } else { 12 },
+                latest: "read_file: path=src/a.ts".to_owned(),
+                recent: (0..60)
+                    .map(|line| ChildLine {
+                        kind: if line % 3 == 0 {
+                            ChildLineKind::Call
+                        } else {
+                            ChildLineKind::Output
+                        },
+                        text: format!("read_file: path=src/modules/arena/file{line}.ts"),
+                        call: format!("c{}", line / 3),
+                    })
+                    .collect(),
+                state: if child < 2 {
+                    ChildRunState::Running
+                } else {
+                    ChildRunState::Done
+                },
+                ..ChildActivity::default()
+            })
+            .collect();
+        let time =
+            |screen: &mut FullscreenScreen<ratatui::backend::TestBackend>,
+             state: &crate::interactive::events::UiState,
+             what: &str,
+             change: &dyn Fn(&mut FullscreenScreen<ratatui::backend::TestBackend>)| {
+                let mut worst = Duration::ZERO;
+                let mut total = Duration::ZERO;
+                for _ in 0..20 {
+                    change(screen);
+                    let begun = Instant::now();
+                    screen.draw(state).expect("drawn");
+                    let took = begun.elapsed();
+                    worst = worst.max(took);
+                    total += took;
+                }
+                println!("{what:<28} mean {:>8.2?} worst {:>8.2?}", total / 20, worst);
+            };
+        screen.draw(&state).expect("drawn");
+        time(&mut screen, &state, "idle frame (tick)", &|_| {});
+        time(&mut screen, &state, "wheel notch up", &|screen| {
+            let _ = screen.mouse(
+                MouseInput {
+                    kind: MouseKind::WheelUp,
+                    column: 120,
+                    row: 20,
+                    modified: false,
+                },
+                false,
+            );
+        });
+        screen.follow();
+        let pick = |screen: &mut FullscreenScreen<ratatui::backend::TestBackend>,
+                    state: &crate::interactive::events::UiState,
+                    what: &str,
+                    number: u8| {
+            let _ = screen.agent_key(number, state);
+            let begun = Instant::now();
+            screen.draw(state).expect("drawn");
+            println!("{what:<28} {:>8.2?}", begun.elapsed());
+        };
+        pick(&mut screen, &state, "open a child's pane", 2);
+        pick(&mut screen, &state, "close it", 1);
+        for _ in 0..30 {
+            let _ = screen.mouse(
+                MouseInput {
+                    kind: MouseKind::WheelUp,
+                    column: 120,
+                    row: 20,
+                    modified: false,
+                },
+                false,
+            );
+        }
+        screen.draw(&state).expect("drawn");
+        pick(&mut screen, &state, "scrolled back, open a pane", 2);
+        pick(&mut screen, &state, "scrolled back, close it", 1);
+        screen.follow();
+        screen.draw(&state).expect("drawn");
+        let started = Instant::now();
+        let mut ticks = 0;
+        while screen.built_from > 0 {
+            screen.tick();
+            ticks += 1;
+        }
+        println!(
+            "{:<28} {:>8.2?} in {ticks} ticks",
+            "older entries drawn",
+            started.elapsed()
+        );
+        let _ = screen.agent_key(2, &state);
+        time(&mut screen, &state, "child pane open (tick)", &|_| {});
+        time(&mut screen, &state, "child pane, wheel", &|screen| {
+            let _ = screen.mouse(
+                MouseInput {
+                    kind: MouseKind::WheelDown,
+                    column: 120,
+                    row: 20,
+                    modified: false,
+                },
+                false,
+            );
+        });
+        let _ = screen.agent_key(1, &state);
+        time(&mut screen, &state, "a notice comes in", &|screen| {
+            screen.insert_history_batch(&[HistoryItem::Notice {
+                message: "agent message · main → coder-cd196090 · tiếp tục".to_owned(),
+            }]);
+        });
+        time(&mut screen, &state, "a tool card comes in", &|screen| {
+            screen.insert_history_batch(&[HistoryItem::Tool {
+                name: "read_file".to_owned(),
+                summary: "read_file: path=src/a.ts".to_owned(),
+                input: String::new(),
+                state: ToolState::Ok {
+                    elapsed: Duration::from_millis(20),
+                },
+            }]);
+        });
+        time(&mut screen, &state, "scrolled back, notice", &|screen| {
+            let _ = screen.mouse(
+                MouseInput {
+                    kind: MouseKind::WheelUp,
+                    column: 120,
+                    row: 20,
+                    modified: false,
+                },
+                false,
+            );
+            screen.insert_history_batch(&[HistoryItem::Notice {
+                message: "context: compacted".to_owned(),
+            }]);
+        });
     }
 }

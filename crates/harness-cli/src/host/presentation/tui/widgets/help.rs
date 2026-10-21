@@ -297,7 +297,7 @@ pub fn rich_rows(lines: &[RefLine], width: u16, theme: &Theme) -> Vec<Line<'stat
             }
             RefLine::Text(text) => rows.push(Line::from(Span::raw(format!(" {text}")))),
             RefLine::Hint(text) => rows.push(Line::from(vec![
-                Span::styled(" ℹ ", theme.info),
+                Span::styled(" • ", theme.info),
                 Span::styled(text.clone(), theme.dim),
             ])),
             RefLine::Blank => rows.push(Line::default()),
@@ -438,7 +438,7 @@ mod tests {
             text.lines().all(|line| line.chars().count() <= 40),
             "a description wraps inside the panel:\n{text}"
         );
-        assert!(text.contains("ℹ /skill:<name> runs one"), "{text}");
+        assert!(text.contains("• /skill:<name> runs one"), "{text}");
     }
 
     #[test]

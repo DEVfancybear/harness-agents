@@ -1,7 +1,7 @@
 //! What a tool is, at a glance: a kind, its glyph and its colour.
 //!
 //! The transcript is read by scrolling, so a call has to be recognisable before
-//! its words are: a reader who sees `▤` in blue knows a file was read, `✎` in
+//! its words are: a reader who sees `▤` in blue knows a file was read, `✐` in
 //! amber that one was written, `❯` in magenta that a command ran. The glyphs are
 //! from blocks every console font falls back to (geometric shapes, arrows,
 //! dingbats), not from a private-use icon font, so nothing needs installing.
@@ -85,7 +85,7 @@ impl ToolKind {
             Self::Read => "▤",
             Self::List => "▥",
             Self::Search => "⌕",
-            Self::Edit => "✎",
+            Self::Edit => "✐",
             Self::Write => "✚",
             Self::Shell => "❯",
             Self::Git => "⎇",

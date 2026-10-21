@@ -313,9 +313,9 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Readouts) {
             ));
             push(Span::styled(
                 if state.max_tool_calls == crate::interactive::bounds::UNLIMITED {
-                    format!(" · ⚙ tools {}", state.tool_calls)
+                    format!(" · ◈ tools {}", state.tool_calls)
                 } else {
-                    format!(" · ⚙ tools {}/{}", state.tool_calls, state.max_tool_calls)
+                    format!(" · ◈ tools {}/{}", state.tool_calls, state.max_tool_calls)
                 },
                 theme.dim,
             ));

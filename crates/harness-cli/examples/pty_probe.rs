@@ -102,6 +102,36 @@ fn main() {
                     std::thread::sleep(Duration::from_millis(gap));
                 }
             }
+            // The pointer moved with no button held, `n` reports 4 ms apart
+            // across the window: what a hand resting on the mouse sends.
+            "hover" => {
+                for step in 0..value.parse::<u16>().unwrap_or(1) {
+                    let column = 10 + step % (cols - 20);
+                    let row = 5 + (step / 7) % (rows - 10);
+                    send(format!("\x1b[<35;{column};{row}M").as_bytes());
+                    std::thread::sleep(Duration::from_millis(4));
+                }
+            }
+            // `n` wheel notches up (`scrollmove`) with the pointer drifting
+            // between them, as a real hand on a wheel does.
+            "scrollmove" => {
+                for notch in 0..value.parse::<u16>().unwrap_or(1) {
+                    for drift in 0..3 {
+                        let column = cols / 2 + (notch + drift) % 5;
+                        send(format!("\x1b[<35;{column};{}M", rows / 2).as_bytes());
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    send(format!("\x1b[<64;{};{}M", cols / 2, rows / 2).as_bytes());
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+            }
+            // A left click at `<column>x<row>` (1-based, as the reports are).
+            "click" => {
+                let (column, row) = value.split_once('x').unwrap_or(("1", "1"));
+                send(format!("\x1b[<0;{column};{row}M").as_bytes());
+                std::thread::sleep(Duration::from_millis(20));
+                send(format!("\x1b[<0;{column};{row}m").as_bytes());
+            }
             // Wait until the screen has been quiet for 300 ms (at most the
             // value, in ms), and mark how long it went on painting after the
             // last input: how far the screen lags behind the wheel.

@@ -23,6 +23,7 @@ pub struct Extra {
 
 /// The `/status` panel.
 #[must_use]
+#[allow(clippy::too_many_lines, reason = "one panel, a section at a time")]
 pub fn rows(header: &[String], extra: &Extra) -> Vec<RefLine> {
     let facts: Vec<(String, String)> = header.iter().flat_map(|line| facts(line)).collect();
     let fact = |label: &str| {
@@ -180,16 +181,12 @@ fn facts(line: &str) -> Vec<(String, String)> {
                 })
                 .map(|_| (at, tail.len() - after.len()))
         });
-        match next {
-            Some((end, start)) => {
-                found.push((label.to_owned(), tail[..end].trim().to_owned()));
-                rest = &tail[start..];
-            }
-            None => {
-                found.push((label.to_owned(), tail.trim().to_owned()));
-                break;
-            }
-        }
+        let Some((end, start)) = next else {
+            found.push((label.to_owned(), tail.trim().to_owned()));
+            break;
+        };
+        found.push((label.to_owned(), tail[..end].trim().to_owned()));
+        rest = &tail[start..];
     }
     found
 }

@@ -9,7 +9,7 @@
 //!  harness-agents          ● │  the project, with the session's status dot
 //!    master                  │  the branch, in mauve
 //!    ◆ deepseek-v4 · high    │
-//!    ⚙ full-auto             │
+//!    ◈ full-auto             │
 //! ───────────────────────────│
 //!  agents        2 working · 3 │
 //!  1 ⣾ main         working  │  on the selected background: in front
@@ -351,7 +351,7 @@ fn lines(
         } else {
             theme.dim
         };
-        rows.push(detail(vec![Span::styled(format!("⚙ {mode}"), style)]));
+        rows.push(detail(vec![Span::styled(format!("◈ {mode}"), style)]));
     }
     // A chat named after its workspace says nothing the row above did not.
     if let Some(chat) = find(state, "Chat: ").filter(|chat| *chat != project) {
@@ -865,7 +865,7 @@ mod tests {
         assert!(rows[1].contains("harness-agents"), "{text}");
         assert!(text.contains("feat/sidebar"), "{text}");
         assert!(text.contains("◆ deepseek-v4 · high"), "{text}");
-        assert!(text.contains("⚙ full-auto"), "{text}");
+        assert!(text.contains("◈ full-auto"), "{text}");
         assert!(
             agent_rows(&rows)
                 .iter()

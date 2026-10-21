@@ -338,13 +338,13 @@ fn spans_cells(spans: &[Span<'static>]) -> usize {
 }
 
 /// prime-agent's injected prompts (`injected-prompt-message.ts`): a heartbeat is
-/// `♥ Heartbeat prompt · <schedule>`, a goal continuation `◆ Goal · <objective>`,
+/// `♡ Heartbeat prompt · <schedule>`, a goal continuation `◆ Goal · <objective>`,
 /// anything else the app sent by itself `◆ <first line>`.
 fn injected_prompt(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let first = text.lines().next().unwrap_or_default();
     let (marker, marker_style, label) = if let Some(rest) = first.strip_prefix("[heartbeat: ") {
         let schedule = rest.split(" run#").next().unwrap_or(rest);
-        ("♥ ", theme.error, format!("Heartbeat prompt · {schedule}"))
+        ("♡ ", theme.error, format!("Heartbeat prompt · {schedule}"))
     } else if let Some(objective) = first.strip_prefix("Continue working toward the goal: ") {
         ("◆ ", theme.accent, format!("Goal · {objective}"))
     } else {
@@ -432,7 +432,9 @@ fn error_rows(
 }
 
 /// A status line in `dim`; a warning (`goal paused`, `refine failed`, ...) in the
-/// warning colour with prime-agent's `⚠`, and a refinement in its own colour.
+/// warning colour with a `▲`, and a refinement in its own colour. The icons are
+/// one cell wide everywhere: prime-agent's `⚠` and `ℹ` are emoji that Windows
+/// Terminal draws two cells wide, over the space after them (`ℹgoal ...`).
 fn notice_rows(message: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let lowered = message.to_ascii_lowercase();
     let spans = if message.starts_with("refine ") {
@@ -453,7 +455,7 @@ fn notice_rows(message: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
         || lowered.contains("skipped")
     {
         vec![
-            Span::styled("⚠ ", theme.warning),
+            Span::styled("▲ ", theme.warning),
             Span::styled(message.to_owned(), theme.warning),
         ]
     } else {
@@ -477,7 +479,7 @@ fn notice_rows(message: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
                     })
                     .collect::<Vec<_>>();
                 let mut with_icon = vec![if index == 0 {
-                    Span::styled("ℹ ", theme.info)
+                    Span::styled("• ", theme.info)
                 } else {
                     Span::raw("  ")
                 }];
@@ -1098,7 +1100,7 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
                 theme.badge_ok
             };
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(format!(" ⚙ {mode} "), style));
+            spans.push(Span::styled(format!(" ◈ {mode} "), style));
         }
         if let Some(level) = lines
             .iter()
@@ -1174,7 +1176,7 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
     }) {
         rows.extend(wrap_spans(
             vec![
-                Span::styled("  ⚠ ", theme.warning),
+                Span::styled("  ▲ ", theme.warning),
                 Span::styled(line.clone(), theme.warning),
             ],
             width,
@@ -1245,7 +1247,7 @@ fn run_rows(
         Span::styled(format!(" {glyph} {} ", outcome.label()), badge),
         Span::styled(
             format!(
-                "  ⟳ {}  ⚙ {}  ◷ {} ",
+                "  ⟳ {}  ◈ {}  ◷ {} ",
                 counted(u64::from(steps), "step", "steps"),
                 counted(u64::from(tool_calls), "tool call", "tool calls"),
                 view::seconds_label(elapsed)
@@ -1662,7 +1664,7 @@ mod tests {
             &theme,
             Detail::Collapsed,
         ));
-        assert!(beat.contains("♥ Heartbeat prompt · every 5m"), "{beat}");
+        assert!(beat.contains("♡ Heartbeat prompt · every 5m"), "{beat}");
         let goal = plain_text(&render(
             &HistoryItem::Automatic {
                 text: "Continue working toward the goal: ship it\nmore".to_owned(),
@@ -1730,7 +1732,7 @@ mod tests {
         );
         assert_eq!(
             plain_text(&rows),
-            "  ℹ Sign in:\n    https://auth.example/authorize?x=1\n    Esc cancels."
+            "  • Sign in:\n    https://auth.example/authorize?x=1\n    Esc cancels."
         );
         let link = rows[1]
             .spans
