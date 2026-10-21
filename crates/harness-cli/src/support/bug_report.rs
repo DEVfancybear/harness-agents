@@ -71,6 +71,9 @@ struct Report {
     /// the log line before the newest, and which logs.
     log_panics: BTreeMap<String, (usize, i64, BTreeSet<String>)>,
     conversations: BTreeSet<String>,
+    /// The delegated children of the conversation (of every conversation of
+    /// the window when the report has none), by task: their ledger entries.
+    children: BTreeMap<String, Value>,
     notes: Vec<String>,
     known_secrets: Vec<String>,
     redactions: usize,
@@ -169,6 +172,7 @@ async fn gather(options: Options) -> Result<Report, HarnessError> {
         store_problems: BTreeMap::new(),
         log_panics: BTreeMap::new(),
         conversations: BTreeSet::new(),
+        children: BTreeMap::new(),
         notes: Vec::new(),
         known_secrets,
         redactions: 0,
@@ -177,6 +181,8 @@ async fn gather(options: Options) -> Result<Report, HarnessError> {
         report.conversations.insert(task.clone());
     }
     report.environment(&environment);
+    // The children first: their records are kept with the conversation's.
+    report.ledgers();
     report.diagnostics();
     report.workers();
     report.stores().await;
@@ -245,11 +251,9 @@ impl Report {
 
     /// Whether a record or row with these ids is in scope.
     fn wanted(&self, task: Option<&str>, session: Option<&str>) -> bool {
-        let task_ok = self
-            .options
-            .task
-            .as_deref()
-            .is_none_or(|wanted| task.is_none_or(|task| task == wanted));
+        let task_ok = self.options.task.as_deref().is_none_or(|wanted| {
+            task.is_none_or(|task| task == wanted || self.children.contains_key(task))
+        });
         let session_ok = self
             .options
             .session
@@ -405,6 +409,7 @@ impl Report {
             // the window - another project, a test run - came along with them.
             if let Some(wanted) = &self.options.task
                 && !tasks.contains(wanted)
+                && !tasks.iter().any(|task| self.children.contains_key(task))
             {
                 if !kept.is_empty() {
                     left_out += 1;
@@ -425,6 +430,54 @@ impl Report {
             self.notes.push(format!(
                 "{left_out} process log(s) with no record of this conversation left out (`ha bug-report` without a conversation keeps them)"
             ));
+        }
+    }
+
+    /// The delegation ledgers: each conversation's children, with their role,
+    /// model, state, error, time and tool calls - what a `[child-failed]`
+    /// notice does not say. A conversation's report follows its children's
+    /// ledgers down, and keeps their diagnostics with its own.
+    fn ledgers(&mut self) {
+        let dir = self.data_dir.join("delegation").join("ledger");
+        let mut pending = match &self.options.task {
+            Some(task) => vec![task.clone()],
+            None => std::fs::read_dir(&dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .filter(|path| modified_ms(path).is_none_or(|ms| ms >= self.since_ms))
+                        .filter_map(|path| {
+                            path.file_stem()
+                                .map(|stem| stem.to_string_lossy().into_owned())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        let mut read = BTreeSet::new();
+        while let Some(task) = pending.pop() {
+            if !is_id(&task) || !read.insert(task.clone()) {
+                continue;
+            }
+            let path = dir.join(format!("{task}.json"));
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(mut ledger) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            for child in ledger.as_array().into_iter().flatten() {
+                if let Some(id) = child["task_id"].as_str() {
+                    self.children.insert(id.to_owned(), child.clone());
+                    pending.push(id.to_owned());
+                }
+            }
+            self.redact_value(&mut ledger);
+            self.add_bytes(
+                &format!("delegation/ledger/{task}.json"),
+                pretty(&ledger).into_bytes(),
+            );
         }
     }
 
@@ -626,8 +679,14 @@ impl Report {
             };
             let tables = store.bug_report_tables(self.options.include_content).await;
             let _ = store.close().await;
-            let tables = self.filter_tables(&project, tables);
-            self.add_text(&format!("store/{project}.json"), &pretty(&tables));
+            let mut tables = self.filter_tables(&project, tables);
+            // Field by field: a row's millisecond times were taken for card
+            // numbers when the file was redacted as one text.
+            self.redact_value(&mut tables);
+            self.add_bytes(
+                &format!("store/{project}.json"),
+                pretty(&tables).into_bytes(),
+            );
             for name in [
                 "hidden-conversations.json",
                 "writer.owner.json",
@@ -936,8 +995,74 @@ impl Report {
         self.summary_header(&mut out);
         self.summary_problems(&mut out);
         self.summary_activity(&mut out);
+        self.summary_children(&mut out);
         self.summary_timeline(&mut out);
         out
+    }
+
+    /// The delegated children: who, on which model, how they ended and why.
+    fn summary_children(&self, out: &mut String) {
+        if self.children.is_empty() {
+            return;
+        }
+        let failed = self
+            .children
+            .values()
+            .filter(|child| {
+                child["error"].is_string()
+                    || matches!(
+                        child["status"].as_str(),
+                        Some("failed" | "error" | "canceled")
+                    )
+            })
+            .count();
+        let _ = writeln!(
+            out,
+            "## Sub-agents\n\n{} child(ren), {failed} failed or stopped. Their ledgers are in `delegation/ledger/`; their records are in the diagnostics and the timeline.\n",
+            self.children.len()
+        );
+        let _ = writeln!(
+            out,
+            "| child | role | model | status | time | tool calls | error |"
+        );
+        let _ = writeln!(out, "|---|---|---|---|---|---|---|");
+        let mut children = self.children.values().collect::<Vec<_>>();
+        // The failed first, then by name.
+        children.sort_by_key(|child| {
+            (
+                !child["error"].is_string(),
+                child["name"].as_str().unwrap_or_default().to_owned(),
+            )
+        });
+        for child in children {
+            let error = child["error"]
+                .as_str()
+                .map(|error| self.clip_cell(error))
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "| `{}` | {} | {} | {} | {} | {} | {} |",
+                child["name"].as_str().unwrap_or("?"),
+                child["role"].as_str().unwrap_or("?"),
+                child["model"].as_str().unwrap_or("-"),
+                child["status"].as_str().unwrap_or("?"),
+                child["duration_ms"]
+                    .as_u64()
+                    .map_or_else(|| "-".to_owned(), |ms| format!("{:.0}s", seconds(ms))),
+                child["tool_calls"].as_u64().unwrap_or_default(),
+                error,
+            );
+        }
+        let _ = writeln!(out);
+    }
+
+    /// A table cell's text: one line, at most 200 characters, redacted.
+    fn clip_cell(&self, text: &str) -> String {
+        let mut text = learned_redact(text);
+        for secret in &self.known_secrets {
+            text = text.replace(secret.as_str(), "[REDACTED:known]");
+        }
+        clip(&text.replace(['\n', '|'], " "), 200)
     }
 
     /// The records of one `kind.event`, oldest first.
@@ -1318,14 +1443,17 @@ impl Report {
 
     fn into_zip(mut self) -> Vec<u8> {
         let summary = self.summary();
-        let timeline = self
-            .sorted_points()
-            .iter()
-            .map(|point| point_json(point).to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Each point's texts are redacted, never the line: its `ms` was taken
+        // for a card number and the line was no longer JSON.
+        let points = self.sorted_points();
+        let mut lines = Vec::with_capacity(points.len());
+        for point in &points {
+            let mut value = point_json(point);
+            self.redact_value(&mut value);
+            lines.push(value.to_string());
+        }
+        let timeline = lines.join("\n");
         let summary = self.redact(&summary);
-        let timeline = self.redact(&timeline);
         let manifest = json!({
             "schema_version": 1,
             "kind": "ha-bug-report",
@@ -1404,6 +1532,10 @@ fn withhold_secret_values(value: &mut Value) {
         Value::Array(items) => items.iter_mut().for_each(withhold_secret_values),
         _ => {}
     }
+}
+
+fn learned_redact(text: &str) -> String {
+    crate::interactive::learned::redact(text)
 }
 
 fn level_of(level: Option<&str>) -> &'static str {
