@@ -5,6 +5,7 @@
 #               build it with `cargo build -p harness-cli --example pty_probe`)
 #   PY          a Python 3.11+ with the kernel's packages, for the checks and the REPL
 #   MODEL       the model the agents run on      (default: opencode-go/deepseek-v4.1-flash)
+#   THINKING    the agents' thinking level (off .. max), when set
 #   LIVE_ROOT   where each test makes its own home and projects (default: $TEMP/ha-live)
 #   HA_CONFIG   the config.toml to copy into each test's home (default: the user's)
 #   HA_CREDENTIALS_DIR  the private directory holding the model's credentials (required)
@@ -28,6 +29,11 @@ fresh() {
   rm -rf "$RX"
   mkdir -p "$RX/home"
   cp "$HA_CONFIG" "$RX/home/"
+  # THINKING (off .. max) sets the agents' thinking level, as the model's own
+  # default may be lower than a run wants.
+  if [ -n "${THINKING:-}" ]; then
+    printf '{"defaultThinkingLevel": "%s"}\n' "$THINKING" > "$RX/home/settings.json"
+  fi
   export HA_HOME="$RX/home" LOG="$RX/conversation.md"
   : > "$LOG"
 }
