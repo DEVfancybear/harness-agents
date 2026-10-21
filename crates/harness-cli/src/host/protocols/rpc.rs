@@ -193,6 +193,12 @@ impl Rpc {
     }
 
     fn start(&mut self, text: String) {
+        self.start_as(text, false);
+    }
+
+    /// Start a turn; `automatic` for the host's own input (an agent's
+    /// message), which names no file to attach.
+    fn start_as(&mut self, text: String, automatic: bool) {
         self.paused = false;
         self.running = true;
         self.messages.clear();
@@ -205,6 +211,7 @@ impl Rpc {
             shell_prefix: None,
             compact_guidance: None,
             refine: None,
+            automatic,
         });
         self.emit(json!({ "type": "agent_start" }));
     }
@@ -219,6 +226,7 @@ impl Rpc {
             shell_prefix: None,
             compact_guidance: Some(guidance.unwrap_or_default()),
             refine: None,
+            automatic: false,
         });
         self.emit(json!({ "type": "compaction_start", "reason": "manual" }));
     }
@@ -230,7 +238,7 @@ impl Rpc {
         if self.running || self.paused {
             self.steering.push_back(text);
         } else {
-            self.start(text);
+            self.start_as(text, true);
         }
     }
 
@@ -736,6 +744,7 @@ impl Rpc {
                             curate: false,
                             history: None,
                         }),
+                        automatic: false,
                     });
                     return;
                 }

@@ -712,6 +712,7 @@ impl Acp {
             shell_prefix: None,
             compact_guidance: None,
             refine: None,
+            automatic: false,
         });
     }
 

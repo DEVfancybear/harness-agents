@@ -1439,9 +1439,7 @@ async fn settle_children(
     let mut notices = Vec::new();
     loop {
         while let Ok(event) = inbox.try_recv() {
-            if let SessionEvent::ChildSettled { notice, .. } = event {
-                notices.push(notice);
-            }
+            notices.extend(child_report(event));
         }
         if agents.running() == 0 || cancellation.is_cancelled() {
             break;
@@ -1456,11 +1454,21 @@ async fn settle_children(
         }
     }
     while let Ok(event) = inbox.try_recv() {
-        if let SessionEvent::ChildSettled { notice, .. } = event {
-            notices.push(notice);
-        }
+        notices.extend(child_report(event));
     }
     notices
+}
+
+/// What a child told the run: its terminal notice, or the message it sent
+/// its parent. A child that answered by message settles with no notice (its
+/// answer was the message), and `ha exec` dropped that message: asked for two
+/// counts, it reported the one child that answered by notice and ended.
+fn child_report(event: SessionEvent) -> Option<String> {
+    match event {
+        SessionEvent::ChildSettled { notice, .. } => Some(notice),
+        SessionEvent::AgentMessage { text } => Some(text),
+        _ => None,
+    }
 }
 
 /// A run with nobody to ask refuses what needs approval.
@@ -1478,4 +1486,38 @@ impl harness_tools::ApprovalGate for RefusingApprovals {
 
 pub(super) fn headless_approval_mode() -> ApprovalMode {
     ApprovalMode::None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::child_report;
+    use crate::interactive::events::SessionEvent;
+
+    /// Seen in prime.sh's `ha exec` check: asked to count the .txt files of
+    /// two folders, one explorer answered with its notice and the other by
+    /// message to its parent; the run reported only the first and ended.
+    #[test]
+    fn a_childs_message_is_a_report_as_its_notice_is() {
+        assert_eq!(
+            child_report(SessionEvent::ChildSettled {
+                name: "explorer-b".to_owned(),
+                notice: "[child-exited: no-reply child:explorer-b]\n\nLast assistant text: 2"
+                    .to_owned(),
+            }),
+            Some("[child-exited: no-reply child:explorer-b]\n\nLast assistant text: 2".to_owned())
+        );
+        assert_eq!(
+            child_report(SessionEvent::AgentMessage {
+                text: "[agent-message from child:explorer-a]\n3".to_owned(),
+            }),
+            Some("[agent-message from child:explorer-a]\n3".to_owned())
+        );
+        assert_eq!(
+            child_report(SessionEvent::Notice {
+                message: "[child explorer-a] read_file: path=a".to_owned(),
+            }),
+            None,
+            "progress is not a report"
+        );
+    }
 }

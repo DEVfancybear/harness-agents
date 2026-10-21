@@ -312,6 +312,11 @@ pub struct InteractiveController {
     /// After the user stopped a turn, children's notices wait for the user's next
     /// turn to end rather than starting work the user just interrupted.
     notices_held: bool,
+    /// The provider's usage limit parked the session until then. Until it
+    /// resumes, nothing the host would start by itself - a child's report or
+    /// message, a heartbeat - starts a turn: each one used to call the
+    /// provider, fail on the same limit and park the session again.
+    parked_until: Option<chrono::DateTime<chrono::Utc>>,
     /// What the tool about to settle returned, shown under its card in the TUI.
     pending_tool_output: Option<String>,
     /// prime-agent's detail mode, cycled with ctrl+o.
@@ -443,6 +448,7 @@ impl InteractiveController {
             pending_compact: None,
             pending_heartbeats: std::collections::VecDeque::new(),
             pending_notices: std::collections::VecDeque::new(),
+            parked_until: None,
             notices_held: false,
             pending_tool_output: None,
             detail: super::events::Detail::default(),
@@ -2139,6 +2145,20 @@ impl InteractiveController {
         !self.phase.has_active_run()
             && self.pending_approval.is_none()
             && self.pending_question.is_none()
+            && !self.parked()
+    }
+
+    /// Whether the provider's usage limit still parks the session.
+    fn parked(&self) -> bool {
+        self.parked_until
+            .is_some_and(|until| chrono::Utc::now() < until)
+    }
+
+    /// When a parked session resumes, as the notices say it (`14:05 UTC`).
+    fn resumes_at(&self) -> String {
+        self.parked_until.map_or_else(String::new, |until| {
+            until.format("%H:%M UTC").to_string()
+        })
     }
 
     /// A child's terminal notice: a turn of its own when the parent is free,
@@ -2149,14 +2169,15 @@ impl InteractiveController {
             effects.extend(self.dispatch(notice, true));
         } else {
             self.pending_notices.push_back(notice);
-            self.push_history(
-                effects,
-                HistoryItem::Notice {
-                    message: format!(
-                        "child {name} finished; its report is read when this turn ends"
-                    ),
-                },
-            );
+            let message = if self.parked() {
+                format!(
+                    "child {name} finished; its report is read when the session resumes ({})",
+                    self.resumes_at()
+                )
+            } else {
+                format!("child {name} finished; its report is read when this turn ends")
+            };
+            self.push_history(effects, HistoryItem::Notice { message });
         }
     }
 
@@ -2183,9 +2204,12 @@ impl InteractiveController {
     fn deliver_heartbeats(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
         for due in self.service.due_heartbeats() {
+            // The park's own resume comes due when the park ends, so it is
+            // free to run; a heartbeat before then waits for it.
             let free = !self.phase.has_active_run()
                 && self.pending_approval.is_none()
-                && self.pending_question.is_none();
+                && self.pending_question.is_none()
+                && !self.parked();
             if free && self.pending_heartbeats.is_empty() {
                 effects.extend(self.dispatch(due.text, true));
             } else if self.phase.has_active_run()
@@ -2197,6 +2221,17 @@ impl InteractiveController {
                 }));
             } else {
                 self.pending_heartbeats.push_back(due.text);
+            }
+        }
+        // What waited for a park to end starts once it has: nothing else
+        // would, with no turn running to end and hand it on.
+        if effects.is_empty() && self.free_for_automatic_turn() {
+            if let Some(text) = self.pending_heartbeats.pop_front() {
+                effects.extend(self.dispatch(text, true));
+            } else if !self.notices_held
+                && let Some(text) = self.pending_notices.pop_front()
+            {
+                effects.extend(self.dispatch(text, true));
             }
         }
         effects
@@ -2978,7 +3013,10 @@ impl InteractiveController {
             }
             SessionEvent::QuotaParked { until } => {
                 let item = match self.service.park_until(until) {
-                    Ok(message) => HistoryItem::Notice { message },
+                    Ok(message) => {
+                        self.parked_until = Some(self.parked_until.map_or(until, |at| at.max(until)));
+                        HistoryItem::Notice { message }
+                    }
                     Err(message) => HistoryItem::Error { message },
                 };
                 self.push_history(effects, item);
@@ -3125,8 +3163,10 @@ impl InteractiveController {
                     return;
                 }
                 // What a child reported while this turn ran is read now, one turn
-                // for each report.
+                // for each report - unless the usage limit parked the session:
+                // then the reports wait for it to resume.
                 if !self.notices_held
+                    && !self.parked()
                     && let Some(text) = self.pending_notices.pop_front()
                 {
                     self.close_run_grant();
@@ -3135,7 +3175,9 @@ impl InteractiveController {
                     return;
                 }
                 // A heartbeat that waited for this turn runs now.
-                if let Some(text) = self.pending_heartbeats.pop_front() {
+                if !self.parked()
+                    && let Some(text) = self.pending_heartbeats.pop_front()
+                {
                     effects.extend(self.dispatch(text, true));
                     self.finish_pending_exit(effects);
                     return;
@@ -3374,6 +3416,7 @@ impl InteractiveController {
             shell_prefix: None,
             compact_guidance: None,
             refine: None,
+            automatic,
         });
         if !automatic {
             self.unstash_after_send();
@@ -3441,6 +3484,7 @@ impl InteractiveController {
             shell_prefix: None,
             compact_guidance: None,
             refine: None,
+            automatic: false,
         });
         vec![Effect::History(HistoryItem::User { text }), Effect::Redraw]
     }
@@ -3481,6 +3525,7 @@ impl InteractiveController {
             shell_prefix: Some(shell_prefix),
             compact_guidance: None,
             refine: None,
+            automatic: false,
         });
         let mut effects = Vec::new();
         self.push_history(&mut effects, HistoryItem::User { text });
@@ -4628,6 +4673,7 @@ impl InteractiveController {
                         shell_prefix: None,
                         compact_guidance: Some(guidance),
                         refine: None,
+                        automatic: false,
                     });
                     self.push_history(&mut effects, HistoryItem::User { text });
                 }
@@ -4693,6 +4739,7 @@ impl InteractiveController {
                         shell_prefix: None,
                         compact_guidance: None,
                         refine: Some(options),
+                        automatic: false,
                     });
                     self.push_history(&mut effects, HistoryItem::User { text });
                 }
@@ -5009,6 +5056,7 @@ impl InteractiveController {
             shell_prefix: None,
             compact_guidance: None,
             refine: None,
+            automatic: false,
         });
         self.unstash_after_send();
         self.push_history(&mut effects, HistoryItem::User { text: shown });
@@ -5607,6 +5655,7 @@ impl InteractiveController {
             shell_prefix: None,
             compact_guidance: None,
             refine: None,
+            automatic: false,
         });
         self.push_history(effects, HistoryItem::User { text });
     }
@@ -6563,9 +6612,15 @@ mod tests {
         child_answers: Arc<Mutex<Vec<(String, String)>>>,
         /// The project's `[verify]` checks.
         verify_checks: Arc<Mutex<Vec<crate::interactive::verify::Check>>>,
+        /// Whether each submission was the host's own (`automatic`).
+        automatics: Arc<Mutex<Vec<bool>>>,
     }
 
     impl SessionPort for RecordingPort {
+        fn park_until(&mut self, until: chrono::DateTime<chrono::Utc>) -> Result<String, String> {
+            Ok(format!("Session parked until {until}"))
+        }
+
         fn label(&self) -> String {
             "recording port".to_owned()
         }
@@ -6620,6 +6675,10 @@ mod tests {
             }
             let shell_prefix = request.shell_prefix.clone();
             let answer_question = request.answer_question_id.clone();
+            self.automatics
+                .lock()
+                .expect("automatic log")
+                .push(request.automatic);
             self.submissions
                 .lock()
                 .expect("submission log")
@@ -10796,6 +10855,85 @@ Command: \"npm run build\""
             })
             .expect("child event");
         effects_to_plain(&harness.controller.pump_events())
+    }
+
+    /// Seen when a ChatGPT plan's usage limit parked a session: each of six
+    /// children's reports started a turn of its own as the parked turn ended,
+    /// called the provider, failed on the same limit and parked the session
+    /// again - and each report attached the README.md it named. While the
+    /// session is parked the reports, the children's messages and the
+    /// heartbeats wait for the resume; the host's own input attaches nothing.
+    #[test]
+    fn a_parked_session_holds_what_comes_in_until_it_resumes() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "giao cho 6 explorer");
+        harness
+            .events
+            .send(SessionEvent::QuotaParked {
+                until: chrono::Utc::now() + chrono::Duration::hours(2),
+            })
+            .expect("park");
+        let _ = harness.controller.pump_events();
+        end_with(
+            &mut harness,
+            RunOutcome::Failed("rate_limited: usage limit".to_owned()),
+        );
+        let said = child_settled(&mut harness, "[child-done child:scout]\n\nREADME.md says # p");
+        harness
+            .events
+            .send(SessionEvent::AgentMessage {
+                text: "[agent-message from child:explorer-2] I read README.md".to_owned(),
+            })
+            .expect("message");
+        harness
+            .port
+            .heartbeats_due
+            .lock()
+            .expect("heartbeats")
+            .push(crate::interactive::heartbeat::Due {
+                text: "[heartbeat: every 5m run#1] check".to_owned(),
+                delivery: crate::interactive::heartbeat::Delivery::FollowUp,
+            });
+        let _ = harness.controller.pump_events();
+        assert_eq!(
+            submissions(&harness),
+            ["giao cho 6 explorer"],
+            "no turn starts while the session is parked"
+        );
+        assert_eq!(harness.controller.pending_notices.len(), 2);
+        assert!(
+            said.iter().any(|line| line.contains("read when the session resumes")),
+            "{said:?}"
+        );
+
+        // The park ends: its resume comes due and runs; what waited follows.
+        harness.controller.parked_until =
+            Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        harness
+            .port
+            .heartbeats_due
+            .lock()
+            .expect("heartbeats")
+            .push(crate::interactive::heartbeat::Due {
+                text: "Continue: the usage limit has reset".to_owned(),
+                delivery: crate::interactive::heartbeat::Delivery::FollowUp,
+            });
+        let _ = harness.controller.pump_events();
+        end_with(&mut harness, RunOutcome::Done);
+        let sent = submissions(&harness);
+        assert!(sent.len() >= 3, "{sent:?}");
+        assert!(sent[1].contains("check") || sent[1].contains("usage limit has reset"), "{sent:?}");
+        assert!(
+            sent.iter().any(|text| text.contains("[child-done child:scout]")),
+            "the report runs once the session resumed: {sent:?}"
+        );
+        let automatics = harness.port.automatics.lock().expect("automatic log").clone();
+        assert_eq!(automatics[0], false, "the user's message may attach files");
+        assert!(
+            automatics[1..].iter().all(|automatic| *automatic),
+            "the host's own input attaches nothing: {automatics:?}"
+        );
     }
 
     /// After a stop, the children's reports wait and then go with the user's

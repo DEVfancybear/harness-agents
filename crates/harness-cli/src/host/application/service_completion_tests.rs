@@ -399,6 +399,7 @@ async fn resume_flow() {
         shell_prefix: None,
         compact_guidance: None,
         refine: None,
+        automatic: false,
     });
     let (request, outcome) = tokio::time::timeout(Duration::from_mins(1), async {
         tokio::join!(
@@ -494,6 +495,7 @@ async fn g06_bang_prefix_uses_interactive_approval_and_attaches_output() {
         }),
         compact_guidance: None,
         refine: None,
+        automatic: false,
     });
 
     let approval = tokio::time::timeout(Duration::from_secs(30), async {

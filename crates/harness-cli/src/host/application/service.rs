@@ -261,6 +261,11 @@ pub struct SubmitRequest {
     pub compact_guidance: Option<String>,
     /// A host-issued `/refine`: like compaction, it never reaches the model as a turn.
     pub refine: Option<super::refine::RefineOptions>,
+    /// Sent by the host itself - a child's report or message, a heartbeat, a
+    /// goal's continuation - not typed: a path it names is not a file the user
+    /// handed over, so nothing is attached. A child's "read README.md" used to
+    /// attach README.md to the parent's turn.
+    pub automatic: bool,
 }
 
 /// Everything the status line shows about the model in use.
@@ -8541,8 +8546,14 @@ async fn run_turn(
     // Content the message names rides with it: images as blocks the model is shown, files
     // as text the model reads. A candidate that cannot be attached is said out loud: a
     // reader who is not told why cannot tell it from a bug.
-    let mut attached = attachments::from_message(&request.text, &workspace_root);
-    if let Some(mcp) = &active_mcp {
+    let mut attached = if request.automatic {
+        attachments::Attachments::default()
+    } else {
+        attachments::from_message(&request.text, &workspace_root)
+    };
+    if !request.automatic
+        && let Some(mcp) = &active_mcp
+    {
         let (mut resource_files, notes) = mcp.attach_mentions(&request.text).await;
         attached.files.append(&mut resource_files);
         attached.notes.extend(notes);
@@ -10801,6 +10812,7 @@ mod tests {
             shell_prefix: None,
             compact_guidance: None,
             refine: None,
+            automatic: false,
         }
     }
 
