@@ -468,6 +468,11 @@ pub trait SessionPort: Send {
     fn rename(&mut self, _title: &str) -> Result<String, String> {
         Err("this backend does not support session titles".to_owned())
     }
+    /// `rlm.rename` of the session itself: the agent's name for it, which never
+    /// replaces a name the user gave.
+    fn rename_by_model(&mut self, title: &str) -> Result<String, String> {
+        self.rename(title)
+    }
     /// The goal the next turns work toward; `None` while it is paused or gone.
     fn set_goal(&mut self, _objective: Option<String>) {}
     /// Drop the stored goal, so `/resume` no longer brings it back.
@@ -5066,45 +5071,11 @@ impl SessionPort for AgentSessionService {
     }
 
     fn rename(&mut self, title: &str) -> Result<String, String> {
-        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
-        if title.is_empty() || title.chars().count() > 60 {
-            return Err("usage: /rename <name up to 60 characters>".to_owned());
-        }
-        let task_id = TaskId::parse(
-            self.conversation_id()
-                .unwrap_or_else(|| self.task_id.to_string()),
-        )
-        .map_err(|error| error.to_string())?;
-        let store_dir = self.store_dir.clone();
-        let sender = self.sender.clone();
-        let title_for_write = title.clone();
-        let writer_gate = Arc::clone(&self.writer_gate);
-        let shared_store = self.agents.store();
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| "the application service needs an async runtime".to_owned())?;
-        handle.spawn(async move {
-            let _ = store_dir;
-            let result = async {
-                let _writer = writer_gate.lock().await;
-                let lease = shared_store
-                    .lease()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                lease
-                    .store()
-                    .set_session_setting(&task_id, "title", &title_for_write)
-                    .await
-                    .map_err(|error| error.to_string())
-            }
-            .await;
-            let _ = sender.send(SessionEvent::Notice {
-                message: result.map_or_else(
-                    |error| format!("session title could not be saved: {error}"),
-                    |()| format!("session renamed to {title_for_write}"),
-                ),
-            });
-        });
-        Ok(format!("saving session title: {title}"))
+        self.rename_as(title, TITLE_BY_USER)
+    }
+
+    fn rename_by_model(&mut self, title: &str) -> Result<String, String> {
+        self.rename_as(title, TITLE_BY_MODEL)
     }
 
     fn set_model(&mut self, model: &str) -> Result<String, String> {
@@ -6542,7 +6513,82 @@ struct ForkPlan {
     before: bool,
 }
 
+/// Who named a conversation: `/name` (the user) or the agent's `rlm.rename`.
+const TITLE_BY_SETTING: &str = "title_by";
+const TITLE_BY_USER: &str = "user";
+const TITLE_BY_MODEL: &str = "model";
+
 impl AgentSessionService {
+    /// Name the conversation, as `by` asks. The agent's rename never replaces
+    /// the user's name: a session the user named "Tạo game" was renamed by
+    /// the model to a line of its progress report.
+    fn rename_as(&mut self, title: &str, by: &'static str) -> Result<String, String> {
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        if title.is_empty() || title.chars().count() > 60 {
+            return Err("usage: /rename <name up to 60 characters>".to_owned());
+        }
+        let task_id = TaskId::parse(
+            self.conversation_id()
+                .unwrap_or_else(|| self.task_id.to_string()),
+        )
+        .map_err(|error| error.to_string())?;
+        let store_dir = self.store_dir.clone();
+        let sender = self.sender.clone();
+        let title_for_write = title.clone();
+        let writer_gate = Arc::clone(&self.writer_gate);
+        let shared_store = self.agents.store();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let _ = store_dir;
+            let result = async {
+                let _writer = writer_gate.lock().await;
+                let lease = shared_store
+                    .lease()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let store = lease.store();
+                if by == TITLE_BY_MODEL
+                    && store
+                        .session_setting(&task_id, TITLE_BY_SETTING)
+                        .await
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        == Some(TITLE_BY_USER)
+                {
+                    let kept = store
+                        .session_setting(&task_id, "title")
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    return Ok(Some(kept));
+                }
+                store
+                    .set_session_setting(&task_id, "title", &title_for_write)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                store
+                    .set_session_setting(&task_id, TITLE_BY_SETTING, by)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(None)
+            }
+            .await;
+            let _ = sender.send(SessionEvent::Notice {
+                message: match result {
+                    Err(error) => format!("session title could not be saved: {error}"),
+                    Ok(Some(kept)) => format!(
+                        "the session keeps the name you gave it ({kept}); the agent's rename to {title_for_write} was not applied"
+                    ),
+                    Ok(None) => format!("session renamed to {title_for_write}"),
+                },
+            });
+        });
+        Ok(format!("saving session title: {title}"))
+    }
+
     /// A new conversation, as `/new` starts one, that its first turn will
     /// continue from the fork point.
     fn start_fork(&mut self, plan: ForkPlan) -> Result<(), String> {
@@ -11812,6 +11858,18 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.expect("rename completed");
+        // The agent's own rename (`rlm.rename`) never replaces the user's name.
+        service
+            .rename_by_model("M4 fully closed earlier (verifier round 4 PASS).")
+            .expect("the agent's rename is scheduled");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if channel.drain().iter().any(|event| matches!(
+                    event, SessionEvent::Notice { message } if message.contains("keeps the name you gave it (CP-C review)")
+                )) { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("the user's name was kept");
         service.list_sessions();
         let sessions = tokio::time::timeout(Duration::from_secs(3), async {
             loop {

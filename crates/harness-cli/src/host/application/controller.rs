@@ -3042,7 +3042,7 @@ impl InteractiveController {
             SessionEvent::RenameRequested { name } => {
                 let message = self
                     .service
-                    .rename(&name)
+                    .rename_by_model(&name)
                     .unwrap_or_else(|error| format!("the session could not be renamed: {error}"));
                 self.push_history(effects, HistoryItem::Notice { message });
             }
@@ -4943,7 +4943,7 @@ impl InteractiveController {
 
     /// `/skill:<name>` written inside a message, not at its start: the user
     /// asked for the agent to read that skill (measured: "... sử dụng
-    /// /skill:swarm-planner" reached the model as plain text, and the model,
+    /// /skill:<name>" reached the model as plain text, and the model,
     /// which is not shown user-only skills, answered that no such skill
     /// exists). Each named skill is expanded as prime-agent expands a leading
     /// one, and the whole message follows as the request. `None` when the
