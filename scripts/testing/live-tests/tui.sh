@@ -84,9 +84,10 @@ steps="$steps,esc,until:MOC-GIAO:20000,settle:3000"
 (cd "$RX/p" && "$PROBE" "$RX/forest.bin" "$HA" "$steps" -- attach t1 >/dev/null)
 sed 's/^/   /' "$RX/forest.bin.marks" | grep -E 'until|settled'
 opened=$(awk '/until found subagents/ { print $(NF-1) }' "$RX/forest.bin.marks")
-# The keys pressed in the view, up to Esc: back in the session, its running
-# children keep the spinner turning, which is not a key's frame.
-slowest=$(awk '$2 == "esc" { exit } /settled/ { if ($3 > max) max = $3 } END { print max + 0 }' "$RX/forest.bin.marks")
+# The keys pressed in the view, after the frame that opened it (timed by the
+# check before) and up to Esc: back in the session, its running children
+# keep the spinner turning, which is not a key's frame.
+slowest=$(awk '$2 == "esc" { exit } /settled/ { if (++seen > 1 && $3 > max) max = $3 } END { print max + 0 }' "$RX/forest.bin.marks")
 echo "   the list showed after ${opened:-?} ms; the slowest key in the view settled ${slowest} ms after it"
 check "the agents view listed the forest within 3 s" '[ -n "$opened" ] && [ "$opened" -lt 3000 ]'
 check "every key in the view settled within 400 ms" '[ "$slowest" -lt 400 ]'
