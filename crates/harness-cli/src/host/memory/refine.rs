@@ -1247,6 +1247,13 @@ impl Refinement {
             );
         }
         if applied.is_empty() {
+            if !rollback && edits.iter().all(|edit| edit["skipped"] == true) {
+                return format!(
+                    "Harness unchanged · the conversation had already updated what the review proposed ({} edit{} skipped)",
+                    edits.len(),
+                    plural(edits.len())
+                );
+            }
             return format!("{operation} failed · 0/{} edits applied", edits.len());
         }
         if applied.len() < edits.len() {
@@ -1449,9 +1456,15 @@ fn apply(
             && !modified.contains(&key)
             && before != baseline["entries"][&kind][&computed]
         {
+            // The conversation updated the entry while the review planned:
+            // its version stands, and the review's edit is skipped - not a
+            // failure, which is how it was shown.
             record["before"] = before;
             record["applied"] = json!(false);
-            record["error"] = json!("entry changed during refinement planning");
+            record["skipped"] = json!(true);
+            record["error"] = json!(
+                "entry changed during refinement planning: the conversation updated it meanwhile, and its version is kept"
+            );
             applied_edits.push(record);
             continue;
         }
@@ -4827,9 +4840,19 @@ mod tests {
         ]}));
         let result =
             apply(&scopes, &planned, "r3", false, None, Some(&baseline), None).expect("applied");
-        assert_eq!(
-            result.record["appliedEdits"][0]["error"],
-            "entry changed during refinement planning"
+        assert!(
+            result.record["appliedEdits"][0]["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("entry changed during refinement planning")),
+            "{}",
+            result.record
+        );
+        assert_eq!(result.record["appliedEdits"][0]["skipped"], true);
+        // Skipped for the conversation's own update: not shown as a failure.
+        let outcome = result.outcome();
+        assert!(
+            outcome.starts_with("Harness unchanged") && !outcome.contains("failed"),
+            "{outcome}"
         );
         assert_eq!(
             load_raw(&scopes.local)["entries"]["memory"]["note"]["content"],

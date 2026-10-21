@@ -298,9 +298,16 @@ impl MemoryHost {
             "search" => search_queries(arguments).map(|_| ()),
             "read" => text(arguments, "id").map(|_| ()),
             "write" => {
-                let title = text(arguments, "title")?.trim();
+                // An update by id keeps the entry's title when none is given.
+                let updating = optional_text(arguments, "id")?.is_some();
+                let title = if updating {
+                    optional_text(arguments, "title")?.unwrap_or_default()
+                } else {
+                    text(arguments, "title")?
+                }
+                .trim();
                 let content = text(arguments, "content")?.trim();
-                if title.is_empty() || content.is_empty() {
+                if content.is_empty() || (!updating && title.is_empty()) {
                     return Err("write needs a non-empty title and content".to_owned());
                 }
                 if title.chars().count() > MAX_TITLE_CHARS {
@@ -549,7 +556,10 @@ impl MemoryHost {
         reason = "one write: an update, or a create with its duplicate check"
     )]
     fn write(&self, arguments: &Value) -> Result<Value, String> {
-        let title = text(arguments, "title")?.trim().to_owned();
+        let given_title = optional_text(arguments, "title")?
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned);
         let content = text(arguments, "content")?.trim().to_owned();
         let path = optional_text(arguments, "path")?
             .map(str::trim)
@@ -570,6 +580,10 @@ impl MemoryHost {
                     "{scope}:{id} is at version {current}, not {expected}: read it again and merge before updating"
                 ));
             }
+            // An update that names no title keeps the entry's: the model
+            // updating a checkpoint by id sent only the new content.
+            let title = given_title
+                .unwrap_or_else(|| entry["title"].as_str().unwrap_or_default().to_owned());
             journal(dir, "update", &kind, &id, entry, &self.origin())?;
             let entry = &mut state["entries"][&kind][&id];
             entry["origin"] = self.origin();
@@ -618,6 +632,7 @@ impl MemoryHost {
             }
             return Ok(saved);
         }
+        let title = given_title.ok_or("write needs a non-empty title and content")?;
         let scope = self.scopes(arguments)?[0];
         let kind = kinds(arguments)?[0];
         let mut id = super::refine::slug(&title, kind);
@@ -1317,7 +1332,7 @@ impl ExternalToolCatalog for MemoryHost {
                 "kind":{"type":"string","enum":KINDS,"description":"memory (default for write) or prompt; list and search cover both when omitted."},
                 "scope":{"type":"string","enum":scopes,"description":"global: every conversation and project; project: this project's conversations; local: this one. Required to create; list, search and read cover them all when omitted."},
                 "id":{"type":"string","description":"An entry id from list, search or history (a global:/project:/local: prefix picks the scope). With write, updates that entry."},
-                "title":{"type":"string","description":"write: a short name for the fact or rule."},
+                "title":{"type":"string","description":"write: a short name for the fact or rule; an update by id keeps the entry's title when this is left out."},
                 "content":{"type":"string","description":"write: the whole entry, replacing the old content. One fact or rule, self-contained."},
                 "path":{"type":"string","description":"write: an optional grouping such as user/preferences or project/<name>; constraints (or constraints/<topic>) for a rule the user set for the work, shown in every turn ahead of the ranked entries."},
                 "pinned":{"type":"boolean","description":"write: true shows the entry whole in every turn (the user's language, form of address, a hard rule); false unpins; omitted keeps it as it is. Pinned entries share a 4,000-character bound."},
@@ -1768,6 +1783,37 @@ mod tests {
             }),
             ..host(root)
         }
+    }
+
+    /// An update by id may leave the title out: the entry keeps its title. A
+    /// model updating a checkpoint sent only the new content and was refused
+    /// for a missing title; a new entry still needs one.
+    #[test]
+    fn an_update_by_id_without_a_title_keeps_the_entrys_title() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = host(directory.path());
+        run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Deploy day","content":"Deploys happen on Thursdays."}),
+        )
+        .expect("create");
+        let updated = run(
+            &host,
+            &json!({"action":"write","id":"deploy_day","expected_version":1,"content":"Deploys happen on Fridays."}),
+        )
+        .expect("an update needs no title");
+        assert_eq!(updated["id"], "deploy_day");
+        let read = run(&host, &json!({"action":"read","id":"deploy_day"})).expect("read");
+        assert_eq!(read["title"], "Deploy day");
+        assert_eq!(read["content"], "Deploys happen on Fridays.");
+        assert!(
+            run(
+                &host,
+                &json!({"action":"write","scope":"global","content":"A fact with no name."}),
+            )
+            .expect_err("a new entry needs a title")
+            .contains("title")
+        );
     }
 
     /// After Graphiti: an update or a delete keeps what it replaced, history
