@@ -1692,11 +1692,13 @@ pub trait SummaryProvider: Send + Sync {
 /// before it is used, and a long history is slow to read and to condense. A
 /// flat 30 seconds failed every summary of a long session (a thinking model on
 /// a 300k-token history), so the context was never compacted and every step
-/// carried all of it.
+/// carried all of it. A 200k-token history then timed out at 190 seconds on
+/// a model that took 88 seconds for one ordinary step over it: the summary is
+/// read and then written, up to its budget.
 fn summary_timeout(prompt: &str) -> Duration {
-    // About a second per 2,000 tokens read, on top of the time to write.
-    let reading = u64::try_from(prompt.len() / 8_000).unwrap_or(u64::MAX);
-    Duration::from_secs(90_u64.saturating_add(reading).min(300))
+    // About a second per 1,000 tokens read, on top of two minutes to write.
+    let reading = u64::try_from(prompt.len() / 4_000).unwrap_or(u64::MAX);
+    Duration::from_secs(120_u64.saturating_add(reading).min(600))
 }
 tokio::task_local! {
     /// The cancellation of the turn being run, for the summaries it asks for.
@@ -6104,11 +6106,12 @@ mod compaction_ceiling_tests {
     #[test]
     fn a_long_history_has_longer_to_be_summarised() {
         use std::time::Duration;
-        assert_eq!(super::summary_timeout("short"), Duration::from_secs(90));
+        assert_eq!(super::summary_timeout("short"), Duration::from_mins(2));
+        // About 200k tokens: the history that timed out at 190 seconds.
         let long = "x".repeat(800_000);
-        assert_eq!(super::summary_timeout(&long), Duration::from_secs(190));
+        assert_eq!(super::summary_timeout(&long), Duration::from_secs(320));
         let huge = "x".repeat(8_000_000);
-        assert_eq!(super::summary_timeout(&huge), Duration::from_mins(5));
+        assert_eq!(super::summary_timeout(&huge), Duration::from_mins(10));
     }
 
     /// A million-token window compacts at the ceiling, not near 950k; a small
