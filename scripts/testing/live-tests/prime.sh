@@ -175,7 +175,12 @@ print("STOP=" + json.dumps(wait(3).get("result", {}).get("stopReason")))
 p.stdin.close(); p.kill()
 EOF
 cat "$RX/acp.txt"
-check "the capped answer ended with max_tokens" "grep -q 'STOP=\"max_tokens\"' '$RX/acp.txt'"
+# The ChatGPT Codex backend takes no output cap, so ha sends none to it.
+if [ "$PROVIDER" = "openai-codex" ]; then
+  echo "SKIP  the capped answer ended with max_tokens: $PROVIDER takes no output cap"
+else
+  check "the capped answer ended with max_tokens" "grep -q 'STOP=\"max_tokens\"' '$RX/acp.txt'"
+fi
 rm -f "$HA_HOME/models.json"
 
 echo "################ 13. extra certificate authorities keep the model reachable"

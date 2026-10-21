@@ -39,7 +39,11 @@ check "no turn ran after the pause" '[ "$(continued)" = "$paused_at" ]'
 
 echo "################ 3. the workspace refusal says where a file elsewhere goes"
 TMPFILE=$(cd "$RX" && (pwd -W 2>/dev/null || pwd))/outside.txt
-say g1 "Kiểm thử: gọi tool write_file (không dùng python_repl hay bash) để ghi chữ 'x' vào đường dẫn tuyệt đối $TMPFILE. In nguyên văn thông báo lỗi tool trả về, không làm gì thêm." | tail -3
+# A new conversation: g1's still says to answer CHUA-XONG every turn, and a
+# model that keeps to it never calls the tool.
+"$HA" shutdown --force >/dev/null 2>&1
+agent "$RX/p" g3
+say g3 "Kiểm thử: gọi tool write_file (không dùng python_repl hay bash) để ghi chữ 'x' vào đường dẫn tuyệt đối $TMPFILE. In nguyên văn thông báo lỗi tool trả về, không làm gì thêm." | tail -3
 check "the write outside the workspace was refused" '[ ! -f "$RX/outside.txt" ]'
 check "the refusal names bash or python_repl" 'last | grep -qi "bash or python_repl"'
 "$HA" shutdown --force >/dev/null 2>&1
