@@ -541,10 +541,12 @@ impl InteractiveController {
         self.service.conversation_id()
     }
 
-    /// Count a delegated agent's progress notice (`[child verifier] read_file:
-    /// path=a.js`) for the running delegate card: a notice that starts a call
-    /// (`tool: arguments`) counts one, a failure notice of the same call only
-    /// becomes the latest line.
+    /// Count a delegated agent's progress notice (`[child verifier-b105bf50]
+    /// read_file: path=a.js`) for the running delegate card: a notice that
+    /// starts a call (`tool: arguments`) counts one, a failure notice of the
+    /// same call only becomes the latest line. The pane gets the calls and how
+    /// they settled from the child's own lines ([`Self::note_child_output`]);
+    /// any other notice is a line of its own there.
     fn note_child_activity(&mut self, message: &str) {
         let Some((name, text)) = message
             .strip_prefix("[child ")
@@ -563,6 +565,9 @@ impl InteractiveController {
             .split_whitespace()
             .next()
             .is_some_and(|word| word.ends_with(':') && word.len() > 1);
+        let call_failed = text
+            .split_once(' ')
+            .is_some_and(|(_, rest)| rest.starts_with("failed: "));
         let index = if let Some(index) = self
             .child_activity
             .iter()
@@ -581,20 +586,23 @@ impl InteractiveController {
             entry.tool_calls = entry.tool_calls.saturating_add(1);
         }
         entry.latest = latest;
-        let kind = if starts_call {
-            super::events::ChildLineKind::Call
-        } else {
-            super::events::ChildLineKind::Failed
-        };
-        Self::keep_child_lines(&mut entry.recent, kind, text.lines());
+        if !starts_call && !call_failed {
+            Self::keep_child_lines(
+                &mut entry.recent,
+                super::events::ChildLineKind::Failed,
+                "",
+                text.lines(),
+            );
+        }
     }
 
-    /// A delegated agent's output or answer, for its pane.
+    /// A delegated agent's call, output, outcome or answer, for its pane.
     fn note_child_output(
         &mut self,
         name: &str,
         kind: super::events::ChildLineKind,
         lines: &[String],
+        call: &str,
     ) {
         let index = if let Some(index) = self
             .child_activity
@@ -612,6 +620,7 @@ impl InteractiveController {
         Self::keep_child_lines(
             &mut self.child_activity[index].recent,
             kind,
+            call,
             lines.iter().map(String::as_str),
         );
     }
@@ -621,11 +630,13 @@ impl InteractiveController {
     fn keep_child_lines<'a>(
         recent: &mut Vec<super::events::ChildLine>,
         kind: super::events::ChildLineKind,
+        call: &str,
         lines: impl Iterator<Item = &'a str>,
     ) {
         recent.extend(lines.map(|line| super::events::ChildLine {
             kind,
             text: line.chars().take(400).collect(),
+            call: call.to_owned(),
         }));
         let excess = recent
             .len()
@@ -1071,9 +1082,7 @@ impl InteractiveController {
         };
         self.refresh_menu();
         let mut lines = self.banner_lines();
-        lines.push(
-            "Nhập yêu cầu. / lệnh · Alt+V dán ảnh/file · /login đăng nhập · /quit thoát".to_owned(),
-        );
+        lines.push(boot_hint(self.setup_required));
         // Codex's launch notice: a newer release is out.
         if !self.plain
             && super::update_check::enabled(
@@ -1121,34 +1130,8 @@ impl InteractiveController {
         }
         self.editor.set_menu_commands(self.service.menu_commands());
         let stored = self.service.stored_credentials();
-        self.editor.set_argument_options(
-            "/login",
-            super::providers::PROVIDERS
-                .iter()
-                .map(|entry| {
-                    let state = if stored.iter().any(|(id, _)| id == entry.id) {
-                        " · logged in"
-                    } else {
-                        ""
-                    };
-                    (entry.id.to_owned(), format!("{}{state}", entry.name))
-                })
-                .chain([(
-                    super::web::SERPER_CREDENTIAL.to_owned(),
-                    format!(
-                        "Serper (web search){}",
-                        if stored
-                            .iter()
-                            .any(|(id, _)| id == super::web::SERPER_CREDENTIAL)
-                        {
-                            " · logged in"
-                        } else {
-                            ""
-                        }
-                    ),
-                )])
-                .collect(),
-        );
+        self.editor
+            .set_argument_options("/login", login_options(&stored, true));
         self.editor.set_argument_options(
             "/logout",
             stored
@@ -2228,12 +2211,29 @@ impl InteractiveController {
     /// how acceptance U06 proves the idle loop does not redraw.
     #[allow(dead_code, reason = "T05 wires the tick into the render loop")]
     pub fn tick(&mut self) -> Vec<Effect> {
-        if self.phase.has_active_run() || self.pending_approval.is_some() {
+        let changed = !self.plain && self.sync_children();
+        let children_running = self
+            .child_activity
+            .iter()
+            .any(|child| child.state == super::events::ChildRunState::Running);
+        if self.phase.has_active_run() || self.pending_approval.is_some() || children_running {
             self.tick = self.tick.saturating_add(1);
+            vec![Effect::Redraw]
+        } else if changed {
             vec![Effect::Redraw]
         } else {
             Vec::new()
         }
+    }
+
+    /// Take each delegated child's state from the session's child registry -
+    /// what the agents view lists - so the sidebar never shows a running child
+    /// as done, or a finished one as working. True when a state changed.
+    fn sync_children(&mut self) -> bool {
+        if self.child_activity.is_empty() && self.service.running_children() == 0 {
+            return false;
+        }
+        super::events::sync_child_states(&mut self.child_activity, &self.service.subagents())
     }
 
     /// The tick [`Self::ui_state`] would report, without building the state:
@@ -2962,9 +2962,14 @@ impl InteractiveController {
                 }
                 effects.push(Effect::Redraw);
             }
-            SessionEvent::ChildOutput { name, kind, lines } => {
+            SessionEvent::ChildOutput {
+                name,
+                kind,
+                lines,
+                call,
+            } => {
                 if !self.plain {
-                    self.note_child_output(&name, kind, &lines);
+                    self.note_child_output(&name, kind, &lines, &call);
                     effects.push(Effect::Redraw);
                 }
             }
@@ -3822,7 +3827,8 @@ impl InteractiveController {
         self.active_deliveries.clear();
         self.open_tools.clear();
         self.tool_progress.clear();
-        self.child_activity.clear();
+        self.child_activity
+            .retain(|child| child.state == super::events::ChildRunState::Running);
         self.turn_activity = None;
         self.steps = 0;
         self.tool_calls = 0;
@@ -5191,20 +5197,8 @@ impl InteractiveController {
         self.editor
             .set_argument_options("/subagent-effort", subagent_levels);
         let own = self.service.stored_subagent_credentials();
-        self.editor.set_argument_options(
-            "/subagent-login",
-            super::providers::PROVIDERS
-                .iter()
-                .map(|entry| {
-                    let state = if own.iter().any(|(id, _)| id == entry.id) {
-                        " · logged in for subagents"
-                    } else {
-                        ""
-                    };
-                    (entry.id.to_owned(), format!("{}{state}", entry.name))
-                })
-                .collect(),
-        );
+        self.editor
+            .set_argument_options("/subagent-login", login_options(&own, false));
         self.editor.set_argument_options(
             "/subagent-logout",
             own.iter()
@@ -6435,8 +6429,74 @@ fn first_word(value: &str) -> &str {
         .map_or(value, |end| &value[..end])
 }
 
+/// The hint under the opening banner. `/login` is offered only while the
+/// session cannot run without one: logged in, it was a button to an action
+/// already done.
+fn boot_hint(setup_required: bool) -> String {
+    if setup_required {
+        "Nhập yêu cầu. / lệnh · Alt+V dán ảnh/file · /login đăng nhập · /quit thoát".to_owned()
+    } else {
+        "Nhập yêu cầu. / lệnh · Alt+V dán ảnh/file · /quit thoát".to_owned()
+    }
+}
+
+/// What `/login`'s menu offers: the providers without a stored login (and,
+/// for the main login, the web search key without one). One already logged
+/// in is not offered; `/login <id>` typed out still replaces its key, and
+/// `/logout` lists it.
+fn login_options(stored: &[(String, &'static str)], web_search: bool) -> Vec<(String, String)> {
+    let logged_in = |id: &str| stored.iter().any(|(stored, _)| stored == id);
+    super::providers::PROVIDERS
+        .iter()
+        .filter(|entry| !logged_in(entry.id))
+        .map(|entry| (entry.id.to_owned(), entry.name.to_owned()))
+        .chain(
+            (web_search && !logged_in(super::web::SERPER_CREDENTIAL)).then(|| {
+                (
+                    super::web::SERPER_CREDENTIAL.to_owned(),
+                    "Serper (web search)".to_owned(),
+                )
+            }),
+        )
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    /// The login offers seen while logged in: the boot hint and `/login`'s
+    /// menu offer no login for a provider that has one.
+    #[test]
+    fn a_provider_already_logged_in_is_not_offered_a_login() {
+        assert!(super::boot_hint(true).contains("/login"));
+        assert!(!super::boot_hint(false).contains("/login"));
+        let first = super::super::providers::PROVIDERS[0].id;
+        let none = super::login_options(&[], true);
+        assert!(none.iter().any(|(id, _)| id == first));
+        assert!(
+            none.iter()
+                .any(|(id, _)| id == super::super::web::SERPER_CREDENTIAL)
+        );
+        let stored = vec![
+            (first.to_owned(), "api_key"),
+            (super::super::web::SERPER_CREDENTIAL.to_owned(), "api_key"),
+        ];
+        let offered = super::login_options(&stored, true);
+        assert!(!offered.iter().any(|(id, _)| id == first), "{offered:?}");
+        assert!(
+            !offered
+                .iter()
+                .any(|(id, _)| id == super::super::web::SERPER_CREDENTIAL),
+            "{offered:?}"
+        );
+        assert_eq!(offered.len(), none.len() - 2);
+        assert!(
+            !super::login_options(&[], false)
+                .iter()
+                .any(|(id, _)| id == super::super::web::SERPER_CREDENTIAL),
+            "the children's login has no web search key"
+        );
+    }
+
     use super::{DEFAULT_CONTINUATIONS, EXIT_SUCCESS, Effect, InteractiveController, TurnBounds};
     use crate::interactive::bootstrap::{self, LaunchContext, LaunchRequest};
     use crate::interactive::events::{
@@ -6981,10 +7041,46 @@ mod tests {
         h.events
             .send(SessionEvent::ChildOutput {
                 name: "explorer".to_owned(),
+                kind: ChildLineKind::Call,
+                lines: vec!["read_file: path=a.rs".to_owned()],
+                call: "c1".to_owned(),
+            })
+            .expect("call");
+        h.events
+            .send(SessionEvent::ChildOutput {
+                name: "explorer".to_owned(),
                 kind: ChildLineKind::Output,
                 lines: vec!["fn main() {}".to_owned()],
+                call: "c1".to_owned(),
             })
             .expect("output");
+        h.events
+            .send(SessionEvent::Notice {
+                message: "[child explorer] read_file failed: not_found".to_owned(),
+            })
+            .expect("failure notice");
+        h.events
+            .send(SessionEvent::ChildOutput {
+                name: "explorer".to_owned(),
+                kind: ChildLineKind::Settled,
+                lines: vec!["failed 12: not_found".to_owned()],
+                call: "c1".to_owned(),
+            })
+            .expect("settled");
+        let _ = h.controller.pump_events();
+        let recent = h.controller.ui_state().child_activity[0].recent.clone();
+        assert_eq!(
+            recent
+                .iter()
+                .map(|line| (line.kind, line.call.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ChildLineKind::Call, "c1"),
+                (ChildLineKind::Output, "c1"),
+                (ChildLineKind::Settled, "c1"),
+            ],
+            "a call and its failure are the child's own lines, not its notices"
+        );
         h.events
             .send(SessionEvent::ChildOutput {
                 name: "explorer".to_owned(),
@@ -6992,6 +7088,7 @@ mod tests {
                 lines: (0..CHILD_RECENT_LINES)
                     .map(|n| format!("answer {n}"))
                     .collect(),
+                call: String::new(),
             })
             .expect("text");
         let _ = h.controller.pump_events();
@@ -7011,6 +7108,7 @@ mod tests {
                 name: "explorer".to_owned(),
                 kind: ChildLineKind::Output,
                 lines: vec!["fn main() {}".to_owned()],
+                call: "c1".to_owned(),
             })
             .expect("output");
         let _ = plain.controller.pump_events();

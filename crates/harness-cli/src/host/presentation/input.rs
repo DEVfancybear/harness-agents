@@ -784,6 +784,7 @@ impl LineEditor {
             | Key::Redraw
             | Key::CycleDetail
             | Key::Stash
+            | Key::Find
             | Key::CycleModel { .. }
             | Key::Resize { .. }
             // Ctrl-V reaches the controller as its own key because the terminal forwards

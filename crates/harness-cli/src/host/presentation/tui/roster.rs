@@ -20,12 +20,16 @@ pub struct Scope {
     pub project_root: PathBuf,
 }
 
-/// Another agent of the project, as the sidebar lists it.
+/// Another agent, as the sidebar lists it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Entry {
     pub id: String,
     pub name: String,
     pub status: Status,
+    /// The folder it works in, when that is not this terminal's project
+    /// (`web`): the agents view lists every agent, and one of another folder
+    /// left out of the sidebar was an agent gone missing.
+    pub folder: Option<String>,
 }
 
 /// The roster's thread and the newest list it read.
@@ -95,14 +99,15 @@ impl Poller {
     }
 }
 
-/// The agents of `scope`'s project other than its own, running first, then
-/// by name.
+/// Every agent but `scope`'s own, as the agents view lists them: the
+/// project's first, then those of other folders (each named by its folder);
+/// in each, running first, then by name.
 #[must_use]
 pub fn entries(scope: &Scope, agents: Vec<AgentInfo>) -> Vec<Entry> {
     let project = normalized(&scope.project_root);
     let mut entries = agents
         .into_iter()
-        .filter(|agent| agent.id != scope.agent_id && normalized(&agent.project_root) == project)
+        .filter(|agent| agent.id != scope.agent_id)
         .map(|agent| Entry {
             status: status(&agent),
             name: agent
@@ -110,14 +115,41 @@ pub fn entries(scope: &Scope, agents: Vec<AgentInfo>) -> Vec<Entry> {
                 .clone()
                 .or_else(|| agent.title.clone())
                 .unwrap_or_else(|| agent.id.clone()),
+            folder: (normalized(&agent.project_root) != project)
+                .then(|| folder(&agent.project_root)),
             id: agent.id,
         })
         .collect::<Vec<_>>();
+    // The folder and the id after the name: two agents named alike keep
+    // their places from one read to the next.
     entries.sort_by(|left, right| {
-        (left.status != Status::Working, &left.name)
-            .cmp(&(right.status != Status::Working, &right.name))
+        (
+            left.folder.is_some(),
+            left.status != Status::Working,
+            &left.name,
+            &left.folder,
+            &left.id,
+        )
+            .cmp(&(
+                right.folder.is_some(),
+                right.status != Status::Working,
+                &right.name,
+                &right.folder,
+                &right.id,
+            ))
     });
     entries
+}
+
+/// A folder's last part, as the sidebar names it.
+fn folder(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    text.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&text)
+        .to_owned()
 }
 
 /// herdr's state for an agent the roster lists.
@@ -164,6 +196,45 @@ mod tests {
         .expect("an agent")
     }
 
+    /// Seen in the ninja project: the agents view listed four idle agents
+    /// (`hello` twice, `0e0dde4f`, and the one the terminal drew) while the
+    /// sidebar listed `main` and `0e0dde4f`: both `hello` agents worked in
+    /// other folders and were left out without a word.
+    #[test]
+    fn agents_of_other_folders_are_listed_after_the_projects_own() {
+        let scope = Scope {
+            agent_id: "me".to_owned(),
+            project_root: PathBuf::from("F:\\work\\ninja"),
+        };
+        let listed = entries(
+            &scope,
+            vec![
+                agent("me", Some("M4 fully closed"), "F:\\work\\ninja", "ready"),
+                agent("h1", Some("hello"), "F:\\work\\ninja\\web", "ready"),
+                agent(
+                    "h2",
+                    Some("hello"),
+                    "C:\\Users\\d\\Downloads\\scratch\\",
+                    "ready",
+                ),
+                agent("0e0dde4f", None, "f:/work/ninja", "ready"),
+            ],
+        );
+        let shown = listed
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.folder.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            vec![
+                ("0e0dde4f", None),
+                ("hello", Some("scratch")),
+                ("hello", Some("web")),
+            ],
+            "the three others the agents view lists, the project's first"
+        );
+    }
+
     #[test]
     fn it_lists_the_projects_other_agents_running_first() {
         let scope = Scope {
@@ -190,7 +261,10 @@ mod tests {
                 ("a2", Status::Working),
                 ("asks", Status::Blocked),
                 ("tests", Status::Idle),
-            ]
+                ("elsewhere", Status::Working),
+            ],
+            "another folder's agent comes after the project's"
         );
+        assert_eq!(listed[3].folder.as_deref(), Some("other"));
     }
 }

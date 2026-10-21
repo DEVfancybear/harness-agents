@@ -18,7 +18,10 @@ under it as warnings. While the card is still on screen, `/model` and `/effort`
 it has scrolled away, the status line is the current source.
 
 **Turns.** Each turn sits on a colored rail: the operator's message on a blue
-rail over a shaded background, the assistant's answer on a mauve rail. The palette
+rail over a shaded background, the assistant's answer on a mauve rail. A command
+typed with long guidance (`/compact` and several hundred words of what to keep)
+shows the command, its first two rows and `… N more lines (ctrl+o)`; the
+details and expanded modes show all of it. The palette
 is herdr's default, Catppuccin Mocha: soft text, a blue accent for what has the
 focus, mauve for branches, and yellow, green and red for working, done and
 blocked (true color where the terminal says it supports it, the 256-color cube
@@ -51,17 +54,30 @@ when the queue is empty.
 herdr's style sits at the left. `workspace` names the project (with a status dot
 while its agent works or waits), the checked-out branch, the model and thinking
 level, the permission mode, the chat's name and the goal. `agents` lists the
-session's own agent (`main`) and every agent the turn delegated to, each with
-herdr's glyph and word: a spinner and `working`, `◉ blocked` when an approval or a
-question waits for you, `✓ done` for a delegate whose turn ended, `○ idle`; a
-delegate's second row says how many tools it called and the latest. A terminal
-attached to a background agent also lists the project's `other agents` (read
-every second). Every agent row is numbered: Alt and its number, or a click,
-opens it. `main` brings the conversation back to the front; a delegate opens
-its pane beside the conversation, herdr's split in the accent's border, with
-the calls it starts, the first lines each tool returns and its answer as it
-writes it (the newest at the bottom; a new turn closes it); another agent
-switches the terminal to that agent, as the agents view's Enter does. The row
+session's own agent (`main`) and every agent the run delegated to, each by its
+own name (`coder-c0cc21d5`: several children share a role) and in herdr's two
+lines: the glyph and the name, then the state in its colour - a spinner and
+`working`, `◉ blocked` when an approval or a question waits for you, `✓ done`,
+`✗ failed`, `■ stopped`, `○ idle` - with the tools it called, and under that the
+model and thinking level it runs on (`◆ deepseek-v4.1-flash high`). A child's
+state is the one the agents view shows (the session's child registry), working
+children come first, and `main` says `working` while children it started still
+work after its own turn ended. The header counts them (`5 working · 10`); a
+console too short for two lines each gives every agent one line, and children
+that do not fit are counted (`+3 more · 2 working`). A terminal attached to a
+background agent also lists the `other agents` of the project and, under `other
+folders`, the agents of other folders the agents view lists, each with its
+folder (`⌂ web`); those that do not fit are counted (`+2 more · /agents`), never
+left out. Every agent row is numbered: Alt and its number, or a click, opens it.
+`main` brings the conversation back to the front; a delegate opens its pane
+beside the conversation, herdr's split in the accent's border: its latest
+message at the top, then one row per call - the tool, its target (a path loses
+its middle, not its file name), `✓`/`✗` and the time it took - with at most two
+rows of what a command returned and a count of the rest; a run of reads or
+searches is one row and the paths under it (`▤ Read file ×4`, `↳ …/src/main.rs`),
+and the pane's foot names the child's model and thinking level. Ctrl+O's detail
+modes show every call and all its output. Another agent switches the terminal to
+that agent, as the agents view's Enter does. The row
 in front is on the selected background. The last row points to the agents view
 (Left on an empty prompt). `terminal.sidebar: false` in `settings.json` turns
 the sidebar off; a narrower console never shows it.
@@ -71,7 +87,9 @@ the sidebar off; a narrower console never shows it.
 needs a decision (an approval's countdown, a selector's keys). The right carries
 telemetry only worth a glance: cost, `↯ cache NN%` (the share of the session's
 prompt served from the provider's cache), herdr's context gauge `ctx ━━━━──── NN%`
-(green, then yellow from 60% and red from 85%) and the detail mode. A narrow
+(green, then yellow from 60% and red from 85%) with the provider's tightest usage
+window as its own pages say it, what is left (`5h 30% left`: yellow from 40% left,
+red from 15%), and the detail mode. A narrow
 console drops the right end piece by piece (detail mode first, then the gauge for
 the bare `◔ ctx NN%`, then cost and cache), keeping the context readout last,
 before it truncates the left.
@@ -100,6 +118,9 @@ cargo run -p harness-cli --bin ha -- chat --fixture
 
 The fixture needs no provider credentials. For normal use, build and install
 with `pwsh -NoProfile -File scripts/install/Install-Ha.ps1`, then run `ha` and `/login`.
+Once the model in use has a login, the opening hint no longer offers `/login`, and
+`/login`'s menu lists only the providers without one (`/login <provider>` typed out
+still replaces a key; `/logout` lists the logins there are).
 Use `/config` to inspect configuration and `/permissions` to choose a permission
 mode.
 
@@ -117,6 +138,7 @@ mode.
 | Ctrl+D | Exit on an empty prompt; deletes forward while there is text. A background agent keeps running: `ha attach` brings it back |
 | Left (empty prompt) | Hand the terminal to the agents view (agent keeps running) |
 | Ctrl+O | Cycle tool detail (collapsed, details, expanded) |
+| Ctrl+F | Find in the conversation (fullscreen): typing searches as you type, case-insensitive; every match is marked and the current one reversed, with a count (`3/17`); Enter or Down goes to the next, Shift+Enter or Up to the one before, and the window scrolls to it; Esc closes the bar where the window is |
 | Alt+1..9 | The sidebar's numbered row: the conversation, a delegate's pane, or another agent of the project (fullscreen). Ctrl+Alt is left alone, since AltGr arrives as it |
 | Ctrl+L | Repaint the screen |
 | Ctrl+G | Edit the draft in `$VISUAL` / `$EDITOR`; the saved text replaces the prompt |
@@ -128,8 +150,9 @@ mode.
 | Ctrl+End / Ctrl+Shift+Down | Back to the end, following the output (Windows Terminal keeps Ctrl+Shift+Down, so use Ctrl+End) |
 
 Prompt editing follows prime-agent. Ctrl/Alt+Left and Right, Alt+B and Alt+F move
-by word; Ctrl+A and Ctrl+E go to the line's start and end; Ctrl+B and Ctrl+F move
-by character. Ctrl+K, Ctrl+U and Ctrl+W delete to the end of the line, to its
+by word; Ctrl+A and Ctrl+E go to the line's start and end; Ctrl+B moves back a
+character (Ctrl+F, readline's forward-char before, now finds in the conversation;
+Right moves forward). Ctrl+K, Ctrl+U and Ctrl+W delete to the end of the line, to its
 start and the word before the cursor into a kill ring that Ctrl+Y yanks back;
 Alt+D or Alt+Delete deletes the next word; Alt+Backspace the previous one; Ctrl+T
 transposes two characters. Ctrl+Z (or Ctrl+-) undoes an edit and Ctrl+Shift+Z

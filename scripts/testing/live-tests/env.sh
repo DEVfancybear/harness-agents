@@ -5,7 +5,9 @@
 #               build it with `cargo build -p harness-cli --example pty_probe`)
 #   PY          a Python 3.11+ with the kernel's packages, for the checks and the REPL
 #   MODEL       the model the agents run on      (default: opencode-go/deepseek-v4.1-flash)
-#   THINKING    the agents' thinking level (off .. max), when set
+#   THINKING    the agents' thinking level (off .. max), when set: each home's
+#               settings.json default, and --thinking wherever --model is (a
+#               suite that rewrites settings.json keeps the level)
 #   LIVE_ROOT   where each test makes its own home and projects (default: $TEMP/ha-live)
 #   HA_CONFIG   the config.toml to copy into each test's home (default: the user's)
 #   HA_CREDENTIALS_DIR  the private directory holding the model's credentials (required)
@@ -15,6 +17,10 @@ export HA=${HA:-$REPO/target/release/ha.exe}
 export PROBE=${PROBE:-$REPO/target/debug/examples/pty_probe.exe}
 export PY=${PY:-python}
 export MODEL=${MODEL:-opencode-go/deepseek-v4.1-flash}
+export THINKING=${THINKING:-}
+# What follows `--model "$MODEL"` on every command line: the thinking level.
+TH=()
+if [ -n "$THINKING" ]; then TH=(--thinking "$THINKING"); fi
 export LIVE_ROOT=${LIVE_ROOT:-${TEMP:-/tmp}/ha-live}
 export HA_CONFIG=${HA_CONFIG:-${APPDATA:-$HOME/.config}/HarnessAgents/config.toml}
 : "${HA_CREDENTIALS_DIR:?set HA_CREDENTIALS_DIR to the directory with the model credentials}"
@@ -62,7 +68,7 @@ result() { echo "################ RESULT: $pass passed, $fail failed"; [ "$fail"
 
 # agent <dir> <name>: start an agent in <dir> through a pseudo-console and name it.
 agent() {
-  (cd "$1" && "$PROBE" "$RX/$2.bin" "$HA" "wait:9000" -- chat --model "$MODEL" --approval full-auto >/dev/null)
+  (cd "$1" && "$PROBE" "$RX/$2.bin" "$HA" "wait:9000" -- chat --model "$MODEL" "${TH[@]}" --approval full-auto >/dev/null)
   local id
   id=$("$HA" list --json | "$PY" -c "import json,sys; d=json.load(sys.stdin); a=d if isinstance(d,list) else d.get('agents',d); print([x['id'] for x in a if not x.get('name')][0])")
   "$HA" rename "$id" "$2" >/dev/null

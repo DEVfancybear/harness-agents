@@ -11,16 +11,21 @@
 //!    ◆ deepseek-v4 · high    │
 //!    ⚙ full-auto             │
 //! ───────────────────────────│
-//!  agents                  2 │
+//!  agents        2 working · 3 │
 //!  1 ⣾ main         working  │  on the selected background: in front
-//!  2 ✓ verifier        done  │
+//!  2 ⣾ coder-c0cc21d working │  each child by its own name, working first
 //!      12 tools · read_file  │
+//!  3 ✓ explorer-d3cc6  done  │
 //!                            │
 //!  other agents            1 │
 //!  3 ○ fix-tests       idle  │
 //!                            │
 //!  ← agents view    alt+1-9  │
 //! ```
+//!
+//! A child's state is the session's child registry's - what the agents view
+//! lists - and the session's own agent is working while children it started
+//! still are, even after its run ended.
 //!
 //! Every agent row carries the number Alt reaches it with: the session's own
 //! closes a delegate's pane, a delegate's opens it ([`super::pane`]), and the
@@ -31,6 +36,8 @@
 //! [`MIN_CONTENT_COLUMNS`] or more beside it, and `terminal.sidebar: false` in
 //! `settings.json` turns it off. A pure function of [`UiState`].
 
+use std::fmt::Write as _;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -39,7 +46,7 @@ use ratatui::widgets::Paragraph;
 
 use super::theme::Theme;
 use super::widgets::composer::{char_width, display_width};
-use crate::interactive::events::{AppPhase, Modal, UiState};
+use crate::interactive::events::{AppPhase, ChildActivity, ChildRunState, Modal, UiState};
 
 /// The sidebar's width: its rows, the divider, and one blank column that keeps
 /// the conversation's boxes off the divider.
@@ -58,12 +65,14 @@ pub const fn width(columns: u16, enabled: bool) -> u16 {
     }
 }
 
-/// herdr's agent states.
+/// herdr's agent states, and how a delegated child ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Status {
     Working,
     Blocked,
     Done,
+    Failed,
+    Stopped,
     Idle,
 }
 
@@ -74,6 +83,8 @@ impl Status {
             Self::Working => "working",
             Self::Blocked => "blocked",
             Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
             Self::Idle => "idle",
         }
     }
@@ -83,6 +94,8 @@ impl Status {
             Self::Working => Theme::spinner(tick),
             Self::Blocked => "◉",
             Self::Done => "✓",
+            Self::Failed => "✗",
+            Self::Stopped => "■",
             Self::Idle => "○",
         }
     }
@@ -91,14 +104,25 @@ impl Status {
     pub const fn style(self, theme: &Theme) -> Style {
         match self {
             Self::Working => theme.warning,
-            Self::Blocked => theme.error,
+            Self::Blocked | Self::Failed => theme.error,
             Self::Done => theme.tool_ok,
-            Self::Idle => theme.dim,
+            Self::Stopped | Self::Idle => theme.dim,
+        }
+    }
+
+    /// Where a row sorts: what needs looking at first.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Working => 0,
+            Self::Blocked => 1,
+            Self::Failed => 2,
+            Self::Done | Self::Stopped | Self::Idle => 3,
         }
     }
 }
 
-/// What the session's own agent is doing.
+/// What the session's own agent is doing. A run that ended while children it
+/// started still work is waiting on them: working, as the agents view says.
 #[must_use]
 pub fn main_status(state: &UiState) -> Status {
     if matches!(
@@ -113,8 +137,61 @@ pub fn main_status(state: &UiState) -> Status {
         | AppPhase::WaitingInput
         | AppPhase::WaitingMcpInput
         | AppPhase::SetupRequired => Status::Blocked,
+        AppPhase::Booting | AppPhase::Ready | AppPhase::Closed
+            if state
+                .child_activity
+                .iter()
+                .any(|child| child.state == ChildRunState::Running) =>
+        {
+            Status::Working
+        }
         AppPhase::Booting | AppPhase::Ready | AppPhase::Closed => Status::Idle,
     }
+}
+
+/// A delegated child's state: the registry's, or - for a child it never
+/// listed - working while the run is, done after.
+#[must_use]
+pub fn child_status(state: &UiState, child: &ChildActivity) -> Status {
+    match child.state {
+        ChildRunState::Running => Status::Working,
+        ChildRunState::Failed => Status::Failed,
+        ChildRunState::Stopped => Status::Stopped,
+        ChildRunState::Unknown if state.phase.has_active_run() => Status::Working,
+        ChildRunState::Done | ChildRunState::Unknown => Status::Done,
+    }
+}
+
+/// The run's children in the sidebar's order, each with its state: working
+/// first, then failed, then the rest, each group in the order they started.
+#[must_use]
+pub fn ordered_children(state: &UiState) -> Vec<(&ChildActivity, Status)> {
+    let mut children = state
+        .child_activity
+        .iter()
+        .map(|child| (child, child_status(state, child)))
+        .collect::<Vec<_>>();
+    children.sort_by_key(|(_, status)| status.rank());
+    children
+}
+
+/// A child's name in `room` cells. A generated name (`coder-c0cc21d5`) keeps
+/// its role and gives up the end of its id first, so `coder-c0cc` still
+/// tells two coders apart.
+fn child_label(name: &str, room: usize) -> String {
+    if display_width(name) <= room {
+        return name.to_owned();
+    }
+    if let Some((role, id)) = name.rsplit_once('-')
+        && id.len() >= 4
+        && id.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        let keep = room.saturating_sub(display_width(role) + 1).min(id.len());
+        if keep >= 4 {
+            return format!("{role}-{}", &id[..keep]);
+        }
+    }
+    truncate(name, room)
 }
 
 /// What a numbered row of the sidebar opens (Alt+its number, or a click).
@@ -142,10 +219,9 @@ pub struct Extra<'a> {
 pub fn targets(state: &UiState, others: &[super::roster::Entry]) -> Vec<Target> {
     std::iter::once(Target::Main)
         .chain(
-            state
-                .child_activity
-                .iter()
-                .map(|activity| Target::Child(activity.name.clone())),
+            ordered_children(state)
+                .into_iter()
+                .map(|(activity, _)| Target::Child(activity.name.clone())),
         )
         .chain(others.iter().map(|entry| Target::Agent(entry.id.clone())))
         .collect()
@@ -197,8 +273,8 @@ fn lines(
     width: usize,
     height: usize,
 ) -> (Vec<Line<'static>>, Vec<(usize, Target)>) {
-    let header = |text: &str, count: usize| -> Line<'static> {
-        let label = count.to_string();
+    let header = |text: &str, label: &str| -> Line<'static> {
+        let label = label.to_owned();
         Line::from(vec![
             Span::styled(format!(" {text}"), theme.dim.add_modifier(Modifier::BOLD)),
             Span::raw(" ".repeat(width.saturating_sub(1 + display_width(text) + label.len() + 1))),
@@ -287,12 +363,23 @@ fn lines(
     // is in front is on the selected row's background.
     rows.push(Line::default());
     rows.push(Line::from(Span::styled("─".repeat(width), theme.border)));
-    rows.push(header("agents", 1 + state.child_activity.len()));
-    let mut number = 0_usize;
-    let mut agent = |status: Status, name: &str, active: bool| -> Line<'static> {
-        number += 1;
+    let children = ordered_children(state);
+    let working = std::iter::once(main)
+        .chain(children.iter().map(|(_, status)| *status))
+        .filter(|status| *status == Status::Working)
+        .count();
+    let total = 1 + children.len();
+    // How many work, beside how many there are: four coders running among
+    // nine children is what the agents view says too.
+    let count = if working > 0 && working < total {
+        format!("{working} working · {total}")
+    } else {
+        total.to_string()
+    };
+    rows.push(header("agents", &count));
+    let agent = |number: usize, status: Status, name: &str, active: bool| -> Line<'static> {
         let word = status.word();
-        let name = truncate(name, width.saturating_sub(7 + word.len() + 1));
+        let name = child_label(name, width.saturating_sub(5 + word.len() + 2));
         let gap = width.saturating_sub(5 + display_width(&name) + word.len() + 1);
         let line = Line::from(vec![
             Span::styled(
@@ -323,36 +410,98 @@ fn lines(
             line
         }
     };
-    hits.push((rows.len(), Target::Main));
-    rows.push(agent(main, "main", extra.focus.is_none()));
-    let child = if state.phase.has_active_run() {
-        Status::Working
-    } else {
-        Status::Done
-    };
-    // Room left above the footer and the other agents: a delegate takes two
-    // rows while there is room for what it last did, one row otherwise.
+    // herdr's agent row is two lines: the name, then its state in its colour
+    // (and here the model and thinking level it runs on). Where the agents do
+    // not all fit that way, each is one line with its state at the right.
     let footer_rows = 2 + usize::from(!extra.others.is_empty()) * (2 + extra.others.len().min(3));
-    for activity in &state.child_activity {
-        let left = height.saturating_sub(rows.len() + footer_rows);
-        if left == 0 {
-            break;
-        }
-        hits.push((rows.len(), Target::Child(activity.name.clone())));
-        rows.push(agent(
-            child,
-            &activity.name,
-            extra.focus == Some(activity.name.as_str()),
-        ));
-        if left >= 2 {
-            let mut spans = vec![Span::styled(
-                format!(
-                    "{} tool{}",
-                    activity.tool_calls,
-                    if activity.tool_calls == 1 { "" } else { "s" }
-                ),
+    let room = height.saturating_sub(rows.len() + footer_rows);
+    let two_lines = 2 * (1 + children.len()) <= room;
+    // herdr's two lines: the name in front, the state under it.
+    let pair = |number: usize, status: Status, name: &str, below: String, active: bool| {
+        let first = Line::from(vec![
+            Span::styled(
+                if number <= 9 {
+                    format!(" {number} ")
+                } else {
+                    "   ".to_owned()
+                },
                 theme.dim,
-            )];
+            ),
+            Span::styled(status.glyph(state.tick), status.style(theme)),
+            Span::raw(" "),
+            Span::styled(
+                truncate(name, width.saturating_sub(6)),
+                if status == Status::Idle {
+                    theme.muted
+                } else {
+                    theme.strong
+                },
+            ),
+        ]);
+        let mut spans = vec![
+            Span::raw("     "),
+            Span::styled(status.word(), status.style(theme)),
+        ];
+        if !below.is_empty() {
+            spans.push(Span::styled(format!(" · {below}"), theme.dim));
+        }
+        let second = Line::from(fit(spans, width.saturating_sub(1)));
+        if active {
+            [first.style(theme.selection), second.style(theme.selection)]
+        } else {
+            [first, second]
+        }
+    };
+    hits.push((rows.len(), Target::Main));
+    if two_lines {
+        rows.extend(pair(1, main, "main", String::new(), extra.focus.is_none()));
+    } else {
+        rows.push(agent(1, main, "main", extra.focus.is_none()));
+    }
+    // Room left above the footer and the other agents. Every child gets its
+    // row before any gets one for what it last did, and the working ones get
+    // theirs first; the children that do not fit are counted.
+    let room = height.saturating_sub(rows.len() + footer_rows);
+    let per_child = if two_lines { 2 } else { 1 };
+    let (listed, hidden) = if children.len() * per_child > room {
+        let listed = room.saturating_sub(1) / per_child;
+        (listed, children.len() - listed)
+    } else {
+        (children.len(), 0)
+    };
+    let working_children = children
+        .iter()
+        .take(listed)
+        .filter(|(_, status)| *status == Status::Working)
+        .count();
+    let used = listed * per_child;
+    let details = |status: Status| {
+        used + listed <= room || (status == Status::Working && used + working_children <= room)
+    };
+    for (index, (activity, status)) in children.iter().take(listed).enumerate() {
+        hits.push((rows.len(), Target::Child(activity.name.clone())));
+        let active = extra.focus == Some(activity.name.as_str());
+        let tools = format!(
+            "{} tool{}",
+            activity.tool_calls,
+            if activity.tool_calls == 1 { "" } else { "s" }
+        );
+        if two_lines {
+            rows.extend(pair(index + 2, *status, &activity.name, tools, active));
+            // The model and thinking level it runs on: the level is kept
+            // whole, the model gives way.
+            if details(*status) && !activity.model.is_empty() {
+                rows.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled("◆ ", theme.accent),
+                    Span::styled(model_effort(activity, width.saturating_sub(8)), theme.muted),
+                ]));
+            }
+            continue;
+        }
+        rows.push(agent(index + 2, *status, &activity.name, active));
+        if details(*status) {
+            let mut spans = vec![Span::styled(tools, theme.dim)];
             if !activity.latest.is_empty() {
                 spans.push(Span::styled(format!(" · {}", activity.latest), theme.dim));
             }
@@ -361,18 +510,81 @@ fn lines(
             rows.push(Line::from(all));
         }
     }
+    if hidden > 0 {
+        let working = children
+            .iter()
+            .skip(listed)
+            .filter(|(_, status)| *status == Status::Working)
+            .count();
+        let mut text = format!("     +{hidden} more");
+        if working > 0 {
+            let _ = write!(text, " · {working} working");
+        }
+        rows.push(Line::from(Span::styled(truncate(&text, width), theme.dim)));
+    }
 
-    // The project's other agents: a number or a click switches to one.
-    if !extra.others.is_empty() && height > rows.len() + 4 {
+    // The other agents the agents view lists: the project's, then those of
+    // other folders, each folder named under its agent. A number or a click
+    // switches to one; those that do not fit are counted, never left out
+    // without a word.
+    let fits = |rows: &Vec<Line<'static>>, more: usize| rows.len() + more < height;
+    let mut left_out = 0;
+    for (title, here) in [("other agents", true), ("other folders", false)] {
+        let group = extra
+            .others
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.folder.is_none() == here)
+            .collect::<Vec<_>>();
+        if group.is_empty() {
+            continue;
+        }
+        let later = if here {
+            extra
+                .others
+                .iter()
+                .filter(|entry| entry.folder.is_some())
+                .count()
+        } else {
+            0
+        };
+        if left_out > 0 || !fits(&rows, 3) {
+            left_out += group.len();
+            continue;
+        }
         rows.push(Line::default());
-        rows.push(header("other agents", extra.others.len()));
-        for entry in extra.others {
-            if height <= rows.len() + 2 {
+        rows.push(header(title, &group.len().to_string()));
+        for (at, (index, entry)) in group.iter().enumerate() {
+            let after = group.len() - at - 1 + later;
+            if !fits(&rows, 1 + usize::from(after > 0)) {
+                left_out += group.len() - at;
                 break;
             }
             hits.push((rows.len(), Target::Agent(entry.id.clone())));
-            rows.push(agent(entry.status, &entry.name, false));
+            rows.push(agent(
+                children.len() + 2 + index,
+                entry.status,
+                &entry.name,
+                false,
+            ));
+            if let Some(folder) = &entry.folder
+                && fits(&rows, 1 + after)
+            {
+                rows.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled(
+                        truncate(&format!("⌂ {folder}"), width.saturating_sub(6)),
+                        theme.dim,
+                    ),
+                ]));
+            }
         }
+    }
+    if left_out > 0 && fits(&rows, 1) {
+        rows.push(Line::from(Span::styled(
+            truncate(&format!("     +{left_out} more · /agents"), width),
+            theme.dim,
+        )));
     }
 
     // The way to every agent, on the last row.
@@ -396,6 +608,22 @@ fn find<'a>(state: &'a UiState, prefix: &str) -> Option<&'a str> {
         .find_map(|line| line.strip_prefix(prefix))
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+/// A child's model and thinking level in `room` cells: the level whole, the
+/// model cut before it.
+pub fn model_effort(child: &ChildActivity, room: usize) -> String {
+    let label = child.model_label();
+    if display_width(&label) <= room {
+        return label;
+    }
+    match label.rsplit_once(' ') {
+        Some((model, level)) if child.thinking.as_deref() == Some(level) => {
+            let model = truncate(model, room.saturating_sub(display_width(level) + 1));
+            format!("{model} {level}")
+        }
+        _ => truncate(&label, room),
+    }
 }
 
 /// `text` cut to `width` cells, an ellipsis standing in for what was cut.
@@ -440,9 +668,11 @@ fn fit(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Extra, MIN_CONTENT_COLUMNS, Status, Target, WIDTH, main_status, render, targets, width,
+        Extra, MIN_CONTENT_COLUMNS, Status, Target, WIDTH, main_status, ordered_children, render,
+        targets, width,
     };
-    use crate::interactive::events::{AppPhase, ChildActivity, UiState};
+    use crate::interactive::agents::protocol::SubagentInfo;
+    use crate::interactive::events::{AppPhase, ChildActivity, UiState, sync_child_states};
     use crate::interactive::tui::roster::Entry;
     use crate::interactive::tui::theme::Theme;
     use ratatui::Terminal;
@@ -493,6 +723,18 @@ mod tests {
         }
     }
 
+    /// Each row with the one under it: herdr's agent row is two lines, the
+    /// name and then the state.
+    fn agent_rows(rows: &[String]) -> Vec<String> {
+        rows.windows(2)
+            .filter(|pair| {
+                pair[0].starts_with(' ')
+                    && pair[0].chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+            })
+            .map(|pair| format!("{} {}", pair[0], pair[1]))
+            .collect()
+    }
+
     fn screen(state: &UiState, height: u16) -> Vec<String> {
         screen_with(state, height, Extra::default()).0
     }
@@ -537,6 +779,7 @@ mod tests {
             id: "a7".to_owned(),
             name: "fix-tests".to_owned(),
             status: Status::Idle,
+            folder: None,
         }];
         assert_eq!(
             targets(&running, &others),
@@ -618,16 +861,18 @@ mod tests {
         assert!(text.contains("◆ deepseek-v4 · high"), "{text}");
         assert!(text.contains("⚙ full-auto"), "{text}");
         assert!(
-            rows.iter()
+            agent_rows(&rows)
+                .iter()
                 .any(|row| row.contains("main") && row.contains("working")),
             "{text}"
         );
         assert!(
-            rows.iter()
+            agent_rows(&rows)
+                .iter()
                 .any(|row| row.contains("verifier") && row.contains("working")),
             "{text}"
         );
-        assert!(text.contains("12 tools · read_file"), "{text}");
+        assert!(text.contains("working · 12 tools"), "{text}");
         assert!(rows[19].contains("agents view"), "the footer: {text}");
         assert!(
             rows.iter().all(|row| row.trim_end().ends_with('│')),
@@ -639,6 +884,310 @@ mod tests {
         let text = screen(&running, 20).join("\n");
         assert!(text.contains("✓ verifier"), "{text}");
         assert!(text.contains("○ main"), "{text}");
+    }
+
+    /// The children of the session the bug was seen in: the agents view had
+    /// the conversation running with "9 subagents (4 running)" while the
+    /// sidebar said `1 main idle`, `2 verifier done`, `3 coder done` - one row
+    /// per role, each with the state of an older child.
+    fn nine_children() -> Vec<SubagentInfo> {
+        [
+            ("verifier-b105bf50", "running"),
+            ("explorer-d3cc6099", "completed"),
+            ("explorer-8a0ec09b", "completed"),
+            ("coder-7ce2ed20", "completed"),
+            ("coder-10da2461", "completed"),
+            ("coder-c0cc21d5", "running"),
+            ("coder-6bcf5921", "completed"),
+            ("coder-243a54dc", "running"),
+            ("coder-64d1e8a3", "running"),
+        ]
+        .into_iter()
+        .map(|(name, status)| SubagentInfo {
+            name: name.to_owned(),
+            status: status.to_owned(),
+            model: "opencode-go/deepseek-v4.1-flash".to_owned(),
+            thinking: Some("high".to_owned()),
+            depth: 1,
+            program: String::new(),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn nine_children_are_listed_each_with_its_own_state_running_first() {
+        // The run ended; its children still work. The pane lines named some
+        // of them (in the order they started), the registry lists them all.
+        let mut waiting = state(AppPhase::Ready);
+        waiting.child_activity = [
+            "explorer-d3cc6099",
+            "verifier-b105bf50",
+            "coder-7ce2ed20",
+            "coder-c0cc21d5",
+        ]
+        .into_iter()
+        .map(|name| ChildActivity {
+            name: name.to_owned(),
+            tool_calls: 3,
+            ..ChildActivity::default()
+        })
+        .collect();
+        assert!(sync_child_states(
+            &mut waiting.child_activity,
+            &nine_children()
+        ));
+        assert!(
+            !sync_child_states(&mut waiting.child_activity, &nine_children()),
+            "nothing changed the second time"
+        );
+        assert_eq!(
+            waiting.child_activity.len(),
+            6,
+            "a running child that sent nothing yet is listed; a finished one that never showed is not"
+        );
+        assert_eq!(
+            main_status(&waiting),
+            Status::Working,
+            "main waits on its running children"
+        );
+        assert_eq!(
+            targets(&waiting, &[]),
+            vec![
+                Target::Main,
+                Target::Child("verifier-b105bf50".to_owned()),
+                Target::Child("coder-c0cc21d5".to_owned()),
+                Target::Child("coder-243a54dc".to_owned()),
+                Target::Child("coder-64d1e8a3".to_owned()),
+                Target::Child("explorer-d3cc6099".to_owned()),
+                Target::Child("coder-7ce2ed20".to_owned()),
+            ],
+            "running first, each group in the order it started"
+        );
+        let rows = screen(&waiting, 40);
+        let text = rows.join("\n");
+        // herdr's two lines: the name, then the state under it.
+        let row = |number: usize| {
+            let at = rows
+                .iter()
+                .position(|row| row.starts_with(&format!(" {number} ")))
+                .unwrap_or_else(|| panic!("alt+{number}: {text}"));
+            format!("{} {}", rows[at], rows[at + 1])
+        };
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("agents") && row.contains("5 working · 7")),
+            "{text}"
+        );
+        for (number, name, word) in [
+            (1, "main", "working"),
+            (2, "verifier-b105", "working"),
+            (3, "coder-c0cc", "working"),
+            (4, "coder-243a", "working"),
+            (5, "coder-64d1", "working"),
+            (6, "explorer-d3cc", "done"),
+            (7, "coder-7ce2", "done"),
+        ] {
+            assert!(
+                row(number).contains(name) && row(number).contains(word),
+                "alt+{number} is {name}, {word}: {text}"
+            );
+        }
+        // A child says the model and thinking level it runs on; the level
+        // stays whole when the model is cut.
+        let model = rows
+            .iter()
+            .position(|row| row.starts_with(" 2 "))
+            .map(|at| rows[at + 2].clone())
+            .unwrap_or_default();
+        assert!(
+            model.contains("◆ deepseek") && model.trim_end().ends_with("high │"),
+            "{text}"
+        );
+
+        // Once every child settled, main is idle and the failed one sorts
+        // before the done ones.
+        let mut settled = nine_children();
+        for row in &mut settled {
+            row.status = "completed".to_owned();
+        }
+        settled[5].status = "error".to_owned();
+        assert!(sync_child_states(&mut waiting.child_activity, &settled));
+        assert_eq!(main_status(&waiting), Status::Idle);
+        let text = screen(&waiting, 40).join("\n");
+        assert!(text.contains(" 2 ✗ coder-c0cc21d5"), "{text}");
+        assert!(text.contains("failed"), "{text}");
+    }
+
+    /// Seen in a later session: the sidebar said `main working` and
+    /// `explorer working · 114 tools`, its pane "2 explorer · working", while
+    /// the agents view said "22 subagents (0 running, 7 failed)".
+    #[test]
+    fn a_child_the_registry_shows_settled_is_never_drawn_working() {
+        let mut ended = state(AppPhase::Running);
+        ended.child_activity = vec![
+            ChildActivity {
+                name: "explorer".to_owned(),
+                tool_calls: 114,
+                ..ChildActivity::default()
+            },
+            ChildActivity {
+                name: "explorer-0d1e2f3a".to_owned(),
+                tool_calls: 9,
+                state: crate::interactive::events::ChildRunState::Running,
+                ..ChildActivity::default()
+            },
+        ];
+        let rows = (0..22)
+            .map(|index| SubagentInfo {
+                name: if index == 0 {
+                    "explorer-0d1e2f3a".to_owned()
+                } else {
+                    format!("coder-{index:08x}")
+                },
+                status: if index % 3 == 0 { "error" } else { "completed" }.to_owned(),
+                model: "m".to_owned(),
+                thinking: None,
+                depth: 1,
+                program: String::new(),
+            })
+            .collect::<Vec<_>>();
+        assert!(sync_child_states(&mut ended.child_activity, &rows));
+        let shown = ordered_children(&ended)
+            .into_iter()
+            .map(|(child, status)| (child.name.as_str(), status))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            vec![
+                ("explorer-0d1e2f3a", Status::Failed),
+                ("explorer", Status::Done),
+            ],
+            "nothing is working while the run still is"
+        );
+        let text = screen(&ended, 30).join("\n");
+        assert!(!text.contains("explorer… working"), "{text}");
+        assert!(
+            !agent_rows(&text.lines().map(str::to_owned).collect::<Vec<_>>())
+                .iter()
+                .any(|row| row.contains("explorer") && row.contains("working")),
+            "{text}"
+        );
+        // A child that left the registry (deleted) is not running either.
+        let mut gone = state(AppPhase::Ready);
+        gone.child_activity = vec![ChildActivity {
+            name: "coder-c0cc21d5".to_owned(),
+            state: crate::interactive::events::ChildRunState::Running,
+            ..ChildActivity::default()
+        }];
+        assert_eq!(main_status(&gone), Status::Working);
+        assert!(sync_child_states(&mut gone.child_activity, &[]));
+        assert_eq!(main_status(&gone), Status::Idle, "nothing runs any more");
+    }
+
+    #[test]
+    fn children_that_do_not_fit_are_counted_and_keep_their_numbers() {
+        let mut busy = state(AppPhase::Running);
+        sync_child_states(&mut busy.child_activity, &nine_children());
+        let others = vec![Entry {
+            id: "a7".to_owned(),
+            name: "fix-tests".to_owned(),
+            status: Status::Idle,
+            folder: None,
+        }];
+        let (rows, hits) = screen_with(
+            &busy,
+            16,
+            Extra {
+                others: &others,
+                focus: None,
+            },
+        );
+        let text = rows.join("\n");
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(" more · ") && row.contains(" working")),
+            "the children left out are counted: {text}"
+        );
+        let listed = hits
+            .iter()
+            .filter(|(_, target)| matches!(target, Target::Child(_)))
+            .count();
+        assert!(listed < 4, "{text}");
+        let all = targets(&busy, &others);
+        for (row, target) in &hits {
+            let number = all.iter().position(|t| t == target).expect("a target") + 1;
+            assert!(
+                rows[usize::from(*row)].starts_with(&format!(" {number} ")),
+                "row {row} is reached with alt+{number}: {text}"
+            );
+        }
+    }
+
+    /// The ninja project's four idle agents: the agents view listed them all,
+    /// the sidebar `main` and `0e0dde4f` only. Every one is listed now - the
+    /// project's, then the other folders' with their folder - and those that
+    /// do not fit are counted.
+    #[test]
+    fn every_agent_the_agents_view_lists_is_in_the_sidebar() {
+        let ready = state(AppPhase::Ready);
+        let entry = |id: &str, name: &str, folder: Option<&str>| Entry {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            status: Status::Idle,
+            folder: folder.map(str::to_owned),
+        };
+        let others = vec![
+            entry("0e0dde4f", "0e0dde4f", None),
+            entry("h2", "hello", Some("scratch")),
+            entry("h1", "hello", Some("web")),
+        ];
+        let (rows, hits) = screen_with(
+            &ready,
+            30,
+            Extra {
+                others: &others,
+                focus: None,
+            },
+        );
+        let text = rows.join("\n");
+        assert!(text.contains("other agents"), "{text}");
+        assert!(text.contains("other folders"), "{text}");
+        assert!(
+            text.contains("⌂ scratch") && text.contains("⌂ web"),
+            "{text}"
+        );
+        assert_eq!(
+            hits.iter()
+                .filter(|(_, target)| matches!(target, Target::Agent(_)))
+                .count(),
+            3,
+            "main and the three others, as the agents view: {text}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with(" 4 ") && row.contains("hello")),
+            "{text}"
+        );
+
+        // A short sidebar counts the agents it has no room for.
+        let (rows, hits) = screen_with(
+            &ready,
+            16,
+            Extra {
+                others: &others,
+                focus: None,
+            },
+        );
+        let text = rows.join("\n");
+        let listed = hits
+            .iter()
+            .filter(|(_, target)| matches!(target, Target::Agent(_)))
+            .count();
+        assert!(listed < 3, "{text}");
+        assert!(
+            text.contains(&format!("+{} more · /agents", 3 - listed)),
+            "{text}"
+        );
     }
 
     #[test]

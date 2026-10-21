@@ -68,6 +68,29 @@ if [ -n "${PROBE_WT:-}" ]; then
 else
   echo "SKIP  the wheel checks: PROBE_WT is not set"
 fi
+
+echo "################ 4. the agents view keeps up with a forest of subagents"
+# Children with long briefs, as a real run's are: the view copied every brief
+# into every row of every frame, and redrew four times a second.
+task=$(for _ in $(seq 1 40); do printf 'Đọc README.md và kể lại dòng đầu tiên của nó trong một câu ngắn. '; done)
+say t1 "Dùng tool delegate với wait=false giao cho 6 agent role explorer; mỗi brief chép nguyên văn nhiệm vụ sau: $task Giao xong thì trả lời ngay đúng một dòng MOC-GIAO, không đợi kết quả." | tail -1
+check "the model delegated and answered" 'last | grep -q MOC-GIAO'
+"$HA" list --json > "$RX/forest.json"
+children=$("$PY" -c "import json,sys; d=json.load(open(sys.argv[1],encoding='utf-8')); a=d if isinstance(d,list) else d.get('agents',d); print(max(len(x.get('subagents') or []) for x in a))" "$RX/forest.json")
+echo "   t1 has $children subagents"
+steps="wait:6000,key:/agents,enter,until:subagents:20000,settle:3000"
+steps="$steps,down,settle:3000,enter,settle:3000,down,settle:3000,down,settle:3000,down,settle:3000,up,settle:3000"
+steps="$steps,esc,until:MOC-GIAO:20000,settle:3000"
+(cd "$RX/p" && "$PROBE" "$RX/forest.bin" "$HA" "$steps" -- attach t1 >/dev/null)
+sed 's/^/   /' "$RX/forest.bin.marks" | grep -E 'until|settled'
+opened=$(awk '/until found subagents/ { print $(NF-1) }' "$RX/forest.bin.marks")
+# The keys pressed in the view, up to Esc: back in the session, its running
+# children keep the spinner turning, which is not a key's frame.
+slowest=$(awk '$2 == "esc" { exit } /settled/ { if ($3 > max) max = $3 } END { print max + 0 }' "$RX/forest.bin.marks")
+echo "   the list showed after ${opened:-?} ms; the slowest key in the view settled ${slowest} ms after it"
+check "the agents view listed the forest within 3 s" '[ -n "$opened" ] && [ "$opened" -lt 3000 ]'
+check "every key in the view settled within 400 ms" '[ "$slowest" -lt 400 ]'
+check "Esc went back to the session" 'grep -q "until found MOC-GIAO" "$RX/forest.bin.marks"'
 "$HA" shutdown --force >/dev/null 2>&1
 
 result

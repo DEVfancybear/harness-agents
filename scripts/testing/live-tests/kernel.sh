@@ -59,7 +59,7 @@ check "bash() ran" "ans | grep -q 'BASH=from-bash'"
 echo "################ 6. the kernel namespace survives a restart"
 say r1 "Dùng ipython: bien_kiem_tra = 4000 + 242; in bien_kiem_tra." | tail -2
 "$HA" shutdown --force >/dev/null 2>&1
-(cd "$RX/p" && "$PROBE" "$RX/resume.bin" "$HA" "wait:10000" -- chat --resume latest --model "$MODEL" --approval full-auto >/dev/null)
+(cd "$RX/p" && "$PROBE" "$RX/resume.bin" "$HA" "wait:10000" -- chat --resume latest --model "$MODEL" "${TH[@]}" --approval full-auto >/dev/null)
 say r1 "Dùng ipython chạy print('REVIVED=' + str(bien_kiem_tra)) (không gán lại). Báo nguyên văn output." | tail -3
 check "variable revived after restart" "ans | grep -q 'REVIVED=4242'"
 

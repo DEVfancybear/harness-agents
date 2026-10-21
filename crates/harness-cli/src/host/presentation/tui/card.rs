@@ -148,23 +148,12 @@ pub enum Outcome {
     Failed(String),
 }
 
-/// The header row of a card, `width` cells wide.
+/// What a card titles a call and the arguments it shows: a delegate by its
+/// agent and brief, a REPL cell as the commands it runs, any other call by
+/// its label and split summary.
 #[must_use]
-pub fn header(
-    name: &str,
-    summary: &str,
-    outcome: &Outcome,
-    width: u16,
-    theme: &Theme,
-) -> Line<'static> {
-    let kind = ToolKind::of(name);
-    let base = kind.style(theme);
-    let (tail_text, tail_style) = match outcome {
-        Outcome::Running(frame) => (format!("{frame} running"), base),
-        Outcome::Done(duration) => (format!("✓ {duration}"), theme.tool_ok),
-        Outcome::Failed(duration) => (format!("✗ {duration}"), theme.tool_failed),
-    };
-    let (title, arguments) = if name == "delegate" {
+pub fn call_parts(name: &str, summary: &str) -> (String, Arguments) {
+    if name == "delegate" {
         let (role, brief) = delegate_parts(summary);
         (
             role,
@@ -188,7 +177,26 @@ pub fn header(
         ("Python".to_owned(), split_summary(summary))
     } else {
         (label(name), split_summary(summary))
+    }
+}
+
+/// The header row of a card, `width` cells wide.
+#[must_use]
+pub fn header(
+    name: &str,
+    summary: &str,
+    outcome: &Outcome,
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    let kind = ToolKind::of(name);
+    let base = kind.style(theme);
+    let (tail_text, tail_style) = match outcome {
+        Outcome::Running(frame) => (format!("{frame} running"), base),
+        Outcome::Done(duration) => (format!("✓ {duration}"), theme.tool_ok),
+        Outcome::Failed(duration) => (format!("✗ {duration}"), theme.tool_failed),
     };
+    let (title, arguments) = call_parts(name, summary);
     let mut head = vec![
         Span::raw("  "),
         Span::styled(

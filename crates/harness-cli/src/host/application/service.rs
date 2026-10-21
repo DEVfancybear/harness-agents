@@ -1810,6 +1810,7 @@ impl super::delegation::ChildModels for ServiceChildModels {
             provider,
             reference: entry.reference(),
             price,
+            thinking: Some(level.as_str().to_owned()),
         })
     }
 }
@@ -2251,9 +2252,17 @@ fn usage_label(context_tokens: u64, window: u64, provider_id: &str) -> String {
         && let Some(window) = snapshot.tightest()
         && let Some(used) = window.used_percent
     {
-        let _ = write!(label, " · {} {used:.0}%", window.label);
+        let _ = write!(label, " · {}", limit_label(&window.label, used));
     }
     label
+}
+
+/// A usage window as the status line names it: what is left of it, as the
+/// provider's own pages say (`5h 30% left`, `7d 88% left`). `5h 70%` was the
+/// share used, and read as disagreeing with a page that said 31% left.
+fn limit_label(window: &str, used_percent: f64) -> String {
+    let left = (100.0 - used_percent).clamp(0.0, 100.0);
+    format!("{window} {left:.0}% left")
 }
 
 /// Maps turn progress onto the UI vocabulary.
@@ -7125,6 +7134,19 @@ fn compacted_title(summary: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+mod limit_label_tests {
+    /// The user read `5h 70%` beside Codex's "5-hour limit · 31% left" as two
+    /// numbers that disagree: the status line says what is left, as the page does.
+    #[test]
+    fn a_usage_window_says_what_is_left() {
+        assert_eq!(super::limit_label("5h", 69.6), "5h 30% left");
+        assert_eq!(super::limit_label("7d", 12.0), "7d 88% left");
+        assert_eq!(super::limit_label("5h", 100.0), "5h 0% left");
+        assert_eq!(super::limit_label("requests", 120.0), "requests 0% left");
+    }
+}
+
+#[cfg(test)]
 mod compacted_title_tests {
     #[test]
     fn the_title_is_the_first_line_of_the_summarys_goal() {
@@ -8206,6 +8228,7 @@ async fn run_turn(
                 provider: child_provider,
                 reference: format!("{}/{}", config.provider_id, config.model),
                 price: config.model_price,
+                thinking: Some(thinking_level.as_str().to_owned()),
             },
             models: Some(Arc::new(ServiceChildModels {
                 base: config.clone(),

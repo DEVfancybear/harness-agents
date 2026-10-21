@@ -34,7 +34,7 @@ check "the tool is called python_repl" "last | grep -q 'python_repl'"
 echo "################ 2. a revived kernel says cwd and env were reset"
 say r1 "Trong python_repl: tạo thư mục sub, os.chdir('sub'), rồi in os.getcwd()." | tail -2
 "$HA" shutdown --force >/dev/null 2>&1
-(cd "$RX/p" && "$PROBE" "$RX/resume.bin" "$HA" "wait:10000" -- chat --resume latest --model "$MODEL" --approval full-auto >/dev/null)
+(cd "$RX/p" && "$PROBE" "$RX/resume.bin" "$HA" "wait:10000" -- chat --resume latest --model "$MODEL" "${TH[@]}" --approval full-auto >/dev/null)
 say r1 "Trong python_repl chạy print('CWD=' + os.getcwd()). Harness có thông báo gì về thư mục làm việc và biến môi trường khi kernel khởi động lại không? Trích nguyên văn câu đó." | tail -4
 check "the notice says the working directory was reset" "last | grep -qi 'working directory and environment variables were reset'"
 
@@ -148,7 +148,7 @@ rm -f "$HA_HOME/settings.json"
 
 echo "################ 11. ha exec delegates and waits for its children"
 mkdir -p "$RX/p/a" "$RX/p/b"; for i in 1 2 3; do echo x > "$RX/p/a/$i.txt"; done; for i in 1 2; do echo x > "$RX/p/b/$i.txt"; done
-(cd "$RX/p" && "$HA" exec "Dùng tool delegate với wait=false để khởi chạy hai explorer song song: một đếm số file .txt trong thư mục a, một đếm trong thư mục b; mỗi explorer chỉ trả lời bằng một con số. Không tự đếm, không chờ chúng trong lượt này: kết thúc lượt ngay. Khi nhận được kết quả của cả hai thì trả lời đúng dạng A=<số> B=<số>." --model "$MODEL" --approval full-auto --output-format text > "$RX/exec.txt" 2>&1)
+(cd "$RX/p" && "$HA" exec "Dùng tool delegate với wait=false để khởi chạy hai explorer song song: một đếm số file .txt trong thư mục a, một đếm trong thư mục b; mỗi explorer chỉ trả lời bằng một con số. Không tự đếm, không chờ chúng trong lượt này: kết thúc lượt ngay. Khi nhận được kết quả của cả hai thì trả lời đúng dạng A=<số> B=<số>." --model "$MODEL" "${TH[@]}" --approval full-auto --output-format text > "$RX/exec.txt" 2>&1)
 tail -5 "$RX/exec.txt"
 check "the run waited and reported both children" "grep -q 'A=3' '$RX/exec.txt' && grep -q 'B=2' '$RX/exec.txt'"
 
@@ -157,9 +157,10 @@ cat > "$HA_HOME/models.json" <<EOF
 {"providers": {"$PROVIDER": {"modelOverrides": {"$MODEL_ID": {"maxTokens": 120}}}}}
 EOF
 "$PY" - "$HA" "$MODEL" "$RX/p" > "$RX/acp.txt" 2>&1 <<'EOF'
-import json, subprocess, sys
+import json, os, subprocess, sys
 ha, model, cwd = sys.argv[1:4]
-p = subprocess.Popen([ha, "--mode", "acp", "--model", model], stdin=subprocess.PIPE, stdout=subprocess.PIPE, cwd=cwd, text=True, encoding="utf-8")
+thinking = ["--thinking", os.environ["THINKING"]] if os.environ.get("THINKING") else []
+p = subprocess.Popen([ha, "--mode", "acp", "--model", model, *thinking], stdin=subprocess.PIPE, stdout=subprocess.PIPE, cwd=cwd, text=True, encoding="utf-8")
 def send(obj):
     p.stdin.write(json.dumps(obj) + "\n"); p.stdin.flush()
 def wait(rid):

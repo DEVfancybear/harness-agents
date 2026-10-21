@@ -313,7 +313,8 @@ pub fn hint(state: &UiState) -> String {
 }
 
 /// The progress of the agent a running `delegate` call started, when its
-/// notices have arrived: the agent's notices carry its role as their name.
+/// notices have arrived: the agent's notices carry its name, which starts
+/// with its role (`coder-c0cc21d5`).
 #[must_use]
 pub fn delegate_activity<'a>(
     name: &str,
@@ -324,11 +325,18 @@ pub fn delegate_activity<'a>(
         return None;
     }
     let (role, _) = super::super::card::delegate_parts(summary);
+    let prefix = format!("{role}-");
+    let of_role = |activity: &&crate::interactive::events::ChildActivity| {
+        activity.name == role || activity.name.starts_with(&prefix)
+    };
+    // Several children share a role: the one still running is this call's.
     state
         .child_activity
         .iter()
         .rev()
-        .find(|activity| activity.name == role || activity.name.starts_with(&format!("{role}-")))
+        .filter(of_role)
+        .find(|activity| activity.state == crate::interactive::events::ChildRunState::Running)
+        .or_else(|| state.child_activity.iter().rev().find(of_role))
 }
 
 /// How many children without a `delegate` card of their own the live block

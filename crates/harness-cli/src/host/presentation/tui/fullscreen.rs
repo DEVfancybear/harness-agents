@@ -27,7 +27,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::{Terminal, TerminalOptions, Viewport as RatatuiViewport};
 use unicode_width::UnicodeWidthStr;
 
-use super::super::events::{Detail, HistoryItem, MouseInput, MouseKind, UiState};
+use super::super::events::{Detail, HistoryItem, Key, MouseInput, MouseKind, UiState};
 use super::super::paths::LaunchEnvironment;
 use super::theme::Theme;
 use super::{REPRINT_ENTRIES, history, layout, to_io, widgets};
@@ -191,6 +191,28 @@ impl Viewport {
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_top = self.max_scroll;
         self.following = true;
+    }
+
+    /// The first conversation row the window shows.
+    #[must_use]
+    pub const fn top(&self) -> usize {
+        if self.following {
+            self.max_scroll
+        } else {
+            self.scroll_top
+        }
+    }
+
+    /// Scroll so conversation row `row` is in the window, a third of the way
+    /// down it; a row already in view does not move the window.
+    pub fn reveal(&mut self, row: usize) {
+        let height = usize::from(self.window_height.max(1));
+        let top = self.top();
+        if row >= top && row < top + height {
+            return;
+        }
+        self.scroll_top = row.saturating_sub(height / 3).min(self.max_scroll);
+        self.following = self.scroll_top >= self.max_scroll;
     }
 
     #[must_use]
@@ -593,6 +615,8 @@ pub struct FullscreenScreen<B: Backend> {
     focus: Option<String>,
     /// The sidebar's agent rows as last drawn, for a click.
     hits: Vec<(u16, super::sidebar::Target)>,
+    /// Ctrl+F's find bar, while it is open.
+    find: Option<super::find::Find>,
 }
 
 impl<B: Backend> FullscreenScreen<B>
@@ -638,6 +662,7 @@ where
             roster: None,
             focus: None,
             hits: Vec::new(),
+            find: None,
         })
     }
 
@@ -890,8 +915,10 @@ where
         let focus = self.focus.as_deref();
         let mut hits = Vec::new();
         let theme = self.theme;
+        let dropped = self.dropped_rows;
         let rows = &self.rows;
         let viewport = &mut self.viewport;
+        let find = &mut self.find;
         let running = state.phase.has_active_run();
         if !running {
             self.dock_floor = 0;
@@ -988,22 +1015,21 @@ where
                 // as tall as the window and the row below it.
                 if pane > 0
                     && let Some(name) = focus
-                    && let Some(index) = state
-                        .child_activity
-                        .iter()
-                        .position(|child| child.name == name)
+                    && let Some((index, (child, status))) = super::sidebar::ordered_children(state)
+                        .into_iter()
+                        .enumerate()
+                        .find(|(_, (child, _))| child.name == name)
                 {
-                    let status = if running {
-                        super::sidebar::Status::Working
-                    } else {
-                        super::sidebar::Status::Done
-                    };
                     super::pane::render(
                         frame,
                         Rect::new(window.x + window.width, window.y, pane, window_rows),
-                        &state.child_activity[index],
-                        status,
-                        index + 2,
+                        super::pane::View {
+                            activity: child,
+                            status,
+                            number: index + 2,
+                            detail: state.detail,
+                            tick: state.tick,
+                        },
                         &theme,
                     );
                 }
@@ -1016,6 +1042,22 @@ where
                     .cloned()
                     .collect::<Vec<_>>();
                 frame.render_widget(Paragraph::new(visible), window);
+                // Ctrl+F: every match in the window marked, the current one
+                // apart, and the bar over the window's top right.
+                if let Some(find) = find.as_mut() {
+                    find.refresh(rows, dropped, top);
+                    let buffer = frame.buffer_mut();
+                    for (rect, current) in super::find::marks(find, top, window) {
+                        buffer.set_style(rect, super::find::style(&theme, current));
+                    }
+                    let width = window.width.min(56);
+                    if width >= 20 && window.height > 0 {
+                        frame.render_widget(
+                            Paragraph::new(super::find::bar(find, usize::from(width), &theme)),
+                            Rect::new(window.x + window.width - width, window.y, width, 1),
+                        );
+                    }
+                }
                 // The held room is the live block's tallest: a shorter block sat
                 // at its foot, by the composer, and left blank rows between it
                 // and the conversation. It starts below the spacer row instead.
@@ -1226,6 +1268,60 @@ where
     pub fn follow(&mut self) {
         self.viewport.scroll_to_bottom();
     }
+
+    /// Ctrl+F: open the find bar (it stays open, with its query, when it is).
+    pub fn open_find(&mut self) {
+        if self.find.is_none() {
+            self.find = Some(super::find::Find::default());
+        }
+    }
+
+    /// A key while the find bar is open: typing searches, Enter or Down goes
+    /// to the next match and Shift+Enter or Up to the one before, Esc closes
+    /// the bar where the window is. `None` when the bar is closed or the key
+    /// is not the bar's (the wheel, the pages, the sidebar's keys); else
+    /// whether the frame changed.
+    pub fn find_key(&mut self, key: &Key) -> Option<bool> {
+        let from = self.viewport.top();
+        let find = self.find.as_mut()?;
+        match key {
+            Key::Char(character) => {
+                let mut query = find.query.clone();
+                query.push(*character);
+                find.set_query(query, &self.rows, self.dropped_rows, from);
+            }
+            Key::Backspace => {
+                let mut query = find.query.clone();
+                if query.pop().is_none() {
+                    return Some(false);
+                }
+                find.set_query(query, &self.rows, self.dropped_rows, from);
+            }
+            Key::Enter | Key::Down => find.step(true),
+            Key::Newline | Key::Up => find.step(false),
+            Key::Esc => {
+                self.find = None;
+                return Some(true);
+            }
+            Key::Mouse(_)
+            | Key::Agent(_)
+            | Key::Resize { .. }
+            | Key::PageUp
+            | Key::PageDown
+            | Key::ViewportTop
+            | Key::ViewportFollow
+            | Key::Interrupt => return None,
+            _ => return Some(false),
+        }
+        if let Some(found) = self
+            .find
+            .as_ref()
+            .and_then(super::find::Find::current_match)
+        {
+            self.viewport.reveal(found.row);
+        }
+        Some(true)
+    }
 }
 
 /// `frame` as the screen shows it once the terminal scrolled `window` by
@@ -1413,7 +1509,9 @@ mod tests {
             recent: vec![ChildLine {
                 kind: ChildLineKind::Call,
                 text: "read_file: path=pane-marker.rs".to_owned(),
+                call: "c1".to_owned(),
             }],
+            ..ChildActivity::default()
         }];
         screen.insert_history_batch(&[HistoryItem::User {
             text: "x".repeat(200),
@@ -1469,6 +1567,87 @@ mod tests {
             std::collections::VecDeque::new(),
         )
         .expect("screen")
+    }
+
+    /// Ctrl+F: typing marks the matches and counts them, the current one
+    /// reversed and scrolled into view; Enter steps to the next (wrapping)
+    /// and Shift+Enter back; Esc closes the bar and leaves the window there.
+    #[test]
+    fn find_marks_counts_and_scrolls_to_the_current_match() {
+        use crate::interactive::events::Key;
+        let mut screen = screen(80, 20);
+        let state = crate::interactive::tui::tests::idle_state();
+        let items = (0..60)
+            .map(|index| HistoryItem::Notice {
+                message: if index % 20 == 5 {
+                    format!("row {index} needle here")
+                } else {
+                    format!("row {index}")
+                },
+            })
+            .collect::<Vec<_>>();
+        screen.restore(&items);
+        screen.draw(&state).expect("drawn");
+        assert_eq!(
+            screen.find_key(&Key::Char('n')),
+            None,
+            "closed, the bar reads no key"
+        );
+        screen.open_find();
+        for character in "NEEDLE".chars() {
+            assert_eq!(screen.find_key(&Key::Char(character)), Some(true));
+        }
+        // The current match's row, by its index: the matches are rows 5, 25, 45.
+        let shown = |screen: &FullscreenScreen<ratatui::backend::TestBackend>| {
+            let current = screen.find.as_ref().expect("open").current;
+            (
+                format!("row {} needle", 5 + 20 * current),
+                format!("{}/3", current + 1),
+            )
+        };
+        let reversed_needle = |screen: &FullscreenScreen<ratatui::backend::TestBackend>| {
+            let buffer = screen.backend().buffer();
+            (0..buffer.area.height).any(|y| {
+                (0..buffer.area.width)
+                    .filter_map(|x| buffer.cell((x, y)))
+                    .filter(|cell| cell.modifier.contains(ratatui::style::Modifier::REVERSED))
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    .contains("needle")
+            })
+        };
+        screen.draw(&state).expect("drawn");
+        let text = painted(&screen).join("\n");
+        let (row, count) = shown(&screen);
+        assert!(text.contains("⌕ NEEDLE"), "{text}");
+        assert!(text.contains(&count), "{count}: {text}");
+        assert!(text.contains(&row), "the current match is in view: {text}");
+        assert!(
+            reversed_needle(&screen),
+            "the current match is marked: {text}"
+        );
+
+        for key in [Key::Enter, Key::Enter, Key::Newline] {
+            assert_eq!(screen.find_key(&key), Some(true));
+            screen.draw(&state).expect("drawn");
+            let text = painted(&screen).join("\n");
+            let (row, count) = shown(&screen);
+            assert!(
+                text.contains(&row) && text.contains(&count),
+                "{row} {count}: {text}"
+            );
+        }
+
+        let (row, _) = shown(&screen);
+        assert_eq!(screen.find_key(&Key::Esc), Some(true));
+        screen.draw(&state).expect("drawn");
+        let text = painted(&screen).join("\n");
+        assert!(!text.contains('⌕'), "the bar closed: {text}");
+        assert!(
+            text.contains(&row),
+            "the window stayed where it was: {text}"
+        );
+        assert!(!reversed_needle(&screen), "no match is marked: {text}");
     }
 
     fn painted(screen: &FullscreenScreen<ratatui::backend::TestBackend>) -> Vec<String> {

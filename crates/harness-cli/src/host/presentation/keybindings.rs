@@ -49,6 +49,7 @@ fn action(id: &str) -> Option<Key> {
         "app.tools.expand" => Key::CycleDetail,
         "app.editor.external" => Key::ExternalEditor,
         "app.prompt.stash" => Key::Stash,
+        "app.find" => Key::Find,
         "app.clipboard.pasteImage" => Key::PasteImage,
         _ => return None,
     })
@@ -89,6 +90,7 @@ fn id_of(key: &Key) -> Option<&'static str> {
         Key::CycleDetail => "app.tools.expand",
         Key::ExternalEditor => "app.editor.external",
         Key::Stash => "app.prompt.stash",
+        Key::Find => "app.find",
         Key::PasteImage => "app.clipboard.pasteImage",
         _ => return None,
     })

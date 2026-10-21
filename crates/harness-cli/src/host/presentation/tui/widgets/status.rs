@@ -139,8 +139,8 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Readouts) {
             cache_label(state).map(|share| Span::styled(format!("↯ cache {share}"), theme.dim));
         // herdr's gauge where there is room for it, the bare number where not.
         let gauge = context_label(state).map(|value| context_gauge(&value, theme));
-        let context = context_label(state)
-            .map(|value| vec![Span::styled(format!("◔ ctx {value}"), theme.dim)]);
+        let context =
+            context_label(state).map(|value| context_text(&format!("◔ ctx {value}"), theme));
         let detail = (matches!(state.phase, AppPhase::Ready | AppPhase::WaitingInput)
             && state.modal.is_none())
         .then(|| Span::styled(state.detail.hint(), theme.dim));
@@ -387,11 +387,38 @@ fn context_gauge(label: &str, theme: &Theme) -> Vec<Span<'static>> {
     } else {
         theme.tool_ok
     };
-    vec![
+    let mut spans = vec![
         Span::styled("ctx ", theme.dim),
         Span::styled("━".repeat(filled), fill),
         Span::styled("─".repeat(CELLS - filled), theme.border),
-        Span::styled(format!(" {label}"), theme.dim),
+    ];
+    spans.extend(context_text(&format!(" {label}"), theme));
+    spans
+}
+
+/// The context readout's text, the provider's usage window (`5h 30% left`)
+/// in yellow, then red, as what is left of it runs out.
+fn context_text(text: &str, theme: &Theme) -> Vec<Span<'static>> {
+    let Some((head, window)) = text.rsplit_once(" · ") else {
+        return vec![Span::styled(text.to_owned(), theme.dim)];
+    };
+    let left = window
+        .strip_suffix("% left")
+        .and_then(|rest| rest.rsplit(' ').next())
+        .and_then(|number| number.parse::<f64>().ok());
+    let Some(left) = left else {
+        return vec![Span::styled(text.to_owned(), theme.dim)];
+    };
+    let style = if left <= 15.0 {
+        theme.error
+    } else if left <= 40.0 {
+        theme.warning
+    } else {
+        theme.dim
+    };
+    vec![
+        Span::styled(format!("{head} · "), theme.dim),
+        Span::styled(window.to_owned(), style),
     ]
 }
 
@@ -448,6 +475,34 @@ pub fn model_label(state: &UiState) -> Option<String> {
                 .find_map(|line| line.split_once("Provider: ").map(|(_, provider)| provider))
         })
         .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod usage_window_tests {
+    use super::context_text;
+    use crate::interactive::tui::theme::Theme;
+
+    /// The usage window says what is left and turns yellow, then red, as
+    /// that runs out; the rest of the readout stays dim.
+    #[test]
+    fn the_usage_window_colours_as_what_is_left_falls() {
+        let theme = Theme::colored();
+        let style_of = |text: &str| {
+            let spans = context_text(text, &theme);
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>(),
+                text
+            );
+            spans.last().expect("a span").style
+        };
+        assert_eq!(style_of(" 12% · 123k/1M · 5h 70% left"), theme.dim);
+        assert_eq!(style_of(" 12% · 123k/1M · 5h 30% left"), theme.warning);
+        assert_eq!(style_of(" 12% · 123k/1M · 7d 9% left"), theme.error);
+        assert_eq!(style_of(" 12% · 123k/1M"), theme.dim);
+    }
 }
 
 #[cfg(test)]

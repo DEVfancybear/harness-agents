@@ -325,7 +325,9 @@ fn map_key(key: KeyEvent) -> Key {
         KeyCode::Char('t') if control => Key::Transpose,
         KeyCode::Char('g') if control => Key::ExternalEditor,
         KeyCode::Char('b') if control => Key::Left,
-        KeyCode::Char('f') if control => Key::Right,
+        // Ctrl+F finds in the conversation, as a browser does; Right still
+        // moves the cursor (it was readline's forward-char here).
+        KeyCode::Char('f') if control => Key::Find,
         KeyCode::Char('z' | 'Z') if control && key.modifiers.contains(KeyModifiers::SHIFT) => {
             Key::Redo
         }
@@ -600,6 +602,26 @@ mod tests {
         assert_eq!(
             map_key(key(KeyCode::F(5), KeyModifiers::NONE)),
             Key::Unknown
+        );
+    }
+
+    /// Ctrl+F finds in the conversation, as a browser does: it was readline's
+    /// forward-char, which Right still is; Ctrl+B still moves back.
+    #[test]
+    fn ctrl_f_finds_and_right_still_moves() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        assert_eq!(
+            map_key(key(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+            Key::Find
+        );
+        assert_eq!(map_key(key(KeyCode::Right, KeyModifiers::NONE)), Key::Right);
+        assert_eq!(
+            map_key(key(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            Key::Left
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('f'), KeyModifiers::ALT)),
+            Key::WordRight
         );
     }
 

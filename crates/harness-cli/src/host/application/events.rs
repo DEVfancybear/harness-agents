@@ -135,6 +135,8 @@ pub enum Key {
     CycleDetail,
     /// Ctrl-S: prime-agent's prompt stash - put the draft aside, or bring it back.
     Stash,
+    /// Ctrl-F: find in the conversation (the fullscreen window's find bar).
+    Find,
     /// Alt+M (forward) or Shift+Alt+M: prime-agent's scoped model cycling.
     CycleModel {
         forward: bool,
@@ -708,8 +710,9 @@ impl Modal {
 
 /// The controller state the TUI viewport draws.
 ///
-/// One delegated agent's progress in the run: its name, its tool calls so
-/// far, and the latest one as its notice described it.
+/// One delegated agent's progress in the run: its name (the child's own,
+/// `coder-c0cc21d5`: several children share a role), its tool calls so far,
+/// and the latest one as its notice described it.
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChildActivity {
     pub name: String,
@@ -719,6 +722,112 @@ pub struct ChildActivity {
     /// what its pane shows.
     #[serde(default)]
     pub recent: Vec<ChildLine>,
+    /// Where the child is, as the session's child registry last said.
+    #[serde(default)]
+    pub state: ChildRunState,
+    /// The model it runs on (`provider/id`) and its thinking level, as the
+    /// registry lists them: what the sidebar and the pane say beside it.
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub thinking: Option<String>,
+}
+
+impl ChildActivity {
+    /// The model without its provider, and the thinking level after it:
+    /// `deepseek-v4.1-flash high`. Empty while the registry has not said.
+    #[must_use]
+    pub fn model_label(&self) -> String {
+        let model = self
+            .model
+            .rsplit_once('/')
+            .map_or(self.model.as_str(), |(_, id)| id);
+        match (&self.thinking, model.is_empty()) {
+            (_, true) => String::new(),
+            (Some(level), false) if level != "off" => format!("{model} {level}"),
+            _ => model.to_owned(),
+        }
+    }
+}
+
+/// Where a delegated agent is, as the agents view lists it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ChildRunState {
+    /// The registry has not listed it (a session without one): the run's
+    /// phase stands in for it.
+    #[default]
+    Unknown,
+    Running,
+    Done,
+    Failed,
+    Stopped,
+}
+
+impl ChildRunState {
+    /// The state of a registry row's `status` (`running`, `completed`,
+    /// `stopped`, anything else a failure).
+    #[must_use]
+    pub fn of_status(status: &str) -> Self {
+        match status {
+            "running" => Self::Running,
+            "completed" => Self::Done,
+            "stopped" => Self::Stopped,
+            _ => Self::Failed,
+        }
+    }
+}
+
+/// Bring `activity` in line with the child registry's `rows` (the agents
+/// view's): every listed child takes the row's state, and a running child
+/// that has sent nothing yet gets a row of its own. A child the registry no
+/// longer lists - or, while it lists any, never did - is not running: it was
+/// shown working, `explorer · 114 tools`, beside an agents view with nothing
+/// running. True when anything changed.
+pub fn sync_child_states(
+    activity: &mut Vec<ChildActivity>,
+    rows: &[super::agents::protocol::SubagentInfo],
+) -> bool {
+    let mut changed = false;
+    for child in activity.iter_mut() {
+        let listed = rows.iter().any(|row| row.name == child.name);
+        let gone = match child.state {
+            ChildRunState::Running => !listed,
+            ChildRunState::Unknown => !listed && !rows.is_empty(),
+            _ => false,
+        };
+        if gone {
+            child.state = ChildRunState::Done;
+            changed = true;
+        }
+    }
+    for row in rows {
+        let state = ChildRunState::of_status(&row.status);
+        match activity.iter_mut().find(|child| child.name == row.name) {
+            Some(child) => {
+                if child.state != state
+                    || child.model != row.model
+                    || child.thinking != row.thinking
+                {
+                    child.state = state;
+                    child.model.clone_from(&row.model);
+                    child.thinking.clone_from(&row.thinking);
+                    changed = true;
+                }
+            }
+            None if state == ChildRunState::Running => {
+                activity.push(ChildActivity {
+                    name: row.name.clone(),
+                    state,
+                    model: row.model.clone(),
+                    thinking: row.thinking.clone(),
+                    ..ChildActivity::default()
+                });
+                changed = true;
+            }
+            None => {}
+        }
+    }
+    changed
 }
 
 /// One line of a delegated agent's pane.
@@ -726,6 +835,10 @@ pub struct ChildActivity {
 pub struct ChildLine {
     pub kind: ChildLineKind,
     pub text: String,
+    /// The tool call the line belongs to, when it belongs to one: a batch's
+    /// calls print and settle in any order.
+    #[serde(default)]
+    pub call: String,
 }
 
 /// What a line of a delegated agent's pane is.
@@ -733,10 +846,12 @@ pub struct ChildLine {
 pub enum ChildLineKind {
     /// A call it started: `read_file: path=a.rs`.
     Call,
-    /// A call that failed, or a notice it raised.
+    /// A notice it raised.
     Failed,
     /// A line a tool returned.
     Output,
+    /// How a call ended: `ok 206ms`, or `failed 1.2s: why`.
+    Settled,
     /// A line of its own answer.
     Text,
 }
@@ -992,7 +1107,7 @@ pub enum SessionEvent {
         label: String,
     },
     /// How full the context window is and the provider's tightest limit, after
-    /// a response reported its usage (`12% · 123k/1M · 5h 34%`).
+    /// a response reported its usage (`12% · 123k/1M · 5h 66% left`).
     UsageUpdated {
         label: String,
         /// The input and output tokens of the call, which a goal's budget
@@ -1138,6 +1253,8 @@ pub enum SessionEvent {
         name: String,
         kind: ChildLineKind,
         lines: Vec<String>,
+        /// The tool call the lines belong to; empty for the answer's text.
+        call: String,
     },
     /// The turns of this conversation, oldest first: each turn's session id and
     /// the input that opened it.

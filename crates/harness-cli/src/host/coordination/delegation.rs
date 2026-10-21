@@ -124,6 +124,9 @@ pub struct ChildModel {
     /// `provider/id`, as the catalog names it.
     pub reference: String,
     pub price: Option<ModelPrice>,
+    /// The thinking level it runs at (`high`), when known: the sidebar and
+    /// the agents view show it beside the model.
+    pub thinking: Option<String>,
 }
 
 /// One model `rlm.find_models` may offer.
@@ -378,6 +381,8 @@ struct ChildRecord {
     name: String,
     role: AgentRole,
     model: String,
+    /// The thinking level it runs at, when known.
+    thinking: Option<String>,
     started: Instant,
     duration_ms: Option<i64>,
     state: ChildState,
@@ -441,6 +446,9 @@ struct LedgerEntry {
     name: String,
     role: String,
     model: String,
+    /// The thinking level it ran at, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
     depth: u32,
     max_depth: u32,
     parent: Option<String>,
@@ -482,6 +490,7 @@ impl ChildRecord {
             name: self.name.clone(),
             role: self.role.as_str().to_owned(),
             model: self.model.clone(),
+            thinking: self.thinking.clone(),
             depth: self.depth,
             max_depth: self.max_depth,
             parent: self
@@ -552,6 +561,7 @@ impl ChildRecord {
             name: entry.name,
             role,
             model: entry.model,
+            thinking: entry.thinking,
             started: Instant::now(),
             duration_ms: entry.duration_ms,
             state,
@@ -2026,8 +2036,19 @@ impl SessionAgents {
                             }
                             .to_owned(),
                             model: child.model.clone(),
+                            thinking: child.thinking.clone(),
                             depth: child.depth,
-                            program: child.objective.clone(),
+                            // The view shows a program's first line: the
+                            // whole of every child's brief, read every
+                            // second by every terminal, was the roster's bulk.
+                            program: child
+                                .objective
+                                .lines()
+                                .find(|line| !line.trim().is_empty())
+                                .unwrap_or_default()
+                                .chars()
+                                .take(200)
+                                .collect(),
                         })
                         .collect()
                 },
@@ -2353,6 +2374,7 @@ impl SessionAgents {
                 name: name.clone(),
                 role,
                 model: launch.model.reference.clone(),
+                thinking: launch.model.thinking.clone(),
                 started: Instant::now(),
                 duration_ms: None,
                 state: ChildState::Running,
@@ -4583,7 +4605,10 @@ impl WorkerBackend for InteractiveWorkerBackend {
             };
             let observer = Arc::new(ExplorerObserver {
                 task_id: task_id.clone(),
-                role_name: role_name.clone(),
+                child_name: self
+                    .shared
+                    .update(&task_id, |child| child.name.clone())
+                    .unwrap_or_else(|| role_name.clone()),
                 shared: Arc::clone(&self.shared),
                 ledger: self
                     .shared
@@ -4598,6 +4623,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 token_usage: Mutex::new((0_u64, 0_u64)),
                 cost_tracker: Mutex::new(CostTracker::default()),
                 text: Mutex::new(String::new()),
+                calls: Mutex::new(HashMap::new()),
             });
             let approval: Arc<dyn ApprovalGate> = Arc::new(ChildApprovalGate {
                 role: role_name.clone(),
@@ -4879,7 +4905,9 @@ impl WorkerBackend for InteractiveWorkerBackend {
 
 struct ExplorerObserver {
     task_id: TaskId,
-    role_name: String,
+    /// The child's own name (`coder-c0cc21d5`), which its notices and pane
+    /// lines carry: several children share a role.
+    child_name: String,
     shared: Arc<AgentsShared>,
     ledger: Option<Arc<BudgetLedger>>,
     model_price: Option<ModelPrice>,
@@ -4890,6 +4918,8 @@ struct ExplorerObserver {
     cost_tracker: Mutex<CostTracker>,
     /// The answer's text since its last whole line, for the child's pane.
     text: Mutex<String>,
+    /// When each running call started, by its id: its pane shows how long it took.
+    calls: Mutex<HashMap<String, Instant>>,
 }
 
 /// How many lines of a tool's output a child's pane is sent.
@@ -4897,14 +4927,15 @@ const CHILD_OUTPUT_LINES: usize = 8;
 
 impl ExplorerObserver {
     /// Send the child's pane some lines.
-    fn pane(&self, kind: super::events::ChildLineKind, lines: Vec<String>) {
+    fn pane(&self, kind: super::events::ChildLineKind, lines: Vec<String>, call: &str) {
         if lines.is_empty() {
             return;
         }
         let _ = self.sender.send(SessionEvent::ChildOutput {
-            name: self.role_name.clone(),
+            name: self.child_name.clone(),
             kind,
             lines,
+            call: call.to_owned(),
         });
     }
 
@@ -4927,11 +4958,12 @@ impl ExplorerObserver {
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         };
-        self.pane(super::events::ChildLineKind::Text, lines);
+        self.pane(super::events::ChildLineKind::Text, lines, "");
     }
 }
 
 impl TurnObserver for ExplorerObserver {
+    #[allow(clippy::too_many_lines, reason = "one arm per kind of progress")]
     fn observe(&self, progress: TurnProgress) {
         match progress {
             TurnProgress::StepStarted { step } => {
@@ -4973,31 +5005,63 @@ impl TurnObserver for ExplorerObserver {
                     self.shared.update(&self.task_id, |child| child.cost = cost);
                 }
             }
-            TurnProgress::ToolStarted { name, summary, .. } => {
+            TurnProgress::ToolStarted {
+                name,
+                summary,
+                call_id,
+                ..
+            } => {
                 self.flush_text(true);
                 self.shared.update(&self.task_id, |child| {
                     child.tool_calls += 1;
                     child.activity = format!("{name}: {summary}");
                     child.activity_tool = Some(name.clone());
                 });
+                if let Ok(mut calls) = self.calls.lock() {
+                    calls.insert(call_id.clone(), Instant::now());
+                }
                 let _ = self.sender.send(SessionEvent::Notice {
-                    message: format!("[child {}] {name}: {summary}", self.role_name),
+                    message: format!("[child {}] {name}: {summary}", self.child_name),
                 });
+                self.pane(
+                    super::events::ChildLineKind::Call,
+                    vec![format!("{name}: {summary}")],
+                    &call_id,
+                );
             }
             TurnProgress::ToolSettled {
-                name, ok, detail, ..
-            } if !ok => {
-                let _ = self.sender.send(SessionEvent::Notice {
-                    message: format!(
-                        "[child {}] {name} failed: {}",
-                        self.role_name,
-                        detail.unwrap_or_else(|| "no detail".to_owned())
-                    ),
-                });
+                name,
+                ok,
+                detail,
+                call_id,
+            } => {
+                let millis = self
+                    .calls
+                    .lock()
+                    .ok()
+                    .and_then(|mut calls| calls.remove(&call_id))
+                    .map_or(0, |started| started.elapsed().as_millis());
+                let settled = if ok {
+                    format!("ok {millis}")
+                } else {
+                    let detail = detail.unwrap_or_else(|| "no detail".to_owned());
+                    let _ = self.sender.send(SessionEvent::Notice {
+                        message: format!("[child {}] {name} failed: {detail}", self.child_name),
+                    });
+                    format!(
+                        "failed {millis}: {}",
+                        detail.lines().next().unwrap_or_default()
+                    )
+                };
+                self.pane(
+                    super::events::ChildLineKind::Settled,
+                    vec![settled],
+                    &call_id,
+                );
             }
             TurnProgress::Notice(message) => {
                 let _ = self.sender.send(SessionEvent::Notice {
-                    message: format!("[child {}] {message}", self.role_name),
+                    message: format!("[child {}] {message}", self.child_name),
                 });
             }
             TurnProgress::TextDelta(delta) => {
@@ -5009,7 +5073,7 @@ impl TurnObserver for ExplorerObserver {
                     self.flush_text(false);
                 }
             }
-            TurnProgress::ToolOutput { text, .. } => {
+            TurnProgress::ToolOutput { text, call_id, .. } => {
                 let lines = text.lines().filter(|line| !line.trim().is_empty());
                 let total = lines.clone().count();
                 let mut shown = lines
@@ -5019,13 +5083,12 @@ impl TurnObserver for ExplorerObserver {
                 if total > CHILD_OUTPUT_LINES {
                     shown.push(format!("… {} more lines", total - CHILD_OUTPUT_LINES));
                 }
-                self.pane(super::events::ChildLineKind::Output, shown);
+                self.pane(super::events::ChildLineKind::Output, shown, &call_id);
             }
             TurnProgress::ThinkingDelta(_)
             | TurnProgress::StreamRestarted
             | TurnProgress::ToolCallStreaming { .. }
             | TurnProgress::ToolProgress { .. }
-            | TurnProgress::ToolSettled { .. }
             | TurnProgress::Info(_) => {}
         }
     }
@@ -5389,6 +5452,7 @@ pub(super) mod tests {
                         if strict { "!" } else { "" }
                     ),
                     price: None,
+                    thinking: None,
                 })
             }
         }
@@ -5447,7 +5511,7 @@ pub(super) mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let observer = ExplorerObserver {
             task_id: TaskId::generate(),
-            role_name: "explorer".to_owned(),
+            child_name: "explorer".to_owned(),
             shared: shared(sender.clone()),
             ledger: None,
             model_price: None,
@@ -5457,6 +5521,7 @@ pub(super) mod tests {
             token_usage: std::sync::Mutex::new((0, 0)),
             cost_tracker: std::sync::Mutex::new(CostTracker::default()),
             text: std::sync::Mutex::new(String::new()),
+            calls: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let output = (1..=10)
             .map(|n| format!("line {n}"))
@@ -5473,7 +5538,10 @@ pub(super) mod tests {
         observer.observe(TurnProgress::StepStarted { step: 1 });
         let mut panes = Vec::new();
         while let Ok(event) = receiver.try_recv() {
-            if let SessionEvent::ChildOutput { name, kind, lines } = event {
+            if let SessionEvent::ChildOutput {
+                name, kind, lines, ..
+            } = event
+            {
                 assert_eq!(name, "explorer");
                 panes.push((kind, lines));
             }
@@ -5506,7 +5574,7 @@ pub(super) mod tests {
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let observer = ExplorerObserver {
             task_id: TaskId::generate(),
-            role_name: "explorer".to_owned(),
+            child_name: "explorer".to_owned(),
             shared: shared(sender.clone()),
             ledger: Some(Arc::clone(&ledger)),
             model_price: None,
@@ -5516,6 +5584,7 @@ pub(super) mod tests {
             token_usage: std::sync::Mutex::new((0, 0)),
             cost_tracker: std::sync::Mutex::new(CostTracker::default()),
             text: std::sync::Mutex::new(String::new()),
+            calls: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         observer.observe(TurnProgress::StepStarted { step: 2 });
         assert_eq!(ledger.requests_used(), 2);
@@ -5645,6 +5714,7 @@ pub(super) mod tests {
                         provider: Arc::new(harness_providers::MockProvider::scripted(Vec::new())),
                         reference: reference.to_owned(),
                         price: None,
+                        thinking: None,
                     })
                 } else {
                     Err(format!(
@@ -5728,6 +5798,7 @@ pub(super) mod tests {
                 provider,
                 reference: "deepseek/fixture-model".to_owned(),
                 price: None,
+                thinking: None,
             },
             models: None,
             runtime_config: harness_runtime::RuntimeConfig::default(),
@@ -7629,6 +7700,7 @@ mod real_worker_tests {
             name: "inner".to_owned(),
             role: "explorer".to_owned(),
             model: "deepseek/fixture-model".to_owned(),
+            thinking: None,
             depth: 2,
             max_depth: 2,
             parent: Some(alpha.as_str().to_owned()),
@@ -7961,6 +8033,7 @@ mod real_worker_tests {
             name: "gone".to_owned(),
             role: "explorer".to_owned(),
             model: "m".to_owned(),
+            thinking: None,
             depth: 1,
             max_depth: 2,
             parent: None,
@@ -8003,6 +8076,7 @@ mod real_worker_tests {
             name: "coder-1".to_owned(),
             role: "coder".to_owned(),
             model: "m".to_owned(),
+            thinking: None,
             depth: 1,
             max_depth: 2,
             parent: None,

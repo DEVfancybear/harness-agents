@@ -58,12 +58,14 @@ fn preview_dump() {
 /// The fullscreen app on a wide console, herdr's sidebar beside it: the
 /// finished run with its delegates done, the same run still working with the
 /// project's other agents listed, and a delegate's pane open.
+#[allow(clippy::too_many_lines, reason = "the scenes' fixtures, written out")]
 fn fullscreen_dump(directory: &std::path::Path, theme: &Theme) {
-    use crate::interactive::events::{ChildActivity, ChildLine, ChildLineKind};
+    use crate::interactive::events::{ChildActivity, ChildLine, ChildLineKind, ChildRunState};
     let theme = *theme;
-    let line = |kind, text: &str| ChildLine {
+    let line = |kind, call: &str, text: &str| ChildLine {
         kind,
         text: text.to_owned(),
+        call: call.to_owned(),
     };
     let mut working = busy();
     working.name = "11-sidebar-running";
@@ -74,56 +76,93 @@ fn fullscreen_dump(directory: &std::path::Path, theme: &Theme) {
     working.state.open_tools = vec![("run_shell".to_owned(), "npm test".to_owned())];
     working.state.child_activity = vec![
         ChildActivity {
-            name: "explorer".to_owned(),
-            tool_calls: 3,
-            latest: "read_file: path=src/lib/orders.ts".to_owned(),
+            name: "explorer-d3cc6099".to_owned(),
+            tool_calls: 4,
+            latest: "search_text: query=globalThis path=src".to_owned(),
             recent: vec![
                 line(
                     ChildLineKind::Call,
+                    "c1",
                     "read_file: path=src/app/api/orders/route.ts",
                 ),
                 line(
                     ChildLineKind::Output,
+                    "c1",
                     "import { saveOrder } from '@/lib/orders';",
                 ),
                 line(
                     ChildLineKind::Output,
+                    "c1",
                     "export async function POST(request: Request) {",
                 ),
                 line(
                     ChildLineKind::Output,
+                    "c1",
                     "  const cart = await request.json();",
                 ),
-                line(ChildLineKind::Output, "… 41 more lines"),
-                line(ChildLineKind::Call, "search_text: query=saveOrder path=src"),
+                line(ChildLineKind::Output, "c1", "… 41 more lines"),
+                line(ChildLineKind::Settled, "c1", "ok 21"),
+                line(
+                    ChildLineKind::Call,
+                    "c2",
+                    "search_text: query=saveOrder path=src",
+                ),
                 line(
                     ChildLineKind::Output,
+                    "c2",
                     "src/lib/orders.ts:12: export function saveOrder(",
                 ),
-                line(ChildLineKind::Call, "read_file: path=src/lib/orders.ts"),
+                line(ChildLineKind::Settled, "c2", "ok 140"),
                 line(
-                    ChildLineKind::Failed,
-                    "read_file failed: limit must be at most 2000",
+                    ChildLineKind::Call,
+                    "c3",
+                    "read_file: path=src/lib/orders.ts limit=5000",
+                ),
+                line(
+                    ChildLineKind::Settled,
+                    "c3",
+                    "failed 2: limit must be at most 2000",
                 ),
                 line(
                     ChildLineKind::Text,
+                    "",
                     "The order flow: POST /api/orders validates the cart,",
                 ),
                 line(
                     ChildLineKind::Text,
+                    "",
                     "then saveOrder() keeps it in globalThis.__shopHaOrders,",
                 ),
-                line(ChildLineKind::Text, "which a restart loses."),
+                line(ChildLineKind::Text, "", "which a restart loses."),
+                line(
+                    ChildLineKind::Call,
+                    "c4",
+                    "search_text: query=globalThis path=src",
+                ),
             ],
+            state: ChildRunState::Running,
+            model: "opencode-go/deepseek-v4.1-flash".to_owned(),
+            thinking: Some("high".to_owned()),
         },
         ChildActivity {
-            name: "verifier".to_owned(),
+            name: "verifier-b105bf50".to_owned(),
             tool_calls: 1,
             latest: "run_process: args=[\"npm\",\"test\"]".to_owned(),
             recent: vec![line(
                 ChildLineKind::Call,
+                "c1",
                 "run_process: args=[\"npm\",\"test\"]",
             )],
+            state: ChildRunState::Running,
+            model: "opencode-go/deepseek-v4.1-flash".to_owned(),
+            thinking: Some("high".to_owned()),
+        },
+        ChildActivity {
+            name: "coder-7ce2ed20".to_owned(),
+            tool_calls: 6,
+            latest: "write_file: path=src/lib/orders.ts".to_owned(),
+            state: ChildRunState::Done,
+            ..ChildActivity::default()
         },
     ];
     let others = vec![
@@ -131,21 +170,27 @@ fn fullscreen_dump(directory: &std::path::Path, theme: &Theme) {
             id: "a1".to_owned(),
             name: "seo-sitemap".to_owned(),
             status: super::sidebar::Status::Working,
+            folder: None,
         },
         super::roster::Entry {
             id: "a2".to_owned(),
             name: "fix-voucher".to_owned(),
             status: super::sidebar::Status::Blocked,
+            folder: None,
         },
         super::roster::Entry {
             id: "a3".to_owned(),
             name: "docs".to_owned(),
             status: super::sidebar::Status::Idle,
+            folder: None,
         },
     ];
     let mut finished = busy();
     finished.name = "12-sidebar-done";
     finished.state.child_activity = working.state.child_activity.clone();
+    for child in &mut finished.state.child_activity {
+        child.state = ChildRunState::Done;
+    }
     let mut pane = busy();
     pane.name = "13-pane";
     pane.state = working.state.clone();

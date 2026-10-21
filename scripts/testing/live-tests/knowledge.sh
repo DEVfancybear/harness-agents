@@ -164,7 +164,7 @@ rm -f "$HA_HOME/settings.json"
 run_exec() {
   local name="$1"; shift
   printf '\n## %s (ha exec %s)\n\n> %s\n\n' "$(date +%H:%M:%S)" "$name" "${*: -1}" >> "$LOG"
-  (cd "$P" && "$HA" exec --model "$MODEL" --approval full-auto --output-format json "$@" >"$RX/$name.json" 2>"$RX/$name.err")
+  (cd "$P" && "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto --output-format json "$@" >"$RX/$name.json" 2>"$RX/$name.err")
   "$PY" -c "import json,sys; print(json.load(open(sys.argv[1],encoding='utf-8')).get('response',''))" "$RX/$name.json" >> "$LOG" 2>/dev/null
   sed 's/^/    /' "$RX/$name.err" >> "$LOG"
 }

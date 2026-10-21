@@ -13,6 +13,7 @@
 //! screen above the shell prompt.
 
 pub mod card;
+pub mod find;
 pub mod fullscreen;
 pub mod highlight;
 pub mod history;
@@ -194,6 +195,13 @@ pub trait TuiRenderer {
     /// changed, and the agent the terminal should switch to.
     fn agent_key(&mut self, _number: u8, _state: &UiState) -> (bool, Option<String>) {
         (false, None)
+    }
+    /// Ctrl+F: open the find bar over the fullscreen window.
+    fn open_find(&mut self) {}
+    /// A key while the find bar is open; `None` when it is closed or the key
+    /// is not the bar's, else whether the frame changed.
+    fn find_key(&mut self, _key: &Key) -> Option<bool> {
+        None
     }
     /// Erase the viewport footprint and leave the cursor on a fresh line.
     fn finish(&mut self) -> io::Result<()>;
@@ -767,6 +775,19 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
         }
     }
 
+    fn open_find(&mut self) {
+        if let Screen::Fullscreen(screen) = &mut self.screen {
+            screen.open_find();
+        }
+    }
+
+    fn find_key(&mut self, key: &Key) -> Option<bool> {
+        match &mut self.screen {
+            Screen::Fullscreen(screen) => screen.find_key(key),
+            Screen::Inline(_) => None,
+        }
+    }
+
     /// Copy through the system clipboard and, as prime-agent's clipboard
     /// chain does, through OSC 52 too: a terminal reached over SSH, in tmux or
     /// in a container has no system clipboard here, and the escape sequence
@@ -1222,6 +1243,20 @@ fn fullscreen_input(
     key: &Key,
     effects: &mut Vec<Effect>,
 ) -> Option<bool> {
+    // Ctrl+F's find bar keeps the keys it reads while it is open.
+    if let Some(redraw) = renderer.find_key(key) {
+        return Some(redraw);
+    }
+    if *key == Key::Find {
+        if renderer.fullscreen() {
+            renderer.open_find();
+        } else {
+            effects.push(Effect::History(HistoryItem::Notice {
+                message: "Find (Ctrl+F) needs the fullscreen view: /fullscreen on".to_owned(),
+            }));
+        }
+        return Some(true);
+    }
     // herdr's sidebar keys: a delegate's pane, or another agent.
     if let Key::Agent(number) = key {
         let (redraw, switch_to) = renderer.agent_key(*number, &controller.ui_state());

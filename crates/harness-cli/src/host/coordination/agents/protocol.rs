@@ -178,6 +178,9 @@ pub struct SubagentInfo {
     /// `running`, `completed` or `error`.
     pub status: String,
     pub model: String,
+    /// The thinking level it runs at (`high`), when known.
+    #[serde(default)]
+    pub thinking: Option<String>,
     /// 1 for the agent's own children.
     pub depth: u32,
     /// What the child was spawned with (prime-agent's spawn program).

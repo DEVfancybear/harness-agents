@@ -72,10 +72,12 @@ impl Section {
     }
 }
 
-/// What a row stands for.
+/// What a row stands for. An agent's rows share one copy of what its worker
+/// listed: a copy per row - its subagents and their spawn programs with it -
+/// was most of what a frame of a large forest cost.
 #[derive(Clone, Debug)]
 pub enum Target {
-    Live(Box<client::Listed>),
+    Live(std::sync::Arc<client::Listed>),
     Saved(SavedConversation),
 }
 
@@ -116,7 +118,7 @@ impl Row {
 
 /// What the forest shows: the expanded subagent lines and the parents whose
 /// spawn programs show.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Forest {
     pub expanded: std::collections::HashSet<String>,
     pub programs: std::collections::HashSet<String>,
@@ -202,6 +204,7 @@ pub fn rows_with(
 ) -> Vec<Row> {
     let mut rows = Vec::new();
     for listed in live {
+        let shared = std::sync::Arc::new(listed.clone());
         let agent = &listed.agent;
         // An active turn (the app's `has_active_run` phases, or a question
         // waiting on the user) or children still working; a ready or
@@ -264,7 +267,7 @@ pub fn rows_with(
             } else {
                 age_label(agent.idle_seconds)
             },
-            target: Target::Live(Box::new(listed.clone())),
+            target: Target::Live(std::sync::Arc::clone(&shared)),
             kind: RowKind::Agent,
             depth: 0,
         });
@@ -299,7 +302,7 @@ pub fn rows_with(
                 ),
                 model: String::new(),
                 age: String::new(),
-                target: Target::Live(Box::new(listed.clone())),
+                target: Target::Live(std::sync::Arc::clone(&shared)),
                 kind: RowKind::SubagentSummary,
                 depth: 1,
             });
@@ -310,9 +313,13 @@ pub fn rows_with(
                         section,
                         identity: format!("sub:{}:{}", agent.id, child.name),
                         title: format!("{} · {}", child.name, child.status),
-                        model: child.model.clone(),
+                        // The model and the thinking level it runs at.
+                        model: match child.thinking.as_deref() {
+                            Some(level) if level != "off" => format!("{} {level}", child.model),
+                            _ => child.model.clone(),
+                        },
                         age: String::new(),
-                        target: Target::Live(Box::new(listed.clone())),
+                        target: Target::Live(std::sync::Arc::clone(&shared)),
                         kind: RowKind::Subagent,
                         depth,
                     });
@@ -323,7 +330,7 @@ pub fn rows_with(
                             title: first_line(&child.program),
                             model: String::new(),
                             age: String::new(),
-                            target: Target::Live(Box::new(listed.clone())),
+                            target: Target::Live(std::sync::Arc::clone(&shared)),
                             kind: RowKind::Code,
                             depth: depth + 1,
                         });
@@ -446,7 +453,16 @@ struct View {
     came_from: Option<String>,
     /// The roster and the saved conversations are still being read.
     loading: bool,
+    /// Bumped whenever the roster or the saved conversations change.
+    data_version: u64,
+    /// The rows of the last frame and what they were built from: a frame,
+    /// and every key, read them again, and a large forest took long to build.
+    rows_cache: std::cell::RefCell<Option<(RowsKey, std::rc::Rc<Vec<Row>>)>>,
 }
+
+/// What the rows are built from: the data's version, the search, the forest,
+/// and the second (for the ages).
+type RowsKey = (u64, String, Forest, i64);
 
 impl View {
     /// Esc: back to the session the view was opened from while its agent
@@ -465,14 +481,28 @@ impl View {
             })
     }
 
-    fn rows(&self) -> Vec<Row> {
-        rows_with(
+    fn rows(&self) -> std::rc::Rc<Vec<Row>> {
+        let now = chrono::Utc::now();
+        let key = (
+            self.data_version,
+            self.query.clone(),
+            self.forest.clone(),
+            now.timestamp(),
+        );
+        if let Some((built, rows)) = &*self.rows_cache.borrow()
+            && *built == key
+        {
+            return std::rc::Rc::clone(rows);
+        }
+        let rows = std::rc::Rc::new(rows_with(
             &self.live,
             &self.saved,
             &self.query,
-            chrono::Utc::now(),
+            now,
             &self.forest,
-        )
+        ));
+        *self.rows_cache.borrow_mut() = Some((key, std::rc::Rc::clone(&rows)));
+        rows
     }
 
     /// The selected row, kept on its identity while the roster changes.
@@ -523,12 +553,13 @@ impl View {
 
     fn refresh(&mut self) {
         self.live = client::list_all(&self.registry);
+        self.data_version += 1;
     }
 
     fn selected_row(&self) -> Option<Row> {
         let rows = self.rows();
         let index = self.selection(&rows)?;
-        rows.into_iter().nth(index)
+        rows.get(index).cloned()
     }
 }
 
@@ -598,6 +629,8 @@ pub fn run(
         store_dir: context.project_store_dir(),
         came_from,
         loading: true,
+        data_version: 0,
+        rows_cache: std::cell::RefCell::new(None),
     };
     let mut stdout = io::stdout();
     execute!(
@@ -613,19 +646,34 @@ pub fn run(
         let mut refreshed = Instant::now();
         // A roster read on the screen's own thread stalled every key for it.
         let mut refreshing = true;
+        // A frame is drawn when something changed - a key, the roster - and
+        // once a second for the ages; drawing every quarter second redrew a
+        // large forest for nothing.
+        let mut dirty = true;
+        let mut drawn = Instant::now();
         loop {
             if let Ok((live, saved)) = arrived.try_recv() {
+                // A roster the same as the last one changes nothing on screen.
+                let changed = live_changed(&view.live, &live) || saved.is_some();
                 view.live = live;
                 if let Some(saved) = saved {
                     view.saved = saved;
+                }
+                if changed {
+                    view.data_version += 1;
+                    dirty = true;
                 }
                 view.loading = false;
                 refreshing = false;
                 refreshed = Instant::now();
             }
-            screen
-                .draw(|frame| draw(frame, &view, &theme))
-                .map_err(|error| error.to_string())?;
+            if dirty || drawn.elapsed() >= REFRESH {
+                screen
+                    .draw(|frame| draw(frame, &view, &theme))
+                    .map_err(|error| error.to_string())?;
+                dirty = false;
+                drawn = Instant::now();
+            }
             if !refreshing && refreshed.elapsed() >= REFRESH {
                 refreshing = true;
                 let registry = view.registry.clone();
@@ -637,6 +685,7 @@ pub fn run(
             if !event::poll(Duration::from_millis(250)).map_err(|error| error.to_string())? {
                 continue;
             }
+            dirty = true;
             match event::read().map_err(|error| error.to_string())? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if let Some(choice) = handle_key(&mut view, key, context, environment) {
@@ -767,7 +816,7 @@ fn handle_key(
                         );
                         return None;
                     }
-                    return Some(Choice::Open(listed));
+                    return Some(Choice::Open(Box::new((*listed).clone())));
                 }
                 Target::Saved(conversation) => {
                     return Some(Choice::Resume(conversation.session_id));
@@ -837,6 +886,7 @@ fn handle_key(
                             Ok(()) => {
                                 view.saved
                                     .retain(|saved| saved.task_id != conversation.task_id);
+                                view.data_version += 1;
                                 format!("deleted {title}")
                             }
                             Err(error) => format!("could not delete {title}: {error}"),
@@ -872,7 +922,7 @@ fn reply(
     environment: &LaunchEnvironment,
 ) -> String {
     let rows = view.rows();
-    let Some(row) = rows.into_iter().find(|row| row.identity == identity) else {
+    let Some(row) = rows.iter().find(|row| row.identity == identity).cloned() else {
         return "the session is gone".to_owned();
     };
     match row.target {
@@ -923,7 +973,11 @@ fn rename(view: &View, identity: &str, name: &str) -> String {
     let Some(Row {
         target: Target::Live(listed),
         ..
-    }) = view.rows().into_iter().find(|row| row.identity == identity)
+    }) = view
+        .rows()
+        .iter()
+        .find(|row| row.identity == identity)
+        .cloned()
     else {
         return "the agent is gone".to_owned();
     };
@@ -949,6 +1003,15 @@ fn stop(listed: &client::Listed) -> String {
         Ok(_) => format!("stopped {}", listed.agent.display_name()),
         Err(error) => error,
     }
+}
+
+/// Whether a roster read differs from the one on screen.
+fn live_changed(old: &[client::Listed], new: &[client::Listed]) -> bool {
+    old.len() != new.len()
+        || old
+            .iter()
+            .zip(new)
+            .any(|(old, new)| old.agent != new.agent || old.descriptor != new.descriptor)
 }
 
 /// A cell of `width` columns: cut with `…`, padded with spaces.
@@ -1340,6 +1403,78 @@ mod tests {
         }
     }
 
+    /// Seen: the view lagged on a conversation with many subagents. Its rows
+    /// share one copy of the agent (not one per row, briefs and all), are
+    /// built once until the roster, the search or the forest changes, and a
+    /// subagent row names its model with its thinking level.
+    #[test]
+    fn a_forest_is_built_once_and_its_rows_share_the_agent() {
+        let mut parent = agent("a1", "running", "t1");
+        parent.agent.subagents = (0..20)
+            .map(|index| super::super::agents::protocol::SubagentInfo {
+                name: format!("explorer-{index:08x}"),
+                status: "running".to_owned(),
+                model: "opencode-go/deepseek-v4.1-flash".to_owned(),
+                thinking: Some("high".to_owned()),
+                depth: 1,
+                program: "read the README ".repeat(200),
+            })
+            .collect();
+        let mut view = super::View {
+            registry: std::path::PathBuf::new(),
+            live: vec![parent],
+            saved: Vec::new(),
+            query: String::new(),
+            draft: String::new(),
+            composer: super::Composer::Search,
+            selected: None,
+            status: None,
+            stop_armed: None,
+            forest: {
+                let mut forest = super::Forest::default();
+                forest.expanded.insert("live:a1".to_owned());
+                forest
+            },
+            list_rows: std::cell::RefCell::new(Vec::new()),
+            store_dir: std::path::PathBuf::new(),
+            came_from: None,
+            loading: false,
+            data_version: 0,
+            rows_cache: std::cell::RefCell::new(None),
+        };
+        let rows = view.rows();
+        assert_eq!(rows.len(), 22, "the agent, its summary, twenty subagents");
+        let shared = rows
+            .iter()
+            .map(|row| match &row.target {
+                super::Target::Live(listed) => std::sync::Arc::as_ptr(listed),
+                super::Target::Saved(_) => std::ptr::null(),
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(shared.len(), 1, "one copy of the agent for all its rows");
+        assert_eq!(rows[2].model, "opencode-go/deepseek-v4.1-flash high");
+        // Two reads in the same second (the ages change by the second).
+        assert!(
+            (0..3).any(|_| {
+                let first = view.rows();
+                std::rc::Rc::ptr_eq(&first, &view.rows())
+            }),
+            "a second read is the same rows"
+        );
+        let rows = view.rows();
+        view.query.push('x');
+        assert!(
+            !std::rc::Rc::ptr_eq(&rows, &view.rows()),
+            "a search rebuilds"
+        );
+        view.query.clear();
+        view.data_version += 1;
+        assert!(
+            !std::rc::Rc::ptr_eq(&rows, &view.rows()),
+            "a new roster rebuilds"
+        );
+    }
+
     /// Seen: a conversation woken after a usage limit was listed as
     /// `[heartbeat: at ... run#1]`, "now" for days, its failed children unseen.
     /// The frame names what each row is doing and the keys that act on it.
@@ -1352,6 +1487,7 @@ mod tests {
             name: "verifier-1".to_owned(),
             status: "error".to_owned(),
             model: "m".to_owned(),
+            thinking: None,
             depth: 1,
             program: String::new(),
         }];
@@ -1374,6 +1510,8 @@ mod tests {
             store_dir: std::path::PathBuf::new(),
             came_from: Some("a1".to_owned()),
             loading: false,
+            data_version: 0,
+            rows_cache: std::cell::RefCell::new(None),
         };
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 18)).expect("terminal");
@@ -1443,6 +1581,7 @@ mod tests {
                     name: format!("coder-{index}"),
                     status: (*status).to_owned(),
                     model: "m".to_owned(),
+                    thinking: None,
                     depth: 1,
                     program: String::new(),
                 },
@@ -1491,6 +1630,8 @@ mod tests {
             store_dir: std::path::PathBuf::new(),
             came_from: came_from.map(str::to_owned),
             loading: false,
+            data_version: 0,
+            rows_cache: std::cell::RefCell::new(None),
         };
         assert!(matches!(
             view(Some("a1")).back(),
@@ -1558,6 +1699,7 @@ mod tests {
                 name: "scout".to_owned(),
                 status: "running".to_owned(),
                 model: "m".to_owned(),
+                thinking: None,
                 depth: 1,
                 program: "look at the parser".to_owned(),
             },
@@ -1565,6 +1707,7 @@ mod tests {
                 name: "done".to_owned(),
                 status: "completed".to_owned(),
                 model: "m".to_owned(),
+                thinking: None,
                 depth: 1,
                 program: String::new(),
             },

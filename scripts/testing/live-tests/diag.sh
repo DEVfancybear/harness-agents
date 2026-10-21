@@ -41,7 +41,7 @@ EOF
 screen() { "$PY" "$HERE/screen.py" "$1"; }
 
 echo "== a headless run"
-answer=$(cd "$P" && "$HA" exec --model "$MODEL" --approval full-auto "What is 17 + 25? Answer with the number only." 2>"$RX/exec.err")
+answer=$(cd "$P" && "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto "What is 17 + 25? Answer with the number only." 2>"$RX/exec.err")
 printf '%s\n' "$answer" > "$RX/exec.out"
 check "the headless run answers" 'grep -q 42 "$RX/exec.out"'
 check "it recorded its start and its exit" '[ "$(records exec "r[\"kind\"]==\"process\" and r[\"event\"] in (\"start\",\"exit\")")" -ge 2 ]'
@@ -49,7 +49,7 @@ check "it recorded the turn's start and end, with the conversation" '[ "$(record
 check "the turn ended final" '[ "$(records exec "r[\"event\"]==\"end\" and f.get(\"stop\")==\"final\"")" -ge 1 ]'
 
 echo "== a compaction"
-(cd "$P" && HA_COMPACT_AT=12000 "$HA" exec --model "$MODEL" --approval full-auto "Read gen/m1.txt, gen/m2.txt, gen/m3.txt and gen/m4.txt one at a time with read_file, whole. Then answer with the number of the last row of m4 only." >"$RX/compact.out" 2>"$RX/compact.err")
+(cd "$P" && HA_COMPACT_AT=12000 "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto "Read gen/m1.txt, gen/m2.txt, gen/m3.txt and gen/m4.txt one at a time with read_file, whole. Then answer with the number of the last row of m4 only." >"$RX/compact.out" 2>"$RX/compact.err")
 check "the compacting run answers" 'grep -q 299 "$RX/compact.out"'
 check "a compaction was recorded with its numbers" '[ "$(records exec "r[\"kind\"]==\"compaction\" and (\"before\" in f or \"shortened\" in f or \"covered\" in f or \"after\" in f)")" -ge 1 ]'
 
@@ -62,14 +62,14 @@ check "the refusal is recorded as an error or warning" '[ "$(records exec "r[\"l
 echo "== two runs that want the same store"
 Q="$RX/q"
 project "$Q"
-(cd "$Q" && "$HA" exec --model "$MODEL" --approval full-auto "Run the shell command: sleep 25 (with bash), then answer: done" >"$RX/holder.out" 2>"$RX/holder.err") &
+(cd "$Q" && "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto "Run the shell command: sleep 25 (with bash), then answer: done" >"$RX/holder.out" 2>"$RX/holder.err") &
 holder=$!
 for _ in $(seq 1 40); do
   ls "$HA_HOME"/data/projects/*/writer.owner.json >/dev/null 2>&1 && break
   sleep 0.5
 done
 cat "$HA_HOME"/data/projects/*/writer.owner.json > "$RX/owner.json" 2>/dev/null
-(cd "$Q" && "$HA" exec --model "$MODEL" --approval full-auto "Answer: second" >"$RX/second.out" 2>"$RX/second.err")
+(cd "$Q" && "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto "Answer: second" >"$RX/second.out" 2>"$RX/second.err")
 second=$?
 wait "$holder"
 check "the holder noted itself beside the lock" 'grep -q "\"role\":\"exec\"" "$RX/owner.json"'

@@ -32,7 +32,7 @@ const TOOL_OUTPUT_PREVIEW_LINES: usize = 3;
 pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> Vec<Line<'static>> {
     match item {
         HistoryItem::Banner { lines } => banner_rows(lines, width, theme),
-        HistoryItem::User { text } => user_box(text, width, theme),
+        HistoryItem::User { text } => user_box(text, width, theme, detail),
         HistoryItem::Automatic { text } => injected_prompt(text, width, theme),
         HistoryItem::Assistant { text } => assistant_message(text, width, theme),
         // Collapsed mode hides reasoning, as prime-agent's overview does.
@@ -247,18 +247,54 @@ fn counted(count: u64, one: &str, many: &str) -> String {
 /// The rail is what makes a turn's start findable while scrolling, and the card -
 /// the row's own style, so it reaches the right edge of the console - is what
 /// separates what the operator asked for from what the agent answered.
-fn user_box(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+///
+/// A command typed with long guidance (`/compact` and several hundred words of
+/// what to keep) folds to its first [`FOLDED_COMMAND_ROWS`] rows and a count;
+/// ctrl+o's detail modes show all of it.
+fn user_box(text: &str, width: u16, theme: &Theme, detail: Detail) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(RAIL_CELLS).max(1);
-    let mut rows = vec![Line::default()];
-    for line in text.split('\n') {
-        for row in wrap_spans(vec![Span::styled(line.to_owned(), theme.user)], inner) {
-            let mut spans = vec![Span::styled(RAIL, theme.rail_user)];
-            spans.extend(row.spans);
-            rows.push(Line::from(spans).style(theme.user_box));
-        }
+    let command = command_word(text);
+    let mut body = Vec::new();
+    for (index, line) in text.split('\n').enumerate() {
+        let spans = match command {
+            Some(word) if index == 0 => vec![
+                Span::styled(word.to_owned(), theme.user.add_modifier(Modifier::BOLD)),
+                Span::styled(line[word.len()..].to_owned(), theme.user),
+            ],
+            _ => vec![Span::styled(line.to_owned(), theme.user)],
+        };
+        body.extend(wrap_spans(spans, inner));
     }
+    if command.is_some() && detail == Detail::Collapsed && body.len() > FOLDED_COMMAND_ROWS + 1 {
+        let more = body.len() - FOLDED_COMMAND_ROWS;
+        body.truncate(FOLDED_COMMAND_ROWS);
+        body.push(Line::from(Span::styled(
+            format!("… {more} more lines (ctrl+o)"),
+            theme.dim,
+        )));
+    }
+    let mut rows = vec![Line::default()];
+    rows.extend(body.into_iter().map(|row| {
+        let mut spans = vec![Span::styled(RAIL, theme.rail_user)];
+        spans.extend(row.spans);
+        Line::from(spans).style(theme.user_box)
+    }));
     rows.push(Line::default());
     rows
+}
+
+/// Rows a folded command keeps.
+const FOLDED_COMMAND_ROWS: usize = 2;
+
+/// The `/command` a typed line starts with, when it is one.
+fn command_word(text: &str) -> Option<&str> {
+    let word = text.split([' ', '\n']).next()?;
+    let name = word.strip_prefix('/')?;
+    (!name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':')))
+    .then_some(word)
 }
 
 /// The rail in front of a turn's label and body: two cells of margin, the rail,
@@ -1450,6 +1486,68 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    /// Seen in a real session: `/compact Retain task_state and memory v3. …`
+    /// with several hundred words of guidance filled the screen as one user
+    /// block. Collapsed, it is the command, two rows and a count; ctrl+o's
+    /// detail mode shows all of it. A plain prompt is never folded.
+    #[test]
+    fn a_command_with_long_guidance_folds_until_ctrl_o() {
+        let theme = Theme::plain();
+        let guidance =
+            "Retain task_state and memory v3. Ongoing baseline_fixed_gate handle. ".repeat(12);
+        let text = format!("/compact {guidance}");
+        let folded = plain_text(&render(
+            &HistoryItem::User { text: text.clone() },
+            60,
+            &theme,
+            Detail::Collapsed,
+        ));
+        let rows = folded.trim_matches('\n').lines().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3, "{folded}");
+        assert!(
+            rows[0].starts_with("  ▎ /compact Retain task_state"),
+            "{folded}"
+        );
+        assert!(
+            rows[2].contains("more lines (ctrl+o)"),
+            "the rest is counted: {folded}"
+        );
+        let full = plain_text(&render(
+            &HistoryItem::User { text: text.clone() },
+            60,
+            &theme,
+            Detail::Details,
+        ));
+        let full_rows = full.trim_matches('\n').lines().count();
+        assert!(full_rows > 3 && !full.contains("ctrl+o"), "{full}");
+        assert!(
+            rows[2].contains(&format!("… {} more lines", full_rows - 2)),
+            "{folded}"
+        );
+
+        let prompt = plain_text(&render(
+            &HistoryItem::User {
+                text: guidance.clone(),
+            },
+            60,
+            &theme,
+            Detail::Collapsed,
+        ));
+        assert!(
+            !prompt.contains("ctrl+o"),
+            "a prompt is shown whole: {prompt}"
+        );
+        let short = plain_text(&render(
+            &HistoryItem::User {
+                text: "/compact keep the plan".to_owned(),
+            },
+            60,
+            &theme,
+            Detail::Collapsed,
+        ));
+        assert_eq!(short, "\n  ▎ /compact keep the plan\n");
     }
 
     #[test]

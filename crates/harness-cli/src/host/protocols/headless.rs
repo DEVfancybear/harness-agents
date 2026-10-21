@@ -594,6 +594,7 @@ pub async fn run_with(
                     provider: Arc::clone(&provider),
                     reference: format!("{}/{}", config.provider_id, config.model),
                     price: config.model_price,
+                    thinking: None,
                 },
                 models: None,
                 runtime_config: RuntimeConfig {
