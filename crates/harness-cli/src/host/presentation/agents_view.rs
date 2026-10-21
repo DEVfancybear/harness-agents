@@ -864,9 +864,13 @@ pub fn run(
         rows_cache: std::cell::RefCell::new(None),
     };
     let mut stdout = io::stdout();
+    // Cleared as well as entered: a terminal that keeps the alternate
+    // screen's last contents showed the session under the view's rows, as
+    // the view draws only the cells it fills.
     execute!(
         stdout,
         terminal::EnterAlternateScreen,
+        terminal::Clear(terminal::ClearType::All),
         event::EnableMouseCapture
     )
     .map_err(|error| error.to_string())?;
