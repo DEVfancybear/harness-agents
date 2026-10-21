@@ -1263,6 +1263,37 @@ async fn a12_compaction_cas() {
     close(store).await;
 }
 
+/// Seen live: `/compact` failed with only "the model summary was
+/// unavailable", and the report could not say why the summarizer failed.
+#[tokio::test]
+async fn a_compaction_that_cannot_fall_back_says_why_the_summary_failed() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let long = format!("constraint: keep everything {}", "word ".repeat(200_000));
+    let (session, _) = admit(&store, &bench, &long).await;
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderStreamEvent::completed("stop"),
+        ]])),
+        RuntimeConfig::default(),
+    )
+    .with_summarizer(Arc::new(FailingSummaryProvider));
+    let error = runtime
+        .compact(&session)
+        .await
+        .expect_err("a conversation too large for the fallback keeps its checkpoint");
+    assert_eq!(error.code(), ErrorCode::MandatoryContextOverflow);
+    assert!(
+        error
+            .to_string()
+            .contains("summary provider fixture failed"),
+        "the error names the summarizer's failure: {error}"
+    );
+    drop(runtime);
+    close(store).await;
+}
+
 #[tokio::test]
 async fn a19_summary_failure_falls_back_to_the_mandatory_state() {
     let bench = bench();

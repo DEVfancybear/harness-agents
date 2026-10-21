@@ -4686,7 +4686,15 @@ impl RuntimeService {
                     "the compaction was canceled; the checkpoint was kept unchanged",
                 ));
             }
-            let summary = if let Ok(Some(text)) = whole {
+            // Why the whole conversation's summary failed, for the error that
+            // ends the compaction: without it a report only said "the model
+            // summary was unavailable".
+            let whole = match whole {
+                Ok(Some(text)) => Ok(text),
+                Ok(None) => Err(None),
+                Err(error) => Err(Some(error.to_string())),
+            };
+            let summary = if let Ok(text) = whole {
                 Ok(text)
             } else if previous_in_conversation(&self.store, session_id)
                 .await?
@@ -4701,7 +4709,10 @@ impl RuntimeService {
                 // a previous checkpoint. Preserve their transcript on failure.
                 Err(RuntimeError::new(
                     ErrorCode::ServiceUnavailable,
-                    "the conversation summary was unavailable",
+                    whole
+                        .err()
+                        .flatten()
+                        .unwrap_or_else(|| "the conversation summary was unavailable".to_owned()),
                 ))
             } else {
                 let summarizer = Arc::clone(&self.summarizer);
@@ -4730,12 +4741,20 @@ impl RuntimeService {
             // and the result says which one the checkpoint holds.
             let (system_policy, fallback_used, summary_source) = match summary {
                 Ok(text) if !text.trim().is_empty() => (text, false, "model".to_owned()),
-                _ => (
-                    self.deterministic_conversation_summary(session_id, &recovery, budget)
+                failed => {
+                    let reason = failed.err().map_or_else(
+                        || "the summary was empty".to_owned(),
+                        |error| error.to_string(),
+                    );
+                    (
+                        self.deterministic_conversation_summary(
+                            session_id, &recovery, budget, &reason,
+                        )
                         .await?,
-                    true,
-                    "deterministic_fallback".to_owned(),
-                ),
+                        true,
+                        "deterministic_fallback".to_owned(),
+                    )
+                }
             };
             // A checkpoint id is minted per publication, never derived from the
             // sequence it covers: two compactions may legitimately cover the
@@ -5303,6 +5322,7 @@ impl RuntimeService {
         session: &SessionId,
         recovery: &RecoveryView,
         budget: u64,
+        reason: &str,
     ) -> Result<String, RuntimeError> {
         let history = conversation_history(&self.store, session).await?;
         let mut text = deterministic_summary(recovery, budget);
@@ -5323,7 +5343,9 @@ impl RuntimeService {
         if history.omitted > 0 || BudgetLedger::estimate_tokens(&text) > budget {
             return Err(RuntimeError::new(
                 ErrorCode::MandatoryContextOverflow,
-                "the model summary was unavailable and the complete conversation does not fit the summary budget; the checkpoint was kept unchanged; retry compaction when the summarizer is available",
+                format!(
+                    "the model summary was unavailable ({reason}) and the complete conversation does not fit the summary budget; the checkpoint was kept unchanged; retry compaction when the summarizer is available"
+                ),
             ));
         }
         Ok(text)
