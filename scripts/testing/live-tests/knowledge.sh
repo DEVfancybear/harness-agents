@@ -250,9 +250,18 @@ seeded=$(count_entries "$L/harness_state.json")
 run_exec e11 --resume "$T" "Lượt này đừng gọi tool memory hay knowledge. Trả lời đúng một từ: OK"
 after=$(count_entries "$L/harness_state.json")
 echo "   local entries: $seeded -> $after"
-check "the consolidation ran on this conversation's memory" 'grep -q "This conversation.s memory: [0-9]* -> [0-9]* entries" "$RX/e11.err"'
+# The review runs first and may merge the 45 step entries itself (DeepSeek
+# did: one entry saying steps 0-44 were done), which leaves nothing for the
+# consolidation past forty. Either way the store shrinks; the half rule is
+# the consolidation's own guard rail.
+if grep -q "This conversation.s memory: [0-9]* -> [0-9]* entries" "$RX/e11.err"; then
+  check "the consolidation ran on this conversation's memory" true
+  check "at most half were deleted" '[ "$after" -ge $((seeded / 2)) ]'
+else
+  check "the review merged the step entries into one it created" 'grep -q "Created local memory" "$RX/e11.err" && grep -q "Deleted local memory .ship_step_" "$RX/e11.err"'
+  check "and left the store under the consolidation's threshold" '[ "$after" -le 40 ]'
+fi
 check "it left fewer entries" '[ "$after" -lt "$seeded" ]'
-check "at most half were deleted" '[ "$after" -ge $((seeded / 2)) ]'
 
 echo "################ 12. hybrid search embeds every query variant"
 export HA_AUTO_REFINE=off
