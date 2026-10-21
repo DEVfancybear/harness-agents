@@ -52,10 +52,9 @@ pub fn rows(header: &[String], extra: &Extra) -> Vec<RefLine> {
     };
 
     let mut session = Vec::new();
-    for (label, shown) in [("Session", "Session"), ("Mode", "Mode")] {
-        if let Some(value) = fact(label) {
-            session.push(RefLine::field(shown, value));
-        }
+    // The header's `Session: new` says nothing: every session starts so.
+    if let Some(value) = fact("Mode") {
+        session.push(RefLine::field("Mode", value));
     }
     session.push(RefLine::field("Phase", extra.phase.clone()));
     if let Some(value) = fact("Permissions") {
@@ -95,12 +94,29 @@ pub fn rows(header: &[String], extra: &Extra) -> Vec<RefLine> {
     if let Some(endpoint) = &endpoint {
         provider.push(RefLine::field("Endpoint", endpoint.clone()));
     }
-    provider.extend(provider_rows(
-        &extra.provider,
-        model.as_deref(),
-        endpoint.as_deref(),
-    ));
-    section("Model", "", provider);
+    // The provider check reads the configuration: after a `/model` choice
+    // its provider is not the one in use, and is shown on its own.
+    let configured = extra
+        .provider
+        .iter()
+        .find_map(|line| line.strip_prefix("Provider: ready, would call "));
+    let in_use =
+        model.is_none() || configured.is_none_or(|called| Some(called) == model.as_deref());
+    if in_use {
+        provider.extend(provider_rows(
+            &extra.provider,
+            model.as_deref(),
+            endpoint.as_deref(),
+        ));
+        section("Model", "", provider);
+    } else {
+        section("Model", "", provider);
+        section(
+            "Default",
+            "the configured provider, not the model in use",
+            provider_rows(&extra.provider, None, None),
+        );
+    }
 
     let mut usage = Vec::new();
     if let Some(context) = fact("Context") {
@@ -218,10 +234,21 @@ fn provider_rows(lines: &[String], model: Option<&str>, endpoint: Option<&str>) 
         value,
         tone,
     };
+    // Beside the model in use, the configured endpoint and model are named as
+    // such; on their own (the default provider) they are just the endpoint
+    // and the model.
+    let alone = model.is_none();
     let configured = |label: &str, value: &str, source: &str, current: Option<&str>| {
         if current.is_some_and(|current| current == value) {
             None
         } else {
+            let label = if alone {
+                label.trim_start_matches("Config ")
+            } else {
+                label
+            };
+            let label = if label == "URL" { "Endpoint" } else { label };
+            let label = if label == "model" { "Model" } else { label };
             Some(RefLine::field(label, format!("{value} ({source})")))
         }
     };
@@ -262,7 +289,7 @@ fn provider_rows(lines: &[String], model: Option<&str>, endpoint: Option<&str>) 
         } else if let Some(called) = fact.strip_prefix("ready, would call ") {
             Some(tone(
                 "Status",
-                if model == Some(called) {
+                if alone || model == Some(called) {
                     "ready".to_owned()
                 } else {
                     format!("ready, configured for {called}")
@@ -433,14 +460,29 @@ mod tests {
                 ],
             },
         );
+        // Seen live: the Model section said gpt-6-luna and, under it,
+        // `Provider deepseek`. The configured provider has a section of its own.
         let plain: Vec<String> = rows.iter().map(RefLine::plain).collect();
-        assert!(
-            plain.contains(&"Config model: gpt-5.6-terra (user config)".to_owned()),
-            "{plain:#?}"
-        );
-        assert!(
-            plain.contains(&"Status: ready, configured for gpt-5.6-terra".to_owned()),
-            "{plain:#?}"
-        );
+        let default = plain
+            .iter()
+            .position(|line| line.starts_with("Default"))
+            .unwrap_or_else(|| panic!("no Default section in {plain:#?}"));
+        let model = plain
+            .iter()
+            .position(|line| line == "Model")
+            .expect("a Model section");
+        assert!(model < default, "{plain:#?}");
+        assert_eq!(plain[model + 1], "Model: deepseek-v4-flash");
+        for expected in [
+            "Provider: openai-codex (responses)",
+            "Model: gpt-5.6-terra (user config)",
+            "Status: ready",
+        ] {
+            let at = plain.iter().position(|line| line == expected);
+            assert!(
+                at.is_some_and(|at| at > default),
+                "{expected} under Default in {plain:#?}"
+            );
+        }
     }
 }
