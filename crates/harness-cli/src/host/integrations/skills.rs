@@ -785,11 +785,10 @@ mod tests {
         }
     }
 
-    /// am-will/swarms ships as five user-only skills (`/skill:<name>`), without
-    /// `co-design` or `parallel-task-tmux`, and every file a `SKILL.md` links to
-    /// ships with it.
+    /// The am-will/swarms skills were removed from the bundle at the user's
+    /// request: none of them ships any more.
     #[test]
-    fn the_swarms_skills_ship_for_the_user_to_start() {
+    fn the_swarms_skills_are_not_bundled() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let catalog = discover(
             &temporary.path().join("config"),
@@ -805,33 +804,7 @@ mod tests {
             "super-swarm",
             "super-swarm-spark",
         ] {
-            let entry = catalog.entry(name).expect("a swarms skill");
-            assert_eq!(entry.source, SkillSource::Builtin, "{name}");
-            assert_eq!(entry.version, "1102681", "{name}");
-            assert!(
-                !entry.model_invocable,
-                "{name} starts only with /skill:{name}"
-            );
-            assert!(entry.description.contains("Use when"), "{name}");
-            let activation = catalog
-                .activate(name, None, 1)
-                .expect("the user can run it");
-            for link in activation.content.split("](").skip(1) {
-                let target = link.split(')').next().expect("link target");
-                if target.starts_with("references/") {
-                    assert!(
-                        activation
-                            .resources
-                            .iter()
-                            .any(|file| file.ends_with(target)),
-                        "{name} links {target}, which is not shipped: {:?}",
-                        activation.resources
-                    );
-                }
-            }
-        }
-        for name in ["co-design", "parallel-task-tmux"] {
-            assert!(catalog.entry(name).is_none(), "{name} is not imported");
+            assert!(catalog.entry(name).is_none(), "{name} is not bundled");
         }
     }
 
