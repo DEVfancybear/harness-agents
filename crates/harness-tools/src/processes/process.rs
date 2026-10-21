@@ -638,8 +638,14 @@ fn windows_shell(host: &HostEnvironment) -> (String, String) {
 /// holding `big.txt` searched for `big.txt` alone, found nothing and exited 0.
 /// A structured call's arguments are already words, so nothing may expand them
 /// again. A value a grant resolved for the call still wins.
-#[cfg(windows)]
-const UNGLOBBED: [(&str, &str); 2] = [("MSYS", "noglob"), ("CYGWIN", "noglob")];
+///
+/// These are fixed values, never copied from the host, so they reveal nothing
+/// the host holds; they are published next to the allowlist for that reason.
+pub const PROCESS_ENVIRONMENT_FIXED: &[(&str, &str)] = if cfg!(windows) {
+    &[("MSYS", "noglob"), ("CYGWIN", "noglob")]
+} else {
+    &[]
+};
 
 /// The program a bare name starts, found the way a Windows shell finds it.
 ///
@@ -995,8 +1001,7 @@ async fn run(
                 child_command.env(name, value);
             }
         }
-        #[cfg(windows)]
-        for (name, value) in UNGLOBBED {
+        for (name, value) in PROCESS_ENVIRONMENT_FIXED {
             child_command.env(name, value);
         }
         for (name, value) in environment.values() {

@@ -27,10 +27,11 @@ use harness_store_sqlite::{SqliteStore, ToolIntentStatus, WriterOpenOptions};
 use harness_tools::{
     AcceptanceState, ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CaptureStream,
     CodingToolAction, EffectClass, EnvBinding, IsolationMode, PROCESS_ENVIRONMENT_ALLOWLIST,
-    ProcessSpoolConfig, SecretResolver, SpoolLimits, ToolExecutionService, ToolOutput, ToolPolicy,
-    ToolRequest, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnOutcome, TurnProgress,
-    TurnStop, coding_tool_descriptors, coding_tool_names, coding_tool_schemas, effect_class_for,
-    observe_workspace, observed_file_hash, parse_capture_header,
+    PROCESS_ENVIRONMENT_FIXED, ProcessSpoolConfig, SecretResolver, SpoolLimits,
+    ToolExecutionService, ToolOutput, ToolPolicy, ToolRequest, TurnDriver, TurnLimits,
+    TurnObserver, TurnOptions, TurnOutcome, TurnProgress, TurnStop, coding_tool_descriptors,
+    coding_tool_names, coding_tool_schemas, effect_class_for, observe_workspace,
+    observed_file_hash, parse_capture_header,
 };
 use harness_types::{
     ContentHash, ErrorCode, HarnessError, HostId, InputId, ProjectId, SessionId, SourceAuthority,
@@ -2141,14 +2142,21 @@ async fn a16_process_tree_env() {
     assert!(stdout.is_empty(), "the fixture printed nothing: {stdout}");
 
     // The environment the child received holds nothing this host did not
-    // allowlist: the host's own variables are not inherited wholesale.
+    // allowlist, but ha's own fixed values: the host's own variables are not
+    // inherited wholesale.
+    let fixed = |name: &str, value: &str| {
+        PROCESS_ENVIRONMENT_FIXED
+            .iter()
+            .any(|(fixed, set)| fixed.eq_ignore_ascii_case(name) && *set == value)
+    };
     let visible = child_environment(&env_out);
     let allowed = visible
         .iter()
-        .filter(|(name, _)| {
+        .filter(|(name, value)| {
             PROCESS_ENVIRONMENT_ALLOWLIST
                 .iter()
                 .any(|allowed| allowed.eq_ignore_ascii_case(name))
+                || fixed(name, value)
         })
         .count();
     assert_eq!(
@@ -2165,6 +2173,7 @@ async fn a16_process_tree_env() {
         .filter(|name| {
             !PROCESS_ENVIRONMENT_ALLOWLIST
                 .iter()
+                .chain(PROCESS_ENVIRONMENT_FIXED.iter().map(|(fixed, _)| fixed))
                 .any(|allowed| allowed.eq_ignore_ascii_case(name))
         })
         .collect();

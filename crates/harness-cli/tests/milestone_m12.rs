@@ -19,9 +19,9 @@ use harness_tools::{
     CapabilityEvidence, CapabilityFinding, CapabilityMatrix, CapabilityProbe, CapabilityVerdict,
     CodingToolAction, EXECUTION_PLAN_SCHEMA_VERSION, ExecutionPlan, ExportProvenance, HostIdentity,
     IsolationMode, LEASE_GRACE_MS, LeaseOutcome, LeaseOwner, LeaseRequest,
-    PROCESS_ENVIRONMENT_ALLOWLIST, PROCESS_OUTPUT_PAGE_MAX_BYTES, ProbeChild, StrictProfile,
-    ToolExecutionService, ToolOutput, ToolRequest, export_artifact, export_destination,
-    observe_workspace, reconcile_backend_leases,
+    PROCESS_ENVIRONMENT_ALLOWLIST, PROCESS_ENVIRONMENT_FIXED, PROCESS_OUTPUT_PAGE_MAX_BYTES,
+    ProbeChild, StrictProfile, ToolExecutionService, ToolOutput, ToolRequest, export_artifact,
+    export_destination, observe_workspace, reconcile_backend_leases,
 };
 use harness_types::{
     ContentHash, ErrorCode, HostId, InputId, SessionId, SourceAuthority, TaskId, ToolIntentState,
@@ -534,15 +534,17 @@ async fn m12_02_a_normal_command_succeeds_inside_the_backend() {
     );
     assert!(artifact_id.is_some(), "the capture is published");
 
-    // The environment the child printed contains nothing outside the allowlist.
+    // The environment the child printed contains nothing outside the allowlist
+    // but ha's own fixed values.
     let mut seen = 0_usize;
     for line in stdout.lines() {
-        let Some((name, _)) = line.split_once('=') else {
+        let Some((name, value)) = line.split_once('=') else {
             continue;
         };
         seen += 1;
         assert!(
-            PROCESS_ENVIRONMENT_ALLOWLIST.contains(&name),
+            PROCESS_ENVIRONMENT_ALLOWLIST.contains(&name)
+                || PROCESS_ENVIRONMENT_FIXED.contains(&(name, value)),
             "the child saw {name}, which is not in the allowlist"
         );
     }
