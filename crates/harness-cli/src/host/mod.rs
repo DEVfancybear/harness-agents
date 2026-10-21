@@ -146,6 +146,8 @@ pub mod side_question;
 pub mod skill_requests;
 #[path = "integrations/skills.rs"]
 pub mod skills;
+#[path = "application/status_panel.rs"]
+pub mod status_panel;
 #[path = "application/store_lease.rs"]
 pub mod store_lease;
 #[path = "memory/task_state.rs"]

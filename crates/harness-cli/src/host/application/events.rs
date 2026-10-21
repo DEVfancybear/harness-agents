@@ -655,6 +655,13 @@ pub enum RefLine {
         badges: Vec<(String, BadgeKind)>,
         detail: String,
     },
+    /// A labelled fact (`/status`'s `Branch  master`): the panel puts the
+    /// values of its fields in one column, and `tone` colours the value.
+    Field {
+        label: String,
+        value: String,
+        tone: BadgeKind,
+    },
     /// Running text.
     Text(String),
     /// A quiet line: a hint at the end of a panel.
@@ -693,8 +700,19 @@ impl RefLine {
                 }
                 line
             }
+            Self::Field { label, value, .. } => format!("{label}: {value}"),
             Self::Text(text) | Self::Hint(text) => text.clone(),
             Self::Blank => String::new(),
+        }
+    }
+
+    /// A plain field of no particular tone.
+    #[must_use]
+    pub fn field(label: &str, value: impl Into<String>) -> Self {
+        Self::Field {
+            label: label.to_owned(),
+            value: value.into(),
+            tone: BadgeKind::Neutral,
         }
     }
 }

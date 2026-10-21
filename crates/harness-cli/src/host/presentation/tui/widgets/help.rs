@@ -31,10 +31,7 @@ pub fn render(
 ) {
     let compact = area.height <= 3;
     let width = area.width.saturating_sub(if compact { 0 } else { 2 });
-    let base = match rich {
-        Some(rich) => rich_rows(rich, width, theme),
-        None => rows(lines, theme),
-    };
+    let base = panel_rows(lines, rich, width, theme);
     let rows: Vec<_> = base
         .into_iter()
         .flat_map(|line| super::super::markdown::wrap_spans(line.spans, width))
@@ -109,15 +106,149 @@ fn wrap_plain(text: &str, cells: usize) -> Vec<String> {
     rows
 }
 
+/// Text cut into rows of at most `cells` cells, at spaces where it can be and
+/// inside a word too long for a row (a path) where it cannot.
+fn wrap_hard(text: &str, cells: usize) -> Vec<String> {
+    let cells = cells.max(1);
+    let mut rows = Vec::new();
+    for row in wrap_plain(text, cells) {
+        if display_width(&row) <= cells {
+            rows.push(row);
+            continue;
+        }
+        let mut piece = String::new();
+        for character in row.chars() {
+            let mut buffer = [0; 4];
+            if !piece.is_empty()
+                && display_width(&piece) + display_width(character.encode_utf8(&mut buffer)) > cells
+            {
+                rows.push(std::mem::take(&mut piece));
+            }
+            piece.push(character);
+        }
+        if !piece.is_empty() {
+            rows.push(piece);
+        }
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+
+/// The style of a field's value for what it means.
+fn tone_style(kind: BadgeKind, theme: &Theme) -> ratatui::style::Style {
+    match kind {
+        BadgeKind::Ok => theme.tool_ok,
+        BadgeKind::Accent => theme.accent,
+        BadgeKind::Warn => theme.warning,
+        BadgeKind::Neutral => ratatui::style::Style::default(),
+    }
+}
+
+/// A value's spans: a closing note in brackets (`[default]`, `(value hidden)`)
+/// is dimmed, so the value itself stands out.
+fn value_spans(row: &str, style: ratatui::style::Style, theme: &Theme) -> Vec<Span<'static>> {
+    let note = row
+        .rfind(" (")
+        .filter(|_| row.ends_with(')'))
+        .or_else(|| row.rfind(" [").filter(|_| row.ends_with(']')));
+    match note {
+        Some(at) => vec![
+            Span::styled(row[..at].to_owned(), style),
+            Span::styled(row[at..].to_owned(), theme.dim),
+        ],
+        None => vec![Span::styled(row.to_owned(), style)],
+    }
+}
+
+/// The widest label a value column makes room for; a longer one pushes its own
+/// value along instead of the whole column.
+const LABEL_CELLS: usize = 14;
+
+/// A plain panel line as a structured row: `Label: value` as a field, the rest
+/// as text. A label is a few words at the start of the line: `Config:` is
+/// one, and so is `AGENTS.md:`, but `C:\work` and a sentence with a colon
+/// in it are not.
+#[must_use]
+pub fn line_row(line: &str) -> RefLine {
+    let field = line.split_once(':').filter(|(label, value)| {
+        let label = label.trim_end();
+        !label.is_empty()
+            && label.len() <= 24
+            && label.chars().next().is_some_and(char::is_alphabetic)
+            && label.split_whitespace().count() <= 3
+            && !label.contains(['/', '\\', '(', '`'])
+            && value.starts_with(char::is_whitespace)
+            && !value.trim().is_empty()
+    });
+    match field {
+        Some((label, value)) => RefLine::field(label.trim_end(), value.trim()),
+        None if line.trim().is_empty() => RefLine::Blank,
+        None => RefLine::Text(line.to_owned()),
+    }
+}
+
+/// The rows of a panel: its structured rows when it has them, else its plain
+/// lines read as fields and text, so every reference panel is drawn alike.
+#[must_use]
+pub fn panel_rows(
+    lines: &[String],
+    rich: Option<&[RefLine]>,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    match rich {
+        Some(rich) => rich_rows(rich, width, theme),
+        None if lines.is_empty() => rows(lines, theme),
+        None => {
+            let converted: Vec<RefLine> = lines.iter().map(|line| line_row(line)).collect();
+            rich_rows(&converted, width, theme)
+        }
+    }
+}
+
 /// The rows of a structured reference panel: headings as chips, each item on a
-/// row of its own with its description wrapped and hung under the name.
+/// row of its own with its description wrapped and hung under the name, and
+/// fields with their values in one column.
 #[must_use]
 pub fn rich_rows(lines: &[RefLine], width: u16, theme: &Theme) -> Vec<Line<'static>> {
     /// Cells the description is indented: past the margin, the glyph and its gap.
     const HANG: usize = 5;
+    let column = lines
+        .iter()
+        .filter_map(|line| match line {
+            RefLine::Field { label, .. } => Some(display_width(label)),
+            _ => None,
+        })
+        .filter(|cells| *cells <= LABEL_CELLS)
+        .max()
+        .unwrap_or(0);
     let mut rows = Vec::new();
     for line in lines {
         match line {
+            RefLine::Field { label, value, tone } => {
+                let pad = column.max(display_width(label));
+                let hang = 2 + pad + 2;
+                let room = usize::from(width).saturating_sub(hang + 1).max(12);
+                let style = tone_style(*tone, theme);
+                for (index, row) in wrap_hard(value, room).into_iter().enumerate() {
+                    let mut spans = if index == 0 {
+                        vec![
+                            Span::raw("  "),
+                            Span::styled(label.clone(), theme.muted),
+                            Span::raw(" ".repeat(pad - display_width(label) + 2)),
+                        ]
+                    } else {
+                        vec![Span::raw(" ".repeat(hang))]
+                    };
+                    spans.extend(value_spans(&row, style, theme));
+                    rows.push(Line::from(spans));
+                }
+            }
+            RefLine::Text(text) if text.starts_with('/') && text.contains("  ") => {
+                rows.extend(self::rows(std::slice::from_ref(text), theme));
+            }
             RefLine::Heading { title, note } => {
                 let mut spans = vec![
                     Span::raw(" "),
@@ -242,7 +373,30 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
-        assert!(text.contains("Store: final entry"), "{text}");
+        // `Store:` is drawn as a field: the label, then its value in the column.
+        assert!(text.contains("Store  final entry"), "{text}");
+    }
+
+    /// Every panel's `Label: value` lines share one value column, and a path
+    /// too long for a row wraps under the value instead of under the label.
+    #[test]
+    fn fields_line_up_and_a_long_path_hangs_under_its_value() {
+        let lines = vec![
+            "Git:     clean".to_owned(),
+            r"Store:   C:\Users\me\AppData\Local\HarnessAgents\data\projects\0123456789abcdef"
+                .to_owned(),
+            "/help  list commands".to_owned(),
+        ];
+        let text = plain_text(&super::panel_rows(&lines, None, 40, &Theme::plain()));
+        let rows: Vec<&str> = text.lines().collect();
+        assert!(rows[0].starts_with("  Git    clean"), "{text}");
+        assert!(rows[1].starts_with(r"  Store  C:\Users"), "{text}");
+        assert!(
+            rows[2].starts_with("         "),
+            "a path hangs under its value:\n{text}"
+        );
+        assert!(rows.iter().all(|row| row.chars().count() <= 40), "{text}");
+        assert!(text.contains("/help  list commands"), "{text}");
     }
 
     #[test]

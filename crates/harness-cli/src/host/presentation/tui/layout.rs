@@ -66,7 +66,7 @@ pub struct Plan {
 /// Lay one frame out inside `area`.
 #[must_use]
 #[allow(clippy::too_many_lines)] // one frame, top to bottom, in reading order
-pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
+pub fn plan(area: Rect, state: &UiState, theme: &Theme) -> Plan {
     let empty = Rect::new(area.x, area.y, 0, 0);
     if area.width < 12 || area.height < 5 || (state.modal.is_some() && area.height < 7) {
         return Plan {
@@ -118,7 +118,12 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
         rect
     };
     let (live, modal, queue, suggest) = if let Some(modal) = &state.modal {
-        (None, Some(take(modal_rows(modal, available))), None, None)
+        (
+            None,
+            Some(take(modal_rows(modal, available, area.width, theme))),
+            None,
+            None,
+        )
     } else {
         let menu_rows = u16::try_from(state.suggestions.len())
             .unwrap_or(u16::MAX)
@@ -232,7 +237,7 @@ pub fn live_rows(state: &UiState, width: u16) -> u16 {
 }
 
 /// Rows a modal wants, capped by the space available.
-fn modal_rows(modal: &Modal, available: u16) -> u16 {
+fn modal_rows(modal: &Modal, available: u16, width: u16, theme: &Theme) -> u16 {
     let content = match modal {
         // The panel owns its own height: a row added to it without raising the
         // reservation would be clipped off the bottom of the viewport instead.
@@ -267,16 +272,21 @@ fn modal_rows(modal: &Modal, available: u16) -> u16 {
             u16::try_from(message.lines().count() + schema_lines + 4).unwrap_or(u16::MAX)
         }
         Modal::Overlay { lines, rich, .. } => {
-            let rows = rich.as_ref().map_or(lines.len(), |rich| {
-                rich.iter()
-                    .map(|row| match row {
-                        crate::interactive::events::RefLine::Item { detail, .. } => {
-                            if detail.is_empty() { 1 } else { 2 }
-                        }
-                        _ => 1,
-                    })
-                    .sum()
-            });
+            // The panel's own rows at this width: a field whose path wraps
+            // takes the rows it is drawn on.
+            let rows = super::widgets::help::panel_rows(
+                lines,
+                rich.as_deref(),
+                width.saturating_sub(2),
+                theme,
+            )
+            .into_iter()
+            .map(|line| {
+                line.width()
+                    .max(1)
+                    .div_ceil(usize::from(width.saturating_sub(2).max(1)))
+            })
+            .sum::<usize>();
             u16::try_from(rows + 2).unwrap_or(u16::MAX)
         }
     };

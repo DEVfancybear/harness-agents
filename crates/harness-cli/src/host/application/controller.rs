@@ -4077,38 +4077,32 @@ impl InteractiveController {
                 }
             }
             "/session" => {
-                let mut lines = self.header.clone();
-                // The session's spend counts its children's (prime-agent
-                // d592d5e7); the header's line is this agent's own.
-                let cost = format!("Cost: {}", self.service.cost_summary());
-                match lines.iter_mut().find(|line| line.starts_with("Cost:")) {
-                    Some(line) => *line = cost,
-                    None => lines.push(cost),
-                }
-                lines.push(format!("Phase:   {}", self.phase.label()));
-                // The project id names this workspace's store, and the app shows it
-                // nowhere else: the projects directory is named after a digest, so
-                // without this line there is nothing to hand to `--project-id`.
-                lines.push(match self.service.project_id() {
-                    Some(id) => format!("Project: {id} (store scope for this workspace)"),
-                    None => {
-                        "Project: not registered yet; the first turn in this workspace creates it"
-                            .to_owned()
-                    }
-                });
-                // What one turn may spend, and whether the app carries on by itself when
-                // a bound stops it: "paused" without this line is a mystery, and these
-                // are the numbers to raise when a long task keeps pausing.
-                lines.push(bounds::describe(
-                    &self.service.turn_limits(),
-                    self.max_continuations,
-                ));
-                // The provider facts answer "what is this app actually using?":
-                // which credential variable holds the key (never its value), whether
-                // the endpoint and the model came from the environment or from the
-                // defaults, and whether the endpoint is reachable at all.
-                lines.extend(self.service.provider_diagnostics());
-                self.reference("/status", lines, &mut effects);
+                let extra = super::status_panel::Extra {
+                    // The session's spend counts its children's (prime-agent
+                    // d592d5e7); the header's line is this agent's own.
+                    cost: self.service.cost_summary(),
+                    phase: self.phase.label().to_owned(),
+                    // The project id names this workspace's store, and the app shows
+                    // it nowhere else: the projects directory is named after a
+                    // digest, so without it there is nothing to hand to `--project-id`.
+                    project: match self.service.project_id() {
+                        Some(id) => format!("{id} (store scope for this workspace)"),
+                        None => "not registered yet; the first turn in this workspace creates it"
+                            .to_owned(),
+                    },
+                    // What one turn may spend, and whether the app carries on by
+                    // itself when a bound stops it: "paused" without this is a
+                    // mystery, and these are the numbers to raise when a long task
+                    // keeps pausing.
+                    bounds: bounds::describe(&self.service.turn_limits(), self.max_continuations),
+                    // The provider facts answer "what is this app actually using?":
+                    // which credential variable holds the key (never its value),
+                    // whether the endpoint and the model came from the environment
+                    // or from the defaults, and whether the endpoint is reachable.
+                    provider: self.service.provider_diagnostics(),
+                };
+                let rows = super::status_panel::rows(&self.header, &extra);
+                self.reference_rows("/status", rows, &mut effects);
             }
             "/config" => {
                 let mut lines = self.service.config_explain();
@@ -4916,10 +4910,11 @@ impl InteractiveController {
                     self.refresh_status();
                     self.refresh_banner(&mut effects);
                 } else {
-                    let label = self.service.label();
-                    let mut lines = vec![format!("backend: {label}")];
-                    lines.extend(self.service.provider_diagnostics());
-                    self.reference("/model", lines, &mut effects);
+                    let rows = super::status_panel::model_rows(
+                        &self.service.label(),
+                        &self.service.provider_diagnostics(),
+                    );
+                    self.reference_rows("/model", rows, &mut effects);
                     // prime-agent's bare `/model` opens the model selector: the
                     // catalog menu, filtered as the user types.
                     self.editor.open_argument_menu("/model");
@@ -9079,7 +9074,7 @@ Command: \"npm run build\""
         assert!(status.contains("Phase:"), "{status}");
 
         let model = effects_to_plain(&submit_text(&mut harness.controller, "/model")).join("\n");
-        assert!(model.contains("backend: "), "{model}");
+        assert!(model.contains("Model: "), "{model}");
 
         let unknown = effects_to_plain(&submit_text(&mut harness.controller, "/nope")).join("\n");
         assert!(unknown.contains("unknown command"), "{unknown}");
