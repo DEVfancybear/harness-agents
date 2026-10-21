@@ -631,6 +631,16 @@ fn windows_shell(host: &HostEnvironment) -> (String, String) {
     }
 }
 
+/// The runtime settings that keep a Cygwin or MSYS program's arguments as given.
+///
+/// Started from a native Windows process, such a program expands wildcards in
+/// its own command line: Git's `find` called with `-name *.txt` in a directory
+/// holding `big.txt` searched for `big.txt` alone, found nothing and exited 0.
+/// A structured call's arguments are already words, so nothing may expand them
+/// again. A value a grant resolved for the call still wins.
+#[cfg(windows)]
+const UNGLOBBED: [(&str, &str); 2] = [("MSYS", "noglob"), ("CYGWIN", "noglob")];
+
 /// The program a bare name starts, found the way a Windows shell finds it.
 ///
 /// `CreateProcess` only tries `<name>.exe`, so the batch shims most JavaScript
@@ -752,6 +762,58 @@ mod windows_program_tests {
         assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
         assert!(result.stdout.contains("shim-ran lint"), "{}", result.stdout);
         assert_eq!(result.executable, "shim");
+    }
+
+    /// Git's `find -name *.txt` matched only the workspace's own `big.txt`:
+    /// the MSYS runtime expanded the pattern before `find` saw it.
+    #[tokio::test]
+    async fn a_cygwin_or_msys_program_is_told_not_to_expand_its_arguments() {
+        let bin = tempfile::tempdir().expect("bin");
+        std::fs::write(
+            bin.path().join("runtime.cmd"),
+            "@echo off\r\necho msys=%MSYS% cygwin=%CYGWIN%\r\n",
+        )
+        .expect("shim");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let result = run_structured_with_host(
+            workspace.path(),
+            "runtime",
+            &[],
+            60_000,
+            CancellationToken::new(),
+            &ProcessEnvironment::empty(),
+            &ProcessSpoolConfig::default(),
+            &host(bin.path()),
+        )
+        .await
+        .expect("the shim starts");
+        assert!(
+            result.stdout.contains("msys=noglob cygwin=noglob"),
+            "{}",
+            result.stdout
+        );
+        // Where Git for Windows is installed, its own find shows it end to end.
+        let find = std::path::Path::new(r"C:\Program Files\Git\usr\bin\find.exe");
+        if !find.is_file() {
+            return;
+        }
+        std::fs::create_dir(workspace.path().join("a")).expect("a");
+        std::fs::write(workspace.path().join("a").join("1.txt"), "").expect("1.txt");
+        std::fs::write(workspace.path().join("big.txt"), "").expect("big.txt");
+        let found = run_structured_with_host(
+            workspace.path(),
+            &find.display().to_string(),
+            &["a", "-type", "f", "-name", "*.txt"].map(str::to_owned),
+            60_000,
+            CancellationToken::new(),
+            &ProcessEnvironment::empty(),
+            &ProcessSpoolConfig::default(),
+            &host(bin.path()),
+        )
+        .await
+        .expect("find starts");
+        assert_eq!(found.exit_code, Some(0), "stderr: {}", found.stderr);
+        assert!(found.stdout.contains("1.txt"), "{}", found.stdout);
     }
 }
 
@@ -932,6 +994,10 @@ async fn run(
             if let Some(value) = host.lookup(name) {
                 child_command.env(name, value);
             }
+        }
+        #[cfg(windows)]
+        for (name, value) in UNGLOBBED {
+            child_command.env(name, value);
         }
         for (name, value) in environment.values() {
             child_command.env(name, value);
