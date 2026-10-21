@@ -127,6 +127,7 @@ mod g03_model_selection_tests {
             project_trusted: false,
             bell: false,
             agents_default_model: None,
+            agents_max_workers: None,
             queue_modes: (None, None),
             routing: super::super::config::Routing::default(),
             verify: super::super::verify::Verify::default(),
@@ -1112,6 +1113,8 @@ pub struct ProviderConfig {
     pub bell: bool,
     /// `[agents] default_model`: the model a delegated child runs on by default.
     pub agents_default_model: Option<String>,
+    /// `[agents] max_workers`: how many children run at once; `None` or 0, all.
+    pub agents_max_workers: Option<u32>,
     /// `[queue]` modes, as written.
     pub queue_modes: (Option<String>, Option<String>),
     /// `[routing]`: scoped, auxiliary, backup and image models.
@@ -1345,6 +1348,7 @@ pub(super) fn resolve_provider_with_overrides(
         project_trusted: resolved.project_trusted,
         bell: resolved.bell,
         agents_default_model: resolved.agents_default_model,
+        agents_max_workers: resolved.agents_max_workers,
         queue_modes: resolved.queue_modes,
         routing: resolved.routing,
         verify: resolved.verify,
@@ -7078,6 +7082,7 @@ mod model_reads_images_tests {
             project_trusted: false,
             bell: false,
             agents_default_model: None,
+            agents_max_workers: None,
             queue_modes: (None, None),
             routing: crate::interactive::config::Routing::default(),
             verify: crate::interactive::verify::Verify::default(),
@@ -8312,6 +8317,7 @@ async fn run_turn(
     let (max_depth, depth_source) =
         resolve_rlm_max_depth(&store, &task_id, &config_file, &environment).await;
     agents.set_max_depth(max_depth, depth_source);
+    agents.set_max_workers(config.agents_max_workers.unwrap_or(0));
     let delegate_host = Some(super::delegation::DelegateHost::new(
         &agents,
         super::delegation::ChildLaunch {

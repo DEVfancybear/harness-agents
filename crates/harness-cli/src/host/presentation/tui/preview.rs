@@ -76,6 +76,7 @@ fn fullscreen_dump(directory: &std::path::Path, theme: &Theme) {
     working.state.open_tools = vec![("run_shell".to_owned(), "npm test".to_owned())];
     working.state.child_activity = vec![
         ChildActivity {
+            queued: false,
             name: "explorer-d3cc6099".to_owned(),
             tool_calls: 4,
             latest: "search_text: query=globalThis path=src".to_owned(),
@@ -145,6 +146,7 @@ fn fullscreen_dump(directory: &std::path::Path, theme: &Theme) {
             thinking: Some("high".to_owned()),
         },
         ChildActivity {
+            queued: false,
             name: "verifier-b105bf50".to_owned(),
             tool_calls: 1,
             latest: "run_process: args=[\"npm\",\"test\"]".to_owned(),

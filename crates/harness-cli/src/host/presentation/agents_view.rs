@@ -278,7 +278,7 @@ pub fn rows_with(
             let running = agent
                 .subagents
                 .iter()
-                .filter(|child| child.status == "running")
+                .filter(|child| child.status == "running" && !child.queued)
                 .count();
             let failed = agent
                 .subagents
@@ -312,7 +312,15 @@ pub fn rows_with(
                     rows.push(Row {
                         section,
                         identity: format!("sub:{}:{}", agent.id, child.name),
-                        title: format!("{} · {}", child.name, child.status),
+                        title: format!(
+                            "{} · {}",
+                            child.name,
+                            if child.queued {
+                                "queued"
+                            } else {
+                                &child.status
+                            }
+                        ),
                         // The model and the thinking level it runs at.
                         model: match child.thinking.as_deref() {
                             Some(level) if level != "off" => format!("{} {level}", child.model),
@@ -1044,6 +1052,7 @@ fn status_mark(row: &Row, theme: &Theme) -> (&'static str, ratatui::style::Style
             let status = row.title.rsplit(" · ").next().unwrap_or_default();
             match status {
                 "running" => ("●", theme.tool_ok),
+                "queued" => ("◌", theme.dim),
                 "error" => ("✗", theme.error),
                 "stopped" => ("■", theme.muted),
                 _ => ("✓", theme.dim),
@@ -1412,6 +1421,7 @@ mod tests {
         let mut parent = agent("a1", "running", "t1");
         parent.agent.subagents = (0..20)
             .map(|index| super::super::agents::protocol::SubagentInfo {
+                queued: false,
                 name: format!("explorer-{index:08x}"),
                 status: "running".to_owned(),
                 model: "opencode-go/deepseek-v4.1-flash".to_owned(),
@@ -1484,6 +1494,7 @@ mod tests {
         running.agent.busy = true;
         running.agent.model = "deepseek-v4.1-flash via https://api.example/v1".to_owned();
         running.agent.subagents = vec![super::super::agents::protocol::SubagentInfo {
+            queued: false,
             name: "verifier-1".to_owned(),
             status: "error".to_owned(),
             model: "m".to_owned(),
@@ -1578,6 +1589,7 @@ mod tests {
             .enumerate()
             .map(
                 |(index, status)| super::super::agents::protocol::SubagentInfo {
+                    queued: false,
                     name: format!("coder-{index}"),
                     status: (*status).to_owned(),
                     model: "m".to_owned(),
@@ -1696,6 +1708,7 @@ mod tests {
         parent.agent.heartbeats = 2;
         parent.agent.subagents = vec![
             SubagentInfo {
+                queued: false,
                 name: "scout".to_owned(),
                 status: "running".to_owned(),
                 model: "m".to_owned(),
@@ -1704,6 +1717,7 @@ mod tests {
                 program: "look at the parser".to_owned(),
             },
             SubagentInfo {
+                queued: false,
                 name: "done".to_owned(),
                 status: "completed".to_owned(),
                 model: "m".to_owned(),

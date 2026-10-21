@@ -895,6 +895,11 @@ struct AgentsShared {
     /// The model each running child calls, which a change of the session's
     /// defaults replaces between two of its calls.
     live: Mutex<HashMap<TaskId, Arc<LiveModel>>>,
+    /// `[agents] max_workers`: how many of the root's children run at once,
+    /// 0 for all of them; the ones running now; a child's end, for those waiting.
+    max_workers: std::sync::atomic::AtomicU32,
+    running_workers: Mutex<u32>,
+    worker_freed: tokio::sync::Notify,
     children: Mutex<Vec<ChildRecord>>,
     changed: tokio::sync::Notify,
     buckets: Mutex<HashMap<String, (f64, Instant)>>,
@@ -950,6 +955,19 @@ impl Drop for ChildMessageDelivery<'_> {
 /// How many exchanges `/agents messages` keeps.
 const EXCHANGES_KEPT: usize = 500;
 
+/// A running child's place under `[agents] max_workers`, given back when its
+/// run ends.
+struct WorkerSlot(Arc<AgentsShared>);
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        if let Ok(mut running) = self.0.running_workers.lock() {
+            *running = running.saturating_sub(1);
+        }
+        self.0.worker_freed.notify_waiters();
+    }
+}
+
 impl AgentsShared {
     fn new(
         store: Arc<SharedStore>,
@@ -963,6 +981,9 @@ impl AgentsShared {
             ledger: Mutex::new(None),
             launches: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
+            max_workers: std::sync::atomic::AtomicU32::new(0),
+            running_workers: Mutex::new(0),
+            worker_freed: tokio::sync::Notify::new(),
             children: Mutex::new(Vec::new()),
             changed: tokio::sync::Notify::new(),
             buckets: Mutex::new(HashMap::new()),
@@ -1046,6 +1067,28 @@ impl AgentsShared {
                     child.cancellation.cancel();
                 }
             }
+        }
+    }
+
+    /// Wait for a place to run under `[agents] max_workers`; with none set
+    /// (0) there is always one. Only the root's children count: a coder that
+    /// waits for its own explorer would otherwise hold the place it needs.
+    async fn worker_slot(self: &Arc<Self>) -> WorkerSlot {
+        loop {
+            let freed = self.worker_freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            {
+                let Ok(mut running) = self.running_workers.lock() else {
+                    return WorkerSlot(Arc::clone(self));
+                };
+                let max = self.max_workers.load(Ordering::SeqCst);
+                if max == 0 || *running < max {
+                    *running += 1;
+                    return WorkerSlot(Arc::clone(self));
+                }
+            }
+            freed.await;
         }
     }
 
@@ -1808,6 +1851,13 @@ impl SessionAgents {
         self.shared.max_depth()
     }
 
+    /// Set `[agents] max_workers`, 0 for no limit: how many of the root's
+    /// children run at once. A raised limit starts the waiting ones at once.
+    pub fn set_max_workers(&self, max_workers: u32) {
+        self.shared.max_workers.store(max_workers, Ordering::SeqCst);
+        self.shared.worker_freed.notify_waiters();
+    }
+
     /// Move each running child whose model or thinking level came from the
     /// session's defaults to what the defaults give now, from its next model
     /// call; its row and its later runs follow. A child whose spawn named
@@ -1915,11 +1965,13 @@ impl SessionAgents {
             .map(|_| {
                 WorkerScheduler::new(
                     SchedulerConfig {
-                        max_concurrent_workers: 3,
+                        max_concurrent_workers: harness_orchestrator::UNBOUNDED_WORKERS,
                         max_depth: RLM_MAX_DEPTH_CAP,
-                        // Children beyond the running three wait for a slot rather
-                        // than being refused, as prime-agent admits every spawn.
-                        max_queued_workers: 8,
+                        // Every child runs at once and none is refused, as prime-agent
+                        // admits every spawn; `[agents] max_workers` limits the root's
+                        // children in [`AgentsShared::worker_slot`] when the user wants.
+                        // (Three ran at once here; the rest showed `working` with no call.)
+                        max_queued_workers: harness_orchestrator::UNBOUNDED_WORKERS,
                         // prime-agent bounds a child by its own turn - its steps,
                         // tool calls and deadline - and the depth, not by a request
                         // pool shared across siblings. A pool of 24 ran out after
@@ -2194,6 +2246,8 @@ impl SessionAgents {
                                 _ => "error",
                             }
                             .to_owned(),
+                            queued: matches!(child.state, ChildState::Running)
+                                && child.activity == "queued",
                             model: child.model.clone(),
                             thinking: child.thinking.clone(),
                             depth: child.depth,
@@ -4686,6 +4740,16 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     };
                 }
             };
+            // `[agents] max_workers`: past it a root's child waits here, its
+            // row saying queued, until a running one ends. Unset, none waits.
+            let _slot = if request.depth <= 1 {
+                tokio::select! {
+                    slot = self.shared.worker_slot() => Some(slot),
+                    () = request.cancellation.cancelled() => None,
+                }
+            } else {
+                None
+            };
             if request.cancellation.is_cancelled() {
                 return WorkerOutcome::OutcomeUnknown {
                     reason: "the child was stopped before it started".to_owned(),
@@ -6639,6 +6703,92 @@ pub(super) mod tests {
             second.contains("luna") && !second.contains("deepseek"),
             "{second}"
         );
+    }
+
+    /// Three children ran at once and eight more waited, each drawn working
+    /// with no call made; a twelfth was refused. Every child now runs at once.
+    #[tokio::test]
+    async fn every_child_runs_at_once() {
+        use super::RlmChildren;
+        use crate::interactive::repl::HostRequests;
+        use serde_json::json;
+
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let repo = temporary.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo directory");
+        clean_repository(&repo);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(crate::interactive::service::ChannelApprovalGate::new(
+            sender.clone(),
+            Duration::from_secs(5),
+        ));
+        let agents = SessionAgents::with_backend(
+            SharedStore::new(temporary.path().join("store")),
+            sender,
+            gate,
+            temporary.path().join("delegation"),
+            &(Arc::new(ScriptedBackend) as Arc<dyn harness_orchestrator::WorkerBackend>),
+        );
+        let children = RlmChildren {
+            agents: Arc::clone(&agents),
+            launch: launch_for(
+                &repo,
+                Arc::new(harness_providers::MockProvider::scripted(Vec::new())),
+            ),
+        };
+        for index in 0..12 {
+            children
+                .handle(&json!({"type": "rlm.run", "prompt": "slow survey", "kwargs": {"name": format!("c{index}")}}))
+                .await
+                .expect("a known request type")
+                .expect("every spawn is admitted");
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(agents.scheduler().live_worker_count(), 12, "all twelve run");
+    }
+
+    /// `[agents] max_workers` bounds how many of the root's children run at
+    /// once; 0 (the default) bounds nothing, and a raised limit starts the
+    /// ones waiting.
+    #[tokio::test]
+    async fn max_workers_holds_the_children_past_it() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let shared = shared(sender);
+        let unbounded = futures_util::future::join_all((0..20).map(|_| shared.worker_slot())).await;
+        assert_eq!(unbounded.len(), 20);
+        drop(unbounded);
+
+        shared
+            .max_workers
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let first = shared.worker_slot().await;
+        let waiting = tokio::spawn({
+            let shared = Arc::clone(&shared);
+            async move { shared.worker_slot().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "the second waits for a place");
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("it starts once the first ends")
+            .expect("joined");
+
+        let third = tokio::spawn({
+            let shared = Arc::clone(&shared);
+            async move { shared.worker_slot().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!third.is_finished());
+        shared
+            .max_workers
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        shared.worker_freed.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), third)
+            .await
+            .expect("no limit starts it at once")
+            .expect("joined");
+        drop(second);
     }
 
     /// Reports each brief back as its answer; "slow" briefs take a moment, "fail"

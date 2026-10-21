@@ -1164,6 +1164,10 @@ pub struct AgentsConfigV2 {
     /// The model a child runs on when it does not ask for one, as `provider/id`.
     #[serde(default)]
     pub default_model: Option<String>,
+    /// How many delegated children run at once; unset or 0 runs every child at
+    /// once, the default. Children past the number wait for one to finish.
+    #[serde(default)]
+    pub max_workers: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

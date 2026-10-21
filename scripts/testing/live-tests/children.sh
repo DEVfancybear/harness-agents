@@ -6,7 +6,10 @@
 #      the coder's worktree (the read said only "File not found");
 #   3. a goal whose turn ends while a child works waits for the child's report
 #      instead of starting another turn at once;
-#   4. a review's diagnostic record names the task, not the whole transcript.
+#   4. a review's diagnostic record names the task, not the whole transcript;
+#   5. a child started before the user chose full-auto does not ask once the
+#      next turn begins;
+#   6. every child runs at once (three did, the rest waited shown working).
 # Every check prints PASS or FAIL; the conversation and the diagnostics stay in
 # $LIVE_ROOT/children as evidence.
 #
@@ -83,24 +86,65 @@ check "the refusal says the coder made it in its worktree" 'ans | grep -qE "code
 "$HA" shutdown --force >/dev/null 2>&1
 
 echo "################ 3. a goal waits for a child that is still working"
-agent "$RX/p" c3
-"$HA" send c3 "/goal Kiểm thử harness: dùng tool delegate với wait=false giao cho đúng một agent role explorer nhiệm vụ: gọi run_process một lần với executable python, args -c và import time; time.sleep(60), rồi trả lời WAITED. Sau khi giao thì kết thúc lượt ngay, trả lời đúng một dòng ĐÃ-GIAO. Khi nhận được kết quả WAITED của explorer thì gọi goal_complete." >/dev/null 2>&1
-for _ in $(seq 1 60); do
-  notices | grep -q "child(ren) still working; their reports carry the goal on" && break
-  sleep 5
+# The turn that delegates ends while the explorer works; the goal used to start
+# another turn at once. Read from the diagnostics: the delegating turn's end,
+# the explorer's report, and the turn starts between and after them.
+waited() {
+  "$PY" - "$D" "$1" <<'PYEOF'
+import glob, json, os, sys
+directory, start = sys.argv[1], int(sys.argv[2])
+records = []
+for path in glob.glob(os.path.join(directory, "*.jsonl")):
+    for line in open(path, encoding="utf-8", errors="replace"):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get("ms", 0) >= start:
+            records.append(record)
+records.sort(key=lambda record: record.get("ms", 0))
+settled = [r for r in records if r.get("kind") == "child" and r.get("event") == "settled"]
+if not settled:
+    print("   no child reported")
+    sys.exit(1)
+report = settled[0]
+task, at = report.get("task"), report["ms"]
+turns = [r for r in records if r.get("kind") == "turn" and r.get("task") == task]
+for r in sorted(turns + [report], key=lambda r: r["ms"]):
+    print(f"   +{(r['ms'] - start) / 1000:6.1f}s {r.get('kind')} {r.get('event')}")
+ends = [r["ms"] for r in turns if r.get("event") == "terminal" and r["ms"] < at]
+if not ends:
+    print("   the child reported before the turn that started it ended")
+    sys.exit(2)
+between = [r for r in turns if r.get("event") == "start" and ends[-1] < r["ms"] < at]
+after = [r for r in turns if r.get("event") == "start" and at <= r["ms"] <= at + 10_000]
+sys.exit(0 if not between and after else 3)
+PYEOF
+}
+# A model may skip the sleep, so the explorer reports before the turn ends and
+# nothing is shown either way: then the scenario runs again, three times at most.
+verdict=1
+for attempt in 1 2 3; do
+  agent "$RX/p" "c3-$attempt"
+  since=$(date +%s%3N)
+  "$HA" send "c3-$attempt" "/goal Kiểm thử harness: dùng tool delegate với wait=false giao cho đúng một agent role explorer nhiệm vụ: gọi run_process đúng một lần với executable python, args -c và import time; time.sleep(30) (bắt buộc chạy lệnh này, không được bỏ qua), rồi trả lời WAITED. Sau khi giao thì kết thúc lượt ngay, trả lời đúng một dòng ĐÃ-GIAO. Khi nhận được kết quả WAITED của explorer thì gọi goal_complete." >/dev/null 2>&1
+  for _ in $(seq 1 60); do
+    waited "$since" >/dev/null 2>&1; [ $? -ne 1 ] && break
+    sleep 5
+  done
+  sleep 15
+  echo "   attempt $attempt:"
+  waited "$since"; verdict=$?
+  "$HA" send "c3-$attempt" "/goal clear" --wait >/dev/null 2>&1
+  "$HA" shutdown --force >/dev/null 2>&1
+  [ "$verdict" -ne 1 ] && [ "$verdict" -ne 2 ] && break
 done
-for _ in $(seq 1 60); do
-  "$HA" send c3 "/goal status" --wait 2>&1 | grep -qiE "status: *(complete|done)|no goal" && break
-  sleep 5
-done
-"$HA" send c3 "/goal status" --wait 2>&1 | head -4 | sed 's/^/   /'
-notices | grep -iE "goal" | sed 's/^/   notice: /' | head -8
-check "the goal waited while the explorer worked" 'notices | grep -q "child(ren) still working; their reports carry the goal on"'
-check "no turn ran just to nudge it: not continued while it worked" '! notices | grep -q "goal not complete yet; continuing (turn 2)"'
-check "the explorer's report carried the goal to its end" '"$HA" send c3 "/goal status" --wait 2>&1 | grep -qiE "status: *(complete|done)|no goal"'
-"$HA" shutdown --force >/dev/null 2>&1
+check "the explorer outlived the turn that delegated" '[ "$verdict" -ne 1 ] && [ "$verdict" -ne 2 ]'
+check "no turn started while it worked; its report started the next" '[ "$verdict" -eq 0 ]'
 
 echo "################ 4. a review's record names its task"
+# A review after every turn, as knowledge.sh asks for one.
+"$PY" -c "import json,os,sys; p=sys.argv[1]; d=json.load(open(p)) if os.path.exists(p) else {}; d['autoRefine']={'turnInterval': 1}; json.dump(d, open(p,'w'))" "$HA_HOME/settings.json"
 (cd "$RX/p" && HA_AUTO_REFINE=on "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto "Trả lời đúng một dòng: MOC-REVIEW" > "$RX/exec.out" 2>&1)
 tail -3 "$RX/exec.out" | sed 's/^/   /'
 reviews() {
@@ -114,5 +158,88 @@ for line in sys.stdin:
 reviews | sed 's/^/   review: /'
 check "the exec ran a review and recorded it" '[ -n "$(reviews)" ]'
 check "every review record names a task id and stays small" 'reviews | awk "{ if (\$1 > 8000 || \$3 !~ /^task_/) bad=1 } END { exit bad }"'
+
+echo "################ 5. a child of an earlier turn keeps the mode the user chose"
+# The turn starts asking; the user switches to full-auto while it runs, and it
+# delegates under the switch. Its child kept that turn's policy (ask), and the
+# next turn cleared the switch: the child's later read asked the user.
+(cd "$RX/p" && "$PROBE" "$RX/c5.bin" "$HA" "wait:9000" -- chat --model "$MODEL" "${TH[@]}" --approval ask >/dev/null)
+id=$("$HA" list --json | "$PY" -c "import json,sys; d=json.load(sys.stdin); a=d if isinstance(d,list) else d.get('agents',d); print([x['id'] for x in a if not x.get('name')][0])")
+"$HA" rename "$id" c5 >/dev/null
+since=$(date +%s%3N)
+"$HA" send c5 "Kiểm thử harness: dùng tool delegate với wait=false giao cho đúng một agent role explorer nhiệm vụ: trước hết gọi run_process đúng một lần với executable python, args -c và import time; time.sleep(60) (bắt buộc chạy, không bỏ qua); sau đó gọi read_file với path README.md và trả lời đúng dòng đầu tiên của file. Giao xong thì kết thúc lượt ngay, trả lời đúng một dòng ĐÃ-GIAO." >/dev/null 2>&1
+sleep 2
+"$HA" send c5 "/permissions full-auto" --wait 2>&1 | sed 's/^/   /'
+# The first turn's end, then a second turn while the explorer sleeps.
+records() {
+  cat "$D"/*.jsonl 2>/dev/null | "$PY" -c "
+import json, sys
+since, kind, event = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+for line in sys.stdin:
+    try: r = json.loads(line)
+    except ValueError: continue
+    if r.get('ms', 0) >= since and r.get('kind') == kind and r.get('event') == event:
+        print(r.get('msg', '').replace(chr(10), ' ')[:300])" "$since" "$1" "$2"
+}
+for _ in $(seq 1 60); do
+  [ -n "$(records turn terminal)" ] && break
+  sleep 3
+done
+say c5 "Trả lời đúng một dòng: LUOT-HAI" | tail -1 | sed 's/^/   /'
+report=""
+for _ in $(seq 1 40); do
+  report=$(records child settled)
+  [ -n "$report" ] && break
+  sleep 5
+done
+echo "   report: ${report:-none}"
+check "the second turn ran while the explorer slept" 'last | grep -q LUOT-HAI'
+check "the explorer read README.md without asking: its report has the first line" 'echo "$report" | grep -q "# p"'
+check "no approval expired" '[ -z "$(records approval expired)" ]'
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 6. every child runs at once"
+# Three ran at once and the rest waited, shown working with no call made. Five
+# explorers that each wait: more than three must be in their calls together.
+agent "$RX/p" c6
+since=$(date +%s%3N)
+say c6 "Kiểm thử harness: dùng tool delegate với wait=false giao cùng lúc cho đúng 5 agent role explorer, mỗi agent cùng một nhiệm vụ: gọi run_process đúng một lần với executable python, args -c và import time; time.sleep(40) (bắt buộc chạy), rồi trả lời DONE. Giao xong cả 5 thì trả lời đúng một dòng ĐÃ-GIAO-5." | tail -1 | sed 's/^/   /'
+sleep 60
+together=$("$PY" - "$D" "$since" <<'PYEOF'
+import glob, json, os, sys
+directory, since = sys.argv[1], int(sys.argv[2])
+spans = {}
+root = None
+for path in glob.glob(os.path.join(directory, "*.jsonl")):
+    for line in open(path, encoding="utf-8", errors="replace"):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("ms", 0) < since:
+            continue
+        if r.get("kind") == "child" and r.get("event") == "settled":
+            root = r.get("task")
+        if r.get("kind") == "provider" and r.get("event") == "call":
+            end = r["ms"]
+            start = end - r.get("fields", {}).get("duration_ms", 0)
+            low, high = spans.get(r.get("task"), (start, end))
+            spans[r.get("task")] = (min(low, start), max(high, end))
+children = {task: span for task, span in spans.items() if task != root}
+# The root's own calls are the earliest task's: drop the task of the first call.
+first = min(spans, key=lambda task: spans[task][0]) if spans else None
+children.pop(first, None)
+points = sorted([(low, 1) for low, _ in children.values()] + [(high, -1) for _, high in children.values()])
+most = running = 0
+for _, step in points:
+    running += step
+    most = max(most, running)
+print(len(children), most)
+PYEOF
+)
+echo "   children, most at once: $together"
+check "five explorers ran" '[ "${together%% *}" -ge 5 ]'
+check "more than three ran at once" '[ "${together##* }" -gt 3 ]'
+"$HA" shutdown --force >/dev/null 2>&1
 
 result

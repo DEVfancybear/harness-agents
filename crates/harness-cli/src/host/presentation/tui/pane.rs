@@ -273,7 +273,11 @@ fn lines(pane: View<'_>, width: usize, height: usize, theme: &Theme) -> Vec<Line
     }
     if body.is_empty() && top.is_empty() {
         body.push(Line::from(Span::styled(
-            "waiting for its first call…",
+            if pane.activity.queued {
+                "queued: waiting for a place to run ([agents] max_workers)"
+            } else {
+                "waiting for its first call…"
+            },
             theme.dim,
         )));
     }

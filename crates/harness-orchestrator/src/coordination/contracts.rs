@@ -25,6 +25,10 @@ pub const DEFAULT_MAX_WORKERS: u32 = 3;
 /// [`SchedulerConfig::max_queued_workers`] for why a bound exists at all.
 pub const DEFAULT_MAX_QUEUED_WORKERS: u32 = 8;
 pub const DEFAULT_MAX_DEPTH: u32 = 2;
+/// A [`SchedulerConfig`] worker or queue bound that bounds nothing: an
+/// interactive session runs every child it starts at once, as prime-agent
+/// does, and the user limits it in `[agents] max_workers` if they want to.
+pub const UNBOUNDED_WORKERS: u32 = u32::MAX;
 pub const DEFAULT_MAX_MODEL_REQUESTS: u32 = 24;
 
 /// Typed P5 failure carrying a stable `ErrorCode` plus detail.
@@ -1142,7 +1146,10 @@ impl Default for SchedulerConfig {
 
 impl SchedulerConfig {
     pub fn validate(&self) -> Result<(), OrchestratorError> {
-        if self.max_concurrent_workers == 0 || self.max_concurrent_workers > DEFAULT_MAX_WORKERS {
+        if self.max_concurrent_workers == 0
+            || (self.max_concurrent_workers > DEFAULT_MAX_WORKERS
+                && self.max_concurrent_workers != UNBOUNDED_WORKERS)
+        {
             return Err(OrchestratorError::new(
                 ErrorCode::BudgetExhausted,
                 format!(
@@ -1160,7 +1167,9 @@ impl SchedulerConfig {
                 ),
             ));
         }
-        if self.max_queued_workers > DEFAULT_MAX_QUEUED_WORKERS {
+        if self.max_queued_workers > DEFAULT_MAX_QUEUED_WORKERS
+            && self.max_queued_workers != UNBOUNDED_WORKERS
+        {
             return Err(OrchestratorError::new(
                 ErrorCode::DelegationQueueFull,
                 format!(

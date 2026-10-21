@@ -418,6 +418,9 @@ pub struct ResolvedConfig {
     pub bell: bool,
     /// `[agents] default_model`: the model a delegated child runs on by default.
     pub agents_default_model: Option<String>,
+    /// `[agents] max_workers`: how many delegated children run at once;
+    /// `None` or 0 runs them all at once.
+    pub agents_max_workers: Option<u32>,
     /// `[queue] steering_mode` and `follow_up_mode`, as written.
     pub queue_modes: (Option<String>, Option<String>),
     /// `[routing]`, merged across layers key by key.
@@ -455,6 +458,7 @@ pub fn resolve_layers(
     let mut notify_command = None;
     let mut bell = false;
     let mut agents_default_model: Option<String> = None;
+    let mut agents_max_workers: Option<u32> = None;
     let mut queue_modes: (Option<String>, Option<String>) = (None, None);
     let mut routing = Routing::new();
     let mut verify = super::verify::Verify::default();
@@ -535,6 +539,7 @@ pub fn resolve_layers(
         )?;
         apply_agents(
             &mut agents_default_model,
+            &mut agents_max_workers,
             config,
             ConfigLayer::User,
             &mut entries,
@@ -632,6 +637,7 @@ pub fn resolve_layers(
             )?;
             apply_agents(
                 &mut agents_default_model,
+                &mut agents_max_workers,
                 &config,
                 ConfigLayer::Project,
                 &mut entries,
@@ -712,6 +718,7 @@ pub fn resolve_layers(
         }
         apply_agents(
             &mut agents_default_model,
+            &mut agents_max_workers,
             &config,
             ConfigLayer::Local,
             &mut entries,
@@ -911,6 +918,7 @@ pub fn resolve_layers(
         project_trusted: trusted,
         bell,
         agents_default_model,
+        agents_max_workers,
         queue_modes,
         routing,
         verify,
@@ -1103,6 +1111,7 @@ fn apply_verify(
 
 fn apply_agents(
     default_model: &mut Option<String>,
+    max_workers: &mut Option<u32>,
     config: &HarnessConfigV2,
     layer: ConfigLayer,
     entries: &mut BTreeMap<String, ConfigExplainEntry>,
@@ -1116,6 +1125,15 @@ fn apply_agents(
     {
         *default_model = Some(model.to_owned());
         set_explain(entries, "agents.default_model", model, layer, None);
+    }
+    if let Some(workers) = config.agents.as_ref().and_then(|agents| agents.max_workers) {
+        *max_workers = Some(workers);
+        let shown = if workers == 0 {
+            "0 (every child at once)".to_owned()
+        } else {
+            workers.to_string()
+        };
+        set_explain(entries, "agents.max_workers", &shown, layer, None);
     }
 }
 
@@ -2004,6 +2022,35 @@ mod tests {
                 .reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("notice"))
+        );
+    }
+
+    /// `[agents] max_workers` limits how many children run at once; unset,
+    /// every child runs at once.
+    #[test]
+    fn agents_max_workers_is_read_and_unset_by_default() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).expect("project dir");
+        let user = temp.path().join("user.toml");
+        let resolve = |text: &str| {
+            std::fs::write(&user, text).expect("user config");
+            resolve_layers(
+                &user,
+                &root,
+                &super::super::paths::LaunchEnvironment::default(),
+                &ConfigOverrides::default(),
+            )
+            .expect("configuration resolves")
+        };
+        assert_eq!(resolve("schema_version = 2\n").agents_max_workers, None);
+        assert_eq!(
+            resolve("schema_version = 2\n[agents]\nmax_workers = 5\n").agents_max_workers,
+            Some(5)
+        );
+        assert_eq!(
+            resolve("schema_version = 2\n[agents]\nmax_workers = 0\n").agents_max_workers,
+            Some(0)
         );
     }
 

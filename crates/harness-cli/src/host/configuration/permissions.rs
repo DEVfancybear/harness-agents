@@ -231,6 +231,7 @@ mod tests {
             project_trusted: false,
             bell: false,
             agents_default_model: None,
+            agents_max_workers: None,
             queue_modes: (None, None),
             routing: crate::interactive::config::Routing::default(),
             verify: crate::interactive::verify::Verify::default(),

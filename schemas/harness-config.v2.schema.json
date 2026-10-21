@@ -10,6 +10,16 @@
             "string",
             "null"
           ]
+        },
+        "max_workers": {
+          "default": null,
+          "description": "How many delegated children run at once; unset or 0 runs every child at\nonce, the default. Children past the number wait for one to finish.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "type": "object"

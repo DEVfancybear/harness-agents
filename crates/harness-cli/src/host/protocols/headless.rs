@@ -583,6 +583,7 @@ pub async fn run_with(
         )
         .ok()?;
         agents.bind_ledger(task_id.as_str());
+        agents.set_max_workers(resolved_config.agents_max_workers.unwrap_or(0));
         Some((agents, config))
     });
     let delegate_host = agents.as_ref().map(|(agents, config)| {

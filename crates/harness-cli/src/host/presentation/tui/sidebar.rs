@@ -69,6 +69,9 @@ pub const fn width(columns: u16, enabled: bool) -> u16 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Status {
     Working,
+    /// Waiting for a place to run under `[agents] max_workers`: it has not
+    /// made a call yet, so it is not drawn working.
+    Queued,
     Blocked,
     Done,
     Failed,
@@ -81,6 +84,7 @@ impl Status {
     pub const fn word(self) -> &'static str {
         match self {
             Self::Working => "working",
+            Self::Queued => "queued",
             Self::Blocked => "blocked",
             Self::Done => "done",
             Self::Failed => "failed",
@@ -92,6 +96,7 @@ impl Status {
     fn glyph(self, tick: u64) -> &'static str {
         match self {
             Self::Working => Theme::spinner(tick),
+            Self::Queued => "◌",
             Self::Blocked => "◉",
             Self::Done => "✓",
             Self::Failed => "✗",
@@ -106,7 +111,7 @@ impl Status {
             Self::Working => theme.warning,
             Self::Blocked | Self::Failed => theme.error,
             Self::Done => theme.tool_ok,
-            Self::Stopped | Self::Idle => theme.dim,
+            Self::Queued | Self::Stopped | Self::Idle => theme.dim,
         }
     }
 
@@ -114,7 +119,7 @@ impl Status {
     const fn rank(self) -> u8 {
         match self {
             Self::Working => 0,
-            Self::Blocked => 1,
+            Self::Blocked | Self::Queued => 1,
             Self::Failed => 2,
             Self::Done | Self::Stopped | Self::Idle => 3,
         }
@@ -154,6 +159,7 @@ pub fn main_status(state: &UiState) -> Status {
 #[must_use]
 pub fn child_status(state: &UiState, child: &ChildActivity) -> Status {
     match child.state {
+        ChildRunState::Running if child.queued => Status::Queued,
         ChildRunState::Running => Status::Working,
         ChildRunState::Failed => Status::Failed,
         ChildRunState::Stopped => Status::Stopped,
@@ -904,6 +910,7 @@ mod tests {
         ]
         .into_iter()
         .map(|(name, status)| SubagentInfo {
+            queued: false,
             name: name.to_owned(),
             status: status.to_owned(),
             model: "opencode-go/deepseek-v4.1-flash".to_owned(),
@@ -1018,6 +1025,27 @@ mod tests {
         assert!(text.contains("failed"), "{text}");
     }
 
+    /// A child waiting for a place under `[agents] max_workers` has made no
+    /// call: it was drawn working beside the ones that were.
+    #[test]
+    fn a_queued_child_is_drawn_queued_not_working() {
+        let mut run = state(AppPhase::Running);
+        run.child_activity = vec![ChildActivity {
+            name: "verifier-cde190d4".to_owned(),
+            state: crate::interactive::events::ChildRunState::Running,
+            queued: true,
+            ..ChildActivity::default()
+        }];
+        let status = super::child_status(&run, &run.child_activity[0]);
+        assert_eq!(status, Status::Queued);
+        assert_eq!(status.word(), "queued");
+        run.child_activity[0].queued = false;
+        assert_eq!(
+            super::child_status(&run, &run.child_activity[0]),
+            Status::Working
+        );
+    }
+
     /// Seen in a later session: the sidebar said `main working` and
     /// `explorer working · 114 tools`, its pane "2 explorer · working", while
     /// the agents view said "22 subagents (0 running, 7 failed)".
@@ -1039,6 +1067,7 @@ mod tests {
         ];
         let rows = (0..22)
             .map(|index| SubagentInfo {
+                queued: false,
                 name: if index == 0 {
                     "explorer-0d1e2f3a".to_owned()
                 } else {

@@ -731,6 +731,10 @@ pub struct ChildActivity {
     pub model: String,
     #[serde(default)]
     pub thinking: Option<String>,
+    /// Waiting for a place to run (`[agents] max_workers`): listed as
+    /// running, drawn as queued.
+    #[serde(default)]
+    pub queued: bool,
 }
 
 impl ChildActivity {
@@ -807,10 +811,12 @@ pub fn sync_child_states(
                 if child.state != state
                     || child.model != row.model
                     || child.thinking != row.thinking
+                    || child.queued != row.queued
                 {
                     child.state = state;
                     child.model.clone_from(&row.model);
                     child.thinking.clone_from(&row.thinking);
+                    child.queued = row.queued;
                     changed = true;
                 }
             }
@@ -820,6 +826,7 @@ pub fn sync_child_states(
                     state,
                     model: row.model.clone(),
                     thinking: row.thinking.clone(),
+                    queued: row.queued,
                     ..ChildActivity::default()
                 });
                 changed = true;

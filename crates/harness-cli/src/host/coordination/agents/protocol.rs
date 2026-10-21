@@ -183,6 +183,10 @@ pub struct SubagentInfo {
     pub thinking: Option<String>,
     /// 1 for the agent's own children.
     pub depth: u32,
+    /// Waiting for a place to run (`[agents] max_workers`): its status still
+    /// says running, as a child that will run is not done.
+    #[serde(default)]
+    pub queued: bool,
     /// What the child was spawned with (prime-agent's spawn program).
     pub program: String,
 }
