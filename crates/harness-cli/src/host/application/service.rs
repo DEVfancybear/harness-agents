@@ -4068,18 +4068,27 @@ fn catalog_models_scoped(
             providers.push(model.provider.clone());
         }
     }
+    // Asked once per provider and key, not per model: each answer reads the
+    // credential file again, and a catalog of a few hundred models made every
+    // menu refresh at a turn's end take 20-40 ms on the agent's own thread,
+    // where a terminal's key waited for it.
+    let mut keyed = std::collections::HashMap::new();
     providers
         .iter()
         .flat_map(|provider| catalog.for_provider(provider))
         .filter(|model| {
-            credentials::source_for_scope(
-                environment,
-                data_dir,
-                &model.provider,
-                &model.key_env(),
-                scope,
-            )
-            .is_some()
+            *keyed
+                .entry((model.provider.clone(), model.key_env()))
+                .or_insert_with(|| {
+                    credentials::source_for_scope(
+                        environment,
+                        data_dir,
+                        &model.provider,
+                        &model.key_env(),
+                        scope,
+                    )
+                    .is_some()
+                })
         })
         .cloned()
         .collect()

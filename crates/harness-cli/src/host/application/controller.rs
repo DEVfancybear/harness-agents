@@ -288,6 +288,10 @@ pub struct InteractiveController {
     run_started_at: Option<Instant>,
     last_run_elapsed: Duration,
     last_request: Option<String>,
+    /// The slash menu's skills and prompt commands are read again before the
+    /// menu is next offered, not at every turn's end: reading them is a scan
+    /// of the skill folders, on the thread a terminal's key waits for.
+    menu_stale: bool,
     /// Why the host is not using the TUI, when it fell back to plain.
     fallback_reason: Option<String>,
     /// Tick counter, so the spinner animates and an idle loop stays still.
@@ -440,6 +444,7 @@ impl InteractiveController {
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,
             last_request: None,
+            menu_stale: true,
             fallback_reason: None,
             tick: 0,
             exit_after_run: false,
@@ -535,10 +540,16 @@ impl InteractiveController {
         self.service.heartbeat_count()
     }
 
-    /// The model this agent's turns use, as the session port names it.
+    /// The model this agent's turns use, as the session port names it. The
+    /// header's `Service:` line holds it, kept current wherever the model
+    /// changes; asking the port resolved the configuration from its files, and
+    /// a background agent asked once a second.
     #[must_use]
     pub fn model_label(&self) -> String {
-        self.service.label()
+        self.header
+            .iter()
+            .find_map(|line| line.strip_prefix("Service: "))
+            .map_or_else(|| self.service.label(), str::to_owned)
     }
 
     /// The conversation the agent is in, once it has one.
@@ -882,10 +893,15 @@ impl InteractiveController {
         self
     }
 
-    #[cfg(test)]
     #[must_use]
     pub const fn phase(&self) -> AppPhase {
         self.phase
+    }
+
+    /// What the user last asked, as the agents view lists it.
+    #[must_use]
+    pub fn last_request(&self) -> Option<&str> {
+        self.last_request.as_deref()
     }
 
     /// How many automatic continuations one request may use.
@@ -1129,12 +1145,26 @@ impl InteractiveController {
     /// What the slash menu offers beyond the built-ins: the skills and prompt
     /// commands on disk now. Skills can appear mid-session (`/refine` writes them),
     /// so this runs at boot, after `/reload` and after every turn.
+    /// Read the skills and prompt commands for the slash menu when a key may
+    /// open it and they may have changed since they were read.
+    fn fresh_menu(&mut self, key: &Key) {
+        let opens = match key {
+            Key::Char('/') => true,
+            Key::Paste(text) | Key::SetDraft(text) => text.contains('/'),
+            _ => self.editor.text().contains('/'),
+        };
+        if self.menu_stale && opens && !self.plain {
+            self.menu_stale = false;
+            self.editor.set_menu_commands(self.service.menu_commands());
+        }
+    }
+
     fn refresh_menu(&mut self) {
         self.refresh_status();
         if self.plain {
             return;
         }
-        self.editor.set_menu_commands(self.service.menu_commands());
+        self.menu_stale = true;
         let stored = self.service.stored_credentials();
         self.editor
             .set_argument_options("/login", login_options(&stored, true));
@@ -1199,6 +1229,7 @@ impl InteractiveController {
         if key == Key::Redraw {
             return vec![Effect::Redraw];
         }
+        self.fresh_menu(&key);
         // prime-agent's `app.editor.external`: the prompt's draft, while no
         // approval or question holds the keyboard.
         if self.pending_approval.is_none() && self.pending_question.is_none() {
@@ -1555,7 +1586,18 @@ impl InteractiveController {
 
     /// Move everything the session port produced into effects.
     pub fn pump_events(&mut self) -> Vec<Effect> {
+        self.pump_events_timed(None)
+    }
+
+    /// [`Self::pump_events`], telling `note` what each part took: the
+    /// heartbeats, each session event by its kind, and the stream's overflow.
+    /// A background agent's slow-step log reads it.
+    pub fn pump_events_timed(&mut self, mut note: Option<&mut StepTimer<'_>>) -> Vec<Effect> {
+        let begun = std::time::Instant::now();
         let mut effects = self.deliver_heartbeats();
+        if let Some(note) = note.as_mut() {
+            note("heartbeats", begun.elapsed());
+        }
         if let Some(level) = self.initial_thinking.take()
             && let Err(message) = self.service.set_thinking(&level)
         {
@@ -1584,8 +1626,15 @@ impl InteractiveController {
             return effects;
         }
         for event in events {
+            // The event's kind, only when it is asked for: naming it formats it.
+            let kind = note.is_some().then(|| event_kind(&event));
+            let begun = std::time::Instant::now();
             self.apply_event(event, &mut effects);
+            if let (Some(note), Some(kind)) = (note.as_mut(), kind) {
+                note(&kind, begun.elapsed());
+            }
         }
+        let begun = std::time::Instant::now();
         // Plain output is an append-only transcript, so it consumes every delta.
         // The TUI keeps the newest rows in its live block and only moves overflow
         // into scrollback. Boundary events still call `flush_stream` explicitly
@@ -1594,6 +1643,9 @@ impl InteractiveController {
             self.flush_stream(&mut effects);
         } else {
             self.flush_stream_overflow(&mut effects);
+        }
+        if let Some(note) = note.as_mut() {
+            note("stream", begun.elapsed());
         }
         effects.push(Effect::Redraw);
         effects
@@ -6522,6 +6574,18 @@ fn login_options(stored: &[(String, &'static str)], web_search: bool) -> Vec<(St
         .collect()
 }
 
+/// Told what each part of [`InteractiveController::pump_events_timed`] took.
+pub type StepTimer<'a> = dyn FnMut(&str, std::time::Duration) + 'a;
+
+/// A session event's kind, as its variant is named (`ChildOutput`).
+fn event_kind(event: &SessionEvent) -> String {
+    let text = format!("{event:?}");
+    text.split([' ', '{', '('])
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     /// The login offers seen while logged in: the boot hint and `/login`'s
@@ -10159,6 +10223,82 @@ Command: \"npm run build\""
             );
             drop(temp);
         }
+    }
+
+    /// A turn's end no longer scans the skill folders for the slash menu: a
+    /// background agent's terminal waited on that scan for each key typed
+    /// then. The menu is read when a key may open it, once per change.
+    #[test]
+    fn the_slash_menu_reads_skills_when_it_opens_not_at_every_turn_end() {
+        struct MenuPort {
+            recorded: RecordingPort,
+            reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl SessionPort for MenuPort {
+            fn label(&self) -> String {
+                "m via https://example.test".to_owned()
+            }
+            fn submit(&mut self, request: SubmitRequest) {
+                self.recorded.submit(request);
+            }
+            fn cancel(&mut self) {
+                self.recorded.cancel();
+            }
+            fn answer(&mut self, request_id: &str, decision: ApprovalDecision) -> bool {
+                self.recorded.answer(request_id, decision)
+            }
+            fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
+                self.recorded.resume(session_id)
+            }
+            fn limits(&self) -> TurnBounds {
+                self.recorded.limits()
+            }
+            fn menu_commands(&self) -> Vec<super::super::commands::MenuCommand> {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                vec![super::super::commands::MenuCommand {
+                    name: "/skill:demo".to_owned(),
+                    description: "a demo skill".to_owned(),
+                    argument_hint: String::new(),
+                    tag: "skill",
+                }]
+            }
+        }
+
+        let (_temp, context) = context(true);
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut controller = InteractiveController::new(
+            &context,
+            Box::new(MenuPort {
+                recorded: RecordingPort::default(),
+                reads: std::sync::Arc::clone(&reads),
+            }),
+            SessionChannel::new(),
+            false,
+        );
+        let _ = controller.boot_lines();
+        let count = || reads.load(std::sync::atomic::Ordering::SeqCst);
+        let before = count();
+        for _ in 0..3 {
+            controller.refresh_menu();
+        }
+        assert_eq!(count(), before, "a turn's end read the skills");
+        let _ = controller.handle_key(Key::Char('/'));
+        assert_eq!(count(), before + 1);
+        assert!(
+            controller
+                .ui_state()
+                .suggestions
+                .iter()
+                .any(|item| item.label.starts_with("/skill:demo")),
+            "{:?}",
+            controller.ui_state().suggestions
+        );
+        let _ = controller.handle_key(Key::Char('s'));
+        assert_eq!(count(), before + 1, "read once until something changes");
+        controller.refresh_menu();
+        let _ = controller.handle_key(Key::Char('k'));
+        assert_eq!(count(), before + 2, "read again after a turn ended");
     }
 
     /// Choosing a model or a thinking level must reach the screen: the status row

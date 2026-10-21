@@ -1196,11 +1196,15 @@ fn run_loop_inner(
             Effect::EditExternally(draft) => Some(draft.clone()),
             _ => None,
         });
+        if frames.is_some() {
+            timing.effects = effect_kinds(&effects);
+        }
         let begun = Instant::now();
         renderer
             .begin_update()
             .map_err(|error| terminal_error(&error))?;
         let step = apply(renderer, effects);
+        timing.applied = begun.elapsed();
         let mut built = Duration::ZERO;
         let drawn = match step {
             Ok(Step::Continue) if redraw => {
@@ -1254,15 +1258,51 @@ struct Timing {
     key: Duration,
     /// Taking the session's events (an attached terminal's frames).
     pump: Duration,
+    /// Applying the effects: history in, a reprint, a restore.
+    applied: Duration,
     built: Duration,
     frame: Duration,
+    /// What the frame applied, by kind and count: `History×3 Redraw`.
+    effects: String,
+}
+
+/// The effects of a frame by kind, for [`FrameLog`].
+fn effect_kinds(effects: &[Effect]) -> String {
+    let mut kinds: Vec<(&str, usize)> = Vec::new();
+    for effect in effects {
+        let kind = match effect {
+            Effect::History(_) => "History",
+            Effect::Stream(_) => "Stream",
+            Effect::Thinking(_) => "Thinking",
+            Effect::Reprint(_) => "Reprint",
+            Effect::Restore(_) => "Restore",
+            Effect::Redraw => "Redraw",
+            _ => "Other",
+        };
+        match kinds.iter_mut().find(|(seen, _)| *seen == kind) {
+            Some((_, count)) => *count += 1,
+            None => kinds.push((kind, 1)),
+        }
+    }
+    kinds
+        .iter()
+        .map(|(kind, count)| {
+            if *count == 1 {
+                (*kind).to_owned()
+            } else {
+                format!("{kind}×{count}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// `HA_FRAME_LOG=<file>`: one line per frame, for finding what makes the
 /// screen lag: when the frame ended (ms since the app started), then in
 /// microseconds the key's round trip, taking the events, building the
-/// state, the whole frame, and the input's latency to the painted frame
-/// (`-` when no input caused it): `1520 0 40 180 2410 2650`.
+/// state, the whole frame, the input's latency to the painted frame (`-`
+/// when no input caused it) and applying the effects, then the effects by
+/// kind: `1520 0 40 180 2410 2650 90 History×2,Redraw`.
 struct FrameLog {
     file: std::io::BufWriter<std::fs::File>,
     started: Instant,
@@ -1289,12 +1329,18 @@ impl FrameLog {
             .map_or_else(|| "-".to_owned(), |at| at.elapsed().as_micros().to_string());
         let _ = writeln!(
             self.file,
-            "{} {} {} {} {} {latency}",
+            "{} {} {} {} {} {latency} {} {}",
             self.started.elapsed().as_millis(),
             timing.key.as_micros(),
             timing.pump.as_micros(),
             timing.built.as_micros(),
             timing.frame.as_micros(),
+            timing.applied.as_micros(),
+            if timing.effects.is_empty() {
+                "-"
+            } else {
+                &timing.effects
+            },
         );
         let _ = self.file.flush();
     }

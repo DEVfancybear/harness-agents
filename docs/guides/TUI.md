@@ -203,7 +203,9 @@ To see where a frame's time goes, set `HA_FRAME_LOG=<file>` for the terminal (on
 line per frame: when it ended in ms, then in microseconds the key's round trip to
 a background agent, taking its events, building the state, the whole frame, and
 the input's latency to the painted frame) and `HA_WORKER_LOG=<file>` for a
-background agent (each step of its loop that took 5 ms or more).
+background agent (each step of its loop that took 5 ms or more, a session event
+by its kind: `events:RunTerminal 10466`). A key typed in an attached terminal
+waits for the step the agent is in.
 
 - `/fullscreen` toggles it and saves `terminal.fullscreen` in `settings.json`;
   `terminal.fullscreenMouse` turns mouse tracking off, and `terminal.sidebar:

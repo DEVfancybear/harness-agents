@@ -1260,7 +1260,20 @@ impl Agent {
                 return;
             }
             let begun = Instant::now();
-            let pumped = self.controller.pump_events();
+            let pumped = if slow.on() {
+                let mut parts = Vec::new();
+                let pumped =
+                    self.controller
+                        .pump_events_timed(Some(&mut |part: &str, took: Duration| {
+                            parts.push((part.to_owned(), took));
+                        }));
+                for (part, took) in parts {
+                    slow.took(&format!("events:{part}"), took);
+                }
+                pumped
+            } else {
+                self.controller.pump_events()
+            };
             slow.note("events", begun);
             let ticked = if last_tick.elapsed() >= TICK {
                 last_tick = Instant::now();
@@ -1415,7 +1428,10 @@ impl Agent {
 
     fn refresh_status(&mut self) {
         self.last_status = Instant::now();
-        let state = self.controller.ui_state();
+        // The phase and the last request, not the whole view: building it
+        // copied every child's recent lines once a second.
+        let phase = self.controller.phase();
+        let last_request = self.controller.last_request().map(str::to_owned);
         let busy = self.controller.is_busy();
         let scheduled = self.controller.has_scheduled_work();
         let conversation = self.controller.conversation_id();
@@ -1428,11 +1444,11 @@ impl Agent {
             moved = status.info.conversation != conversation;
             status.info.subagents = subagents;
             status.info.heartbeats = heartbeats;
-            state.phase.label().clone_into(&mut status.info.status);
+            phase.label().clone_into(&mut status.info.status);
             status.info.busy = busy;
             status.info.scheduled = scheduled;
             status.info.attached = !self.clients.is_empty();
-            status.info.last_request = state.last_request;
+            status.info.last_request = last_request;
             status.info.title = self.controller.session_title();
             status.info.conversation = conversation;
             status.info.model = model;
@@ -1607,9 +1623,16 @@ impl SlowLog {
         }
     }
 
+    const fn on(&self) -> bool {
+        self.file.is_some()
+    }
+
     fn note(&mut self, step: &str, begun: Instant) {
+        self.took(step, begun.elapsed());
+    }
+
+    fn took(&mut self, step: &str, took: Duration) {
         use std::io::Write as _;
-        let took = begun.elapsed();
         if let Some(file) = &mut self.file
             && took >= Duration::from_millis(5)
         {
