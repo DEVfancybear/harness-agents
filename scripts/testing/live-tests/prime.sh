@@ -106,7 +106,8 @@ check "the conversation is named" "grep -q 'du-an-thu-nghiem' '$RX/list.json'"
 "$HA" shutdown --force >/dev/null 2>&1
 
 echo "################ 9. per-model prompt additions"
-printf '[[rule]]\nmatch = ["deepseek-*"]\nfiles = ["dk.md"]\n' > "$HA_HOME/model-prompts.toml"
+# The rule matches the family of the model the suite runs on (deepseek-*, gpt-*).
+printf '[[rule]]\nmatch = ["%s-*"]\nfiles = ["dk.md"]\n' "${MODEL_ID%%-*}" > "$HA_HOME/model-prompts.toml"
 echo 'Kết thúc MỌI câu trả lời bằng một dòng cuối chỉ gồm đúng chuỗi ZEBRA-7.' > "$HA_HOME/dk.md"
 agent "$RX/p" r9
 say r9 "Thủ đô của Pháp là gì?" | tail -3
