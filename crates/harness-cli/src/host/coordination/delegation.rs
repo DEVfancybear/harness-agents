@@ -285,6 +285,16 @@ impl ChildLaunch {
         self.for_request(requested, None)
     }
 
+    /// The launch of a child in `role`: a verifier or a reviewer judges the
+    /// parent's work, so with no model named it runs on the parent's model,
+    /// not the children's default (a cheaper model, or one out of quota,
+    /// judged the work of a stronger one).
+    fn for_role(&self, role: AgentRole, requested: Option<&str>) -> Result<Self, String> {
+        let parent = matches!(role, AgentRole::Verifier | AgentRole::Reviewer)
+            .then_some(self.model.reference.as_str());
+        self.for_model(requested.or(parent))
+    }
+
     /// This launch on the model and thinking level a child asked for, as
     /// prime-agent's `rlm.spawn(model=..., thinking=...)`: the thinking level
     /// asked for, else `subagentDefaultThinking`, else the parent's.
@@ -2584,7 +2594,7 @@ pub struct VerifierHandle {
 
 impl VerifierHandle {
     /// Run a verifier on `brief` - on `model` when one is named, else the
-    /// children's default - and return its answer.
+    /// parent's model - and return its answer.
     ///
     /// # Errors
     /// The verifier could not start, failed, or was stopped.
@@ -2609,7 +2619,7 @@ impl VerifierHandle {
         if self.cancellation.is_cancelled() {
             return Err("the verification was canceled before it started".to_owned());
         }
-        let launch = self.launch.for_model(model)?;
+        let launch = self.launch.for_role(AgentRole::Verifier, model)?;
         let (task_id, _) = self
             .agents
             .start(AgentRole::Verifier, brief, None, &launch, None)
@@ -2902,7 +2912,7 @@ impl DelegateTool {
         let (role, brief, wait) = Self::arguments(arguments)?;
         let launch = self
             .launch
-            .for_model(None)
+            .for_role(role, None)
             .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error))?;
         let (task_id, name) = self.agents.start(role, brief, None, &launch, None).await?;
         let payload = if wait {
@@ -5658,6 +5668,31 @@ pub(super) mod tests {
             launch.for_model(None).expect("default").model.reference,
             "known/default"
         );
+        // A verifier or a reviewer judges the parent's work: with no model named
+        // it runs on the parent's model, not the children's default.
+        for role in [super::AgentRole::Verifier, super::AgentRole::Reviewer] {
+            assert_eq!(
+                launch.for_role(role, None).expect("judge").model.reference,
+                "deepseek/fixture-model",
+                "{role:?}"
+            );
+        }
+        assert_eq!(
+            launch
+                .for_role(super::AgentRole::Verifier, Some("known/asked"))
+                .expect("asked")
+                .model
+                .reference,
+            "known/asked",
+            "a model named for the verifier wins"
+        );
+        for role in [super::AgentRole::Explorer, super::AgentRole::Coder] {
+            assert_eq!(
+                launch.for_role(role, None).expect("worker").model.reference,
+                "known/default",
+                "{role:?}"
+            );
+        }
         assert_eq!(
             launch
                 .for_model(Some("known/asked"))
