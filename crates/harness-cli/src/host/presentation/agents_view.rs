@@ -106,6 +106,9 @@ pub struct Row {
     pub kind: RowKind,
     /// Nesting depth: 0 for an agent row.
     pub depth: usize,
+    /// Why a search found the row, when the match is not in its title or
+    /// model: `request: …luna…`.
+    pub note: String,
 }
 
 impl Row {
@@ -270,6 +273,7 @@ pub fn rows_with(
             target: Target::Live(std::sync::Arc::clone(&shared)),
             kind: RowKind::Agent,
             depth: 0,
+            note: String::new(),
         });
         // prime-agent's subagent forest: one summary line, expanded to the
         // subagents, running first.
@@ -305,32 +309,13 @@ pub fn rows_with(
                 target: Target::Live(std::sync::Arc::clone(&shared)),
                 kind: RowKind::SubagentSummary,
                 depth: 1,
+                note: String::new(),
             });
             if expanded {
                 for child in &agent.subagents {
-                    let depth = usize::try_from(child.depth).unwrap_or(1).max(1) + 1;
-                    rows.push(Row {
-                        section,
-                        identity: format!("sub:{}:{}", agent.id, child.name),
-                        title: format!(
-                            "{} · {}",
-                            child.name,
-                            if child.queued {
-                                "queued"
-                            } else {
-                                &child.status
-                            }
-                        ),
-                        // The model and the thinking level it runs at.
-                        model: match child.thinking.as_deref() {
-                            Some(level) if level != "off" => format!("{} {level}", child.model),
-                            _ => child.model.clone(),
-                        },
-                        age: String::new(),
-                        target: Target::Live(std::sync::Arc::clone(&shared)),
-                        kind: RowKind::Subagent,
-                        depth,
-                    });
+                    let row = subagent_row(section, &shared, child);
+                    let depth = row.depth;
+                    rows.push(row);
                     if forest.programs.contains(&parent) && !child.program.trim().is_empty() {
                         rows.push(Row {
                             section,
@@ -341,6 +326,7 @@ pub fn rows_with(
                             target: Target::Live(std::sync::Arc::clone(&shared)),
                             kind: RowKind::Code,
                             depth: depth + 1,
+                            note: String::new(),
                         });
                     }
                 }
@@ -372,6 +358,7 @@ pub fn rows_with(
             target: Target::Saved(conversation.clone()),
             kind: RowKind::Agent,
             depth: 0,
+            note: String::new(),
         });
     }
     // A stable sort: a forest stays under its agent.
@@ -380,48 +367,284 @@ pub fn rows_with(
     if query.is_empty() {
         return rows;
     }
-    let mut ranked = rows
-        .into_iter()
-        .filter(|row| row.kind == RowKind::Agent)
-        .filter_map(|row| {
-            let haystack = search_text(&row, saved);
-            super::commands::fuzzy_score(&fold(query), &haystack).map(|score| (score, row))
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|(left, _), (right, _)| left.total_cmp(right));
-    ranked.into_iter().map(|(_, row)| row).collect()
+    search(rows, saved, &tokens(query))
 }
 
-/// What a search reads of a row: its title, model and id, and for an agent
-/// its last request and its conversation's saved title, without accents
-/// (`du an` finds `dự án`).
-fn search_text(row: &Row, saved: &[SavedConversation]) -> String {
-    let mut text = format!("{} {} {}", row.title, row.model, row.identity);
-    if let Target::Live(listed) = &row.target {
-        let agent = &listed.agent;
-        for extra in [
-            &agent.last_request,
-            &agent.title,
-            &agent.name,
-            &agent.conversation,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            text.push(' ');
-            text.push_str(extra);
+/// A subagent's row under its agent: its name and state, the model and the
+/// thinking level it runs at.
+fn subagent_row(
+    section: Section,
+    shared: &std::sync::Arc<client::Listed>,
+    child: &super::agents::protocol::SubagentInfo,
+) -> Row {
+    Row {
+        section,
+        identity: format!("sub:{}:{}", shared.agent.id, child.name),
+        title: format!("{} · {}", child.name, child_state(child)),
+        model: match child.thinking.as_deref() {
+            Some(level) if level != "off" => format!("{} {level}", child.model),
+            _ => child.model.clone(),
+        },
+        age: String::new(),
+        target: Target::Live(std::sync::Arc::clone(shared)),
+        kind: RowKind::Subagent,
+        depth: usize::try_from(child.depth).unwrap_or(1).max(1) + 1,
+        note: String::new(),
+    }
+}
+
+/// A subagent's state as its row says it: `queued` while it waits for a
+/// worker, else what the registry reports.
+fn child_state(child: &super::agents::protocol::SubagentInfo) -> &str {
+    if child.queued {
+        "queued"
+    } else {
+        &child.status
+    }
+}
+
+/// The words of a query, folded as the text they are looked for in.
+#[must_use]
+pub fn tokens(query: &str) -> Vec<String> {
+    fold(query).split_whitespace().map(str::to_owned).collect()
+}
+
+/// One thing a search reads: its text, what to call it when the row does not
+/// show it, and whether it is a long text (a request, a brief), where only
+/// the word itself counts: a long request spells nearly any word's letters
+/// in order somewhere.
+struct Field<'a> {
+    text: &'a str,
+    label: &'static str,
+    shown: bool,
+    long: bool,
+}
+
+impl<'a> Field<'a> {
+    const fn new(text: &'a str, label: &'static str, shown: bool, long: bool) -> Self {
+        Self {
+            text,
+            label,
+            shown,
+            long,
         }
-        if let Some(title) = agent.conversation.as_deref().and_then(|task| {
+    }
+}
+
+/// The longest field a word may be spelled across (`gpt6` in `gpt-6-luna`):
+/// in a longer one, a title taken from a request, only the word counts.
+const FUZZY_CHARS: usize = 32;
+
+/// How well the fields answer every token (lower is better), each token in
+/// one field, and the note for a token found only in a field the row does
+/// not show.
+fn field_match(tokens: &[String], fields: &[Field<'_>]) -> Option<(f64, String)> {
+    let folded: Vec<String> = fields.iter().map(|field| fold(field.text)).collect();
+    let mut total = 0.0;
+    let mut note = String::new();
+    for token in tokens {
+        let mut best: Option<(f64, &Field<'_>)> = None;
+        for (field, text) in fields.iter().zip(&folded) {
+            let score = if let Some(at) = text.find(token.as_str()) {
+                // The word itself, nearer the field's start the better.
+                Some(f64::from(u32::try_from(at.min(999)).unwrap_or(999)) / 1000.0)
+            } else if field.long || text.chars().count() > FUZZY_CHARS {
+                None
+            } else {
+                super::commands::fuzzy_score(token, text).map(|score| score + 10.0)
+            };
+            // What the row shows ranks above what it does not.
+            let score = score.map(|score| score + if field.shown { 0.0 } else { 2.0 });
+            if let Some(score) = score
+                && best.is_none_or(|(kept, _)| score < kept)
+            {
+                best = Some((score, field));
+            }
+        }
+        let (score, field) = best?;
+        total += score;
+        if !field.shown && note.is_empty() {
+            note = format!("{}: {}", field.label, snippet(field.text, token));
+        }
+    }
+    Some((total, note))
+}
+
+/// A few words of `text` around the first place it holds `token`.
+fn snippet(text: &str, token: &str) -> String {
+    let (folded, map) = folded_chars(text);
+    let characters: Vec<char> = text.chars().collect();
+    let Some(at) = folded.find(token) else {
+        return first_line(text);
+    };
+    let begin = map[folded[..at].chars().count()];
+    let from = begin.saturating_sub(16);
+    let to = (begin + token.chars().count() + 24).min(characters.len());
+    let mut shown: String = characters[from..to]
+        .iter()
+        .map(|character| {
+            if character.is_whitespace() {
+                ' '
+            } else {
+                *character
+            }
+        })
+        .collect();
+    if from > 0 {
+        shown.insert(0, '…');
+    }
+    if to < characters.len() {
+        shown.push('…');
+    }
+    shown
+}
+
+/// `text` folded (as [`fold`] does), and for each of its characters the
+/// character of `text` it came from.
+#[must_use]
+pub fn folded_chars(text: &str) -> (String, Vec<usize>) {
+    let mut folded = String::new();
+    let mut map = Vec::new();
+    let mut buffer = [0; 4];
+    for (index, character) in text.chars().enumerate() {
+        for each in fold(character.encode_utf8(&mut buffer)).chars() {
+            folded.push(each);
+            map.push(index);
+        }
+    }
+    (folded, map)
+}
+
+/// A query's hits. An agent is found by its title, name, model or id, its
+/// conversation's title or its last request; a subagent by its name (which
+/// starts with its role), state, model, thinking level or brief, and is
+/// listed under its agent. Groups are ranked by their best hit. Every row
+/// used to be read as one text of all its fields, and subagents not at
+/// all: `luna` found two sessions through their model and none of the
+/// children working on gpt-6-luna.
+fn search(rows: Vec<Row>, saved: &[SavedConversation], tokens: &[String]) -> Vec<Row> {
+    let mut groups: Vec<(f64, Vec<Row>)> = Vec::new();
+    for mut row in rows.into_iter().filter(|row| row.kind == RowKind::Agent) {
+        let listed = match &row.target {
+            Target::Live(listed) => Some(std::sync::Arc::clone(listed)),
+            Target::Saved(_) => None,
+        };
+        let saved_title = listed.as_ref().and_then(|listed| {
+            let task = listed.agent.conversation.as_deref()?;
             saved
                 .iter()
                 .find(|conversation| conversation.task_id == task)
-                .and_then(|conversation| conversation.title.as_deref())
-        }) {
-            text.push(' ');
-            text.push_str(title);
+                .and_then(|conversation| conversation.title.clone())
+        });
+        let own = {
+            let mut fields = vec![
+                Field::new(&row.title, "title", true, false),
+                Field::new(&row.model, "model", true, false),
+            ];
+            if let Some(listed) = &listed {
+                let agent = &listed.agent;
+                fields.push(Field::new(&agent.id, "id", false, false));
+                for (text, label) in [(&agent.name, "name"), (&agent.title, "title")] {
+                    if let Some(text) = text {
+                        fields.push(Field::new(text, label, false, false));
+                    }
+                }
+                if let Some(text) = &saved_title {
+                    fields.push(Field::new(text, "title", false, false));
+                }
+                if let Some(text) = &agent.last_request {
+                    fields.push(Field::new(text, "request", false, true));
+                }
+            }
+            field_match(tokens, &fields)
+        };
+        let mut children = Vec::new();
+        if let Some(listed) = &listed {
+            for child in &listed.agent.subagents {
+                let thinking = child.thinking.clone().unwrap_or_default();
+                let fields = [
+                    Field::new(&child.name, "name", true, false),
+                    Field::new(child_state(child), "state", true, false),
+                    Field::new(&child.model, "model", true, false),
+                    Field::new(&thinking, "thinking", true, false),
+                    Field::new(&child.program, "brief", false, true),
+                ];
+                if let Some((score, note)) = field_match(tokens, &fields) {
+                    let mut found = subagent_row(row.section, listed, child);
+                    found.note = note;
+                    children.push((score, found));
+                }
+            }
+        }
+        let best = own
+            .as_ref()
+            .map(|(score, _)| *score)
+            .into_iter()
+            .chain(children.iter().map(|(score, _)| *score))
+            .min_by(f64::total_cmp);
+        let Some(best) = best else {
+            continue;
+        };
+        if let Some((_, note)) = own {
+            row.note = note;
+        }
+        children.sort_by(|(left, _), (right, _)| left.total_cmp(right));
+        let mut group = vec![row];
+        group.extend(children.into_iter().map(|(_, child)| child));
+        groups.push((best, group));
+    }
+    groups.sort_by(|(left, _), (right, _)| left.total_cmp(right));
+    groups.into_iter().flat_map(|(_, group)| group).collect()
+}
+
+/// The spans with every place one of `tokens` is found (accents and case
+/// aside) restyled with `style` over the span's own: why a row is a hit.
+fn highlight(
+    spans: Vec<Span<'static>>,
+    tokens: &[String],
+    style: ratatui::style::Style,
+) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    for span in spans {
+        let text = span.content.to_string();
+        let (folded, map) = folded_chars(&text);
+        let characters: Vec<char> = text.chars().collect();
+        let mut marked = vec![false; characters.len()];
+        for token in tokens {
+            let length = token.chars().count();
+            for (at, _) in folded.match_indices(token.as_str()) {
+                let first = folded[..at].chars().count();
+                for index in first..first + length {
+                    if let Some(&original) = map.get(index) {
+                        marked[original] = true;
+                    }
+                }
+            }
+        }
+        if !marked.contains(&true) {
+            out.push(span);
+            continue;
+        }
+        let mut start = 0;
+        while start < characters.len() {
+            let on = marked[start];
+            let mut end = start;
+            while end < characters.len() && marked[end] == on {
+                end += 1;
+            }
+            let piece: String = characters[start..end].iter().collect();
+            out.push(Span::styled(
+                piece,
+                if on {
+                    span.style.patch(style)
+                } else {
+                    span.style
+                },
+            ));
+            start = end;
         }
     }
-    fold(&text)
+    out
 }
 
 /// Lowercase without the accents of Latin letters (`đ` as `d`).
@@ -1173,6 +1396,8 @@ fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
         "AGE"
     );
     line(list_top, Line::from(Span::styled(legend, theme.dim)), frame);
+    let query_tokens = tokens(view.query.trim());
+    let find_style = super::tui::find::style(theme, false);
     let mut items: Vec<Item> = Vec::new();
     if view.query.trim().is_empty() {
         for section in [Section::Running, Section::Idle, Section::Inactive] {
@@ -1248,7 +1473,13 @@ fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
                     let marker = if is_selected { " ❯ " } else { "   " };
                     let (mark, mark_style) = status_mark(row, theme);
                     let indent = "  ".repeat(row.depth);
-                    let title = format!("{indent}{}", row.title);
+                    let mut title = format!("{indent}{}", row.title);
+                    // Where in the name cell the title ends and the note on
+                    // why a search found the row begins.
+                    let titled = title.chars().count();
+                    if !row.note.is_empty() {
+                        let _ = write!(title, "  ↳ {}", row.note);
+                    }
                     let base = if is_selected {
                         theme.selection
                     } else if row.kind == RowKind::Code {
@@ -1292,8 +1523,18 @@ fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
                             .nth(name_width)
                             .map_or(rest.len(), |(index, _)| index);
                         let (name, tail) = rest.split_at(split);
+                        let noted = name
+                            .char_indices()
+                            .nth(titled)
+                            .map_or(name.len(), |(index, _)| index);
+                        let (name, note) = name.split_at(noted);
                         spans.push(Span::styled(name.to_owned(), base));
+                        spans.push(Span::styled(note.to_owned(), theme.dim));
                         spans.push(Span::styled(tail.to_owned(), theme.muted));
+                    }
+                    // What the search found, marked as Ctrl+F marks a match.
+                    if !query_tokens.is_empty() {
+                        spans = highlight(spans, &query_tokens, find_style);
                     }
                     Line::from(spans)
                 }
@@ -1748,5 +1989,136 @@ mod tests {
             ]
         );
         assert!(!open[3].selectable());
+    }
+
+    /// Seen: `luna` listed two sessions (their model) and none of the
+    /// children at work on gpt-6-luna. A search reads each field on its own,
+    /// finds children by name, role, model or brief and lists them under their
+    /// agent, and says why a row matched when its title and model do not.
+    #[test]
+    fn a_search_finds_subagents_by_name_role_and_model_under_their_agent() {
+        use super::{Forest, RowKind, rows_with};
+        use crate::interactive::agents::protocol::SubagentInfo;
+        let now = chrono::Utc::now();
+        let child = |name: &str, model: &str, thinking: Option<&str>, program: &str| SubagentInfo {
+            name: name.to_owned(),
+            status: "running".to_owned(),
+            model: model.to_owned(),
+            thinking: thinking.map(str::to_owned),
+            depth: 1,
+            program: program.to_owned(),
+            queued: false,
+        };
+        let mut game = agent("a1", "running", "t1");
+        game.agent.name = Some("làm game full chức năng".to_owned());
+        game.agent.model = "gpt-6-luna".to_owned();
+        game.agent.subagents = vec![
+            child(
+                "coder-cd196007",
+                "deepseek-v4.1-flash",
+                Some("high"),
+                "Sửa arena service",
+            ),
+            child(
+                "coder-bbd2acd3",
+                "deepseek-v4.1-flash",
+                None,
+                "Viết test cho shop",
+            ),
+            child(
+                "explorer-181def05",
+                "gpt-6-luna",
+                Some("xhigh"),
+                "Map the world service",
+            ),
+        ];
+        let mut other = agent("b2", "ready", "t2");
+        other.agent.model = "deepseek-v4-flash".to_owned();
+        other.agent.name = Some("ci-runner".to_owned());
+        other.agent.last_request =
+            Some("Hãy chạy lại toàn bộ bộ test của arena rồi báo kết quả".to_owned());
+        let live = [game, other];
+        let found = |query: &str| {
+            rows_with(&live, &[], query, now, &Forest::default())
+                .into_iter()
+                .map(|row| (row.kind, row.title, row.note))
+                .collect::<Vec<_>>()
+        };
+
+        // A child by its name: under its agent, collapsed forest or not.
+        let hits = found("cd196007");
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].0, RowKind::Agent);
+        assert_eq!(
+            hits[1],
+            (
+                RowKind::Subagent,
+                "coder-cd196007 · running".to_owned(),
+                String::new()
+            )
+        );
+
+        // By role: both coders, not the explorer.
+        let coders = found("coder");
+        let children: Vec<&str> = coders
+            .iter()
+            .filter(|hit| hit.0 == RowKind::Subagent)
+            .map(|hit| hit.1.as_str())
+            .collect();
+        assert_eq!(
+            children,
+            ["coder-cd196007 · running", "coder-bbd2acd3 · running"]
+        );
+
+        // By model: the agent on it and the child on it, not the coders.
+        let luna = found("luna");
+        let titles: Vec<&str> = luna.iter().map(|hit| hit.1.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["làm game full chức năng", "explorer-181def05 · running"],
+            "{luna:?}"
+        );
+
+        // A word only a brief or a request holds says where it was found.
+        let arena = found("arena");
+        assert!(
+            arena.iter().any(|hit| hit.0 == RowKind::Subagent
+                && hit.2.starts_with("brief: ")
+                && hit.2.contains("arena")),
+            "{arena:?}"
+        );
+        assert!(
+            arena
+                .iter()
+                .any(|hit| hit.0 == RowKind::Agent && hit.2.starts_with("request: ")),
+            "{arena:?}"
+        );
+
+        // A long request no longer matches every word spelled across it.
+        assert!(
+            found("lnua").is_empty()
+                || found("lnua")
+                    .iter()
+                    .all(|hit| !hit.2.starts_with("request"))
+        );
+    }
+
+    /// The matched words are marked in the row, as Ctrl+F marks them.
+    #[test]
+    fn a_hit_is_marked_where_it_matched() {
+        let spans = vec![ratatui::text::Span::raw(
+            "explorer-181def05 · running".to_owned(),
+        )];
+        let style = ratatui::style::Style::new().add_modifier(ratatui::style::Modifier::UNDERLINED);
+        let marked = super::highlight(spans, &super::tokens("EXPLORER"), style);
+        assert_eq!(marked[0].content, "explorer");
+        assert_eq!(marked[0].style, style);
+        assert_eq!(marked[1].content, "-181def05 · running");
+        let accents = super::highlight(
+            vec![ratatui::text::Span::raw("làm game".to_owned())],
+            &super::tokens("lam"),
+            style,
+        );
+        assert_eq!(accents[0].content, "làm");
     }
 }
