@@ -123,6 +123,12 @@ impl JevSettings {
                     // A needless check costs one step; a missed one, an
                     // unverified "done".
                     "instructions" | "output" | "completion" => 0.80,
+                    // A fresh start is weighed only when it costs nothing
+                    // (the cache expired), and the note it leaves names every
+                    // earlier request for the history tools: a "does not
+                    // continue" at p <= 0.05. Unrelated requests came out at
+                    // 0.02 and 0.03 live, under the shared 0.95's p <= 0.025.
+                    "cache" => 0.90,
                     _ => self.threshold,
                 },
                 |(_, threshold)| *threshold,

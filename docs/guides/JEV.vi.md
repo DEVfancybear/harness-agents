@@ -127,6 +127,7 @@ cái giá của một câu trả lời sai.
 - Mặc định là `jev.threshold` (0.95).
 - Riêng ba quyết định nhẹ là `instructions`, `output` và `completion` thì dùng 0.80, tức một câu
   "không" rõ ràng (p ≤ 0.10) hoặc một câu "có" rõ ràng.
+- `cache` dùng 0.90: chỉ bắt đầu lại khi p(yêu cầu nối tiếp hội thoại) ≤ 0.05.
 - `/jev status` liệt kê từng quyết định kèm ngưỡng của nó.
 
 Mọi câu hỏi gửi cho Jev đều được ghi vào diagnostics, gồm quyết định nào, phiên bản Jev nào trả

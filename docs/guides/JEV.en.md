@@ -116,7 +116,8 @@ The decisions are on while the plugin is on, unless switched off one by one. A d
 at its own threshold, `jev.thresholds.<decision>`, set from the cost of its wrong answer as
 TypeSafe advises. The default is `jev.threshold` (0.95), except for the three mild ones -
 `instructions`, `output` and `completion` - which act at 0.80, a clear no (p ≤ 0.10) or a clear
-yes. `/jev status` lists each decision with its threshold.
+yes, and `cache` at 0.90 (a fresh start only when p ≤ 0.05 that the request continues the
+conversation). `/jev status` lists each decision with its threshold.
 
 Every question asked of Jev is recorded in the diagnostics with its decision, the Jev version
 that answered, its input tokens and how long it took, and every outcome record names its
