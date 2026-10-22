@@ -1137,13 +1137,17 @@ fn apply_verify(
     }
 }
 
+/// `[agents] max_workers`, `max_depth`, and `commit_name`/`commit_email`, as
+/// the layers resolve them.
+type AgentsLimits<'a> = (
+    &'a mut Option<u32>,
+    &'a mut Option<u32>,
+    &'a mut (Option<String>, Option<String>),
+);
+
 fn apply_agents(
     default_model: &mut Option<String>,
-    (max_workers, max_depth, commit): (
-        &mut Option<u32>,
-        &mut Option<u32>,
-        &mut (Option<String>, Option<String>),
-    ),
+    (max_workers, max_depth, commit): AgentsLimits<'_>,
     config: &HarnessConfigV2,
     layer: ConfigLayer,
     entries: &mut BTreeMap<String, ConfigExplainEntry>,

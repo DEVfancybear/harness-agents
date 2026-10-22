@@ -69,7 +69,7 @@ pub const SEARCH_ORDER_VARIABLE: &str = "HA_WEB_SEARCH";
 
 /// How long a key an API refused (401, 402: invalid, expired, out of balance)
 /// is skipped before it is tried again; a different key is tried at once.
-const REFUSED_KEY_RETRY: Duration = Duration::from_secs(30 * 60);
+const REFUSED_KEY_RETRY: Duration = Duration::from_mins(30);
 
 /// A search API `web_search` can ask with a key.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -136,11 +136,11 @@ struct Searcher {
 }
 
 /// Keys an API refused, by API and a hash of the key, with when.
-fn refused_keys()
--> std::sync::MutexGuard<'static, std::collections::HashMap<(SearchApi, u64), std::time::Instant>> {
-    static REFUSED: std::sync::LazyLock<
-        std::sync::Mutex<std::collections::HashMap<(SearchApi, u64), std::time::Instant>>,
-    > = std::sync::LazyLock::new(Default::default);
+type RefusedKeys = std::collections::HashMap<(SearchApi, u64), std::time::Instant>;
+
+fn refused_keys() -> std::sync::MutexGuard<'static, RefusedKeys> {
+    static REFUSED: std::sync::LazyLock<std::sync::Mutex<RefusedKeys>> =
+        std::sync::LazyLock::new(Default::default);
     REFUSED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -596,7 +596,7 @@ impl WebHost {
         // "Not enough credits".
         let data = self
             .ask_api(searcher, request, |status, body| {
-                matches!(status, 401 | 402 | 403) || body.to_ascii_lowercase().contains("credits")
+                matches!(status, 401..=403) || body.to_ascii_lowercase().contains("credits")
             })
             .await?;
         Ok(format_serper(&data, query, results))
@@ -1697,6 +1697,7 @@ mod tests {
 
     /// Serve fixed answers on loopback: `/html/` is a `DuckDuckGo` results page,
     /// `/article` an HTML page, `/search` a Serper answer (POST), `/pdf` a binary file.
+    #[allow(clippy::too_many_lines)]
     async fn serve() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
