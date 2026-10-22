@@ -1382,6 +1382,7 @@ async fn m5_02_compaction_tail_carries_pairs_not_orphans() {
                 case_insensitive: false,
                 glob: None,
                 context_lines: None,
+                any_of: Vec::new(),
             },
         ))
         .await

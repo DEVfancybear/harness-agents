@@ -2572,14 +2572,32 @@ fn summarize_action(action: &CodingToolAction) -> String {
         CodingToolAction::ListFiles { path } => {
             format!("list {}", path.as_deref().unwrap_or("."))
         }
-        CodingToolAction::SearchText { query, path, .. } => {
-            format!("search {query:?} in {}", path.as_deref().unwrap_or("."))
+        CodingToolAction::SearchText {
+            query,
+            path,
+            any_of,
+            ..
+        } => {
+            let mut texts = vec![query.clone()];
+            texts.extend(any_of.iter().cloned());
+            format!(
+                "search {} in {}",
+                texts
+                    .iter()
+                    .map(|text| format!("{text:?}"))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                path.as_deref().unwrap_or(".")
+            )
         }
         CodingToolAction::ApplyPatch { path, .. } => format!("patch {path}"),
         CodingToolAction::WriteFile { path, .. } => format!("write {path}"),
         CodingToolAction::EditFile { path, .. } => format!("edit {path}"),
         CodingToolAction::Glob { pattern, path } => {
             format!("glob {pattern:?} in {}", path.as_deref().unwrap_or("."))
+        }
+        CodingToolAction::FindFiles { query, path, .. } => {
+            format!("find files {query:?} in {}", path.as_deref().unwrap_or("."))
         }
         CodingToolAction::RunProcess {
             executable, args, ..
@@ -3075,6 +3093,7 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             matches,
             truncated,
             ignored,
+            note,
         } => {
             let mut notices = String::new();
             if matches.is_empty() && !ignored.is_empty() {
@@ -3136,9 +3155,11 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
                 .collect::<Vec<_>>()
                 .join(if with_context { "\n--\n" } else { "\n" });
             format!(
-                "search_text{}: {} match(es){}{hits}{notices}",
+                "search_text{}: {} match(es){}{}{hits}{notices}",
                 if *truncated { " (truncated)" } else { "" },
                 matches.len(),
+                note.as_deref()
+                    .map_or_else(String::new, |note| format!("\n{note}")),
                 if matches.is_empty() {
                     ""
                 } else {
@@ -3146,6 +3167,37 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
 "
                 }
             )
+        }
+        ToolOutput::FindFiles {
+            files,
+            truncated,
+            note,
+        } => {
+            let mut text = format!(
+                "find_files{}: {} file(s)",
+                if *truncated { " (truncated)" } else { "" },
+                files.len()
+            );
+            if let Some(note) = note {
+                text.push('\n');
+                text.push_str(note);
+            }
+            for file in files {
+                text.push('\n');
+                text.push_str(&file.path);
+                if let Some(line) = &file.line {
+                    let _ = write!(text, ":{line}");
+                }
+                if let Some(git) = &file.git {
+                    let _ = write!(text, "  [{git}]");
+                }
+            }
+            if *truncated {
+                text.push_str(
+                    "\n[More files match: add a word or a filter (*.rs, src/, !test/) to narrow it, or raise limit.]",
+                );
+            }
+            text
         }
         ToolOutput::Glob { paths, truncated } => format!(
             "glob{}: {} path(s){}{}",
@@ -3605,6 +3657,7 @@ mod tool_output_render_tests {
             }],
             truncated: false,
             ignored: Vec::new(),
+            note: None,
         };
         let rendered = render_tool_output("search_text", &output);
         assert!(
@@ -3627,6 +3680,7 @@ mod tool_output_render_tests {
             }],
             truncated: true,
             ignored: Vec::new(),
+            note: None,
         };
         let rendered = render_tool_output("search_text", &output);
         assert!(

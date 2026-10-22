@@ -162,7 +162,7 @@ model / CLI proposal
   -> session projection và user-facing view
 ```
 
-Mọi coding-tool action đi qua cùng một ranh giới `harness-tools`. Tool lõi gồm đọc/liệt kê/tìm/glob file, `edit_file`, `write_file`, `apply_patch`, `run_process`, `run_shell`, `read_process_output`, Git status/diff/log, history search/read và `task_update`. Tool đến từ nơi khác vào cùng gate dưới dạng external-tool action: tool của extension và MCP, `web_search`/`web_fetch` (từ chối đích loopback, private và link-local; `HA_WEB=off` gỡ chúng), tool Python `ipython` (duyệt như `run_shell`) và tool `delegate` ở mục 7.
+Mọi coding-tool action đi qua cùng một ranh giới `harness-tools`. Tool lõi gồm đọc/liệt kê/tìm/glob/find file, `edit_file`, `write_file`, `apply_patch`, `run_process`, `run_shell`, `read_process_output`, Git status/diff/log, history search/read và `task_update`. Tool đến từ nơi khác vào cùng gate dưới dạng external-tool action: tool của extension và MCP, `web_search`/`web_fetch` (từ chối đích loopback, private và link-local; `HA_WEB=off` gỡ chúng), tool Python `ipython` (duyệt như `run_shell`) và tool `delegate` ở mục 7.
 
 Presentation trả về model hoặc UI có thể bị truncate hoặc định hình lại, nhưng không phải execution record có authority. Receipt ghi action đã admit, outcome, output references và các hash liên quan trong phạm vi host biết được. Approval mode gồm `ask`, `auto-edit` và `full-auto`; mọi mode đều giữ path validation, deny rules, workspace revalidation và receipt. Hook có thể chặn một call hoặc hỏi người dùng, nhưng `allow` từ hook không bỏ qua được approval, và hook `pre_tool_use` bị lỗi thì chặn call.
 

@@ -98,7 +98,10 @@ pub(crate) fn keep_search(key: String, output: &SearchOutput, stamp: u64, watche
 /// Never fails and never blocks: anything it cannot do is left to the
 /// dispatch.
 pub(crate) fn prefetch(root: &Path, hashline: bool, name: &str, arguments: &str) {
-    if !matches!(name, "search_text" | "glob" | "list_files" | "read_file") {
+    if !matches!(
+        name,
+        "search_text" | "glob" | "list_files" | "find_files" | "read_file"
+    ) {
         return;
     }
     let Ok(value) = serde_json::from_str::<Value>(arguments) else {
@@ -143,11 +146,14 @@ fn run(root: &Path, hashline: bool, name: &str, value: &Value) {
                 }
             }
         }
-        "glob" | "list_files" => {
+        "glob" | "list_files" | "find_files" => {
             let _ = tool_walk(root, text(value, "path"), name);
         }
         "search_text" => {
-            let Some(query) = text(value, "query") else {
+            // Several spellings are one search the dispatch makes itself.
+            let Some(query) =
+                text(value, "query").filter(|_| value.get("any_of").is_none_or(Value::is_null))
+            else {
                 return;
             };
             let flag = |key: &str| value.get(key).and_then(Value::as_bool).unwrap_or(false);

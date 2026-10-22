@@ -162,7 +162,7 @@ model / CLI proposal
   -> session projection and user-facing view
 ```
 
-All coding-tool actions pass through the same `harness-tools` boundary. The core tools are file read/list/search/glob, `edit_file`, `write_file`, `apply_patch`, `run_process`, `run_shell`, `read_process_output`, Git status/diff/log, history search/read, and `task_update`. Tools that come from elsewhere reach the same gate as an external-tool action: extension and MCP tools, `web_search`/`web_fetch` (loopback, private and link-local targets refused; `HA_WEB=off` removes them), the Python `ipython` tool (approved like `run_shell`), and the `delegate` tool of section 7.
+All coding-tool actions pass through the same `harness-tools` boundary. The core tools are file read/list/search/glob/find, `edit_file`, `write_file`, `apply_patch`, `run_process`, `run_shell`, `read_process_output`, Git status/diff/log, history search/read, and `task_update`. Tools that come from elsewhere reach the same gate as an external-tool action: extension and MCP tools, `web_search`/`web_fetch` (loopback, private and link-local targets refused; `HA_WEB=off` removes them), the Python `ipython` tool (approved like `run_shell`), and the `delegate` tool of section 7.
 
 The presentation returned to the model or UI may be truncated or otherwise shaped, but it is not the authoritative execution record. The receipt records what the host knows about the admitted action, its outcome, output references and relevant hashes. Approval modes are `ask`, `auto-edit` and `full-auto`; all of them keep path validation, deny rules, workspace revalidation and receipts. A hook can block a call or ask the user, but an `allow` from a hook cannot skip an approval, and a `pre_tool_use` hook that fails blocks the call.
 

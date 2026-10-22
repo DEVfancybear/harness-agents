@@ -70,6 +70,7 @@ fn review_p3_policy_cannot_be_bypassed_by_path_spelling_or_ancestor() {
             case_insensitive: false,
             glob: None,
             context_lines: None,
+            any_of: Vec::new(),
         },
         CodingToolAction::GitDiff { path: None },
     ] {
@@ -234,6 +235,7 @@ async fn review_p3_search_redacts_before_truncation() {
             case_insensitive: false,
             glob: None,
             context_lines: None,
+            any_of: Vec::new(),
         },
     )
     .await;
@@ -297,6 +299,7 @@ async fn p3_a_folder_without_git_supports_the_coding_tools() {
             case_insensitive: false,
             glob: None,
             context_lines: None,
+            any_of: Vec::new(),
         },
         process_action("Write-Output ok", 30_000),
         CodingToolAction::GitStatus,
@@ -390,6 +393,7 @@ async fn p3_a_search_names_a_file_and_a_failed_read_is_not_an_unknown_outcome() 
         case_insensitive: false,
         glob: None,
         context_lines: None,
+        any_of: Vec::new(),
     };
     let (prepared, approval) =
         prepared_and_approved(&tools, &session, &task, &root, search("src/parser.txt")).await;
@@ -682,7 +686,7 @@ async fn p3_s01_tool_contracts_are_versioned_and_receipts_are_immutable() {
     // The schema set grows additively when tools are added, while the tool
     // contract version stays stable. M4/M5 added six tools; CP-B adds the
     // write/edit/glob and ask_user tools without changing old tool digests.
-    assert_eq!(schemas.len(), 17);
+    assert_eq!(schemas.len(), 18);
     let names = schemas
         .iter()
         .map(|schema| {
@@ -982,6 +986,7 @@ async fn p3_s03_rooted_files_search_and_patch_handle_crlf_unicode_and_stale_edit
             case_insensitive: false,
             glob: None,
             context_lines: None,
+            any_of: Vec::new(),
         },
     )
     .await;
@@ -1925,7 +1930,7 @@ fn p3_s07_code_capabilities_reports_the_tool_contract() {
     assert_eq!(capabilities["tool_contract_version"], 1);
     // M4/M5 tools and the CP-B write/edit/glob/ask_user tools are advertised
     // additively without changing the tool contract version.
-    assert_eq!(capabilities["tool_schema_count"], 17);
+    assert_eq!(capabilities["tool_schema_count"], 18);
 }
 
 #[tokio::test]

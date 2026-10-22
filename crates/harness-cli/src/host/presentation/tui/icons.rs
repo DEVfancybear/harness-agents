@@ -53,7 +53,7 @@ impl ToolKind {
     pub fn of(name: &str) -> Self {
         match name {
             "read_file" | "history_read" => Self::Read,
-            "list_files" | "glob" => Self::List,
+            "list_files" | "glob" | "find_files" => Self::List,
             "search_text" | "history_search" => Self::Search,
             "edit_file" | "apply_patch" => Self::Edit,
             "write_file" => Self::Write,

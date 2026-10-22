@@ -31,7 +31,7 @@ use crate::{
     workspace::{
         apply_text_patch, edit_text, glob_files, inspect_workspace, inspect_workspace_for_read,
         list_files, plan_edit_text, read_file_range_with_hash, read_text, redact_text,
-        resolve_relative, search_text, validate_glob, validate_search, write_text_checked,
+        resolve_relative, validate_glob, validate_search, write_text_checked,
     },
 };
 use harness_store_sqlite::HistoryScope;
@@ -1234,6 +1234,7 @@ impl ToolExecutionService {
             }
             CodingToolAction::ListFiles { path }
             | CodingToolAction::SearchText { path, .. }
+            | CodingToolAction::FindFiles { path, .. }
             | CodingToolAction::GitDiff { path }
             | CodingToolAction::GitLog { path, .. } => {
                 if let Some(path) = path {
@@ -1262,9 +1263,11 @@ impl ToolExecutionService {
                 case_insensitive,
                 glob,
                 context_lines,
+                any_of,
                 ..
             } => {
                 validate_search(query, *regex, *case_insensitive)?;
+                crate::lookup::validate_any_of(*regex, any_of)?;
                 if let Some(glob) = glob {
                     validate_glob(glob)?;
                 }
@@ -1391,9 +1394,11 @@ impl ToolExecutionService {
                 regex,
                 case_insensitive,
                 glob,
+                any_of,
                 ..
             } => {
                 validate_search(query, *regex, *case_insensitive)?;
+                crate::lookup::validate_any_of(*regex, any_of)?;
                 if let Some(glob) = glob {
                     validate_glob(glob)?;
                 }
@@ -1629,16 +1634,20 @@ impl ToolExecutionService {
                 case_insensitive,
                 glob,
                 context_lines,
+                any_of,
             } => {
-                let output = search_text(
+                let (output, note) = crate::lookup::lookup(
                     root,
-                    query,
-                    path.as_deref(),
-                    *regex,
-                    *case_insensitive,
-                    glob.as_deref(),
-                    context_lines.unwrap_or(0),
-                    self.hashline,
+                    &crate::lookup::Lookup {
+                        query,
+                        any_of,
+                        path: path.as_deref(),
+                        regex: *regex,
+                        case_insensitive: *case_insensitive,
+                        glob: glob.as_deref(),
+                        context_lines: context_lines.unwrap_or(0),
+                        anchors: self.hashline,
+                    },
                 )?;
                 let ignored = if output.matches.is_empty() {
                     crate::workspace::ignored_folders(root, path.as_deref())
@@ -1649,6 +1658,7 @@ impl ToolExecutionService {
                     matches: output.matches,
                     truncated: output.truncated,
                     ignored,
+                    note,
                 }))
             }
             CodingToolAction::ApplyPatch {
@@ -1723,6 +1733,19 @@ impl ToolExecutionService {
             CodingToolAction::Glob { pattern, path } => {
                 let (paths, truncated) = glob_files(root, path.as_deref(), pattern)?;
                 Ok(Dispatched::plain(ToolOutput::Glob { paths, truncated }))
+            }
+            CodingToolAction::FindFiles { query, path, limit } => {
+                let found = crate::find::find_files(
+                    root,
+                    path.as_deref(),
+                    query,
+                    limit.unwrap_or(crate::find::FIND_DEFAULT_LIMIT),
+                )?;
+                Ok(Dispatched::plain(ToolOutput::FindFiles {
+                    files: found.files,
+                    truncated: found.truncated,
+                    note: found.note,
+                }))
             }
             CodingToolAction::ReadProcessOutput {
                 artifact_id,
@@ -3019,6 +3042,7 @@ mod tests {
             ToolKind::ListFiles,
             ToolKind::SearchText,
             ToolKind::Glob,
+            ToolKind::FindFiles,
             ToolKind::GitStatus,
             ToolKind::GitDiff,
             ToolKind::GitLog,

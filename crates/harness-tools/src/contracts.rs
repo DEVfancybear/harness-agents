@@ -157,6 +157,8 @@ pub const READ_FILE_MAX_LINES: u32 = 500;
 pub const READ_FILE_DEFAULT_LINES: u32 = 200;
 /// Maximum number of lines included on either side of one search match.
 pub const SEARCH_CONTEXT_MAX_LINES: u32 = 3;
+/// The most extra spellings one `search_text` call ORs with its query.
+pub const SEARCH_ANY_OF_MAX: u32 = 16;
 /// Hard ceiling for `git_log`: a model may ask for fewer, never for unbounded
 /// history. The provider schema and the typed action both carry this bound.
 pub const GIT_LOG_MAX_LIMIT: u32 = 100;
@@ -172,6 +174,8 @@ pub enum ToolKind {
     WriteFile,
     EditFile,
     Glob,
+    /// Find files by name: fuzzy, typo-tolerant, best first.
+    FindFiles,
     RunProcess,
     RunShell,
     ReadProcessOutput,
@@ -198,6 +202,7 @@ impl ToolKind {
             Self::WriteFile => "write_file",
             Self::EditFile => "edit_file",
             Self::Glob => "glob",
+            Self::FindFiles => "find_files",
             Self::RunProcess => "run_process",
             Self::RunShell => "run_shell",
             Self::ReadProcessOutput => "read_process_output",
@@ -232,6 +237,7 @@ impl ToolKind {
                 | Self::ListFiles
                 | Self::SearchText
                 | Self::Glob
+                | Self::FindFiles
                 | Self::ReadProcessOutput
                 | Self::HistorySearch
                 | Self::HistoryRead
@@ -256,6 +262,7 @@ pub const fn coding_tool_names() -> &'static [&'static str] {
         "write_file",
         "edit_file",
         "glob",
+        "find_files",
         "run_process",
         "run_shell",
         "read_process_output",
@@ -284,11 +291,13 @@ fn allowed_fields(name: &str) -> Option<&'static [&'static str]> {
             "case_insensitive",
             "glob",
             "context_lines",
+            "any_of",
         ],
         "apply_patch" => &["path", "expected_hash", "replacement"],
         "write_file" => &["path", "content", "expected_hash"],
         "edit_file" => &["path", "old_string", "new_string", "replace_all", "edits"],
         "glob" => &["pattern", "path"],
+        "find_files" => &["query", "path", "limit"],
         "run_process" => &["executable", "args", "timeout_ms", "isolation", "env"],
         "run_shell" => &["command", "timeout_ms", "isolation", "env"],
         "git_status" => &[],
@@ -379,9 +388,10 @@ fn workspace_tool_schemas(hashline: bool) -> Vec<Value> {
         ),
         function_schema(
             "search_text",
-            "Search bounded UTF-8 workspace text without following links. path is a folder or one file. Regex and context are bounded.",
+            "Search bounded UTF-8 workspace text without following links. path is a folder or one file. Regex and context are bounded. Lines that define the searched name come first. any_of adds other literal spellings searched together with query (OR), e.g. [\"prepare_upload\", \"PrepareUpload\"]. When an identifier matches nothing, its other spellings (snake_case, camelCase, kebab-case) are tried and the result says so.",
             json!({
                 "query": string_schema(),
+                "any_of": {"type": "array", "items": string_schema(), "minItems": 1, "maxItems": SEARCH_ANY_OF_MAX, "description": "More literal strings, any of which may match (OR with query); never escaped."},
                 "path": nullable_string_schema(),
                 "regex": {"type": "boolean"},
                 "case_insensitive": {"type": "boolean"},
@@ -427,6 +437,16 @@ fn workspace_tool_schemas(hashline: bool) -> Vec<Value> {
             "List workspace-relative file paths matching a bounded glob, respecting .gitignore, newest-modified first. A bare word with no wildcard or folder (parser) finds every file whose name contains it.",
             json!({"pattern": string_schema(), "path": nullable_string_schema()}),
             &["pattern"],
+        ),
+        function_schema(
+            "find_files",
+            "Find files by name: fuzzy and typo-tolerant (mian.rs finds main.rs), over the whole path, best match first, with each file's git status where it is not clean. All words must match. Inline filters: *.rs or *.{ts,tsx}, src/ (in a folder), src/**/*.rs (glob), !test/ or !*.md (exclude), git:modified|staged|untracked|changed. An empty query lists what git says is changed, then the newest files. When nothing matches it drops a word, then lists files whose text contains it, and says so. Use search_text for contents; read the top hit instead of searching again.",
+            json!({
+                "query": {"type": "string", "description": "Name words and filters, e.g. 'config loader *.rs !test/'."},
+                "path": nullable_string_schema(),
+                "limit": {"type": "integer", "minimum": 1, "maximum": crate::find::FIND_MAX_LIMIT, "description": "Files to list (default 30)."}
+            }),
+            &["query"],
         ),
     ]
 }
@@ -663,6 +683,9 @@ pub enum CodingToolAction {
         glob: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_lines: Option<u32>,
+        /// More literal spellings, OR'd with `query` (fsearch's `multi_grep`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        any_of: Vec<String>,
     },
     ApplyPatch {
         path: String,
@@ -691,6 +714,12 @@ pub enum CodingToolAction {
     Glob {
         pattern: String,
         path: Option<String>,
+    },
+    FindFiles {
+        query: String,
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
     },
     RunProcess {
         executable: String,
@@ -774,6 +803,7 @@ impl CodingToolAction {
             Self::WriteFile { .. } => ToolKind::WriteFile,
             Self::EditFile { .. } => ToolKind::EditFile,
             Self::Glob { .. } => ToolKind::Glob,
+            Self::FindFiles { .. } => ToolKind::FindFiles,
             Self::RunProcess { .. } => ToolKind::RunProcess,
             Self::RunShell { .. } => ToolKind::RunShell,
             Self::ReadProcessOutput { .. } => ToolKind::ReadProcessOutput,
@@ -797,6 +827,7 @@ impl CodingToolAction {
             Self::ListFiles { path }
             | Self::SearchText { path, .. }
             | Self::Glob { path, .. }
+            | Self::FindFiles { path, .. }
             | Self::GitDiff { path }
             | Self::GitLog { path, .. } => path.as_deref(),
             Self::RunProcess { .. }
@@ -857,7 +888,7 @@ impl CodingToolAction {
         }
         if matches!(
             name,
-            "list_files" | "search_text" | "glob" | "git_diff" | "git_log"
+            "list_files" | "search_text" | "glob" | "find_files" | "git_diff" | "git_log"
         ) && object
             .get("path")
             .is_some_and(|value| !value.is_null() && !value.is_string())
@@ -926,6 +957,7 @@ impl CodingToolAction {
                 // is a request for the most there is, so it is read as the bound.
                 context_lines: parse_optional_bounded_u32(object, "context_lines", 0, u32::MAX)?
                     .map(|lines| lines.min(SEARCH_CONTEXT_MAX_LINES)),
+                any_of: parse_any_of(object)?,
             }),
             "apply_patch" => Ok(Self::ApplyPatch {
                 path: required_string(object, "path")?,
@@ -964,6 +996,14 @@ impl CodingToolAction {
             "glob" => Ok(Self::Glob {
                 pattern: required_string(object, "pattern")?,
                 path: optional_path(object),
+            }),
+            // An empty query is a request too: what git says is changed.
+            "find_files" => Ok(Self::FindFiles {
+                query: parse_optional_string(object, "query")?.unwrap_or_default(),
+                path: optional_path(object),
+                // More than the bound is a request for the most there is.
+                limit: parse_optional_bounded_u32(object, "limit", 1, u32::MAX)?
+                    .map(|limit| limit.min(crate::find::FIND_MAX_LIMIT)),
             }),
             "run_process" => {
                 let args = object
@@ -1317,6 +1357,31 @@ fn optional_path(object: &serde_json::Map<String, Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// `search_text`'s `any_of`: literal strings, at most [`SEARCH_ANY_OF_MAX`],
+/// blank ones dropped.
+fn parse_any_of(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Vec<String>, harness_types::HarnessError> {
+    let Some(value) = object.get("any_of").filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let invalid = || {
+        harness_types::HarnessError::new(
+            harness_types::ErrorCode::InvalidPayload,
+            format!("search_text any_of must be an array of at most {SEARCH_ANY_OF_MAX} strings"),
+        )
+    };
+    let items = value.as_array().ok_or_else(invalid)?;
+    if items.len() > SEARCH_ANY_OF_MAX as usize {
+        return Err(invalid());
+    }
+    items
+        .iter()
+        .map(|item| item.as_str().map(str::to_owned).ok_or_else(invalid))
+        .filter(|item| item.as_ref().map_or(true, |text| !text.is_empty()))
+        .collect()
+}
+
 fn parse_optional_string(
     object: &serde_json::Map<String, Value>,
     key: &str,
@@ -1580,7 +1645,8 @@ pub fn effect_class_for(name: &str) -> EffectClass {
         | "read_process_output"
         | "history_search"
         | "history_read"
-        | "glob" => EffectClass::ReadOnly,
+        | "glob"
+        | "find_files" => EffectClass::ReadOnly,
         "apply_patch" | "write_file" | "edit_file" => EffectClass::Mutating,
         "ask_user" => EffectClass::Interactive,
         _ => EffectClass::External,
@@ -1688,10 +1754,21 @@ pub enum ToolOutput {
         /// when nothing was found: an empty result read as "it is nowhere".
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         ignored: Vec<String>,
+        /// How the search was loosened when the query itself matched nothing
+        /// (its identifier's other spellings).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     Glob {
         paths: Vec<String>,
         truncated: bool,
+    },
+    FindFiles {
+        files: Vec<FoundFile>,
+        truncated: bool,
+        /// How the query was loosened, or that nothing matched.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     ApplyPatch {
         path: String,
@@ -1806,6 +1883,19 @@ pub enum ToolOutput {
     OutcomeUnknown {
         reason: String,
     },
+}
+
+/// One `find_files` hit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FoundFile {
+    pub path: String,
+    /// What git says about it when it is not clean (`modified`, `staged`,
+    /// `untracked`, `conflict`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<String>,
+    /// The line that holds the text, when the file was found by its text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
 }
 
 /// A bounded match returned by `search_text`.

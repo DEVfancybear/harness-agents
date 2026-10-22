@@ -308,6 +308,7 @@ async fn main() {
                     case_insensitive: false,
                     glob: None,
                     context_lines: None,
+                    any_of: Vec::new(),
                 })
                 .collect(),
         )
@@ -323,6 +324,7 @@ async fn main() {
                     case_insensitive: false,
                     glob: None,
                     context_lines: Some(1),
+                    any_of: Vec::new(),
                 })
                 .collect(),
         )
@@ -338,6 +340,7 @@ async fn main() {
                     case_insensitive: true,
                     glob: None,
                     context_lines: None,
+                    any_of: Vec::new(),
                 })
                 .collect(),
         )

@@ -12,12 +12,16 @@ mod contracts;
 #[path = "filesystem/edit_diff.rs"]
 mod edit_diff;
 mod execution;
+#[path = "filesystem/find.rs"]
+mod find;
 #[path = "security/git_guard.rs"]
 mod git_guard;
 #[path = "runtime/hooks.rs"]
 mod hooks;
 #[path = "filesystem/index.rs"]
 mod index;
+#[path = "filesystem/lookup.rs"]
+mod lookup;
 #[path = "security/policy.rs"]
 mod policy;
 #[path = "filesystem/prefetch.rs"]

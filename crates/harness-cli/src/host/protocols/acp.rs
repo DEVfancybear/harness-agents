@@ -181,7 +181,7 @@ fn tool_kind(name: &str) -> &'static str {
         "python_repl" | "ipython" | "python" | "bash" | "run_shell" | "run_process" => "execute",
         "read_file" | "read" => "read",
         "edit_file" | "write_file" | "apply_patch" | "edit" | "write" => "edit",
-        "search_text" | "glob" | "list_files" => "search",
+        "search_text" | "glob" | "list_files" | "find_files" => "search",
         "web_fetch" | "web_search" => "fetch",
         _ => "other",
     }
