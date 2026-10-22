@@ -343,9 +343,12 @@ pub fn hotkey_lines() -> Vec<String> {
     .collect()
 }
 
-/// One help row: the command in a fixed column, then what it does.
+/// One help row: the command in a fixed column, then what it does, always
+/// two spaces or more apart: a key longer than the column ran into its
+/// description (`Alt+M / Shift+Alt+Mnext / previous scoped model`).
 fn usage_line(usage: &str, summary: &str) -> String {
-    format!("{usage:<HELP_COLUMN$}{summary}")
+    let width = HELP_COLUMN.max(usage.chars().count() + 2);
+    format!("{usage:<width$}{summary}")
 }
 
 /// Cells the command column of `/help` occupies.

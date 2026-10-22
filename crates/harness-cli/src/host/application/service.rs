@@ -3675,7 +3675,7 @@ impl AgentSessionService {
                         config.provider_id,
                         harness_providers::limits::duration_label(age)
                     ));
-                    lines.extend(snapshot.lines().into_iter().map(|line| format!("  {line}")));
+                    lines.extend(snapshot.lines());
                 }
                 None => lines.push(format!(
                     "Limits:   {} has not reported any on its responses in this session",
@@ -9287,20 +9287,23 @@ async fn run_turn(
     }
 
     if let Some(built) = runtime.context_result(&session_id) {
+        // `Label: value` lines, so the panel lines the blocks up as fields.
         let mut lines = vec![
-            format!("model: {}", built.manifest.model_id),
-            format!("source revision: {}", built.manifest.source_revision),
+            format!("Packet: built for {}", built.manifest.model_id),
+            format!("Revision: {}", built.manifest.source_revision),
             format!(
-                "tokens: mandatory {}, optional {}",
-                built.mandatory_tokens, built.optional_tokens
+                "Tokens: {} mandatory, {} optional",
+                super::cost::format_tokens(built.mandatory_tokens),
+                super::cost::format_tokens(built.optional_tokens)
             ),
+            String::new(),
         ];
         lines.extend(built.block_usage.iter().map(|block| {
             format!(
-                "{} [{}] {} tokens — {}{}",
+                "{}: {} tokens · {} · {}{}",
                 block.block_id,
+                super::cost::format_tokens(block.token_estimate),
                 block.channel.as_str(),
-                block.token_estimate,
                 if block.included {
                     "included"
                 } else {

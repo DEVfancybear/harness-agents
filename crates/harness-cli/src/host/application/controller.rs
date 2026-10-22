@@ -292,6 +292,9 @@ pub struct InteractiveController {
     /// menu is next offered, not at every turn's end: reading them is a scan
     /// of the skill folders, on the thread a terminal's key waits for.
     menu_stale: bool,
+    /// When a key last came in: the menu is read ahead only while none has
+    /// for a while, so the read never holds up typing.
+    last_key: Option<Instant>,
     /// Why the host is not using the TUI, when it fell back to plain.
     fallback_reason: Option<String>,
     /// Tick counter, so the spinner animates and an idle loop stays still.
@@ -445,6 +448,7 @@ impl InteractiveController {
             last_run_elapsed: Duration::ZERO,
             last_request: None,
             menu_stale: true,
+            last_key: None,
             fallback_reason: None,
             tick: 0,
             exit_after_run: false,
@@ -1159,6 +1163,17 @@ impl InteractiveController {
         }
     }
 
+    /// Read the slash menu while nothing is typed, so the `/` that opens it
+    /// finds it ready: the first read scans the skill folders cold (about
+    /// 150 ms), and the key that asked for it waited that long.
+    fn read_menu_ahead(&mut self) {
+        const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
+        if self.menu_stale && !self.plain && self.last_key.is_none_or(|at| at.elapsed() >= QUIET) {
+            self.menu_stale = false;
+            self.editor.set_menu_commands(self.service.menu_commands());
+        }
+    }
+
     fn refresh_menu(&mut self) {
         self.refresh_status();
         if self.plain {
@@ -1229,6 +1244,7 @@ impl InteractiveController {
         if key == Key::Redraw {
             return vec![Effect::Redraw];
         }
+        self.last_key = Some(Instant::now());
         self.fresh_menu(&key);
         // prime-agent's `app.editor.external`: the prompt's draft, while no
         // approval or question holds the keyboard.
@@ -2297,6 +2313,7 @@ impl InteractiveController {
     /// how acceptance U06 proves the idle loop does not redraw.
     #[allow(dead_code, reason = "T05 wires the tick into the render loop")]
     pub fn tick(&mut self) -> Vec<Effect> {
+        self.read_menu_ahead();
         let changed = !self.plain && self.sync_children();
         let children_running = self
             .child_activity
@@ -4164,6 +4181,8 @@ impl InteractiveController {
             }
             "/config" => {
                 let mut lines = self.service.config_explain();
+                // The files after a gap: their own group and column.
+                lines.push(String::new());
                 lines.extend(self
                     .header
                     .iter()
@@ -4952,6 +4971,17 @@ impl InteractiveController {
                 // without leaving the app.
                 if let Some(direction @ ("next" | "prev")) = argument {
                     self.cycle_model(direction == "next", &mut effects);
+                } else if let Some(command) = argument.filter(|model| model.starts_with('/')) {
+                    // Seen: `/config` typed into the model menu's line became
+                    // the model, and the session's next call went nowhere.
+                    self.push_history(
+                        &mut effects,
+                        HistoryItem::Error {
+                            message: format!(
+                                "{command} is a command, not a model; /model lists the models"
+                            ),
+                        },
+                    );
                 } else if let Some(model) = argument {
                     // Allowed while the agent works, as prime-agent's model
                     // selector is: the running turn switches at its next call.
@@ -6035,7 +6065,16 @@ impl InteractiveController {
         let mut lines = Vec::new();
         for entry in &self.recall {
             match entry {
-                Recalled::Line(line) => lines.push(line.clone()),
+                // A prompt reads as its first words: the goal's continuation
+                // prompt, a few hundred words, filled the panel once a turn and
+                // hid the answers between. Ctrl+O's expanded mode keeps it whole.
+                Recalled::Line(line)
+                    if self.detail != super::events::Detail::Expanded
+                        && (line.starts_with("> ") || line.starts_with("[auto] ")) =>
+                {
+                    lines.push(short_prompt(line));
+                }
+                Recalled::Line(line) => lines.extend(line.split('\n').map(str::to_owned)),
                 Recalled::Tool(item) if self.detail == super::events::Detail::Expanded => {
                     let rows = super::tui::history::render(
                         item,
@@ -6578,6 +6617,27 @@ fn login_options(stored: &[(String, &'static str)], web_search: bool) -> Vec<(St
             }),
         )
         .collect()
+}
+
+/// A prompt in `/more`: its first line, at most [`PROMPT_CELLS`] characters,
+/// and how much more there is.
+fn short_prompt(line: &str) -> String {
+    use std::fmt::Write as _;
+    const PROMPT_CELLS: usize = 160;
+    let first = line.lines().next().unwrap_or_default();
+    let rest = line.lines().count().saturating_sub(1);
+    let mut shown: String = first.chars().take(PROMPT_CELLS).collect();
+    let cut = first.chars().count() > PROMPT_CELLS;
+    if !cut && rest == 0 {
+        return shown;
+    }
+    shown.push('…');
+    if rest > 0 {
+        let _ = write!(shown, " (+{rest} lines, ctrl+o shows them)");
+    } else {
+        shown.push_str(" (ctrl+o shows all)");
+    }
+    shown
 }
 
 /// Told what each part of [`InteractiveController::pump_events_timed`] took.
@@ -10229,6 +10289,24 @@ Command: \"npm run build\""
             );
             drop(temp);
         }
+    }
+
+    /// `/more` showed the goal's continuation prompt, a few hundred words, in
+    /// full once a turn; a prompt reads as its first line and what is left.
+    #[test]
+    fn more_shows_a_long_prompt_as_its_first_line() {
+        let prompt = format!(
+            "> Continue toward the goal.\n{}",
+            "The objective.\n".repeat(5)
+        );
+        let short = super::short_prompt(&prompt);
+        assert_eq!(
+            short,
+            "> Continue toward the goal.… (+5 lines, ctrl+o shows them)"
+        );
+        assert_eq!(super::short_prompt("> hi"), "> hi");
+        let long = format!("> {}", "word ".repeat(60));
+        assert!(super::short_prompt(&long).ends_with("… (ctrl+o shows all)"));
     }
 
     /// A turn's end no longer scans the skill folders for the slash menu: a

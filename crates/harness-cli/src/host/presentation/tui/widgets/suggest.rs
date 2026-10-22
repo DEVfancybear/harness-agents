@@ -32,7 +32,7 @@ pub fn rows(state: &UiState, theme: &Theme) -> Vec<Line<'static>> {
     // within bounds, so the descriptions line up.
     let column = state.suggestions[start..end]
         .iter()
-        .map(|item| item.label.chars().count() + 2)
+        .map(|item| super::composer::display_width(&item.label) + 2)
         .max()
         .unwrap_or(NAME_COLUMN)
         .clamp(NAME_COLUMN, MAX_NAME_COLUMN);
@@ -58,7 +58,20 @@ pub fn rows(state: &UiState, theme: &Theme) -> Vec<Line<'static>> {
                 marker.to_owned(),
                 if selected { theme.selection } else { theme.dim },
             ),
-            Span::styled(format!("{:<column$}", item.label), name_style),
+            // Two spaces at least after a label longer than the column:
+            // `openai-codex/gpt-5.1-codex-mini GPT-5.1 Codex Mini` ran together.
+            Span::styled(
+                format!(
+                    "{}{}",
+                    item.label,
+                    " ".repeat(
+                        column
+                            .saturating_sub(super::composer::display_width(&item.label))
+                            .max(2)
+                    )
+                ),
+                name_style,
+            ),
             Span::styled(item.description.clone(), text_style),
         ];
         if let Some(tag) = &item.tag {

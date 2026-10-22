@@ -162,35 +162,73 @@ fn value_spans(row: &str, style: ratatui::style::Style, theme: &Theme) -> Vec<Sp
     }
 }
 
-/// The widest label a value column makes room for; a longer one pushes its own
-/// value along instead of the whole column.
-const LABEL_CELLS: usize = 14;
+/// The widest label a value column makes room for. A longer one stands on
+/// a row of its own, its value on the next row in the column: `Ctrl-J /
+/// Alt+Enter` ran into its description when it pushed it along.
+const LABEL_CELLS: usize = 32;
 
-/// A plain panel line as a structured row: `Label: value` as a field, the rest
-/// as text. A label is a few words at the start of the line: `Config:` is
-/// one, and so is `AGENTS.md:`, but `C:\work` and a sentence with a colon
-/// in it are not.
+/// The most words a label has: `Ctrl-Z / Ctrl-Shift-Z` is five.
+const LABEL_WORDS: usize = 6;
+
+/// A plain panel line as a structured row: `Label: value` and a column table's
+/// `Label   value` (two spaces or more apart) as a field, the rest as text. A
+/// label is a few words at the start of the line: `Config:` is one, and so are
+/// `AGENTS.md:`, `5h:` and `Ctrl-K / Ctrl-Y`, but `C:\work` and a sentence with
+/// a colon in it are not.
 #[must_use]
 pub fn line_row(line: &str) -> RefLine {
-    let field = line.split_once(':').filter(|(label, value)| {
-        let label = label.trim_end();
+    if line.trim().is_empty() {
+        return RefLine::Blank;
+    }
+    // A command's usage is a label however long its arguments run:
+    // `/heartbeat [every <dur>] [--steer|--follow-up] <instr>`.
+    let label_like = |label: &str| {
+        let label = label.trim();
+        let command = label.starts_with('/');
         !label.is_empty()
-            && label.len() <= 24
-            && label.chars().next().is_some_and(char::is_alphabetic)
-            && label.split_whitespace().count() <= 3
-            && !label.contains(['/', '\\', '(', '`'])
+            && display_width(label) <= if command { 72 } else { 32 }
+            && label.split_whitespace().count() <= if command { 10 } else { LABEL_WORDS }
+            && !label.ends_with(['.', ',', ';'])
+    };
+    let colon = line.split_once(':').filter(|(label, value)| {
+        label_like(label)
+            && label.trim().len() <= 24
+            && label.trim().split_whitespace().count() <= 3
+            && label
+                .trim()
+                .chars()
+                .next()
+                .is_some_and(char::is_alphanumeric)
+            && !label.contains(['/', '\\', '(', '`', '['])
             && value.starts_with(char::is_whitespace)
             && !value.trim().is_empty()
     });
-    match field {
-        Some((label, value)) => RefLine::field(label.trim_end(), value.trim()),
-        None if line.trim().is_empty() => RefLine::Blank,
-        None => RefLine::Text(line.to_owned()),
+    if let Some((label, value)) = colon {
+        return RefLine::field(label.trim(), value.trim());
     }
+    // A setting: `provider.model = deepseek-v4-flash [default]`.
+    if let Some((label, value)) = line.trim_start().split_once(" = ")
+        && !label.is_empty()
+        && !label.contains(char::is_whitespace)
+        && !value.trim().is_empty()
+    {
+        return RefLine::field(label, value.trim());
+    }
+    // A column table: the first cell, two spaces or more, the rest.
+    let trimmed = line.trim_start();
+    if let Some(at) = trimmed.find("  ") {
+        let (label, value) = trimmed.split_at(at);
+        if label_like(label) && !value.trim().is_empty() {
+            return RefLine::field(label.trim(), value.trim());
+        }
+    }
+    RefLine::Text(line.to_owned())
 }
 
 /// The rows of a panel: its structured rows when it has them, else its plain
-/// lines read as fields and text, so every reference panel is drawn alike.
+/// lines read as fields and text, so every reference panel is drawn alike. A
+/// line holding line breaks is that many lines: a row cannot draw a break, and
+/// the words on either side of one ran together (`goal.The objective`).
 #[must_use]
 pub fn panel_rows(
     lines: &[String],
@@ -202,42 +240,77 @@ pub fn panel_rows(
         Some(rich) => rich_rows(rich, width, theme),
         None if lines.is_empty() => rows(lines, theme),
         None => {
-            let converted: Vec<RefLine> = lines.iter().map(|line| line_row(line)).collect();
+            let converted: Vec<RefLine> = lines
+                .iter()
+                .flat_map(|line| line.split('\n'))
+                .map(|line| line_row(line.trim_end_matches('\r')))
+                .collect();
             rich_rows(&converted, width, theme)
         }
     }
 }
 
+/// Each field's value column: as wide as the widest label of its group (the
+/// fields between two headings or gaps), at most [`LABEL_CELLS`].
+fn columns(lines: &[RefLine]) -> Vec<usize> {
+    let mut columns = vec![0; lines.len()];
+    let mut start = 0;
+    for end in 0..=lines.len() {
+        let boundary =
+            end == lines.len() || matches!(lines[end], RefLine::Heading { .. } | RefLine::Blank);
+        if !boundary {
+            continue;
+        }
+        let width = lines[start..end]
+            .iter()
+            .filter_map(|line| match line {
+                RefLine::Field { label, .. } => Some(display_width(label)),
+                _ => None,
+            })
+            .filter(|cells| *cells <= LABEL_CELLS)
+            .max()
+            .unwrap_or(0);
+        columns[start..end].fill(width);
+        start = end + 1;
+    }
+    columns
+}
+
 /// The rows of a structured reference panel: headings as chips, each item on a
-/// row of its own with its description wrapped and hung under the name, and
-/// fields with their values in one column.
+/// row of its own with its description wrapped and hung under the name, fields
+/// with their values in their group's column, and text wrapped under its own
+/// indent.
 #[must_use]
 pub fn rich_rows(lines: &[RefLine], width: u16, theme: &Theme) -> Vec<Line<'static>> {
     /// Cells the description is indented: past the margin, the glyph and its gap.
     const HANG: usize = 5;
-    let column = lines
-        .iter()
-        .filter_map(|line| match line {
-            RefLine::Field { label, .. } => Some(display_width(label)),
-            _ => None,
-        })
-        .filter(|cells| *cells <= LABEL_CELLS)
-        .max()
-        .unwrap_or(0);
+    let columns = columns(lines);
     let mut rows = Vec::new();
-    for line in lines {
+    for (line, column) in lines.iter().zip(columns) {
         match line {
             RefLine::Field { label, value, tone } => {
-                let pad = column.max(display_width(label));
-                let hang = 2 + pad + 2;
+                let command = label.starts_with('/');
+                let label_style = if command { theme.accent } else { theme.muted };
+                let style = if command && *tone == BadgeKind::Neutral {
+                    theme.dim
+                } else {
+                    tone_style(*tone, theme)
+                };
+                let alone = display_width(label) > column;
+                let hang = 2 + column + 2;
                 let room = usize::from(width).saturating_sub(hang + 1).max(12);
-                let style = tone_style(*tone, theme);
+                if alone {
+                    rows.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(label.clone(), label_style),
+                    ]));
+                }
                 for (index, row) in wrap_hard(value, room).into_iter().enumerate() {
-                    let mut spans = if index == 0 {
+                    let mut spans = if index == 0 && !alone {
                         vec![
                             Span::raw("  "),
-                            Span::styled(label.clone(), theme.muted),
-                            Span::raw(" ".repeat(pad - display_width(label) + 2)),
+                            Span::styled(label.clone(), label_style),
+                            Span::raw(" ".repeat(column - display_width(label) + 2)),
                         ]
                     } else {
                         vec![Span::raw(" ".repeat(hang))]
@@ -245,9 +318,6 @@ pub fn rich_rows(lines: &[RefLine], width: u16, theme: &Theme) -> Vec<Line<'stat
                     spans.extend(value_spans(&row, style, theme));
                     rows.push(Line::from(spans));
                 }
-            }
-            RefLine::Text(text) if text.starts_with('/') && text.contains("  ") => {
-                rows.extend(self::rows(std::slice::from_ref(text), theme));
             }
             RefLine::Heading { title, note } => {
                 let mut spans = vec![
@@ -295,7 +365,27 @@ pub fn rich_rows(lines: &[RefLine], width: u16, theme: &Theme) -> Vec<Line<'stat
                     ]));
                 }
             }
-            RefLine::Text(text) => rows.push(Line::from(Span::raw(format!(" {text}")))),
+            RefLine::Text(text) => {
+                // Wrapped under its own indent; a list item's rest under its
+                // words, past the bullet.
+                let indent = text.len() - text.trim_start().len();
+                let lead = 2 + indent;
+                let body = text.trim_start();
+                let bullet = body
+                    .split_once(' ')
+                    .filter(|(mark, _)| {
+                        matches!(*mark, "-" | "*" | "•")
+                            || (mark.ends_with(['.', ')'])
+                                && mark.len() <= 4
+                                && mark[..mark.len() - 1].chars().all(|c| c.is_ascii_digit()))
+                    })
+                    .map_or(0, |(mark, _)| display_width(mark) + 1);
+                let room = usize::from(width).saturating_sub(lead + bullet + 1).max(12);
+                for (index, row) in wrap_hard(body, room).into_iter().enumerate() {
+                    let pad = if index == 0 { lead } else { lead + bullet };
+                    rows.push(Line::from(vec![Span::raw(" ".repeat(pad)), Span::raw(row)]));
+                }
+            }
             RefLine::Hint(text) => rows.push(Line::from(vec![
                 Span::styled(" • ", theme.info),
                 Span::styled(text.clone(), theme.dim),
@@ -397,6 +487,99 @@ mod tests {
         );
         assert!(rows.iter().all(|row| row.chars().count() <= 40), "{text}");
         assert!(text.contains("/help  list commands"), "{text}");
+    }
+
+    /// Seen in `/hotkeys`, `/help`, `/more` and `/config`: a key longer than
+    /// the column ran into its description, a wrapped row of commands started
+    /// at the panel's edge, the words around a line break ran together, and
+    /// settings were a wall of `key = value`.
+    #[test]
+    fn every_panel_lines_up_and_wraps_under_its_column() {
+        let draw = |lines: &[&str], width: u16| {
+            let lines: Vec<String> = lines.iter().map(|line| (*line).to_owned()).collect();
+            plain_text(&super::panel_rows(&lines, None, width, &Theme::plain()))
+        };
+        // A long key widens the column, two spaces from its description.
+        let keys = draw(
+            &[
+                "Enter            send",
+                "Ctrl-J / \\ Enter / Alt+Enter  new line",
+            ],
+            80,
+        );
+        let rows: Vec<&str> = keys.lines().collect();
+        assert_eq!(
+            rows[1].trim_end(),
+            "  Ctrl-J / \\ Enter / Alt+Enter  new line",
+            "{keys}"
+        );
+        assert_eq!(rows[0].find("send"), rows[1].find("new line"), "{keys}");
+        // A usage past the column stands alone; its description sits in the column.
+        let usage = draw(
+            &[
+                "/help  list the commands",
+                "/heartbeat [every <dur>] [--steer|--follow-up] <instr>  Add a heartbeat",
+            ],
+            80,
+        );
+        let rows: Vec<&str> = usage.lines().collect();
+        assert_eq!(rows[0].trim_end(), "  /help  list the commands", "{usage}");
+        assert_eq!(
+            rows[1].trim_end(),
+            "  /heartbeat [every <dur>] [--steer|--follow-up] <instr>",
+            "{usage}"
+        );
+        assert_eq!(rows[2].trim_end(), "         Add a heartbeat", "{usage}");
+        // A group's commands wrap under the column, not at the edge.
+        let help = draw(
+            &["Run      /goal /handoff /verify /review /features /more"],
+            30,
+        );
+        let rows: Vec<&str> = help.lines().collect();
+        assert!(rows[0].starts_with("  Run  /goal"), "{help}");
+        assert!(
+            rows[1..].iter().all(|row| row.starts_with("       /")),
+            "{help}"
+        );
+        // A line break is a new row.
+        let broken = draw(&["> Continue toward the goal.\nThe objective below"], 80);
+        assert!(!broken.contains("goal.The"), "{broken}");
+        assert!(broken.contains("The objective below"), "{broken}");
+        // Settings are fields.
+        let config = draw(
+            &[
+                "approval = full-auto [cli]",
+                "runtime.context_window_tokens = 128000 [default]",
+            ],
+            80,
+        );
+        assert!(
+            config.contains("  approval                       full-auto [cli]"),
+            "{config}"
+        );
+        assert!(
+            config.contains("  runtime.context_window_tokens  128000"),
+            "{config}"
+        );
+        // A list item's rest wraps past its bullet; prose stays flush.
+        let prose = draw(
+            &[
+                "- one two three four five six seven eight nine ten eleven",
+                "one two three four five six seven eight nine ten eleven twelve",
+            ],
+            30,
+        );
+        let rows: Vec<&str> = prose.lines().collect();
+        assert!(rows[0].starts_with("  - one"), "{prose}");
+        assert!(rows[1].starts_with("    "), "{prose}");
+        let flush = rows
+            .iter()
+            .position(|row| row.starts_with("  one"))
+            .expect("prose");
+        assert!(
+            rows[flush + 1].starts_with("  ") && !rows[flush + 1].starts_with("   "),
+            "{prose}"
+        );
     }
 
     #[test]
