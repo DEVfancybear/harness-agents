@@ -1,6 +1,6 @@
-//! The `jev` plugin: TypeSafe's Jev, a System One model, as a tool of the agent.
+//! The `jev` plugin: `TypeSafe`'s Jev, a System One model, as a tool of the agent.
 //!
-//! An agent + Jev workflow (TypeSafe's skill, `jev-fraud`): the reasoning model
+//! An agent + Jev workflow (`TypeSafe`'s skill, `jev-fraud`): the reasoning model
 //! researches, reasons and drafts; Jev makes the repeated narrow judgments -
 //! yes/no (`noul`), one of a set (`choice`), a degree (`score`) - in about 100 ms
 //! for a fraction of the cost, each with a probability and a confidence. An answer
@@ -28,7 +28,7 @@ use super::paths::LaunchEnvironment;
 
 /// The settings.json key that holds `enabled`, `threshold` and `model`.
 pub const SETTING: &str = "jev";
-/// The TypeSafe key; else what `/login typesafe` saved.
+/// The `TypeSafe` key; else what `/login typesafe` saved.
 pub const KEY_VARIABLE: &str = "TYPESAFE_API_KEY";
 /// The credential-file entry `/login typesafe` saves.
 pub const CREDENTIAL: &str = "typesafe";
@@ -38,7 +38,7 @@ const ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 const DEFAULT_MODEL: &str = "jev-latest";
 /// `jev-fraud`'s threshold: below it, a decision goes to review.
 pub const DEFAULT_THRESHOLD: f64 = 0.95;
-/// TypeSafe's input price, $0.042 per million tokens; output is free.
+/// `TypeSafe`'s input price, $0.042 per million tokens; output is free.
 const INPUT_PRICE: f64 = 0.042 / 1_000_000.0;
 /// `jev-fraud` runs 20 Jev calls at once.
 const CONCURRENCY: usize = 20;
@@ -113,7 +113,7 @@ impl JevSettings {
     }
 }
 
-/// The TypeSafe key: `TYPESAFE_API_KEY`, else the one `/login typesafe` saved.
+/// The `TypeSafe` key: `TYPESAFE_API_KEY`, else the one `/login typesafe` saved.
 #[must_use]
 pub fn api_key(environment: &LaunchEnvironment, data_dir: &Path) -> Option<String> {
     environment
@@ -152,15 +152,14 @@ pub fn status(config_file: &Path, environment: &LaunchEnvironment, data_dir: &Pa
         "no TypeSafe key yet: /login typesafe (or set TYPESAFE_API_KEY)".to_owned()
     };
     if settings.enabled {
-        let decisions = DECISIONS
-            .iter()
-            .map(|(name, what)| {
-                format!(
-                    "\n  {name:<13}{} - {what}",
-                    if settings.decides(name) { "on " } else { "off" }
-                )
-            })
-            .collect::<String>();
+        let mut decisions = String::new();
+        for (name, what) in DECISIONS {
+            let _ = write!(
+                decisions,
+                "\n  {name:<13}{} - {what}",
+                if settings.decides(name) { "on " } else { "off" }
+            );
+        }
         format!(
             "Jev plugin: on (settings.json jev.enabled). The agent has the jev tool and the jev skill: TypeSafe's Jev makes repeated narrow decisions (yes/no, choice, score) and hands back what it is not sure of. Model {}, threshold {}; {key}. /jev off turns it off.\nHarness decisions (/jev <decision> on|off):{decisions}",
             settings.model, settings.threshold
@@ -1246,7 +1245,7 @@ mod tests {
         assert!(sure.accepted && sure.decision.starts_with("no"));
     }
 
-    /// TypeSafe on loopback: an item mentioning "scam" is fraud with
+    /// `TypeSafe` on loopback: an item mentioning "scam" is fraud with
     /// confidence 0.99, anything else legitimate at 0.6; one call refuses.
     async fn serve() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1364,7 +1363,7 @@ mod tests {
         assert!(text.contains("200 input tokens"), "{text}");
     }
 
-    /// A TypeSafe on loopback whose answers `answer` computes from the request.
+    /// A `TypeSafe` on loopback whose answers `answer` computes from the request.
     async fn serve_with(
         answer: std::sync::Arc<dyn Fn(&serde_json::Value) -> serde_json::Value + Send + Sync>,
     ) -> String {

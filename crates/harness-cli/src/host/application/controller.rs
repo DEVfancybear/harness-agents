@@ -5241,6 +5241,10 @@ impl InteractiveController {
     /// pushed to history, not rendered, and not sent anywhere. The gate clears in
     /// the same step, so the next message is dispatched for real instead of being
     /// refused — a saved key that still needed a restart would be a trap.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "every credential's own notice: providers, Serper, TypeSafe"
+    )]
     fn save_key(&mut self, value: &str) -> Vec<Effect> {
         let Some(provider) = self.login_provider.take() else {
             return vec![Effect::Redraw];

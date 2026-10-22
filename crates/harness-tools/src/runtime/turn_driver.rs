@@ -2228,6 +2228,10 @@ struct ReadyAction {
 /// user when the policy says so) and the durable intent. It runs one call at a
 /// time, in the order the model asked, so approvals are asked in that order and
 /// intents take their journal sequences in that order.
+#[allow(
+    clippy::too_many_lines,
+    reason = "every gate in the order it runs: policy, guard, hooks, approval, intent"
+)]
 async fn gate_action(
     tools: &ToolExecutionService,
     request: ToolRequest,
