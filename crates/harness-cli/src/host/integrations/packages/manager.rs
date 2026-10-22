@@ -188,6 +188,11 @@ impl PackageManager {
             .unwrap_or(true)
     }
 
+    /// Settings flag: the jev plugin (default off), which shows its skill.
+    pub(super) fn jev_plugin_enabled(&self) -> bool {
+        self.settings.settings().jev_enabled.unwrap_or(false)
+    }
+
     /// Extra force-exclude patterns for built-in skills.
     pub(super) fn extra_builtin_skill_overrides(&self) -> &[String] {
         &self.extra_builtin_skill_overrides

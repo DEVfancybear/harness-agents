@@ -721,6 +721,10 @@ pub trait SessionPort: Send {
     fn factory(&mut self, _enable: Option<bool>) -> Result<String, String> {
         Err("this backend has no Python kernel".to_owned())
     }
+    /// `/jev on|off|status`: the jev plugin, off by default (`jev.enabled`).
+    fn jev_plugin(&mut self, _enable: Option<bool>) -> Result<String, String> {
+        Err("this backend has no plugins".to_owned())
+    }
     /// prime-agent's global `harnessRefinements` switch: report or set it.
     fn refinements(&mut self, _enable: Option<bool>) -> Result<String, String> {
         Err("this backend keeps no harness".to_owned())
@@ -6411,6 +6415,21 @@ impl SessionPort for AgentSessionService {
         })
     }
 
+    fn jev_plugin(&mut self, enable: Option<bool>) -> Result<String, String> {
+        if let Some(enable) = enable {
+            let mut setting = super::config::load_setting(&self.config_file, super::jev::SETTING)
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            setting["enabled"] = serde_json::json!(enable);
+            super::config::save_setting(&self.config_file, super::jev::SETTING, Some(setting))?;
+        }
+        Ok(super::jev::status(
+            &self.config_file,
+            &self.environment,
+            &self.data_dir,
+        ))
+    }
+
     fn refinements(&mut self, enable: Option<bool>) -> Result<String, String> {
         if let Some(enable) = enable {
             // On is the default: the key is kept only to say off.
@@ -8664,12 +8683,17 @@ async fn run_turn(
     let memory_host = super::memory::MemoryHost::new(&data_dir, task_id.as_str())
         .with_project(&workspace_root)
         .with_refinements(refinements);
-    tools = tools.with_external(super::task_state::with_dispatcher(
-        super::memory::with_dispatcher(
-            super::knowledge::with_dispatcher(dispatcher, &knowledge_host),
-            &memory_host,
+    // The jev plugin, when `/jev on` turned it on.
+    let jev_host = super::jev::JevHost::from_settings(&environment, &data_dir, &config_file);
+    tools = tools.with_external(super::jev::with_dispatcher(
+        super::task_state::with_dispatcher(
+            super::memory::with_dispatcher(
+                super::knowledge::with_dispatcher(dispatcher, &knowledge_host),
+                &memory_host,
+            ),
+            &task_state_host,
         ),
-        &task_state_host,
+        jev_host.as_ref(),
     ));
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
     let external_tools = super::mcp::combined_tools_with_delegate(
@@ -8682,16 +8706,19 @@ async fn run_turn(
         feature_host.as_ref(),
         repl_host.as_ref(),
     );
-    let external_tools = Some(super::task_state::with_tools(
-        Some(super::memory::with_tools(
-            Some(super::knowledge::with_tools(
-                external_tools,
-                &knowledge_host,
+    let external_tools = super::jev::with_tools(
+        Some(super::task_state::with_tools(
+            Some(super::memory::with_tools(
+                Some(super::knowledge::with_tools(
+                    external_tools,
+                    &knowledge_host,
+                )),
+                &memory_host,
             )),
-            &memory_host,
+            &task_state_host,
         )),
-        &task_state_host,
-    ));
+        jev_host.as_ref(),
+    );
     let driver = match &external_tools {
         Some(tools) => driver.with_external(tools.clone()),
         None => driver,

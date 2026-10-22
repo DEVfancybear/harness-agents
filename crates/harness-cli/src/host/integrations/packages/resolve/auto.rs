@@ -145,6 +145,10 @@ impl PackageManager {
                     // Web search stays disabled until explicitly enabled.
                     builtin_skill_overrides.push("-websearch/SKILL.md".to_string());
                 }
+                if !self.jev_plugin_enabled() {
+                    // The jev skill comes with its plugin: `/jev on`.
+                    builtin_skill_overrides.push("-jev/SKILL.md".to_string());
+                }
                 builtin_skill_overrides
                     .extend(self.extra_builtin_skill_overrides().iter().cloned());
                 add_resources(

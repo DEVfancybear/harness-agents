@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 66] = [
+pub const SLASH_COMMANDS: [SlashCommand; 67] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -160,6 +160,11 @@ pub const SLASH_COMMANDS: [SlashCommand; 66] = [
         "/factory",
         "[on|off|status]",
         "Show or set prime-agent's opt-in factory: state machines of child agents in the Python kernel",
+    ),
+    command(
+        "/jev",
+        "[on|off|status]",
+        "Show or set the jev plugin (off by default): TypeSafe's Jev for fast typed decisions, uncertain ones handed back",
     ),
     SlashCommand {
         options: &[

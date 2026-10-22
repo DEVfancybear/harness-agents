@@ -29,6 +29,9 @@ pub struct Settings {
     pub npm_command: Option<Vec<String>>,
     pub enable_builtin_skills: Option<bool>,
     pub bundled_skills: Option<BundledSkillsSettings>,
+    /// `jev.enabled`: the jev plugin, whose skill is bundled but hidden while
+    /// the plugin is off.
+    pub jev_enabled: Option<bool>,
 }
 
 impl Settings {
@@ -55,6 +58,10 @@ impl Settings {
                 .map(|bundled| BundledSkillsSettings {
                     websearch: bundled.get("websearch").and_then(Value::as_bool),
                 }),
+            jev_enabled: document
+                .get("jev")
+                .and_then(|jev| jev.get("enabled"))
+                .and_then(Value::as_bool),
         }
     }
 
@@ -77,6 +84,7 @@ impl Settings {
                 (_, Some(project)) if project.websearch.is_some() => Some(project.clone()),
                 (global, _) => global.clone(),
             },
+            jev_enabled: project.jev_enabled.or(global.jev_enabled),
         }
     }
 }

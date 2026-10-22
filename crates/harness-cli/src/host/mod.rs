@@ -75,6 +75,8 @@ pub mod heartbeat;
 pub mod input;
 #[path = "prompting/instructions.rs"]
 pub mod instructions;
+#[path = "integrations/jev.rs"]
+pub mod jev;
 #[path = "presentation/keybindings.rs"]
 pub mod keybindings;
 #[path = "memory/knowledge/mod.rs"]

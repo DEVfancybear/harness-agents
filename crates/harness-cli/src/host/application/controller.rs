@@ -4757,7 +4757,7 @@ impl InteractiveController {
                     self.push_history(&mut effects, HistoryItem::User { text });
                 }
             }
-            name @ ("/refinements" | "/factory") => {
+            name @ ("/refinements" | "/factory" | "/jev") => {
                 let enable = match argument {
                     None | Some("status") => Ok(None),
                     Some("on") => Ok(Some(true)),
@@ -4767,6 +4767,8 @@ impl InteractiveController {
                 let outcome = enable.and_then(|enable| {
                     if name == "/factory" {
                         self.service.factory(enable)
+                    } else if name == "/jev" {
+                        self.service.jev_plugin(enable)
                     } else {
                         self.service.refinements(enable)
                     }
@@ -5245,6 +5247,21 @@ impl InteractiveController {
                 ];
             }
         };
+        if provider == super::jev::CREDENTIAL {
+            let mut effects = Vec::new();
+            self.push_history(
+                &mut effects,
+                HistoryItem::Notice {
+                    message: format!(
+                        "Saved the TypeSafe key for the jev plugin to {}; the jev tool uses it from the next turn (/jev on turns the plugin on). The value is never shown, logged or kept in history.",
+                        source.describe()
+                    ),
+                },
+            );
+            self.refresh_menu();
+            effects.push(Effect::Redraw);
+            return effects;
+        }
         if provider == super::web::SERPER_CREDENTIAL {
             let mut effects = Vec::new();
             self.push_history(
@@ -5404,6 +5421,18 @@ impl InteractiveController {
             );
             return;
         }
+        // The jev plugin's TypeSafe key, kept like Serper's.
+        if argument == Some(super::jev::CREDENTIAL) && !for_subagents {
+            self.login_provider = Some(super::jev::CREDENTIAL.to_owned());
+            self.editor.begin_secret_entry();
+            self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: "Enter the TypeSafe API key for the jev plugin (from https://console.typesafe.ai): it is masked, never kept in history, and saved to the credential file. Esc cancels.".to_owned(),
+                },
+            );
+            return;
+        }
         let Some(provider) = argument.and_then(super::providers::provider) else {
             let (stored, command) = if for_subagents {
                 (
@@ -5443,6 +5472,15 @@ impl InteractiveController {
                 lines.push(format!(
                     "  {:<14}Serper (web search) · API key{state}",
                     super::web::SERPER_CREDENTIAL
+                ));
+                let state = if stored.iter().any(|(id, _)| id == super::jev::CREDENTIAL) {
+                    " · logged in (api_key)"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "  {:<14}TypeSafe (jev plugin) · API key{state}",
+                    super::jev::CREDENTIAL
                 ));
             }
             self.reference(command, lines, effects);
@@ -6607,6 +6645,12 @@ fn login_options(stored: &[(String, &'static str)], web_search: bool) -> Vec<(St
                 )
             }),
         )
+        .chain((web_search && !logged_in(super::jev::CREDENTIAL)).then(|| {
+            (
+                super::jev::CREDENTIAL.to_owned(),
+                "TypeSafe (jev plugin)".to_owned(),
+            )
+        }))
         .collect()
 }
 

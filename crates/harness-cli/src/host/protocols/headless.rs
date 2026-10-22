@@ -665,9 +665,18 @@ pub async fn run_with(
     if let Some((agents, _)) = &agents {
         tools = tools.with_elsewhere(Arc::clone(agents) as Arc<dyn harness_tools::PathElsewhere>);
     }
-    tools = tools.with_external(super::memory::with_dispatcher(
-        super::knowledge::with_dispatcher(dispatcher, &knowledge_host),
-        &memory_host,
+    // The jev plugin, when `/jev on` turned it on.
+    let jev_host = super::jev::JevHost::from_settings(
+        environment,
+        &context.paths.data_dir,
+        &context.paths.config_file,
+    );
+    tools = tools.with_external(super::jev::with_dispatcher(
+        super::memory::with_dispatcher(
+            super::knowledge::with_dispatcher(dispatcher, &knowledge_host),
+            &memory_host,
+        ),
+        jev_host.as_ref(),
     ));
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
     let external_tools = super::mcp::combined_tools_with_delegate(
@@ -680,13 +689,16 @@ pub async fn run_with(
         None,
         None,
     );
-    let external_tools = Some(super::memory::with_tools(
-        Some(super::knowledge::with_tools(
-            external_tools,
-            &knowledge_host,
+    let external_tools = super::jev::with_tools(
+        Some(super::memory::with_tools(
+            Some(super::knowledge::with_tools(
+                external_tools,
+                &knowledge_host,
+            )),
+            &memory_host,
         )),
-        &memory_host,
-    ));
+        jev_host.as_ref(),
+    );
     let driver = match &external_tools {
         Some(external) => driver.with_external(external.clone()),
         None => driver,
