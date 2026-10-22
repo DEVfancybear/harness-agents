@@ -60,7 +60,7 @@ pub struct JevSettings {
 
 /// The harness decision points Jev answers, each with its own switch, after
 /// the design notes on Jev engineering for coding agents.
-pub const DECISIONS: [(&str, &str); 8] = [
+pub const DECISIONS: [(&str, &str); 9] = [
     (
         "commands",
         "refuse a command Jev judges harmful, in every mode",
@@ -92,6 +92,10 @@ pub const DECISIONS: [(&str, &str); 8] = [
     (
         "tools",
         "point the model at the listed tools that fit the request",
+    ),
+    (
+        "cache",
+        "start fresh when the cache has expired and the request does not continue the conversation",
     ),
 ];
 
@@ -1334,6 +1338,99 @@ impl super::delegation::ChildJudge for JevDecisions {
     }
 }
 
+impl std::fmt::Debug for JevDecisions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JevDecisions")
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How long `provider_id`'s cache keeps a prefix after its last use. Taken
+/// long when unsure: a cache thought expired while it holds is the one wrong
+/// guess that costs, since a fresh start would then throw it away.
+#[must_use]
+pub fn cache_lifetime(provider_id: &str) -> Duration {
+    let long = harness_providers::cache_retention_long();
+    let provider = provider_id.to_ascii_lowercase();
+    if provider.contains("anthropic") {
+        // Five minutes, refreshed on each use; an hour when asked for.
+        Duration::from_secs(if long { 3_600 } else { 300 })
+    } else if provider.contains("deepseek") {
+        // A disk cache, cleared within hours to days.
+        Duration::from_secs(6 * 3_600)
+    } else if provider == "openai" && long {
+        // `prompt_cache_retention: 24h`.
+        Duration::from_secs(24 * 3_600)
+    } else {
+        // OpenAI keeps an idle prefix for 5 to 10 minutes, up to an hour.
+        Duration::from_secs(3_600)
+    }
+}
+
+/// The cache decision of one input: the jev plugin with the provider's cache
+/// lifetime.
+#[derive(Debug)]
+pub struct CacheJudge {
+    decisions: Arc<JevDecisions>,
+    lifetime: Duration,
+}
+
+impl CacheJudge {
+    /// The judge when the plugin decides `cache`; `None` otherwise.
+    #[must_use]
+    pub fn new(decisions: Option<&Arc<JevDecisions>>, provider_id: &str) -> Option<Self> {
+        let decisions = decisions.filter(|decisions| decisions.decides("cache"))?;
+        Some(Self {
+            decisions: Arc::clone(decisions),
+            lifetime: cache_lifetime(provider_id),
+        })
+    }
+}
+
+impl harness_runtime::FreshStartJudge for CacheJudge {
+    fn cache_lifetime(&self) -> Duration {
+        self.lifetime
+    }
+
+    fn needs_earlier<'a>(
+        &'a self,
+        request: &'a str,
+        earlier_requests: &'a [String],
+        last_answer: &'a str,
+        facts: harness_runtime::FreshStartFacts,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            let shown = earlier_requests.len().min(20);
+            let state = json!({
+                "request": request.chars().take(4_000).collect::<String>(),
+                "earlier_requests": earlier_requests[earlier_requests.len() - shown..]
+                    .iter()
+                    .map(|text| text.chars().take(600).collect::<String>())
+                    .collect::<Vec<_>>(),
+                "last_answer": last_answer.chars().take(2_000).collect::<String>(),
+            });
+            let mut questions = Map::new();
+            questions.insert("continues".to_owned(), json!({
+                "type": "noul",
+                "instructions": "A user comes back to a coding agent's conversation with `request`. `earlier_requests` are what they asked before, oldest first, and `last_answer` is the agent's last reply. Does `request` continue, refer to or depend on that earlier work - the same task, its files, its results, or something said in it (\"it\", \"that\", \"again\", \"the fix\")? A request about something else entirely does not.",
+            }));
+            let answers = self.decisions.answers("cache", state, questions).await?;
+            let sure = self.decisions.sure_noul("cache", &answers["continues"]);
+            harness_types::diag::info("jev", "cache_decided")
+                .field("decision", "cache")
+                .field("acted", sure == Some(false))
+                .field("tokens", facts.tokens)
+                .field("idle_s", facts.idle.as_secs())
+                .field("lifetime_s", self.lifetime.as_secs())
+                .field("continues", answers["continues"]["noul"].as_f64())
+                .emit();
+            sure
+        })
+    }
+}
+
 /// At most this many deferred tools are offered to Jev's first pass (a choice
 /// takes 255 options, one is `none`).
 const TOOLS_MAX_OPTIONS: usize = 254;
@@ -2120,6 +2217,68 @@ mod tests {
             super::tool_suggestions(Some(&off), "x", &deferred)
                 .await
                 .is_none()
+        );
+    }
+
+    /// A request that does not continue the conversation, judged so with
+    /// confidence, starts fresh; one that refers back, or an unsure answer,
+    /// keeps it. The cache lifetime is taken long when unsure.
+    #[tokio::test]
+    async fn a_cold_conversation_starts_fresh_only_for_an_unrelated_request() {
+        use harness_runtime::FreshStartJudge as _;
+        let endpoint = serve_with(std::sync::Arc::new(|request: &serde_json::Value| {
+            let text = request["state"]["request"].as_str().unwrap_or_default();
+            let noul = if text.contains("again") {
+                0.99
+            } else if text.contains("maybe") {
+                0.4
+            } else {
+                0.01
+            };
+            json!({"continues": {"type": "noul", "noul": noul}})
+        }))
+        .await;
+        let jev = std::sync::Arc::new(decisions(endpoint, &[]));
+        let judge = super::CacheJudge::new(Some(&jev), "deepseek").expect("on");
+        assert_eq!(
+            judge.cache_lifetime(),
+            std::time::Duration::from_secs(6 * 3_600)
+        );
+        let facts = harness_runtime::FreshStartFacts {
+            tokens: 50_000,
+            idle: std::time::Duration::from_secs(90_000),
+        };
+        let earlier = ["fix the parser".to_owned()];
+        assert_eq!(
+            judge
+                .needs_earlier("write the release notes", &earlier, "Fixed.", facts)
+                .await,
+            Some(false)
+        );
+        assert_eq!(
+            judge
+                .needs_earlier("run that again", &earlier, "Fixed.", facts)
+                .await,
+            Some(true)
+        );
+        assert_eq!(
+            judge
+                .needs_earlier("maybe", &earlier, "Fixed.", facts)
+                .await,
+            None
+        );
+        let off = std::sync::Arc::new(decisions(
+            "http://127.0.0.1:9/v1/systemone".to_owned(),
+            &["cache"],
+        ));
+        assert!(super::CacheJudge::new(Some(&off), "deepseek").is_none());
+        assert_eq!(
+            super::cache_lifetime("anthropic"),
+            std::time::Duration::from_secs(300)
+        );
+        assert_eq!(
+            super::cache_lifetime("openai-codex"),
+            std::time::Duration::from_secs(3_600)
         );
     }
 }

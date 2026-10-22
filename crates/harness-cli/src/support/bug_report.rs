@@ -1245,6 +1245,25 @@ impl Report {
                 (cached * 100).checked_div(input).unwrap_or_default(),
                 sum("output")
             );
+            // The cache decision of each input: carried on (the judge asked
+            // or not) or started fresh.
+            let reused = self.recorded("cache", "reused");
+            let fresh = self.recorded("cache", "fresh_start").len();
+            if !reused.is_empty() || fresh > 0 {
+                let asked = reused
+                    .iter()
+                    .filter(|record| record["fields"]["asked"] == true)
+                    .count();
+                let cold = reused
+                    .iter()
+                    .filter(|record| record["fields"]["warm"] == false)
+                    .count();
+                let _ = writeln!(
+                    out,
+                    "- conversations carried on: {} ({cold} with the cache expired, {asked} after asking whether the request needs them); started fresh: {fresh}",
+                    reused.len()
+                );
+            }
             let _ = writeln!(
                 out,
                 "- duration: median {:.1}s, 95th percentile {:.1}s, longest {:.1}s",

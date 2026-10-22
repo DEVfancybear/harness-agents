@@ -9254,6 +9254,11 @@ async fn run_turn(
     if let Some(imported) = imported {
         run_request = run_request.with_conversation(imported);
     }
+    // The design notes' cache decision: a cold, long conversation whose new
+    // request does not continue it starts fresh.
+    if let Some(judge) = super::jev::CacheJudge::new(jev_decisions.as_ref(), &config.provider_id) {
+        run_request = run_request.with_fresh_start_judge(Arc::new(judge));
+    }
     if live
         .auto_compaction_off
         .load(std::sync::atomic::Ordering::SeqCst)

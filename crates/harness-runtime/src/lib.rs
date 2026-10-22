@@ -951,6 +951,112 @@ fn split_turn(messages: &[ProviderMessage], keep: u64) -> Option<(usize, usize)>
     cut.filter(|cut| *cut > start + 1).map(|cut| (start, cut))
 }
 
+/// What a host knows that decides whether a cold conversation starts fresh.
+#[derive(Clone, Copy, Debug)]
+pub struct FreshStartFacts {
+    /// The earlier conversation's size, in estimated tokens.
+    pub tokens: u64,
+    /// How long since this conversation's last model call.
+    pub idle: Duration,
+}
+
+/// A host's judgment, once per input, of whether the new request needs the
+/// earlier conversation at all: the design notes' cache decision, reuse the
+/// cached prefix or rebuild. It is asked only when the provider's cache has
+/// expired - [`Self::cache_lifetime`] since the last call - and the earlier
+/// conversation is long, since then reusing it costs its full price anyway.
+/// `Some(false)` - sure it is not needed - starts the conversation fresh: the
+/// earlier turns are named in one note and read with the history tools.
+/// Anything else, or no answer, carries the conversation on as it was.
+pub trait FreshStartJudge: Send + Sync + std::fmt::Debug {
+    /// How long the provider keeps a prefix cached after its last use.
+    fn cache_lifetime(&self) -> Duration;
+
+    fn needs_earlier<'a>(
+        &'a self,
+        request: &'a str,
+        earlier_requests: &'a [String],
+        last_answer: &'a str,
+        facts: FreshStartFacts,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<bool>> + Send + 'a>>;
+}
+
+/// The task setting that keeps a fresh start: the conversation it set aside
+/// and the note that stands for it, applied to every later turn while the
+/// conversation still starts with it, so the new prefix stays cached.
+const FRESH_START_SETTING: &str = "fresh_start";
+
+/// A conversation this short is carried on whatever the request.
+const FRESH_START_MIN_TOKENS: u64 = 20_000;
+
+/// Without a call this process saw, the last turn's start stands for the last
+/// call; it is this much older than the last call can be at most, so a turn
+/// that ran long is not taken for an idle one.
+const FRESH_START_UNSEEN_MARGIN: Duration = Duration::from_secs(3_600);
+
+/// How a fresh start introduces the turns it set aside.
+const FRESH_START_PREFIX: &str = "[A fresh start: the earlier turns of this conversation are not shown here, because the new request does not continue them. history_search and history_read read them if one turns out to matter. They were:]";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FreshStart {
+    covers: usize,
+    digest: String,
+    note: String,
+}
+
+/// The last model call of each conversation this process made, by task.
+fn last_calls() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>
+{
+    static CALLS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    CALLS.get_or_init(Default::default)
+}
+
+fn note_model_call(task_id: &TaskId) {
+    if let Ok(mut calls) = last_calls().lock() {
+        calls.insert(task_id.as_str().to_owned(), std::time::Instant::now());
+    }
+}
+
+/// Seconds since the epoch of `SQLite`'s `CURRENT_TIMESTAMP` (`2026-10-20
+/// 08:15:02`, UTC).
+fn sqlite_seconds(text: &str) -> Option<u64> {
+    let (date, time) = text.trim().split_once(' ')?;
+    let mut date = date.split('-').map(str::parse::<i64>);
+    let (year, month, day) = (date.next()?.ok()?, date.next()?.ok()?, date.next()?.ok()?);
+    let mut time = time.split(':').map(str::parse::<i64>);
+    let (hour, minute, second) = (time.next()?.ok()?, time.next()?.ok()?, time.next()?.ok()?);
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let of_era = year - era * 400;
+    let of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let of_cycle = of_era * 365 + of_era / 4 - of_era / 100 + of_year;
+    let days = era * 146_097 + of_cycle - 719_468;
+    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
+}
+
+/// The note that stands for the turns a fresh start set aside: one line per
+/// thing the user asked.
+fn fresh_start_note(requests: &[String]) -> String {
+    let mut note = FRESH_START_PREFIX.to_owned();
+    let shown = requests.len().min(40);
+    for (index, request) in requests[requests.len() - shown..].iter().enumerate() {
+        let line = request
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default();
+        let _ = write!(
+            note,
+            "\n{}. {}",
+            requests.len() - shown + index + 1,
+            line.chars().take(160).collect::<String>()
+        );
+    }
+    note
+}
+
 /// The task setting that keeps the summary of a conversation's earlier part.
 const ROLLING_SUMMARY_SETTING: &str = "rolling_summary";
 
@@ -1266,9 +1372,18 @@ pub struct RunRequest {
     turn_summary: Arc<Mutex<Option<(usize, String)>>>,
     /// The summary of this turn's steps failed: the turn goes on without it.
     turn_summary_failed: Arc<AtomicBool>,
+    /// Whether a cold, long conversation starts fresh for this input.
+    fresh_start_judge: Option<Arc<dyn FreshStartJudge>>,
 }
 
 impl RunRequest {
+    /// Let `judge` decide whether a cold, long conversation starts fresh.
+    #[must_use]
+    pub fn with_fresh_start_judge(mut self, judge: Arc<dyn FreshStartJudge>) -> Self {
+        self.fresh_start_judge = Some(judge);
+        self
+    }
+
     /// prime-agent's `setAutoCompactionEnabled(false)`: this input never
     /// compacts the context on its own; a context over the window is the
     /// turn's overflow.
@@ -1307,6 +1422,7 @@ impl RunRequest {
             earlier_summary_failed: Arc::new(AtomicBool::new(false)),
             turn_summary: Arc::new(Mutex::new(None)),
             turn_summary_failed: Arc::new(AtomicBool::new(false)),
+            fresh_start_judge: None,
         }
     }
 
@@ -4317,6 +4433,7 @@ impl RuntimeService {
                         } => Some((*prompt_tokens, *completion_tokens, *cache_read_tokens)),
                         _ => None,
                     });
+                    note_model_call(&request.task_id);
                     harness_types::diag::info("provider", "call")
                         .task(request.task_id.as_str())
                         .session(request.session_id.as_str())
@@ -5152,6 +5269,133 @@ impl RuntimeService {
         Ok((summary, true))
     }
 
+    /// The conversation this input carries: as it was, or after a fresh start.
+    ///
+    /// A fresh start kept for this conversation is applied while the
+    /// conversation still begins with what it set aside, so every later turn
+    /// sends the same prefix. Otherwise, when the provider's cache has expired
+    /// and the conversation is long, the judge is asked whether the request
+    /// needs it; a sure no sets the earlier turns aside behind one note. Each
+    /// input records what was decided (`cache reused` or `cache fresh_start`).
+    async fn fresh_start(
+        &self,
+        source_session_id: &SessionId,
+        request: &RunRequest,
+        sent: Vec<ProviderMessage>,
+        bare: Vec<(usize, String)>,
+        typed: &[String],
+    ) -> (Vec<ProviderMessage>, Vec<(usize, String)>) {
+        let set_aside = |covers: usize, note: String, sent: Vec<ProviderMessage>| {
+            let mut conversation = vec![ProviderMessage::new(MessageRole::User, note)];
+            conversation.extend_from_slice(&sent[covers..]);
+            let bare = bare
+                .iter()
+                .filter(|(index, _)| *index >= covers)
+                .map(|(index, text)| (index - covers + 1, text.clone()))
+                .collect::<Vec<_>>();
+            (conversation, bare)
+        };
+        let kept = self
+            .store
+            .session_setting(&request.task_id, FRESH_START_SETTING)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|text| serde_json::from_str::<FreshStart>(&text).ok())
+            .filter(|kept| {
+                kept.covers > 0
+                    && kept.covers <= sent.len()
+                    && messages_digest(&sent[..kept.covers]) == kept.digest
+            });
+        if let Some(kept) = kept {
+            return set_aside(kept.covers, kept.note, sent);
+        }
+        let tokens = messages_tokens(&sent);
+        let Some(judge) = request
+            .fresh_start_judge
+            .as_ref()
+            .filter(|_| !sent.is_empty())
+        else {
+            return (sent, bare);
+        };
+        let lifetime = judge.cache_lifetime();
+        let seen = last_calls()
+            .lock()
+            .ok()
+            .and_then(|calls| calls.get(request.task_id.as_str()).copied())
+            .map(|at| at.elapsed());
+        let idle = match seen {
+            Some(idle) => Some(idle),
+            None => self
+                .store
+                .session_summary(source_session_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|summary| sqlite_seconds(&summary.created_at))
+                .and_then(|started| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()?
+                        .as_secs();
+                    now.checked_sub(started)
+                })
+                .map(Duration::from_secs)
+                .and_then(|age| age.checked_sub(FRESH_START_UNSEEN_MARGIN)),
+        };
+        let cold = idle.is_some_and(|idle| idle >= lifetime);
+        let record = |event: &'static str, asked: bool| {
+            harness_types::diag::info("cache", event)
+                .task(request.task_id.as_str())
+                .session(request.session_id.as_str())
+                .field("tokens", tokens)
+                .field("idle_s", idle.map(|idle| idle.as_secs()))
+                .field("lifetime_s", lifetime.as_secs())
+                .field("warm", !cold)
+                .field("asked", asked)
+                .emit();
+        };
+        if !cold || tokens < FRESH_START_MIN_TOKENS {
+            record("reused", false);
+            return (sent, bare);
+        }
+        let last_answer = sent
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        let needed = judge
+            .needs_earlier(
+                &request.text,
+                typed,
+                &last_answer,
+                FreshStartFacts {
+                    tokens,
+                    idle: idle.unwrap_or_default(),
+                },
+            )
+            .await;
+        if needed != Some(false) {
+            record("reused", true);
+            return (sent, bare);
+        }
+        let covers = sent.len();
+        let kept = FreshStart {
+            covers,
+            digest: messages_digest(&sent),
+            note: fresh_start_note(typed),
+        };
+        if let Ok(text) = serde_json::to_string(&kept) {
+            let _ = self
+                .store
+                .set_session_setting(&request.task_id, FRESH_START_SETTING, &text)
+                .await;
+        }
+        record("fresh_start", true);
+        set_aside(covers, kept.note, sent)
+    }
+
     /// The kept [`Self::rolling_summary`] of `conversation`'s start, with how
     /// many messages it covers, when that start is still the one it summarized.
     async fn kept_summary(
@@ -5814,6 +6058,14 @@ impl RuntimeService {
             None => request,
         };
         let replayed = history.interrupted_replayed;
+        let typed = history
+            .typed_inputs
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect::<Vec<_>>();
+        let (sent, bare) = self
+            .fresh_start(source_session_id, &request, sent, bare, &typed)
+            .await;
         let mut request = request.with_conversation(sent).with_bare_inputs(bare);
         request.continues = Some(source_session_id.clone());
         // An interrupted source turn is already replayed with its results.
@@ -6968,6 +7220,31 @@ mod long_task_compaction_tests {
             history.bare_inputs()[0],
             (0, "keep BLUE-HERON".to_owned()),
             "the typed words stand for the packet that was sent"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fresh_start_tests {
+    use super::{FRESH_START_PREFIX, fresh_start_note, sqlite_seconds};
+
+    #[test]
+    fn sqlite_time_reads_as_seconds_since_the_epoch() {
+        assert_eq!(sqlite_seconds("1970-01-01 00:00:00"), Some(0));
+        assert_eq!(sqlite_seconds("2026-10-20 08:15:02"), Some(1_792_484_102));
+        assert_eq!(sqlite_seconds("2024-02-29 12:00:00"), Some(1_709_208_000));
+        assert_eq!(sqlite_seconds("not a time"), None);
+    }
+
+    /// The note names each thing the user asked, newest last.
+    #[test]
+    fn a_fresh_start_names_what_was_set_aside() {
+        let note =
+            fresh_start_note(&["fix the parser\nmore".to_owned(), "\nadd a test".to_owned()]);
+        assert!(note.starts_with(FRESH_START_PREFIX));
+        assert!(
+            note.ends_with("\n1. fix the parser\n2. add a test"),
+            "{note}"
         );
     }
 }

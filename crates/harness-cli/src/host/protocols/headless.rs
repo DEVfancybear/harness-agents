@@ -919,6 +919,12 @@ pub async fn run_with(
         project_blocks.push(block);
     }
     let run_request = run_request.with_project_rules(project_blocks);
+    // A resumed conversation that went cold starts fresh, as in the app.
+    let run_request =
+        match super::jev::CacheJudge::new(jev_decisions.as_ref(), &resolved_config.provider.id) {
+            Some(judge) => run_request.with_fresh_start_judge(Arc::new(judge)),
+            None => run_request,
+        };
     let run_request = if attached.is_empty() {
         run_request
     } else {
