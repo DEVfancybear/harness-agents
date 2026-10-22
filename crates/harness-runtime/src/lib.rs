@@ -6226,7 +6226,10 @@ mod compaction_ceiling_tests {
             compaction_threshold_percent: 1.0,
             ..unbounded.clone()
         };
-        assert_eq!(compaction_threshold(&one), KEEP_RECENT_TOKENS + 16_384 * 2 + 1);
+        assert_eq!(
+            compaction_threshold(&one),
+            super::KEEP_RECENT_TOKENS + 16_384 * 2 + 1
+        );
         let invalid = RuntimeConfig {
             compaction_threshold_percent: 150.0,
             ..unbounded.clone()
