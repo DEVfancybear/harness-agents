@@ -163,7 +163,9 @@ bằng `HA_TOOL_TIERS`. Khi đó:
   schema của nó, rồi được gate và duyệt như mọi lời gọi khác.
 
 Danh sách tool gửi cho provider không đổi theo những gì model xem, nên prefix đã cache vẫn còn
-nguyên. Tool lõi và tool riêng của ha luôn ở trong danh sách.
+nguyên. Tool lõi và tool riêng của ha luôn ở trong danh sách. Khi bật Python REPL, server MCP được
+truy cập qua đối tượng `mcp` của REPL, vốn đã là theo yêu cầu. Vì vậy tầng tool áp cho tool MCP
+native (`HA_REPL=off`, hoặc máy không có Python) và tool extension.
 
 Cơ chế này chạy được cả khi không có plugin jev. Khi có plugin, quyết định 8 chỉ cho model những
 tool phù hợp.

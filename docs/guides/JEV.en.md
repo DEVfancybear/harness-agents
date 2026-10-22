@@ -145,7 +145,9 @@ or `HA_TOOL_TIERS`), they leave the tool list:
   its schema, and it is gated and approved like any other.
 
 The tool list sent to the provider does not change with what the model looks at, so the cached
-prefix stays whole. The core tools and ha's own always stay in the list. This works without the
+prefix stays whole. The core tools and ha's own always stay in the list. With the Python REPL on,
+MCP servers are reached through its `mcp` object instead, which is on demand already; the tiers
+apply to native MCP tools (`HA_REPL=off`, or no Python) and to extension tools. This works without the
 jev plugin; with it, decision 8 points the model at the tools that fit.
 
 ### The cache decision
