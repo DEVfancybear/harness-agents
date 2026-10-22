@@ -164,7 +164,7 @@ pub const SLASH_COMMANDS: [SlashCommand; 67] = [
     command(
         "/jev",
         "[on|off|status] | <decision> on|off",
-        "Show or set the jev plugin (off by default): TypeSafe's Jev for fast typed decisions, uncertain ones handed back; decisions: commands, subgoals, context, instructions, routing",
+        "Show or set the jev plugin (off by default) and its decisions: commands, subgoals, context, instructions, routing",
     ),
     SlashCommand {
         options: &[
