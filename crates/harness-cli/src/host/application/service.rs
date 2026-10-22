@@ -128,6 +128,9 @@ mod g03_model_selection_tests {
             bell: false,
             agents_default_model: None,
             agents_max_workers: None,
+            agents_max_depth: None,
+            web_search: None,
+            agents_commit: (None, None),
             queue_modes: (None, None),
             routing: super::super::config::Routing::default(),
             verify: super::super::verify::Verify::default(),
@@ -1115,6 +1118,12 @@ pub struct ProviderConfig {
     pub agents_default_model: Option<String>,
     /// `[agents] max_workers`: how many children run at once; `None` or 0, all.
     pub agents_max_workers: Option<u32>,
+    /// `[agents] max_depth`: how deep children nest; `None`, no limit.
+    pub agents_max_depth: Option<u32>,
+    /// `[agents] commit_name` and `commit_email`.
+    pub agents_commit: (Option<String>, Option<String>),
+    /// `[web] search`: the search APIs `web_search` asks, in order.
+    pub web_search: Option<Vec<String>>,
     /// `[queue]` modes, as written.
     pub queue_modes: (Option<String>, Option<String>),
     /// `[routing]`: scoped, auxiliary, backup and image models.
@@ -1349,6 +1358,9 @@ pub(super) fn resolve_provider_with_overrides(
         bell: resolved.bell,
         agents_default_model: resolved.agents_default_model,
         agents_max_workers: resolved.agents_max_workers,
+        agents_max_depth: resolved.agents_max_depth,
+        agents_commit: resolved.agents_commit,
+        web_search: resolved.web_search,
         queue_modes: resolved.queue_modes,
         routing: resolved.routing,
         verify: resolved.verify,
@@ -3239,35 +3251,42 @@ async fn conversation_task(
 }
 
 /// prime-agent's `_resolveRlmMaxDepth`: the chat's own value, else the global
-/// `rlmMaxDepth` setting, else `RLM_MAX_DEPTH`, else 2. ha has no parent session
-/// to inherit from: a child takes its value from the host when it is created.
+/// `rlmMaxDepth` setting, else `[agents] max_depth` in the config, else
+/// `RLM_MAX_DEPTH`, else no limit (prime-agent's default is 2). ha has no parent
+/// session to inherit from: a child takes its value from the host when it is
+/// created.
 async fn resolve_rlm_max_depth(
     store: &SqliteStore,
     task_id: &TaskId,
     config_file: &Path,
+    configured: Option<u32>,
     environment: &LaunchEnvironment,
 ) -> (u32, super::delegation::MaxDepthSource) {
-    use super::delegation::{DEFAULT_RLM_MAX_DEPTH, MaxDepthSource};
+    use super::delegation::{DEFAULT_RLM_MAX_DEPTH, MaxDepthSource, parse_max_depth};
     if let Some(depth) = store
         .session_setting(task_id, RLM_MAX_DEPTH_SETTING)
         .await
         .ok()
         .flatten()
-        .and_then(|value| value.trim().parse::<u32>().ok())
+        .and_then(|value| parse_max_depth(&value))
     {
         return (depth, MaxDepthSource::Chat);
     }
-    if let Some(depth) = super::config::load_setting(config_file, "rlmMaxDepth")
-        .and_then(|value| value.as_u64())
-        .and_then(|value| u32::try_from(value).ok())
+    if let Some(depth) =
+        super::config::load_setting(config_file, "rlmMaxDepth").and_then(|value| match value {
+            serde_json::Value::String(text) => parse_max_depth(&text),
+            value => value.as_u64().and_then(|value| u32::try_from(value).ok()),
+        })
     {
         return (depth, MaxDepthSource::Global);
     }
-    if let Some(depth) = environment.value("RLM_MAX_DEPTH").and_then(|value| {
-        value
-            .to_str()
-            .and_then(|value| value.trim().parse::<u32>().ok())
-    }) {
+    if let Some(depth) = configured {
+        return (depth, MaxDepthSource::Config);
+    }
+    if let Some(depth) = environment
+        .value("RLM_MAX_DEPTH")
+        .and_then(|value| value.to_str().and_then(parse_max_depth))
+    {
         return (depth, MaxDepthSource::Env);
     }
     (DEFAULT_RLM_MAX_DEPTH, MaxDepthSource::Default)
@@ -6529,35 +6548,48 @@ impl SessionPort for AgentSessionService {
                         Ok(lease) => {
                             let store = lease.store();
                             let task = conversation_task(&store, previous.as_ref(), task_id).await;
-                            resolve_rlm_max_depth(&store, &task, &config_file, &environment).await
+                            resolve_rlm_max_depth(
+                                &store,
+                                &task,
+                                &config_file,
+                                agents.configured_depth(),
+                                &environment,
+                            )
+                            .await
                         }
                         Err(_) => agents.max_depth(),
                     };
-                    format!("RLM max depth: {} ({})", resolved.0, resolved.1.as_str())
+                    format!(
+                        "RLM max depth: {} ({})",
+                        super::delegation::describe_max_depth(resolved.0),
+                        resolved.1.as_str()
+                    )
                 }
                 Some((depth, global)) => {
+                    let shown = super::delegation::describe_max_depth(depth);
                     agents.set_max_depth(depth, super::delegation::MaxDepthSource::Chat);
                     // The chat keeps its value: the conversation's task carries it.
                     if let Ok(lease) = agents.store().lease().await {
                         let store = lease.store();
                         let task = conversation_task(&store, previous.as_ref(), task_id).await;
                         let _ = store
-                            .set_session_setting(&task, RLM_MAX_DEPTH_SETTING, &depth.to_string())
+                            .set_session_setting(&task, RLM_MAX_DEPTH_SETTING, &shown)
                             .await;
                     }
                     if global {
-                        match super::config::save_setting(
-                            &config_file,
-                            "rlmMaxDepth",
-                            Some(serde_json::json!(depth)),
-                        ) {
-                            Ok(()) => format!("RLM max depth set: {depth} and saved as global default"),
+                        let saved = if depth == super::delegation::UNLIMITED_RLM_MAX_DEPTH {
+                            serde_json::json!("unlimited")
+                        } else {
+                            serde_json::json!(depth)
+                        };
+                        match super::config::save_setting(&config_file, "rlmMaxDepth", Some(saved)) {
+                            Ok(()) => format!("RLM max depth set: {shown} and saved as global default"),
                             Err(error) => format!(
                                 "RLM max depth set for this chat, but the global default was not saved: {error}"
                             ),
                         }
                     } else {
-                        format!("RLM max depth set: {depth}")
+                        format!("RLM max depth set: {shown}")
                     }
                 }
             };
@@ -7122,6 +7154,9 @@ mod model_reads_images_tests {
             bell: false,
             agents_default_model: None,
             agents_max_workers: None,
+            agents_max_depth: None,
+            web_search: None,
+            agents_commit: (None, None),
             queue_modes: (None, None),
             routing: crate::interactive::config::Routing::default(),
             verify: crate::interactive::verify::Verify::default(),
@@ -8332,7 +8367,11 @@ async fn run_turn(
             return;
         }
     };
-    let web_host = super::web::WebHost::from_environment(&environment, &data_dir);
+    let web_host = super::web::WebHost::from_environment(
+        &environment,
+        &data_dir,
+        config.web_search.as_deref(),
+    );
     // Children run on a provider of their own, fixed at the model this turn
     // started with: `/model` in a later turn does not switch a child mid-task.
     // Their cache key is the conversation's with `:agents` after it, as Codex
@@ -8354,8 +8393,19 @@ async fn run_turn(
     // this turn and nothing is refined after it.
     let refinements = super::config::harness_refinements(&config_file);
     let hashline = hashline_rule.applies(&format!("{}/{}", config.provider_id, config.model));
-    let (max_depth, depth_source) =
-        resolve_rlm_max_depth(&store, &task_id, &config_file, &environment).await;
+    agents.set_configured_depth(config.agents_max_depth);
+    harness_orchestrator::workspace::set_commit_identity(
+        config.agents_commit.0.as_deref(),
+        config.agents_commit.1.as_deref(),
+    );
+    let (max_depth, depth_source) = resolve_rlm_max_depth(
+        &store,
+        &task_id,
+        &config_file,
+        config.agents_max_depth,
+        &environment,
+    )
+    .await;
     agents.set_max_depth(max_depth, depth_source);
     agents.set_max_workers(config.agents_max_workers.unwrap_or(0));
     let delegate_host = Some(super::delegation::DelegateHost::new(

@@ -412,8 +412,9 @@ fn prepare_integration_worktree(
             &root.to_string_lossy(),
         ],
     )?;
-    git(root, &["config", "user.email", "harness-p5@localhost"])?;
-    git(root, &["config", "user.name", "harness-p5"])?;
+    let (name, email) = super::workspace::commit_identity();
+    git(root, &["config", "user.email", &email])?;
+    git(root, &["config", "user.name", &name])?;
     git(root, &["checkout", "--force", &snapshot.base_commit])?;
     Ok(())
 }

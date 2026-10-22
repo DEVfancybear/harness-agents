@@ -25,6 +25,10 @@ pub const DEFAULT_MAX_WORKERS: u32 = 3;
 /// [`SchedulerConfig::max_queued_workers`] for why a bound exists at all.
 pub const DEFAULT_MAX_QUEUED_WORKERS: u32 = 8;
 pub const DEFAULT_MAX_DEPTH: u32 = 2;
+/// A depth allowance that bounds nothing: an interactive session nests children
+/// as deep as its own `RLM_MAX_DEPTH` allows, which is unlimited by default; the
+/// host refuses a spawn past the session's value before it reaches a scheduler.
+pub const UNBOUNDED_DEPTH: u32 = u32::MAX;
 /// A [`SchedulerConfig`] worker or queue bound that bounds nothing: an
 /// interactive session runs every child it starts at once, as prime-agent
 /// does, and the user limits it in `[agents] max_workers` if they want to.
@@ -198,7 +202,7 @@ impl DelegationGrants {
     }
 
     pub fn validate(&self) -> Result<(), OrchestratorError> {
-        if self.max_depth > DEFAULT_MAX_DEPTH {
+        if self.max_depth > DEFAULT_MAX_DEPTH && self.max_depth != UNBOUNDED_DEPTH {
             return Err(OrchestratorError::new(
                 ErrorCode::DelegationDepthExceeded,
                 format!(
@@ -1158,7 +1162,9 @@ impl SchedulerConfig {
                 ),
             ));
         }
-        if self.max_depth == 0 || self.max_depth > DEFAULT_MAX_DEPTH {
+        if self.max_depth == 0
+            || (self.max_depth > DEFAULT_MAX_DEPTH && self.max_depth != UNBOUNDED_DEPTH)
+        {
             return Err(OrchestratorError::new(
                 ErrorCode::DelegationDepthExceeded,
                 format!(

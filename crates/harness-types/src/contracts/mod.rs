@@ -672,6 +672,9 @@ pub struct HarnessConfigV2 {
     /// before a goal or a feature counts as done, and as autonomous gates.
     #[serde(default)]
     pub verify: Option<VerifyConfigV2>,
+    /// The web tools: which search APIs `web_search` asks, in order.
+    #[serde(default)]
+    pub web: Option<WebConfigV2>,
 }
 
 impl HarnessConfigV2 {
@@ -1168,6 +1171,31 @@ pub struct AgentsConfigV2 {
     /// once, the default. Children past the number wait for one to finish.
     #[serde(default)]
     pub max_workers: Option<u32>,
+    /// How deep delegated children nest: a child at depth d starts children of
+    /// its own while d is below it, and 0 lets the root start none. Unset, the
+    /// default, sets no limit.
+    #[serde(default)]
+    pub max_depth: Option<u32>,
+    /// The author name of the commits ha makes for coders and when it
+    /// integrates their work; unset, `Harness Agents`.
+    #[serde(default)]
+    pub commit_name: Option<String>,
+    /// Their author email; unset, `harness-agents@localhost`. GitHub shows the
+    /// avatar of the account that owns this email.
+    #[serde(default)]
+    pub commit_email: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfigV2 {
+    /// The search APIs `web_search` asks, in order, by id: `deepseek` (the
+    /// `DeepSeek` Search API, with the `DeepSeek` key) and `serper` (Google, with
+    /// the Serper key). Only those with a key are asked; one that fails hands the
+    /// query to the next, and keyless `DuckDuckGo` comes last. Unset, the default
+    /// is `["deepseek", "serper"]`.
+    #[serde(default)]
+    pub search: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

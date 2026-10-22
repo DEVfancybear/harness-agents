@@ -421,6 +421,13 @@ pub struct ResolvedConfig {
     /// `[agents] max_workers`: how many delegated children run at once;
     /// `None` or 0 runs them all at once.
     pub agents_max_workers: Option<u32>,
+    /// `[agents] max_depth`: how deep delegated children nest; `None`, the
+    /// default, sets no limit.
+    pub agents_max_depth: Option<u32>,
+    /// `[agents] commit_name` and `commit_email`: who ha's commits are by.
+    pub agents_commit: (Option<String>, Option<String>),
+    /// `[web] search`: the search APIs `web_search` asks, in order.
+    pub web_search: Option<Vec<String>>,
     /// `[queue] steering_mode` and `follow_up_mode`, as written.
     pub queue_modes: (Option<String>, Option<String>),
     /// `[routing]`, merged across layers key by key.
@@ -459,6 +466,9 @@ pub fn resolve_layers(
     let mut bell = false;
     let mut agents_default_model: Option<String> = None;
     let mut agents_max_workers: Option<u32> = None;
+    let mut agents_max_depth: Option<u32> = None;
+    let mut agents_commit: (Option<String>, Option<String>) = (None, None);
+    let mut web_search: Option<Vec<String>> = None;
     let mut queue_modes: (Option<String>, Option<String>) = (None, None);
     let mut routing = Routing::new();
     let mut verify = super::verify::Verify::default();
@@ -539,11 +549,16 @@ pub fn resolve_layers(
         )?;
         apply_agents(
             &mut agents_default_model,
-            &mut agents_max_workers,
+            (
+                &mut agents_max_workers,
+                &mut agents_max_depth,
+                &mut agents_commit,
+            ),
             config,
             ConfigLayer::User,
             &mut entries,
         );
+        apply_web(&mut web_search, config, ConfigLayer::User, &mut entries)?;
         apply_queue(&mut queue_modes, config, ConfigLayer::User, &mut entries)?;
         apply_routing(&mut routing, config, ConfigLayer::User, &mut entries);
         apply_verify(&mut verify, config, ConfigLayer::User, &mut entries);
@@ -637,11 +652,16 @@ pub fn resolve_layers(
             )?;
             apply_agents(
                 &mut agents_default_model,
-                &mut agents_max_workers,
+                (
+                    &mut agents_max_workers,
+                    &mut agents_max_depth,
+                    &mut agents_commit,
+                ),
                 &config,
                 ConfigLayer::Project,
                 &mut entries,
             );
+            apply_web(&mut web_search, &config, ConfigLayer::Project, &mut entries)?;
             apply_queue(
                 &mut queue_modes,
                 &config,
@@ -718,11 +738,16 @@ pub fn resolve_layers(
         }
         apply_agents(
             &mut agents_default_model,
-            &mut agents_max_workers,
+            (
+                &mut agents_max_workers,
+                &mut agents_max_depth,
+                &mut agents_commit,
+            ),
             &config,
             ConfigLayer::Local,
             &mut entries,
         );
+        apply_web(&mut web_search, &config, ConfigLayer::Local, &mut entries)?;
         apply_queue(&mut queue_modes, &config, ConfigLayer::Local, &mut entries)?;
         apply_routing(&mut routing, &config, ConfigLayer::Local, &mut entries);
     }
@@ -919,6 +944,9 @@ pub fn resolve_layers(
         bell,
         agents_default_model,
         agents_max_workers,
+        agents_max_depth,
+        agents_commit,
+        web_search,
         queue_modes,
         routing,
         verify,
@@ -1111,7 +1139,11 @@ fn apply_verify(
 
 fn apply_agents(
     default_model: &mut Option<String>,
-    max_workers: &mut Option<u32>,
+    (max_workers, max_depth, commit): (
+        &mut Option<u32>,
+        &mut Option<u32>,
+        &mut (Option<String>, Option<String>),
+    ),
     config: &HarnessConfigV2,
     layer: ConfigLayer,
     entries: &mut BTreeMap<String, ConfigExplainEntry>,
@@ -1135,6 +1167,57 @@ fn apply_agents(
         };
         set_explain(entries, "agents.max_workers", &shown, layer, None);
     }
+    if let Some(depth) = config.agents.as_ref().and_then(|agents| agents.max_depth) {
+        *max_depth = Some(depth);
+        set_explain(entries, "agents.max_depth", &depth.to_string(), layer, None);
+    }
+    let text = |value: Option<&String>| {
+        value
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(name) = text(
+        config
+            .agents
+            .as_ref()
+            .and_then(|agents| agents.commit_name.as_ref()),
+    ) {
+        set_explain(entries, "agents.commit_name", &name, layer, None);
+        commit.0 = Some(name);
+    }
+    if let Some(email) = text(
+        config
+            .agents
+            .as_ref()
+            .and_then(|agents| agents.commit_email.as_ref()),
+    ) {
+        set_explain(entries, "agents.commit_email", &email, layer, None);
+        commit.1 = Some(email);
+    }
+}
+
+/// `[web] search`, a layer's list replacing the one before it.
+fn apply_web(
+    search: &mut Option<Vec<String>>,
+    config: &HarnessConfigV2,
+    layer: ConfigLayer,
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+) -> Result<(), HarnessError> {
+    let Some(order) = config.web.as_ref().and_then(|web| web.search.as_ref()) else {
+        return Ok(());
+    };
+    if let Some(unknown) = order
+        .iter()
+        .find(|id| super::web::SearchApi::parse(id).is_none())
+    {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            format!("[web] search lists {unknown:?}; the search APIs are deepseek and serper"),
+        ));
+    }
+    *search = Some(order.clone());
+    set_explain(entries, "web.search", &order.join(", "), layer, None);
+    Ok(())
 }
 
 fn apply_hooks(
@@ -2023,6 +2106,46 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("notice"))
         );
+    }
+
+    /// `[agents] max_depth` limits how deep children nest (unset: no limit),
+    /// `commit_name`/`commit_email` name ha's commits, and `[web] search` orders
+    /// the search APIs, refusing one it does not know.
+    #[test]
+    fn agents_depth_commit_identity_and_web_search_are_read() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).expect("project dir");
+        let user = temp.path().join("user.toml");
+        let resolve = |text: &str| {
+            std::fs::write(&user, text).expect("user config");
+            resolve_layers(
+                &user,
+                &root,
+                &super::super::paths::LaunchEnvironment::default(),
+                &ConfigOverrides::default(),
+            )
+        };
+        let unset = resolve("schema_version = 2\n").expect("resolves");
+        assert_eq!(unset.agents_max_depth, None);
+        assert_eq!(unset.agents_commit, (None, None));
+        assert_eq!(unset.web_search, None);
+        let set = resolve(
+            "schema_version = 2\n[agents]\nmax_depth = 3\ncommit_name = \"Bear\"\ncommit_email = \"bear@example.org\"\n[web]\nsearch = [\"serper\", \"deepseek\"]\n",
+        )
+        .expect("resolves");
+        assert_eq!(set.agents_max_depth, Some(3));
+        assert_eq!(
+            set.agents_commit,
+            (Some("Bear".to_owned()), Some("bear@example.org".to_owned()))
+        );
+        assert_eq!(
+            set.web_search,
+            Some(vec!["serper".to_owned(), "deepseek".to_owned()])
+        );
+        let unknown = resolve("schema_version = 2\n[web]\nsearch = [\"bing\"]\n")
+            .expect_err("an unknown search API is refused");
+        assert!(unknown.message().contains("bing"), "{}", unknown.message());
     }
 
     /// `[agents] max_workers` limits how many children run at once; unset,

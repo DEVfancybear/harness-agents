@@ -555,7 +555,11 @@ pub async fn run_with(
     };
     // The web tools, as the app has them: a scripted run that is asked about
     // current events can search and read pages too. `HA_WEB=off` removes them.
-    let web_host = super::web::WebHost::from_environment(environment, &context.paths.data_dir);
+    let web_host = super::web::WebHost::from_environment(
+        environment,
+        &context.paths.data_dir,
+        resolved_config.web_search.as_deref(),
+    );
     let hashline = super::config::HashlineRule::load(
         &context.paths.config_file,
         environment.value("HA_HASHLINE"),

@@ -416,9 +416,56 @@ fn join_git<T>(
     })
 }
 
-/// The identity worker commits are made with.
-const WORKER_EMAIL: &str = "harness-p5@localhost";
-const WORKER_NAME: &str = "harness-p5";
+/// The name commits by coders and the integration carry unless `[agents]
+/// commit_name` sets another.
+pub const DEFAULT_COMMIT_NAME: &str = "Harness Agents";
+/// Their email unless `[agents] commit_email` sets another. GitHub shows the
+/// avatar of the account that owns a commit's email, so an account of its own
+/// (with `docs/assets/ha-commit-avatar.png`) gives these commits a face.
+pub const DEFAULT_COMMIT_EMAIL: &str = "harness-agents@localhost";
+
+fn commit_identity_slot() -> &'static std::sync::RwLock<(String, String)> {
+    static IDENTITY: std::sync::OnceLock<std::sync::RwLock<(String, String)>> =
+        std::sync::OnceLock::new();
+    IDENTITY.get_or_init(|| {
+        std::sync::RwLock::new((
+            DEFAULT_COMMIT_NAME.to_owned(),
+            DEFAULT_COMMIT_EMAIL.to_owned(),
+        ))
+    })
+}
+
+/// Set the name and email the host's commits carry from here on; `None` (or
+/// blank) keeps the default.
+pub fn set_commit_identity(name: Option<&str>, email: Option<&str>) {
+    let pick = |value: Option<&str>, default: &str| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.contains(['\n', '\r', '<', '>']))
+            .unwrap_or(default)
+            .to_owned()
+    };
+    if let Ok(mut identity) = commit_identity_slot().write() {
+        *identity = (
+            pick(name, DEFAULT_COMMIT_NAME),
+            pick(email, DEFAULT_COMMIT_EMAIL),
+        );
+    }
+}
+
+/// The name and email the host's commits carry.
+#[must_use]
+pub fn commit_identity() -> (String, String) {
+    commit_identity_slot().read().map_or_else(
+        |_| {
+            (
+                DEFAULT_COMMIT_NAME.to_owned(),
+                DEFAULT_COMMIT_EMAIL.to_owned(),
+            )
+        },
+        |identity| identity.clone(),
+    )
+}
 
 /// The blocking body of [`WorkspaceManager::create_worktree`], under the Git lock.
 fn add_worktree_locked(
@@ -505,17 +552,15 @@ fn add_worktree_locked(
     .unwrap_or_default();
     let mut identity = identity.lines().map(str::trim).collect::<Vec<_>>();
     identity.sort_unstable();
-    let expected = [
-        format!("user.email {WORKER_EMAIL}"),
-        format!("user.name {WORKER_NAME}"),
-    ];
+    let (name, email) = commit_identity();
+    let expected = [format!("user.email {email}"), format!("user.name {name}")];
     if identity
         .iter()
         .copied()
         .ne(expected.iter().map(String::as_str))
     {
-        git(clone_source, &["config", "user.email", WORKER_EMAIL])?;
-        git(clone_source, &["config", "user.name", WORKER_NAME])?;
+        git(clone_source, &["config", "user.email", &email])?;
+        git(clone_source, &["config", "user.name", &name])?;
     }
     Ok(())
 }

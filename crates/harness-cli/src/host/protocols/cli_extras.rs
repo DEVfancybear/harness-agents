@@ -279,7 +279,8 @@ pub fn prompt(cwd: Option<&Path>, json: bool) -> Result<ExitCode, HarnessError> 
                 .and_then(serde_json::Value::as_str)
         })
         .collect::<Vec<_>>();
-    if super::web::WebHost::from_environment(&environment, &data_dir(&environment)?).is_some() {
+    if super::web::WebHost::from_environment(&environment, &data_dir(&environment)?, None).is_some()
+    {
         names.extend(["web_search", "web_fetch"]);
     }
     if !super::knowledge::KnowledgeHost::new(&root, &data_dir(&environment)?)

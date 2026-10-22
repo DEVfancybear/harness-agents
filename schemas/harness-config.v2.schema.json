@@ -3,11 +3,37 @@
     "AgentsConfigV2": {
       "additionalProperties": false,
       "properties": {
+        "commit_email": {
+          "default": null,
+          "description": "Their author email; unset, `harness-agents@localhost`. GitHub shows the\navatar of the account that owns this email.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commit_name": {
+          "default": null,
+          "description": "The author name of the commits ha makes for coders and when it\nintegrates their work; unset, `Harness Agents`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "default_model": {
           "default": null,
           "description": "The model a child runs on when it does not ask for one, as `provider/id`.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "max_depth": {
+          "default": null,
+          "description": "How deep delegated children nest: a child at depth d starts children of\nits own while d is below it, and 0 lets the root start none. Unset, the\ndefault, sets no limit.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
             "null"
           ]
         },
@@ -618,6 +644,23 @@
         }
       },
       "type": "object"
+    },
+    "WebConfigV2": {
+      "additionalProperties": false,
+      "properties": {
+        "search": {
+          "default": null,
+          "description": "The search APIs `web_search` asks, in order, by id: `deepseek` (the\n`DeepSeek` Search API, with the `DeepSeek` key) and `serper` (Google, with\nthe Serper key). Only those with a key are asked; one that fails hands the\nquery to the next, and keyless `DuckDuckGo` comes last. Unset, the default\nis `[\"deepseek\", \"serper\"]`.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
     }
   },
   "$id": "https://harness-agents.local/schemas/harness-config.v2.schema.json",
@@ -771,6 +814,18 @@
       ],
       "default": null,
       "description": "The project's own checks, which the harness runs itself - not the model -\nbefore a goal or a feature counts as done, and as autonomous gates."
+    },
+    "web": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WebConfigV2"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The web tools: which search APIs `web_search` asks, in order."
     }
   },
   "required": [

@@ -24,8 +24,8 @@ pub use contracts::{
     DEFAULT_MAX_QUEUED_WORKERS, DEFAULT_MAX_WORKERS, DELEGATION_CONTRACT_VERSION, DelegatedOutcome,
     DelegatedResult, DelegationBudget, DelegationGrants, DirtyReason, GrantAction,
     IntegrationReport, IntegrationStep, OrchestratorError, SchedulerConfig, TaskBrief, TaskGraph,
-    TaskNode, TaskPlan, TaskStatus, UNBOUNDED_WORKERS, VerifiedSnapshot, WorkerRef, WorktreeRecord,
-    WorktreeState,
+    TaskNode, TaskPlan, TaskStatus, UNBOUNDED_DEPTH, UNBOUNDED_WORKERS, VerifiedSnapshot,
+    WorkerRef, WorktreeRecord, WorktreeState,
 };
 pub use coordinator::{
     DelegationCoordinator, EvidenceVerifier, ResultVerifier, StepOutcome, fresh_run,

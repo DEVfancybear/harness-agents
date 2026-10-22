@@ -7,13 +7,18 @@
 //! `httpx`); here the two operations are host tools, so they work in every turn
 //! whether or not the kernel is up:
 //!
-//! - `web_search` asks Google through Serper when `SERPER_API_KEY` is set, formatted
-//!   the way prime-agent formats it (knowledge graph, organic results, people also
-//!   ask), and falls back to `DuckDuckGo`'s HTML endpoint, which needs no key, so search
+//! - `web_search` asks the search APIs that have a key, in the configured order
+//!   (`[web] search`, `HA_WEB_SEARCH`; `DeepSeek`, then Serper, by default): `DeepSeek`'s
+//!   Search API with the `DeepSeek` key, Google through Serper with `SERPER_API_KEY`,
+//!   formatted the way prime-agent formats it. An API that fails hands the query to
+//!   the next one, and a key an API refuses (expired, out of balance) is skipped for
+//!   a while; `DuckDuckGo`'s HTML endpoint, which needs no key, comes last, so search
 //!   works on a fresh install;
 //! - `web_fetch` downloads one http(s) page and returns readable text - scripts and
 //!   styles dropped, blocks on their own lines, entities decoded - with the page's
-//!   links, in windows the model pages through with `start_index`.
+//!   links, in windows the model pages through with `start_index`. A site that
+//!   refuses ha (a bot check, a rate limit) is read through `DeepSeek`'s Fetch API
+//!   when a `DeepSeek` key is set.
 //!
 //! Both are bounded: a size cap on what is downloaded, a window on what is returned,
 //! and a timeout. Loopback, private and link-local hosts are refused, including as
@@ -45,6 +50,131 @@ const SERPER_ENDPOINT: &str = "https://google.serper.dev/search";
 
 /// The credential-file entry `/login serper` saves, prime-agent's `serper` id.
 pub const SERPER_CREDENTIAL: &str = "serper";
+
+/// The `DeepSeek` key, the one the `DeepSeek` models use: `DEEPSEEK_API_KEY`, else
+/// what `/login deepseek` saved.
+pub const DEEPSEEK_KEY_VARIABLE: &str = "DEEPSEEK_API_KEY";
+const DEEPSEEK_CREDENTIAL: &str = "deepseek";
+
+/// `DeepSeek`'s Search and Fetch APIs (`/search`, `/fetch` under it); the
+/// variable moves them, for a proxy or a test.
+const DEEPSEEK_TOOLS_ENDPOINT: &str = "https://api.deepseek.com/v1/tools";
+pub const DEEPSEEK_TOOLS_VARIABLE: &str = "HA_DEEPSEEK_TOOLS_URL";
+/// `DeepSeek` Search takes a query of at most 128 characters.
+const DEEPSEEK_MAX_QUERY_CHARS: usize = 128;
+
+/// The search APIs in the order they are asked, by id (`deepseek,serper`):
+/// overrides `[web] search`.
+pub const SEARCH_ORDER_VARIABLE: &str = "HA_WEB_SEARCH";
+
+/// How long a key an API refused (401, 402: invalid, expired, out of balance)
+/// is skipped before it is tried again; a different key is tried at once.
+const REFUSED_KEY_RETRY: Duration = Duration::from_secs(30 * 60);
+
+/// A search API `web_search` can ask with a key.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SearchApi {
+    DeepSeek,
+    Serper,
+}
+
+impl SearchApi {
+    /// The order when nothing sets one.
+    pub const DEFAULT_ORDER: [Self; 2] = [Self::DeepSeek, Self::Serper];
+
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::DeepSeek => "deepseek",
+            Self::Serper => "serper",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::DeepSeek => "DeepSeek Search",
+            Self::Serper => "Google via Serper",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(id: &str) -> Option<Self> {
+        match id.trim().to_ascii_lowercase().as_str() {
+            "deepseek" => Some(Self::DeepSeek),
+            "serper" | "google" => Some(Self::Serper),
+            _ => None,
+        }
+    }
+
+    /// An order as written (`deepseek, serper`): known ids, each once.
+    #[must_use]
+    pub fn order(ids: &[String]) -> Vec<Self> {
+        let mut order = Vec::new();
+        for api in ids.iter().filter_map(|id| Self::parse(id)) {
+            if !order.contains(&api) {
+                order.push(api);
+            }
+        }
+        order
+    }
+
+    /// The command that saves this API's key.
+    const fn login(self) -> &'static str {
+        match self {
+            Self::DeepSeek => "/login deepseek",
+            Self::Serper => "/login serper",
+        }
+    }
+}
+
+/// One search API with its key.
+#[derive(Clone)]
+struct Searcher {
+    api: SearchApi,
+    key: String,
+    endpoint: String,
+}
+
+/// Keys an API refused, by API and a hash of the key, with when.
+fn refused_keys()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<(SearchApi, u64), std::time::Instant>> {
+    static REFUSED: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<(SearchApi, u64), std::time::Instant>>,
+    > = std::sync::LazyLock::new(Default::default);
+    REFUSED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn key_hash(key: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// How long ago `api` refused `key`, while that still counts.
+fn refused_since(api: SearchApi, key: &str) -> Option<Duration> {
+    let mut refused = refused_keys();
+    let entry = (api, key_hash(key));
+    let since = refused.get(&entry)?.elapsed();
+    if since >= REFUSED_KEY_RETRY {
+        refused.remove(&entry);
+        return None;
+    }
+    Some(since)
+}
+
+fn remember_refused(api: SearchApi, key: &str) {
+    refused_keys().insert((api, key_hash(key)), std::time::Instant::now());
+}
+
+/// Why one search API did not answer.
+struct SearchFailure {
+    message: String,
+    /// The API refused the key itself: skip it for a while.
+    key_refused: bool,
+}
 const FALLBACK_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 const USER_AGENT: &str =
     "Mozilla/5.0 (compatible; ha/0.1; +https://github.com/DEVfancybear/harness-agents)";
@@ -69,8 +199,10 @@ pub struct WebHost {
 
 struct WebInner {
     client: reqwest::Client,
-    serper_key: Option<String>,
-    serper_endpoint: String,
+    /// The APIs with a key, in the order they are asked.
+    searchers: Vec<Searcher>,
+    /// `DeepSeek`'s Fetch API and its key, for a site that refuses ha.
+    page_reader: Option<(String, String)>,
     fallback_endpoint: String,
     allow_private_hosts: bool,
 }
@@ -78,11 +210,15 @@ struct WebInner {
 impl WebHost {
     /// The web tools as the environment configures them, or `None` when turned off.
     /// The Serper key is `SERPER_API_KEY`, else the one `/login serper` saved
-    /// in the credential file under `data_dir`, as prime-agent keeps it.
+    /// in the credential file under `data_dir`, as prime-agent keeps it; the
+    /// `DeepSeek` key is `DEEPSEEK_API_KEY`, else the one `/login deepseek` saved.
+    /// `configured` is `[web] search`, the order the APIs are asked in;
+    /// `HA_WEB_SEARCH` overrides it.
     #[must_use]
     pub fn from_environment(
         environment: &LaunchEnvironment,
         data_dir: &std::path::Path,
+        configured: Option<&[String]>,
     ) -> Option<Self> {
         let value = |name: &str| {
             environment
@@ -100,26 +236,54 @@ impl WebHost {
         }) {
             return None;
         }
-        let saved = || {
-            super::credentials::load(
-                &super::credentials::resolve_file(environment, data_dir),
-                SERPER_CREDENTIAL,
-            )
-            .ok()
-            .flatten()
-            .map(|credential| credential.secret().to_owned())
+        let credential_file = super::credentials::resolve_file(environment, data_dir);
+        let saved = |provider: &str| {
+            super::credentials::load(&credential_file, provider)
+                .ok()
+                .flatten()
+                .filter(|credential| {
+                    matches!(credential, super::credentials::Credential::ApiKey { .. })
+                })
+                .map(|credential| credential.secret().trim().to_owned())
+                .filter(|key| !key.is_empty())
         };
+        let order = value(SEARCH_ORDER_VARIABLE)
+            .map(|ids| SearchApi::order(&ids.split(',').map(str::to_owned).collect::<Vec<_>>()))
+            .or_else(|| configured.map(SearchApi::order))
+            .unwrap_or_else(|| SearchApi::DEFAULT_ORDER.to_vec());
+        let tools = value(DEEPSEEK_TOOLS_VARIABLE)
+            .unwrap_or_else(|| DEEPSEEK_TOOLS_ENDPOINT.to_owned())
+            .trim_end_matches('/')
+            .to_owned();
+        let deepseek_key = value(DEEPSEEK_KEY_VARIABLE).or_else(|| saved(DEEPSEEK_CREDENTIAL));
+        let searchers = order
+            .iter()
+            .filter_map(|api| {
+                let (key, endpoint) = match api {
+                    SearchApi::DeepSeek => (deepseek_key.clone()?, format!("{tools}/search")),
+                    SearchApi::Serper => (
+                        value(SERPER_KEY_VARIABLE).or_else(|| saved(SERPER_CREDENTIAL))?,
+                        SERPER_ENDPOINT.to_owned(),
+                    ),
+                };
+                Some(Searcher {
+                    api: *api,
+                    key,
+                    endpoint,
+                })
+            })
+            .collect();
         Self::build(
-            value(SERPER_KEY_VARIABLE).or_else(saved),
-            SERPER_ENDPOINT.to_owned(),
+            searchers,
+            deepseek_key.map(|key| (format!("{tools}/fetch"), key)),
             FALLBACK_ENDPOINT.to_owned(),
             false,
         )
     }
 
     fn build(
-        serper_key: Option<String>,
-        serper_endpoint: String,
+        searchers: Vec<Searcher>,
+        page_reader: Option<(String, String)>,
         fallback_endpoint: String,
         allow_private_hosts: bool,
     ) -> Option<Self> {
@@ -156,8 +320,8 @@ impl WebHost {
         Some(Self {
             inner: Arc::new(WebInner {
                 client,
-                serper_key,
-                serper_endpoint,
+                searchers,
+                page_reader,
                 fallback_endpoint,
                 allow_private_hosts,
             }),
@@ -335,54 +499,131 @@ impl WebHost {
         }
     }
 
+    /// Ask the search APIs in order until one answers: one that fails hands the
+    /// query to the next, and a key an API refused is skipped for a while, so
+    /// an expired key costs one failed request, not one per search. The keyless
+    /// provider answers when none does, and a note says what was skipped.
     async fn search(&self, query: &str, results: usize) -> Result<String, HarnessError> {
-        let body = match &self.inner.serper_key {
-            Some(key) => match self.serper(query, key, results).await {
-                Ok(body) => body,
-                // Serper down, out of quota or refusing the key: the keyless
-                // provider still answers, and the note says why it was used.
-                Err(error) => {
-                    let hint = if error.code() == ErrorCode::AccessDenied {
-                        " Ask the user to run /login serper with a valid key."
-                    } else {
-                        ""
-                    };
-                    format!(
-                        "(Google results via Serper failed: {}; these come from DuckDuckGo.{hint})\n\n{}",
-                        error.message(),
-                        self.fallback_search(query, results).await?
-                    )
+        let mut notes = Vec::new();
+        let mut renew = Vec::new();
+        for searcher in &self.inner.searchers {
+            let api = searcher.api;
+            if let Some(since) = refused_since(api, &searcher.key) {
+                notes.push(format!(
+                    "{} skipped: it refused its key {} min ago",
+                    api.label(),
+                    since.as_secs() / 60
+                ));
+                renew.push(api.login());
+                continue;
+            }
+            let answer = match api {
+                SearchApi::DeepSeek => self.deepseek_search(searcher, query, results).await,
+                SearchApi::Serper => self.serper(searcher, query, results).await,
+            };
+            match answer {
+                Ok(body) => {
+                    return Ok(search_answer(query, api.label(), &notes, &renew, &body));
                 }
-            },
-            None => self.fallback_search(query, results).await?,
-        };
-        Ok(format!("Results for query \"{query}\":\n\n{body}"))
+                Err(failure) => {
+                    harness_types::diag::warn("web", "search_failed")
+                        .field("api", api.id())
+                        .field("key_refused", failure.key_refused)
+                        .field("reason", failure.message.as_str())
+                        .emit();
+                    if failure.key_refused {
+                        remember_refused(api, &searcher.key);
+                        renew.push(api.login());
+                    }
+                    notes.push(format!("{} failed: {}", api.label(), failure.message));
+                }
+            }
+        }
+        let body = self.fallback_search(query, results).await?;
+        Ok(search_answer(query, "DuckDuckGo", &notes, &renew, &body))
     }
 
-    async fn serper(&self, query: &str, key: &str, results: usize) -> Result<String, HarnessError> {
-        let response = self
-            .inner
-            .client
-            .post(&self.inner.serper_endpoint)
-            .header("X-API-KEY", key)
-            .json(&json!({ "q": query, "num": results }))
-            .send()
-            .await
-            .map_err(|error| {
-                unavailable(format!("the search request failed: {}", with_cause(&error)))
-            })?;
+    /// One search API's answer, or why it gave none.
+    async fn ask_api(
+        &self,
+        searcher: &Searcher,
+        request: reqwest::RequestBuilder,
+        refuses_key: impl Fn(u16, &str) -> bool,
+    ) -> Result<Value, SearchFailure> {
+        let label = searcher.api.label();
+        let response = request.send().await.map_err(|error| SearchFailure {
+            message: format!("the request failed: {}", with_cause(&error)),
+            key_refused: false,
+        })?;
         let status = response.status();
-        let bytes = read_bounded(response).await?;
+        let bytes = read_bounded(response)
+            .await
+            .map_err(|error| SearchFailure {
+                message: error.message().to_owned(),
+                key_refused: false,
+            })?;
         if !status.is_success() {
             let body = String::from_utf8_lossy(&bytes)
                 .chars()
                 .take(300)
                 .collect::<String>();
-            return Err(http_error(&format!("Serper ({body})"), status));
+            return Err(SearchFailure {
+                key_refused: refuses_key(status.as_u16(), &body),
+                message: http_error(&format!("{label} ({body})"), status)
+                    .message()
+                    .to_owned(),
+            });
         }
-        let data: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| unavailable("Serper did not answer with JSON"))?;
+        serde_json::from_slice(&bytes).map_err(|_| SearchFailure {
+            message: format!("{label} did not answer with JSON"),
+            key_refused: false,
+        })
+    }
+
+    async fn serper(
+        &self,
+        searcher: &Searcher,
+        query: &str,
+        results: usize,
+    ) -> Result<String, SearchFailure> {
+        let request = self
+            .inner
+            .client
+            .post(&searcher.endpoint)
+            .header("X-API-KEY", &searcher.key)
+            .json(&json!({ "q": query, "num": results }));
+        // Serper answers a bad key 401/403 and a key out of credits 400
+        // "Not enough credits".
+        let data = self
+            .ask_api(searcher, request, |status, body| {
+                matches!(status, 401 | 402 | 403) || body.to_ascii_lowercase().contains("credits")
+            })
+            .await?;
         Ok(format_serper(&data, query, results))
+    }
+
+    /// `DeepSeek`'s Search API: `POST /v1/tools/search` with the `DeepSeek` key.
+    async fn deepseek_search(
+        &self,
+        searcher: &Searcher,
+        query: &str,
+        results: usize,
+    ) -> Result<String, SearchFailure> {
+        let request = self
+            .inner
+            .client
+            .post(&searcher.endpoint)
+            .bearer_auth(&searcher.key)
+            .json(&json!({
+                "query": deepseek_query(query),
+                "count": results,
+                "need_content": false,
+            }));
+        // 401: no valid key; 402: the balance ran out.
+        let data = self
+            .ask_api(searcher, request, |status, _| matches!(status, 401 | 402))
+            .await?;
+        Ok(format_deepseek(&data, query, results))
     }
 
     async fn fallback_search(&self, query: &str, results: usize) -> Result<String, HarnessError> {
@@ -432,7 +673,79 @@ impl WebHost {
             .join("\n\n---\n\n"))
     }
 
+    /// Open a page; a site that refuses ha or fails is read through `DeepSeek`'s
+    /// Fetch API when a `DeepSeek` key is set, and the note says so.
     async fn fetch(&self, url: &Url, start: usize, window: usize) -> Result<String, HarnessError> {
+        let error = match self.fetch_directly(url, start, window).await {
+            Ok(page) => return Ok(page),
+            Err(error) => error,
+        };
+        let relayed = matches!(
+            error.code(),
+            ErrorCode::AccessDenied | ErrorCode::RateLimited | ErrorCode::ServiceUnavailable
+        );
+        let Some((endpoint, key)) = self.inner.page_reader.as_ref().filter(|_| relayed) else {
+            return Err(error);
+        };
+        if refused_since(SearchApi::DeepSeek, key).is_some() {
+            return Err(error);
+        }
+        let searcher = Searcher {
+            api: SearchApi::DeepSeek,
+            key: key.clone(),
+            endpoint: endpoint.clone(),
+        };
+        let request = self
+            .inner
+            .client
+            .post(endpoint)
+            .bearer_auth(key)
+            .json(&json!({ "url": url.as_str() }));
+        match self
+            .ask_api(&searcher, request, |status, _| matches!(status, 401 | 402))
+            .await
+        {
+            Ok(page) => {
+                let content = page
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if content.trim().is_empty() {
+                    return Err(error);
+                }
+                let mut document = format!("[{} - read through DeepSeek Fetch]\n", error.message());
+                let title = page
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !title.trim().is_empty() {
+                    let _ = writeln!(document, "Title: {}", title.trim());
+                }
+                let _ = write!(document, "URL: {url}\n\n{content}");
+                Ok(window_of(&document, start, window))
+            }
+            Err(failure) => {
+                if failure.key_refused {
+                    remember_refused(SearchApi::DeepSeek, key);
+                }
+                Err(HarnessError::new(
+                    error.code(),
+                    format!(
+                        "{} (DeepSeek Fetch could not read it either: {})",
+                        error.message(),
+                        failure.message
+                    ),
+                ))
+            }
+        }
+    }
+
+    async fn fetch_directly(
+        &self,
+        url: &Url,
+        start: usize,
+        window: usize,
+    ) -> Result<String, HarnessError> {
         let response = self
             .inner
             .client
@@ -649,6 +962,96 @@ fn is_private_host(url: &Url) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// A search's answer: which API it came from, and a note of the ones that did
+/// not answer before it.
+fn search_answer(
+    query: &str,
+    source: &str,
+    notes: &[String],
+    renew: &[&str],
+    body: &str,
+) -> String {
+    let mut answer = format!("Results for query \"{query}\" ({source}):\n\n");
+    if !notes.is_empty() {
+        let _ = write!(answer, "({}; these come from {source}.", notes.join("; "));
+        if !renew.is_empty() {
+            let mut commands = renew.to_vec();
+            commands.dedup();
+            let _ = write!(
+                answer,
+                " Ask the user to renew the key with {}.",
+                commands.join(" or ")
+            );
+        }
+        answer.push_str(")\n\n");
+    }
+    answer.push_str(body);
+    answer
+}
+
+/// A query `DeepSeek` Search takes: at most 128 characters, cut at a word.
+fn deepseek_query(query: &str) -> String {
+    if query.chars().count() <= DEEPSEEK_MAX_QUERY_CHARS {
+        return query.to_owned();
+    }
+    let cut = query
+        .chars()
+        .take(DEEPSEEK_MAX_QUERY_CHARS)
+        .collect::<String>();
+    match cut.rfind(char::is_whitespace) {
+        Some(end) if end > DEEPSEEK_MAX_QUERY_CHARS / 2 => cut[..end].trim_end().to_owned(),
+        _ => cut,
+    }
+}
+
+/// Format a `DeepSeek` Search answer like the other providers': title, URL, the
+/// site and date when known, then its model-oriented summary.
+fn format_deepseek(data: &Value, query: &str, results: usize) -> String {
+    let text = |item: &Value, key: &str| {
+        item.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let entries = data
+        .get("results")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .take(results)
+                .enumerate()
+                .map(|(index, item)| {
+                    let mut entry = format!(
+                        "Result {}: {}",
+                        index + 1,
+                        text(item, "title").unwrap_or_else(|| "Untitled".to_owned())
+                    );
+                    if let Some(url) = text(item, "url") {
+                        let _ = write!(entry, "\nURL: {url}");
+                    }
+                    let about = [text(item, "site_name"), text(item, "date")]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    if !about.is_empty() {
+                        let _ = write!(entry, "\n{}", about.join(" - "));
+                    }
+                    if let Some(summary) = text(item, "summary").or_else(|| text(item, "snippet")) {
+                        let _ = write!(entry, "\n{summary}");
+                    }
+                    entry
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if entries.is_empty() {
+        return format!("No results returned for query: {query}");
+    }
+    entries.join("\n\n---\n\n")
 }
 
 /// Format a Serper answer as prime-agent's websearch skill does.
@@ -1134,7 +1537,8 @@ impl ExternalToolDispatcher for WebHost {
 #[cfg(test)]
 mod tests {
     use super::{
-        WebHost, format_serper, html_to_text, is_private_host, parse_duckduckgo, window_of,
+        SearchApi, Searcher, WebHost, deepseek_query, format_serper, html_to_text, is_private_host,
+        parse_duckduckgo, window_of,
     };
     use harness_tools::ExternalToolDispatcher;
     use reqwest::Url;
@@ -1346,6 +1750,43 @@ mod tests {
                         ("text/html; charset=utf-8", DUCK_PAGE.as_bytes().to_vec())
                     } else if path.starts_with("/article") {
                         ("text/html", ARTICLE.as_bytes().to_vec())
+                    } else if path.starts_with("/ds/search") {
+                        let lower = text.to_ascii_lowercase();
+                        assert!(lower.contains("\"need_content\":false"), "{text}");
+                        if lower.contains("bearer ds-good") {
+                            (
+                                "application/json",
+                                serde_json::to_vec(&json!({"results": [{
+                                    "rerank_score": 2.1,
+                                    "title": "The Rust Book",
+                                    "url": "https://doc.rust-lang.org/book/",
+                                    "snippet": "short",
+                                    "summary": "The Rust Programming Language, the official book.",
+                                    "content": "",
+                                    "site_name": "Rust",
+                                    "site_icon": null,
+                                    "date": "2026-01-02T00:00:00Z",
+                                    "authority": 4
+                                }]}))
+                                .expect("json"),
+                            )
+                        } else {
+                            status = "402 Payment Required".to_owned();
+                            (
+                                "application/json",
+                                br#"{"error":{"message":"Insufficient Balance","type":"payment","param":null,"code":"insufficient_balance"}}"#.to_vec(),
+                            )
+                        }
+                    } else if path.starts_with("/ds/fetch") {
+                        assert!(
+                            text.to_ascii_lowercase().contains("bearer ds-good"),
+                            "{text}"
+                        );
+                        (
+                            "application/json",
+                            serde_json::to_vec(&json!({"title": "Relayed page", "content": "# Hello\n\nRead through the Fetch API."}))
+                                .expect("json"),
+                        )
                     } else if path.starts_with("/search") {
                         assert!(
                             text.contains("x-api-key: test-key")
@@ -1396,18 +1837,21 @@ mod tests {
         host.run(call).await.map_err(|error| error.to_string())
     }
 
+    fn searcher(api: SearchApi, key: &str, endpoint: String) -> Searcher {
+        Searcher {
+            api,
+            key: key.to_owned(),
+            endpoint,
+        }
+    }
+
     /// The whole path the agent takes: search, then open a result - without a key
     /// (the keyless fallback) and with one (Serper).
     #[tokio::test]
     async fn search_and_fetch_work_end_to_end_with_and_without_a_key() {
         let base = serve().await;
-        let keyless = WebHost::build(
-            None,
-            format!("{base}/search"),
-            format!("{base}/html/"),
-            true,
-        )
-        .expect("client");
+        let keyless =
+            WebHost::build(Vec::new(), None, format!("{base}/html/"), true).expect("client");
         let found = call(&keyless, "web_search", json!({"query": "rust book"}))
             .await
             .expect("fallback search");
@@ -1441,8 +1885,12 @@ mod tests {
         assert!(binary.contains("application/pdf"), "{binary}");
 
         let keyed = WebHost::build(
-            Some("test-key".to_owned()),
-            format!("{base}/search"),
+            vec![searcher(
+                SearchApi::Serper,
+                "test-key",
+                format!("{base}/search"),
+            )],
+            None,
             format!("{base}/html/"),
             true,
         )
@@ -1467,8 +1915,12 @@ mod tests {
     async fn a_failed_page_says_whether_asking_again_can_help() {
         let base = serve().await;
         let host = WebHost::build(
-            Some("test-key".to_owned()),
-            format!("{base}/denied"),
+            vec![searcher(
+                SearchApi::Serper,
+                "denied-key",
+                format!("{base}/denied"),
+            )],
+            None,
             format!("{base}/html/"),
             true,
         )
@@ -1500,16 +1952,112 @@ mod tests {
             .await
             .expect("the keyless search answers");
         assert!(found.contains("Result 1: Learn Rust"), "{found}");
-        assert!(found.contains("Serper failed"), "{found}");
+        assert!(found.contains("Google via Serper failed"), "{found}");
         assert!(found.contains("/login serper"), "{found}");
+        assert!(found.contains("(DuckDuckGo)"), "{found}");
+    }
+
+    /// The first API with a key answers; one whose key is refused (here out of
+    /// balance) hands the query to the next and is skipped by later searches,
+    /// and a site that refuses ha is read through `DeepSeek` Fetch.
+    #[tokio::test]
+    async fn search_moves_to_the_next_api_when_a_key_is_refused() {
+        let base = serve().await;
+        let deepseek = WebHost::build(
+            vec![
+                searcher(SearchApi::DeepSeek, "ds-good", format!("{base}/ds/search")),
+                searcher(SearchApi::Serper, "test-key", format!("{base}/search")),
+            ],
+            Some((format!("{base}/ds/fetch"), "ds-good".to_owned())),
+            format!("{base}/html/"),
+            true,
+        )
+        .expect("client");
+        let found = call(&deepseek, "web_search", json!({"query": "rust book"}))
+            .await
+            .expect("deepseek search");
+        assert!(found.contains("(DeepSeek Search)"), "{found}");
+        assert!(
+            found.contains(
+                "Result 1: The Rust Book\nURL: https://doc.rust-lang.org/book/\nRust - 2026-01-02T00:00:00Z\nThe Rust Programming Language, the official book."
+            ),
+            "{found}"
+        );
+        let relayed = call(
+            &deepseek,
+            "web_fetch",
+            json!({"url": format!("{base}/denied/page")}),
+        )
+        .await
+        .expect("read through DeepSeek Fetch");
+        assert!(relayed.contains("read through DeepSeek Fetch"), "{relayed}");
+        assert!(relayed.contains("Title: Relayed page"), "{relayed}");
+        assert!(relayed.contains("Read through the Fetch API."), "{relayed}");
+        let missing = call(
+            &deepseek,
+            "web_fetch",
+            json!({"url": format!("{base}/status/404")}),
+        )
+        .await
+        .expect_err("a page that does not exist is not relayed");
+        assert!(missing.contains("404"), "{missing}");
+
+        let expired = WebHost::build(
+            vec![
+                searcher(
+                    SearchApi::DeepSeek,
+                    "ds-expired",
+                    format!("{base}/ds/search"),
+                ),
+                searcher(SearchApi::Serper, "test-key", format!("{base}/search")),
+            ],
+            None,
+            format!("{base}/html/"),
+            true,
+        )
+        .expect("client");
+        let first = call(&expired, "web_search", json!({"query": "rust"}))
+            .await
+            .expect("serper answers");
+        assert!(first.contains("(Google via Serper)"), "{first}");
+        assert!(first.contains("DeepSeek Search failed"), "{first}");
+        assert!(first.contains("402"), "{first}");
+        assert!(first.contains("/login deepseek"), "{first}");
+        assert!(first.contains("Result 1: Rust"), "{first}");
+        let second = call(&expired, "web_search", json!({"query": "rust"}))
+            .await
+            .expect("serper answers again");
+        assert!(
+            second.contains("DeepSeek Search skipped: it refused its key"),
+            "{second}"
+        );
+        assert!(second.contains("(Google via Serper)"), "{second}");
+    }
+
+    #[test]
+    fn the_search_order_is_read_from_ids_and_long_queries_fit_deepseek() {
+        assert_eq!(
+            SearchApi::order(&[
+                "serper".to_owned(),
+                "DeepSeek".to_owned(),
+                "serper".to_owned(),
+                "bing".to_owned()
+            ]),
+            vec![SearchApi::Serper, SearchApi::DeepSeek]
+        );
+        let long = "word ".repeat(40);
+        let cut = deepseek_query(&long);
+        assert!(cut.chars().count() <= 128, "{cut}");
+        assert!(cut.ends_with("word"), "{cut:?}");
+        assert_eq!(deepseek_query("short query"), "short query");
     }
 
     /// A page on the web must not steer the agent into the user's own network.
     #[tokio::test]
     async fn private_addresses_and_other_schemes_are_refused_before_any_request() {
         let host = WebHost::build(
+            Vec::new(),
             None,
-            "https://google.serper.dev/search".to_owned(),
             "https://html.duckduckgo.com/html/".to_owned(),
             false,
         )

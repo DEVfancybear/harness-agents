@@ -138,7 +138,8 @@ hint = "Fix the failing test before finishing."
 | `HA_COMPACT_AT` | 200000 | Tokens of context before it is compacted, however large the model's window (`0`: the window's own bound) |
 | `HA_SKILL_PATHS` | — | Extra skill directories (e.g. `~/.claude/skills`) |
 | `HA_AUTO_REFINE` / `HA_SKILL_LIFECYCLE` | on | `off` stops the background review / keeps unused learned skills |
-| `SERPER_API_KEY` | — | Google results for `web_search` (DuckDuckGo without it) |
+| `SERPER_API_KEY` | — | Google results for `web_search`; the DeepSeek key also searches (DeepSeek Search), and DuckDuckGo needs no key |
+| `HA_WEB_SEARCH` | `deepseek,serper` | Order of the search APIs `web_search` asks (`[web] search`); a failing one hands over to the next |
 | `HA_WEB` / `HA_REPL` / `HA_DAEMON` | on | `off` removes web tools / the Python REPL / background agents |
 | `HA_PYTHON` | `python3`, `python`, `py -3` | Interpreter for the REPL kernel (3.11+) |
 | `HA_UI` | auto | `plain` forces line mode |
@@ -282,7 +283,8 @@ hint = "Sửa test đang fail trước khi kết thúc."
 | `HA_COMPACT_AT` | 200000 | Số token context trước khi compact, dù cửa sổ của model lớn đến đâu (`0`: theo giới hạn của chính cửa sổ) |
 | `HA_SKILL_PATHS` | — | Thư mục skill bổ sung (ví dụ `~/.claude/skills`) |
 | `HA_AUTO_REFINE` / `HA_SKILL_LIFECYCLE` | bật | `off` tắt lượt xem xét nền / giữ cả skill không dùng |
-| `SERPER_API_KEY` | — | Kết quả Google cho `web_search` (không có thì DuckDuckGo) |
+| `SERPER_API_KEY` | — | Kết quả Google cho `web_search`; key DeepSeek cũng tìm được (DeepSeek Search); DuckDuckGo không cần key |
+| `HA_WEB_SEARCH` | `deepseek,serper` | Thứ tự các search API mà `web_search` dùng (`[web] search`); API lỗi thì chuyển sang API kế tiếp |
 | `HA_WEB` / `HA_REPL` / `HA_DAEMON` | bật | `off` gỡ tool web / Python REPL / agent nền |
 | `HA_PYTHON` | `python3`, `python`, `py -3` | Trình thông dịch cho kernel REPL (3.11+) |
 | `HA_UI` | tự động | `plain` ép chế độ dòng lệnh |

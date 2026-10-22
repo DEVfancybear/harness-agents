@@ -4459,32 +4459,23 @@ impl InteractiveController {
                     .unwrap_or_default()
                     .split_whitespace()
                     .collect::<Vec<_>>();
-                // `Err(())`: the words are not `[<int> [--global]]`.
+                // `Err(())`: the words are not `[<int>|unlimited [--global]]`.
+                let parse = super::delegation::parse_max_depth;
                 let change: Result<Option<(u32, bool)>, ()> = match words.as_slice() {
                     [] => Ok(None),
-                    [depth] => depth.parse().map(|depth| Some((depth, false))).map_err(drop),
-                    [depth, "--global"] => {
-                        depth.parse().map(|depth| Some((depth, true))).map_err(drop)
-                    }
+                    [depth] => parse(depth).map(|depth| Some((depth, false))).ok_or(()),
+                    [depth, "--global"] => parse(depth).map(|depth| Some((depth, true))).ok_or(()),
                     _ => Err(()),
                 };
                 match change {
-                    Ok(Some((depth, _))) if depth > super::delegation::RLM_MAX_DEPTH_CAP => {
-                        self.push_history(&mut effects, HistoryItem::Error {
-                            message: format!(
-                                "ha runs children at most {} levels deep; /rlm-max-depth takes 0..={}",
-                                super::delegation::RLM_MAX_DEPTH_CAP,
-                                super::delegation::RLM_MAX_DEPTH_CAP
-                            ),
-                        });
-                    }
                     Ok(change) => {
                         if let Err(message) = self.service.rlm_max_depth(change) {
                             self.push_history(&mut effects, HistoryItem::Error { message });
                         }
                     }
                     Err(()) => self.push_history(&mut effects, HistoryItem::Notice {
-                        message: "Usage: /rlm-max-depth [<non-negative integer> [--global]]".to_owned(),
+                        message: "Usage: /rlm-max-depth [<non-negative integer>|unlimited [--global]]"
+                            .to_owned(),
                     }),
                 }
                 effects.push(Effect::Redraw);
@@ -12267,7 +12258,7 @@ Command: \"npm run build\""
         );
     }
 
-    /// prime-agent's `/rlm-max-depth [<int> [--global]]`, and its usage line.
+    /// prime-agent's `/rlm-max-depth [<int> [--global]]` (and `unlimited`), and its usage line.
     #[test]
     fn rlm_max_depth_reads_prime_agents_arguments() {
         let mut harness = bench(true);
@@ -12275,23 +12266,29 @@ Command: \"npm run build\""
             "/rlm-max-depth",
             "/rlm-max-depth 1",
             "/rlm-max-depth 0 --global",
+            "/rlm-max-depth 5",
+            "/rlm-max-depth unlimited --global",
         ] {
             submit_text(&mut harness.controller, line);
         }
+        let unlimited = crate::interactive::delegation::UNLIMITED_RLM_MAX_DEPTH;
         assert_eq!(
             *harness.port.depths.lock().expect("depths"),
-            [None, Some((1, false)), Some((0, true))]
+            [
+                None,
+                Some((1, false)),
+                Some((0, true)),
+                Some((5, false)),
+                Some((unlimited, true))
+            ]
         );
         let usage = effects_to_plain(&submit_text(&mut harness.controller, "/rlm-max-depth two"))
             .join("\n");
         assert!(
-            usage.contains("Usage: /rlm-max-depth [<non-negative integer> [--global]]"),
+            usage.contains("Usage: /rlm-max-depth [<non-negative integer>|unlimited [--global]]"),
             "{usage}"
         );
-        let over =
-            effects_to_plain(&submit_text(&mut harness.controller, "/rlm-max-depth 5")).join("\n");
-        assert!(over.contains("0..=2"), "{over}");
-        assert_eq!(harness.port.depths.lock().expect("depths").len(), 3);
+        assert_eq!(harness.port.depths.lock().expect("depths").len(), 5);
     }
 
     #[test]

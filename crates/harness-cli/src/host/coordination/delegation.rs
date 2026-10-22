@@ -79,13 +79,37 @@ const MAX_NOTE_CHARS: usize = 512;
 const NOTE_INTERVAL: Duration = Duration::from_secs(10);
 const NOTE_RING: usize = 5;
 
-/// prime-agent's default `RLM_MAX_DEPTH`: the root's children may spawn children
-/// of their own, whose children may not.
-pub const DEFAULT_RLM_MAX_DEPTH: u32 = 2;
+/// An `RLM_MAX_DEPTH` that bounds nothing: every child may start children of its
+/// own. prime-agent's default is 2; ha's is no limit, and `[agents] max_depth`,
+/// `rlmMaxDepth`, `RLM_MAX_DEPTH` or `/rlm-max-depth` set one.
+pub const UNLIMITED_RLM_MAX_DEPTH: u32 = harness_orchestrator::UNBOUNDED_DEPTH;
 
-/// The deepest `RLM_MAX_DEPTH` this host runs: the delegation contract's depth
-/// cap. prime-agent takes any non-negative integer.
-pub const RLM_MAX_DEPTH_CAP: u32 = harness_orchestrator::DEFAULT_MAX_DEPTH;
+/// The `RLM_MAX_DEPTH` a session runs with when nothing sets one.
+pub const DEFAULT_RLM_MAX_DEPTH: u32 = UNLIMITED_RLM_MAX_DEPTH;
+
+/// An `RLM_MAX_DEPTH` as the user reads and writes it: a number, or `unlimited`.
+#[must_use]
+pub fn describe_max_depth(value: u32) -> String {
+    if value == UNLIMITED_RLM_MAX_DEPTH {
+        "unlimited".to_owned()
+    } else {
+        value.to_string()
+    }
+}
+
+/// Read an `RLM_MAX_DEPTH` the user wrote: a non-negative integer, or
+/// `unlimited` (also `none`, `inf`, `-1`).
+#[must_use]
+pub fn parse_max_depth(text: &str) -> Option<u32> {
+    let text = text.trim();
+    if matches!(
+        text.to_ascii_lowercase().as_str(),
+        "unlimited" | "none" | "inf" | "infinite" | "-1"
+    ) {
+        return Some(UNLIMITED_RLM_MAX_DEPTH);
+    }
+    text.parse().ok()
+}
 
 /// Where the session's `RLM_MAX_DEPTH` came from, in prime-agent's words
 /// (`core/rlm-max-depth.ts`).
@@ -93,6 +117,7 @@ pub const RLM_MAX_DEPTH_CAP: u32 = harness_orchestrator::DEFAULT_MAX_DEPTH;
 pub enum MaxDepthSource {
     Chat,
     Global,
+    Config,
     Env,
     Default,
 }
@@ -103,6 +128,7 @@ impl MaxDepthSource {
         match self {
             Self::Chat => "chat",
             Self::Global => "global",
+            Self::Config => "config",
             Self::Env => "env",
             Self::Default => "default",
         }
@@ -111,7 +137,10 @@ impl MaxDepthSource {
 
 /// prime-agent's refusal of a spawn past the depth limit.
 fn depth_limit_error(depth: u32, max_depth: u32) -> String {
-    format!("RLM recursion depth limit reached (RLM_DEPTH={depth}, RLM_MAX_DEPTH={max_depth})")
+    format!(
+        "RLM recursion depth limit reached (RLM_DEPTH={depth}, RLM_MAX_DEPTH={})",
+        describe_max_depth(max_depth)
+    )
 }
 
 /// The parent's web tools, which a child inherits: its catalog and dispatcher.
@@ -915,6 +944,8 @@ struct AgentsShared {
     buckets: Mutex<HashMap<String, (f64, Instant)>>,
     /// The session's `RLM_MAX_DEPTH` and where it came from.
     max_depth: Mutex<(u32, MaxDepthSource)>,
+    /// `[agents] max_depth` as the config last said it.
+    configured_depth: Mutex<Option<u32>>,
     /// The session's children, for a child that spawns children of its own.
     agents: std::sync::OnceLock<std::sync::Weak<SessionAgents>>,
     /// Where `rlm.create_session` starts a top-level agent, when the session
@@ -1000,6 +1031,7 @@ impl AgentsShared {
             exchanges: Mutex::new(std::collections::VecDeque::new()),
             question_host: Mutex::new(None),
             max_depth: Mutex::new((DEFAULT_RLM_MAX_DEPTH, MaxDepthSource::Default)),
+            configured_depth: Mutex::new(None),
             agents: std::sync::OnceLock::new(),
             session_host: Mutex::new(None),
             answers: std::sync::OnceLock::new(),
@@ -1816,13 +1848,23 @@ fn state_payload(role: AgentRole, name: &str, state: &ChildState) -> Value {
 /// The children of one interactive session.
 pub struct SessionAgents {
     shared: Arc<AgentsShared>,
-    /// One scheduler per depth, the root's children first. A child that waits
-    /// for its own children holds a slot of its level, never one of theirs, so
-    /// a full level cannot starve the level it waits on.
-    schedulers: Vec<Arc<WorkerScheduler>>,
+    /// One scheduler per depth, the root's children first, each made the first
+    /// time a child reaches its depth: depth is unlimited by default, so the
+    /// levels cannot all be made up front. A child that waits for its own
+    /// children holds a slot of its level, never one of theirs, so a full level
+    /// cannot starve the level it waits on.
+    levels: Mutex<Vec<Level>>,
+    /// The root's children's scheduler, `levels[0]`, which holds the ledger.
+    first: Arc<WorkerScheduler>,
+    backend: Arc<dyn WorkerBackend>,
     workspace_manager: Arc<WorkspaceManager>,
-    dispatched: Vec<Arc<tokio::sync::Notify>>,
     pump: AtomicBool,
+}
+
+/// The scheduler of one depth and the signal that it has work.
+struct Level {
+    scheduler: Arc<WorkerScheduler>,
+    dispatched: Arc<tokio::sync::Notify>,
 }
 
 impl SessionAgents {
@@ -1857,11 +1899,27 @@ impl SessionAgents {
         }
     }
 
+    /// Keep `[agents] max_depth` as the config says it, for `/rlm-max-depth`.
+    pub fn set_configured_depth(&self, value: Option<u32>) {
+        if let Ok(mut configured) = self.shared.configured_depth.lock() {
+            *configured = value;
+        }
+    }
+
+    #[must_use]
+    pub fn configured_depth(&self) -> Option<u32> {
+        self.shared
+            .configured_depth
+            .lock()
+            .ok()
+            .and_then(|value| *value)
+    }
+
     /// Set the session's `RLM_MAX_DEPTH`; children already running keep the
     /// value they were created with.
     pub fn set_max_depth(&self, value: u32, source: MaxDepthSource) {
         if let Ok(mut max_depth) = self.shared.max_depth.lock() {
-            *max_depth = (value.min(RLM_MAX_DEPTH_CAP), source);
+            *max_depth = (value, source);
         }
     }
 
@@ -1956,7 +2014,66 @@ impl SessionAgents {
     }
 
     fn scheduler(&self) -> &Arc<WorkerScheduler> {
-        &self.schedulers[0]
+        &self.first
+    }
+
+    /// A scheduler for one depth, sharing the session's workspaces.
+    fn level_scheduler(
+        backend: &Arc<dyn WorkerBackend>,
+        workspace_manager: &Arc<WorkspaceManager>,
+    ) -> Result<Arc<WorkerScheduler>, HarnessError> {
+        WorkerScheduler::new(
+            SchedulerConfig {
+                max_concurrent_workers: harness_orchestrator::UNBOUNDED_WORKERS,
+                max_depth: harness_orchestrator::UNBOUNDED_DEPTH,
+                // Every child runs at once and none is refused, as prime-agent
+                // admits every spawn; `[agents] max_workers` limits the root's
+                // children in [`AgentsShared::worker_slot`] when the user wants.
+                // (Three ran at once here; the rest showed `working` with no call.)
+                max_queued_workers: harness_orchestrator::UNBOUNDED_WORKERS,
+                // prime-agent bounds a child by its own turn - its steps,
+                // tool calls and deadline - and the depth, not by a request
+                // pool shared across siblings. A pool of 24 ran out after
+                // four or five children had each read a large file, and
+                // every later step and spawn of the turn was refused.
+                budget: DelegationBudget {
+                    max_model_requests: u32::MAX,
+                    ..DelegationBudget::default()
+                },
+            },
+            Arc::clone(backend),
+            Some(Arc::clone(workspace_manager)),
+        )
+        .map(Arc::new)
+        .map_err(|error| HarnessError::new(error.code(), error.to_string()))
+    }
+
+    /// The scheduler of `depth` (1 for the root's children) and its signal,
+    /// made the first time a child reaches that depth; its pump starts with it
+    /// once the session's pumps run.
+    fn level(
+        &self,
+        depth: u32,
+    ) -> Result<(Arc<WorkerScheduler>, Arc<tokio::sync::Notify>), HarnessError> {
+        let index = usize::try_from(depth.saturating_sub(1)).unwrap_or(usize::MAX);
+        let mut levels = self.levels.lock().map_err(|_| {
+            HarnessError::new(
+                ErrorCode::ServiceUnavailable,
+                "the scheduler levels are unavailable",
+            )
+        })?;
+        while levels.len() <= index {
+            let level = Level {
+                scheduler: Self::level_scheduler(&self.backend, &self.workspace_manager)?,
+                dispatched: Arc::new(tokio::sync::Notify::new()),
+            };
+            if self.pump.load(Ordering::SeqCst) {
+                self.pump_level(&level);
+            }
+            levels.push(level);
+        }
+        let level = &levels[index];
+        Ok((Arc::clone(&level.scheduler), Arc::clone(&level.dispatched)))
     }
 
     /// The session's children with a scripted worker in place of the model.
@@ -1980,44 +2097,19 @@ impl SessionAgents {
         let _ = shared.answers.set(state_root.join("answers"));
         let _ = shared.ledger_dir.set(state_root.join("ledger"));
         let workspace_manager = Arc::new(WorkspaceManager::new(state_root));
-        let schedulers = (0..RLM_MAX_DEPTH_CAP)
-            .map(|_| {
-                WorkerScheduler::new(
-                    SchedulerConfig {
-                        max_concurrent_workers: harness_orchestrator::UNBOUNDED_WORKERS,
-                        max_depth: RLM_MAX_DEPTH_CAP,
-                        // Every child runs at once and none is refused, as prime-agent
-                        // admits every spawn; `[agents] max_workers` limits the root's
-                        // children in [`AgentsShared::worker_slot`] when the user wants.
-                        // (Three ran at once here; the rest showed `working` with no call.)
-                        max_queued_workers: harness_orchestrator::UNBOUNDED_WORKERS,
-                        // prime-agent bounds a child by its own turn - its steps,
-                        // tool calls and deadline - and the depth, not by a request
-                        // pool shared across siblings. A pool of 24 ran out after
-                        // four or five children had each read a large file, and
-                        // every later step and spawn of the turn was refused.
-                        budget: DelegationBudget {
-                            max_model_requests: u32::MAX,
-                            ..DelegationBudget::default()
-                        },
-                    },
-                    Arc::clone(backend),
-                    Some(Arc::clone(&workspace_manager)),
-                )
-                .map(Arc::new)
-                .map_err(|error| HarnessError::new(error.code(), error.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let first = Self::level_scheduler(backend, &workspace_manager)?;
         if let Ok(mut ledger) = shared.ledger.lock() {
-            *ledger = Some(Arc::clone(schedulers[0].ledger()));
+            *ledger = Some(Arc::clone(first.ledger()));
         }
         let agents = Arc::new(Self {
             shared,
-            schedulers,
+            levels: Mutex::new(vec![Level {
+                scheduler: Arc::clone(&first),
+                dispatched: Arc::new(tokio::sync::Notify::new()),
+            }]),
+            first,
+            backend: Arc::clone(backend),
             workspace_manager,
-            dispatched: (0..RLM_MAX_DEPTH_CAP)
-                .map(|_| Arc::new(tokio::sync::Notify::new()))
-                .collect(),
             pump: AtomicBool::new(false),
         });
         let _ = agents.shared.agents.set(Arc::downgrade(&agents));
@@ -2409,11 +2501,7 @@ impl SessionAgents {
         if let Ok(mut launches) = self.shared.launches.lock() {
             launches.entry(task_id.clone()).or_insert(launch);
         }
-        let index = usize::try_from(depth.saturating_sub(1)).unwrap_or(usize::MAX);
-        let scheduler = self
-            .schedulers
-            .get(index)
-            .ok_or("the child's depth has no scheduler")?;
+        let (scheduler, dispatched) = self.level(depth).map_err(|error| error.to_string())?;
         self.ensure_pump();
         scheduler
             .dispatch(WorkerRequest {
@@ -2426,35 +2514,43 @@ impl SessionAgents {
                 cancellation,
             })
             .map_err(|error| error.to_string())?;
-        if let Some(dispatched) = self.dispatched.get(index) {
-            dispatched.notify_one();
-        }
+        dispatched.notify_one();
         self.shared.persist_ledger();
         Ok(())
     }
 
     fn ensure_pump(self: &Arc<Self>) {
+        // Under the levels lock, so a level made at the same moment gets its
+        // pump exactly once: here, or in [`Self::level`].
+        let Ok(levels) = self.levels.lock() else {
+            return;
+        };
         if self.pump.swap(true, Ordering::SeqCst) {
             return;
         }
-        for (scheduler, dispatched) in self.schedulers.iter().zip(&self.dispatched) {
-            let scheduler = Arc::clone(scheduler);
-            let shared = Arc::clone(&self.shared);
-            let dispatched = Arc::clone(dispatched);
-            tokio::spawn(async move {
-                loop {
-                    match scheduler.next_settled().await {
-                        Some(Ok((task_id, outcome))) => shared.settle(&task_id, outcome),
-                        Some(Err(error)) => {
-                            let _ = shared.sender.send(SessionEvent::Notice {
-                                message: format!("delegated workers stopped: {error}"),
-                            });
-                        }
-                        None => dispatched.notified().await,
-                    }
-                }
-            });
+        for level in levels.iter() {
+            self.pump_level(level);
         }
+    }
+
+    /// Settle what one level's scheduler finishes, for the session's life.
+    fn pump_level(&self, level: &Level) {
+        let scheduler = Arc::clone(&level.scheduler);
+        let shared = Arc::clone(&self.shared);
+        let dispatched = Arc::clone(&level.dispatched);
+        tokio::spawn(async move {
+            loop {
+                match scheduler.next_settled().await {
+                    Some(Ok((task_id, outcome))) => shared.settle(&task_id, outcome),
+                    Some(Err(error)) => {
+                        let _ = shared.sender.send(SessionEvent::Notice {
+                            message: format!("delegated workers stopped: {error}"),
+                        });
+                    }
+                    None => dispatched.notified().await,
+                }
+            }
+        });
     }
 
     /// Admit and dispatch one child, returning as soon as it is admitted - the part
@@ -2495,16 +2591,7 @@ impl SessionAgents {
                 "a child agent can spawn explorers only",
             ));
         }
-        let scheduler = Arc::clone(
-            self.schedulers
-                .get(usize::try_from(depth - 1).unwrap_or(usize::MAX))
-                .ok_or_else(|| {
-                    HarnessError::new(
-                        ErrorCode::DelegationDepthExceeded,
-                        depth_limit_error(parent_depth, max_depth),
-                    )
-                })?,
-        );
+        let (scheduler, level_dispatched) = self.level(depth)?;
         scheduler
             .require_admission(1)
             .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
@@ -2589,7 +2676,7 @@ impl SessionAgents {
                     .as_ref()
                     .map_or_else(Vec::new, |record| record.write_scope.clone()),
                 edit_workspace: role == AgentRole::Coder,
-                max_depth: RLM_MAX_DEPTH_CAP,
+                max_depth: harness_orchestrator::UNBOUNDED_DEPTH,
                 budget: DelegationBudget::default(),
             },
             expected_artifacts: Vec::new(),
@@ -2665,12 +2752,14 @@ impl SessionAgents {
             }
             return Err(HarnessError::new(error.code(), error.to_string()));
         }
-        if let Some(dispatched) = self
-            .dispatched
-            .get(usize::try_from(depth - 1).unwrap_or(usize::MAX))
-        {
-            dispatched.notify_one();
-        }
+        level_dispatched.notify_one();
+        harness_types::diag::info("child", "started")
+            .task(task_id.as_str())
+            .field("child", name.clone())
+            .field("role", role.as_str())
+            .field("depth", depth)
+            .field("max_depth", describe_max_depth(max_depth))
+            .emit();
         Ok((task_id, name))
     }
 }
@@ -2735,7 +2824,7 @@ fn coder_brief(
             actions: vec![GrantAction::Read, GrantAction::Propose],
             write_scope: worktree.write_scope.clone(),
             edit_workspace: true,
-            max_depth: RLM_MAX_DEPTH_CAP,
+            max_depth: harness_orchestrator::UNBOUNDED_DEPTH,
             budget: DelegationBudget::default(),
         },
         expected_artifacts: Vec::new(),
@@ -2761,7 +2850,7 @@ fn explorer_brief(task_id: &TaskId, objective: &str, launch: &ChildLaunch) -> Ta
             actions: vec![GrantAction::Read],
             write_scope: Vec::new(),
             edit_workspace: false,
-            max_depth: RLM_MAX_DEPTH_CAP,
+            max_depth: harness_orchestrator::UNBOUNDED_DEPTH,
             budget: DelegationBudget::default(),
         },
         expected_artifacts: Vec::new(),
@@ -8863,12 +8952,13 @@ mod real_worker_tests {
         }
     }
 
-    /// prime-agent's nesting: with the default depth of 2 the root's child
-    /// spawns a child of its own, whose answer comes back to the child - not to
-    /// the root - and the root hears only from its own child.
+    /// prime-agent's nesting: with prime-agent's default depth of 2 the root's
+    /// child spawns a child of its own, whose answer comes back to the child -
+    /// not to the root - and the root hears only from its own child.
     #[tokio::test]
     async fn a_child_spawns_a_grandchild_and_hears_its_answer() {
         let mut bench = bench();
+        bench.agents.set_max_depth(2, super::MaxDepthSource::Chat);
         let provider = Routed::new(|request| {
             if is_child(request, "inner task") {
                 Reply::Text("inner answer")
@@ -9093,6 +9183,91 @@ mod real_worker_tests {
                 "retries are bounded"
             );
         }
+    }
+
+    /// With no limit, the default, a grandchild spawns a child of its own: its
+    /// scheduler is made when the first child reaches depth 3 (two levels were
+    /// all a session had), and each answer comes back one level up.
+    #[tokio::test]
+    async fn with_no_limit_children_nest_past_two_levels() {
+        let mut bench = bench();
+        assert_eq!(
+            bench.agents.max_depth(),
+            (
+                super::UNLIMITED_RLM_MAX_DEPTH,
+                super::MaxDepthSource::Default
+            )
+        );
+        let provider = Routed::new(|request| {
+            if is_child(request, "deep task") {
+                Reply::Text("deep answer")
+            } else if is_child(request, "middle task") {
+                if tool_results(request) == 0 {
+                    Reply::Tool(
+                        "delegate",
+                        json!({"role": "explorer", "brief": "deep task"}),
+                    )
+                } else {
+                    Reply::Text("middle answer")
+                }
+            } else if tool_results(request) == 0 {
+                Reply::Tool(
+                    "delegate",
+                    json!({"role": "explorer", "brief": "middle task"}),
+                )
+            } else {
+                Reply::Text("outer answer")
+            }
+        });
+        let host = host(&bench, provider.clone());
+        spawn(&host, "outer", "outer task").await;
+        match next_child_event(&mut bench.events).await {
+            SessionEvent::ChildSettled { name, notice } => {
+                assert_eq!(name, "outer", "the root hears only from its own child");
+                assert!(notice.contains("outer answer"), "{notice}");
+            }
+            other => panic!("expected the child's notice: {other:?}"),
+        }
+        let middle = provider.requests_of("middle task");
+        assert!(
+            last_text(middle.last().expect("middle requests")).contains("deep answer"),
+            "the depth-3 answer is the middle child's delegate result"
+        );
+        let deep = provider.requests_of("deep task");
+        assert!(
+            offers(&deep[0], "delegate"),
+            "with no limit depth 3 may spawn"
+        );
+        let depths = bench
+            .agents
+            .shared
+            .children
+            .lock()
+            .expect("children")
+            .iter()
+            .map(|child| child.depth)
+            .collect::<Vec<_>>();
+        assert!(depths.contains(&3), "{depths:?}");
+        assert_eq!(bench.agents.levels.lock().expect("levels").len(), 3);
+    }
+
+    #[test]
+    fn a_max_depth_is_a_number_or_unlimited() {
+        assert_eq!(super::parse_max_depth("3"), Some(3));
+        assert_eq!(super::parse_max_depth(" 0 "), Some(0));
+        for unlimited in ["unlimited", "Unlimited", "none", "inf", "-1"] {
+            assert_eq!(
+                super::parse_max_depth(unlimited),
+                Some(super::UNLIMITED_RLM_MAX_DEPTH),
+                "{unlimited}"
+            );
+        }
+        assert_eq!(super::parse_max_depth("deep"), None);
+        assert_eq!(
+            super::describe_max_depth(super::UNLIMITED_RLM_MAX_DEPTH),
+            "unlimited"
+        );
+        assert_eq!(super::describe_max_depth(2), "2");
     }
 
     /// `RLM_MAX_DEPTH` 0 stops the root from spawning, with prime-agent's error;
