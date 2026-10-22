@@ -767,6 +767,20 @@ pub async fn run_with(
     if let Some(external) = &external_tools {
         tool_schemas.extend(super::service::in_cache_order(external.schemas()));
     }
+    // Long extension tools are listed and reached on demand, as in the app.
+    let deferrable = super::tool_tiers::deferrable(&[active_extensions
+        .as_ref()
+        .map(|extensions| extensions.tools().schemas())
+        .unwrap_or_default()]);
+    let (mut tool_schemas, deferred_tools) = super::tool_tiers::split(
+        tool_schemas,
+        &deferrable,
+        super::tool_tiers::mode(&context.paths.config_file, environment),
+    );
+    if !deferred_tools.is_empty() {
+        tool_schemas.extend(harness_tools::tier_tool_schemas());
+    }
+    let driver = driver.with_deferred_tools(deferred_tools.clone());
     // Content the prompt names rides with it, exactly as it does in the app: an image is
     // shown to the model, and a text file is put in the message. A scripted run can
     // therefore look at a screenshot or read a log the same way a person can.
@@ -811,6 +825,14 @@ pub async fn run_with(
             .collect::<Vec<_>>()
         } else {
             request.options.append_system_prompt.clone()
+        };
+        // The deferred tools' roster ahead of what the user appends.
+        let appended = if deferred_tools.is_empty() {
+            appended
+        } else {
+            std::iter::once(super::tool_tiers::roster(&deferred_tools))
+                .chain(appended)
+                .collect()
         };
         let (git_branch, changed_files) = git_facts.await.unwrap_or_default();
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -875,6 +897,10 @@ pub async fn run_with(
         harness_session::ContextBlockKind::Instruction,
         environment_facts,
     )];
+    project_blocks.extend(
+        super::jev::tool_suggestions(jev_decisions.as_deref(), &request.prompt, &deferred_tools)
+            .await,
+    );
     // With harness refinements off, no saved entry reaches the model.
     if refinements {
         project_blocks.push(super::harness::digest_block(

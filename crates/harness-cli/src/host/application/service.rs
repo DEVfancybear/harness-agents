@@ -8826,6 +8826,27 @@ async fn run_turn(
     if let Some(tools) = &external_tools {
         tool_schemas.extend(in_cache_order(tools.schemas()));
     }
+    // The design notes' tiered disclosure: the tools of MCP servers and
+    // extensions, when their schemas are long, are listed one per line in the
+    // system prompt and reached through `tool_schema` and `use_tool`.
+    let deferrable = super::tool_tiers::deferrable(&[
+        active_mcp
+            .as_ref()
+            .map(|mcp| mcp.tools().schemas())
+            .unwrap_or_default(),
+        active_extensions
+            .as_ref()
+            .map(|extensions| extensions.tools().schemas())
+            .unwrap_or_default(),
+    ]);
+    let (mut tool_schemas, deferred_tools) = super::tool_tiers::split(
+        tool_schemas,
+        &deferrable,
+        super::tool_tiers::mode(&config_file, &environment),
+    );
+    if !deferred_tools.is_empty() {
+        tool_schemas.extend(harness_tools::tier_tool_schemas());
+    }
     // What the user typed, kept with the turn: the admitted input is the prompt
     // composed below (notices, attached files, hook context), and a summary of
     // the conversation keeps the user's own words. A turn the host started - a
@@ -9003,6 +9024,13 @@ async fn run_turn(
             built_prompt.text.push_str(&note);
         }
     }
+    // The deferred tools' roster, sorted, so it stays cached with the rest.
+    if !deferred_tools.is_empty() {
+        built_prompt.text.push_str("\n\n");
+        built_prompt
+            .text
+            .push_str(&super::tool_tiers::roster(&deferred_tools));
+    }
     // prime-agent's per-model additions: the last stable segment, before the
     // session tail, so it stays cached with the rest.
     let model_prompts = super::model_prompts::resolve(
@@ -9047,6 +9075,10 @@ async fn run_turn(
         harness_session::ContextBlockKind::Instruction,
         super::prompt::volatile_facts(&prompt_environment),
     )];
+    project_blocks.extend(
+        super::jev::tool_suggestions(jev_decisions.as_deref(), &request.text, &deferred_tools)
+            .await,
+    );
     project_blocks.extend(
         super::jev::conditional_instructions(
             jev_decisions.as_deref(),
@@ -9279,6 +9311,7 @@ async fn run_turn(
         });
     }
     // `[queue] steering_mode`: pa-agent's `one-at-a-time` unless set to `all`.
+    let driver = driver.with_deferred_tools(deferred_tools.clone());
     let driver = driver.with_inbox(run_inbox).with_steering_all(
         config
             .queue_modes

@@ -455,6 +455,125 @@ pub trait ResultVisibility: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = std::collections::HashMap<usize, Visibility>> + Send + 'a>>;
 }
 
+/// The tool that shows the arguments of tools listed but not sent: the design
+/// notes' tiered disclosure, schema on demand.
+pub const TOOL_SCHEMA_TOOL: &str = "tool_schema";
+
+/// The tool that calls a tool listed but not sent, with its arguments.
+pub const USE_TOOL_TOOL: &str = "use_tool";
+
+/// The two tools a turn with deferred tools is given. Their schemas never
+/// change, so the tools that lead every request - and the cached prefix -
+/// stay the same whichever deferred tools the model looks at.
+#[must_use]
+pub fn tier_tool_schemas() -> Vec<Value> {
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": TOOL_SCHEMA_TOOL,
+                "description": "Show the full description and the arguments (JSON schema) of tools from the 'More tools' list, which are not in your tool list. Then call them with use_tool.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "names": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 8, "description": "Tool names from the 'More tools' list."}
+                    },
+                    "required": ["names"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": USE_TOOL_TOOL,
+                "description": "Call a tool from the 'More tools' list with its arguments, as tool_schema showed them. The arguments are checked against its schema and the call is approved like any other.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "A tool name from the 'More tools' list."},
+                        "arguments": {"type": "object", "description": "The tool's arguments."}
+                    },
+                    "required": ["name", "arguments"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+    ]
+}
+
+/// A deferred tool's name.
+fn schema_name(schema: &Value) -> Option<&str> {
+    schema
+        .get("function")
+        .unwrap_or(schema)
+        .get("name")
+        .and_then(Value::as_str)
+}
+
+/// `tool_schema`'s answer: each named tool's description and arguments.
+fn tool_schema_answer(deferred: &[Value], arguments: &str) -> String {
+    let names = serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|arguments| arguments.get("names").cloned())
+        .and_then(|names| serde_json::from_value::<Vec<String>>(names).ok())
+        .unwrap_or_default();
+    if names.is_empty() {
+        return "tool_schema needs names: a list of tool names from the 'More tools' list"
+            .to_owned();
+    }
+    names
+        .iter()
+        .take(8)
+        .map(|name| {
+            deferred
+                .iter()
+                .find(|schema| schema_name(schema) == Some(name.as_str()))
+                .map_or_else(
+                    || format!("{name}: not in the 'More tools' list"),
+                    |schema| {
+                        let function = schema.get("function").unwrap_or(schema);
+                        format!(
+                            "{name}: {}\narguments: {}",
+                            function
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                            function
+                                .get("parameters")
+                                .map_or_else(|| "{}".to_owned(), Value::to_string)
+                        )
+                    },
+                )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// A `use_tool` call as the call it stands for: the deferred tool's name and
+/// its arguments as JSON text, or why it cannot be.
+fn unwrap_use_tool(deferred: &[Value], arguments: &str) -> Result<(String, String), String> {
+    let arguments = serde_json::from_str::<Value>(arguments)
+        .map_err(|_| "use_tool arguments must be JSON: {name, arguments}".to_owned())?;
+    let name = arguments
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "use_tool needs name: a tool from the 'More tools' list".to_owned())?;
+    if !deferred
+        .iter()
+        .any(|schema| schema_name(schema) == Some(name))
+    {
+        return Err(format!(
+            "{name} is not in the 'More tools' list; tools in your own tool list are called directly"
+        ));
+    }
+    let inner = arguments
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    Ok((name.to_owned(), inner.to_string()))
+}
+
 /// A host's judgment of a turn's last answer when the turn changed files and
 /// ran no command after its last change: does the answer tell the user the
 /// work is done, fixed or passing? A yes sends the model back once, to check
@@ -863,6 +982,9 @@ pub struct TurnDriver {
     visibility: Option<Arc<dyn ResultVisibility>>,
     admission: Option<Arc<dyn OutputAdmission>>,
     completion: Option<Arc<dyn CompletionCheck>>,
+    /// The tools listed in the roster but not sent, reached through
+    /// `tool_schema` and `use_tool`.
+    deferred: Arc<Vec<Value>>,
 }
 
 /// A workspace path as a key: one separator, no leading `./`.
@@ -980,6 +1102,7 @@ impl TurnDriver {
             visibility: None,
             admission: None,
             completion: None,
+            deferred: Arc::default(),
         }
     }
 
@@ -994,6 +1117,14 @@ impl TurnDriver {
     #[must_use]
     pub fn with_visibility(mut self, visibility: Arc<dyn ResultVisibility>) -> Self {
         self.visibility = Some(visibility);
+        self
+    }
+
+    /// Tools the model reaches through `tool_schema` and `use_tool` instead of
+    /// its tool list: their schemas, for the arguments to be checked against.
+    #[must_use]
+    pub fn with_deferred_tools(mut self, deferred: Vec<Value>) -> Self {
+        self.deferred = Arc::new(deferred);
         self
     }
 
@@ -1719,6 +1850,15 @@ impl TurnDriver {
                 result.tool_calls.clone().into_iter().zip(transcript_ids)
             {
                 tool_calls += 1;
+                // A deferred tool is called through `use_tool`: from here on it
+                // is that tool's call, checked against its schema and gated as
+                // any call is.
+                let unwrapped = (call.name == USE_TOOL_TOOL && !self.deferred.is_empty())
+                    .then(|| unwrap_use_tool(&self.deferred, &call.arguments));
+                if let Some(Ok((inner, arguments))) = &unwrapped {
+                    call.name.clone_from(inner);
+                    call.arguments.clone_from(arguments);
+                }
                 let name = call.name.clone();
                 observer.observe(TurnProgress::ToolStarted {
                     name: name.clone(),
@@ -1740,11 +1880,26 @@ impl TurnDriver {
                     ));
                     continue;
                 }
+                if let Some(Err(message)) = unwrapped {
+                    slots.push((
+                        name.clone(),
+                        transcript_id,
+                        Slot::Failed(message.clone(), message),
+                    ));
+                    continue;
+                }
+                if name == TOOL_SCHEMA_TOOL && !self.deferred.is_empty() {
+                    let answer = tool_schema_answer(&self.deferred, &call.arguments);
+                    slots.push((name.clone(), transcript_id, Slot::Answered(answer)));
+                    continue;
+                }
                 // pa-agent's `validateToolArguments` before every call: the
                 // arguments are checked against the schema the model was shown,
                 // with its primitive coercion (`"50"` for an integer is 50), and a
                 // failure names every problem and echoes what was sent.
-                if let Some(schema) = parameters_schema(&request.tool_schemas, &name) {
+                if let Some(schema) = parameters_schema(&request.tool_schemas, &name)
+                    .or_else(|| parameters_schema(&self.deferred, &name))
+                {
                     match crate::validation::validate_tool_arguments_json(
                         &name,
                         schema,
@@ -4590,5 +4745,53 @@ mod admission_tests {
         assert!(!kept.contains("line 200:"), "the middle is left out");
         assert!(kept.len() < text.len() / 4);
         assert_eq!(long_result("short"), "short");
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::{tool_schema_answer, unwrap_use_tool};
+    use serde_json::json;
+
+    fn deferred() -> Vec<serde_json::Value> {
+        vec![json!({"type": "function", "function": {
+            "name": "mcp_issue",
+            "description": "Create an issue in the tracker.",
+            "parameters": {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}
+        }})]
+    }
+
+    /// `tool_schema` shows a deferred tool's description and arguments, and
+    /// says which names are not deferred.
+    #[test]
+    fn tool_schema_shows_the_arguments_of_deferred_tools() {
+        let answer = tool_schema_answer(&deferred(), r#"{"names": ["mcp_issue", "nope"]}"#);
+        assert!(
+            answer.contains("mcp_issue: Create an issue in the tracker."),
+            "{answer}"
+        );
+        assert!(answer.contains(r#""required":["title"]"#), "{answer}");
+        assert!(
+            answer.contains("nope: not in the 'More tools' list"),
+            "{answer}"
+        );
+        assert!(tool_schema_answer(&deferred(), "{}").contains("needs names"));
+    }
+
+    /// `use_tool` becomes the deferred tool's own call; a tool that is not
+    /// deferred, or a call without a name, is refused with the reason.
+    #[test]
+    fn use_tool_becomes_the_deferred_call() {
+        let (name, arguments) = unwrap_use_tool(
+            &deferred(),
+            r#"{"name": "mcp_issue", "arguments": {"title": "crash"}}"#,
+        )
+        .expect("unwrapped");
+        assert_eq!(name, "mcp_issue");
+        assert_eq!(arguments, r#"{"title":"crash"}"#);
+        let refused = unwrap_use_tool(&deferred(), r#"{"name": "read_file", "arguments": {}}"#)
+            .expect_err("not deferred");
+        assert!(refused.contains("called directly"), "{refused}");
+        assert!(unwrap_use_tool(&deferred(), r#"{"arguments": {}}"#).is_err());
     }
 }

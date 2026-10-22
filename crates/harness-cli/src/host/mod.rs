@@ -156,6 +156,8 @@ pub mod store_lease;
 pub mod task_state;
 #[path = "presentation/terminal.rs"]
 pub mod terminal;
+#[path = "integrations/tool_tiers.rs"]
+pub mod tool_tiers;
 #[path = "presentation/tree_view.rs"]
 pub mod tree_view;
 #[path = "presentation/tui/mod.rs"]

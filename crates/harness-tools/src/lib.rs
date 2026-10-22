@@ -99,9 +99,9 @@ pub use service::{
 pub use turn_driver::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CompletionCheck,
     ExternalToolCatalog, ExternalTools, FLUSH_PREFIX, GoalReport, OutputAdmission, QuestionHost,
-    RECAP_EVERY_STEPS, RECAP_PREFIX, ResultSummary, ResultVisibility, TurnContextHooks, TurnDriver,
-    TurnLimits, TurnObserver, TurnOptions, TurnOutcome, TurnProgress, TurnStop, Visibility,
-    execute_action_with_approval,
+    RECAP_EVERY_STEPS, RECAP_PREFIX, ResultSummary, ResultVisibility, TOOL_SCHEMA_TOOL,
+    TurnContextHooks, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnOutcome, TurnProgress,
+    TurnStop, USE_TOOL_TOOL, Visibility, execute_action_with_approval, tier_tool_schemas,
 };
 pub use workspace::{
     git_branch, is_sensitive_workspace_path, observe_workspace, observed_file_hash,
