@@ -1317,6 +1317,27 @@ pub struct OpenAiChatOptions {
 }
 
 impl OpenAiChatAdapter {
+    /// The body of one call, the same whether it is streamed or buffered: the
+    /// messages, the cache key, the output budget and the tools.
+    pub(crate) fn request_body(&self, request: &ProviderRequest) -> Value {
+        let mut body = chat_body(request, self.thinking.as_ref());
+        if let Some(key) = &self.prompt_cache_key {
+            body["prompt_cache_key"] = json!(key);
+        }
+        if let Some(max_tokens) = request.max_output_tokens {
+            body["max_tokens"] = json!(max_tokens);
+        }
+        if !request.tool_schemas.is_empty()
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert(
+                "tools".to_owned(),
+                Value::Array(request.tool_schemas.to_vec()),
+            );
+        }
+        body
+    }
+
     pub fn new(
         endpoint: impl Into<String>,
         credentials: Arc<dyn CredentialResolver>,
@@ -1528,27 +1549,11 @@ impl ModelProvider for OpenAiChatAdapter {
         let target = endpoint_target(&endpoint);
         let credentials = Arc::clone(&self.credentials);
         let client = self.client.clone();
-        let thinking = self.thinking;
         let provider_id = self.capabilities.provider_id.clone();
         let headers = self.headers.clone();
-        let prompt_cache_key = self.prompt_cache_key.clone();
+        let body = self.request_body(&request);
         Box::pin(async move {
             let token = credentials.resolve()?;
-            let mut body = chat_body(&request, thinking.as_ref());
-            if let Some(key) = prompt_cache_key {
-                body["prompt_cache_key"] = json!(key);
-            }
-            if let Some(max_tokens) = request.max_output_tokens {
-                body["max_tokens"] = json!(max_tokens);
-            }
-            if !request.tool_schemas.is_empty()
-                && let Some(object) = body.as_object_mut()
-            {
-                object.insert(
-                    "tools".to_owned(),
-                    Value::Array(Arc::unwrap_or_clone(request.tool_schemas)),
-                );
-            }
             let response = tokio::select! {
                 result = headers
                     .iter()
@@ -2767,6 +2772,51 @@ mod g03_openai_wire_snapshot_tests {
             String::from_utf8(body).expect("UTF-8 body"),
             r#"{"messages":[{"content":"hello","role":"user"}],"model":"fixture-model","stream":true,"stream_options":{"include_usage":true},"thinking":{"type":"disabled"}}"#
         );
+    }
+}
+
+#[cfg(test)]
+mod request_body_tests {
+    use std::sync::Arc;
+
+    use super::{
+        MessageRole, ModelCapabilities, OpenAiChatAdapter, OpenAiChatOptions, ProviderMessage,
+        ProviderRequest, StaticCredentialResolver,
+    };
+    use harness_types::RequestId;
+
+    /// Turns stream their calls, so the streamed body is the one that must carry
+    /// the cache key; it used to be built apart and left it out.
+    #[test]
+    fn a_streamed_call_carries_the_cache_key_and_the_tools() {
+        let provider = OpenAiChatAdapter::with_options(
+            "https://api.openai.com/v1/chat/completions",
+            Arc::new(StaticCredentialResolver::new("fixture-token")),
+            ModelCapabilities {
+                provider_id: "openai".to_owned(),
+                model: "fixture-model".to_owned(),
+                supports_streaming: true,
+                supports_tools: true,
+                fixture: false,
+            },
+            OpenAiChatOptions {
+                prompt_cache_key: Some("session-1".to_owned()),
+                ..OpenAiChatOptions::default()
+            },
+        )
+        .expect("adapter");
+        let request = ProviderRequest::new(
+            RequestId::generate(),
+            "fixture-model",
+            vec![ProviderMessage::new(MessageRole::User, "hello")],
+        )
+        .with_tool_schemas(vec![
+            serde_json::json!({"type": "function", "function": {"name": "read_file"}}),
+        ]);
+        let body = provider.request_body(&request);
+        assert_eq!(body["prompt_cache_key"], "session-1");
+        assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(body["stream"], true);
     }
 }
 

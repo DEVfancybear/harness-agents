@@ -134,10 +134,12 @@ pub(crate) fn adapter_stream(
     {
         let endpoint = provider.endpoint.clone();
         let credentials = Arc::clone(&provider.credentials);
-        let thinking = provider.thinking;
         let provider_id = provider.capabilities.provider_id.clone();
         let client = provider.client.clone();
         let headers = provider.headers.clone();
+        // The streamed request is the one turns send, so it is built as the
+        // buffered one is; it used to leave out the cache key.
+        let body = provider.request_body(&request);
         let (sender, mut receiver) =
             mpsc::channel::<Result<ProviderStreamEvent, ProviderError>>(16);
         tokio::spawn(async move {
@@ -157,20 +159,6 @@ pub(crate) fn adapter_stream(
                     return;
                 }
             };
-            let mut body = crate::chat_body(&request, thinking.as_ref());
-            // The streamed request asks for the same output budget the
-            // buffered one does; it used to send none.
-            if let Some(max_tokens) = request.max_output_tokens {
-                body["max_tokens"] = serde_json::json!(max_tokens);
-            }
-            if !request.tool_schemas.is_empty()
-                && let Some(object) = body.as_object_mut()
-            {
-                object.insert(
-                    "tools".to_owned(),
-                    serde_json::Value::Array(request.tool_schemas.to_vec()),
-                );
-            }
             let response = tokio::select! {
                 result = headers
                     .iter()

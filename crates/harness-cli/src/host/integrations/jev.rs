@@ -13,7 +13,7 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::stream::{self, StreamExt as _};
@@ -53,6 +53,9 @@ pub struct JevSettings {
     pub model: String,
     /// The harness decisions switched off one by one (`/jev <decision> off`).
     pub off: Vec<String>,
+    /// A decision's own threshold (`jev.thresholds.<decision>`), set from the
+    /// cost of its wrong answer, as `TypeSafe` advises; else its default.
+    pub thresholds: Vec<(String, f64)>,
 }
 
 /// The harness decision points Jev answers, each with its own switch, after
@@ -86,6 +89,25 @@ impl JevSettings {
     pub fn decides(&self, decision: &str) -> bool {
         self.enabled && !self.off.iter().any(|off| off == decision)
     }
+
+    /// The confidence at which `decision` acts: its own threshold, else its
+    /// default. Leaving an instruction section out is mild - the turn names it
+    /// and the model can read the file - so a clear "no" (p <= 0.10, confidence
+    /// 0.80) is enough; on the live test's AGENTS.md unrelated sections came out
+    /// at 0.07. The others act at the shared threshold.
+    #[must_use]
+    pub fn threshold_for(&self, decision: &str) -> f64 {
+        self.thresholds
+            .iter()
+            .find(|(name, _)| name == decision)
+            .map_or_else(
+                || match decision {
+                    "instructions" => 0.80,
+                    _ => self.threshold,
+                },
+                |(_, threshold)| *threshold,
+            )
+    }
 }
 
 impl JevSettings {
@@ -108,6 +130,15 @@ impl JevSettings {
                 .iter()
                 .filter(|(name, _)| setting["decisions"][*name] == false)
                 .map(|(name, _)| (*name).to_owned())
+                .collect(),
+            thresholds: DECISIONS
+                .iter()
+                .filter_map(|(name, _)| {
+                    setting["thresholds"][*name]
+                        .as_f64()
+                        .filter(|value| (0.0..=1.0).contains(value))
+                        .map(|value| ((*name).to_owned(), value))
+                })
                 .collect(),
         }
     }
@@ -156,12 +187,13 @@ pub fn status(config_file: &Path, environment: &LaunchEnvironment, data_dir: &Pa
         for (name, what) in DECISIONS {
             let _ = write!(
                 decisions,
-                "\n  {name:<13}{} - {what}",
-                if settings.decides(name) { "on " } else { "off" }
+                "\n  {name:<13}{} at {:.2} - {what}",
+                if settings.decides(name) { "on " } else { "off" },
+                settings.threshold_for(name)
             );
         }
         format!(
-            "Jev plugin: on (settings.json jev.enabled). The agent has the jev tool and the jev skill: TypeSafe's Jev makes repeated narrow decisions (yes/no, choice, score) and hands back what it is not sure of. Model {}, threshold {}; {key}. /jev off turns it off.\nHarness decisions (/jev <decision> on|off):{decisions}",
+            "Jev plugin: on (settings.json jev.enabled). The agent has the jev tool and the jev skill: TypeSafe's Jev makes repeated narrow decisions (yes/no, choice, score) and hands back what it is not sure of. Model {}, threshold {}; {key}. /jev off turns it off.\nHarness decisions (/jev <decision> on|off; jev.thresholds.<decision> sets one's threshold):{decisions}",
             settings.model, settings.threshold
         )
     } else {
@@ -214,10 +246,7 @@ impl JevHost {
     }
 
     fn build(key: Option<String>, endpoint: String, model: String, threshold: f64) -> Option<Self> {
-        let client = harness_providers::with_extra_roots(reqwest::Client::builder())
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .ok()?;
+        let client = shared_client()?;
         Some(Self {
             inner: Arc::new(Inner {
                 client,
@@ -242,6 +271,24 @@ impl JevHost {
     pub fn dispatcher(&self) -> Arc<dyn ExternalToolDispatcher> {
         Arc::new(self.clone())
     }
+}
+
+/// One client for the process: a turn builds its own `JevHost`, and a client per
+/// turn paid a new TLS handshake on each turn's first decision. Kept-alive
+/// connections (HTTP/2 when the server offers it) keep a decision near Jev's own
+/// ~100 ms.
+fn shared_client() -> Option<reqwest::Client> {
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            harness_providers::with_extra_roots(reqwest::Client::builder())
+                .timeout(REQUEST_TIMEOUT)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_keepalive(Duration::from_secs(30))
+                .build()
+                .ok()
+        })
+        .clone()
 }
 
 struct Catalog;
@@ -559,6 +606,7 @@ impl JevHost {
         let report = render(call, &outcomes, started.elapsed());
         let (decided, review, failed, input) = tally(&outcomes);
         harness_types::diag::info("jev", "call")
+            .field("model", model_of(&outcomes))
             .field("items", call.items.len())
             .field("decided", decided)
             .field("review", review)
@@ -608,15 +656,21 @@ fn answer_line(answer: &Judged) -> String {
 
 /// The tool's answer: a summary line, then the decided items, those for review
 /// with Jev's leaning, and the failures.
-fn render(call: &Call, outcomes: &[(String, Outcome)], elapsed: Duration) -> String {
-    let (decided, review, failed, input) = tally(outcomes);
-    let model = outcomes
+/// The Jev version that answered (`jev-latest` moves, so a tuned threshold
+/// belongs to the version it was tuned on).
+fn model_of(outcomes: &[(String, Outcome)]) -> String {
+    outcomes
         .iter()
         .find_map(|(_, outcome)| match outcome {
             Outcome::Answered { model, .. } => model.clone(),
             Outcome::Failed(_) => None,
         })
-        .unwrap_or_else(|| "jev".to_owned());
+        .unwrap_or_else(|| "jev".to_owned())
+}
+
+fn render(call: &Call, outcomes: &[(String, Outcome)], elapsed: Duration) -> String {
+    let (decided, review, failed, input) = tally(outcomes);
+    let model = model_of(outcomes);
     #[allow(clippy::cast_precision_loss, reason = "a cost estimate")]
     let cost = input as f64 * INPUT_PRICE;
     let mut text = format!(
@@ -825,13 +879,6 @@ impl ExternalToolDispatcher for Routed {
 /// How long a harness decision waits for Jev before going on without it.
 const DECISION_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// An instruction section is left out when Jev gives it at most this chance of
-/// applying. Leaving one out is milder than refusing a command - the turn
-/// names it and the model can read the file - so a clear "no" is enough, where
-/// the shared threshold (|2p - 1| >= 0.95) asked for p <= 0.025. Measured on
-/// the live test's AGENTS.md: unrelated sections came out at 0.07.
-const INSTRUCTION_LEAVE_OUT_AT: f64 = 0.10;
-
 /// The harness decisions of one turn: Jev asked at the decision points the
 /// design notes name, each failing open - no answer, a slow one or an unsure
 /// one leaves ha doing what it does without the plugin.
@@ -873,7 +920,18 @@ impl JevDecisions {
             tokio::time::timeout(DECISION_TIMEOUT, self.host.ask(&state, &questions)).await;
         let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match answer {
-            Ok(Ok(data)) => Some(data["answers"].clone()),
+            Ok(Ok(data)) => {
+                harness_types::diag::debug("jev", "answered")
+                    .field("decision", decision)
+                    .field(
+                        "model",
+                        data["model"].as_str().unwrap_or_default().to_owned(),
+                    )
+                    .field("input", data["usage"]["input_tokens"].as_u64().unwrap_or(0))
+                    .field("ms", elapsed)
+                    .emit();
+                Some(data["answers"].clone())
+            }
             Ok(Err(error)) => {
                 harness_types::diag::warn("jev", "decision_failed")
                     .field("decision", decision)
@@ -892,9 +950,10 @@ impl JevDecisions {
         }
     }
 
-    /// A `choice` answer Jev is sure of: its option and confidence.
-    fn sure_choice(&self, answer: &Value) -> Option<(String, f64)> {
-        let judged = judge("", answer, self.settings.threshold);
+    /// A `choice` answer Jev is sure of, at `decision`'s threshold: its option
+    /// and confidence.
+    fn sure_choice(&self, decision: &str, answer: &Value) -> Option<(String, f64)> {
+        let judged = judge("", answer, self.settings.threshold_for(decision));
         judged.accepted.then(|| {
             (
                 answer["choice"].as_str().unwrap_or_default().to_owned(),
@@ -903,10 +962,11 @@ impl JevDecisions {
         })
     }
 
-    /// A `noul` answer Jev is sure of: yes or no.
-    fn sure_noul(&self, answer: &Value) -> Option<bool> {
+    /// A `noul` answer Jev is sure of, at `decision`'s threshold: yes or no.
+    fn sure_noul(&self, decision: &str, answer: &Value) -> Option<bool> {
         let probability = answer["noul"].as_f64()?;
-        ((2.0 * probability - 1.0).abs() >= self.settings.threshold).then_some(probability >= 0.5)
+        ((2.0 * probability - 1.0).abs() >= self.settings.threshold_for(decision))
+            .then_some(probability >= 0.5)
     }
 }
 
@@ -992,7 +1052,7 @@ impl harness_tools::ToolGuard for JevDecisions {
                 }
             }));
             let answers = self.answers("commands", state, questions).await?;
-            let (choice, confidence) = self.sure_choice(&answers["verdict"])?;
+            let (choice, confidence) = self.sure_choice("commands", &answers["verdict"])?;
             harness_types::diag::info("jev", "command_judged")
                 .field("verdict", choice.clone())
                 .field("confidence", confidence)
@@ -1050,7 +1110,9 @@ impl harness_tools::ResultVisibility for JevDecisions {
                 return ranks;
             };
             for (index, result) in results.iter().enumerate() {
-                if let Some((choice, _)) = self.sure_choice(&answers[format!("r{index}")]) {
+                if let Some((choice, _)) =
+                    self.sure_choice("context", &answers[format!("r{index}")])
+                {
                     let visibility = match choice.as_str() {
                         "hide" => harness_tools::Visibility::Hide,
                         "short" => harness_tools::Visibility::Short,
@@ -1090,8 +1152,9 @@ impl super::delegation::ChildJudge for JevDecisions {
                 }));
             }
             let answers = self.answers("subgoals", state, questions).await?;
-            (0..existing.len())
-                .find(|index| self.sure_noul(&answers[format!("t{index}")]) == Some(true))
+            (0..existing.len()).find(|index| {
+                self.sure_noul("subgoals", &answers[format!("t{index}")]) == Some(true)
+            })
         })
     }
 
@@ -1119,7 +1182,7 @@ impl super::delegation::ChildJudge for JevDecisions {
             else {
                 return false;
             };
-            self.sure_choice(&answers["sensitivity"])
+            self.sure_choice("routing", &answers["sensitivity"])
                 .is_some_and(|(choice, _)| choice == "restricted")
         })
     }
@@ -1179,8 +1242,7 @@ pub async fn conditional_instructions(
         let mut text = sections[0].clone();
         let mut left_out = Vec::new();
         for (index, section) in sections[1..].iter().enumerate() {
-            let applies = answers[format!("s{index}")]["noul"].as_f64();
-            if applies.is_some_and(|probability| probability <= INSTRUCTION_LEAVE_OUT_AT) {
+            if decisions.sure_noul("instructions", &answers[format!("s{index}")]) == Some(false) {
                 left_out.push(section.lines().next().unwrap_or_default().trim().to_owned());
             } else {
                 text.push_str(section);
@@ -1445,8 +1507,34 @@ mod tests {
                 threshold: 0.95,
                 model: "jev-latest".to_owned(),
                 off: off.iter().map(|name| (*name).to_owned()).collect(),
+                thresholds: Vec::new(),
             },
         }
+    }
+
+    /// A decision acts at its own threshold when settings.json gives one, else
+    /// at its default: the shared one, or 0.80 for leaving a section out.
+    #[test]
+    fn each_decision_has_its_own_threshold() {
+        let settings = super::JevSettings {
+            enabled: true,
+            threshold: 0.9,
+            model: "jev-latest".to_owned(),
+            off: Vec::new(),
+            thresholds: vec![("commands".to_owned(), 0.99)],
+        };
+        assert!((settings.threshold_for("commands") - 0.99).abs() < f64::EPSILON);
+        assert!((settings.threshold_for("routing") - 0.9).abs() < f64::EPSILON);
+        assert!((settings.threshold_for("instructions") - 0.80).abs() < f64::EPSILON);
+        let directory = tempfile::tempdir().expect("config dir");
+        let config = directory.path().join("config.toml");
+        std::fs::write(
+            config.with_file_name("settings.json"),
+            r#"{"jev": {"enabled": true, "thresholds": {"routing": 0.7, "nope": 0.1, "context": 3}}}"#,
+        )
+        .expect("settings");
+        let loaded = super::JevSettings::load(&config);
+        assert_eq!(loaded.thresholds, vec![("routing".to_owned(), 0.7)]);
     }
 
     fn shell(command: &str) -> harness_tools::CodingToolAction {

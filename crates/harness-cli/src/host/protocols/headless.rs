@@ -753,7 +753,7 @@ pub async fn run_with(
     let driver = driver.with_inbox(RunInbox::new(Arc::clone(&store)));
     let mut tool_schemas = harness_tools::coding_tool_schemas_for(hashline);
     if let Some(external) = &external_tools {
-        tool_schemas.extend(external.schemas());
+        tool_schemas.extend(super::service::in_cache_order(external.schemas()));
     }
     // Content the prompt names rides with it, exactly as it does in the app: an image is
     // shown to the model, and a text file is put in the message. A scripted run can
@@ -774,7 +774,7 @@ pub async fn run_with(
     // tools this run has; a run used to get one generic sentence.
     // `--system-prompt` replaces the static layers and `--append-system-prompt`
     // adds to the end, as prime-agent's print mode takes them.
-    let system_prompt = {
+    let (system_prompt, environment_facts) = {
         let config_dir = context
             .paths
             .config_file
@@ -811,20 +811,24 @@ pub async fn run_with(
                     .and_then(serde_json::Value::as_str)
             })
             .collect::<Vec<_>>();
-        super::prompt::assemble(
-            custom.as_deref(),
-            &super::prompt::PromptEnvironment {
-                os: std::env::consts::OS,
-                shell,
-                cwd: &context.project.root,
-                project_root: &context.project.root,
-                git_branch: git_branch.as_deref(),
-                changed_files,
-                date_iso: &today,
-                limits: bounds::limits_from_environment(environment),
-            },
-            &tool_names,
-            &appended,
+        let prompt_environment = super::prompt::PromptEnvironment {
+            os: std::env::consts::OS,
+            shell,
+            cwd: &context.project.root,
+            project_root: &context.project.root,
+            git_branch: git_branch.as_deref(),
+            changed_files,
+            date_iso: &today,
+            limits: bounds::limits_from_environment(environment),
+        };
+        (
+            super::prompt::assemble(
+                custom.as_deref(),
+                &prompt_environment,
+                &tool_names,
+                &appended,
+            ),
+            super::prompt::volatile_facts(&prompt_environment),
         )
     };
     let run_request = RunRequest::new(
@@ -852,8 +856,14 @@ pub async fn run_with(
         ),
     );
     let harness_entries = harness_state.total();
+    // The date and the Git facts ride the input, as in the app, so the system
+    // prompt is the same from one run to the next and stays cached.
+    let mut project_blocks = vec![harness_session::ContextBlock::mandatory(
+        "environment",
+        harness_session::ContextBlockKind::Instruction,
+        environment_facts,
+    )];
     // With harness refinements off, no saved entry reaches the model.
-    let mut project_blocks = Vec::new();
     if refinements {
         project_blocks.push(super::harness::digest_block(
             &super::harness::format_digest(

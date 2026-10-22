@@ -123,7 +123,9 @@ impl SystemPromptBuilder {
 
 /// A whole system prompt the way prime-agent's `system_prompt_breakdown`
 /// assembles one: `--system-prompt` in place of the static layers when given,
-/// the dynamic tail, then each `--append-system-prompt` text.
+/// the session tail, then each `--append-system-prompt` text. The volatile facts
+/// are left out: they go with the run's input, so two runs in one project share
+/// the cached system prompt.
 #[must_use]
 pub fn assemble(
     custom: Option<&str>,
@@ -135,7 +137,7 @@ pub fn assemble(
         Some(custom) => custom.to_owned(),
         None => SystemPromptBuilder::build(environment, tools).text,
     }];
-    sections.push(dynamic_tail(environment, None, 0));
+    sections.push(session_tail(environment, None, 0));
     sections.extend(
         appended
             .iter()
@@ -405,9 +407,11 @@ mod tests {
         assert!(!prefix.contains("feature/agent"), "{prefix}");
         let prompt = assemble(None, &environment(), &["read_file"], &[]);
         assert!(prompt.contains("windows"), "{prompt}");
-        assert!(prompt.contains("feature/agent"), "{prompt}");
         assert!(prompt.contains("C:/work/project/sub"), "{prompt}");
         assert!(!prompt.contains("sentinel-secret"));
+        // The branch and the date change from run to run, so they ride the input.
+        assert!(!prompt.contains("feature/agent"), "{prompt}");
+        assert!(super::volatile_facts(&environment()).contains("feature/agent"));
     }
 
     /// prime-agent's loop contract is stated in the base, whatever tools are active.

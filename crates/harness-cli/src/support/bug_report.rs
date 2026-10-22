@@ -1234,12 +1234,14 @@ impl Report {
                     .sum::<u64>()
             };
             let _ = writeln!(out, "## Model calls\n");
+            let (input, cached) = (sum("input"), sum("cached"));
             let _ = writeln!(
                 out,
-                "- {} call(s): {} input token(s) ({} from the cache), {} output token(s)",
+                "- {} call(s): {} input token(s) ({} from the cache, {}%), {} output token(s)",
                 calls.len(),
-                sum("input"),
-                sum("cached"),
+                input,
+                cached,
+                (cached * 100).checked_div(input).unwrap_or_default(),
                 sum("output")
             );
             let _ = writeln!(

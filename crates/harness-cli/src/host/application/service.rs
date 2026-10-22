@@ -8810,20 +8810,7 @@ async fn run_turn(
     )));
     let mut tool_schemas = harness_tools::coding_tool_schemas_for(hashline);
     if let Some(tools) = &external_tools {
-        // The tool definitions lead every request, so their order is part of
-        // the cached prefix: sorted by name, the order hosts and servers list
-        // them in cannot change it (as pi-deepseek-cache sorts `tools`).
-        let mut external = tools.schemas();
-        external.sort_by_cached_key(|schema| {
-            schema
-                .get("function")
-                .and_then(|function| function.get("name"))
-                .or_else(|| schema.get("name"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_owned()
-        });
-        tool_schemas.extend(external);
+        tool_schemas.extend(in_cache_order(tools.schemas()));
     }
     // What the user typed, kept with the turn: the admitted input is the prompt
     // composed below (notices, attached files, hook context), and a summary of
@@ -11107,6 +11094,23 @@ impl SessionPort for FixtureService {
     fn provider_diagnostics(&self) -> Vec<String> {
         vec!["Provider: the labelled fixture; no model is called".to_owned()]
     }
+}
+
+/// External tool schemas in the order every request sends them. The tool
+/// definitions lead every request, so their order is part of the cached prefix:
+/// sorted by name, the order hosts and servers list them in cannot change it (as
+/// pi-deepseek-cache sorts `tools`).
+pub(crate) fn in_cache_order(mut schemas: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    schemas.sort_by_cached_key(|schema| {
+        schema
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .or_else(|| schema.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    });
+    schemas
 }
 
 #[cfg(test)]
