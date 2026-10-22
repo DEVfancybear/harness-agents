@@ -1352,6 +1352,14 @@ impl std::fmt::Debug for JevDecisions {
 /// guess that costs, since a fresh start would then throw it away.
 #[must_use]
 pub fn cache_lifetime(provider_id: &str) -> Duration {
+    // `HA_CACHE_LIFETIME` (seconds) for a provider whose cache keeps longer or
+    // shorter than its kind's.
+    if let Some(seconds) = std::env::var(CACHE_LIFETIME_VARIABLE)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return Duration::from_secs(seconds);
+    }
     let long = harness_providers::cache_retention_long();
     let provider = provider_id.to_ascii_lowercase();
     if provider.contains("anthropic") {
@@ -1368,6 +1376,9 @@ pub fn cache_lifetime(provider_id: &str) -> Duration {
         Duration::from_secs(3_600)
     }
 }
+
+/// Sets the cache lifetime, in seconds, in place of the provider's.
+pub const CACHE_LIFETIME_VARIABLE: &str = "HA_CACHE_LIFETIME";
 
 /// The cache decision of one input: the jev plugin with the provider's cache
 /// lifetime.

@@ -67,17 +67,25 @@ answers: changing a weight or a filter later needs no new calls.
 
 ## The harness side
 
-With the plugin on, ha itself also asks Jev at five decision points, each narrowing only and
+With the plugin on, ha itself also asks Jev at nine decision points, each narrowing only and
 each failing open (`/jev status` lists them; `/jev <decision> off` switches one off):
 
 - a command Jev is sure is harmful is refused;
 - a brief a sibling child already serves reuses that child;
 - earlier tool results the request does not need are shortened first;
 - `AGENTS.md` sections unrelated to the request are left out, and named;
-- a subtask touching secrets or infrastructure stays on the session's model.
+- a subtask touching secrets or infrastructure stays on the session's model;
+- the parts of a long tool result the request does not need are left out, each run named with
+  its lines: read them again (`read_file` with offset, `read_process_output`) if one matters;
+- an answer that says an unchecked change works is sent back once: run the project's check, or
+  say the change is not verified;
+- when MCP or extension tools are listed under "More tools", the ones that fit the request are
+  named in the turn's input (call them with `use_tool`);
+- a cold, long conversation whose new request does not continue it starts fresh, behind a note
+  that names the earlier requests (`history_search`, `history_read` read them).
 
-When one of these refuses or reuses something, the result says so: tell the user, and do not try
-to get around it.
+When one of these refuses, reuses or leaves out something, the result says so: tell the user, and
+do not try to get around it.
 
 ## Rules
 

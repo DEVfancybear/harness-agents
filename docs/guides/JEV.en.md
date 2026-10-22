@@ -90,30 +90,75 @@ judges it from the item itself.
 ## Layer 2: Jev at the harness's decision points
 
 The design notes ask how a coding agent would be built if models had no KV cache. Their answer
-is a harness whose every per-turn decision is a typed question to Jev. ha asks Jev at five of
+is a harness whose every per-turn decision is a typed question to Jev. ha asks Jev at nine of
 those points.
 
 Each decision **only narrows** what the harness does. Jev never grants a permission that the
 policy did not grant, and never removes work the user asked for. Each decision also **fails
-open**: if Jev is unavailable, slow or unsure, ha does what it does without the plugin.
+open**: if Jev is unavailable, slow (8 seconds) or unsure, ha does what it does without the
+plugin. And none of them rewrites a prefix the provider has cached.
 
 | # | Decision point | Question to Jev | What ha does with a confident answer | Switch |
 |---|---|---|---|---|
 | 1 | **Permissions.** Should this command run? | `choice` allow / ask / deny. The state is the command, plus the contents of any local script it runs. | `deny` refuses the command and gives the model Jev's reason. This happens in every mode, including full-auto, headless and children. `ask` and `allow` change nothing. | `/jev commands` |
 | 2 | **Subgoals.** Is this subtask already done or in flight? | A `noul` per sibling: is it the same work? | ha reuses that child (its answer, or its run in flight) instead of starting a duplicate. | `/jev subgoals` |
-| 3 | **Context.** How visible should each earlier tool result be for this request? | `choice` hide / short / full, asked when a turn's results overflow their budget. | Results are shortened in that order: `hide`, then `short` (the head kept), then the oldest of the rest. `full` results are cut last. | `/jev context` |
+| 3 | **Context.** How visible should each earlier tool result be for this request? | `choice` hide / short / long / full, asked when a turn's results overflow their budget. | Results are shortened in that order: `hide`, then `short` (the start kept), then the oldest unranked, then `long` (the start and the end kept, as a log's command and its failure). `full` results are cut last. | `/jev context` |
 | 4 | **Conditional instructions.** Does this `AGENTS.md` section apply to this request? | A `noul` per section, for instruction files with several sections. | A section Jev gives at most a 10% chance of applying is left out of the turn. The turn names what was left out, so the model can read the file. The preamble is always kept. | `/jev instructions` |
 | 5 | **Security-aware routing.** How sensitive is what this subtask will touch? | `choice` restricted (secrets, credentials, env, infrastructure or deploy config) / standard / open. | A `restricted` subtask runs on the session's own model, not the cheaper subagent model. | `/jev routing` |
+| 6 | **Large output.** Which parts of a long tool result does this request need? | A `noul` per part, for a result of 16 KB or more from a command, a search, a whole-file read or a fetched page, cut into parts of about 2,000 characters at line ends. | A part Jev gives at most a 10% chance of being needed is left out, when a quarter or more of the result goes. Each run of left-out parts becomes a note naming its lines and how to read them again. The first and the last part always stay, and the user still sees all of it. | `/jev output` |
+| 7 | **Completion.** Does the answer say an unchecked change works? | A `noul`, asked only when the turn changed files and ran no command after its last change (a code gate). | The model is sent back once, to run the project's check on what changed or to say plainly that the change is not verified. | `/jev completion` |
+| 8 | **Tools.** Which of the listed tools fit this request? | When MCP or extension tools are deferred (see below): a `choice` over the roster for the best three, then a `noul` for each. | The tools Jev leans yes on are named in the turn's input; one it is sure of comes with its arguments, which saves a `tool_schema` call. | `/jev tools` |
+| 9 | **Cache.** Reuse the cached prefix, or start fresh? | A `noul`: does the new request continue the earlier work? Asked only when the provider's cache has expired and the earlier conversation is 20k tokens or more, since reusing it then costs its full price anyway. | The earlier turns are set aside behind one note that names each request and points at the history tools. The fresh start is kept and applied to every later turn, so the new prefix stays cached. A warm cache is never rebuilt. | `/jev cache` |
 
-The decisions are on while the plugin is on, unless switched off one by one. The threshold is
-`jev.threshold`, 0.95 by default. Every decision is recorded in the diagnostics (`jev`
-records), so `/bug-report` shows what Jev decided.
+Decisions 3, 6 and 7 judge children's turns too, as the root's are judged.
 
-Two points from the notes are not in this release:
-- **Cache reuse.** Rebuilding against reusing the provider's prefix cache depends on each
-  provider's caching.
-- **Tiered tool disclosure.** Snippets first and schemas on demand would change how tools are
-  declared.
+The decisions are on while the plugin is on, unless switched off one by one. A decision acts
+at its own threshold, `jev.thresholds.<decision>`, set from the cost of its wrong answer as
+TypeSafe advises. The default is `jev.threshold` (0.95), except for the three mild ones -
+`instructions`, `output` and `completion` - which act at 0.80, a clear no (p ≤ 0.10) or a clear
+yes. `/jev status` lists each decision with its threshold.
+
+Every question asked of Jev is recorded in the diagnostics with its decision, the Jev version
+that answered, its input tokens and how long it took, and every outcome record names its
+decision and whether it changed what ha did. `/bug-report` has a **Jev** section:
+
+- each decision: how often Jev was asked, how often it acted, its failures and time-outs, the
+  median answer time and the versions that answered;
+- the agent's own `jev` calls;
+- the newest 30 Jev records, with what each decided (the command judged, the sections and lines
+  left out, the tools suggested).
+
+The bug report's model calls also give the share of input read from the cache, and how many
+conversations were carried on or started fresh.
+
+### Tiered tool disclosure
+
+The design notes' three tiers - a snippet per tool, the schema on demand, the docs for a one-off
+need - apply to the tools of MCP servers and extensions, which can be many and long. When their
+schemas take 12 KB or more (`tools.tiered` in settings.json: `auto`, the default; `on`; `off`;
+or `HA_TOOL_TIERS`), they leave the tool list:
+
+- the system prompt lists each one on one line (its name and the first sentence of its
+  description), sorted;
+- `tool_schema` shows a tool's whole description and arguments;
+- `use_tool` calls it. The call becomes the tool's own call: its arguments are checked against
+  its schema, and it is gated and approved like any other.
+
+The tool list sent to the provider does not change with what the model looks at, so the cached
+prefix stays whole. The core tools and ha's own always stay in the list. This works without the
+jev plugin; with it, decision 8 points the model at the tools that fit.
+
+### The cache decision
+
+ha keeps the prefix the provider caches stable: the system prompt holds what stays for the
+session, the date and Git facts go with each turn's input (in `ha exec` too), the tool list is
+sorted, and streamed OpenAI calls carry `prompt_cache_key`. Rebuilding that prefix is considered
+only when it is free: once the provider's cache has expired since the conversation's last model
+call. The lifetime is 5 minutes on Anthropic (an hour with `HA_CACHE_RETENTION=long`), 6 hours on
+DeepSeek, an hour on OpenAI and others (a day on OpenAI's API with `HA_CACHE_RETENTION=long`),
+taken long when unsure, because a cache thought expired while it holds is the one guess that
+costs. `HA_CACHE_LIFETIME` (seconds) sets it for a provider, and `HA_FRESH_START_MIN_TOKENS` the
+size below which a conversation is always carried on.
 
 ## Settings
 
@@ -125,7 +170,12 @@ Two points from the notes are not in this release:
     "enabled": true,
     "threshold": 0.95,
     "model": "jev-latest",
-    "decisions": {"commands": true, "subgoals": true, "context": true, "instructions": true, "routing": true}
-  }
+    "decisions": {"commands": true, "subgoals": true, "context": true, "instructions": true, "routing": true, "output": true, "completion": true, "tools": true, "cache": true},
+    "thresholds": {"commands": 0.97}
+  },
+  "tools": {"tiered": "auto"}
 }
 ```
+
+`jev-latest` moves to new versions; once thresholds are tuned, pin the version that answered
+(`/bug-report` and the `jev` tool name it), as TypeSafe advises.

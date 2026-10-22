@@ -986,7 +986,8 @@ pub trait FreshStartJudge: Send + Sync + std::fmt::Debug {
 /// conversation still starts with it, so the new prefix stays cached.
 const FRESH_START_SETTING: &str = "fresh_start";
 
-/// A conversation this short is carried on whatever the request.
+/// A conversation this short is carried on whatever the request
+/// (`HA_FRESH_START_MIN_TOKENS` moves it).
 const FRESH_START_MIN_TOKENS: u64 = 20_000;
 
 /// Without a call this process saw, the last turn's start stands for the last
@@ -5276,7 +5277,8 @@ impl RuntimeService {
     /// sends the same prefix. Otherwise, when the provider's cache has expired
     /// and the conversation is long, the judge is asked whether the request
     /// needs it; a sure no sets the earlier turns aside behind one note. Each
-    /// input records what was decided (`cache reused` or `cache fresh_start`).
+    /// input records what was decided (`cache reused`, `cache fresh_start`, or
+    /// `cache fresh_kept` for a later turn of a fresh start).
     async fn fresh_start(
         &self,
         source_session_id: &SessionId,
@@ -5308,6 +5310,11 @@ impl RuntimeService {
                     && messages_digest(&sent[..kept.covers]) == kept.digest
             });
         if let Some(kept) = kept {
+            harness_types::diag::info("cache", "fresh_kept")
+                .task(request.task_id.as_str())
+                .session(request.session_id.as_str())
+                .field("covers", kept.covers)
+                .emit();
             return set_aside(kept.covers, kept.note, sent);
         }
         let tokens = messages_tokens(&sent);
@@ -5355,7 +5362,11 @@ impl RuntimeService {
                 .field("asked", asked)
                 .emit();
         };
-        if !cold || tokens < FRESH_START_MIN_TOKENS {
+        let least = std::env::var("HA_FRESH_START_MIN_TOKENS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(FRESH_START_MIN_TOKENS);
+        if !cold || tokens < least {
             record("reused", false);
             return (sent, bare);
         }

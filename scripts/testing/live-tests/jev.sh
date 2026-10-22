@@ -2,7 +2,7 @@
 # The jev plugin with a real model and TypeSafe's real Jev (a TypeSafe key in
 # HA_CREDENTIALS_DIR's credential file, `typesafe`, or TYPESAFE_API_KEY):
 #   1. off by default: /jev status says so and no turn has the jev tool;
-#   2. /jev on: the status lists the five harness decisions;
+#   2. /jev on: the status lists the nine harness decisions;
 #   3. the agent's workflow (jev-fraud): the jev tool judges a batch of emails,
 #      decides the confident ones and hands the rest back for review;
 #   4. the command guard refuses a script that reaches for SSH keys and sends
@@ -13,7 +13,15 @@
 #   7. a sensitive subtask stays on the session's model when children otherwise
 #      run on another (SUBAGENT_FROM, deepseek/deepseek-v4-flash by default);
 #   8. a long turn's earlier results are ranked for the request before any is
-#      shortened.
+#      shortened (with `output` switched off, so the results stay long);
+#   9. a long command output leaves out the parts the request does not need,
+#      and the part it needs still answers it;
+#  10. an answer that says an unchecked change works is sent back once;
+#  11. an MCP server's tools, deferred (HA_TOOL_TIERS=on), are listed and
+#      called through use_tool, with Jev naming the one that fits;
+#  12. a cold conversation (HA_CACHE_LIFETIME=5) whose new request does not
+#      continue it starts fresh, and the next turn keeps the new prefix;
+#  13. the bug report's Jev section counts what each decision did.
 # Every check prints PASS or FAIL; the conversation and the diagnostics stay in
 # $LIVE_ROOT/jev as evidence. No key value is printed.
 #
@@ -117,7 +125,7 @@ check "a turn has no jev tool while the plugin is off" 'last | grep -q "KHONG-JE
 echo "################ 2. /jev on"
 "$HA" send j1 "/jev on" --wait >/dev/null 2>&1
 sleep 3
-check "/jev on reports the plugin on with its five decisions" 'records jev | grep -q "^status decisions=5 enabled=True"'
+check "/jev on reports the plugin on with its nine decisions" 'records jev | grep -q "^status decisions=9 enabled=True"'
 check "/jev on saved jev.enabled" 'grep -q "\"enabled\": *true" "$HA_HOME/settings.json"'
 "$HA" shutdown --force >/dev/null 2>&1
 
@@ -173,10 +181,83 @@ for n in $(seq 1 11); do
 done
 printf 'line 7 of file 11: THE-ANSWER-IS-PLUM\n' >> "$P/big/f11.txt"
 agent "$P" j8
+# The results must stay long for the ranking to be needed.
+"$HA" send j8 "/jev output off" --wait >/dev/null 2>&1
 say j8 "Kiểm thử harness: đọc lần lượt từng file big/f1.txt đến big/f11.txt bằng read_file (mỗi file một lần gọi, theo thứ tự, mỗi lần chỉ một file, đọc toàn bộ). Sau đó trả lời đúng một dòng: chuỗi viết hoa xuất hiện ở cuối big/f11.txt." | tail -2 | sed 's/^/   /'
 records jev | grep "^context" | sed 's/^/   /'
 check "Jev ranked the earlier results for the request" 'records jev | grep -qE "^context_ranked .*judged=[1-9]"'
 check "the turn still answered from the file it needed" 'last | grep -q "THE-ANSWER-IS-PLUM"'
+"$HA" send j8 "/jev output on" --wait >/dev/null 2>&1
 "$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 9. a long command output keeps what the request needs"
+mkdir -p "$P/logs"
+for n in $(seq 1 620); do
+  if [ "$n" -eq 413 ]; then echo "line 413: FATAL quota exceeded for bucket ORCHID-7"
+  else echo "line $n: build step finished ok, nothing to report for this step"; fi
+done > "$P/logs/build.log"
+agent "$P" j9
+since=$(date +%s%3N)
+say j9 "Kiểm thử harness: chạy đúng lệnh Get-Content logs/build.log bằng run_shell (timeout_ms 60000), một lần, không chạy lệnh nào khác và không đọc file. Rồi trả lời đúng một dòng: tên bucket trong dòng FATAL của output." | tail -2 | sed 's/^/   /'
+records jev "$since" | grep "^output_judged" | sed 's/^/   /'
+check "Jev left parts of the long output out" 'records jev "$since" | grep -qE "^output_judged .*acted=True"'
+check "the part the request needs reached the model" 'last | grep -q "ORCHID-7"'
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 10. an unchecked change said to work is sent back"
+agent "$P" j10
+since=$(date +%s%3N)
+say j10 "Kiểm thử harness: dùng edit_file đổi chuỗi hello from the project thành xin chao tu du an trong src/hello.py. Không chạy lệnh nào và không đọc lại file. Sau đó trả lời đúng một dòng: Đã sửa xong, mọi test đều pass." | tail -3 | sed 's/^/   /'
+records jev "$since" | grep "^completion" | sed 's/^/   /'
+check "Jev caught the unchecked claim" 'records jev "$since" | grep -qE "^completion_checked .*acted=True"'
+check "the turn did not end on the unchecked claim" '! (last | tr -d "\r" | grep -qxF "Đã sửa xong, mọi test đều pass.")'
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 11. deferred MCP tools are listed and called through use_tool"
+MCP_SERVER="$(dirname "$(cygpath -u "$HA")")/p6_fixture_mcp_server.exe"
+[ -f "$MCP_SERVER" ] || echo "   (no $MCP_SERVER next to ha.exe)"
+CONFIG="$(ls "$RX/home"/*.toml | head -1)"
+printf '\n[mcp_servers.fixture]\ncommand = %s\n' "'$(cygpath -m "$MCP_SERVER")'" >> "$CONFIG"
+HA_TOOL_TIERS=on agent "$P" j11
+since=$(date +%s%3N)
+say j11 "Kiểm thử harness: dùng tool observe của MCP server fixture để quan sát subject ORCHID-OBS, rồi trả lời đúng nguyên văn kết quả tool trả về." | tail -2 | sed 's/^/   /'
+records jev "$since" | grep "^tools_suggested" | sed 's/^/   /'
+records tool "$since" | sed 's/^/   /'
+check "Jev named the MCP tool that fits" 'records jev "$since" | grep -qE "^tools_suggested .*acted=True .*suggested=mcp__fixture__observe"'
+check "the deferred tool ran" 'records tool "$since" | grep -q "tool=mcp__fixture__observe"'
+check "its result came back" 'last | grep -q "observed ORCHID-OBS"'
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 12. a cold conversation that a new request does not continue starts fresh"
+HA_CACHE_LIFETIME=5 HA_FRESH_START_MIN_TOKENS=2000 agent "$P" j12
+say j12 "Đọc toàn bộ big/f1.txt và big/f2.txt bằng read_file, rồi trả lời đúng một dòng: số dòng của big/f1.txt." | tail -1 | sed 's/^/   /'
+sleep 8
+since=$(date +%s%3N)
+say j12 "Không gọi tool nào. Viết đúng một câu thơ tiếng Anh về mùa thu." | tail -1 | sed 's/^/   /'
+records cache "$since" | sed 's/^/   /'
+records jev "$since" | grep "^cache" | sed 's/^/   /'
+check "the expired, unrelated conversation started fresh" 'records cache "$since" | grep -q "^fresh_start"'
+check "Jev judged the request does not continue it" 'records jev "$since" | grep -qE "^cache_decided .*acted=True"'
+next=$(date +%s%3N)
+say j12 "Không gọi tool nào. Viết thêm đúng một câu thơ tiếng Anh về mùa đông." | tail -1 | sed 's/^/   /'
+records cache "$next" | sed 's/^/   /'
+records provider "$next" | sed 's/^/   /'
+check "the next turn kept the fresh start" 'records cache "$next" | grep -q "^fresh_kept"'
+check "the next turn read its prefix from the cache" 'records provider "$next" | grep -qE "cached=[1-9]"'
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 13. the bug report shows what Jev decided"
+"$HA" bug-report --since 2h --out "$RX/report.zip" >/dev/null 2>&1
+"$PY" - "$RX/report.zip" > "$RX/report-jev.md" <<'EOF'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    name = next(n for n in archive.namelist() if n.endswith("SUMMARY.md"))
+    text = archive.read(name).decode("utf-8", "replace")
+print(text.split("## Jev", 1)[1].split("\n## ", 1)[0] if "## Jev" in text else "")
+EOF
+sed -n 1,16p "$RX/report-jev.md" | sed 's/^/   /'
+for decision in commands output completion tools cache; do
+  check "the report counts the $decision decision" "grep -qE '^\| $decision \| [1-9]' '$RX/report-jev.md'"
+done
 
 result

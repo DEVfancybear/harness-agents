@@ -95,32 +95,105 @@ Tầng này gồm skill `jev`, tool `jev` và import `jev` trong kernel Python. 
 
 Bản ghi chú thiết kế đặt câu hỏi: nếu model không có KV cache, ta sẽ thiết kế coding agent ra
 sao? Câu trả lời của nó là một harness mà mọi quyết định trong mỗi lượt đều là một câu hỏi có
-kiểu gửi cho Jev. ha hỏi Jev ở năm điểm sau.
+kiểu gửi cho Jev. ha hỏi Jev ở chín điểm sau.
 
-Hai nguyên tắc chung cho cả năm điểm:
+Ba nguyên tắc chung cho cả chín điểm:
 
 - Mỗi quyết định **chỉ siết chặt hơn**. Jev không bao giờ cho phép điều mà policy không cho, và
   không bao giờ bỏ việc người dùng đã yêu cầu.
-- Mỗi quyết định **an toàn khi lỗi** (fail open). Nếu Jev không trả lời, trả lời chậm hoặc
-  không chắc, ha làm đúng như khi không có plugin.
+- Mỗi quyết định **an toàn khi lỗi** (fail open). Nếu Jev không trả lời, trả lời chậm (quá 8
+  giây) hoặc không chắc, ha làm đúng như khi không có plugin.
+- Không quyết định nào ghi đè lên prefix mà provider đã cache.
 
 | # | Điểm quyết định | Câu hỏi cho Jev | ha làm gì khi Jev chắc chắn | Công tắc |
 |---|---|---|---|---|
 | 1 | **Quyền chạy lệnh**: lệnh này có nên chạy không? | `choice` allow / ask / deny. State gồm lệnh và nội dung các script cục bộ mà lệnh chạy. | `deny` thì từ chối lệnh và đưa lý do cho model, ở mọi chế độ: kể cả full-auto, headless và child. `ask` và `allow` không đổi gì. | `/jev commands` |
 | 2 | **Subgoal**: việc này đã xong hoặc đang chạy chưa? | Mỗi child cùng cấp một câu `noul`: có phải cùng một việc không? | Dùng lại child đó (câu trả lời của nó, hoặc lần chạy đang diễn ra) thay vì tạo thêm một child trùng. | `/jev subgoals` |
-| 3 | **Ngữ cảnh**: mỗi kết quả tool cũ nên hiện đến đâu với yêu cầu này? | `choice` hide / short / full, hỏi khi kết quả của lượt vượt ngân sách. | Cắt theo thứ tự: `hide` trước, rồi `short` (giữ phần đầu), rồi phần còn lại từ cũ nhất. Kết quả `full` bị cắt sau cùng. | `/jev context` |
+| 3 | **Ngữ cảnh**: mỗi kết quả tool cũ nên hiện đến đâu với yêu cầu này? | `choice` hide / short / long / full, hỏi khi kết quả của lượt vượt ngân sách. | Cắt theo thứ tự: `hide` trước, rồi `short` (giữ phần đầu), rồi các kết quả chưa xếp hạng từ cũ nhất, rồi `long` (giữ phần đầu và phần cuối, như lệnh và lỗi của một log). Kết quả `full` bị cắt sau cùng. | `/jev context` |
 | 4 | **Chỉ dẫn theo điều kiện**: mục này của `AGENTS.md` có áp dụng cho yêu cầu này không? | Mỗi mục một câu `noul`, chỉ với file chỉ dẫn có nhiều mục. | Mục mà Jev cho tối đa 10% khả năng áp dụng sẽ bị bỏ khỏi lượt, và lượt ghi tên các mục đã bỏ để model đọc file nếu cần. Phần mở đầu luôn được giữ. | `/jev instructions` |
 | 5 | **Định tuyến theo độ nhạy**: subtask này chạm dữ liệu nhạy cảm cỡ nào? | `choice` restricted (secrets, credentials, env, cấu hình hạ tầng hay deploy) / standard / open. | Subtask `restricted` chạy trên model của phiên, không chạy trên model subagent rẻ hơn. | `/jev routing` |
+| 6 | **Output lớn**: yêu cầu này cần những phần nào của một kết quả tool dài? | Mỗi phần một câu `noul`. Áp dụng cho kết quả từ 16 KB trở lên của lệnh, tìm kiếm, đọc nguyên file hay trang web; kết quả được cắt ở cuối dòng thành các phần khoảng 2.000 ký tự. | Phần mà Jev cho tối đa 10% khả năng cần sẽ bị bỏ, nếu tổng cộng bỏ được từ một phần tư kết quả trở lên. Mỗi đoạn bị bỏ được thay bằng một ghi chú nêu số dòng và cách đọc lại. Phần đầu và phần cuối luôn được giữ, và người dùng vẫn thấy toàn bộ. | `/jev output` |
+| 7 | **Báo xong**: câu trả lời có nói rằng một thay đổi chưa được kiểm tra là chạy được không? | Một câu `noul`, chỉ hỏi khi lượt có sửa file và không chạy lệnh nào sau lần sửa cuối (điều kiện này do code kiểm tra). | Model được gửi lại một lần, để chạy bước kiểm tra của dự án trên phần đã đổi, hoặc nói rõ là chưa kiểm tra. | `/jev completion` |
+| 8 | **Tool**: tool nào trong danh sách hợp với yêu cầu này? | Khi tool MCP hoặc extension được hoãn (xem bên dưới): một câu `choice` trên cả danh sách để lấy 3 tool tốt nhất, rồi mỗi tool một câu `noul`. | Các tool mà Jev nghiêng về "có" được nêu tên trong input của lượt. Tool nào Jev chắc chắn thì kèm luôn tham số, đỡ một lần gọi `tool_schema`. | `/jev tools` |
+| 9 | **Cache**: dùng lại prefix đã cache, hay bắt đầu lại? | Một câu `noul`: yêu cầu mới có nối tiếp việc trước không? Chỉ hỏi khi cache của provider đã hết hạn và hội thoại cũ từ 20k token trở lên, vì lúc đó dùng lại cũng phải trả đủ giá. | Các lượt cũ được cất đi sau một ghi chú, ghi chú này nêu từng yêu cầu và chỉ tới tool history. Lần bắt đầu lại được lưu và áp cho mọi lượt sau, nên prefix mới vẫn được cache. Cache còn ấm thì không bao giờ dựng lại. | `/jev cache` |
 
-Khi plugin bật, cả năm quyết định đều bật, trừ những cái bạn tắt riêng. Ngưỡng là
-`jev.threshold` (mặc định 0.95). Mọi quyết định đều được ghi vào diagnostics (bản ghi `jev`), nên
-`/bug-report` cho thấy Jev đã quyết định những gì.
+Quyết định 3, 6 và 7 cũng áp cho lượt của child, giống như lượt gốc.
 
-Hai điểm trong ghi chú chưa có trong bản này:
+Khi plugin bật, cả chín quyết định đều bật, trừ những cái bạn tắt riêng.
 
-- **Dùng lại cache**: chọn giữa dựng lại và dùng lại prefix cache phụ thuộc cách cache của từng
-  provider.
-- **Công bố tool theo tầng** (mô tả ngắn trước, schema khi cần): phải đổi cách khai báo tool.
+Mỗi quyết định có ngưỡng riêng `jev.thresholds.<quyết định>`. TypeSafe khuyên đặt ngưỡng theo
+cái giá của một câu trả lời sai.
+
+- Mặc định là `jev.threshold` (0.95).
+- Riêng ba quyết định nhẹ là `instructions`, `output` và `completion` thì dùng 0.80, tức một câu
+  "không" rõ ràng (p ≤ 0.10) hoặc một câu "có" rõ ràng.
+- `/jev status` liệt kê từng quyết định kèm ngưỡng của nó.
+
+Mọi câu hỏi gửi cho Jev đều được ghi vào diagnostics, gồm quyết định nào, phiên bản Jev nào trả
+lời, bao nhiêu token input và mất bao lâu. Mọi bản ghi kết quả đều nêu quyết định nào, và có làm
+thay đổi hành vi của ha hay không. `/bug-report` có mục **Jev** gồm:
+
+- từng quyết định: hỏi bao nhiêu lần, có tác dụng bao nhiêu lần, lỗi và timeout, thời gian trả
+  lời trung vị, các phiên bản đã trả lời;
+- các lần agent tự gọi tool `jev`;
+- 30 bản ghi Jev mới nhất kèm nội dung đã quyết: lệnh được judge, các mục và dòng bị bỏ, các
+  tool được gợi ý.
+
+Phần model calls của bug report còn cho biết:
+
+- tỉ lệ input đọc từ cache;
+- bao nhiêu hội thoại được dùng tiếp, bao nhiêu được bắt đầu lại.
+
+### Công bố tool theo tầng
+
+Ba tầng trong ghi chú thiết kế là:
+
+1. mỗi tool một dòng mô tả ngắn;
+2. schema đầy đủ, chỉ khi cần;
+3. tài liệu hướng dẫn, cho một nhu cầu dùng một lần.
+
+ha áp ba tầng này cho tool của MCP server và extension, vì loại tool này có thể rất nhiều và
+schema rất dài. Khi tổng schema của chúng từ 12 KB trở lên, chúng được rút khỏi danh sách tool.
+Chế độ đặt bằng `tools.tiered` trong settings.json (`auto` là mặc định, hoặc `on`, `off`) hoặc
+bằng `HA_TOOL_TIERS`. Khi đó:
+
+- system prompt liệt kê mỗi tool một dòng (tên và câu đầu của mô tả), đã sắp xếp;
+- `tool_schema` cho xem toàn bộ mô tả và tham số của một tool;
+- `use_tool` gọi tool đó. Lời gọi trở thành lời gọi của chính tool đó: tham số được kiểm tra theo
+  schema của nó, rồi được gate và duyệt như mọi lời gọi khác.
+
+Danh sách tool gửi cho provider không đổi theo những gì model xem, nên prefix đã cache vẫn còn
+nguyên. Tool lõi và tool riêng của ha luôn ở trong danh sách.
+
+Cơ chế này chạy được cả khi không có plugin jev. Khi có plugin, quyết định 8 chỉ cho model những
+tool phù hợp.
+
+### Quyết định về cache
+
+ha giữ cho prefix mà provider cache được ổn định:
+
+- system prompt chỉ chứa những gì cố định trong suốt phiên;
+- ngày giờ và thông tin Git đi kèm input của từng lượt (cả trong `ha exec`);
+- danh sách tool được sắp xếp;
+- các lần gọi OpenAI dạng streaming đều gửi `prompt_cache_key`.
+
+Việc dựng lại prefix chỉ được cân nhắc khi nó miễn phí, tức là khi cache của provider đã hết hạn
+kể từ lần gọi model cuối của hội thoại. Thời gian lưu cache được ước như sau:
+
+| Provider | Thời gian lưu cache |
+|---|---|
+| Anthropic | 5 phút (1 giờ với `HA_CACHE_RETENTION=long`) |
+| DeepSeek | 6 giờ |
+| OpenAI API | 1 giờ (1 ngày với `HA_CACHE_RETENTION=long`) |
+| OpenAI qua Codex, và các provider khác | 1 giờ |
+
+Khi không chắc, ha ước dài hơn, vì đoán cache đã hết hạn trong khi nó vẫn còn là trường hợp duy
+nhất gây thiệt.
+
+Hai biến điều chỉnh:
+
+- `HA_CACHE_LIFETIME`: thời gian lưu cache (tính bằng giây) cho một provider.
+- `HA_FRESH_START_MIN_TOKENS`: hội thoại nhỏ hơn mức này luôn được dùng tiếp.
 
 ## Cấu hình
 
@@ -132,7 +205,12 @@ Hai điểm trong ghi chú chưa có trong bản này:
     "enabled": true,
     "threshold": 0.95,
     "model": "jev-latest",
-    "decisions": {"commands": true, "subgoals": true, "context": true, "instructions": true, "routing": true}
-  }
+    "decisions": {"commands": true, "subgoals": true, "context": true, "instructions": true, "routing": true, "output": true, "completion": true, "tools": true, "cache": true},
+    "thresholds": {"commands": 0.97}
+  },
+  "tools": {"tiered": "auto"}
 }
 ```
+
+`jev-latest` sẽ chuyển sang phiên bản mới. Theo khuyến nghị của TypeSafe, khi đã chỉnh xong ngưỡng
+thì nên cố định phiên bản đã trả lời (`/bug-report` và tool `jev` đều ghi tên phiên bản).
