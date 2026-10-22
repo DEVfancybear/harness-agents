@@ -169,6 +169,26 @@ impl GoalHost {
         }
     }
 
+    /// Why an ask is not verified again: nothing changed since the last
+    /// verification failed. Once only: a failure that no change fixes - a
+    /// service that was not running, a finding the model checked and found
+    /// wrong - would otherwise hold the goal open for good. A session was
+    /// refused 29 times in four hours this way, its fixes committed to a clean
+    /// tree.
+    async fn refuse_unchanged(&self, root: &std::path::Path) -> Option<String> {
+        let workspace = super::autonomous::snapshot(root).await;
+        let unchanged = workspace.is_some()
+            && self
+                .failed_at
+                .lock()
+                .is_ok_and(|failed| failed.as_ref() == workspace.as_ref());
+        if unchanged && !self.refused_unchanged.swap(true, Ordering::SeqCst) {
+            return Some("The goal is NOT complete, and it was not verified again: nothing in the workspace changed (no edit, no new commit) since the last verification failed. Fix what that verification reported, then call goal_complete again. If what it reported is not fixed by a change - a service that was not running, a finding you checked and found wrong - call goal_complete once more and it is verified again.".to_owned());
+        }
+        self.refused_unchanged.store(false, Ordering::SeqCst);
+        None
+    }
+
     /// The model says the goal is done: verify it, and complete it only when the
     /// checks and the verifier agree. `Ok` is the completion, `Err` what is left
     /// to fix - both written for the model.
@@ -214,20 +234,9 @@ impl GoalHost {
                 ));
             }
         }
-        let workspace = super::autonomous::snapshot(&check.root).await;
-        let unchanged = workspace.is_some()
-            && self
-                .failed_at
-                .lock()
-                .is_ok_and(|failed| failed.as_ref() == workspace.as_ref());
-        // Once only: a failure that no change fixes - a service that was not
-        // running, a finding the model checked and found wrong - would
-        // otherwise hold the goal open for good. A session was refused 29
-        // times in four hours this way, its fixes committed to a clean tree.
-        if unchanged && !self.refused_unchanged.swap(true, Ordering::SeqCst) {
-            return Err("The goal is NOT complete, and it was not verified again: nothing in the workspace changed (no edit, no new commit) since the last verification failed. Fix what that verification reported, then call goal_complete again. If what it reported is not fixed by a change - a service that was not running, a finding you checked and found wrong - call goal_complete once more and it is verified again.".to_owned());
+        if let Some(refusal) = self.refuse_unchanged(&check.root).await {
+            return Err(refusal);
         }
-        self.refused_unchanged.store(false, Ordering::SeqCst);
         if !check.checks.is_empty() {
             self.notice(format!(
                 "goal: running {} verification check(s) before it can complete",
