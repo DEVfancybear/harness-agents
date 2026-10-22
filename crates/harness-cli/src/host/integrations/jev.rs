@@ -1444,7 +1444,8 @@ mod tests {
     fn shell(command: &str) -> harness_tools::CodingToolAction {
         harness_tools::CodingToolAction::from_provider_call(
             "run_shell",
-            &json!({"command": command, "timeout_ms": 1000, "isolation": "best_effort"}).to_string(),
+            &json!({"command": command, "timeout_ms": 1000, "isolation": "best_effort"})
+                .to_string(),
         )
         .expect("a shell call")
     }
