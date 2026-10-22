@@ -92,6 +92,44 @@ echo "   the list showed after ${opened:-?} ms; the slowest key in the view sett
 check "the agents view listed the forest within 3 s" '[ -n "$opened" ] && [ "$opened" -lt 3000 ]'
 check "every key in the view settled within 400 ms" '[ "$slowest" -lt 400 ]'
 check "Esc went back to the session" 'grep -q "until found MOC-GIAO" "$RX/forest.bin.marks"'
+
+echo "################ 5. the reference panels line up"
+# Each panel is read while it is open: a wait of its own length marks it.
+# Seen in 0.7.2: a key longer than the column ran into its description
+# (`Alt+Enternew line`), a wrapped row of commands started at the panel's
+# edge, and /context listed its blocks as unaligned text.
+panels=(/hotkeys /help /context)
+steps="wait:6000"
+n=0
+for panel in "${panels[@]}"; do
+  n=$((n + 1))
+  steps="$steps,key:$panel,enter,wait:$((2500 + n)),esc,key:$(printf '\025'),wait:600"
+done
+(cd "$RX/p" && "$PROBE" "$RX/panels.bin" "$HA" "$steps" -- attach t1 >/dev/null)
+n=0
+for panel in "${panels[@]}"; do
+  n=$((n + 1))
+  at=$(awk -v w="wait:$((2500 + n))" 'found { print $1; exit } $2 == w { found = 1 }' "$RX/panels.bin.marks")
+  shot "$RX/panels.bin" "$at" > "$RX/panel-${panel#/}.txt"
+done
+grep -E "Alt\+Enter|Shift\+Alt\+M" "$RX/panel-hotkeys.txt" | sed 's/^/   /'
+check "/hotkeys keeps every key apart from its description" \
+  'grep -q "Alt+Enter  .*new line" "$RX/panel-hotkeys.txt" && ! grep -qE "Alt\+Enternew|Shift\+Alt\+Mnext" "$RX/panel-hotkeys.txt"'
+# The first row of a group and the row its commands wrap to begin at the same
+# column: `│ │  Run      /goal` and then `│ │           /steer`.
+check "/help wraps a group's commands under its column" \
+  '"$PY" - "$RX/panel-help.txt" <<'"'"'EOF'"'"'
+import re, sys
+rows = open(sys.argv[1], encoding="utf-8").read().splitlines()
+at = next((i for i, row in enumerate(rows) if re.search(r"Run +/goal", row)), None)
+if at is None or at + 1 >= len(rows) or "/" not in rows[at + 1]:
+    sys.exit(1)
+# The Run group runs past one row at this width; its next row is its rest.
+sys.exit(0 if rows[at + 1].index("/") == rows[at].index("/goal") else 1)
+EOF'
+grep -E "tokens ·" "$RX/panel-context.txt" | head -3 | sed 's/^/   /'
+check "/context lists its blocks as fields, with their tokens" \
+  'grep -q "Packet" "$RX/panel-context.txt" && grep -qE "  [a-z_-]+ +[0-9.k]+ tokens · " "$RX/panel-context.txt"'
 "$HA" shutdown --force >/dev/null 2>&1
 
 result
