@@ -455,6 +455,122 @@ pub trait ResultVisibility: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = std::collections::HashMap<usize, Visibility>> + Send + 'a>>;
 }
 
+/// A tool result at least this long is offered to the admission judge before
+/// it enters the transcript (about 4k tokens).
+const ADMIT_AT_BYTES: usize = 16_000;
+
+/// The size of one judged part of a long result, cut at a line end.
+const ADMIT_CHUNK_CHARS: usize = 2_000;
+
+/// Admission is applied only when it leaves out at least this share: a few
+/// dropped lines are not worth breaking a result up.
+const ADMIT_MIN_SAVING_PERCENT: usize = 25;
+
+/// The tools whose long output is mostly noise for one request: command
+/// output, searches, whole-file reads, fetched pages. A read of chosen lines,
+/// an edit or a child's report is kept whole.
+const ADMITTED_TOOLS: [&str; 6] = [
+    "run_shell",
+    "run_process",
+    "read_process_output",
+    "search_text",
+    "read_file",
+    "web_fetch",
+];
+
+/// A host's judgment of which parts of one long tool result the current
+/// request needs, before the result enters the transcript: the design notes'
+/// query-aware filtering of large output (mu's chunk admission). It answers
+/// one keep (`true`) or leave-out per part; an answer of another length, or
+/// none, keeps the result whole. The first and the last part are always kept,
+/// and what is left out is named, so the model can read it again.
+pub trait OutputAdmission: Send + Sync {
+    fn admit<'a>(
+        &'a self,
+        query: &'a str,
+        tool: &'a str,
+        arguments: &'a str,
+        parts: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Vec<bool>> + Send + 'a>>;
+}
+
+/// Whether a result of `tool` called with `arguments` is offered for
+/// admission: a long result of a tool in [`ADMITTED_TOOLS`], and for
+/// `read_file` only a whole-file read.
+fn admissible(tool: &str, arguments: &str, text: &str) -> bool {
+    if text.len() < ADMIT_AT_BYTES || !ADMITTED_TOOLS.contains(&tool) {
+        return false;
+    }
+    if tool == "read_file" {
+        let arguments = serde_json::from_str::<serde_json::Value>(arguments).unwrap_or_default();
+        return arguments
+            .get("offset")
+            .is_none_or(serde_json::Value::is_null)
+            && arguments
+                .get("limit")
+                .is_none_or(serde_json::Value::is_null);
+    }
+    true
+}
+
+/// A long result cut into parts of about [`ADMIT_CHUNK_CHARS`], each ending at
+/// a line end, with the first line of each (1-based).
+fn result_parts(text: &str) -> Vec<(usize, String)> {
+    let mut parts: Vec<(usize, String)> = Vec::new();
+    let mut line = 1;
+    for piece in text.split_inclusive('\n') {
+        match parts.last_mut() {
+            Some((_, part)) if part.len() + piece.len() <= ADMIT_CHUNK_CHARS => {
+                part.push_str(piece);
+            }
+            _ => parts.push((line, piece.to_owned())),
+        }
+        line += 1;
+    }
+    parts
+}
+
+/// The result with the parts the judge left out replaced by a note naming
+/// their lines, or `None` when it keeps all, or too little would be left out
+/// to be worth it. The first and the last part always stay.
+fn admitted_result(parts: &[(usize, String)], keep: &[bool]) -> Option<(String, usize)> {
+    if keep.len() != parts.len() || parts.len() < 3 {
+        return None;
+    }
+    let total = parts.iter().map(|(_, part)| part.len()).sum::<usize>();
+    let left_out = (1..parts.len() - 1)
+        .filter(|index| !keep[*index])
+        .map(|index| parts[index].1.len())
+        .sum::<usize>();
+    if left_out * 100 < total * ADMIT_MIN_SAVING_PERCENT {
+        return None;
+    }
+    let mut text = String::with_capacity(total - left_out + 256);
+    let mut dropped = 0;
+    let mut run: Option<(usize, usize)> = None;
+    let close = |text: &mut String, run: &mut Option<(usize, usize)>| {
+        if let Some((first, last)) = run.take() {
+            let _ = writeln!(
+                text,
+                "[jev: lines {first}-{last} of this result left out as unrelated to this request; call the tool again (read_file with offset, read_process_output, a narrower search) if they matter]"
+            );
+        }
+    };
+    for (index, (first_line, part)) in parts.iter().enumerate() {
+        let kept = index == 0 || index == parts.len() - 1 || keep[index];
+        if kept {
+            close(&mut text, &mut run);
+            text.push_str(part);
+        } else {
+            dropped += 1;
+            let last_line = first_line + part.matches('\n').count().max(1) - 1;
+            run = Some(run.map_or((*first_line, last_line), |(first, _)| (first, last_line)));
+        }
+    }
+    close(&mut text, &mut run);
+    Some((text, dropped))
+}
+
 /// The bytes a transcript's messages and calls take.
 fn transcript_size(messages: &[ProviderMessage]) -> usize {
     messages
@@ -692,6 +808,7 @@ pub struct TurnDriver {
     context_hooks: Option<Arc<dyn TurnContextHooks>>,
     /// Which earlier results the current request needs, when the host judges it.
     visibility: Option<Arc<dyn ResultVisibility>>,
+    admission: Option<Arc<dyn OutputAdmission>>,
 }
 
 /// A workspace path as a key: one separator, no leading `./`.
@@ -807,6 +924,7 @@ impl TurnDriver {
             seen: Arc::default(),
             context_hooks: None,
             visibility: None,
+            admission: None,
         }
     }
 
@@ -822,6 +940,43 @@ impl TurnDriver {
     pub fn with_visibility(mut self, visibility: Arc<dyn ResultVisibility>) -> Self {
         self.visibility = Some(visibility);
         self
+    }
+
+    /// Leave out the parts of a long tool result the current request does not
+    /// need, before the result enters the transcript.
+    #[must_use]
+    pub fn with_admission(mut self, admission: Arc<dyn OutputAdmission>) -> Self {
+        self.admission = Some(admission);
+        self
+    }
+
+    /// `rendered` as the transcript takes it: whole, or without the parts the
+    /// admission judge left out. Once in, it is never rewritten for this, so
+    /// the provider's cached prefix stays whole.
+    async fn admit(
+        &self,
+        query: &str,
+        tool: &str,
+        arguments: &str,
+        rendered: String,
+        cancellation: &CancellationToken,
+    ) -> String {
+        let Some(admission) = &self.admission else {
+            return rendered;
+        };
+        if !admissible(tool, arguments, &rendered) {
+            return rendered;
+        }
+        let parts = result_parts(&rendered);
+        let texts = parts.iter().map(|(_, part)| part.clone()).collect();
+        let keep = tokio::select! {
+            keep = admission.admit(query, tool, arguments, texts) => keep,
+            () = cancellation.cancelled() => Vec::new(),
+        };
+        match admitted_result(&parts, &keep) {
+            Some((text, _)) => text,
+            None => rendered,
+        }
     }
 
     /// Advertise the external tools of trusted extensions to this driver.
@@ -1762,6 +1917,23 @@ impl TurnDriver {
                             request.project_rules.push(block.clone());
                         }
                         let rendered = render_tool_output(&name, &view.output);
+                        let arguments = appended
+                            .iter()
+                            .flat_map(|message| message.tool_calls.iter())
+                            .find(|call| call.call_id == transcript_id)
+                            .map(|call| call.arguments.clone())
+                            .unwrap_or_default();
+                        // The user sees all of it; the transcript takes what
+                        // this request needs.
+                        let admitted = self
+                            .admit(
+                                &request.text,
+                                &name,
+                                &arguments,
+                                rendered.clone(),
+                                &cancellation,
+                            )
+                            .await;
                         if !shown {
                             observer.observe(TurnProgress::ToolOutput {
                                 name: name.clone(),
@@ -1777,8 +1949,8 @@ impl TurnDriver {
                         }
                         let note = hook_notes.get(&transcript_id);
                         let rendered = match note.and_then(crate::HookResponse::context_text) {
-                            Some(context) => format!("{rendered}\n\nHook feedback:\n{context}"),
-                            None => rendered,
+                            Some(context) => format!("{admitted}\n\nHook feedback:\n{context}"),
+                            None => admitted,
                         };
                         let rendered = match note.and_then(crate::HookResponse::host_context_text) {
                             Some(context) => format!("{rendered}\n\n{context}"),
@@ -4168,5 +4340,92 @@ mod stream_restart_tests {
                 TurnProgress::TextDelta("Hello".to_owned()),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::{ADMIT_AT_BYTES, admissible, admitted_result, long_result, result_parts};
+
+    fn log(lines: usize) -> String {
+        (1..=lines)
+            .map(|line| format!("line {line}: {}\n", "x".repeat(60)))
+            .collect()
+    }
+
+    /// A long result is cut at line ends into parts of about 2,000 characters,
+    /// and each part knows its first line.
+    #[test]
+    fn a_long_result_is_cut_at_line_ends() {
+        let text = log(400);
+        let parts = result_parts(&text);
+        assert!(parts.len() > 10);
+        assert_eq!(parts[0].0, 1);
+        assert!(parts.iter().all(|(_, part)| part.ends_with('\n')));
+        assert_eq!(
+            parts
+                .iter()
+                .map(|(_, part)| part.as_str())
+                .collect::<String>(),
+            text
+        );
+        let second = parts[1].1.lines().next().unwrap();
+        assert!(
+            second.starts_with(&format!("line {}:", parts[1].0)),
+            "{second}"
+        );
+    }
+
+    /// What the judge leaves out is replaced by one note per run of parts,
+    /// naming the lines; the first and the last part always stay.
+    #[test]
+    fn left_out_parts_become_one_note_naming_their_lines() {
+        let text = log(400);
+        let parts = result_parts(&text);
+        let mut keep = vec![false; parts.len()];
+        keep[parts.len() / 2] = true;
+        let (admitted, dropped) = admitted_result(&parts, &keep).expect("admitted");
+        assert_eq!(dropped, parts.len() - 3);
+        assert!(admitted.starts_with("line 1:"), "{admitted}");
+        assert!(admitted.contains("line 400:"), "the end stays");
+        assert_eq!(admitted.matches("[jev: lines ").count(), 2, "{admitted}");
+        let first_run = format!("[jev: lines {}-", parts[1].0);
+        assert!(admitted.contains(&first_run), "{admitted}");
+        // Keeping almost everything is not worth breaking the result up.
+        let mut most = vec![true; parts.len()];
+        most[1] = false;
+        assert!(admitted_result(&parts, &most).is_none());
+        // An answer of another length keeps it whole.
+        assert!(admitted_result(&parts, &[false]).is_none());
+    }
+
+    /// Only long output of the noisy tools is judged, and a read of chosen
+    /// lines is kept whole.
+    #[test]
+    fn only_long_output_of_noisy_tools_is_judged() {
+        let long = "x".repeat(ADMIT_AT_BYTES);
+        assert!(admissible("run_shell", "{}", &long));
+        assert!(admissible("read_file", r#"{"path":"a.rs"}"#, &long));
+        assert!(!admissible(
+            "read_file",
+            r#"{"path":"a.rs","offset":10}"#,
+            &long
+        ));
+        assert!(!admissible("edit_file", "{}", &long));
+        assert!(!admissible("run_shell", "{}", "short"));
+    }
+
+    /// A result ranked `long` keeps its start and its end.
+    #[test]
+    fn a_long_rank_keeps_both_ends() {
+        let text = log(400);
+        let kept = long_result(&text);
+        assert!(
+            kept.contains("line 1:") && kept.contains("line 400:"),
+            "{kept}"
+        );
+        assert!(!kept.contains("line 200:"), "the middle is left out");
+        assert!(kept.len() < text.len() / 4);
+        assert_eq!(long_result("short"), "short");
     }
 }

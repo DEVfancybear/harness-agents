@@ -607,6 +607,12 @@ pub async fn run_with(
                 .clone()
                 .map(|decisions| decisions as Arc<dyn harness_tools::ToolGuard>),
         );
+        agents.set_result_judges(jev_decisions.clone().map(|decisions| {
+            super::delegation::ResultJudges {
+                visibility: Arc::clone(&decisions) as Arc<dyn harness_tools::ResultVisibility>,
+                admission: decisions as Arc<dyn harness_tools::OutputAdmission>,
+            }
+        }));
         Some((agents, config))
     });
     let delegate_host = agents.as_ref().map(|(agents, config)| {
@@ -700,7 +706,8 @@ pub async fn run_with(
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
     let driver = match &jev_decisions {
         Some(decisions) => driver
-            .with_visibility(Arc::clone(decisions) as Arc<dyn harness_tools::ResultVisibility>),
+            .with_visibility(Arc::clone(decisions) as Arc<dyn harness_tools::ResultVisibility>)
+            .with_admission(Arc::clone(decisions) as Arc<dyn harness_tools::OutputAdmission>),
         None => driver,
     };
     let external_tools = super::mcp::combined_tools_with_delegate(

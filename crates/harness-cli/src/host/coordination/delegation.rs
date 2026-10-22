@@ -285,6 +285,13 @@ fn find_rlm_model_matches(query: &str, models: &[SearchableModel], limit: usize)
         .collect()
 }
 
+/// The judges of a child's tool results, handed to every child's turn.
+#[derive(Clone)]
+pub struct ResultJudges {
+    pub visibility: Arc<dyn harness_tools::ResultVisibility>,
+    pub admission: Arc<dyn harness_tools::OutputAdmission>,
+}
+
 /// A host's judgments about a child before it starts (the jev plugin's
 /// subgoal and routing decisions). Each only narrows what happens: a judge that
 /// cannot answer says `None` or `false`, and the child starts as without one.
@@ -962,6 +969,9 @@ struct AgentsShared {
     judge: Mutex<Option<Arc<dyn ChildJudge>>>,
     /// The jev plugin's command guard, which children's commands pass too.
     guard: Mutex<Option<Arc<dyn harness_tools::ToolGuard>>>,
+    /// The jev plugin's judges of a child's own tool results: what a long one
+    /// leaves out, and what is shortened first as its turn grows.
+    results: Mutex<Option<ResultJudges>>,
     running_workers: Mutex<u32>,
     worker_freed: tokio::sync::Notify,
     children: Mutex<Vec<ChildRecord>>,
@@ -1050,6 +1060,7 @@ impl AgentsShared {
             max_workers: std::sync::atomic::AtomicU32::new(0),
             judge: Mutex::new(None),
             guard: Mutex::new(None),
+            results: Mutex::new(None),
             running_workers: Mutex::new(0),
             worker_freed: tokio::sync::Notify::new(),
             children: Mutex::new(Vec::new()),
@@ -1974,6 +1985,13 @@ impl SessionAgents {
     pub fn set_guard(&self, guard: Option<Arc<dyn harness_tools::ToolGuard>>) {
         if let Ok(mut current) = self.shared.guard.lock() {
             *current = guard;
+        }
+    }
+
+    /// The judges of children's tool results, as the root's are judged.
+    pub fn set_result_judges(&self, judges: Option<ResultJudges>) {
+        if let Ok(mut current) = self.shared.results.lock() {
+            *current = judges;
         }
     }
 
@@ -5117,6 +5135,20 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     Arc::clone(&child_tools) as Arc<dyn ExternalToolCatalog>
                 ))
                 .with_inbox(RunInbox::new(Arc::clone(&store)));
+            // An explorer reads more than anyone: its long results are judged
+            // as the root's are.
+            let judges = self
+                .shared
+                .results
+                .lock()
+                .ok()
+                .and_then(|judges| judges.clone());
+            let driver = match judges {
+                Some(judges) => driver
+                    .with_visibility(judges.visibility)
+                    .with_admission(judges.admission),
+                None => driver,
+            };
             // A child's question is shown to the user, named after the child, and
             // the child waits for the answer.
             let question_host = self
