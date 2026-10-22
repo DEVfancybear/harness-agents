@@ -84,12 +84,12 @@ check "no search API failed" '! (records web | grep -q "^search_failed")'
 echo "################ 3. a refused DeepSeek key hands the search to the next API"
 # A key DeepSeek refuses (401), set for this agent only: the search moves on.
 DEEPSEEK_API_KEY=sk-ha-live-refused-key agent "$RX/p" n3
-say n3 "Kiểm thử harness: gọi tool web_search đúng một lần với query 'rust programming language', rồi in nguyên văn hai dòng đầu tiên của kết quả tool (dòng Results for query và dòng ghi chú trong ngoặc ngay sau, nếu có). Không gọi tool nào khác." | tail -5 | sed 's/^/   /'
+say n3 "Kiểm thử harness: gọi tool web_search đúng một lần với query 'rust programming language', rồi in nguyên văn dòng đầu tiên của kết quả tool (Results for query ...) và dòng ghi chú bắt đầu bằng dấu ngoặc '(' nếu có (bỏ qua dòng trống). Không gọi tool nào khác." | tail -5 | sed 's/^/   /'
 records web | sed 's/^/   /'
 check "DeepSeek's refusal was recorded as a refused key" 'records web | grep -qE "^search_failed .*api=deepseek .*refused=True"'
 check "the results came from the next API" 'last | grep -qE "\((Google via Serper|DuckDuckGo)\)"'
 check "the answer names the failure and /login deepseek" 'last | grep -q "DeepSeek Search failed" && last | grep -q "/login deepseek"'
-say n3 "Gọi tool web_search thêm đúng một lần với query 'rust book', rồi in nguyên văn hai dòng đầu tiên của kết quả tool." | tail -4 | sed 's/^/   /'
+say n3 "Gọi tool web_search thêm đúng một lần với query 'rust book', rồi in nguyên văn dòng đầu tiên của kết quả tool (Results for query ...) và dòng ghi chú bắt đầu bằng dấu ngoặc '(' nếu có (bỏ qua dòng trống)." | tail -4 | sed 's/^/   /'
 check "the refused key is skipped by the next search" 'last | grep -q "DeepSeek Search skipped: it refused its key"'
 check "the skipped key made no second request" '[ "$(records web | grep -c "^search_failed .*api=deepseek")" -eq 1 ]'
 "$HA" shutdown --force >/dev/null 2>&1
