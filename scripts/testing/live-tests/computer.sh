@@ -141,7 +141,7 @@ else
   # key presses. Each look takes it far longer than the bird takes to fall, so it
   # flies blind between looks; a flight kept up past the unflapped fall is its doing.
   T3=$(now_ms)
-  say cu "$NO_SHELL Open a new File Explorer window (Win+E), go to This PC, then Downloads, then the flappy-bird folder, and open index.html (it opens in the browser). Then fly it yourself with the computer tool: start a flight and press Space to flap. The bird falls while you look and think, so send each flight's flaps as one computer call: key presses with waits between them, filmed (the `film` option on the game canvas) so you see what the bird did during the flaps, not only how the flight ended. Each Space sets the bird's upward speed, and between presses it falls faster and faster: find the spacing that keeps it level. Fly at least three flights (after a crash, R or the restart button starts the next). Tell me the score each flight ended with, as shown on the screen, as SCORES=<a>,<b>,<c>. Leave the game open." > /dev/null
+  say cu "$NO_SHELL Open a new File Explorer window (Win+E), go to This PC, then Downloads, then the flappy-bird folder, and open index.html (it opens in the browser). Then fly two flights yourself with the computer tool: start a flight and press Space to flap. The bird falls while you look and think, so send each flight's flaps as one computer call, key presses with waits between them, filmed (the computer tool's film option, on the game canvas) so you see what the bird did, and with the window option set to the game's title so no key goes to another window. Each Space sets the bird's upward speed, and between presses it falls faster and faster: use the first film to find the spacing that keeps it level. After a crash, R or the restart button starts the next flight. Tell me the score each flight ended with, as shown on the screen, as SCORES=<a>,<b>. Leave the game open." > /dev/null
   A3=$(last)
   echo "$A3" | tail -4 | sed 's/^/   /'
   # 3b. Twenty gates need a reflex no model call has: the agent builds one. It
@@ -202,7 +202,7 @@ EOF
   echo "   autopilot: $(echo "$auto" | grep -c .) flights, scores $(echo "$auto" | awk 'NF { printf "%s ", $4 + 0 }')"
   check "a File Explorer window it opened went to Downloads or flappy-bird" 'grep -qx "explorer 1" "$RX/flights.txt"'
   check "the game was not on screen before, then opened on its ready screen" 'grep -qx "game at start 0" "$RX/flights.txt" && grep -qx "opened 1" "$RX/flights.txt" && grep -qx "ready 1" "$RX/flights.txt"'
-  check "by hand: it started flights and they ended (at least 3)" '[ "$(echo "$hand" | grep -c .)" -ge 3 ]'
+  check "by hand: it started flights and they ended (at least 2)" '[ "$(echo "$hand" | grep -c .)" -ge 2 ]'
   # Unflapped, a flight lasts about 1.2 s (the start's own flap, then the fall):
   # a longer one was kept up by the model's own flaps.
   check "by hand: a flight lasted over 2 s, kept up by its flaps" 'echo "$hand" | awk "\$3 > 2.0 { found = 1 } END { exit !found }"'

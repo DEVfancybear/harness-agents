@@ -203,6 +203,10 @@ fn schema() -> Value {
         "type": "boolean",
         "description": "Whether input steps return a screenshot taken after them (default true)."
     });
+    properties["window"] = json!({
+        "type": "string",
+        "description": "Part of the title of the window your keys are for, e.g. \"Notepad\" or \"Skyline Flap\". Before each key or type step the tool checks that this window has the keyboard; if another window does (the user switched, a dialog opened), the call stops before sending any key there."
+    });
     properties["film"] = json!({
         "type": "object",
         "description": "Film the steps while they run: frames of `region` (default the whole screen) every `every` seconds (default 0.25, from 0.1 to 2), returned as one image of frames left to right, top to bottom, with each frame's time in the text. Use it to see what moved during the steps (an animation, a game, a page that loads), not only how they ended.",
@@ -378,6 +382,9 @@ struct Call {
     steps: Vec<Step>,
     screenshot_after: bool,
     film: Option<Film>,
+    /// Text the title of the window with the keyboard must hold before a key
+    /// or text step is sent, any case.
+    window: Option<String>,
 }
 
 /// Frames taken while a call's steps run: of a region of the screenshot (the
@@ -419,10 +426,22 @@ fn parse_call(arguments: &Value) -> Result<Call, HarnessError> {
         .ok_or_else(|| invalid("computer takes an object: {\"action\": \"screenshot\"}"))?;
     if let Some(unknown) = object.keys().find(|key| {
         !STEP_FIELDS.contains(&key.as_str())
-            && !matches!(key.as_str(), "actions" | "screenshot_after" | "film")
+            && !matches!(
+                key.as_str(),
+                "actions" | "screenshot_after" | "film" | "window"
+            )
     }) {
         return Err(invalid(format!("computer has no field {unknown:?}")));
     }
+    let window = match object.get("window") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(window)) if !window.trim().is_empty() => Some(window.trim().to_owned()),
+        Some(_) => {
+            return Err(invalid(
+                "window is part of a window title, e.g. \"Notepad\"",
+            ));
+        }
+    };
     let film = match object.get("film") {
         None | Some(Value::Null) => None,
         Some(Value::Object(film)) => Some(parse_film(film)?),
@@ -470,6 +489,7 @@ fn parse_call(arguments: &Value) -> Result<Call, HarnessError> {
             let mut step = object.clone();
             step.remove("film");
             step.remove("screenshot_after");
+            step.remove("window");
             vec![parse_step(&step)?]
         }
         (None, None) => return Err(invalid("computer needs an `action`, e.g. \"screenshot\"")),
@@ -484,6 +504,7 @@ fn parse_call(arguments: &Value) -> Result<Call, HarnessError> {
         steps,
         screenshot_after,
         film,
+        window,
     })
 }
 
@@ -979,9 +1000,35 @@ struct Run<'a> {
     /// pointer step, a person moved the mouse, and the batch stops.
     placed: Option<(i32, i32)>,
     held: &'a AtomicBool,
+    /// The call's `window`: keys go only to a window whose title holds it.
+    window: Option<&'a str>,
+}
+
+/// Whether a window title holds the text a call named, any case.
+fn title_holds(title: &str, wanted: &str) -> bool {
+    title.to_lowercase().contains(&wanted.to_lowercase())
 }
 
 impl Run<'_> {
+    /// Keys go to whatever window has the keyboard. On 0.7.2 a path meant for a
+    /// browser went into the user's chat box; live, a game's flaps went to the
+    /// chat app the user had just clicked. With `window` named, a key or text
+    /// step that would go elsewhere stops the call before anything is sent.
+    fn check_focus(&self) -> Result<(), Stop> {
+        let Some(wanted) = self.window else {
+            return Ok(());
+        };
+        match harness_desktop::foreground_title() {
+            Some(title) if title_holds(&title, wanted) => Ok(()),
+            Some(title) => Err(Stop::Failed(format!(
+                "no key was sent: the window \"{title}\" has the keyboard, not one titled \"{wanted}\". Someone may have switched windows; click into the target and try again"
+            ))),
+            None => Err(Stop::Failed(format!(
+                "no key was sent: no window has the keyboard, not one titled \"{wanted}\""
+            ))),
+        }
+    }
+
     fn pause(&self, duration: Duration) -> Result<(), Stop> {
         let until = Instant::now() + duration;
         loop {
@@ -1220,6 +1267,7 @@ impl Run<'_> {
                 })?;
             }
             Step::Type(text) => {
+                self.check_focus()?;
                 for character in text.chars() {
                     if self.canceled.load(Ordering::SeqCst) {
                         return Err(Stop::Canceled);
@@ -1230,6 +1278,7 @@ impl Run<'_> {
                 }
             }
             Step::Key { chords, repeat } => {
+                self.check_focus()?;
                 for press in 0..*repeat {
                     for (index, chord) in chords.iter().enumerate() {
                         if press > 0 || index > 0 {
@@ -1240,6 +1289,7 @@ impl Run<'_> {
                 }
             }
             Step::HoldKey { chord, seconds } => {
+                self.check_focus()?;
                 let mut pressed = Vec::new();
                 let mut result = Ok(());
                 for key in chord {
@@ -1312,6 +1362,7 @@ fn execute(call: &Call, canceled: &AtomicBool, held: &AtomicBool) -> Result<Outc
         shot,
         placed: None,
         held,
+        window: call.window.as_deref(),
     };
     let mut shots = Vec::new();
     let mut notes = Vec::new();
@@ -1848,6 +1899,29 @@ mod tests {
             refused(&json!({"action": "wait", "duration": 1, "film": {"fps": 4}}))
                 .contains("no field")
         );
+    }
+
+    /// Keys meant for a game went to the chat app the user had clicked; with
+    /// `window` named, they are not sent at all.
+    #[test]
+    fn keys_wait_for_the_window_they_are_meant_for() {
+        let call = parse_call(&json!({
+            "actions": [{"action": "key", "text": "space"}],
+            "window": " Skyline Flap "
+        }))
+        .expect("guarded");
+        assert_eq!(call.window.as_deref(), Some("Skyline Flap"));
+        let single = parse_call(&json!({"action": "type", "text": "hi", "window": "Notepad"}))
+            .expect("one step");
+        assert_eq!(single.window.as_deref(), Some("Notepad"));
+        assert!(
+            refused(&json!({"action": "key", "text": "a", "window": 3})).contains("window title")
+        );
+        assert!(title_holds(
+            "Skyline Flap — Arcade Flight - Microsoft Edge",
+            "skyline flap"
+        ));
+        assert!(!title_holds("Claude", "Skyline Flap"));
     }
 
     #[test]

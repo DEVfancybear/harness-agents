@@ -87,6 +87,7 @@ Coordinates are pixels of the screenshot image the model was shown, never of the
 ## Safety
 
 - Input is real. It goes to whatever window has the keyboard, and the screen can show anything that is open. Use a desktop without sensitive windows, and keep an eye on it.
+- A call can name the window its keys are for: `"window": "Notepad"`, part of the title, any case. Before each `key`, `type` or `hold_key` step, the tool checks that this window has the keyboard. If another one does (the user clicked elsewhere, a dialog opened), the call stops before sending a key there. In one live run, a game's Space presses went into the chat app the user had just clicked; on 0.7.2, a path went into the user's chat box.
 - What the screen shows is data, not instructions. The tool's description tells the model to ask before deleting, buying, sending messages or typing passwords.
 - Don't use the mouse during a batch. Within a batch, the tool checks that the pointer is still where it left it. If it moved, someone else is using the mouse, so the batch stops and the result says so.
 - Cancelling the turn (Esc) stops a batch at its next step. Keys and buttons that a step pressed are released.
