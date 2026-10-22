@@ -6437,6 +6437,17 @@ impl SessionPort for AgentSessionService {
             setting["enabled"] = serde_json::json!(enable);
             super::config::save_setting(&self.config_file, super::jev::SETTING, Some(setting))?;
         }
+        let settings = super::jev::JevSettings::load(&self.config_file);
+        harness_types::diag::info("jev", "status")
+            .field("enabled", settings.enabled)
+            .field(
+                "decisions",
+                super::jev::DECISIONS
+                    .iter()
+                    .filter(|(name, _)| settings.decides(name))
+                    .count(),
+            )
+            .emit();
         Ok(super::jev::status(
             &self.config_file,
             &self.environment,

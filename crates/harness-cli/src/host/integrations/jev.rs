@@ -825,6 +825,13 @@ impl ExternalToolDispatcher for Routed {
 /// How long a harness decision waits for Jev before going on without it.
 const DECISION_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// An instruction section is left out when Jev gives it at most this chance of
+/// applying. Leaving one out is milder than refusing a command - the turn
+/// names it and the model can read the file - so a clear "no" is enough, where
+/// the shared threshold (|2p - 1| >= 0.95) asked for p <= 0.025. Measured on
+/// the live test's AGENTS.md: unrelated sections came out at 0.07.
+const INSTRUCTION_LEAVE_OUT_AT: f64 = 0.10;
+
 /// The harness decisions of one turn: Jev asked at the decision points the
 /// design notes name, each failing open - no answer, a slow one or an unsure
 /// one leaves ha doing what it does without the plugin.
@@ -1162,7 +1169,7 @@ pub async fn conditional_instructions(
         for index in 0..sections.len() - 1 {
             questions.insert(format!("s{index}"), json!({
                 "type": "noul",
-                "instructions": format!("`sections[{index}]` is a section of a project's instructions for coding agents. Does it apply to `request` - should the agent follow it or keep it in mind while doing this request? General rules for all work apply."),
+                "instructions": format!("`sections[{index}]` is one section of a project's instruction file for coding agents. Is it needed for `request`: does it govern the files, area or kind of work the request involves? A section about a different area or a different kind of work (another service, a release process, a different language) is not needed. Rules for all code, whatever it touches, are needed for any code change."),
             }));
         }
         let Some(answers) = decisions.answers("instructions", state, questions).await else {
@@ -1172,17 +1179,19 @@ pub async fn conditional_instructions(
         let mut text = sections[0].clone();
         let mut left_out = Vec::new();
         for (index, section) in sections[1..].iter().enumerate() {
-            if decisions.sure_noul(&answers[format!("s{index}")]) == Some(false) {
+            let applies = answers[format!("s{index}")]["noul"].as_f64();
+            if applies.is_some_and(|probability| probability <= INSTRUCTION_LEAVE_OUT_AT) {
                 left_out.push(section.lines().next().unwrap_or_default().trim().to_owned());
             } else {
                 text.push_str(section);
             }
         }
+        harness_types::diag::info("jev", "instructions_judged")
+            .field("block", block.id.clone())
+            .field("sections", sections.len() - 1)
+            .field("left_out", left_out.len())
+            .emit();
         if !left_out.is_empty() {
-            harness_types::diag::info("jev", "instructions_left_out")
-                .field("block", block.id.clone())
-                .field("sections", left_out.len())
-                .emit();
             let _ = write!(
                 text,
                 "\n\n[jev: {} section(s) of this file were left out as unrelated to this request: {}. Read the file if one turns out to matter.]",
@@ -1530,8 +1539,10 @@ mod tests {
                     }
                     "r0" => json!({"type": "choice", "choice": "hide", "confidence": 0.97}),
                     "r1" => json!({"type": "choice", "choice": "full", "confidence": 0.5}),
-                    // The billing section does not apply; the others do.
-                    "s1" => json!({"type": "noul", "noul": 0.01}),
+                    // The billing section does not apply; the others do (the
+                    // tests section is unsure, and stays).
+                    "s1" => json!({"type": "noul", "noul": 0.04}),
+                    "s2" => json!({"type": "noul", "noul": 0.45}),
                     _ => json!({"type": "noul", "noul": 0.99}),
                 };
                 answers.insert(name, answer);

@@ -38,12 +38,12 @@ EOF
 
 echo "################ 1. a report after /goal resume wakes the session"
 agent "$RX/p" q1
-"$HA" send q1 "/goal Kiểm thử harness, làm đúng thứ tự: (1) dùng tool delegate với wait=false giao cho một agent role explorer nhiệm vụ: gọi run_process đúng một lần với executable python, args -c và import time; time.sleep(30) (bắt buộc chạy), rồi trả lời đúng CHILD-DONE. (2) Sau khi giao, tự gọi run_process với executable python, args -c và import time; time.sleep(120). (3) Khi nhận được báo cáo CHILD-DONE của explorer thì gọi goal_complete. Nếu explorer bị dừng thì giao lại đúng nhiệm vụ đó cho một explorer mới, rồi kết thúc lượt và chờ báo cáo." >/dev/null 2>&1
+"$HA" send q1 "/goal Kiểm thử harness, làm đúng thứ tự: (1) dùng tool delegate với wait=false giao cho một agent role explorer nhiệm vụ: gọi run_shell đúng một lần với command Start-Sleep -Seconds 40 và timeout_ms 90000 (bắt buộc chạy), rồi trả lời đúng CHILD-DONE. (2) Sau khi giao, tự gọi run_shell với command Start-Sleep -Seconds 60 và timeout_ms 120000. (3) Khi nhận được báo cáo CHILD-DONE của explorer thì gọi goal_complete. Nếu explorer bị dừng thì giao lại đúng nhiệm vụ đó cho một explorer mới, rồi kết thúc lượt và chờ báo cáo." >/dev/null 2>&1
 for _ in $(seq 1 60); do
   records child | grep -q " started " && break
   sleep 3
 done
-sleep 5
+sleep 8
 "$HA" abort q1 2>&1 | sed 's/^/   abort: /'
 sleep 5
 records turn | sed 's/^/   /'
@@ -77,26 +77,23 @@ for attempt in 1 2 3; do
   say "q2-$attempt" "Đọc lần lượt big/part1.txt, big/part2.txt và big/part3.txt bằng read_file (đọc toàn bộ mỗi file), rồi trả lời đúng một dòng: ĐÃ-ĐỌC." | tail -1 | sed 's/^/   /'
   starts_before=$(records turn | grep -c " start ")
   since=$(date +%s%3N)
-  "$HA" send "q2-$attempt" "Trả lời đúng một dòng: số dòng của big/part1.txt (không đọc lại file, dùng những gì bạn đã thấy)." >/dev/null 2>&1 &
+  # The turn summarizes before its first step; the steer comes in meanwhile.
+  "$HA" send "q2-$attempt" "Trả lời đúng một dòng: số dòng của big/part1.txt (không đọc lại file, dùng những gì bạn đã thấy)." --wait > "$RX/q2-$attempt.out" 2>&1 &
   sleep 3
-  "$HA" send "q2-$attempt" --steer "Thêm một dòng STEER-SEEN vào cuối câu trả lời của lượt này." >/dev/null 2>&1
+  "$HA" send "q2-$attempt" --steer "Thêm một dòng STEER-SEEN vào cuối câu trả lời của lượt này." 2>&1 | sed 's/^/   steer: /'
   wait
-  for _ in $(seq 1 60); do
-    records turn | awk -v since="$since" '$1 > since && $2 == "terminal"' | grep -q . && break
-    sleep 3
-  done
   sleep 10
-  summarized=$(records compaction | awk -v since="$since" '$1 > since && $2 == "earlier_summarized"' | head -1)
+  summarized=$(records compaction | awk -v since="$since" '$1 > since && ($2 == "auto" || $2 == "earlier_summarized")' | head -1)
   starts_after=$(records turn | grep -c " start ")
-  answer=$("$HA" send "q2-$attempt" "Lượt trước bạn có thấy yêu cầu STEER-SEEN trong chính lượt đó không? Trả lời CO hoặc KHONG." --wait 2>&1)
-  echo "   attempt $attempt: summarized=[${summarized:+yes}] turns $starts_before -> $starts_after; $answer" | head -3
+  answer=$(cat "$RX/q2-$attempt.out")
+  echo "   attempt $attempt: summarized=[${summarized:+yes}] turns $starts_before -> $starts_after; answer: $(echo "$answer" | tr '\n' ' ' | cut -c1-120)"
   "$HA" shutdown --force >/dev/null 2>&1
   # The precondition: this turn summarized before its first step.
   [ -z "$summarized" ] && continue
-  if [ $((starts_after - starts_before)) -eq 1 ]; then verdict=0; else verdict=2; fi
+  if [ $((starts_after - starts_before)) -eq 1 ] && echo "$answer" | grep -q "STEER-SEEN"; then verdict=0; else verdict=2; fi
   break
 done
 check "the turn summarized before its first step (the precondition)" '[ "$verdict" -ne 1 ]'
-check "the steer reached that turn: no turn of its own" '[ "$verdict" -eq 0 ]'
+check "the steer reached that turn: read in its answer, no turn of its own" '[ "$verdict" -eq 0 ]'
 
 result
