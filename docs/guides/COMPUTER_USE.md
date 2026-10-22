@@ -1,5 +1,13 @@
 # Desktop computer use
 
+> **In development (ha 0.7.4).** Desktop control is not yet reliable, and a native
+> `computer` tool is being built and tested live to replace the Python skill described
+> below. The skill still ships, but treat it as experimental.
+>
+> **Đang phát triển (ha 0.7.4).** Điều khiển máy tính chưa ổn định. Một tool `computer`
+> native đang được xây dựng và test live để thay skill Python mô tả dưới đây. Skill vẫn
+> đi kèm, nhưng chỉ nên dùng thử nghiệm.
+
 ha ships a Python-backed `computer-use` skill for a vision-capable model on an unlocked Windows desktop. It uses real mouse/keyboard input and screenshots, including browser canvas games and native apps. `web_fetch` still only reads web text; it does not operate an app.
 
 ## Start

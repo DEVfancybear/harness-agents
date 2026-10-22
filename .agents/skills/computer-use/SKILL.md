@@ -1,9 +1,13 @@
 ---
 name: computer-use
-description: Observe and control the primary logged-in Windows desktop using screenshots and bounded mouse/keyboard batches. Use for authorized graphical tasks that cannot be completed with a narrower API. Requires a vision-capable model and an unlocked interactive Windows desktop.
+description: (In development - not yet reliable; tell the user so before relying on it.) Observe and control the primary logged-in Windows desktop using screenshots and bounded mouse/keyboard batches. Use for authorized graphical tasks that cannot be completed with a narrower API. Requires a vision-capable model and an unlocked interactive Windows desktop.
 ---
 
 # Computer Use
+
+> **In development.** This skill is not yet reliable: a native `computer` tool is being
+> built to replace it. Use it only when the user asks for desktop control, tell them it
+> is experimental, and check every step against a new screenshot.
 
 Use the prepared `computer_use` module in the Python kernel. Imports do not
 initialize the GUI; PyAutoGUI is imported lazily at call time.

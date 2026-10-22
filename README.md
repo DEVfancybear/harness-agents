@@ -169,7 +169,7 @@ CI runs the phase and milestone gates on Windows; a test that fails in the crowd
 - [Operator guide](docs/guides/OPERATOR_GUIDE.en.md): every command, setting and workflow
 - [Documentation index](docs/README.md)
 - [Architecture overview](docs/architecture/ARCHITECTURE_OVERVIEW.en.md) · [Terminal interface](docs/guides/TUI.md) · [Plugin architecture](docs/architecture/PLUGIN_ARCHITECTURE.en.md)
-- [Desktop computer use](docs/guides/COMPUTER_USE.md): real screenshots, mouse and keyboard on Windows
+- [Desktop computer use](docs/guides/COMPUTER_USE.md) (in development): real screenshots, mouse and keyboard on Windows
 - [Build and release](docs/guides/BUILD_AND_RELEASE.md) · [Changelog](https://github.com/DEVfancybear/harness-agents/releases)
 
 ---
@@ -314,7 +314,7 @@ CI chạy các gate phase và milestone trên Windows; test fail trong lượt c
 - [Hướng dẫn vận hành](docs/guides/OPERATOR_GUIDE.vi.md): mọi lệnh, cấu hình và quy trình
 - [Mục lục tài liệu](docs/README.md)
 - [Tổng quan kiến trúc](docs/architecture/ARCHITECTURE_OVERVIEW.vi.md) · [Giao diện terminal](docs/guides/TUI.md) · [Kiến trúc plugin](docs/architecture/PLUGIN_ARCHITECTURE.vi.md)
-- [Điều khiển máy tính](docs/guides/COMPUTER_USE.md): chụp màn hình, chuột và bàn phím thật trên Windows
+- [Điều khiển máy tính](docs/guides/COMPUTER_USE.md) (đang phát triển): chụp màn hình, chuột và bàn phím thật trên Windows
 - [Build và release](docs/guides/BUILD_AND_RELEASE.md) · [Changelog](https://github.com/DEVfancybear/harness-agents/releases)
 
 ---
