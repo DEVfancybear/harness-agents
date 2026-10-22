@@ -6549,7 +6549,10 @@ impl SessionPort for AgentSessionService {
             &self.environment,
             &self.config_overrides,
         )
-        .map_or_else(|_| agents.configured_depth(), |resolved| resolved.agents_max_depth);
+        .map_or_else(
+            |_| agents.configured_depth(),
+            |resolved| resolved.agents_max_depth,
+        );
         handle.spawn(async move {
             let message = match change {
                 None => {
