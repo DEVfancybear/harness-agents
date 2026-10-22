@@ -246,21 +246,25 @@ fn input_items(messages: &[crate::ProviderMessage]) -> (Vec<String>, Vec<Value>)
             }
             MessageRole::Tool => {
                 let call_id = message.tool_call_id.as_deref().unwrap_or("missing-call-id");
+                // An image a tool returned is part of the call's output, as Codex
+                // (`FunctionCallOutputContentItem::InputImage`) and prime-agent send
+                // it: the output becomes a list of parts. It used to follow as a user
+                // message, which put a "user" turn between the outputs of one batch
+                // of calls and told the model the user had attached the image.
+                let output = if message.attachments.is_empty() {
+                    json!(message.content)
+                } else {
+                    let mut parts = vec![json!({"type": "input_text", "text": message.content})];
+                    for image in &message.attachments {
+                        parts.push(json!({"type": "input_image", "image_url": image.url(), "detail": "auto"}));
+                    }
+                    Value::Array(parts)
+                };
                 input.push(json!({
                     "type": "function_call_output",
                     "call_id": call_id,
-                    "output": message.content,
+                    "output": output,
                 }));
-                // An image a tool returned goes in as the user turn that follows.
-                if !message.attachments.is_empty() {
-                    let mut content = vec![
-                        json!({"type": "input_text", "text": "Attached image(s) from tool result:"}),
-                    ];
-                    for image in &message.attachments {
-                        content.push(json!({"type": "input_image", "image_url": image.url()}));
-                    }
-                    input.push(json!({"role": "user", "content": content}));
-                }
             }
         }
     }
@@ -799,7 +803,46 @@ mod tests {
         assert_eq!(input[1]["type"], "reasoning");
         assert_eq!(input[2]["type"], "function_call");
         assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["output"], "a.rs");
         assert_eq!(body["tools"][0]["name"], "list_files");
+    }
+
+    /// A screenshot a tool returned is part of that call's output, not a user
+    /// message after it: two calls of one batch stay back to back.
+    #[test]
+    fn a_tool_image_is_part_of_the_call_output() {
+        let request = ProviderRequest::new(
+            RequestId::generate(),
+            "gpt-5",
+            vec![
+                ProviderMessage::new(MessageRole::User, "look"),
+                ProviderMessage::assistant_with_calls(
+                    "",
+                    vec![
+                        ProviderToolCall::new("call_1", "computer", "{\"action\":\"screenshot\"}"),
+                        ProviderToolCall::new("call_2", "read_file", "{\"path\":\"a\"}"),
+                    ],
+                ),
+                ProviderMessage::tool_result("call_1", "Done 1 of 1 step").with_attachments(vec![
+                    crate::ImageAttachment::inline("image/jpeg", "AAAA", "computer: screenshot"),
+                ]),
+                ProviderMessage::tool_result("call_2", "text"),
+            ],
+        );
+        let body = adapter(ResponsesFlavor::Api).request_body(&request);
+        let input = body["input"].as_array().expect("input");
+        assert_eq!(input.len(), 5, "{input:?}");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_1");
+        let output = input[3]["output"].as_array().expect("a list of parts");
+        assert_eq!(
+            output[0],
+            json!({"type": "input_text", "text": "Done 1 of 1 step"})
+        );
+        assert_eq!(output[1]["type"], "input_image");
+        assert_eq!(output[1]["image_url"], "data:image/jpeg;base64,AAAA");
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert_eq!(input[4]["output"], "text");
     }
 
     #[test]

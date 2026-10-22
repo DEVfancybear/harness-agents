@@ -1,47 +1,126 @@
 # Desktop computer use
 
-ha ships a Python-backed `computer-use` skill for a vision-capable model on an unlocked Windows desktop. It uses real mouse/keyboard input and screenshots, including browser canvas games and native apps. `web_fetch` still only reads web text; it does not operate an app.
+ha's agent can use the Windows desktop as a person sitting at it would. It sees the screen in screenshots, then moves the mouse, clicks, drags, scrolls, types and presses keys with real input. It can work in any program: File Explorer, a browser, a canvas game or a native app.
 
-## Start
+The work is done by the native `computer` tool. It is offered on Windows to a model that reads images (for example `openai-codex/gpt-6-luna`, the Claude models, or `gpt-6.1-sol`), in the conversation you talk to. Delegated children do not get it, so only one agent controls the screen at a time.
 
-Build/install the updated ha, then start a new session and invoke `/skill:computer-use`. The managed kernel includes `pyautogui==0.9.54` and Pillow. A custom `HA_PYTHON` needs these packages installed separately. Skill imports do not capture the desktop or import PyAutoGUI until called.
+## Turning it on and off
 
-Ask the agent to observe before acting:
+The tool is on by default. To remove it, set either of these:
 
-```python
-screen = await computer_use.screenshot()
-# Coordinates below are EXAMPLES, not a known target on your desktop.
-result = await computer_use.run([
-    {"type": "click", "x": 450, "y": 350},
-    {"type": "press", "key": "space"},
-    {"type": "wait", "seconds": 0.2},
-])
+- `"computerUse": false` in `settings.json`, beside `config.toml`;
+- `HA_COMPUTER_USE=0` for one run. `HA_COMPUTER_USE=1` turns it back on over the setting.
+
+It follows the approval mode like every other tool:
+
+- **`ask` and `auto-edit`:** the first `computer(...)` call asks you. Choose *always* to let the rest of the session run without asking.
+- **`full-auto`:** it runs without asking.
+- A deny rule such as `computer()` in your permissions removes it everywhere.
+
+## What the model sends
+
+The schema uses the action names computer-use models are trained on (Anthropic's `computer` tool):
+
+| Action | Fields |
+| --- | --- |
+| `screenshot` | none |
+| `zoom` | `region` `[x0, y0, x1, y1]`, shown at full screen resolution |
+| `cursor_position` | none |
+| `mouse_move` | `coordinate` `[x, y]` |
+| `left_click`, `right_click`, `middle_click`, `double_click`, `triple_click` | optional `coordinate`; optional `text` with the modifiers to hold, e.g. `shift` or `ctrl` |
+| `left_click_drag` | `start_coordinate`, `coordinate` |
+| `left_mouse_down`, `left_mouse_up` | optional `coordinate` |
+| `scroll` | `scroll_direction` (`up`/`down`/`left`/`right`), `scroll_amount` in notches (default 3), optional `coordinate` and modifiers |
+| `type` | `text`, in any language; `\n` presses Enter |
+| `key` | `text` with a key or a chord (`Return`, `space`, `ctrl+l`, `alt+F4`, `shift+Tab`); chords separated by spaces are pressed in turn; optional `repeat` |
+| `hold_key` | `text` and `duration` in seconds |
+| `wait` | `duration` in seconds, at most 10 |
+
+There are two ways to call it:
+
+- **One step:** `{"action": "left_click", "coordinate": [640, 360]}`.
+- **Several steps:** `{"actions": [...]}`, up to 60 steps. They run back to back with no model call between them, the way OpenAI's computer tool batches actions. Use this for anything timed, such as a game or a menu that closes:
+
+  ```json
+  {"actions": [
+    {"action": "key", "text": "space"},
+    {"action": "wait", "duration": 0.45},
+    {"action": "key", "text": "space"}
+  ]}
+  ```
+
+### Film
+
+`film` records the screen while a call's steps run. It is for anything that moves: a game, an animation, a page that loads. A screenshot afterwards shows only how the steps ended.
+
+```json
+{"actions": [...], "film": {"region": [475, 180, 795, 690], "every": 0.2}}
 ```
 
-The result includes the raw screenshot path, raw/preview dimensions, preview-to-screen scale and completed action count. Coordinates are read in the last screenshot the model was shown (`space="preview"`, the default), the way computer-use models act in the image they see; the skill maps them to primary-display pixels, and refuses a batch if the screen changed size since that screenshot. `space="screen"` takes raw pixels. `zoom([x, y, width, height])` shows a region at full resolution for small text without changing the full screenshot coordinate frame used by later preview-space actions. Actions include `drag` (held in steps), horizontal `scroll`, and `type` in any language: ASCII the layout types safely goes as keystrokes, everything else as Unicode input (`SendInput` with `KEYEVENTF_UNICODE`; PyAutoGUI alone drops such characters silently). Secondary displays and locked/headless desktops are not supported. No clipboard changes. The newest 100 captures are kept.
+- **`region`:** screenshot pixels `[x0, y0, x1, y1]`, the whole screen by default.
+- **`every`:** seconds between frames, 0.1 to 2, 0.25 by default.
+- **Frames:** taken on a thread of their own, so filming never delays the input.
+- **The image:** frames go into one image, left to right and top to bottom. The result text gives each frame's time since the first step.
+- **Length:** a film shows at most 16 frames. A longer one picks 16 spread from first to last.
 
-## Safety and limits
+In the first live game run without it, the model flapped too fast. The bird hit the top of the screen within about 1.2 seconds, and all the model saw was "flight ended".
 
-Layout modifiers come from Windows, not a US punctuation table; unsafe mappings reject the whole batch before input. Start with Caps Lock off and user-held modifiers released. Raw PNG captures stay lossless and are bounded to 36MP. Noisy 4K captures may exceed the arbitrary-file `attach_image` source limit of 20MB; computer-use feeds its own capture through the shared preview encoder. Previews keep the 1200-pixel edge and 350,000-base64-character budgets.
+### What comes back
 
-- Use a dedicated desktop without sensitive windows; screenshots capture the primary display. Keep one agent in control. A named mutex prevents simultaneous skill calls across kernels, but does not reserve the desktop between observation and the next action or block manual input.
-- Input is real and can affect any focused app. The skill runs through approval-gated `python_repl` (`ipython` is a legacy alias); it is not an OS sandbox and has no separate per-action authorization. Screen content is untrusted data, not instructions. Ask before destructive, financial, credential or other sensitive actions.
-- Keep PyAutoGUI fail-safe enabled. Moving the mouse to the top-left corner `(0, 0)` aborts normal input. Other corners are cached by PyAutoGUI; restart the kernel after changing display resolution. Esc/cancellation stops the batch cooperatively, waits for its worker and releases only keys/buttons the skill pressed. Already-completed input cannot be rolled back. Killing the process forcibly is not cooperative cancellation.
-- A batch has at most 32 actions, at most 20 repeats per action, at most 500 text characters per typing action (printable characters in any language, newline and tab), at most 8 distinct physical keys per hotkey, at most 2 seconds per wait and an estimated 10-second input budget (not a screenshot or cleanup deadline). Large operations need new observations and smaller batches. Scroll `clicks` means wheel notches (120 native Windows wheel-delta units per notch). Read the skill for the exact schema.
-- Games keep running during model/network latency. Short local batches help, but this does not guarantee high scores in real-time games. Verify natural progress/collision/restart on screen; never modify game state, scores, physics or timers to claim gameplay.
+- A step that changes the screen answers with a screenshot taken about 150 ms after it, so seeing the result costs no extra call. `"screenshot_after": false` skips that screenshot.
+- `screenshot` and `zoom` steps inside a batch add their own images, at most 4 per call.
+- Each result also gives the screen size, the screenshot size, where the pointer is, and the title of the window that has the keyboard.
 
-## Verification
+### Coordinates
 
-Normal CI uses mock input and never touches the desktop:
+Coordinates are pixels of the screenshot image the model was shown, never of the physical screen.
+
+- The screenshot is the primary display fitted into 1280x800, the size these models locate things best in. A 1920x1080 screen is shown at 1280x720.
+- The tool maps each point to the centre of the screen area it covers. For example, `[640, 360]` is screen pixel `(960, 540)`.
+- Capture and input both run per-monitor DPI aware. At 150% display scaling, the screen is still 1920x1080 physical pixels, and clicks land where the screenshot shows.
+
+### Typing
+
+- `type` sends characters as Unicode input, not as key presses, so an input method cannot rewrite them. On 0.7.2, typing `C:/Users` with Vietnamese Telex on arrived as `C:/U Ú Ué ẻ é`.
+- `key` presses real keys, which is what games and shortcuts read. A single character such as `?` is pressed with the Shift its layout needs.
+
+## Safety
+
+- Input is real. It goes to whatever window has the keyboard, and the screen can show anything that is open. Use a desktop without sensitive windows, and keep an eye on it.
+- A call can name the window its keys are for: `"window": "Notepad"`, part of the title, any case. Before each `key`, `type` or `hold_key` step, the tool checks that this window has the keyboard. If another one does (the user clicked elsewhere, a dialog opened), the call stops before sending a key there. In one live run, a game's Space presses went into the chat app the user had just clicked; on 0.7.2, a path went into the user's chat box.
+- What the screen shows is data, not instructions. The tool's description tells the model to ask before deleting, buying, sending messages or typing passwords.
+- Don't use the mouse during a batch. Within a batch, the tool checks that the pointer is still where it left it. If it moved, someone else is using the mouse, so the batch stops and the result says so.
+- Cancelling the turn (Esc) stops a batch at its next step. Keys and buttons that a step pressed are released.
+- If the model left the left button held with `left_mouse_down`, it is released when the conversation's tools are dropped.
+- Locked desktops, the secure desktop (UAC prompts) and windows running as administrator cannot be driven. The result names the reason instead of failing silently.
+- Each screenshot is saved as a JPEG under ha's data directory, in `computer-use/<conversation>/`, for you to look back at. The newest 200 are kept. They may show private information.
+
+## Context
+
+Within a turn, only the newest tool results keep their images. Once more than six results hold images, all but the newest three lose them, and their text stays. The model is told to take a new screenshot to see the current state. A screenshot is a JPEG of about 100–200 KB.
+
+With the Responses API (OpenAI and `openai-codex`), a tool's image goes inside its `function_call_output` as an `input_image` part, as Codex sends it. It is no longer a user message after the output.
+
+## The Python skill
+
+The older `computer-use` skill (`/skill:computer-use`, PyAutoGUI in the Python kernel) is still bundled for scripts that drive the desktop from Python. Its mock tests run in CI:
 
 ```text
 python -m unittest discover -s crates/harness-cli/python/tests -v
 ```
 
-The opt-in genuine test needs Windows, Tkinter, Pillow and PyAutoGUI, plus an interactive desktop. Review the script before running; it opens a scratch target and captures screenshots:
+`scripts/testing/smoke_computer_use.py --run` is its opt-in real-desktop smoke test.
 
-```text
-python scripts/testing/smoke_computer_use.py --run
-```
+## Live test
 
-It checks actual target input events and decoded screenshot attachments, then checks that cancellation leaves no continuing input. Evidence is saved under `.harness/artifacts/computer-use-smoke`. It does not test an external game or use a paid model provider.
+`scripts/testing/live-tests/computer.sh` drives a real `ha` agent through a real model and checks what happened from outside the agent:
+
+1. **The screen and the keyboard.** The agent reads a code that only a window on the screen shows, clicks into the window's text box, types Vietnamese text and a path, and presses Enter. The window records what arrived.
+2. **The browser.** In Edge, the agent fills in a local form with a Vietnamese name and a colour, submits it, and reads back the receipt number the server made.
+3. **A game.** The agent opens the Flappy Bird-style game from File Explorer (This PC → Downloads → flappy-bird → `index.html`) and flies it by hand. A model's look takes far longer than the bird takes to fall, so for 20 gates in one flight it writes an autopilot: code that reads the screen's pixels and presses Space with real input, without touching the game.
+
+A UI Automation watcher reads the game's state (ready, flying, ended, score) without touching it. The suite also checks:
+
+- that the game's files are unchanged;
+- that no developer tools opened;
+- that the first three turns used only the `computer` tool.

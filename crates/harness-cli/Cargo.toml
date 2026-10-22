@@ -65,6 +65,8 @@ harness-orchestrator = { path = "../harness-orchestrator" }
 harness-extensions = { path = "../harness-extensions" }
 harness-kernel = { path = "../harness-kernel" }
 harness-maintenance = { path = "../harness-maintenance" }
+# The `computer` tool's screen capture and real mouse and keyboard input.
+harness-desktop = { path = "../harness-desktop" }
 # The schedule evaluator needs a real timezone database: a cron expression in a
 # zone with daylight saving cannot be evaluated with a fixed offset. Both are
 # already in Cargo.lock through other dependencies.

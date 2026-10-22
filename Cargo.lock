@@ -1285,6 +1285,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "globset",
+ "harness-desktop",
  "harness-extensions",
  "harness-kernel",
  "harness-maintenance",
@@ -1315,6 +1316,13 @@ dependencies = [
  "two-face",
  "unicode-normalization",
  "unicode-width",
+]
+
+[[package]]
+name = "harness-desktop"
+version = "0.7.2"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1812,6 +1820,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
