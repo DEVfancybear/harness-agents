@@ -468,6 +468,10 @@ fn luhn(number: i64) -> bool {
 /// asked, how often it changed what ha did, its failures and time-outs, how
 /// fast it answered and which version answered; then the newest records.
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the records of one report, then its checks"
+)]
 fn a_bug_report_shows_what_jev_decided() {
     let fixture = tempfile::tempdir().unwrap();
     let home = fixture.path();

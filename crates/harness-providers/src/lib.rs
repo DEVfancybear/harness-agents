@@ -1541,7 +1541,7 @@ impl ModelProvider for OpenAiChatAdapter {
         request: ProviderRequest,
         cancellation: CancellationToken,
     ) -> ProviderEventStream {
-        streaming::adapter_stream(self, request, cancellation)
+        streaming::adapter_stream(self, &request, cancellation)
     }
 
     fn stream(&self, request: ProviderRequest, cancellation: CancellationToken) -> ProviderFuture {

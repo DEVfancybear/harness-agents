@@ -1366,6 +1366,10 @@ impl Report {
     /// answered; the agent's own `jev` calls; then the newest records with what
     /// each decided. Every outcome record names its `decision` and whether it
     /// `acted`, so a decision added later shows here without a change.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "three parts of one section, each a few lines"
+    )]
     fn summary_jev(&self, out: &mut String) {
         let mut records = self
             .records
@@ -1389,8 +1393,7 @@ impl Report {
             );
         }
         // decision -> (asked, acted, failed, timed out, answer times, versions)
-        let mut decisions: BTreeMap<String, (usize, usize, usize, usize, Vec<u64>, Vec<String>)> =
-            BTreeMap::new();
+        let mut decisions: BTreeMap<String, DecisionTally> = BTreeMap::new();
         for record in &records {
             let fields = &record["fields"];
             let Some(decision) = fields["decision"].as_str() else {
@@ -1799,6 +1802,10 @@ fn withhold_secret_values(value: &mut Value) {
         _ => {}
     }
 }
+
+/// One Jev decision in the window: asked, acted, failed, timed out, the answer
+/// times and the versions that answered.
+type DecisionTally = (usize, usize, usize, usize, Vec<u64>, Vec<String>);
 
 fn learned_redact(text: &str) -> String {
     crate::interactive::learned::redact(text)

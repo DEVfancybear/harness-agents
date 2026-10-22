@@ -689,15 +689,13 @@ fn admissible(tool: &str, arguments: &str, text: &str) -> bool {
 /// a line end, with the first line of each (1-based).
 fn result_parts(text: &str) -> Vec<(usize, String)> {
     let mut parts: Vec<(usize, String)> = Vec::new();
-    let mut line = 1;
-    for piece in text.split_inclusive('\n') {
+    for (line, piece) in (1..).zip(text.split_inclusive('\n')) {
         match parts.last_mut() {
             Some((_, part)) if part.len() + piece.len() <= ADMIT_CHUNK_CHARS => {
                 part.push_str(piece);
             }
             _ => parts.push((line, piece.to_owned())),
         }
-        line += 1;
     }
     parts
 }
@@ -4664,11 +4662,14 @@ mod stream_restart_tests {
 #[cfg(test)]
 mod admission_tests {
     use super::{ADMIT_AT_BYTES, admissible, admitted_result, long_result, result_parts};
+    use std::fmt::Write as _;
 
     fn log(lines: usize) -> String {
-        (1..=lines)
-            .map(|line| format!("line {line}: {}\n", "x".repeat(60)))
-            .collect()
+        let mut text = String::new();
+        for line in 1..=lines {
+            let _ = writeln!(text, "line {line}: {}", "x".repeat(60));
+        }
+        text
     }
 
     /// A long result is cut at line ends into parts of about 2,000 characters,

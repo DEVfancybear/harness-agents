@@ -128,7 +128,7 @@ pub(crate) fn mock_stream(
 #[allow(clippy::too_many_lines)]
 pub(crate) fn adapter_stream(
     provider: &OpenAiChatAdapter,
-    request: ProviderRequest,
+    request: &ProviderRequest,
     cancellation: CancellationToken,
 ) -> ProviderEventStream {
     {
@@ -139,7 +139,7 @@ pub(crate) fn adapter_stream(
         let headers = provider.headers.clone();
         // The streamed request is the one turns send, so it is built as the
         // buffered one is; it used to leave out the cache key.
-        let body = provider.request_body(&request);
+        let body = provider.request_body(request);
         let (sender, mut receiver) =
             mpsc::channel::<Result<ProviderStreamEvent, ProviderError>>(16);
         tokio::spawn(async move {

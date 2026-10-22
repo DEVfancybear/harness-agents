@@ -1367,13 +1367,13 @@ pub fn cache_lifetime(provider_id: &str) -> Duration {
         Duration::from_secs(if long { 3_600 } else { 300 })
     } else if provider.contains("deepseek") {
         // A disk cache, cleared within hours to days.
-        Duration::from_secs(6 * 3_600)
+        Duration::from_hours(6)
     } else if provider == "openai" && long {
         // `prompt_cache_retention: 24h`.
-        Duration::from_secs(24 * 3_600)
+        Duration::from_hours(24)
     } else {
         // OpenAI keeps an idle prefix for 5 to 10 minutes, up to an hour.
-        Duration::from_secs(3_600)
+        Duration::from_hours(1)
     }
 }
 
@@ -1453,6 +1453,10 @@ const TOOLS_CANDIDATES: usize = 3;
 /// the best few, then a yes/no for each. A tool Jev leans yes on is named; one
 /// it is sure of comes with its arguments, which saves a `tool_schema` call.
 /// The roster in the system prompt is never changed, so it stays cached.
+#[allow(
+    clippy::too_many_lines,
+    reason = "two passes of one decision, each a question and its reading"
+)]
 pub async fn tool_suggestions(
     decisions: Option<&JevDecisions>,
     request: &str,
@@ -2251,13 +2255,10 @@ mod tests {
         .await;
         let jev = std::sync::Arc::new(decisions(endpoint, &[]));
         let judge = super::CacheJudge::new(Some(&jev), "deepseek").expect("on");
-        assert_eq!(
-            judge.cache_lifetime(),
-            std::time::Duration::from_secs(6 * 3_600)
-        );
+        assert_eq!(judge.cache_lifetime(), std::time::Duration::from_hours(6));
         let facts = harness_runtime::FreshStartFacts {
             tokens: 50_000,
-            idle: std::time::Duration::from_secs(90_000),
+            idle: std::time::Duration::from_hours(25),
         };
         let earlier = ["fix the parser".to_owned()];
         assert_eq!(
@@ -2285,11 +2286,11 @@ mod tests {
         assert!(super::CacheJudge::new(Some(&off), "deepseek").is_none());
         assert_eq!(
             super::cache_lifetime("anthropic"),
-            std::time::Duration::from_secs(300)
+            std::time::Duration::from_mins(5)
         );
         assert_eq!(
             super::cache_lifetime("openai-codex"),
-            std::time::Duration::from_secs(3_600)
+            std::time::Duration::from_hours(1)
         );
     }
 }

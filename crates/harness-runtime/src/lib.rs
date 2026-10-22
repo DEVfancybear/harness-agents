@@ -993,7 +993,7 @@ const FRESH_START_MIN_TOKENS: u64 = 20_000;
 /// Without a call this process saw, the last turn's start stands for the last
 /// call; it is this much older than the last call can be at most, so a turn
 /// that ran long is not taken for an idle one.
-const FRESH_START_UNSEEN_MARGIN: Duration = Duration::from_secs(3_600);
+const FRESH_START_UNSEEN_MARGIN: Duration = Duration::from_hours(1);
 
 /// How a fresh start introduces the turns it set aside.
 const FRESH_START_PREFIX: &str = "[A fresh start: the earlier turns of this conversation are not shown here, because the new request does not continue them. history_search and history_read read them if one turns out to matter. They were:]";
@@ -5270,6 +5270,36 @@ impl RuntimeService {
         Ok((summary, true))
     }
 
+    /// How long since this conversation's last model call: the one this process
+    /// made, else - after a restart - the last turn's start less a margin, so a
+    /// turn that ran long is not taken for an idle one. `None` when unknown.
+    async fn idle_since_last_call(
+        &self,
+        source_session_id: &SessionId,
+        task_id: &TaskId,
+    ) -> Option<Duration> {
+        let seen = last_calls()
+            .lock()
+            .ok()
+            .and_then(|calls| calls.get(task_id.as_str()).copied())
+            .map(|at| at.elapsed());
+        if seen.is_some() {
+            return seen;
+        }
+        let started = self
+            .store
+            .session_summary(source_session_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|summary| sqlite_seconds(&summary.created_at))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        Duration::from_secs(now.checked_sub(started)?).checked_sub(FRESH_START_UNSEEN_MARGIN)
+    }
+
     /// The conversation this input carries: as it was, or after a fresh start.
     ///
     /// A fresh start kept for this conversation is applied while the
@@ -5326,30 +5356,9 @@ impl RuntimeService {
             return (sent, bare);
         };
         let lifetime = judge.cache_lifetime();
-        let seen = last_calls()
-            .lock()
-            .ok()
-            .and_then(|calls| calls.get(request.task_id.as_str()).copied())
-            .map(|at| at.elapsed());
-        let idle = match seen {
-            Some(idle) => Some(idle),
-            None => self
-                .store
-                .session_summary(source_session_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|summary| sqlite_seconds(&summary.created_at))
-                .and_then(|started| {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()?
-                        .as_secs();
-                    now.checked_sub(started)
-                })
-                .map(Duration::from_secs)
-                .and_then(|age| age.checked_sub(FRESH_START_UNSEEN_MARGIN)),
-        };
+        let idle = self
+            .idle_since_last_call(source_session_id, &request.task_id)
+            .await;
         let cold = idle.is_some_and(|idle| idle >= lifetime);
         let record = |event: &'static str, asked: bool| {
             harness_types::diag::info("cache", event)
