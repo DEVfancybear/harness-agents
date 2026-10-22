@@ -132,6 +132,9 @@ pub struct GoalHost {
     /// The workspace as it was when a verification last failed: asking again
     /// without changing anything is answered without running anything.
     failed_at: Arc<Mutex<Option<super::autonomous::Snapshot>>>,
+    /// The last ask was refused for an unchanged workspace: the next one is
+    /// verified again, for a failure no change fixes.
+    refused_unchanged: Arc<AtomicBool>,
 }
 
 impl GoalHost {
@@ -142,6 +145,7 @@ impl GoalHost {
             completed: Arc::new(AtomicBool::new(false)),
             check: None,
             failed_at: Arc::new(Mutex::new(None)),
+            refused_unchanged: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -216,9 +220,14 @@ impl GoalHost {
                 .failed_at
                 .lock()
                 .is_ok_and(|failed| failed.as_ref() == workspace.as_ref());
-        if unchanged {
-            return Err("The goal is NOT complete, and it was not verified again: nothing in the workspace changed since the last verification failed. Fix what that verification reported, then call goal_complete again.".to_owned());
+        // Once only: a failure that no change fixes - a service that was not
+        // running, a finding the model checked and found wrong - would
+        // otherwise hold the goal open for good. A session was refused 29
+        // times in four hours this way, its fixes committed to a clean tree.
+        if unchanged && !self.refused_unchanged.swap(true, Ordering::SeqCst) {
+            return Err("The goal is NOT complete, and it was not verified again: nothing in the workspace changed (no edit, no new commit) since the last verification failed. Fix what that verification reported, then call goal_complete again. If what it reported is not fixed by a change - a service that was not running, a finding you checked and found wrong - call goal_complete once more and it is verified again.".to_owned());
         }
+        self.refused_unchanged.store(false, Ordering::SeqCst);
         if !check.checks.is_empty() {
             self.notice(format!(
                 "goal: running {} verification check(s) before it can complete",
@@ -248,7 +257,11 @@ impl GoalHost {
                         evidence.push_str("; independent verifier: PASS");
                     }
                     verdict => {
-                        self.remember_failure(&check.root).await;
+                        // A verifier with no verdict found nothing to fix:
+                        // asking again is not refused for an unchanged tree.
+                        if verdict == super::verify::Verdict::Fail {
+                            self.remember_failure(&check.root).await;
+                        }
                         self.notice(format!(
                             "goal: the verifier {}; the goal stays active",
                             if verdict == super::verify::Verdict::Fail {
@@ -659,12 +672,59 @@ mod tests {
         host.finish("done").await.expect_err("fails");
         let again = host.finish("done").await.expect_err("still not done");
         assert!(again.contains("not verified again"), "{again}");
-        let runs = std::fs::read_to_string(root.path().join("runs.log")).expect("log");
-        assert_eq!(runs.lines().count(), 1, "the check ran once");
+        let runs = || {
+            std::fs::read_to_string(root.path().join("runs.log"))
+                .expect("log")
+                .lines()
+                .count()
+        };
+        assert_eq!(runs(), 1, "the check ran once");
         std::fs::write(root.path().join("marker"), "2").expect("change");
         host.finish("done").await.expect_err("fails again");
-        let runs = std::fs::read_to_string(root.path().join("runs.log")).expect("log");
-        assert_eq!(runs.lines().count(), 2, "a change runs the check again");
+        assert_eq!(runs(), 2, "a change runs the check again");
+        // A fix committed leaves a tree as clean as the one that failed: the
+        // new commit is the change.
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.email=ha@example.invalid",
+            "-c",
+            "user.name=ha",
+            "commit",
+            "-q",
+            "-m",
+            "fix",
+        ]);
+        host.finish("done")
+            .await
+            .expect_err("fails, and is remembered");
+        assert_eq!(runs(), 3);
+        git(&[
+            "-c",
+            "user.email=ha@example.invalid",
+            "-c",
+            "user.name=ha",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "another fix",
+        ]);
+        host.finish("done").await.expect_err("verified again");
+        assert_eq!(
+            runs(),
+            4,
+            "a new commit on a clean tree runs the check again"
+        );
+        // Unchanged: refused once, then the model's second ask is verified.
+        let refused = host.finish("done").await.expect_err("refused");
+        assert!(
+            refused.contains("call goal_complete once more"),
+            "{refused}"
+        );
+        assert_eq!(runs(), 4);
+        host.finish("done").await.expect_err("verified again");
+        assert_eq!(runs(), 5, "the second ask in a row runs the check");
     }
 
     /// Cancellation must also be honored when there is no process to cancel.

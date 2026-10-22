@@ -253,9 +253,12 @@ pub struct GateFailure {
     pub output: String,
 }
 
-/// The worktree as git sees it, so an unchanged one is not checked again.
+/// The worktree as git sees it, so an unchanged one is not checked again. The
+/// commit it is on is part of it: a fix that was committed leaves a clean
+/// worktree, as clean as the one that failed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
+    head: String,
     status: String,
     diff: String,
     untracked: String,
@@ -622,7 +625,26 @@ async fn git(root: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// prime-agent's `captureGitWorktreeSnapshot`.
+/// The commit `root` is on; empty before the first commit.
+async fn head_commit(root: &Path) -> String {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("git")
+            .args(["--no-optional-locks", "rev-parse", "--verify", "-q", "HEAD"])
+            .current_dir(root)
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await;
+    match output {
+        Ok(Ok(output)) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+        _ => String::new(),
+    }
+}
+
+/// prime-agent's `captureGitWorktreeSnapshot`, with the commit it is on.
 pub(crate) async fn snapshot(root: &Path) -> Option<Snapshot> {
     let status = git(
         root,
@@ -664,6 +686,7 @@ pub(crate) async fn snapshot(root: &Path) -> Option<Snapshot> {
         aggregate.update([0]);
     }
     Some(Snapshot {
+        head: head_commit(root).await,
         status,
         diff,
         untracked: hex(&aggregate.finalize()),
