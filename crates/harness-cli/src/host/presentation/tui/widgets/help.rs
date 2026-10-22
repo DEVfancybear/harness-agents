@@ -193,7 +193,7 @@ pub fn line_row(line: &str) -> RefLine {
     let colon = line.split_once(':').filter(|(label, value)| {
         label_like(label)
             && label.trim().len() <= 24
-            && label.trim().split_whitespace().count() <= 3
+            && label.split_whitespace().count() <= 3
             && label
                 .trim()
                 .chars()
@@ -276,6 +276,75 @@ fn columns(lines: &[RefLine]) -> Vec<usize> {
     columns
 }
 
+/// A field's rows: the label, then its value in `column`, wrapped under it. A
+/// label wider than the column stands on a row of its own above its value.
+fn field_rows(
+    label: &str,
+    value: &str,
+    tone: BadgeKind,
+    column: usize,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let command = label.starts_with('/');
+    let label_style = if command { theme.accent } else { theme.muted };
+    let style = if command && tone == BadgeKind::Neutral {
+        theme.dim
+    } else {
+        tone_style(tone, theme)
+    };
+    let alone = display_width(label) > column;
+    let hang = 2 + column + 2;
+    let room = usize::from(width).saturating_sub(hang + 1).max(12);
+    let mut rows = Vec::new();
+    if alone {
+        rows.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(label.to_owned(), label_style),
+        ]));
+    }
+    for (index, row) in wrap_hard(value, room).into_iter().enumerate() {
+        let mut spans = if index == 0 && !alone {
+            vec![
+                Span::raw("  "),
+                Span::styled(label.to_owned(), label_style),
+                Span::raw(" ".repeat(column - display_width(label) + 2)),
+            ]
+        } else {
+            vec![Span::raw(" ".repeat(hang))]
+        };
+        spans.extend(value_spans(&row, style, theme));
+        rows.push(Line::from(spans));
+    }
+    rows
+}
+
+/// A text row wrapped under its own indent; a list item's rest under its
+/// words, past the bullet.
+fn text_rows(text: &str, width: u16) -> Vec<Line<'static>> {
+    let indent = text.len() - text.trim_start().len();
+    let lead = 2 + indent;
+    let body = text.trim_start();
+    let bullet = body
+        .split_once(' ')
+        .filter(|(mark, _)| {
+            matches!(*mark, "-" | "*" | "•")
+                || (mark.ends_with(['.', ')'])
+                    && mark.len() <= 4
+                    && mark[..mark.len() - 1].chars().all(|c| c.is_ascii_digit()))
+        })
+        .map_or(0, |(mark, _)| display_width(mark) + 1);
+    let room = usize::from(width).saturating_sub(lead + bullet + 1).max(12);
+    wrap_hard(body, room)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let pad = if index == 0 { lead } else { lead + bullet };
+            Line::from(vec![Span::raw(" ".repeat(pad)), Span::raw(row)])
+        })
+        .collect()
+}
+
 /// The rows of a structured reference panel: headings as chips, each item on a
 /// row of its own with its description wrapped and hung under the name, fields
 /// with their values in their group's column, and text wrapped under its own
@@ -289,35 +358,7 @@ pub fn rich_rows(lines: &[RefLine], width: u16, theme: &Theme) -> Vec<Line<'stat
     for (line, column) in lines.iter().zip(columns) {
         match line {
             RefLine::Field { label, value, tone } => {
-                let command = label.starts_with('/');
-                let label_style = if command { theme.accent } else { theme.muted };
-                let style = if command && *tone == BadgeKind::Neutral {
-                    theme.dim
-                } else {
-                    tone_style(*tone, theme)
-                };
-                let alone = display_width(label) > column;
-                let hang = 2 + column + 2;
-                let room = usize::from(width).saturating_sub(hang + 1).max(12);
-                if alone {
-                    rows.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(label.clone(), label_style),
-                    ]));
-                }
-                for (index, row) in wrap_hard(value, room).into_iter().enumerate() {
-                    let mut spans = if index == 0 && !alone {
-                        vec![
-                            Span::raw("  "),
-                            Span::styled(label.clone(), label_style),
-                            Span::raw(" ".repeat(column - display_width(label) + 2)),
-                        ]
-                    } else {
-                        vec![Span::raw(" ".repeat(hang))]
-                    };
-                    spans.extend(value_spans(&row, style, theme));
-                    rows.push(Line::from(spans));
-                }
+                rows.extend(field_rows(label, value, *tone, column, width, theme));
             }
             RefLine::Heading { title, note } => {
                 let mut spans = vec![
@@ -365,27 +406,7 @@ pub fn rich_rows(lines: &[RefLine], width: u16, theme: &Theme) -> Vec<Line<'stat
                     ]));
                 }
             }
-            RefLine::Text(text) => {
-                // Wrapped under its own indent; a list item's rest under its
-                // words, past the bullet.
-                let indent = text.len() - text.trim_start().len();
-                let lead = 2 + indent;
-                let body = text.trim_start();
-                let bullet = body
-                    .split_once(' ')
-                    .filter(|(mark, _)| {
-                        matches!(*mark, "-" | "*" | "•")
-                            || (mark.ends_with(['.', ')'])
-                                && mark.len() <= 4
-                                && mark[..mark.len() - 1].chars().all(|c| c.is_ascii_digit()))
-                    })
-                    .map_or(0, |(mark, _)| display_width(mark) + 1);
-                let room = usize::from(width).saturating_sub(lead + bullet + 1).max(12);
-                for (index, row) in wrap_hard(body, room).into_iter().enumerate() {
-                    let pad = if index == 0 { lead } else { lead + bullet };
-                    rows.push(Line::from(vec![Span::raw(" ".repeat(pad)), Span::raw(row)]));
-                }
-            }
+            RefLine::Text(text) => rows.extend(text_rows(text, width)),
             RefLine::Hint(text) => rows.push(Line::from(vec![
                 Span::styled(" • ", theme.info),
                 Span::styled(text.clone(), theme.dim),
