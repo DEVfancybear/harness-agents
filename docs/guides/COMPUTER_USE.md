@@ -49,6 +49,22 @@ There are two ways to call it:
   ]}
   ```
 
+### Film
+
+`film` records the screen while a call's steps run. It is for anything that moves: a game, an animation, a page that loads. A screenshot afterwards shows only how the steps ended.
+
+```json
+{"actions": [...], "film": {"region": [475, 180, 795, 690], "every": 0.2}}
+```
+
+- **`region`:** screenshot pixels `[x0, y0, x1, y1]`, the whole screen by default.
+- **`every`:** seconds between frames, 0.1 to 2, 0.25 by default.
+- **Frames:** taken on a thread of their own, so filming never delays the input.
+- **The image:** frames go into one image, left to right and top to bottom. The result text gives each frame's time since the first step.
+- **Length:** a film shows at most 16 frames. A longer one picks 16 spread from first to last.
+
+In the first live game run without it, the model flapped too fast. The bird hit the top of the screen within about 1.2 seconds, and all the model saw was "flight ended".
+
 ### What comes back
 
 - A step that changes the screen answers with a screenshot taken about 150 ms after it, so seeing the result costs no extra call. `"screenshot_after": false` skips that screenshot.
