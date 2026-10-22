@@ -528,7 +528,8 @@ impl WebHost {
                 Err(failure) => {
                     harness_types::diag::warn("web", "search_failed")
                         .field("api", api.id())
-                        .field("key_refused", failure.key_refused)
+                        // Not `key_*`: diagnostics withhold fields named like a secret.
+                        .field("refused", failure.key_refused)
                         .field("reason", failure.message.as_str())
                         .emit();
                     if failure.key_refused {
@@ -563,7 +564,19 @@ impl WebHost {
                 key_refused: false,
             })?;
         if !status.is_success() {
-            let body = String::from_utf8_lossy(&bytes)
+            // The API's own reason (`{"error": {"message": ...}}` from DeepSeek,
+            // `{"message": ...}` from Serper), else the start of the body.
+            let text = String::from_utf8_lossy(&bytes);
+            let body = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer("/error/message")
+                        .or_else(|| value.get("message"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| text.into_owned())
                 .chars()
                 .take(300)
                 .collect::<String>();
@@ -2023,6 +2036,10 @@ mod tests {
         assert!(first.contains("(Google via Serper)"), "{first}");
         assert!(first.contains("DeepSeek Search failed"), "{first}");
         assert!(first.contains("402"), "{first}");
+        assert!(
+            first.contains("Insufficient Balance") && !first.contains("\"type\""),
+            "the API's own reason, not its JSON: {first}"
+        );
         assert!(first.contains("/login deepseek"), "{first}");
         assert!(first.contains("Result 1: Rust"), "{first}");
         let second = call(&expired, "web_search", json!({"query": "rust"}))

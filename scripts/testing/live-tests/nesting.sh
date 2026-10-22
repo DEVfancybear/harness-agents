@@ -38,12 +38,23 @@ for _, row in sorted(rows):
     print(row)
 EOF
 }
+# What the slash commands answered: their notices, as diagnostics hold them.
+notices() { records notice | sed -n 's/^shown *//p'; }
 
 echo "################ 1. children nest past two levels"
 agent "$RX/p" n1
-say n1 "/rlm-max-depth" | tail -2 | sed 's/^/   /'
-check "the depth is unlimited by default" 'last | grep -q "RLM max depth: unlimited (default)"'
-say n1 "Kiểm thử harness về agent lồng nhau, làm đúng: dùng tool delegate (wait mặc định) giao cho một agent role explorer nhiệm vụ giữ nguyên văn: 'Dùng tool delegate giao cho một agent role explorer nhiệm vụ: Dùng tool delegate giao cho một agent role explorer nhiệm vụ: trả lời đúng một dòng TANG-BA-OK. Đợi nó xong rồi trả lời nguyên văn câu trả lời của nó. Đợi nó xong rồi trả lời nguyên văn câu trả lời của nó.' Đợi explorer xong rồi trả lời nguyên văn câu trả lời cuối cùng nhận được, kèm mọi lỗi tool nếu có." | tail -4 | sed 's/^/   /'
+"$HA" send n1 "/rlm-max-depth" --wait >/dev/null 2>&1
+sleep 3
+notices | grep "RLM max depth" | sed 's/^/   /'
+check "the depth is unlimited by default" 'notices | grep -q "RLM max depth: unlimited (default)"'
+# A brief that copies itself one level down: a model handed a nested brief
+# once answered for the levels below instead of delegating.
+BRIEF="NESTING-BRIEF tầng 1. Đọc số tầng N ở đầu brief này. Nếu N nhỏ hơn 3 thì BẮT BUỘC gọi tool delegate với role explorer, brief là đúng nguyên văn toàn bộ brief này nhưng thay 'tầng N' bằng tầng N+1; không được tự trả lời thay tầng dưới; đợi kết quả rồi trả lời nguyên văn kết quả đó. Nếu N bằng 3 thì trả lời đúng một dòng TANG-BA-OK."
+for attempt in 1 2 3; do
+  say n1 "Kiểm thử harness về agent lồng nhau. Gọi tool delegate với role explorer và brief là đúng nguyên văn chuỗi sau (không sửa chữ nào): $BRIEF -- Đợi xong rồi trả lời nguyên văn kết quả, kèm mọi lỗi tool nếu có." | tail -3 | sed 's/^/   /'
+  records child | grep -qE "^started .*depth=3" && break
+  echo "   attempt $attempt: no child reached depth 3"
+done
 records child | grep -E "^started" | sed 's/^/   /'
 check "a child started at depth 3" 'records child | grep -qE "^started .*depth=3"'
 check "the answer from depth 3 came back" 'last | grep -q "TANG-BA-OK"'
@@ -52,10 +63,13 @@ check "no spawn was refused for depth" '! (ans | grep -q "depth limit reached")'
 # A limit in the config holds again.
 printf '\n[agents]\nmax_depth = 1\n' >> "$HA_HOME/$(basename "$HA_CONFIG")"
 agent "$RX/p" n1b
-say n1b "/rlm-max-depth" | tail -2 | sed 's/^/   /'
-check "[agents] max_depth = 1 is read from the config" 'last | grep -q "RLM max depth: 1 (config)"'
+"$HA" send n1b "/rlm-max-depth" --wait >/dev/null 2>&1
+sleep 3
+check "[agents] max_depth = 1 is read from the config" 'notices | grep -q "RLM max depth: 1 (config)"'
+second=$(records child | grep -cE "^started .*depth=2")
 say n1b "Kiểm thử harness: dùng tool delegate giao cho một agent role explorer nhiệm vụ giữ nguyên văn: 'Dùng tool delegate giao cho một agent role explorer nhiệm vụ trả lời CHAU-OK. Nếu tool delegate không có hoặc báo lỗi thì trả lời nguyên văn lỗi đó hoặc KHONG-CO-DELEGATE.' Đợi explorer xong rồi trả lời nguyên văn câu trả lời của nó." | tail -3 | sed 's/^/   /'
-check "a child under max_depth = 1 starts no child" '! (records child | grep -qE "^started .*depth=2")'
+check "a child under max_depth = 1 starts no child" '[ "$(records child | grep -cE "^started .*depth=2")" -eq "$second" ]'
+check "the child under max_depth = 1 was started with that limit" 'records child | grep -qE "^started .*depth=1 max_depth=1 "'
 "$HA" shutdown --force >/dev/null 2>&1
 cp "$RX/home/$(basename "$HA_CONFIG")" "$RX/config-with-limit.toml"
 cp "$HA_CONFIG" "$HA_HOME/"
@@ -72,7 +86,7 @@ echo "################ 3. a refused DeepSeek key hands the search to the next AP
 DEEPSEEK_API_KEY=sk-ha-live-refused-key agent "$RX/p" n3
 say n3 "Kiểm thử harness: gọi tool web_search đúng một lần với query 'rust programming language', rồi in nguyên văn hai dòng đầu tiên của kết quả tool (dòng Results for query và dòng ghi chú trong ngoặc ngay sau, nếu có). Không gọi tool nào khác." | tail -5 | sed 's/^/   /'
 records web | sed 's/^/   /'
-check "DeepSeek's refusal was recorded as a refused key" 'records web | grep -qE "^search_failed .*api=deepseek .*key_refused=true"'
+check "DeepSeek's refusal was recorded as a refused key" 'records web | grep -qE "^search_failed .*api=deepseek refused=true"'
 check "the results came from the next API" 'last | grep -qE "\((Google via Serper|DuckDuckGo)\)"'
 check "the answer names the failure and /login deepseek" 'last | grep -q "DeepSeek Search failed" && last | grep -q "/login deepseek"'
 say n3 "Gọi tool web_search thêm đúng một lần với query 'rust book', rồi in nguyên văn hai dòng đầu tiên của kết quả tool." | tail -4 | sed 's/^/   /'

@@ -6541,6 +6541,15 @@ impl SessionPort for AgentSessionService {
         let environment = self.environment.clone();
         let agents = Arc::clone(&self.agents);
         let sender = self.sender.clone();
+        // `[agents] max_depth` as the config says it now: before the first turn
+        // the agents have not been told it yet.
+        let configured = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .map_or_else(|_| agents.configured_depth(), |resolved| resolved.agents_max_depth);
         handle.spawn(async move {
             let message = match change {
                 None => {
@@ -6552,7 +6561,7 @@ impl SessionPort for AgentSessionService {
                                 &store,
                                 &task,
                                 &config_file,
-                                agents.configured_depth(),
+                                configured,
                                 &environment,
                             )
                             .await
