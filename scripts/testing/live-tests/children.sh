@@ -162,41 +162,51 @@ check "every review record names a task id and stays small" 'reviews | awk "{ if
 echo "################ 5. a child of an earlier turn keeps the mode the user chose"
 # The turn starts asking; the user switches to full-auto while it runs, and it
 # delegates under the switch. Its child kept that turn's policy (ask), and the
-# next turn cleared the switch: the child's later read asked the user.
-(cd "$RX/p" && "$PROBE" "$RX/c5.bin" "$HA" "wait:9000" -- chat --model "$MODEL" "${TH[@]}" --approval ask >/dev/null)
-id=$("$HA" list --json | "$PY" -c "import json,sys; d=json.load(sys.stdin); a=d if isinstance(d,list) else d.get('agents',d); print([x['id'] for x in a if not x.get('name')][0])")
-"$HA" rename "$id" c5 >/dev/null
-since=$(date +%s%3N)
-"$HA" send c5 "Kiểm thử harness: dùng tool delegate với wait=false giao cho đúng một agent role explorer nhiệm vụ: trước hết gọi run_process đúng một lần với executable python, args -c và import time; time.sleep(60) (bắt buộc chạy, không bỏ qua); sau đó gọi read_file với path README.md và trả lời đúng dòng đầu tiên của file. Giao xong thì kết thúc lượt ngay, trả lời đúng một dòng ĐÃ-GIAO." >/dev/null 2>&1
-sleep 2
-"$HA" send c5 "/permissions full-auto" --wait 2>&1 | sed 's/^/   /'
-# The first turn's end, then a second turn while the explorer sleeps.
+# next turn cleared the switch: the child's later read asked the user and
+# never finished. Shown only when the child reads after the second turn has
+# begun; a model that skips the wait runs the scenario again (three at most).
 records() {
   cat "$D"/*.jsonl 2>/dev/null | "$PY" -c "
 import json, sys
 since, kind, event = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+by = sys.argv[4] if len(sys.argv) > 4 else None
 for line in sys.stdin:
     try: r = json.loads(line)
     except ValueError: continue
-    if r.get('ms', 0) >= since and r.get('kind') == kind and r.get('event') == event:
-        print(r.get('msg', '').replace(chr(10), ' ')[:300])" "$since" "$1" "$2"
+    if r.get('ms', 0) >= since and r.get('kind') == kind and r.get('event') == event \
+            and (by is None or r.get('fields', {}).get('by') == by):
+        print(r['ms'], r.get('msg', '').replace(chr(10), ' ')[:200])" "$since" "$@"
 }
-for _ in $(seq 1 60); do
-  [ -n "$(records turn terminal)" ] && break
-  sleep 3
+verdict=inconclusive
+for attempt in 1 2 3; do
+  (cd "$RX/p" && "$PROBE" "$RX/c5-$attempt.bin" "$HA" "wait:9000" -- chat --model "$MODEL" "${TH[@]}" --approval ask >/dev/null)
+  id=$("$HA" list --json | "$PY" -c "import json,sys; d=json.load(sys.stdin); a=d if isinstance(d,list) else d.get('agents',d); print([x['id'] for x in a if not x.get('name')][0])")
+  "$HA" rename "$id" "c5-$attempt" >/dev/null
+  since=$(date +%s%3N)
+  "$HA" send "c5-$attempt" "Kiểm thử harness: dùng tool delegate với wait=false giao cho đúng một agent role explorer nhiệm vụ: trước hết gọi run_process đúng một lần với executable python, args -c và import time; time.sleep(60) (bắt buộc chạy, không bỏ qua); sau đó gọi read_file với path README.md và kết thúc bằng câu trả lời là đúng dòng đầu tiên của file. Giao xong thì kết thúc lượt ngay, trả lời đúng một dòng ĐÃ-GIAO." >/dev/null 2>&1
+  sleep 2
+  "$HA" send "c5-$attempt" "/permissions full-auto" --wait 2>&1 | sed 's/^/   /'
+  for _ in $(seq 1 60); do
+    [ -n "$(records turn terminal)" ] && break
+    sleep 3
+  done
+  say "c5-$attempt" "Trả lời đúng một dòng: LUOT-HAI" | tail -1 | sed 's/^/   /'
+  second=$(records turn start user | sed -n 2p | cut -d' ' -f1)
+  report=""
+  for _ in $(seq 1 40); do
+    report=$( (records child settled; records turn start agent_message) | sort -n | head -1)
+    [ -n "$report" ] && break
+    sleep 5
+  done
+  reported=${report%% *}
+  echo "   attempt $attempt: second turn at ${second:-?}, the explorer reported at ${reported:-never}: ${report#* }"
+  "$HA" shutdown --force >/dev/null 2>&1
+  if [ -z "$report" ]; then verdict=asked; break; fi
+  if [ -n "$second" ] && [ "$reported" -gt "$second" ]; then verdict=finished; break; fi
 done
-say c5 "Trả lời đúng một dòng: LUOT-HAI" | tail -1 | sed 's/^/   /'
-report=""
-for _ in $(seq 1 40); do
-  report=$(records child settled)
-  [ -n "$report" ] && break
-  sleep 5
-done
-echo "   report: ${report:-none}"
-check "the second turn ran while the explorer slept" 'last | grep -q LUOT-HAI'
-check "the explorer read README.md without asking: its report has the first line" 'echo "$report" | grep -q "# p"'
+check "the second turn ran while the explorer worked" 'last | grep -q LUOT-HAI'
+check "the explorer finished its read after the next turn began, asking no one" '[ "$verdict" = finished ]'
 check "no approval expired" '[ -z "$(records approval expired)" ]'
-"$HA" shutdown --force >/dev/null 2>&1
 
 echo "################ 6. every child runs at once"
 # Three ran at once and the rest waited, shown working with no call made. Five

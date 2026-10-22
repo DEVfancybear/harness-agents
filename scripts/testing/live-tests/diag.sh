@@ -88,7 +88,8 @@ check "the worker recorded the agent's turn ending, by agent" '[ "$(records work
 echo "== /bug-report in the terminal"
 (cd "$P" && "$PROBE" "$RX/bugreport.bin" "$HA" "wait:4000,key:/bug-report,enter,wait:15000" -- attach a1 >/dev/null)
 screen "$RX/bugreport.bin" > "$RX/bugreport.txt"
-check "/bug-report says where it wrote the zip" 'grep -q "Written:" "$RX/bugreport.txt"'
+# The panel reads `Written  <path>` since 0.7.1, `Written: <path>` before.
+check "/bug-report says where it wrote the zip" 'grep -qE "Written:? +[A-Za-z]:" "$RX/bugreport.txt"'
 check "the zip is in the data directory" 'ls "$HA_HOME"/data/bug-reports/ha-bug-report-*.zip >/dev/null 2>&1'
 
 echo "== a worker killed under its supervisor"
