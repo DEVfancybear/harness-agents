@@ -455,6 +455,59 @@ pub trait ResultVisibility: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = std::collections::HashMap<usize, Visibility>> + Send + 'a>>;
 }
 
+/// A host's judgment of a turn's last answer when the turn changed files and
+/// ran no command after its last change: does the answer tell the user the
+/// work is done, fixed or passing? A yes sends the model back once, to check
+/// its change or to say it is unchecked (jev-belay, mu's turn completion).
+pub trait CompletionCheck: Send + Sync {
+    fn claims_unchecked_success<'a>(
+        &'a self,
+        query: &'a str,
+        answer: &'a str,
+        changed: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+}
+
+/// The files this turn changed after the last command it ran, by path: empty
+/// when it changed nothing, or ran a command (a test, a build, anything) after
+/// its last change. A deterministic gate, so the judge is asked only then.
+fn unchecked_changes(executions: &[ToolExecutionView]) -> Vec<String> {
+    let mut changed: Vec<String> = Vec::new();
+    for execution in executions {
+        match &execution.output {
+            ToolOutput::ApplyPatch { path, .. }
+            | ToolOutput::WriteFile { path, .. }
+            | ToolOutput::EditFile { path, .. } => {
+                if !changed.contains(path) {
+                    changed.push(path.clone());
+                }
+            }
+            ToolOutput::Process { .. } => changed.clear(),
+            _ => {}
+        }
+    }
+    changed
+}
+
+/// What the model is told when its answer claims an unchecked change works.
+fn completion_nudge(changed: &[String]) -> String {
+    let shown = changed
+        .iter()
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = changed.len().saturating_sub(8);
+    format!(
+        "Before you finish: this turn changed {shown}{} and ran no command after the last change, yet your answer says the work is done or passing. Run the project's check on what changed (its tests, build or linter) and report the result, or say plainly in your answer that the change is not verified.",
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        }
+    )
+}
+
 /// A tool result at least this long is offered to the admission judge before
 /// it enters the transcript (about 4k tokens).
 const ADMIT_AT_BYTES: usize = 16_000;
@@ -809,6 +862,7 @@ pub struct TurnDriver {
     /// Which earlier results the current request needs, when the host judges it.
     visibility: Option<Arc<dyn ResultVisibility>>,
     admission: Option<Arc<dyn OutputAdmission>>,
+    completion: Option<Arc<dyn CompletionCheck>>,
 }
 
 /// A workspace path as a key: one separator, no leading `./`.
@@ -925,6 +979,7 @@ impl TurnDriver {
             context_hooks: None,
             visibility: None,
             admission: None,
+            completion: None,
         }
     }
 
@@ -939,6 +994,13 @@ impl TurnDriver {
     #[must_use]
     pub fn with_visibility(mut self, visibility: Arc<dyn ResultVisibility>) -> Self {
         self.visibility = Some(visibility);
+        self
+    }
+
+    /// Send the model back once when its answer claims an unchecked change works.
+    #[must_use]
+    pub fn with_completion_check(mut self, completion: Arc<dyn CompletionCheck>) -> Self {
+        self.completion = Some(completion);
         self
     }
 
@@ -1157,6 +1219,8 @@ impl TurnDriver {
         // Whether a stop hook already sent this turn on: Claude Code's
         // `stop_hook_active`, so a hook can let the second stop through.
         let mut stop_hook_active = false;
+        // The completion check sends the model back once per turn.
+        let mut completion_checked = false;
         // The step the task was last recited at, and whether the model was
         // already asked to save before a summary.
         let mut recited_at = 1_u32;
@@ -1482,6 +1546,52 @@ impl TurnDriver {
                         .await
                         .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
                     continue 'turn;
+                }
+                // A turn that changed files and ran nothing after its last
+                // change, whose answer says it works: once, the model checks
+                // or says it did not. It goes in as a user-role message, as
+                // the hooks' feedback does, so the cached prefix stays whole.
+                let changed = if completion_checked || steps >= options.limits.max_steps {
+                    Vec::new()
+                } else {
+                    unchecked_changes(&executions)
+                };
+                if let (Some(check), false) = (&self.completion, changed.is_empty()) {
+                    completion_checked = true;
+                    let claims = tokio::select! {
+                        claims = check.claims_unchecked_success(&request.text, &result.response, &changed) => claims,
+                        () = cancellation.cancelled() => false,
+                    };
+                    if claims {
+                        steps += 1;
+                        observer.observe(TurnProgress::StepStarted { step: steps });
+                        if !result.response.trim().is_empty() {
+                            transcript.push(
+                                ProviderMessage::new(
+                                    MessageRole::Assistant,
+                                    result.response.clone(),
+                                )
+                                .with_reasoning(result.reasoning.clone()),
+                            );
+                        }
+                        let nudge = completion_nudge(&changed);
+                        observer.observe(TurnProgress::Notice(
+                            "jev: the answer says the change works, but nothing ran after it; asking for a check".to_owned(),
+                        ));
+                        self.record_host_message(&result.run_id, &nudge).await;
+                        transcript.push(ProviderMessage::new(MessageRole::User, nudge));
+                        result = self
+                            .runtime
+                            .continue_run(
+                                &request,
+                                &transcript,
+                                cancellation.clone(),
+                                Some(sink_with(&observer, prefetcher.clone())),
+                            )
+                            .await
+                            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+                        continue 'turn;
+                    }
                 }
                 break TurnStop::Final;
             }
@@ -3938,6 +4048,59 @@ mod tool_output_render_tests {
             "{rendered}"
         );
         assert!(!rendered.contains("HEAD ONLY"), "{rendered}");
+    }
+
+    /// The completion check is asked only when the turn changed files and
+    /// ran no command after its last change.
+    #[test]
+    fn only_a_change_with_nothing_run_after_it_is_unchecked() {
+        let view = |output: ToolOutput| crate::ToolExecutionView {
+            schema_version: 1,
+            execution_id: None,
+            receipt: None,
+            output,
+            observer_failure: None,
+        };
+        let edit = |path: &str| {
+            view(ToolOutput::EditFile {
+                path: path.to_owned(),
+                before_hash: ContentHash::from_bytes(b"a"),
+                after_hash: ContentHash::from_bytes(b"b"),
+                replacements: 1,
+                diff: String::new(),
+            })
+        };
+        let run = || {
+            view(ToolOutput::Process {
+                executable: "cargo".to_owned(),
+                shell: None,
+                exit_code: Some(0),
+                timed_out: false,
+                canceled: false,
+                queued: false,
+                tree_cleanup_confirmed: false,
+                tree_cleanup: "reaped_on_exit".to_owned(),
+                stdout: String::new(),
+                stderr: String::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                artifact_id: None,
+                captured_bytes: 0,
+                capture_hash: None,
+                capture_truncated: false,
+                capture_tail: String::new(),
+                stdout_tail: stream(""),
+                stderr_tail: stream(""),
+            })
+        };
+        assert!(super::unchecked_changes(&[]).is_empty());
+        assert!(super::unchecked_changes(&[edit("a.rs"), run()]).is_empty());
+        assert_eq!(
+            super::unchecked_changes(&[edit("a.rs"), run(), edit("b.rs"), edit("b.rs")]),
+            vec!["b.rs".to_owned()]
+        );
+        let nudge = super::completion_nudge(&["b.rs".to_owned()]);
+        assert!(nudge.contains("changed b.rs and ran no command"), "{nudge}");
     }
 
     #[test]

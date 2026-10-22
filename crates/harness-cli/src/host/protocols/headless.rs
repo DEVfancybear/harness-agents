@@ -607,10 +607,11 @@ pub async fn run_with(
                 .clone()
                 .map(|decisions| decisions as Arc<dyn harness_tools::ToolGuard>),
         );
-        agents.set_result_judges(jev_decisions.clone().map(|decisions| {
-            super::delegation::ResultJudges {
+        agents.set_turn_judges(jev_decisions.clone().map(|decisions| {
+            super::delegation::TurnJudges {
                 visibility: Arc::clone(&decisions) as Arc<dyn harness_tools::ResultVisibility>,
-                admission: decisions as Arc<dyn harness_tools::OutputAdmission>,
+                admission: Arc::clone(&decisions) as Arc<dyn harness_tools::OutputAdmission>,
+                completion: decisions as Arc<dyn harness_tools::CompletionCheck>,
             }
         }));
         Some((agents, config))
@@ -704,12 +705,16 @@ pub async fn run_with(
         jev_host.as_ref(),
     ));
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
-    let driver = match &jev_decisions {
-        Some(decisions) => driver
-            .with_visibility(Arc::clone(decisions) as Arc<dyn harness_tools::ResultVisibility>)
-            .with_admission(Arc::clone(decisions) as Arc<dyn harness_tools::OutputAdmission>),
-        None => driver,
-    };
+    let driver =
+        match &jev_decisions {
+            Some(decisions) => driver
+                .with_visibility(Arc::clone(decisions) as Arc<dyn harness_tools::ResultVisibility>)
+                .with_admission(Arc::clone(decisions) as Arc<dyn harness_tools::OutputAdmission>)
+                .with_completion_check(
+                    Arc::clone(decisions) as Arc<dyn harness_tools::CompletionCheck>
+                ),
+            None => driver,
+        };
     let external_tools = super::mcp::combined_tools_with_delegate(
         None,
         active_extensions.as_ref(),

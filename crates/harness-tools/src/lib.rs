@@ -97,10 +97,10 @@ pub use service::{
     git_head_commit,
 };
 pub use turn_driver::{
-    ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ExternalToolCatalog,
-    ExternalTools, FLUSH_PREFIX, GoalReport, OutputAdmission, QuestionHost, RECAP_EVERY_STEPS,
-    RECAP_PREFIX, ResultSummary, ResultVisibility, TurnContextHooks, TurnDriver, TurnLimits,
-    TurnObserver, TurnOptions, TurnOutcome, TurnProgress, TurnStop, Visibility,
+    ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CompletionCheck,
+    ExternalToolCatalog, ExternalTools, FLUSH_PREFIX, GoalReport, OutputAdmission, QuestionHost,
+    RECAP_EVERY_STEPS, RECAP_PREFIX, ResultSummary, ResultVisibility, TurnContextHooks, TurnDriver,
+    TurnLimits, TurnObserver, TurnOptions, TurnOutcome, TurnProgress, TurnStop, Visibility,
     execute_action_with_approval,
 };
 pub use workspace::{

@@ -285,11 +285,13 @@ fn find_rlm_model_matches(query: &str, models: &[SearchableModel], limit: usize)
         .collect()
 }
 
-/// The judges of a child's tool results, handed to every child's turn.
+/// The judges of a child's own turn - its tool results and its last answer -
+/// handed to every child's turn, as the root's turn has them.
 #[derive(Clone)]
-pub struct ResultJudges {
+pub struct TurnJudges {
     pub visibility: Arc<dyn harness_tools::ResultVisibility>,
     pub admission: Arc<dyn harness_tools::OutputAdmission>,
+    pub completion: Arc<dyn harness_tools::CompletionCheck>,
 }
 
 /// A host's judgments about a child before it starts (the jev plugin's
@@ -969,9 +971,10 @@ struct AgentsShared {
     judge: Mutex<Option<Arc<dyn ChildJudge>>>,
     /// The jev plugin's command guard, which children's commands pass too.
     guard: Mutex<Option<Arc<dyn harness_tools::ToolGuard>>>,
-    /// The jev plugin's judges of a child's own tool results: what a long one
-    /// leaves out, and what is shortened first as its turn grows.
-    results: Mutex<Option<ResultJudges>>,
+    /// The jev plugin's judges of a child's own turn: what a long result leaves
+    /// out, what is shortened first as the turn grows, and whether its answer
+    /// claims an unchecked change works.
+    results: Mutex<Option<TurnJudges>>,
     running_workers: Mutex<u32>,
     worker_freed: tokio::sync::Notify,
     children: Mutex<Vec<ChildRecord>>,
@@ -1988,8 +1991,8 @@ impl SessionAgents {
         }
     }
 
-    /// The judges of children's tool results, as the root's are judged.
-    pub fn set_result_judges(&self, judges: Option<ResultJudges>) {
+    /// The judges of children's turns, as the root's turn is judged.
+    pub fn set_turn_judges(&self, judges: Option<TurnJudges>) {
         if let Ok(mut current) = self.shared.results.lock() {
             *current = judges;
         }
@@ -5146,7 +5149,8 @@ impl WorkerBackend for InteractiveWorkerBackend {
             let driver = match judges {
                 Some(judges) => driver
                     .with_visibility(judges.visibility)
-                    .with_admission(judges.admission),
+                    .with_admission(judges.admission)
+                    .with_completion_check(judges.completion),
                 None => driver,
             };
             // A child's question is shown to the user, named after the child, and

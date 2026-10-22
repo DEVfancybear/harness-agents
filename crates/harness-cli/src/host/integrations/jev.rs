@@ -60,7 +60,7 @@ pub struct JevSettings {
 
 /// The harness decision points Jev answers, each with its own switch, after
 /// the design notes on Jev engineering for coding agents.
-pub const DECISIONS: [(&str, &str); 6] = [
+pub const DECISIONS: [(&str, &str); 7] = [
     (
         "commands",
         "refuse a command Jev judges harmful, in every mode",
@@ -85,6 +85,10 @@ pub const DECISIONS: [(&str, &str); 6] = [
         "output",
         "leave out the parts of a long tool result this request does not need",
     ),
+    (
+        "completion",
+        "send the model back once when it says an unchecked change works",
+    ),
 ];
 
 impl JevSettings {
@@ -108,7 +112,9 @@ impl JevSettings {
                 || match decision {
                     // Leaving out a part of a result is as mild: it is named,
                     // and the model can read it again.
-                    "instructions" | "output" => 0.80,
+                    // A needless check costs one step; a missed one, an
+                    // unverified "done".
+                    "instructions" | "output" | "completion" => 0.80,
                     _ => self.threshold,
                 },
                 |(_, threshold)| *threshold,
@@ -1213,6 +1219,59 @@ impl harness_tools::OutputAdmission for JevDecisions {
     }
 }
 
+impl harness_tools::CompletionCheck for JevDecisions {
+    fn claims_unchecked_success<'a>(
+        &'a self,
+        query: &'a str,
+        answer: &'a str,
+        changed: &'a [String],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            if !self.decides("completion") || answer.trim().is_empty() {
+                return false;
+            }
+            // The end of a long answer is where it says how it went.
+            let tail = answer
+                .chars()
+                .rev()
+                .take(4_000)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<String>();
+            let state = json!({
+                "request": query.chars().take(2_000).collect::<String>(),
+                "changed_files": changed,
+                "answer": tail,
+            });
+            let mut questions = Map::new();
+            questions.insert("claims".to_owned(), json!({
+                "type": "noul",
+                "instructions": "A coding agent changed `changed_files` and ran no command after its last change. Does `answer` tell the user, as a fact, that the work is done, fixed, working, tested or passing? An answer that says the change is untested or unverified, asks the user to run or test it, or only describes what was changed does not.",
+            }));
+            let Some(answers) = self.answers("completion", state, questions).await else {
+                return false;
+            };
+            let claims = self.sure_noul("completion", &answers["claims"]) == Some(true);
+            harness_types::diag::info("jev", "completion_checked")
+                .field("decision", "completion")
+                .field("acted", claims)
+                .field("changed", changed.len())
+                .field(
+                    "files",
+                    changed
+                        .iter()
+                        .take(8)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+                .emit();
+            claims
+        })
+    }
+}
+
 impl super::delegation::ChildJudge for JevDecisions {
     fn same_work<'a>(
         &'a self,
@@ -1827,6 +1886,41 @@ mod tests {
             off.admit("fix the parser", "run_shell", "{}", parts)
                 .await
                 .is_empty()
+        );
+    }
+    /// An answer that says an unchecked change works sends the model back;
+    /// an unsure judgment, or the decision off, does not.
+    #[tokio::test]
+    async fn an_answer_claiming_an_unchecked_change_works_is_caught() {
+        use harness_tools::CompletionCheck as _;
+        let endpoint = serve_with(std::sync::Arc::new(|request: &serde_json::Value| {
+            let answer = request["state"]["answer"].as_str().unwrap_or_default();
+            let noul = if answer.contains("all tests pass") {
+                0.98
+            } else {
+                0.6
+            };
+            json!({"claims": {"type": "noul", "noul": noul}})
+        }))
+        .await;
+        let changed = ["src/parser.rs".to_owned()];
+        let jev = decisions(endpoint, &[]);
+        assert!(
+            jev.claims_unchecked_success("fix the parser", "Fixed; all tests pass.", &changed)
+                .await
+        );
+        assert!(
+            !jev.claims_unchecked_success("fix the parser", "Changed the loop.", &changed)
+                .await,
+            "unsure: no nudge"
+        );
+        let off = decisions(
+            "http://127.0.0.1:9/v1/systemone".to_owned(),
+            &["completion"],
+        );
+        assert!(
+            !off.claims_unchecked_success("x", "all tests pass", &changed)
+                .await
         );
     }
 }
