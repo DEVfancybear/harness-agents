@@ -86,7 +86,7 @@ echo "################ 3. a refused DeepSeek key hands the search to the next AP
 DEEPSEEK_API_KEY=sk-ha-live-refused-key agent "$RX/p" n3
 say n3 "Kiểm thử harness: gọi tool web_search đúng một lần với query 'rust programming language', rồi in nguyên văn hai dòng đầu tiên của kết quả tool (dòng Results for query và dòng ghi chú trong ngoặc ngay sau, nếu có). Không gọi tool nào khác." | tail -5 | sed 's/^/   /'
 records web | sed 's/^/   /'
-check "DeepSeek's refusal was recorded as a refused key" 'records web | grep -qE "^search_failed .*api=deepseek refused=true"'
+check "DeepSeek's refusal was recorded as a refused key" 'records web | grep -qE "^search_failed .*api=deepseek .*refused=True"'
 check "the results came from the next API" 'last | grep -qE "\((Google via Serper|DuckDuckGo)\)"'
 check "the answer names the failure and /login deepseek" 'last | grep -q "DeepSeek Search failed" && last | grep -q "/login deepseek"'
 say n3 "Gọi tool web_search thêm đúng một lần với query 'rust book', rồi in nguyên văn hai dòng đầu tiên của kết quả tool." | tail -4 | sed 's/^/   /'
