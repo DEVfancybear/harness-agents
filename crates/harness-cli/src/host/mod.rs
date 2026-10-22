@@ -31,6 +31,8 @@ pub mod checks;
 pub mod cli_extras;
 #[path = "protocols/commands.rs"]
 pub mod commands;
+#[path = "integrations/computer.rs"]
+pub mod computer;
 #[path = "configuration/config.rs"]
 pub mod config;
 #[path = "configuration/config_selector.rs"]

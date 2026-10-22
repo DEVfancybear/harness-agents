@@ -8602,12 +8602,19 @@ async fn run_turn(
     let memory_host = super::memory::MemoryHost::new(&data_dir, task_id.as_str())
         .with_project(&workspace_root)
         .with_refinements(refinements);
-    tools = tools.with_external(super::task_state::with_dispatcher(
-        super::memory::with_dispatcher(
-            super::knowledge::with_dispatcher(dispatcher, &knowledge_host),
-            &memory_host,
+    // The desktop, for the conversation the user talks to (never a delegated
+    // child: one controller of the screen at a time).
+    let computer_host = super::computer::enabled(&environment, &config_file, capabilities_images)
+        .then(|| super::computer::ComputerHost::new(&data_dir, task_id.as_str()));
+    tools = tools.with_external(super::computer::with_dispatcher(
+        super::task_state::with_dispatcher(
+            super::memory::with_dispatcher(
+                super::knowledge::with_dispatcher(dispatcher, &knowledge_host),
+                &memory_host,
+            ),
+            &task_state_host,
         ),
-        &task_state_host,
+        computer_host.as_ref(),
     ));
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
     let external_tools = super::mcp::combined_tools_with_delegate(
@@ -8620,16 +8627,19 @@ async fn run_turn(
         feature_host.as_ref(),
         repl_host.as_ref(),
     );
-    let external_tools = Some(super::task_state::with_tools(
-        Some(super::memory::with_tools(
-            Some(super::knowledge::with_tools(
-                external_tools,
-                &knowledge_host,
+    let external_tools = super::computer::with_tools(
+        Some(super::task_state::with_tools(
+            Some(super::memory::with_tools(
+                Some(super::knowledge::with_tools(
+                    external_tools,
+                    &knowledge_host,
+                )),
+                &memory_host,
             )),
-            &memory_host,
+            &task_state_host,
         )),
-        &task_state_host,
-    ));
+        computer_host.as_ref(),
+    );
     let driver = match &external_tools {
         Some(tools) => driver.with_external(tools.clone()),
         None => driver,

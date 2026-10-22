@@ -11,6 +11,7 @@ members = [
     "crates/harness-orchestrator",
     "crates/harness-extensions",
     "crates/harness-maintenance",
+    "crates/harness-desktop",
 ]
 resolver = "2"
 
@@ -27,8 +28,9 @@ repository = "https://github.com/DEVfancybear/harness-agents"
 # `Clipboard::get_image`, and on Windows it already pulls `image` with `png`+`bmp`.
 arboard = "=3.6.1"
 # Encoding only: the API takes images as PNG/JPEG/GIF/WebP and detects the format
-# from the bytes, while the clipboard hands back raw RGBA.
-image = { version = "=0.25.10", default-features = false, features = ["png"] }
+# from the bytes, while the clipboard hands back raw RGBA. JPEG keeps a computer-use
+# screenshot a fraction of its PNG size; zune-jpeg is already in the tree (tiff).
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
 clap = { version = "=4.6.6", features = ["derive"] }
 fs2 = "=0.4.3"
 futures-util = "=0.3.34"

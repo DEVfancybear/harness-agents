@@ -46,7 +46,9 @@
       "harness-store-sqlite",
       "harness-types"
     ],
+    "harness-desktop": [],
     "harness-cli": [
+      "harness-desktop",
       "harness-extensions",
       "harness-kernel",
       "harness-maintenance",

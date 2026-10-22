@@ -1,9 +1,14 @@
 ---
 name: computer-use
-description: Observe and control the primary logged-in Windows desktop using screenshots and bounded mouse/keyboard batches. Use for authorized graphical tasks that cannot be completed with a narrower API. Requires a vision-capable model and an unlocked interactive Windows desktop.
+description: Drive the Windows desktop from Python code in the kernel (PyAutoGUI). When the native `computer` tool is in your tool list, use that tool instead; this skill is for scripted desktop work from Python. Requires a vision-capable model and an unlocked interactive Windows desktop.
 ---
 
 # Computer Use
+
+**If you have the `computer` tool, use it, not this skill.** It is ha's native
+desktop tool: one call per step or a batch of steps, a screenshot back after
+input, coordinates in the screenshot you see, text typed as characters. This
+skill remains for driving the desktop from Python code.
 
 Use the prepared `computer_use` module in the Python kernel. Imports do not
 initialize the GUI; PyAutoGUI is imported lazily at call time.

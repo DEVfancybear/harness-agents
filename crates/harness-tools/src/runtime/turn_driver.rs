@@ -399,6 +399,38 @@ const TRANSCRIPT_BUDGET_BYTES: usize = 200_000;
 /// How many of the newest tool results always stay whole.
 const KEEP_RECENT_RESULTS: usize = 6;
 
+/// Tool results whose images stay in the turn's transcript, at most and after a
+/// trim. A desktop step answers with a screenshot, and a game or a form takes
+/// dozens of steps: every one of them kept would send megabytes of old screens
+/// with each call (Anthropic's computer-use loop keeps only the newest few as
+/// well). The images go in a batch, down to the smaller number, so the cached
+/// prefix is rewritten once every few steps rather than at every step.
+const MAX_RESULT_IMAGES: usize = 6;
+const KEEP_RESULT_IMAGES: usize = 3;
+
+/// What an older tool image is replaced with.
+const ELIDED_IMAGE: &str = "[the image this result returned was removed to save context; take a new one to see the current state]";
+
+/// Drop the images of all but the newest tool results that returned images, once
+/// more than `most` of them hold any. The results' text stays.
+fn forget_old_images(transcript: &mut [ProviderMessage], most: usize, keep: usize) {
+    let with_images: Vec<usize> = transcript
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == MessageRole::Tool && !message.attachments.is_empty())
+        .map(|(index, _)| index)
+        .collect();
+    if with_images.len() <= most {
+        return;
+    }
+    for &index in &with_images[..with_images.len() - keep] {
+        let message = &mut transcript[index];
+        message.attachments.clear();
+        message.content.push_str("\n\n");
+        message.content.push_str(ELIDED_IMAGE);
+    }
+}
+
 /// Once the transcript is over budget it is cut down to this share of it, not
 /// to just under it. Every shortened result rewrites a message the provider
 /// already cached, and everything after it misses; cutting just enough meant a
@@ -488,6 +520,9 @@ const TOOL_RESULT_LIMIT: usize = DEFAULT_MAX_BYTES + 4 * 1024;
 
 /// How many recent tool signatures the loop detector remembers.
 const LOOP_WINDOW: usize = 6;
+
+/// The host's desktop tool (`computer`), whose identical calls are not repeats.
+const DESKTOP_TOOL: &str = "computer";
 
 /// How often the same tool signature may repeat in the window before the loop
 /// is stopped. Three repeats of one identical call is already a loop; two is a
@@ -1798,6 +1833,7 @@ impl TurnDriver {
                 }
             }
             transcript.extend(appended);
+            forget_old_images(&mut transcript, MAX_RESULT_IMAGES, KEEP_RESULT_IMAGES);
             let elided = trim_transcript(
                 &mut transcript,
                 TRANSCRIPT_BUDGET_BYTES,
@@ -2933,10 +2969,20 @@ fn repeated_read<'a>(
 /// six explorers given one brief were six identical `delegate` calls in one
 /// response, read as a call repeated six times, and the model was told to stop
 /// and answer - it answered the brief's question instead of the user's.
+///
+/// A desktop step is never a repeat: the screen changes between two identical
+/// calls (a game pressing `space` again and again, a screenshot of a page that
+/// is loading), so each one counts as a call of its own.
 fn push_batch(signatures: &mut Vec<String>, calls: &[NormalizedToolCall]) {
+    static DESKTOP_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut seen = std::collections::HashSet::new();
     for call in calls {
-        let signature = call_signature(call);
+        let signature = if call.name == DESKTOP_TOOL {
+            let step = DESKTOP_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!("{}|#{step}", call.name)
+        } else {
+            call_signature(call)
+        };
         if seen.insert(signature.clone()) {
             signatures.push(signature);
         }
@@ -3749,6 +3795,51 @@ mod repeated_read_tests {
             name: name.to_owned(),
             arguments: arguments.to_owned(),
         }
+    }
+
+    /// A game flapped with `space` makes the same desktop call step after step;
+    /// the screen moved between them, so it is play, not a loop.
+    #[test]
+    fn the_same_desktop_step_again_is_not_a_loop() {
+        let flap = call("computer", r#"{"action":"key","text":"space"}"#);
+        let mut window = Vec::new();
+        for _ in 0..10 {
+            push_batch(&mut window, std::slice::from_ref(&flap));
+            assert!(!repeated_tail(&window), "{window:?}");
+        }
+    }
+
+    /// Screenshots pile up in a desktop task: the oldest results lose their
+    /// images in one batch, the newest keep theirs, and every result keeps its text.
+    #[test]
+    fn older_tool_images_are_dropped_in_batches() {
+        use harness_providers::{ImageAttachment, ProviderMessage};
+        let shot = |index: usize| {
+            ProviderMessage::tool_result(format!("call-{index}"), format!("step {index}"))
+                .with_attachments(vec![ImageAttachment::inline(
+                    "image/jpeg",
+                    "AAAA",
+                    "computer: screenshot",
+                )])
+        };
+        let mut transcript: Vec<ProviderMessage> = (0..6).map(shot).collect();
+        super::forget_old_images(&mut transcript, 6, 3);
+        assert!(
+            transcript
+                .iter()
+                .all(|message| message.attachments.len() == 1),
+            "six are kept"
+        );
+        transcript.push(shot(6));
+        super::forget_old_images(&mut transcript, 6, 3);
+        let kept: Vec<bool> = transcript
+            .iter()
+            .map(|message| !message.attachments.is_empty())
+            .collect();
+        assert_eq!(kept, [false, false, false, false, true, true, true]);
+        assert!(transcript[0].content.starts_with("step 0"));
+        assert!(transcript[0].content.contains("removed to save context"));
+        assert_eq!(transcript[6].content, "step 6");
     }
 
     /// The delegated turn in the report: five files read round-robin, one per
