@@ -294,6 +294,157 @@ fn a_conversations_report_holds_its_children_and_why_they_failed() {
 }
 
 /// Whether a number passes the card-number (Luhn) check.
+/// A long session read back: a verifier whose reports kept waking its parent,
+/// turns its children started, a summary written turn after turn and a tool
+/// failing the same way are named in Patterns; a problem's first and last are
+/// in time order though its records come from two files.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one session's records, written and read back"
+)]
+fn a_bug_report_names_what_repeats() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path();
+    let now = chrono::Utc::now().timestamp_millis();
+    let at = |minutes: i64| now - 3_600_000 / 2 + minutes * 60_000;
+    let ts = |ms: i64| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    };
+    let task = "task_01a13d6f-385f-7390-a32a-c2a3326523b3";
+    let record = |ms: i64,
+                  level: &str,
+                  kind: &str,
+                  event: &str,
+                  msg: &str,
+                  fields: serde_json::Value| {
+        serde_json::json!({"v":1,"ms":ms,"ts":ts(ms),"pid":9,"role":"worker","level":level,"kind":kind,"event":event,"msg":msg,"task":task,"fields":fields}).to_string()
+    };
+    let mut newer = Vec::new();
+    for minute in 0..4 {
+        newer.push(record(
+            at(minute),
+            "info",
+            "child",
+            "settled",
+            "[child-exited: no-reply child:verifier-9aa0eac5]",
+            serde_json::json!({"child":"verifier-9aa0eac5"}),
+        ));
+        newer.push(record(
+            at(minute),
+            "info",
+            "turn",
+            "start",
+            "",
+            serde_json::json!({"by":"child_report"}),
+        ));
+        newer.push(record(
+            at(minute) + 20_000,
+            "info",
+            "turn",
+            "terminal",
+            "",
+            serde_json::json!({"outcome":"done","steps":3,"tool_calls":4}),
+        ));
+        newer.push(record(
+            at(minute) + 1_000,
+            "info",
+            "compaction",
+            "earlier_summarized",
+            "",
+            serde_json::json!({"model_call":true}),
+        ));
+        newer.push(record(
+            at(minute) + 2_000,
+            "warn",
+            "tool",
+            "failed",
+            "invalid arguments: limit: Expected integer",
+            serde_json::json!({"tool":"list_skills"}),
+        ));
+    }
+    newer.push(record(
+        at(10),
+        "info",
+        "turn",
+        "start",
+        "",
+        serde_json::json!({"by":"user"}),
+    ));
+    let older = [record(
+        at(-20),
+        "warn",
+        "tool",
+        "failed",
+        "invalid arguments: limit: Expected integer",
+        serde_json::json!({"tool":"list_skills"}),
+    )];
+    let diagnostics = home.join("data").join("diagnostics");
+    std::fs::create_dir_all(&diagnostics).unwrap();
+    // The newer file sorts first by name: read in that order, the oldest
+    // record was taken for the last.
+    std::fs::write(
+        diagnostics.join("20260101-worker-1.jsonl"),
+        newer.join("\n") + "\n",
+    )
+    .unwrap();
+    std::fs::write(
+        diagnostics.join("20260101-worker-2.jsonl"),
+        older.join("\n") + "\n",
+    )
+    .unwrap();
+
+    let out = home.join("report.zip");
+    let report = ha(
+        home,
+        &[
+            "bug-report",
+            "--since",
+            "1h",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let entries = entries(&std::fs::read(&out).unwrap());
+    let summary = &entries[0].1;
+    let patterns = summary
+        .split("## Patterns")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .unwrap_or_else(|| panic!("a Patterns section: {summary}"));
+    assert!(
+        patterns.contains("turns started by: child_report 4, user 1"),
+        "{patterns}"
+    );
+    assert!(
+        patterns.contains("`verifier-9aa0eac5` reported 4 times"),
+        "{patterns}"
+    );
+    assert!(
+        patterns.contains("summarized by a model call 4 times in 4 turns"),
+        "{patterns}"
+    );
+    assert!(
+        patterns.contains("`list_skills` failed 5 times"),
+        "{patterns}"
+    );
+    let row = summary
+        .lines()
+        .find(|line| line.contains("`tool.failed`"))
+        .unwrap_or_else(|| panic!("the failures' row: {summary}"));
+    let first = row.split('|').nth(4).unwrap().trim().to_owned();
+    let last = row.split('|').nth(5).unwrap().trim().to_owned();
+    assert!(first < last, "first {first} is before last {last}: {row}");
+}
+
 fn luhn(number: i64) -> bool {
     let digits = number.to_string();
     let sum: u32 = digits

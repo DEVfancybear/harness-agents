@@ -18,6 +18,8 @@ fresh compaction
 # The automatic review stays on: a long turn that compacts is reviewed as it goes.
 export HA_PYTHON=${HA_PYTHON:-$PY}
 export HA_COMPACT_AT=${HA_COMPACT_AT:-40000}
+# Debug records: a turn that starts from the kept summary says so only there.
+export HA_DIAG=debug
 P="$RX/p"
 project "$P"
 mkdir -p "$P/vendor" "$P/gen"
@@ -108,6 +110,12 @@ say c1 "Kiểm tra: dùng python_repl import lần lượt src/m1.py..src/m8.py 
 SUMMARIES=$(store summaries); RECAPS=$(store recaps); FLUSH=$(store flush); FITTED=$(store fitted)
 echo "   summaries=$SUMMARIES recaps=$RECAPS flush-notes=$FLUSH shortened-with-head=$FITTED"
 check "the earlier turns were summarized again and again ($SUMMARIES)" "[ $SUMMARIES -ge 3 ]"
+# A turn after a compaction starts from the kept summary and all said since
+# while that fits: each turn was cut again and summarized by a model call.
+KEPT=$(cat "$HA_HOME"/data/diagnostics/*.jsonl 2>/dev/null | grep -c '"event":"earlier_kept"')
+WRITTEN=$(cat "$HA_HOME"/data/diagnostics/*.jsonl 2>/dev/null | grep '"event":"earlier_summarized"' | grep -c '"model_call":true')
+echo "   requests from the kept summary=$KEPT, summary calls=$WRITTEN"
+check "a later turn started from the kept summary with no summary call ($KEPT)" "[ $KEPT -ge 1 ]"
 check "the task was recited after a summary ($RECAPS)" "[ $RECAPS -ge 1 ]"
 check "the model was asked to save before a summary ($FLUSH)" "[ $FLUSH -ge 1 ]"
 STATE=$(store state)

@@ -472,6 +472,12 @@ struct ChildRecord {
     suppress_notice: bool,
     /// The child sent its parent a message since its task began.
     replied: bool,
+    /// The child's task was answered or announced once: a run a later message
+    /// wakes it for ends without another no-reply notice, as prime-agent's
+    /// `notice_delivered`. Each such notice woke the parent, which messaged
+    /// the child again: a verifier waiting on CI and its parent pinged each
+    /// other every half minute for hours.
+    notice_delivered: bool,
     session_id: Option<SessionId>,
     /// Messages sent before the child's run opened its inbox.
     backlog: Vec<String>,
@@ -633,6 +639,7 @@ impl ChildRecord {
                 error: entry.error.unwrap_or_default(),
             },
         };
+        let announced = matches!(state, ChildState::Done { .. });
         Some(Self {
             task_id,
             name: entry.name,
@@ -648,6 +655,9 @@ impl ChildRecord {
             deleted: false,
             suppress_notice: true,
             replied: false,
+            // A task done before the restart was answered then; one cut off
+            // (now failed) still reports when it is woken and carries on.
+            notice_delivered: announced,
             session_id: None,
             backlog: Vec::new(),
             notes: VecDeque::new(),
@@ -1152,7 +1162,11 @@ impl AgentsShared {
                 let pending = !child.deleted
                     && matches!(child.state, ChildState::Done { .. })
                     && !child.pending.is_empty();
-                let notice = (!pending && child.waiters == 0 && !child.suppress_notice)
+                let done = matches!(child.state, ChildState::Done { .. });
+                let notice = (!pending
+                    && child.waiters == 0
+                    && !child.suppress_notice
+                    && (!done || !child.notice_delivered))
                     .then(|| {
                         terminal_notice(
                             &child.name,
@@ -1162,6 +1176,11 @@ impl AgentsShared {
                         )
                     })
                     .flatten();
+                // The task's answer reached the parent - by a notice, its own
+                // message or a caller waiting for it - once and for all.
+                if done && !pending {
+                    child.notice_delivered = true;
+                }
                 // A top-level child's notice is sent while its state turns
                 // settled, under the same lock: sent after, a run that saw no
                 // child running (`ha exec`'s wait) could gather the notices
@@ -2597,6 +2616,7 @@ impl SessionAgents {
                 deleted: false,
                 suppress_notice: false,
                 replied: false,
+                notice_delivered: false,
                 session_id: None,
                 backlog: Vec::new(),
                 notes: VecDeque::new(),
@@ -2925,7 +2945,7 @@ impl ExternalToolCatalog for DelegateCatalog {
                 "type": "function",
                 "function": {
                     "name": "delegate",
-                    "description": "Delegate a bounded explorer or an isolated-worktree coder to investigate or implement the brief, or a verifier to check work independently: a verifier starts with a fresh context, cannot edit, runs what shows whether the work holds and ends with VERDICT: PASS or VERDICT: FAIL - use it before you call work done, since the agent that wrote the work is too generous grading it. By default the call waits for the child's answer; with wait=false it returns at once, the child keeps running after this turn, and its result arrives later as a [child-exited ...] or [child-failed ...] message.",
+                    "description": "Delegate a bounded explorer or an isolated-worktree coder to investigate or implement the brief, or a verifier to check work independently: a verifier starts with a fresh context, cannot edit, runs what shows whether the work holds and ends with VERDICT: PASS or VERDICT: FAIL - use it before you call work done, since the agent that wrote the work is too generous grading it. By default the call waits for the child's answer; with wait=false it returns at once, the child keeps running after this turn, and its result arrives later as a [child-exited ...] or [child-failed ...] message. Do not message a child only to ask how it is doing: its result, or its own agent_message, reaches you, and each message wakes it for another run that sends no further notice.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -3955,7 +3975,7 @@ impl ChildTools {
                 "type": "function",
                 "function": {
                     "name": "agent_message",
-                    "description": "Send a message to your parent agent (receiver_role \"parent\", the default), to a sibling by name (\"sibling\" with receiver_name), to one of your own children by name (\"child\" with receiver_name), or to all of them (\"all\"). The receiver reads it at its next step, or it wakes the root agent when that agent is idle. Use it to report what you found before you finish.",
+                    "description": "Send a message to your parent agent (receiver_role \"parent\", the default), to a sibling by name (\"sibling\" with receiver_name), to one of your own children by name (\"child\" with receiver_name), or to all of them (\"all\"). The receiver reads it at its next step, or it wakes the root agent when that agent is idle. Use it to report what you found before you finish. Do not send a child a message only to ask for its status: each one wakes it for another run, and its result or its own message reaches you without asking.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -4686,7 +4706,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     child_policy(&launch.parent_policy),
                     harness_tools::coding_tool_schemas_for(hashline),
                     format!(
-                        "You are a child agent spawned by your parent agent. Task prompts are labeled `[task from parent]`.{} Use agent_message to tell your parent what you found when it helps before you finish.",
+                        "You are a child agent spawned by your parent agent. Task prompts are labeled `[task from parent]`.{} Use agent_message to tell your parent what you found when it helps before you finish. Once your task is done, a message that wakes you again sends your parent no notice when you stop: answer it with agent_message when it asks for something, and send nothing when you would only repeat a status it already has.",
                         if can_spawn {
                             spawn_line
                         } else {
@@ -8044,6 +8064,76 @@ mod real_worker_tests {
             "the follow-up carries the history: {seen}"
         );
         assert!(seen.contains("one more thing"), "{seen}");
+    }
+
+    /// prime-agent's daemon announces a child's task once: a run a later
+    /// message wakes it for ends without another no-reply notice. Each notice
+    /// woke the parent, which asked the child again - a verifier waiting on CI
+    /// and its parent pinged each other every half minute for hours.
+    #[tokio::test]
+    async fn a_woken_child_does_not_announce_its_task_again() {
+        let mut bench = bench();
+        let _parent_lease = bench
+            .agents
+            .shared
+            .store
+            .lease()
+            .await
+            .expect("parent lease");
+        let provider = Scripted::new(vec![
+            Reply::Text("first answer"),
+            Reply::Text("still waiting"),
+        ]);
+        let host = host(&bench, Arc::clone(&provider) as Arc<dyn ModelProvider>);
+        spawn(&host, "worker", "look around").await;
+        match next_child_event(&mut bench.events).await {
+            SessionEvent::ChildSettled { notice, .. } => {
+                assert!(
+                    notice.contains("[child-exited: no-reply child:worker]"),
+                    "{notice}"
+                );
+                assert!(notice.contains("first answer"), "{notice}");
+            }
+            other => panic!("expected the task's notice, got {other:?}"),
+        }
+        let task_id = bench.agents.shared.find(None, "worker").expect("child");
+        host.rlm_requests()
+            .handle(&json!({
+                "type": "agent_message.send",
+                "message": "any news?",
+                "receiver_role": "child",
+                "receiver_name": "worker",
+            }))
+            .await
+            .expect("known")
+            .expect("send");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let answered = bench
+                .agents
+                .shared
+                .update(&task_id, |child| {
+                    matches!(&child.state, ChildState::Done { answer, .. } if answer == "still waiting")
+                })
+                .unwrap_or(false);
+            if answered {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the woken child never ran"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let again = tokio::time::timeout(
+            Duration::from_millis(800),
+            next_child_event(&mut bench.events),
+        )
+        .await;
+        assert!(
+            again.is_err(),
+            "the woken run announced itself again: {again:?}"
+        );
     }
 
     #[tokio::test]

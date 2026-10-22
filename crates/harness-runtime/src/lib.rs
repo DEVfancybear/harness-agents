@@ -759,9 +759,12 @@ fn compaction_threshold(config: &RuntimeConfig) -> u64 {
         reason = "a share of a token count"
     )]
     let requested = (window as f64 * percent / 100.0) as u64;
-    // The summary passes must fit below the trigger, or a low percentage
-    // summarises the same context again on every step (prime-agent a498cbd4).
-    let floor = effective_reserve.saturating_mul(2).saturating_add(1);
+    // The kept recent end and the summary passes must fit below the trigger,
+    // or a low percentage summarises the same context again on every step:
+    // prime-agent's retention floor, `keepRecentTokens + 2 * reserve + 1`.
+    let floor = KEEP_RECENT_TOKENS
+        .saturating_add(effective_reserve.saturating_mul(2))
+        .saturating_add(1);
     let threshold = window
         .saturating_sub(config.output_reservation_tokens)
         .saturating_sub(effective_reserve)
@@ -3609,6 +3612,41 @@ impl RuntimeService {
             return Err(error.clone());
         }
         let before = estimate(&attempt);
+        // The summary an earlier compaction kept, with everything said since,
+        // as the request that compacted left it. Each turn was built from the
+        // whole history again, which never fits once a conversation has
+        // compacted, and cut again to its newest few thousand tokens: a summary
+        // call and a review every turn, and the model shown only the last steps
+        // of a window that holds far more. The cut moves when this stops fitting.
+        if !fits(&attempt)
+            && let Some((covers, summary)) = self
+                .kept_summary(&request.task_id, &request.conversation)
+                .await
+        {
+            let mut conversation = vec![ProviderMessage::new(
+                MessageRole::User,
+                format!("{COMPACTED_PREFIX}\n\n{summary}"),
+            )];
+            conversation.extend_from_slice(&request.conversation[covers..]);
+            let kept = self.build_context(
+                request,
+                continuation_context.as_deref(),
+                &conversation,
+                build_recovery.clone(),
+                checkpoint_id.clone(),
+                &appended,
+            );
+            if fits(&kept) {
+                harness_types::diag::debug("compaction", "earlier_kept")
+                    .task(request.task_id.as_str())
+                    .session(request.session_id.as_str())
+                    .field("covers", covers)
+                    .field("after", estimate(&kept))
+                    .emit();
+                earlier = std::borrow::Cow::Owned(conversation);
+                attempt = kept;
+            }
+        }
         // Whether this step summarized for the first time in the turn, and
         // whether it is close to having to: the driver recites the task after
         // the one and asks the model to save what matters at the other.
@@ -3660,7 +3698,7 @@ impl RuntimeService {
                 harness_types::diag::debug("compaction", "start")
                     .task(request.task_id.as_str())
                     .session(request.session_id.as_str())
-                    .field("before", before)
+                    .field("before", (before != u64::MAX).then_some(before))
                     .field("older", older.len())
                     .field("prefix", prefix.len())
                     .emit();
@@ -3745,7 +3783,7 @@ impl RuntimeService {
                         .session(request.session_id.as_str())
                         .field("window", window)
                         .field("threshold", threshold)
-                        .field("before", before)
+                        .field("before", (before != u64::MAX).then_some(before))
                         .field(
                             "after",
                             attempt
@@ -3782,7 +3820,7 @@ impl RuntimeService {
                             .task(request.task_id.as_str())
                             .session(request.session_id.as_str())
                             .msg(error.to_string())
-                            .field("before", before)
+                            .field("before", (before != u64::MAX).then_some(before))
                             .field("older", older.len())
                             .field("prefix", prefix.len())
                             .emit();
@@ -5114,6 +5152,26 @@ impl RuntimeService {
         Ok((summary, true))
     }
 
+    /// The kept [`Self::rolling_summary`] of `conversation`'s start, with how
+    /// many messages it covers, when that start is still the one it summarized.
+    async fn kept_summary(
+        &self,
+        task_id: &TaskId,
+        conversation: &[ProviderMessage],
+    ) -> Option<(usize, String)> {
+        let stored = self
+            .store
+            .session_setting(task_id, ROLLING_SUMMARY_SETTING)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|text| serde_json::from_str::<RollingSummary>(&text).ok())?;
+        (stored.covers > 0
+            && stored.covers <= conversation.len()
+            && messages_digest(&conversation[..stored.covers]) == stored.digest)
+            .then_some((stored.covers, stored.summary))
+    }
+
     /// The summary of `older`, the earlier part of a conversation, kept with the
     /// task and extended rather than written again.
     ///
@@ -6157,7 +6215,8 @@ mod compaction_ceiling_tests {
             ..large
         };
         assert_eq!(compaction_threshold(&unbounded), 1_000_000 / 20 * 19);
-        // A lower share compacts earlier, never below what the summaries need.
+        // A lower share compacts earlier, never below what the kept recent end
+        // and the summaries need (prime-agent's retention floor).
         let sixty = RuntimeConfig {
             compaction_threshold_percent: 60.0,
             ..unbounded.clone()
@@ -6167,7 +6226,7 @@ mod compaction_ceiling_tests {
             compaction_threshold_percent: 1.0,
             ..unbounded.clone()
         };
-        assert_eq!(compaction_threshold(&one), 16_384 * 2 + 1);
+        assert_eq!(compaction_threshold(&one), KEEP_RECENT_TOKENS + 16_384 * 2 + 1);
         let invalid = RuntimeConfig {
             compaction_threshold_percent: 150.0,
             ..unbounded.clone()

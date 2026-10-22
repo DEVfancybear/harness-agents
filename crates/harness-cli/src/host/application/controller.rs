@@ -3670,6 +3670,9 @@ impl InteractiveController {
         // again, compacting it, to nudge coders that were still busy.
         let running = self.service.running_children();
         if running > 0 {
+            harness_types::diag::info("goal", "waits_for_children")
+                .field("running", running)
+                .emit();
             return vec![Effect::History(HistoryItem::Notice {
                 message: format!(
                     "goal: {running} child(ren) still working; their reports carry the goal on"
@@ -3680,6 +3683,9 @@ impl InteractiveController {
             return Vec::new();
         };
         goal.continuations += 1;
+        harness_types::diag::info("goal", "continued")
+            .field("turn", goal.continuations)
+            .emit();
         let text = super::goal::continuation_text(goal);
         let mut effects = vec![Effect::History(HistoryItem::Notice {
             message: format!(

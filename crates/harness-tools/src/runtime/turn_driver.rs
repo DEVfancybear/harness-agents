@@ -873,6 +873,10 @@ impl TurnDriver {
         // already asked to save before a summary.
         let mut recited_at = 1_u32;
         let mut flush_asked = false;
+        // Older tool results shortened in this turn so far: the user is told
+        // once, not at every step of a long turn (one turn showed the notice
+        // sixty times in twenty-five minutes).
+        let mut trimmed_total = 0_usize;
         // Everything this turn has already said and executed. Each continuation
         // sends the whole transcript, not just the newest step: a model that is
         // handed back only the last tool result has no record of what it already
@@ -1354,7 +1358,10 @@ impl TurnDriver {
                             slots.push((
                                 name.clone(),
                                 transcript_id,
-                                Slot::Failed(message, "invalid arguments".to_owned()),
+                                // The reason shown and recorded names what was
+                                // wrong: "invalid arguments" alone left a bug
+                                // report unable to say which call or field.
+                                Slot::Failed(message.clone(), invalid_arguments_detail(&message)),
                             ));
                             continue;
                         }
@@ -1804,10 +1811,14 @@ impl TurnDriver {
                 unchanged_reads.remove(signature);
             }
             if !elided.is_empty() {
-                observer.observe(TurnProgress::Notice(format!(
-                    "context: {} older tool result(s) in this turn were shortened to stay within budget",
-                    elided.len()
-                )));
+                let first = trimmed_total == 0;
+                trimmed_total += elided.len();
+                if first {
+                    observer.observe(TurnProgress::Notice(format!(
+                        "context: {} older tool result(s) in this turn were shortened to stay within budget; older ones are shortened as the turn goes on",
+                        elided.len()
+                    )));
+                }
             }
             result = self
                 .runtime
@@ -1820,6 +1831,14 @@ impl TurnDriver {
                 .await
                 .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
         };
+        // One record for the turn: a bug report counts what was shortened.
+        if trimmed_total > 0 {
+            harness_types::diag::info("compaction", "tool_results_trimmed")
+                .run(result.run_id.as_str())
+                .field("total", trimmed_total)
+                .field("steps", steps)
+                .emit();
+        }
 
         // Persist the terminal outcome of the run. Resumable bounds keep the run
         // running: a later turn continues it, and a reopen must not read a pause
@@ -2284,6 +2303,25 @@ async fn run_ready_slots(
         slots[index].2 = Slot::Done(done);
     }
     Ok(())
+}
+
+/// The one-line reason of an argument check that failed: its problems, each
+/// `path: message`, without the arguments it echoes for the model.
+fn invalid_arguments_detail(message: &str) -> String {
+    let problems = message
+        .lines()
+        .filter_map(|line| line.strip_prefix("  - "))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut detail = if problems.is_empty() {
+        "invalid arguments".to_owned()
+    } else {
+        format!("invalid arguments: {problems}")
+    };
+    if detail.chars().count() > 240 {
+        detail = detail.chars().take(239).collect::<String>() + "…";
+    }
+    detail
 }
 
 /// One call of a batch on its way to a result.

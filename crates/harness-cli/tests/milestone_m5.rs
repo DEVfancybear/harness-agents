@@ -1101,6 +1101,32 @@ SUMMARY_{written}"
     assert!(new.contains("beta question"), "{new}");
 }
 
+/// A turn after a compaction starts from the kept summary and everything said
+/// since, while that fits: it was cut again to its newest few thousand tokens
+/// each turn, a summary call (and a review) every turn of a long session.
+#[tokio::test]
+async fn a_turn_after_a_compaction_reuses_the_kept_summary_while_it_fits() {
+    let bench = bench();
+    let task = TaskId::generate();
+    let summary = Arc::new(RecordingSummary::default());
+    let mut conversation = worked_turns(60, "kappa");
+    compacting_turn(&bench, &task, conversation.clone(), &summary).await;
+    let written = summary.prompts.lock().expect("prompts").len();
+    assert!(written >= 1, "the first turn compacted");
+
+    // A small turn more: the kept summary and what follows it still fit.
+    conversation.extend(worked_turns(1, "lambda"));
+    compacting_turn(&bench, &task, conversation.clone(), &summary).await;
+    assert_eq!(
+        summary.prompts.lock().expect("prompts").len(),
+        written,
+        "no summary was written for a turn that fits"
+    );
+    conversation.extend(worked_turns(1, "sigma"));
+    compacting_turn(&bench, &task, conversation, &summary).await;
+    assert_eq!(summary.prompts.lock().expect("prompts").len(), written);
+}
+
 /// prime-agent cuts a turn too large to keep at an assistant message and
 /// summarises its start on its own, instead of summarising all of it away.
 #[tokio::test]

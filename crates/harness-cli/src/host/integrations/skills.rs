@@ -239,8 +239,15 @@ impl ExternalToolCatalog for SkillToolCatalog {
                 "type": "function",
                 "function": {
                     "name": "list_skills",
-                    "description": "When a task may match a skill, list available skills and exact version digests before activating one. Bodies stay unloaded.",
-                    "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+                    "description": "When a task may match a skill, list available skills and exact version digests before activating one. Bodies stay unloaded. Pass query to list only the skills whose name or description has its words, and limit to list fewer.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Optional: words the skill's name or description must contain."},
+                            "limit": {"type": "integer", "minimum": 1, "description": "Optional: at most this many skills."}
+                        },
+                        "additionalProperties": false
+                    }
                 }
             }),
             json!({
@@ -304,6 +311,46 @@ fn same_digest(catalog: &str, supplied: &str) -> bool {
     !supplied.trim().is_empty() && bare(catalog) == bare(supplied)
 }
 
+/// The skills `list_skills` lists: the ones the model may invoke, narrowed to
+/// those whose name or description holds the query's words (every word when
+/// some have them all, else the most), at most `limit`.
+fn listed_skills<'a>(
+    catalog: &'a SkillCatalog,
+    arguments: &Value,
+) -> Vec<&'a harness_extensions::SkillCatalogEntry> {
+    let words = |text: &str| {
+        text.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let query = arguments["query"].as_str().map(words).unwrap_or_default();
+    let mut skills = catalog
+        .entries()
+        .iter()
+        .filter(|entry| entry.model_invocable)
+        .map(|entry| {
+            let have = words(&format!("{} {}", entry.name, entry.description));
+            let hits = query.iter().filter(|word| have.contains(word)).count();
+            (hits, entry)
+        })
+        .collect::<Vec<_>>();
+    if !query.is_empty() {
+        let best = skills.iter().map(|(hits, _)| *hits).max().unwrap_or(0);
+        skills.retain(|(hits, _)| best > 0 && *hits == best);
+    }
+    let limit = arguments["limit"]
+        .as_u64()
+        .and_then(|limit| usize::try_from(limit).ok())
+        .unwrap_or(usize::MAX);
+    skills
+        .into_iter()
+        .take(limit)
+        .map(|(_, entry)| entry)
+        .collect()
+}
+
 struct SkillToolDispatcher {
     catalog: SkillCatalog,
     active: Arc<Mutex<BTreeMap<String, SkillActivation>>>,
@@ -318,10 +365,18 @@ impl SkillToolDispatcher {
             )
         })?;
         match tool_name {
-            "list_skills" if object.is_empty() => Ok(()),
+            // The model asked for `{"query": ..., "limit": 3}` and was refused:
+            // a filter it reached for is one it can have.
+            "list_skills"
+                if object.keys().all(|key| key == "query" || key == "limit")
+                    && object.get("query").is_none_or(Value::is_string)
+                    && object.get("limit").is_none_or(Value::is_u64) =>
+            {
+                Ok(())
+            }
             "list_skills" => Err(HarnessError::new(
                 ErrorCode::InvalidPayload,
-                "list_skills accepts no arguments",
+                "list_skills accepts only an optional query (string) and limit (integer)",
             )),
             "activate_skill" => {
                 if object.keys().any(|key| key != "name" && key != "digest") {
@@ -523,7 +578,7 @@ impl ExternalToolDispatcher for SkillToolDispatcher {
                     tool_name: "list_skills".to_owned(),
                     payload: json!({
                         "catalog_digest": self.catalog.catalog_digest().as_str(),
-                        "skills": self.catalog.entries().iter().filter(|entry| entry.model_invocable).map(|entry| json!({
+                        "skills": listed_skills(&self.catalog, arguments).into_iter().map(|entry| json!({
                             "name": entry.name,
                             "description": entry.description,
                             "version": entry.version,
@@ -849,6 +904,61 @@ mod tests {
         dispatcher
             .validate("activate_skill", &serde_json::json!({ "name": "release" }))
             .expect("a skill the user ran is active");
+    }
+
+    /// The model called `list_skills` with `{"query": ..., "limit": 3}` and was
+    /// refused four times in one session: the filter it reached for works.
+    #[test]
+    fn list_skills_takes_a_query_and_a_limit() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = temporary.path().join("skills");
+        let catalog = skill_catalog(&root);
+        let deploy = root.join("deploy");
+        std::fs::create_dir_all(&deploy).expect("skill folder");
+        std::fs::write(
+            deploy.join("SKILL.md"),
+            "---\nname: deploy\ndescription: Ship the service to staging\n---\nDeploy it.\n",
+        )
+        .expect("skill body");
+        let catalog = SkillCatalog::discover(&[TrustedSkillRoot::new(&root, SkillSource::User)])
+            .unwrap_or(catalog);
+        let dispatcher = SkillToolDispatcher {
+            catalog: catalog.clone(),
+            active: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        for accepted in [
+            serde_json::json!({}),
+            serde_json::json!({"query": "rust review", "limit": 3}),
+            serde_json::json!({"limit": 200}),
+        ] {
+            assert!(
+                dispatcher.validate("list_skills", &accepted).is_ok(),
+                "{accepted}"
+            );
+        }
+        for refused in [
+            serde_json::json!({"query": 3}),
+            serde_json::json!({"filter": "x"}),
+        ] {
+            assert!(
+                dispatcher.validate("list_skills", &refused).is_err(),
+                "{refused}"
+            );
+        }
+        let names = |arguments: serde_json::Value| {
+            super::listed_skills(&catalog, &arguments)
+                .into_iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(serde_json::json!({"query": "Rust changes"})),
+            ["review"]
+        );
+        assert_eq!(names(serde_json::json!({"query": "staging"})), ["deploy"]);
+        assert!(names(serde_json::json!({"query": "kubernetes"})).is_empty());
+        assert_eq!(names(serde_json::json!({"limit": 1})).len(), 1);
+        assert!(names(serde_json::json!({})).len() >= 2);
     }
 
     #[test]

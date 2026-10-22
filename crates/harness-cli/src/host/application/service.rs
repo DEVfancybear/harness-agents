@@ -3133,6 +3133,31 @@ const RLM_MAX_DEPTH_SETTING: &str = "rlm_max_depth";
 /// The session setting a conversation's service tier is kept in.
 const SERVICE_TIER_SETTING: &str = "service_tier";
 
+/// What started a turn, for its diagnostic record: the user, or the host on a
+/// child's report or message, a heartbeat, a goal or a bound. A bug report
+/// could not tell a session the user drove from one its children kept waking.
+fn turn_source(request: &SubmitRequest) -> &'static str {
+    if !request.automatic {
+        return "user";
+    }
+    let text = request.text.trim_start();
+    if text.starts_with("[child-exited") || text.starts_with("[child-failed") {
+        "child_report"
+    } else if text.starts_with("[agent-message") {
+        "agent_message"
+    } else if text.starts_with("[heartbeat:") {
+        "heartbeat"
+    } else if text.starts_with("[bash-done") {
+        "bash_done"
+    } else if text.starts_with(super::goal::CONTINUATION_LEAD) {
+        "goal"
+    } else if text.starts_with("continue: the previous turn stopped at a bound") {
+        "bound"
+    } else {
+        "host"
+    }
+}
+
 /// What `/subagent-model` does.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SubagentSetting {
@@ -6789,6 +6814,11 @@ impl AgentSessionService {
 /// started began, and in which session.
 const REVIEW_STARTED_SETTING: &str = "review_started";
 
+/// How long after one compaction's review the next compaction starts none
+/// (prime-agent's `autoRefine.cooldownMs`, twenty minutes). A long session
+/// compacted on every turn, and each compaction reviewed the turn again.
+const COMPACTION_REVIEW_COOLDOWN: chrono::TimeDelta = chrono::TimeDelta::minutes(20);
+
 /// How long a session is quiet before the work since its last review is
 /// reviewed (`HA_IDLE_REVIEW_SECONDS` sets it).
 const IDLE_REVIEW_AFTER: std::time::Duration = std::time::Duration::from_mins(10);
@@ -7507,6 +7537,7 @@ async fn run_turn(
         .session(session_id.as_str())
         .field("input", request.input_id.as_str())
         .field("model", selected_model.clone())
+        .field("by", turn_source(&request))
         .emit();
     let lease = match agents.store().lease().await {
         Ok(lease) => lease,
@@ -9138,6 +9169,24 @@ async fn run_turn(
             let Some(store) = slot.as_ref() else {
                 return;
             };
+            // One compaction's review at a time, twenty minutes apart.
+            let reviewed_lately = store
+                .session_setting(&task, REVIEW_STARTED_SETTING)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|started| {
+                    started["at"]
+                        .as_str()
+                        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                })
+                .is_some_and(|at| {
+                    chrono::Utc::now().signed_duration_since(at) < COMPACTION_REVIEW_COOLDOWN
+                });
+            if reviewed_lately {
+                return;
+            }
             let Some(turns) = cadence.claim_now() else {
                 return;
             };

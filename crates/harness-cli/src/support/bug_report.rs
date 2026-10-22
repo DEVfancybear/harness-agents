@@ -994,10 +994,112 @@ impl Report {
         let mut out = String::new();
         self.summary_header(&mut out);
         self.summary_problems(&mut out);
+        self.summary_patterns(&mut out);
         self.summary_activity(&mut out);
         self.summary_children(&mut out);
         self.summary_timeline(&mut out);
         out
+    }
+
+    /// What repeats in the window, as prime-agent's incident timeline counts
+    /// what recurs: who started the turns, a child that kept waking its
+    /// parent, a summary written turn after turn, a tool failing the same way,
+    /// the busiest ten minutes. A session where a verifier and its parent
+    /// pinged each other every half minute for hours read as many short,
+    /// healthy turns.
+    fn summary_patterns(&self, out: &mut String) {
+        let mut lines = Vec::new();
+        let starts = self.recorded("turn", "start");
+        let mut by: BTreeMap<String, usize> = BTreeMap::new();
+        for record in &starts {
+            if let Some(source) = record["fields"]["by"].as_str() {
+                *by.entry(source.to_owned()).or_default() += 1;
+            }
+        }
+        if !by.is_empty() {
+            let mut by = by.into_iter().collect::<Vec<_>>();
+            by.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+            lines.push(format!(
+                "turns started by: {}",
+                by.iter()
+                    .map(|(source, count)| format!("{source} {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let mut reports: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        for record in self.recorded("child", "settled") {
+            if let Some(child) = record["fields"]["child"].as_str() {
+                reports
+                    .entry(child.to_owned())
+                    .or_default()
+                    .push(record["ms"].as_i64().unwrap_or_default());
+            }
+        }
+        for (child, times) in reports.iter().filter(|(_, times)| times.len() >= 3) {
+            lines.push(format!(
+                "`{child}` reported {} times ({} to {}); each report starts a turn of its parent when it is idle",
+                times.len(),
+                ms_text(times[0]),
+                ms_text(times[times.len() - 1])
+            ));
+        }
+        let written = self
+            .recorded("compaction", "earlier_summarized")
+            .iter()
+            .filter(|record| record["fields"]["model_call"] == true)
+            .count();
+        let turns = self.recorded("turn", "terminal").len();
+        if written >= 3 && written * 3 >= turns {
+            lines.push(format!(
+                "the earlier conversation was summarized by a model call {written} times in {turns} turns"
+            ));
+        }
+        let mut failures: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for record in self.recorded("tool", "failed") {
+            let tool = record["fields"]["tool"].as_str().unwrap_or("?").to_owned();
+            let message = clip(record["msg"].as_str().unwrap_or_default(), 90);
+            *failures.entry((tool, message)).or_default() += 1;
+        }
+        for ((tool, message), count) in failures.iter().filter(|(_, count)| **count >= 3) {
+            lines.push(format!("`{tool}` failed {count} times: {message}"));
+        }
+        let times = starts
+            .iter()
+            .filter_map(|record| record["ms"].as_i64())
+            .collect::<Vec<_>>();
+        let mut busiest = (0, 0);
+        let mut from = 0;
+        for (index, at) in times.iter().enumerate() {
+            while at - times[from] > 10 * 60 * 1000 {
+                from += 1;
+            }
+            if index + 1 - from > busiest.0 {
+                busiest = (index + 1 - from, times[from]);
+            }
+        }
+        if busiest.0 >= 10 {
+            lines.push(format!(
+                "busiest ten minutes: {} turns from {}",
+                busiest.0,
+                ms_text(busiest.1)
+            ));
+        }
+        let waits = self.recorded("goal", "waits_for_children").len();
+        let continued = self.recorded("goal", "continued").len();
+        if waits + continued > 0 {
+            lines.push(format!(
+                "goal: continued {continued} time(s), waited for children {waits} time(s)"
+            ));
+        }
+        if lines.is_empty() {
+            return;
+        }
+        let _ = writeln!(out, "## Patterns\n");
+        for line in lines {
+            let _ = writeln!(out, "- {line}");
+        }
+        out.push('\n');
     }
 
     /// The delegated children: who, on which model, how they ended and why.
@@ -1171,9 +1273,15 @@ impl Report {
         let summarized = self.recorded("compaction", "earlier_summarized");
         let steps = self.recorded("compaction", "turn_steps_summarized").len();
         let shortened = self.recorded("compaction", "tool_results_shortened").len();
+        // A long turn shortens its oldest results as it grows; one record a turn.
+        let trimmed: u64 = self
+            .recorded("compaction", "tool_results_trimmed")
+            .iter()
+            .filter_map(|record| field(record, "total"))
+            .sum();
         let failed = self.recorded("compaction", "earlier_summary_failed").len()
             + self.recorded("compaction", "turn_summary_failed").len();
-        if !summarized.is_empty() || steps + shortened + failed > 0 {
+        if !summarized.is_empty() || steps + shortened + failed > 0 || trimmed > 0 {
             let written = summarized
                 .iter()
                 .filter(|record| record["fields"]["model_call"] == true)
@@ -1194,7 +1302,10 @@ impl Report {
                 }
             );
             let _ = writeln!(out, "- a turn's own steps summarized: {steps}");
-            let _ = writeln!(out, "- tool results shortened: {shortened}");
+            let _ = writeln!(
+                out,
+                "- tool results shortened: {shortened} time(s) to fit the window, {trimmed} older result(s) as long turns grew"
+            );
             let _ = writeln!(out, "- summaries that failed: {failed}\n");
         }
         let mut tools: BTreeMap<String, (usize, usize, u64, u64)> = BTreeMap::new();
@@ -1266,12 +1377,16 @@ impl Report {
     fn recorded_problems(&self) -> BTreeMap<(String, String), (usize, String, String, String)> {
         let mut groups: BTreeMap<(String, String), (usize, String, String, String)> =
             BTreeMap::new();
-        for record in self
+        // Oldest first: the records come file by file, and a group's first and
+        // last were the first and last read (first 20:44, last 09:31).
+        let mut problems = self
             .records
             .iter()
             .filter(|record| matches!(record["level"].as_str(), Some("error" | "warn")))
             .filter(|record| record["kind"] != "panic" && record["event"] != "died")
-        {
+            .collect::<Vec<_>>();
+        problems.sort_by_key(|record| record["ms"].as_i64().unwrap_or_default());
+        for record in problems {
             let key = (
                 record["level"].as_str().unwrap_or_default().to_owned(),
                 format!(

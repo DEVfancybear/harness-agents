@@ -53,7 +53,7 @@ fn remaining_value(goal: &GoalState) -> String {
 }
 
 /// How a goal's continuation opens: the host's words, not the user's.
-const CONTINUATION_LEAD: &str = "Continue working toward the active thread goal.";
+pub(crate) const CONTINUATION_LEAD: &str = "Continue working toward the active thread goal.";
 
 /// How the steer a goal gets at its token budget opens.
 const BUDGET_LIMIT_LEAD: &str = "The active thread goal has reached its token budget.";
