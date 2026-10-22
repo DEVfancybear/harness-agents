@@ -234,10 +234,14 @@ check "the expired, unrelated conversation started fresh" 'records cache "$since
 check "Jev judged the request does not continue it" 'records jev "$since" | grep -qE "^cache_decided .*acted=True"'
 next=$(date +%s%3N)
 say j12 "Không gọi tool nào. Viết thêm đúng một câu thơ tiếng Anh về mùa đông." | tail -1 | sed 's/^/   /'
+say j12 "Không gọi tool nào. Viết thêm đúng một câu thơ tiếng Anh về mùa xuân." | tail -1 | sed 's/^/   /'
 records cache "$next" | sed 's/^/   /'
 records provider "$next" | sed 's/^/   /'
-check "the next turn kept the fresh start" 'records cache "$next" | grep -q "^fresh_kept"'
-check "the next turn read its prefix from the cache" 'records provider "$next" | grep -qE "cached=[1-9]"'
+check "the later turns kept the fresh start" '[ "$(records cache "$next" | grep -c "^fresh_kept")" -eq 2 ]'
+# The provider's cache is best effort: a call can miss even the system prompt
+# and tools every session shares. Of two later turns, one reads the kept
+# prefix back.
+check "a later turn read the kept prefix from the cache" 'records provider "$next" | grep -qE "cached=[1-9]"'
 "$HA" shutdown --force >/dev/null 2>&1
 
 echo "################ 13. the bug report shows what Jev decided"
