@@ -2028,6 +2028,8 @@ impl SessionAgents {
         let (task_id, name, _) = siblings.get(index)?.clone();
         harness_types::diag::info("jev", "subgoal_reused")
             .task(task_id.as_str())
+            .field("decision", "subgoals")
+            .field("acted", true)
             .field("child", name.clone())
             .emit();
         let _ = self.shared.sender.send(SessionEvent::Notice {
@@ -2051,7 +2053,10 @@ impl SessionAgents {
             return None;
         }
         harness_types::diag::info("jev", "routed_to_session_model")
+            .field("decision", "routing")
+            .field("acted", true)
             .field("model", launch.model.reference.clone())
+            .field("instead_of", default.clone())
             .emit();
         let _ = self.shared.sender.send(SessionEvent::Notice {
             message: format!(

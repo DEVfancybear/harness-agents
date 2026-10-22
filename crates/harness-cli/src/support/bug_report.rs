@@ -996,6 +996,7 @@ impl Report {
         self.summary_problems(&mut out);
         self.summary_patterns(&mut out);
         self.summary_activity(&mut out);
+        self.summary_jev(&mut out);
         self.summary_children(&mut out);
         self.summary_timeline(&mut out);
         out
@@ -1338,6 +1339,135 @@ impl Report {
             }
             let _ = writeln!(out);
         }
+    }
+
+    /// What the jev plugin did: each harness decision, how often Jev was asked,
+    /// how often it changed what ha did, how often it failed or ran out of time
+    /// (ha then went on without it), how fast it answered and which version
+    /// answered; the agent's own `jev` calls; then the newest records with what
+    /// each decided. Every outcome record names its `decision` and whether it
+    /// `acted`, so a decision added later shows here without a change.
+    fn summary_jev(&self, out: &mut String) {
+        let mut records = self
+            .records
+            .iter()
+            .filter(|record| record["kind"] == "jev")
+            .collect::<Vec<_>>();
+        if records.is_empty() {
+            return;
+        }
+        records.sort_by_key(|record| record["ms"].as_i64().unwrap_or_default());
+        let _ = writeln!(out, "## Jev\n");
+        if let Some(status) = records
+            .iter()
+            .rev()
+            .find(|record| record["event"] == "status")
+        {
+            let _ = writeln!(
+                out,
+                "- plugin at the last /jev: enabled {}, {} decision(s) on",
+                status["fields"]["enabled"], status["fields"]["decisions"]
+            );
+        }
+        // decision -> (asked, acted, failed, timed out, answer times, versions)
+        let mut decisions: BTreeMap<String, (usize, usize, usize, usize, Vec<u64>, Vec<String>)> =
+            BTreeMap::new();
+        for record in &records {
+            let fields = &record["fields"];
+            let Some(decision) = fields["decision"].as_str() else {
+                continue;
+            };
+            let entry = decisions.entry(decision.to_owned()).or_default();
+            match record["event"].as_str().unwrap_or_default() {
+                "answered" => {
+                    entry.0 += 1;
+                    entry.4.push(fields["ms"].as_u64().unwrap_or_default());
+                    if let Some(model) = fields["model"].as_str().filter(|model| !model.is_empty())
+                        && !entry.5.iter().any(|seen| seen == model)
+                    {
+                        entry.5.push(model.to_owned());
+                    }
+                }
+                "decision_failed" => entry.2 += 1,
+                "decision_timed_out" => entry.3 += 1,
+                _ => entry.1 += usize::from(fields["acted"] == true),
+            }
+        }
+        if !decisions.is_empty() {
+            let _ = writeln!(
+                out,
+                "\n| decision | asked | acted | failed | timed out | median answer | Jev version |"
+            );
+            let _ = writeln!(out, "|---|---|---|---|---|---|---|");
+            for (decision, (asked, acted, failed, timed_out, mut times, versions)) in decisions {
+                times.sort_unstable();
+                let median = times
+                    .get(times.len().saturating_sub(1) / 2)
+                    .map_or_else(|| "-".to_owned(), |ms| format!("{ms} ms"));
+                let _ = writeln!(
+                    out,
+                    "| {decision} | {asked} | {acted} | {failed} | {timed_out} | {median} | {} |",
+                    if versions.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        versions.join(", ")
+                    }
+                );
+            }
+        }
+        let calls = records
+            .iter()
+            .filter(|record| record["event"] == "call")
+            .collect::<Vec<_>>();
+        if !calls.is_empty() {
+            let sum = |name: &str| {
+                calls
+                    .iter()
+                    .filter_map(|record| record["fields"][name].as_u64())
+                    .sum::<u64>()
+            };
+            let _ = writeln!(
+                out,
+                "\n- the agent's jev tool: {} call(s), {} item(s): {} decided, {} for review, {} failed; {} input token(s)",
+                calls.len(),
+                sum("items"),
+                sum("decided"),
+                sum("review"),
+                sum("failed"),
+                sum("input")
+            );
+        }
+        let _ = writeln!(
+            out,
+            "\nThe newest {} of {} Jev record(s):\n",
+            records.len().min(30),
+            records.len()
+        );
+        let _ = writeln!(out, "| time | event | what |");
+        let _ = writeln!(out, "|---|---|---|");
+        for record in records.iter().rev().take(30).rev() {
+            let what = record["fields"]
+                .as_object()
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .map(|(name, value)| match value {
+                            Value::String(text) => format!("{name}={text}"),
+                            other => format!("{name}={other}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} |",
+                ms_text(record["ms"].as_i64().unwrap_or_default()),
+                record["event"].as_str().unwrap_or("?"),
+                self.clip_cell(&what)
+            );
+        }
+        let _ = writeln!(out);
     }
 
     fn summary_header(&self, out: &mut String) {

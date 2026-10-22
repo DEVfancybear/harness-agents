@@ -463,3 +463,125 @@ fn luhn(number: i64) -> bool {
         .sum();
     sum.is_multiple_of(10)
 }
+
+/// What the jev plugin decided is in the report: per decision how often Jev was
+/// asked, how often it changed what ha did, its failures and time-outs, how
+/// fast it answered and which version answered; then the newest records.
+#[test]
+fn a_bug_report_shows_what_jev_decided() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path();
+    let now = chrono::Utc::now().timestamp_millis() - 600_000;
+    let record = |offset: i64, level: &str, event: &str, fields: serde_json::Value| {
+        let ms = now + offset;
+        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        serde_json::json!({"v":1,"ms":ms,"ts":ts,"pid":9,"role":"worker","level":level,"kind":"jev","event":event,"msg":"","fields":fields}).to_string()
+    };
+    let records = [
+        record(
+            0,
+            "info",
+            "status",
+            serde_json::json!({"enabled": true, "decisions": 5}),
+        ),
+        record(
+            1_000,
+            "info",
+            "answered",
+            serde_json::json!({"decision": "commands", "model": "jev-1.14.0", "input": 300, "ms": 120}),
+        ),
+        record(
+            1_001,
+            "info",
+            "command_judged",
+            serde_json::json!({"decision": "commands", "acted": true, "verdict": "deny", "confidence": 1.0, "command": "python src/sync_keys.py"}),
+        ),
+        record(
+            2_000,
+            "info",
+            "answered",
+            serde_json::json!({"decision": "commands", "model": "jev-1.14.0", "input": 200, "ms": 90}),
+        ),
+        record(
+            2_001,
+            "info",
+            "command_judged",
+            serde_json::json!({"decision": "commands", "acted": false, "verdict": "allow", "confidence": 0.97, "command": "cargo test"}),
+        ),
+        record(
+            3_000,
+            "info",
+            "answered",
+            serde_json::json!({"decision": "instructions", "model": "jev-1.14.0", "input": 900, "ms": 140}),
+        ),
+        record(
+            3_001,
+            "info",
+            "instructions_judged",
+            serde_json::json!({"decision": "instructions", "acted": true, "sections": 4, "left_out": 1, "left": "## Release process"}),
+        ),
+        record(
+            4_000,
+            "warn",
+            "decision_timed_out",
+            serde_json::json!({"decision": "context", "ms": 8000}),
+        ),
+        record(
+            5_000,
+            "info",
+            "call",
+            serde_json::json!({"model": "jev-1.14.0", "items": 8, "decided": 7, "review": 1, "failed": 0, "input": 2888}),
+        ),
+    ];
+    let diagnostics = home.join("data").join("diagnostics");
+    std::fs::create_dir_all(&diagnostics).unwrap();
+    std::fs::write(
+        diagnostics.join("20260101-worker-1.jsonl"),
+        records.join("\n") + "\n",
+    )
+    .unwrap();
+    let out = home.join("report.zip");
+    let report = ha(
+        home,
+        &[
+            "bug-report",
+            "--since",
+            "1h",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let entries = entries(&std::fs::read(&out).unwrap());
+    let summary = &entries[0].1;
+    let jev = summary
+        .split("## Jev")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .unwrap_or_else(|| panic!("a Jev section: {summary}"));
+    assert!(jev.contains("enabled true, 5 decision(s) on"), "{jev}");
+    assert!(
+        jev.contains("| commands | 2 | 1 | 0 | 0 | 90 ms | jev-1.14.0 |"),
+        "{jev}"
+    );
+    assert!(
+        jev.contains("| instructions | 1 | 1 | 0 | 0 | 140 ms | jev-1.14.0 |"),
+        "{jev}"
+    );
+    assert!(jev.contains("| context | 0 | 0 | 0 | 1 | - | - |"), "{jev}");
+    assert!(
+        jev.contains(
+            "1 call(s), 8 item(s): 7 decided, 1 for review, 0 failed; 2888 input token(s)"
+        ),
+        "{jev}"
+    );
+    assert!(jev.contains("left=## Release process"), "{jev}");
+    assert!(jev.contains("command=python src/sync_keys.py"), "{jev}");
+}

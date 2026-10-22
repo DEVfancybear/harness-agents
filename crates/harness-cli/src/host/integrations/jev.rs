@@ -921,7 +921,9 @@ impl JevDecisions {
         let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match answer {
             Ok(Ok(data)) => {
-                harness_types::diag::debug("jev", "answered")
+                // Every question asked, so a bug report shows what Jev was
+                // asked, by which version, at what cost and how fast.
+                harness_types::diag::info("jev", "answered")
                     .field("decision", decision)
                     .field(
                         "model",
@@ -1054,8 +1056,11 @@ impl harness_tools::ToolGuard for JevDecisions {
             let answers = self.answers("commands", state, questions).await?;
             let (choice, confidence) = self.sure_choice("commands", &answers["verdict"])?;
             harness_types::diag::info("jev", "command_judged")
+                .field("decision", "commands")
+                .field("acted", choice == "deny")
                 .field("verdict", choice.clone())
                 .field("confidence", confidence)
+                .field("command", command.chars().take(160).collect::<String>())
                 .emit();
             (choice == "deny").then(|| {
                 format!(
@@ -1102,6 +1107,7 @@ impl harness_tools::ResultVisibility for JevDecisions {
                     "criteria": {
                         "hide": "Not needed any more: unrelated to the request, superseded by a later result, or already acted on.",
                         "short": "Only its start or gist is still useful.",
+                        "long": "Its start and its end are what matter - a command's setup and its outcome or failure - not the middle.",
                         "full": "Needed in full: the agent will use its details to finish the request."
                     }
                 }));
@@ -1116,14 +1122,24 @@ impl harness_tools::ResultVisibility for JevDecisions {
                     let visibility = match choice.as_str() {
                         "hide" => harness_tools::Visibility::Hide,
                         "short" => harness_tools::Visibility::Short,
+                        "long" => harness_tools::Visibility::Long,
                         _ => harness_tools::Visibility::Full,
                     };
                     ranks.insert(result.index, visibility);
                 }
             }
+            let count = |level: harness_tools::Visibility| {
+                ranks.values().filter(|rank| **rank == level).count()
+            };
             harness_types::diag::info("jev", "context_ranked")
+                .field("decision", "context")
+                .field("acted", !ranks.is_empty())
                 .field("judged", results.len())
                 .field("ranked", ranks.len())
+                .field("hide", count(harness_tools::Visibility::Hide))
+                .field("short", count(harness_tools::Visibility::Short))
+                .field("long", count(harness_tools::Visibility::Long))
+                .field("full", count(harness_tools::Visibility::Full))
                 .emit();
             ranks
         })
@@ -1249,9 +1265,12 @@ pub async fn conditional_instructions(
             }
         }
         harness_types::diag::info("jev", "instructions_judged")
+            .field("decision", "instructions")
+            .field("acted", !left_out.is_empty())
             .field("block", block.id.clone())
             .field("sections", sections.len() - 1)
             .field("left_out", left_out.len())
+            .field("left", left_out.join("; "))
             .emit();
         if !left_out.is_empty() {
             let _ = write!(

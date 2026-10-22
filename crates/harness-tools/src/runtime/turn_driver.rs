@@ -413,15 +413,22 @@ const ELIDED_RESULT: &str =
 /// What a result judged worth a short form keeps: its start.
 const SHORT_RESULT_CHARS: usize = 600;
 
+/// What a result judged worth a long form keeps at each end: a log's command
+/// and setup at the start, its failure and cause at the end.
+const LONG_RESULT_CHARS: usize = 1_500;
+
 /// How visible an earlier tool result stays for the current request when the
 /// turn's results overflow their budget: the design notes' visibility ladder
-/// (hide / short / full), decided per query instead of oldest first.
+/// (hide / short / long / full), decided per query instead of oldest first.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Visibility {
     /// Not needed for this request: shortened first, to the one-line note.
     Hide,
     /// Its start is enough: shortened next, to the note and its head.
     Short,
+    /// Its start and its end are enough - a test log's command and its failure:
+    /// shortened after the unranked results, to both ends.
+    Long,
     /// Needed whole: shortened last.
     Full,
 }
@@ -505,6 +512,23 @@ fn short_result(content: &str) -> String {
     )
 }
 
+/// A result kept long: the note, then its start and its end.
+fn long_result(content: &str) -> String {
+    let chars = content.chars().count();
+    if chars <= 2 * LONG_RESULT_CHARS + 200 {
+        return content.to_owned();
+    }
+    let head = content.chars().take(LONG_RESULT_CHARS).collect::<String>();
+    let tail = content
+        .chars()
+        .skip(chars - LONG_RESULT_CHARS)
+        .collect::<String>();
+    format!(
+        "[earlier tool result shortened to its start and end to save context; call the tool again for all of it]\n{head}\n[... {} characters left out ...]\n{tail}",
+        chars - 2 * LONG_RESULT_CHARS
+    )
+}
+
 /// Keep a long turn's transcript within budget by shortening its oldest tool results.
 ///
 /// A turn now carries everything it said and ran, which is what fixed the loop that
@@ -536,13 +560,14 @@ fn trim_transcript(
     let eligible = results.len().saturating_sub(keep_recent);
     // Oldest first, unless a ranker judged them for this request: what it
     // would hide goes first, then what it would keep short, then the rest
-    // oldest first, and what it needs whole last.
+    // oldest first, then what it would keep long, and what it needs whole last.
     let mut order = results.iter().take(eligible).copied().collect::<Vec<_>>();
     order.sort_by_key(|index| match ranks.get(index) {
         Some(Visibility::Hide) => 0,
         Some(Visibility::Short) => 1,
         None => 2,
-        Some(Visibility::Full) => 3,
+        Some(Visibility::Long) => 3,
+        Some(Visibility::Full) => 4,
     });
     let mut elided = Vec::new();
     for index in order {
@@ -550,10 +575,10 @@ fn trim_transcript(
             break;
         }
         let message = &mut transcript[index];
-        let replacement = if ranks.get(&index) == Some(&Visibility::Short) {
-            short_result(&message.content)
-        } else {
-            ELIDED_RESULT.to_owned()
+        let replacement = match ranks.get(&index) {
+            Some(Visibility::Short) => short_result(&message.content),
+            Some(Visibility::Long) => long_result(&message.content),
+            _ => ELIDED_RESULT.to_owned(),
         };
         if message.content.len() <= replacement.len() {
             continue;
