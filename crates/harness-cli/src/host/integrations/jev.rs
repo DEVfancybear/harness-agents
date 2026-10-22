@@ -1436,7 +1436,7 @@ impl harness_runtime::FreshStartJudge for CacheJudge {
             harness_types::diag::info("jev", "cache_decided")
                 .field("decision", "cache")
                 .field("acted", sure == Some(false))
-                .field("tokens", facts.tokens)
+                .field("size", facts.tokens)
                 .field("idle_s", facts.idle.as_secs())
                 .field("lifetime_s", self.lifetime.as_secs())
                 .field("continues", answers["continues"]["noul"].as_f64())

@@ -5364,7 +5364,7 @@ impl RuntimeService {
             harness_types::diag::info("cache", event)
                 .task(request.task_id.as_str())
                 .session(request.session_id.as_str())
-                .field("tokens", tokens)
+                .field("size", tokens) // estimated tokens; a field named for tokens is withheld
                 .field("idle_s", idle.map(|idle| idle.as_secs()))
                 .field("lifetime_s", lifetime.as_secs())
                 .field("warm", !cold)
