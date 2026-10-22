@@ -327,6 +327,10 @@ pub trait SessionPort: Send {
     fn steer(&mut self, _text: &str) -> Result<(), String> {
         Err("this backend does not support steering an active run".to_owned())
     }
+    /// Whether the running turn has opened its inbox, so a steer reaches it.
+    fn steer_ready(&self) -> bool {
+        false
+    }
     /// Answer one pending approval request; false when the id is not pending.
     fn answer(&mut self, _request_id: &str, _decision: ApprovalDecision) -> bool {
         false
@@ -5969,6 +5973,12 @@ impl SessionPort for AgentSessionService {
 
     fn steer(&mut self, text: &str) -> Result<(), String> {
         self.queue_into_run(text, false)
+    }
+
+    fn steer_ready(&self) -> bool {
+        self.active_inbox
+            .lock()
+            .is_ok_and(|active| active.is_some())
     }
 
     fn answer_child_question(&mut self, request_id: &str, answer: &str) -> bool {

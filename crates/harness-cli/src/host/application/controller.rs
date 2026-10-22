@@ -2314,6 +2314,10 @@ impl InteractiveController {
     #[allow(dead_code, reason = "T05 wires the tick into the render loop")]
     pub fn tick(&mut self) -> Vec<Effect> {
         self.read_menu_ahead();
+        let steered = self.deliver_waiting_steers();
+        if !steered.is_empty() {
+            return steered;
+        }
         let changed = !self.plain && self.sync_children();
         let children_running = self
             .child_activity
@@ -2327,6 +2331,37 @@ impl InteractiveController {
         } else {
             Vec::new()
         }
+    }
+
+    /// A steer sent before the running turn opened its inbox - while it set
+    /// up, or summarized the conversation first - waited in the queue for the
+    /// whole turn ("queued: sent after the active run finishes"). It goes into
+    /// the turn as soon as the inbox opens.
+    fn deliver_waiting_steers(&mut self) -> Vec<Effect> {
+        if self.phase != AppPhase::Running || !self.service.steer_ready() {
+            return Vec::new();
+        }
+        let mut effects = Vec::new();
+        while let Some((text, receipts)) = self.queue.take_next_tracked(super::queue::Lane::Steer) {
+            if self.service.steer(&text).is_err() {
+                self.queue
+                    .push_tracked(super::queue::Lane::Steer, text, receipts.first().copied());
+                break;
+            }
+            for receipt in receipts {
+                self.active_deliveries.push((receipt, text.clone()));
+            }
+            effects.push(Effect::History(HistoryItem::User { text }));
+            effects.push(Effect::History(HistoryItem::Notice {
+                message:
+                    "a queued message reached the running agent; it reads this at its next step"
+                        .to_owned(),
+            }));
+        }
+        if !effects.is_empty() {
+            effects.push(Effect::Redraw);
+        }
+        effects
     }
 
     /// Take each delegated child's state from the session's child registry -
@@ -3467,15 +3502,14 @@ impl InteractiveController {
             return self.submit_prompt_as(expanded, text, Vec::new());
         }
         let text = self.attach_pending_shell_outputs(text);
-        // The reports held back by a Ctrl-C ride with the user's next message.
-        // Each used to become a turn of its own after it: stopping nine
-        // verifiers queued nine more turns behind the user's "continue".
+        // The reports held back by a Ctrl-C ride with the next turn. Each used
+        // to become a turn of its own after it: stopping nine verifiers queued
+        // nine more turns behind the user's "continue". Whoever starts that
+        // turn ends the hold - the user, or the goal carrying on: a hold that
+        // outlived the goal's own turn kept every later report from waking the
+        // session, and the goal sat idle until the user typed again.
         let mut sent = text.clone();
-        let folded = if automatic {
-            0
-        } else {
-            self.fold_held_notices(&mut sent)
-        };
+        let folded = self.fold_held_notices(&mut sent);
         let input_id = InputId::generate();
         self.fresh_run(Instant::now(), Some(text.clone()));
         self.service.submit(SubmitRequest {
@@ -6775,7 +6809,7 @@ mod tests {
         answers: Arc<Mutex<Vec<(String, ApprovalDecision)>>>,
         steers: Arc<Mutex<Vec<String>>>,
         /// Refuse steering, as a service without a running inbox does.
-        refuse_steer: bool,
+        refuse_steer: Arc<std::sync::atomic::AtomicBool>,
         resumes: Arc<Mutex<Vec<Option<String>>>>,
         /// Every turn-wide grant the controller handed to the port, and every
         /// revocation, so a test can assert the grant is scoped to one turn.
@@ -6918,15 +6952,19 @@ mod tests {
         }
 
         fn steer(&mut self, text: &str) -> Result<(), String> {
-            if self.refuse_steer {
+            if self.refuse_steer.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err("no active run inbox is available".to_owned());
             }
             self.steers.lock().expect("steer log").push(text.to_owned());
             Ok(())
         }
 
+        fn steer_ready(&self) -> bool {
+            !self.refuse_steer.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
         fn deliver_message(&mut self, text: &str) -> Result<(), String> {
-            if self.refuse_steer {
+            if self.refuse_steer.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err("no active run inbox is available".to_owned());
             }
             self.delivered
@@ -7655,11 +7693,44 @@ mod tests {
         );
     }
 
+    /// Seen in a session: "sắp xong chưa", sent while the turn summarized the
+    /// conversation before its first step, stayed queued for the whole turn.
+    /// It goes in once the turn's inbox opens.
+    #[test]
+    fn a_steer_queued_before_the_inbox_opened_reaches_the_turn() {
+        let port = RecordingPort {
+            refuse_steer: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ..RecordingPort::default()
+        };
+        let refuse = Arc::clone(&port.refuse_steer);
+        let mut harness = bench_with(true, port, false);
+        submit_text(&mut harness.controller, "first input");
+        submit_text(&mut harness.controller, "sắp xong chưa");
+        assert!(harness.controller.ui_state().queued_input);
+        let _ = harness.controller.tick();
+        assert!(
+            harness.port.steers.lock().expect("steers").is_empty(),
+            "the inbox is not open yet"
+        );
+        refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+        let effects = harness.controller.tick();
+        assert_eq!(
+            *harness.port.steers.lock().expect("steers"),
+            ["sắp xong chưa"]
+        );
+        assert!(!harness.controller.ui_state().queued_input);
+        assert!(
+            effects_to_plain(&effects)
+                .join("\n")
+                .contains("a queued message reached the running agent")
+        );
+    }
+
     /// A turn that cannot take the message yet (no inbox) keeps it for after.
     #[test]
     fn g06_enter_while_running_queues_when_the_turn_cannot_take_it() {
         let port = RecordingPort {
-            refuse_steer: true,
+            refuse_steer: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             ..RecordingPort::default()
         };
         let mut harness = bench_with(true, port, false);
@@ -7681,7 +7752,7 @@ mod tests {
 
     fn refusing_bench() -> Bench {
         let port = RecordingPort {
-            refuse_steer: true,
+            refuse_steer: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             ..RecordingPort::default()
         };
         bench_with(true, port, false)
@@ -11281,6 +11352,47 @@ Command: \"npm run build\""
             shown.contains("2 delegated agent report(s) that arrived after you stopped"),
             "{shown}"
         );
+    }
+
+    /// Seen in a session: a stop held the reports, the goal carried on in a
+    /// turn of its own, and the verifier's report that came after that turn was
+    /// held too - the goal sat idle for fifty minutes, until the user typed
+    /// "???". A turn that starts after a stop, the user's or the host's, takes
+    /// the held reports and ends the hold.
+    #[test]
+    fn a_turn_after_a_stop_ends_the_hold_whoever_starts_it() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        harness.controller.notices_held = true;
+        harness.controller.phase = AppPhase::Ready;
+        let _ = child_settled(
+            &mut harness,
+            "[child-exited: cancelled child:coder-a]\n\nStopped by the user with Ctrl-C",
+        );
+        assert!(submissions(&harness).is_empty(), "held after the stop");
+        let _ = harness
+            .controller
+            .dispatch("continue the goal".to_owned(), true);
+        let sent = submissions(&harness);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(
+            sent[0].starts_with("continue the goal") && sent[0].contains("child:coder-a"),
+            "the held report rides with the goal's turn: {}",
+            sent[0]
+        );
+        assert!(!harness.controller.notices_held, "the hold is over");
+        harness.controller.phase = AppPhase::Ready;
+        let _ = child_settled(
+            &mut harness,
+            "[child-exited: no-reply child:verifier-b]\n\nLast assistant text: PASS",
+        );
+        let sent = submissions(&harness);
+        assert_eq!(
+            sent.len(),
+            2,
+            "a later report wakes the idle session: {sent:?}"
+        );
+        assert!(sent[1].contains("child:verifier-b"));
     }
 
     /// Q02: an idle parent reads a child's notice in a turn of its own, at once.
