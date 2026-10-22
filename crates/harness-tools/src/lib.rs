@@ -93,13 +93,14 @@ pub use hooks::{HOOK_EVENTS, HookResponse, fit_payload, hook_matches, run_hooks}
 pub use secrets::{HostEnvironmentSecrets, SecretResolver};
 pub use service::{
     ConfiguredToolHook, ExternalToolDispatcher, PathElsewhere, ToolDispatchAuthorization,
-    ToolExecutionService, ToolObserver, ToolResultContext, git_diff_from, git_head_commit,
+    ToolExecutionService, ToolGuard, ToolObserver, ToolResultContext, git_diff_from,
+    git_head_commit,
 };
 pub use turn_driver::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ExternalToolCatalog,
     ExternalTools, FLUSH_PREFIX, GoalReport, QuestionHost, RECAP_EVERY_STEPS, RECAP_PREFIX,
-    TurnContextHooks, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnOutcome, TurnProgress,
-    TurnStop, execute_action_with_approval,
+    ResultSummary, ResultVisibility, TurnContextHooks, TurnDriver, TurnLimits, TurnObserver,
+    TurnOptions, TurnOutcome, TurnProgress, TurnStop, Visibility, execute_action_with_approval,
 };
 pub use workspace::{
     git_branch, is_sensitive_workspace_path, observe_workspace, observed_file_hash,

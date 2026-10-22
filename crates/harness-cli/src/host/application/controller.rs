@@ -4757,6 +4757,23 @@ impl InteractiveController {
                     self.push_history(&mut effects, HistoryItem::User { text });
                 }
             }
+            "/jev" if raw_argument.is_some_and(|argument| argument.split_whitespace().count() == 2) => {
+                let words = raw_argument.unwrap_or_default().split_whitespace().collect::<Vec<_>>();
+                let enable = match words[1] {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    _ => None,
+                };
+                let outcome = match enable {
+                    Some(enable) => self.service.jev_decision(words[0], enable),
+                    None => Err("Usage: /jev [on|off|status] or /jev <decision> on|off".to_owned()),
+                };
+                match outcome {
+                    Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
+                    Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                }
+                effects.push(Effect::Redraw);
+            }
             name @ ("/refinements" | "/factory" | "/jev") => {
                 let enable = match argument {
                     None | Some("status") => Ok(None),

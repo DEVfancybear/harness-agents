@@ -725,6 +725,10 @@ pub trait SessionPort: Send {
     fn jev_plugin(&mut self, _enable: Option<bool>) -> Result<String, String> {
         Err("this backend has no plugins".to_owned())
     }
+    /// `/jev <decision> on|off`: one of the plugin's harness decisions.
+    fn jev_decision(&mut self, _decision: &str, _enable: bool) -> Result<String, String> {
+        Err("this backend has no plugins".to_owned())
+    }
     /// prime-agent's global `harnessRefinements` switch: report or set it.
     fn refinements(&mut self, _enable: Option<bool>) -> Result<String, String> {
         Err("this backend keeps no harness".to_owned())
@@ -6430,6 +6434,35 @@ impl SessionPort for AgentSessionService {
         ))
     }
 
+    fn jev_decision(&mut self, decision: &str, enable: bool) -> Result<String, String> {
+        if !super::jev::DECISIONS
+            .iter()
+            .any(|(name, _)| *name == decision)
+        {
+            return Err(format!(
+                "/jev: no decision {decision:?}; the decisions are {}",
+                super::jev::DECISIONS
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let mut setting = super::config::load_setting(&self.config_file, super::jev::SETTING)
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !setting["decisions"].is_object() {
+            setting["decisions"] = serde_json::json!({});
+        }
+        setting["decisions"][decision] = serde_json::json!(enable);
+        super::config::save_setting(&self.config_file, super::jev::SETTING, Some(setting))?;
+        Ok(super::jev::status(
+            &self.config_file,
+            &self.environment,
+            &self.data_dir,
+        ))
+    }
+
     fn refinements(&mut self, enable: Option<bool>) -> Result<String, String> {
         if let Some(enable) = enable {
             // On is the default: the key is kept only to say off.
@@ -8439,6 +8472,19 @@ async fn run_turn(
     .await;
     agents.set_max_depth(max_depth, depth_source);
     agents.set_max_workers(config.agents_max_workers.unwrap_or(0));
+    // The jev plugin's harness decisions, when it is on and has a key.
+    let jev_decisions =
+        super::jev::JevDecisions::from_settings(&environment, &data_dir, &config_file);
+    agents.set_judge(
+        jev_decisions
+            .clone()
+            .map(|decisions| decisions as Arc<dyn super::delegation::ChildJudge>),
+    );
+    agents.set_guard(
+        jev_decisions
+            .clone()
+            .map(|decisions| decisions as Arc<dyn harness_tools::ToolGuard>),
+    );
     let delegate_host = Some(super::delegation::DelegateHost::new(
         &agents,
         super::delegation::ChildLaunch {
@@ -8668,6 +8714,9 @@ async fn run_turn(
             task_id.as_str(),
             nested_instructions,
         )));
+    if let Some(decisions) = &jev_decisions {
+        tools = tools.with_guard(Arc::clone(decisions) as Arc<dyn harness_tools::ToolGuard>);
+    }
     let dispatcher = super::mcp::combined_dispatcher_with_delegate(
         active_mcp.as_ref(),
         active_extensions.as_ref(),
@@ -8696,6 +8745,11 @@ async fn run_turn(
         jev_host.as_ref(),
     ));
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
+    let driver = match &jev_decisions {
+        Some(decisions) => driver
+            .with_visibility(Arc::clone(decisions) as Arc<dyn harness_tools::ResultVisibility>),
+        None => driver,
+    };
     let external_tools = super::mcp::combined_tools_with_delegate(
         active_mcp.as_ref(),
         active_extensions.as_ref(),
@@ -8971,7 +9025,14 @@ async fn run_turn(
         harness_session::ContextBlockKind::Instruction,
         super::prompt::volatile_facts(&prompt_environment),
     )];
-    project_blocks.extend(loaded_instructions.blocks);
+    project_blocks.extend(
+        super::jev::conditional_instructions(
+            jev_decisions.as_deref(),
+            &request.text,
+            loaded_instructions.blocks,
+        )
+        .await,
+    );
     if let Ok(active) = active_skills.lock() {
         project_blocks.extend(
             active

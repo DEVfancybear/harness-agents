@@ -245,6 +245,20 @@ pub struct ToolExecutionService {
     hashline: bool,
     /// Where a missing path may be instead (a coder's worktree).
     elsewhere: Option<Arc<dyn PathElsewhere>>,
+    /// A host's check before a command runs (the jev plugin's command guard).
+    guard: Option<Arc<dyn ToolGuard>>,
+}
+
+/// A host's own check before a command runs, after the policy allowed it:
+/// `Some(reason)` refuses the command with that reason, which the model reads;
+/// `None` lets it run. It can only narrow what the policy allowed, and a guard
+/// that cannot answer says `None`, so the command runs as without a guard.
+pub trait ToolGuard: Send + Sync {
+    fn check<'a>(
+        &'a self,
+        action: &'a CodingToolAction,
+        workspace_root: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>>;
 }
 
 impl ToolExecutionService {
@@ -262,6 +276,7 @@ impl ToolExecutionService {
             result_context: None,
             hashline: false,
             elsewhere: None,
+            guard: None,
         }
     }
 
@@ -285,6 +300,33 @@ impl ToolExecutionService {
     pub fn with_elsewhere(mut self, elsewhere: Arc<dyn PathElsewhere>) -> Self {
         self.elsewhere = Some(elsewhere);
         self
+    }
+
+    /// Check every command with `guard` before it runs, in every mode.
+    #[must_use]
+    pub fn with_guard(mut self, guard: Arc<dyn ToolGuard>) -> Self {
+        self.guard = Some(guard);
+        self
+    }
+
+    /// The guard's refusal of a prepared command, or `None`. Only commands are
+    /// checked: reads in a batch never wait for it.
+    pub(crate) async fn guard_refusal(
+        &self,
+        prepared: &PreparedToolRequest,
+        cancellation: &CancellationToken,
+    ) -> Option<String> {
+        let guard = self.guard.as_ref()?;
+        if !matches!(
+            prepared.final_action,
+            CodingToolAction::RunShell { .. } | CodingToolAction::RunProcess { .. }
+        ) {
+            return None;
+        }
+        tokio::select! {
+            refusal = guard.check(&prepared.final_action, &prepared.workspace_root_text) => refusal,
+            () = cancellation.cancelled() => None,
+        }
     }
 
     /// Add host context to the results of calls that ran.

@@ -170,6 +170,7 @@ CI runs the phase and milestone gates on Windows; a test that fails in the crowd
 - [Documentation index](docs/README.md)
 - [Architecture overview](docs/architecture/ARCHITECTURE_OVERVIEW.en.md) · [Terminal interface](docs/guides/TUI.md) · [Plugin architecture](docs/architecture/PLUGIN_ARCHITECTURE.en.md)
 - [Desktop computer use](docs/guides/COMPUTER_USE.md) (in development): real screenshots, mouse and keyboard on Windows
+- [The Jev workflow](docs/guides/JEV.en.md) (plugin, off by default): TypeSafe's Jev for fast typed decisions beside the agent and at the harness's decision points
 - [Build and release](docs/guides/BUILD_AND_RELEASE.md) · [Changelog](https://github.com/DEVfancybear/harness-agents/releases)
 
 ---
@@ -315,6 +316,7 @@ CI chạy các gate phase và milestone trên Windows; test fail trong lượt c
 - [Mục lục tài liệu](docs/README.md)
 - [Tổng quan kiến trúc](docs/architecture/ARCHITECTURE_OVERVIEW.vi.md) · [Giao diện terminal](docs/guides/TUI.md) · [Kiến trúc plugin](docs/architecture/PLUGIN_ARCHITECTURE.vi.md)
 - [Điều khiển máy tính](docs/guides/COMPUTER_USE.md) (đang phát triển): chụp màn hình, chuột và bàn phím thật trên Windows
+- [Workflow Jev](docs/guides/JEV.vi.md) (plugin, mặc định tắt): Jev của TypeSafe ra quyết định có kiểu nhanh, bên cạnh agent và ở các điểm quyết định của harness
 - [Build và release](docs/guides/BUILD_AND_RELEASE.md) · [Changelog](https://github.com/DEVfancybear/harness-agents/releases)
 
 ---

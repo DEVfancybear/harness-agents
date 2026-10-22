@@ -410,6 +410,101 @@ const TRIM_TARGET_PERCENT: usize = 75;
 const ELIDED_RESULT: &str =
     "[earlier tool result shortened to save context; call the tool again if you need it]";
 
+/// What a result judged worth a short form keeps: its start.
+const SHORT_RESULT_CHARS: usize = 600;
+
+/// How visible an earlier tool result stays for the current request when the
+/// turn's results overflow their budget: the design notes' visibility ladder
+/// (hide / short / full), decided per query instead of oldest first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Visibility {
+    /// Not needed for this request: shortened first, to the one-line note.
+    Hide,
+    /// Its start is enough: shortened next, to the note and its head.
+    Short,
+    /// Needed whole: shortened last.
+    Full,
+}
+
+/// One earlier tool result, as a ranker sees it.
+#[derive(Clone, Debug)]
+pub struct ResultSummary {
+    /// Its position in the turn's transcript.
+    pub index: usize,
+    pub tool: String,
+    pub arguments: String,
+    /// Its start, at most a couple of thousand characters.
+    pub head: String,
+}
+
+/// A host's judgment of which earlier results the current request needs. It
+/// only orders what is shortened; a ranker that cannot answer returns nothing
+/// and the oldest results are shortened first, as without one.
+pub trait ResultVisibility: Send + Sync {
+    fn rank<'a>(
+        &'a self,
+        query: &'a str,
+        results: Vec<ResultSummary>,
+    ) -> Pin<Box<dyn Future<Output = std::collections::HashMap<usize, Visibility>> + Send + 'a>>;
+}
+
+/// The bytes a transcript's messages and calls take.
+fn transcript_size(messages: &[ProviderMessage]) -> usize {
+    messages
+        .iter()
+        .map(|message| {
+            message.content.len()
+                + message
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.arguments.len())
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+/// The results `trim_transcript` may shorten, for a ranker to judge.
+fn trimmable_results(transcript: &[ProviderMessage], keep_recent: usize) -> Vec<ResultSummary> {
+    let results = transcript
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == MessageRole::Tool)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let eligible = results.len().saturating_sub(keep_recent);
+    results
+        .into_iter()
+        .take(eligible)
+        .filter(|index| {
+            transcript[*index].content.len() > short_result(&transcript[*index].content).len()
+        })
+        .map(|index| {
+            let call_id = transcript[index].tool_call_id.as_ref();
+            let call = transcript[..index]
+                .iter()
+                .rev()
+                .flat_map(|message| message.tool_calls.iter())
+                .find(|call| Some(&call.call_id) == call_id);
+            ResultSummary {
+                index,
+                tool: call.map(|call| call.name.clone()).unwrap_or_default(),
+                arguments: call
+                    .map(|call| call.arguments.chars().take(300).collect())
+                    .unwrap_or_default(),
+                head: transcript[index].content.chars().take(1_500).collect(),
+            }
+        })
+        .collect()
+}
+
+/// A result kept short: the note, then its start.
+fn short_result(content: &str) -> String {
+    let head = content.chars().take(SHORT_RESULT_CHARS).collect::<String>();
+    format!(
+        "[earlier tool result shortened to its start to save context; call the tool again for all of it]\n{head}"
+    )
+}
+
 /// Keep a long turn's transcript within budget by shortening its oldest tool results.
 ///
 /// A turn now carries everything it said and ran, which is what fixed the loop that
@@ -425,21 +520,9 @@ fn trim_transcript(
     transcript: &mut [ProviderMessage],
     budget: usize,
     keep_recent: usize,
+    ranks: &std::collections::HashMap<usize, Visibility>,
 ) -> Vec<String> {
-    let size = |messages: &[ProviderMessage]| -> usize {
-        messages
-            .iter()
-            .map(|message| {
-                message.content.len()
-                    + message
-                        .tool_calls
-                        .iter()
-                        .map(|call| call.arguments.len())
-                        .sum::<usize>()
-            })
-            .sum()
-    };
-    let mut total = size(transcript);
+    let mut total = transcript_size(transcript);
     if total <= budget {
         return Vec::new();
     }
@@ -451,17 +534,32 @@ fn trim_transcript(
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let eligible = results.len().saturating_sub(keep_recent);
+    // Oldest first, unless a ranker judged them for this request: what it
+    // would hide goes first, then what it would keep short, then the rest
+    // oldest first, and what it needs whole last.
+    let mut order = results.iter().take(eligible).copied().collect::<Vec<_>>();
+    order.sort_by_key(|index| match ranks.get(index) {
+        Some(Visibility::Hide) => 0,
+        Some(Visibility::Short) => 1,
+        None => 2,
+        Some(Visibility::Full) => 3,
+    });
     let mut elided = Vec::new();
-    for &index in results.iter().take(eligible) {
+    for index in order {
         if total <= target {
             break;
         }
         let message = &mut transcript[index];
-        if message.content.len() <= ELIDED_RESULT.len() {
+        let replacement = if ranks.get(&index) == Some(&Visibility::Short) {
+            short_result(&message.content)
+        } else {
+            ELIDED_RESULT.to_owned()
+        };
+        if message.content.len() <= replacement.len() {
             continue;
         }
-        total -= message.content.len() - ELIDED_RESULT.len();
-        ELIDED_RESULT.clone_into(&mut message.content);
+        total -= message.content.len() - replacement.len();
+        message.content = replacement;
         let call_id = message.tool_call_id.clone();
         let signature = transcript[..index]
             .iter()
@@ -567,6 +665,8 @@ pub struct TurnDriver {
     seen: Arc<std::sync::Mutex<std::collections::HashMap<String, harness_types::ContentHash>>>,
     /// The recap and the request to save, when the host keeps a task state.
     context_hooks: Option<Arc<dyn TurnContextHooks>>,
+    /// Which earlier results the current request needs, when the host judges it.
+    visibility: Option<Arc<dyn ResultVisibility>>,
 }
 
 /// A workspace path as a key: one separator, no leading `./`.
@@ -681,6 +781,7 @@ impl TurnDriver {
             stop_event: "stop",
             seen: Arc::default(),
             context_hooks: None,
+            visibility: None,
         }
     }
 
@@ -688,6 +789,13 @@ impl TurnDriver {
     #[must_use]
     pub fn with_context_hooks(mut self, hooks: Arc<dyn TurnContextHooks>) -> Self {
         self.context_hooks = Some(hooks);
+        self
+    }
+
+    /// Order what is shortened by what the current request needs.
+    #[must_use]
+    pub fn with_visibility(mut self, visibility: Arc<dyn ResultVisibility>) -> Self {
+        self.visibility = Some(visibility);
         self
     }
 
@@ -1798,10 +1906,23 @@ impl TurnDriver {
                 }
             }
             transcript.extend(appended);
+            // Over budget: ask the host which earlier results this request
+            // needs before any is shortened.
+            let ranks = match &self.visibility {
+                Some(visibility) if transcript_size(&transcript) > TRANSCRIPT_BUDGET_BYTES => {
+                    let candidates = trimmable_results(&transcript, KEEP_RECENT_RESULTS);
+                    tokio::select! {
+                        ranks = visibility.rank(&request.text, candidates) => ranks,
+                        () = cancellation.cancelled() => std::collections::HashMap::new(),
+                    }
+                }
+                _ => std::collections::HashMap::new(),
+            };
             let elided = trim_transcript(
                 &mut transcript,
                 TRANSCRIPT_BUDGET_BYTES,
                 KEEP_RECENT_RESULTS,
+                &ranks,
             );
             // A shortened result tells the model to call the tool again; that call
             // reads what the model can no longer see, so it is not a repeat. Measured:
@@ -2130,6 +2251,16 @@ async fn gate_action(
             tools
                 .execute_with_cancellation(prepared, None, cancellation.clone())
                 .await,
+        ));
+    }
+    // The host's command guard, in every mode: it can refuse what the policy
+    // allowed, never allow what it refused.
+    if let Some(reason) = tools.guard_refusal(&prepared, cancellation).await {
+        observer.observe(TurnProgress::Notice(format!(
+            "refused by the command guard: {reason}"
+        )));
+        return Ok(Gated::Done(
+            tools.record_hook_block(&prepared, &reason).await,
         ));
     }
     let answer = tools.run_pre_tool_hooks(&prepared, cancellation).await;
@@ -3711,12 +3842,53 @@ mod transcript_budget_tests {
         ]
     }
 
+    /// A ranker's judgment orders the cut: what this request does not need goes
+    /// first and what it needs whole stays, where oldest-first cut the reverse.
+    #[test]
+    fn a_ranked_transcript_cuts_what_the_request_does_not_need_first() {
+        use super::Visibility;
+        let mut transcript = (0..10)
+            .flat_map(|index| step(index, 30_000))
+            .collect::<Vec<_>>();
+        let ranks = [(1, Visibility::Full), (7, Visibility::Hide)]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let elided = trim_transcript(&mut transcript, 290_000, 6, &ranks);
+        assert_eq!(elided.len(), 3, "{elided:?}");
+        assert_eq!(transcript[1].content.len(), 30_000, "needed whole: kept");
+        assert_eq!(
+            transcript[7].content, ELIDED_RESULT,
+            "not needed: cut first"
+        );
+        assert_eq!(transcript[3].content, ELIDED_RESULT);
+        assert_eq!(transcript[5].content, ELIDED_RESULT);
+        let mut shortened = (0..10)
+            .flat_map(|index| step(index, 30_000))
+            .collect::<Vec<_>>();
+        let short = [(1, Visibility::Short)]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        trim_transcript(&mut shortened, 280_000, 6, &short);
+        assert!(
+            shortened[1]
+                .content
+                .starts_with("[earlier tool result shortened to its start")
+        );
+        assert!(shortened[1].content.ends_with(&"x".repeat(600)));
+    }
+
     #[test]
     fn the_oldest_results_are_shortened_first_and_the_newest_stay_whole() {
         let mut transcript = (0..10)
             .flat_map(|index| step(index, 30_000))
             .collect::<Vec<_>>();
-        let elided = trim_transcript(&mut transcript, 200_000, 6).len();
+        let elided = trim_transcript(
+            &mut transcript,
+            200_000,
+            6,
+            &std::collections::HashMap::new(),
+        )
+        .len();
         assert!(elided > 0);
         let results = transcript
             .iter()
@@ -3743,12 +3915,26 @@ mod transcript_budget_tests {
         let mut transcript = (0..20)
             .flat_map(|index| step(index, 15_000))
             .collect::<Vec<_>>();
-        assert!(!trim_transcript(&mut transcript, 200_000, 6).is_empty());
+        assert!(
+            !trim_transcript(
+                &mut transcript,
+                200_000,
+                6,
+                &std::collections::HashMap::new()
+            )
+            .is_empty()
+        );
         for index in 20..24 {
             let before = transcript.clone();
             transcript.extend(step(index, 5_000));
             assert!(
-                trim_transcript(&mut transcript, 200_000, 6).is_empty(),
+                trim_transcript(
+                    &mut transcript,
+                    200_000,
+                    6,
+                    &std::collections::HashMap::new()
+                )
+                .is_empty(),
                 "step {index} rewrote an older result"
             );
             assert_eq!(&transcript[..before.len()], &before[..]);
@@ -3761,7 +3947,15 @@ mod transcript_budget_tests {
             .flat_map(|index| step(index, 1_000))
             .collect::<Vec<_>>();
         let before = transcript.clone();
-        assert!(trim_transcript(&mut transcript, 200_000, 6).is_empty());
+        assert!(
+            trim_transcript(
+                &mut transcript,
+                200_000,
+                6,
+                &std::collections::HashMap::new()
+            )
+            .is_empty()
+        );
         assert_eq!(transcript, before);
     }
 }

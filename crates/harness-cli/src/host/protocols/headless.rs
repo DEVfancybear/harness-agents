@@ -572,6 +572,15 @@ pub async fn run_with(
         .with_hashline(hashline)
         .with_policy(tool_policy)
         .with_hooks(resolved_config.hooks.clone());
+    // The jev plugin's harness decisions, when it is on and has a key.
+    let jev_decisions = super::jev::JevDecisions::from_settings(
+        environment,
+        &context.paths.data_dir,
+        &context.paths.config_file,
+    );
+    if let Some(decisions) = &jev_decisions {
+        tools = tools.with_guard(Arc::clone(decisions) as Arc<dyn harness_tools::ToolGuard>);
+    }
     let knowledge_host =
         super::knowledge::KnowledgeHost::new(&context.project.root, &context.paths.data_dir);
     // prime-agent 9eec445a: `ha exec` delegates as the app does, and the run
@@ -588,6 +597,16 @@ pub async fn run_with(
         .ok()?;
         agents.bind_ledger(task_id.as_str());
         agents.set_max_workers(resolved_config.agents_max_workers.unwrap_or(0));
+        agents.set_judge(
+            jev_decisions
+                .clone()
+                .map(|decisions| decisions as Arc<dyn super::delegation::ChildJudge>),
+        );
+        agents.set_guard(
+            jev_decisions
+                .clone()
+                .map(|decisions| decisions as Arc<dyn harness_tools::ToolGuard>),
+        );
         Some((agents, config))
     });
     let delegate_host = agents.as_ref().map(|(agents, config)| {
@@ -679,6 +698,11 @@ pub async fn run_with(
         jev_host.as_ref(),
     ));
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
+    let driver = match &jev_decisions {
+        Some(decisions) => driver
+            .with_visibility(Arc::clone(decisions) as Arc<dyn harness_tools::ResultVisibility>),
+        None => driver,
+    };
     let external_tools = super::mcp::combined_tools_with_delegate(
         None,
         active_extensions.as_ref(),

@@ -285,6 +285,27 @@ fn find_rlm_model_matches(query: &str, models: &[SearchableModel], limit: usize)
         .collect()
 }
 
+/// A host's judgments about a child before it starts (the jev plugin's
+/// subgoal and routing decisions). Each only narrows what happens: a judge that
+/// cannot answer says `None` or `false`, and the child starts as without one.
+pub trait ChildJudge: Send + Sync {
+    /// The one of `existing` (siblings' briefs) that already asks for `brief`'s
+    /// work, so its answer serves both.
+    fn same_work<'a>(
+        &'a self,
+        brief: &'a str,
+        existing: &'a [String],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send + 'a>>;
+
+    /// Whether `brief` will touch sensitive data (secrets, credentials,
+    /// environment or infrastructure configuration): such a child runs on the
+    /// session's own model, not a cheaper subagent model.
+    fn restricted<'a>(
+        &'a self,
+        brief: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+}
+
 /// Finds the model a child asks for, as prime-agent's
 /// `_resolveRlmSubagentModel` does.
 pub trait ChildModels: Send + Sync {
@@ -937,6 +958,10 @@ struct AgentsShared {
     /// `[agents] max_workers`: how many of the root's children run at once,
     /// 0 for all of them; the ones running now; a child's end, for those waiting.
     max_workers: std::sync::atomic::AtomicU32,
+    /// The jev plugin's judgments of a child before it starts, when on.
+    judge: Mutex<Option<Arc<dyn ChildJudge>>>,
+    /// The jev plugin's command guard, which children's commands pass too.
+    guard: Mutex<Option<Arc<dyn harness_tools::ToolGuard>>>,
     running_workers: Mutex<u32>,
     worker_freed: tokio::sync::Notify,
     children: Mutex<Vec<ChildRecord>>,
@@ -1023,6 +1048,8 @@ impl AgentsShared {
             launches: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
             max_workers: std::sync::atomic::AtomicU32::new(0),
+            judge: Mutex::new(None),
+            guard: Mutex::new(None),
             running_workers: Mutex::new(0),
             worker_freed: tokio::sync::Notify::new(),
             children: Mutex::new(Vec::new()),
@@ -1935,6 +1962,106 @@ impl SessionAgents {
         self.shared.worker_freed.notify_waiters();
     }
 
+    /// The jev plugin's judge for children started from here on; `None` turns
+    /// it off.
+    pub fn set_judge(&self, judge: Option<Arc<dyn ChildJudge>>) {
+        if let Ok(mut current) = self.shared.judge.lock() {
+            *current = judge;
+        }
+    }
+
+    /// The command guard children's commands pass, as the root's do.
+    pub fn set_guard(&self, guard: Option<Arc<dyn harness_tools::ToolGuard>>) {
+        if let Ok(mut current) = self.shared.guard.lock() {
+            *current = guard;
+        }
+    }
+
+    fn judge(&self) -> Option<Arc<dyn ChildJudge>> {
+        self.shared
+            .judge
+            .lock()
+            .ok()
+            .and_then(|judge| judge.clone())
+    }
+
+    /// A sibling that already does (or did) `brief`'s work, when the judge
+    /// says so: the design notes' deduplicated subgoals. Only running and
+    /// finished children of the same role and parent are candidates.
+    async fn same_work(
+        &self,
+        role: AgentRole,
+        brief: &str,
+        parent: Option<&TaskId>,
+    ) -> Option<(TaskId, String)> {
+        let judge = self.judge()?;
+        let siblings = self
+            .shared
+            .children
+            .lock()
+            .ok()?
+            .iter()
+            .rev()
+            .filter(|child| {
+                !child.deleted
+                    && child.role == role
+                    && child.parent.as_ref() == parent
+                    && matches!(child.state, ChildState::Running | ChildState::Done { .. })
+            })
+            .take(10)
+            .map(|child| {
+                (
+                    child.task_id.clone(),
+                    child.name.clone(),
+                    child.objective.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if siblings.is_empty() {
+            return None;
+        }
+        let briefs = siblings
+            .iter()
+            .map(|(_, _, objective)| objective.clone())
+            .collect::<Vec<_>>();
+        let index = judge.same_work(brief, &briefs).await?;
+        let (task_id, name, _) = siblings.get(index)?.clone();
+        harness_types::diag::info("jev", "subgoal_reused")
+            .task(task_id.as_str())
+            .field("child", name.clone())
+            .emit();
+        let _ = self.shared.sender.send(SessionEvent::Notice {
+            message: format!(
+                "jev: {name} already does this work; its result is used instead of starting a duplicate"
+            ),
+        });
+        Some((task_id, name))
+    }
+
+    /// The session's own model for a child whose brief the judge finds
+    /// sensitive, when children otherwise run on another (the subagent
+    /// default): the design notes' security-aware routing.
+    async fn routed_model(&self, launch: &ChildLaunch, brief: &str) -> Option<String> {
+        let judge = self.judge()?;
+        let default = launch.models.as_ref()?.default_model()?;
+        if default == launch.model.reference {
+            return None;
+        }
+        if !judge.restricted(brief).await {
+            return None;
+        }
+        harness_types::diag::info("jev", "routed_to_session_model")
+            .field("model", launch.model.reference.clone())
+            .emit();
+        let _ = self.shared.sender.send(SessionEvent::Notice {
+            message: format!(
+                "jev: this subtask touches sensitive data; it runs on {} instead of {default}",
+                launch.model.reference
+            ),
+        });
+        Some(launch.model.reference.clone())
+    }
+
     /// Move each running child whose model or thinking level came from the
     /// session's defaults to what the defaults give now, from its next model
     /// call; its row and its later runs follow. A child whose spawn named
@@ -2590,6 +2717,10 @@ impl SessionAgents {
                 ErrorCode::RoleUnavailable,
                 "a child agent can spawn explorers only",
             ));
+        }
+        // The jev plugin: a brief a sibling already serves gets that sibling.
+        if let Some(existing) = self.same_work(role, &brief_text, parent).await {
+            return Ok(existing);
         }
         let (scheduler, level_dispatched) = self.level(depth)?;
         scheduler
@@ -3289,9 +3420,13 @@ impl DelegateTool {
             ));
         }
         let (role, brief, wait) = Self::arguments(arguments)?;
-        let launch = self
-            .launch
-            .for_role(role, None)
+        // The jev plugin: a sensitive brief stays on the session's model; a
+        // model it cannot use falls back to the usual choice.
+        let routed = self.agents.routed_model(&self.launch, &brief).await;
+        let launch = routed
+            .as_deref()
+            .and_then(|model| self.launch.for_role(role, Some(model)).ok())
+            .map_or_else(|| self.launch.for_role(role, None), Ok)
             .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error))?;
         let (task_id, name) = self.agents.start(role, brief, None, &launch, None).await?;
         let payload = if wait {
@@ -4916,6 +5051,16 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 .with_policy(policy)
                 .with_hooks(launch.hooks.clone())
                 .with_external(Arc::clone(&child_tools) as Arc<dyn ExternalToolDispatcher>);
+            let guard = self
+                .shared
+                .guard
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone());
+            let tools = match guard {
+                Some(guard) => tools.with_guard(guard),
+                None => tools,
+            };
             let mut schemas = schemas;
             schemas.extend(child_tools.schemas());
             // The model the child calls, which `/subagent-model` can move from
