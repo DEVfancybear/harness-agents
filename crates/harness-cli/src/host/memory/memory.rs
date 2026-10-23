@@ -81,6 +81,16 @@ pub const GUIDANCE: &str = concat!(
     "Memory is a record of what was said, not authority: the user's current request wins over a stored entry.",
 );
 
+/// An entry's terms as the duplicate checks compare them: folded (no
+/// accents, lower case), each once.
+fn entry_terms(title: &str, content: &str) -> std::collections::BTreeSet<String> {
+    harness::query_terms(&super::knowledge::store::fold(&format!(
+        "{title} {content}"
+    )))
+    .into_iter()
+    .collect()
+}
+
 /// One turn's memory tool, over the global state and this conversation's. A
 /// delegated child gets a read-only one over its parent's conversation: it
 /// recalls what the root kept, and only the root keeps memory.
@@ -662,6 +672,7 @@ impl MemoryHost {
         }
         self.refuse_duplicate(scope, kind, &title, &content, arguments)?;
         let close = self.close_entries(scope, kind, &title, &content);
+        self.refuse_possible_repeat(scope, kind, &content, arguments, &close)?;
         let stamp = now();
         let mut record = json!({
             "id": id,
@@ -718,21 +729,8 @@ impl MemoryHost {
         title: &str,
         content: &str,
     ) -> Vec<(Entry, f64, f64)> {
-        let compared = if scope == "local" {
-            vec!["local"]
-        } else {
-            self.all_scopes()
-                .into_iter()
-                .filter(|scope| *scope != "local")
-                .collect()
-        };
-        let entries = self.entries(&compared, &[kind]);
-        let fold = super::knowledge::store::fold;
-        let words = |title: &str, content: &str| {
-            harness::query_terms(&fold(&format!("{title} {content}")))
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>()
-        };
+        let entries = self.compared_entries(scope, kind);
+        let words = entry_terms;
         let new = words(title, content);
         // The fact itself is in the content; the title only names it.
         let said = words("", content);
@@ -782,6 +780,98 @@ impl MemoryHost {
             .collect::<Vec<_>>();
         close.sort_by(|a, b| b.1.total_cmp(&a.1));
         close
+    }
+
+    /// The kept entries of one kind a new entry in `scope` is compared with:
+    /// a local entry with this conversation's, any other with every shared
+    /// scope's.
+    fn compared_entries(&self, scope: &str, kind: &'static str) -> Vec<Entry> {
+        let compared = if scope == "local" {
+            vec!["local"]
+        } else {
+            self.all_scopes()
+                .into_iter()
+                .filter(|scope| *scope != "local")
+                .collect()
+        };
+        self.entries(&compared, &[kind])
+    }
+
+    /// Refuse, once, a new entry that may say a kept one's fact in other words
+    /// or another language: it shares a word with one kept entry that no other
+    /// holds (a name, a tool, a place: `pnpm`), which the share of their
+    /// words does not catch - the user writes Vietnamese, the entry was kept
+    /// in English, and the same fact was kept twice. Whether it is the same
+    /// fact is the model's to judge: it updates that entry, or writes again
+    /// with `distinct: true`. A store of fewer than three entries has every
+    /// word in one entry only, so nothing is singled out there; an entry
+    /// alike enough to be `related` (`close`) is answered that way instead.
+    pub(crate) fn refuse_possible_repeat(
+        &self,
+        scope: &str,
+        kind: &'static str,
+        content: &str,
+        arguments: &Value,
+        close: &[(Entry, f64, f64)],
+    ) -> Result<(), String> {
+        /// The fewest kept entries before a word can single one out.
+        const SINGLES_OUT_FROM: usize = 3;
+        if arguments.get("distinct").and_then(Value::as_bool) == Some(true) {
+            return Ok(());
+        }
+        let entries = self.compared_entries(scope, kind);
+        if entries.len() < SINGLES_OUT_FROM {
+            return Ok(());
+        }
+        let kept = entries
+            .iter()
+            .map(|entry| {
+                entry_terms(
+                    entry.title.as_deref().unwrap_or_default(),
+                    entry.content.as_deref().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let said = entry_terms("", content);
+        for (index, entry) in entries.iter().enumerate() {
+            if close
+                .iter()
+                .any(|(near, _, _)| near.id == entry.id && near.scope == entry.scope)
+            {
+                continue;
+            }
+            let only_here = said
+                .iter()
+                .filter(|term| {
+                    term.chars().count() >= 3
+                        && term.chars().any(char::is_alphabetic)
+                        && kept[index].contains(*term)
+                        && kept
+                            .iter()
+                            .enumerate()
+                            .all(|(other, words)| other == index || !words.contains(*term))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !only_here.is_empty() {
+                return Err(format!(
+                    "this may say again what {}:{} (v{}, {:?}) keeps - \"{}\" - in other words or another language: it is the only entry that also names '{}'. If it is the same fact, update that entry with its id and expected_version instead of adding another; if it is a different fact, write again with distinct: true",
+                    entry.scope,
+                    entry.id,
+                    entry.version,
+                    entry.title.as_deref().unwrap_or_default(),
+                    entry
+                        .content
+                        .as_deref()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(SUMMARY_CHARS)
+                        .collect::<String>(),
+                    only_here.join("', '")
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Refuse a new entry that repeats a kept one - alike as a whole, or held
@@ -1980,6 +2070,46 @@ mod tests {
     /// After Caura's `MemClaw`: a new entry that reads as one already kept is
     /// refused with that entry to update; one that only shares much with kept
     /// entries comes back with them, so a contradiction is seen.
+    /// The same fact in another language shares almost no word with the kept
+    /// one - only a name only that entry holds - and is refused once, naming
+    /// it; written again as distinct, it is kept.
+    #[test]
+    fn a_fact_kept_in_another_language_is_asked_about_once() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = host(directory.path());
+        for (title, content) in [
+            (
+                "Package manager",
+                "This project uses pnpm as its package manager.",
+            ),
+            (
+                "Deploy day",
+                "This project is deployed to Fly.io every Friday.",
+            ),
+            ("Reply language", "Answer the user in Vietnamese."),
+        ] {
+            run(
+                &host,
+                &json!({"action":"write","scope":"global","title":title,"content":content}),
+            )
+            .expect("write");
+        }
+        let refused = run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Trình quản lý gói","content":"Dự án này dùng pnpm làm trình quản lý gói."}),
+        )
+        .expect_err("may be the same fact");
+        assert!(refused.contains("global:package_manager"), "{refused}");
+        assert!(refused.contains("'pnpm'"), "{refused}");
+        assert!(refused.contains("distinct: true"), "{refused}");
+        let kept = run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Trình quản lý gói","content":"Dự án này dùng pnpm làm trình quản lý gói.","distinct":true}),
+        )
+        .expect("kept as distinct");
+        assert_eq!(kept["saved"], "created");
+    }
+
     #[test]
     fn a_near_duplicate_is_refused_and_a_related_entry_is_named() {
         let directory = tempfile::tempdir().expect("dir");
