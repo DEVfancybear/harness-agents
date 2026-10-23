@@ -1018,7 +1018,10 @@ where
     /// The terminal cannot be cleared.
     pub fn clear(&mut self) -> io::Result<()> {
         self.last_window = None;
-        self.terminal.clear().map_err(to_io)
+        self.terminal.clear().map_err(to_io)?;
+        // Written now: the backend gathers a frame until it is flushed, and
+        // what follows a clear may go to the console another way.
+        self.terminal.backend_mut().flush().map_err(to_io)
     }
 
     /// Draw one frame: the top bar, the window over the conversation, the dock.
@@ -1254,6 +1257,9 @@ where
             }
             frame.area()
         };
+        // The cursor is hidden while the frame is written and shown at its
+        // place after: left on, it ran across every row the frame wrote.
+        self.terminal.hide_cursor().map_err(to_io)?;
         self.scroll_window(area, drawn_window, drawn_top)?;
         let completed = self
             .terminal

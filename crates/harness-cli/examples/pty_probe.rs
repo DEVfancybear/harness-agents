@@ -11,7 +11,8 @@
 //! output went on), `until:<text>:<ms>` (wait until the app has written
 //! `text` since the step began, at most `ms`; the mark says whether it did). The raw bytes
 //! the app wrote go to `out.bin`; `out.bin.marks` lists the byte offset at which
-//! each step began.
+//! each step began, and `out.bin.reads` the offset at which each read from the
+//! console ended (how the output arrived in pieces).
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -55,6 +56,7 @@ fn main() {
     let mut reader = master.try_clone_reader().expect("reader");
     let writer = Arc::new(Mutex::new(master.take_writer().expect("writer")));
     let transcript = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let reads = Arc::new(Mutex::new(String::new()));
     // When output last arrived and input was last sent: how far the screen
     // lags behind the input.
     let started = Instant::now();
@@ -64,6 +66,7 @@ fn main() {
         let sink = Arc::clone(&transcript);
         let answer = Arc::clone(&writer);
         let arrived = Arc::clone(&last_output);
+        let pieces = Arc::clone(&reads);
         std::thread::spawn(move || {
             let mut chunk = [0_u8; 8192];
             while let Ok(read) = reader.read(&mut chunk) {
@@ -71,7 +74,10 @@ fn main() {
                     break;
                 }
                 let bytes = &chunk[..read];
-                sink.lock().expect("sink").extend_from_slice(bytes);
+                let mut sink = sink.lock().expect("sink");
+                sink.extend_from_slice(bytes);
+                let _ = writeln!(pieces.lock().expect("reads"), "{}", sink.len());
+                drop(sink);
                 *arrived.lock().expect("arrived") = Instant::now();
                 if bytes.windows(4).any(|window| window == b"\x1b[6n") {
                     let _ = answer.lock().expect("w").write_all(b"\x1b[1;1R");
@@ -206,5 +212,10 @@ fn main() {
     }
     std::fs::write(out, transcript.lock().expect("t").as_slice()).expect("write");
     std::fs::write(format!("{out}.marks"), marks).expect("marks");
+    std::fs::write(
+        format!("{out}.reads"),
+        reads.lock().expect("reads").as_str(),
+    )
+    .expect("reads");
     let _ = child.kill();
 }

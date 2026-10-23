@@ -481,11 +481,23 @@ where
     }
 }
 
+/// Where the fullscreen screen writes: a frame is gathered whole and written
+/// in one go when it is done. Rust's stdout passes a write on every 1 KB,
+/// so a frame went to the console in a dozen pieces, and a terminal that does
+/// not hold a frame for synchronized output (`?2026`, which Windows Terminal
+/// keeps only from 1.23) drew the window between them: on every wheel notch
+/// it showed the window scrolled with its new rows not yet written, a flicker
+/// while an agent streamed.
+type FrameWriter = io::BufWriter<io::Stdout>;
+
+/// Room for the largest frame: a full screen of styled cells.
+const FRAME_BUFFER_BYTES: usize = 1 << 20;
+
 /// What the real console shows: prime-agent's inline viewport, or its
 /// fullscreen screen.
 enum Screen {
     Inline(Box<RealRenderer<ratatui::backend::CrosstermBackend<io::Stdout>>>),
-    Fullscreen(Box<fullscreen::FullscreenScreen<ratatui::backend::CrosstermBackend<io::Stdout>>>),
+    Fullscreen(Box<fullscreen::FullscreenScreen<ratatui::backend::CrosstermBackend<FrameWriter>>>),
 }
 
 /// The real renderer: keys through the host backend, frames through ratatui.
@@ -723,6 +735,11 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
         }
         let backend = || ratatui::backend::CrosstermBackend::new(io::stdout());
         if on {
+            // A whole frame in one write; see `FrameWriter`.
+            let frames = ratatui::backend::CrosstermBackend::new(io::BufWriter::with_capacity(
+                FRAME_BUFFER_BYTES,
+                io::stdout(),
+            ));
             let Screen::Inline(inline) = &mut self.screen else {
                 return Ok(());
             };
@@ -734,7 +751,7 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
                 inline.shown = shown;
                 return Err(error);
             }
-            let screen = fullscreen::FullscreenScreen::open(backend(), &theme, detail, shown)?
+            let screen = fullscreen::FullscreenScreen::open(frames, &theme, detail, shown)?
                 .with_sidebar(self.sidebar)
                 .with_roster(self.roster.clone());
             self.screen = Screen::Fullscreen(Box::new(screen));

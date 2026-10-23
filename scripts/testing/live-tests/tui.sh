@@ -66,6 +66,13 @@ if [ -n "${PROBE_WT:-}" ]; then
   check "scrolled back, older rows are on screen and the newest is not" 'grep -q "muc " "$RX/wheel-up.txt" && ! grep -q MOC-CUOI "$RX/wheel-up.txt"'
   check "a notch writes the rows that came in, not the window (< 2000 bytes)" '[ "$per_notch" -lt 2000 ]'
   check "scrolled down again, the screen is the one it left" 'diff -q "$RX/wheel-start.txt" "$RX/wheel-back.txt" >/dev/null'
+  # (0.7.9) A terminal that does not hold a frame (Windows Terminal before its
+  # synchronized output) drew the cursor on every row a frame wrote: each
+  # frame hides it while it is written and shows it at its place after.
+  frames=$(grep -aoF $'\e[?2026l' "$RX/wheel.bin" | wc -l)
+  hidden=$(grep -aoF $'\e[?25l' "$RX/wheel.bin" | wc -l)
+  echo "   $frames frames, $hidden hid the cursor"
+  check "every frame hides the cursor while it is written" '[ "$frames" -gt 0 ] && [ "$hidden" -ge "$frames" ]'
 else
   echo "SKIP  the wheel checks: PROBE_WT is not set"
 fi
