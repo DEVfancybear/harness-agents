@@ -663,10 +663,13 @@ impl TaskStateHost {
         if let Some(expected) = arguments.get("expected_revision").and_then(Value::as_u64)
             && expected != state.revision
         {
-            return Err(refused(format!(
-                "task_state: the state is at revision {}, not {expected}; view it and update again",
-                state.revision
-            )));
+            return Err(HarnessError::new(
+                ErrorCode::RevisionConflict,
+                format!(
+                    "task_state: the state is at revision {}, not {expected}; view it and update again",
+                    state.revision
+                ),
+            ));
         }
         let notes = apply(&mut state, arguments)?;
         state.revision += 1;
@@ -953,6 +956,11 @@ mod tests {
             .execute(&json!({"action":"update","expected_revision":1,"objective":"x"}))
             .expect_err("stale");
         assert!(error.to_string().contains("revision 2"), "{error}");
+        assert_eq!(
+            error.retry_class(),
+            harness_types::RetryClass::Conflict,
+            "a stale revision is a conflict: read and write again"
+        );
     }
 
     #[test]

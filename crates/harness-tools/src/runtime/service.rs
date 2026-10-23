@@ -1108,7 +1108,14 @@ impl ToolExecutionService {
             // A read that failed changed nothing, so its outcome is known: the
             // error, which the model may correct and retry. "Side effect may be
             // uncertain" on a search that named a file kept models from retrying.
-            Err(error) if is_read_only(&call.transformed) => {
+            // So is a write refused because its state moved on (a stale
+            // revision): nothing was written, and the model reads and writes
+            // again - "do not rerun automatically" on a `task_state` update
+            // told it the opposite.
+            Err(error)
+                if is_read_only(&call.transformed)
+                    || error.retry_class() == harness_types::RetryClass::Conflict =>
+            {
                 self.settle(
                     &prepared,
                     execution_id,

@@ -116,6 +116,10 @@ pub enum ErrorCode {
     BackupManifestInvalid,
     RestoreTargetConflict,
     RetentionRefused,
+    /// The state a write was checked against had moved on (another writer
+    /// took the revision first): nothing was written; read it again and write
+    /// on top of it.
+    RevisionConflict,
     /// A remote resource answered that it does not exist (HTTP 404, 410):
     /// asking again will not find it.
     ResourceNotFound,
@@ -228,6 +232,7 @@ impl ErrorCode {
             Self::BackupManifestInvalid => "backup_manifest_invalid",
             Self::RestoreTargetConflict => "restore_target_conflict",
             Self::RetentionRefused => "retention_refused",
+            Self::RevisionConflict => "revision_conflict",
             Self::ResourceNotFound => "resource_not_found",
             Self::AccessDenied => "access_denied",
         }
@@ -310,7 +315,8 @@ impl ErrorCode {
             | Self::DuplicateFrameId
             | Self::SchemaVersionMismatch
             | Self::RestoreTargetConflict
-            | Self::RetentionRefused => RetryClass::Conflict,
+            | Self::RetentionRefused
+            | Self::RevisionConflict => RetryClass::Conflict,
             Self::RuntimeBlocked
             | Self::BlockedByHook
             | Self::ApprovalRequired
@@ -430,6 +436,7 @@ impl ErrorCode {
             | Self::DuplicateFrameId
             | Self::DuplicateRegistration
             | Self::RetentionRefused
+            | Self::RevisionConflict
             | Self::RestoreTargetConflict => 5,
             Self::StorageOpenFailed
             | Self::StorageWriteFailed

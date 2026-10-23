@@ -123,6 +123,11 @@
           "type": "string"
         },
         {
+          "const": "revision_conflict",
+          "description": "The state a write was checked against had moved on (another writer\ntook the revision first): nothing was written; read it again and write\non top of it.",
+          "type": "string"
+        },
+        {
           "const": "resource_not_found",
           "description": "A remote resource answered that it does not exist (HTTP 404, 410):\nasking again will not find it.",
           "type": "string"

@@ -375,6 +375,91 @@ async fn p3_a_program_that_is_not_found_is_a_plain_failure() {
     close_writer(store).await;
 }
 
+/// A write that answers `revision_conflict` (`task_state` with a stale
+/// `expected_revision`).
+struct StaleWrite;
+
+impl harness_tools::ExternalToolDispatcher for StaleWrite {
+    fn validate_external<'a>(
+        &'a self,
+        _plugin_id: &'a str,
+        _tool_name: &'a str,
+        _arguments: &'a Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), harness_types::HarnessError>> + Send + 'a>,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn dispatch_external<'a>(
+        &'a self,
+        _authorization: &'a harness_tools::ToolDispatchAuthorization,
+        _plugin_id: &'a str,
+        _tool_name: &'a str,
+        _arguments: &'a Value,
+        _timeout_ms: u64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ToolOutput, harness_types::HarnessError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Err(harness_types::HarnessError::new(
+                ErrorCode::RevisionConflict,
+                "task_state: the state is at revision 5, not 4; view it and update again",
+            ))
+        })
+    }
+}
+
+/// Seen in a session: `task_state update expected_revision=4` against
+/// revision 5 came back as "side effect may be uncertain; do not rerun
+/// automatically". Nothing was written: it settles as a plain refusal the
+/// model answers by reading the state and writing again.
+#[tokio::test]
+async fn p3_a_stale_revision_is_a_plain_refusal_not_an_unknown_outcome() {
+    let temp = TempDir::new().unwrap();
+    let root = setup_workspace(&temp);
+    let store = writer(&temp).await;
+    let (session, task, _) = admit(&store, &root).await;
+    let tools = ToolExecutionService::new(Arc::clone(&store)).with_external(Arc::new(StaleWrite));
+    let (prepared, approval) = prepared_and_approved(
+        &tools,
+        &session,
+        &task,
+        &root,
+        CodingToolAction::ExternalTool {
+            plugin_id: "task".to_owned(),
+            tool_name: "task_state".to_owned(),
+            arguments: json!({"action": "update", "expected_revision": 4}),
+            parent_invocation_id: None,
+            timeout_ms: 10_000,
+        },
+    )
+    .await;
+    let view = tools.execute(prepared, Some(approval)).await.unwrap();
+    let ToolOutput::Denied { code, reason } = &view.output else {
+        panic!("expected a plain refusal, got {:?}", view.output)
+    };
+    assert_eq!(code, "revision_conflict");
+    assert!(reason.contains("view it and update again"), "{reason}");
+    assert_eq!(
+        view.receipt.expect("receipt").outcome_state,
+        ToolOutcomeState::Settled
+    );
+    assert!(
+        store
+            .pending_tool_intents(&session)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(tools);
+    close_writer(store).await;
+}
+
 /// Seen in a session: `search_text path=README.md` failed with "`search_text`
 /// path must be a directory" under "side effect may be uncertain; do not rerun
 /// automatically" - for a read. A file is searched now, and a read that fails

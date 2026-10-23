@@ -369,13 +369,26 @@ impl ToolPolicy {
             tool_name,
             ..
         } = action
-            && ((plugin_id == "skill"
-                && matches!(
-                    tool_name.as_str(),
-                    "list_skills" | "activate_skill" | "read_skill_file"
-                ))
+            && plugin_id == "skill"
+            && matches!(
+                tool_name.as_str(),
+                "list_skills" | "activate_skill" | "read_skill_file"
+            )
+        {
+            return Decision::Allow {
+                reason: "skill catalogue (read-only)".to_owned(),
+            };
+        }
+        // The rest change only ha's own state; they were labelled "skill
+        // catalogue (read-only)" too, on a `task_state` update.
+        if let CodingToolAction::ExternalTool {
+            plugin_id,
+            tool_name,
+            ..
+        } = action
+            && (
                 // Marking the user's own goal complete changes only host state.
-                || (plugin_id == "goal" && tool_name == "goal_complete")
+                (plugin_id == "goal" && tool_name == "goal_complete")
                 // So does the task's own checklist.
                 || (plugin_id == "task" && tool_name == "task_state")
                 // The feature list is host state too; a verification runs only the
@@ -385,10 +398,11 @@ impl ToolPolicy {
                 // A delegated child's message to its family and its progress note
                 // stay inside the session, as prime-agent's agent messages do.
                 || (plugin_id == "agent"
-                    && matches!(tool_name.as_str(), "agent_message" | "progress_note")))
+                    && matches!(tool_name.as_str(), "agent_message" | "progress_note"))
+            )
         {
             return Decision::Allow {
-                reason: "skill catalogue (read-only)".to_owned(),
+                reason: "ha's own state".to_owned(),
             };
         }
         // A web search sends a query to the search provider and nothing else, like the
