@@ -897,7 +897,32 @@ fn http_error(what: &str, status: reqwest::StatusCode) -> HarnessError {
             "the request was refused as it is; repeating it will not change that",
         ),
     };
-    HarnessError::new(code, format!("{what} answered {status}: {advice}"))
+    let mut message = format!("{what} answered {status}: {advice}");
+    if status.as_u16() == 404
+        && let Some(tree) = github_tree(what)
+    {
+        // A guessed path in a repository is the usual 404 there: its file
+        // list says what the path is.
+        let _ = write!(message, ". The repository's files: web_fetch {tree}");
+    }
+    HarnessError::new(code, message)
+}
+
+/// The file-list URL of the GitHub repository and branch a `blob`, `tree` or
+/// raw file URL is in.
+fn github_tree(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let parts = parsed.path_segments()?.collect::<Vec<_>>();
+    let (owner, repo, branch) = match parsed.host_str()? {
+        "github.com" if parts.len() >= 4 && matches!(parts[2], "blob" | "tree") => {
+            (parts[0], parts[1], parts[3])
+        }
+        "raw.githubusercontent.com" if parts.len() >= 3 => (parts[0], parts[1], parts[2]),
+        _ => return None,
+    };
+    Some(format!(
+        "https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
+    ))
 }
 
 /// Read a response body, stopping at [`MAX_DOWNLOAD_BYTES`].
@@ -1549,6 +1574,26 @@ impl ExternalToolDispatcher for WebHost {
 
 #[cfg(test)]
 mod tests {
+    /// A 404 on a GitHub file names the repository's file list.
+    #[test]
+    fn a_missing_github_file_points_at_the_file_list() {
+        let error = super::http_error(
+            "https://github.com/owner/repo/blob/main/docs/invariants.md",
+            reqwest::StatusCode::NOT_FOUND,
+        );
+        assert!(
+            error.to_string().contains(
+                "web_fetch https://api.github.com/repos/owner/repo/git/trees/main?recursive=1"
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            super::github_tree("https://raw.githubusercontent.com/o/r/dev/a.md").as_deref(),
+            Some("https://api.github.com/repos/o/r/git/trees/dev?recursive=1")
+        );
+        assert!(super::github_tree("https://example.com/a/b/blob/c/d").is_none());
+    }
+
     use super::{
         SearchApi, Searcher, WebHost, deepseek_query, format_serper, html_to_text, is_private_host,
         parse_duckduckgo, window_of,

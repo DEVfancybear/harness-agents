@@ -52,7 +52,7 @@ impl Poller {
             .spawn(move || {
                 loop {
                     let listed = client::user_registry()
-                        .map(|directory| client::list_all(&directory))
+                        .map(|directory| client::list_all_quick(&directory))
                         .unwrap_or_default();
                     let entries = entries(
                         &scope,

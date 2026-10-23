@@ -27,6 +27,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 const LIVENESS_EVERY: Duration = Duration::from_secs(1);
 /// How long a question to the worker may take; starting an agent is the slow one.
 const CALL_TIMEOUT: Duration = Duration::from_secs(150);
+/// How long a screen's poll waits for one worker's list.
+const LIST_TIMEOUT: Duration = Duration::from_millis(1500);
 /// How long a new worker has to write its descriptor.
 const START_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a key waits for what it produced before the frame is drawn.
@@ -143,12 +145,20 @@ impl Connection {
     }
 
     fn open_within(descriptor: &Descriptor, limit: Duration) -> Result<Self, String> {
+        Self::open_answering(descriptor, limit, CALL_TIMEOUT)
+    }
+
+    fn open_answering(
+        descriptor: &Descriptor,
+        limit: Duration,
+        answer: Duration,
+    ) -> Result<Self, String> {
         let address = SocketAddr::from(([127, 0, 0, 1], descriptor.port));
         let stream = TcpStream::connect_timeout(&address, limit)
             .map_err(|error| format!("the worker at {address} does not answer: {error}"))?;
         let _ = stream.set_nodelay(true);
         stream
-            .set_read_timeout(Some(CALL_TIMEOUT))
+            .set_read_timeout(Some(answer))
             .map_err(|error| error.to_string())?;
         let reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
         let mut connection = Self {
@@ -481,6 +491,45 @@ pub fn list_all(directory: &Path) -> Vec<Listed> {
         }));
     }
     listed
+}
+
+/// Every agent of every worker that answers at once, the workers asked side
+/// by side: what a screen polls every second. A worker that misses the probe,
+/// or does not list within [`LIST_TIMEOUT`], is left out of this poll - no
+/// `tasklist`, no two-second retry - so a busy or stale one no longer holds
+/// back every other's rows. [`list_all`] stays for the commands, which wait.
+#[must_use]
+pub fn list_all_quick(directory: &Path) -> Vec<Listed> {
+    let keys = registry::all(directory);
+    std::thread::scope(|scope| {
+        let polls = keys
+            .into_iter()
+            .map(|(key, _)| {
+                scope.spawn(move || {
+                    let descriptor = registry::read(&registry::descriptor_path(directory, &key))?;
+                    let mut connection =
+                        Connection::open_answering(&descriptor, PROBE_TIMEOUT, LIST_TIMEOUT)
+                            .ok()?;
+                    let value = connection.call(&Request::List).ok()?;
+                    let agents: Vec<AgentInfo> = serde_json::from_value(value).unwrap_or_default();
+                    Some(
+                        agents
+                            .into_iter()
+                            .map(|agent| Listed {
+                                descriptor: descriptor.clone(),
+                                agent,
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        polls
+            .into_iter()
+            .filter_map(|poll| poll.join().ok().flatten())
+            .flatten()
+            .collect()
+    })
 }
 
 /// The agent `selector` names, across every worker.

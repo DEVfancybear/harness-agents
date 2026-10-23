@@ -914,7 +914,7 @@ pub fn run(
                 let registry = view.registry.clone();
                 let loaded = loaded_sender.clone();
                 std::thread::spawn(move || {
-                    let _ = loaded.send((client::list_all(&registry), None));
+                    let _ = loaded.send((client::list_all_quick(&registry), None));
                 });
             }
             if !event::poll(Duration::from_millis(250)).map_err(|error| error.to_string())? {

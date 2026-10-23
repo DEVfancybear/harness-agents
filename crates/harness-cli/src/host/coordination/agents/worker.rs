@@ -1117,6 +1117,9 @@ struct Agent {
     last_full: Instant,
     /// A redraw that waits for [`FRAME_EVERY`] to pass.
     redraw_due: bool,
+    /// Effects that wait, in order, for the next frame: each streamed chunk
+    /// used to send - and before that serialize and compare - the whole view.
+    held: Vec<Effect>,
     /// The worker, whose journal is written again when the agent moves to
     /// another conversation.
     worker: Weak<Worker>,
@@ -1217,6 +1220,7 @@ impl Agent {
             dirty: false,
             last_full: Instant::now(),
             redraw_due: false,
+            held: Vec::new(),
             worker: Weak::clone(worker),
         };
         if let Some(prompt) = spec.prompt {
@@ -1289,24 +1293,33 @@ impl Agent {
                 self.touch();
             }
             if !pumped.is_empty() {
-                // Only redraws can wait: anything else is part of the
-                // conversation and keeps its order with the replies to keys.
-                let only_redraw = pumped.iter().all(|effect| matches!(effect, Effect::Redraw));
-                if only_redraw && self.last_full.elapsed() < FRAME_EVERY {
+                // Within a frame, effects wait for the next one, in order;
+                // whatever is sent next - a reply to a key included - sends
+                // them first, so the conversation keeps its order.
+                if self.last_full.elapsed() < FRAME_EVERY {
+                    self.held.extend(
+                        pumped
+                            .into_iter()
+                            .filter(|effect| !matches!(effect, Effect::Redraw)),
+                    );
                     self.redraw_due = true;
                 } else {
-                    self.forward(&pumped, None);
+                    self.send(pumped, None);
                 }
             }
             if !ticked.is_empty() {
-                if self.dirty || self.redraw_due || self.last_full.elapsed() >= FULL_EVERY {
-                    self.forward(&ticked, None);
+                if self.dirty
+                    || self.redraw_due
+                    || !self.held.is_empty()
+                    || self.last_full.elapsed() >= FULL_EVERY
+                {
+                    self.send(ticked, None);
                 } else {
                     self.forward_tick();
                 }
             }
             if self.redraw_due && self.last_full.elapsed() >= FRAME_EVERY {
-                self.forward(&[Effect::Redraw], None);
+                self.send(vec![Effect::Redraw], None);
             }
             slow.note("frames", begun);
             if self.last_status.elapsed() >= STATUS_EVERY {
@@ -1365,7 +1378,7 @@ impl Agent {
                 key,
             } => {
                 let effects = self.controller.handle_key(key);
-                self.forward(&effects, Some((connection, seq)));
+                self.send(effects, Some((connection, seq)));
             }
             Command::Columns {
                 connection,
@@ -1398,12 +1411,12 @@ impl Agent {
                     from_agent,
                     &mut effects,
                 );
-                self.forward(&effects, None);
+                self.send(effects, None);
                 let _ = reply.send(Ok(outcome));
             }
             Command::Abort { reply } => {
                 let (aborted, effects) = self.controller.abort_run();
-                self.forward(&effects, None);
+                self.send(effects, None);
                 let _ = reply.send(aborted);
             }
             Command::LastAnswer { reply } => {
@@ -1466,6 +1479,16 @@ impl Agent {
     /// attached terminals: to the one that typed key `ack` as its answer, and
     /// to the others as a frame. `/quit` detaches only the terminal that typed
     /// it; the agent carries on.
+    /// Forward `effects` after the ones held for the frame, in that order.
+    fn send(&mut self, effects: Vec<Effect>, ack: Option<(u64, u64)>) {
+        let mut all = std::mem::take(&mut self.held);
+        all.extend(effects);
+        if all.is_empty() {
+            all.push(Effect::Redraw);
+        }
+        self.forward(&all, ack);
+    }
+
     fn forward(&mut self, effects: &[Effect], ack: Option<(u64, u64)>) {
         let mut exit = false;
         for effect in effects {
