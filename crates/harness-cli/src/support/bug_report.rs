@@ -54,6 +54,21 @@ struct Point {
     task: Option<String>,
 }
 
+/// One usage-limit park of a conversation, as its records tell it.
+struct Park {
+    task: String,
+    at: i64,
+    until: i64,
+    /// When a model's answer ended it early.
+    lifted: Option<i64>,
+    /// When its resume job came due.
+    fired: Option<i64>,
+    /// When its resume started a turn.
+    resumed: Option<i64>,
+    /// Model calls of the conversation answered while it was parked.
+    answered: usize,
+}
+
 /// The report as it is gathered: files by their path in the zip.
 struct Report {
     options: Options,
@@ -817,7 +832,7 @@ impl Report {
                 ) {
                     self.problem(format!("run ended {state} ({stop})"), ms);
                 }
-                ("info", "run", format!("{state} {stop}"))
+                ("info", "run", format!("started; ended {state} {stop}"))
             }
             "context_checkpoints" => (
                 "info",
@@ -841,7 +856,11 @@ impl Report {
                     ),
                     ms,
                 );
-                ("warn", "runtime.command", clip(&error, 300))
+                (
+                    "warn",
+                    "runtime.command",
+                    format!("started; ended {}", clip(&error, 300)),
+                )
             }
             _ => return,
         };
@@ -995,6 +1014,7 @@ impl Report {
         self.summary_header(&mut out);
         self.summary_problems(&mut out);
         self.summary_patterns(&mut out);
+        self.summary_parks(&mut out);
         self.summary_activity(&mut out);
         self.summary_jev(&mut out);
         self.summary_children(&mut out);
@@ -1103,6 +1123,198 @@ impl Report {
         out.push('\n');
     }
 
+    /// The records of one `kind.event` of one conversation between two times
+    /// (exclusive), oldest first.
+    fn recorded_between(
+        &self,
+        kind: &str,
+        event: &str,
+        task: &str,
+        from: i64,
+        to: i64,
+    ) -> Vec<&Value> {
+        self.recorded(kind, event)
+            .into_iter()
+            .filter(|record| record["task"].as_str() == Some(task))
+            .filter(|record| {
+                let at = record["ms"].as_i64().unwrap_or_default();
+                at > from && at < to
+            })
+            .collect()
+    }
+
+    /// Each usage-limit park as one row: when, until when, and how it ended -
+    /// lifted by an answer, resumed by its job, or still waiting. A park that
+    /// outlived the limit (the model answered for half an hour while its
+    /// resume still waited) was found only by reading the schedule file.
+    fn parks(&self) -> Vec<Park> {
+        let parks = self.recorded("provider", "quota_parked");
+        let mut rows = Vec::new();
+        for (index, park) in parks.iter().enumerate() {
+            let task = park["task"].as_str().unwrap_or_default().to_owned();
+            let at = park["ms"].as_i64().unwrap_or_default();
+            let until = park["fields"]["until"]
+                .as_str()
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map_or(at, |until| until.timestamp_millis());
+            // The next park of the conversation ends this one's span.
+            let next = parks[index + 1..]
+                .iter()
+                .find(|other| other["task"].as_str() == Some(task.as_str()))
+                .and_then(|other| other["ms"].as_i64())
+                .unwrap_or(i64::MAX);
+            let first = |kind: &str, event: &str, keep: &dyn Fn(&Value) -> bool| {
+                self.recorded_between(kind, event, &task, at, next)
+                    .into_iter()
+                    .find(|record| keep(record))
+                    .and_then(|record| record["ms"].as_i64())
+            };
+            let lifted = first("provider", "quota_lifted", &|_| true);
+            let fired = first("schedule", "fired", &|record| {
+                record["fields"]["kind"] == "quota_resume"
+            });
+            let resumed = first("turn", "start", &|record| {
+                record["fields"]["by"] == "quota_resume"
+            });
+            let ended = lifted.or(resumed).unwrap_or(next.min(until));
+            let answered = self
+                .recorded_between("provider", "call", &task, at, ended.min(until))
+                .len();
+            rows.push(Park {
+                task,
+                at,
+                until,
+                lifted,
+                fired,
+                resumed,
+                answered,
+            });
+        }
+        rows
+    }
+
+    fn summary_parks(&self, out: &mut String) {
+        let parks = self.parks();
+        if parks.is_empty() {
+            return;
+        }
+        let _ = writeln!(out, "## Quota parks\n");
+        let _ = writeln!(
+            out,
+            "| parked | conversation | until | answered while parked | ended |"
+        );
+        let _ = writeln!(out, "|---|---|---|---|---|");
+        let now = now_ms();
+        for park in &parks {
+            let ended = match (park.lifted, park.resumed, park.fired) {
+                (Some(at), _, _) => format!("lifted {}: the model answered", ms_text(at)),
+                (None, Some(at), _) => format!("resumed {}", ms_text(at)),
+                (None, None, Some(at)) => {
+                    format!("its resume came due {} and started no turn", ms_text(at))
+                }
+                (None, None, None) if park.until > now => "still parked".to_owned(),
+                (None, None, None) => "no resume recorded".to_owned(),
+            };
+            let _ = writeln!(
+                out,
+                "| {} | `{}` | {} | {} | {ended} |",
+                ms_text(park.at),
+                short_id(&park.task),
+                ms_text(park.until),
+                park.answered,
+            );
+        }
+        let _ = writeln!(out);
+    }
+
+    /// What the records show went wrong although nothing failed: a park that
+    /// outlived its limit, a resume that came due inside a running turn or
+    /// after the work was done, a rate limit retried in seconds that the
+    /// provider said lasts minutes.
+    fn found_problems(&self) -> Vec<String> {
+        let mut found = Vec::new();
+        for park in self.parks() {
+            if park.lifted.is_none() && park.answered > 0 {
+                found.push(format!(
+                    "`{}` was parked from {} until {}, but the model answered {} call(s) in that time and the park was not lifted",
+                    short_id(&park.task),
+                    ms_text(park.at),
+                    ms_text(park.until),
+                    park.answered
+                ));
+            }
+        }
+        let starts = self.recorded("turn", "start");
+        let ends = self.recorded("turn", "terminal");
+        for fired in self.recorded("schedule", "fired") {
+            if fired["fields"]["kind"] != "quota_resume" {
+                continue;
+            }
+            let task = fired["task"].as_str().unwrap_or_default();
+            let at = fired["ms"].as_i64().unwrap_or_default();
+            let start = newest_by(&starts, task, at).and_then(|record| record["ms"].as_i64());
+            let end = newest_by(&ends, task, at);
+            let ended_at = end.and_then(|record| record["ms"].as_i64());
+            if start.is_some_and(|start| ended_at.is_none_or(|end| end < start)) {
+                found.push(format!(
+                    "a park's resume ({}) came due at {} while a turn of `{}` was running",
+                    fired["fields"]["job"].as_str().unwrap_or("?"),
+                    ms_text(at),
+                    short_id(task)
+                ));
+            } else if let Some(end) = end
+                && end["fields"]["outcome"] == "done"
+            {
+                found.push(format!(
+                    "a park's resume ({}) came due at {} after the turn before it ended done ({})",
+                    fired["fields"]["job"].as_str().unwrap_or("?"),
+                    ms_text(at),
+                    ms_text(end["ms"].as_i64().unwrap_or_default())
+                ));
+            }
+        }
+        // The runtime waits at most 30 s between attempts.
+        let mut retried: BTreeMap<String, (usize, u64, i64)> = BTreeMap::new();
+        for record in self.recorded("provider", "attempt_failed") {
+            let fields = &record["fields"];
+            let reset = fields["retry_after_ms"].as_u64().unwrap_or_default();
+            let last = fields["attempt"].as_u64() >= fields["max_attempts"].as_u64();
+            if fields["code"] != "rate_limited" || reset <= 30_000 || last {
+                continue;
+            }
+            let entry = retried
+                .entry(record["task"].as_str().unwrap_or("-").to_owned())
+                .or_insert((0, 0, record["ms"].as_i64().unwrap_or_default()));
+            entry.0 += 1;
+            entry.1 = entry.1.max(reset);
+        }
+        for (task, (count, reset, first)) in retried {
+            found.push(format!(
+                "`{}` retried a rate limit {count} time(s) from {} although the provider said it resets in up to {} min",
+                short_id(&task),
+                ms_text(first),
+                reset / 60_000
+            ));
+        }
+        found
+    }
+
+    /// The models a conversation's calls named, in the order it first used them.
+    fn models_used(&self, task: &str) -> Vec<String> {
+        let mut models: Vec<String> = Vec::new();
+        for record in self.recorded("provider", "call") {
+            if record["task"].as_str() != Some(task) {
+                continue;
+            }
+            if let Some(model) = record["fields"]["model"].as_str()
+                && !models.iter().any(|seen| seen == model)
+            {
+                models.push(model.to_owned());
+            }
+        }
+        models
+    }
+
     /// The delegated children: who, on which model, how they ended and why.
     fn summary_children(&self, out: &mut String) {
         if self.children.is_empty() {
@@ -1142,12 +1354,20 @@ impl Report {
                 .as_str()
                 .map(|error| self.clip_cell(error))
                 .unwrap_or_default();
+            // Every model its calls named, in order: a child that ran on one
+            // model and was woken on another showed only the last.
+            let used = self.models_used(child["task_id"].as_str().unwrap_or_default());
+            let model = if used.len() > 1 {
+                used.join(" → ")
+            } else {
+                child["model"].as_str().unwrap_or("-").to_owned()
+            };
             let _ = writeln!(
                 out,
                 "| `{}` | {} | {} | {} | {} | {} | {} |",
                 child["name"].as_str().unwrap_or("?"),
                 child["role"].as_str().unwrap_or("?"),
-                child["model"].as_str().unwrap_or("-"),
+                model,
                 child["status"].as_str().unwrap_or("?"),
                 child["duration_ms"]
                     .as_u64()
@@ -1192,15 +1412,32 @@ impl Report {
             let _ = writeln!(out, "## Turns\n");
             let _ = writeln!(
                 out,
-                "| ended | conversation | outcome | steps | tool calls |"
+                "| ended | conversation | started by | model | outcome | steps | tool calls |"
             );
-            let _ = writeln!(out, "|---|---|---|---|---|");
+            let _ = writeln!(out, "|---|---|---|---|---|---|---|");
+            let starts = self.recorded("turn", "start");
+            let models = self.recorded("turn", "model");
             for record in turns.iter().rev().take(30).rev() {
+                let task = record["task"].as_str().unwrap_or("-");
+                let end = record["ms"].as_i64().unwrap_or_default();
+                let by = newest_by(&starts, task, end)
+                    .and_then(|start| start["fields"]["by"].as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "-".to_owned());
+                let model = newest_by(&models, task, end).map_or_else(
+                    || "-".to_owned(),
+                    |model| {
+                        let name = model["fields"]["model"].as_str().unwrap_or("?").to_owned();
+                        match model["fields"]["thinking"].as_str() {
+                            Some(thinking) => format!("{name} {thinking}"),
+                            None => name,
+                        }
+                    },
+                );
                 let _ = writeln!(
                     out,
-                    "| {} | `{}` | {} | {} | {} |",
-                    ms_text(record["ms"].as_i64().unwrap_or_default()),
-                    short_id(record["task"].as_str().unwrap_or("-")),
+                    "| {} | `{}` | {by} | {model} | {} | {} | {} |",
+                    ms_text(end),
+                    short_id(task),
                     record["fields"]["outcome"].as_str().unwrap_or("?"),
                     field(record, "steps").map_or_else(|| "-".to_owned(), |n| n.to_string()),
                     field(record, "tool_calls").map_or_else(|| "-".to_owned(), |n| n.to_string()),
@@ -1631,9 +1868,37 @@ impl Report {
             }
             out.push('\n');
         }
+        any |= self.summary_found_and_stored(out);
+        if !any {
+            let _ = writeln!(
+                out,
+                "Nothing was recorded as an error or a warning in the window.\n"
+            );
+        }
+    }
+
+    /// The problems the records show although nothing failed, and those the
+    /// stores show; whether there were any.
+    fn summary_found_and_stored(&self, out: &mut String) -> bool {
+        let mut any = false;
+        let found = self.found_problems();
+        if !found.is_empty() {
+            any = true;
+            let _ = writeln!(out, "### Found in the records\n");
+            for line in &found {
+                let _ = writeln!(out, "- {line}");
+            }
+            out.push('\n');
+        }
         if !self.store_problems.is_empty() {
             any = true;
             let _ = writeln!(out, "### From the stores\n");
+            // A command's row is stamped when it was created: one that failed
+            // two minutes later read as failing at once.
+            let _ = writeln!(
+                out,
+                "Times are when each row was created - an attempt's, a run's or a command's start - not when it failed; the records above have when it failed.\n"
+            );
             let _ = writeln!(out, "| count | first | last | what |");
             let _ = writeln!(out, "|---|---|---|---|");
             let mut rows = self.store_problems.iter().collect::<Vec<_>>();
@@ -1649,12 +1914,7 @@ impl Report {
             }
             out.push('\n');
         }
-        if !any {
-            let _ = writeln!(
-                out,
-                "Nothing was recorded as an error or a warning in the window.\n"
-            );
-        }
+        any
     }
 
     fn summary_timeline(&self, out: &mut String) {
@@ -1741,6 +2001,16 @@ impl Report {
         }
         zip.finish()
     }
+}
+
+/// The newest of `records` of conversation `task` at or before `at`.
+fn newest_by<'a>(records: &[&'a Value], task: &str, at: i64) -> Option<&'a Value> {
+    records
+        .iter()
+        .filter(|record| record["task"].as_str() == Some(task))
+        .filter(|record| record["ms"].as_i64().unwrap_or_default() <= at)
+        .max_by_key(|record| record["ms"].as_i64().unwrap_or_default())
+        .copied()
 }
 
 fn point_json(point: &Point) -> Value {

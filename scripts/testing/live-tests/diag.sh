@@ -133,6 +133,9 @@ check "it names the refused provider" 'grep -Eqi "provider|no-such-model" "$S"'
 check "its timeline has the turns and the compaction" 'grep -q "turn.start" "$RX/report/timeline.jsonl" && grep -q "compaction\." "$RX/report/timeline.jsonl"'
 check "it holds the stores and the workers' logs" 'ls "$RX"/report/store/project-*.json >/dev/null && ls "$RX"/report/workers/*.log >/dev/null'
 check "its summary has the turns and the model calls" 'grep -q "^## Turns" "$S" && grep -q "^## Model calls" "$S"'
+# 0.7.8: `turn.start` named a model only when the turn chose one.
+check "an agent's turn recorded the model it ran on" '[ "$(records worker "r[\"kind\"]==\"turn\" and r[\"event\"]==\"model\" and \"/\" in f.get(\"model\",\"\")")" -ge 1 ]'
+check "the turns table says who started each turn and on which model" 'grep -q "| started by | model |" "$S" && grep -Eq "\| user \| [A-Za-z0-9._-]+/[A-Za-z0-9._-]+" "$S"'
 # The tools table needs a tool call recorded: the turns here may answer without one.
 check "its tools table is there when a tool call was recorded" '! grep -qh "\"kind\":\"tool\"" "$RX"/report/diagnostics/*.jsonl || grep -q "^## Tools" "$S"'
 check "the model calls carry their tokens and duration" 'grep -q "\"event\":\"call\"" "$RX"/report/diagnostics/*.jsonl && grep -q "duration_ms" "$RX"/report/diagnostics/*.jsonl'

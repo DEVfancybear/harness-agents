@@ -238,6 +238,13 @@ pub const MAX_PAUSE: Duration = Duration::from_hours(24);
 /// prime-agent's `QUOTA_RESUME_MARKER_TEXT`: the prompt a parked session wakes with.
 pub const QUOTA_RESUME_PROMPT: &str = "<provider_quota_resumed>\nThe provider usage limit that paused this session has been reported as reset; this resume is automatic. Continue the interrupted task from where it stopped.\n</provider_quota_resumed>";
 
+/// Whether `text` is a park's resume: the prompt as its scheduled job sends
+/// it, after the job's `[heartbeat: at ... run#1]` line.
+#[must_use]
+pub fn is_quota_resume(text: &str) -> bool {
+    text.trim_end().ends_with(QUOTA_RESUME_PROMPT.trim())
+}
+
 /// prime-agent's `parseProviderResetMs`: a recovery window the provider names
 /// in its error text, such as the `ChatGPT` plan's "Try again in ~7272 min."
 #[must_use]
@@ -327,6 +334,8 @@ pub struct Router {
     /// provider again, fail on the same limit, and end the turn with that bare
     /// error instead of the one saying when the session resumes.
     parked: Mutex<Option<ProviderError>>,
+    /// Whether the session model has answered this turn, said once.
+    answered: AtomicBool,
     told: Mutex<Vec<String>>,
 }
 
@@ -359,6 +368,7 @@ impl Router {
             on_backup: AtomicBool::new(false),
             gave_up: AtomicBool::new(false),
             parked: Mutex::new(None),
+            answered: AtomicBool::new(false),
             told: Mutex::new(Vec::new()),
         }
     }
@@ -516,18 +526,7 @@ impl Router {
                         self.waiting(None);
                     }
                     if matches!(first, Some(Ok(_))) {
-                        self.failures.store(0, Ordering::SeqCst);
-                        let left = self
-                            .left_primary
-                            .lock()
-                            .ok()
-                            .and_then(|mut left| left.take());
-                        if left.is_some() {
-                            self.notice(format!(
-                                "Primary provider recovered — back on {}",
-                                self.primary
-                            ));
-                        }
+                        self.primary_answered();
                     }
                     return Box::pin(
                         futures_util::stream::iter(head.into_iter().chain(first)).chain(stream),
@@ -602,6 +601,27 @@ impl Router {
 }
 
 impl Router {
+    /// The session model answered: its failures are forgotten, the session
+    /// hears once a turn that it answers (the end of a usage-limit park), and
+    /// a primary a previous turn left for the backup is announced as back.
+    fn primary_answered(&self) {
+        self.failures.store(0, Ordering::SeqCst);
+        if !self.answered.swap(true, Ordering::SeqCst) {
+            let _ = self.sender.send(SessionEvent::PrimaryAnswered);
+        }
+        let left = self
+            .left_primary
+            .lock()
+            .ok()
+            .and_then(|mut left| left.take());
+        if left.is_some() {
+            self.notice(format!(
+                "Primary provider recovered — back on {}",
+                self.primary
+            ));
+        }
+    }
+
     /// prime-agent's `providerWaitDecision`: a reported reset within the
     /// remaining bound is waited for exactly; one beyond it parks the session
     /// until then (the error is the turn's); otherwise the doubling backoff.
@@ -638,10 +658,19 @@ impl Router {
             + chrono::Duration::from_std(pause).unwrap_or(chrono::Duration::zero());
         let at = until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let _ = self.sender.send(SessionEvent::QuotaParked { until });
+        // The provider's own words without its code: the error carries
+        // `rate_limited` already, and it read `rate_limited: ...: rate_limited:`;
+        // a park at the first refusal said "Retry failed after 0 attempts".
+        let said = harness_types::without_code_prefix(error.code(), error.to_string());
+        let retried = if attempts == 0 {
+            String::new()
+        } else {
+            format!("Retry failed after {attempts} attempts: ")
+        };
         let parked = ProviderError::new(
             ErrorCode::RateLimited,
             format!(
-                "Retry failed after {attempts} attempts: provider reported recovery in {}s, beyond the wait bound of {}s. Session parked until {at} and will resume automatically: {error}",
+                "{retried}provider reported recovery in {}s, beyond the wait bound of {}s. Session parked until {at} and will resume automatically: {said}",
                 reset.as_secs(),
                 wait.max_total.as_secs()
             ),
@@ -1314,12 +1343,61 @@ mod tests {
                 error.to_string().contains("will resume automatically"),
                 "{error}"
             );
+            // Parked at the first refusal: no "after 0 attempts", and the
+            // provider's words without a second `rate_limited:`.
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("rate_limited: provider reported recovery in 12240s"),
+                "{error}"
+            );
+            assert_eq!(
+                error.to_string().matches("rate_limited").count(),
+                1,
+                "{error}"
+            );
         }
         assert_eq!(
             primary.calls(),
             1,
             "the parked turn asked the provider once"
         );
+    }
+
+    /// The router says once a turn that the session model answered: the end of
+    /// a park the provider's usage limit set, however early.
+    #[tokio::test]
+    async fn q13_an_answer_is_said_once_a_turn() {
+        let primary = Failing::new(&[harness_types::ErrorCode::RateLimited]);
+        let (turn, mut events) =
+            router(true, None, None, Some(quick(3)), std::sync::Arc::default());
+        let token = harness_providers::CancellationToken::new;
+        for _ in 0..2 {
+            call(&turn, primary.clone(), request(false), token())
+                .await
+                .expect("answers");
+        }
+        let mut answered = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(
+                event,
+                crate::interactive::events::SessionEvent::PrimaryAnswered
+            ) {
+                answered += 1;
+            }
+        }
+        assert_eq!(answered, 1);
+
+        // A turn that never got an answer says nothing.
+        let refusing = Failing::always(harness_types::ErrorCode::InvalidPayload);
+        let (turn, mut events) = router(true, None, None, None, std::sync::Arc::default());
+        let _ = call(&turn, refusing, request(false), token()).await;
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(
+                event,
+                crate::interactive::events::SessionEvent::PrimaryAnswered
+            ));
+        }
     }
 
     #[tokio::test]

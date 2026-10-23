@@ -2252,6 +2252,7 @@ impl InteractiveController {
         if self.free_for_automatic_turn() && !self.notices_held && self.pending_notices.is_empty() {
             effects.extend(self.dispatch(notice, true));
         } else {
+            self.note_held(&notice, self.pending_notices.len());
             self.pending_notices.push_back(notice);
             let message = if self.parked() {
                 format!(
@@ -2269,6 +2270,7 @@ impl InteractiveController {
     /// messages: into the running turn at its next step, or as a turn of its own.
     fn deliver_agent_message(&mut self, text: String, effects: &mut Vec<Effect>) {
         if self.phase.has_active_run() && self.service.deliver_message(&text).is_ok() {
+            note_delivery("steered", &text, "turn_running", 0);
             self.push_history(
                 effects,
                 HistoryItem::Notice {
@@ -2281,8 +2283,30 @@ impl InteractiveController {
         {
             effects.extend(self.dispatch(text, true));
         } else {
+            self.note_held(&text, self.pending_notices.len());
             self.pending_notices.push_back(text);
         }
+    }
+
+    /// Why what the host would send waits instead of starting a turn, for its
+    /// record: a bug report could not tell which reports, messages and
+    /// resumes waited, for what, or when they ran.
+    fn hold_reason(&self) -> &'static str {
+        if self.parked() {
+            "parked"
+        } else if self.notices_held {
+            "after_cancel"
+        } else if self.phase.has_active_run() {
+            "turn_running"
+        } else if self.pending_approval.is_some() || self.pending_question.is_some() {
+            "waiting_for_user"
+        } else {
+            "queued_behind"
+        }
+    }
+
+    fn note_held(&self, text: &str, ahead: usize) {
+        note_delivery("held", text, self.hold_reason(), ahead);
     }
 
     fn deliver_heartbeats(&mut self) -> Vec<Effect> {
@@ -2300,10 +2324,12 @@ impl InteractiveController {
                 && due.delivery == super::heartbeat::Delivery::Steer
                 && self.service.steer(&due.text).is_ok()
             {
+                note_delivery("steered", &due.text, "turn_running", 0);
                 effects.push(Effect::History(HistoryItem::Notice {
                     message: "heartbeat steered into the running turn".to_owned(),
                 }));
             } else {
+                self.note_held(&due.text, self.pending_heartbeats.len());
                 self.pending_heartbeats.push_back(due.text);
             }
         }
@@ -3141,6 +3167,35 @@ impl InteractiveController {
                     Err(message) => HistoryItem::Error { message },
                 };
                 self.push_history(effects, item);
+            }
+            // A session parked until 07:25 took the user's turn at 06:55 and
+            // worked through it; at 07:25 the park's resume still came due,
+            // asking it to "continue the interrupted task" after the task was
+            // done. A model call answered is the park's end.
+            SessionEvent::PrimaryAnswered => {
+                let waiting = self.pending_heartbeats.len();
+                self.pending_heartbeats
+                    .retain(|text| !super::routing::is_quota_resume(text));
+                let cancelled = self.service.unpark();
+                if self.parked_until.take().is_some()
+                    || cancelled.is_some()
+                    || waiting != self.pending_heartbeats.len()
+                {
+                    harness_types::diag::info("provider", "quota_lifted")
+                        .field("job", cancelled.clone().unwrap_or_default())
+                        .field("dropped", waiting - self.pending_heartbeats.len())
+                        .emit();
+                    self.push_history(
+                        effects,
+                        HistoryItem::Notice {
+                            message: format!(
+                                "the model answers again; the usage-limit park is over{}",
+                                cancelled
+                                    .map_or_else(String::new, |id| format!(" ({id} cancelled)"))
+                            ),
+                        },
+                    );
+                }
             }
             SessionEvent::AgentMessage { text } => {
                 self.deliver_agent_message(text, effects);
@@ -6421,6 +6476,19 @@ fn bash_done_notice(pid: u64, command: &str, exit_code: i64) -> String {
         "[bash-done pid:{pid} exit:{exit_code}]\n\nCommand: {}",
         serde_json::to_string(command).unwrap_or_default()
     )
+}
+
+/// What became of a message the host sends on its own (a child's report or
+/// message, a heartbeat, a park's resume, a background command's end):
+/// `held` with why and how many wait ahead of it, or `steered` into the
+/// running turn. Its kind only, never its text; the turn it starts later is
+/// `turn.start` with the same kind as `by`.
+fn note_delivery(event: &'static str, text: &str, reason: &str, ahead: usize) {
+    harness_types::diag::info("delivery", event)
+        .field("kind", super::service::message_source(text))
+        .field("reason", reason)
+        .field("ahead", ahead)
+        .emit();
 }
 
 /// A path as the composer should hold it: quoted, because a path with spaces is one token
@@ -11279,6 +11347,76 @@ Command: \"npm run build\""
             })
             .expect("child event");
         effects_to_plain(&harness.controller.pump_events())
+    }
+
+    /// Seen in a bug report: a `ChatGPT` plan's limit parked the session until
+    /// 07:25 ("try again in ~32 min"), the user typed again at 06:55 and the
+    /// model answered for half an hour; at 07:25 the park's resume still came
+    /// due inside that turn and waited to "continue the interrupted task"
+    /// after the task was done. The model's answer ends the park: what
+    /// children report is read at once, and the resume does not run.
+    #[test]
+    fn an_answer_ends_the_park_before_its_reset() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "giao cho 3 explorer");
+        harness
+            .events
+            .send(SessionEvent::QuotaParked {
+                until: chrono::Utc::now() + chrono::Duration::minutes(32),
+            })
+            .expect("park");
+        let _ = harness.controller.pump_events();
+        end_with(
+            &mut harness,
+            RunOutcome::Failed("rate_limited: usage limit".to_owned()),
+        );
+        assert!(harness.controller.parked());
+
+        // The user's own turn runs while parked, and its model answers.
+        let _ = submit_text(&mut harness.controller, "tiếp tục");
+        harness
+            .events
+            .send(SessionEvent::PrimaryAnswered)
+            .expect("answer");
+        let said = effects_to_plain(&harness.controller.pump_events());
+        assert!(!harness.controller.parked());
+        assert!(
+            said.iter().any(|line| line.contains("park is over")),
+            "{said:?}"
+        );
+        // The resume that came due inside the turn is dropped.
+        harness
+            .port
+            .heartbeats_due
+            .lock()
+            .expect("heartbeats")
+            .push(crate::interactive::heartbeat::Due {
+                // As the park's job sends it.
+                text: format!(
+                    "[heartbeat: at 2026-10-23T07:25:59Z run#1]\n\n{}",
+                    super::super::routing::QUOTA_RESUME_PROMPT
+                ),
+                delivery: crate::interactive::heartbeat::Delivery::FollowUp,
+            });
+        let _ = harness.controller.pump_events();
+        harness
+            .events
+            .send(SessionEvent::PrimaryAnswered)
+            .expect("answer");
+        let _ = harness.controller.pump_events();
+        assert!(harness.controller.pending_heartbeats.is_empty());
+        end_with(&mut harness, RunOutcome::Done);
+        let _ = child_settled(&mut harness, "[child-done child:scout]\n\nfound it");
+        let sent = submissions(&harness);
+        assert_eq!(sent.len(), 3, "{sent:?}");
+        assert!(sent[2].contains("[child-done child:scout]"), "{sent:?}");
+        assert!(
+            !sent
+                .iter()
+                .any(|text| text.contains("provider_quota_resumed")),
+            "{sent:?}"
+        );
     }
 
     /// Seen when a `ChatGPT` plan's usage limit parked a session: each of six

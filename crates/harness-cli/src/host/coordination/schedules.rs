@@ -599,6 +599,36 @@ impl Schedules {
         }
     }
 
+    /// Cancel the one-shot job still waiting to run `prompt`, as [`Self::once_at`]
+    /// keeps one: the id of the job cancelled, if one was waiting.
+    pub fn cancel_once(&self, prompt: &str, now: DateTime<Utc>) -> Result<Option<String>, String> {
+        // Asked after every turn's first answer: the file is written only
+        // when there is a job to cancel.
+        let waiting = self.inner.lock().is_ok_and(|inner| {
+            inner.jobs.iter().any(|job| {
+                job.status == Status::Active
+                    && job.schedule.kind == Kind::Once
+                    && job.prompt == prompt.trim()
+            })
+        });
+        if !waiting {
+            return Ok(None);
+        }
+        self.change(|jobs| {
+            let Some(job) = jobs.iter_mut().find(|job| {
+                job.status == Status::Active
+                    && job.schedule.kind == Kind::Once
+                    && job.prompt == prompt.trim()
+            }) else {
+                return Ok(None);
+            };
+            job.status = Status::Cancelled;
+            job.next_run_at = None;
+            job.updated_at = now;
+            Ok(Some(job.id.clone()))
+        })
+    }
+
     /// Pause, resume or cancel a job.
     pub fn set_status(&self, id: &str, action: &str, now: DateTime<Utc>) -> Result<Job, String> {
         self.change(|jobs| {
@@ -656,6 +686,13 @@ impl Schedules {
         let Ok(mut inner) = self.inner.lock() else {
             return due;
         };
+        // The file is the conversation's: `<task>.json`.
+        let task = inner
+            .path
+            .as_ref()
+            .and_then(|path| path.file_stem())
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
         for job in inner
             .jobs
             .iter_mut()
@@ -664,6 +701,26 @@ impl Schedules {
             if job.next_run_at.is_none_or(|next| next > now) {
                 continue;
             }
+            // A park's resume came due inside a turn that was running fine and
+            // left no record: only the file's `lastRunAt` showed it ran.
+            let late = job
+                .next_run_at
+                .map_or(0, |next| (now - next).num_seconds().max(0));
+            harness_types::diag::info("schedule", "fired")
+                .task(&task)
+                .field("job", job.id.clone())
+                .field(
+                    "kind",
+                    if crate::interactive::routing::is_quota_resume(&job.prompt) {
+                        "quota_resume"
+                    } else {
+                        "job"
+                    },
+                )
+                .field("delivery", job.delivery().as_str())
+                .field("run", job.run_count + 1)
+                .field("late_s", late)
+                .emit();
             job.run_count += 1;
             job.last_run_at = Some(now);
             job.updated_at = now;
@@ -907,6 +964,41 @@ mod tests {
         assert!(super::tasks_with_due_resume(dir.path(), "another prompt", due_at).is_empty());
         assert_eq!(schedules.due(due_at).len(), 1);
         assert!(super::tasks_with_due_resume(dir.path(), prompt, due_at).is_empty());
+    }
+
+    /// A park the model's answer ended before its reset: its resume is
+    /// cancelled, on disk too, and the jobs beside it are left alone.
+    #[test]
+    fn a_park_ended_early_cancels_its_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_for(dir.path(), "task-parked");
+        let schedules = Schedules::default();
+        schedules.bind(path.clone());
+        let now = Utc.with_ymd_and_hms(2026, 10, 23, 6, 53, 21).unwrap();
+        let reset = Utc.with_ymd_and_hms(2026, 10, 23, 7, 25, 59).unwrap();
+        let prompt = "<resume>continue</resume>";
+        command(&schedules, Some("add every 10m -- look at the build")).unwrap();
+        assert_eq!(schedules.cancel_once(prompt, now).unwrap(), None);
+        let job = schedules
+            .once_at(reset, prompt, Delivery::FollowUp, now)
+            .unwrap();
+        let answered = now + chrono::Duration::minutes(2);
+        assert_eq!(
+            schedules.cancel_once(prompt, answered).unwrap(),
+            Some(job.id)
+        );
+        assert!(schedules.due(reset).is_empty(), "the resume does not run");
+        assert!(super::tasks_with_due_resume(dir.path(), prompt, reset).is_empty());
+        let again = Schedules::default();
+        again.bind(path);
+        let listed = command(&again, Some("list")).unwrap();
+        assert!(listed[0].starts_with("job-1 active"), "{listed:?}");
+        assert!(listed[1].starts_with("job-2 cancelled"), "{listed:?}");
+        // The next park waits as a job of its own.
+        let later = schedules
+            .once_at(reset, prompt, Delivery::FollowUp, answered)
+            .unwrap();
+        assert_eq!(later.id, "job-3");
     }
 
     #[test]

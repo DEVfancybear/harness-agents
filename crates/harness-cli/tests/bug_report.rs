@@ -589,3 +589,214 @@ fn a_bug_report_shows_what_jev_decided() {
     assert!(jev.contains("left=## Release process"), "{jev}");
     assert!(jev.contains("command=python src/sync_keys.py"), "{jev}");
 }
+
+/// The session a bug report was traced from: a `ChatGPT` plan's limit parked
+/// it ("~32 min"), the user typed again and the model answered while it was
+/// parked, the park's resume came due inside that running turn, and a child
+/// retried the limit every 30 s. The report names each, lists the park with
+/// how it ended, says who started each turn on which model, and shows every
+/// model a child ran on.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one traced session's records, written and read back"
+)]
+fn a_bug_report_traces_a_park_and_what_waited() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path();
+    let data = home.join("data");
+    let now = chrono::Utc::now().timestamp_millis();
+    let at = |minutes: i64| now - 3_600_000 / 2 + minutes * 60_000;
+    let ts = |ms: i64| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    };
+    let parent = "task_01a16781-91e7-76d9-904b-9f8d4a73ed4c";
+    let child = "task_01a16785-ed91-71c9-9d27-548c5d50c94e";
+    let record = |ms: i64, level: &str, kind: &str, event: &str, task: &str, fields| {
+        serde_json::json!({"v":1,"ms":ms,"ts":ts(ms),"pid":9,"role":"worker","level":level,"kind":kind,"event":event,"msg":"","task":task,"fields":fields}).to_string()
+    };
+    let call = |ms: i64, task: &str, model: &str| {
+        record(
+            ms,
+            "info",
+            "provider",
+            "call",
+            task,
+            serde_json::json!({"model":model,"duration_ms":4000,"input":1000,"output":10}),
+        )
+    };
+    let records = [
+        record(
+            at(0),
+            "info",
+            "turn",
+            "start",
+            parent,
+            serde_json::json!({"by":"user","model":null}),
+        ),
+        record(
+            at(0),
+            "info",
+            "turn",
+            "model",
+            parent,
+            serde_json::json!({"model":"openai-codex/gpt-6.1-sol","thinking":"max"}),
+        ),
+        call(at(0) + 1_000, child, "gpt-6-luna"),
+        call(at(0) + 2_000, child, "gpt-6.1-sol"),
+        record(
+            at(1),
+            "warn",
+            "provider",
+            "attempt_failed",
+            child,
+            serde_json::json!({"code":"rate_limited","attempt":1,"max_attempts":3,"retry_after_ms":1_935_000}),
+        ),
+        record(
+            at(1),
+            "warn",
+            "provider",
+            "quota_parked",
+            parent,
+            serde_json::json!({"until": ts(at(20))}),
+        ),
+        record(
+            at(1) + 1_000,
+            "error",
+            "turn",
+            "terminal",
+            parent,
+            serde_json::json!({"outcome":"failed","steps":8,"tool_calls":13}),
+        ),
+        record(
+            at(1) + 2_000,
+            "info",
+            "delivery",
+            "held",
+            parent,
+            serde_json::json!({"kind":"child_report","reason":"parked","ahead":0}),
+        ),
+        record(
+            at(3),
+            "info",
+            "turn",
+            "start",
+            parent,
+            serde_json::json!({"by":"user","model":null}),
+        ),
+        call(at(4), parent, "gpt-6.1-sol"),
+        call(at(5), parent, "gpt-6.1-sol"),
+        record(
+            at(20),
+            "info",
+            "schedule",
+            "fired",
+            parent,
+            serde_json::json!({"job":"job-1","kind":"quota_resume","delivery":"follow_up","run":1,"late_s":0}),
+        ),
+        record(
+            at(22),
+            "info",
+            "turn",
+            "terminal",
+            parent,
+            serde_json::json!({"outcome":"done","steps":75,"tool_calls":83}),
+        ),
+    ];
+    let diagnostics = data.join("diagnostics");
+    std::fs::create_dir_all(&diagnostics).unwrap();
+    std::fs::write(
+        diagnostics.join("20261023-worker-18460.jsonl"),
+        records.join("\n") + "\n",
+    )
+    .unwrap();
+    let ledger = data.join("delegation").join("ledger");
+    std::fs::create_dir_all(&ledger).unwrap();
+    std::fs::write(
+        ledger.join(format!("{parent}.json")),
+        serde_json::json!([{
+            "task_id": child, "name": "explorer-5d50c94e", "role": "explorer",
+            "model": "openai-codex/gpt-6.1-sol", "depth": 1, "parent": null,
+            "status": "completed", "error": null,
+            "duration_ms": 162_000, "tool_calls": 9, "answer": null
+        }])
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = home.join("park.zip");
+    let report = ha(
+        home,
+        &[
+            "bug-report",
+            "--since",
+            "1h",
+            "--task",
+            parent,
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let entries = entries(&std::fs::read(&out).unwrap());
+    let summary = &entries[0].1;
+    let section = |name: &str| {
+        summary
+            .split(&format!("## {name}"))
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .unwrap_or_else(|| panic!("a {name} section: {summary}"))
+            .to_owned()
+    };
+    let found = section("Problems");
+    assert!(found.contains("### Found in the records"), "{found}");
+    assert!(
+        found.contains("the model answered 2 call(s) in that time and the park was not lifted"),
+        "{found}"
+    );
+    assert!(
+        found.contains("a park's resume (job-1) came due at") && found.contains("while a turn of"),
+        "{found}"
+    );
+    assert!(
+        found.contains("retried a rate limit 1 time(s)")
+            && found.contains("resets in up to 32 min"),
+        "{found}"
+    );
+    assert!(found.contains("not when it failed") || !found.contains("From the stores"));
+    let parks = section("Quota parks");
+    let row = parks
+        .lines()
+        .find(|line| line.starts_with("| ") && line.contains("`task"))
+        .unwrap_or_else(|| panic!("a park's row: {parks}"));
+    assert!(
+        row.contains("| 2 |") && row.contains("its resume came due"),
+        "{row}"
+    );
+    let turns = section("Turns");
+    assert!(turns.contains("| started by | model |"), "{turns}");
+    assert!(
+        turns.contains("| user | openai-codex/gpt-6.1-sol max | done |"),
+        "{turns}"
+    );
+    let children = section("Sub-agents");
+    assert!(
+        children.contains("| gpt-6-luna → gpt-6.1-sol |"),
+        "{children}"
+    );
+    let timeline = &entries
+        .iter()
+        .find(|(name, _)| name == "timeline.jsonl")
+        .expect("the timeline")
+        .1;
+    for what in ["delivery.held", "schedule.fired", "turn.model"] {
+        assert!(timeline.contains(what), "{what} in the timeline");
+    }
+}

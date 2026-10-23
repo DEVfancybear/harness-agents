@@ -1271,6 +1271,9 @@ pub enum SessionEvent {
     QuotaParked {
         until: chrono::DateTime<chrono::Utc>,
     },
+    /// The session model answered one of a turn's calls (once a turn): a park
+    /// the usage limit set is over, even before the reset the provider named.
+    PrimaryAnswered,
     /// A delegated child settled and nobody was waiting for its result:
     /// prime-agent's terminal notice (`[child-failed ...]`, `[child-exited ...]`),
     /// which the parent reads in a turn of its own once it is idle.

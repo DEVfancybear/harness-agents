@@ -2138,6 +2138,13 @@ impl SessionAgents {
             {
                 continue;
             }
+            harness_types::diag::info("child", "model_changed")
+                .task(task_id.as_str())
+                .field("child", name.clone())
+                .field("from", launch.model.reference.clone())
+                .field("model", model.reference.clone())
+                .field("thinking", model.thinking.clone())
+                .emit();
             if let Ok(mut launches) = self.shared.launches.lock()
                 && let Some(stored) = launches.get_mut(&task_id)
             {
@@ -2918,6 +2925,8 @@ impl SessionAgents {
             .field("role", role.as_str())
             .field("depth", depth)
             .field("max_depth", describe_max_depth(max_depth))
+            .field("model", launch.model.reference.clone())
+            .field("thinking", launch.model.thinking.clone())
             .emit();
         Ok((task_id, name))
     }

@@ -427,6 +427,12 @@ pub trait SessionPort: Send {
     fn park_until(&mut self, _until: chrono::DateTime<chrono::Utc>) -> Result<String, String> {
         Err("this backend cannot park a session".to_owned())
     }
+    /// End the park early: the session model answered before the reset the
+    /// provider named, so its resume job is cancelled. The job's id, if one
+    /// was waiting.
+    fn unpark(&mut self) -> Option<String> {
+        None
+    }
     /// `/tree <n> --summarize [focus]`: the next turn summarises the turns the
     /// switch leaves. Called before [`Self::switch_to`].
     fn plan_branch_summary(&mut self, _focus: Option<String>) -> Result<(), String> {
@@ -1717,6 +1723,11 @@ impl LiveTurn {
         config: ProviderConfig,
         level: Option<harness_providers::ThinkingLevel>,
     ) {
+        harness_types::diag::info("model", "selected")
+            .field("for", "session")
+            .field("model", format!("{}/{}", config.provider_id, config.model))
+            .field("thinking", level.map(|level| level.as_str().to_owned()))
+            .emit();
         if let Ok(mut current) = self.selection.lock() {
             current.config = Some(config);
             if level.is_some() {
@@ -3164,8 +3175,17 @@ fn turn_source(request: &SubmitRequest) -> &'static str {
     if !request.automatic {
         return "user";
     }
-    let text = request.text.trim_start();
-    if text.starts_with("[child-exited") || text.starts_with("[child-failed") {
+    message_source(&request.text)
+}
+
+/// What a message the host sends on its own is: the kind a turn it starts, or
+/// its wait for one, is recorded under. Only the kind: never its text.
+pub(crate) fn message_source(text: &str) -> &'static str {
+    let text = text.trim_start();
+    // A park's resume comes as a scheduled job: `[heartbeat: at ...]` first.
+    if super::routing::is_quota_resume(text) {
+        "quota_resume"
+    } else if text.starts_with("[child-") {
         "child_report"
     } else if text.starts_with("[agent-message") {
         "agent_message"
@@ -3190,6 +3210,16 @@ pub enum SubagentSetting {
     Set(String),
     /// Remove `subagentDefaultModel`: children run on their parent's model.
     Inherit,
+}
+
+/// `/subagent-model` or `/subagent-thinking` changed the children's default
+/// (`None`: they follow this agent): when the children's model changed is
+/// otherwise found only by the model their calls name.
+fn subagent_default_noted(what: &'static str, value: Option<&str>) {
+    harness_types::diag::info("model", "selected")
+        .field("for", "subagents")
+        .field(what, value.unwrap_or("inherit"))
+        .emit();
 }
 
 /// Move the running children that follow the session's defaults, and say
@@ -4726,6 +4756,13 @@ impl SessionPort for AgentSessionService {
             "Session parked until {at}; it resumes automatically ({} - /schedule cancel {} stops it)",
             job.id, job.id
         ))
+    }
+
+    fn unpark(&mut self) -> Option<String> {
+        self.schedules
+            .cancel_once(super::routing::QUOTA_RESUME_PROMPT, chrono::Utc::now())
+            .ok()
+            .flatten()
     }
 
     fn import_session(&mut self, path: &str) -> Result<String, String> {
@@ -6518,6 +6555,7 @@ impl SessionPort for AgentSessionService {
             }),
             SubagentSetting::Inherit => {
                 super::config::save_setting(&self.config_file, "subagentDefaultThinking", None)?;
+                subagent_default_noted("thinking", None);
                 Ok(format!(
                     "Subagent thinking cleared: children run at this agent's level{}",
                     moved_children(&self.agents)
@@ -6534,6 +6572,7 @@ impl SessionPort for AgentSessionService {
                     "subagentDefaultThinking",
                     Some(serde_json::json!(parsed.as_str())),
                 )?;
+                subagent_default_noted("thinking", Some(parsed.as_str()));
                 Ok(format!(
                     "Subagent thinking set: {} (saved as subagentDefaultThinking); a child's model that lacks it uses the nearest level it offers{}",
                     parsed.as_str(),
@@ -6565,6 +6604,7 @@ impl SessionPort for AgentSessionService {
             }
             SubagentSetting::Inherit => {
                 super::config::save_setting(&self.config_file, "subagentDefaultModel", None)?;
+                subagent_default_noted("model", None);
                 Ok(format!(
                     "Subagent model cleared: children run on this agent's model{}",
                     moved_children(&self.agents)
@@ -6593,6 +6633,7 @@ impl SessionPort for AgentSessionService {
                     "subagentDefaultModel",
                     Some(serde_json::json!(model)),
                 )?;
+                subagent_default_noted("model", Some(&model));
                 Ok(format!(
                     "Subagent model set: {model} (saved as subagentDefaultModel); children that named no model run on it from their next call{}",
                     moved_children(&self.agents)
@@ -8059,6 +8100,14 @@ async fn run_turn(
     // What `/model` and `/effort` change while this turn runs reaches its next
     // model call.
     live.start(thinking_level);
+    // `turn.start` names a model only when the turn chose one: a bug report
+    // read `model=null` and had to find it in the model calls.
+    harness_types::diag::info("turn", "model")
+        .task(task_id.as_str())
+        .session(session_id.as_str())
+        .field("model", format!("{}/{}", config.provider_id, config.model))
+        .field("thinking", thinking_level.as_str())
+        .emit();
     let _ = (credentials, capabilities);
     let provider = LiveProvider::new(
         Arc::clone(&live),

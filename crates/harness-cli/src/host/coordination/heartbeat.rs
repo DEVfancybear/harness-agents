@@ -31,7 +31,7 @@ pub enum Delivery {
 }
 
 impl Delivery {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Steer => "steer",
             Self::FollowUp => "follow_up",
@@ -450,6 +450,16 @@ impl Heartbeats {
             if heartbeat.next_run_ms > now_ms {
                 continue;
             }
+            harness_types::diag::info("schedule", "fired")
+                .field("job", heartbeat.id.clone())
+                .field("kind", "heartbeat")
+                .field("delivery", heartbeat.delivery.as_str())
+                .field("run", heartbeat.run_count + 1)
+                .field(
+                    "late_s",
+                    now_ms.saturating_sub(heartbeat.next_run_ms) / 1000,
+                )
+                .emit();
             heartbeat.run_count += 1;
             heartbeat.last_run_at = Some(now_label());
             // A session that was busy for several intervals - or closed - runs
