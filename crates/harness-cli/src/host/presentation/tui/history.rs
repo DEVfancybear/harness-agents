@@ -1121,7 +1121,7 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
             let here: String = here.chars().take(44).collect();
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
-                format!(" {here} "),
+                format!(" ⎇ {here} "),
                 theme.branch.patch(theme.chip),
             ));
         }

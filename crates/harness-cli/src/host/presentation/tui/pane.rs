@@ -111,8 +111,8 @@ pub fn render(frame: &mut Frame, area: Rect, pane: View<'_>, theme: &Theme) {
             footer.push(Span::styled(format!("{model} "), theme.muted));
         }
         if !workplace.is_empty() && room > 4 {
-            let workplace: String = workplace.chars().take(room - 2).collect();
-            footer.push(Span::styled(format!(" {workplace} "), theme.branch));
+            let workplace: String = workplace.chars().take(room - 4).collect();
+            footer.push(Span::styled(format!(" ⎇ {workplace} "), theme.branch));
         }
         block = block.title_bottom(Line::from(footer).left_aligned());
     }

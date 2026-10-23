@@ -639,15 +639,16 @@ fn find<'a>(state: &'a UiState, prefix: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
-/// Where an agent works, as every view writes it: `⎇ branch`, and the
-/// worktree's folder after it when the agent works in a worktree of its own
-/// (`⎇ feat/x · ha-078`). Empty when neither is known.
+/// Where an agent works, as every view writes it: the branch, and the
+/// worktree's folder after it when the agent works in a linked worktree
+/// (`feat/x · ha-078`). Empty when neither is known. The chip and a pane's
+/// footer put `⎇` before it; the sidebar names it bare, as it named the
+/// branch.
 #[must_use]
 pub fn place(branch: Option<&str>, worktree: Option<&str>) -> String {
     match (branch, worktree) {
-        (Some(branch), Some(tree)) => format!("⎇ {branch} · {tree}"),
-        (Some(branch), None) => format!("⎇ {branch}"),
-        (None, Some(tree)) => format!("⎇ {tree}"),
+        (Some(branch), Some(tree)) => format!("{branch} · {tree}"),
+        (Some(name), None) | (None, Some(name)) => name.to_owned(),
         (None, None) => String::new(),
     }
 }
