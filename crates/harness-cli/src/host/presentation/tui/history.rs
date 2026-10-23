@@ -1164,6 +1164,7 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
                 "Session:",
                 "Git:",
                 "Branch:",
+                "Worktree:",
                 "AGENTS.md:",
                 "Config:",
                 "Data:",
@@ -1613,6 +1614,24 @@ mod tests {
         assert!(text.contains("deepseek-v4-flash"));
         assert!(text.contains("Log in with /login"));
         assert!(!text.contains("Store:") && !text.contains("Config:"));
+    }
+
+    /// In a linked worktree the chip names the branch and the worktree's
+    /// folder, and the header's `Worktree:` line is not shown again below
+    /// the box as a line nothing else claimed.
+    #[test]
+    fn the_banner_names_the_worktree_beside_the_branch() {
+        let lines = vec![
+            "Harness Agents 0.8.0".into(),
+            "Project: C:/work/ha-wt-demo    Provider: credential present".into(),
+            "Git:     clean".into(),
+            "Branch: feat/fts5-index".into(),
+            "Worktree: ha-wt-demo".into(),
+            "Service: gpt-6-luna via https://chatgpt.com".into(),
+        ];
+        let text = plain_text(&super::banner_rows(&lines, 120, &Theme::plain()));
+        assert!(text.contains("⎇ feat/fts5-index · ha-wt-demo"), "{text}");
+        assert!(!text.contains("Worktree:"), "{text}");
     }
 
     #[test]
