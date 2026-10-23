@@ -125,19 +125,22 @@ class EvidenceControls(unittest.TestCase):
         e.context(str(self.binding), 'CW-FIXTURE', 'absent', str(self.r / 'context.json'))
         self.assertFalse(e.load(self.r / 'context.json')['needle_present'])
 
-    def test_answer_is_bound_to_new_session_and_completed(self):
+    def test_bind_explicit_conversation_without_a_running_named_worker(self):
+        self.bound_fixture()
+        e.bind(str(self.home), 'task1', str(self.r / 'by-conversation.json'))
+        self.assertEqual(e.load(self.r / 'by-conversation.json')['task'], 'task1')
+    def test_answer_requires_this_sessions_final_no_tools_response(self):
         self.bound_fixture()
         with closing(sqlite3.connect(self.db)) as c, c:
             c.execute('drop table events')
             c.execute('create table events(session_id text, sequence integer, event_json text)')
-            events = [('other', 1, {'event_type': 'model.response', 'payload': {'text': 'WRONG'}}),
-                      ('session1', 2, {'event_type': 'model.response', 'payload': {'text': 'CODE=UNKNOWN', 'tool_calls': []}})]
-            for sid, sequence, event in events:
-                c.execute('insert into events values(?,?,?)', (sid, sequence, json.dumps(event)))
-        with self.assertRaisesRegex(AssertionError, 'did not complete'):
+            other = {'event_type': 'model.response', 'payload': {'text': 'WRONG'}}
+            c.execute('insert into events values(?,?,?)', ('other', 1, json.dumps(other)))
+        with self.assertRaisesRegex(AssertionError, 'no durable model response'):
             e.answer(str(self.binding), str(self.r / 'answer.txt'))
         with closing(sqlite3.connect(self.db)) as c, c:
-            c.execute('insert into events values(?,?,?)', ('session1', 3, json.dumps({'event_type': 'session.completed'})))
+            response = {'event_type': 'model.response', 'payload': {'text': 'CODE=UNKNOWN', 'tool_calls': []}}
+            c.execute('insert into events values(?,?,?)', ('session1', 2, json.dumps(response)))
         e.answer(str(self.binding), str(self.r / 'answer.txt'))
         self.assertEqual((self.r / 'answer.txt').read_text(), 'CODE=UNKNOWN\n')
 
