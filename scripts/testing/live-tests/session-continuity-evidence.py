@@ -233,12 +233,25 @@ def kill_worker(home, binding, ha, listing, out):
         k.CloseHandle(handle)
 
 
+def answer(bound, out):
+    b = load(bound)
+    with ro(b['db']) as c:
+        events = [json.loads(row[0]) for row in c.execute('select event_json from events where session_id=? order by sequence', (b['session'],))]
+    responses = [event['payload'] for event in events if event['event_type'] == 'model.response']
+    assert responses, 'no durable model response after app input'
+    assert not responses[-1].get('tool_calls') and not responses[-1].get('incomplete_tool_calls'), 'model requested tools'
+    assert any(event['event_type'] == 'session.completed' for event in events), 'resumed turn did not complete within the probe bound'
+    Path(out).write_text(responses[-1]['text'].strip() + '\n', encoding='utf-8')
+
+
 def main():
     op, *args = sys.argv[1:]
     if op == 'bind':
         bind(*args)
     elif op == 'context':
         context(*args)
+    elif op == 'answer':
+        answer(*args)
     elif op == 'clean':
         clean(args[0], args[1], args[2:])
     elif op == 'settings':

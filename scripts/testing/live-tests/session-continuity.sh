@@ -124,10 +124,15 @@ need "$HA" shutdown --force
 # old and candidate binaries; it must not be mistaken for automatic new recall.
 echo '################ 5. explicit resume remains authoritative'
 SEED_ID=$("$PY" "$E" field "$RX/c-seed.binding.json" conversation)
-(cd "$P" && "$PROBE" "$RX/c-resume.bin" "$HA" wait:9000 -- chat --resume "$SEED_ID" --model "$MODEL" "${TH[@]}" --approval full-auto >/dev/null) || exit 2
-need "$HA" rename c-seed c-resume >/dev/null
-need turn c-resume 'Without tools, return the codeword from THIS resumed conversation. Answer exactly CODE=<codeword>, or CODE=UNKNOWN if unavailable.'
+RESUME_PROMPT='Without tools, return the codeword from THIS resumed conversation. Answer exactly CODE=<codeword>, or CODE=UNKNOWN if unavailable.'
+# Launch-only resume restores local history; submit the turn through that app
+# before addressing its worker. Receipt extraction is bound to its new session.
+(cd "$P" && "$PROBE" "$RX/c-resume.bin" "$HA" wait:9000 "key:$RESUME_PROMPT" enter wait:30000 -- chat --resume "$SEED_ID" --model "$MODEL" "${TH[@]}" --approval full-auto >/dev/null) || exit 2
+RESUME_AGENT_ID=$("$HA" list --json | "$PY" -c 'import json,sys; rows=[a for a in json.load(sys.stdin)["agents"] if not a.get("name")]; assert len(rows)==1, rows; print(rows[0]["id"])') || exit 2
+need "$HA" rename "$RESUME_AGENT_ID" c-resume >/dev/null
 bind c-resume
+need "$PY" "$E" answer "$RX/c-resume.binding.json" "$RX/c-resume.answer"
+cat "$RX/c-resume.answer"
 check 'SAFETY: explicit resume keeps original task identity' '"$PY" "$E" same-task "$RX/c-seed.binding.json" "$RX/c-resume.binding.json"'
 check 'SAFETY: explicit resume recalls original journal on old and new builds' 'answer_is c-resume "CODE=$CODE"'
 check 'SAFETY: no tool/memory/taskstate/handoff alternative' 'clean'

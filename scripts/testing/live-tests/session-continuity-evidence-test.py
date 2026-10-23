@@ -125,5 +125,21 @@ class EvidenceControls(unittest.TestCase):
         e.context(str(self.binding), 'CW-FIXTURE', 'absent', str(self.r / 'context.json'))
         self.assertFalse(e.load(self.r / 'context.json')['needle_present'])
 
+    def test_answer_is_bound_to_new_session_and_completed(self):
+        self.bound_fixture()
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute('drop table events')
+            c.execute('create table events(session_id text, sequence integer, event_json text)')
+            events = [('other', 1, {'event_type': 'model.response', 'payload': {'text': 'WRONG'}}),
+                      ('session1', 2, {'event_type': 'model.response', 'payload': {'text': 'CODE=UNKNOWN', 'tool_calls': []}})]
+            for sid, sequence, event in events:
+                c.execute('insert into events values(?,?,?)', (sid, sequence, json.dumps(event)))
+        with self.assertRaisesRegex(AssertionError, 'did not complete'):
+            e.answer(str(self.binding), str(self.r / 'answer.txt'))
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute('insert into events values(?,?,?)', ('session1', 3, json.dumps({'event_type': 'session.completed'})))
+        e.answer(str(self.binding), str(self.r / 'answer.txt'))
+        self.assertEqual((self.r / 'answer.txt').read_text(), 'CODE=UNKNOWN\n')
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
