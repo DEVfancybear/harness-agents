@@ -695,7 +695,7 @@ Bản 0.6.1 ghi lại những gì đã xảy ra, để tìm bug từ một file 
   - các lượt, kèm ai mở lượt (người dùng, báo cáo của agent con, heartbeat, resume sau park, ...), model và mức thinking của lượt, kết quả, số bước và số tool call;
   - các lần gọi model: token, thời gian trung vị, phân vị 95 và lâu nhất, các lần gọi chậm nhất;
   - các lần compact: bao nhiêu lần phải gọi model, bao nhiêu lần đọc lại bản tóm tắt đã lưu;
-  - các tool, theo số lần gọi, số lần lỗi và thời gian;
+  - memory: chi phí duy trì - các lần gọi model của review và Deep Dream theo mục đích (`review_gate`, `review_plan`, `deep_dream`, `skill_curation`, `skill_repair`), kèm token và thời gian - đặt cạnh số lần agent đọc memory, knowledge và bản ghi thô (`history_search`, `history_read`), làm thước đo để quyết định nên review thường xuyên đến đâu;
   - các agent con: vai trò, model (mọi model mà các lần gọi của nó dùng, theo thứ tự, nếu nó chạy trên hơn một model), trạng thái, thời gian, số tool call và lỗi của từng agent con bị lỗi, lấy từ ledger delegation (`delegation/ledger/` trong file zip);
   - một timeline gộp.
 

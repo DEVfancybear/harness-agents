@@ -1016,6 +1016,7 @@ impl Report {
         self.summary_patterns(&mut out);
         self.summary_parks(&mut out);
         self.summary_activity(&mut out);
+        self.summary_memory(&mut out);
         self.summary_jev(&mut out);
         self.summary_children(&mut out);
         self.summary_timeline(&mut out);
@@ -1595,6 +1596,74 @@ impl Report {
             }
             let _ = writeln!(out);
         }
+    }
+
+    /// What keeping memory cost beside what read it: the model calls of the
+    /// reviews and Deep Dream (`refine.call`, by purpose, with their tokens)
+    /// and the agent's calls of the tools that read memory and the raw
+    /// record. A store written ahead of any question pays off only when it is
+    /// read (MemoryTax, arXiv:2610.29823); this is the measure for deciding how
+    /// often to review.
+    fn summary_memory(&self, out: &mut String) {
+        /// The tools that read what memory kept, or the turns themselves.
+        const READERS: [&str; 4] = ["memory", "knowledge", "history_search", "history_read"];
+        let calls = self.recorded("refine", "call");
+        let mut reads = [0_usize; READERS.len()];
+        for event in ["ok", "failed"] {
+            for record in self.recorded("tool", event) {
+                if let Some(index) = READERS
+                    .iter()
+                    .position(|tool| record["fields"]["tool"] == *tool)
+                {
+                    reads[index] += 1;
+                }
+            }
+        }
+        if calls.is_empty() && reads.iter().all(|count| *count == 0) {
+            return;
+        }
+        let _ = writeln!(
+            out,
+            "## Memory
+"
+        );
+        if !calls.is_empty() {
+            let mut purposes: BTreeMap<String, (usize, u64, u64, u64)> = BTreeMap::new();
+            for record in &calls {
+                let fields = &record["fields"];
+                let entry = purposes
+                    .entry(fields["purpose"].as_str().unwrap_or("?").to_owned())
+                    .or_default();
+                entry.0 += 1;
+                entry.1 += fields["input"].as_u64().unwrap_or_default();
+                entry.2 += fields["output"].as_u64().unwrap_or_default();
+                entry.3 += fields["duration_ms"].as_u64().unwrap_or_default();
+            }
+            let _ = writeln!(
+                out,
+                "| upkeep call | calls | input tokens | output tokens | time |"
+            );
+            let _ = writeln!(out, "|---|---|---|---|---|");
+            for (purpose, (count, input, output, ms)) in &purposes {
+                let _ = writeln!(
+                    out,
+                    "| {purpose} | {count} | {input} | {output} | {:.1}s |",
+                    seconds(*ms)
+                );
+            }
+            let _ = writeln!(out);
+        }
+        let _ = writeln!(
+            out,
+            "Read by the agent: {}.
+",
+            READERS
+                .iter()
+                .zip(reads)
+                .map(|(tool, count)| format!("`{tool}` {count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     /// What the jev plugin did: each harness decision, how often Jev was asked,

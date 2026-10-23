@@ -697,6 +697,7 @@ A task of hundreds of steps passes through many compactions, and what a compacti
   - the model calls: tokens, median, 95th percentile and longest duration, the slowest calls;
   - the compactions: how many took a model call and how many read a kept summary back;
   - the tools, by calls, failures and time;
+  - memory: what its upkeep cost - the reviews' and Deep Dream's model calls by purpose (`review_gate`, `review_plan`, `deep_dream`, `skill_curation`, `skill_repair`), with tokens and time - beside how often the agent read memory, knowledge and the raw record (`history_search`, `history_read`), the measure for deciding how often to review;
   - the delegated children: role, model (every model its calls named, in order, when it ran on more than one), state, time, tool calls and the error of each one that failed, from the delegation ledger (`delegation/ledger/` in the zip);
   - one merged timeline.
 

@@ -590,6 +590,93 @@ fn a_bug_report_shows_what_jev_decided() {
     assert!(jev.contains("command=python src/sync_keys.py"), "{jev}");
 }
 
+/// What keeping memory cost beside what read it: the reviews' and Deep
+/// Dream's model calls by purpose, and the agent's calls of the tools that
+/// read memory and the raw record.
+#[test]
+fn a_bug_report_sets_memory_upkeep_beside_its_reads() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path();
+    let now = chrono::Utc::now().timestamp_millis() - 600_000;
+    let record = |offset: i64, kind: &str, event: &str, fields: serde_json::Value| {
+        let ms = now + offset;
+        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        serde_json::json!({"v":1,"ms":ms,"ts":ts,"pid":9,"role":"worker","level":"info","kind":kind,"event":event,"msg":"","fields":fields}).to_string()
+    };
+    let call = |purpose: &str, ms: u64, input: u64, output: u64| serde_json::json!({"purpose": purpose, "model": "m", "duration_ms": ms, "input": input, "output": output});
+    let tool = |name: &str| serde_json::json!({"tool": name, "elapsed_ms": 5});
+    let records = [
+        record(0, "refine", "call", call("review_gate", 2000, 9000, 300)),
+        record(
+            1_000,
+            "refine",
+            "call",
+            call("review_plan", 9000, 20000, 1500),
+        ),
+        record(
+            2_000,
+            "refine",
+            "call",
+            call("review_gate", 1000, 8000, 200),
+        ),
+        record(3_000, "refine", "call", call("deep_dream", 4000, 6000, 900)),
+        record(4_000, "tool", "ok", tool("memory")),
+        record(5_000, "tool", "ok", tool("history_search")),
+        record(6_000, "tool", "ok", tool("read_file")),
+    ];
+    let diagnostics = home.join("data").join("diagnostics");
+    std::fs::create_dir_all(&diagnostics).unwrap();
+    std::fs::write(
+        diagnostics.join("20260101-worker-1.jsonl"),
+        records.join("\n") + "\n",
+    )
+    .unwrap();
+    let out = home.join("report.zip");
+    let report = ha(
+        home,
+        &[
+            "bug-report",
+            "--since",
+            "1h",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let entries = entries(&std::fs::read(&out).unwrap());
+    let summary = &entries[0].1;
+    let memory = summary
+        .split("## Memory")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .unwrap_or_else(|| panic!("a Memory section: {summary}"));
+    assert!(
+        memory.contains("| review_gate | 2 | 17000 | 500 | 3.0s |"),
+        "{memory}"
+    );
+    assert!(
+        memory.contains("| review_plan | 1 | 20000 | 1500 | 9.0s |"),
+        "{memory}"
+    );
+    assert!(
+        memory.contains("| deep_dream | 1 | 6000 | 900 | 4.0s |"),
+        "{memory}"
+    );
+    assert!(
+        memory.contains(
+            "Read by the agent: `memory` 1, `knowledge` 0, `history_search` 1, `history_read` 0."
+        ),
+        "{memory}"
+    );
+}
+
 /// The session a bug report was traced from: a `ChatGPT` plan's limit parked
 /// it ("~32 min"), the user typed again and the model answered while it was
 /// parked, the park's resume came due inside that running turn, and a child

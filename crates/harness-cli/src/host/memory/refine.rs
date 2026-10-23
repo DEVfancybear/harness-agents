@@ -1748,6 +1748,7 @@ async fn promote_with_repair(
     let repaired = match complete_json(
         provider,
         model,
+        "skill_repair",
         REPAIR_SYSTEM_PROMPT,
         parts.join("\n\n"),
         REFINEMENT_MAX_OUTPUT_TOKENS,
@@ -1920,11 +1921,12 @@ const RETRY_MAX_OUTPUT_TOKENS: u32 = 65_536;
 async fn complete_json(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
+    purpose: &str,
     system: &str,
     user: String,
     max_tokens: u32,
 ) -> Result<Value, String> {
-    let text = complete(provider, model, system, user.clone(), max_tokens).await?;
+    let text = complete(provider, model, purpose, system, user.clone(), max_tokens).await?;
     match extract_json(&text) {
         Err(error) if error != TRUNCATED_JSON_ERROR => {
             let shown = if text.trim().is_empty() {
@@ -1935,7 +1937,7 @@ async fn complete_json(
             let again = format!(
                 "{user}\n\n<previous_reply>\n{shown}\n</previous_reply>\nThat reply was not the JSON object asked for ({error}). Answer again with the JSON object only, nothing before or after it."
             );
-            let text = complete(provider, model, system, again, max_tokens).await?;
+            let text = complete(provider, model, purpose, system, again, max_tokens).await?;
             extract_json(&text)
         }
         result => result,
@@ -1945,26 +1947,33 @@ async fn complete_json(
 async fn complete(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
+    purpose: &str,
     system: &str,
     user: String,
     max_tokens: u32,
 ) -> Result<String, String> {
-    match complete_once(provider, model, system, user.clone(), max_tokens).await {
+    match complete_once(provider, model, purpose, system, user.clone(), max_tokens).await {
         Err(error) if error == TRUNCATED_JSON_ERROR && max_tokens < RETRY_MAX_OUTPUT_TOKENS => {
             let larger = max_tokens.saturating_mul(4).min(RETRY_MAX_OUTPUT_TOKENS);
-            complete_once(provider, model, system, user, larger).await
+            complete_once(provider, model, purpose, system, user, larger).await
         }
         result => result,
     }
 }
 
+/// One model call of the memory's upkeep. Each is recorded (`refine.call`:
+/// its purpose, model, time and tokens) so the bug report sets what keeping
+/// memory costs beside what read it: a store built ahead of any question
+/// pays off only when it is read (MemoryTax, arXiv:2610.29823).
 async fn complete_once(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
+    purpose: &str,
     system: &str,
     user: String,
     max_tokens: u32,
 ) -> Result<String, String> {
+    let started = std::time::Instant::now();
     let request = ProviderRequest::new(
         RequestId::generate(),
         model,
@@ -1981,6 +1990,26 @@ async fn complete_once(
     .await
     .map_err(|_| "the refinement model call timed out".to_owned())?
     .map_err(|error| format!("the refinement model call failed: {error}"))?;
+    let usage = events.iter().rev().find_map(|event| match event {
+        harness_providers::ProviderStreamEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            cache_read_tokens,
+            ..
+        } => Some((*prompt_tokens, *completion_tokens, *cache_read_tokens)),
+        _ => None,
+    });
+    harness_types::diag::info("refine", "call")
+        .field("purpose", purpose)
+        .field("model", model)
+        .field(
+            "duration_ms",
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        )
+        .field("input", usage.map(|usage| usage.0))
+        .field("output", usage.map(|usage| usage.1))
+        .field("cached", usage.map(|usage| usage.2))
+        .emit();
     let response =
         harness_providers::assemble_stream(&events).map_err(|error| error.to_string())?;
     if response.finish_reason.as_deref() == Some("length") {
@@ -2137,6 +2166,7 @@ async fn plan(
     let value = complete_json(
         provider,
         model,
+        "review_plan",
         REFINEMENT_SYSTEM_PROMPT,
         parts.join("\n\n"),
         REFINEMENT_MAX_OUTPUT_TOKENS,
@@ -2779,6 +2809,7 @@ async fn curate_skills(
     let value = complete_json(
         provider,
         model,
+        "skill_curation",
         CURATOR_SYSTEM_PROMPT,
         parts.join("\n\n"),
         CURATE_MAX_OUTPUT_TOKENS,
@@ -3129,6 +3160,7 @@ async fn memory_edits(
     let value = complete_json(
         provider,
         model,
+        "deep_dream",
         MEMORY_CURATOR_SYSTEM_PROMPT,
         parts.join("\n\n"),
         CURATE_MAX_OUTPUT_TOKENS,
@@ -3343,6 +3375,7 @@ pub async fn review(
     let value = complete_json(
         provider,
         model,
+        "review_gate",
         AUTO_REFINE_REVIEW_SYSTEM_PROMPT,
         prompt,
         REVIEW_MAX_OUTPUT_TOKENS,
@@ -4636,7 +4669,7 @@ mod tests {
             prompts: std::sync::Mutex::new(Vec::new()),
         });
         let dynamic: std::sync::Arc<dyn harness_providers::ModelProvider> = provider.clone();
-        let text = super::complete(&dynamic, "m", "system", "user".to_owned(), 1024)
+        let text = super::complete(&dynamic, "m", "test", "system", "user".to_owned(), 1024)
             .await
             .expect("the retry answers");
         assert_eq!(text, "{\"summary\": \"whole\"}");
