@@ -1408,6 +1408,31 @@ impl Refinement {
     }
 }
 
+/// Where a reviewed entry came from: the refinement, the conversation it
+/// reviewed and the quote it rests on. An entry is what a review chose to
+/// keep of the turns, cut short; the quote and the conversation lead back to
+/// those turns (`history_search` with scope "project"), which the journal
+/// keeps word for word. Before, an entry named only its refinement.
+fn refine_origin(scopes: &HarnessScopes, refinement: &str, evidence: Option<&str>) -> Value {
+    /// The longest quote an origin keeps.
+    const EVIDENCE_CHARS: usize = 300;
+    let mut origin = json!({"via": "refine", "refinement": refinement});
+    // The local scope is `sessions/<conversation>/harness`.
+    if let Some(conversation) = scopes
+        .local
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .filter(|name| name.starts_with("task_"))
+    {
+        origin["conversation"] = json!(conversation);
+    }
+    if let Some(evidence) = evidence.map(str::trim).filter(|quote| !quote.is_empty()) {
+        origin["evidence"] = json!(evidence.chars().take(EVIDENCE_CHARS).collect::<String>());
+    }
+    origin
+}
+
 /// `applyRefinementProposal`, on the target scope's file, with `baseline` the state
 /// read before planning: an entry changed meanwhile is not overwritten.
 #[allow(
@@ -1493,7 +1518,7 @@ fn apply(
         }
         // What a refinement replaces or removes stays in the memory journal,
         // so the `memory` tool's history and restore reach it too.
-        let by = json!({"via": "refine", "refinement": id});
+        let by = refine_origin(scopes, id, edit.text("evidence"));
         if action == "delete" {
             super::memory::journal(dir, "delete", &kind, &computed, &before, &by)?;
             if let Some(records) = state["entries"][&kind].as_object_mut() {
@@ -3426,6 +3451,33 @@ mod tests {
     /// A review's memory write passes the `memory` tool's checks: the same fact
     /// under another title, a secret and an over-long entry are refused, and a
     /// fact written anew in place of the entry the same refinement deletes is
+    /// An entry a review wrote names the conversation it reviewed and the
+    /// quote it rests on, which lead back to the turns themselves.
+    #[test]
+    fn a_reviewed_entry_leads_back_to_its_turns() {
+        let directory = tempfile::tempdir().expect("dir");
+        let local = directory.path().join("sessions/task_0123/harness");
+        let scopes = HarnessScopes {
+            global: directory.path().join("global"),
+            local,
+        };
+        let proposal = Proposal::from_value(&json!({"edits": [
+            {"action": "create", "kind": "memory", "title": "Reply language",
+             "content": "Always answer in Vietnamese", "reason": "a lasting preference",
+             "evidence": "  luôn trả lời bằng tiếng Việt  "}
+        ]}));
+        apply(&scopes, &proposal, "refine_1", false, None, None, None).expect("applied");
+        let state = load_raw(&scopes.local);
+        let entry = state["entries"]["memory"]
+            .as_object()
+            .and_then(|entries| entries.values().next())
+            .expect("one entry");
+        assert_eq!(entry["origin"]["via"], "refine");
+        assert_eq!(entry["origin"]["refinement"], "refine_1");
+        assert_eq!(entry["origin"]["conversation"], "task_0123");
+        assert_eq!(entry["origin"]["evidence"], "luôn trả lời bằng tiếng Việt");
+    }
+
     /// not a duplicate of it.
     #[test]
     fn a_refinement_passes_the_memory_tools_checks() {
