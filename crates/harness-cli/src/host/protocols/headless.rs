@@ -583,6 +583,9 @@ pub async fn run_with(
     }
     let knowledge_host =
         super::knowledge::KnowledgeHost::new(&context.project.root, &context.paths.data_dir);
+    tools = tools.with_history_semantic(Arc::new(
+        knowledge_host.history_embeddings(&context.paths.data_dir, &context.project.root),
+    ));
     // prime-agent 9eec445a: `ha exec` delegates as the app does, and the run
     // waits for its children. Nobody can answer an approval here, so a gated
     // action a child asks for is refused, as the root's is.

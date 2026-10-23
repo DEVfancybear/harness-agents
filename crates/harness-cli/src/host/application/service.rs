@@ -8811,7 +8811,10 @@ async fn run_turn(
             &caller_dir,
             task_id.as_str(),
             nested_instructions,
-        )));
+        )))
+        .with_history_semantic(Arc::new(
+            knowledge_host.history_embeddings(&data_dir, &workspace_root),
+        ));
     if let Some(decisions) = &jev_decisions {
         tools = tools.with_guard(Arc::clone(decisions) as Arc<dyn harness_tools::ToolGuard>);
     }

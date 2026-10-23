@@ -92,9 +92,9 @@ pub use harness_runtime::AcceptanceState;
 pub use hooks::{HOOK_EVENTS, HookResponse, fit_payload, hook_matches, run_hooks};
 pub use secrets::{HostEnvironmentSecrets, SecretResolver};
 pub use service::{
-    ConfiguredToolHook, ExternalToolDispatcher, PathElsewhere, ToolDispatchAuthorization,
-    ToolExecutionService, ToolGuard, ToolObserver, ToolResultContext, git_diff_from,
-    git_head_commit,
+    ConfiguredToolHook, ExternalToolDispatcher, HistorySemantic, PathElsewhere,
+    ToolDispatchAuthorization, ToolExecutionService, ToolGuard, ToolObserver, ToolResultContext,
+    git_diff_from, git_head_commit,
 };
 pub use turn_driver::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CompletionCheck,

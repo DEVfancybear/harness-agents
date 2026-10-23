@@ -266,6 +266,19 @@ pub(crate) async fn search_variants(
     limit: usize,
 ) -> Result<Vec<VectorHit>, String> {
     let config = active_config(root)?;
+    search_with(root, &config, documents, queries, limit).await
+}
+
+/// [`search_variants`] with a configuration read elsewhere, its vectors kept
+/// under `root`: history search embeds with the global library's
+/// configuration and keeps its own cache.
+pub(crate) async fn search_with(
+    root: &Path,
+    config: &EmbeddingConfig,
+    documents: &[EmbeddingDocument],
+    queries: &[String],
+    limit: usize,
+) -> Result<Vec<VectorHit>, String> {
     if queries.is_empty()
         || queries.len() > MAX_BATCH
         || queries.iter().any(|query| {
@@ -280,7 +293,7 @@ pub(crate) async fn search_variants(
         return Ok(Vec::new());
     }
     let _lock = operation_lock(root).await?;
-    let mut indexed = index_inner(root, documents, &config).await?;
+    let mut indexed = index_inner(root, documents, config).await?;
     let mut vectors = Vec::with_capacity(queries.len());
     for query in queries {
         vectors.push(
@@ -294,7 +307,7 @@ pub(crate) async fn search_variants(
                 .await?,
         );
     }
-    let mut fetched = request_missing(&config, queries, &mut vectors).await?;
+    let mut fetched = request_missing(config, queries, &mut vectors).await?;
     if vectors
         .iter()
         .flatten()
@@ -303,7 +316,7 @@ pub(crate) async fn search_variants(
         // The model changed: the documents are embedded again, and so is every
         // variant whose vector is of the old size.
         indexed.cache.clear(&indexed.namespace).await?;
-        indexed = index_inner(root, documents, &config).await?;
+        indexed = index_inner(root, documents, config).await?;
         for vector in &mut vectors {
             if vector
                 .as_ref()
@@ -312,7 +325,7 @@ pub(crate) async fn search_variants(
                 *vector = None;
             }
         }
-        fetched.extend(request_missing(&config, queries, &mut vectors).await?);
+        fetched.extend(request_missing(config, queries, &mut vectors).await?);
         if vectors
             .iter()
             .flatten()
@@ -471,52 +484,8 @@ fn sync_bridge<T: Send, F: std::future::Future<Output = Result<T, String>>>(
     })
 }
 
-/// `CowAgent` fuses rank-normalized scores over channels that returned each page.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "Bounded ranks have at most 2048 entries"
-)]
-pub(crate) fn hybrid_fuse(
-    lexical: &[(String, f64)],
-    vectors: &[(String, f64)],
-    vector_weight: f64,
-    keyword_weight: f64,
-    min_score: Option<f64>,
-) -> Vec<(String, f64)> {
-    if !vector_weight.is_finite()
-        || !keyword_weight.is_finite()
-        || vector_weight < 0.0
-        || keyword_weight < 0.0
-        || vector_weight + keyword_weight <= 0.0
-    {
-        return Vec::new();
-    }
-    let mut scores = BTreeMap::<String, (f64, f64)>::new();
-    for (channel, weight) in [(lexical, keyword_weight), (vectors, vector_weight)] {
-        let mut seen = BTreeSet::new();
-        let unique = channel
-            .iter()
-            .filter(|(path, score)| score.is_finite() && seen.insert(path))
-            .collect::<Vec<_>>();
-        let count = unique.len();
-        for (rank, (path, _)) in unique.into_iter().enumerate() {
-            let normalized = (count - rank) as f64 / count as f64;
-            let entry = scores.entry(path.clone()).or_default();
-            entry.0 += normalized * weight;
-            entry.1 += weight;
-        }
-    }
-    let minimum = min_score.filter(|score| score.is_finite()).unwrap_or(0.0);
-    let mut hits = scores
-        .into_iter()
-        .filter_map(|(path, (score, weight))| {
-            let score = if weight > 0.0 { score / weight } else { 0.0 };
-            (weight > 0.0 && score >= minimum).then_some((path, score))
-        })
-        .collect::<Vec<_>>();
-    hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    hits
-}
+/// Shared with history search.
+pub(crate) use harness_types::search::hybrid_fuse;
 
 async fn index_inner(
     root: &Path,

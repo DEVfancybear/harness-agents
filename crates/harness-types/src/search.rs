@@ -11,6 +11,8 @@
 //! - else the items holding the most words come first, and the answer names
 //!   the words no item holds, so the model knows which part found nothing.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 /// How much of a query one item holds: the words it matches, then the
 /// search's own score for them. Ordered the way an answer is: more words
 /// first, then the higher score.
@@ -102,6 +104,57 @@ pub fn partial_note(what: &str, words: &[String], unmatched: &[String]) -> Strin
         "0 {what} match all of '{}'; {what} matching the most of its words{missing}:",
         words.join(" ")
     )
+}
+
+/// Fuse two rankings of the same items - by words and by meaning - as
+/// `CowAgent` does: each channel's ranks normalized, weighted, and averaged
+/// over the channels that returned the item. Knowledge and history search
+/// both rank this way.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Bounded ranks have at most 2048 entries"
+)]
+#[must_use]
+pub fn hybrid_fuse(
+    lexical: &[(String, f64)],
+    vectors: &[(String, f64)],
+    vector_weight: f64,
+    keyword_weight: f64,
+    min_score: Option<f64>,
+) -> Vec<(String, f64)> {
+    if !vector_weight.is_finite()
+        || !keyword_weight.is_finite()
+        || vector_weight < 0.0
+        || keyword_weight < 0.0
+        || vector_weight + keyword_weight <= 0.0
+    {
+        return Vec::new();
+    }
+    let mut scores = BTreeMap::<String, (f64, f64)>::new();
+    for (channel, weight) in [(lexical, keyword_weight), (vectors, vector_weight)] {
+        let mut seen = BTreeSet::new();
+        let unique = channel
+            .iter()
+            .filter(|(path, score)| score.is_finite() && seen.insert(path))
+            .collect::<Vec<_>>();
+        let count = unique.len();
+        for (rank, (path, _)) in unique.into_iter().enumerate() {
+            let normalized = (count - rank) as f64 / count as f64;
+            let entry = scores.entry(path.clone()).or_default();
+            entry.0 += normalized * weight;
+            entry.1 += weight;
+        }
+    }
+    let minimum = min_score.filter(|score| score.is_finite()).unwrap_or(0.0);
+    let mut hits = scores
+        .into_iter()
+        .filter_map(|(path, (score, weight))| {
+            let score = if weight > 0.0 { score / weight } else { 0.0 };
+            (weight > 0.0 && score >= minimum).then_some((path, score))
+        })
+        .collect::<Vec<_>>();
+    hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    hits
 }
 
 /// BM25's inverse document frequency of a term that `matching` of

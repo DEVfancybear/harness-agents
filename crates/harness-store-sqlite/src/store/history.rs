@@ -115,6 +115,16 @@ pub struct HistoryHit {
     pub started: String,
 }
 
+/// One source as semantic search embeds it: its id, kind and hash, and the
+/// head of its text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryText {
+    pub source_id: String,
+    pub kind: String,
+    pub content_hash: String,
+    pub text: String,
+}
+
 /// One page of an exact source read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoryPage {
@@ -584,31 +594,85 @@ impl SqliteStore {
             })?;
         let query_terms = u64::try_from(terms.len()).unwrap_or(u64::MAX);
         rows.iter()
+            .map(|row| hit_from_row(row, query_terms))
+            .collect()
+    }
+
+    /// The newest sources of a scope as semantic search embeds them: each
+    /// one's head, at most `chars` characters, newest first.
+    pub async fn history_texts(
+        &self,
+        scope: &HistoryScope,
+        limit: usize,
+        chars: usize,
+    ) -> Result<Vec<HistoryText>, StoreError> {
+        let sql = format!(
+            "SELECT s.source_id, s.kind, s.content_hash, substr(s.content, 1, ?) AS head
+             FROM history_sources s
+             WHERE {} AND s.availability = 'available'
+             ORDER BY s.rowid DESC LIMIT ?",
+            scope_predicate(scope)
+        );
+        // A fixed template: only the scope's placeholders vary.
+        let mut statement =
+            sqlx::query(sqlx::AssertSqlSafe(sql)).bind(i64::try_from(chars).unwrap_or(i64::MAX));
+        for value in scope_binds(scope) {
+            statement = statement.bind(value);
+        }
+        let rows = statement
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::StorageWriteFailed, "read history texts", error)
+            })?;
+        rows.iter()
             .map(|row| {
-                let head: String = row_get(row, "head")?;
-                Ok(HistoryHit {
-                    query_terms,
+                Ok(HistoryText {
                     source_id: row_get(row, "source_id")?,
-                    sequence: u64::try_from(row_get::<i64>(row, "sequence")?).unwrap_or_default(),
                     kind: row_get(row, "kind")?,
-                    content_hash: ContentHash::parse(row_get::<String>(row, "content_hash")?)?,
-                    availability: SourceAvailability::parse(&row_get::<String>(
-                        row,
-                        "availability",
-                    )?)
-                    .ok_or_else(|| {
-                        StoreError::new(
-                            ErrorCode::StorageWriteFailed,
-                            "history source has an unknown availability",
-                        )
-                    })?,
-                    preview: preview_of(&head),
-                    matched_terms: u64::try_from(row_get::<i64>(row, "matched")?)
-                        .unwrap_or_default(),
-                    task_id: row_get(row, "task_id")?,
-                    started: row_get(row, "started")?,
+                    content_hash: row_get(row, "content_hash")?,
+                    text: row_get(row, "head")?,
                 })
             })
+            .collect()
+    }
+
+    /// The hits for sources found by meaning rather than by words, in scope:
+    /// they hold none of `query`'s terms the search counted (`matched=0/n`).
+    pub async fn history_hits(
+        &self,
+        scope: &HistoryScope,
+        query: &str,
+        source_ids: &[String],
+    ) -> Result<Vec<HistoryHit>, StoreError> {
+        if source_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT s.source_id, s.sequence, s.kind, substr(s.content, 1, ?) AS head,
+                    s.content_hash, s.availability, 0 AS matched, s.task_id,
+                    COALESCE(se.created_at, '') AS started
+             FROM history_sources s LEFT JOIN sessions se ON se.session_id = s.session_id
+             WHERE {} AND s.source_id IN ({})",
+            scope_predicate(scope),
+            vec!["?"; source_ids.len()].join(",")
+        );
+        // A fixed template: only the number of placeholders varies.
+        let mut statement = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(i64::try_from(PREVIEW_CHARS + 1).unwrap_or(i64::MAX));
+        for value in scope_binds(scope) {
+            statement = statement.bind(value);
+        }
+        for id in source_ids {
+            statement = statement.bind(id);
+        }
+        let rows = statement.fetch_all(&self.pool).await.map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "read history hits", error)
+        })?;
+        let query_terms = u64::try_from(search_terms(query).len()).unwrap_or(u64::MAX);
+        rows.iter()
+            .map(|row| hit_from_row(row, query_terms))
             .collect()
     }
 
@@ -1117,6 +1181,30 @@ impl SqliteStore {
             )
         })
     }
+}
+
+/// A search hit from its row: `source_id`, `sequence`, `kind`, `head`,
+/// `content_hash`, `availability`, `matched`, `task_id` and `started`.
+fn hit_from_row(row: &sqlx::sqlite::SqliteRow, query_terms: u64) -> Result<HistoryHit, StoreError> {
+    let head: String = row_get(row, "head")?;
+    Ok(HistoryHit {
+        query_terms,
+        source_id: row_get(row, "source_id")?,
+        sequence: u64::try_from(row_get::<i64>(row, "sequence")?).unwrap_or_default(),
+        kind: row_get(row, "kind")?,
+        content_hash: ContentHash::parse(row_get::<String>(row, "content_hash")?)?,
+        availability: SourceAvailability::parse(&row_get::<String>(row, "availability")?)
+            .ok_or_else(|| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "history source has an unknown availability",
+                )
+            })?,
+        preview: preview_of(&head),
+        matched_terms: u64::try_from(row_get::<i64>(row, "matched")?).unwrap_or_default(),
+        task_id: row_get(row, "task_id")?,
+        started: row_get(row, "started")?,
+    })
 }
 
 /// The `WHERE` part that keeps a search inside its scope, over

@@ -33,6 +33,90 @@ impl Scope {
     }
 }
 
+/// History search by meaning ([`harness_tools::HistorySemantic`]) with the
+/// embeddings the user configured for knowledge (`/knowledge semantic`): the
+/// project library's configuration when it is on, else the global one's.
+/// Nothing is sent anywhere unless one is on. The vectors are kept apart from
+/// the library's, under `cache`: one set per conversation and one for the
+/// project.
+pub struct HistoryEmbeddings {
+    roots: [PathBuf; 2],
+    cache: PathBuf,
+}
+
+impl HistoryEmbeddings {
+    fn config(&self) -> Option<super::embedding::EmbeddingConfig> {
+        self.roots.iter().find_map(|root| {
+            super::embedding::load_config(root)
+                .ok()
+                .filter(|config| config.enabled)
+        })
+    }
+}
+
+impl harness_tools::HistorySemantic for HistoryEmbeddings {
+    fn enabled(&self) -> bool {
+        self.config().is_some()
+    }
+
+    fn weights(&self) -> (f64, f64, Option<f64>) {
+        self.config().map_or((0.7, 0.3, None), |config| {
+            (
+                config.vector_weight,
+                config.keyword_weight,
+                config.min_score,
+            )
+        })
+    }
+
+    fn nearest<'a>(
+        &'a self,
+        corpus: &'a str,
+        texts: Vec<harness_store_sqlite::HistoryText>,
+        query: &'a str,
+        limit: usize,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<(String, f64)>, String>> + Send + 'a>,
+    > {
+        /// The longest query an embedding takes: one line of 512 bytes.
+        const QUERY_BYTES: usize = 512;
+        Box::pin(async move {
+            let config = self
+                .config()
+                .ok_or_else(|| "semantic retrieval is off".to_owned())?;
+            let corpus = corpus
+                .chars()
+                .filter(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+                .collect::<String>();
+            let mut line = query.split_whitespace().collect::<Vec<_>>().join(" ");
+            while line.len() > QUERY_BYTES {
+                line.pop();
+            }
+            let documents = texts
+                .into_iter()
+                .filter(|text| !text.text.trim().is_empty())
+                .map(|text| super::embedding::EmbeddingDocument {
+                    path: text.source_id,
+                    hash: text.content_hash,
+                    title: text.kind,
+                    content: text.text,
+                })
+                .collect::<Vec<_>>();
+            let hits = super::embedding::search_with(
+                &self.cache.join(corpus),
+                &config,
+                &documents,
+                &[line],
+                limit,
+            )
+            .await?;
+            Ok(hits.into_iter().map(|hit| (hit.path, hit.score)).collect())
+        })
+    }
+}
+
 /// A turn's knowledge tools. Children receive a read-only clone, including at
 /// the dispatcher boundary, so forged arguments cannot mutate shared knowledge.
 #[derive(Clone)]
@@ -54,6 +138,18 @@ impl KnowledgeHost {
             global: data_dir.join("knowledge"),
             read_only: false,
             origin: None,
+        }
+    }
+
+    /// History search by meaning with this host's embedding configuration,
+    /// its vectors under `<data>/history-embedding/<project>`.
+    #[must_use]
+    pub fn history_embeddings(&self, data_dir: &Path, workspace: &Path) -> HistoryEmbeddings {
+        HistoryEmbeddings {
+            roots: [self.project.clone(), self.global.clone()],
+            cache: data_dir
+                .join("history-embedding")
+                .join(crate::interactive::bootstrap::project_key_of(workspace)),
         }
     }
 
