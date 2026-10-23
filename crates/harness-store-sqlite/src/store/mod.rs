@@ -3289,9 +3289,15 @@ async fn open_pool(
             // is idle (see `checkpoint`).
             .pragma("wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES);
     }
+    // The one connection is kept for the store's life: sqlx recycles one
+    // after 30 minutes by default, and closing the last connection of a
+    // database checkpoints its WAL, while every store call of the session
+    // waits for it.
     let mut pool_options = SqlitePoolOptions::new()
         .max_connections(1)
-        .min_connections(1);
+        .min_connections(1)
+        .max_lifetime(None)
+        .idle_timeout(None);
     if let Some(signal) = on_commit {
         // Set on every connection the pool makes, so a reconnect keeps it.
         pool_options = pool_options.after_connect(move |connection, _| {

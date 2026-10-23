@@ -9788,7 +9788,7 @@ async fn run_turn(
                     knowledge: knowledge_host.clone(),
                 };
                 let cadence = Arc::clone(&refine_cadence);
-                tokio::spawn(async move {
+                spawn_off_workers(async move {
                     background.run().await;
                     cadence.release();
                 });
@@ -9828,7 +9828,7 @@ async fn run_turn(
                 reviewed: Some(session_id.as_str().to_owned()),
                 knowledge: knowledge_host.clone(),
             };
-            tokio::spawn(async move {
+            spawn_off_workers(async move {
                 tokio::time::sleep(quiet).await;
                 if cadence.generation() != generation || background.conversation.is_empty() {
                     return;
@@ -9885,7 +9885,7 @@ async fn run_turn(
                     deferred.turns
                 ),
             });
-            tokio::spawn(background.run());
+            spawn_off_workers(background.run());
         }
     }
     // A finished goal is not brought back by `/resume`.
@@ -11146,6 +11146,21 @@ impl SessionPort for FixtureService {
     fn provider_diagnostics(&self) -> Vec<String> {
         vec!["Provider: the labelled fixture; no model is called".to_owned()]
     }
+}
+
+/// Run a background review on a blocking thread, not on one of the runtime's
+/// workers. A review takes the harness lock (a spin of `std::thread::sleep`
+/// for up to 30 s) and reads the embedding index synchronously; on a worker
+/// that wait blocked the task that returns the store's one connection to its
+/// pool - queued on that same worker - and every other store call of the
+/// session waited 30 s and failed (`pool timed out while waiting for an open
+/// connection`).
+fn spawn_off_workers<F>(future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || handle.block_on(future));
 }
 
 /// External tool schemas in the order every request sends them. The tool

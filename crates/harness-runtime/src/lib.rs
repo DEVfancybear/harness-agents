@@ -3980,6 +3980,15 @@ impl RuntimeService {
                 ));
             }
         }
+        // A stopped turn compacts no further: after a canceled summary the
+        // turn went on to summarize its steps and checkpoint the session, and
+        // ended as failed on a store call instead of as canceled.
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::new(
+                ErrorCode::ProviderCanceled,
+                "the turn was canceled while its context was being compacted",
+            ));
+        }
         // Still over, and this turn's own steps are what fills the window: a
         // goal turn ran to 204k tokens of a 200k bound with only its old tool
         // results shortened. Its earlier steps are summarized into its first
@@ -4029,6 +4038,12 @@ impl RuntimeService {
                     ));
                 }
             }
+        }
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::new(
+                ErrorCode::ProviderCanceled,
+                "the turn was canceled while its context was being compacted",
+            ));
         }
         if !fits(&attempt)
             && request
