@@ -19,13 +19,17 @@ ha                      # then /login and start typing
 
 ### Screenshots / Ảnh chụp
 
-![A child verifier agent investigating read-only and messaging the main agent](docs/assets/child-verifier.png)
+![The main agent working in a persistent Python REPL while three explorer children work beside it](docs/assets/agents-at-work.png)
 
-*An independent `verifier` child agent re-checks the work read-only and reports back to the main agent as a message the running turn picks up, while the status line shows cost, cache hit rate and context use. / Agent con `verifier` kiểm tra độc lập ở chế độ chỉ đọc và báo lại cho agent chính bằng một tin nhắn mà lượt đang chạy nhận được; thanh trạng thái hiện chi phí, tỉ lệ cache và mức dùng context.*
+*The main agent reads two repositories through the persistent Python REPL while three `explorer` children work in parallel; the sidebar lists each agent with its state, tool count and model, and a child's findings reach the running turn as a message. / Agent chính đọc hai repository qua Python REPL bền trong khi ba agent con `explorer` làm song song; sidebar liệt kê từng agent với trạng thái, số tool và model, và phát hiện của một agent con tới lượt đang chạy dưới dạng tin nhắn.*
 
-![The reasoning panel next to a Python REPL call and a verifier finding](docs/assets/reasoning-and-verifier.png)
+![A child's pane open beside the main agent's turn](docs/assets/child-pane.png)
 
-*The model's reasoning shown as its own block, then a call into the persistent Python REPL and the verifier's next finding. / Phần suy nghĩ của model hiện thành một khối riêng, rồi một lời gọi vào Python REPL bền và phát hiện tiếp theo của verifier.*
+*Alt+1..9 opens a child's pane beside the conversation: every call it makes, with its output, as it runs. / Alt+1..9 mở pane của một agent con cạnh cuộc hội thoại: từng lời gọi của nó, kèm output, ngay lúc chạy.*
+
+![A finished explorer's summary and its report to the main agent](docs/assets/child-report.png)
+
+*A finished explorer: its pane keeps its summary and the report it sent to the main agent, which records the decision in its task state. / Một explorer đã xong: pane giữ phần tóm tắt và báo cáo nó gửi cho agent chính, rồi agent chính ghi quyết định vào task state.*
 
 ---
 
