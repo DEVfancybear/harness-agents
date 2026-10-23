@@ -3663,7 +3663,7 @@ fn parameters_schema<'a>(schemas: &'a [Value], name: &str) -> Option<&'a Value> 
 }
 
 /// The arguments a call gave that its tool does not take but another does:
-/// "`code` is an argument of python_repl, not of git_status." A model that
+/// "`code` is an argument of `python_repl`, not of `git_status`." A model that
 /// mixed two tools up read only "Property is not allowed".
 fn misplaced_arguments(
     schemas: [&[Value]; 2],

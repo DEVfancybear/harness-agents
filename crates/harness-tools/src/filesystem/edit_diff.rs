@@ -647,13 +647,13 @@ fn repeats_in_batch(content: &str, edits: &[EditSpec], index: usize) -> bool {
 }
 
 /// Replace the first exact copy of `old_text`.
-fn apply_first(content: &str, old_text: &str, new_text: &str) -> Result<AppliedEdit, HarnessError> {
+fn apply_first(content: &str, old_text: &str, new_text: &str) -> AppliedEdit {
     let old_text = normalize_to_lf(old_text);
-    Ok(AppliedEdit {
+    AppliedEdit {
         base_content: content.to_owned(),
         new_content: content.replacen(old_text.as_str(), &normalize_to_lf(new_text), 1),
         replacements: 1,
-    })
+    }
 }
 
 /// Which earlier edit of the batch changed a text the file held before the
@@ -702,7 +702,7 @@ pub(crate) fn plan_edits(
                 path,
             ),
             None if repeats_in_batch(&content, edits, index) => {
-                apply_first(&content, &step.old_string, &step.new_string)
+                Ok(apply_first(&content, &step.old_string, &step.new_string))
             }
             None => apply_edit_to_normalized_content(
                 &content,
