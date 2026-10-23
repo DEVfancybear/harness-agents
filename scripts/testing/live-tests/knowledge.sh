@@ -301,6 +301,9 @@ for _ in $(seq 1 50); do [ -s "$RX/embed.port" ] && break; sleep 0.2; done
 printf '# Sầu riêng\n\nSầu riêng thu hoạch vào tháng sáu ở miền Tây.\n' > "$K/concepts/durian.md"
 printf '{"schema_version":1,"enabled":true,"endpoint":"http://127.0.0.1:%s/v1/embeddings","model":"fake-embed"}' "$(cat "$RX/embed.port")" > "$K/.ha-embedding.json"
 run_exec e12 "Kiểm thử: gọi tool knowledge action search đúng một lần, với queries là hai biến thể: 'zzqx' và 'trái cây có gai'. Không gọi tool nào khác. In nguyên văn path và matched_queries của từng kết quả."
+# The request after e12's search, taken before the history search below
+# sends the same words in a request of its own.
+request "trái cây có gai" > "$RX/e12.request"
 # (0.7.9) History search by meaning with the same configuration: a turn names
 # a durian without any word of the later query, and the query finds it.
 run_exec e13 "Trả lời đúng một dòng: Món tôi thích nhất là sầu riêng Ri6."
@@ -309,7 +312,6 @@ kill "$embedder" 2>/dev/null
 check "the second variant was embedded" 'grep -q "\"trái cây có gai\"" "$RX/embed.log"'
 check "history search embedded the turn that named the durian" 'grep -q "Ri6" "$RX/embed.log"'
 check "history search found it by meaning, with none of the query words" 'grep -q "matched=0/" "$RX/e14.json" && grep -q "Ri6" "$RX/e14.json"'
-request "trái cây có gai" > "$RX/e12.request"
 cat > "$RX/matched.py" <<'EOF'
 import json, sys
 # The search result, as the next request carried it: the durian page is in it,
