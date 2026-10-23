@@ -12,7 +12,14 @@ use super::super::theme::Theme;
 
 /// Draw the picker with the highlighted row marked.
 pub fn render(frame: &mut Frame, area: Rect, items: &[String], selected: usize, theme: &Theme) {
-    render_named(frame, area, items, selected, theme, " chọn session ");
+    render_named(
+        frame,
+        area,
+        items,
+        selected,
+        theme,
+        " chọn session · Del xoá ",
+    );
 }
 
 /// Draw the workspace file picker opened by `@`.

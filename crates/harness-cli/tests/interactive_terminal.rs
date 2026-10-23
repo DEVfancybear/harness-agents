@@ -3772,7 +3772,8 @@ fn d07_pty_two_terminals_share_one_agent() {
 
 /// prime-agent's agents view: `ha agents` lists every session; Ctrl+N starts
 /// one, Left on its empty prompt comes back to the view with the agent listed
-/// as idle, Ctrl+X twice stops it, and Esc leaves.
+/// as idle, Ctrl+X twice deletes it (an idle agent no terminal holds is
+/// stopped and its conversation deleted), and Esc leaves.
 #[ignore = "needs a real console; run scripts/testing/Invoke-HaPtyAcceptance.ps1"]
 #[test]
 fn i22_agents_view_opens_returns_and_stops() {
@@ -3787,11 +3788,11 @@ fn i22_agents_view_opens_returns_and_stops() {
     session.send("\u{18}");
     wait_for_normalized(
         &session,
-        "Press ctrl+x again to stop",
+        "Press ctrl+x (or delete) again to delete",
         Duration::from_secs(10),
     );
     session.send("\u{18}");
-    wait_for_normalized(&session, "stopped", Duration::from_secs(30));
+    wait_for_normalized(&session, "deleted", Duration::from_secs(30));
     session.send("\u{1b}");
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }

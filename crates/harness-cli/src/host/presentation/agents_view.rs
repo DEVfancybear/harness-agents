@@ -1082,58 +1082,12 @@ fn handle_key(
             }
             None => {}
         },
-        KeyCode::Char('x') if control && empty => match view.selected_row() {
-            Some(Row {
-                target: Target::Live(listed),
-                identity,
-                ..
-            }) => {
-                let armed = view.stop_armed.take().is_some_and(|(armed, at)| {
-                    armed == identity && at.elapsed() < Duration::from_secs(3)
-                });
-                if armed {
-                    view.status = Some(stop(&listed));
-                    view.refresh();
-                } else {
-                    view.status = Some(format!(
-                        "Press ctrl+x again to stop {}",
-                        listed.agent.display_name()
-                    ));
-                    view.stop_armed = Some((identity, Instant::now()));
-                }
-            }
-            // prime-agent's delete of a saved session (press twice).
-            Some(Row {
-                target: Target::Saved(conversation),
-                identity,
-                title,
-                ..
-            }) => {
-                let armed = view.stop_armed.take().is_some_and(|(armed, at)| {
-                    armed == identity && at.elapsed() < Duration::from_secs(3)
-                });
-                if armed {
-                    view.status = Some(
-                        match super::service::hide_conversation(
-                            &view.store_dir,
-                            &conversation.task_id,
-                        ) {
-                            Ok(()) => {
-                                view.saved
-                                    .retain(|saved| saved.task_id != conversation.task_id);
-                                view.data_version += 1;
-                                format!("deleted {title}")
-                            }
-                            Err(error) => format!("could not delete {title}: {error}"),
-                        },
-                    );
-                } else {
-                    view.status = Some(format!("Press ctrl+x again to delete {title}"));
-                    view.stop_armed = Some((identity, Instant::now()));
-                }
-            }
-            None => {}
-        },
+        // Delete too: the key a user reaches for, and it did nothing. Both
+        // act on the selected row while a search is typed as well: find the
+        // conversation, then delete it.
+        KeyCode::Char('x') | KeyCode::Delete if control || key.code == KeyCode::Delete => {
+            delete_selected(view);
+        }
         KeyCode::Backspace => {
             view.query.pop();
             view.selected = None;
@@ -1238,6 +1192,64 @@ fn stop(listed: &client::Listed) -> String {
         Ok(_) => format!("stopped {}", listed.agent.display_name()),
         Err(error) => error,
     }
+}
+
+/// Ctrl+X or Delete on the selected row, pressed twice within 3 s: a working
+/// agent is stopped; a saved conversation is deleted, and so is an idle agent
+/// no terminal holds - stopped, then its conversation deleted. An idle agent
+/// stays listed (a worker keeps it for 90 minutes), and Ctrl+X only stopped
+/// it, so a conversation the user wanted gone could not be deleted from here.
+fn delete_selected(view: &mut View) {
+    let Some(row) = view.selected_row() else {
+        return;
+    };
+    let armed = view
+        .stop_armed
+        .take()
+        .is_some_and(|(armed, at)| armed == row.identity && at.elapsed() < Duration::from_secs(3));
+    let (verb, name) = match &row.target {
+        Target::Live(listed) if deletable(listed) => {
+            ("delete", listed.agent.display_name().to_string())
+        }
+        Target::Live(listed) => ("stop", listed.agent.display_name().to_string()),
+        Target::Saved(_) => ("delete", row.title.clone()),
+    };
+    if !armed {
+        view.status = Some(format!("Press ctrl+x (or delete) again to {verb} {name}"));
+        view.stop_armed = Some((row.identity, Instant::now()));
+        return;
+    }
+    let task = match &row.target {
+        Target::Live(listed) => {
+            let stopped = stop(listed);
+            if verb == "stop" {
+                view.status = Some(stopped);
+                view.refresh();
+                return;
+            }
+            listed.agent.conversation.clone()
+        }
+        Target::Saved(conversation) => Some(conversation.task_id.clone()),
+    };
+    view.status = Some(match task {
+        Some(task) => match super::service::hide_conversation(&view.store_dir, &task) {
+            Ok(()) => {
+                view.saved.retain(|saved| saved.task_id != task);
+                view.data_version += 1;
+                format!("deleted {name}")
+            }
+            Err(error) => format!("could not delete {name}: {error}"),
+        },
+        None => format!("stopped {name}; it had no saved conversation"),
+    });
+    view.refresh();
+}
+
+/// An agent deleting may stop: idle, with nothing running for it and no
+/// terminal on it.
+fn deletable(listed: &client::Listed) -> bool {
+    let agent = &listed.agent;
+    agent.status == "ready" && !agent.busy && !agent.attached && agent.conversation.is_some()
 }
 
 /// Whether a roster read differs from the one on screen.
@@ -1563,7 +1575,8 @@ fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
             hints.push(("ctrl+r", "rename"));
         }
         hints.push(("space", "reply"));
-        hints.push(("ctrl+x", if running { "stop" } else { "delete" }));
+        let stops = matches!(&row.target, Target::Live(listed) if !deletable(listed));
+        hints.push(("del", if stops { "stop" } else { "delete" }));
         if running
             && rows
                 .iter()

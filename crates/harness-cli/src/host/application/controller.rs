@@ -337,6 +337,9 @@ pub struct InteractiveController {
     turn_picker: Option<super::events::TurnsPurpose>,
     /// The shared picker is `/plugins`: the service id of each row.
     plugin_picker: Option<Vec<String>>,
+    /// The `/resume` row Delete was pressed on once, with its label: a
+    /// second Delete removes it, any other key keeps it.
+    resume_delete: Option<(usize, String)>,
     /// prime-agent's `/tree` selector, while it is open.
     tree_view: Option<super::tree_view::TreeView>,
     /// The turns the selector was opened over.
@@ -465,6 +468,7 @@ impl InteractiveController {
             escape_armed_at: None,
             turn_picker: None,
             plugin_picker: None,
+            resume_delete: None,
             tree_view: None,
             tree_turns: Vec::new(),
             writing_code: false,
@@ -1416,6 +1420,12 @@ impl InteractiveController {
                 return vec![Effect::Redraw];
             }
         } else if self.editor.picker().is_some() {
+            if self.session_picker_open() {
+                if key == Key::Delete {
+                    return self.delete_highlighted_session();
+                }
+                self.keep_highlighted_session();
+            }
             match key {
                 Key::Up => {
                     self.editor.move_picker(-1);
@@ -5916,6 +5926,88 @@ impl InteractiveController {
         self.push_history(effects, HistoryItem::User { text });
     }
 
+    /// Whether the shared picker is `/resume`'s list of conversations.
+    fn session_picker_open(&self) -> bool {
+        self.editor.picker().is_some()
+            && !self.file_picker_active
+            && self.turn_picker.is_none()
+            && self.plugin_picker.is_none()
+    }
+
+    /// Delete on a `/resume` row: the first press asks, on the row itself;
+    /// the second removes the conversation from the list. The picker had no
+    /// key for it, and a list of old conversations could only grow.
+    fn delete_highlighted_session(&mut self) -> Vec<Effect> {
+        let Some(picker) = self.editor.picker() else {
+            return Vec::new();
+        };
+        let selected = picker.selected();
+        let mut items = picker.items().to_vec();
+        let Some(candidate) = self.session_candidates.get(selected).cloned() else {
+            return Vec::new();
+        };
+        let Some((armed, label)) = self.resume_delete.take() else {
+            if let Some(item) = items.get_mut(selected) {
+                self.resume_delete = Some((selected, item.clone()));
+                item.push_str("   ← Delete again to remove it from this list");
+            }
+            self.editor.open_picker_at(items, selected);
+            return vec![Effect::Redraw];
+        };
+        if armed != selected {
+            if let Some(item) = items.get_mut(armed) {
+                *item = label;
+            }
+            self.editor.open_picker_at(items, selected);
+            return self.delete_highlighted_session();
+        }
+        let mut effects = Vec::new();
+        match self.service.remove_session(&candidate.task_id) {
+            Ok(()) => {
+                self.session_candidates.remove(selected);
+                items.remove(selected);
+                if items.is_empty() {
+                    self.editor.close_picker();
+                } else {
+                    self.editor.open_picker_at(items, selected);
+                }
+                self.push_history(
+                    &mut effects,
+                    HistoryItem::Notice {
+                        message: format!(
+                            "removed from /resume: {}",
+                            candidate.detail.split(" · ").next().unwrap_or_default()
+                        ),
+                    },
+                );
+            }
+            Err(reason) => {
+                if let Some(item) = items.get_mut(selected) {
+                    *item = label;
+                }
+                self.editor.open_picker_at(items, selected);
+                self.push_history(&mut effects, HistoryItem::Notice { message: reason });
+            }
+        }
+        effects.push(Effect::Redraw);
+        effects
+    }
+
+    /// Any key but a second Delete keeps the row Delete was pressed on.
+    fn keep_highlighted_session(&mut self) {
+        let Some((armed, label)) = self.resume_delete.take() else {
+            return;
+        };
+        if let Some(picker) = self.editor.picker() {
+            let selected = picker.selected();
+            let mut items = picker.items().to_vec();
+            if let Some(item) = items.get_mut(armed) {
+                *item = label;
+            }
+            self.editor.open_picker_at(items, selected);
+        }
+    }
+
     /// The session the picker currently highlights.
     fn selected_candidate(&self) -> Option<String> {
         let picker = self.editor.picker()?;
@@ -6896,6 +6988,8 @@ mod tests {
         /// Refuse steering, as a service without a running inbox does.
         refuse_steer: Arc<std::sync::atomic::AtomicBool>,
         resumes: Arc<Mutex<Vec<Option<String>>>>,
+        /// The conversations removed from `/resume`.
+        removals: Arc<Mutex<Vec<String>>>,
         /// Every turn-wide grant the controller handed to the port, and every
         /// revocation, so a test can assert the grant is scoped to one turn.
         run_grants: Arc<Mutex<Vec<bool>>>,
@@ -7170,6 +7264,14 @@ mod tests {
 
         fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
             self.resumes.lock().expect("resume log").push(session_id);
+            Ok(())
+        }
+
+        fn remove_session(&mut self, task_id: &str) -> Result<(), String> {
+            self.removals
+                .lock()
+                .expect("removal log")
+                .push(task_id.to_owned());
             Ok(())
         }
 
@@ -10298,6 +10400,75 @@ Command: \"npm run build\""
             effects_to_plain(&effects)
                 .join("\n")
                 .contains("continuing from session")
+        );
+    }
+
+    /// Delete on a `/resume` row asks on the row; a second Delete removes
+    /// the conversation, any other key keeps it.
+    #[test]
+    fn delete_twice_removes_a_conversation_from_the_resume_list() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let sessions = vec![
+            SessionCandidate {
+                session_id: "session_a".to_owned(),
+                task_id: "task_1".to_owned(),
+                detail: "first · model · time · 1 turn(s)".to_owned(),
+            },
+            SessionCandidate {
+                session_id: "session_b".to_owned(),
+                task_id: "task_2".to_owned(),
+                detail: "second · model · time · 2 turn(s)".to_owned(),
+            },
+        ];
+        harness
+            .events
+            .send(SessionEvent::SessionsListed { sessions })
+            .expect("sessions");
+        let _ = harness.controller.pump_events();
+        let items = |harness: &Bench| {
+            harness
+                .controller
+                .editor
+                .picker()
+                .map(|picker| picker.items().to_vec())
+                .unwrap_or_default()
+        };
+
+        let _ = harness.controller.handle_key(Key::Delete);
+        assert!(
+            items(&harness)[0].contains("Delete again"),
+            "{:?}",
+            items(&harness)
+        );
+        let _ = harness.controller.handle_key(Key::Down);
+        assert!(
+            !items(&harness)[0].contains("Delete again"),
+            "another key keeps it"
+        );
+        assert!(harness.port.removals.lock().expect("removals").is_empty());
+
+        let _ = harness.controller.handle_key(Key::Delete);
+        let effects = harness.controller.handle_key(Key::Delete);
+        assert_eq!(
+            harness.port.removals.lock().expect("removals").as_slice(),
+            ["task_2"]
+        );
+        assert_eq!(items(&harness).len(), 1);
+        assert!(items(&harness)[0].contains("first"));
+        assert!(
+            effects_to_plain(&effects)
+                .join(
+                    "
+"
+                )
+                .contains("removed from /resume: second")
+        );
+        // Enter still resumes what is left.
+        let _ = harness.controller.handle_key(Key::Enter);
+        assert_eq!(
+            harness.port.resumes.lock().expect("resumes").as_slice(),
+            [Some("session_a".to_owned())]
         );
     }
 

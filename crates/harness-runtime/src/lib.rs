@@ -7048,10 +7048,10 @@ mod long_task_compaction_tests {
     use harness_providers::{MessageRole, ProviderMessage};
 
     use super::{
-        COMPACTED_PREFIX, COMPACTED_PREFIX_BEFORE, CONVERSATION_MAX_BYTES, CONVERSATION_MAX_TURNS, ConversationHistory,
-        InputId, RunRequest, SessionId, TaskId, USER_MESSAGES_MAX_CHARS, carry_forward,
-        dropped_facts, format_user_messages, listed_user_messages, omitted_user_messages,
-        strip_appended_blocks, user_messages,
+        COMPACTED_PREFIX, COMPACTED_PREFIX_BEFORE, CONVERSATION_MAX_BYTES, CONVERSATION_MAX_TURNS,
+        ConversationHistory, InputId, RunRequest, SessionId, TaskId, USER_MESSAGES_MAX_CHARS,
+        carry_forward, dropped_facts, format_user_messages, listed_user_messages,
+        omitted_user_messages, strip_appended_blocks, user_messages,
     };
 
     /// The summary says where the turns it stands for are still read; one
@@ -7061,9 +7061,11 @@ mod long_task_compaction_tests {
         assert!(COMPACTED_PREFIX.contains("history_search"));
         assert!(COMPACTED_PREFIX.contains("history_read"));
         for prefix in [COMPACTED_PREFIX, COMPACTED_PREFIX_BEFORE] {
-            let text = format!("{prefix}
+            let text = format!(
+                "{prefix}
 
-the summary");
+the summary"
+            );
             assert_eq!(
                 super::compacted_summary(&text).map(str::trim),
                 Some("the summary")

@@ -2,7 +2,8 @@
 # The fullscreen TUI with a real model: leaving a session for the
 # agents view (`/agents`, a bare `/resume`) does not print the conversation
 # into the primary screen first, and the mouse wheel moves the window's rows
-# with the terminal instead of writing every row again. Every check prints
+# with the terminal instead of writing every row again, and Delete removes a
+# conversation from the agents view and /resume. Every check prints
 # PASS or FAIL; the recordings stay in $LIVE_ROOT/tui as evidence.
 #
 #   bash scripts/testing/live-tests/tui.sh
@@ -130,6 +131,23 @@ EOF'
 grep -E "tokens ·" "$RX/panel-context.txt" | head -3 | sed 's/^/   /'
 check "/context lists its blocks as fields, with their tokens" \
   'grep -q "Packet" "$RX/panel-context.txt" && grep -qE "  [a-z_-]+ +[0-9.k]+ tokens · " "$RX/panel-context.txt"'
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 6. Delete removes a conversation from the agents view and /resume"
+# (0.7.9) The agents view had Ctrl+X only, and on an idle agent it stopped
+# it: a conversation the user wanted gone stayed. Delete (or Ctrl+X) twice on
+# an idle agent stops it and deletes its conversation; /resume no longer has it.
+agent "$RX/p" t9
+say t9 "Trả lời đúng một dòng: MOC-XOA" | tail -1
+t9=$("$HA" list --json | "$PY" -c "import json,sys; d=json.load(sys.stdin); a=d if isinstance(d,list) else d.get('agents',d); print([x.get('conversation') or '' for x in a if x.get('name')=='t9'][0])")
+echo "   t9's conversation: $t9"
+(cd "$RX/p" && "$PROBE" "$RX/delete.bin" "$HA" "wait:6000,key:t9,wait:1500,delete,wait:600,delete,until:deleted:8000,wait:1500,esc,esc,wait:1000" -- agents >/dev/null)
+check "the second Delete deleted it" 'grep -q "until found deleted" "$RX/delete.bin.marks"'
+check "the agent was stopped" '! "$HA" list --json | grep -q "\"name\": *\"t9\""'
+(cd "$RX/p" && "$PROBE" "$RX/after-delete.bin" "$HA" "wait:6000,key:MOC,wait:1500,esc,esc,wait:1000" -- agents >/dev/null)
+"$PY" "$HERE/screen.py" "$RX/after-delete.bin" --upto "$(mark "$RX/after-delete.bin" esc 1)" > "$RX/after-delete.txt"
+check "the agents view no longer lists it" '! grep -q "t9" "$RX/after-delete.txt"'
+check "it is in the list of deleted conversations" '[ -n "$t9" ] && grep -rq "$t9" "$RX/home/data" --include=hidden-conversations.json'
 "$HA" shutdown --force >/dev/null 2>&1
 
 result

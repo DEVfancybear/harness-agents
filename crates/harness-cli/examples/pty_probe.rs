@@ -4,7 +4,7 @@
 //! `cargo run -p harness-cli --example pty_probe -- <out.bin> <ha.exe> <steps> -- <args...>`
 //!
 //! `steps` is a comma list run in order: `wait:<ms>`, `wheelup:<n>` (mouse wheel
-//! notches at the window's middle), `pgup`, `end`, `up`, `down`, `left`, `right`, `esc`,
+//! notches at the window's middle), `pgup`, `end`, `up`, `down`, `left`, `right`, `esc`, `delete`,
 //! `key:<text>`, `enter`, `ctrlc`, `ctrls`,
 //! `altenter`, `shiftenter`, `ctrlj`, `alt:<key>` (Alt and a key, as ESC then the
 //! key), `settle:<ms>` (wait for the screen to go quiet and mark how long the
@@ -160,6 +160,7 @@ fn main() {
             "right" => send(b"\x1b[C"),
             "left" => send(b"\x1b[D"),
             "esc" => send(&[27]),
+            "delete" => send(b"[3~"),
             "end" => send(b"\x1b[1;5F"),
             "key" => send(value.as_bytes()),
             "enter" => send(&[13]),

@@ -347,6 +347,12 @@ pub trait SessionPort: Send {
     fn revoke_run_approval(&mut self) {}
     /// Ask for the resumable sessions of this project; the list arrives as an event.
     fn list_sessions(&mut self) {}
+    /// Delete a conversation from `/resume`'s list, `latest` and its name, as
+    /// the agents view deletes one: ha's store keeps every turn, so it is
+    /// hidden.
+    fn remove_session(&mut self, _task_id: &str) -> Result<(), String> {
+        Err("this backend does not keep sessions".to_owned())
+    }
     /// Continue from a persisted session, or start a fresh conversation when None.
     fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
         if session_id.is_some() {
@@ -3377,9 +3383,16 @@ pub(super) async fn user_conversation_sessions(
             children.insert(task.clone());
         }
     }
+    // A conversation the user deleted is left out with them, from every
+    // listing: the agents view hid it, but `/resume`'s picker, `latest` and
+    // a name still found it.
+    let hidden = hidden_conversations(&store.paths().data_dir);
     sessions
         .into_iter()
-        .filter(|session| !children.contains(session.task_id.as_str()))
+        .filter(|session| {
+            !children.contains(session.task_id.as_str())
+                && !hidden.iter().any(|task| task == session.task_id.as_str())
+        })
         .collect()
 }
 
@@ -3507,23 +3520,23 @@ pub fn hidden_conversations_path(store_dir: &Path) -> PathBuf {
 /// # Errors
 /// The list could not be written.
 pub fn hide_conversation(store_dir: &Path, task: &str) -> Result<(), String> {
-    let path = hidden_conversations_path(store_dir);
-    let mut hidden: Vec<String> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default();
+    let mut hidden = hidden_conversations(store_dir);
     if !hidden.iter().any(|known| known == task) {
         hidden.push(task.to_owned());
     }
     let text = serde_json::to_string_pretty(&hidden).map_err(|error| error.to_string())?;
-    std::fs::write(&path, text).map_err(|error| error.to_string())
+    std::fs::write(hidden_conversations_path(store_dir), text).map_err(|error| error.to_string())
+}
+
+/// The conversations deleted from the listings.
+fn hidden_conversations(store_dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(hidden_conversations_path(store_dir))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
 }
 
 pub async fn saved_conversations(store_dir: PathBuf, limit: usize) -> Vec<SavedConversation> {
-    let hidden: Vec<String> = std::fs::read_to_string(hidden_conversations_path(&store_dir))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default();
     let Ok(store) = SqliteStore::open_read_only(store_dir).await else {
         return Vec::new();
     };
@@ -3533,11 +3546,7 @@ pub async fn saved_conversations(store_dir: PathBuf, limit: usize) -> Vec<SavedC
     let summaries = user_conversation_sessions(&store, summaries).await;
     let (summaries, turns) = conversation_heads(summaries);
     let mut saved = Vec::new();
-    for summary in summaries
-        .into_iter()
-        .filter(|summary| !hidden.iter().any(|task| task == summary.task_id.as_str()))
-        .take(limit)
-    {
+    for summary in summaries.into_iter().take(limit) {
         let title = store
             .session_setting(&summary.task_id, "title")
             .await
@@ -5860,6 +5869,16 @@ impl SessionPort for AgentSessionService {
         ];
         options.extend(catalog_options(&self.environment, &self.data_dir));
         options
+    }
+
+    fn remove_session(&mut self, task_id: &str) -> Result<(), String> {
+        if task_id == self.task_id.as_str() {
+            return Err(
+                "this is the conversation in use; start another (/new) to remove it".to_owned(),
+            );
+        }
+        hide_conversation(&self.store_dir, task_id)
+            .map_err(|error| format!("the conversation could not be removed from /resume: {error}"))
     }
 
     fn list_sessions(&mut self) {
@@ -12750,6 +12769,14 @@ mod tests {
             legacy.clone(),
         )
         .await;
+        // A conversation the user removed from /resume.
+        let removed = harness_types::TaskId::generate();
+        admit("an old conversation", removed.clone()).await;
+        store
+            .set_session_setting(&removed, "title", "old one")
+            .await
+            .expect("title");
+        super::hide_conversation(&store.paths().data_dir, removed.as_str()).expect("remove");
 
         let listed =
             super::user_conversation_sessions(&store, store.list_sessions().await.expect("list"))
@@ -12761,6 +12788,10 @@ mod tests {
         assert!(listed.contains(&typed_into));
         assert!(!listed.contains(&marked), "a marked child is left out");
         assert!(!listed.contains(&legacy), "an unmarked child is left out");
+        assert!(
+            !listed.contains(&removed),
+            "a removed conversation is left out"
+        );
         for selector in [
             "agents test",
             user_task.as_str(),
