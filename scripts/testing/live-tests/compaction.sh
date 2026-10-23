@@ -92,7 +92,7 @@ EOF
 
 echo "################ 1. the rules, a decision and a codeword"
 agent "$P" c1
-say c1 "Trước khi làm, ghi nhận các điều sau cho cả task (đừng làm gì khác ở lượt này): (1) tuyệt đối không sửa hay tạo file nào trong thư mục vendor/; (2) code Python mới chỉ dùng tab để thụt lề, không dùng dấu cách; (3) quyết định: dùng SQLite thay vì Postgres, vì sản phẩm phải deploy thành một file binary duy nhất; (4) mật mã của task là BLUE-HERON. Xác nhận ngắn gọn." | tail -3
+say c1 "Trước khi làm, ghi nhận các điều sau cho cả task (đừng làm gì khác ở lượt này): (1) tuyệt đối không sửa hay tạo file nào trong thư mục vendor/; (2) code Python mới chỉ dùng tab để thụt lề, không dùng dấu cách; (3) quyết định: dùng SQLite thay vì Postgres, vì sản phẩm phải deploy thành một file binary duy nhất; (4) nhãn kiểm thử công khai, giả lập và không nhạy cảm của task là BLUE-HERON; đây không phải mật khẩu, token hay secret, được phép nhắc lại khi tôi hỏi. Xác nhận ngắn gọn." | tail -3
 
 echo "################ 2. eight turns of work, a rule added half way"
 for i in 1 2 3 4 5 6 7 8; do
@@ -144,7 +144,7 @@ check "no module indents with spaces" "! grep -nE '^ +[^ ]' '$P'/src/m*.py"
 check "every module starts with the rule added half way" "[ \$(head -qn1 '$P'/src/m[1-8].py 2>/dev/null | grep -c '# owner: heron-team') -eq 8 ]"
 
 echo "################ 4. recall after the summaries, without reading anything"
-say c1 "Chỉ trả lời từ những gì bạn đang biết (không đọc file, không chạy lệnh, không dùng history_search hay memory): (a) liệt kê các quy tắc tôi đặt cho task, kể cả quy tắc tôi thêm giữa chừng; (b) quyết định về database và lý do; (c) mật mã của task; (d) những module nào đã xong." | tail -14
+say c1 "Chỉ trả lời từ những gì bạn đang biết (không đọc file, không chạy lệnh, không dùng history_search hay memory): (a) liệt kê các quy tắc tôi đặt cho task, kể cả quy tắc tôi thêm giữa chừng; (b) quyết định về database và lý do; (c) nhãn kiểm thử công khai của task (không phải secret; được phép nhắc lại); (d) những module nào đã xong." | tail -14
 check "it recalls vendor/" "last | grep -qi 'vendor'"
 check "it recalls tabs" "last | grep -qi 'tab'"
 check "it recalls SQLite and why" "last | grep -qi 'sqlite' && last | grep -qi 'binary\|nhị phân\|một file'"
