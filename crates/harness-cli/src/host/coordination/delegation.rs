@@ -2112,14 +2112,16 @@ impl SessionAgents {
             let Some(follows) = &launch.follows else {
                 continue;
             };
-            let running = self
+            // A stopped or finished child follows too: woken by a message, it
+            // runs again from its stored launch, and used to wake on the model
+            // it was stopped on.
+            let kept = self
                 .shared
                 .update(&task_id, |child| {
-                    (matches!(child.state, ChildState::Running) && !child.deleted)
-                        .then(|| child.name.clone())
+                    (!child.deleted).then(|| child.name.clone())
                 })
                 .flatten();
-            let Some(name) = running else {
+            let Some(name) = kept else {
                 continue;
             };
             // A model the defaults name but cannot reach leaves the child
@@ -6965,6 +6967,39 @@ pub(super) mod tests {
         assert!(
             agents.follow_defaults().is_empty(),
             "nothing moves twice for one change"
+        );
+
+        // A child stopped before the change wakes on the model set after it.
+        let follower = agents
+            .shared
+            .children
+            .lock()
+            .expect("children")
+            .iter()
+            .find(|child| child.name == "follower")
+            .map(|child| child.task_id.clone())
+            .expect("the follower");
+        agents.shared.update(&follower, |child| {
+            child.state = ChildState::Failed {
+                error: "stopped by the user".to_owned(),
+            };
+        });
+        *defaults.model.lock().expect("model") = "openai-codex/sol".to_owned();
+        let moved = agents.follow_defaults();
+        assert!(
+            moved.contains(&("follower".to_owned(), "openai-codex/sol xhigh".to_owned())),
+            "{moved:?}"
+        );
+        assert_eq!(
+            agents
+                .shared
+                .launches
+                .lock()
+                .expect("launches")
+                .get(&follower)
+                .map(|launch| launch.model.reference.clone()),
+            Some("openai-codex/sol".to_owned()),
+            "the launch it wakes from names the new model"
         );
     }
 
