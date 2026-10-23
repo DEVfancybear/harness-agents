@@ -92,7 +92,7 @@ pub use harness_runtime::AcceptanceState;
 pub use hooks::{HOOK_EVENTS, HookResponse, fit_payload, hook_matches, run_hooks};
 pub use secrets::{HostEnvironmentSecrets, SecretResolver};
 pub use service::{
-    ConfiguredToolHook, ExternalToolDispatcher, HistorySemantic, PathElsewhere,
+    ConfiguredToolHook, ExternalToolDispatcher, HistorySemantic, NearestFuture, PathElsewhere,
     ToolDispatchAuthorization, ToolExecutionService, ToolGuard, ToolObserver, ToolResultContext,
     git_diff_from, git_head_commit,
 };

@@ -257,6 +257,12 @@ pub struct ToolExecutionService {
 /// texts are (a conversation, or the project) so their vectors are kept
 /// apart. Words alone miss what the record says another way or in another
 /// language; an error or a slow answer leaves the search to words.
+/// What [`HistorySemantic::nearest`] answers: source ids with their
+/// similarity, nearest first.
+pub type NearestFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<(String, f64)>, String>> + Send + 'a>,
+>;
+
 pub trait HistorySemantic: Send + Sync {
     /// Whether embeddings are configured now (`/knowledge semantic`): off,
     /// the search reads no texts for them.
@@ -267,9 +273,7 @@ pub trait HistorySemantic: Send + Sync {
         texts: Vec<harness_store_sqlite::HistoryText>,
         query: &'a str,
         limit: usize,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<(String, f64)>, String>> + Send + 'a>,
-    >;
+    ) -> NearestFuture<'a>;
     /// How the two rankings are fused: the weight of meaning, of words, and
     /// the lowest fused score kept.
     fn weights(&self) -> (f64, f64, Option<f64>);

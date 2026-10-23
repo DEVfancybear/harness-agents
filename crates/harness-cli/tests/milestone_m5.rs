@@ -1589,9 +1589,7 @@ impl harness_tools::HistorySemantic for NearestTo {
         texts: Vec<harness_store_sqlite::HistoryText>,
         _query: &'a str,
         _limit: usize,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<(String, f64)>, String>> + Send + 'a>,
-    > {
+    ) -> harness_tools::NearestFuture<'a> {
         Box::pin(async move {
             let Some(near) = self.0 else {
                 return Err("the embedding provider failed".to_owned());

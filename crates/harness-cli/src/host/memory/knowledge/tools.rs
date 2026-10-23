@@ -75,9 +75,7 @@ impl harness_tools::HistorySemantic for HistoryEmbeddings {
         texts: Vec<harness_store_sqlite::HistoryText>,
         query: &'a str,
         limit: usize,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<(String, f64)>, String>> + Send + 'a>,
-    > {
+    ) -> harness_tools::NearestFuture<'a> {
         /// The longest query an embedding takes: one line of 512 bytes.
         const QUERY_BYTES: usize = 512;
         Box::pin(async move {
