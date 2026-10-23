@@ -139,8 +139,67 @@ pub(crate) fn lookup(
             }
         }
     }
+    let words = query_words(request.query);
+    if output.matches.is_empty() && !request.regex && texts.len() == 1 && words.len() > 1 {
+        let any = search(
+            &any_of_pattern(&words.iter().map(String::as_str).collect::<Vec<_>>()),
+            true,
+            true,
+        )?;
+        if !any.matches.is_empty() {
+            let (found, said) = by_words(any, request.query, &words);
+            (output, note) = (found, Some(said));
+        }
+    }
     definitions_first(&mut output, &names);
     Ok((output, note))
+}
+
+/// The words of a literal query, lowercased, each once.
+fn query_words(query: &str) -> Vec<String> {
+    let mut words = Vec::<String>::new();
+    for word in query.split_whitespace().map(str::to_lowercase) {
+        if !words.contains(&word) {
+            words.push(word);
+        }
+    }
+    words
+}
+
+/// The lines of a search for any of `words`, the files holding the most of
+/// them first (the shared rule of `harness_types::search`), and the note that
+/// says so.
+fn by_words(any: SearchOutput, query: &str, words: &[String]) -> (SearchOutput, String) {
+    let mut files: Vec<(String, Vec<crate::contracts::SearchMatch>)> = Vec::new();
+    for hit in any.matches {
+        match files.iter_mut().find(|(path, _)| *path == hit.path) {
+            Some((_, lines)) => lines.push(hit),
+            None => files.push((hit.path.clone(), vec![hit])),
+        }
+    }
+    let mut found = harness_types::search::match_words(files, words, |(_, lines), word| {
+        let holding = lines
+            .iter()
+            .filter(|line| line.preview.to_lowercase().contains(word))
+            .count();
+        (holding > 0).then(|| u64::try_from(holding).unwrap_or(u64::MAX))
+    });
+    let note = found.note("files", words).unwrap_or_else(|| {
+        format!("0 matches for '{query}'; lines of the files holding all its words:")
+    });
+    found.most_first();
+    let matches = found
+        .hits
+        .into_iter()
+        .flat_map(|(_, (_, lines))| lines)
+        .collect();
+    (
+        SearchOutput {
+            matches,
+            truncated: any.truncated,
+        },
+        note,
+    )
 }
 
 /// Move the lines that declare one of `names` to the front, keeping the
@@ -422,6 +481,21 @@ mod tests {
         assert!(regex.is_err(), "any_of is literal");
         let (found, note) = lookup(&root, &request("nowhere_at_all", &[])).expect("search");
         assert!(found.matches.is_empty() && note.is_none());
+
+        // Several words no line holds together: the lines of their words, the
+        // files holding the most words first, and the word nothing holds.
+        let (found, note) =
+            lookup(&root, &request("upload nowhere_word file", &[])).expect("search");
+        let mut files = found
+            .matches
+            .iter()
+            .map(|hit| hit.path.as_str())
+            .collect::<Vec<_>>();
+        files.dedup();
+        assert_eq!(files.len(), 3, "{files:?}");
+        assert_eq!(files[2], "c.ts", "one word of three comes last: {files:?}");
+        let note = note.expect("a note");
+        assert!(note.contains("no files match 'nowhere_word'"), "{note}");
     }
 
     #[test]

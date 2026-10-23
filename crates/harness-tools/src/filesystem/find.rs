@@ -5,16 +5,18 @@
 //! files first, so `mian.rs` found nothing and `config loader` found nothing
 //! either. Here:
 //!
-//! - every word must match somewhere in the path, and a word forgives a typo
-//!   (one from five letters, two from eight; a short word two swapped letters);
+//! - the files matching every word somewhere in their path, else those
+//!   matching the most words (`harness_types::search`); a word forgives a
+//!   typo (one from five letters, two from eight; a short word two swapped
+//!   letters);
 //! - results come best first: the name itself, then a name that starts with the
 //!   word, contains it, a folder that contains it, then a match through a typo;
 //!   at equal scores what git says is changed, then the newest;
 //! - filters go inline: `*.rs`, `src/`, `src/**/*.rs`, `!test/`, `git:modified`;
 //! - each hit carries its git status where it is not clean;
 //! - with no words, what git says is changed comes first, then the newest;
-//! - nothing found loosens the query one way at a time, and says how: without
-//!   one of the words, then the files whose text holds it.
+//! - no name matching a word, the files whose text holds the query or the
+//!   most of its words, and the result says so.
 
 use std::{
     collections::HashMap,
@@ -24,6 +26,8 @@ use std::{
 
 use globset::{Glob, GlobMatcher};
 use harness_types::{ErrorCode, HarnessError};
+
+use harness_types::search::{Coverage, match_words};
 
 use crate::{
     contracts::FoundFile,
@@ -224,16 +228,6 @@ impl<'a> Candidate<'a> {
             tokens,
             git,
         }
-    }
-
-    /// The file's score for `words`, or `None` when one of them matches
-    /// nowhere in its path.
-    fn score(&self, words: &[String]) -> Option<u32> {
-        let mut total = 0;
-        for word in words {
-            total += self.word_score(word)?;
-        }
-        Some(total)
     }
 
     fn word_score(&self, word: &str) -> Option<u32> {
@@ -453,12 +447,9 @@ fn found(candidate: &Candidate<'_>) -> FoundFile {
     }
 }
 
-/// Rank the candidates for `words`, best first; `None` for an empty result.
-fn ranked<'a, 'b>(candidates: &'b [Candidate<'a>], words: &[String]) -> Vec<&'b Candidate<'a>> {
-    let mut scored = candidates
-        .iter()
-        .filter_map(|candidate| Some((candidate.score(words)?, candidate)))
-        .collect::<Vec<_>>();
+/// Sort scored candidates best first: by score, then what git says is changed,
+/// then the newest, then the shorter path.
+fn best_first<S: Ord>(scored: &mut [(S, &Candidate<'_>)]) {
     scored.sort_by(|(left_score, left), (right_score, right)| {
         right_score
             .cmp(left_score)
@@ -467,7 +458,36 @@ fn ranked<'a, 'b>(candidates: &'b [Candidate<'a>], words: &[String]) -> Vec<&'b 
             .then_with(|| left.path.len().cmp(&right.path.len()))
             .then_with(|| left.path.cmp(&right.path))
     });
-    scored.into_iter().map(|(_, candidate)| candidate).collect()
+}
+
+/// The candidates for `words`, best first, under the shared rule of
+/// `harness_types::search`: those matching every word, else those matching
+/// the most; and the note an incomplete answer carries. No words: every
+/// candidate, what git says is changed first, then the newest.
+fn ranked<'a, 'b>(
+    candidates: &'b [Candidate<'a>],
+    words: &[String],
+) -> (Vec<&'b Candidate<'a>>, Option<String>) {
+    let (mut scored, note) = if words.is_empty() {
+        (
+            candidates
+                .iter()
+                .map(|candidate| (Coverage::default(), candidate))
+                .collect::<Vec<_>>(),
+            None,
+        )
+    } else {
+        let found = match_words(candidates, words, |candidate, word| {
+            candidate.word_score(word).map(u64::from)
+        });
+        let note = found.note("files", words);
+        (found.hits, note)
+    };
+    best_first(&mut scored);
+    (
+        scored.into_iter().map(|(_, candidate)| candidate).collect(),
+        note,
+    )
 }
 
 /// The first few of `candidates` whose text holds `text`, each with the line.
@@ -481,9 +501,19 @@ fn files_by_text(
         .iter()
         .map(|candidate| (candidate.path.as_str(), candidate))
         .collect::<HashMap<_, _>>();
-    let Ok(found_text) =
-        crate::workspace::search_text(root, text, requested, false, true, None, 0, false)
-    else {
+    let Ok((found_text, _)) = crate::lookup::lookup(
+        root,
+        &crate::lookup::Lookup {
+            query: text,
+            any_of: &[],
+            path: requested,
+            regex: false,
+            case_insensitive: true,
+            glob: None,
+            context_lines: 0,
+            anchors: false,
+        },
+    ) else {
         return Vec::new();
     };
     let mut files: Vec<FoundFile> = Vec::new();
@@ -542,48 +572,31 @@ pub(crate) fn find_files(
         truncated: hits.len() > limit || !walk.complete,
         note,
     };
+    let (hits, note) = ranked(&candidates, &parsed.words);
     if parsed.words.is_empty() {
-        // No words: what git says is changed, then the newest.
-        let hits = ranked(&candidates, &[]);
         let note = (query.trim().is_empty() && !hits.is_empty())
             .then(|| "no query: changed in git first, then the newest".to_owned());
         return Ok(listing(&hits, note));
     }
-    let hits = ranked(&candidates, &parsed.words);
     if !hits.is_empty() {
-        return Ok(listing(&hits, None));
+        return Ok(listing(&hits, note));
     }
-    // Nothing: drop one word at a time, the last first.
-    if parsed.words.len() > 1 {
-        for skipped in (0..parsed.words.len()).rev() {
-            let fewer = parsed
-                .words
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| *index != skipped)
-                .map(|(_, word)| word.clone())
-                .collect::<Vec<_>>();
-            let hits = ranked(&candidates, &fewer);
-            if !hits.is_empty() {
-                return Ok(listing(
-                    &hits,
-                    Some(format!(
-                        "0 files match all of '{}'; without '{}':",
-                        parsed.words.join(" "),
-                        parsed.words[skipped]
-                    )),
-                ));
-            }
-        }
-    }
-    // Then the files' text: a name is often a file's subject.
+    // No name holds a word: the files' text, where a name is often a file's
+    // subject; several words find the files holding the most of them.
     let text = parsed.words.join(" ");
     let files = files_by_text(root, requested, &text, &candidates);
     if !files.is_empty() {
         return Ok(FindOutput {
             files,
             truncated: false,
-            note: Some(format!("0 file names match '{text}'; files containing it:")),
+            note: Some(format!(
+                "0 file names match '{text}'; files containing {}:",
+                if parsed.words.len() > 1 {
+                    "its words"
+                } else {
+                    "it"
+                }
+            )),
         });
     }
     Ok(FindOutput {
@@ -672,7 +685,19 @@ mod tests {
             found
                 .note
                 .as_deref()
-                .is_some_and(|note| note.contains("without 'frobnicate'")),
+                .is_some_and(|note| note.contains("no files match 'frobnicate'")),
+            "{:?}",
+            found.note
+        );
+        // Several files named in one query: each is found, though no path
+        // holds every word.
+        let found = find_files(&root, None, "guide loader nginx", 30).expect("find");
+        let mut listed = paths(&found);
+        listed.sort_unstable();
+        assert_eq!(listed, ["docs/guide.md", "src/config/loader.rs"]);
+        assert!(
+            found.note.as_deref().is_some_and(|note| note
+                .contains("files matching the most of its words; no files match 'nginx'")),
             "{:?}",
             found.note
         );
@@ -698,6 +723,9 @@ mod tests {
             ["src/config/loader.rs"],
             "paths stay root-relative"
         );
+        // No name holds any word: the files whose text holds one of them.
+        let found = find_files(&root, None, "qqqqqqqq zebrafinch", 30).expect("find");
+        assert_eq!(paths(&found), ["docs/guide.md"]);
         let none = find_files(&root, None, "qqqqqqqq", 30).expect("find");
         assert!(none.files.is_empty());
         assert!(

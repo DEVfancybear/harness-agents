@@ -6,7 +6,9 @@
 #   3. search_text's any_of finds every spelling in one call;
 #   4. search_text puts the line that defines the name first;
 #   5. search_text, finding nothing for an identifier, tries its other
-#      spellings and says so.
+#      spellings and says so;
+#   6. (0.7.8) find_files naming several files, no path holding them all,
+#      lists the files matching the most words instead of nothing.
 # Every check prints PASS or FAIL; the conversation stays in $LIVE_ROOT/search
 # as evidence.
 #
@@ -66,6 +68,10 @@ echo "################ 5. another spelling when nothing matched"
 say s1 "Gọi tool search_text đúng một lần với query 'PrepareUpload' (không có tham số nào khác). In nguyên văn toàn bộ kết quả tool." | tail -6 | sed 's/^/   /'
 check "the search said it found another spelling" 'last | grep -q "0 matches for .PrepareUpload.; found as"'
 check "the other spellings were found" 'last | grep -q "src/upload.rs" && last | grep -q "web/upload.ts"'
+echo "################ 6. several files named in one find_files query"
+say s1 "Gọi tool find_files đúng một lần với query 'upload loader nginx' (không có tham số nào khác). In nguyên văn toàn bộ kết quả tool." | tail -8 | sed 's/^/   /'
+check "each named file was found though no path holds every word" 'last | grep -q "src/upload.rs" && last | grep -q "src/config/loader.rs"'
+check "it named the word no file name holds" 'last | grep -q "no files match .nginx."'
 "$HA" shutdown --force >/dev/null 2>&1
 
 result

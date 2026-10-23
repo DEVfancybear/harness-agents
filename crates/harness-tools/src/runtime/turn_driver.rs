@@ -3888,12 +3888,13 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             hits.len(),
             hits.iter()
                 .map(|hit| format!(
-                    "{} seq={} kind={} availability={} matched={}{} :: {}",
+                    "{} seq={} kind={} availability={} matched={}/{}{} :: {}",
                     hit.source_id,
                     hit.sequence,
                     hit.kind,
                     hit.availability,
                     hit.matched_terms,
+                    hit.query_terms,
                     match (&hit.conversation, &hit.started) {
                         (Some(conversation), Some(started)) =>
                             format!(" conversation={conversation} started={started}"),

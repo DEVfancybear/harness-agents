@@ -1571,6 +1571,92 @@ async fn m5_03_index_rebuild_is_identical_and_scope_is_a_filter() {
 }
 
 #[tokio::test]
+async fn m5_03_search_follows_the_word_rule_and_ranks_rare_words_first() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let (session, task) = admit(&store, &bench, "the first turn").await;
+    for index in 0..20 {
+        append_note(
+            &store,
+            &session,
+            &task,
+            &format!("build {index}: the worker ran the parser"),
+        )
+        .await;
+    }
+    append_note(
+        &store,
+        &session,
+        &task,
+        "the parser panicked on a stack overflow",
+    )
+    .await;
+    append_note(
+        &store,
+        &session,
+        &task,
+        "an overflow in the heartbeat counter",
+    )
+    .await;
+    // A long output: its last line falls after the first 1024 distinct terms.
+    let words = (0..3000).map(|n| format!("w{n:04}")).collect::<Vec<_>>();
+    append_note(
+        &store,
+        &session,
+        &task,
+        &format!("cargo test {}\nzymurgy: 3 tests failed", words.join(" ")),
+    )
+    .await;
+    // Newer entries that only repeat the common word.
+    for index in 0..5 {
+        append_note(&store, &session, &task, &format!("parser note {index}")).await;
+    }
+    store.index_history(&session).await.expect("index");
+    let scope = HistoryScope::new(bench.project_id.clone(), task.clone());
+
+    // A source holds every word: it is the answer.
+    let hits = store
+        .history_search(&scope, "parser panicked overflow", 10)
+        .await
+        .expect("search");
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].preview, "the parser panicked on a stack overflow");
+    assert_eq!((hits[0].matched_terms, hits[0].query_terms), (3, 3));
+
+    // None does: the most words first, then the rarer word.
+    let hits = store
+        .history_search(&scope, "parser overflow frobnicate", 10)
+        .await
+        .expect("search");
+    assert_eq!(hits[0].preview, "the parser panicked on a stack overflow");
+    assert_eq!((hits[0].matched_terms, hits[0].query_terms), (2, 3));
+    assert_eq!(
+        hits[1].preview, "an overflow in the heartbeat counter",
+        "the rare word outranks the newer sources that hold only the common one: {hits:?}"
+    );
+    assert_eq!(hits[1].matched_terms, 1);
+
+    let hits = store
+        .history_search(&scope, "panicked frobnicate", 10)
+        .await
+        .expect("search");
+    assert_eq!(
+        hits.len(),
+        1,
+        "a word no source has hides nothing: {hits:?}"
+    );
+    assert_eq!((hits[0].matched_terms, hits[0].query_terms), (1, 2));
+
+    let hits = store
+        .history_search(&scope, "zymurgy", 10)
+        .await
+        .expect("search");
+    assert_eq!(hits.len(), 1, "the end of a long output is findable");
+    assert!(hits[0].preview.starts_with("cargo test w0000"));
+    close(store).await;
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)] // batches, sessions, previews and pages in one story
 async fn m5_03_batched_index_previews_and_pages_match_the_journal() {
     let bench = bench();

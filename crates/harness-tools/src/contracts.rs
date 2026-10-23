@@ -388,7 +388,7 @@ fn workspace_tool_schemas(hashline: bool) -> Vec<Value> {
         ),
         function_schema(
             "search_text",
-            "Search bounded UTF-8 workspace text without following links. path is a folder or one file. Regex and context are bounded. Lines that define the searched name come first. any_of adds other literal spellings searched together with query (OR), e.g. [\"prepare_upload\", \"PrepareUpload\"]. When an identifier matches nothing, its other spellings (snake_case, camelCase, kebab-case) are tried and the result says so.",
+            "Search bounded UTF-8 workspace text without following links. path is a folder or one file. Regex and context are bounded. Lines that define the searched name come first. any_of adds other literal spellings searched together with query (OR), e.g. [\"prepare_upload\", \"PrepareUpload\"]. When an identifier matches nothing, its other spellings (snake_case, camelCase, kebab-case) are tried and the result says so; when several words match nothing as written, the lines holding any of them are listed, the files holding the most words first.",
             json!({
                 "query": string_schema(),
                 "any_of": {"type": "array", "items": string_schema(), "minItems": 1, "maxItems": SEARCH_ANY_OF_MAX, "description": "More literal strings, any of which may match (OR with query); never escaped."},
@@ -440,7 +440,7 @@ fn workspace_tool_schemas(hashline: bool) -> Vec<Value> {
         ),
         function_schema(
             "find_files",
-            "Find files by name: fuzzy and typo-tolerant (mian.rs finds main.rs), over the whole path, best match first, with each file's git status where it is not clean. All words must match. Inline filters: *.rs or *.{ts,tsx}, src/ (in a folder), src/**/*.rs (glob), !test/ or !*.md (exclude), git:modified|staged|untracked|changed. An empty query lists what git says is changed, then the newest files. When nothing matches it drops a word, then lists files whose text contains it, and says so. Use search_text for contents; read the top hit instead of searching again.",
+            "Find files by name: fuzzy and typo-tolerant (mian.rs finds main.rs), over the whole path, best match first, with each file's git status where it is not clean. A file matching every word comes first; when none does, it lists the files matching the most words and names the words no file matches. Inline filters: *.rs or *.{ts,tsx}, src/ (in a folder), src/**/*.rs (glob), !test/ or !*.md (exclude), git:modified|staged|untracked|changed. An empty query lists what git says is changed, then the newest files. When no name matches at all it lists files whose text contains the query or its words, and says so. Use search_text for contents; read the top hit instead of searching again.",
             json!({
                 "query": {"type": "string", "description": "Name words and filters, e.g. 'config loader *.rs !test/'."},
                 "path": nullable_string_schema(),
@@ -572,7 +572,7 @@ pub fn history_tool_schemas() -> Vec<Value> {
     vec![
         function_schema(
             "history_search",
-            "Search this conversation's journal for earlier sources by keyword, including exact identifiers. With scope \"project\", search every earlier conversation in this project too (how something was done or decided before); hits from another conversation name it and when it started.",
+            "Search this conversation's journal for earlier sources by keyword, including exact identifiers. The sources holding every word are the hits; when none does, those holding the most words come first (matched=2/3), and a rare word counts more than a common one. With scope \"project\", search every earlier conversation in this project too (how something was done or decided before); hits from another conversation name it and when it started.",
             json!({
                 "query": string_schema(),
                 "limit": {"type": "integer", "minimum": 1, "maximum": HISTORY_SEARCH_MAX_LIMIT},
@@ -1925,6 +1925,8 @@ pub struct HistoryHitView {
     pub kind: String,
     pub availability: String,
     pub matched_terms: u64,
+    /// The terms the query looked for; a hit may hold only some of them.
+    pub query_terms: u64,
     pub preview: String,
     /// The conversation a hit from another one belongs to, and when it began.
     #[serde(skip_serializing_if = "Option::is_none")]

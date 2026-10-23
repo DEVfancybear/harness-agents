@@ -243,7 +243,7 @@ impl ExternalToolCatalog for SkillToolCatalog {
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "query": {"type": "string", "description": "Optional: words the skill's name or description must contain."},
+                            "query": {"type": "string", "description": "Optional: words to look for in a skill's name or description; the skills holding every word, else those holding the most."},
                             "limit": {"type": "integer", "minimum": 1, "description": "Optional: at most this many skills."}
                         },
                         "additionalProperties": false
@@ -312,8 +312,9 @@ fn same_digest(catalog: &str, supplied: &str) -> bool {
 }
 
 /// The skills `list_skills` lists: the ones the model may invoke, narrowed to
-/// those whose name or description holds the query's words (every word when
-/// some have them all, else the most), at most `limit`.
+/// those whose name or description holds the query's words under the shared
+/// rule of `harness_types::search` (every word when some have them all, else
+/// the most words first), at most `limit`.
 fn listed_skills<'a>(
     catalog: &'a SkillCatalog,
     arguments: &Value,
@@ -326,29 +327,27 @@ fn listed_skills<'a>(
             .collect::<Vec<_>>()
     };
     let query = arguments["query"].as_str().map(words).unwrap_or_default();
-    let mut skills = catalog
+    let invocable = catalog
         .entries()
         .iter()
-        .filter(|entry| entry.model_invocable)
-        .map(|entry| {
-            let have = words(&format!("{} {}", entry.name, entry.description));
-            let hits = query.iter().filter(|word| have.contains(word)).count();
-            (hits, entry)
-        })
-        .collect::<Vec<_>>();
-    if !query.is_empty() {
-        let best = skills.iter().map(|(hits, _)| *hits).max().unwrap_or(0);
-        skills.retain(|(hits, _)| best > 0 && *hits == best);
-    }
+        .filter(|entry| entry.model_invocable);
+    let skills = if query.is_empty() {
+        invocable.collect::<Vec<_>>()
+    } else {
+        let mut found = harness_types::search::match_words(invocable, &query, |entry, word| {
+            words(&format!("{} {}", entry.name, entry.description))
+                .iter()
+                .any(|have| have == word)
+                .then_some(1)
+        });
+        found.most_first();
+        found.hits.into_iter().map(|(_, entry)| entry).collect()
+    };
     let limit = arguments["limit"]
         .as_u64()
         .and_then(|limit| usize::try_from(limit).ok())
         .unwrap_or(usize::MAX);
-    skills
-        .into_iter()
-        .take(limit)
-        .map(|(_, entry)| entry)
-        .collect()
+    skills.into_iter().take(limit).collect()
 }
 
 struct SkillToolDispatcher {
@@ -956,6 +955,13 @@ mod tests {
             ["review"]
         );
         assert_eq!(names(serde_json::json!({"query": "staging"})), ["deploy"]);
+        let mut partial = names(serde_json::json!({"query": "staging kubernetes rust"}));
+        partial.sort_unstable();
+        assert_eq!(
+            partial,
+            ["deploy", "review"],
+            "no skill holds every word: each holding one is listed"
+        );
         assert!(names(serde_json::json!({"query": "kubernetes"})).is_empty());
         assert_eq!(names(serde_json::json!({"limit": 1})).len(), 1);
         assert!(names(serde_json::json!({})).len() >= 2);

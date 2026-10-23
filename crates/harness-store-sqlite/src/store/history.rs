@@ -28,8 +28,13 @@ pub const HISTORY_SOURCE_LIMIT_BYTES: usize = 64 * 1024;
 /// Longest single term kept in the index.
 const HISTORY_TERM_LIMIT_CHARS: usize = 64;
 
-/// Most terms one source contributes.
-const HISTORY_TERMS_PER_SOURCE: usize = 512;
+/// Most terms one source contributes. A longer source keeps the terms it
+/// opens with and the ones it ends with (see `history_terms`).
+const HISTORY_TERMS_PER_SOURCE: usize = 1024;
+
+/// BM25's IDF scaled to an integer, so a score sums the same way on every
+/// read: a float sum depends on the order the rows arrive in.
+const HISTORY_IDF_SCALE: f64 = 1000.0;
 
 /// Largest page `history_read` returns.
 pub const HISTORY_READ_MAX_BYTES: usize = 64 * 1024;
@@ -102,8 +107,9 @@ pub struct HistoryHit {
     pub content_hash: ContentHash,
     pub availability: SourceAvailability,
     pub preview: String,
-    /// How many of the query's terms this source contains.
+    /// How many of the query's terms this source contains, of how many.
     pub matched_terms: u64,
+    pub query_terms: u64,
     /// The task the source belongs to, and when its session began.
     pub task_id: String,
     pub started: String,
@@ -186,43 +192,86 @@ impl NoteRecord {
 /// separators *and* keep the joined form, so `XYZ-731` is findable as a whole
 /// identifier and as its parts. A test that depends on these rules is a test of
 /// this function, not of a build flag.
+///
+/// A source with more distinct terms than the index keeps keeps the first
+/// half it meets and the last half: a long tool output names its command at
+/// the top and its error at the bottom. (It kept the alphabetically first
+/// ones, so in a long output nothing after the first letters was findable.)
 #[must_use]
 pub fn history_terms(text: &str) -> Vec<String> {
-    let mut terms = BTreeSet::new();
-    let mut current = String::new();
-    for character in text.chars() {
-        if character.is_alphanumeric() {
-            current.extend(character.to_lowercase());
-        } else if !current.is_empty() {
-            terms.insert(std::mem::take(&mut current));
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered = Vec::new();
+    let mut keep = |term: String| {
+        let term = term
+            .chars()
+            .take(HISTORY_TERM_LIMIT_CHARS)
+            .collect::<String>();
+        if !term.is_empty() && seen.insert(term.clone()) {
+            ordered.push(term);
         }
-    }
-    if !current.is_empty() {
-        terms.insert(current);
-    }
-    // Joined identifiers: every run of alphanumerics joined by `-`, `_` or `.`
-    // is a term of its own, so `XYZ-731` is findable whole and by its parts.
-    for run in text.split(|character: char| {
-        !(character.is_alphanumeric() || character == '-' || character == '_' || character == '.')
-    }) {
+    };
+    // Each run of alphanumerics joined by `-`, `_` or `.` gives its parts and,
+    // when it has more than one, the joined form too, so `XYZ-731` is
+    // findable whole and by its parts.
+    for run in text.split(|character: char| !is_term_character(character)) {
         let joined = run.trim_matches(['-', '_', '.']).to_lowercase();
         if joined.is_empty() {
             continue;
         }
+        for part in joined.split(|character: char| !character.is_alphanumeric()) {
+            keep(part.to_owned());
+        }
         if joined.chars().any(|character| !character.is_alphanumeric()) {
-            terms.insert(joined);
+            keep(joined);
         }
     }
+    if ordered.len() > HISTORY_TERMS_PER_SOURCE {
+        let tail = HISTORY_TERMS_PER_SOURCE / 2;
+        let head = HISTORY_TERMS_PER_SOURCE - tail;
+        ordered.drain(head..ordered.len() - tail);
+    }
+    ordered
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn is_term_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '-' | '_' | '.')
+}
+
+/// The terms a search looks for: those of the query, less the parts of an
+/// identifier it names whole. `XYZ-731` looks for `xyz-731`, not for every
+/// source that mentions `xyz` or `731`.
+fn search_terms(query: &str) -> Vec<String> {
+    let terms = history_terms(query);
+    let parts = terms
+        .iter()
+        .filter(|term| term.chars().any(|character| !character.is_alphanumeric()))
+        .flat_map(|joined| {
+            joined
+                .split(|character: char| !character.is_alphanumeric())
+                .filter(|part| !part.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
     terms
         .into_iter()
-        .filter(|term| !term.is_empty())
-        .map(|term| {
-            term.chars()
-                .take(HISTORY_TERM_LIMIT_CHARS)
-                .collect::<String>()
-        })
-        .take(HISTORY_TERMS_PER_SOURCE)
+        .filter(|term| !parts.contains(term))
         .collect()
+}
+
+/// BM25's IDF of a term that `matching` of `sources` contain, scaled to an
+/// integer. The index records which terms a source has, not how often, so a
+/// hit scores the IDF of each query term it contains: BM25 with every term
+/// frequency at one and no length normalization.
+fn scaled_idf(sources: u64, matching: u64) -> i64 {
+    let idf = harness_types::search::bm25_idf(sources, matching);
+    #[allow(clippy::cast_possible_truncation)] // a small positive number
+    let scaled = (idf * HISTORY_IDF_SCALE).round() as i64;
+    scaled.max(1)
 }
 
 /// The text a journal entry contributes to the index.
@@ -443,17 +492,26 @@ impl SqliteStore {
         Ok(indexed)
     }
 
-    /// Search the index within one scope.
+    /// Search the index within one scope, the most relevant sources first.
     ///
     /// The scope is part of the query: a source from another task is never a
     /// candidate, so no ranking decision can leak it.
+    ///
+    /// The rule of every search (`harness_types::search`): the sources
+    /// holding every term of the query, else those holding the most terms
+    /// first. Among them a source scores the BM25 IDF of the terms it holds
+    /// (`scaled_idf`), so a rare word counts for more than a common one, and
+    /// equal scores go newest first. Every term used to be required and the
+    /// newest match came first, so one word the source put differently hid it,
+    /// and a source that only repeated the query's common words came ahead of
+    /// the one that answered it.
     pub async fn history_search(
         &self,
         scope: &HistoryScope,
         query: &str,
         limit: usize,
     ) -> Result<Vec<HistoryHit>, StoreError> {
-        let terms = history_terms(query);
+        let terms = search_terms(query);
         if terms.is_empty() {
             return Err(StoreError::new(
                 ErrorCode::InvalidPayload,
@@ -461,60 +519,75 @@ impl SqliteStore {
             ));
         }
         let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(20);
-        let mut sql = String::from(
-            "SELECT s.source_id, s.sequence, s.kind, substr(s.content, 1, ?) AS head,
-                    s.content_hash, s.availability, COUNT(DISTINCT t.term) AS matched,
-                    s.task_id, COALESCE(se.created_at, '') AS started
-             FROM history_sources s JOIN history_terms t ON t.source_id = s.source_id
-             LEFT JOIN sessions se ON se.session_id = s.session_id
-             WHERE s.project_id = ? AND (? OR s.task_id = ?",
-        );
-        for index in 0..scope.granted_source_ids.len() {
-            let _ = index;
-            sql.push_str(" OR s.source_id = ?");
-        }
-        sql.push_str(") AND t.term IN (");
-        for index in 0..terms.len() {
-            if index > 0 {
-                sql.push(',');
-            }
-            sql.push('?');
-        }
-        // Newest first: across conversations a sequence only orders one
-        // session, so the session's start orders them.
-        sql.push_str(if scope.project_wide {
-            ") GROUP BY s.source_id HAVING matched = ? ORDER BY started DESC, s.sequence DESC LIMIT ?"
+        let weights = self.history_term_weights(scope, &terms).await?;
+        let term_list = vec!["?"; terms.len()].join(",");
+        let weight_cases = " WHEN ? THEN ?".repeat(terms.len());
+        // Newest first among equal scores: across conversations a sequence
+        // only orders one session, so the session's start orders them.
+        let (order, page_order) = if scope.project_wide {
+            (
+                "matched DESC, weight DESC, started DESC, sequence DESC",
+                "ranked.matched DESC, ranked.weight DESC, ranked.started DESC, ranked.sequence DESC",
+            )
         } else {
-            ") GROUP BY s.source_id HAVING matched = ? ORDER BY s.sequence DESC LIMIT ?"
-        });
+            (
+                "matched DESC, weight DESC, sequence DESC",
+                "ranked.matched DESC, ranked.weight DESC, ranked.sequence DESC",
+            )
+        };
+        // The ranking reads only the term rows; the preview is cut from the
+        // few sources that make the page.
+        let sql = format!(
+            "SELECT s.source_id, s.sequence, s.kind, substr(s.content, 1, ?) AS head,
+                    s.content_hash, s.availability, ranked.matched, s.task_id, ranked.started
+             FROM (
+                 SELECT * FROM (
+                     SELECT t.source_id, COUNT(*) AS matched,
+                            SUM(CASE t.term{weight_cases} ELSE 0 END) AS weight,
+                            s.sequence AS sequence, COALESCE(se.created_at, '') AS started,
+                            MAX(COUNT(*)) OVER () AS best
+                     FROM history_terms t JOIN history_sources s ON s.source_id = t.source_id
+                     LEFT JOIN sessions se ON se.session_id = s.session_id
+                     WHERE {} AND t.term IN ({term_list})
+                     GROUP BY t.source_id
+                 ) WHERE matched = ? OR best < ?
+                 ORDER BY {order} LIMIT ?
+             ) ranked JOIN history_sources s ON s.source_id = ranked.source_id
+             ORDER BY {page_order}",
+            scope_predicate(scope),
+        );
         // The statement is assembled from a fixed template: every caller value
         // is a bind parameter, and the only thing that varies is how many `?`
         // placeholders the scope grants and the query terms need.
         // A hit shows a preview, never the source: fetch one character more
         // than the preview keeps, which is enough to know it was cut.
         let mut statement = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(i64::try_from(PREVIEW_CHARS + 1).unwrap_or(i64::MAX))
-            .bind(scope.project_id.as_str())
-            .bind(scope.project_wide)
-            .bind(scope.task_id.as_str());
-        for granted in &scope.granted_source_ids {
-            statement = statement.bind(granted);
+            .bind(i64::try_from(PREVIEW_CHARS + 1).unwrap_or(i64::MAX));
+        for (term, weight) in terms.iter().zip(&weights) {
+            statement = statement.bind(term).bind(*weight);
+        }
+        for value in scope_binds(scope) {
+            statement = statement.bind(value);
         }
         for term in &terms {
             statement = statement.bind(term);
         }
+        let every = i64::try_from(terms.len()).unwrap_or(i64::MAX);
         let rows = statement
-            .bind(i64::try_from(terms.len()).unwrap_or(i64::MAX))
+            .bind(every)
+            .bind(every)
             .bind(limit)
             .fetch_all(&self.pool)
             .await
             .map_err(|error| {
                 database_error(ErrorCode::StorageWriteFailed, "search history", error)
             })?;
+        let query_terms = u64::try_from(terms.len()).unwrap_or(u64::MAX);
         rows.iter()
             .map(|row| {
                 let head: String = row_get(row, "head")?;
                 Ok(HistoryHit {
+                    query_terms,
                     source_id: row_get(row, "source_id")?,
                     sequence: u64::try_from(row_get::<i64>(row, "sequence")?).unwrap_or_default(),
                     kind: row_get(row, "kind")?,
@@ -537,6 +610,51 @@ impl SqliteStore {
                 })
             })
             .collect()
+    }
+
+    /// Each term's scaled IDF within the scope, in the order of `terms`.
+    async fn history_term_weights(
+        &self,
+        scope: &HistoryScope,
+        terms: &[String],
+    ) -> Result<Vec<i64>, StoreError> {
+        let sql = format!(
+            "SELECT t.term, COUNT(*) AS matching,
+                    (SELECT COUNT(*) FROM history_sources s WHERE {predicate}) AS sources
+             FROM history_terms t JOIN history_sources s ON s.source_id = t.source_id
+             WHERE {predicate} AND t.term IN ({})
+             GROUP BY t.term",
+            vec!["?"; terms.len()].join(","),
+            predicate = scope_predicate(scope),
+        );
+        // A fixed template: only the number of placeholders varies.
+        let mut statement = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for _ in 0..2 {
+            for value in scope_binds(scope) {
+                statement = statement.bind(value);
+            }
+        }
+        for term in terms {
+            statement = statement.bind(term);
+        }
+        let rows = statement.fetch_all(&self.pool).await.map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "weigh history terms", error)
+        })?;
+        let mut counts = std::collections::HashMap::new();
+        for row in &rows {
+            let term: String = row_get(row, "term")?;
+            let matching = u64::try_from(row_get::<i64>(row, "matching")?).unwrap_or_default();
+            let sources = u64::try_from(row_get::<i64>(row, "sources")?).unwrap_or_default();
+            counts.insert(term, (sources, matching));
+        }
+        Ok(terms
+            .iter()
+            .map(|term| {
+                counts
+                    .get(term)
+                    .map_or(0, |(sources, matching)| scaled_idf(*sources, *matching))
+            })
+            .collect())
     }
 
     /// Read an exact page of one source.
@@ -1001,6 +1119,29 @@ impl SqliteStore {
     }
 }
 
+/// The `WHERE` part that keeps a search inside its scope, over
+/// `history_sources s`; `scope_binds` are its values. A task's scope names
+/// the task outright, so counting its sources reads the task's index.
+fn scope_predicate(scope: &HistoryScope) -> String {
+    if scope.project_wide {
+        "s.project_id = ?".to_owned()
+    } else {
+        format!(
+            "s.project_id = ? AND (s.task_id = ?{})",
+            " OR s.source_id = ?".repeat(scope.granted_source_ids.len())
+        )
+    }
+}
+
+fn scope_binds(scope: &HistoryScope) -> Vec<&str> {
+    let mut binds = vec![scope.project_id.as_str()];
+    if !scope.project_wide {
+        binds.push(scope.task_id.as_str());
+        binds.extend(scope.granted_source_ids.iter().map(String::as_str));
+    }
+    binds
+}
+
 fn note_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<NoteRecord, StoreError> {
     let sources: Vec<SourceRef> = serde_json::from_str(&row_get::<String>(row, "sources_json")?)
         .map_err(|_| {
@@ -1077,4 +1218,54 @@ where
 #[allow(clippy::needless_pass_by_value)] // mirrors the store's own helper
 fn database_error(code: ErrorCode, action: &str, error: sqlx::Error) -> StoreError {
     StoreError::new(code, format!("cannot {action}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_long_source_keeps_its_first_and_last_terms() {
+        let words = (0..3000).map(|n| format!("w{n:04}")).collect::<Vec<_>>();
+        let text = format!("cargo test started {} zymurgy failed", words.join(" "));
+        let terms = history_terms(&text);
+        assert_eq!(terms.len(), HISTORY_TERMS_PER_SOURCE);
+        for kept in ["cargo", "started", "w0000", "zymurgy", "failed", "w2999"] {
+            assert!(terms.contains(&kept.to_owned()), "{kept} is kept");
+        }
+        assert!(
+            !terms.contains(&"w1500".to_owned()),
+            "the middle is what goes"
+        );
+    }
+
+    #[test]
+    fn an_identifier_is_a_term_whole_and_by_its_parts() {
+        assert_eq!(
+            history_terms("see XYZ-731 now"),
+            ["731", "now", "see", "xyz", "xyz-731"]
+        );
+        assert_eq!(
+            history_terms("crates/foo.rs"),
+            ["crates", "foo", "foo.rs", "rs"]
+        );
+    }
+
+    #[test]
+    fn a_search_for_an_identifier_looks_for_it_whole() {
+        assert_eq!(search_terms("XYZ-731"), ["xyz-731"]);
+        assert_eq!(
+            search_terms("parser ZK-42 budget"),
+            ["budget", "parser", "zk-42"]
+        );
+    }
+
+    #[test]
+    fn a_rare_term_weighs_more_than_a_common_one() {
+        assert!(scaled_idf(1000, 2) > scaled_idf(1000, 300));
+        assert!(
+            scaled_idf(1000, 1000) >= 1,
+            "every match counts for something"
+        );
+    }
 }

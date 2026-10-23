@@ -21,6 +21,7 @@ mod ports;
 mod schema;
 #[path = "domain/scope.rs"]
 mod scope;
+pub mod search;
 #[path = "contracts/store_transactions.rs"]
 mod store_transactions;
 #[path = "domain/version.rs"]

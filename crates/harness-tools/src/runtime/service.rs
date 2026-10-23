@@ -1980,6 +1980,7 @@ impl ToolExecutionService {
                     kind: hit.kind,
                     availability: hit.availability.as_str().to_owned(),
                     matched_terms: hit.matched_terms,
+                    query_terms: hit.query_terms,
                     preview: hit.preview,
                     conversation: (hit.task_id != prepared.request.task_id.as_str())
                         .then(|| hit.task_id.clone()),
