@@ -1,0 +1,5 @@
+schema_version = 2
+
+[provider]
+id = "openai-codex"
+model = "gpt-6-luna"

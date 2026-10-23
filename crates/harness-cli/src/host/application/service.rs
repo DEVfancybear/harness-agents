@@ -9185,6 +9185,14 @@ async fn run_turn(
             project_blocks.push(super::task_state::earlier_block(&state, title.as_deref()));
         }
     }
+    if fork_plan.is_none()
+        && request.compact_guidance.is_none()
+        && let Some(block) =
+            super::session_brief::context_block(&store, &task_id, source.as_ref(), refinements)
+                .await
+    {
+        project_blocks.push(block);
+    }
     // Where the project's feature list stands, and its rules.
     if let Some(block) = super::features::context_block(&workspace_root) {
         project_blocks.push(block);
