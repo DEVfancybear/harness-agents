@@ -881,8 +881,14 @@ pub enum ChildLineKind {
     Text,
 }
 
-/// How many lines of a delegated agent's notices its pane keeps.
-pub const CHILD_RECENT_LINES: usize = 60;
+/// How many lines of a delegated agent's notices its pane keeps at most.
+pub const CHILD_RECENT_LINES: usize = 240;
+
+/// How many of a delegated agent's tool calls its pane keeps. A call takes
+/// about eleven lines (its call, up to nine of output, its end), so the 60
+/// lines kept before held five or six calls: a tall pane drew a dozen rows
+/// and left the rest blank. Kept by calls, it fills the pane.
+pub const CHILD_RECENT_CALLS: usize = 24;
 
 /// Pure data: the renderer never reaches back into the controller, so a frame is
 /// a function of this snapshot plus the theme.

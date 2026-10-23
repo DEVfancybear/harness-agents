@@ -643,6 +643,9 @@ pub struct FullscreenScreen<B: Backend> {
     sidebar: bool,
     /// The project's other agents, read on a thread of their own.
     roster: Option<super::roster::Poller>,
+    /// The other agents' spinner clock, and the frame last drawn from it.
+    spin_clock: std::time::Instant,
+    spun: u64,
     /// The delegate whose pane is open beside the conversation.
     focus: Option<String>,
     /// The sidebar's agent rows as last drawn, for a click.
@@ -693,6 +696,8 @@ where
             scrolled_frames: 0,
             sidebar: false,
             roster: None,
+            spin_clock: std::time::Instant::now(),
+            spun: 0,
             focus: None,
             hits: Vec::new(),
             find: None,
@@ -1050,6 +1055,7 @@ where
             .as_ref()
             .map_or(&[][..], super::roster::Poller::entries);
         let focus = self.focus.as_deref();
+        let spin = self.spin_frame();
         let mut hits = Vec::new();
         let theme = self.theme;
         let dropped = self.dropped_rows;
@@ -1086,7 +1092,11 @@ where
                         frame,
                         Rect::new(screen.x, screen.y, left, screen.height),
                         state,
-                        super::sidebar::Extra { others, focus },
+                        super::sidebar::Extra {
+                            others,
+                            focus,
+                            spin,
+                        },
                         &theme,
                     );
                 }
@@ -1378,7 +1388,23 @@ where
         let older = self.built_from > 0
             && self.draw_older(usize::MAX, Some(OLDER_BUDGET), 0) > 0
             && !self.viewport.is_following();
-        roster || scrolled || older
+        // An agent elsewhere that works spins on the screen's own clock.
+        let spinning = self.roster.as_ref().is_some_and(|roster| {
+            roster
+                .entries()
+                .iter()
+                .any(|entry| entry.status == super::sidebar::Status::Working)
+        }) && {
+            let frame = self.spin_frame();
+            std::mem::replace(&mut self.spun, frame) != frame
+        };
+        roster || scrolled || older || spinning
+    }
+
+    /// The other agents' spinner frame: one every 100 ms, the session's own
+    /// spinner's pace.
+    fn spin_frame(&self) -> u64 {
+        u64::try_from(self.spin_clock.elapsed().as_millis() / 100).unwrap_or(u64::MAX)
     }
 
     fn scroll_tick(&mut self) -> bool {

@@ -646,8 +646,11 @@ impl InteractiveController {
         );
     }
 
-    /// Append lines to a pane's, keeping the newest
-    /// [`super::events::CHILD_RECENT_LINES`].
+    /// Append lines to a pane's, keeping its newest
+    /// [`super::events::CHILD_RECENT_CALLS`] calls within
+    /// [`super::events::CHILD_RECENT_LINES`] lines. Whole calls go, oldest
+    /// first: cutting by lines left a call's output without its call, drawn as
+    /// error lines.
     fn keep_child_lines<'a>(
         recent: &mut Vec<super::events::ChildLine>,
         kind: super::events::ChildLineKind,
@@ -659,10 +662,24 @@ impl InteractiveController {
             text: line.chars().take(400).collect(),
             call: call.to_owned(),
         }));
-        let excess = recent
-            .len()
-            .saturating_sub(super::events::CHILD_RECENT_LINES);
-        recent.drain(..excess);
+        let calls = |recent: &[super::events::ChildLine]| {
+            recent
+                .iter()
+                .filter(|line| !line.call.is_empty())
+                .map(|line| line.call.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        };
+        while recent.len() > super::events::CHILD_RECENT_LINES
+            || calls(recent) > super::events::CHILD_RECENT_CALLS
+        {
+            let oldest = recent[0].call.clone();
+            if oldest.is_empty() {
+                recent.remove(0);
+            } else {
+                recent.retain(|line| line.call != oldest);
+            }
+        }
     }
 
     /// The session's title, once it has one (`/name`, or after `/compact`).
@@ -7325,6 +7342,43 @@ mod tests {
             .expect("done");
         let _ = h.controller.pump_events();
         assert_eq!(h.controller.ui_state().activity, None);
+    }
+
+    /// A pane keeps its newest calls whole: thirty calls of ten lines each
+    /// keep the last 24, each with its call line, none cut in half.
+    #[test]
+    fn a_delegates_pane_keeps_whole_calls() {
+        use super::super::events::{CHILD_RECENT_CALLS, ChildLineKind};
+        let mut h = tui_bench(true);
+        h.controller.boot_lines();
+        for call in 0..30 {
+            let id = format!("c{call}");
+            for (kind, lines) in [
+                (ChildLineKind::Call, 1),
+                (ChildLineKind::Output, 8),
+                (ChildLineKind::Settled, 1),
+            ] {
+                h.events
+                    .send(SessionEvent::ChildOutput {
+                        name: "explorer".to_owned(),
+                        kind,
+                        lines: (0..lines).map(|n| format!("{id} line {n}")).collect(),
+                        call: id.clone(),
+                    })
+                    .expect("line");
+            }
+        }
+        let _ = h.controller.pump_events();
+        let recent = h.controller.ui_state().child_activity[0].recent.clone();
+        let calls = recent
+            .iter()
+            .filter(|line| line.kind == ChildLineKind::Call)
+            .map(|line| line.call.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), CHILD_RECENT_CALLS);
+        assert_eq!(calls[0], format!("c{}", 30 - CHILD_RECENT_CALLS));
+        assert_eq!(recent[0].kind, ChildLineKind::Call, "no call cut in half");
+        assert_eq!(recent.len(), CHILD_RECENT_CALLS * 10);
     }
 
     /// A delegate's pane keeps its calls, its tools' output and its answer,

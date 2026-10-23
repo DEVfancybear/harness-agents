@@ -217,6 +217,10 @@ pub enum Target {
 pub struct Extra<'a> {
     pub others: &'a [super::roster::Entry],
     pub focus: Option<&'a str>,
+    /// The spinner frame of the other agents' rows, from the screen's own
+    /// clock: the session's tick stands still while it is idle, and a busy
+    /// agent elsewhere showed one frozen frame.
+    pub spin: u64,
 }
 
 /// The rows Alt+1..9 reach, in their order: the session, its delegates, then
@@ -383,39 +387,40 @@ fn lines(
         total.to_string()
     };
     rows.push(header("agents", &count));
-    let agent = |number: usize, status: Status, name: &str, active: bool| -> Line<'static> {
-        let word = status.word();
-        let name = child_label(name, width.saturating_sub(5 + word.len() + 2));
-        let gap = width.saturating_sub(5 + display_width(&name) + word.len() + 1);
-        let line = Line::from(vec![
-            Span::styled(
-                if number <= 9 {
-                    format!(" {number} ")
-                } else {
-                    "   ".to_owned()
-                },
-                theme.dim,
-            ),
-            Span::styled(status.glyph(state.tick), status.style(theme)),
-            Span::raw(" "),
-            Span::styled(
-                name,
-                if status == Status::Idle {
-                    theme.muted
-                } else {
-                    theme.strong
-                },
-            ),
-            Span::raw(" ".repeat(gap)),
-            Span::styled(word, status.style(theme)),
-            Span::raw(" "),
-        ]);
-        if active {
-            line.style(theme.selection)
-        } else {
-            line
-        }
-    };
+    let agent =
+        |number: usize, status: Status, name: &str, active: bool, tick: u64| -> Line<'static> {
+            let word = status.word();
+            let name = child_label(name, width.saturating_sub(5 + word.len() + 2));
+            let gap = width.saturating_sub(5 + display_width(&name) + word.len() + 1);
+            let line = Line::from(vec![
+                Span::styled(
+                    if number <= 9 {
+                        format!(" {number} ")
+                    } else {
+                        "   ".to_owned()
+                    },
+                    theme.dim,
+                ),
+                Span::styled(status.glyph(tick), status.style(theme)),
+                Span::raw(" "),
+                Span::styled(
+                    name,
+                    if status == Status::Idle {
+                        theme.muted
+                    } else {
+                        theme.strong
+                    },
+                ),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(word, status.style(theme)),
+                Span::raw(" "),
+            ]);
+            if active {
+                line.style(theme.selection)
+            } else {
+                line
+            }
+        };
     // herdr's agent row is two lines: the name, then its state in its colour
     // (and here the model and thinking level it runs on). Where the agents do
     // not all fit that way, each is one line with its state at the right.
@@ -462,7 +467,7 @@ fn lines(
     if two_lines {
         rows.extend(pair(1, main, "main", String::new(), extra.focus.is_none()));
     } else {
-        rows.push(agent(1, main, "main", extra.focus.is_none()));
+        rows.push(agent(1, main, "main", extra.focus.is_none(), state.tick));
     }
     // Room left above the footer and the other agents. Every child gets its
     // row before any gets one for what it last did, and the working ones get
@@ -505,7 +510,13 @@ fn lines(
             }
             continue;
         }
-        rows.push(agent(index + 2, *status, &activity.name, active));
+        rows.push(agent(
+            index + 2,
+            *status,
+            &activity.name,
+            active,
+            state.tick,
+        ));
         if details(*status) {
             let mut spans = vec![Span::styled(tools, theme.dim)];
             if !activity.latest.is_empty() {
@@ -572,6 +583,7 @@ fn lines(
                 entry.status,
                 &entry.name,
                 false,
+                extra.spin,
             ));
             if let Some(folder) = &entry.folder
                 && fits(&rows, 1 + after)
@@ -801,6 +813,7 @@ mod tests {
             Extra {
                 others: &others,
                 focus: Some("verifier"),
+                spin: 0,
             },
         );
         let text = rows.join("\n");
@@ -1129,6 +1142,7 @@ mod tests {
             Extra {
                 others: &others,
                 focus: None,
+                spin: 0,
             },
         );
         let text = rows.join("\n");
@@ -1176,6 +1190,7 @@ mod tests {
             Extra {
                 others: &others,
                 focus: None,
+                spin: 0,
             },
         );
         let text = rows.join("\n");
@@ -1205,6 +1220,7 @@ mod tests {
             Extra {
                 others: &others,
                 focus: None,
+                spin: 0,
             },
         );
         let text = rows.join("\n");
