@@ -1964,7 +1964,7 @@ async fn complete(
 /// One model call of the memory's upkeep. Each is recorded (`refine.call`:
 /// its purpose, model, time and tokens) so the bug report sets what keeping
 /// memory costs beside what read it: a store built ahead of any question
-/// pays off only when it is read (MemoryTax, arXiv:2610.29823).
+/// pays off only when it is read (`MemoryTax`, arXiv 2610.29823).
 async fn complete_once(
     provider: &Arc<dyn ModelProvider>,
     model: &str,

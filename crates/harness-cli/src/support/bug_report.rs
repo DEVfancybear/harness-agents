@@ -1602,7 +1602,7 @@ impl Report {
     /// reviews and Deep Dream (`refine.call`, by purpose, with their tokens)
     /// and the agent's calls of the tools that read memory and the raw
     /// record. A store written ahead of any question pays off only when it is
-    /// read (MemoryTax, arXiv:2610.29823); this is the measure for deciding how
+    /// read (`MemoryTax`, arXiv 2610.29823); this is the measure for deciding how
     /// often to review.
     fn summary_memory(&self, out: &mut String) {
         /// The tools that read what memory kept, or the turns themselves.
