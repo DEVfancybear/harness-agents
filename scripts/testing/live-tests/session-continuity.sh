@@ -124,7 +124,8 @@ need "$HA" shutdown --force
 # old and candidate binaries; it must not be mistaken for automatic new recall.
 echo '################ 5. explicit resume remains authoritative'
 SEED_ID=$("$PY" "$E" field "$RX/c-seed.binding.json" conversation)
-(cd "$P" && "$PROBE" "$RX/c-resume.bin" "$HA" wait:9000 -- chat --resume "$SEED_ID" --model "$MODEL" "${TH[@]}" --name c-resume --approval full-auto >/dev/null) || exit 2
+(cd "$P" && "$PROBE" "$RX/c-resume.bin" "$HA" wait:9000 -- chat --resume "$SEED_ID" --model "$MODEL" "${TH[@]}" --approval full-auto >/dev/null) || exit 2
+need "$HA" rename c-seed c-resume >/dev/null
 need turn c-resume 'Without tools, return the codeword from THIS resumed conversation. Answer exactly CODE=<codeword>, or CODE=UNKNOWN if unavailable.'
 bind c-resume
 check 'SAFETY: explicit resume keeps original task identity' '"$PY" "$E" same-task "$RX/c-seed.binding.json" "$RX/c-resume.binding.json"'
