@@ -2837,6 +2837,15 @@ async fn gate_action(
     }
 }
 
+/// A call's tool as the records name it: a plugin, MCP or skill tool by its
+/// own name (`python_repl`), not as `external_tool`.
+fn action_name(action: &CodingToolAction) -> String {
+    match action {
+        CodingToolAction::ExternalTool { tool_name, .. } => tool_name.clone(),
+        action => action.kind().as_str().to_owned(),
+    }
+}
+
 /// How long each step of a call's gate took, recorded when the gate took
 /// long. The calls of a batch run once every one of them is through its gate,
 /// so one call waiting - for an approval, a hook, the store - held the others:
@@ -2858,10 +2867,7 @@ impl GatePhases {
         let now = std::time::Instant::now();
         Self {
             task: request.task_id.as_str().to_owned(),
-            tool: match &request.action {
-                CodingToolAction::ExternalTool { tool_name, .. } => tool_name.clone(),
-                action => action.kind().as_str().to_owned(),
-            },
+            tool: action_name(&request.action),
             started: now,
             last: now,
             phases: Vec::new(),
@@ -3125,11 +3131,11 @@ async fn resolve_action_approval(
                 // Asked and answered are both recorded, with the wait: the
                 // calls of a batch wait for every approval of it, and a report
                 // that left them out showed four calls taking 90 s for nothing.
-                let tool = prepared.final_action.kind().as_str();
+                let tool = action_name(&prepared.final_action);
                 harness_types::diag::info("approval", "asked")
                     .task(prepared.request.task_id.as_str())
                     .request(&request_id)
-                    .field("tool", tool)
+                    .field("tool", tool.clone())
                     .emit();
                 let asked = std::time::Instant::now();
                 // A canceled turn does not wait for an answer nobody will give: the
