@@ -13,6 +13,18 @@ fresh kernel
 export HA_AUTO_REFINE=off HA_PYTHON=${HA_PYTHON:-$PY}
 D=$HA_HOME/data
 project "$RX/p"
+# What the kernel printed, from the journal's tool results: the model retells
+# a print in its own words (`**KERNEL_LIST:** ...`), the journal keeps it.
+printed() { "$PY" - "$D" "$1" <<'EOF'
+import glob, os, sqlite3, sys
+sys.stdout.reconfigure(encoding="utf-8")
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select event_json from events"):
+        at = text.find(sys.argv[2] + "[")
+        if at >= 0:
+            print(text[at:at + 200])
+EOF
+}
 state() { "$PY" - "$D" <<'EOF'
 import json,sys,glob,os
 d=sys.argv[1]
@@ -36,7 +48,7 @@ echo "################ 2. the memory tool and rlm.harness see each other's write
 say r1 "Dùng tool memory (action write, scope local) ghi một entry tiêu đề 'Nhánh làm việc', nội dung 'Làm trên nhánh feature/rlm'. Sau đó dùng ipython chạy print('KERNEL_LIST=' + str([(x.id, x.content) for x in rlm.harness.list('memory')])). Rồi dùng ipython tạo rlm.harness.create_prompt_note('Định dạng commit', 'Commit message dạng loai: mo ta') (local), và dùng tool memory action list để liệt kê. Báo lại hai danh sách." | tail -10
 check "memory tool entry visible in the local file" "state | grep -q 'local memory nhanh_lam_viec'"
 check "kernel prompt note visible in the local file" "state | grep -q 'local prompt dinh_dang_commit'"
-check "the kernel listed the tool's entry" "ans | grep -q \"KERNEL_LIST=\[('nhanh_lam_viec'\""
+check "the kernel listed the tool's entry" "printed KERNEL_LIST= | grep -q \"KERNEL_LIST=\[('nhanh_lam_viec'\""
 
 echo "################ 3. a rejected write is refused with the host's words"
 say r1 "Dùng ipython chạy đúng: rlm.harness.create_skill('Deploy', 'Chạy deploy', reference={'type':'python','import':'deploy'}) và in ra exception (type và message)." | tail -4
