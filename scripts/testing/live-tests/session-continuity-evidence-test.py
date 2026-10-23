@@ -66,6 +66,10 @@ class EvidenceControls(unittest.TestCase):
             self.clean()
         report = e.load(self.r / 'clean-evidence.json')
         self.assertEqual(report['databases'][0]['task_states_columns'], ['unknown_payload'])
+    def test_default_on_is_omitted_by_native_settings_writer(self):
+        self.put(self.home / 'settings.json', {'defaultThinkingLevel': 'max'})
+        e.settings(str(self.home), 'on', str(self.r / 'settings.json'))
+        self.assertTrue(e.load(self.r / 'settings.json')['harnessRefinements'])
     def test_root_normalized_settings_path(self):
         self.put(self.home / 'settings.json', {'harnessRefinements': False, 'defaultThinkingLevel': 'max'})
         e.settings(str(self.home), 'off', str(self.r / 'settings.json'))

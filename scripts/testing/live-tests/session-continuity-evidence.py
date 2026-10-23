@@ -163,9 +163,11 @@ def settings(home, expected, out):
     path = home / 'settings.json'
     assert not (home / 'config/settings.json').exists(), 'ambiguous settings layout: inspect candidate source'
     state = load(path)
-    assert state.get('harnessRefinements') is (expected == 'on'), 'optout was not persisted in actual user settings'
+    # Native config::harness_refinements is on unless explicitly false.
+    enabled = state.get('harnessRefinements') is not False
+    assert enabled == (expected == 'on'), 'optout was not persisted in actual user settings'
     assert state.get('defaultThinkingLevel') == 'max', 'optout lost mandated thinking setting'
-    save(out, dict(path=str(path), harnessRefinements=state['harnessRefinements'], defaultThinkingLevel=state['defaultThinkingLevel']))
+    save(out, dict(path=str(path), harnessRefinements=enabled, defaultThinkingLevel=state['defaultThinkingLevel']))
 
 
 def durable(binding, secret, out):
