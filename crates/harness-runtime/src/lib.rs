@@ -811,9 +811,22 @@ fn history_summary_budget(config: &RuntimeConfig) -> u64 {
     (reserve * 4 / 5).min(MAX_SUMMARY_TOKENS)
 }
 
-/// How the summary that replaces the earlier turns introduces itself.
-const COMPACTED_PREFIX: &str =
+/// How the summary that replaces the earlier turns introduces itself. It
+/// names the tools that read those turns: the journal keeps them word for
+/// word, but a model shown only the summary took it for all there was, and a
+/// reader cannot recover what the summary's writer left out.
+const COMPACTED_PREFIX: &str = "[The conversation before this point was compacted to fit the context window; history_search and history_read still read its turns word for word. Summary of it:]";
+
+/// The prefix before 0.7.9, still recognized in a conversation compacted then.
+const COMPACTED_PREFIX_BEFORE: &str =
     "[The conversation before this point was compacted to fit the context window. Summary of it:]";
+
+/// The summary a compacted conversation's first message carries, under
+/// either prefix.
+fn compacted_summary(text: &str) -> Option<&str> {
+    text.strip_prefix(COMPACTED_PREFIX)
+        .or_else(|| text.strip_prefix(COMPACTED_PREFIX_BEFORE))
+}
 
 /// Split messages into the older part and the recent end that fits `keep`
 /// tokens. The recent end starts at a user message, so a tool call is never
@@ -2363,7 +2376,7 @@ const OMITTED_TURNS_NOTE: &str =
 /// Whether `text` is a note the host put among the user's messages: a
 /// summary standing for earlier turns, or the turns past the replay bound.
 fn is_host_note(text: &str) -> bool {
-    text.starts_with(COMPACTED_PREFIX) || text.ends_with(OMITTED_TURNS_NOTE)
+    compacted_summary(text).is_some() || text.ends_with(OMITTED_TURNS_NOTE)
 }
 
 /// One question or answer, cut to the replay bound and saying so when cut.
@@ -5084,7 +5097,7 @@ impl RuntimeService {
     ) -> Result<String, RuntimeError> {
         let previous_whole = messages
             .first()
-            .and_then(|message| message.content.strip_prefix(COMPACTED_PREFIX))
+            .and_then(|message| compacted_summary(&message.content))
             .map(str::trim);
         let messages = if previous_whole.is_some() {
             &messages[1..]
@@ -7035,11 +7048,29 @@ mod long_task_compaction_tests {
     use harness_providers::{MessageRole, ProviderMessage};
 
     use super::{
-        COMPACTED_PREFIX, CONVERSATION_MAX_BYTES, CONVERSATION_MAX_TURNS, ConversationHistory,
+        COMPACTED_PREFIX, COMPACTED_PREFIX_BEFORE, CONVERSATION_MAX_BYTES, CONVERSATION_MAX_TURNS, ConversationHistory,
         InputId, RunRequest, SessionId, TaskId, USER_MESSAGES_MAX_CHARS, carry_forward,
         dropped_facts, format_user_messages, listed_user_messages, omitted_user_messages,
         strip_appended_blocks, user_messages,
     };
+
+    /// The summary says where the turns it stands for are still read; one
+    /// written before it said so is still a summary.
+    #[test]
+    fn a_summary_names_the_tools_that_read_its_turns() {
+        assert!(COMPACTED_PREFIX.contains("history_search"));
+        assert!(COMPACTED_PREFIX.contains("history_read"));
+        for prefix in [COMPACTED_PREFIX, COMPACTED_PREFIX_BEFORE] {
+            let text = format!("{prefix}
+
+the summary");
+            assert_eq!(
+                super::compacted_summary(&text).map(str::trim),
+                Some("the summary")
+            );
+            assert!(super::is_host_note(&text));
+        }
+    }
 
     /// What the user said is kept word for word and carried from summary to
     /// summary; a message said again is kept once, at its newest place.
