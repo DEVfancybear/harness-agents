@@ -1906,13 +1906,31 @@ impl TurnDriver {
                         Ok(None) => {}
                         Ok(Some(coerced)) => call.arguments = coerced.to_string(),
                         Err(message) => {
+                            // An argument of another tool (`code` on
+                            // `git_status`): the error says whose it is.
+                            let whose = misplaced_arguments(
+                                [request.tool_schemas.as_slice(), self.deferred.as_slice()],
+                                &name,
+                                schema,
+                                &call.arguments,
+                            );
+                            let detail = match &whose {
+                                Some(whose) => {
+                                    format!("{} - {whose}", invalid_arguments_detail(&message))
+                                }
+                                None => invalid_arguments_detail(&message),
+                            };
+                            let message = match whose {
+                                Some(whose) => format!("{message}\n{whose}"),
+                                None => message,
+                            };
                             slots.push((
                                 name.clone(),
                                 transcript_id,
                                 // The reason shown and recorded names what was
                                 // wrong: "invalid arguments" alone left a bug
                                 // report unable to say which call or field.
-                                Slot::Failed(message.clone(), invalid_arguments_detail(&message)),
+                                Slot::Failed(message, detail),
                             ));
                             continue;
                         }
@@ -3644,6 +3662,50 @@ fn parameters_schema<'a>(schemas: &'a [Value], name: &str) -> Option<&'a Value> 
     })
 }
 
+/// The arguments a call gave that its tool does not take but another does:
+/// "`code` is an argument of python_repl, not of git_status." A model that
+/// mixed two tools up read only "Property is not allowed".
+fn misplaced_arguments(
+    schemas: [&[Value]; 2],
+    name: &str,
+    schema: &Value,
+    arguments: &str,
+) -> Option<String> {
+    let Ok(Value::Object(given)) = serde_json::from_str::<Value>(arguments) else {
+        return None;
+    };
+    let own = schema.get("properties").and_then(Value::as_object);
+    let lines = given
+        .keys()
+        .filter(|key| own.is_none_or(|own| !own.contains_key(*key)))
+        .filter_map(|key| {
+            let owners = schemas
+                .iter()
+                .flat_map(|list| list.iter())
+                .filter_map(|schema| {
+                    let function = schema.get("function").unwrap_or(schema);
+                    let tool = function.get("name").and_then(Value::as_str)?;
+                    (tool != name
+                        && function
+                            .get("parameters")
+                            .and_then(|parameters| parameters.get("properties"))
+                            .and_then(Value::as_object)
+                            .is_some_and(|properties| properties.contains_key(key)))
+                    .then_some(tool)
+                })
+                .take(3)
+                .collect::<Vec<_>>();
+            (!owners.is_empty()).then(|| {
+                format!(
+                    "`{key}` is an argument of {}, not of {name}.",
+                    owners.join(" or ")
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    (!lines.is_empty()).then(|| lines.join(" "))
+}
+
 fn malformed_call(call: &NormalizedToolCall) -> Option<&'static str> {
     if call.name.trim().is_empty() {
         return Some("the function name is missing");
@@ -4340,6 +4402,29 @@ mod tool_output_render_tests {
             rendered
                 .ends_with("[Some lines truncated to 500 chars. Use read_file to see full lines.]"),
             "{rendered}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod misplaced_argument_tests {
+    use super::{misplaced_arguments, parameters_schema};
+
+    /// A stray argument names the tool it belongs to.
+    #[test]
+    fn an_argument_of_another_tool_names_its_tool() {
+        let schemas = vec![
+            serde_json::json!({"type": "function", "function": {"name": "git_status", "parameters": {"type": "object", "properties": {}, "additionalProperties": false}}}),
+            serde_json::json!({"type": "function", "function": {"name": "python_repl", "parameters": {"type": "object", "properties": {"code": {"type": "string"}}}}}),
+        ];
+        let own = parameters_schema(&schemas, "git_status").expect("schema");
+        assert_eq!(
+            misplaced_arguments([&schemas, &[]], "git_status", own, r#"{"code":"print(1)"}"#)
+                .as_deref(),
+            Some("`code` is an argument of python_repl, not of git_status.")
+        );
+        assert!(
+            misplaced_arguments([&schemas, &[]], "git_status", own, r#"{"nothing":1}"#).is_none()
         );
     }
 }
