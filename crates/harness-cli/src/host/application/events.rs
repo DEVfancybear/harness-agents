@@ -753,6 +753,12 @@ pub struct ChildActivity {
     /// running, drawn as queued.
     #[serde(default)]
     pub queued: bool,
+    /// A coder's own worktree, as the registry lists it: its branch and its
+    /// folder. None for a child working in the user's checkout.
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub worktree: Option<String>,
 }
 
 impl ChildActivity {
@@ -830,11 +836,15 @@ pub fn sync_child_states(
                     || child.model != row.model
                     || child.thinking != row.thinking
                     || child.queued != row.queued
+                    || child.branch != row.branch
+                    || child.worktree != row.worktree
                 {
                     child.state = state;
                     child.model.clone_from(&row.model);
                     child.thinking.clone_from(&row.thinking);
                     child.queued = row.queued;
+                    child.branch.clone_from(&row.branch);
+                    child.worktree.clone_from(&row.worktree);
                     changed = true;
                 }
             }
@@ -845,6 +855,8 @@ pub fn sync_child_states(
                     model: row.model.clone(),
                     thinking: row.thinking.clone(),
                     queued: row.queued,
+                    branch: row.branch.clone(),
+                    worktree: row.worktree.clone(),
                     ..ChildActivity::default()
                 });
                 changed = true;

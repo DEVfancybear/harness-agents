@@ -54,7 +54,7 @@ pub const TOOLS_SCHEMA_VERSION: i64 = 3;
 /// and the manifest columns a frozen packet and checkpoint record. Version 1 is
 /// the first revision of this module, so a database that predates M5 upgrades
 /// by creating the tables and adding the columns in place.
-pub const CONTEXT_SCHEMA_VERSION: i64 = 1;
+pub const CONTEXT_SCHEMA_VERSION: i64 = 2;
 /// Additive P5 delegation tables retain all earlier schema revisions.
 pub const DELEGATION_SCHEMA_VERSION: i64 = 1;
 /// Additive P7 maintenance tables retain all earlier schema revisions.

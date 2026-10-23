@@ -168,18 +168,29 @@ impl Drop for WriterLease {
 
 /// The P1 `SQLite` transaction coordinator.
 ///
-/// There is one connection in each pool deliberately: all durable P1 writes
-/// are serialized through one host-owned coordinator, while process ownership
-/// is protected by the lock file and fencing epoch.
+/// There is one writing connection deliberately: all durable P1 writes are
+/// serialized through one host-owned coordinator, while process ownership is
+/// protected by the lock file and fencing epoch. Reads that are not part of a
+/// write go to `readers`, read-only connections of their own: in WAL mode
+/// they run beside the writer and beside each other. With every read on the
+/// one connection, a child's project-wide `history_search` held it for
+/// twelve minutes and every other agent's store call waited behind it.
 pub struct SqliteStore {
     paths: StorePaths,
     pool: SqlitePool,
+    readers: SqlitePool,
     writer: Option<WriterLease>,
     fault_plan: StoreFaultPlan,
     /// The messages of the last frozen request of each recently active session,
     /// so the next one of the same session is stored as what it adds (see
     /// `persist_hashed_frozen_request`). Most recent first.
     last_frozen: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<LastFrozen>>>,
+    /// The background catch-ups of the history index running: a task's id,
+    /// or empty for the whole store's (`catch_up_history_in_background`).
+    history_catch_ups: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// No index of an older version is left to delete
+    /// (`retire_old_history_index`).
+    history_retired: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The last frozen request a session wrote: its id and its full messages.
@@ -416,9 +427,11 @@ impl SqliteStore {
             checkpoint::Checkpointer::start(&paths.database_path, BUSY_TIMEOUT, signal);
         let owner_note = write_writer_owner(&paths.writer_owner_path)
             .map(|text| (paths.writer_owner_path.clone(), text));
+        let readers = open_readers(&paths);
         Self {
             paths,
             pool,
+            readers,
             writer: Some(WriterLease {
                 lock_file,
                 fence,
@@ -427,6 +440,8 @@ impl SqliteStore {
             }),
             fault_plan,
             last_frozen: std::sync::Arc::default(),
+            history_catch_ups: std::sync::Arc::default(),
+            history_retired: std::sync::Arc::default(),
         }
     }
 
@@ -444,10 +459,13 @@ impl SqliteStore {
         let pool = open_pool(&paths, true, None).await?;
         Ok(Self {
             paths,
+            readers: pool.clone(),
             pool,
             writer: None,
             fault_plan: StoreFaultPlan::default(),
             last_frozen: std::sync::Arc::default(),
+            history_catch_ups: std::sync::Arc::default(),
+            history_retired: std::sync::Arc::default(),
         })
     }
 
@@ -484,7 +502,7 @@ impl SqliteStore {
              WHERE host_epoch.singleton = 1",
         )
         .bind(fence.host_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read host epoch", error))?;
         if current != Some(to_i64(fence.generation, "fence generation")?) {
@@ -951,7 +969,7 @@ impl SqliteStore {
              FROM tool_approvals WHERE approval_id = ?",
         )
         .bind(approval_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read tool approval", error))?;
         row.map(|row| tool_approval_from_row(&row)).transpose()
@@ -1042,7 +1060,7 @@ impl SqliteStore {
         let row =
             sqlx::query("SELECT project_id FROM project_registrations WHERE canonical_root = ?")
                 .bind(canonical_root)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.readers)
                 .await
                 .map_err(|error| {
                     database_error(
@@ -1484,7 +1502,7 @@ impl SqliteStore {
             "SELECT sequence, event_json FROM events WHERE session_id = ? ORDER BY sequence",
         )
         .bind(session_id.as_str())
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| {
             database_error(
@@ -1538,7 +1556,7 @@ impl SqliteStore {
              FROM tool_intents WHERE session_id = ? AND status = 'recorded' ORDER BY intent_sequence",
         )
         .bind(session_id.as_str())
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list pending tool intents", error))?;
         rows.into_iter()
@@ -1557,7 +1575,7 @@ impl SqliteStore {
             "SELECT call_id FROM tool_intents WHERE session_id = ? AND call_id IS NOT NULL",
         )
         .bind(session_id.as_str())
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map(|ids| ids.into_iter().collect())
         .map_err(|error| {
@@ -1580,7 +1598,7 @@ impl SqliteStore {
              FROM tool_intents WHERE tool_execution_id = ?",
         )
         .bind(tool_execution_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read tool intent", error))?;
         row.map(|row| tool_intent_from_row(&row)).transpose()
@@ -1600,7 +1618,7 @@ impl SqliteStore {
         .bind(artifact_id.as_str())
         .bind(project_id.as_str())
         .bind(task_id.as_str())
-        .fetch_one(&self.pool)
+        .fetch_one(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read tool artifact scope", error))?;
         Ok(found == 1)
@@ -1781,7 +1799,7 @@ impl SqliteStore {
             "SELECT content_hash, byte_len, relative_path FROM artifacts WHERE artifact_id = ?",
         )
         .bind(artifact_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "read artifact record", error)
@@ -1900,7 +1918,7 @@ impl SqliteStore {
         let rows = sqlx::query(
             "SELECT manifest_json, generation FROM plugin_manifests ORDER BY instance_id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| {
             database_error(
@@ -1940,7 +1958,7 @@ impl SqliteStore {
             "SELECT manifest_json, generation FROM plugin_manifests WHERE instance_id = ?",
         )
         .bind(instance_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "read plugin manifest", error)
@@ -1972,7 +1990,7 @@ impl SqliteStore {
              GROUP BY sessions.session_id, sessions.task_id, sessions.next_sequence
              ORDER BY sessions.session_id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list sessions", error))?;
         rows.into_iter()
@@ -1995,7 +2013,7 @@ impl SqliteStore {
              WHERE sessions.session_id = ?",
         )
         .bind(session_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read session summary", error))?;
         row.map(|row| session_summary_from_row(&row)).transpose()
@@ -2005,7 +2023,7 @@ impl SqliteStore {
     pub async fn newest_session_id(&self) -> Result<Option<SessionId>, StoreError> {
         let id: Option<String> =
             sqlx::query_scalar("SELECT session_id FROM sessions ORDER BY rowid DESC LIMIT 1")
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.readers)
                 .await
                 .map_err(|error| {
                     database_error(ErrorCode::StorageWriteFailed, "read newest session", error)
@@ -2020,7 +2038,7 @@ impl SqliteStore {
         let task_id =
             sqlx::query_scalar::<_, String>("SELECT task_id FROM sessions WHERE session_id = ?")
                 .bind(session_id.as_str())
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.readers)
                 .await
                 .map_err(|error| {
                     database_error(ErrorCode::StorageWriteFailed, "read session task", error)
@@ -2044,7 +2062,7 @@ impl SqliteStore {
         )
         .bind(session_id.as_str())
         .bind(to_i64(through_sequence, "tail sequence")?)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "read journal tail", error)
@@ -2075,7 +2093,7 @@ impl SqliteStore {
         .bind(session_id.as_str())
         .bind(to_i64(through_sequence, "tail sequence")?)
         .bind(to_i64(limit.min(4096) as u64, "journal page limit")?)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read journal page", error))?;
         rows.into_iter()
@@ -2097,7 +2115,7 @@ impl SqliteStore {
              FROM snapshots WHERE session_id = ? ORDER BY through_sequence DESC LIMIT 1",
         )
         .bind(session_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read latest snapshot", error))?;
         row.map(|row| snapshot_from_row(&row)).transpose()
@@ -2110,7 +2128,7 @@ impl SqliteStore {
         let rows =
             sqlx::query("SELECT receipt_json FROM receipts WHERE session_id = ? ORDER BY sequence")
                 .bind(session_id.as_str())
-                .fetch_all(&self.pool)
+                .fetch_all(&self.readers)
                 .await
                 .map_err(|error| {
                     database_error(ErrorCode::StorageWriteFailed, "read receipts", error)
@@ -2136,7 +2154,7 @@ impl SqliteStore {
     ) -> Result<Option<WorkingState>, StoreError> {
         let row = sqlx::query("SELECT working_state_json FROM task_projections WHERE task_id = ?")
             .bind(task_id.as_str())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.readers)
             .await
             .map_err(|error| {
                 database_error(ErrorCode::StorageWriteFailed, "read task projection", error)
@@ -2173,7 +2191,7 @@ impl SqliteStore {
              WHERE session_id = ? AND state IN ('pending', 'claimed')",
         )
         .bind(session_id.as_str())
-        .fetch_one(&self.pool)
+        .fetch_one(&self.readers)
         .await
         .map_err(|error| {
             database_error(
@@ -2188,7 +2206,7 @@ impl SqliteStore {
     pub async fn inbox_count(&self, session_id: &SessionId) -> Result<u64, StoreError> {
         let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM inbox WHERE session_id = ?")
             .bind(session_id.as_str())
-            .fetch_one(&self.pool)
+            .fetch_one(&self.readers)
             .await
             .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "count inbox", error))?;
         to_u64(count, "inbox count")
@@ -2208,7 +2226,7 @@ impl SqliteStore {
              ORDER BY admitted_sequence DESC LIMIT 1",
         )
         .bind(session_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "read admitted input", error)
@@ -2322,7 +2340,7 @@ impl SqliteStore {
         let value =
             sqlx::query_scalar::<_, i64>("SELECT next_sequence FROM sessions WHERE session_id = ?")
                 .bind(session_id.as_str())
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.readers)
                 .await
                 .map_err(|error| {
                     database_error(ErrorCode::StorageWriteFailed, "read next sequence", error)
@@ -2437,7 +2455,7 @@ impl SqliteStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<ContextPacketRecord>, StoreError> {
-        let rows = sqlx::query("SELECT packet_json, composition_snapshot_id, omitted_json, degradation FROM context_packets WHERE session_id = ? ORDER BY rowid").bind(session_id.as_str()).fetch_all(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list context packets", error))?;
+        let rows = sqlx::query("SELECT packet_json, composition_snapshot_id, omitted_json, degradation FROM context_packets WHERE session_id = ? ORDER BY rowid").bind(session_id.as_str()).fetch_all(&self.readers).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list context packets", error))?;
         rows.into_iter()
             .map(|row| context_packet_from_row(&row))
             .collect()
@@ -2454,7 +2472,7 @@ impl SqliteStore {
             "SELECT c.packet_json FROM frozen_requests f JOIN context_packets c ON c.packet_id = f.packet_id WHERE f.session_id = ? ORDER BY f.rowid LIMIT 1",
         )
         .bind(session_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read sent input", error))?;
         Ok(packet.and_then(|packet| {
@@ -2470,7 +2488,7 @@ impl SqliteStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<ContextPacketRecord>, StoreError> {
-        let row = sqlx::query("SELECT packet_json, composition_snapshot_id, omitted_json, degradation FROM context_packets WHERE session_id = ? ORDER BY rowid DESC LIMIT 1").bind(session_id.as_str()).fetch_optional(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "latest context packet", error))?;
+        let row = sqlx::query("SELECT packet_json, composition_snapshot_id, omitted_json, degradation FROM context_packets WHERE session_id = ? ORDER BY rowid DESC LIMIT 1").bind(session_id.as_str()).fetch_optional(&self.readers).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "latest context packet", error))?;
         row.map(|row| context_packet_from_row(&row)).transpose()
     }
 
@@ -2630,7 +2648,7 @@ impl SqliteStore {
             "SELECT provider_id, model FROM frozen_requests WHERE session_id = ? ORDER BY rowid DESC LIMIT 1",
         )
         .bind(session_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read session model", error))?;
         row.map(|row| {
@@ -2654,7 +2672,7 @@ impl SqliteStore {
             "SELECT request_id FROM frozen_requests WHERE session_id = ? ORDER BY rowid DESC LIMIT 1",
         )
         .bind(session_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "read latest request", error)
@@ -2674,7 +2692,7 @@ impl SqliteStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<FrozenRequestRecord>, StoreError> {
-        let rows = sqlx::query("SELECT request_id, packet_id, composition_snapshot_id, session_id, task_id, request_json, content_hash, provider_id, model, config_revision FROM frozen_requests WHERE session_id = ? ORDER BY rowid").bind(session_id.as_str()).fetch_all(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list frozen requests", error))?;
+        let rows = sqlx::query("SELECT request_id, packet_id, composition_snapshot_id, session_id, task_id, request_json, content_hash, provider_id, model, config_revision FROM frozen_requests WHERE session_id = ? ORDER BY rowid").bind(session_id.as_str()).fetch_all(&self.readers).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list frozen requests", error))?;
         let mut full = FrozenBases::new();
         rows.into_iter()
             .map(|row| frozen_request_from_row(&row, &mut full))
@@ -2703,7 +2721,7 @@ impl SqliteStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<ProviderAttemptRecord>, StoreError> {
-        let rows = sqlx::query("SELECT attempt_id, request_id, session_id, task_id, attempt_number, state, events_json, response_hash, error FROM provider_attempts WHERE session_id = ? ORDER BY attempt_number").bind(session_id.as_str()).fetch_all(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list provider attempts", error))?;
+        let rows = sqlx::query("SELECT attempt_id, request_id, session_id, task_id, attempt_number, state, events_json, response_hash, error FROM provider_attempts WHERE session_id = ? ORDER BY attempt_number").bind(session_id.as_str()).fetch_all(&self.readers).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list provider attempts", error))?;
         rows.into_iter()
             .map(|row| provider_attempt_from_row(&row))
             .collect()
@@ -2727,7 +2745,7 @@ impl SqliteStore {
              FROM provider_attempts WHERE session_id = ?1 ORDER BY rowid DESC LIMIT 1",
         )
         .bind(session_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| {
             database_error(
@@ -2801,7 +2819,7 @@ impl SqliteStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<ContextCheckpointRecord>, StoreError> {
-        let row = sqlx::query("SELECT checkpoint_id, session_id, task_id, through_sequence, revision, content_json, content_hash FROM context_checkpoints WHERE session_id = ? ORDER BY revision DESC LIMIT 1").bind(session_id.as_str()).fetch_optional(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "latest context checkpoint", error))?;
+        let row = sqlx::query("SELECT checkpoint_id, session_id, task_id, through_sequence, revision, content_json, content_hash FROM context_checkpoints WHERE session_id = ? ORDER BY revision DESC LIMIT 1").bind(session_id.as_str()).fetch_optional(&self.readers).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "latest context checkpoint", error))?;
         row.map(|row| checkpoint_from_row(&row)).transpose()
     }
 
@@ -2875,7 +2893,7 @@ impl SqliteStore {
         &self,
         command_id: &RuntimeCommandId,
     ) -> Result<Option<RuntimeCommandRecord>, StoreError> {
-        let row = sqlx::query("SELECT command_id, session_id, task_id, state, attempts, owner_generation, payload_json, last_error FROM runtime_commands WHERE command_id = ?").bind(command_id.as_str()).fetch_optional(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read runtime command", error))?;
+        let row = sqlx::query("SELECT command_id, session_id, task_id, state, attempts, owner_generation, payload_json, last_error FROM runtime_commands WHERE command_id = ?").bind(command_id.as_str()).fetch_optional(&self.readers).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read runtime command", error))?;
         row.map(|row| runtime_command_from_row(&row)).transpose()
     }
 
@@ -3088,7 +3106,7 @@ impl SqliteStore {
         let row = sqlx::query("SELECT checkpoint_id, session_id, task_id, through_sequence, revision, content_json, content_hash FROM context_checkpoints WHERE session_id = ? AND checkpoint_id = ?")
             .bind(session_id.as_str())
             .bind(checkpoint_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.readers)
             .await
             .map_err(|error| {
                 database_error(ErrorCode::StorageWriteFailed, "read context checkpoint", error)
@@ -3103,7 +3121,7 @@ impl SqliteStore {
     ) -> Result<Vec<ContextCheckpointRecord>, StoreError> {
         let rows = sqlx::query("SELECT checkpoint_id, session_id, task_id, through_sequence, revision, content_json, content_hash FROM context_checkpoints WHERE session_id = ? ORDER BY revision")
             .bind(session_id.as_str())
-            .fetch_all(&self.pool)
+            .fetch_all(&self.readers)
             .await
             .map_err(|error| {
                 database_error(ErrorCode::StorageWriteFailed, "list context checkpoints", error)
@@ -3115,7 +3133,7 @@ impl SqliteStore {
         &self,
         new_session_id: &SessionId,
     ) -> Result<Option<ContinuationLinkRecord>, StoreError> {
-        let row = sqlx::query("SELECT source_session_id, new_session_id, task_id FROM session_lineage WHERE new_session_id = ?").bind(new_session_id.as_str()).fetch_optional(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read continuation link", error))?;
+        let row = sqlx::query("SELECT source_session_id, new_session_id, task_id FROM session_lineage WHERE new_session_id = ?").bind(new_session_id.as_str()).fetch_optional(&self.readers).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read continuation link", error))?;
         row.map(|row| {
             Ok(ContinuationLinkRecord {
                 source_session_id: parse_session(row_get(&row, "source_session_id")?)?,
@@ -3132,6 +3150,8 @@ impl SqliteStore {
         if let Some(writer) = self.writer.as_mut() {
             writer.checkpointer.stop().await;
         }
+        // The writer's connection is the last one, so its close finishes the log.
+        self.readers.close().await;
         self.pool.close().await;
         if let Some(mut writer) = self.writer.take() {
             writer.forget_owner();
@@ -3314,6 +3334,23 @@ async fn open_pool(
     pool_options.connect_with(options).await.map_err(|error| {
         database_error(ErrorCode::StorageOpenFailed, "open SQLite database", error)
     })
+}
+
+/// Read-only connections a writer store reads through, beside its writer.
+const READERS: u32 = 4;
+
+/// The read-only connections of a writer store. None is opened until a read
+/// needs it, and one left idle closes again.
+fn open_readers(paths: &StorePaths) -> SqlitePool {
+    let options = SqliteConnectOptions::new()
+        .filename(&paths.database_path)
+        .read_only(true)
+        .busy_timeout(BUSY_TIMEOUT);
+    SqlitePoolOptions::new()
+        .max_connections(READERS)
+        .min_connections(0)
+        .idle_timeout(Some(Duration::from_mins(1)))
+        .connect_lazy_with(options)
 }
 
 /// Read and validate the data directory marker, if this directory has one.
@@ -3759,40 +3796,23 @@ async fn apply_runtime_slice_7(
 /// M5 context surface: the rebuildable journal index, the notes table and the
 /// manifest column a frozen packet records.
 ///
-/// The history index is a plain term table rather than an FTS5 virtual table:
-/// FTS5 is a build flag, and the plan requires the index to be rebuildable and
-/// its results to be identical after a rebuild. A term table this host writes
-/// itself is deterministic, tokenizer-independent and testable on any build.
+/// The history index keeps its terms in an FTS5 table, one row per source:
+/// the terms are this host's (`history_terms`), joined by spaces, and the
+/// tokenizer splits on spaces only and changes nothing, so a rebuild finds
+/// exactly what the journal says. It was a table of `(term, source)` rows:
+/// every term landed on its own page of that table's index, and catching up
+/// a long journal wrote about 200 KiB per entry - 702 entries of a real store
+/// took 1.7 s and 141 MiB of log, against 0.1 s and 5 MiB in FTS5.
 async fn ensure_context_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     let mut tx = pool.begin().await.map_err(|error| {
         database_error(ErrorCode::MigrationFailed, "begin context migration", error)
     })?;
-    let statements = [
-        "CREATE TABLE IF NOT EXISTS context_schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-        "CREATE TABLE IF NOT EXISTS history_sources (source_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, project_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, content_hash TEXT NOT NULL, availability TEXT NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS history_sources_by_task ON history_sources(task_id, sequence)",
-        "CREATE TABLE IF NOT EXISTS history_terms (term TEXT NOT NULL, source_id TEXT NOT NULL REFERENCES history_sources(source_id) ON DELETE CASCADE, PRIMARY KEY(term, source_id))",
-        // The primary key already leads with the term; a second index on it
-        // only made every term insert write twice.
-        "DROP INDEX IF EXISTS history_terms_by_term",
-        // Clearing one source's terms (a re-index, a rebuild, the cascade from
-        // a deleted source) looks them up by source.
-        "CREATE INDEX IF NOT EXISTS history_terms_by_source ON history_terms(source_id)",
-        // The index's high-water mark per session, read before every search.
-        "CREATE INDEX IF NOT EXISTS history_sources_by_session ON history_sources(session_id, sequence)",
-        // A task's sessions, listed before every search.
-        "CREATE INDEX IF NOT EXISTS sessions_by_task ON sessions(task_id, created_at)",
-        "CREATE TABLE IF NOT EXISTS session_notes (note_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, session_id TEXT NOT NULL, note_key TEXT NOT NULL, revision INTEGER NOT NULL, content TEXT NOT NULL, sources_json TEXT NOT NULL, authority TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(task_id, note_key))",
-        "CREATE INDEX IF NOT EXISTS session_notes_by_task ON session_notes(task_id, note_key)",
-    ];
-    for statement in statements {
-        sqlx::query(statement)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| {
-                database_error(ErrorCode::MigrationFailed, "apply context schema", error)
-            })?;
-    }
+    sqlx::query("CREATE TABLE IF NOT EXISTS context_schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            database_error(ErrorCode::MigrationFailed, "apply context schema", error)
+        })?;
     let current =
         sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM context_schema_migrations")
             .fetch_one(&mut *tx)
@@ -3810,6 +3830,54 @@ async fn ensure_context_schema(pool: &SqlitePool) -> Result<(), StoreError> {
             ErrorCode::MigrationFailed,
             "context schema is newer than this host supports",
         ));
+    }
+    if (1..2).contains(&current) {
+        // The index of version 1 is thrown away whole and rebuilt from the
+        // journal, in the background (`catch_up_history_in_background`): it
+        // is derived state, and nothing else ever wrote it. Its tables are
+        // only renamed here and deleted in the background a little at a time
+        // (`retire_old_history_index`): dropping them here held the first
+        // open of a 3.5 GB store for 23 s.
+        for statement in [
+            "DROP INDEX IF EXISTS history_sources_by_task",
+            "DROP INDEX IF EXISTS history_sources_by_session",
+            "ALTER TABLE history_terms RENAME TO history_terms_retired",
+            "ALTER TABLE history_sources RENAME TO history_sources_retired",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    database_error(
+                        ErrorCode::MigrationFailed,
+                        "drop the old history index",
+                        error,
+                    )
+                })?;
+        }
+    }
+    let statements = [
+        "CREATE TABLE IF NOT EXISTS history_sources (source_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, project_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, content_hash TEXT NOT NULL, availability TEXT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS history_sources_by_task ON history_sources(task_id, sequence)",
+        // A project-wide search's count of sources, from the index alone.
+        "CREATE INDEX IF NOT EXISTS history_sources_by_project ON history_sources(project_id)",
+        // Contentless: the content is `history_sources`'s, the rowids are
+        // its rowids.
+        "CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(terms, content = '', contentless_delete = 1, tokenize = \"unicode61 remove_diacritics 0 separators ' ' tokenchars '-_.'\")",
+        // The index's high-water mark per session, read before every search.
+        "CREATE INDEX IF NOT EXISTS history_sources_by_session ON history_sources(session_id, sequence)",
+        // A task's sessions, listed before every search.
+        "CREATE INDEX IF NOT EXISTS sessions_by_task ON sessions(task_id, created_at)",
+        "CREATE TABLE IF NOT EXISTS session_notes (note_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, session_id TEXT NOT NULL, note_key TEXT NOT NULL, revision INTEGER NOT NULL, content TEXT NOT NULL, sources_json TEXT NOT NULL, authority TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(task_id, note_key))",
+        "CREATE INDEX IF NOT EXISTS session_notes_by_task ON session_notes(task_id, note_key)",
+    ];
+    for statement in statements {
+        sqlx::query(statement)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::MigrationFailed, "apply context schema", error)
+            })?;
     }
     if current < 1 {
         for (table, column, definition) in [
@@ -5624,7 +5692,7 @@ impl SqliteStore {
     async fn text_rows(&self, query: &str) -> Value {
         // Every query is one of this file's constants.
         let rows = match sqlx::query(sqlx::AssertSqlSafe(query.to_owned()))
-            .fetch_all(&self.pool)
+            .fetch_all(&self.readers)
             .await
         {
             Ok(rows) => rows,
@@ -5703,7 +5771,7 @@ impl SqliteStore {
         )
         .bind(task_id.as_str())
         .bind(key)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| {
             database_error(ErrorCode::StorageOpenFailed, "read session setting", error)

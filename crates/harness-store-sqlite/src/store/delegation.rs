@@ -497,7 +497,7 @@ impl SqliteStore {
              FROM delegation_tasks WHERE task_id = ?",
         )
         .bind(task_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read task", error))?;
         let Some(row) = row else {
@@ -511,7 +511,7 @@ impl SqliteStore {
             "SELECT task_id, parent_task_id, role, status, revision, depth, brief_json, node_json
              FROM delegation_tasks ORDER BY depth, created_at, task_id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list tasks", error))?;
         rows.iter().map(read_task_row).collect()
@@ -526,7 +526,7 @@ impl SqliteStore {
              FROM delegation_task_owners WHERE task_id = ?",
         )
         .bind(task_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read owner", error))?;
         let Some(row) = row else {
@@ -548,7 +548,7 @@ impl SqliteStore {
              WHERE task_id = ? ORDER BY depends_on_task_id",
         )
         .bind(task_id.as_str())
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "read dependencies", error)
@@ -571,7 +571,7 @@ impl SqliteStore {
              FROM delegation_results WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
         )
         .bind(task_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read result", error))?;
         let Some(row) = row else {
@@ -619,7 +619,7 @@ impl SqliteStore {
              ORDER BY created_at, message_id",
         )
         .bind(recipient_task_id.as_str())
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list deliveries", error))?;
         rows.iter().map(read_delivery_row).collect()
@@ -635,7 +635,7 @@ impl SqliteStore {
              FROM message_deliveries WHERE message_id = ?",
         )
         .bind(message_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read delivery", error))?;
         let Some(row) = row else {
@@ -654,7 +654,7 @@ impl SqliteStore {
              FROM delegation_worktrees WHERE worktree_id = ?",
         )
         .bind(worktree_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read worktree", error))?;
         let Some(row) = row else {
@@ -669,7 +669,7 @@ impl SqliteStore {
                     path, write_scope_json, state, input_fingerprint, result_fingerprint, generation
              FROM delegation_worktrees ORDER BY created_at, worktree_id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list worktrees", error))?;
         rows.iter().map(read_worktree_row).collect()
@@ -677,7 +677,7 @@ impl SqliteStore {
 
     pub async fn delegation_task_count(&self) -> Result<u64, StoreError> {
         let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM delegation_tasks")
-            .fetch_one(&self.pool)
+            .fetch_one(&self.readers)
             .await
             .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "count tasks", error))?;
         to_u64(count, "task count")

@@ -10,11 +10,11 @@ use harness_providers::CancellationToken;
 use harness_types::{ErrorCode, HarnessError};
 #[cfg(unix)]
 use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
-#[cfg(windows)]
-use process_wrap::tokio::JobObject;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessSession;
 use process_wrap::tokio::{CommandWrap, KillOnDrop};
+#[cfg(windows)]
+use process_wrap::tokio::{CreationFlags, JobObject};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     task::JoinHandle,
@@ -33,6 +33,15 @@ use crate::{
 /// without them. No process existed, so it is reported as a plain failure,
 /// never as "side effect may be uncertain".
 const NOT_STARTED: &str = "the program did not start:";
+
+/// The Windows priority class of what the agent runs, which every process it
+/// starts inherits: below normal, so a build that takes every core (cargo's
+/// rustc) leaves the terminal and ha's own threads the processor first. An
+/// idle machine still gives it every core. At normal priority a build froze
+/// the screen it was started from.
+#[cfg(windows)]
+pub const AGENT_PROCESS_PRIORITY: u32 =
+    windows::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS.0;
 
 /// Whether this error is a spawn the operating system refused.
 pub(crate) fn never_started(error: &HarnessError) -> bool {
@@ -1009,6 +1018,10 @@ async fn run(
         }
     });
     command.wrap(KillOnDrop);
+    #[cfg(windows)]
+    command.wrap(CreationFlags(
+        windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(AGENT_PROCESS_PRIORITY),
+    ));
     #[cfg(windows)]
     command.wrap(JobObject);
     #[cfg(unix)]

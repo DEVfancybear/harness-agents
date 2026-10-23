@@ -2535,6 +2535,12 @@ impl SessionAgents {
                                 .chars()
                                 .take(200)
                                 .collect(),
+                            branch: child.worktree.as_ref().map(|tree| tree.branch.clone()),
+                            worktree: child.worktree.as_ref().and_then(|tree| {
+                                std::path::Path::new(&tree.path)
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                            }),
                         })
                         .collect()
                 },
@@ -5617,12 +5623,26 @@ impl TurnObserver for ExplorerObserver {
                 detail,
                 call_id,
             } => {
-                let millis = self
+                let elapsed = self
                     .calls
                     .lock()
                     .ok()
                     .and_then(|mut calls| calls.remove(&call_id))
-                    .map_or(0, |started| started.elapsed().as_millis());
+                    .map_or(Duration::ZERO, |started| started.elapsed());
+                let millis = elapsed.as_millis();
+                // A child's call is recorded as the agent's own are: a child's
+                // `history_search` took 12 minutes and no bug report showed it.
+                if let Some(record) = (SessionEvent::ToolSettled {
+                    name: name.clone(),
+                    call_id: call_id.clone(),
+                    ok,
+                    elapsed,
+                    detail: detail.clone().unwrap_or_default(),
+                })
+                .diagnostic()
+                {
+                    record.task(&self.task_id).emit();
+                }
                 let settled = if ok {
                     format!("ok {millis}")
                 } else {

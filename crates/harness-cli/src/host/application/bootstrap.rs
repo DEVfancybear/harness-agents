@@ -100,9 +100,7 @@ impl LaunchContext {
             "Session: new    Mode: trusted host".to_owned(),
             format!("Git:     {git}"),
         ];
-        if let Some(branch) = self.git_root.as_deref().and_then(git_branch) {
-            lines.push(format!("Branch: {branch}"));
-        }
+        lines.extend(place_lines(self.git_root.as_deref()));
         lines.extend([
             format!("AGENTS.md: {instruction_count} files"),
             format!(
@@ -350,6 +348,31 @@ pub fn git_branch(root: &Path) -> Option<String> {
     }
 }
 
+/// The folder of a linked worktree at `root` - its `.git` is a file naming
+/// its git directory - or none for a repository's main checkout.
+#[must_use]
+pub fn git_worktree(root: &Path) -> Option<String> {
+    root.join(".git")
+        .is_file()
+        .then(|| root.file_name())
+        .flatten()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+/// The header's lines for where the agent works: `Branch: ` and, in a linked
+/// worktree, `Worktree: ` with its folder.
+#[must_use]
+pub fn place_lines(git_root: Option<&Path>) -> Vec<String> {
+    let Some(root) = git_root else {
+        return Vec::new();
+    };
+    git_branch(root)
+        .map(|branch| format!("Branch: {branch}"))
+        .into_iter()
+        .chain(git_worktree(root).map(|tree| format!("Worktree: {tree}")))
+        .collect()
+}
+
 /// Drop the Windows verbatim prefix so paths stay readable in the header.
 fn displayable(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
@@ -373,7 +396,8 @@ fn displayable(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        CREDENTIAL_VARIABLES, LaunchRequest, ProviderState, displayable, git_branch, resolve,
+        CREDENTIAL_VARIABLES, LaunchRequest, ProviderState, displayable, git_branch, git_worktree,
+        place_lines, resolve,
     };
     use crate::interactive::credentials::{self, CredentialSource};
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
@@ -414,6 +438,14 @@ mod tests {
         )
         .expect("pointer");
         assert_eq!(git_branch(&tree).as_deref(), Some("0123456"), "detached");
+        // A linked worktree says its folder; the main checkout does not.
+        assert_eq!(git_worktree(&tree).as_deref(), Some("tree"));
+        assert_eq!(git_worktree(&repo), None);
+        assert_eq!(
+            place_lines(Some(&tree)),
+            ["Branch: 0123456", "Worktree: tree"]
+        );
+        assert_eq!(place_lines(Some(&repo)), ["Branch: feat/sidebar"]);
 
         assert_eq!(git_branch(temp.path()), None, "not a repository");
     }

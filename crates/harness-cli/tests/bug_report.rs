@@ -594,6 +594,10 @@ fn a_bug_report_shows_what_jev_decided() {
 /// Dream's model calls by purpose, and the agent's calls of the tools that
 /// read memory and the raw record.
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one report's records, then what its summary says of them"
+)]
 fn a_bug_report_sets_memory_upkeep_beside_its_reads() {
     let fixture = tempfile::tempdir().unwrap();
     let home = fixture.path();
@@ -626,6 +630,25 @@ fn a_bug_report_sets_memory_upkeep_beside_its_reads() {
         record(4_000, "tool", "ok", tool("memory")),
         record(5_000, "tool", "ok", tool("history_search")),
         record(6_000, "tool", "ok", tool("read_file")),
+        // A batch held 90 s by an approval, as a report could not say.
+        record(
+            7_000,
+            "approval",
+            "asked",
+            serde_json::json!({"tool": "web_search"}),
+        ),
+        record(
+            97_000,
+            "approval",
+            "answered",
+            serde_json::json!({"tool": "web_search", "answer": "granted", "waited_ms": 90_000}),
+        ),
+        record(
+            97_100,
+            "tool",
+            "gate_slow",
+            serde_json::json!({"tool": "web_search", "prepare_ms": 2, "guard_ms": 0, "hooks_ms": 0, "approval_ms": 90_000, "intent_ms": 4}),
+        ),
     ];
     let diagnostics = home.join("data").join("diagnostics");
     std::fs::create_dir_all(&diagnostics).unwrap();
@@ -674,6 +697,16 @@ fn a_bug_report_sets_memory_upkeep_beside_its_reads() {
             "Read by the agent: `memory` 1, `knowledge` 0, `history_search` 1, `history_read` 0."
         ),
         "{memory}"
+    );
+    assert!(
+        summary.contains(
+            "- approvals answered: 1, 90.0s waited in all; the longest 90.0s for `web_search`"
+        ),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("`web_search` held: approval 90.0s"),
+        "{summary}"
     );
 }
 

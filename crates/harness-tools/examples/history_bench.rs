@@ -17,7 +17,7 @@ use std::{
 };
 
 use harness_session::{AdmitInputRequest, SessionService};
-use harness_store_sqlite::{HistoryScope, SqliteStore, WriterOpenOptions};
+use harness_store_sqlite::{CatchUpPace, HistoryScope, SqliteStore, WriterOpenOptions};
 use harness_tools::observe_workspace;
 use harness_types::{HostId, InputId, ProjectId, SessionId, SourceAuthority, TaskId};
 
@@ -94,9 +94,130 @@ fn report(name: &str, mut times: Vec<Duration>) {
     );
 }
 
+/// `--store <dir> <query>... [--watch <seconds>]`: a copy of a real project
+/// store instead of a made-up journal, searched across the project the way
+/// `history_search` with `scope: project` searches it - the index caught up
+/// for at most three seconds, the rest in the background - and then, while
+/// the background catch-up runs, the agent's own reads and writes, timed.
+#[allow(clippy::too_many_lines, reason = "one benchmark, read top to bottom")]
+async fn real_store(directory: &str, queries: &[String]) {
+    let started = Instant::now();
+    let store = Arc::new(
+        SqliteStore::open_writer(WriterOpenOptions::new(directory, HostId::generate()))
+            .await
+            .expect("store opens"),
+    );
+    println!("open the store: {:.0} ms", ms(started.elapsed()));
+    let session = store
+        .newest_session_id()
+        .await
+        .expect("sessions")
+        .expect("a session");
+    let task = store
+        .session_task(&session)
+        .await
+        .expect("task")
+        .expect("task");
+    let project = store
+        .session_project(&session)
+        .await
+        .expect("project")
+        .expect("project");
+    let behind = |store: Arc<SqliteStore>| async move {
+        store
+            .catch_up_history(None, CatchUpPace::Until(Instant::now()))
+            .await
+            .expect("count")
+            .behind
+    };
+    println!(
+        "conversations behind the index: {}",
+        behind(Arc::clone(&store)).await
+    );
+    // `--whole`: the whole index rebuilt at once, timed, before the searches.
+    if std::env::args().any(|word| word == "--whole") {
+        let started = Instant::now();
+        let caught = store
+            .catch_up_history(None, CatchUpPace::Whole)
+            .await
+            .expect("index");
+        println!(
+            "rebuild the project index: {:.1} s ({} sources)",
+            started.elapsed().as_secs_f64(),
+            caught.indexed
+        );
+    }
+    let scope = HistoryScope::new(project, task.clone()).across_project();
+    for query in queries {
+        let started = Instant::now();
+        let caught = store
+            .catch_up_history(
+                None,
+                CatchUpPace::Until(Instant::now() + Duration::from_secs(3)),
+            )
+            .await
+            .expect("index");
+        if caught.behind > 0 {
+            store.catch_up_history_in_background(None);
+        }
+        let hits = store
+            .history_search(&scope, query, 10)
+            .await
+            .expect("search");
+        println!(
+            "{:<34} {:>8.0} ms   ({} hits; {} sources indexed, {} conversations left)",
+            format!("search {query:?}"),
+            ms(started.elapsed()),
+            hits.len(),
+            caught.indexed,
+            caught.behind
+        );
+    }
+    let watch = Duration::from_secs(u64::try_from(arg("--watch", 30)).unwrap_or(30));
+    let probe = queries.first().map_or("cargo", String::as_str);
+    let (mut reads, mut writes) = (Vec::new(), Vec::new());
+    let started = Instant::now();
+    while started.elapsed() < watch {
+        let at = Instant::now();
+        let _ = store
+            .history_search(&scope, probe, 10)
+            .await
+            .expect("search");
+        reads.push(at.elapsed());
+        let at = Instant::now();
+        append(&store, &session, &task, "a tool call's record".to_owned()).await;
+        writes.push(at.elapsed());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    println!(
+        "while indexing in the background for {:.0} s:",
+        watch.as_secs_f64()
+    );
+    report("  an agent's read (history_search)", reads);
+    report("  an agent's write (journal entry)", writes);
+    println!(
+        "conversations still behind: {}",
+        behind(Arc::clone(&store)).await
+    );
+    if let Ok(store) = Arc::try_unwrap(store) {
+        let _ = store.close().await;
+    }
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines, reason = "one benchmark, read top to bottom")]
 async fn main() {
+    let words = std::env::args().collect::<Vec<_>>();
+    if let Some(at) = words.iter().position(|word| word == "--store") {
+        let queries = words
+            .iter()
+            .skip(at + 2)
+            .take_while(|word| !word.starts_with("--"))
+            .cloned()
+            .collect::<Vec<_>>();
+        real_store(&words[at + 1], &queries).await;
+        return;
+    }
     let events = arg("--events", 2000);
     let rounds = arg("--rounds", 20);
     let sessions = arg("--sessions", 1).max(1);

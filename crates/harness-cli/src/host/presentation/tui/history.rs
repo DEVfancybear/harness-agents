@@ -1109,13 +1109,19 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
             spans.push(Span::raw(" "));
             spans.push(Span::styled(format!(" ✧ {level} "), theme.badge_info));
         }
-        if let Some(branch) = lines.iter().find_map(|line| line.strip_prefix("Branch: "))
-            && !branch.trim().is_empty()
-        {
-            let branch: String = branch.trim().chars().take(28).collect();
+        let line = |prefix: &str| {
+            lines
+                .iter()
+                .find_map(|line| line.strip_prefix(prefix))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
+        let here = super::sidebar::place(line("Branch: "), line("Worktree: "));
+        if !here.is_empty() {
+            let here: String = here.chars().take(44).collect();
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
-                format!(" ⎇ {branch} "),
+                format!(" {here} "),
                 theme.branch.patch(theme.chip),
             ));
         }

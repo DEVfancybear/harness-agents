@@ -1843,6 +1843,10 @@ pub enum ToolOutput {
         hits: Vec<HistoryHitView>,
         /// Whether the result was cut at the requested limit.
         truncated: bool,
+        /// Conversations not indexed in time for this search, the oldest of
+        /// the scope: they are being indexed and a later search reads them.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        unindexed: u64,
     },
     /// One exact page of an indexed journal source.
     HistoryRead {

@@ -1679,6 +1679,8 @@ mod tests {
         let mut parent = agent("a1", "running", "t1");
         parent.agent.subagents = (0..20)
             .map(|index| super::super::agents::protocol::SubagentInfo {
+                branch: None,
+                worktree: None,
                 queued: false,
                 name: format!("explorer-{index:08x}"),
                 status: "running".to_owned(),
@@ -1752,6 +1754,8 @@ mod tests {
         running.agent.busy = true;
         running.agent.model = "deepseek-v4.1-flash via https://api.example/v1".to_owned();
         running.agent.subagents = vec![super::super::agents::protocol::SubagentInfo {
+            branch: None,
+            worktree: None,
             queued: false,
             name: "verifier-1".to_owned(),
             status: "error".to_owned(),
@@ -1847,6 +1851,8 @@ mod tests {
             .enumerate()
             .map(
                 |(index, status)| super::super::agents::protocol::SubagentInfo {
+                    branch: None,
+                    worktree: None,
                     queued: false,
                     name: format!("coder-{index}"),
                     status: (*status).to_owned(),
@@ -1966,6 +1972,8 @@ mod tests {
         parent.agent.heartbeats = 2;
         parent.agent.subagents = vec![
             SubagentInfo {
+                branch: None,
+                worktree: None,
                 queued: false,
                 name: "scout".to_owned(),
                 status: "running".to_owned(),
@@ -1975,6 +1983,8 @@ mod tests {
                 program: "look at the parser".to_owned(),
             },
             SubagentInfo {
+                branch: None,
+                worktree: None,
                 queued: false,
                 name: "done".to_owned(),
                 status: "completed".to_owned(),
@@ -2018,6 +2028,8 @@ mod tests {
         use crate::interactive::agents::protocol::SubagentInfo;
         let now = chrono::Utc::now();
         let child = |name: &str, model: &str, thinking: Option<&str>, program: &str| SubagentInfo {
+            branch: None,
+            worktree: None,
             name: name.to_owned(),
             status: "running".to_owned(),
             model: model.to_owned(),

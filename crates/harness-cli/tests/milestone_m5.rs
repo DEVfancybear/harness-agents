@@ -1806,6 +1806,22 @@ async fn m5_03_batched_index_previews_and_pages_match_the_journal() {
     admit_into(&store, &bench, &second, &task, "the second turn").await;
     append_note(&store, &second, &task, "the follow-up names ZK-42 again").await;
 
+    // A search waits for the index only until its deadline: one already
+    // past indexes nothing and says how many conversations are behind.
+    let waited = store
+        .catch_up_history(
+            Some(&task),
+            harness_store_sqlite::CatchUpPace::Until(std::time::Instant::now()),
+        )
+        .await
+        .expect("bounded catch-up");
+    assert_eq!(
+        waited,
+        harness_store_sqlite::HistoryCatchUp {
+            indexed: 0,
+            behind: 2
+        }
+    );
     let indexed = store.index_task_history(&task).await.expect("index");
     assert_eq!(indexed, 303, "every entry of both sessions is a source");
     assert_eq!(

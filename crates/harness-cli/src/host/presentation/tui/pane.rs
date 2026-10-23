@@ -97,20 +97,24 @@ pub fn render(frame: &mut Frame, area: Rect, pane: View<'_>, theme: &Theme) {
         .border_style(theme.accent)
         .title(title)
         .title_bottom(Line::from(Span::styled(" alt+1 back ", theme.dim)).right_aligned());
-    // herdr's pane footer: the model and thinking level the agent runs on.
+    // herdr's pane footer: the model and thinking level the agent runs on,
+    // and the branch and worktree of a coder that works in one of its own.
     let model = activity.model_label();
-    if !model.is_empty() {
-        let room = usize::from(area.width).saturating_sub(18);
-        block = block.title_bottom(
-            Line::from(vec![
-                Span::styled(" ◆ ", theme.accent),
-                Span::styled(
-                    format!("{} ", super::sidebar::model_effort(activity, room)),
-                    theme.muted,
-                ),
-            ])
-            .left_aligned(),
-        );
+    let workplace = super::sidebar::place(activity.branch.as_deref(), activity.worktree.as_deref());
+    if !model.is_empty() || !workplace.is_empty() {
+        let mut room = usize::from(area.width).saturating_sub(18);
+        let mut footer = Vec::new();
+        if !model.is_empty() {
+            let model = super::sidebar::model_effort(activity, room);
+            room = room.saturating_sub(display_width(&model) + 3);
+            footer.push(Span::styled(" ◆ ", theme.accent));
+            footer.push(Span::styled(format!("{model} "), theme.muted));
+        }
+        if !workplace.is_empty() && room > 4 {
+            let workplace: String = workplace.chars().take(room - 2).collect();
+            footer.push(Span::styled(format!(" {workplace} "), theme.branch));
+        }
+        block = block.title_bottom(Line::from(footer).left_aligned());
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -697,6 +701,34 @@ mod tests {
         let text = screen(&activity, Detail::Details, 48, 24).join("\n");
         assert!(text.contains("8: line 8 of the file"), "{text}");
         assert!(text.contains("… 40 more lines"), "{text}");
+    }
+
+    /// A coder in a worktree of its own says which: its branch and folder
+    /// follow the model in the footer. One in the user's checkout says none.
+    #[test]
+    fn a_coder_in_its_own_worktree_names_its_branch_and_folder() {
+        let coder = ChildActivity {
+            name: "coder-4b27c5cd".to_owned(),
+            model: "openai-codex/gpt-6.1-sol".to_owned(),
+            thinking: Some("high".to_owned()),
+            branch: Some("ha/coder-4b27c5cd".to_owned()),
+            worktree: Some("wt-4b27c5cd".to_owned()),
+            ..ChildActivity::default()
+        };
+        let rows = screen(&coder, Detail::Collapsed, 72, 8);
+        let text = rows.join("\n");
+        assert!(rows[7].contains("◆ gpt-6.1-sol high"), "{text}");
+        assert!(
+            rows[7].contains("⎇ ha/coder-4b27c5cd · wt-4b27c5cd"),
+            "{text}"
+        );
+        let explorer = ChildActivity {
+            branch: None,
+            worktree: None,
+            ..coder
+        };
+        let text = screen(&explorer, Detail::Collapsed, 72, 8).join("\n");
+        assert!(!text.contains('⎇'), "{text}");
     }
 
     /// herdr's run of one tool: `Read 4 files` and the paths under it, not

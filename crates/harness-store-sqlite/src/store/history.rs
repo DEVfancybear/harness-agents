@@ -14,7 +14,12 @@
 //!     were written from; checking a source exists proves provenance, never
 //!     correctness.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    fmt::Write as _,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use harness_types::{ContentHash, ErrorCode, ProjectId, SessionId, SourceRef, TaskId};
 use sqlx::Row;
@@ -48,12 +53,50 @@ pub const NOTE_KEY_LIMIT_CHARS: usize = 120;
 /// Longest note body.
 pub const NOTE_CONTENT_LIMIT_BYTES: usize = 16 * 1024;
 
-/// Journal entries written per index transaction.
-const HISTORY_SOURCES_PER_TRANSACTION: usize = 128;
+/// Journal entries written per index transaction: few, so the one writing
+/// connection goes back to the agents between them. At 128 a transaction
+/// held it for about a second, and its commit for seconds more when it made
+/// the writer copy the log back.
+const HISTORY_SOURCES_PER_TRANSACTION: usize = 32;
 
-/// Term rows per `INSERT` statement; two bind parameters each, far below
-/// `SQLite`'s limit.
-const HISTORY_TERMS_PER_STATEMENT: usize = 400;
+/// Transactions a background catch-up writes between pauses, and how long it
+/// pauses: long enough for the store's checkpointer to find the writer quiet
+/// and copy the log back itself (`checkpoint`). Without the pauses the log
+/// outgrew the writer's own limit every few transactions and the writer
+/// copied it back inside a commit: 648 entries of a 140 MB store took 36 s,
+/// and 5 s once no commit copied.
+const HISTORY_BATCHES_PER_PAUSE: usize = 8;
+const HISTORY_PAUSE: Duration = Duration::from_millis(300);
+
+/// The tables an older version's index was kept in, renamed when the schema
+/// moved on and deleted in the background.
+const RETIRED_HISTORY_TABLES: [&str; 2] = ["history_terms_retired", "history_sources_retired"];
+
+/// Rows of a retired table deleted per transaction. Dropping a 5.9-million-row
+/// table at once held the writer for 15 s, and 5,000 rows at a time made the
+/// agent's own writes wait 133 ms in the median.
+const RETIRED_ROWS_PER_TRANSACTION: i64 = 1_000;
+
+/// How a catch-up of the index spends its time.
+#[derive(Clone, Copy, Debug)]
+pub enum CatchUpPace {
+    /// As fast as it can, for as long as it takes.
+    Whole,
+    /// As fast as it can, until the deadline: what a search waits for.
+    Until(Instant),
+    /// Behind everything else: it pauses every few transactions.
+    Background,
+}
+
+/// How a catch-up of the index ended.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HistoryCatchUp {
+    /// Sources written.
+    pub indexed: u64,
+    /// Conversations still behind when the time ran out. The newest go
+    /// first, so these are the oldest.
+    pub behind: u64,
+}
 
 /// A journal entry about to be indexed.
 struct NewSource {
@@ -318,6 +361,20 @@ impl SqliteStore {
     /// Returns the number of sources written. It is safe to call before every
     /// search: the work is proportional to what changed, not to the session.
     pub async fn index_history(&self, session_id: &SessionId) -> Result<u64, StoreError> {
+        Ok(self
+            .index_history_paced(session_id, CatchUpPace::Whole)
+            .await?
+            .0)
+    }
+
+    /// `index_history` at a pace: the sources written, and whether the
+    /// session is caught up. A deadline stops it between transactions; the
+    /// rest is read again next time, from the last source written.
+    async fn index_history_paced(
+        &self,
+        session_id: &SessionId,
+        pace: CatchUpPace,
+    ) -> Result<(u64, bool), StoreError> {
         let indexed_through = self.history_watermark(session_id).await?;
         let rows = sqlx::query(
             "SELECT sequence, event_id, event_json FROM events
@@ -325,7 +382,7 @@ impl SqliteStore {
         )
         .bind(session_id.as_str())
         .bind(to_i64(indexed_through, "history watermark")?)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| {
             database_error(
@@ -364,7 +421,7 @@ impl SqliteStore {
             });
         }
         if sources.is_empty() {
-            return Ok(0);
+            return Ok((0, true));
         }
         // The session's task and project are the same for every entry: look
         // them up once, not once per entry (the project is behind a parse of
@@ -385,12 +442,25 @@ impl SqliteStore {
         let mut written = 0_u64;
         // Several entries per transaction, but bounded, so a long backlog does
         // not hold the writer away from the runtime for the whole catch-up.
-        for batch in sources.chunks(HISTORY_SOURCES_PER_TRANSACTION) {
+        for (index, batch) in sources.chunks(HISTORY_SOURCES_PER_TRANSACTION).enumerate() {
+            match pace {
+                CatchUpPace::Until(deadline) if Instant::now() >= deadline => {
+                    return Ok((written, false));
+                }
+                CatchUpPace::Background
+                    if index > 0 && index.is_multiple_of(HISTORY_BATCHES_PER_PAUSE) =>
+                {
+                    tokio::time::sleep(HISTORY_PAUSE).await;
+                }
+                _ => {}
+            }
             self.write_history_sources(&owner, batch, SourceAvailability::Available)
                 .await?;
             written += u64::try_from(batch.len()).unwrap_or(u64::MAX);
+            // Whoever waits for the writer goes next.
+            tokio::task::yield_now().await;
         }
-        Ok(written)
+        Ok((written, true))
     }
 
     /// Drop a session's index and rebuild it from the journal.
@@ -401,7 +471,7 @@ impl SqliteStore {
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
         sqlx::query(
-            "DELETE FROM history_terms WHERE source_id IN (SELECT source_id FROM history_sources WHERE session_id = ?)",
+            "DELETE FROM history_fts WHERE rowid IN (SELECT rowid FROM history_sources WHERE session_id = ?)",
         )
         .bind(session_id.as_str())
         .execute(&mut *tx)
@@ -443,26 +513,10 @@ impl SqliteStore {
     /// nothing to index stays listed and is re-read from its last source on;
     /// that read is small and writes nothing.
     pub async fn index_task_history(&self, task_id: &TaskId) -> Result<u64, StoreError> {
-        let rows = sqlx::query(
-            "SELECT session_id FROM sessions
-             WHERE task_id = ?
-               AND next_sequence - 1 > COALESCE(
-                   (SELECT MAX(h.sequence) FROM history_sources h
-                    WHERE h.session_id = sessions.session_id), 0)
-             ORDER BY created_at",
-        )
-        .bind(task_id.as_str())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|error| {
-            database_error(ErrorCode::StorageWriteFailed, "list task sessions", error)
-        })?;
-        let mut indexed = 0_u64;
-        for row in rows {
-            let session_id = SessionId::parse(row_get::<String>(&row, "session_id")?)?;
-            indexed += self.index_history(&session_id).await?;
-        }
-        Ok(indexed)
+        Ok(self
+            .catch_up_history(Some(task_id), CatchUpPace::Whole)
+            .await?
+            .indexed)
     }
 
     /// Index every session of the store that is behind, whatever its task:
@@ -472,34 +526,198 @@ impl SqliteStore {
     /// The first call indexes the conversations no search reached before;
     /// later ones skip every caught-up session in one query.
     pub async fn index_project_history(&self) -> Result<u64, StoreError> {
+        Ok(self
+            .catch_up_history(None, CatchUpPace::Whole)
+            .await?
+            .indexed)
+    }
+
+    /// The sessions of one task (`Some`) or of the whole store (`None`)
+    /// whose journal is ahead of the index, the newest first.
+    async fn sessions_behind(
+        &self,
+        task_id: Option<&TaskId>,
+    ) -> Result<Vec<SessionId>, StoreError> {
         let rows = sqlx::query(
             "SELECT session_id FROM sessions
-             WHERE next_sequence - 1 > COALESCE(
+             WHERE (?1 IS NULL OR task_id = ?1)
+               AND next_sequence - 1 > COALESCE(
                    (SELECT MAX(h.sequence) FROM history_sources h
                     WHERE h.session_id = sessions.session_id), 0)
-             ORDER BY created_at",
+             ORDER BY created_at DESC",
         )
-        .fetch_all(&self.pool)
+        .bind(task_id.map(TaskId::as_str))
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| {
-            database_error(
-                ErrorCode::StorageWriteFailed,
-                "list project sessions",
-                error,
-            )
+            database_error(ErrorCode::StorageWriteFailed, "list sessions behind", error)
         })?;
-        let mut indexed = 0_u64;
-        for row in rows {
-            let session_id = SessionId::parse(row_get::<String>(&row, "session_id")?)?;
-            // A session without an admitted task has nothing a search could
-            // attribute; it is skipped, not fatal to the others.
-            match self.index_history(&session_id).await {
-                Ok(count) => indexed += count,
-                Err(error) if error.code() == ErrorCode::InvalidPayload => {}
-                Err(error) => return Err(error),
+        rows.iter()
+            .map(|row| Ok(SessionId::parse(row_get::<String>(row, "session_id")?)?))
+            .collect()
+    }
+
+    /// Index one session that is behind, in a catch-up of `task_id`'s
+    /// sessions or of the store's: whether it was caught up. Across the store,
+    /// a session without an admitted task has nothing a search could
+    /// attribute; it is skipped, not fatal to the others.
+    async fn catch_up_session(
+        &self,
+        task_id: Option<&TaskId>,
+        session_id: &SessionId,
+        pace: CatchUpPace,
+    ) -> Result<(u64, bool), StoreError> {
+        match self.index_history_paced(session_id, pace).await {
+            Err(error) if task_id.is_none() && error.code() == ErrorCode::InvalidPayload => {
+                Ok((0, true))
+            }
+            caught => caught,
+        }
+    }
+
+    /// Index the sessions of one task (`Some`) or of the whole store
+    /// (`None`) that are behind, the newest first, at `pace`.
+    ///
+    /// A search waits for this only until its deadline: the first
+    /// project-wide search of a store with months of conversations indexed all
+    /// of them first and took twelve minutes. What is left is caught up by
+    /// `catch_up_history_in_background`.
+    pub async fn catch_up_history(
+        &self,
+        task_id: Option<&TaskId>,
+        pace: CatchUpPace,
+    ) -> Result<HistoryCatchUp, StoreError> {
+        let sessions = self.sessions_behind(task_id).await?;
+        let total = u64::try_from(sessions.len()).unwrap_or(u64::MAX);
+        let mut caught = HistoryCatchUp::default();
+        for (done, session_id) in (0_u64..).zip(&sessions) {
+            if matches!(pace, CatchUpPace::Until(deadline) if Instant::now() >= deadline) {
+                caught.behind = total - done;
+                break;
+            }
+            let (indexed, finished) = self.catch_up_session(task_id, session_id, pace).await?;
+            caught.indexed += indexed;
+            if !finished {
+                caught.behind = total - done;
+                break;
             }
         }
-        Ok(indexed)
+        Ok(caught)
+    }
+
+    /// Delete some rows of the tables an older version kept its index in, or
+    /// drop one that is empty: whether there was anything to delete.
+    async fn retire_old_history_index(&self) -> Result<bool, StoreError> {
+        use std::sync::atomic::Ordering;
+        if self.history_retired.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        for table in RETIRED_HISTORY_TABLES {
+            let exists = sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_optional(&self.readers)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::StorageWriteFailed, "find a retired index", error)
+            })?;
+            if exists.is_none() {
+                continue;
+            }
+            let fence = self.fence()?;
+            let mut tx = self.begin_write(&fence).await?;
+            // The table names are this file's constants, not a caller's.
+            let deleted = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} LIMIT ?)"
+            )))
+            .bind(RETIRED_ROWS_PER_TRANSACTION)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "delete a retired index",
+                    error,
+                )
+            })?
+            .rows_affected();
+            if deleted == 0 {
+                sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| {
+                        database_error(ErrorCode::StorageWriteFailed, "drop a retired index", error)
+                    })?;
+            }
+            tx.commit().await.map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "commit a retired index",
+                    error,
+                )
+            })?;
+            return Ok(true);
+        }
+        self.history_retired.store(true, Ordering::Relaxed);
+        Ok(false)
+    }
+
+    /// Catch the index of one task (`Some`) or of the whole store (`None`)
+    /// up behind everything else, one such catch-up at a time. It does not
+    /// keep the store open: a store closed meanwhile ends it, and the next
+    /// search starts it again.
+    pub fn catch_up_history_in_background(self: &Arc<Self>, task_id: Option<TaskId>) {
+        let key = task_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let running = Arc::clone(&self.history_catch_ups);
+        if !running
+            .lock()
+            .is_ok_and(|mut running| running.insert(key.clone()))
+        {
+            return;
+        }
+        let store = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let sessions = match store.upgrade() {
+                Some(store) => store
+                    .sessions_behind(task_id.as_ref())
+                    .await
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            // The store is held only while one session is written.
+            for session_id in &sessions {
+                let Some(store) = store.upgrade() else {
+                    break;
+                };
+                if store
+                    .catch_up_session(task_id.as_ref(), session_id, CatchUpPace::Background)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            // Then what an older version indexed goes, a little at a time.
+            let mut deleted = 0_usize;
+            while let Some(store) = store.upgrade() {
+                if !store.retire_old_history_index().await.unwrap_or(false) {
+                    break;
+                }
+                deleted += 1;
+                if deleted.is_multiple_of(HISTORY_BATCHES_PER_PAUSE) {
+                    tokio::time::sleep(HISTORY_PAUSE).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
+            }
+            if let Ok(mut running) = running.lock() {
+                running.remove(&key);
+            }
+        });
     }
 
     /// Search the index within one scope, the most relevant sources first.
@@ -530,8 +748,10 @@ impl SqliteStore {
         }
         let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(20);
         let weights = self.history_term_weights(scope, &terms).await?;
-        let term_list = vec!["?"; terms.len()].join(",");
-        let weight_cases = " WHEN ? THEN ?".repeat(terms.len());
+        let weight_cases = (0..terms.len()).fold(String::new(), |mut cases, index| {
+            let _ = write!(cases, " WHEN {index} THEN ?");
+            cases
+        });
         // Newest first among equal scores: across conversations a sequence
         // only orders one session, so the session's start orders them.
         let (order, page_order) = if scope.project_wide {
@@ -545,49 +765,51 @@ impl SqliteStore {
                 "ranked.matched DESC, ranked.weight DESC, ranked.sequence DESC",
             )
         };
-        // The ranking reads only the term rows; the preview is cut from the
-        // few sources that make the page.
+        // The ranking reads only the index's hits; the preview is cut from
+        // the few sources that make the page.
         let sql = format!(
-            "SELECT s.source_id, s.sequence, s.kind, substr(s.content, 1, ?) AS head,
+            "WITH hits(id, term) AS ({})
+             SELECT s.source_id, s.sequence, s.kind, substr(s.content, 1, ?) AS head,
                     s.content_hash, s.availability, ranked.matched, s.task_id, ranked.started
              FROM (
                  SELECT * FROM (
-                     SELECT t.source_id, COUNT(*) AS matched,
-                            SUM(CASE t.term{weight_cases} ELSE 0 END) AS weight,
+                     SELECT h.id AS id, COUNT(*) AS matched,
+                            SUM(CASE h.term{weight_cases} ELSE 0 END) AS weight,
                             s.sequence AS sequence, COALESCE(se.created_at, '') AS started,
                             MAX(COUNT(*)) OVER () AS best
-                     FROM history_terms t JOIN history_sources s ON s.source_id = t.source_id
+                     FROM hits h JOIN history_sources s ON s.rowid = h.id
                      LEFT JOIN sessions se ON se.session_id = s.session_id
-                     WHERE {} AND t.term IN ({term_list})
-                     GROUP BY t.source_id
+                     WHERE {}
+                     GROUP BY h.id
                  ) WHERE matched = ? OR best < ?
                  ORDER BY {order} LIMIT ?
-             ) ranked JOIN history_sources s ON s.source_id = ranked.source_id
+             ) ranked JOIN history_sources s ON s.rowid = ranked.id
              ORDER BY {page_order}",
+            term_hits(terms.len()),
             scope_predicate(scope),
         );
         // The statement is assembled from a fixed template: every caller value
         // is a bind parameter, and the only thing that varies is how many `?`
         // placeholders the scope grants and the query terms need.
+        let mut statement = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for term in &terms {
+            statement = statement.bind(match_term(term));
+        }
         // A hit shows a preview, never the source: fetch one character more
         // than the preview keeps, which is enough to know it was cut.
-        let mut statement = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(i64::try_from(PREVIEW_CHARS + 1).unwrap_or(i64::MAX));
-        for (term, weight) in terms.iter().zip(&weights) {
-            statement = statement.bind(term).bind(*weight);
+        statement = statement.bind(i64::try_from(PREVIEW_CHARS + 1).unwrap_or(i64::MAX));
+        for weight in &weights {
+            statement = statement.bind(*weight);
         }
         for value in scope_binds(scope) {
             statement = statement.bind(value);
-        }
-        for term in &terms {
-            statement = statement.bind(term);
         }
         let every = i64::try_from(terms.len()).unwrap_or(i64::MAX);
         let rows = statement
             .bind(every)
             .bind(every)
             .bind(limit)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.readers)
             .await
             .map_err(|error| {
                 database_error(ErrorCode::StorageWriteFailed, "search history", error)
@@ -621,7 +843,7 @@ impl SqliteStore {
         }
         let rows = statement
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .fetch_all(&self.pool)
+            .fetch_all(&self.readers)
             .await
             .map_err(|error| {
                 database_error(ErrorCode::StorageWriteFailed, "read history texts", error)
@@ -667,7 +889,7 @@ impl SqliteStore {
         for id in source_ids {
             statement = statement.bind(id);
         }
-        let rows = statement.fetch_all(&self.pool).await.map_err(|error| {
+        let rows = statement.fetch_all(&self.readers).await.map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "read history hits", error)
         })?;
         let query_terms = u64::try_from(search_terms(query).len()).unwrap_or(u64::MAX);
@@ -682,43 +904,50 @@ impl SqliteStore {
         scope: &HistoryScope,
         terms: &[String],
     ) -> Result<Vec<i64>, StoreError> {
-        let sql = format!(
-            "SELECT t.term, COUNT(*) AS matching,
-                    (SELECT COUNT(*) FROM history_sources s WHERE {predicate}) AS sources
-             FROM history_terms t JOIN history_sources s ON s.source_id = t.source_id
-             WHERE {predicate} AND t.term IN ({})
-             GROUP BY t.term",
-            vec!["?"; terms.len()].join(","),
-            predicate = scope_predicate(scope),
-        );
         // A fixed template: only the number of placeholders varies.
+        let mut sources = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM history_sources s WHERE {}",
+            scope_predicate(scope)
+        )));
+        for value in scope_binds(scope) {
+            sources = sources.bind(value);
+        }
+        let sources = sources.fetch_one(&self.readers).await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "count history sources",
+                error,
+            )
+        })?;
+        let sources = u64::try_from(sources).unwrap_or_default();
+        let sql = format!(
+            "WITH hits(id, term) AS ({})
+             SELECT h.term AS term, COUNT(*) AS matching
+             FROM hits h JOIN history_sources s ON s.rowid = h.id
+             WHERE {}
+             GROUP BY h.term",
+            term_hits(terms.len()),
+            scope_predicate(scope),
+        );
         let mut statement = sqlx::query(sqlx::AssertSqlSafe(sql));
-        for _ in 0..2 {
-            for value in scope_binds(scope) {
-                statement = statement.bind(value);
-            }
-        }
         for term in terms {
-            statement = statement.bind(term);
+            statement = statement.bind(match_term(term));
         }
-        let rows = statement.fetch_all(&self.pool).await.map_err(|error| {
+        for value in scope_binds(scope) {
+            statement = statement.bind(value);
+        }
+        let rows = statement.fetch_all(&self.readers).await.map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "weigh history terms", error)
         })?;
-        let mut counts = std::collections::HashMap::new();
+        let mut weights = vec![0; terms.len()];
         for row in &rows {
-            let term: String = row_get(row, "term")?;
+            let term = usize::try_from(row_get::<i64>(row, "term")?).unwrap_or(usize::MAX);
             let matching = u64::try_from(row_get::<i64>(row, "matching")?).unwrap_or_default();
-            let sources = u64::try_from(row_get::<i64>(row, "sources")?).unwrap_or_default();
-            counts.insert(term, (sources, matching));
+            if let Some(weight) = weights.get_mut(term) {
+                *weight = scaled_idf(sources, matching);
+            }
         }
-        Ok(terms
-            .iter()
-            .map(|term| {
-                counts
-                    .get(term)
-                    .map_or(0, |(sources, matching)| scaled_idf(*sources, *matching))
-            })
-            .collect())
+        Ok(weights)
     }
 
     /// Read an exact page of one source.
@@ -740,7 +969,7 @@ impl SqliteStore {
         .bind(i64::try_from(offset).unwrap_or(i64::MAX).saturating_add(1))
         .bind(i64::try_from(length).unwrap_or(i64::MAX))
         .bind(source_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "read history source", error)
@@ -828,7 +1057,7 @@ impl SqliteStore {
         .bind(scope.task_id.as_str())
         .bind(i64::try_from(HEAD_CHARS).unwrap_or(i64::MAX))
         .bind(head)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "list history sources", error)
@@ -881,7 +1110,7 @@ impl SqliteStore {
         )
         .bind(session_id.as_str())
         .bind(i64::try_from(limit.clamp(1, 1000)).unwrap_or(200))
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "list history sources", error)
@@ -893,7 +1122,7 @@ impl SqliteStore {
     pub async fn history_grants(&self, session_id: &SessionId) -> Result<Vec<String>, StoreError> {
         let row = sqlx::query("SELECT fork_policy FROM session_lineage WHERE new_session_id = ?")
             .bind(session_id.as_str())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.readers)
             .await
             .map_err(|error| {
                 database_error(ErrorCode::StorageWriteFailed, "read fork policy", error)
@@ -1036,7 +1265,7 @@ impl SqliteStore {
         )
         .bind(task_id.as_str())
         .bind(key)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read note", error))?;
         row.map(|row| note_from_row(&row)).transpose()
@@ -1047,7 +1276,7 @@ impl SqliteStore {
             "SELECT MAX(sequence) FROM history_sources WHERE session_id = ?",
         )
         .bind(session_id.as_str())
-        .fetch_one(&self.pool)
+        .fetch_one(&self.readers)
         .await
         .map_err(|error| {
             database_error(
@@ -1075,7 +1304,6 @@ impl SqliteStore {
     ) -> Result<(), StoreError> {
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
-        let mut terms = Vec::new();
         for source in sources {
             let content_hash = ContentHash::from_bytes(source.content.as_bytes());
             let existed =
@@ -1087,13 +1315,14 @@ impl SqliteStore {
                         database_error(ErrorCode::StorageWriteFailed, "read history source", error)
                     })?
                     .is_some();
-            sqlx::query(
+            let rowid = sqlx::query_scalar::<_, i64>(
                 "INSERT INTO history_sources(source_id, session_id, task_id, project_id, sequence, kind, content, content_hash, availability)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(source_id) DO UPDATE SET
                      content = excluded.content,
                      content_hash = excluded.content_hash,
-                     availability = excluded.availability",
+                     availability = excluded.availability
+                 RETURNING rowid",
             )
             .bind(&source.source_id)
             .bind(owner.session.as_str())
@@ -1104,46 +1333,30 @@ impl SqliteStore {
             .bind(&source.content)
             .bind(content_hash.as_str())
             .bind(availability.as_str())
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|error| {
                 database_error(ErrorCode::StorageWriteFailed, "write history source", error)
             })?;
             if existed {
-                sqlx::query("DELETE FROM history_terms WHERE source_id = ?")
-                    .bind(&source.source_id)
+                sqlx::query("DELETE FROM history_fts WHERE rowid = ?")
+                    .bind(rowid)
                     .execute(&mut *tx)
                     .await
                     .map_err(|error| {
                         database_error(ErrorCode::StorageWriteFailed, "clear history terms", error)
                     })?;
             }
-            terms.extend(
-                history_terms(&source.content)
-                    .into_iter()
-                    .map(|term| (term, source.source_id.as_str())),
-            );
-        }
-        // Many rows per statement: one round trip per term was most of the
-        // cost of indexing a long journal.
-        for chunk in terms.chunks(HISTORY_TERMS_PER_STATEMENT) {
-            let mut sql = String::from("INSERT INTO history_terms(term, source_id) VALUES ");
-            for index in 0..chunk.len() {
-                if index > 0 {
-                    sql.push(',');
-                }
-                sql.push_str("(?, ?)");
-            }
-            sql.push_str(" ON CONFLICT DO NOTHING");
-            // A fixed template: only the number of `(?, ?)` rows varies, and
-            // every value is a bind parameter.
-            let mut statement = sqlx::query(sqlx::AssertSqlSafe(sql));
-            for (term, source_id) in chunk {
-                statement = statement.bind(term.as_str()).bind(*source_id);
-            }
-            statement.execute(&mut *tx).await.map_err(|error| {
-                database_error(ErrorCode::StorageWriteFailed, "write history term", error)
-            })?;
+            // One row per source, its terms separated by spaces: the
+            // tokenizer splits on nothing else (`ensure_context_schema`).
+            sqlx::query("INSERT INTO history_fts(rowid, terms) VALUES (?, ?)")
+                .bind(rowid)
+                .bind(history_terms(&source.content).join(" "))
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    database_error(ErrorCode::StorageWriteFailed, "write history terms", error)
+                })?;
         }
         tx.commit().await.map_err(|error| {
             database_error(
@@ -1219,6 +1432,22 @@ fn scope_predicate(scope: &HistoryScope) -> String {
             " OR s.source_id = ?".repeat(scope.granted_source_ids.len())
         )
     }
+}
+
+/// The index's rows holding each query term, as `(id, term)`: the source's
+/// rowid and the term's place in the query. One `?` per term, bound with
+/// `match_term`.
+fn term_hits(terms: usize) -> String {
+    (0..terms)
+        .map(|index| format!("SELECT rowid, {index} FROM history_fts WHERE history_fts MATCH ?"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+}
+
+/// A term as an FTS5 query: a quoted string, so `xyz-731` or `not` is the
+/// one token the index holds and never an operator.
+fn match_term(term: &str) -> String {
+    format!("\"{}\"", term.replace('"', "\"\""))
 }
 
 fn scope_binds(scope: &HistoryScope) -> Vec<&str> {
@@ -1311,6 +1540,46 @@ fn database_error(code: ErrorCode, action: &str, error: sqlx::Error) -> StoreErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tables an older version kept its index in go a thousand rows at a
+    /// time, then the empty table is dropped, and nothing is asked again.
+    #[tokio::test]
+    async fn an_older_index_is_deleted_a_little_at_a_time() {
+        let directory = tempfile::tempdir().expect("temp");
+        let store = SqliteStore::open_writer(crate::WriterOpenOptions::new(
+            directory.path(),
+            harness_types::HostId::generate(),
+        ))
+        .await
+        .expect("store");
+        sqlx::query(
+            "CREATE TABLE history_terms_retired (term TEXT NOT NULL, source_id TEXT NOT NULL)",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("table");
+        sqlx::query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2500)
+             INSERT INTO history_terms_retired SELECT 'term' || i, 'source' FROM n",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("rows");
+        let mut steps = 0;
+        while store.retire_old_history_index().await.expect("retire") {
+            steps += 1;
+            assert!(steps < 10, "it ends");
+        }
+        assert_eq!(steps, 4, "1,000, 1,000 and 500 rows, then the drop");
+        let left = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM sqlite_master WHERE name = 'history_terms_retired'",
+        )
+        .fetch_optional(&store.pool)
+        .await
+        .expect("schema");
+        assert_eq!(left, None);
+        store.close().await.expect("close");
+    }
 
     #[test]
     fn a_long_source_keeps_its_first_and_last_terms() {

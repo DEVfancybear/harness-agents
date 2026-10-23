@@ -124,7 +124,7 @@ impl SqliteStore {
     ) -> Result<Option<StoredBackendLease>, StoreError> {
         let row = sqlx::query("SELECT * FROM backend_leases WHERE lease_id = ?")
             .bind(lease_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.readers)
             .await
             .map_err(|error| {
                 database_error(ErrorCode::StorageWriteFailed, "read backend lease", error)
@@ -141,7 +141,7 @@ impl SqliteStore {
             sqlx::query("SELECT * FROM backend_leases WHERE host_id = ? AND tool_execution_id = ?")
                 .bind(host_id)
                 .bind(tool_execution_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.readers)
                 .await
                 .map_err(|error| {
                     database_error(ErrorCode::StorageWriteFailed, "read backend lease", error)
@@ -162,7 +162,7 @@ impl SqliteStore {
             "SELECT * FROM backend_leases WHERE released_at_unix_ms IS NULL AND heartbeat_at_unix_ms <= ? ORDER BY created_at_unix_ms",
         )
         .bind(older_than_unix_ms)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "list backend leases", error)

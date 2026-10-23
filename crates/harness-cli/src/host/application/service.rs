@@ -9553,12 +9553,7 @@ async fn run_turn(
     // `history_search` does not pay for a turn's worth of entries first (a
     // long turn writes several hundred). The search still catches up itself
     // when this has not finished.
-    {
-        let store = Arc::clone(&store);
-        tokio::spawn(async move {
-            let _ = store.index_task_history(&indexed_task).await;
-        });
-    }
+    store.catch_up_history_in_background(Some(indexed_task));
 
     // prime-agent syncs the kernel after every compaction, the automatic ones a
     // turn ran included: the next prompt says the kernel and its names lived on.

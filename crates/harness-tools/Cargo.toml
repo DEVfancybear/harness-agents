@@ -32,6 +32,11 @@ tokio.workspace = true
 tokio-util.workspace = true
 unicode-normalization.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# Already in Cargo.lock through process-wrap: the priority class of what
+# the agent runs (`AGENT_PROCESS_PRIORITY`).
+windows = { version = "=0.62.2", default-features = false, features = ["Win32_System_Threading"] }
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28", features = ["process", "signal"] }
 

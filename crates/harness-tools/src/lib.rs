@@ -82,6 +82,8 @@ pub use policy::{
 // The environment a tool process may inherit is an operator-facing contract:
 // it is published so a host can state what it exposes instead of implying a
 // sandbox it does not have.
+#[cfg(windows)]
+pub use process::AGENT_PROCESS_PRIORITY;
 pub use process::{
     HookProcessResult, HookProcessStatus, HostEnvironment, PROCESS_ENVIRONMENT_ALLOWLIST,
     PROCESS_ENVIRONMENT_FIXED, run_hook_command, run_hook_command_with_host, run_user_command,

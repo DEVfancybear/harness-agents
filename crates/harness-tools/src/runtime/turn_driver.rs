@@ -2726,7 +2726,9 @@ async fn gate_action(
             },
             (decision, _) => decision,
         };
+    let mut phases = GatePhases::start(&request);
     let mut prepared = tools.prepare(request.clone()).await?;
+    phases.passed("prepare_ms");
     let mut decision = decide(&prepared);
     if matches!(&decision, Decision::Blocked(_) | Decision::Deny(_)) {
         return Ok(Gated::Done(
@@ -2745,7 +2747,9 @@ async fn gate_action(
             tools.record_hook_block(&prepared, &reason).await,
         ));
     }
+    phases.passed("guard_ms");
     let answer = tools.run_pre_tool_hooks(&prepared, cancellation).await;
+    phases.passed("hooks_ms");
     for notice in &answer.notices {
         observer.observe(TurnProgress::Notice(notice.clone()));
     }
@@ -2808,7 +2812,11 @@ async fn gate_action(
         cancellation,
     )
     .await?;
-    match tools.begin(prepared.clone(), approval, cancellation).await {
+    phases.passed("approval_ms");
+    let begun = tools.begin(prepared.clone(), approval, cancellation).await;
+    phases.passed("intent_ms");
+    phases.record();
+    match begun {
         Ok(crate::service::Begun::Ready(begun)) => Ok(Gated::Ready(Box::new(ReadyAction {
             begun,
             prepared,
@@ -2826,6 +2834,60 @@ async fn gate_action(
             }
             Ok(Gated::Done(Err(error)))
         }
+    }
+}
+
+/// How long each step of a call's gate took, recorded when the gate took
+/// long. The calls of a batch run once every one of them is through its gate,
+/// so one call waiting - for an approval, a hook, the store - held the others:
+/// four calls of one batch settled together after 90 s, and no record said
+/// which step they waited in.
+struct GatePhases {
+    task: String,
+    tool: String,
+    started: std::time::Instant,
+    last: std::time::Instant,
+    phases: Vec<(&'static str, u64)>,
+}
+
+impl GatePhases {
+    /// A gate this long or longer is recorded.
+    const SLOW: std::time::Duration = std::time::Duration::from_secs(1);
+
+    fn start(request: &ToolRequest) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            task: request.task_id.as_str().to_owned(),
+            tool: match &request.action {
+                CodingToolAction::ExternalTool { tool_name, .. } => tool_name.clone(),
+                action => action.kind().as_str().to_owned(),
+            },
+            started: now,
+            last: now,
+            phases: Vec::new(),
+        }
+    }
+
+    fn passed(&mut self, phase: &'static str) {
+        let now = std::time::Instant::now();
+        self.phases.push((
+            phase,
+            u64::try_from(now.duration_since(self.last).as_millis()).unwrap_or(u64::MAX),
+        ));
+        self.last = now;
+    }
+
+    fn record(self) {
+        if self.started.elapsed() < Self::SLOW {
+            return;
+        }
+        let mut record = harness_types::diag::info("tool", "gate_slow")
+            .task(&self.task)
+            .field("tool", self.tool);
+        for (phase, ms) in self.phases {
+            record = record.field(phase, ms);
+        }
+        record.emit();
     }
 }
 
@@ -3060,6 +3122,16 @@ async fn resolve_action_approval(
                     ToolExecutionService::approval_diff(prepared)?,
                 );
                 let request_id = proposal.request_id.clone();
+                // Asked and answered are both recorded, with the wait: the
+                // calls of a batch wait for every approval of it, and a report
+                // that left them out showed four calls taking 90 s for nothing.
+                let tool = prepared.final_action.kind().as_str();
+                harness_types::diag::info("approval", "asked")
+                    .task(prepared.request.task_id.as_str())
+                    .request(&request_id)
+                    .field("tool", tool)
+                    .emit();
+                let asked = std::time::Instant::now();
                 // A canceled turn does not wait for an answer nobody will give: the
                 // action is refused and the cancellation ends the turn.
                 let answer = tokio::select! {
@@ -3071,6 +3143,23 @@ async fn resolve_action_approval(
                         ));
                     }
                 };
+                harness_types::diag::info("approval", "answered")
+                    .task(prepared.request.task_id.as_str())
+                    .request(&request_id)
+                    .field("tool", tool)
+                    .field(
+                        "answer",
+                        match answer {
+                            ApprovalAnswer::Granted => "granted",
+                            ApprovalAnswer::Denied => "denied",
+                            ApprovalAnswer::Expired => "expired",
+                        },
+                    )
+                    .field(
+                        "waited_ms",
+                        u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    )
+                    .emit();
                 match answer {
                     ApprovalAnswer::Granted => {
                         granted_gate = Some((Arc::clone(gate), request_id));
@@ -3944,10 +4033,21 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
         } => format!(
             "read_process_output {artifact_id} {stream} @{offset} ({length}/{total_bytes} bytes):\n{text}"
         ),
-        ToolOutput::HistorySearch { hits, truncated } => format!(
-            "history_search{}: {} hit(s)\n{}",
+        ToolOutput::HistorySearch {
+            hits,
+            truncated,
+            unindexed,
+        } => format!(
+            "history_search{}: {} hit(s){}\n{}",
             if *truncated { " (truncated)" } else { "" },
             hits.len(),
+            if *unindexed > 0 {
+                format!(
+                    "; {unindexed} older conversation(s) are still being indexed and were not searched - search again later to include them"
+                )
+            } else {
+                String::new()
+            },
             hits.iter()
                 .map(|hit| format!(
                     "{} seq={} kind={} availability={} matched={}/{}{} :: {}",
@@ -4403,6 +4503,42 @@ mod tool_output_render_tests {
                 .ends_with("[Some lines truncated to 500 chars. Use read_file to see full lines.]"),
             "{rendered}"
         );
+    }
+}
+
+#[cfg(test)]
+mod gate_phase_tests {
+    use std::time::{Duration, Instant};
+
+    use super::GatePhases;
+
+    /// A gate that held its call says which step it waited in; a quick one
+    /// leaves no record.
+    #[test]
+    fn a_slow_gate_is_recorded_with_the_step_it_waited_in() {
+        let gate = |took: Duration, phases: Vec<(&'static str, u64)>| {
+            let now = Instant::now();
+            let started = now.checked_sub(took).expect("a past instant");
+            GatePhases {
+                task: "task_1".to_owned(),
+                tool: "web_search".to_owned(),
+                started,
+                last: started,
+                phases,
+            }
+        };
+        let records = harness_types::diag::capture(|| {
+            gate(
+                Duration::from_secs(90),
+                vec![("prepare_ms", 2), ("approval_ms", 90_000), ("intent_ms", 3)],
+            )
+            .record();
+            gate(Duration::from_millis(5), vec![("prepare_ms", 5)]).record();
+        });
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!((records[0].kind, records[0].event), ("tool", "gate_slow"));
+        assert_eq!(records[0].fields["tool"], "web_search");
+        assert_eq!(records[0].fields["approval_ms"], 90_000);
     }
 }
 

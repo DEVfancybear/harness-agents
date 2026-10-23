@@ -1596,6 +1596,72 @@ impl Report {
             }
             let _ = writeln!(out);
         }
+        self.summary_waits(out);
+    }
+
+    /// What held calls before they ran: approvals the user answered, and
+    /// gates that took a second or more and the step they waited in. A
+    /// batch's calls run once all of them are through their gates, so one
+    /// call's wait is every call's: four calls of a report took 90 s and
+    /// nothing in it said why.
+    fn summary_waits(&self, out: &mut String) {
+        let answered = self.recorded("approval", "answered");
+        let gates = self.recorded("tool", "gate_slow");
+        if answered.is_empty() && gates.is_empty() {
+            return;
+        }
+        let _ = writeln!(
+            out,
+            "### Waits before calls ran
+"
+        );
+        if !answered.is_empty() {
+            let waits = answered
+                .iter()
+                .map(|record| record["fields"]["waited_ms"].as_u64().unwrap_or_default())
+                .collect::<Vec<_>>();
+            let longest = answered
+                .iter()
+                .max_by_key(|record| record["fields"]["waited_ms"].as_u64().unwrap_or_default());
+            let _ = writeln!(
+                out,
+                "- approvals answered: {}, {:.1}s waited in all; the longest {:.1}s for `{}`",
+                answered.len(),
+                seconds(waits.iter().sum()),
+                seconds(waits.iter().copied().max().unwrap_or_default()),
+                longest
+                    .and_then(|record| record["fields"]["tool"].as_str())
+                    .unwrap_or("?")
+            );
+        }
+        for record in &gates {
+            let fields = record["fields"].as_object();
+            let steps = fields
+                .into_iter()
+                .flatten()
+                .filter(|(name, _)| name.ends_with("_ms"))
+                .filter_map(|(name, value)| {
+                    let ms = value.as_u64()?;
+                    (ms >= 100)
+                        .then(|| format!("{} {:.1}s", name.trim_end_matches("_ms"), seconds(ms)))
+                })
+                .collect::<Vec<_>>();
+            let _ = writeln!(
+                out,
+                "- {} `{}` held{}: {}",
+                record["ts"].as_str().unwrap_or("?"),
+                record["fields"]["tool"].as_str().unwrap_or("?"),
+                record["task"]
+                    .as_str()
+                    .map_or(String::new(), |task| format!(" in `{task}`")),
+                if steps.is_empty() {
+                    "no step over 0.1s".to_owned()
+                } else {
+                    steps.join(", ")
+                }
+            );
+        }
+        let _ = writeln!(out);
     }
 
     /// What keeping memory cost beside what read it: the model calls of the

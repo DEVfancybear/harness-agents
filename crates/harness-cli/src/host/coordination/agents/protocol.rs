@@ -189,6 +189,12 @@ pub struct SubagentInfo {
     pub queued: bool,
     /// What the child was spawned with (prime-agent's spawn program).
     pub program: String,
+    /// A coder's own worktree, where it works instead of the user's
+    /// checkout: its branch and its folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
 }
 
 impl AgentInfo {

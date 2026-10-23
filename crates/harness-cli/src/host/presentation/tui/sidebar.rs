@@ -331,8 +331,9 @@ fn lines(
         all.extend(fit(spans, width.saturating_sub(3)));
         Line::from(all)
     };
-    if let Some(branch) = find(state, "Branch: ") {
-        rows.push(detail(vec![Span::styled(branch.to_owned(), theme.branch)]));
+    let here = place(find(state, "Branch: "), find(state, "Worktree: "));
+    if !here.is_empty() {
+        rows.push(detail(vec![Span::styled(here, theme.branch)]));
     }
     if let Some(model) = super::widgets::status::short_model(state) {
         let mut spans = vec![
@@ -508,6 +509,16 @@ fn lines(
                     Span::styled(model_effort(activity, width.saturating_sub(8)), theme.muted),
                 ]));
             }
+            // A coder in a worktree of its own says which, under its model.
+            let workplace = place(activity.branch.as_deref(), activity.worktree.as_deref());
+            if details(*status) && !workplace.is_empty() {
+                let mut all = vec![Span::raw("     ")];
+                all.extend(fit(
+                    vec![Span::styled(workplace, theme.branch)],
+                    width.saturating_sub(6),
+                ));
+                rows.push(Line::from(all));
+            }
             continue;
         }
         rows.push(agent(
@@ -626,6 +637,19 @@ fn find<'a>(state: &'a UiState, prefix: &str) -> Option<&'a str> {
         .find_map(|line| line.strip_prefix(prefix))
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+/// Where an agent works, as every view writes it: `⎇ branch`, and the
+/// worktree's folder after it when the agent works in a worktree of its own
+/// (`⎇ feat/x · ha-078`). Empty when neither is known.
+#[must_use]
+pub fn place(branch: Option<&str>, worktree: Option<&str>) -> String {
+    match (branch, worktree) {
+        (Some(branch), Some(tree)) => format!("⎇ {branch} · {tree}"),
+        (Some(branch), None) => format!("⎇ {branch}"),
+        (None, Some(tree)) => format!("⎇ {tree}"),
+        (None, None) => String::new(),
+    }
 }
 
 /// A child's model and thinking level in `room` cells: the level whole, the
@@ -923,6 +947,8 @@ mod tests {
         ]
         .into_iter()
         .map(|(name, status)| SubagentInfo {
+            branch: None,
+            worktree: None,
             queued: false,
             name: name.to_owned(),
             status: status.to_owned(),
@@ -1080,6 +1106,8 @@ mod tests {
         ];
         let rows = (0..22)
             .map(|index| SubagentInfo {
+                branch: None,
+                worktree: None,
                 queued: false,
                 name: if index == 0 {
                     "explorer-0d1e2f3a".to_owned()

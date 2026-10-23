@@ -1730,8 +1730,9 @@ impl Kernel {
         }
         #[cfg(windows)]
         {
-            // No console window flashes up for the kernel.
-            command.creation_flags(0x0800_0000);
+            // No console window flashes up for the kernel, and what its
+            // `bash()` starts runs below the terminal, as `run_process` does.
+            command.creation_flags(0x0800_0000 | harness_tools::AGENT_PROCESS_PRIORITY);
         }
         let mut child = command
             .spawn()

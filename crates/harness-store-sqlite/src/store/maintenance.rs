@@ -116,7 +116,7 @@ impl SqliteStore {
             "SELECT artifact_id, relative_path, content_hash, byte_len
              FROM artifacts ORDER BY artifact_id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list artifacts", error))?;
         let mut pins = Vec::with_capacity(rows.len());
@@ -160,7 +160,7 @@ impl SqliteStore {
             ),
         ] {
             let row = sqlx::query(sql)
-                .fetch_one(&self.pool)
+                .fetch_one(&self.readers)
                 .await
                 .map_err(|error| {
                     database_error(ErrorCode::StorageWriteFailed, "read schema revision", error)
@@ -177,7 +177,7 @@ impl SqliteStore {
             "SELECT source_kind, source_id FROM maintenance_tombstones
              ORDER BY source_kind, source_id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list tombstones", error))?;
         let mut ids = Vec::with_capacity(rows.len());
@@ -198,7 +198,7 @@ impl SqliteStore {
                     created_unix_ms
              FROM maintenance_tombstones ORDER BY created_unix_ms, tombstone_id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list tombstones", error))?;
         let mut records = Vec::with_capacity(rows.len());
@@ -369,7 +369,7 @@ impl SqliteStore {
     pub async fn retention_pins(&self) -> Result<Vec<(String, Option<TaskId>)>, StoreError> {
         let rows =
             sqlx::query("SELECT DISTINCT reason, task_id FROM maintenance_pins ORDER BY reason")
-                .fetch_all(&self.pool)
+                .fetch_all(&self.readers)
                 .await
                 .map_err(|error| {
                     database_error(ErrorCode::StorageWriteFailed, "list pins", error)
@@ -388,7 +388,7 @@ impl SqliteStore {
     /// Artifact identities currently pinned by any reason.
     pub async fn pinned_artifact_ids(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query("SELECT DISTINCT artifact_id FROM maintenance_pins")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.readers)
             .await
             .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list pins", error))?;
         rows.iter()
@@ -439,7 +439,7 @@ impl SqliteStore {
                 OR artifact_id IN (SELECT artifact_id FROM tool_artifact_scopes)
              ORDER BY artifact_id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| {
             database_error(

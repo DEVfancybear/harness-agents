@@ -340,7 +340,7 @@ impl SqliteStore {
             "SELECT command_id, record_json FROM acceptance_commands WHERE task_id = ?",
         )
         .bind(task_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "read task acceptance", error)
@@ -431,7 +431,7 @@ impl SqliteStore {
             "SELECT run_id, session_id, task_id, input_id, state, acceptance, stop_reason, owner_generation, revision, budget_id, awaiting_question_id FROM runs WHERE input_id = ?"
         )
         .bind(input_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read run by input", error))?;
         row.map(|row| run_from_row(&row)).transpose()
@@ -442,7 +442,7 @@ impl SqliteStore {
             "SELECT run_id, session_id, task_id, input_id, state, acceptance, stop_reason, owner_generation, revision, budget_id, awaiting_question_id FROM runs WHERE run_id = ?"
         )
         .bind(run_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read run", error))?;
         row.map(|row| run_from_row(&row)).transpose()
@@ -456,7 +456,7 @@ impl SqliteStore {
             "SELECT run_id, session_id, task_id, input_id, state, acceptance, stop_reason, owner_generation, revision, budget_id, awaiting_question_id FROM runs WHERE session_id = ? ORDER BY rowid DESC LIMIT 1"
         )
         .bind(session_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read latest run", error))?;
         row.map(|row| run_from_row(&row)).transpose()
@@ -465,7 +465,7 @@ impl SqliteStore {
     pub async fn run_steps(&self, run_id: &AgentRunId) -> Result<Vec<RunStepRecord>, StoreError> {
         let rows = sqlx::query("SELECT step_id, run_id, step_index, request_id, packet_id, manifest_hash, source_sequence, state, stop_reason FROM run_steps WHERE run_id = ? ORDER BY step_index")
             .bind(run_id.as_str())
-            .fetch_all(&self.pool)
+            .fetch_all(&self.readers)
             .await
             .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list run steps", error))?;
         rows.iter().map(step_from_row).collect()
@@ -479,7 +479,7 @@ impl SqliteStore {
     pub async fn run_step_count(&self, run_id: &AgentRunId) -> Result<u64, StoreError> {
         let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM run_steps WHERE run_id = ?")
             .bind(run_id.as_str())
-            .fetch_one(&self.pool)
+            .fetch_one(&self.readers)
             .await
             .map_err(|error| {
                 database_error(ErrorCode::StorageWriteFailed, "count run steps", error)
@@ -869,7 +869,7 @@ impl SqliteStore {
     ) -> Result<Option<BudgetAccountRecord>, StoreError> {
         let row = sqlx::query("SELECT budget_id, parent_budget_id, limit_tokens, spent_tokens, revision FROM budget_accounts WHERE budget_id = ?")
             .bind(budget_id.as_str())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.readers)
             .await
             .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read budget account", error))?;
         row.map(|row| budget_account_from_row(&row)).transpose()
@@ -935,7 +935,7 @@ impl SqliteStore {
     ) -> Result<Option<BudgetReservationRecord>, StoreError> {
         let row = sqlx::query("SELECT reservation_id, budget_id, operation_id, origin, upper_bound_tokens, settled_tokens, state, revision FROM budget_reservations WHERE operation_id = ?")
             .bind(operation_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.readers)
             .await
             .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read reservation", error))?;
         row.map(|row| reservation_from_row(&row)).transpose()
@@ -1039,7 +1039,7 @@ impl SqliteStore {
             "SELECT question_id, scope_key, session_id, task_id, run_id, kind, prompt, payload_json, state, answer_json, answer_hash, answered_by, expires_at_unix_ms, created_at_unix_ms, answered_at_unix_ms FROM questions WHERE question_id = ?"
         )
         .bind(question_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read question by ID", error))?;
         row.map(|row| question_from_row(&row)).transpose()
@@ -1053,7 +1053,7 @@ impl SqliteStore {
             "SELECT question_id, scope_key, session_id, task_id, run_id, kind, prompt, payload_json, state, answer_json, answer_hash, answered_by, expires_at_unix_ms, created_at_unix_ms, answered_at_unix_ms FROM questions WHERE session_id = ? ORDER BY rowid"
         )
         .bind(session_id.as_str())
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list questions", error))?;
         rows.iter().map(question_from_row).collect()
@@ -1305,7 +1305,7 @@ impl SqliteStore {
             "SELECT command_id, run_id, session_id, task_id, kind, state, payload_json, detail, created_at_unix_ms, claimed_at_unix_ms, applied_at_unix_ms FROM run_commands WHERE session_id = ? AND kind = 'steer' AND state = 'applied' ORDER BY applied_at_unix_ms, rowid"
         )
         .bind(session_id.as_str())
-        .fetch_all(&self.pool)
+        .fetch_all(&self.readers)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read applied steering", error))?;
         rows.iter().map(command_from_row).collect()

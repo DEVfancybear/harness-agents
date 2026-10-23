@@ -6522,22 +6522,17 @@ impl InteractiveController {
     }
 
     /// Read the checked-out branch again: a turn may have switched it, and the
-    /// sidebar and the banner name it.
+    /// sidebar and the banner name it, with the worktree it is checked out in.
     fn refresh_branch(&mut self) {
-        let branch = self
-            .context
-            .git_root
-            .as_deref()
-            .and_then(super::bootstrap::git_branch);
-        self.header.retain(|line| !line.starts_with("Branch: "));
-        if let Some(branch) = branch {
-            let at = self
-                .header
-                .iter()
-                .position(|line| line.starts_with("Git:"))
-                .map_or(self.header.len(), |index| index + 1);
-            self.header.insert(at, format!("Branch: {branch}"));
-        }
+        let place = super::bootstrap::place_lines(self.context.git_root.as_deref());
+        self.header
+            .retain(|line| !line.starts_with("Branch: ") && !line.starts_with("Worktree: "));
+        let at = self
+            .header
+            .iter()
+            .position(|line| line.starts_with("Git:"))
+            .map_or(self.header.len(), |index| index + 1);
+        self.header.splice(at..at, place);
     }
 
     /// Close the turn-wide grant, and tell the port.

@@ -1994,19 +1994,24 @@ impl ToolExecutionService {
         limit: Option<u32>,
         project: bool,
     ) -> Result<ToolOutput, HarnessError> {
+        /// How long a search waits for the index to catch up. The newest
+        /// conversations go first; the rest is caught up in the background and
+        /// the answer says how many were not searched.
+        const CATCH_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
         // The read scope is the task, so the index has to cover every session
         // that worked on it; otherwise a continuation session could not find
         // what its predecessor wrote. A project search covers every task's.
-        if project {
-            self.store
-                .index_project_history()
-                .await
-                .map_err(store_error)?;
-        } else {
-            self.store
-                .index_task_history(&prepared.request.task_id)
-                .await
-                .map_err(store_error)?;
+        let task = (!project).then_some(&prepared.request.task_id);
+        let caught = self
+            .store
+            .catch_up_history(
+                task,
+                harness_store_sqlite::CatchUpPace::Until(std::time::Instant::now() + CATCH_UP_WAIT),
+            )
+            .await
+            .map_err(store_error)?;
+        if caught.behind > 0 {
+            self.store.catch_up_history_in_background(task.cloned());
         }
         let scope = self.history_scope(prepared, project).await?;
         let wanted = limit.unwrap_or(HISTORY_SEARCH_DEFAULT_LIMIT);
@@ -2053,6 +2058,7 @@ impl ToolExecutionService {
                 })
                 .collect(),
             truncated,
+            unindexed: caught.behind,
         })
     }
 

@@ -30,7 +30,7 @@ pub use store::SqliteStore;
 pub use store::backend_leases::{LEASE_STATES, StoredBackendLease};
 pub use store::delegation::TaskAdmission;
 pub use store::history::{
-    HISTORY_READ_DEFAULT_BYTES, HISTORY_READ_MAX_BYTES, HISTORY_SOURCE_LIMIT_BYTES, HistoryHit,
-    HistoryPage, HistoryScope, HistoryText, NOTE_CONTENT_LIMIT_BYTES, NOTE_KEY_LIMIT_CHARS,
-    NoteRecord, SourceAvailability, history_terms,
+    CatchUpPace, HISTORY_READ_DEFAULT_BYTES, HISTORY_READ_MAX_BYTES, HISTORY_SOURCE_LIMIT_BYTES,
+    HistoryCatchUp, HistoryHit, HistoryPage, HistoryScope, HistoryText, NOTE_CONTENT_LIMIT_BYTES,
+    NOTE_KEY_LIMIT_CHARS, NoteRecord, SourceAvailability, history_terms,
 };
