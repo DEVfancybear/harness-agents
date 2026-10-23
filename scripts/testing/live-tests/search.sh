@@ -8,7 +8,9 @@
 #   5. search_text, finding nothing for an identifier, tries its other
 #      spellings and says so;
 #   6. (0.7.8) find_files naming several files, no path holding them all,
-#      lists the files matching the most words instead of nothing.
+#      lists the files matching the most words instead of nothing;
+#   7. (0.7.9) edit_file with one edit per copy of the same text changes
+#      each copy, where every copy was refused as ambiguous.
 # Every check prints PASS or FAIL; the conversation stays in $LIVE_ROOT/search
 # as evidence.
 #
@@ -42,6 +44,7 @@ EOF
 printf 'export const prepareUpload = (file) => file.length;\n' > "$P/web/upload.ts"
 (cd "$P" && git init -q && git add -A && git -c user.name=t -c user.email=t@t commit -qm init)
 printf 'mod loader; // changed\n' > "$P/src/config/mod.rs"
+printf 'if a {\n    retry();\n}\nif b {\n    retry();\n}\n' > "$P/dup.txt"
 
 agent "$P" s1
 echo "################ 1. find_files through typos"
@@ -72,6 +75,10 @@ echo "################ 6. several files named in one find_files query"
 say s1 "Gọi tool find_files đúng một lần với query 'upload loader nginx' (không có tham số nào khác). In nguyên văn toàn bộ kết quả tool." | tail -8 | sed 's/^/   /'
 check "each named file was found though no path holds every word" 'last | grep -q "src/upload.rs" && last | grep -q "src/config/loader.rs"'
 check "it named the word no file name holds" 'last | grep -q "no files match .nginx."'
+echo "################ 7. one edit per copy of the same text"
+say s1 "Gọi tool edit_file đúng một lần trên dup.txt với tham số edits gồm đúng hai phần tử theo thứ tự: phần tử 1 có old_string là '    retry();' và new_string là '    retry(1);'; phần tử 2 có old_string là '    retry();' và new_string là '    retry(2);'. Không gọi tool nào khác. In nguyên văn kết quả tool." | tail -6 | sed 's/^/   /'
+cat "$P/dup.txt" | sed 's/^/   dup.txt: /'
+check "each edit took the next copy, in the file's order" '[ "$(tr -d "\r" < "$P/dup.txt")" = "$(printf "if a {\n    retry(1);\n}\nif b {\n    retry(2);\n}")" ]'
 "$HA" shutdown --force >/dev/null 2>&1
 
 result

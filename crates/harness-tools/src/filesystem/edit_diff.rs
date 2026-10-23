@@ -123,6 +123,60 @@ fn occurrence_lines(content: &str, old_text: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Where the old text's first line is in the file, when it is there: the
+/// rest of the text is what differs, from that line on.
+fn first_line_at(content: &str, old_text: &str) -> String {
+    let Some(first) = old_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+    else {
+        return String::new();
+    };
+    let at = content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.trim() == first)
+        .map(|(index, _)| (index + 1).to_string())
+        .take(3)
+        .collect::<Vec<_>>();
+    if at.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Its first line is at line {} of the file; the text differs after it.",
+            at.join(", ")
+        )
+    }
+}
+
+/// The line above each copy, for the context that tells them apart
+/// ("The line before each: 215: ...; 241: ...").
+fn lines_before(content: &str, found_at: &[usize]) -> String {
+    /// The most of a line shown.
+    const SHOWN: usize = 80;
+    let lines = content.lines().collect::<Vec<_>>();
+    let shown = found_at
+        .iter()
+        .filter(|line| **line > 1)
+        .filter_map(|line| {
+            let above = lines.get(line - 2)?.trim();
+            (!above.is_empty()).then(|| {
+                format!(
+                    "{}: `{}`",
+                    line - 1,
+                    above.chars().take(SHOWN).collect::<String>()
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if shown.is_empty() {
+        String::new()
+    } else {
+        format!(" The line before each: {}.", shown.join("; "))
+    }
+}
+
 fn count_occurrences(content: &str, old_text: &str) -> usize {
     let fuzzy_old = normalize_for_fuzzy_match(old_text);
     if fuzzy_old.is_empty() {
@@ -202,9 +256,9 @@ pub(crate) fn apply_edit_to_normalized_content(
             format!(
                 "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines.{}",
                 if applied {
-                    " The new text is already in the file: this edit looks applied already; read the file before editing it again."
+                    " The new text is already in the file: this edit looks applied already; read the file before editing it again.".to_owned()
                 } else {
-                    ""
+                    first_line_at(&base_content, &old_text)
                 }
             ),
         ));
@@ -215,7 +269,8 @@ pub(crate) fn apply_edit_to_normalized_content(
         // told about it here because it is the other way out of an ambiguity.
         // The lines say where the copies are, so the context it adds can be the
         // lines around the one it means.
-        let lines = occurrence_lines(&base_content, &old_text)
+        let found_at = occurrence_lines(&base_content, &old_text);
+        let lines = found_at
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
@@ -223,7 +278,8 @@ pub(crate) fn apply_edit_to_normalized_content(
         return Err(HarnessError::new(
             ErrorCode::EditAmbiguous,
             format!(
-                "Found {occurrences} occurrences of the text in {path} (lines {lines}). The text must be unique. Please provide more context to make it unique, or set replace_all to change every occurrence."
+                "Found {occurrences} occurrences of the text in {path} (lines {lines}). The text must be unique. Please provide more context to make it unique, or set replace_all to change every occurrence; to change each copy differently, give one edit per copy with the same old_string, in the file's order.{}",
+                lines_before(&base_content, &found_at)
             ),
         ));
     }
@@ -568,6 +624,57 @@ pub(crate) fn plan_edit(
     )
 }
 
+/// Whether edit `index` is one of a group in this batch that change the same
+/// text, as many as the file holds it: the model changes each copy with an
+/// edit of its own, and each takes the next copy in the file's order. Every
+/// copy but the last was refused as ambiguous, and the whole batch with it.
+fn repeats_in_batch(content: &str, edits: &[EditSpec], index: usize) -> bool {
+    let step = &edits[index];
+    if step.replace_all || step.old_string.is_empty() {
+        return false;
+    }
+    let group = edits[index..]
+        .iter()
+        .filter(|other| {
+            other.start.is_none() && !other.replace_all && other.old_string == step.old_string
+        })
+        .count();
+    group > 1
+        && content
+            .matches(normalize_to_lf(&step.old_string).as_str())
+            .count()
+            == group
+}
+
+/// Replace the first exact copy of `old_text`.
+fn apply_first(content: &str, old_text: &str, new_text: &str) -> Result<AppliedEdit, HarnessError> {
+    let old_text = normalize_to_lf(old_text);
+    Ok(AppliedEdit {
+        base_content: content.to_owned(),
+        new_content: content.replacen(old_text.as_str(), &normalize_to_lf(new_text), 1),
+        replacements: 1,
+    })
+}
+
+/// Which earlier edit of the batch changed a text the file held before the
+/// call: edits are written against the file as it was, but each applies to
+/// what the one before left, and "could not find" did not say so.
+fn changed_by(before: &[String], old_text: &str) -> String {
+    let old_text = normalize_to_lf(old_text);
+    let holds = |content: &String| fuzzy_find_text(content, &old_text).is_some();
+    if !before.first().is_some_and(holds) {
+        return String::new();
+    }
+    before
+        .iter()
+        .position(|content| !holds(content))
+        .map_or_else(String::new, |after| {
+            format!(
+                " The file held this text before the call: edit {after} of this call changed it, and each edit applies to what the one before left. Give it as the text reads after edit {after}, or fold its change into edit {after}."
+            )
+        })
+}
+
 /// Plan the edits of one `edit_file` call, in order, each on the result of
 /// the one before: a match by text (exact, normalized, then by lines with
 /// their indentation set aside) or by hashline anchors. The file is written
@@ -582,7 +689,10 @@ pub(crate) fn plan_edits(
     let mut content = normalize_to_lf(text);
     let mut base: Option<String> = None;
     let mut replacements = 0_u64;
+    // What the file read before each edit: the first is the file itself.
+    let mut before = Vec::with_capacity(edits.len());
     for (index, step) in edits.iter().enumerate() {
+        before.push(content.clone());
         let applied = match &step.start {
             Some(start) => apply_anchored(
                 &content,
@@ -591,6 +701,9 @@ pub(crate) fn plan_edits(
                 &normalize_to_lf(&step.new_string),
                 path,
             ),
+            None if repeats_in_batch(&content, edits, index) => {
+                apply_first(&content, &step.old_string, &step.new_string)
+            }
             None => apply_edit_to_normalized_content(
                 &content,
                 &step.old_string,
@@ -601,10 +714,15 @@ pub(crate) fn plan_edits(
         }
         .map_err(|error| {
             if edits.len() > 1 {
+                let changed = if error.code() == ErrorCode::EditNotFound && step.start.is_none() {
+                    changed_by(&before, &step.old_string)
+                } else {
+                    String::new()
+                };
                 HarnessError::new(
                     error.code(),
                     format!(
-                        "edit {} of {} failed, and none of them was written: {}",
+                        "edit {} of {} failed, and none of them was written: {}{changed}",
                         index + 1,
                         edits.len(),
                         error.message()
@@ -947,6 +1065,61 @@ mod tests {
         .expect("two edits");
         assert_eq!(planned.content, "1\n2\nthree\n");
         assert_eq!(planned.replacements, 2);
+        // An edit written against the file as it was, after an earlier edit
+        // of the call changed its text: the error names that edit.
+        let stale = plan_edits(
+            "fn a() {\n    x();\n    y();\n}\n",
+            &[
+                spec("    x();\n    y();", "    x2();\n    y();"),
+                spec("    x();\n    y();\n}", "    x();\n    y2();\n}"),
+            ],
+            "f.txt",
+        )
+        .expect_err("stale");
+        assert!(
+            stale.to_string().contains("edit 1 of this call changed it"),
+            "{stale}"
+        );
+        // A text the file never held says where its first line is.
+        let missing = plan_edits(
+            "fn a() {\n    x();\n}\n",
+            &[spec("fn a() {\n    z();", "fn a() {\n    w();")],
+            "f.txt",
+        )
+        .expect_err("missing");
+        assert!(
+            missing
+                .to_string()
+                .contains("Its first line is at line 1 of the file"),
+            "{missing}"
+        );
+        // The same text twice, an edit for each copy: each takes the next.
+        let planned = plan_edits(
+            "if a {\n    retry();\n}\nif b {\n    retry();\n}\n",
+            &[
+                spec("    retry();", "    retry(1);"),
+                spec("    retry();", "    retry(2);"),
+            ],
+            "f.txt",
+        )
+        .expect("one edit per copy");
+        assert_eq!(
+            planned.content,
+            "if a {\n    retry(1);\n}\nif b {\n    retry(2);\n}\n"
+        );
+        // One edit for two copies is still ambiguous, and says where they are.
+        let ambiguous = plan_edits(
+            "if a {\n    retry();\n}\nif b {\n    retry();\n}\n",
+            &[spec("    retry();", "    retry(1);")],
+            "f.txt",
+        )
+        .expect_err("ambiguous");
+        assert!(
+            ambiguous
+                .to_string()
+                .contains("The line before each: 1: `if a {`; 4: `if b {`."),
+            "{ambiguous}"
+        );
         let failed = plan_edits("one\n", &[spec("one", "1"), spec("zzz", "y")], "f.txt")
             .expect_err("second fails");
         assert!(

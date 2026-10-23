@@ -364,9 +364,9 @@ fn edit_item_schema(hashline: bool) -> Value {
 
 fn workspace_tool_schemas(hashline: bool) -> Vec<Value> {
     let edit_description = if hashline {
-        "Replace text in one file. Give old_string and new_string for one replacement (old_string must be unique unless replace_all), or edits for several, applied in order and written together. An edit may name lines by the LINE#HASH anchors read_file and search_text show (start, optional end) instead of old_string; a changed line refuses the edit."
+        "Replace text in one file. Give old_string and new_string for one replacement (old_string must be unique unless replace_all), or edits for several, applied in order and written together (to change several copies of the same text differently, give one edit per copy with that old_string: each takes the next copy). An edit may name lines by the LINE#HASH anchors read_file and search_text show (start, optional end) instead of old_string; a changed line refuses the edit."
     } else {
-        "Replace text in one file. Give old_string and new_string for one replacement (old_string must be unique unless replace_all), or edits for several, applied in order and written together; old_string is matched exactly, then ignoring trailing whitespace, quote and dash styles, then ignoring indentation."
+        "Replace text in one file. Give old_string and new_string for one replacement (old_string must be unique unless replace_all), or edits for several, applied in order and written together (to change several copies of the same text differently, give one edit per copy with that old_string: each takes the next copy); old_string is matched exactly, then ignoring trailing whitespace, quote and dash styles, then ignoring indentation."
     };
     vec![
         function_schema(

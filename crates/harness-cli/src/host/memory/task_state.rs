@@ -666,8 +666,8 @@ impl TaskStateHost {
             return Err(HarnessError::new(
                 ErrorCode::RevisionConflict,
                 format!(
-                    "task_state: the state is at revision {}, not {expected}; view it and update again",
-                    state.revision
+                    "task_state: the state is at revision {current}, not {expected}: another update came first (two updates in one batch read the same revision), and nothing was written. Update again with expected_revision {current}; view it first when that update may have changed what this one relies on",
+                    current = state.revision
                 ),
             ));
         }
