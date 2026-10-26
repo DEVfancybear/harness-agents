@@ -5868,7 +5868,7 @@ pub(super) mod tests {
             .expect("memory schema");
         assert_eq!(
             schema["function"]["parameters"]["properties"]["action"]["enum"],
-            json!(["list", "search", "read", "history"])
+            json!(["list", "search", "read", "history", "tree", "count"])
         );
         let search = json!({"action":"search","query":"tabs indentation"});
         let action = tools.resolve("memory", &search).expect("resolves");
@@ -5931,7 +5931,7 @@ pub(super) mod tests {
             .expect("knowledge schema");
         assert_eq!(
             schema["function"]["parameters"]["properties"]["action"]["enum"],
-            json!(["list", "search", "read", "graph"])
+            json!(["list", "search", "read", "graph", "history"])
         );
         for action in ["list", "search", "read", "graph"] {
             let args = json!({"action":action,"scope":"project","query":"architecture","path":"architecture.md"});

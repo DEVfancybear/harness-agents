@@ -76,8 +76,6 @@ pub(crate) const MAX_TITLE_CHARS: usize = 200;
 const MAX_PATH_CHARS: usize = 120;
 const SNIPPET_CHARS: usize = 400;
 const SUMMARY_CHARS: usize = 160;
-const DEFAULT_RESULTS: usize = 10;
-const MAX_RESULTS: usize = 20;
 const LIST_PAGE: usize = 50;
 /// The most other wordings one search takes, as knowledge search does.
 const MAX_VARIANTS: usize = 4;
@@ -121,6 +119,8 @@ pub struct MemoryHost {
     conversation: String,
     /// The project this conversation works in, for `scope: project`.
     project: Option<ProjectTag>,
+    /// The project's folder, whose knowledge a search with `sources` reads.
+    workspace: Option<PathBuf>,
     /// Harness refinements are off: the tool is not offered.
     off: bool,
 }
@@ -160,6 +160,7 @@ impl MemoryHost {
             read_only: false,
             conversation: conversation.to_owned(),
             project: None,
+            workspace: None,
             off: false,
         }
     }
@@ -174,6 +175,7 @@ impl MemoryHost {
             read_only: false,
             conversation: String::new(),
             project: None,
+            workspace: None,
             off: false,
         }
     }
@@ -189,6 +191,7 @@ impl MemoryHost {
     #[must_use]
     pub fn with_project(mut self, root: &Path) -> Self {
         self.project = Some(ProjectTag::of(root));
+        self.workspace = Some(root.to_path_buf());
         self
     }
 
@@ -420,7 +423,7 @@ impl MemoryHost {
                 }
                 Ok(())
             }
-            "search" => search_queries(arguments).map(|_| ()),
+            "search" => super::memory_search::check(arguments),
             "read" => text(arguments, "id").map(|_| ()),
             "write" => {
                 // An update by id keeps the entry's title when none is given.
@@ -593,7 +596,23 @@ impl MemoryHost {
 
     fn execute(&self, arguments: &Value) -> Result<Value, String> {
         self.check(arguments)?;
-        match text(arguments, "action")? {
+        let action = text(arguments, "action")?;
+        let result = self.run_action(action, arguments)?;
+        // A change is embedded in the background when embeddings are on, so
+        // the next search by meaning finds it without waiting.
+        if WRITES.contains(&action)
+            && arguments.get("dry_run").and_then(Value::as_bool) != Some(true)
+        {
+            super::memory_search::embed_soon(
+                vec![self.global.clone(), self.local.clone()],
+                &self.embedding_root(),
+            );
+        }
+        Ok(result)
+    }
+
+    fn run_action(&self, action: &str, arguments: &Value) -> Result<Value, String> {
+        match action {
             "list" => Ok(self.list(arguments)?),
             "search" => Ok(self.search(arguments)?),
             "read" => self.read(arguments),
@@ -632,50 +651,130 @@ impl MemoryHost {
         Ok(payload)
     }
 
+    /// `search`: memory-engine's search over the asked scopes and kinds
+    /// (`memory_search`), and with `sources` naming knowledge, the knowledge
+    /// libraries' pages too, the two rankings fused by RRF.
     fn search(&self, arguments: &Value) -> Result<Value, String> {
-        let queries = search_queries(arguments)?;
-        let entries = self.entries(&self.scopes(arguments)?, &kinds(arguments)?);
-        // A query typed without accents finds accented entries, as knowledge
-        // search does; one with accents still matches them exactly.
-        let fold = super::knowledge::store::fold;
-        let folded = entries
-            .iter()
-            .map(|entry| Entry {
-                title: entry.title.as_deref().map(fold),
-                content: entry.content.as_deref().map(fold),
-                path: fold(&entry.path),
-                ..entry.clone()
-            })
-            .collect::<Vec<_>>();
-        let rankings = queries
-            .iter()
-            .map(|query| {
-                if fold(query) == *query {
-                    harness::rank(&folded, query)
-                } else {
-                    harness::rank(&entries, query)
-                }
-            })
-            .collect::<Vec<_>>();
-        let ranked = fuse(&rankings);
-        let limit = integer(arguments, "limit", DEFAULT_RESULTS).clamp(1, MAX_RESULTS);
-        let hits = ranked
-            .iter()
-            .take(limit)
-            .map(|(index, score)| {
-                let mut hit = view(&entries[*index], SNIPPET_CHARS);
-                hit["score"] = json!((score * 100.0).round() / 100.0);
-                hit
-            })
-            .collect::<Vec<_>>();
-        if hits.is_empty() {
-            return Ok(json!({
-                "hits": [],
-                "total": entries.len(),
-                "note": "No memory matched. Memory holds only what was written before; if the answer matters and you have not yet, search once more with variants in queries (synonyms, a translation); otherwise say it is not remembered."
-            }));
+        let sources = super::memory_search::sources(arguments)?;
+        if sources == ["memory"] {
+            return self.search_memory(arguments);
         }
-        Ok(json!({"hits": hits, "total": entries.len()}))
+        let yaml = arguments["format"] == "yaml";
+        let mut plain = arguments.clone();
+        if let Some(arguments) = plain.as_object_mut() {
+            arguments.remove("format");
+        }
+        let mut result = if sources.contains(&"memory") {
+            self.search_memory(&plain)?
+        } else {
+            json!({"hits": [], "total": 0, "mode": "knowledge"})
+        };
+        let limit = integer(arguments, "limit", 10).clamp(1, 200);
+        let mut queries = arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .into_iter()
+            .chain(
+                arguments
+                    .get("queries")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            )
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if queries.is_empty()
+            && let Some(semantic) = arguments.get("semantic").and_then(Value::as_str)
+        {
+            queries.push(semantic.to_owned());
+        }
+        let knowledge = match (&self.workspace, self.global.parent()) {
+            (_, _) if queries.is_empty() => {
+                Err("knowledge is searched by words: give a query".to_owned())
+            }
+            (Some(workspace), Some(data)) => {
+                let host = super::knowledge::KnowledgeHost::new(workspace, data);
+                let host = if self.read_only {
+                    host.readonly()
+                } else {
+                    host
+                };
+                host.search_hits(&queries, limit)
+            }
+            _ => Err("this conversation has no project, so no knowledge to search".to_owned()),
+        };
+        match knowledge {
+            Ok(pages) => {
+                let memory = result["hits"].as_array().cloned().unwrap_or_default();
+                let keyed = |prefix: &str, count: usize| {
+                    (0..count)
+                        .map(|index| (format!("{prefix}{index:08}"), 0.0))
+                        .collect::<Vec<_>>()
+                };
+                let (from_memory, from_knowledge) =
+                    (keyed("m", memory.len()), keyed("k", pages.len()));
+                let fused = harness_types::search::weighted_rrf(&[
+                    (&from_memory, 1.0),
+                    (&from_knowledge, 1.0),
+                ]);
+                let hits = fused
+                    .into_iter()
+                    .take(limit)
+                    .filter_map(|(key, score)| {
+                        let index = key[1..].parse::<usize>().ok()?;
+                        let (mut hit, source) = if key.starts_with('m') {
+                            (memory.get(index)?.clone(), "memory")
+                        } else {
+                            (pages.get(index)?.clone(), "knowledge")
+                        };
+                        hit["source"] = json!(source);
+                        hit["fused"] = json!((score * 1e6).round() / 1e6);
+                        Some(hit)
+                    })
+                    .collect::<Vec<_>>();
+                result["total"] = json!(result["total"].as_u64().unwrap_or(0) + pages.len() as u64);
+                result["hits"] = json!(hits);
+            }
+            Err(error) => {
+                result["knowledge"] = json!(format!("knowledge was not searched: {error}"));
+            }
+        }
+        result["sources"] = json!(sources);
+        Ok(if yaml {
+            json!({"text": super::memory_search::yaml(&result)})
+        } else {
+            result
+        })
+    }
+
+    /// [`Self::search`] over memory alone.
+    fn search_memory(&self, arguments: &Value) -> Result<Value, String> {
+        let kinds = kinds(arguments)?;
+        let mut rows = Vec::new();
+        for scope in self.scopes(arguments)? {
+            let dir = self.dir(scope).to_path_buf();
+            let state = super::refine::load_raw(&dir);
+            for entry in self.entries(&[scope], &kinds) {
+                let doc = state["entries"][&entry.kind][&entry.id].clone();
+                rows.push((entry, dir.clone(), doc));
+            }
+        }
+        let placed = rows
+            .iter()
+            .map(|(entry, dir, doc)| super::memory_search::Placed { entry, dir, doc })
+            .collect::<Vec<_>>();
+        super::memory_search::search(&placed, &self.embedding_root(), arguments, &|entry| {
+            view(entry, SNIPPET_CHARS)
+        })
+    }
+
+    /// The knowledge library whose embedding configuration memory uses: the
+    /// global one, `<data>/knowledge`.
+    fn embedding_root(&self) -> PathBuf {
+        self.global
+            .parent()
+            .map_or_else(|| self.global.clone(), |data| data.join("knowledge"))
     }
 
     /// The scopes an id may be in, and the id itself: a `global:`, `local:`
@@ -2033,66 +2132,6 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// A search's query and its variants, without repeats.
-fn search_queries(arguments: &Value) -> Result<Vec<String>, String> {
-    let mut candidates = Vec::new();
-    if let Some(query) = arguments.get("query").and_then(Value::as_str) {
-        candidates.push(query.trim().to_owned());
-    }
-    match arguments.get("queries") {
-        None | Some(Value::Null) => {}
-        Some(Value::Array(variants)) => {
-            if variants.len() > MAX_VARIANTS {
-                return Err(format!(
-                    "queries takes at most {MAX_VARIANTS} variants beside query"
-                ));
-            }
-            for variant in variants {
-                let variant = variant.as_str().ok_or("queries holds strings")?;
-                candidates.push(variant.trim().to_owned());
-            }
-        }
-        Some(_) => return Err("queries is a list of strings".to_owned()),
-    }
-    let mut queries: Vec<String> = Vec::new();
-    for query in candidates {
-        if !query.is_empty()
-            && !queries
-                .iter()
-                .any(|seen| seen.to_lowercase() == query.to_lowercase())
-        {
-            queries.push(query);
-        }
-    }
-    if queries.is_empty() {
-        return Err("search needs a query (or queries)".to_owned());
-    }
-    Ok(queries)
-}
-
-/// One ranking from several: reciprocal-rank fusion, so an entry any wording
-/// finds near the top ranks high, and one several find ranks higher. The
-/// score shown is the fused one.
-fn fuse(rankings: &[Vec<(usize, f64)>]) -> Vec<(usize, f64)> {
-    if let [only] = rankings {
-        return only.clone();
-    }
-    let mut fused = std::collections::BTreeMap::<usize, f64>::new();
-    for ranking in rankings {
-        for (position, (index, _)) in ranking.iter().enumerate() {
-            #[allow(clippy::cast_precision_loss, reason = "a rank position")]
-            let share = 1.0 / (60.0 + position as f64 + 1.0);
-            *fused.entry(*index).or_default() += share;
-        }
-    }
-    let mut ranked = fused
-        .into_iter()
-        .map(|(index, score)| (index, score * 60.0))
-        .collect::<Vec<_>>();
-    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    ranked
-}
-
 fn text<'a>(arguments: &'a Value, key: &str) -> Result<&'a str, String> {
     arguments
         .get(key)
@@ -2153,6 +2192,26 @@ fn organizing_properties() -> serde_json::Map<String, Value> {
         "order":{"type":"string","enum":["asc","desc"],"description":"history: oldest or newest (default) first."},
         "cursor":{"type":"string","description":"history: the next_cursor of the page before."}
     });
+    let mut properties = properties.as_object().cloned().unwrap_or_default();
+    properties.extend(search_properties());
+    properties
+}
+
+/// The `memory` tool's search arguments beside `query`/`queries`:
+/// memory-engine's meaning arm, fusion, filters and presentation.
+fn search_properties() -> serde_json::Map<String, Value> {
+    let properties = json!({
+        "semantic":{"type":"string","description":"search: what you mean, in words, ranked by meaning when embeddings are configured (with query, the two are fused). Without it, query is also searched by meaning when they are."},
+        "weights":{"type":"object","properties":{"fulltext":{"type":"number","minimum":0,"maximum":1},"semantic":{"type":"number","minimum":0,"maximum":1}},"description":"search: how much each arm weighs when both rank (default 1 and 1)."},
+        "candidate_limit":{"type":"integer","minimum":1,"maximum":1000,"description":"search: candidates per arm before fusion (default 30)."},
+        "semantic_threshold":{"type":"number","minimum":0,"maximum":1,"description":"search: the least cosine similarity a meaning hit needs."},
+        "meta_predicate":{"type":"string","description":"search: a SQL/JSON path predicate on meta, such as $.priority >= 3 && !exists($.archivedAt) or exists($.tags[*] ? (@ == \"auth\"))."},
+        "grep":{"type":"string","description":"search: a case-insensitive regular expression the content must match; give it with a query or a tree, meta or temporal filter."},
+        "order_by":{"type":"string","enum":["asc","desc"],"description":"search by filters alone: oldest or newest (default) first."},
+        "select":{"type":"array","items":{"type":"string"},"description":"search: only these fields of each hit: id, scope, kind, title, tree, path, meta, meta.<key>, temporal, version, version_hash, content, content:N, content:M:N, content_length, score, created_at, updated_at, pinned."},
+        "format":{"type":"string","enum":["json","compact","yaml"],"description":"search: the result as JSON (default) or YAML text."},
+        "sources":{"type":"array","items":{"type":"string","enum":["memory","knowledge"]},"description":"search: what to search, memory (default) and/or the knowledge libraries' pages; with both, one ranking of entries and pages, each hit naming its source."}
+    });
     properties.as_object().cloned().unwrap_or_default()
 }
 
@@ -2167,7 +2226,7 @@ impl ExternalToolCatalog for MemoryHost {
         }
         let scopes = self.all_scopes();
         if self.read_only {
-            return vec![json!({"type":"function","function":{
+            let mut schema = json!({"type":"function","function":{
                 "name":"memory",
                 "description":"Read-only recall of the memory the root agent keeps: memory entries (facts, the user's preferences and decisions) and prompt notes (narrow rules), global, for this project or for this conversation. list and search show entries with id and version; read returns one whole; history shows an entry's earlier versions. Search before relying on an earlier decision or preference you do not see in your brief. You cannot write or delete entries: report what should be kept in your answer to the parent.",
                 "parameters":{"type":"object","properties":{
@@ -2177,7 +2236,7 @@ impl ExternalToolCatalog for MemoryHost {
                     "kind":{"type":"string","enum":KINDS},
                     "scope":{"type":"string","enum":scopes},
                     "id":{"type":"string","description":"An entry id from list or search, or its <tree>/<name> address."},
-                    "limit":{"type":"integer","minimum":1,"maximum":MAX_LIST_PAGE},
+                    "limit":{"type":"integer","minimum":1,"maximum":200},
                     "offset":{"type":"integer","minimum":0},
                     "tree":{"type":"string","description":"tree, count, history: an absolute tree such as /global/team."},
                     "levels":{"type":"integer","minimum":1},
@@ -2189,7 +2248,20 @@ impl ExternalToolCatalog for MemoryHost {
                     "order":{"type":"string","enum":["asc","desc"]},
                     "cursor":{"type":"string"}
                 },"required":["action"],"additionalProperties":false}
-            }})];
+            }});
+            if let Some(properties) = schema["function"]["parameters"]["properties"].as_object_mut()
+            {
+                properties.extend(search_properties());
+                properties.insert(
+                    "meta".to_owned(),
+                    json!({"type":"object","description":"search: facets an entry's meta must contain."}),
+                );
+                properties.insert(
+                    "temporal".to_owned(),
+                    json!({"type":"object","description":"search: {before, after, contains, overlaps: {start, end}, within: {start, end}}; every mode given must hold."}),
+                );
+            }
+            return vec![schema];
         }
         let mut schema = json!({"type":"function","function":{
             "name":"memory",
@@ -2206,15 +2278,15 @@ impl ExternalToolCatalog for MemoryHost {
                 "path":{"type":"string","description":"write: an optional grouping such as user/preferences or project/<name>; constraints (or constraints/<topic>) for a rule the user set for the work, shown in every turn ahead of the ranked entries."},
                 "tree":{"type":"string","description":"tree, count, delete_tree, history: an absolute tree such as /global/team. write: where the entry sits, instead of path: absolute (/global/user/preferences, /local/..., or this project's /projects/<key>/..., which also picks the scope) or relative to scope. Labels are letters, digits, _ and -."},
                 "name":{"type":"string","description":"write: the entry's id as a slug (jwt-rotation), instead of one made from the title; on an update, renames it."},
-                "meta":{"type":"object","description":"write: facets to filter and judge by, such as {\"type\": \"decision\", \"status\": \"active\", \"source\": \"meeting\", \"confidence\": \"low\"}; replaces the entry's facets whole."},
-                "temporal":{"description":"write: when it happened (\"2026-10-26\" or an RFC 3339 time), or {\"start\", \"end\"} for the period it holds; an entry whose period ended is no longer shown every turn. null clears it.","anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":2},{"type":"object","properties":{"start":{"type":"string"},"end":{"type":"string"}},"required":["start"]},{"type":"null"}]},
+                "meta":{"type":"object","description":"write: facets to filter and judge by, such as {\"type\": \"decision\", \"status\": \"active\", \"source\": \"meeting\", \"confidence\": \"low\"}; replaces the entry's facets whole. search: facets an entry's meta must contain."},
+                "temporal":{"description":"write: when it happened (\"2026-10-26\" or an RFC 3339 time), or {\"start\", \"end\"} for the period it holds; an entry whose period ended is no longer shown every turn. null clears it. search: a filter {before, after, contains, overlaps: {start, end}, within: {start, end}}, every mode given holding.","anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":2},{"type":"object","properties":{"start":{"type":"string"},"end":{"type":"string"},"before":{"type":"string"},"after":{"type":"string"},"contains":{"type":"string"},"overlaps":{"type":"object"},"within":{"type":"object"}}},{"type":"null"}]},
                 "on_conflict":{"type":"string","enum":ON_CONFLICT,"description":"write, new entry: when its name is taken, error (default), replace (overwrite when it differs) or ignore (keep the one there)."},
                 "pinned":{"type":"boolean","description":"write: true shows the entry whole in every turn (the user's language, form of address, a hard rule); false unpins; omitted keeps it as it is. Pinned entries share a 4,000-character bound."},
                 "expected_version":{"type":"integer","minimum":1,"description":"The version list, search or read returned; required to update, delete, or revert over an entry that exists."},
                 "version_hash":{"type":"string","description":"Instead of expected_version: the version_hash read returned."},
                 "version":{"type":"integer","minimum":1,"description":"revert: the earlier version history showed; omitted, a deleted entry comes back as it was."},
                 "distinct":{"type":"boolean","description":"write: true keeps a new entry that reads like a kept one because it is a different fact."},
-                "limit":{"type":"integer","minimum":1,"maximum":MAX_LIST_PAGE},
+                "limit":{"type":"integer","minimum":1,"maximum":200},
                 "offset":{"type":"integer","minimum":0,"description":"list: continue from next_offset."}
             },"required":["action"],"additionalProperties":false}
         }});
@@ -2395,6 +2467,7 @@ mod tests {
             read_only: false,
             conversation: "test-conversation".to_owned(),
             project: None,
+            workspace: None,
             off: false,
         }
     }
@@ -3288,6 +3361,205 @@ mod tests {
             )
             .expect("seed");
         }
+    }
+
+    /// memory-engine's search: BM25 that returns only real matches, every
+    /// filter, browsing by filters alone, and select/format.
+    #[test]
+    fn search_ranks_filters_browses_and_projects() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = host(directory.path());
+        for (tree, name, content, meta, temporal) in [
+            (
+                "/global/team/decisions",
+                "queue",
+                "Redis Streams carry the order queue.",
+                json!({"type":"decision","priority":4}),
+                json!("2026-03-01"),
+            ),
+            (
+                "/global/team/decisions",
+                "db",
+                "Postgres 17 holds the orders.",
+                json!({"type":"decision","priority":1}),
+                json!("2026-05-01"),
+            ),
+            (
+                "/global/team/drafts",
+                "cache",
+                "Maybe a Redis cache in front of the API.",
+                json!({"type":"idea"}),
+                Value::Null,
+            ),
+            (
+                "/global/ops",
+                "deploy",
+                "Deploys go out on Fridays.",
+                json!({"type":"runbook"}),
+                Value::Null,
+            ),
+        ] {
+            run(
+                &host,
+                &json!({"action":"write","tree":tree,"name":name,"title":name,"content":content,"meta":meta,"temporal":temporal,"distinct":true}),
+            )
+            .expect("seed");
+        }
+        let search = |arguments: Value| run(&host, &arguments).expect("search");
+        let ids = |result: &Value| {
+            result["hits"]
+                .as_array()
+                .expect("hits")
+                .iter()
+                .map(|hit| hit["id"].as_str().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+        };
+        // Words: only entries holding one; a prefix finds the longer word.
+        let redis = search(json!({"action":"search","query":"redis"}));
+        assert_eq!(redis["mode"], "fulltext");
+        assert_eq!(redis["total"], 2);
+        assert_eq!(
+            ids(&search(json!({"action":"search","query":"deploy"}))),
+            ["deploy"]
+        );
+        assert_eq!(
+            search(json!({"action":"search","query":"kubernetes"}))["total"],
+            0
+        );
+        // Filters narrow any search.
+        assert_eq!(
+            ids(&search(
+                json!({"action":"search","query":"redis","tree":"*/decisions/*"})
+            )),
+            ["queue"]
+        );
+        assert_eq!(
+            ids(&search(
+                json!({"action":"search","query":"redis","meta":{"type":"idea"}})
+            )),
+            ["cache"]
+        );
+        assert_eq!(
+            ids(&search(
+                json!({"action":"search","meta_predicate":"$.priority >= 3"})
+            )),
+            ["queue"]
+        );
+        assert_eq!(
+            ids(&search(
+                json!({"action":"search","tree":"/global/team","temporal":{"after":"2026-04-01"}})
+            )),
+            ["db"]
+        );
+        assert_eq!(
+            ids(&search(
+                json!({"action":"search","tree":"/global","grep":"fri(day)?s"})
+            )),
+            ["deploy"]
+        );
+        assert!(run(&host, &json!({"action":"search","grep":"redis"})).is_err());
+        assert!(run(&host, &json!({"action":"search","meta_predicate":"$.a =="})).is_err());
+        assert!(
+            run(
+                &host,
+                &json!({"action":"search","query":"x","semantic_threshold":2})
+            )
+            .is_err()
+        );
+        // Filters alone browse, newest first; order_by asc reverses.
+        let browse = search(json!({"action":"search","meta":{"type":"decision"},"order_by":"asc"}));
+        assert_eq!(browse["mode"], "filter");
+        assert_eq!(ids(&browse).len(), 2);
+        assert_eq!(browse["hits"][0]["score"], -1.0);
+        // select and format.
+        let selected = search(
+            json!({"action":"search","query":"postgres","select":["id","tree","meta.priority","content:8"]}),
+        );
+        assert_eq!(
+            selected["hits"][0],
+            json!({"id":"db","tree":"/global/team/decisions","meta.priority":1,"content":"Postgres","content_length":29})
+        );
+        let yaml =
+            search(json!({"action":"search","query":"postgres","format":"yaml","select":["id"]}));
+        assert!(
+            yaml["text"]
+                .as_str()
+                .expect("yaml text")
+                .contains("hits:\n- id: db\n"),
+            "{yaml}"
+        );
+        // Without embeddings, a semantic text is searched by its words.
+        let semantic = search(json!({"action":"search","semantic":"postgres orders"}));
+        assert_eq!(semantic["mode"], "fulltext");
+        assert!(
+            semantic["semantic"]
+                .as_str()
+                .is_some_and(|note| note.contains("not configured"))
+        );
+    }
+
+    /// `sources` with knowledge: one ranking of entries and pages, each hit
+    /// naming where it came from.
+    #[test]
+    fn a_search_reads_memory_and_knowledge_as_one_ranking() {
+        let directory = tempfile::tempdir().expect("dir");
+        let workspace = directory.path().join("project");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let library = super::super::knowledge::store::Store::new(
+            workspace.join(".harness").join("knowledge"),
+        );
+        library.set_enabled(true).expect("on");
+        library
+            .write(super::super::knowledge::store::WritePage {
+                path: "ops/queue.md".to_owned(),
+                title: "Queue runbook".to_owned(),
+                summary: "How the order queue is drained".to_owned(),
+                content: "Drain the Redis queue before a deploy.".to_owned(),
+                sources: Vec::new(),
+                related: Vec::new(),
+                expected_hash: None,
+            })
+            .expect("page");
+        let mut host = host(directory.path());
+        host.workspace = Some(workspace);
+        run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Queue","content":"The order queue runs on Redis Streams."}),
+        )
+        .expect("entry");
+        let both = run(
+            &host,
+            &json!({"action":"search","query":"redis queue","sources":["memory","knowledge"]}),
+        )
+        .expect("search");
+        let sources = both["hits"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .map(|hit| hit["source"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        assert!(sources.contains(&"memory".to_owned()), "{both}");
+        assert!(sources.contains(&"knowledge".to_owned()), "{both}");
+        let pages = run(
+            &host,
+            &json!({"action":"search","query":"redis","sources":["knowledge"]}),
+        )
+        .expect("knowledge only");
+        assert!(
+            pages["hits"]
+                .as_array()
+                .expect("hits")
+                .iter()
+                .all(|hit| hit["source"] == "knowledge"),
+            "{pages}"
+        );
+        assert!(
+            run(
+                &host,
+                &json!({"action":"search","query":"x","sources":["web"]})
+            )
+            .is_err()
+        );
     }
 
     #[test]

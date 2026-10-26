@@ -156,7 +156,7 @@ CREATE INDEX memory_event_at ON memory_event(at DESC);
 
 CREATE TABLE refinement (seq INTEGER PRIMARY KEY, event TEXT NOT NULL);  -- mảng `refinements`
 CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);     -- `schema` và các trường cấp gốc khác
--- P3: memory_fts (FTS5), memory_vector, memory_embedding_queue (§6)
+-- P3 (schema 2): memory_vector, memory_embedding_queue (§6)
 ```
 
 Entry của ha ánh xạ sang record của ME như sau:
@@ -295,20 +295,24 @@ Mỗi refinement ghi lại `operation_id` của lần ghi, để `/refine --roll
 
 ### 6.1 Theo từ khóa
 
-`memory_fts` là bảng FTS5 trên `title`, `content`, `tree`/`name` và các giá trị
-`meta`. Văn bản được index là kết quả `query_terms` của ha, nối bằng dấu cách:
+BM25 chạy trong `memory/search.rs` trên các entry mà search xét, sau khi lọc. Kho
+global và kho của cuộc trò chuyện được xếp hạng như một kho chung, với cùng một
+bộ thống kê. Vì kho nhỏ, cách này đơn giản hơn giữ một index FTS5 đồng bộ; khi
+kho lớn lên thì có thể thêm index sau.
+
+Từ được tách theo cách của ha:
 
 - chữ thường, NFC;
 - chuỗi CJK tách thành bigram;
-- tokenizer `unicode61 remove_diacritics 2`.
+- câu hỏi không dấu thì đọc entry đã bỏ dấu, nên `may in` tìm ra `máy in`; câu
+  hỏi có dấu thì đọc đúng như đã viết.
 
-Nhờ vậy giữ được cách khớp không phân biệt dấu và chạy được trên nhiều hệ chữ như
-hiện nay. Các từ trong câu hỏi được nối bằng OR và khớp theo tiền tố
-(`"deploy"*`), nên "deploy" vẫn tìm ra "deploys" như cách khớp chuỗi con hiện tại.
+Một từ trong câu hỏi khớp các từ bắt đầu bằng nó, nên "deploy" vẫn tìm ra
+"deploys" như cách khớp chuỗi con trước đây.
 
-Xếp hạng bằng `bm25()`, trọng số cột: title 3, content 1, path 1, meta 0,5. Chỉ
-dòng khớp ít nhất một từ mới là ứng viên; đây là điều kiện "phải thật sự khớp"
-của ME, do `MATCH` bảo đảm.
+Trọng số trường: title 3, content 1, tree và name 1, giá trị meta 0,5. Chỉ entry
+chứa ít nhất một từ của câu hỏi mới được trả về: điều kiện "phải thật sự khớp"
+của ME. Các cách diễn đạt (`queries`) được gộp bằng RRF ngay trong nhánh này.
 
 ### 6.2 Theo nghĩa
 
@@ -320,8 +324,10 @@ Memory dùng endpoint embedding đã cấu hình cho thư viện knowledge globa
 | `memory_vector` | `memory_id`, `content_version`, `namespace` (endpoint + model), vector |
 | `memory_embedding_queue` | Một dòng cho mỗi `(memory_id, content_version)` |
 
-Hàng đợi được thêm dòng khi chèn và khi nội dung đổi. Nó được xử lý bởi task chạy
-nền sau mỗi lượt, và tối đa 20 s ngay trước một lần search theo nghĩa.
+Một entry cần vector khi chưa có vector cho phiên bản nội dung hiện tại trong
+namespace hiện tại. Bảng hàng đợi chỉ ghi các lần thử thất bại. Việc embed chạy
+trong một thread nền sau mỗi lần ghi qua tool `memory`, và tối đa 20 s ngay trước
+một lần search theo nghĩa.
 
 Lúc ghi kết quả có kiểm `content_version`, nên vector cũ không bao giờ ghi đè.
 Lỗi thì thử lại 3 lần; gặp 429 thì hoãn dòng đó mà không tính một lần thử.
@@ -402,8 +408,13 @@ tới 10 000.
 | `select` | Các trường cần trả: `id`, `name`, `tree`, `kind`, `title`, `meta`, `meta.<khóa>`, `temporal`, `version`, `version_hash`, `score`, và lát cắt content `content:N`, `content:M:N`, `content:M:` (tính theo ký tự, kèm `content_length`). |
 | `format` | `json` (mặc định của tool, dạng gọn), `compact`, hoặc `yaml`. |
 
-YAML (cũng cần cho pack và import) dùng một crate YAML cho serde, còn được bảo
-trì, ghim phiên bản; chọn và ghi vào `Cargo.toml` ở P3.
+`format: yaml` dùng một bộ xuất nhỏ trong `memory/search.rs`, đặt ngoặc kép cho
+mọi chuỗi mà YAML có thể đọc thành thứ khác. Đọc YAML (pack, import) cần một
+parser: crate YAML cho serde sẽ được chọn và ghim khi làm tiếp P5.
+
+`semantic` là điều muốn tìm theo nghĩa. Không có nó, `query` cũng được tìm theo
+nghĩa mỗi khi đã cấu hình embedding, như search knowledge vẫn làm. Một `semantic`
+mà chưa có embedding thì được tìm theo từ, và kết quả ghi rõ lý do.
 
 ## 7. Knowledge và history (P4)
 
@@ -416,8 +427,11 @@ xóa:
 - `operation`, `operation_id`, `cause`, `actor`;
 - `hash`, `title`, `summary`, `sources`, `related` và toàn bộ nội dung trang.
 
-Event được ghi trong cùng bước commit cập nhật `log.md` và `.ha-pending.json`, nên
-khi khôi phục sau sự cố thì cả hai cùng được hoàn tất.
+Event được ghi ngay sau khi trang được commit, vẫn trong khóa của thư viện. Nếu
+không ghi được lịch sử thì lỗi được báo trong diagnostics, còn lần ghi trang vẫn
+giữ nguyên. Lần thay đổi đầu tiên được ghi lại của một trang cũng lưu văn bản mà
+nó thay thế (cause `baseline`), nên trang viết trước khi có lịch sử vẫn revert về
+được.
 
 Tool `knowledge` có thêm:
 
@@ -439,10 +453,13 @@ trang knowledge thì có `path` cùng khoảng dòng. CLI làm tương tự vớ
 ### Tool history
 
 - **`history_search`** có thêm:
-  - `since` và `until`; cần cột `occurred_at` trên `history_sources`, được một
-    migration điền từ timestamp trong journal;
-  - `kind`, một danh sách loại event của journal;
-  - `order`.
+  - `since` và `until`: ID của nguồn là `evt_<UUIDv7>` của event trong journal,
+    phần đầu chính là thời điểm, nên một khoảng thời gian là một khoảng ID và
+    không cần thêm cột;
+  - `kind`, một loại event của journal hoặc một danh sách;
+  - `order`, `newest` (mặc định) hoặc `oldest` trước khi điểm bằng nhau.
+
+  Kết quả tìm theo nghĩa cũng phải nằm trong cùng khoảng thời gian và loại đó.
 - **`history_read`** trả thêm `previous_source_id` và `next_source_id` trong cùng
   phiên, theo `sequence`, để đọc nối tiếp mà không phải tìm lại.
 

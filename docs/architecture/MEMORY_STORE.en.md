@@ -151,7 +151,7 @@ CREATE INDEX memory_event_at ON memory_event(at DESC);
 
 CREATE TABLE refinement (seq INTEGER PRIMARY KEY, event TEXT NOT NULL);  -- the `refinements` array
 CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);     -- `schema` and other top-level fields
--- P3: memory_fts (FTS5), memory_vector, memory_embedding_queue (§6)
+-- P3 (schema 2): memory_vector, memory_embedding_queue (§6)
 ```
 
 How ha's entries map onto ME's record:
@@ -291,20 +291,24 @@ A refinement records the `operation_id` of its write, so `/refine --rollback` an
 
 ### 6.1 Lexical
 
-`memory_fts` is an FTS5 table over `title`, `content`, `tree`/`name` and `meta`
-values. Its text is ha's own `query_terms` output, joined by spaces:
+BM25 runs in `memory/search.rs` over the entries a search considers, after the
+filters. A global and a conversation's store rank as one corpus, with one set of
+statistics. The stores are small, so this beats keeping an FTS5 index in step;
+an index can come later if they grow.
+
+Words are ha's own tokens:
 
 - lowercase and NFC;
 - CJK runs as bigrams;
-- the `unicode61 remove_diacritics 2` tokenizer.
+- a query without accents reads the entries without theirs, so `may in` finds
+  `máy in`; one with accents reads them as written.
 
-This keeps today's accent-insensitive, cross-script matching. Query terms are
-OR-ed prefix terms (`"deploy"*`), so "deploy" still finds "deploys" as today's
-substring match does.
+A query word matches the words it begins, so "deploy" still finds "deploys" as
+the old substring match did.
 
-Ranking is `bm25()` with column weights title 3, content 1, path 1, meta 0.5.
-Only rows matching at least one term are candidates; this is ME's positive-match
-invariant, held by `MATCH`.
+The fields weigh title 3, content 1, tree and name 1, meta values 0.5. Only
+entries holding at least one query word are returned: ME's positive-match
+invariant. The query's variants (`queries`) are fused by RRF within the arm.
 
 ### 6.2 Semantic
 
@@ -317,9 +321,10 @@ it.
 | `memory_vector` | `memory_id`, `content_version`, `namespace` (endpoint and model), vector |
 | `memory_embedding_queue` | One row per `(memory_id, content_version)` |
 
-The queue is filled on insert and on a content change. It is drained by the
-background task that runs after a turn, and for up to 20 s before a semantic
-search.
+An entry needs a vector when it has none for its current content version in the
+current namespace. The queue table records only failed attempts. Embedding runs
+in a background thread after each write through the `memory` tool, and for up
+to 20 s before a semantic search.
 
 The write-back is guarded by `content_version`, so a stale vector never lands.
 Failures retry three times, and a 429 defers the row without spending an attempt.
@@ -396,8 +401,14 @@ Every response carries `total`, counted with `max_count` semantics up to 10 000.
 | `select` | Fields to return: `id`, `name`, `tree`, `kind`, `title`, `meta`, `meta.<key>`, `temporal`, `version`, `version_hash`, `score`, and the content slices `content:N`, `content:M:N`, `content:M:` (characters, with `content_length` added). |
 | `format` | `json` (the tool default, compact), `compact`, or `yaml`. |
 
-YAML (also needed by packs and import) comes from one pinned, maintained serde
-YAML crate, chosen and recorded in `Cargo.toml` in P3.
+`format: yaml` comes from a small emitter in `memory/search.rs`, which quotes any
+string YAML could read as something else. Reading YAML (packs, import) needs a
+parser: a pinned serde YAML crate is chosen when P5 resumes.
+
+`semantic` names what is meant. Without it, `query` is also searched by meaning
+whenever embeddings are configured, as knowledge search already does. A
+`semantic` given without embeddings is searched by its words, and the result
+says why.
 
 ## 7. Knowledge and history (P4)
 
@@ -410,8 +421,11 @@ write and delete:
 - `operation`, `operation_id`, `cause`, `actor`;
 - the page's `hash`, `title`, `summary`, `sources`, `related` and full content.
 
-The event is written in the same commit step that updates `log.md` and
-`.ha-pending.json`, so recovery after a crash rolls both forward together.
+The event is written right after the page is committed, under the library's
+lock. A history that cannot be written is reported in the diagnostics and does
+not undo the write. A page's first recorded change also keeps the text it
+replaced (cause `baseline`), so a page written before the history began can
+still be reverted to.
 
 The `knowledge` tool gains:
 
@@ -432,10 +446,13 @@ configured) and are fused by RRF into one list. Each hit says `source`, plus
 ### History tools
 
 - **`history_search`** gains:
-  - `since` and `until`, which need an `occurred_at` column on `history_sources`
-    (a migration backfills it from the journal's timestamps);
-  - `kind`, a list of journal event types;
-  - `order`.
+  - `since` and `until`: a source id is the journal event's `evt_<UUIDv7>`,
+    whose head is its time, so a window of time is a range of ids and needs no
+    new column;
+  - `kind`, one journal event type or a list of them;
+  - `order`, `newest` (the default) or `oldest` first among equal scores.
+
+  A source found by meaning keeps to the same window and kinds.
 - **`history_read`** returns `previous_source_id` and `next_source_id` within the
   same session, by `sequence`, so a reader can walk the thread without searching
   again.

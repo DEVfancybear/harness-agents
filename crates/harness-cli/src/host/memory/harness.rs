@@ -275,13 +275,22 @@ fn is_term_character(character: char) -> bool {
 /// Each term once, in order, with canonically equivalent Unicode normalized.
 #[must_use]
 pub fn query_terms(text: &str) -> Vec<String> {
-    let lowered = normalized_search_text(text);
     let mut terms = Vec::new();
-    let push = |term: String, terms: &mut Vec<String>| {
+    for term in tokens(text) {
         if !terms.contains(&term) {
             terms.push(term);
         }
-    };
+    }
+    terms
+}
+
+/// [`query_terms`] with every occurrence kept, in order: what a ranking that
+/// counts how often a word occurs reads.
+#[must_use]
+pub fn tokens(text: &str) -> Vec<String> {
+    let lowered = normalized_search_text(text);
+    let mut terms = Vec::new();
+    let push = |term: String, terms: &mut Vec<String>| terms.push(term);
     for run in lowered.split(|character: char| !is_term_character(character)) {
         if run.is_empty() {
             continue;
@@ -445,22 +454,6 @@ fn score(entry: &Entry, terms: &[(String, f64)], idf: &BTreeMap<String, f64>) ->
             weight * idf.get(term).copied().unwrap_or(1.0) * spread
         })
         .sum()
-}
-
-/// Entries that match `query`, best first, as indexes into `entries`: the
-/// digest's ranking, for the `memory` tool's search.
-#[must_use]
-pub fn rank(entries: &[Entry], query: &str) -> Vec<(usize, f64)> {
-    let terms = weighted_terms(None, &[query]);
-    let weights = idf(entries, &terms);
-    let mut ranked = entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| (index, score(entry, &terms, &weights)))
-        .filter(|(_, score)| *score > 0.0)
-        .collect::<Vec<_>>();
-    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    ranked
 }
 
 #[cfg(test)]

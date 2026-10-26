@@ -757,3 +757,45 @@ A task of hundreds of steps passes through many compactions, and what a compacti
 - **A conversation's own memory is consolidated.** A conversation's local store past 40 memory entries and prompt notes is consolidated after a turn, by the Deep Dream curator with the same guard rails, told that the current state of the task in progress may stay (one entry per subject, the latest). It is recorded as a local refinement that `/refine --rollback` undoes, and runs again only after 15 more changes. Notice: `memory: consolidating this conversation's memory in the background`.
 - **`ha exec` reviews its conversation.** A headless run counts its turns and tool calls toward the conversation's next review, across `ha exec --resume` runs (`review_cadence.json` in the conversation's harness directory). When the work since the last review is enough for a session's end in the app (5 turns or 10 tool calls, or `autoRefine.turnInterval` turns when that is fewer), or the run compacted after doing anything, the review runs after the answer is printed and before the process exits; it reports on stderr. It follows `autoRefine.enabled` and `HA_AUTO_REFINE=off`, needs harness refinements on, and is skipped for `--mock` and cancelled runs. A local store past 40 entries is consolidated there too.
 - **Hybrid search embeds every query variant.** With semantic search on, each of a search's `query`/`queries` variants is embedded (the ones not cached in one request), and each page is ranked by its best similarity to any of them; each result's `matched_queries` names the variants it is near. Before, only the first variant was embedded.
+
+### 12.15. The memory store (0.8.1)
+
+0.8.1 gives memory the features of [memory-engine](https://github.com/timescale/memory-engine), locally. The design, and what is still to come, are in [Memory store](../architecture/MEMORY_STORE.en.md).
+
+- **One SQLite store per scope.**
+  - The global memory (`<data>/harness/`) and each conversation's (`<data>/sessions/<task>/harness/`) keep `memory.sqlite3` in place of `harness_state.json`. The lock is `memory.lock`.
+  - The first run of 0.8.1 imports the old file and its `memory_history.jsonl`, then renames them `.imported`. The `memory` tool, `/refine`, Deep Dream and `rlm.harness` work as before.
+  - A `harness_state.json` put beside a store later is imported the same way.
+  - Going back to 0.8.0 means restoring the `.imported` files. What was written since stays in the store.
+- **Every change is an event.**
+  - Each insert, update and delete records the whole entry, who made it (`model`, `refine`, `kernel`, `migration`) and why. What one call or one refinement changed shares one `operation_id`.
+  - Events are kept 30 days, and each entry's ten newest are always kept.
+  - `memory` `history` with an id shows an entry's versions. Without an id it is a feed of the changes under a `tree`, of an `operation_id`, or `since` a time.
+  - `revert` brings a version back (`restore` still works). A deleted entry comes back under its old id.
+- **Entries have memory-engine's fields.**
+  - A write takes:
+    - `tree`: `/global/...`, `/projects/<this project>/...`, `/local/...`, or relative to `scope`;
+    - `name`: a slug id;
+    - `meta`: facets such as `type`, `status`, `confidence`;
+    - `temporal`: a time, or `{start, end}`;
+    - `on_conflict`: `error`, `replace` or `ignore`.
+  - An update also takes `version_hash`.
+  - An entry whose period has ended leaves the digest, but search still finds it.
+  - An entry can also be addressed as `<tree>/<name>`.
+- **Organizing.** `tree` (nodes with counts), `count`, `move` and `copy` (a tree prefix replaced; a move keeps each entry's id, across scopes too), and `delete_tree`. The three that change memory need `dry_run`, and a delegated child cannot use them.
+- **Search.**
+  - BM25 over the entries, returning only real word matches.
+  - Also by meaning, when embeddings are configured for the global knowledge library (`/knowledge semantic --global`).
+  - The two are fused by weighted Reciprocal Rank Fusion, tuned with `weights`, `candidate_limit` and `semantic_threshold`.
+  - Filters combine with any search, or browse alone (`order_by`):
+    - `tree`: a path, an lquery such as `*/decisions/*`, or a label search such as `api & !draft`;
+    - `meta`;
+    - `meta_predicate`: a SQL/JSON path, such as `$.priority >= 3 && !exists($.archivedAt)`;
+    - `temporal`: `before`, `after`, `contains`, `overlaps`, `within`;
+    - `grep`.
+  - `select` returns only the named fields (`content:200` for a slice), and `format: yaml` returns YAML.
+  - `sources: ["memory", "knowledge"]` searches the knowledge pages too, in one ranking.
+- **Knowledge search fuses by RRF too.** With embeddings on, a page that both words and meaning find now outranks one that only one of them ranks first. `min_score` in `.ha-embedding.json` is now the least cosine similarity a meaning hit needs. History search by meaning fuses the same way.
+- **A knowledge page's history.** Every write and delete through the store keeps the whole page in `.ha-history.sqlite3` in the library (30 days, and each page's ten newest). The `knowledge` tool's `history` lists the versions of a page, a folder or the library, and `revert` brings one back, a deleted page included.
+- **History filters.** `history_search` takes `since` and `until` (a time or a date), `kind` (one journal event type or a list) and `order` (`newest` or `oldest`). `history_read` names the sources before and after the one read (`previous=`, `next=`).
+- **`ha memory export [--conversation ID]`** prints a store's whole state as JSON. The bug report carries each store's counts and entries (`memory_store.json`), read without changing anything.

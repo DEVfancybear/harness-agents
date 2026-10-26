@@ -30,7 +30,10 @@ pub const LOCK_FILE: &str = "memory.lock";
 pub const LEGACY_STATE: &str = "harness_state.json";
 /// The journal of earlier versions the event log replaced.
 pub const LEGACY_JOURNAL: &str = "memory_history.jsonl";
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
+/// The embedding attempts an entry's content gets before it is left to
+/// keyword search.
+const EMBEDDING_ATTEMPTS: i64 = 3;
 /// Events older than this are dropped...
 const RETAIN_DAYS: i64 = 30;
 /// ...except each memory's newest ones, so a memory that has not changed for a
@@ -84,6 +87,27 @@ CREATE INDEX memory_event_path ON memory_event(tree, name);
 CREATE INDEX memory_event_at ON memory_event(at DESC);
 CREATE TABLE refinement (seq INTEGER PRIMARY KEY, event TEXT NOT NULL);
 CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+";
+
+/// Semantic search: one vector per memory, for the content version and the
+/// endpoint and model (`namespace`) it was made from; and the attempts an
+/// entry's content has failed, so a provider error is retried a few times
+/// and a rate limit waits.
+const SCHEMA_V2: &str = "
+CREATE TABLE memory_vector (
+  memory_id       TEXT PRIMARY KEY,
+  content_version INTEGER NOT NULL,
+  namespace       TEXT NOT NULL,
+  vector          BLOB NOT NULL
+);
+CREATE TABLE memory_embedding_queue (
+  memory_id       TEXT NOT NULL,
+  content_version INTEGER NOT NULL,
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  visible_at      TEXT NOT NULL,
+  last_error      TEXT,
+  PRIMARY KEY (memory_id, content_version)
+);
 ";
 
 /// Who changes the store and why; every event records it.
@@ -488,6 +512,177 @@ pub fn save_document(dir: &Path, state: &Value, writer: &Writer) -> Result<usize
     Ok(changed)
 }
 
+/// An entry to embed: its id, the content version it is for, and its text.
+#[derive(Clone, Debug)]
+pub struct Unembedded {
+    pub memory: String,
+    pub content_version: i64,
+    pub text: String,
+}
+
+/// Entries with no vector in `namespace` for their current content, at most
+/// `limit`: those whose attempts are spent, or which wait out a rate limit,
+/// are left for later.
+///
+/// # Errors
+/// The store cannot be read.
+pub fn unembedded(dir: &Path, namespace: &str, limit: usize) -> Result<Vec<Unembedded>, String> {
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(Vec::new());
+    };
+    let mut statement = store
+        .conn
+        .prepare(
+            "SELECT m.id, m.content_version, m.title, m.content FROM memory m
+             WHERE NOT EXISTS (SELECT 1 FROM memory_vector v WHERE v.memory_id = m.id
+                 AND v.namespace = ?1 AND v.content_version = m.content_version)
+             AND NOT EXISTS (SELECT 1 FROM memory_embedding_queue q WHERE q.memory_id = m.id
+                 AND q.content_version = m.content_version
+                 AND (q.attempts >= ?2 OR q.visible_at > ?3))
+             ORDER BY m.updated_at DESC LIMIT ?4",
+        )
+        .map_err(sql)?;
+    let rows = statement
+        .query_map(
+            params![
+                namespace,
+                EMBEDDING_ATTEMPTS,
+                now(),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                Ok(Unembedded {
+                    memory: row.get(0)?,
+                    content_version: row.get(1)?,
+                    text: format!("{}\n{}", row.get::<_, String>(2)?, row.get::<_, String>(3)?),
+                })
+            },
+        )
+        .map_err(sql)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql)?;
+    Ok(rows)
+}
+
+/// Keep vectors made for `namespace`. A vector made for content that has
+/// changed since is dropped: it no longer says what the entry says.
+///
+/// # Errors
+/// The store cannot be written.
+pub fn save_vectors(
+    dir: &Path,
+    namespace: &str,
+    vectors: &[(Unembedded, Vec<f32>)],
+) -> Result<usize, String> {
+    let mut store = Store::open(dir)?;
+    let transaction = store.begin()?;
+    let mut kept = 0;
+    for (entry, vector) in vectors {
+        kept += transaction
+            .execute(
+                "INSERT INTO memory_vector(memory_id, content_version, namespace, vector)
+                 SELECT ?1, ?2, ?3, ?4 WHERE EXISTS
+                     (SELECT 1 FROM memory WHERE id = ?1 AND content_version = ?2)
+                 ON CONFLICT(memory_id) DO UPDATE SET content_version = excluded.content_version,
+                     namespace = excluded.namespace, vector = excluded.vector",
+                params![
+                    entry.memory,
+                    entry.content_version,
+                    namespace,
+                    super::knowledge::embedding::vector_bytes(vector),
+                ],
+            )
+            .map_err(sql)?;
+        transaction
+            .execute(
+                "DELETE FROM memory_embedding_queue WHERE memory_id = ? AND content_version <= ?",
+                params![entry.memory, entry.content_version],
+            )
+            .map_err(sql)?;
+    }
+    transaction.commit().map_err(sql)?;
+    Ok(kept)
+}
+
+/// Record that embedding these entries failed: each attempt counts, and the
+/// entry waits a minute per attempt; a rate limit waits a minute without
+/// spending an attempt.
+///
+/// # Errors
+/// The store cannot be written.
+pub fn embedding_failed(
+    dir: &Path,
+    entries: &[Unembedded],
+    error: &str,
+    rate_limited: bool,
+) -> Result<(), String> {
+    let mut store = Store::open(dir)?;
+    let transaction = store.begin()?;
+    for entry in entries {
+        let attempts = transaction
+            .query_row(
+                "SELECT attempts FROM memory_embedding_queue WHERE memory_id = ? AND content_version = ?",
+                params![entry.memory, entry.content_version],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(sql)?
+            .unwrap_or(0)
+            + i64::from(!rate_limited);
+        let wait = chrono::Duration::minutes(attempts.max(1));
+        transaction
+            .execute(
+                "INSERT INTO memory_embedding_queue(memory_id, content_version, attempts, visible_at, last_error)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(memory_id, content_version) DO UPDATE SET attempts = excluded.attempts,
+                     visible_at = excluded.visible_at, last_error = excluded.last_error",
+                params![
+                    entry.memory,
+                    entry.content_version,
+                    attempts,
+                    stamp(chrono::Utc::now() + wait),
+                    error,
+                ],
+            )
+            .map_err(sql)?;
+    }
+    transaction.commit().map_err(sql)?;
+    Ok(())
+}
+
+/// The vectors of a store made in `namespace` for its entries' current
+/// content, by memory id.
+///
+/// # Errors
+/// The store cannot be read.
+pub fn vectors(dir: &Path, namespace: &str) -> Result<BTreeMap<String, Vec<f32>>, String> {
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(BTreeMap::new());
+    };
+    let mut statement = store
+        .conn
+        .prepare(
+            "SELECT v.memory_id, v.vector FROM memory_vector v
+             JOIN memory m ON m.id = v.memory_id AND m.content_version = v.content_version
+             WHERE v.namespace = ?",
+        )
+        .map_err(sql)?;
+    let rows = statement
+        .query_map([namespace], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(sql)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql)?;
+    let mut vectors = BTreeMap::new();
+    for (memory, bytes) in rows {
+        if let Ok(vector) = super::knowledge::embedding::vector_from_bytes(&bytes) {
+            vectors.insert(memory, vector);
+        }
+    }
+    Ok(vectors)
+}
+
 /// One earlier version of an entry, as `history` shows it and `restore`
 /// brings back.
 #[derive(Clone, Debug)]
@@ -773,8 +968,12 @@ impl Store {
         }
         let transaction = self.begin()?;
         // Another process may have migrated while this one waited.
-        if read(&transaction)? < 1 {
+        let version = read(&transaction)?;
+        if version < 1 {
             transaction.execute_batch(SCHEMA_V1).map_err(sql)?;
+        }
+        if version < 2 {
+            transaction.execute_batch(SCHEMA_V2).map_err(sql)?;
         }
         transaction
             .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
@@ -1196,9 +1395,13 @@ fn save(
         if wanted.contains_key(key) || renamed.values().any(|from| from == key) {
             continue;
         }
-        transaction
-            .execute("DELETE FROM memory WHERE id = ?", [&row.id])
-            .map_err(sql)?;
+        for statement in [
+            "DELETE FROM memory WHERE id = ?",
+            "DELETE FROM memory_vector WHERE memory_id = ?",
+            "DELETE FROM memory_embedding_queue WHERE memory_id = ?",
+        ] {
+            transaction.execute(statement, [&row.id]).map_err(sql)?;
+        }
         insert_event(
             transaction,
             &EventRow {

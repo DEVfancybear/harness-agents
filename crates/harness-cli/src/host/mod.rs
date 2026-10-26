@@ -95,6 +95,10 @@ pub mod mcp_config;
 pub mod mcp_oauth;
 #[path = "memory/memory.rs"]
 pub mod memory;
+#[path = "memory/filters.rs"]
+pub mod memory_filters;
+#[path = "memory/search.rs"]
+pub mod memory_search;
 #[path = "memory/store.rs"]
 pub mod memory_store;
 #[path = "prompting/model_prompts.rs"]

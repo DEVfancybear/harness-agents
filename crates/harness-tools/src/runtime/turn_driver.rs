@@ -3324,6 +3324,7 @@ fn summarize_action(action: &CodingToolAction) -> String {
             query,
             limit,
             project,
+            ..
         } => format!(
             "search {} history {query:?} (limit {})",
             if *project {
@@ -4082,9 +4083,18 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             length,
             total_bytes,
             text,
-        } => format!(
-            "history_read {source_id} seq={sequence} kind={source_kind} @{offset} ({length}/{total_bytes} bytes):\n{text}"
-        ),
+            previous_source_id,
+            next_source_id,
+        } => {
+            // The sources either side, so the model reads on without searching.
+            let around = [("previous", previous_source_id), ("next", next_source_id)]
+                .into_iter()
+                .filter_map(|(label, id)| id.as_ref().map(|id| format!(" {label}={id}")))
+                .collect::<String>();
+            format!(
+                "history_read {source_id} seq={sequence} kind={source_kind} @{offset} ({length}/{total_bytes} bytes){around}:\n{text}"
+            )
+        }
         ToolOutput::Git {
             operation, output, ..
         } => format!("git {operation}:\n{output}"),

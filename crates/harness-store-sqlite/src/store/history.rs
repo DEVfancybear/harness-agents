@@ -178,6 +178,70 @@ pub struct HistoryPage {
     pub offset: u64,
     pub bytes: Vec<u8>,
     pub total_bytes: u64,
+    /// The sources before and after it in its session: memory-engine's
+    /// thread links, so a reader walks the conversation without searching.
+    pub previous_source_id: Option<String>,
+    pub next_source_id: Option<String>,
+}
+
+/// What a history search keeps beside its words: a window of time, the kinds
+/// of journal events, and which way equal scores go.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HistoryFilter {
+    /// Sources written at or after this many milliseconds since the epoch.
+    pub since_ms: Option<u64>,
+    /// Sources written before this.
+    pub until_ms: Option<u64>,
+    /// Only these journal event types (`user_message`...), when any.
+    pub kinds: Vec<String>,
+    /// Equal scores oldest first instead of newest first.
+    pub oldest_first: bool,
+}
+
+impl HistoryFilter {
+    /// The least source id written at `ms`: a source id is the journal
+    /// event's `evt_<UUIDv7>`, whose head is its time, so ids order as times.
+    #[must_use]
+    pub fn id_at(ms: u64) -> String {
+        format!(
+            "evt_{:08x}-{:04x}-7000-0000-000000000000",
+            (ms >> 16) & 0xffff_ffff,
+            ms & 0xffff
+        )
+    }
+
+    /// Whether a source passes the filter's time window and kinds.
+    #[must_use]
+    pub fn admits(&self, source_id: &str, kind: &str) -> bool {
+        self.since_ms
+            .is_none_or(|ms| source_id >= Self::id_at(ms).as_str())
+            && self
+                .until_ms
+                .is_none_or(|ms| source_id < Self::id_at(ms).as_str())
+            && (self.kinds.is_empty() || self.kinds.iter().any(|wanted| wanted == kind))
+    }
+
+    /// The SQL the filter adds to a query of `history_sources s`, and its
+    /// bind values in order.
+    fn clause(&self) -> (String, Vec<String>) {
+        let mut clauses = String::new();
+        let mut values = Vec::new();
+        if let Some(ms) = self.since_ms {
+            clauses.push_str(" AND s.source_id >= ?");
+            values.push(Self::id_at(ms));
+        }
+        if let Some(ms) = self.until_ms {
+            clauses.push_str(" AND s.source_id < ?");
+            values.push(Self::id_at(ms));
+        }
+        if !self.kinds.is_empty() {
+            clauses.push_str(" AND s.kind IN (");
+            clauses.push_str(&vec!["?"; self.kinds.len()].join(", "));
+            clauses.push(')');
+            values.extend(self.kinds.iter().cloned());
+        }
+        (clauses, values)
+    }
 }
 
 /// Who is asking, and which foreign sources they may still read.
@@ -739,6 +803,19 @@ impl SqliteStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<HistoryHit>, StoreError> {
+        self.history_search_filtered(scope, query, limit, &HistoryFilter::default())
+            .await
+    }
+
+    /// [`Self::history_search`] within a time window and among kinds of
+    /// sources, equal scores in the filter's order.
+    pub async fn history_search_filtered(
+        &self,
+        scope: &HistoryScope,
+        query: &str,
+        limit: usize,
+        filter: &HistoryFilter,
+    ) -> Result<Vec<HistoryHit>, StoreError> {
         let terms = search_terms(query);
         if terms.is_empty() {
             return Err(StoreError::new(
@@ -752,19 +829,28 @@ impl SqliteStore {
             let _ = write!(cases, " WHEN {index} THEN ?");
             cases
         });
-        // Newest first among equal scores: across conversations a sequence
-        // only orders one session, so the session's start orders them.
-        let (order, page_order) = if scope.project_wide {
-            (
+        // Newest first among equal scores, unless the filter says oldest:
+        // across conversations a sequence only orders one session, so the
+        // session's start orders them.
+        let (order, page_order) = match (scope.project_wide, filter.oldest_first) {
+            (true, false) => (
                 "matched DESC, weight DESC, started DESC, sequence DESC",
                 "ranked.matched DESC, ranked.weight DESC, ranked.started DESC, ranked.sequence DESC",
-            )
-        } else {
-            (
+            ),
+            (true, true) => (
+                "matched DESC, weight DESC, started ASC, sequence ASC",
+                "ranked.matched DESC, ranked.weight DESC, ranked.started ASC, ranked.sequence ASC",
+            ),
+            (false, false) => (
                 "matched DESC, weight DESC, sequence DESC",
                 "ranked.matched DESC, ranked.weight DESC, ranked.sequence DESC",
-            )
+            ),
+            (false, true) => (
+                "matched DESC, weight DESC, sequence ASC",
+                "ranked.matched DESC, ranked.weight DESC, ranked.sequence ASC",
+            ),
         };
+        let (filtered, filter_values) = filter.clause();
         // The ranking reads only the index's hits; the preview is cut from
         // the few sources that make the page.
         let sql = format!(
@@ -779,7 +865,7 @@ impl SqliteStore {
                             MAX(COUNT(*)) OVER () AS best
                      FROM hits h JOIN history_sources s ON s.rowid = h.id
                      LEFT JOIN sessions se ON se.session_id = s.session_id
-                     WHERE {}
+                     WHERE {}{filtered}
                      GROUP BY h.id
                  ) WHERE matched = ? OR best < ?
                  ORDER BY {order} LIMIT ?
@@ -802,6 +888,9 @@ impl SqliteStore {
             statement = statement.bind(*weight);
         }
         for value in scope_binds(scope) {
+            statement = statement.bind(value);
+        }
+        for value in filter_values {
             statement = statement.bind(value);
         }
         let every = i64::try_from(terms.len()).unwrap_or(i64::MAX);
@@ -1022,6 +1111,33 @@ impl SqliteStore {
                 format!("requested offset {offset} is past the {total_bytes} stored bytes"),
             ));
         }
+        // The sources either side of it in its own session: the same task, so
+        // in scope whenever it is.
+        let neighbors = sqlx::query(
+            "SELECT
+               (SELECT p.source_id FROM history_sources p WHERE p.session_id = s.session_id
+                  AND p.sequence < s.sequence ORDER BY p.sequence DESC LIMIT 1) AS previous,
+               (SELECT n.source_id FROM history_sources n WHERE n.session_id = s.session_id
+                  AND n.sequence > s.sequence ORDER BY n.sequence ASC LIMIT 1) AS next
+             FROM history_sources s WHERE s.source_id = ?",
+        )
+        .bind(source_id)
+        .fetch_optional(&self.readers)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "read history neighbors",
+                error,
+            )
+        })?;
+        let (previous_source_id, next_source_id) = match &neighbors {
+            Some(row) => (
+                row_get::<Option<String>>(row, "previous")?,
+                row_get::<Option<String>>(row, "next")?,
+            ),
+            None => (None, None),
+        };
         Ok(HistoryPage {
             source_id: source_id.to_owned(),
             sequence: u64::try_from(row_get::<i64>(&row, "sequence")?).unwrap_or_default(),
@@ -1030,6 +1146,8 @@ impl SqliteStore {
             offset,
             bytes: row_get::<Option<Vec<u8>>>(&row, "page")?.unwrap_or_default(),
             total_bytes,
+            previous_source_id,
+            next_source_id,
         })
     }
 
@@ -1579,6 +1697,39 @@ mod tests {
         .expect("schema");
         assert_eq!(left, None);
         store.close().await.expect("close");
+    }
+
+    /// A source id is `evt_<UUIDv7>`, whose head is its time: a time window
+    /// is a range of ids, compared as text.
+    #[test]
+    fn a_time_window_is_a_range_of_source_ids() {
+        let at = 1_790_000_000_000_u64;
+        let uuid = uuid_at(at);
+        let source = format!("evt_{uuid}");
+        assert!(source >= HistoryFilter::id_at(at));
+        assert!(source < HistoryFilter::id_at(at + 1));
+        let filter = HistoryFilter {
+            since_ms: Some(at - 1_000),
+            until_ms: Some(at + 1_000),
+            kinds: vec!["user_message".to_owned()],
+            oldest_first: false,
+        };
+        assert!(filter.admits(&source, "user_message"));
+        assert!(!filter.admits(&source, "tool_result"));
+        assert!(!filter.admits(&format!("evt_{}", uuid_at(at + 5_000)), "user_message"));
+        assert!(!filter.admits(&format!("evt_{}", uuid_at(at - 5_000)), "user_message"));
+        assert!(HistoryFilter::default().admits(&source, "anything"));
+    }
+
+    /// A v7 UUID made at `ms`, as the journal makes them.
+    fn uuid_at(ms: u64) -> String {
+        uuid::Uuid::new_v7(uuid::Timestamp::from_unix(
+            uuid::NoContext,
+            ms / 1_000,
+            u32::try_from((ms % 1_000) * 1_000_000).expect("nanos"),
+        ))
+        .hyphenated()
+        .to_string()
     }
 
     #[test]

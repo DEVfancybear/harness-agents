@@ -8,6 +8,11 @@
 # entry whose period ended left out of the digest yet found by search; a create
 # that replaces the entry its name holds; a deleted entry reverted under its old
 # id; each change an event naming who made it and why; `ha memory export`.
+# P2: the tree, a move that keeps each entry's id, the history feed, a dry run.
+# P3: a search by meta alone, a JSONPath predicate, search by meaning against a
+# fake embedding server. P4: a knowledge page's history and revert, one search
+# over memory and knowledge, history_search by kind and time, history_read's
+# neighbors.
 #
 #   bash scripts/testing/live-tests/memory-store.sh
 set -u
@@ -117,6 +122,124 @@ run_exec m10 "Dùng tool memory action history với tree '/global/platform' (kh
 check "the model read the feed of that tree" 'answer m10 | grep -qi "move\|chuyển\|di chuyển"'
 run_exec m11 "Dùng tool memory action delete_tree với tree '/global/platform' và dry_run true, rồi báo bao nhiêu entry sẽ bị xóa. Không xóa thật."
 check "a dry run deletes nothing" '[ -n "$(row memory queue-choice)" ]'
+
+echo "################ 9. P3: filters, and search by meaning"
+# What the memory tool answered in the turn whose prompt holds $1, decoded.
+tool_result() { "$PY" - "$D" "$1" <<'EOF'
+import glob, json, os, sqlite3, sys
+sys.stdout.reconfigure(encoding="utf-8")
+found = None
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests order by rowid"):
+        if sys.argv[2] in text:
+            found = text
+def walk(value):
+    if isinstance(value, str):
+        if value.startswith("memory: "):
+            print(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            walk(item)
+    elif isinstance(value, list):
+        for item in value:
+            walk(item)
+if found:
+    walk(json.loads(found))
+EOF
+}
+run_exec m12 "Kiểm thử: gọi tool memory action search đúng một lần với meta {\"type\": \"decision\"} và không có query. Không gọi tool nào khác. MARKER_META. Báo các id tìm được."
+check "a search by meta alone browses" 'tool_result MARKER_META | grep -q "\"mode\":\"filter\"" && tool_result MARKER_META | grep -q "queue-choice"'
+run_exec m13 "Kiểm thử: gọi tool memory action search đúng một lần với meta_predicate '\$.confidence == \"high\" && !exists(\$.archived)' và không có query. Không gọi tool nào khác. MARKER_PREDICATE. Báo các id tìm được."
+check "a JSONPath predicate filters by meta" 'tool_result MARKER_PREDICATE | grep -q "queue-choice"'
+cat > "$RX/embed.py" <<'EOF'
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+port_file, log_file = sys.argv[1], sys.argv[2]
+def vector(text):
+    t = text.lower()
+    if "sầu riêng" in t or "gai" in t:
+        return [1.0, 0.0, 0.0]
+    return [0.0, 0.0, 1.0]
+class Fake(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        with open(log_file, "a", encoding="utf-8") as log:
+            for text in body["input"]:
+                log.write(json.dumps(text, ensure_ascii=False) + "\n")
+        data = [{"index": i, "embedding": vector(text)} for i, text in enumerate(body["input"])]
+        out = json.dumps({"data": data}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+    def log_message(self, *args):
+        pass
+server = HTTPServer(("127.0.0.1", 0), Fake)
+open(port_file, "w").write(str(server.server_address[1]))
+server.serve_forever()
+EOF
+"$PY" "$RX/embed.py" "$RX/embed.port" "$RX/embed.log" &
+embedder=$!
+for _ in $(seq 1 50); do [ -s "$RX/embed.port" ] && break; sleep 0.2; done
+mkdir -p "$D/knowledge"
+printf '{"schema_version":1,"enabled":true,"endpoint":"http://127.0.0.1:%s/v1/embeddings","model":"fake-embed"}' "$(cat "$RX/embed.port")" > "$D/knowledge/.ha-embedding.json"
+"$PY" - "$G" <<'EOF'
+import json, os, sys
+entry = {"id": "durian", "kind": "memory", "title": "Mùa trái cây", "content": "Sầu riêng Ri6 thu hoạch vào tháng sáu ở miền Tây.",
+         "path": "garden", "scope": "global", "version": 1, "source": "agent", "updated_at": "2026-10-01T00:00:00Z"}
+json.dump({"schema": 1, "entries": {"memory": {"durian": entry}}}, open(os.path.join(sys.argv[1], "harness_state.json"), "w", encoding="utf-8"), ensure_ascii=False)
+EOF
+run_exec m14 "Kiểm thử: gọi tool memory action search đúng một lần với semantic 'loại quả nhiều gai, mùi rất nồng' (không có query). Không gọi tool nào khác. MARKER_SEMANTIC. Báo id và nội dung kết quả đầu tiên."
+kill "$embedder" 2>/dev/null
+check "the entries were embedded" 'grep -q "Ri6" "$RX/embed.log"'
+check "search by meaning found what no word of it named" 'tool_result MARKER_SEMANTIC | grep -q "\"mode\":\"semantic\"" && tool_result MARKER_SEMANTIC | grep -q "durian"'
+rm -f "$D/knowledge/.ha-embedding.json"
+
+echo "################ 10. P4: a knowledge page's history and revert, one search over both, history filters"
+"$HA" knowledge on --cwd "$P" >/dev/null 2>&1
+run_exec m15 "Dùng tool knowledge action write (scope project) với path 'ops/deploy.md', title 'Deploy', summary 'Lịch deploy của cửa hàng', content 'Deploy vào thứ Năm hằng tuần.'. Chỉ ghi."
+run_exec m16 "Dùng tool knowledge: đọc ops/deploy.md (scope project) để lấy hash, rồi write cập nhật content thành 'Deploy vào thứ Sáu hằng tuần.' với expected_hash đó. Chỉ cập nhật."
+K="$P/.harness/knowledge"
+check "the page now says Friday" 'grep -q "thứ Sáu" "$K/ops/deploy.md"'
+run_exec m17 "Dùng tool knowledge action history với path 'ops/deploy.md' (scope project), tìm phiên bản đầu tiên (operation insert), đọc trang để lấy hash hiện tại, rồi gọi action revert với path đó, version là id của phiên bản đầu tiên và expected_hash là hash hiện tại. Báo kết quả."
+check "the page was reverted to Thursday" 'grep -q "thứ Năm" "$K/ops/deploy.md" && ! grep -q "thứ Sáu" "$K/ops/deploy.md"'
+check "its history holds every version" '[ "$("$PY" -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute(\"select count(*) from page_event where path = '\''ops/deploy.md'\''\").fetchone()[0])" "$K/.ha-history.sqlite3")" -ge 3 ]'
+run_exec m18 "Kiểm thử: gọi tool memory action search đúng một lần với query 'deploy' và sources ['memory', 'knowledge']. Không gọi tool nào khác. MARKER_SOURCES. Báo nguồn của từng kết quả."
+check "one search read memory and knowledge" 'tool_result MARKER_SOURCES | grep -q "\"source\":\"knowledge\"" && tool_result MARKER_SOURCES | grep -q "\"source\":\"memory\""'
+cat > "$RX/history_results.py" <<'EOF'
+import glob, json, os, re, sqlite3, sys
+sys.stdout.reconfigure(encoding="utf-8")
+found = None
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests order by rowid"):
+        if sys.argv[2] in text:
+            found = text
+results = []
+def walk(value):
+    if isinstance(value, str):
+        if value.startswith("history_search") or value.startswith("history_read"):
+            results.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            walk(item)
+    elif isinstance(value, list):
+        for item in value:
+            walk(item)
+if found:
+    walk(json.loads(found))
+mode = sys.argv[3]
+if mode == "filtered":
+    # A search whose hits are all of one kind, and another whose hits are not.
+    kinds = [set(re.findall(r" kind=(\S+) ", r)) for r in results if r.startswith("history_search")]
+    sys.exit(0 if any(len(k) == 1 for k in kinds) and any(len(k) > 1 for k in kinds) else 1)
+if mode == "linked":
+    sys.exit(0 if any(r.startswith("history_read") and (" previous=" in r or " next=" in r) for r in results) else 1)
+EOF
+run_exec m19 "Kiểm thử history: (1) gọi history_search với query 'deploy' và scope 'project', không bộ lọc, rồi xem các kind trong kết quả; (2) gọi lại history_search với cùng query, scope 'project', kind là kind của kết quả đầu tiên và since là ngày hôm nay (dạng YYYY-MM-DD); (3) gọi history_read với source_id của kết quả đầu tiên (scope 'project'). MARKER_HISTORY. Báo lại số kết quả mỗi lần và previous/next của lần đọc."
+# The turn's last request holds every tool result it had.
+check "a history search filters by kind and time" '"$PY" "$RX/history_results.py" "$D" MARKER_HISTORY filtered'
+check "history_read names the sources around it" '"$PY" "$RX/history_results.py" "$D" MARKER_HISTORY linked'
 
 echo "################ 7. ha memory export"
 "$HA" memory export > "$RX/export.json" 2>"$RX/export.err"

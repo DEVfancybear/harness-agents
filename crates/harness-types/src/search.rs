@@ -106,14 +106,43 @@ pub fn partial_note(what: &str, words: &[String], unmatched: &[String]) -> Strin
     )
 }
 
-/// Fuse two rankings of the same items - by words and by meaning - as
-/// `CowAgent` does: each channel's ranks normalized, weighted, and averaged
-/// over the channels that returned the item. Knowledge and history search
-/// both rank this way.
+/// The `k` of Reciprocal Rank Fusion: memory-engine's, and the usual one.
+pub const RRF_K: f64 = 60.0;
+
+/// Fuse rankings of the same items by weighted Reciprocal Rank Fusion, as
+/// memory-engine fuses its keyword and meaning arms: each arm gives an item
+/// `weight / (k + rank)`, from rank 1, and an item's score is the sum, so an
+/// item both arms find outranks one found by one arm alone. A missing arm
+/// gives nothing, and only ranks count: the arms' raw scores are on scales
+/// that cannot be compared. Ties go to the item named first.
 #[allow(
     clippy::cast_precision_loss,
-    reason = "Bounded ranks have at most 2048 entries"
+    reason = "a rank position is far below 2^52"
 )]
+#[must_use]
+pub fn weighted_rrf(arms: &[(&[(String, f64)], f64)]) -> Vec<(String, f64)> {
+    let mut scores = BTreeMap::<String, f64>::new();
+    for (ranking, weight) in arms {
+        if !weight.is_finite() || *weight <= 0.0 {
+            continue;
+        }
+        let mut seen = BTreeSet::new();
+        let unique = ranking
+            .iter()
+            .filter(|(item, score)| score.is_finite() && seen.insert(item))
+            .enumerate();
+        for (rank, (item, _)) in unique {
+            *scores.entry(item.clone()).or_default() += weight / (RRF_K + rank as f64 + 1.0);
+        }
+    }
+    let mut hits = scores.into_iter().collect::<Vec<_>>();
+    hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    hits
+}
+
+/// Fuse two rankings of the same items - by words and by meaning - for
+/// knowledge and history search: [`weighted_rrf`] of the two, the meaning
+/// arm holding only hits at or above `min_score` (a cosine similarity).
 #[must_use]
 pub fn hybrid_fuse(
     lexical: &[(String, f64)],
@@ -122,39 +151,13 @@ pub fn hybrid_fuse(
     keyword_weight: f64,
     min_score: Option<f64>,
 ) -> Vec<(String, f64)> {
-    if !vector_weight.is_finite()
-        || !keyword_weight.is_finite()
-        || vector_weight < 0.0
-        || keyword_weight < 0.0
-        || vector_weight + keyword_weight <= 0.0
-    {
-        return Vec::new();
-    }
-    let mut scores = BTreeMap::<String, (f64, f64)>::new();
-    for (channel, weight) in [(lexical, keyword_weight), (vectors, vector_weight)] {
-        let mut seen = BTreeSet::new();
-        let unique = channel
-            .iter()
-            .filter(|(path, score)| score.is_finite() && seen.insert(path))
-            .collect::<Vec<_>>();
-        let count = unique.len();
-        for (rank, (path, _)) in unique.into_iter().enumerate() {
-            let normalized = (count - rank) as f64 / count as f64;
-            let entry = scores.entry(path.clone()).or_default();
-            entry.0 += normalized * weight;
-            entry.1 += weight;
-        }
-    }
-    let minimum = min_score.filter(|score| score.is_finite()).unwrap_or(0.0);
-    let mut hits = scores
-        .into_iter()
-        .filter_map(|(path, (score, weight))| {
-            let score = if weight > 0.0 { score / weight } else { 0.0 };
-            (weight > 0.0 && score >= minimum).then_some((path, score))
-        })
+    let minimum = min_score.filter(|score| score.is_finite());
+    let near = vectors
+        .iter()
+        .filter(|(_, score)| minimum.is_none_or(|minimum| *score >= minimum))
+        .cloned()
         .collect::<Vec<_>>();
-    hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    hits
+    weighted_rrf(&[(lexical, keyword_weight), (&near, vector_weight)])
 }
 
 /// BM25's inverse document frequency of a term that `matching` of

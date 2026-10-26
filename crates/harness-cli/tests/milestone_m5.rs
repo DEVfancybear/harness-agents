@@ -1633,6 +1633,7 @@ async fn m5_03_history_search_finds_by_meaning_beside_words() {
                         query: "durian".to_owned(),
                         limit: None,
                         project: false,
+                        filter: harness_tools::HistorySearchFilter::default(),
                     },
                 ))
                 .await
@@ -2223,6 +2224,7 @@ async fn a20_source_scope_fork() {
                 query: "XYZ-731".to_owned(),
                 limit: None,
                 project: true,
+                filter: harness_tools::HistorySearchFilter::default(),
             },
         ))
         .await

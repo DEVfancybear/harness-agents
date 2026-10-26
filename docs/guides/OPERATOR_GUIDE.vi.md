@@ -756,3 +756,45 @@ Bản 0.6.3 hoàn tất phần knowledge và Self-Evolution của 0.6.2.
 - **Memory riêng của hội thoại được gom gọn.** Store local của một hội thoại vượt 40 entry memory và prompt note sẽ được gom gọn sau một lượt, bởi curator của Deep Dream với cùng các rào chắn, kèm lưu ý rằng trạng thái hiện tại của task đang làm được giữ lại (mỗi chủ đề một entry, bản mới nhất). Nó được ghi thành một refinement local mà `/refine --rollback` hoàn tác được, và chỉ chạy lại sau thêm 15 thay đổi. Thông báo: `memory: consolidating this conversation's memory in the background`.
 - **`ha exec` review hội thoại của nó.** Một lần chạy headless cộng số lượt và số lần gọi tool vào lần review kế tiếp của hội thoại, qua các lần `ha exec --resume` (`review_cadence.json` trong thư mục harness của hội thoại). Khi phần việc kể từ lần review trước đủ cho một lần kết thúc phiên trong app (5 lượt hoặc 10 lần gọi tool, hoặc số lượt `autoRefine.turnInterval` nếu ít hơn), hoặc lần chạy đã compaction sau khi làm bất cứ việc gì, review chạy sau khi câu trả lời được in và trước khi tiến trình thoát; kết quả in ra stderr. Nó theo `autoRefine.enabled` và `HA_AUTO_REFINE=off`, cần bật harness refinements, và bỏ qua khi chạy `--mock` hoặc bị huỷ. Store local vượt 40 entry cũng được gom gọn ở đây.
 - **Hybrid search embed mọi biến thể truy vấn.** Khi bật semantic search, mỗi biến thể `query`/`queries` của một lần tìm đều được embed (những biến thể chưa có trong cache được gửi trong một request), và mỗi trang được xếp theo độ tương đồng cao nhất của nó với một biến thể bất kỳ; `matched_queries` của mỗi kết quả nêu các biến thể mà trang đó gần. Trước đây chỉ biến thể đầu tiên được embed.
+
+### 12.15. Kho memory (0.8.1)
+
+0.8.1 đưa các tính năng của [memory-engine](https://github.com/timescale/memory-engine) vào memory của ha, chạy cục bộ. Thiết kế và những phần còn làm tiếp nằm trong [Kho memory](../architecture/MEMORY_STORE.vi.md).
+
+- **Mỗi scope một kho SQLite.**
+  - Memory toàn cục (`<data>/harness/`) và memory của mỗi hội thoại (`<data>/sessions/<task>/harness/`) giữ `memory.sqlite3` thay cho `harness_state.json`. Khóa là `memory.lock`.
+  - Lần chạy đầu của 0.8.1 nhập file cũ cùng `memory_history.jsonl`, rồi đổi tên chúng thành `.imported`. Tool `memory`, `/refine`, Deep Dream và `rlm.harness` vẫn chạy như cũ.
+  - Một `harness_state.json` đặt cạnh kho về sau cũng được nhập theo cách đó.
+  - Muốn quay về 0.8.0 thì khôi phục các file `.imported`. Những gì ghi từ lúc nâng cấp vẫn nằm trong kho.
+- **Mỗi thay đổi là một event.**
+  - Mỗi lần chèn, sửa, xóa ghi lại toàn bộ entry, ai làm (`model`, `refine`, `kernel`, `migration`) và vì sao. Mọi thay đổi của một lời gọi hay một lượt refine dùng chung một `operation_id`.
+  - Event được giữ 30 ngày, và luôn giữ 10 phiên bản mới nhất của mỗi entry.
+  - `history` của tool `memory` có id thì hiện các phiên bản của entry đó. Không có id thì là feed các thay đổi dưới một `tree`, của một `operation_id`, hoặc từ một thời điểm (`since`).
+  - `revert` đưa một phiên bản trở lại (`restore` vẫn dùng được). Entry đã xóa quay lại với id cũ.
+- **Entry có các trường của memory-engine.**
+  - Lần ghi nhận:
+    - `tree`: `/global/...`, `/projects/<project này>/...`, `/local/...`, hoặc tương đối theo `scope`;
+    - `name`: id dạng slug;
+    - `meta`: các facet như `type`, `status`, `confidence`;
+    - `temporal`: một thời điểm, hoặc `{start, end}`;
+    - `on_conflict`: `error`, `replace` hoặc `ignore`.
+  - Cập nhật nhận thêm `version_hash`.
+  - Entry có khoảng thời gian đã kết thúc không còn vào digest, nhưng search vẫn tìm thấy.
+  - Entry cũng gọi được theo `<tree>/<name>`.
+- **Sắp xếp.** `tree` (các nút kèm số lượng), `count`, `move` và `copy` (thay tiền tố cây; `move` giữ id của từng entry, kể cả khi chuyển scope), và `delete_tree`. Ba action thay đổi memory cần `dry_run`, và agent con không dùng được.
+- **Tìm kiếm.**
+  - BM25 trên các entry, chỉ trả kết quả thật sự khớp từ.
+  - Thêm tìm theo nghĩa khi đã cấu hình embedding cho thư viện knowledge toàn cục (`/knowledge semantic --global`).
+  - Hai nhánh gộp bằng weighted Reciprocal Rank Fusion, chỉnh bằng `weights`, `candidate_limit` và `semantic_threshold`.
+  - Bộ lọc dùng kèm mọi kiểu tìm, hoặc dùng riêng để duyệt (`order_by`):
+    - `tree`: đường dẫn, lquery như `*/decisions/*`, hoặc tìm theo nhãn như `api & !draft`;
+    - `meta`;
+    - `meta_predicate`: SQL/JSON path, như `$.priority >= 3 && !exists($.archivedAt)`;
+    - `temporal`: `before`, `after`, `contains`, `overlaps`, `within`;
+    - `grep`.
+  - `select` chỉ trả các trường được nêu (`content:200` cho một lát cắt), và `format: yaml` trả YAML.
+  - `sources: ["memory", "knowledge"]` tìm cả trang knowledge, trong cùng một bảng xếp hạng.
+- **Search knowledge cũng gộp bằng RRF.** Khi bật embedding, trang được cả từ khóa lẫn nghĩa tìm thấy giờ đứng trên trang chỉ một bên xếp đầu. `min_score` trong `.ha-embedding.json` giờ là độ tương đồng cosine tối thiểu cho kết quả theo nghĩa. History search theo nghĩa cũng gộp như vậy.
+- **Lịch sử trang knowledge.** Mỗi lần ghi và xóa qua store giữ toàn bộ trang trong `.ha-history.sqlite3` của thư viện (30 ngày, và luôn giữ 10 phiên bản mới nhất của mỗi trang). Action `history` của tool `knowledge` liệt kê các phiên bản của một trang, một thư mục hoặc cả thư viện, và `revert` đưa một phiên bản trở lại, kể cả trang đã xóa.
+- **Bộ lọc history.** `history_search` nhận `since` và `until` (thời điểm hoặc ngày), `kind` (một loại event của journal hoặc một danh sách) và `order` (`newest` hoặc `oldest`). `history_read` nêu nguồn ngay trước và ngay sau nguồn đang đọc (`previous=`, `next=`).
+- **`ha memory export [--conversation ID]`** in toàn bộ trạng thái của một kho ra JSON. Bug report chứa số lượng và các entry của mỗi kho (`memory_store.json`), được đọc mà không thay đổi gì.

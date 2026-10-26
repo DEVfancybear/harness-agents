@@ -1849,9 +1849,16 @@ impl ToolExecutionService {
                 query,
                 limit,
                 project,
+                filter,
             } => {
+                let filter = harness_store_sqlite::HistoryFilter {
+                    since_ms: filter.since_ms,
+                    until_ms: filter.until_ms,
+                    kinds: filter.kinds.clone(),
+                    oldest_first: filter.oldest_first,
+                };
                 let hits = self
-                    .history_search(prepared, query, *limit, *project)
+                    .history_search(prepared, query, *limit, *project, &filter)
                     .await?;
                 Ok(Dispatched::plain(hits))
             }
@@ -1993,6 +2000,7 @@ impl ToolExecutionService {
         query: &str,
         limit: Option<u32>,
         project: bool,
+        filter: &harness_store_sqlite::HistoryFilter,
     ) -> Result<ToolOutput, HarnessError> {
         /// How long a search waits for the index to catch up. The newest
         /// conversations go first; the rest is caught up in the background and
@@ -2017,7 +2025,7 @@ impl ToolExecutionService {
         let wanted = limit.unwrap_or(HISTORY_SEARCH_DEFAULT_LIMIT);
         let hits = self
             .store
-            .history_search(&scope, query, usize::try_from(wanted).unwrap_or(10))
+            .history_search_filtered(&scope, query, usize::try_from(wanted).unwrap_or(10), filter)
             .await
             .map_err(store_error)?;
         let hits = match &self.history_semantic {
@@ -2034,6 +2042,7 @@ impl ToolExecutionService {
                     corpus,
                     hits,
                     usize::try_from(wanted).unwrap_or(10),
+                    filter,
                 )
                 .await
             }
@@ -2068,6 +2077,10 @@ impl ToolExecutionService {
     /// newest sources are embedded, a head of each; the vectors are kept, so
     /// a search embeds only what is new. Words alone when the embeddings fail
     /// or take too long, and the record says why.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one search: its scope, query, corpus, word hits, size and filter"
+    )]
     async fn with_meaning(
         &self,
         semantic: &dyn HistorySemantic,
@@ -2076,6 +2089,7 @@ impl ToolExecutionService {
         corpus: &str,
         words: Vec<harness_store_sqlite::HistoryHit>,
         wanted: usize,
+        filter: &harness_store_sqlite::HistoryFilter,
     ) -> Vec<harness_store_sqlite::HistoryHit> {
         /// The newest sources embedded, and how much of each.
         const SOURCES: usize = 1_500;
@@ -2124,7 +2138,11 @@ impl ToolExecutionService {
             .collect::<Vec<_>>();
         let mut found = words;
         match self.store.history_hits(scope, query, &by_meaning).await {
-            Ok(hits) => found.extend(hits),
+            // A source found by meaning holds to the same window and kinds.
+            Ok(hits) => found.extend(
+                hits.into_iter()
+                    .filter(|hit| filter.admits(&hit.source_id, &hit.kind)),
+            ),
             Err(error) => failed(error.to_string()),
         }
         harness_types::diag::info("history", "semantic")
@@ -2166,6 +2184,8 @@ impl ToolExecutionService {
             length: u64::try_from(page.bytes.len()).unwrap_or(u64::MAX),
             total_bytes: page.total_bytes,
             text: String::from_utf8_lossy(&page.bytes).into_owned(),
+            previous_source_id: page.previous_source_id,
+            next_source_id: page.next_source_id,
         })
     }
 

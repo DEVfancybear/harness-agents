@@ -56,12 +56,12 @@ pub use contracts::{
     ApprovalGrant, AskUserInput, CaptureStream, CodingToolAction, EDIT_FILE_MAX_EDITS,
     ENV_REFERENCE_PREFIX, EditSpec, EffectClass, EnvBinding, GIT_LOG_DEFAULT_LIMIT,
     GIT_LOG_MAX_LIMIT, HISTORY_READ_DEFAULT_BYTES, HISTORY_READ_MAX_BYTES,
-    HISTORY_SEARCH_DEFAULT_LIMIT, HISTORY_SEARCH_MAX_LIMIT, HistoryHitView, IsolationMode,
-    MAX_ENV_BINDINGS, PROCESS_OUTPUT_PAGE_DEFAULT_BYTES, PROCESS_OUTPUT_PAGE_MAX_BYTES,
-    PreparedToolRequest, READ_FILE_MAX_PATHS, TOOL_CONTRACT_VERSION, ToolCapabilities,
-    ToolDescriptor, ToolExecutionView, ToolKind, ToolOutput, ToolRequest, coding_tool_descriptors,
-    coding_tool_names, coding_tool_schemas, coding_tool_schemas_for, effect_class_for,
-    normalize_env_bindings,
+    HISTORY_SEARCH_DEFAULT_LIMIT, HISTORY_SEARCH_MAX_LIMIT, HistoryHitView, HistorySearchFilter,
+    IsolationMode, MAX_ENV_BINDINGS, PROCESS_OUTPUT_PAGE_DEFAULT_BYTES,
+    PROCESS_OUTPUT_PAGE_MAX_BYTES, PreparedToolRequest, READ_FILE_MAX_PATHS, TOOL_CONTRACT_VERSION,
+    ToolCapabilities, ToolDescriptor, ToolExecutionView, ToolKind, ToolOutput, ToolRequest,
+    coding_tool_descriptors, coding_tool_names, coding_tool_schemas, coding_tool_schemas_for,
+    effect_class_for, normalize_env_bindings,
 };
 // M12: the measured capability set, the probe that produces it, and the profile
 // a strict request is answered against. The vocabulary is exported because an

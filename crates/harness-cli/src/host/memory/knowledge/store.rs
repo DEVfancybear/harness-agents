@@ -468,6 +468,9 @@ impl Store {
                 }
             }
             let before = existing.map(|i| pages[i].summary.hash.clone());
+            // What the page said before, for its history.
+            let previous_text =
+                existing.map(|i| (pages[i].summary.hash.clone(), pages[i].text.clone()));
             let actual_path =
                 existing.map_or_else(|| path.clone(), |i| pages[i].summary.path.clone());
             let mut related = BTreeSet::new();
@@ -530,7 +533,7 @@ impl Store {
             let mut changes = vec![Change {
                 path: actual_path.clone(),
                 before,
-                after: Some(text),
+                after: Some(text.clone()),
             }];
             changes.push(change(root, INDEX, Some(render_index(&pages)?))?);
             add_log(
@@ -542,8 +545,137 @@ impl Store {
                 input.origin.as_deref(),
             )?;
             transact(root, changes)?;
+            remember(
+                root,
+                &super::history::Change {
+                    path: &actual_path,
+                    operation: if previous_text.is_some() {
+                        "update"
+                    } else {
+                        "insert"
+                    },
+                    cause: input.origin.as_deref().unwrap_or("write"),
+                    actor: input.origin.as_deref().unwrap_or("agent"),
+                    hash: &output.hash,
+                    title: &output.title,
+                    text: &text,
+                    before: previous_text
+                        .as_ref()
+                        .map(|(hash, text)| (hash.as_str(), text.as_str())),
+                },
+            );
             Ok(output)
         })
+    }
+
+    /// Bring back a version `history` recorded, as the page's next version:
+    /// the whole page as it then was. A deleted page comes back; a page that
+    /// exists needs its current hash. A related page the version names must
+    /// still exist, as for any write.
+    pub(crate) fn revert(
+        &self,
+        path: &str,
+        version: &str,
+        expected_hash: Option<&str>,
+        origin: Option<&str>,
+    ) -> Result<PageSummary, String> {
+        let path = page_path(path)?;
+        let event = super::history::event(&self.root, version)?
+            .ok_or("no such version of this page; history lists them")?;
+        if normalized(&event.path) != normalized(&path) {
+            return Err(format!(
+                "version {version} is of {}, not {path}",
+                event.path
+            ));
+        }
+        let text = event
+            .text
+            .ok_or("that version kept no text to bring back")?;
+        self.with_lock(|root| {
+            require_enabled(root)?;
+            let mut pages = scan(root)?;
+            let existing = pages
+                .iter()
+                .position(|p| normalized(&p.summary.path) == normalized(&path));
+            match existing {
+                Some(i) if expected_hash != Some(pages[i].summary.hash.as_str()) => {
+                    return Err(
+                        "knowledge page changed; read it again and supply its current hash to revert it"
+                            .to_owned(),
+                    );
+                }
+                Some(i) if pages[i].text == text => return Ok(pages[i].summary.clone()),
+                None if expected_hash.is_some() => {
+                    return Err("knowledge page no longer exists; revert it without expected_hash".to_owned());
+                }
+                _ => {}
+            }
+            let actual_path =
+                existing.map_or_else(|| path.clone(), |i| pages[i].summary.path.clone());
+            for target in parse_metadata(&actual_path, &text)?.related {
+                find_page(&pages, &target).map_err(|_| {
+                    format!("{actual_path} relates to {target}, which no longer exists: bring that page back first")
+                })?;
+            }
+            let mut page = parse_page(&actual_path, text.clone())?;
+            let mut admitted = pages
+                .iter()
+                .map(|p| (normalized(&p.summary.path), p.summary.path.clone()))
+                .collect::<BTreeMap<_, _>>();
+            admitted.insert(normalized(&actual_path), actual_path.clone());
+            resolve_page_links(&mut page, &admitted);
+            let output = page.summary.clone();
+            let previous = existing.map(|i| (pages[i].summary.hash.clone(), pages[i].text.clone()));
+            if let Some(i) = existing {
+                pages[i] = page;
+            } else {
+                if pages.len() >= MAX_PAGES {
+                    return Err("knowledge page limit reached".to_owned());
+                }
+                pages.push(page);
+            }
+            pages.sort_by(|a, b| a.summary.path.cmp(&b.summary.path));
+            let mut changes = vec![Change {
+                path: actual_path.clone(),
+                before: previous.as_ref().map(|(hash, _)| hash.clone()),
+                after: Some(text.clone()),
+            }];
+            changes.push(change(root, INDEX, Some(render_index(&pages)?))?);
+            add_log(root, &mut changes, "revert", &actual_path, &output.hash, origin)?;
+            transact(root, changes)?;
+            remember(
+                root,
+                &super::history::Change {
+                    path: &actual_path,
+                    operation: if previous.is_some() { "update" } else { "insert" },
+                    cause: "revert",
+                    actor: origin.unwrap_or("agent"),
+                    hash: &output.hash,
+                    title: &output.title,
+                    text: &text,
+                    before: previous
+                        .as_ref()
+                        .map(|(hash, text)| (hash.as_str(), text.as_str())),
+                },
+            );
+            Ok(output)
+        })
+    }
+
+    /// The versions of a page, of the pages under a folder (`path` ending in
+    /// `/`), or of the library, newest first.
+    pub(crate) fn history(
+        &self,
+        path: Option<&str>,
+        since: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<super::history::Event>, String> {
+        let path = match path {
+            Some(folder) if folder.ends_with('/') => Some(folder.to_owned()),
+            Some(page) => Some(page_path(page)?),
+            None => None,
+        };
+        super::history::events(&self.root, path.as_deref(), since, limit)
     }
 
     pub(crate) fn delete(&self, path: &str, expected_hash: &str) -> Result<(), String> {
@@ -563,6 +695,8 @@ impl Store {
                     referring.join(", ")
                 ));
             }
+            let removed = page.text.clone();
+            let title = page.summary.title.clone();
             pages.retain(|p| p.summary.path != path);
             let mut changes = vec![Change {
                 path: path.clone(),
@@ -571,7 +705,22 @@ impl Store {
             }];
             changes.push(change(root, INDEX, Some(render_index(&pages)?))?);
             add_log(root, &mut changes, "delete", &path, expected_hash, None)?;
-            transact(root, changes)
+            transact(root, changes)?;
+            // The page as it went, so revert can bring it back.
+            remember(
+                root,
+                &super::history::Change {
+                    path: &path,
+                    operation: "delete",
+                    cause: "delete",
+                    actor: "agent",
+                    hash: expected_hash,
+                    title: &title,
+                    text: &removed,
+                    before: None,
+                },
+            );
+            Ok(())
         })
     }
 
@@ -1662,6 +1811,17 @@ fn change(root: &Path, path: &str, after: Option<String>) -> Result<Change, Stri
     })
 }
 
+/// Record a committed change in the page history. The page is already
+/// written, so a history that cannot be written is reported, not undone.
+fn remember(root: &Path, change: &super::history::Change<'_>) {
+    if let Err(error) = super::history::record(root, change) {
+        harness_types::diag::warn("knowledge", "history_failed")
+            .field("path", change.path.to_owned())
+            .field("error", error)
+            .emit();
+    }
+}
+
 fn add_log(
     root: &Path,
     changes: &mut Vec<Change>,
@@ -2013,6 +2173,67 @@ mod tests {
         assert_eq!(store.write(update).unwrap().hash, changed.hash);
         assert_eq!(fs::read_to_string(store.root.join(LOG)).unwrap(), log);
         assert!(store.delete("a.md", "stale").is_err());
+    }
+
+    /// Every write and delete is a version with the whole page, and revert
+    /// brings one back: an earlier text of a page that exists, or a page that
+    /// was deleted.
+    #[test]
+    fn a_pages_history_reverts_an_edit_and_a_delete() {
+        let (_dir, store) = store();
+        let first = store.write(input("a.md", "first text")).unwrap();
+        let mut update = input("a.md", "second text");
+        update.expected_hash = Some(first.hash.clone());
+        let second = store.write(update).unwrap();
+        let history = store.history(Some("a.md"), None, 10).unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|event| event.operation.as_str())
+                .collect::<Vec<_>>(),
+            ["update", "insert"]
+        );
+        let first_version = history[1].id.clone();
+        // An edit taken back needs the page's current hash.
+        assert!(store.revert("a.md", &first_version, None, None).is_err());
+        let reverted = store
+            .revert("a.md", &first_version, Some(&second.hash), Some("review"))
+            .unwrap();
+        assert_eq!(reverted.hash, first.hash);
+        assert!(
+            store
+                .read("a.md", 1, 50)
+                .unwrap()
+                .content
+                .contains("first text")
+        );
+        // A deleted page comes back as it was.
+        store.delete("a.md", &first.hash).unwrap();
+        let gone = store.history(Some("a.md"), None, 10).unwrap();
+        assert_eq!(gone[0].operation, "delete");
+        assert_eq!(gone[1].cause.as_deref(), Some("revert"));
+        let back = store.revert("a.md", &gone[0].id, None, None).unwrap();
+        assert_eq!(back.hash, first.hash);
+        assert_eq!(store.history(None, None, 50).unwrap().len(), 5);
+        assert!(store.revert("a.md", "no-such-version", None, None).is_err());
+    }
+
+    /// A page written before the history began still has a version to go
+    /// back to: its first recorded change keeps the text it replaced.
+    #[test]
+    fn the_first_change_keeps_the_page_it_replaced() {
+        let (_dir, store) = store();
+        let old = store
+            .write(input("b.md", "written before history"))
+            .unwrap();
+        std::fs::remove_file(super::super::history::path(&store.root)).unwrap();
+        let mut update = input("b.md", "rewritten");
+        update.expected_hash = Some(old.hash.clone());
+        store.write(update).unwrap();
+        let history = store.history(Some("b.md"), None, 10).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].cause.as_deref(), Some("baseline"));
+        assert_eq!(history[1].hash, old.hash);
     }
 
     #[test]

@@ -1452,12 +1452,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
 name = "harness-tools"
 version = "0.8.0"
 dependencies = [
+ "chrono",
  "fancy-regex 0.16.2",
  "globset",
  "harness-providers",

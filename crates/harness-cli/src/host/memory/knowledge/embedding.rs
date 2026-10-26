@@ -487,6 +487,42 @@ fn sync_bridge<T: Send, F: std::future::Future<Output = Result<T, String>>>(
 /// Shared with history search.
 pub(crate) use harness_types::search::hybrid_fuse;
 
+/// Vectors for `inputs` from a configuration's endpoint, from code that is
+/// not async: the memory store embeds its entries with the global library's
+/// configuration. Sent in batches the endpoint takes.
+pub(crate) fn embed_sync(
+    config: &EmbeddingConfig,
+    inputs: &[String],
+) -> Result<Vec<Vec<f32>>, String> {
+    let mut vectors = Vec::with_capacity(inputs.len());
+    for batch in inputs.chunks(MAX_BATCH) {
+        vectors.extend(sync_bridge(|| request_vectors(config, batch))?);
+    }
+    Ok(vectors)
+}
+
+/// What a configuration's vectors are kept under: its endpoint and model, so
+/// vectors from another model are never compared.
+pub(crate) fn namespace_of(config: &EmbeddingConfig) -> Result<String, String> {
+    Ok(hash(
+        format!("{}\n{}", endpoint_url(&config.endpoint)?, config.model).as_bytes(),
+    ))
+}
+
+/// Cosine similarity of two vectors, in `[-1, 1]`.
+pub(crate) fn similarity(left: &[f32], right: &[f32]) -> Result<f64, String> {
+    cosine(left, right)
+}
+
+/// A vector as the caches keep it, and back.
+pub(crate) fn vector_bytes(vector: &[f32]) -> Vec<u8> {
+    encode_vector(vector)
+}
+
+pub(crate) fn vector_from_bytes(bytes: &[u8]) -> Result<Vec<f32>, String> {
+    decode_vector(bytes, bytes.len() / 4)
+}
+
 async fn index_inner(
     root: &Path,
     documents: &[EmbeddingDocument],
@@ -1182,18 +1218,77 @@ mod tests {
         assert!(late.hit.snippet.starts_with(&source_prefix));
     }
 
+    /// Weighted RRF, as memory-engine fuses: a page both channels find
+    /// outranks one that only one channel ranks first, and `min_score` holds
+    /// back meaning hits below that cosine similarity.
     #[test]
-    fn fusion_matches_cow_rank_normalization_and_preserves_single_channel_hits() {
+    fn fusion_rewards_agreement_and_keeps_single_channel_hits() {
         let lexical = vec![("shared".to_owned(), 42.0), ("keyword".to_owned(), 1.0)];
-        let vectors = vec![("semantic".to_owned(), 0.9), ("shared".to_owned(), 0.8)];
+        let vectors = vec![("semantic".to_owned(), 0.9), ("shared".to_owned(), 0.5)];
         let fused = hybrid_fuse(&lexical, &vectors, 0.7, 0.3, None);
-        assert_eq!(fused[0], ("semantic".to_owned(), 1.0));
-        assert!((fused[1].1 - 0.65).abs() < 1e-12);
-        assert_eq!(fused[2], ("keyword".to_owned(), 0.5));
-        assert_eq!(
-            hybrid_fuse(&lexical, &[], 0.7, 0.3, Some(0.6)),
-            vec![("shared".to_owned(), 1.0)]
+        let order = fused
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["shared", "semantic", "keyword"]);
+        assert!((fused[0].1 - (0.3 / 61.0 + 0.7 / 62.0)).abs() < 1e-12);
+        let strict = hybrid_fuse(&lexical, &vectors, 0.7, 0.3, Some(0.6));
+        let order = strict
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["semantic", "shared", "keyword"]);
+    }
+
+    /// A vector by what the text is about: durians, buses, or anything else.
+    fn meaning_response(inputs: &[String], _: usize) -> (u16, String) {
+        let data = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let text = text.to_lowercase();
+                let embedding = if text.contains("sầu riêng") || text.contains("có gai") {
+                    [1.0, 0.0, 0.0]
+                } else if text.contains("buýt") {
+                    [0.0, 1.0, 0.0]
+                } else {
+                    [0.0, 0.0, 1.0]
+                };
+                serde_json::json!({"index": index, "embedding": embedding})
+            })
+            .collect::<Vec<_>>();
+        (200, serde_json::json!({"data": data}).to_string())
+    }
+
+    /// Memory search by meaning with the global library's configuration: a
+    /// query sharing no word with an entry finds it, and with a query the two
+    /// arms are fused.
+    #[test]
+    fn memory_search_ranks_by_meaning_with_the_global_configuration() {
+        let fixture = Fixture::new(meaning_response);
+        let data = tempfile::tempdir().unwrap();
+        let library = data.path().join("knowledge");
+        std::fs::create_dir_all(&library).unwrap();
+        fixture.configure(&library);
+        let host = crate::interactive::memory::MemoryHost::new(data.path(), "task_1");
+        for (title, content) in [
+            ("Durian", "Sầu riêng thu hoạch vào tháng sáu."),
+            ("Bus", "Xe buýt số 9 chạy mỗi giờ."),
+            ("Tea", "Trà xanh pha ở 80 độ."),
+        ] {
+            host.search_for_test(&serde_json::json!({"action":"write","scope":"global","title":title,"content":content,"distinct":true}));
+        }
+        let found = host
+            .search_for_test(&serde_json::json!({"action":"search","semantic":"trái cây có gai"}));
+        assert_eq!(found["mode"], "semantic", "{found}");
+        assert_eq!(found["hits"][0]["title"], "Durian", "{found}");
+        let fused = host.search_for_test(&serde_json::json!({"action":"search","query":"xe buýt"}));
+        assert_eq!(fused["mode"], "hybrid", "{fused}");
+        assert_eq!(fused["hits"][0]["title"], "Bus", "{fused}");
+        let strict = host.search_for_test(
+            &serde_json::json!({"action":"search","semantic":"trái cây có gai","semantic_threshold":0.5}),
         );
+        assert_eq!(strict["hits"].as_array().unwrap().len(), 1, "{strict}");
     }
 
     #[tokio::test]

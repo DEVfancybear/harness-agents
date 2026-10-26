@@ -3,6 +3,7 @@
 pub(crate) mod console;
 pub(crate) mod console_links;
 pub(crate) mod embedding;
+pub(crate) mod history;
 pub(crate) mod store;
 mod tools;
 

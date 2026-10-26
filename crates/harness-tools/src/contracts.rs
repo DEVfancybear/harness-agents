@@ -302,7 +302,7 @@ fn allowed_fields(name: &str) -> Option<&'static [&'static str]> {
         "run_shell" => &["command", "timeout_ms", "isolation", "env"],
         "git_status" => &[],
         "read_process_output" => &["artifact_id", "stream", "offset", "length"],
-        "history_search" => &["query", "limit", "scope"],
+        "history_search" => &["query", "limit", "scope", "since", "until", "kind", "order"],
         "history_read" => &["source_id", "offset", "length", "scope"],
         "git_log" => &["path", "limit"],
         "task_update" => &["note"],
@@ -576,13 +576,17 @@ pub fn history_tool_schemas() -> Vec<Value> {
             json!({
                 "query": string_schema(),
                 "limit": {"type": "integer", "minimum": 1, "maximum": HISTORY_SEARCH_MAX_LIMIT},
-                "scope": {"type": "string", "enum": ["task", "project"], "description": "task (default): this conversation; project: every conversation in this project."}
+                "scope": {"type": "string", "enum": ["task", "project"], "description": "task (default): this conversation; project: every conversation in this project."},
+                "since": {"type": "string", "description": "Only sources written at or after this time (2026-10-26T09:30:00Z, or a date)."},
+                "until": {"type": "string", "description": "Only sources written before this time."},
+                "kind": {"description": "Only these kinds of sources (the kind a hit shows, such as a user or assistant message): one or a list.", "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                "order": {"type": "string", "enum": ["newest", "oldest"], "description": "Which come first among equally good hits (default newest)."}
             }),
             &["query"],
         ),
         function_schema(
             "history_read",
-            "Read one exact page of an indexed journal source. A source from another conversation of this project needs scope \"project\".",
+            "Read one exact page of an indexed journal source; the page names the sources just before and after it in the same conversation (previous/next), to read on without searching. A source from another conversation of this project needs scope \"project\".",
             json!({
                 "source_id": string_schema(),
                 "offset": {"type": "integer", "minimum": 0},
@@ -757,6 +761,9 @@ pub enum CodingToolAction {
         limit: Option<u32>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         project: bool,
+        /// A window of time, kinds of sources and an order, when given.
+        #[serde(default, skip_serializing_if = "HistorySearchFilter::is_empty")]
+        filter: HistorySearchFilter,
     },
     /// Read one exact page of an indexed journal source.
     HistoryRead {
@@ -1085,6 +1092,7 @@ impl CodingToolAction {
                     query,
                     limit,
                     project: parse_history_scope(object.get("scope"), "history_search")?,
+                    filter: HistorySearchFilter::parse(object)?,
                 })
             }
             "history_read" => {
@@ -1474,6 +1482,99 @@ fn parse_env_bindings(
     normalize_env_bindings(&bindings)
 }
 
+/// `history_search`'s window of time, kinds of sources and order: memory-engine's
+/// time and attribute filters, on the journal.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HistorySearchFilter {
+    /// Sources written at or after this time, in milliseconds since the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
+    /// Sources written before this time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ms: Option<u64>,
+    /// Only these journal event types.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+    /// Equal scores oldest first.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub oldest_first: bool,
+}
+
+impl HistorySearchFilter {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `since`, `until` (an RFC 3339 time or a date), `kind` (a journal event
+    /// type or a list of them) and `order` (`newest` or `oldest`).
+    fn parse(object: &serde_json::Map<String, Value>) -> Result<Self, harness_types::HarnessError> {
+        let invalid = |message: String| {
+            harness_types::HarnessError::new(harness_types::ErrorCode::InvalidPayload, message)
+        };
+        let time = |key: &str| -> Result<Option<u64>, harness_types::HarnessError> {
+            match object.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(text)) => {
+                    let text = text.trim();
+                    let at = chrono::DateTime::parse_from_rfc3339(text)
+                        .map(|time| time.timestamp_millis())
+                        .or_else(|_| {
+                            chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map(|date| {
+                                date.and_hms_opt(0, 0, 0)
+                                    .map_or(0, |midnight| midnight.and_utc().timestamp_millis())
+                            })
+                        })
+                        .map_err(|_| {
+                            invalid(format!(
+                                "provider history_search {key} is a time such as 2026-10-26T09:30:00Z or a date such as 2026-10-26"
+                            ))
+                        })?;
+                    Ok(Some(u64::try_from(at).unwrap_or(0)))
+                }
+                Some(_) => Err(invalid(format!(
+                    "provider history_search {key} must be a string"
+                ))),
+            }
+        };
+        let kinds = match object.get("kind") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::String(kind)) => vec![kind.trim().to_owned()],
+            Some(Value::Array(kinds)) => kinds
+                .iter()
+                .map(|kind| {
+                    kind.as_str()
+                        .map(|kind| kind.trim().to_owned())
+                        .ok_or_else(|| {
+                            invalid("provider history_search kind holds strings".to_owned())
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => {
+                return Err(invalid(
+                    "provider history_search kind is a source kind or a list of them".to_owned(),
+                ));
+            }
+        };
+        let oldest_first = match object.get("order") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(order)) if order == "newest" => false,
+            Some(Value::String(order)) if order == "oldest" => true,
+            Some(_) => {
+                return Err(invalid(
+                    "provider history_search order is \"newest\" or \"oldest\"".to_owned(),
+                ));
+            }
+        };
+        Ok(Self {
+            since_ms: time("since")?,
+            until_ms: time("until")?,
+            kinds,
+            oldest_first,
+        })
+    }
+}
+
 /// `scope`: `task` (or none) is this conversation, `project` every
 /// conversation of the project.
 fn parse_history_scope(
@@ -1857,6 +1958,11 @@ pub enum ToolOutput {
         length: u64,
         total_bytes: u64,
         text: String,
+        /// The sources before and after it in its conversation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_source_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_source_id: Option<String>,
     },
     Git {
         operation: String,
