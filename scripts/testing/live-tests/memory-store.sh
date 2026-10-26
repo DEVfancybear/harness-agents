@@ -124,29 +124,22 @@ run_exec m11 "Dùng tool memory action delete_tree với tree '/global/platform'
 check "a dry run deletes nothing" '[ -n "$(row memory queue-choice)" ]'
 
 echo "################ 9. P3: filters, and search by meaning"
-# What the memory tool answered in the turn whose prompt holds $1, decoded.
-tool_result() { "$PY" - "$D" "$1" <<'EOF'
+# What the tools answered, as the model read them, in the run whose prompt holds
+# $1: the journal's receipts of that session.
+cat > "$RX/receipts.py" <<'EOF'
 import glob, json, os, sqlite3, sys
 sys.stdout.reconfigure(encoding="utf-8")
-found = None
 for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
-    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests order by rowid"):
-        if sys.argv[2] in text:
-            found = text
-def walk(value):
-    if isinstance(value, str):
-        if value.startswith("memory: "):
-            print(value)
-    elif isinstance(value, dict):
-        for item in value.values():
-            walk(item)
-    elif isinstance(value, list):
-        for item in value:
-            walk(item)
-if found:
-    walk(json.loads(found))
+    rows = sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute(
+        "select session_id, event_json from events order by session_id, sequence").fetchall()
+    sessions = {session for session, text in rows
+                if json.loads(text)["event_type"] == "input.admitted" and sys.argv[2] in text}
+    for session, text in rows:
+        event = json.loads(text)
+        if session in sessions and event["event_type"] == "receipt.recorded":
+            print((event["payload"].get("model_view") or {}).get("text", "").replace("\n", "\\n"))
 EOF
-}
+tool_result() { "$PY" "$RX/receipts.py" "$D" "$1"; }
 run_exec m12 "Kiểm thử: gọi tool memory action search đúng một lần với meta {\"type\": \"decision\"} và không có query. Không gọi tool nào khác. MARKER_META. Báo các id tìm được."
 check "a search by meta alone browses" 'tool_result MARKER_META | grep -q "\"mode\":\"filter\"" && tool_result MARKER_META | grep -q "queue-choice"'
 run_exec m13 "Kiểm thử: gọi tool memory action search đúng một lần với meta_predicate '\$.confidence == \"high\" && !exists(\$.archived)' và không có query. Không gọi tool nào khác. MARKER_PREDICATE. Báo các id tìm được."
@@ -210,24 +203,19 @@ check "one search read memory and knowledge" 'tool_result MARKER_SOURCES | grep 
 cat > "$RX/history_results.py" <<'EOF'
 import glob, json, os, re, sqlite3, sys
 sys.stdout.reconfigure(encoding="utf-8")
-found = None
-for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
-    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests order by rowid"):
-        if sys.argv[2] in text:
-            found = text
+# The history tools' receipts in the run whose prompt holds the marker.
 results = []
-def walk(value):
-    if isinstance(value, str):
-        if value.startswith("history_search") or value.startswith("history_read"):
-            results.append(value)
-    elif isinstance(value, dict):
-        for item in value.values():
-            walk(item)
-    elif isinstance(value, list):
-        for item in value:
-            walk(item)
-if found:
-    walk(json.loads(found))
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    rows = sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute(
+        "select session_id, event_json from events order by session_id, sequence").fetchall()
+    sessions = {session for session, text in rows
+                if json.loads(text)["event_type"] == "input.admitted" and sys.argv[2] in text}
+    for session, text in rows:
+        event = json.loads(text)
+        if session in sessions and event["event_type"] == "receipt.recorded":
+            view = (event["payload"].get("model_view") or {}).get("text", "")
+            if view.startswith("history_search") or view.startswith("history_read"):
+                results.append(view)
 mode = sys.argv[3]
 if mode == "filtered":
     # A search whose hits are all of one kind, and another whose hits are not.

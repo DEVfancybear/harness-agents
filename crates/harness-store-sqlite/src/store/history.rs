@@ -200,11 +200,13 @@ pub struct HistoryFilter {
 
 impl HistoryFilter {
     /// The least source id written at `ms`: a source id is the journal
-    /// event's `evt_<UUIDv7>`, whose head is its time, so ids order as times.
+    /// event's id, `event_<UUIDv7>`, whose head is its time, so ids order as
+    /// times.
     #[must_use]
     pub fn id_at(ms: u64) -> String {
         format!(
-            "evt_{:08x}-{:04x}-7000-0000-000000000000",
+            "{}_{:08x}-{:04x}-7000-0000-000000000000",
+            harness_types::EventId::PREFIX,
             (ms >> 16) & 0xffff_ffff,
             ms & 0xffff
         )
@@ -1699,13 +1701,12 @@ mod tests {
         store.close().await.expect("close");
     }
 
-    /// A source id is `evt_<UUIDv7>`, whose head is its time: a time window
-    /// is a range of ids, compared as text.
+    /// A source id is the journal event's id, whose head is its time: a time
+    /// window is a range of ids, compared as text.
     #[test]
     fn a_time_window_is_a_range_of_source_ids() {
         let at = 1_790_000_000_000_u64;
-        let uuid = uuid_at(at);
-        let source = format!("evt_{uuid}");
+        let source = event_at(at);
         assert!(source >= HistoryFilter::id_at(at));
         assert!(source < HistoryFilter::id_at(at + 1));
         let filter = HistoryFilter {
@@ -1716,20 +1717,21 @@ mod tests {
         };
         assert!(filter.admits(&source, "user_message"));
         assert!(!filter.admits(&source, "tool_result"));
-        assert!(!filter.admits(&format!("evt_{}", uuid_at(at + 5_000)), "user_message"));
-        assert!(!filter.admits(&format!("evt_{}", uuid_at(at - 5_000)), "user_message"));
+        assert!(!filter.admits(&event_at(at + 5_000), "user_message"));
+        assert!(!filter.admits(&event_at(at - 5_000), "user_message"));
         assert!(HistoryFilter::default().admits(&source, "anything"));
     }
 
-    /// A v7 UUID made at `ms`, as the journal makes them.
-    fn uuid_at(ms: u64) -> String {
-        uuid::Uuid::new_v7(uuid::Timestamp::from_unix(
+    /// An event id made at `ms`, as the journal makes them.
+    fn event_at(ms: u64) -> String {
+        let uuid = uuid::Uuid::new_v7(uuid::Timestamp::from_unix(
             uuid::NoContext,
             ms / 1_000,
             u32::try_from((ms % 1_000) * 1_000_000).expect("nanos"),
-        ))
-        .hyphenated()
-        .to_string()
+        ));
+        harness_types::EventId::from_uuid(uuid)
+            .expect("event id")
+            .to_string()
     }
 
     #[test]
