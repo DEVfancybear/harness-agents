@@ -146,7 +146,13 @@ CRASH=$("$PY" "$E" secret "$RX/c-crashseed.answer") || exit 2
 printf '%s\n' "$CRASH" > "$RX/response-secret.fixture"
 need "$PY" "$E" durable "$RX/c-crashseed.binding.json" "$CRASH" "$RX/durable-before-crash.json"
 need clean
-need "$HA" list --json > "$RX/pre-crash-list.json"
+# The answer is in the journal a moment before the worker marks the turn over:
+# wait, bounded, for the agent to be listed idle before killing its worker.
+for _ in $(seq 60); do
+  need "$HA" list --json > "$RX/pre-crash-list.json"
+  "$PY" -c "import json,sys; d=json.load(open(sys.argv[1])); a=d if isinstance(d,list) else d['agents']; sys.exit(not any(x.get('name')=='c-crashseed' and x['status']=='ready' and not x['busy'] for x in a))" "$RX/pre-crash-list.json" && break
+  sleep 0.5
+done
 need "$PY" "$E" kill-worker "$HA_HOME" "$RX/c-crashseed.binding.json" "$HA" "$RX/pre-crash-list.json" "$RX/abrupt-worker.json"
 # No fixed recovery sleep: use env.sh agent()'s bounded PTY startup/list readiness.
 # This tests abrupt worker failure, NOT killing the supervisor or whole host.

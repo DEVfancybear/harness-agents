@@ -23,6 +23,17 @@ for module in range(1, 5):
     open(os.path.join(sys.argv[1], f"m{module}.txt"), "w", encoding="utf-8").write("\n".join(lines) + "\n")
 EOF
 (cd "$P" && git add -A && git -c user.name=t -c user.email=t@t commit -qm inputs)
+# 0.8.1: a 0.8 state file the first turn imports into the global memory store,
+# which the report then carries as memory_store.json.
+mkdir -p "$HA_HOME/data/harness"
+"$PY" - "$HA_HOME/data/harness" <<'EOF'
+import json, os, sys
+entry = {"id": "diag_seed", "kind": "memory", "title": "Diag seed", "content": "The diag suite seeded this entry.",
+         "scope": "global", "version": 1, "source": "agent",
+         "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z"}
+json.dump({"schema": 1, "entries": {"memory": {"diag_seed": entry}}},
+          open(os.path.join(sys.argv[1], "harness_state.json"), "w", encoding="utf-8"))
+EOF
 
 # records <role> <python condition on r>: how many records of that role's files match.
 records() { "$PY" - "$D" "$1" "$2" <<'EOF'
@@ -132,6 +143,7 @@ check "it names the store another run held" 'grep -q "store.open_failed" "$S"'
 check "it names the refused provider" 'grep -Eqi "provider|no-such-model" "$S"'
 check "its timeline has the turns and the compaction" 'grep -q "turn.start" "$RX/report/timeline.jsonl" && grep -q "compaction\." "$RX/report/timeline.jsonl"'
 check "it holds the stores and the workers' logs" 'ls "$RX"/report/store/project-*.json >/dev/null && ls "$RX"/report/workers/*.log >/dev/null'
+check "it holds the global memory store, read from the store" '"$PY" -c "import json,sys; d=json.load(open(sys.argv[1],encoding=\"utf-8\")); sys.exit(\"diag_seed\" not in json.dumps(d))" "$RX/report/harness/global/memory_store.json"'
 check "its summary has the turns and the model calls" 'grep -q "^## Turns" "$S" && grep -q "^## Model calls" "$S"'
 # 0.7.8: `turn.start` named a model only when the turn chose one.
 check "an agent's turn recorded the model it ran on" '[ "$(records worker "r[\"kind\"]==\"turn\" and r[\"event\"]==\"model\" and \"/\" in f.get(\"model\",\"\")")" -ge 1 ]'
