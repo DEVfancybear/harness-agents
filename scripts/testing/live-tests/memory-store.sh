@@ -93,7 +93,9 @@ run_exec m4 "Tìm trong memory (tool memory action search) mã khuyến mãi mù
 check "search still finds the ended entry" 'answer m4 | grep -q "SPRING10"'
 
 echo "################ 4. a create that replaces the entry its name holds"
-run_exec m5 "Dùng tool memory action write với đúng các tham số: tree '/global/team/decisions', name 'queue-choice', title 'Hàng đợi', content 'Đội chuyển sang NATS JetStream làm hàng đợi.', on_conflict 'replace'. Không đọc trước, không làm gì khác. Trả lời: đã ghi."
+# 0.8.2: replace takes the entry whole, as memory-engine does, so the write
+# gives the meta the later searches look for.
+run_exec m5 "Dùng tool memory action write với đúng các tham số: tree '/global/team/decisions', name 'queue-choice', title 'Hàng đợi', content 'Đội chuyển sang NATS JetStream làm hàng đợi.', meta {\"type\": \"decision\", \"confidence\": \"high\"}, on_conflict 'replace'. Không đọc trước, không làm gì khác. Trả lời: đã ghi."
 check "the entry was replaced in place, at version 2" 'row memory queue-choice | grep -q "|2|Đội chuyển sang NATS JetStream"'
 check "and is still one entry" '[ "$("$PY" "$MEMORY_STORE" rows "$G" memory | grep -ac "Hàng đợi\|NATS\|Redis")" -eq 1 ]'
 
@@ -144,6 +146,19 @@ for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3"
             print((event["payload"].get("model_view") or {}).get("text", "").replace("\n", "\\n"))
 EOF
 tool_result() { "$PY" "$RX/receipts.py" "$D" "$1"; }
+# Every event of that session, as JSON text.
+cat > "$RX/session.py" <<'EOF'
+import glob, json, os, sqlite3, sys
+sys.stdout.reconfigure(encoding="utf-8")
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    rows = sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute(
+        "select session_id, event_json from events order by session_id, sequence").fetchall()
+    sessions = {session for session, text in rows
+                if json.loads(text)["event_type"] == "input.admitted" and sys.argv[2] in text}
+    for session, text in rows:
+        if session in sessions:
+            print(text)
+EOF
 run_exec m12 "Kiểm thử: gọi tool memory action search đúng một lần với meta {\"type\": \"decision\"} và không có query. Không gọi tool nào khác. MARKER_META. Báo các id tìm được."
 check "a search by meta alone browses" 'tool_result MARKER_META | grep -q "\"mode\":\"filter\"" && tool_result MARKER_META | grep -q "queue-choice"'
 run_exec m13 "Kiểm thử: gọi tool memory action search đúng một lần với meta_predicate '\$.confidence == \"high\" && !exists(\$.archived)' và không có query. Không gọi tool nào khác. MARKER_PREDICATE. Báo các id tìm được."
@@ -239,8 +254,8 @@ run_exec m20 "Dùng tool memory action write với đúng các tham số: tree '
 run_exec m21 "Dùng tool memory: đọc entry jwt-rotation để lấy version, rồi write với id 'jwt-rotation', expected_version đó và content 'JWT keys rotate every 14 days.' (không đổi title, không truyền name). Trả lời: đã cập nhật."
 check "an update keeps the name it was given" 'row memory jwt-rotation | grep -q "|/global/infra|.*every 14 days"'
 run_exec m22 "Kiểm thử: dùng tool memory: đọc entry jwt-rotation để lấy version, rồi gọi write với id 'jwt-rotation', expected_version đó và chỉ meta {\"owner\": \"platform\"} - KHÔNG truyền content hay title. MARKER_PATCH. Báo kết quả của lần write."
-check "an update changes only what it gives" 'row memory jwt-rotation | grep -q "\"owner\": *\"platform\".*every 14 days" && ! tool_result MARKER_PATCH | grep -q "needs content"'
-run_exec m23 "Dùng tool memory action write với đúng các tham số: tree '/global/apps', name 'jwt-rotation', title 'JWT app', content 'The mobile app refreshes its JWT session every hour.'. Không làm gì khác. Báo id và name mà tool trả về."
+check "an update changes only what it gives" 'row memory jwt-rotation | grep -q "\"owner\": *\"platform\".*every 14 days" && ! "$PY" "$RX/session.py" "$D" MARKER_PATCH | grep -q "needs content"'
+run_exec m23 "Dùng tool memory action write với đúng các tham số: tree '/global/apps', name 'jwt-rotation', title 'Mobile login', content 'The mobile app keeps its login in the operating system keychain.', distinct true. Không làm gì khác. Báo id và name mà tool trả về."
 apps=$("$PY" "$MEMORY_STORE" named "$G" memory /global/apps jwt-rotation)
 check "another tree holds the same name" '[ -n "$apps" ] && [ "$apps" != "jwt-rotation" ]'
 run_exec m24 "Kiểm thử: dùng tool memory action search với query 'JWT rotate' để lấy memory_id của entry ở tree /global/infra, rồi gọi read với id là chính memory_id đó (không dùng id thường). MARKER_UUID. Báo memory_id và content đọc được."
@@ -265,7 +280,8 @@ check "an lquery % word matches anywhere in a label" 'tool_result MARKER_WORDS |
 run_exec m28 "Kiểm thử: gọi tool memory action search đúng một lần với meta_predicate '\$.due.datetime() < \"2026-12-01\".datetime()' và không có query. Không gọi tool nào khác. MARKER_DATETIME. Báo id các kết quả."
 check "a JSONPath predicate compares datetimes" 'tool_result MARKER_DATETIME | grep -q "audit_due"'
 run_exec m29 "Kiểm thử: gọi tool memory action search đúng một lần với meta_predicate '\$.owner.lowercase() == \"platform\"' và không có query. Không gọi tool nào khác. MARKER_METHOD. Báo nguyên văn kết quả hoặc lỗi."
-check "an unknown JSONPath method is refused" 'tool_result MARKER_METHOD | grep -q "not a method"'
+# A call refused before it runs leaves no receipt: read the whole session.
+check "an unknown JSONPath method is refused" '"$PY" "$RX/session.py" "$D" MARKER_METHOD | grep -q "not a method"'
 run_exec m30 "Kiểm thử: gọi tool memory action search đúng một lần với query 'deploy', sources ['memory', 'knowledge'] và tree '/knowledge/project/ops'. Không gọi tool nào khác. MARKER_KTREE. Báo nguồn và tree của từng kết quả."
 check "a tree filter reaches knowledge pages" 'tool_result MARKER_KTREE | grep -q "\"tree\":\"/knowledge/project/ops\""'
 run_exec m31 "Kiểm thử: gọi tool knowledge action history với path 'ops/deploy.md' (scope project), chọn phiên bản có operation update xảy ra sớm nhất, rồi gọi lại knowledge action history với path đó và version là id của phiên bản ấy để đọc nguyên văn trang lúc đó. MARKER_OLDPAGE. Báo nội dung trang ở phiên bản đó."
