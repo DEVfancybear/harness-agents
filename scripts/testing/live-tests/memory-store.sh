@@ -105,6 +105,19 @@ check "replaced by the model" 'events | grep -q "^update|update|model|queue-choi
 check "deleted by the model" 'events | grep -q "^delete|delete|model|queue-choice|v2|"'
 check "reverted by the model" 'events | grep -q "^insert|revert|model|queue-choice|v3|"'
 
+echo "################ 8. P2: the tree, a move that keeps each entry, the history feed"
+run_exec m8 "Dùng tool memory action tree (không cần tham số khác) rồi liệt kê ngắn các nhánh cây trong global và mỗi nhánh có bao nhiêu entry."
+check "the model read the tree" 'answer m8 | grep -q "team/decisions\|decisions"'
+before=$(row memory queue-choice | cut -d'|' -f1)
+run_exec m9 "Dùng tool memory action move với source '/global/team', destination '/global/platform', dry_run false. Không làm gì khác. Trả lời: số entry đã chuyển."
+check "the entry moved to the new tree" 'row memory queue-choice | grep -q "|/global/platform/decisions|"'
+check "and is the same memory" '[ "$(row memory queue-choice | cut -d"|" -f1)" = "$before" ]'
+check "the move is an event by the model" 'events | grep -q "^update|move|model|queue-choice|"'
+run_exec m10 "Dùng tool memory action history với tree '/global/platform' (không truyền id) và cho biết thay đổi mới nhất ở nhánh đó là thao tác gì (operation, cause) và lúc nào."
+check "the model read the feed of that tree" 'answer m10 | grep -qi "move\|chuyển\|di chuyển"'
+run_exec m11 "Dùng tool memory action delete_tree với tree '/global/platform' và dry_run true, rồi báo bao nhiêu entry sẽ bị xóa. Không xóa thật."
+check "a dry run deletes nothing" '[ -n "$(row memory queue-choice)" ]'
+
 echo "################ 7. ha memory export"
 "$HA" memory export > "$RX/export.json" 2>"$RX/export.err"
 check "it exports the global store" '"$PY" -c "import json,sys; d=json.load(open(sys.argv[1],encoding=\"utf-8\")); sys.exit(0 if \"queue-choice\" in d[\"document\"][\"entries\"][\"memory\"] and d[\"document\"][\"refinements\"][0][\"id\"] == \"refine_0001\" else 1)" "$RX/export.json"'

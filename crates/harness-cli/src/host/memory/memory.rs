@@ -42,6 +42,19 @@ const ON_CONFLICT: [&str; 3] = ["error", "replace", "ignore"];
 const MAX_NAME_CHARS: usize = 128;
 /// The earlier versions `history` shows.
 const HISTORY_SHOWN: usize = 10;
+/// The events a page of the history feed holds, and the most one may.
+const DEFAULT_FEED: usize = 20;
+const MAX_FEED: usize = 1_000;
+/// The actions that change memory, which a delegated child may not take.
+const WRITES: [&str; 7] = [
+    "write",
+    "delete",
+    "restore",
+    "revert",
+    "move",
+    "copy",
+    "delete_tree",
+];
 /// How alike a new entry may be to a kept one before it is refused as the same
 /// fact (weighted share of their words), and from when one is named as related.
 const DUPLICATE_SIMILARITY: f64 = 0.6;
@@ -305,7 +318,13 @@ impl MemoryHost {
         if optional_text(arguments, "path")?.is_some() {
             return Err("give tree or path, not both".to_owned());
         }
-        let tree = tree.trim();
+        self.parse_tree(tree).map(Some)
+    }
+
+    /// The scope a tree names (none for a relative one) and the path below
+    /// that scope's root.
+    fn parse_tree(&self, tree: &str) -> Result<(Option<&'static str>, String), String> {
+        let tree = tree.trim().trim_end_matches('/');
         let valid = |labels: &[&str]| {
             labels.iter().all(|label| {
                 !label.is_empty()
@@ -319,7 +338,7 @@ impl MemoryHost {
             if !valid(&labels) {
                 return Err(TREE_LABELS.to_owned());
             }
-            return Ok(Some((None, tree.to_owned())));
+            return Ok((None, tree.to_owned()));
         };
         let labels = absolute.split('/').collect::<Vec<_>>();
         let (scope, rest) = match labels.as_slice() {
@@ -353,7 +372,21 @@ impl MemoryHost {
         if !rest.is_empty() && !valid(rest) {
             return Err(TREE_LABELS.to_owned());
         }
-        Ok(Some((Some(scope), rest.join("/"))))
+        if scope == "project" && self.project.is_none() {
+            return Err("this conversation has no project, so no project entries".to_owned());
+        }
+        Ok((Some(scope), rest.join("/")))
+    }
+
+    /// The tree a scope's entries hang from, as this host sees it.
+    fn scope_root(&self, scope: &str) -> String {
+        match (scope, &self.project) {
+            ("local", _) => "/local".to_owned(),
+            ("project", Some(project)) => {
+                format!("/projects/{}", super::memory_store::label(&project.key))
+            }
+            _ => "/global".to_owned(),
+        }
     }
 
     /// Whether `kind:id` is taken in `scope`.
@@ -364,7 +397,7 @@ impl MemoryHost {
 
     fn check(&self, arguments: &Value) -> Result<(), String> {
         let action = text(arguments, "action")?;
-        if self.read_only && matches!(action, "write" | "delete" | "restore" | "revert") {
+        if self.read_only && WRITES.contains(&action) {
             return Err(
                 "memory is read-only for a delegated agent: report what should be kept to the parent"
                     .to_owned(),
@@ -374,7 +407,10 @@ impl MemoryHost {
         kinds(arguments)?;
         match action {
             "list" => Ok(()),
-            "history" => text(arguments, "id").map(|_| ()),
+            "history" if optional_text(arguments, "id")?.is_some() => Ok(()),
+            "history" | "tree" | "count" | "move" | "copy" | "delete_tree" => {
+                self.check_organizing(action, arguments)
+            }
             "restore" | "revert" => {
                 text(arguments, "id")?;
                 if !matches!(arguments.get("version"), None | Some(Value::Null))
@@ -456,8 +492,60 @@ impl MemoryHost {
                 needs_version(arguments)
             }
             other => Err(format!(
-                "unknown memory action {other:?}; use list, search, read, write, delete, history or revert"
+                "unknown memory action {other:?}; use list, search, read, write, delete, history, revert, tree, count, move, copy or delete_tree"
             )),
+        }
+    }
+
+    /// The arguments of the history feed and of the actions on a tree.
+    fn check_organizing(&self, action: &str, arguments: &Value) -> Result<(), String> {
+        match action {
+            "history" => {
+                if ["tree", "operation_id", "since"]
+                    .iter()
+                    .all(|key| arguments.get(*key).is_none_or(Value::is_null))
+                {
+                    return Err(
+                        "history needs an id, or for the feed a tree, an operation_id or since"
+                            .to_owned(),
+                    );
+                }
+                if optional_text(arguments, "tree")?.is_some() {
+                    self.absolute(arguments, "tree")?;
+                }
+                if let Some(operation) = optional_text(arguments, "operation")?
+                    && !matches!(operation, "insert" | "update" | "delete")
+                {
+                    return Err("operation is insert, update or delete".to_owned());
+                }
+                for key in ["since", "until"] {
+                    if let Some(time) = optional_text(arguments, key)? {
+                        super::memory_store::instant(time)?;
+                    }
+                }
+                Ok(())
+            }
+            "tree" => {
+                if optional_text(arguments, "tree")?.is_some() {
+                    self.absolute(arguments, "tree")?;
+                }
+                Ok(())
+            }
+            "count" => self.absolute(arguments, "tree").map(|_| ()),
+            _ => {
+                if action == "delete_tree" {
+                    self.absolute(arguments, "tree")?;
+                } else {
+                    self.absolute(arguments, "source")?;
+                    self.absolute(arguments, "destination")?;
+                }
+                if arguments.get("dry_run").and_then(Value::as_bool).is_none() {
+                    return Err(format!(
+                        "{action} needs dry_run: true to see what it would change, false to change it"
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -510,7 +598,13 @@ impl MemoryHost {
             "search" => Ok(self.search(arguments)?),
             "read" => self.read(arguments),
             "write" => self.write(arguments),
-            "history" => self.history(arguments),
+            "history" if optional_text(arguments, "id")?.is_some() => self.history(arguments),
+            "history" => self.history_feed(arguments),
+            "tree" => self.tree(arguments),
+            "count" => self.count(arguments),
+            "move" => self.relocate(arguments, false),
+            "copy" => self.relocate(arguments, true),
+            "delete_tree" => self.delete_tree(arguments),
             "restore" | "revert" => self.restore(arguments),
             _ => self.delete(arguments),
         }
@@ -585,12 +679,24 @@ impl MemoryHost {
     }
 
     /// The scopes an id may be in, and the id itself: a `global:`, `local:`
-    /// or `project:` prefix names its scope, else the scope argument.
+    /// or `project:` prefix names its scope, as does memory-engine's path
+    /// address `<tree>/<name>` (`/global/team/decisions/queue-choice`); else
+    /// the scope argument.
     fn id_scopes<'a>(
         &self,
         raw: &'a str,
         arguments: &Value,
     ) -> Result<(Vec<&'static str>, &'a str), String> {
+        if raw.starts_with('/') {
+            let (tree, name) = raw
+                .rsplit_once('/')
+                .filter(|(tree, name)| !tree.is_empty() && !name.is_empty())
+                .ok_or(
+                    "a path address is <tree>/<name>, such as /global/team/decisions/queue-choice",
+                )?;
+            let (scope, _) = self.parse_tree(tree)?;
+            return Ok((scope.into_iter().collect(), name));
+        }
         match raw.split_once(':') {
             Some((scope, rest)) if SCOPES.contains(&scope) => {
                 let scope = self
@@ -610,10 +716,19 @@ impl MemoryHost {
     fn locate(&self, arguments: &Value) -> Result<(String, String, String), String> {
         let raw = text(arguments, "id")?.trim();
         let (wanted_scopes, id) = self.id_scopes(raw, arguments)?;
+        // A path address names the tree too.
+        let tree = raw
+            .starts_with('/')
+            .then(|| {
+                raw.rsplit_once('/')
+                    .map(|(tree, _)| tree.trim_end_matches('/'))
+            })
+            .flatten();
         let found = self
             .entries(&wanted_scopes, &kinds(arguments)?)
             .into_iter()
             .filter(|entry| entry.id == id || entry.aliases.iter().any(|alias| alias == id))
+            .filter(|entry| tree.is_none_or(|tree| entry.tree == tree))
             .collect::<Vec<_>>();
         // The entry itself before one an earlier title renamed.
         let found = if found.len() > 1 && found.iter().any(|entry| entry.id == id) {
@@ -651,7 +766,10 @@ impl MemoryHost {
             "id": id,
             "title": entry["title"],
             "path": entry.get("path").cloned().unwrap_or_else(|| json!("general")),
-            "tree": super::memory_store::tree_for(super::memory_store::root_of(dir), entry),
+            "tree": super::memory_store::tree_for(
+                if scope == "local" { "/local" } else { super::memory_store::root_of(dir) },
+                entry,
+            ),
             "version": entry["version"].as_i64().unwrap_or(1),
             "version_hash": super::memory_store::version_hash(super::memory_store::root_of(dir), &kind, &id, entry),
             "content": entry["content"],
@@ -1309,6 +1427,363 @@ impl MemoryHost {
         Ok(())
     }
 
+    /// Every entry of the kinds this tool keeps, in every scope it sees.
+    fn all_entries(&self) -> Vec<Entry> {
+        self.entries(&self.all_scopes(), &KINDS)
+    }
+
+    /// The absolute tree an argument names, without a trailing slash.
+    fn absolute(&self, arguments: &Value, key: &str) -> Result<String, String> {
+        let tree = text(arguments, key)?.trim().trim_end_matches('/');
+        if !tree.starts_with('/') {
+            return Err(format!(
+                "{key} is an absolute tree, such as {}/team",
+                self.scope_root("global")
+            ));
+        }
+        self.parse_tree(tree)?;
+        Ok(tree.to_owned())
+    }
+
+    /// `tree`: the tree of entries with counts at each node, under `tree`
+    /// when given, at most `levels` below it.
+    fn tree(&self, arguments: &Value) -> Result<Value, String> {
+        let root = match optional_text(arguments, "tree")? {
+            Some(_) => Some(self.absolute(arguments, "tree")?),
+            None => None,
+        };
+        let levels = arguments
+            .get("levels")
+            .and_then(Value::as_u64)
+            .and_then(|levels| usize::try_from(levels).ok());
+        let entries = self
+            .all_entries()
+            .into_iter()
+            .filter(|entry| root.as_deref().is_none_or(|root| under(&entry.tree, root)))
+            .collect::<Vec<_>>();
+        let base = root.as_deref().map_or(0, |root| labels(root).len());
+        let mut nodes = std::collections::BTreeMap::<String, (usize, usize)>::new();
+        for entry in &entries {
+            let path = labels(&entry.tree);
+            for end in 1..=path.len() {
+                if levels.is_some_and(|levels| end > base + levels) {
+                    break;
+                }
+                let node = format!("/{}", path[..end].join("/"));
+                if root.as_deref().is_some_and(|root| !under(&node, root)) {
+                    continue;
+                }
+                let counts = nodes.entry(node).or_default();
+                counts.1 += 1;
+                if end == path.len() {
+                    counts.0 += 1;
+                }
+            }
+        }
+        Ok(json!({
+            "tree": root.as_deref().unwrap_or("/"),
+            "total": entries.len(),
+            "nodes": nodes
+                .into_iter()
+                .map(|(tree, (here, total))| json!({"tree": tree, "entries": total, "here": here}))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// `count`: how many entries a tree filter matches, at most `max_count`.
+    fn count(&self, arguments: &Value) -> Result<Value, String> {
+        let tree = self.absolute(arguments, "tree")?;
+        let count = self
+            .all_entries()
+            .iter()
+            .filter(|entry| under(&entry.tree, &tree))
+            .count();
+        let most = arguments
+            .get("max_count")
+            .and_then(Value::as_u64)
+            .and_then(|most| usize::try_from(most).ok());
+        let mut counted =
+            json!({"tree": tree, "count": most.map_or(count, |most| count.min(most))});
+        if most.is_some_and(|most| count >= most) {
+            counted["at_least"] = json!(true);
+        }
+        Ok(counted)
+    }
+
+    /// `move` and `copy`: every entry under `source` to the same place under
+    /// `destination`, as memory-engine's `mv` and `copy` replace a prefix. A
+    /// move between scopes takes each entry to the other store under its id;
+    /// a copy is a new entry, its name suffixed when the copy's store has it.
+    /// `dry_run` shows what would go where.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one relocation: plan, check, then change every store it touches"
+    )]
+    fn relocate(&self, arguments: &Value, copy: bool) -> Result<Value, String> {
+        let source = self.absolute(arguments, "source")?;
+        let destination = self.absolute(arguments, "destination")?;
+        let dry_run = arguments.get("dry_run").and_then(Value::as_bool) == Some(true);
+        let mut plans = Vec::new();
+        for entry in self.all_entries() {
+            if !under(&entry.tree, &source) {
+                continue;
+            }
+            let tree = format!("{destination}{}", &entry.tree[source.len()..]);
+            let (Some(scope), path) = self.parse_tree(&tree)? else {
+                return Err("destination is an absolute tree".to_owned());
+            };
+            plans.push((entry, tree, scope, path));
+        }
+        let listing = plans
+            .iter()
+            .take(50)
+            .map(|(entry, tree, _, _)| {
+                json!({"id": format!("{}:{}", entry.scope, entry.id), "kind": entry.kind, "from": entry.tree, "to": tree})
+            })
+            .collect::<Vec<_>>();
+        if plans.is_empty() || dry_run {
+            let mut planned = json!({"dry_run": dry_run, "count": plans.len(), "entries": listing});
+            if plans.is_empty() {
+                planned["note"] = json!(format!("no entry is at or under {source}"));
+            }
+            return Ok(planned);
+        }
+        let writer = self.writer(if copy { "copy" } else { "move" });
+        // Every store it touches is locked, the global one first.
+        let mut dirs = plans
+            .iter()
+            .flat_map(|(entry, _, scope, _)| [self.dir(&entry.scope), self.dir(scope)])
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        dirs.sort_by_key(|dir| *dir != self.global);
+        dirs.dedup();
+        let _locks = dirs
+            .iter()
+            .map(|dir| harness::lock_state(dir))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut states = dirs
+            .iter()
+            .map(|dir| (dir.clone(), super::refine::load_raw(dir)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut ids = std::collections::BTreeMap::new();
+        for dir in &dirs {
+            ids.insert(dir.clone(), super::memory_store::ids(dir)?);
+        }
+        let mut kept = std::collections::BTreeMap::<PathBuf, Writer>::new();
+        let stamp = now();
+        let mut done = Vec::new();
+        for (entry, tree, scope, path) in &plans {
+            let from = self.dir(&entry.scope).to_path_buf();
+            let to = self.dir(scope).to_path_buf();
+            let doc = states[&from]["entries"][&entry.kind][&entry.id].clone();
+            if !doc.is_object() {
+                return Err(format!(
+                    "{}:{} changed meanwhile: try again",
+                    entry.scope, entry.id
+                ));
+            }
+            let mut moved = doc.clone();
+            moved["path"] = json!(if path.is_empty() {
+                "general"
+            } else {
+                path.as_str()
+            });
+            moved["scope"] = json!(if *scope == "local" { "local" } else { "global" });
+            match (&self.project, *scope) {
+                (Some(project), "project") => moved["project"] = project.value(),
+                _ => {
+                    if let Some(moved) = moved.as_object_mut() {
+                        moved.remove("project");
+                    }
+                }
+            }
+            moved["updated_at"] = json!(stamp);
+            moved["origin"] = self.origin();
+            let mut name = entry.id.clone();
+            if copy {
+                name = free_name(&states[&to], &entry.kind, &entry.id);
+                moved["id"] = json!(name);
+                moved["version"] = json!(1);
+                moved["created_at"] = json!(stamp);
+                moved["origin"]["copied_from"] = json!(format!("{}:{}", entry.scope, entry.id));
+                if let Some(moved) = moved.as_object_mut() {
+                    moved.remove("aliases");
+                }
+            } else {
+                moved["version"] = json!(doc["version"].as_i64().unwrap_or(1) + 1);
+                if from != to {
+                    if states[&to]["entries"][&entry.kind][&name].is_object() {
+                        return Err(format!(
+                            "{scope}:{name} is taken, so {}:{} cannot move there: rename one of them first; nothing moved",
+                            entry.scope, entry.id
+                        ));
+                    }
+                    if let Some(records) = states
+                        .get_mut(&from)
+                        .and_then(|state| state["entries"][&entry.kind].as_object_mut())
+                    {
+                        records.remove(&entry.id);
+                    }
+                    if let Some(memory) = ids[&from].get(&(entry.kind.clone(), entry.id.clone())) {
+                        let writer = kept.remove(&to).unwrap_or_else(|| writer.clone());
+                        kept.insert(to.clone(), writer.reviving(&entry.kind, &name, memory));
+                    }
+                }
+            }
+            if let Some(state) = states.get_mut(&to) {
+                if !state["entries"][&entry.kind].is_object() {
+                    state["entries"][&entry.kind] = json!({});
+                }
+                state["entries"][&entry.kind][&name] = moved;
+            }
+            done.push(json!({"id": format!("{scope}:{name}"), "kind": entry.kind, "from": entry.tree, "to": tree}));
+        }
+        // The stores entries move into are saved first: a failure in between
+        // leaves an entry in both, never in neither.
+        let mut order = dirs.clone();
+        order.sort_by_key(|dir| !kept.contains_key(dir));
+        for dir in order {
+            let writer = kept.get(&dir).unwrap_or(&writer);
+            super::refine::save_raw(&dir, &states[&dir], writer)?;
+        }
+        Ok(json!({
+            "saved": if copy { "copied" } else { "moved" },
+            "count": done.len(),
+            "entries": done.into_iter().take(50).collect::<Vec<_>>(),
+            "operation_id": writer.operation(),
+        }))
+    }
+
+    /// `delete_tree`: every entry at or under a tree, in one operation; each
+    /// stays in history.
+    fn delete_tree(&self, arguments: &Value) -> Result<Value, String> {
+        let tree = self.absolute(arguments, "tree")?;
+        let dry_run = arguments.get("dry_run").and_then(Value::as_bool) == Some(true);
+        let doomed = self
+            .all_entries()
+            .into_iter()
+            .filter(|entry| under(&entry.tree, &tree))
+            .collect::<Vec<_>>();
+        let listing = doomed
+            .iter()
+            .take(50)
+            .map(|entry| json!({"id": format!("{}:{}", entry.scope, entry.id), "kind": entry.kind, "tree": entry.tree}))
+            .collect::<Vec<_>>();
+        if dry_run || doomed.is_empty() {
+            return Ok(json!({"dry_run": dry_run, "count": doomed.len(), "entries": listing}));
+        }
+        let writer = self.writer("delete");
+        let mut dirs = doomed
+            .iter()
+            .map(|entry| self.dir(&entry.scope).to_path_buf())
+            .collect::<Vec<_>>();
+        dirs.sort_by_key(|dir| *dir != self.global);
+        dirs.dedup();
+        for dir in dirs {
+            let _lock = harness::lock_state(&dir)?;
+            let mut state = super::refine::load_raw(&dir);
+            for entry in &doomed {
+                if self.dir(&entry.scope) == dir
+                    && let Some(records) = state["entries"][&entry.kind].as_object_mut()
+                {
+                    records.remove(&entry.id);
+                }
+            }
+            super::refine::save_raw(&dir, &state, &writer)?;
+        }
+        Ok(json!({
+            "deleted": doomed.len(),
+            "entries": listing,
+            "operation_id": writer.operation(),
+            "note": "kept in history: revert brings an entry back",
+        }))
+    }
+
+    /// `history` without an id: memory-engine's activity feed - the changes
+    /// under a tree, of one operation, or since a time - newest first unless
+    /// `order` is `asc`, a page at a time (`cursor`).
+    fn history_feed(&self, arguments: &Value) -> Result<Value, String> {
+        let tree = match optional_text(arguments, "tree")? {
+            Some(_) => Some(self.absolute(arguments, "tree")?),
+            None => None,
+        };
+        let limit = integer(arguments, "limit", DEFAULT_FEED).clamp(1, MAX_FEED);
+        let ascending = optional_text(arguments, "order")? == Some("asc");
+        let after = optional_text(arguments, "cursor")?
+            .map(|cursor| {
+                cursor
+                    .split_once('|')
+                    .map(|(at, event)| (at.to_owned(), event.to_owned()))
+                    .ok_or("cursor is the next_cursor a history page returned")
+            })
+            .transpose()?;
+        let feed = super::memory_store::Feed {
+            memory: None,
+            tree,
+            operation_id: optional_text(arguments, "operation_id")?.map(str::to_owned),
+            since: optional_text(arguments, "since")?.map(str::to_owned),
+            until: optional_text(arguments, "until")?.map(str::to_owned),
+            operation: optional_text(arguments, "operation")?.map(str::to_owned),
+            ascending,
+            after,
+            limit,
+        };
+        let mut dirs = vec![self.global.clone(), self.local.clone()];
+        dirs.dedup();
+        let project_root = self.scope_root("project");
+        let mut events = Vec::new();
+        for dir in &dirs {
+            for event in super::memory_store::feed(dir, &feed)? {
+                // The global store holds every project's entries; another
+                // project's are not this conversation's to read.
+                let other_project = event.tree.starts_with("/projects/")
+                    && (self.project.is_none() || !under(&event.tree, &project_root));
+                if !other_project {
+                    events.push(event);
+                }
+            }
+        }
+        events.sort_by(|a, b| (&a.at, &a.event_id).cmp(&(&b.at, &b.event_id)));
+        if !ascending {
+            events.reverse();
+        }
+        events.truncate(limit);
+        let next = (events.len() == limit)
+            .then(|| {
+                events
+                    .last()
+                    .map(|event| format!("{}|{}", event.at, event.event_id))
+            })
+            .flatten();
+        let mut page = json!({
+            "events": events
+                .iter()
+                .map(|event| {
+                    let content = event.doc["content"].as_str().unwrap_or_default();
+                    json!({
+                        "event_id": event.event_id,
+                        "at": event.at,
+                        "operation": event.operation,
+                        "cause": event.cause,
+                        "by": event.actor,
+                        "operation_id": event.operation_id,
+                        "memory_id": event.memory,
+                        "kind": event.kind,
+                        "id": event.name,
+                        "tree": event.tree,
+                        "version": event.version,
+                        "title": event.doc["title"],
+                        "content": content.chars().take(SNIPPET_CHARS).collect::<String>(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        });
+        if let Some(next) = next {
+            page["next_cursor"] = json!(next);
+        }
+        Ok(page)
+    }
+
     fn delete(&self, arguments: &Value) -> Result<Value, String> {
         let (scope, kind, id) = self.locate(arguments)?;
         let dir = self.dir(&scope);
@@ -1469,6 +1944,34 @@ fn set_fields(entry: &mut Value, arguments: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Whether `tree` is `prefix` or below it.
+fn under(tree: &str, prefix: &str) -> bool {
+    tree == prefix
+        || tree
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// A tree's labels.
+fn labels(tree: &str) -> Vec<&str> {
+    tree.trim_matches('/')
+        .split('/')
+        .filter(|label| !label.is_empty())
+        .collect()
+}
+
+/// `name`, or `name-2`, `name-3`... the first one a state does not hold.
+fn free_name(state: &Value, kind: &str, name: &str) -> String {
+    let taken = |candidate: &str| state["entries"][kind][candidate].is_object();
+    if !taken(name) {
+        return name.to_owned();
+    }
+    (2..=100_000)
+        .map(|number| format!("{name}-{number}"))
+        .find(|candidate| !taken(candidate))
+        .unwrap_or_else(|| format!("{name}-{}", uuid::Uuid::now_v7().simple()))
 }
 
 /// The facets an entry's `metadata` holds beyond whether it is pinned, which
@@ -1634,6 +2137,25 @@ fn kinds(arguments: &Value) -> Result<Vec<&'static str>, String> {
     }
 }
 
+/// The `memory` tool's arguments for organizing entries and reading the
+/// history feed, beside the ones for keeping them.
+fn organizing_properties() -> serde_json::Map<String, Value> {
+    let properties = json!({
+        "source":{"type":"string","description":"move/copy: the absolute tree whose entries go."},
+        "destination":{"type":"string","description":"move/copy: the absolute tree they go to, keeping their place below source."},
+        "dry_run":{"type":"boolean","description":"move/copy/delete_tree, required: true lists what would change, false changes it."},
+        "levels":{"type":"integer","minimum":1,"description":"tree: how many levels below tree to show."},
+        "max_count":{"type":"integer","minimum":1,"description":"count: stop counting here."},
+        "operation_id":{"type":"string","description":"history: the changes one call or refinement made together."},
+        "since":{"type":"string","description":"history: changes at or after this time."},
+        "until":{"type":"string","description":"history: changes before this time."},
+        "operation":{"type":"string","enum":["insert","update","delete"],"description":"history: only this kind of change."},
+        "order":{"type":"string","enum":["asc","desc"],"description":"history: oldest or newest (default) first."},
+        "cursor":{"type":"string","description":"history: the next_cursor of the page before."}
+    });
+    properties.as_object().cloned().unwrap_or_default()
+}
+
 fn refused(message: String) -> HarnessError {
     HarnessError::new(ErrorCode::InvalidPayload, message)
 }
@@ -1649,31 +2171,40 @@ impl ExternalToolCatalog for MemoryHost {
                 "name":"memory",
                 "description":"Read-only recall of the memory the root agent keeps: memory entries (facts, the user's preferences and decisions) and prompt notes (narrow rules), global, for this project or for this conversation. list and search show entries with id and version; read returns one whole; history shows an entry's earlier versions. Search before relying on an earlier decision or preference you do not see in your brief. You cannot write or delete entries: report what should be kept in your answer to the parent.",
                 "parameters":{"type":"object","properties":{
-                    "action":{"type":"string","enum":["list","search","read","history"]},
+                    "action":{"type":"string","enum":["list","search","read","history","tree","count"]},
                     "query":{"type":"string","description":"search: key words of what you are looking for."},
                     "queries":{"type":"array","items":{"type":"string"},"maxItems":MAX_VARIANTS,"description":"search: up to four other wordings of the same need, such as synonyms and a translation into the language the entries may be in; all are searched at once."},
                     "kind":{"type":"string","enum":KINDS},
                     "scope":{"type":"string","enum":scopes},
-                    "id":{"type":"string","description":"An entry id from list or search."},
+                    "id":{"type":"string","description":"An entry id from list or search, or its <tree>/<name> address."},
                     "limit":{"type":"integer","minimum":1,"maximum":MAX_LIST_PAGE},
-                    "offset":{"type":"integer","minimum":0}
+                    "offset":{"type":"integer","minimum":0},
+                    "tree":{"type":"string","description":"tree, count, history: an absolute tree such as /global/team."},
+                    "levels":{"type":"integer","minimum":1},
+                    "max_count":{"type":"integer","minimum":1},
+                    "operation_id":{"type":"string"},
+                    "since":{"type":"string"},
+                    "until":{"type":"string"},
+                    "operation":{"type":"string","enum":["insert","update","delete"]},
+                    "order":{"type":"string","enum":["asc","desc"]},
+                    "cursor":{"type":"string"}
                 },"required":["action"],"additionalProperties":false}
             }})];
         }
-        vec![json!({"type":"function","function":{
+        let mut schema = json!({"type":"function","function":{
             "name":"memory",
             "description":"Your persistent memory across turns and conversations: memory entries (facts, the user's preferences and decisions) and prompt notes (narrow behavioral rules). list and search show entries with id, tree and version; read returns one whole. Search before answering about earlier decisions or preferences you do not see in context. Write without asking when the user asks you to remember something, states a lasting preference or correction, or a decision is reached; search first and update the matching entry (id + expected_version) rather than duplicating. A new entry needs scope (or an absolute tree): global for what holds across conversations and projects, project for a fact about this project, local for this conversation. An update or delete keeps the earlier version: history lists them, revert brings one back. Never store secrets.",
             "parameters":{"type":"object","properties":{
-                "action":{"type":"string","enum":["list","search","read","write","delete","history","revert"]},
+                "action":{"type":"string","enum":["list","search","read","write","delete","history","revert","tree","count","move","copy","delete_tree"],"description":"tree: the entries' tree with counts; count: entries under a tree; move/copy: every entry under source to the same place under destination; delete_tree: every entry under a tree (history keeps them). history with an id shows that entry's versions; without one, the changes under a tree, of one operation_id, or since a time."},
                 "query":{"type":"string","description":"search: key words of what you are looking for."},
                 "queries":{"type":"array","items":{"type":"string"},"maxItems":MAX_VARIANTS,"description":"search: up to four other wordings of the same need, such as synonyms and a translation into the language the entries may be in; all are searched at once."},
                 "kind":{"type":"string","enum":KINDS,"description":"memory (default for write) or prompt; list and search cover both when omitted."},
                 "scope":{"type":"string","enum":scopes,"description":"global: every conversation and project; project: this project's conversations; local: this one. Required to create; list, search and read cover them all when omitted."},
-                "id":{"type":"string","description":"An entry id from list, search or history (a global:/project:/local: prefix picks the scope). With write, updates that entry."},
+                "id":{"type":"string","description":"An entry id from list, search or history (a global:/project:/local: prefix picks the scope), or its <tree>/<name> address. With write, updates that entry."},
                 "title":{"type":"string","description":"write: a short name for the fact or rule; an update by id keeps the entry's title when this is left out."},
                 "content":{"type":"string","description":"write: the whole entry, replacing the old content. One fact or rule, self-contained."},
                 "path":{"type":"string","description":"write: an optional grouping such as user/preferences or project/<name>; constraints (or constraints/<topic>) for a rule the user set for the work, shown in every turn ahead of the ranked entries."},
-                "tree":{"type":"string","description":"write: where the entry sits, instead of path: absolute (/global/user/preferences, /local/..., or this project's /projects/<key>/..., which also picks the scope) or relative to scope. Labels are letters, digits, _ and -."},
+                "tree":{"type":"string","description":"tree, count, delete_tree, history: an absolute tree such as /global/team. write: where the entry sits, instead of path: absolute (/global/user/preferences, /local/..., or this project's /projects/<key>/..., which also picks the scope) or relative to scope. Labels are letters, digits, _ and -."},
                 "name":{"type":"string","description":"write: the entry's id as a slug (jwt-rotation), instead of one made from the title; on an update, renames it."},
                 "meta":{"type":"object","description":"write: facets to filter and judge by, such as {\"type\": \"decision\", \"status\": \"active\", \"source\": \"meeting\", \"confidence\": \"low\"}; replaces the entry's facets whole."},
                 "temporal":{"description":"write: when it happened (\"2026-10-26\" or an RFC 3339 time), or {\"start\", \"end\"} for the period it holds; an entry whose period ended is no longer shown every turn. null clears it.","anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":2},{"type":"object","properties":{"start":{"type":"string"},"end":{"type":"string"}},"required":["start"]},{"type":"null"}]},
@@ -1686,7 +2217,11 @@ impl ExternalToolCatalog for MemoryHost {
                 "limit":{"type":"integer","minimum":1,"maximum":MAX_LIST_PAGE},
                 "offset":{"type":"integer","minimum":0,"description":"list: continue from next_offset."}
             },"required":["action"],"additionalProperties":false}
-        }})]
+        }});
+        if let Some(properties) = schema["function"]["parameters"]["properties"].as_object_mut() {
+            properties.extend(organizing_properties());
+        }
+        vec![schema]
     }
 
     fn resolve(&self, name: &str, arguments: &Value) -> Option<CodingToolAction> {
@@ -1852,10 +2387,11 @@ impl ExternalToolDispatcher for Dispatcher {
 mod tests {
     use super::*;
 
+    /// A host over the stores as ha lays them out under a data directory.
     fn host(root: &Path) -> MemoryHost {
         MemoryHost {
-            global: root.join("global"),
-            local: root.join("local"),
+            global: harness::global_dir(root),
+            local: harness::local_dir(root, "test-conversation"),
             read_only: false,
             conversation: "test-conversation".to_owned(),
             project: None,
@@ -2007,7 +2543,7 @@ mod tests {
         let properties = &schema[0]["function"]["parameters"]["properties"];
         assert_eq!(
             properties["action"]["enum"],
-            json!(["list", "search", "read", "history"])
+            json!(["list", "search", "read", "history", "tree", "count"])
         );
         assert!(properties["content"].is_null());
         assert_eq!(
@@ -2641,19 +3177,22 @@ mod tests {
         )
         .expect("update by hash");
         assert_eq!(updated["version"], 2);
-        let stale = run(
+        let outdated = run(
             &host,
             &json!({"action":"write","id":"queue-choice","content":"x","version_hash":read["version_hash"]}),
         )
         .expect_err("a stale hash");
-        assert!(stale.contains("changed since"), "{stale}");
+        assert!(outdated.contains("changed since"), "{outdated}");
         // A tree outside the scopes this host keeps is refused.
         let refused = run(
             &host,
             &json!({"action":"write","tree":"/projects/other/x","title":"T","content":"c"}),
         )
         .expect_err("another project");
-        assert!(refused.contains("not this conversation's project"), "{refused}");
+        assert!(
+            refused.contains("not this conversation's project"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -2682,7 +3221,10 @@ mod tests {
         let same = write("Deploys go out on Fridays.", Some("replace")).expect("identical");
         assert_eq!(same["saved"], "unchanged");
         let history = run(&host, &json!({"action":"history","id":"deploy"})).expect("history");
-        assert_eq!(history["earlier"][0]["content"], "Deploys go out on Thursdays.");
+        assert_eq!(
+            history["earlier"][0]["content"],
+            "Deploys go out on Thursdays."
+        );
     }
 
     /// Reverting a deleted entry brings back the same memory: its id in the
@@ -2718,6 +3260,165 @@ mod tests {
         assert_eq!(
             versions,
             [(Some(2), json!("deleted")), (Some(1), json!("updated"))]
+        );
+    }
+
+    fn seed_tree(host: &MemoryHost) {
+        for (tree, name, content) in [
+            (
+                "/global/team/decisions",
+                "queue",
+                "Redis Streams carry the queue.",
+            ),
+            (
+                "/global/team/decisions",
+                "db",
+                "Postgres 17 holds the orders.",
+            ),
+            (
+                "/global/team/people",
+                "lead",
+                "Lan leads the platform team.",
+            ),
+            ("/local/notes", "step", "The migration is at step three."),
+        ] {
+            run(
+                host,
+                &json!({"action":"write","tree":tree,"name":name,"title":name,"content":content,"distinct":true}),
+            )
+            .expect("seed");
+        }
+    }
+
+    #[test]
+    fn the_tree_counts_and_a_path_address_reads_one_entry() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = host(directory.path());
+        seed_tree(&host);
+        let tree = run(&host, &json!({"action":"tree"})).expect("tree");
+        assert_eq!(tree["total"], 4);
+        let node = |tree: &Value, path: &str| {
+            tree["nodes"]
+                .as_array()
+                .expect("nodes")
+                .iter()
+                .find(|node| node["tree"] == path)
+                .cloned()
+        };
+        assert_eq!(node(&tree, "/global/team").expect("team")["entries"], 3);
+        assert_eq!(
+            node(&tree, "/global/team/decisions").expect("decisions")["here"],
+            2
+        );
+        let shallow =
+            run(&host, &json!({"action":"tree","tree":"/global","levels":1})).expect("levels");
+        assert!(node(&shallow, "/global/team").is_some());
+        assert!(
+            node(&shallow, "/global/team/decisions").is_none(),
+            "{shallow}"
+        );
+        let counted = run(
+            &host,
+            &json!({"action":"count","tree":"/global/team","max_count":2}),
+        )
+        .expect("count");
+        assert_eq!(counted["count"], 2);
+        assert_eq!(counted["at_least"], true);
+        let read = run(
+            &host,
+            &json!({"action":"read","id":"/global/team/people/lead"}),
+        )
+        .expect("by path");
+        assert_eq!(read["content"], "Lan leads the platform team.");
+        assert!(
+            run(
+                &host,
+                &json!({"action":"read","id":"/global/team/decisions/lead"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn move_copy_and_delete_tree_work_on_a_subtree_in_one_operation() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = host(directory.path());
+        seed_tree(&host);
+        let ids = |dir: &Path| super::super::memory_store::ids(dir).expect("ids");
+        let queue = ids(&host.global)[&("memory".to_owned(), "queue".to_owned())].clone();
+        // A dry run changes nothing.
+        let planned = run(
+            &host,
+            &json!({"action":"move","source":"/global/team/decisions","destination":"/local/archive","dry_run":true}),
+        )
+        .expect("dry run");
+        assert_eq!(planned["count"], 2);
+        assert_eq!(ids(&host.global).len(), 3);
+        // A move into another scope takes each entry under its id.
+        let moved = run(
+            &host,
+            &json!({"action":"move","source":"/global/team/decisions","destination":"/local/archive","dry_run":false}),
+        )
+        .expect("move");
+        assert_eq!(moved["count"], 2);
+        assert_eq!(
+            ids(&host.local)[&("memory".to_owned(), "queue".to_owned())],
+            queue
+        );
+        let read =
+            run(&host, &json!({"action":"read","id":"/local/archive/queue"})).expect("moved");
+        assert_eq!(read["scope"], "local");
+        assert_eq!(read["version"], 2);
+        // A copy next to its original gets a name of its own.
+        let copied = run(
+            &host,
+            &json!({"action":"copy","source":"/local/archive","destination":"/local/backup","dry_run":false}),
+        )
+        .expect("copy");
+        assert_eq!(copied["count"], 2);
+        let names = run(&host, &json!({"action":"tree","tree":"/local/backup"})).expect("tree");
+        assert_eq!(names["total"], 2);
+        assert!(ids(&host.local).contains_key(&("memory".to_owned(), "queue-2".to_owned())));
+        // delete_tree is one operation, and the feed reads it back.
+        let deleted = run(
+            &host,
+            &json!({"action":"delete_tree","tree":"/local/backup","dry_run":false}),
+        )
+        .expect("delete_tree");
+        assert_eq!(deleted["deleted"], 2);
+        let feed = run(
+            &host,
+            &json!({"action":"history","operation_id":deleted["operation_id"]}),
+        )
+        .expect("feed");
+        let events = feed["events"].as_array().expect("events");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event["operation"] == "delete"));
+        let since = run(
+            &host,
+            &json!({"action":"history","tree":"/local","order":"asc","limit":3}),
+        )
+        .expect("feed by tree");
+        assert_eq!(since["events"].as_array().expect("events").len(), 3);
+        let more = run(
+            &host,
+            &json!({"action":"history","tree":"/local","order":"asc","limit":3,"cursor":since["next_cursor"]}),
+        )
+        .expect("next page");
+        assert_ne!(
+            more["events"][0]["event_id"],
+            since["events"][0]["event_id"]
+        );
+        assert!(run(&host, &json!({"action":"history"})).is_err());
+        // A child reads the tree but cannot reorganize it.
+        let child = host.readonly();
+        assert!(run(&child, &json!({"action":"tree"})).is_ok());
+        assert!(
+            run(
+                &child,
+                &json!({"action":"delete_tree","tree":"/local","dry_run":false})
+            )
+            .is_err()
         );
     }
 }

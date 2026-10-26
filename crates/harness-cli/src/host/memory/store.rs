@@ -91,12 +91,16 @@ CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 pub struct Writer {
     actor: Value,
     cause: String,
-    /// A deleted memory coming back: the entry `(kind, name)` keeps this id.
-    revive: Option<(String, String, String)>,
+    /// The operation its saves belong to: one id for everything one call
+    /// changes, even across stores.
+    operation: String,
+    /// Entries that are a memory coming back or moving in from another
+    /// store: `(kind, name)` keeps that memory's id.
+    keep: BTreeMap<(String, String), String>,
 }
 
 impl Writer {
-    /// `who` is the kind of writer (`model`, `review`, `kernel`, `cli`,
+    /// `who` is the kind of writer (`model`, `refine`, `kernel`, `cli`,
     /// `migration`...), `origin` what the entry's own `origin` says about it,
     /// and `cause` what the write is for (`create`, `update`, `delete`,
     /// `revert`, `refine`...).
@@ -107,18 +111,172 @@ impl Writer {
         Self {
             actor: Value::Object(actor),
             cause: cause.to_owned(),
-            revive: None,
+            operation: new_id(),
+            keep: BTreeMap::new(),
         }
     }
 
-    /// The same writer bringing a deleted memory back: the entry it saves as
-    /// `kind:name` is that memory again, under its old id, so its history goes
-    /// on.
+    /// The same writer bringing a deleted memory back, or moving one in from
+    /// another store: the entry it saves as `kind:name` is that memory, under
+    /// its id, so its history goes on.
     #[must_use]
     pub fn reviving(mut self, kind: &str, name: &str, memory: &str) -> Self {
-        self.revive = Some((kind.to_owned(), name.to_owned(), memory.to_owned()));
+        self.keep
+            .insert((kind.to_owned(), name.to_owned()), memory.to_owned());
         self
     }
+
+    /// The operation id every event this writer records shares.
+    #[must_use]
+    pub fn operation(&self) -> &str {
+        &self.operation
+    }
+}
+
+/// The id of each live memory of a store, by `(kind, name)`.
+///
+/// # Errors
+/// The store cannot be read.
+pub fn ids(dir: &Path) -> Result<BTreeMap<(String, String), String>, String> {
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(BTreeMap::new());
+    };
+    let mut statement = store
+        .conn
+        .prepare("SELECT kind, name, id FROM memory")
+        .map_err(sql)?;
+    let ids = statement
+        .query_map([], |row| {
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(sql)?
+        .collect::<Result<BTreeMap<_, _>, _>>()
+        .map_err(sql)?;
+    Ok(ids)
+}
+
+/// Which events a history feed reads: at least one of `memory`, `tree`,
+/// `operation_id` or `since`, so a read is never an unbounded scan.
+#[derive(Clone, Debug, Default)]
+pub struct Feed {
+    pub memory: Option<String>,
+    /// A subtree: events at or under this tree.
+    pub tree: Option<String>,
+    pub operation_id: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    /// `insert`, `update` or `delete`.
+    pub operation: Option<String>,
+    /// Newest first unless set.
+    pub ascending: bool,
+    /// Past this `(at, event_id)`, in the feed's order.
+    pub after: Option<(String, String)>,
+    pub limit: usize,
+}
+
+/// One event of a feed.
+#[derive(Clone, Debug)]
+pub struct FeedEvent {
+    pub event_id: String,
+    pub at: String,
+    pub memory: String,
+    pub kind: String,
+    pub name: String,
+    pub tree: String,
+    pub operation: String,
+    pub operation_id: String,
+    pub cause: Option<String>,
+    pub actor: Value,
+    pub version: i64,
+    pub doc: Value,
+}
+
+/// The events of a store a feed selects, in its order, at most its limit.
+///
+/// # Errors
+/// The feed has no scope, or the store cannot be read.
+pub fn feed(dir: &Path, feed: &Feed) -> Result<Vec<FeedEvent>, String> {
+    if feed.memory.is_none()
+        && feed.tree.is_none()
+        && feed.operation_id.is_none()
+        && feed.since.is_none()
+    {
+        return Err(
+            "a history feed needs a scope: an id, a tree, an operation_id or since".to_owned(),
+        );
+    }
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(Vec::new());
+    };
+    let mut clauses = Vec::new();
+    let mut values: Vec<String> = Vec::new();
+    if let Some(memory) = &feed.memory {
+        clauses.push("memory_id = ?".to_owned());
+        values.push(memory.clone());
+    }
+    if let Some(tree) = &feed.tree {
+        clauses.push("(tree = ? OR substr(tree, 1, ?) = ?)".to_owned());
+        values.push(tree.clone());
+        let prefix = format!("{}/", tree.trim_end_matches('/'));
+        values.push(prefix.chars().count().to_string());
+        values.push(prefix);
+    }
+    if let Some(operation) = &feed.operation_id {
+        clauses.push("operation_id = ?".to_owned());
+        values.push(operation.clone());
+    }
+    if let Some(since) = &feed.since {
+        clauses.push("at >= ?".to_owned());
+        values.push(instant(since)?);
+    }
+    if let Some(until) = &feed.until {
+        clauses.push("at < ?".to_owned());
+        values.push(instant(until)?);
+    }
+    if let Some(operation) = &feed.operation {
+        clauses.push("operation = ?".to_owned());
+        values.push(operation.clone());
+    }
+    let order = if feed.ascending { "ASC" } else { "DESC" };
+    if let Some((at, event)) = &feed.after {
+        clauses.push(format!(
+            "(at, event_id) {} (?, ?)",
+            if feed.ascending { ">" } else { "<" }
+        ));
+        values.push(at.clone());
+        values.push(event.clone());
+    }
+    let query = format!(
+        "SELECT event_id, at, memory_id, kind, name, tree, operation, operation_id, cause, actor,
+         version, doc FROM memory_event WHERE {} ORDER BY at {order}, event_id {order} LIMIT {}",
+        clauses.join(" AND "),
+        feed.limit.max(1)
+    );
+    let mut statement = store.conn.prepare(&query).map_err(sql)?;
+    let events = statement
+        .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+            Ok(FeedEvent {
+                event_id: row.get(0)?,
+                at: row.get(1)?,
+                memory: row.get(2)?,
+                kind: row.get(3)?,
+                name: row.get(4)?,
+                tree: row.get(5)?,
+                operation: row.get(6)?,
+                operation_id: row.get(7)?,
+                cause: row.get(8)?,
+                actor: parse(&row.get::<_, String>(9)?),
+                version: row.get(10)?,
+                doc: parse(&row.get::<_, String>(11)?),
+            })
+        })
+        .map_err(sql)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql)?;
+    Ok(events)
 }
 
 /// memory-engine's `version_hash` of an entry: 32 hex characters that change
@@ -941,7 +1099,7 @@ fn save(
             renamed.insert(key.clone(), from);
         }
     }
-    let operation = new_id();
+    let operation = writer.operation.clone();
     let at = now();
     let mut changed = 0;
     for (key, doc) in &wanted {
@@ -961,14 +1119,11 @@ fn save(
                     row.content_version + 1
                 },
             ),
-            None => {
-                let revived = writer
-                    .revive
-                    .as_ref()
-                    .filter(|(kind, name, _)| (kind, name) == (&key.0, &key.1))
-                    .map(|(_, _, memory)| memory.clone());
-                (revived.unwrap_or_else(new_id), "insert", 1)
-            }
+            None => (
+                writer.keep.get(key).cloned().unwrap_or_else(new_id),
+                "insert",
+                1,
+            ),
         };
         if operation_kind == "insert" {
             transaction

@@ -1593,6 +1593,8 @@ fn apply(
         "expectedOutcome": proposal.expected_outcome,
         "appliedEdits": applied_edits,
         "harnessStatePath": path.display().to_string(),
+        // The store's events of this refinement share it (`memory` history).
+        "operationId": writer.operation(),
         "rollbackOf": rollback_of,
         "scope": scope,
     });

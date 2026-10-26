@@ -102,8 +102,15 @@ impl State {
 /// an error - the digest runs before every turn.
 #[must_use]
 pub fn load(dir: &Path, scope: &str) -> State {
+    // The caller knows a conversation's store; the directory's shape says so
+    // only for the ones ha lays out itself.
+    let root = if scope == "local" {
+        "/local"
+    } else {
+        super::memory_store::root_of(dir)
+    };
     match super::memory_store::load_document(dir) {
-        Ok(document) => parse(&document, scope, super::memory_store::root_of(dir)),
+        Ok(document) => parse(&document, scope, root),
         Err(error) => {
             harness_types::diag::warn("memory", "store_unreadable")
                 .field("dir", dir.display().to_string())
