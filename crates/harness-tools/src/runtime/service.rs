@@ -2132,7 +2132,11 @@ impl ToolExecutionService {
             .map_err(store_error)?
             .into_iter()
             .filter(|text| {
-                filter.admits(&text.source_id, &text.kind) && !text.text.trim().is_empty()
+                // The turn asking is the query, not one of the documents:
+                // what it holds is in context already.
+                text.session_id != prepared.request.session_id.as_str()
+                    && filter.admits(&text.source_id, &text.kind)
+                    && !text.text.trim().is_empty()
             })
             .collect::<Vec<_>>();
         let corpus = if project {

@@ -302,7 +302,7 @@ port_file = sys.argv[1]
 THEMES = [
     ("anaemia", "anemia", "iron", "eat", "health", "thiếu máu", "sức khỏe"),
     ("deploy", "release", "freeze"),
-    ("password", "mật khẩu", "sign in", "login", "đăng nhập", "credential"),
+    ("password", "mật khẩu", "sign in", "đăng nhập", "credential"),
 ]
 def vector(text):
     t = text.lower()
@@ -339,7 +339,7 @@ check "a readout reads a two-part request into slots by meaning" 'tool_result MA
 run_exec m35 "Lượt này không dùng tool nào. Before my long run tomorrow, what should I eat for breakfast? Chỉ trả lời đúng một từ: MARKER_RECALL"
 R=$(request "MARKER_RECALL")
 check "the digest recalls by meaning an entry no word of the request is in" 'printf "%s" "$R" | grep -q "user_health\] Health ([^)]*) \[recalled by meaning\]"'
-run_exec m36 "Ghi nhận (không dùng tool nào): hôm qua deploy lên staging thất bại vì mật khẩu staging đã hết hạn. Trả lời: đã ghi nhận."
+run_exec m36 "Ghi nhận (không dùng tool nào): hôm qua không vào được staging vì mật khẩu staging đã hết hạn. Trả lời: đã ghi nhận."
 run_exec m37 "Kiểm thử: gọi tool history_search đúng một lần với query 'why could we not sign in to staging', scope 'project' và mode 'readout'. Không gọi tool nào khác. MARKER_HREADOUT. Báo các nguồn và slot của chúng."
 check "history_search reads earlier conversations into slots" 'tool_result MARKER_HREADOUT | grep -q "^history_search.*slot=1 attention=" && tool_result MARKER_HREADOUT | grep -q "mật khẩu staging"'
 kill "$themes" 2>/dev/null

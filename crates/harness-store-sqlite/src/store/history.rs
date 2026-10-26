@@ -163,6 +163,8 @@ pub struct HistoryHit {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoryText {
     pub source_id: String,
+    /// The session (one turn) that wrote it.
+    pub session_id: String,
     pub kind: String,
     pub content_hash: String,
     pub text: String,
@@ -920,7 +922,7 @@ impl SqliteStore {
         chars: usize,
     ) -> Result<Vec<HistoryText>, StoreError> {
         let sql = format!(
-            "SELECT s.source_id, s.kind, s.content_hash, substr(s.content, 1, ?) AS head
+            "SELECT s.source_id, s.session_id, s.kind, s.content_hash, substr(s.content, 1, ?) AS head
              FROM history_sources s
              WHERE {} AND s.availability = 'available'
              ORDER BY s.rowid DESC LIMIT ?",
@@ -943,6 +945,7 @@ impl SqliteStore {
             .map(|row| {
                 Ok(HistoryText {
                     source_id: row_get(row, "source_id")?,
+                    session_id: row_get(row, "session_id")?,
                     kind: row_get(row, "kind")?,
                     content_hash: row_get(row, "content_hash")?,
                     text: row_get(row, "head")?,

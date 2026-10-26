@@ -1750,6 +1750,7 @@ impl harness_tools::HistorySemantic for Themes {
 /// they share no word with the question; an unrelated one does not. Without
 /// embeddings, the words read.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // a conversation, then the questions read against it
 async fn m5_03_a_readout_recalls_the_conversation_for_a_question() {
     let bench = bench();
     let store = bench.open_store().await;
@@ -1784,8 +1785,12 @@ async fn m5_03_a_readout_recalls_the_conversation_for_a_question() {
         )
         .await;
     }
+    // A later conversation asks across the project: the turn asking is the
+    // query, not one of the documents.
+    let (asking, asking_task) = admit(&store, &bench, "a later conversation").await;
     let readout = |tools: ToolExecutionService, query: &'static str| {
-        let (session, task, workspace) = (session.clone(), task.clone(), bench.workspace.clone());
+        let (session, task, workspace) =
+            (asking.clone(), asking_task.clone(), bench.workspace.clone());
         async move {
             let prepared = tools
                 .prepare(ToolRequest::new(
@@ -1796,7 +1801,7 @@ async fn m5_03_a_readout_recalls_the_conversation_for_a_question() {
                     CodingToolAction::HistorySearch {
                         query: query.to_owned(),
                         limit: None,
-                        project: false,
+                        project: true,
                         filter: harness_tools::HistorySearchFilter {
                             readout: Some(4),
                             ..harness_tools::HistorySearchFilter::default()
