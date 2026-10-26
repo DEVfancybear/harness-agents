@@ -25,29 +25,21 @@ for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3"
             print(text[at:at + 200])
 EOF
 }
-state() { "$PY" - "$D" <<'EOF'
-import json,sys,glob,os
-d=sys.argv[1]
-for f in [os.path.join(d,"harness","harness_state.json")]+glob.glob(os.path.join(d,"sessions","*","harness","harness_state.json")):
-    if os.path.exists(f):
-        s=json.load(open(f,encoding="utf-8"))
-        for kind,records in s["entries"].items():
-            for k,e in records.items():
-                print("global" if os.sep+"sessions"+os.sep not in f else "local", kind, k, "v%s"%e.get("version"), "|", str(e.get("content"))[:80])
-EOF
-}
+state() { "$PY" "$MEMORY_STORE" entries "$D"; }
 
 echo "################ 1. rlm.harness through the host: create, update by global: id, search, overview"
 agent "$RX/p" r1
 say r1 "Dùng tool ipython (không dùng tool memory). Trong một cell: e = rlm.harness.create_memory('Ngôn ngữ trả lời', 'Người dùng muốn trả lời bằng tiếng Việt', global_=True); rồi u = rlm.harness.update_memory('global:' + e.id, 'Ngôn ngữ trả lời', 'Người dùng muốn trả lời bằng tiếng Việt, ngắn gọn'); in ra e.id, u.version, u.scope, [x.id for x in rlm.harness.search('tiếng Việt', global_=True)] và dòng đầu của rlm.harness.overview(global_=True). Báo lại đúng những gì cell in ra." | tail -8
 echo "-- state on disk:"; state
-check "kernel write landed in the global file, updated to v2" "state | grep -q 'global memory ngon_ngu_tra_loi v2 | Người dùng muốn trả lời bằng tiếng Việt, ngắn gọn'"
-check "the kernel no longer creates a lock directory" "[ ! -d '$D/harness/harness_state.json.lock' ]"
+check "kernel write landed in the global store, updated to v2" "state | grep -q 'global memory ngon_ngu_tra_loi v2 | Người dùng muốn trả lời bằng tiếng Việt, ngắn gọn'"
+check "the kernel no longer creates a lock directory" "[ ! -d '$D/harness/memory.lock' ] && [ ! -d '$D/harness/harness_state.json.lock' ]"
+check "the store keeps no state file beside it" "[ ! -e '$D/harness/harness_state.json' ]"
+check "the kernel's writes are events by the kernel" "\"\$PY\" \"\$MEMORY_STORE\" events '$D/harness' | grep -q '^update|update|kernel|ngon_ngu_tra_loi|v2|'"
 
 echo "################ 2. the memory tool and rlm.harness see each other's writes"
 say r1 "Dùng tool memory (action write, scope local) ghi một entry tiêu đề 'Nhánh làm việc', nội dung 'Làm trên nhánh feature/rlm'. Sau đó dùng ipython chạy print('KERNEL_LIST=' + str([(x.id, x.content) for x in rlm.harness.list('memory')])). Rồi dùng ipython tạo rlm.harness.create_prompt_note('Định dạng commit', 'Commit message dạng loai: mo ta') (local), và dùng tool memory action list để liệt kê. Báo lại hai danh sách." | tail -10
-check "memory tool entry visible in the local file" "state | grep -q 'local memory nhanh_lam_viec'"
-check "kernel prompt note visible in the local file" "state | grep -q 'local prompt dinh_dang_commit'"
+check "memory tool entry visible in the local store" "state | grep -q 'local memory nhanh_lam_viec'"
+check "kernel prompt note visible in the local store" "state | grep -q 'local prompt dinh_dang_commit'"
 check "the kernel listed the tool's entry" "printed KERNEL_LIST= | grep -q \"KERNEL_LIST=\[('nhanh_lam_viec'\""
 
 echo "################ 3. a rejected write is refused with the host's words"

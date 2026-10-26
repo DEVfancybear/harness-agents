@@ -4,7 +4,7 @@
 //! memory: it creates, updates and deletes entries - memories, prompt notes, skills,
 //! subagent specs - through `rlm.harness` in the Python REPL (the vendored
 //! `rlm/harness.py`), and the host never guesses what is worth keeping. The entries
-//! live in `harness_state.json` files: a global one shared by every conversation, and
+//! live in memory stores (`store.rs`): a global one shared by every conversation, and
 //! a local one per conversation. Before each turn the host reads both, ranks each
 //! kind's entries by relevance to the task, and hands the model a compact digest
 //! inside `<harness_state>`, as prime-agent's harness digest message does.
@@ -19,7 +19,6 @@ use unicode_normalization::UnicodeNormalization as _;
 
 /// The entry kinds, in the order prime-agent renders them.
 const KINDS: [&str; 4] = ["prompt", "memory", "skill", "subagent"];
-const STATE_FILE: &str = "harness_state.json";
 const DEFAULT_ENTRY_LIMIT: usize = 6;
 const DEFAULT_REFINEMENT_LIMIT: usize = 5;
 const DEFAULT_CONTENT_LIMIT: usize = 180;
@@ -75,6 +74,14 @@ pub struct Entry {
     pub project: Option<String>,
     /// The ids the entry had before a new title renamed it.
     pub aliases: Vec<String>,
+    /// Where it sits in the memory tree (`/global/user/preferences`).
+    pub tree: String,
+    /// Its own `metadata`: memory-engine's `meta`.
+    pub meta: Map<String, Value>,
+    /// Its temporal value, `{start}` or `{start, end}`, when it has one.
+    pub temporal: Option<Value>,
+    /// Its period is over (`store::ended`): not shown as current.
+    pub ended: bool,
 }
 
 /// The merged state of one turn.
@@ -91,18 +98,29 @@ impl State {
     }
 }
 
-/// `loadHarnessState`: a missing, unreadable or corrupt file is an empty state,
-/// never an error - the digest runs before every turn.
+/// `loadHarnessState`: a missing or unreadable store is an empty state, never
+/// an error - the digest runs before every turn.
 #[must_use]
 pub fn load(dir: &Path, scope: &str) -> State {
+    match super::memory_store::load_document(dir) {
+        Ok(document) => parse(&document, scope, super::memory_store::root_of(dir)),
+        Err(error) => {
+            harness_types::diag::warn("memory", "store_unreadable")
+                .field("dir", dir.display().to_string())
+                .field("error", error)
+                .emit();
+            State::default()
+        }
+    }
+}
+
+/// [`load`] of a document already read; `root` is its store's tree root.
+#[must_use]
+pub fn parse(parsed: &Value, scope: &str, root: &str) -> State {
     let mut state = State::default();
-    let Some(parsed) = std::fs::read_to_string(dir.join(STATE_FILE))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .filter(Value::is_object)
-    else {
+    if !parsed.is_object() {
         return state;
-    };
+    }
     for kind in KINDS {
         let Some(records) = parsed["entries"][kind].as_object() else {
             continue;
@@ -152,6 +170,15 @@ pub fn load(dir: &Path, scope: &str) -> State {
                             .collect()
                     })
                     .unwrap_or_default(),
+                tree: super::memory_store::tree_for(root, raw),
+                meta: object("metadata"),
+                temporal: super::memory_store::temporal_bounds(
+                    entry.get("temporal").unwrap_or(&Value::Null),
+                )
+                .ok()
+                .flatten()
+                .map(|bounds| super::memory_store::temporal_value(&bounds)),
+                ended: super::memory_store::ended(raw),
             });
         }
     }
@@ -445,9 +472,9 @@ fn lock_wait() -> std::time::Duration {
     std::time::Duration::from_secs(30)
 }
 
-/// Hold a scope's state lock: the sidecar the Python kernel's `rlm.harness`
-/// locks (`harness_state.json.lock`), so a read-modify-write from the host
-/// never interleaves with one from the kernel.
+/// Hold a scope's state lock (`memory.lock`), so a read-modify-write from the
+/// `memory` tool, a refinement or the kernel's `rlm.harness` never interleaves
+/// with another.
 ///
 /// # Errors
 /// The lock cannot be opened, or another writer kept it past 30 seconds.
@@ -458,7 +485,7 @@ pub fn lock_state(dir: &Path) -> Result<std::fs::File, String> {
         .write(true)
         .create(true)
         .truncate(false)
-        .open(dir.join(format!("{STATE_FILE}.lock")))
+        .open(dir.join(super::memory_store::LOCK_FILE))
         .map_err(|error| format!("harness state lock: {error}"))?;
     let deadline = std::time::Instant::now() + lock_wait();
     loop {
@@ -551,6 +578,19 @@ pub struct DigestOptions {
     reason = "one render, told in prime-agent's order"
 )]
 pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f64)]) -> String {
+    // An entry whose period is over records what was, not what is: search
+    // still finds it, the digest leaves it out.
+    let current;
+    let state = if state.entries.values().flatten().any(|entry| entry.ended) {
+        let mut kept = state.clone();
+        for entries in kept.entries.values_mut() {
+            entries.retain(|entry| !entry.ended);
+        }
+        current = kept;
+        &current
+    } else {
+        state
+    };
     let mut lines: Vec<String> = vec![
         "# Continual Harness State".to_owned(),
         String::new(),
@@ -869,9 +909,16 @@ mod tests {
     #[test]
     fn a_missing_or_corrupt_state_is_empty() {
         let directory = tempfile::tempdir().expect("dir");
-        assert_eq!(load(directory.path(), "global").entries.len(), 0);
+        assert_eq!(load(directory.path(), "global").total(), 0);
         std::fs::write(directory.path().join("harness_state.json"), "{not json").expect("write");
-        assert_eq!(load(directory.path(), "global").entries.len(), 0);
+        assert_eq!(load(directory.path(), "global").total(), 0);
+        // A corrupt legacy file is set aside, not read on every turn.
+        assert!(
+            directory
+                .path()
+                .join("harness_state.json.unreadable")
+                .exists()
+        );
     }
 
     #[test]

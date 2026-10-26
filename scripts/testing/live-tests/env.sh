@@ -16,6 +16,8 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && (pwd -W 2>/dev/null || pw
 export HA=${HA:-$REPO/target/release/ha.exe}
 export PROBE=${PROBE:-$REPO/target/debug/examples/pty_probe.exe}
 export PY=${PY:-python}
+# Reads a home's memory stores read-only (see the script's usage).
+export MEMORY_STORE="$REPO/scripts/testing/live-tests/memory_store.py"
 export MODEL=${MODEL:-opencode-go/deepseek-v4.1-flash}
 export THINKING=${THINKING:-}
 # What follows `--model "$MODEL"` on every command line: the thinking level.

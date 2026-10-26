@@ -14,17 +14,13 @@ export HA_AUTO_REFINE=off
 D=$HA_HOME/data
 for p in p-shop p-blog p-skill; do project "$RX/$p"; done
 # Global entries as "scope|project|kind|id|v|content|origin-via".
-entries() { "$PY" - "$D" <<'EOF'
-import json,os,sys
-f=os.path.join(sys.argv[1],"harness","harness_state.json")
-s=json.load(open(f,encoding="utf-8")) if os.path.exists(f) else {"entries":{}}
-for kind,records in s["entries"].items():
-    for k,e in records.items():
-        p=(e.get("project") or {}).get("name","-") if isinstance(e.get("project"),dict) else "-"
-        print("|".join(["global",p,kind,k,"v%s"%e.get("version"),str(e.get("content")).replace("\n"," "),str((e.get("origin") or {}).get("via","-"))]))
-EOF
+entries() {
+  for kind in memory prompt skill subagent; do
+    "$PY" "$MEMORY_STORE" rows "$D/harness" "$kind" | awk -F'|' -v kind="$kind" 'BEGIN{OFS="|"} {print "global",$5,kind,$1,$6,$4,$7}'
+  done
 }
-journal() { cat "$D/harness/memory_history.jsonl" 2>/dev/null; }
+# The global store's event log: each change and the version it left.
+journal() { "$PY" "$MEMORY_STORE" events "$D/harness"; }
 show() { echo "-- global memory on disk:"; entries | sed 's/^/   /'; }
 
 echo "################ 1. extraction: a project fact and a global preference"

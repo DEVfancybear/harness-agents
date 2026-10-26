@@ -877,6 +877,7 @@ impl Report {
     /// The harness files of each conversation in scope, and the global ones.
     fn harness_files(&mut self) {
         let global = crate::interactive::harness::global_dir(&self.data_dir);
+        self.memory_store(&global, "harness/global");
         for name in [
             "harness_state.json",
             "memory_changes",
@@ -911,6 +912,7 @@ impl Report {
         }
         for (_, task) in conversations {
             let local = crate::interactive::harness::local_dir(&self.data_dir, &task);
+            self.memory_store(&local, &format!("harness/{task}"));
             for name in [
                 "harness_state.json",
                 "task_state.json",
@@ -930,6 +932,22 @@ impl Report {
             }
             let schedules = self.data_dir.join("schedules").join(format!("{task}.json"));
             self.copy_file(&schedules, &format!("harness/{task}/schedules.json"), false);
+        }
+    }
+
+    /// A scope's memory store as `memory_store.json`: its counts and its
+    /// entries, read without changing it. A legacy `harness_state.json` not
+    /// yet imported is copied as it is.
+    fn memory_store(&mut self, dir: &Path, prefix: &str) {
+        match crate::interactive::memory_store::snapshot(dir) {
+            Ok(Some(snapshot)) => {
+                let text = serde_json::to_string_pretty(&snapshot).unwrap_or_default();
+                self.add_text(&format!("{prefix}/memory_store.json"), &text);
+            }
+            Ok(None) => {}
+            Err(error) => self
+                .notes
+                .push(format!("memory store {}: {error}", dir.display())),
         }
     }
 

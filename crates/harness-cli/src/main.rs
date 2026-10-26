@@ -15,6 +15,8 @@ mod interactive;
 mod maintenance_cli;
 #[path = "commands/mcp_cli.rs"]
 mod mcp_cli;
+#[path = "commands/memory_cli.rs"]
+mod memory_cli;
 #[path = "commands/package_cli.rs"]
 mod package_cli;
 #[path = "commands/sandbox_cli.rs"]
@@ -191,6 +193,8 @@ enum Command {
     Extensions(extension_cli::ExtensionCommand),
     /// Configure and inspect MCP servers.
     Mcp(mcp_cli::McpCommand),
+    /// The memory stores: export what they hold.
+    Memory(memory_cli::MemoryCommand),
     /// P7 recovery hardening: doctor, backup, restore, retention, GC and release matrix.
     Maintenance(maintenance_cli::MaintenanceCommand),
     /// The models of the catalog you can call (prime-agent's `model list`).
@@ -1300,6 +1304,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
         // which grows the future past the size the other arms keep. Boxing one arm is
         // cheaper than reshaping the dispatch.
         Some(Command::Mcp(command)) => mcp_cli::run(command),
+        Some(Command::Memory(command)) => memory_cli::run(command),
         Some(Command::Init { data_dir, json }) => init_store(&data_dir, json).await,
         Some(Command::Package(command)) => package_cli::run(command),
         Some(Command::Config(ConfigCommand { command: None })) => {

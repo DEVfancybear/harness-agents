@@ -7,6 +7,15 @@ use harness_types::{ErrorCode, HarnessError};
 
 use super::paths::{HostPlatform, LaunchEnvironment, PathRequest};
 
+/// The data directory this process resolves, for a command that works on it
+/// without starting a provider.
+///
+/// # Errors
+/// The data directory cannot be resolved.
+pub fn current_data_dir() -> Result<PathBuf, HarnessError> {
+    data_dir(&LaunchEnvironment::capture())
+}
+
 fn data_dir(environment: &LaunchEnvironment) -> Result<PathBuf, HarnessError> {
     super::paths::resolve(&PathRequest {
         platform: HostPlatform::current(),

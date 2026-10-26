@@ -20,7 +20,6 @@ use harness_providers::{
 use harness_types::RequestId;
 use serde_json::{Map, Value, json};
 
-const STATE_FILE: &str = "harness_state.json";
 const HISTORY_FILE: &str = "refinements.jsonl";
 const KINDS: [&str; 4] = ["prompt", "memory", "skill", "subagent"];
 /// How a learned-skill change is recorded among a refinement's edits.
@@ -579,17 +578,11 @@ impl HarnessScopes {
     }
 }
 
-fn empty_state() -> Value {
-    json!({"schema": 1, "entries": {"prompt": {}, "memory": {}, "skill": {}, "subagent": {}}, "refinements": []})
-}
-
-/// The raw state of one scope; unknown fields are kept through a save.
+/// The raw state of one scope, as one document (`memory_store`); unknown
+/// fields are kept through a save. An unreadable store reads as empty.
 pub(super) fn load_raw(dir: &Path) -> Value {
-    let mut state = std::fs::read_to_string(dir.join(STATE_FILE))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .filter(Value::is_object)
-        .unwrap_or_else(empty_state);
+    let mut state = super::memory_store::load_document(dir)
+        .unwrap_or_else(|_| super::memory_store::empty_document());
     for kind in KINDS {
         if !state["entries"][kind].is_object() {
             state["entries"][kind] = json!({});
@@ -601,41 +594,23 @@ pub(super) fn load_raw(dir: &Path) -> Value {
     state
 }
 
-/// `saveHarnessState`: written to a temporary file and renamed, so a reader never
-/// sees half a file.
-pub(super) fn save_raw(dir: &Path, state: &Value) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(dir).map_err(|error| format!("harness state directory: {error}"))?;
+/// `saveHarnessState`: the document saved over the scope's store in one
+/// transaction, each changed entry an event that `writer` made. Returns the
+/// store's path.
+pub(super) fn save_raw(
+    dir: &Path,
+    state: &Value,
+    writer: &super::memory_store::Writer,
+) -> Result<PathBuf, String> {
     let changed = memory_changes_between(&load_raw(dir), state);
-    let path = dir.join(STATE_FILE);
-    let temporary = dir.join(format!("{STATE_FILE}.tmp"));
-    let text = serde_json::to_string_pretty(state).map_err(|error| error.to_string())? + "\n";
-    std::fs::write(&temporary, text).map_err(|error| format!("harness state: {error}"))?;
-    // A Windows reader that has the file open (the digest, a scanner) briefly
-    // refuses the replace; the Python kernel waits for it the same way.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    loop {
-        match std::fs::rename(&temporary, &path) {
-            Ok(()) => {
-                if changed > 0 {
-                    let _ = std::fs::write(
-                        dir.join(CHANGES_FILE),
-                        (memory_changes(dir) + changed).to_string(),
-                    );
-                }
-                return Ok(path);
-            }
-            Err(error)
-                if error.kind() == std::io::ErrorKind::PermissionDenied
-                    && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(error) => {
-                let _ = std::fs::remove_file(&temporary);
-                return Err(format!("harness state: {error}"));
-            }
-        }
+    super::memory_store::save_document(dir, state, writer)?;
+    if changed > 0 {
+        let _ = std::fs::write(
+            dir.join(CHANGES_FILE),
+            (memory_changes(dir) + changed).to_string(),
+        );
     }
+    Ok(super::memory_store::db_path(dir))
 }
 
 pub(super) fn now() -> String {
@@ -1516,11 +1491,10 @@ fn apply(
             applied_edits.push(record);
             continue;
         }
-        // What a refinement replaces or removes stays in the memory journal,
-        // so the `memory` tool's history and restore reach it too.
+        // What a refinement replaces or removes stays in the store's event
+        // log, so the `memory` tool's history and restore reach it too.
         let by = refine_origin(scopes, id, edit.text("evidence"));
         if action == "delete" {
-            super::memory::journal(dir, "delete", &kind, &computed, &before, &by)?;
             if let Some(records) = state["entries"][&kind].as_object_mut() {
                 records.remove(&computed);
             }
@@ -1558,9 +1532,6 @@ fn apply(
             after["project"] = project.clone();
         }
         after["origin"] = by.clone();
-        if !before.is_null() {
-            super::memory::journal(dir, "update", &kind, &computed, &before, &by)?;
-        }
         state["entries"][&kind][&computed] = after.clone();
         modified.insert(key);
         if !before.is_null() {
@@ -1604,7 +1575,17 @@ fn apply(
             "created_at": now(),
         }));
     }
-    let path = save_raw(dir, &state)?;
+    // One refinement is one operation: its edits share an operation id.
+    let writer = super::memory_store::Writer::new(
+        "refine",
+        &refine_origin(scopes, id, None),
+        if rollback_of.is_some() {
+            "rollback"
+        } else {
+            "refine"
+        },
+    );
+    let path = save_raw(dir, &state, &writer)?;
     let mut record = json!({
         "id": id,
         "summary": proposal.summary,
@@ -3399,6 +3380,10 @@ mod tests {
     };
     use serde_json::json;
 
+    fn test_writer() -> super::super::memory_store::Writer {
+        super::super::memory_store::Writer::new("test", &json!({}), "test")
+    }
+
     fn scopes(root: &std::path::Path) -> HarnessScopes {
         HarnessScopes {
             global: root.join("global"),
@@ -3993,6 +3978,7 @@ mod tests {
         super::save_raw(
             &scopes.global,
             &json!({"schema": 1, "entries": {"memory": memory, "prompt": {}, "skill": {}, "subagent": {}}, "refinements": []}),
+            &test_writer(),
         )
         .expect("state");
         assert!(super::memory_consolidation_due(&scopes.global));
@@ -4054,12 +4040,12 @@ mod tests {
         let mut state = load_raw(&scopes.global);
         state["entries"]["memory"]["temp"] =
             json!({"id": "temp", "kind": "memory", "title": "t", "content": "c", "version": 1});
-        super::save_raw(&scopes.global, &state).expect("create");
+        super::save_raw(&scopes.global, &state, &test_writer()).expect("create");
         state["entries"]["memory"]
             .as_object_mut()
             .expect("map")
             .remove("temp");
-        super::save_raw(&scopes.global, &state).expect("delete");
+        super::save_raw(&scopes.global, &state, &test_writer()).expect("delete");
         assert_eq!(super::memory_changes(&scopes.global), before + 2);
     }
 
@@ -4079,7 +4065,7 @@ mod tests {
         }
         std::fs::create_dir_all(&scopes.local).expect("dir");
         let state = json!({"schema": 1, "entries": {"memory": memory, "prompt": {}, "skill": {}, "subagent": {}}, "refinements": []});
-        super::save_raw(&scopes.local, &state).expect("state");
+        super::save_raw(&scopes.local, &state, &test_writer()).expect("state");
         assert!(super::local_consolidation_due(&scopes.local));
         // Global memory this size is not the local store's concern.
         assert!(!super::local_consolidation_due(&scopes.global));
@@ -4158,6 +4144,7 @@ mod tests {
         super::save_raw(
             &scopes.global,
             &json!({"schema": 1, "entries": {"memory": memory, "prompt": {}, "skill": {}, "subagent": {}}, "refinements": []}),
+            &test_writer(),
         )
         .expect("state");
         assert!(super::memory_consolidation_due(&scopes.global));

@@ -49,6 +49,19 @@ class EvidenceControls(unittest.TestCase):
         self.put(self.state, {'entries': {'memory': {'m': {'content': 'CW-FIXTURE'}}}})
         with self.assertRaisesRegex(AssertionError, 'nonempty continual'):
             self.clean()
+    def test_memory_store_rows_rejected(self):
+        store = self.data / 'sessions/s/harness/memory.sqlite3'
+        store.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(store)) as c, c:
+            c.execute('create table memory(kind text, name text)')
+            c.execute("insert into memory values('memory', 'm')")
+        with self.assertRaisesRegex(AssertionError, 'nonempty continual'):
+            self.clean()
+    def test_empty_memory_store_passes(self):
+        store = self.data / 'harness/memory.sqlite3'
+        with closing(sqlite3.connect(store)) as c, c:
+            c.execute('create table memory(kind text, name text)')
+        self.clean()
     def test_disk_task_state_rejected_even_when_sql_projection_empty(self):
         self.put(self.data / 'sessions/s/harness/task_state.json', {'objective': 'CW-FIXTURE', 'items': []})
         with self.assertRaisesRegex(AssertionError, 'nonempty task_state'):

@@ -20,7 +20,6 @@ use unicode_normalization::UnicodeNormalization as _;
 /// The host request type the kernel's `rlm.harness` sends.
 pub const REQUEST: &str = "harness";
 
-const STATE_FILE: &str = "harness_state.json";
 const KINDS: [&str; 5] = ["prompt", "memory", "skill", "subagent", "factory"];
 /// The longest id a title gives, cut on a word.
 const SLUG_MAX: usize = 60;
@@ -93,23 +92,12 @@ struct Store {
 
 impl Store {
     fn file(&self) -> PathBuf {
-        self.dir.join(STATE_FILE)
+        super::memory_store::db_path(&self.dir)
     }
 
     /// The raw state; unknown fields are kept through a save.
     fn raw(&self) -> Value {
-        let mut state = std::fs::read_to_string(self.file())
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .filter(Value::is_object)
-            .unwrap_or_else(|| json!({"schema": 1}));
-        if !state["entries"].is_object() {
-            state["entries"] = json!({});
-        }
-        if !state["refinements"].is_array() {
-            state["refinements"] = json!([]);
-        }
-        state
+        super::refine::load_raw(&self.dir)
     }
 
     /// `HarnessState.load`'s reading of one kind: entries without a string
@@ -160,19 +148,11 @@ impl Store {
         if self.find(&state, kind, id).is_none() {
             return Ok(json!(false));
         }
-        // What was removed stays in the memory journal (`memory` history).
-        super::memory::journal(
-            &self.dir,
-            "delete",
-            kind,
-            id,
-            &state["entries"][kind][id],
-            &self.origin,
-        )?;
+        // What was removed stays in the store's event log (`memory` history).
         if let Some(records) = state["entries"][kind].as_object_mut() {
             records.remove(id);
         }
-        self.save(&state)?;
+        self.save(&state, "delete")?;
         Ok(json!(true))
     }
 
@@ -229,16 +209,11 @@ impl Store {
         )?;
         self.passes_memory_checks(kind, &entry_id, existing.as_ref(), request)?;
         let now = now();
-        if existing.is_some() {
-            super::memory::journal(
-                &self.dir,
-                "update",
-                kind,
-                &entry_id,
-                &state["entries"][kind][&entry_id],
-                &self.origin,
-            )?;
-        }
+        let cause = if existing.is_some() {
+            "update"
+        } else {
+            "create"
+        };
         let entry = match existing {
             Some(mut entry) => {
                 entry["title"] = title.clone();
@@ -292,7 +267,7 @@ impl Store {
             }
             stored.insert("origin".to_owned(), self.origin.clone());
         }
-        self.save(&state)?;
+        self.save(&state, cause)?;
         Ok(entry)
     }
 
@@ -370,7 +345,7 @@ impl Store {
         if let Some(events) = state["refinements"].as_array_mut() {
             events.push(event.clone());
         }
-        self.save(&state)?;
+        self.save(&state, "refine")?;
         Ok(event)
     }
 
@@ -560,8 +535,9 @@ impl Store {
         })
     }
 
-    fn save(&self, state: &Value) -> Result<(), String> {
-        super::refine::save_raw(&self.dir, state).map(|_| ())
+    fn save(&self, state: &Value, cause: &str) -> Result<(), String> {
+        let writer = super::memory_store::Writer::new("kernel", &self.origin, cause);
+        super::refine::save_raw(&self.dir, state, &writer).map(|_| ())
     }
 }
 
@@ -1038,10 +1014,10 @@ fn python_json(value: &Value) -> String {
     }
 }
 
-/// The directory a state file lives in, for a test outside this module.
+/// The store a scope's entries live in, for a test outside this module.
 #[cfg(test)]
 pub(crate) fn state_file(dir: &std::path::Path) -> PathBuf {
-    dir.join(STATE_FILE)
+    super::memory_store::db_path(dir)
 }
 
 #[cfg(test)]
@@ -1162,7 +1138,7 @@ mod tests {
         let dirs = dirs(root.path());
         std::fs::create_dir_all(&dirs.local).expect("dir");
         std::fs::write(
-            state_file(&dirs.local),
+            dirs.local.join(super::super::memory_store::LEGACY_STATE),
             json!({"entries":{"memory":{"m":{"title":"T","content":"C","topic":"old","history":[1]}}}}).to_string(),
         )
         .expect("seed");
@@ -1172,9 +1148,7 @@ mod tests {
         )
         .expect("update");
         assert_eq!(updated["path"], "old", "a topic is read as the path");
-        let raw: Value =
-            serde_json::from_str(&std::fs::read_to_string(state_file(&dirs.local)).expect("read"))
-                .expect("json");
+        let raw = super::super::refine::load_raw(&dirs.local);
         assert_eq!(raw["entries"]["memory"]["m"]["history"], json!([1]));
         assert_eq!(raw["entries"]["memory"]["m"]["content"], "C2");
     }

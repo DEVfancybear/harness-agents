@@ -135,6 +135,12 @@ def clean(home, roots, needles):
                 assert isinstance(kinds, dict), f'unknown harness schema: {path}'
                 report['harness_states'].append(dict(path=str(path), kinds={k: len(v) for k, v in kinds.items()}))
                 assert all(isinstance(v, dict) and not v for v in kinds.values()), f'nonempty continual entries: {path}'
+            # Since the memory store, the continual entries are rows of memory.sqlite3.
+            for path in root.rglob('memory.sqlite3'):
+                with ro(path) as c:
+                    kinds = dict(c.execute('select kind, count(*) from memory group by kind').fetchall())
+                report['harness_states'].append(dict(path=str(path), kinds=kinds))
+                assert not kinds, f'nonempty continual entries: {path}'
             for path in root.rglob('task_state.json'):
                 state = load(path)
                 fields = ('objective', 'items', 'decisions', 'constraints', 'open', 'files')

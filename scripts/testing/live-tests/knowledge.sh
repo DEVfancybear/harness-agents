@@ -35,17 +35,9 @@ print(found or "")
 EOF
 }
 # Global memory entries as "id|path|pinned|content".
-entries() { "$PY" - "$D" <<'EOF'
-import json, os, sys
-sys.stdout.reconfigure(encoding="utf-8")
-f = os.path.join(sys.argv[1], "harness", "harness_state.json")
-s = json.load(open(f, encoding="utf-8")) if os.path.exists(f) else {"entries": {}}
-for kind in ("memory", "prompt"):
-    for k, e in (s["entries"].get(kind) or {}).items():
-        print("|".join([k, str(e.get("path", "general")), str((e.get("metadata") or {}).get("pinned", False)), str(e.get("content")).replace("\n", " ")]))
-EOF
-}
-# Seed global memory entries, each argument "id|title|content|path|pinned".
+entries() { "$PY" "$MEMORY_STORE" rows "$D/harness" | cut -d'|' -f1-4; }
+# Seed global memory entries, each argument "id|title|content|path|pinned":
+# a harness_state.json the store imports when ha next opens it.
 seed() { "$PY" - "$D" "$@" <<'EOF'
 import json, os, sys
 path = os.path.join(sys.argv[1], "harness", "harness_state.json")
@@ -187,7 +179,9 @@ open(path + ".held", "w").close()
 time.sleep(float(sys.argv[2]))
 EOF
 # Memory entries and prompt notes in a scope's state file.
-count_entries() { "$PY" -c "import json,sys,os; p=sys.argv[1]; s=json.load(open(p,encoding='utf-8')) if os.path.exists(p) else {}; print(sum(len((s.get('entries') or {}).get(k) or {}) for k in ('memory','prompt')))" "$1"; }
+# The memory and prompt entries a scope directory holds, or will once ha
+# imports the harness_state.json waiting beside its store.
+count_entries() { "$PY" "$MEMORY_STORE" count "$1"; }
 history_lines() { if [ -f "$1" ]; then wc -l < "$1" | tr -d ' '; else echo 0; fi; }
 
 echo '{"autoRefine": {"turnInterval": 1}}' > "$HA_HOME/settings.json"
@@ -206,7 +200,7 @@ check "the answer is in the result" '"$PY" -c "import json,sys; sys.exit(0 if js
 echo "################ 8. a review that cannot take the lock leaves no page or skill behind"
 before=$(history_lines "$L/refinements.jsonl")
 touch "$RX/exec8.marker"
-hold "$L/harness_state.json.lock" 600
+hold "$L/memory.lock" 600
 run_exec e8 --resume "$T" "Lượt này đừng gọi tool memory hay knowledge, chỉ trả lời. Mình vừa chốt cách tính phí ship của cửa hàng: đơn dưới 300 nghìn tính 30 nghìn, từ 300 nghìn đến dưới 1 triệu tính 15 nghìn, từ 1 triệu trở lên miễn phí; vùng xa cộng thêm 20 nghìn. Đây là quy tắc lâu dài của cửa hàng, hãy giải thích ngắn quy tắc này cho khách."
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 check "the review's apply timed out on the lock" 'grep -q "refine failed: waiting for another memory write timed out" "$RX/e8.err"'
@@ -218,7 +212,7 @@ check "what it wrote, it undid" '! grep -q "could not undo" "$RX/e8.err"'
 echo "################ 9. a global part that fails leaves the local refinement standing"
 before=$(history_lines "$L/refinements.jsonl")
 touch "$RX/exec9.marker"
-hold "$D/harness/harness_state.json.lock" 600
+hold "$D/harness/memory.lock" 600
 run_exec e9 --resume "$T" "Lượt này đừng gọi tool memory hay knowledge, chỉ trả lời. Từ nay về sau, ở mọi dự án và mọi cuộc trò chuyện, mình muốn bạn luôn trả lời bằng tiếng Việt, xưng 'mình' và gọi mình là 'bạn'. Còn trong cuộc trò chuyện này: bước tiếp theo là viết test cho hàm tính phí ship. Trả lời: đã rõ."
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 check "the global part's failure is reported" 'grep -q "the global memory part failed: waiting for another memory write timed out" "$RX/e9.err"'
@@ -246,9 +240,10 @@ for n in range(45):
     memory[key] = {"id": key, "kind": "memory", "title": f"Tiến độ phí ship {n}", "content": f"Đang làm phí ship: đã xong bước {n} trên 45.", "path": "progress", "scope": "local", "version": 1, "source": "agent", "updated_at": f"@{1790000000 + n * 60}"}
 json.dump(state, open(path, "w", encoding="utf-8"), ensure_ascii=False)
 EOF
-seeded=$(count_entries "$L/harness_state.json")
+seeded=$(count_entries "$L")
 run_exec e11 --resume "$T" "Lượt này đừng gọi tool memory hay knowledge. Trả lời đúng một từ: OK"
-after=$(count_entries "$L/harness_state.json")
+after=$(count_entries "$L")
+check "the seeded state file was imported into the store" '[ ! -e "$L/harness_state.json" ] && [ -e "$L/harness_state.json.imported" ]'
 echo "   local entries: $seeded -> $after"
 # The review runs first and may merge the 45 step entries itself (DeepSeek
 # did: one entry saying steps 0-44 were done), which leaves nothing for the

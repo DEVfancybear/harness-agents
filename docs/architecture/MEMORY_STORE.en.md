@@ -8,6 +8,10 @@ features of [timescale/memory-engine](https://github.com/timescale/memory-engine
 section says which phase delivers it. Until a phase ships, the code is the
 authority, not this document.
 
+0.8.1 ships P1 to P4. P5 (CLI, formats, packs), P6 (importers) and P7 (MCP
+server, integrations, console) are on hold until the maintainer resumes them.
+P1 adds only the one CLI command its tests need: `ha memory export`.
+
 ## 1. Goal and decisions
 
 memory-engine (ME) is a team memory server: Postgres with `ltree`, `pgvector` and
@@ -135,7 +139,7 @@ CREATE TABLE memory_event (
   operation    TEXT NOT NULL,      -- insert|update|delete
   operation_id TEXT NOT NULL,      -- one per write transaction
   cause        TEXT,               -- create|update|delete|move|copy|revert|import|migrate|review|dream|curate|rollback|...
-  actor        TEXT NOT NULL,      -- JSON: {"type": model|user|review|dream|curator|kernel|cli|mcp|import|migration, ...origin}
+  actor        TEXT NOT NULL,      -- JSON: {"type": model|refine|kernel|migration|cli|mcp|import, ...origin}
   version      INTEGER NOT NULL,
   doc          TEXT NOT NULL       -- snapshot of the resulting state (the removed state for a delete)
 );
@@ -191,8 +195,14 @@ They keep their JSON document shape:
   - replaces `refinement` when it changed;
   - bumps the memory-change counter (`memory_changes`) as today.
 - `Writer { actor, cause }` is new and required. Every call site states who
-  writes: the model's `memory` tool, `review`, `dream`, `curator`, `rollback`, the
-  `kernel`, the `cli` or `mcp`.
+  writes:
+  - `model`: the `memory` tool;
+  - `refine`: every refinement (`/refine`, the automatic review, Deep Dream,
+    the curator), with the refinement's id, which `refinements.jsonl` explains,
+    and cause `refine`, or `rollback` for a rollback;
+  - `kernel`: `rlm.harness`;
+  - `migration`: a legacy import;
+  - `cli` and `mcp` once those land.
 
 New features (filters, history, tree operations, search) query the rows directly.
 The document view only serves existing callers, so their behaviour does not

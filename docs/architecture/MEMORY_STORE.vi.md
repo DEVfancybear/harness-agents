@@ -8,6 +8,10 @@ commit `9c9bdc1`, ngày 23/10/2026) vào memory của ha. Việc chia làm bảy
 mỗi mục ghi rõ phase nào làm. Khi một phase chưa ship thì code là chuẩn, không
 phải tài liệu này.
 
+Bản 0.8.1 gồm P1 tới P4. P5 (CLI, định dạng, pack), P6 (importer) và P7 (MCP
+server, tích hợp, console) tạm hoãn tới khi maintainer làm tiếp. P1 chỉ thêm đúng
+một lệnh CLI mà test của nó cần: `ha memory export`.
+
 ## 1. Mục tiêu và quyết định
 
 memory-engine (ME) là server memory dùng chung cho nhóm, chạy trên Postgres với
@@ -140,7 +144,7 @@ CREATE TABLE memory_event (
   operation    TEXT NOT NULL,      -- insert|update|delete
   operation_id TEXT NOT NULL,      -- một giá trị cho mỗi transaction ghi
   cause        TEXT,               -- create|update|delete|move|copy|revert|import|migrate|review|dream|curate|rollback|...
-  actor        TEXT NOT NULL,      -- JSON: {"type": model|user|review|dream|curator|kernel|cli|mcp|import|migration, ...origin}
+  actor        TEXT NOT NULL,      -- JSON: {"type": model|refine|kernel|migration|cli|mcp|import, ...origin}
   version      INTEGER NOT NULL,
   doc          TEXT NOT NULL       -- snapshot trạng thái sau thay đổi (với delete: trạng thái bị xóa)
 );
@@ -196,8 +200,14 @@ Ba chỗ này giữ nguyên dạng document JSON:
   - thay bảng `refinement` nếu nó đổi;
   - tăng bộ đếm thay đổi memory (`memory_changes`) như hiện nay.
 - `Writer { actor, cause }` là tham số mới và bắt buộc: mỗi chỗ gọi phải nói ai
-  đang ghi. Có thể là tool `memory` của model, `review`, `dream`, `curator`,
-  `rollback`, `kernel`, `cli` hoặc `mcp`.
+  đang ghi:
+  - `model`: tool `memory`;
+  - `refine`: mọi lượt refine (`/refine`, review tự động, Deep Dream, curator),
+    kèm id của refinement (giải thích trong `refinements.jsonl`), cause là
+    `refine`, hoặc `rollback` khi rollback;
+  - `kernel`: `rlm.harness`;
+  - `migration`: nhập file cũ;
+  - `cli` và `mcp` khi các phần đó có.
 
 Tính năng mới (bộ lọc, lịch sử, thao tác trên cây, search) truy vấn thẳng các
 dòng. Lớp document chỉ phục vụ các chỗ gọi cũ, nên ở P1 hành vi của chúng không
