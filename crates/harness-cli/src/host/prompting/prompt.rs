@@ -281,6 +281,14 @@ fn additional_guidance(has: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
         "- Read before changing a file; use edit_file for localized changes; never guess paths.",
         "- Keep scratch files out of the checkout: give a commit message with `git commit -m` (or a file in the system temp directory), never a file in the repository; a stray file there gets committed by mistake, and a change left uncommitted stops a coder child from taking the checkout.",
     ];
+    // agentic-file-search's three phases (scan, deep dive, backtrack) and its
+    // citations, for a question about what a folder of files says.
+    if has("list_files") && has("read_file") {
+        lines.push("- To answer from a folder of files you have not read, explore in three phases: scan them all at once (list_files with preview) and decide which are relevant, which might be and which to skip; read the relevant ones whole (read_file with paths); when one refers to a file you skipped - a read result names the workspace files its text refers to - read that one too before answering.");
+    }
+    if has("read_file") {
+        lines.push("- When an answer rests on what files say, cite each fact with its path:line and end with the files you used.");
+    }
     if has("web_search") {
         lines.push("- For current or external information use web_search, then read the most relevant results with web_fetch; cite the URLs you used. Never claim you cannot access the internet when these tools are listed.");
     }
@@ -454,5 +462,19 @@ mod tests {
                 .text
                 .contains(super::super::knowledge::GUIDANCE)
         );
+    }
+
+    /// agentic-file-search's three phases and citations, shown with the file
+    /// tools they name.
+    #[test]
+    fn file_questions_are_explored_in_phases_and_cited() {
+        let both = SystemPromptBuilder::build(&environment(), &["read_file", "list_files"]).text;
+        assert!(both.contains("explore in three phases"), "{both}");
+        assert!(both.contains("cite each fact with its path:line"), "{both}");
+        let read = SystemPromptBuilder::build(&environment(), &["read_file"]).text;
+        assert!(!read.contains("explore in three phases"));
+        assert!(read.contains("cite each fact with its path:line"));
+        let none = SystemPromptBuilder::build(&environment(), &[]).text;
+        assert!(!none.contains("path:line"));
     }
 }

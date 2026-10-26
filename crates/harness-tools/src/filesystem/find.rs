@@ -464,6 +464,11 @@ fn best_first<S: Ord>(scored: &mut [(S, &Candidate<'_>)]) {
 /// `harness_types::search`: those matching every word, else those matching
 /// the most; and the note an incomplete answer carries. No words: every
 /// candidate, what git says is changed first, then the newest.
+///
+/// A word's match counts for its quality times its BM25 IDF over the
+/// candidates' paths: a word in few paths (`loader`) names the file more than
+/// one in many (`src`, `test`), so a file matching only the rare word comes
+/// before one matching only the common word.
 fn ranked<'a, 'b>(
     candidates: &'b [Candidate<'a>],
     words: &[String],
@@ -477,17 +482,54 @@ fn ranked<'a, 'b>(
             None,
         )
     } else {
-        let found = match_words(candidates, words, |candidate, word| {
-            candidate.word_score(word).map(u64::from)
+        let scores = candidates
+            .iter()
+            .map(|candidate| {
+                words
+                    .iter()
+                    .map(|word| candidate.word_score(word))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let documents = u64::try_from(candidates.len()).unwrap_or(u64::MAX);
+        let weights = (0..words.len())
+            .map(|index| {
+                let holding = scores.iter().filter(|each| each[index].is_some()).count();
+                harness_types::search::bm25_idf(
+                    documents,
+                    u64::try_from(holding).unwrap_or(u64::MAX),
+                )
+            })
+            .collect::<Vec<_>>();
+        let found = match_words(candidates.iter().zip(&scores), words, |(_, each), word| {
+            let index = words.iter().position(|other| other == word)?;
+            each[index].map(|quality| weighted(quality, weights[index]))
         });
         let note = found.note("files", words);
-        (found.hits, note)
+        (
+            found
+                .hits
+                .into_iter()
+                .map(|(coverage, (candidate, _))| (coverage, candidate))
+                .collect(),
+            note,
+        )
     };
     best_first(&mut scored);
     (
         scored.into_iter().map(|(_, candidate)| candidate).collect(),
         note,
     )
+}
+
+/// A match's `quality` weighed by its word's IDF, three decimals kept.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a positive score far below u64::MAX"
+)]
+fn weighted(quality: u32, idf: f64) -> u64 {
+    (f64::from(quality) * idf * 1000.0).round().max(1.0) as u64
 }
 
 /// The first few of `candidates` whose text holds `text`, each with the line.
@@ -733,6 +775,39 @@ mod tests {
                 .as_deref()
                 .is_some_and(|note| note.starts_with("0 files match"))
         );
+    }
+
+    /// No path holds every word: a file matching a word few paths hold comes
+    /// before files matching a word many paths hold, as well as it matches.
+    #[test]
+    fn a_rare_word_outranks_a_common_one() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let root = fs::canonicalize(directory.path()).expect("root");
+        for path in [
+            "src/handler.rs",
+            "src/handler_test.rs",
+            "web/handler.ts",
+            "lib/handler.py",
+            "zz/deep/more/ledger.rs",
+        ] {
+            fs::create_dir_all(root.join(path).parent().expect("parent")).expect("dirs");
+            fs::write(root.join(path), "x").expect("file");
+        }
+        // The oldest and longest path: by recency or length it would come last.
+        fs::File::options()
+            .write(true)
+            .open(root.join("zz/deep/more/ledger.rs"))
+            .expect("open")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_hours(1))
+            .expect("age");
+        let found = find_files(&root, None, "handler ledger nginx", 30).expect("find");
+        assert_eq!(
+            paths(&found)[0],
+            "zz/deep/more/ledger.rs",
+            "{:?}",
+            paths(&found)
+        );
+        assert_eq!(paths(&found).len(), 5);
     }
 
     #[test]

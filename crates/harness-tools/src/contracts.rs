@@ -283,7 +283,8 @@ pub const fn coding_tool_names() -> &'static [&'static str] {
 fn allowed_fields(name: &str) -> Option<&'static [&'static str]> {
     Some(match name {
         "read_file" => &["path", "paths", "offset", "limit"],
-        "list_files" | "git_diff" => &["path"],
+        "list_files" => &["path", "preview"],
+        "git_diff" => &["path"],
         "search_text" => &[
             "query",
             "path",
@@ -346,6 +347,15 @@ pub fn coding_tool_schemas_for(hashline: bool) -> Vec<Value> {
 /// Most files one `read_file` call may name in `paths`.
 pub const READ_FILE_MAX_PATHS: usize = 10;
 
+/// Most lines `list_files` previews of one file.
+pub const LIST_PREVIEW_MAX_LINES: u32 = 30;
+
+/// Lines `list_files` previews of each file for `preview: true`.
+pub const LIST_PREVIEW_DEFAULT_LINES: u32 = 10;
+
+/// Most files one `list_files` call previews.
+pub const LIST_PREVIEW_MAX_FILES: usize = 50;
+
 /// Most replacements one `edit_file` call may carry in `edits`.
 pub const EDIT_FILE_MAX_EDITS: usize = 50;
 
@@ -382,8 +392,11 @@ fn workspace_tool_schemas(hashline: bool) -> Vec<Value> {
         ),
         function_schema(
             "list_files",
-            "List bounded non-sensitive files rooted in the registered workspace.",
-            json!({"path": nullable_string_schema()}),
+            "List bounded non-sensitive files rooted in the registered workspace. With preview, also see what the files hold in one call: each file's size and line count, and for a code file its outline (the lines that declare functions, types, classes, with line numbers), for Markdown its headings, else its first lines; the files directly in path come first.",
+            json!({
+                "path": nullable_string_schema(),
+                "preview": {"type": "integer", "minimum": 1, "description": format!("Lines to show of each file (outline or first lines), at most {LIST_PREVIEW_MAX_LINES}; more is read as {LIST_PREVIEW_MAX_LINES}; at most {LIST_PREVIEW_MAX_FILES} files are previewed.")}
+            }),
             &[],
         ),
         function_schema(
@@ -675,6 +688,10 @@ pub enum CodingToolAction {
     },
     ListFiles {
         path: Option<String>,
+        /// Lines of each file to show with the listing (agentic-file-search's
+        /// `scan_folder`): a code file's outline, else its first lines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<u32>,
     },
     SearchText {
         query: String,
@@ -831,7 +848,7 @@ impl CodingToolAction {
             | Self::ApplyPatch { path, .. }
             | Self::WriteFile { path, .. }
             | Self::EditFile { path, .. } => Some(path),
-            Self::ListFiles { path }
+            Self::ListFiles { path, .. }
             | Self::SearchText { path, .. }
             | Self::Glob { path, .. }
             | Self::FindFiles { path, .. }
@@ -951,6 +968,15 @@ impl CodingToolAction {
             }
             "list_files" => Ok(Self::ListFiles {
                 path: optional_path(object),
+                // More lines than the bound are read as the bound, and `true`
+                // as the default, so the call is not refused for its form.
+                preview: match object.get("preview") {
+                    Some(Value::Bool(true)) => Some(LIST_PREVIEW_DEFAULT_LINES),
+                    Some(Value::Bool(false)) => None,
+                    _ => parse_optional_bounded_u32(object, "preview", 0, u32::MAX)?
+                        .filter(|lines| *lines > 0)
+                        .map(|lines| lines.min(LIST_PREVIEW_MAX_LINES)),
+                },
             }),
             "search_text" => Ok(Self::SearchText {
                 query: required_string(object, "query")?,
@@ -1843,10 +1869,17 @@ pub enum ToolOutput {
         /// Hash of the whole file, whatever range was shown: the value
         /// `write_file` and `apply_patch` take as `expected_hash`.
         hash: ContentHash,
+        /// Other workspace files the shown text names (a reference to follow
+        /// before answering, agentic-file-search's "backtrack").
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        references: Vec<String>,
     },
     ListFiles {
         paths: Vec<String>,
         truncated: bool,
+        /// What the listed files hold, when the call asked for a preview.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        previews: Vec<FilePreview>,
     },
     SearchText {
         matches: Vec<SearchMatch>,
@@ -1995,6 +2028,23 @@ pub enum ToolOutput {
     },
 }
 
+/// One file of a `list_files` preview.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct FilePreview {
+    pub path: String,
+    pub bytes: u64,
+    /// Lines of its text; `None` when it is not read as text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<u64>,
+    /// What `text` is: `outline` (the lines declaring something, or a
+    /// Markdown file's headings) or `first lines`; or why there is no text
+    /// (`binary`, `not UTF-8`, `over 1 MiB`).
+    pub shows: String,
+    /// The shown lines, numbered as `read_file` numbers them (`12: text`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text: Vec<String>,
+}
+
 /// One `find_files` hit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct FoundFile {
@@ -2102,6 +2152,58 @@ mod search_context_tests {
                 "{bad}"
             );
         }
+    }
+
+    /// `list_files`' preview: lines past the bound are read as the bound,
+    /// `true` as the default, and the schema the model sees offers it.
+    #[test]
+    fn a_listing_preview_is_read_within_its_bound() {
+        let preview =
+            |arguments: &str| match CodingToolAction::from_provider_call("list_files", arguments)
+                .expect("parses")
+            {
+                CodingToolAction::ListFiles { preview, .. } => preview,
+                other => panic!("{other:?}"),
+            };
+        assert_eq!(preview(r#"{"path":"src"}"#), None);
+        assert_eq!(preview(r#"{"preview":5}"#), Some(5));
+        assert_eq!(
+            preview(r#"{"preview":500}"#),
+            Some(super::LIST_PREVIEW_MAX_LINES)
+        );
+        assert_eq!(
+            preview(r#"{"preview":true}"#),
+            Some(super::LIST_PREVIEW_DEFAULT_LINES)
+        );
+        assert_eq!(preview(r#"{"preview":false}"#), None);
+        assert_eq!(preview(r#"{"preview":0}"#), None);
+        assert!(CodingToolAction::from_provider_call("list_files", r#"{"preview":"x"}"#).is_err());
+        let schemas = super::workspace_tool_schemas(false);
+        let parameters = schemas
+            .iter()
+            .find(|schema| schema["function"]["name"] == "list_files")
+            .map(|schema| schema["function"]["parameters"].clone())
+            .expect("schema");
+        for arguments in [r#"{"preview":5}"#, r#"{"path":"src","preview":99}"#] {
+            assert!(
+                crate::validation::validate_tool_arguments_json(
+                    "list_files",
+                    &parameters,
+                    arguments
+                )
+                .is_ok(),
+                "{arguments}"
+            );
+        }
+        // A listing without a preview hashes as it always has.
+        let plain = CodingToolAction::ListFiles {
+            path: None,
+            preview: None,
+        };
+        assert_eq!(
+            plain.canonical_value().expect("value"),
+            serde_json::json!({"kind": "list_files", "path": null})
+        );
     }
 
     /// Seen in a session: `read_file limit=520` was refused as invalid

@@ -8,7 +8,10 @@
 //! - another spelling when nothing matched: an identifier that matches
 //!   nowhere is searched again in its other spellings (`snake_case`,
 //!   `camelCase`, `kebab-case`, `SCREAMING_CASE`) and case, and the result says
-//!   so - before, "0 matches" left the model to guess the spelling itself.
+//!   so - before, "0 matches" left the model to guess the spelling itself;
+//! - several words no line holds together: every file holding one is
+//!   counted and ranked with BM25's weights (agentic-file-search's keyword
+//!   ranking), so a rare word outranks one on every line (`by_words`).
 
 use std::path::Path;
 
@@ -140,16 +143,13 @@ pub(crate) fn lookup(
         }
     }
     let words = query_words(request.query);
-    if output.matches.is_empty() && !request.regex && texts.len() == 1 && words.len() > 1 {
-        let any = search(
-            &any_of_pattern(&words.iter().map(String::as_str).collect::<Vec<_>>()),
-            true,
-            true,
-        )?;
-        if !any.matches.is_empty() {
-            let (found, said) = by_words(any, request.query, &words);
-            (output, note) = (found, Some(said));
-        }
+    if output.matches.is_empty()
+        && !request.regex
+        && texts.len() == 1
+        && words.len() > 1
+        && let Some((found, said)) = by_words(root, request, &words)?
+    {
+        (output, note) = (found, Some(said));
     }
     definitions_first(&mut output, &names);
     Ok((output, note))
@@ -166,40 +166,119 @@ fn query_words(query: &str) -> Vec<String> {
     words
 }
 
-/// The lines of a search for any of `words`, the files holding the most of
-/// them first (the shared rule of `harness_types::search`), and the note that
-/// says so.
-fn by_words(any: SearchOutput, query: &str, words: &[String]) -> (SearchOutput, String) {
-    let mut files: Vec<(String, Vec<crate::contracts::SearchMatch>)> = Vec::new();
-    for hit in any.matches {
-        match files.iter_mut().find(|(path, _)| *path == hit.path) {
-            Some((_, lines)) => lines.push(hit),
-            None => files.push((hit.path.clone(), vec![hit])),
-        }
+/// Most lines one file shows in a search for several words, so the result
+/// reaches past its first files.
+const WORD_LINES_PER_FILE: usize = 20;
+
+/// BM25's IDF as an integer score: three decimals kept.
+const IDF_SCALE: f64 = 1000.0;
+
+/// BM25's term-frequency saturation: the tenth occurrence of a word adds
+/// little to a file that holds it nine times.
+const TF_SATURATION: f64 = 1.2;
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a positive score far below u64::MAX"
+)]
+fn scaled(score: f64) -> u64 {
+    (score * IDF_SCALE).round().max(1.0) as u64
+}
+
+/// One word's score in a file that holds it `count` times: its IDF `weight`,
+/// saturated by how often it occurs (BM25 without a length norm).
+fn word_score(weight: u64, count: u32) -> u64 {
+    let count = f64::from(count);
+    #[allow(clippy::cast_precision_loss, reason = "a scaled IDF below 2^52")]
+    let weight = weight as f64;
+    scaled(weight / IDF_SCALE * count * (TF_SATURATION + 1.0) / (count + TF_SATURATION))
+}
+
+/// A search for several words no line holds together (agentic-file-search's
+/// keyword ranking, with BM25's weights): every searched file holding one of
+/// them is counted - not only those before the 512-match cut - and the files
+/// holding the most words come first (the shared rule of
+/// `harness_types::search`), then those whose words are rarer in the
+/// workspace and occur more often, so a word on every line no longer outranks
+/// the one that names the thing. A file's lines come with the rarest words
+/// first, at most [`WORD_LINES_PER_FILE`] of them. `None` when no file holds
+/// any word.
+fn by_words(
+    root: &Path,
+    request: &Lookup<'_>,
+    words: &[String],
+) -> Result<Option<(SearchOutput, String)>, HarnessError> {
+    let walk = crate::workspace::search_walk(root, request.path)?;
+    let (files, searched) = crate::search::word_counts(root, &walk, words, request.glob)?;
+    if files.is_empty() {
+        return Ok(None);
     }
-    let mut found = harness_types::search::match_words(files, words, |(_, lines), word| {
-        let holding = lines
-            .iter()
-            .filter(|line| line.preview.to_lowercase().contains(word))
-            .count();
-        (holding > 0).then(|| u64::try_from(holding).unwrap_or(u64::MAX))
+    let documents = u64::try_from(searched.max(files.len())).unwrap_or(u64::MAX);
+    let weights = (0..words.len())
+        .map(|index| {
+            let holding = files.iter().filter(|file| file.counts[index] > 0).count();
+            scaled(harness_types::search::bm25_idf(
+                documents,
+                u64::try_from(holding).unwrap_or(u64::MAX),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut found = harness_types::search::match_words(files, words, |file, word| {
+        let index = words.iter().position(|each| each == word)?;
+        let count = file.counts[index];
+        (count > 0).then(|| word_score(weights[index], count))
     });
-    let note = found.note("files", words).unwrap_or_else(|| {
-        format!("0 matches for '{query}'; lines of the files holding all its words:")
+    let mut note = found.note("files", words).unwrap_or_else(|| {
+        format!(
+            "0 matches for '{}'; lines of the files holding all its words:",
+            request.query
+        )
     });
     found.most_first();
-    let matches = found
+    let order = found
         .hits
-        .into_iter()
-        .flat_map(|(_, (_, lines))| lines)
-        .collect();
-    (
+        .iter()
+        .map(|(_, file)| file.file)
+        .collect::<Vec<_>>();
+    let pattern = any_of_pattern(&words.iter().map(String::as_str).collect::<Vec<_>>());
+    let (lines, cut) = crate::search::ranked_matches(
+        root,
+        &walk,
+        &order,
+        &crate::search::SearchQuery {
+            query: &pattern,
+            use_regex: true,
+            case_insensitive: true,
+            glob: None,
+            context_lines: request.context_lines,
+            anchors: request.anchors,
+        },
+        WORD_LINES_PER_FILE,
+        |line| {
+            let line = line.to_lowercase();
+            words
+                .iter()
+                .zip(&weights)
+                .filter(|(word, _)| line.contains(word.as_str()))
+                .map(|(_, weight)| *weight)
+                .sum()
+        },
+    )?;
+    if cut {
+        let at = note.len() - usize::from(note.ends_with(':'));
+        note.insert_str(
+            at,
+            &format!(" (at most {WORD_LINES_PER_FILE} lines of each file, its rarest words first)"),
+        );
+    }
+    Ok(Some((
         SearchOutput {
-            matches,
-            truncated: any.truncated,
+            matches: lines.matches,
+            truncated: lines.truncated || !walk.complete,
         },
         note,
-    )
+    )))
 }
 
 /// Move the lines that declare one of `names` to the front, keeping the
@@ -350,6 +429,50 @@ const DECLARING: &[&str] = &[
 /// name (`pub(crate) fn parse(`, `class Parser:`, `const PARSE = `), or a Go
 /// method (`func (s *Server) Parse(`).
 fn is_definition(line: &str, name: &str) -> bool {
+    let Some((_, after)) = declaration(line) else {
+        return false;
+    };
+    let Some(tail) = strip_name(after, name) else {
+        return false;
+    };
+    !tail.starts_with(|character: char| character.is_alphanumeric() || character == '_')
+}
+
+/// Keywords that declare a variable: in a file's outline only at its top
+/// level, as a local `let` is not part of a file's shape.
+const VARIABLE: &[&str] = &["let", "var", "val", "const", "static"];
+
+/// Whether `line` belongs in a code file's outline: it declares a named
+/// function, type, class, module or the like at any depth, or a variable or
+/// constant at the top level (unindented).
+///
+/// The declared name must be followed by code: nothing, punctuation (`(`,
+/// `{`, `:`, `=`, `;`...), or a line ending in `{`, `(`, `:` or ` do` - so a
+/// sentence of prose that starts with `let` or `type` is not a declaration.
+pub(crate) fn declares(line: &str) -> bool {
+    let Some((keyword, after)) = declaration(line) else {
+        return false;
+    };
+    if !after.starts_with(|character: char| {
+        character.is_alphabetic() || character == '_' || character == '$'
+    }) || (VARIABLE.contains(&keyword) && line.starts_with([' ', '\t']))
+    {
+        return false;
+    }
+    let rest = after
+        .trim_start_matches(|character: char| {
+            character.is_alphanumeric() || character == '_' || character == '$'
+        })
+        .trim();
+    rest.is_empty()
+        || rest.starts_with(['(', '{', ':', '=', ';', '<', '[', ',', '.', '!'])
+        || rest.ends_with(['{', '(', ':', ';', '='])
+        || rest.ends_with(" do")
+}
+
+/// The declaring keyword of `line` and the text after it, where the declared
+/// name starts; `None` for a line that declares nothing.
+fn declaration(line: &str) -> Option<(&'static str, &str)> {
     let mut rest = line.trim_start();
     loop {
         if let Some(after) = rest
@@ -367,15 +490,13 @@ fn is_definition(line: &str, name: &str) -> bool {
         };
         rest = rest[modifier.len()..].trim_start();
     }
-    let Some(keyword) = DECLARING.iter().find(|keyword| {
-        rest.strip_prefix(**keyword)
+    let keyword = DECLARING.iter().copied().find(|keyword| {
+        rest.strip_prefix(*keyword)
             .is_some_and(|after| after.starts_with([' ', '\t', '<', '(']))
-    }) else {
-        return false;
-    };
+    })?;
     let mut after = rest[keyword.len()..].trim_start();
     // Go's receiver: `func (s *Server) Parse(`.
-    if *keyword == "func" && after.starts_with('(') {
+    if keyword == "func" && after.starts_with('(') {
         after = after
             .split_once(')')
             .map_or("", |(_, rest)| rest.trim_start());
@@ -387,11 +508,7 @@ fn is_definition(line: &str, name: &str) -> bool {
             .map_or("", |(_, rest)| rest.trim_start());
     }
     let after = after.trim_start_matches(['*', '&']);
-    let after = after.strip_prefix("mut ").unwrap_or(after);
-    let Some(tail) = strip_name(after, name) else {
-        return false;
-    };
-    !tail.starts_with(|character: char| character.is_alphanumeric() || character == '_')
+    Some((keyword, after.strip_prefix("mut ").unwrap_or(after)))
 }
 
 /// `text` without `name` at its start, matched without case only when the
@@ -405,7 +522,9 @@ fn strip_name<'a>(text: &'a str, name: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lookup, identifier_words, is_definition, is_identifier, lookup, spellings};
+    use super::{
+        Lookup, declares, identifier_words, is_definition, is_identifier, lookup, spellings,
+    };
     use std::fs;
 
     fn request<'a>(query: &'a str, any_of: &'a [String]) -> Lookup<'a> {
@@ -547,5 +666,107 @@ mod tests {
         }
         assert!(!is_definition("class ParseConfig:", "parse_config"));
         assert!(is_definition("pub struct PrepareUpload {", "prepareupload"));
+    }
+
+    /// A file's outline: what it declares, not its local variables nor a
+    /// sentence of prose that starts with a keyword.
+    #[test]
+    fn an_outline_holds_declarations() {
+        for line in [
+            "pub(crate) fn parse_config(path: &Path) {",
+            "    pub async fn method(&self) -> u8 {",
+            "impl<T> Display for Wrapper<T> {",
+            "mod loader;",
+            "class Parser(Base):",
+            "    def parse(self):",
+            "export default function App() {",
+            "export const ROUTES = [",
+            "type Config struct {",
+            "func (s *Server) Serve() error {",
+            "interface Props {",
+            "defmodule Shop.Cart do",
+            "def run",
+        ] {
+            assert!(declares(line), "{line}");
+        }
+        for line in [
+            "    let total = items.len();",
+            "        const x = 1;",
+            "let me explain how the loader works",
+            "type the name into the box",
+            "class of problems we see",
+            "// fn commented_out() {}",
+            "parse_config(path)?;",
+        ] {
+            assert!(!declares(line), "{line}");
+        }
+    }
+
+    /// Several words no line holds together: every file holding one is
+    /// counted, past the 512-match cut, and a file holding the rare word
+    /// outranks files holding a word that is everywhere.
+    #[test]
+    fn several_words_are_ranked_by_how_rare_they_are() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let root = fs::canonicalize(directory.path()).expect("root");
+        // Six files fill the search with "value" long before z_last.rs, which
+        // alone holds "checksum": path order and the old cut lost it.
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            fs::write(
+                root.join(format!("{name}.rs")),
+                "let value = value + 1;\n".repeat(200),
+            )
+            .expect("common");
+        }
+        fs::write(root.join("z_last.rs"), "fn verify(checksum: u32) {}\n").expect("rare");
+        // One file holds both words, on different lines: it leads, and its
+        // line with the rare word comes before the one with the common word.
+        fs::write(
+            root.join("m_both.rs"),
+            "let value = 1;\nlet other = 2;\nassert_eq!(checksum, 3);\n",
+        )
+        .expect("both");
+
+        let (found, note) =
+            lookup(&root, &request("checksum value nowhere_word", &[])).expect("search");
+        let note = note.expect("a note");
+        assert!(note.contains("no files match 'nowhere_word'"), "{note}");
+        assert!(note.contains("at most 20 lines of each file"), "{note}");
+        let mut files = found
+            .matches
+            .iter()
+            .map(|hit| hit.path.as_str())
+            .collect::<Vec<_>>();
+        files.dedup();
+        assert_eq!(files[0], "m_both.rs", "both words lead: {files:?}");
+        assert_eq!(files[1], "z_last.rs", "the rare word next: {files:?}");
+        assert_eq!(files.len(), 8, "every file shows: {files:?}");
+        assert_eq!(found.matches[0].line, 3, "the rare word's line first");
+        assert_eq!(found.matches[1].line, 1);
+        let common = found
+            .matches
+            .iter()
+            .filter(|hit| hit.path == "a.rs")
+            .count();
+        assert_eq!(common, 20, "a file shows at most 20 lines");
+
+        // Every word in one file but no line holding all: that file's lines,
+        // the line holding more of the words first.
+        let (found, note) = lookup(&root, &request("value checksum", &[])).expect("search");
+        assert!(
+            note.expect("note")
+                .starts_with("0 matches for 'value checksum'")
+        );
+        assert!(found.matches.iter().all(|hit| hit.path == "m_both.rs"));
+        assert_eq!(found.matches[0].line, 3);
+    }
+
+    #[test]
+    fn a_word_score_saturates_and_weighs_its_rarity() {
+        let rare = super::scaled(harness_types::search::bm25_idf(100, 1));
+        let common = super::scaled(harness_types::search::bm25_idf(100, 90));
+        assert!(super::word_score(rare, 1) > super::word_score(common, 50));
+        assert!(super::word_score(rare, 2) > super::word_score(rare, 1));
+        assert!(super::word_score(rare, 100) < 2 * super::word_score(rare, 2));
     }
 }

@@ -417,13 +417,18 @@ The harness runs the checks itself, in order, stopping at the first failure, in 
 - Each hit shows its git status where it is not clean.
 - An empty query lists what git says is changed, then the newest files.
 - When no file name holds any of the words, it lists the files whose text holds the query, or the most of its words, and says so.
+- Among files matching as many words, a word few paths hold counts for more than one many paths hold (BM25's IDF over the paths): `handler ledger` puts `ledger.rs` before the many `handler` files.
 - `limit` defaults to 30, and is at most 200.
 
 `search_text` adds three things:
 - `any_of`: more literal spellings, OR'd with `query` in one call. For example, `["prepare_upload", "PrepareUpload"]`.
 - Definitions first: lines that declare the searched name (`fn`, `def`, `class`, `const`, `func`, …) lead the result.
 - Other spellings: an identifier that matches nothing is searched again in its other spellings (`snake_case`, `camelCase`, `kebab-case`, run together) and without case. The result opens with `0 matches for 'X'; found as 'x_y':`.
-- Several words no line holds as they are written: the lines holding any of them, the files holding the most words first, under the rule above.
+- Several words no line holds as they are written: the lines holding any of them, the files holding the most words first, under the rule above. These follow [agentic-file-search](https://github.com/PromtEngineer/agentic-file-search)'s keyword ranking with BM25's weights: every searched file holding a word is counted (not only those before the 512-match cut), files with as many words are ordered by how rare their words are in the workspace and how often they occur, and a file shows at most 20 of its lines, the lines with the rarest words first. A word on every line no longer buries the file that names the thing.
+
+`list_files` with `preview` (lines per file, at most 30; `true` is 10) shows what a folder holds in one call, after agentic-file-search's `scan_folder`: each file's size and line count, and for a code file its outline - the lines that declare a function, type, class, module or a top-level variable, with their line numbers - for Markdown its headings, else its first lines. The files directly in the folder come first, then each level deeper; at most 50 files and 50 KB are previewed, and the rest are listed by name.
+
+`read_file` names the other workspace files the shown text refers to (`[This text names other workspace files: docs/annex_q.md. …]`): a path from the root or from the file's folder, with or without its extension as an import writes it (`./upload`), or a file name with its extension (`annex_q.md`); a name more than three files share names none. The system prompt then explores a folder of files in agentic-file-search's [three phases](https://github.com/PromtEngineer/agentic-file-search/blob/main/ARCHITECTURE.md#three-phase-exploration-strategy) - scan them all with `list_files` and `preview` and sort them into relevant, maybe and skip; read the relevant ones whole; read a skipped file a read names before answering - and an answer that rests on what files say cites each fact as `path:line` and ends with the files used.
 
 `edit_file` with several `edits` applies them in order and writes them together, or none. An `old_string` the file holds more than once is refused as ambiguous, with each copy's line and the line above it, so the context that tells them apart is in the error. Edits of one call that change the same text, as many as the file holds it, take one copy each in the file's order: one edit per copy changes each differently.
 

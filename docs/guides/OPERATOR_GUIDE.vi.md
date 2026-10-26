@@ -412,13 +412,18 @@ Harness tự chạy các check, theo thứ tự, dừng ở check hỏng đầu 
 - Mỗi kết quả kèm trạng thái git nếu file không sạch.
 - Query trống thì liệt kê các file git báo đã thay đổi, rồi đến các file mới nhất.
 - Không tên file nào chứa từ nào thì liệt kê các file có nội dung chứa câu tìm, hoặc chứa nhiều từ của nó nhất, và ghi rõ như vậy.
+- Giữa các file khớp cùng số từ, một từ ít đường dẫn chứa nặng ký hơn một từ nhiều đường dẫn chứa (IDF của BM25 trên các đường dẫn): `handler ledger` đặt `ledger.rs` trước hàng loạt file `handler`.
 - `limit` mặc định 30, tối đa 200.
 
 `search_text` có thêm:
 - `any_of`: thêm các cách viết khác, tìm trong một lần gọi (OR với `query`), ví dụ `["prepare_upload", "PrepareUpload"]`.
 - Dòng định nghĩa lên đầu: dòng khai báo tên đang tìm (`fn`, `def`, `class`, `const`, `func`, …) đứng trước các chỗ dùng.
 - Cách viết khác: một identifier không khớp chỗ nào sẽ được tìm lại theo các cách viết khác (`snake_case`, `camelCase`, `kebab-case`, viết liền) và không phân biệt hoa thường. Khi đó kết quả mở đầu bằng `0 matches for 'X'; found as 'x_y':`.
-- Nhiều từ mà không dòng nào chứa đúng như cách viết: các dòng chứa bất kỳ từ nào, file chứa nhiều từ nhất đứng trước, theo quy tắc trên.
+- Nhiều từ mà không dòng nào chứa đúng như cách viết: các dòng chứa bất kỳ từ nào, file chứa nhiều từ nhất đứng trước, theo quy tắc trên. Phần này theo cách xếp hạng từ khóa của [agentic-file-search](https://github.com/PromtEngineer/agentic-file-search) với trọng số BM25: mọi file được tìm có chứa một từ đều được đếm (không chỉ những file trước điểm cắt 512 kết quả), các file chứa cùng số từ được xếp theo độ hiếm của từ trong workspace và số lần xuất hiện, và mỗi file hiện tối đa 20 dòng, dòng chứa từ hiếm nhất lên trước. Một từ có ở mọi dòng không còn che mất file thực sự nói về thứ cần tìm.
+
+`list_files` với `preview` (số dòng mỗi file, tối đa 30; `true` là 10) cho thấy một thư mục chứa gì trong một lần gọi, theo `scan_folder` của agentic-file-search: kích thước và số dòng của mỗi file, với file code là outline - các dòng khai báo hàm, kiểu, class, module hay biến cấp cao nhất, kèm số dòng - với Markdown là các tiêu đề, còn lại là các dòng đầu. File nằm ngay trong thư mục đứng trước, rồi đến từng cấp sâu hơn; tối đa 50 file và 50 KB được xem trước, phần còn lại chỉ liệt kê tên.
+
+`read_file` ghi ra các file khác trong workspace mà đoạn văn bản vừa hiện có nhắc tới (`[This text names other workspace files: docs/annex_q.md. …]`): một đường dẫn tính từ gốc hoặc từ thư mục của file, có hoặc không có phần mở rộng như cách viết import (`./upload`), hoặc một tên file kèm phần mở rộng (`annex_q.md`); tên mà hơn ba file dùng chung thì không ghi file nào. System prompt khi đó khám phá một thư mục file theo [ba pha](https://github.com/PromtEngineer/agentic-file-search/blob/main/ARCHITECTURE.md#three-phase-exploration-strategy) của agentic-file-search - quét tất cả bằng `list_files` với `preview` và chia thành liên quan, có thể, bỏ qua; đọc kỹ toàn bộ các file liên quan; đọc thêm file đã bỏ qua nếu một lần đọc nhắc tới nó trước khi trả lời - và câu trả lời dựa vào nội dung file trích dẫn mỗi ý bằng `path:line`, cuối cùng liệt kê các file đã dùng.
 
 `edit_file` với nhiều `edits` áp chúng theo thứ tự và ghi cùng một lần, hoặc không ghi gì. Một `old_string` xuất hiện nhiều lần trong file bị từ chối là mơ hồ, kèm dòng của từng chỗ và dòng ngay trên nó, để ngữ cảnh phân biệt chúng có sẵn trong lỗi. Các edit trong một lần gọi cùng sửa một đoạn văn bản, với số edit bằng số chỗ trong file, thì mỗi edit lấy một chỗ theo thứ tự trong file: mỗi chỗ một edit để sửa mỗi chỗ một khác.
 

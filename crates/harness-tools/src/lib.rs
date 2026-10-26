@@ -28,6 +28,8 @@ mod policy;
 mod prefetch;
 #[path = "processes/process.rs"]
 mod process;
+#[path = "filesystem/references.rs"]
+mod references;
 #[path = "filesystem/search.rs"]
 mod search;
 #[path = "security/secrets.rs"]

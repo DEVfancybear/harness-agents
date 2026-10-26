@@ -272,7 +272,12 @@ async fn main() {
         "tool (ms)", "median", "p90", "mean", "fail"
     );
     // Warm the caches a long session would have warm.
-    let _ = bench.run(CodingToolAction::ListFiles { path: None }).await;
+    let _ = bench
+        .run(CodingToolAction::ListFiles {
+            path: None,
+            preview: None,
+        })
+        .await;
     let read_paths: Vec<String> = if mutate {
         (0..rounds * 3)
             .map(|n| module_path((n * 37) % files))
@@ -360,7 +365,10 @@ async fn main() {
         .measure(
             "list_files",
             (0..rounds)
-                .map(|_| CodingToolAction::ListFiles { path: None })
+                .map(|_| CodingToolAction::ListFiles {
+                    path: None,
+                    preview: None,
+                })
                 .collect(),
         )
         .await;
