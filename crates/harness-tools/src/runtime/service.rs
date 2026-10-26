@@ -277,7 +277,31 @@ pub trait HistorySemantic: Send + Sync {
     /// How the two rankings are fused: the weight of meaning, of words, and
     /// the lowest fused score kept.
     fn weights(&self) -> (f64, f64, Option<f64>);
+    /// Each text's vector, by source id, and the query's: what a readout
+    /// (`mode: readout`) reads. Embedded as [`Self::nearest`] embeds, the
+    /// vectors kept. A host that cannot give them says so, and the readout
+    /// reads words.
+    fn vectors<'a>(
+        &'a self,
+        corpus: &'a str,
+        texts: Vec<harness_store_sqlite::HistoryText>,
+        query: &'a str,
+    ) -> VectorsFuture<'a> {
+        let _ = (corpus, texts, query);
+        Box::pin(async { Err("this host gives no vectors".to_owned()) })
+    }
 }
+
+/// The vectors a [`HistorySemantic`] gives a readout: each source's, by id,
+/// and the query's.
+pub type VectorsFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<(std::collections::BTreeMap<String, Vec<f32>>, Vec<f32>), String>,
+            > + Send
+            + 'a,
+    >,
+>;
 
 /// A host's own check before a command runs, after the policy allowed it:
 /// `Some(reason)` refuses the command with that reason, which the model reads;
@@ -1851,6 +1875,7 @@ impl ToolExecutionService {
                 project,
                 filter,
             } => {
+                let readout = filter.readout;
                 let filter = harness_store_sqlite::HistoryFilter {
                     since_ms: filter.since_ms,
                     until_ms: filter.until_ms,
@@ -1858,7 +1883,7 @@ impl ToolExecutionService {
                     oldest_first: filter.oldest_first,
                 };
                 let hits = self
-                    .history_search(prepared, query, *limit, *project, &filter)
+                    .history_search(prepared, query, *limit, *project, &filter, readout)
                     .await?;
                 Ok(Dispatched::plain(hits))
             }
@@ -2001,6 +2026,7 @@ impl ToolExecutionService {
         limit: Option<u32>,
         project: bool,
         filter: &harness_store_sqlite::HistoryFilter,
+        readout: Option<u32>,
     ) -> Result<ToolOutput, HarnessError> {
         /// How long a search waits for the index to catch up. The newest
         /// conversations go first; the rest is caught up in the background and
@@ -2022,6 +2048,19 @@ impl ToolExecutionService {
             self.store.catch_up_history_in_background(task.cloned());
         }
         let scope = self.history_scope(prepared, project).await?;
+        if let Some(slots) = readout {
+            return self
+                .history_readout(
+                    prepared,
+                    &scope,
+                    query,
+                    project,
+                    slots,
+                    filter,
+                    caught.behind,
+                )
+                .await;
+        }
         let wanted = limit.unwrap_or(HISTORY_SEARCH_DEFAULT_LIMIT);
         let hits = self
             .store
@@ -2052,23 +2091,149 @@ impl ToolExecutionService {
         Ok(ToolOutput::HistorySearch {
             hits: hits
                 .into_iter()
-                .map(|hit| crate::HistoryHitView {
-                    source_id: hit.source_id,
-                    sequence: hit.sequence,
-                    kind: hit.kind,
-                    availability: hit.availability.as_str().to_owned(),
-                    matched_terms: hit.matched_terms,
-                    query_terms: hit.query_terms,
-                    preview: hit.preview,
-                    conversation: (hit.task_id != prepared.request.task_id.as_str())
-                        .then(|| hit.task_id.clone()),
-                    started: (hit.task_id != prepared.request.task_id.as_str())
-                        .then(|| hit.started.clone()),
-                })
+                .map(|hit| hit_view(prepared, hit, None))
                 .collect(),
             truncated,
             unindexed: caught.behind,
         })
+    }
+
+    /// `history_search` with `mode: readout` (`docs/architecture/MEMORY_READOUT.en.md`):
+    /// MEMORILLA's continual setting, where an agent's past turns are its
+    /// documents. Every source in scope is read for the query into at most
+    /// `slots` slots ([`harness_types::readout::recall`]), each shown by the
+    /// sources carrying most of its attention, a later slot reading what the
+    /// earlier ones left of the query - so what was tried, decided or seen
+    /// across a long conversation comes back together, its compacted turns
+    /// included. By meaning when embeddings are configured, else by words.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one readout: its scope, query, corpus, slots, filter and index state"
+    )]
+    async fn history_readout(
+        &self,
+        prepared: &PreparedToolRequest,
+        scope: &harness_store_sqlite::HistoryScope,
+        query: &str,
+        project: bool,
+        slots: u32,
+        filter: &harness_store_sqlite::HistoryFilter,
+        unindexed: u64,
+    ) -> Result<ToolOutput, HarnessError> {
+        /// The newest sources read, and how much of each, as search by
+        /// meaning embeds them.
+        const SOURCES: usize = 1_500;
+        const CHARS: usize = 1_500;
+        use harness_types::readout;
+        let texts = self
+            .store
+            .history_texts(scope, SOURCES, CHARS)
+            .await
+            .map_err(store_error)?
+            .into_iter()
+            .filter(|text| {
+                filter.admits(&text.source_id, &text.kind) && !text.text.trim().is_empty()
+            })
+            .collect::<Vec<_>>();
+        let corpus = if project {
+            "project"
+        } else {
+            prepared.request.task_id.as_str()
+        };
+        let (vectors, query_vector, by_meaning) = self.readout_vectors(corpus, &texts, query).await;
+        let recalled =
+            readout::recall(&vectors, &query_vector, usize::try_from(slots).unwrap_or(8));
+        let placed = recalled
+            .iter()
+            .enumerate()
+            .flat_map(|(slot, read)| {
+                read.documents
+                    .iter()
+                    .map(move |(index, weight)| (*index, slot, *weight))
+            })
+            .collect::<Vec<_>>();
+        let ids = placed
+            .iter()
+            .map(|(index, _, _)| texts[*index].source_id.clone())
+            .collect::<Vec<_>>();
+        let found = self
+            .store
+            .history_hits(scope, query, &ids)
+            .await
+            .map_err(store_error)?;
+        harness_types::diag::info("history", "readout")
+            .field("sources", texts.len())
+            .field("slots", recalled.len())
+            .field("by_meaning", by_meaning)
+            .emit();
+        let hits = placed
+            .iter()
+            .filter_map(|(index, slot, weight)| {
+                let hit = found
+                    .iter()
+                    .find(|hit| hit.source_id == texts[*index].source_id)?
+                    .clone();
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "a share in percent"
+                )]
+                let percent = (weight * 100.0).round().clamp(0.0, 100.0) as u32;
+                Some(hit_view(
+                    prepared,
+                    hit,
+                    Some((u32::try_from(*slot + 1).unwrap_or(u32::MAX), percent)),
+                ))
+            })
+            .collect();
+        Ok(ToolOutput::HistorySearch {
+            hits,
+            truncated: false,
+            unindexed,
+        })
+    }
+
+    /// The vectors a readout reads, one per text, and the query's: the
+    /// embeddings when they are configured and answer within 20 s, else the
+    /// texts' words; says whether they were the embeddings.
+    async fn readout_vectors(
+        &self,
+        corpus: &str,
+        texts: &[harness_store_sqlite::HistoryText],
+        query: &str,
+    ) -> (Vec<Vec<f32>>, Vec<f32>, bool) {
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+        use harness_types::readout;
+        if let Some(semantic) = self
+            .history_semantic
+            .as_ref()
+            .filter(|semantic| semantic.enabled())
+        {
+            let why =
+                match tokio::time::timeout(WAIT, semantic.vectors(corpus, texts.to_vec(), query))
+                    .await
+                {
+                    Ok(Ok((vectors, query_vector))) if !query_vector.is_empty() => {
+                        let vectors = texts
+                            .iter()
+                            .map(|text| vectors.get(&text.source_id).cloned().unwrap_or_default())
+                            .collect();
+                        return (vectors, query_vector, true);
+                    }
+                    Ok(Ok(_)) => "no query vector".to_owned(),
+                    Ok(Err(error)) => error,
+                    Err(_) => "the embeddings took longer than 20 s".to_owned(),
+                };
+            harness_types::diag::warn("history", "readout_vectors_failed")
+                .field("why", why)
+                .emit();
+        }
+        let documents = texts
+            .iter()
+            .map(|text| readout::words(&text.text))
+            .collect::<Vec<_>>();
+        let (vectors, query_vector) = readout::word_vectors(&documents, &readout::words(query));
+        (vectors, query_vector, false)
     }
 
     /// The word hits fused with the sources nearest the query by meaning
@@ -3079,6 +3244,30 @@ fn current_unix_ms() -> Result<u64, HarnessError> {
             "system clock milliseconds exceed range",
         )
     })
+}
+
+/// A journal hit as `history_search` shows it: a hit from another
+/// conversation names it and when it began; one a readout recalled names its
+/// slot and its share of that slot's attention.
+fn hit_view(
+    prepared: &PreparedToolRequest,
+    hit: harness_store_sqlite::HistoryHit,
+    slot: Option<(u32, u32)>,
+) -> crate::HistoryHitView {
+    let elsewhere = hit.task_id != prepared.request.task_id.as_str();
+    crate::HistoryHitView {
+        conversation: elsewhere.then(|| hit.task_id.clone()),
+        started: elsewhere.then(|| hit.started.clone()),
+        source_id: hit.source_id,
+        sequence: hit.sequence,
+        kind: hit.kind,
+        availability: hit.availability.as_str().to_owned(),
+        matched_terms: hit.matched_terms,
+        query_terms: hit.query_terms,
+        preview: hit.preview,
+        slot: slot.map(|(slot, _)| slot),
+        attention: slot.map(|(_, attention)| attention),
+    }
 }
 
 fn store_error(error: StoreError) -> HarnessError {

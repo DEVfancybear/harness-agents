@@ -1691,6 +1691,168 @@ async fn m5_03_history_search_finds_by_meaning_beside_words() {
     close(store).await;
 }
 
+/// Embeddings that place a text by the themes it names: the staging
+/// credentials, the durian, or neither.
+struct Themes;
+
+impl Themes {
+    fn vector(text: &str) -> Vec<f32> {
+        let text = text.to_lowercase();
+        if text.contains("password") || text.contains("credential") || text.contains("log in") {
+            vec![1.0, 0.0, 0.0]
+        } else if text.contains("durian") || text.contains("sầu riêng") {
+            vec![0.0, 1.0, 0.0]
+        } else {
+            vec![0.0, 0.0, 1.0]
+        }
+    }
+}
+
+impl harness_tools::HistorySemantic for Themes {
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    fn weights(&self) -> (f64, f64, Option<f64>) {
+        (0.7, 0.3, None)
+    }
+
+    fn nearest<'a>(
+        &'a self,
+        _corpus: &'a str,
+        _texts: Vec<harness_store_sqlite::HistoryText>,
+        _query: &'a str,
+        _limit: usize,
+    ) -> harness_tools::NearestFuture<'a> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn vectors<'a>(
+        &'a self,
+        _corpus: &'a str,
+        texts: Vec<harness_store_sqlite::HistoryText>,
+        query: &'a str,
+    ) -> harness_tools::VectorsFuture<'a> {
+        Box::pin(async move {
+            Ok((
+                texts
+                    .into_iter()
+                    .map(|text| (text.source_id, Self::vector(&text.text)))
+                    .collect(),
+                Self::vector(query),
+            ))
+        })
+    }
+}
+
+/// A readout reads the whole conversation for a question: the sources behind
+/// it come back in slots, each with its share of the slot's attention, though
+/// they share no word with the question; an unrelated one does not. Without
+/// embeddings, the words read.
+#[tokio::test]
+async fn m5_03_a_readout_recalls_the_conversation_for_a_question() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let (session, task) = admit(&store, &bench, "the first turn").await;
+    append_note(
+        &store,
+        &session,
+        &task,
+        "the deploy failed: the staging password expired",
+    )
+    .await;
+    append_note(
+        &store,
+        &session,
+        &task,
+        "we rotated the staging credentials on Tuesday",
+    )
+    .await;
+    append_note(
+        &store,
+        &session,
+        &task,
+        "the parser crashed on the durian fixture",
+    )
+    .await;
+    for index in 0..6 {
+        append_note(
+            &store,
+            &session,
+            &task,
+            &format!("build cache warmed, run {index}"),
+        )
+        .await;
+    }
+    let readout = |tools: ToolExecutionService, query: &'static str| {
+        let (session, task, workspace) = (session.clone(), task.clone(), bench.workspace.clone());
+        async move {
+            let prepared = tools
+                .prepare(ToolRequest::new(
+                    session,
+                    task,
+                    "actor.readout",
+                    &workspace,
+                    CodingToolAction::HistorySearch {
+                        query: query.to_owned(),
+                        limit: None,
+                        project: false,
+                        filter: harness_tools::HistorySearchFilter {
+                            readout: Some(4),
+                            ..harness_tools::HistorySearchFilter::default()
+                        },
+                    },
+                ))
+                .await
+                .expect("prepares");
+            let grant = tools.approve(&prepared).await.expect("approved");
+            let view = tools.execute(prepared, Some(grant)).await.expect("readout");
+            let ToolOutput::HistorySearch { hits, .. } = view.output else {
+                panic!("hits: {:?}", view.output);
+            };
+            hits
+        }
+    };
+    let hits = readout(
+        ToolExecutionService::new(Arc::clone(&store)).with_history_semantic(Arc::new(Themes)),
+        "why could we not log in to staging",
+    )
+    .await;
+    let previews = hits
+        .iter()
+        .map(|hit| hit.preview.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        previews
+            .iter()
+            .any(|preview| preview.contains("password expired"))
+            && previews
+                .iter()
+                .any(|preview| preview.contains("rotated the staging credentials")),
+        "{previews:?}"
+    );
+    assert!(
+        !previews.iter().any(|preview| preview.contains("durian")),
+        "{previews:?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.slot.is_some() && hit.attention.is_some())
+    );
+
+    let hits = readout(
+        ToolExecutionService::new(Arc::clone(&store)),
+        "durian fixture",
+    )
+    .await;
+    assert!(
+        hits.first()
+            .is_some_and(|hit| hit.preview.contains("durian") && hit.slot == Some(1)),
+        "words read without embeddings: {hits:?}"
+    );
+    close(store).await;
+}
+
 #[tokio::test]
 async fn m5_03_search_follows_the_word_rule_and_ranks_rare_words_first() {
     let bench = bench();

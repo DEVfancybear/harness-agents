@@ -9243,8 +9243,21 @@ async fn run_turn(
     };
     // With harness refinements off, no saved entry reaches the model.
     if refinements {
+        // The memory readout recalls entries by meaning for this request.
+        let recalled = super::memory_readout::digest_recall_async(
+            super::harness::global_dir(&data_dir),
+            super::harness::local_dir(&data_dir, task_id.as_str()),
+            memory_host.project_key().map(str::to_owned),
+            data_dir.join("knowledge"),
+            goal_objective
+                .into_iter()
+                .chain(digest_context.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .await;
         project_blocks.push(super::harness::digest_block(
-            &super::harness::format_digest(
+            &super::harness::format_digest_recalled(
                 &harness_state,
                 super::harness::DigestOptions {
                     repl: repl_host.is_some(),
@@ -9259,6 +9272,7 @@ async fn run_turn(
                         .map(String::as_str)
                         .collect::<Vec<_>>(),
                 ),
+                &recalled,
             ),
         ));
     }

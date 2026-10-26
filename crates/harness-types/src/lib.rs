@@ -17,6 +17,7 @@ mod hash;
 mod ids;
 #[path = "contracts/ports.rs"]
 mod ports;
+pub mod readout;
 #[path = "validation/schema.rs"]
 mod schema;
 #[path = "domain/scope.rs"]

@@ -100,6 +100,29 @@ pub fn check(arguments: &Value) -> Result<(), String> {
             "queries takes at most {MAX_VARIANTS} variants beside query"
         ));
     }
+    match arguments.get("mode").filter(|value| !value.is_null()) {
+        None => {}
+        Some(mode) if mode == "rank" => {}
+        Some(mode) if mode == "readout" => {
+            if !searches {
+                return Err(
+                    "a readout reads for a query: give query, queries or semantic".to_owned(),
+                );
+            }
+            if sources(arguments)?.contains(&"knowledge") {
+                return Err(
+                    "a readout reads memory entries; search knowledge with mode rank".to_owned(),
+                );
+            }
+        }
+        Some(_) => return Err("mode is rank or readout".to_owned()),
+    }
+    if let Some(slots) = arguments.get("slots").filter(|value| !value.is_null()) {
+        let slots = slots.as_u64().ok_or("slots is a whole number")?;
+        if !(1..=MAX_SLOTS as u64).contains(&slots) {
+            return Err(format!("slots is 1 to {MAX_SLOTS}"));
+        }
+    }
     if !searches && !FILTERS.iter().any(|key| given(key)) {
         return Err("search needs a query (or queries, or semantic), or a filter: tree, meta, meta_predicate, temporal or grep".to_owned());
     }
@@ -334,40 +357,7 @@ pub fn search(
             .map(str::trim)
             .filter(|text| !text.is_empty())
     };
-    let tree = text("tree").map(TreeFilter::parse).transpose()?;
-    let meta = arguments.get("meta").filter(|meta| meta.is_object());
-    let predicate = text("meta_predicate").map(Predicate::parse).transpose()?;
-    let temporal = arguments
-        .get("temporal")
-        .filter(|value| !value.is_null())
-        .map(Temporal::parse)
-        .transpose()?;
-    let pattern = text("grep").map(grep).transpose()?;
-    let considered = placed
-        .iter()
-        .filter(|placed| {
-            let entry = placed.entry;
-            let facets = Value::Object(entry.meta.clone());
-            tree.as_ref().is_none_or(|tree| tree.matches(&entry.tree))
-                && meta.is_none_or(|meta| contains(&facets, meta))
-                && predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate.matches(&facets))
-                && temporal.as_ref().is_none_or(|temporal| {
-                    temporal.matches(
-                        memory_store::temporal_bounds(
-                            placed.doc.get("temporal").unwrap_or(&Value::Null),
-                        )
-                        .ok()
-                        .flatten()
-                        .as_ref(),
-                    )
-                })
-                && pattern.as_ref().is_none_or(|pattern| {
-                    pattern.is_match(entry.content.as_deref().unwrap_or_default())
-                })
-        })
-        .collect::<Vec<_>>();
+    let considered = filtered(placed, arguments)?;
     let limit = number(arguments, "limit", DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let candidates =
         number(arguments, "candidate_limit", DEFAULT_CANDIDATES).clamp(limit, MAX_CANDIDATES);
@@ -536,6 +526,58 @@ pub fn search(
         Some("yaml") => json!({"text": yaml(&result)}),
         _ => result,
     })
+}
+
+/// The entries every filter a search gives - `tree`, `meta`,
+/// `meta_predicate`, `temporal`, `grep` - lets through.
+///
+/// # Errors
+/// A filter is malformed.
+pub fn filtered<'a>(
+    placed: &'a [Placed<'a>],
+    arguments: &Value,
+) -> Result<Vec<&'a Placed<'a>>, String> {
+    let text = |key: &str| {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    };
+    let tree = text("tree").map(TreeFilter::parse).transpose()?;
+    let meta = arguments.get("meta").filter(|meta| meta.is_object());
+    let predicate = text("meta_predicate").map(Predicate::parse).transpose()?;
+    let temporal = arguments
+        .get("temporal")
+        .filter(|value| !value.is_null())
+        .map(Temporal::parse)
+        .transpose()?;
+    let pattern = text("grep").map(grep).transpose()?;
+    Ok(placed
+        .iter()
+        .filter(|placed| {
+            let entry = placed.entry;
+            let facets = Value::Object(entry.meta.clone());
+            tree.as_ref().is_none_or(|tree| tree.matches(&entry.tree))
+                && meta.is_none_or(|meta| contains(&facets, meta))
+                && predicate
+                    .as_ref()
+                    .is_none_or(|predicate| predicate.matches(&facets))
+                && temporal.as_ref().is_none_or(|temporal| {
+                    temporal.matches(
+                        memory_store::temporal_bounds(
+                            placed.doc.get("temporal").unwrap_or(&Value::Null),
+                        )
+                        .ok()
+                        .flatten()
+                        .as_ref(),
+                    )
+                })
+                && pattern.as_ref().is_none_or(|pattern| {
+                    pattern.is_match(entry.content.as_deref().unwrap_or_default())
+                })
+        })
+        .collect())
 }
 
 fn hits_empty(result: &Value) -> bool {
@@ -868,6 +910,26 @@ pub fn embed_pending(
         }
     }
 }
+
+/// Embed what `dirs` hold that has no vector yet, waiting at most as long as
+/// a search by meaning waits, when embeddings are configured.
+pub fn embed_before_reading(dirs: &[PathBuf], embedding_root: &Path) {
+    let Ok(config) = embedding::load_config(embedding_root) else {
+        return;
+    };
+    if !config.enabled {
+        return;
+    }
+    let Ok(namespace) = embedding::namespace_of(&config) else {
+        return;
+    };
+    embed_pending(dirs, &config, &namespace, Instant::now() + EMBED_WAIT);
+}
+
+/// The slots a `readout` search reads by default, and at most: MEMORILLA's
+/// `K` is 16.
+pub const DEFAULT_SLOTS: usize = 8;
+pub const MAX_SLOTS: usize = 16;
 
 /// Embed what `dirs` hold in the background, when embeddings are configured:
 /// a write does not wait for its vector.

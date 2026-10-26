@@ -96,7 +96,7 @@ pub use secrets::{HostEnvironmentSecrets, SecretResolver};
 pub use service::{
     ConfiguredToolHook, ExternalToolDispatcher, HistorySemantic, NearestFuture, PathElsewhere,
     ToolDispatchAuthorization, ToolExecutionService, ToolGuard, ToolObserver, ToolResultContext,
-    git_diff_from, git_head_commit,
+    VectorsFuture, git_diff_from, git_head_commit,
 };
 pub use turn_driver::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CompletionCheck,

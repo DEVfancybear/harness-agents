@@ -292,6 +292,59 @@ before=$(row memory "$apps" | cut -d'|' -f1)
 run_exec m33 "Dùng tool memory: đọc entry '$apps' để lấy version, rồi write với id '$apps', expected_version đó và chỉ tree '/local/notes' (không truyền content). Không tạo entry mới, không xóa gì. Trả lời: đã chuyển."
 check "a write to another scope moves the entry, keeping its id" '[ -n "$before" ] && [ -z "$(row memory "$apps")" ] && "$PY" -c "import glob,os,sqlite3,sys; sys.exit(0 if any(sqlite3.connect(f\"file:{p}?mode=ro\", uri=True).execute(\"select 1 from memory where id = ?\", (sys.argv[2],)).fetchone() for p in glob.glob(os.path.join(sys.argv[1], \"sessions\", \"*\", \"harness\", \"memory.sqlite3\"))) else 1)" "$D" "$before"'
 
+echo "################ 12. 0.8.3: the memory readout (MEMORILLA, docs/architecture/MEMORY_READOUT.en.md)"
+# A fake embedding server placing a text by the themes it names; every check
+# here fails on 0.8.2.
+cat > "$RX/themes.py" <<'EOF'
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+port_file = sys.argv[1]
+THEMES = [
+    ("anaemia", "anemia", "iron", "eat", "health", "thiếu máu", "sức khỏe"),
+    ("deploy", "release", "freeze"),
+    ("password", "mật khẩu", "sign in", "login", "đăng nhập", "credential"),
+]
+def vector(text):
+    t = text.lower()
+    v = [1.0 if any(word in t for word in theme) else 0.0 for theme in THEMES]
+    return v + [0.0 if any(v) else 1.0]
+class Fake(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        data = [{"index": i, "embedding": vector(text)} for i, text in enumerate(body["input"])]
+        out = json.dumps({"data": data}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+    def log_message(self, *args):
+        pass
+server = HTTPServer(("127.0.0.1", 0), Fake)
+open(port_file, "w").write(str(server.server_address[1]))
+server.serve_forever()
+EOF
+"$PY" "$RX/themes.py" "$RX/themes.port" &
+themes=$!
+for _ in $(seq 1 50); do [ -s "$RX/themes.port" ] && break; sleep 0.2; done
+printf '{"schema_version":1,"enabled":true,"endpoint":"http://127.0.0.1:%s/v1/embeddings","model":"fake-themes"}' "$(cat "$RX/themes.port")" > "$D/knowledge/.ha-embedding.json"
+"$PY" - "$G" <<'EOF'
+import json, os, sys
+entry = {"id": "user_health", "kind": "memory", "title": "Health", "content": "The user has iron-deficiency anaemia; they avoid tea with meals.",
+         "path": "health", "scope": "global", "version": 1, "source": "agent", "updated_at": "2026-10-20T00:00:00Z"}
+json.dump({"schema": 1, "entries": {"memory": {"user_health": entry}}}, open(os.path.join(sys.argv[1], "harness_state.json"), "w", encoding="utf-8"))
+EOF
+run_exec m34 "Kiểm thử: gọi tool memory action search đúng một lần với mode 'readout', query 'what do I know about the user health and about the release process' và slots 4. Không gọi tool nào khác. MARKER_READOUT. Báo id các entry trong từng slot."
+check "a readout reads a two-part request into slots by meaning" 'tool_result MARKER_READOUT | grep -q "\"mode\":\"readout\"" && tool_result MARKER_READOUT | grep -q "\"encoder\":\"embeddings\"" && tool_result MARKER_READOUT | grep -q "user_health" && tool_result MARKER_READOUT | grep -q "deploy_day"'
+run_exec m35 "Lượt này không dùng tool nào. Before my long run tomorrow, what should I eat for breakfast? Chỉ trả lời đúng một từ: MARKER_RECALL"
+R=$(request "MARKER_RECALL")
+check "the digest recalls by meaning an entry no word of the request is in" 'printf "%s" "$R" | grep -q "user_health\] Health ([^)]*) \[recalled by meaning\]"'
+run_exec m36 "Ghi nhận (không dùng tool nào): hôm qua deploy lên staging thất bại vì mật khẩu staging đã hết hạn. Trả lời: đã ghi nhận."
+run_exec m37 "Kiểm thử: gọi tool history_search đúng một lần với query 'why could we not sign in to staging', scope 'project' và mode 'readout'. Không gọi tool nào khác. MARKER_HREADOUT. Báo các nguồn và slot của chúng."
+check "history_search reads earlier conversations into slots" 'tool_result MARKER_HREADOUT | grep -q "^history_search.*slot=1 attention=" && tool_result MARKER_HREADOUT | grep -q "mật khẩu staging"'
+kill "$themes" 2>/dev/null
+rm -f "$D/knowledge/.ha-embedding.json"
+
 echo "################ 7. ha memory export"
 "$HA" memory export > "$RX/export.json" 2>"$RX/export.err"
 check "it exports the global store" '"$PY" -c "import json,sys; d=json.load(open(sys.argv[1],encoding=\"utf-8\")); sys.exit(0 if \"queue-choice\" in d[\"document\"][\"entries\"][\"memory\"] and d[\"document\"][\"refinements\"][0][\"id\"] == \"refine_0001\" else 1)" "$RX/export.json"'

@@ -906,14 +906,24 @@ pub async fn run_with(
     );
     // With harness refinements off, no saved entry reaches the model.
     if refinements {
+        // The memory readout recalls entries by meaning for this prompt.
+        let recalled = super::memory_readout::digest_recall_async(
+            super::harness::global_dir(&context.paths.data_dir),
+            super::harness::local_dir(&context.paths.data_dir, task_id.as_str()),
+            Some(super::bootstrap::project_key_of(&context.project.root)),
+            context.paths.data_dir.join("knowledge"),
+            request.prompt.clone(),
+        )
+        .await;
         project_blocks.push(super::harness::digest_block(
-            &super::harness::format_digest(
+            &super::harness::format_digest_recalled(
                 &harness_state,
                 super::harness::DigestOptions {
                     memory_tool: true,
                     ..super::harness::DigestOptions::default()
                 },
                 &super::harness::weighted_terms(None, &[request.prompt.as_str()]),
+                &recalled,
             ),
         ));
     }

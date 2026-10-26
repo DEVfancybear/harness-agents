@@ -279,6 +279,55 @@ pub(crate) async fn search_with(
     queries: &[String],
     limit: usize,
 ) -> Result<Vec<VectorHit>, String> {
+    check_queries(queries)?;
+    if documents.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let _lock = operation_lock(root).await?;
+    let (indexed, vectors) = embedded(root, config, documents, queries).await?;
+    fuse_variants(&indexed, &vectors, limit.min(MAX_DOCUMENTS))
+}
+
+/// The vector of each of `documents`, the mean of its passages' (as
+/// MEMORILLA mean-pools a document), by path, and of `query`: what the cache
+/// under `root` lacks is embedded, as [`search_with`] embeds it.
+///
+/// # Errors
+/// The query is not one line of at most 512 bytes, or embedding failed.
+pub(crate) async fn document_vectors(
+    root: &Path,
+    config: &EmbeddingConfig,
+    documents: &[EmbeddingDocument],
+    query: &str,
+) -> Result<(BTreeMap<String, Vec<f32>>, Vec<f32>), String> {
+    let queries = [query.to_owned()];
+    check_queries(&queries)?;
+    if documents.is_empty() {
+        return Ok((BTreeMap::new(), Vec::new()));
+    }
+    let _lock = operation_lock(root).await?;
+    let (indexed, vectors) = embedded(root, config, documents, &queries).await?;
+    let mut sums = BTreeMap::<String, (Vec<f32>, f32)>::new();
+    for chunk in &indexed.chunks {
+        let Some(vector) = indexed.vectors.get(&chunk.key) else {
+            continue;
+        };
+        let (sum, count) = sums
+            .entry(chunk.hit.path.clone())
+            .or_insert_with(|| (vec![0.0; vector.len()], 0.0));
+        for (total, value) in sum.iter_mut().zip(vector) {
+            *total += value;
+        }
+        *count += 1.0;
+    }
+    let means = sums
+        .into_iter()
+        .map(|(path, (sum, count))| (path, sum.into_iter().map(|value| value / count).collect()))
+        .collect();
+    Ok((means, vectors.into_iter().next().unwrap_or_default()))
+}
+
+fn check_queries(queries: &[String]) -> Result<(), String> {
     if queries.is_empty()
         || queries.len() > MAX_BATCH
         || queries.iter().any(|query| {
@@ -289,10 +338,18 @@ pub(crate) async fn search_with(
             "embedding query must be a nonempty single line of at most 512 bytes".to_owned(),
         );
     }
-    if documents.is_empty() || limit == 0 {
-        return Ok(Vec::new());
-    }
-    let _lock = operation_lock(root).await?;
+    Ok(())
+}
+
+/// The documents indexed under `root` and a vector for each of `queries`,
+/// embedding what the cache lacks; a model whose vectors changed size is
+/// embedded again from scratch. The caller holds the operation lock.
+async fn embedded(
+    root: &Path,
+    config: &EmbeddingConfig,
+    documents: &[EmbeddingDocument],
+    queries: &[String],
+) -> Result<(Indexed, Vec<Vec<f32>>), String> {
     let mut indexed = index_inner(root, documents, config).await?;
     let mut vectors = Vec::with_capacity(queries.len());
     for query in queries {
@@ -344,8 +401,7 @@ pub(crate) async fn search_with(
                 .await?;
         }
     }
-    let vectors = vectors.into_iter().flatten().collect::<Vec<_>>();
-    fuse_variants(&indexed, &vectors, limit.min(MAX_DOCUMENTS))
+    Ok((indexed, vectors.into_iter().flatten().collect()))
 }
 
 /// Each page at the passage nearest any variant, the nearest first.

@@ -113,6 +113,43 @@ impl harness_tools::HistorySemantic for HistoryEmbeddings {
             Ok(hits.into_iter().map(|hit| (hit.path, hit.score)).collect())
         })
     }
+
+    fn vectors<'a>(
+        &'a self,
+        corpus: &'a str,
+        texts: Vec<harness_store_sqlite::HistoryText>,
+        query: &'a str,
+    ) -> harness_tools::VectorsFuture<'a> {
+        /// The longest query an embedding takes: one line of 512 bytes.
+        const QUERY_BYTES: usize = 512;
+        Box::pin(async move {
+            let config = self
+                .config()
+                .ok_or_else(|| "semantic retrieval is off".to_owned())?;
+            let corpus = corpus
+                .chars()
+                .filter(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+                .collect::<String>();
+            let mut line = query.split_whitespace().collect::<Vec<_>>().join(" ");
+            while line.len() > QUERY_BYTES {
+                line.pop();
+            }
+            let documents = texts
+                .into_iter()
+                .filter(|text| !text.text.trim().is_empty())
+                .map(|text| super::embedding::EmbeddingDocument {
+                    path: text.source_id,
+                    hash: text.content_hash,
+                    title: text.kind,
+                    content: text.text,
+                })
+                .collect::<Vec<_>>();
+            super::embedding::document_vectors(&self.cache.join(corpus), &config, &documents, &line)
+                .await
+        })
+    }
 }
 
 /// A turn's knowledge tools. Children receive a read-only clone, including at

@@ -4057,7 +4057,11 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             },
             hits.iter()
                 .map(|hit| format!(
-                    "{} seq={} kind={} availability={} matched={}/{}{} :: {}",
+                    "{}{} seq={} kind={} availability={} matched={}/{}{} :: {}",
+                    hit.slot.map_or_else(String::new, |slot| format!(
+                        "slot={slot} attention={}% ",
+                        hit.attention.unwrap_or(0)
+                    )),
                     hit.source_id,
                     hit.sequence,
                     hit.kind,

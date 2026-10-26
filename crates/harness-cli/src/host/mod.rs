@@ -97,6 +97,8 @@ pub mod mcp_oauth;
 pub mod memory;
 #[path = "memory/filters.rs"]
 pub mod memory_filters;
+#[path = "memory/readout.rs"]
+pub mod memory_readout;
 #[path = "memory/search.rs"]
 pub mod memory_search;
 #[path = "memory/store.rs"]

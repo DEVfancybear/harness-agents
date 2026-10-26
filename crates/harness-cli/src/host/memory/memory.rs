@@ -90,6 +90,7 @@ pub const GUIDANCE: &str = concat!(
     "The harness digest each turn shows only the few entries that rank highest for the request, cut short; the rest are found with memory search. ",
     "Before answering about an earlier decision, preference, person, plan or past piece of work you do not see in context, search memory first; when it has nothing, say so instead of guessing. ",
     "Search matches words, not meaning: when the wording or language may differ from the entries (the user writes Vietnamese, an entry may be in English), pass up to four variants in queries in the same search - synonyms and a translation - instead of searching again. ",
+    "When the answer is spread over several entries, or the request shares no word with what you kept, search with mode readout: it reads every entry for the request into a few slots, each the entries behind one part of it, by meaning when embeddings are configured; entries the digest marks [recalled by meaning] came the same way. ",
     "When the user asks you to remember something, states a lasting preference or corrects how you work, or a decision is reached that later work depends on, write it in the same turn without asking. Use scope global for what holds across conversations and projects (the user's preferences, how they like to work), project for a stable fact about this project (its stack, conventions, where things live; it never reaches another project), and local for this conversation's state. ",
     "Search before writing and update the matching entry with its id and expected_version instead of adding a near-duplicate (a write that reads as an entry already kept is refused with that entry's id); when a write returns related entries, update or delete one the new fact replaces or contradicts. Delete an entry that turned out wrong. One fact or rule per entry, short and self-contained. Never store secrets, credentials or tokens. ",
     "An update by id changes only what it gives: leave content out to retag, move or re-time an entry. An update or a delete keeps the earlier version: history shows an entry's earlier versions (also of a deleted one), and revert brings one back. ",
@@ -687,7 +688,14 @@ impl MemoryHost {
     /// `search`: memory-engine's search over the asked scopes and kinds
     /// (`memory_search`), and with `sources` naming knowledge, the knowledge
     /// libraries' pages too, the two rankings fused by RRF.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one search: its mode, then memory and knowledge fused"
+    )]
     fn search(&self, arguments: &Value) -> Result<Value, String> {
+        if arguments["mode"] == "readout" {
+            return self.readout(arguments);
+        }
         let sources = super::memory_search::sources(arguments)?;
         if sources == ["memory"] {
             return self.search_memory(arguments);
@@ -787,6 +795,94 @@ impl MemoryHost {
         } else {
             result
         })
+    }
+
+    /// `search` with `mode: readout` (`docs/architecture/MEMORY_READOUT.en.md`):
+    /// MEMORILLA's query-conditioned read over every entry the filters let
+    /// through, in at most `slots` slots. Each slot reads all of them and is
+    /// shown by the entries carrying most of its attention; a later slot reads
+    /// what the earlier ones left of the query, so the slots together answer
+    /// a request whose parts sit in different entries. By the embeddings the
+    /// user configured, else by the entries' words.
+    fn readout(&self, arguments: &Value) -> Result<Value, String> {
+        let kinds = kinds(arguments)?;
+        let mut rows = Vec::new();
+        let mut dirs = Vec::new();
+        for scope in self.scopes(arguments)? {
+            let dir = self.dir(scope).to_path_buf();
+            let state = super::refine::load_raw(&dir);
+            for entry in self.entries(&[scope], &kinds) {
+                let doc = state["entries"][&entry.kind][&entry.id].clone();
+                rows.push((entry, dir.clone(), doc));
+            }
+            dirs.push(dir);
+        }
+        dirs.dedup();
+        super::memory_search::embed_before_reading(&dirs, &self.embedding_root());
+        let placed = rows
+            .iter()
+            .map(|(entry, dir, doc)| super::memory_search::Placed { entry, dir, doc })
+            .collect::<Vec<_>>();
+        let considered = super::memory_search::filtered(&placed, arguments)?;
+        let query = ["query", "semantic"]
+            .iter()
+            .filter_map(|key| arguments.get(*key).and_then(Value::as_str))
+            .chain(
+                arguments
+                    .get("queries")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+        let slots = integer(arguments, "slots", super::memory_search::DEFAULT_SLOTS)
+            .clamp(1, super::memory_search::MAX_SLOTS);
+        let entries = considered
+            .iter()
+            .map(|placed| (placed.entry, placed.dir))
+            .collect::<Vec<_>>();
+        let recalled =
+            super::memory_readout::recall(&entries, &self.embedding_root(), &query, slots, true)?;
+        let rounded = |value: f64| (value * 1e4).round() / 1e4;
+        let (encoder, slots) =
+            recalled.unwrap_or((super::memory_readout::Encoder::Words, Vec::new()));
+        let shown = slots
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| {
+                json!({
+                    "slot": index + 1,
+                    "relevance": rounded(slot.relevance),
+                    "entries": slot
+                        .documents
+                        .iter()
+                        .map(|(entry, attention)| {
+                            let mut shown = view(considered[*entry].entry, SNIPPET_CHARS);
+                            shown["attention"] = json!(rounded(*attention));
+                            shown
+                        })
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut result = json!({
+            "mode": "readout",
+            "encoder": encoder.label(),
+            "searched": considered.len(),
+            "slots": shown,
+        });
+        if shown.is_empty() {
+            result["note"] = json!(
+                "Nothing stood out from the rest for this request: memory may not hold it. Search with mode rank, or say it is not remembered."
+            );
+        } else if encoder == super::memory_readout::Encoder::Words {
+            result["note"] = json!(
+                "Read by words, as no embeddings are configured (/knowledge semantic --global turns meaning on)."
+            );
+        }
+        Ok(super::memory_search::formatted(result, arguments))
     }
 
     /// [`Self::search`] over memory alone.
@@ -2785,7 +2881,9 @@ fn search_properties() -> serde_json::Map<String, Value> {
         "order_by":{"type":"string","enum":["asc","desc"],"description":"search by filters alone: oldest or newest (default) first."},
         "select":{"type":"array","items":{"type":"string"},"description":"search, read, history: only these fields of each hit or version: id, memory_id, name, scope, kind, title, tree, path, meta, meta.<key>, temporal, version, version_hash, content, content:N, content:M:N, content_length, score, has_embedding, created_at, updated_at, pinned."},
         "format":{"type":"string","enum":["json","compact","yaml"],"description":"search, read, history: the result as JSON (default) or YAML text."},
-        "sources":{"type":"array","items":{"type":"string","enum":["memory","knowledge"]},"description":"search: what to search, memory (default) and/or the knowledge libraries' pages; with both, one ranking of entries and pages, each hit naming its source."}
+        "sources":{"type":"array","items":{"type":"string","enum":["memory","knowledge"]},"description":"search: what to search, memory (default) and/or the knowledge libraries' pages; with both, one ranking of entries and pages, each hit naming its source."},
+        "mode":{"type":"string","enum":["rank","readout"],"description":"search: rank (default) lists the best hits; readout reads every entry for the request into a few slots, each the entries that answer one part of it - for a request whose answer is spread over several entries or shares no word with them."},
+        "slots":{"type":"integer","minimum":1,"maximum":16,"description":"search, mode readout: at most this many slots (default 8)."}
     });
     properties.as_object().cloned().unwrap_or_default()
 }
@@ -4083,6 +4181,64 @@ mod tests {
         assert_eq!(hit["name"], "release");
         assert!(hit["memory_id"].is_string(), "{hit}");
         assert_eq!(hit["has_embedding"], false);
+    }
+
+    /// A readout reads every entry for the request into slots, the later
+    /// ones covering what the first left: a request about two things finds
+    /// both, each in its slot, and an unrelated entry in none.
+    #[test]
+    fn a_readout_reads_the_parts_of_a_request_into_slots() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = host(directory.path());
+        for (title, content) in [
+            (
+                "Deploy day",
+                "Deploys go out on Fridays after the release freeze.",
+            ),
+            (
+                "Queue",
+                "The order queue runs on Redis Streams with three consumers.",
+            ),
+            (
+                "Language",
+                "Answer in Vietnamese unless the user writes English.",
+            ),
+            ("Editor", "The user edits in Zed with vim keys."),
+            (
+                "Tests",
+                "Integration tests need Postgres running in Docker.",
+            ),
+        ] {
+            run(
+                &host,
+                &json!({"action":"write","scope":"global","title":title,"content":content,"distinct":true}),
+            )
+            .expect("write");
+        }
+        let read = run(
+            &host,
+            &json!({"action":"search","mode":"readout","query":"which day do deploys go out, and what runs the order queue","slots":4}),
+        )
+        .expect("readout");
+        assert_eq!(read["mode"], "readout");
+        assert_eq!(read["encoder"], "words");
+        let recalled = read["slots"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .flat_map(|slot| slot["entries"].as_array().cloned().unwrap_or_default())
+            .map(|entry| entry["id"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        assert!(recalled.contains(&"deploy_day".to_owned()), "{read}");
+        assert!(recalled.contains(&"queue".to_owned()), "{read}");
+        assert!(!recalled.contains(&"editor".to_owned()), "{read}");
+        assert!(read["slots"][0]["entries"][0]["attention"].is_number());
+        let refused = run(
+            &host,
+            &json!({"action":"search","mode":"readout","tree":"/global"}),
+        )
+        .expect_err("a readout needs a query");
+        assert!(refused.contains("readout reads for a query"), "{refused}");
     }
 
     #[test]

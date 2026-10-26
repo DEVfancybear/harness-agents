@@ -302,7 +302,9 @@ fn allowed_fields(name: &str) -> Option<&'static [&'static str]> {
         "run_shell" => &["command", "timeout_ms", "isolation", "env"],
         "git_status" => &[],
         "read_process_output" => &["artifact_id", "stream", "offset", "length"],
-        "history_search" => &["query", "limit", "scope", "since", "until", "kind", "order"],
+        "history_search" => &[
+            "query", "limit", "scope", "since", "until", "kind", "order", "mode", "slots",
+        ],
         "history_read" => &["source_id", "offset", "length", "scope"],
         "git_log" => &["path", "limit"],
         "task_update" => &["note"],
@@ -580,7 +582,9 @@ pub fn history_tool_schemas() -> Vec<Value> {
                 "since": {"type": "string", "description": "Only sources written at or after this time (2026-10-26T09:30:00Z, or a date)."},
                 "until": {"type": "string", "description": "Only sources written before this time."},
                 "kind": {"description": "Only these kinds of sources (the kind a hit shows, such as a user or assistant message): one or a list.", "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
-                "order": {"type": "string", "enum": ["newest", "oldest"], "description": "Which come first among equally good hits (default newest)."}
+                "order": {"type": "string", "enum": ["newest", "oldest"], "description": "Which come first among equally good hits (default newest)."},
+                "mode": {"type": "string", "enum": ["rank", "readout"], "description": "rank (default) lists the best hits. readout reads every source in scope for the query into a few slots, each the sources behind one part of it (by meaning when embeddings are configured, else by words): to recall what was tried, decided or seen across a long conversation, its compacted turns included."},
+                "slots": {"type": "integer", "minimum": 1, "maximum": 16, "description": "mode readout: at most this many slots (default 8)."}
             }),
             &["query"],
         ),
@@ -1498,6 +1502,10 @@ pub struct HistorySearchFilter {
     /// Equal scores oldest first.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub oldest_first: bool,
+    /// `mode: readout`: read every source for the query into at most this
+    /// many slots (MEMORILLA's query-conditioned readout) instead of ranking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readout: Option<u32>,
 }
 
 impl HistorySearchFilter {
@@ -1566,11 +1574,34 @@ impl HistorySearchFilter {
                 ));
             }
         };
+        let slots = match object.get("slots") {
+            None | Some(Value::Null) => None,
+            Some(slots) => Some(
+                slots
+                    .as_u64()
+                    .filter(|slots| (1..=16).contains(slots))
+                    .and_then(|slots| u32::try_from(slots).ok())
+                    .ok_or_else(|| {
+                        invalid("provider history_search slots is 1 to 16".to_owned())
+                    })?,
+            ),
+        };
+        let readout = match object.get("mode") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(mode)) if mode == "rank" => None,
+            Some(Value::String(mode)) if mode == "readout" => Some(slots.unwrap_or(8)),
+            Some(_) => {
+                return Err(invalid(
+                    "provider history_search mode is \"rank\" or \"readout\"".to_owned(),
+                ));
+            }
+        };
         Ok(Self {
             since_ms: time("since")?,
             until_ms: time("until")?,
             kinds,
             oldest_first,
+            readout,
         })
     }
 }
@@ -2043,6 +2074,12 @@ pub struct HistoryHitView {
     pub conversation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started: Option<String>,
+    /// The readout slot that recalled it, from 1, and its share of that
+    /// slot's attention, in percent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attention: Option<u32>,
 }
 
 /// The immutable receipt plus a non-authoritative presentation projection.

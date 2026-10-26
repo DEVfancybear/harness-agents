@@ -580,11 +580,26 @@ pub struct DigestOptions {
 
 /// `formatHarnessStateForPrompt`.
 #[must_use]
+pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f64)]) -> String {
+    format_digest_recalled(state, options, terms, &[])
+}
+
+/// [`format_digest`] with the entries the memory readout recalled for the
+/// request (`(kind, id)`, in the readout's order: [`super::memory_readout`]).
+/// Each kind's entries are ranked by the request's words and by the readout,
+/// the two fused by RRF, so an entry recalled by meaning reaches the turn
+/// though it shares no word with the request; such a line says so.
+#[must_use]
 #[allow(
     clippy::too_many_lines,
     reason = "one render, told in prime-agent's order"
 )]
-pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f64)]) -> String {
+pub fn format_digest_recalled(
+    state: &State,
+    options: DigestOptions,
+    terms: &[(String, f64)],
+    recalled: &[(String, String)],
+) -> String {
     // An entry whose period is over records what was, not what is: search
     // still finds it, the digest leaves it out.
     let current;
@@ -660,6 +675,31 @@ pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f6
                     .then_with(|| identity(a).cmp(&identity(b)))
             })
         });
+        let by_meaning = recalled
+            .iter()
+            .filter(|(recalled_kind, _)| recalled_kind == kind)
+            .map(|(_, id)| (id.clone(), 1.0))
+            .collect::<Vec<_>>();
+        if !by_meaning.is_empty() {
+            let by_words = entries
+                .iter()
+                .map(|entry| (entry.id.clone(), score(entry, terms, &weights)))
+                .filter(|(_, score)| *score > 0.0)
+                .collect::<Vec<_>>();
+            let fused =
+                harness_types::search::weighted_rrf(&[(&by_words, 1.0), (&by_meaning, 1.0)])
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, (id, _))| (id, rank))
+                    .collect::<BTreeMap<_, _>>();
+            // Stable: the rest keep their order by words.
+            entries.sort_by_key(|entry| {
+                (
+                    !is_constraint(entry),
+                    fused.get(&entry.id).copied().unwrap_or(usize::MAX),
+                )
+            });
+        }
         let shown = entries
             .iter()
             .filter(|entry| is_constraint(entry))
@@ -717,6 +757,12 @@ pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f6
                         DEFAULT_CONTENT_LIMIT
                     )
                 );
+            }
+            // An entry no word of the request reached was recalled by meaning.
+            if by_meaning.iter().any(|(id, _)| *id == entry.id)
+                && score(entry, terms, &weights) <= 0.0
+            {
+                extra.push_str(" [recalled by meaning]");
             }
             lines.push(format!(
                 "- [{}:{}] {} ({}, v{}{}){extra}: {}",
@@ -1208,6 +1254,44 @@ mod tests {
             digest.find("[local:vendor]").expect("constraint")
                 < digest.find("[local:parser-").expect("ranked"),
             "{digest}"
+        );
+    }
+
+    /// An entry the memory readout recalls by meaning reaches the digest
+    /// though no word of the request is in it, fused with the entries the
+    /// words rank, and its line says how it came.
+    #[test]
+    fn an_entry_recalled_by_meaning_joins_the_ranked_ones() {
+        let directory = tempfile::tempdir().expect("state");
+        let mut memories = serde_json::Map::new();
+        for number in 0..10 {
+            memories.insert(
+                format!("run-{number}"),
+                json!({"title": format!("Running log {number}"), "content": "a long run on the river path"}),
+            );
+        }
+        memories.insert(
+            "anaemia".to_owned(),
+            json!({"title": "Health", "content": "The user has iron-deficiency anaemia."}),
+        );
+        write(directory.path(), &json!({"entries":{"memory":memories}}));
+        let state = load(directory.path(), "local");
+        let terms = weighted_terms(None, &["what should I eat before a long run"]);
+        let by_words = format_digest(&state, DigestOptions::default(), &terms);
+        assert!(!by_words.contains("anaemia"), "{by_words}");
+        let digest = super::format_digest_recalled(
+            &state,
+            DigestOptions::default(),
+            &terms,
+            &[("memory".to_owned(), "anaemia".to_owned())],
+        );
+        assert!(
+            digest.contains("[local:anaemia] Health (, v1) [recalled by meaning]"),
+            "{digest}"
+        );
+        assert!(
+            digest.contains("[local:run-"),
+            "the words' entries stay: {digest}"
         );
     }
 
