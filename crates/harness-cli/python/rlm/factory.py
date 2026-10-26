@@ -3781,6 +3781,20 @@ def factory_enabled() -> bool:
     return factory.get("enabled") is True
 
 
+def factory_status() -> str:
+    """Whether the factory is on, read now, as the first line of ``help()``."""
+    if factory_enabled():
+        return (
+            "Status now: the factory is ON (factory.enabled is true): create_factory, "
+            "run, status, stop and resume work. A refusal seen before the user ran "
+            "/factory on no longer holds."
+        )
+    return (
+        "Status now: the factory is OFF: every call except help() refuses until the "
+        "user runs /factory on."
+    )
+
+
 def require_factory_enabled() -> None:
     """Refuse with one clean error while the factory is disabled.
 

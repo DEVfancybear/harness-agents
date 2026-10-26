@@ -133,7 +133,13 @@ class HarnessShimTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "the factory is disabled"):
                     self.state.create("factory", "f", "c", arguments={"dag": {}})
                 self.assertEqual(fake.requests, [])
+                # help() says the state now, so a refusal seen earlier is not
+                # taken for the state after /factory on.
+                self.assertTrue(rlm.factory.help().startswith("Status now: the factory is OFF"))
                 settings.write_text(json.dumps({"factory": {"enabled": True}}), encoding="utf-8")
+                status = rlm.factory.help().splitlines()[0]
+                self.assertIn("the factory is ON", status)
+                self.assertIn("no longer holds", status)
                 with self.assertRaises(ValueError):
                     self.state.create_factory("f", "c", dag={"nodes": "not a list"})
                 self.assertEqual(fake.requests, [], "an invalid spec never reaches the host")

@@ -51,7 +51,7 @@ say r1 "Dùng ipython: thử rlm.harness.create_factory('Hai bước', 'demo', d
 check "factory refused while disabled, naming /factory on" "ans | grep -q 'run /factory on'"
 say r1 "/factory on" | tail -2
 check "/factory on saved factory.enabled" "grep -q '\"enabled\": true' '$HA_HOME/settings.json'"
-say r1 "Factory đã được bật bằng /factory on ở lượt vừa rồi: lời từ chối trước đó không còn đúng, hãy tạo và chạy thật. Dùng ipython. Đọc rlm.factory.help() để biết cú pháp dag. Tạo một factory bằng rlm.harness.create_factory với dag 2 node: node 'viet' (agent con ghi file a.txt nội dung A vào thư mục dự án) và node 'kiem' phụ thuộc 'viet' (agent con ghi file b.txt nội dung B). Chạy bằng await rlm.factory.run(<id>), rồi lặp await rlm.factory.status(run_id) mỗi 15 giây cho tới khi run kết thúc (tối đa 6 phút). Báo trạng thái cuối và nội dung a.txt, b.txt." | tail -12
+say r1 "Dùng ipython. Đọc rlm.factory.help() để biết cú pháp dag. Tạo một factory bằng rlm.harness.create_factory với dag 2 node: node 'viet' (agent con ghi file a.txt nội dung A vào thư mục dự án) và node 'kiem' phụ thuộc 'viet' (agent con ghi file b.txt nội dung B). Chạy bằng await rlm.factory.run(<id>), rồi lặp await rlm.factory.status(run_id) mỗi 15 giây cho tới khi run kết thúc (tối đa 6 phút). Báo trạng thái cuối và nội dung a.txt, b.txt." | tail -12
 check "factory stored as a factory entry" "state | grep -q ' factory '"
 check "both factory states ran (a.txt and b.txt exist)" "[ -f '$RX/p/a.txt' ] && [ -f '$RX/p/b.txt' ]"
 

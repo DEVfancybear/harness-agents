@@ -11,6 +11,7 @@ from typing import Any
 from .bash import BashHandle, BashResult, bash
 from .factory import (
     FACTORY_HELP,
+    factory_status,
     graph_factory,
     resume_factory,
     run_factory,
@@ -624,8 +625,11 @@ class _RLMFactoryNamespace:
         return await watch_factory(run_id, timeout)
 
     def help(self) -> str:
-        """Return the embedded factory authoring reference and API guide."""
-        return FACTORY_HELP
+        """Return the embedded factory authoring reference and API guide,
+        headed by whether the factory is on now: a model that met a refusal
+        before the user ran /factory on reads the setting as it is, not its
+        memory of the refusal."""
+        return factory_status() + "\n\n" + FACTORY_HELP
 
 
 class _RLMNamespace:
