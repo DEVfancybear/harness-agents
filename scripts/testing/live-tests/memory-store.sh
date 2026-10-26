@@ -12,7 +12,11 @@
 # P3: a search by meta alone, a JSONPath predicate, search by meaning against a
 # fake embedding server. P4: a knowledge page's history and revert, one search
 # over memory and knowledge, history_search by kind and time, history_read's
-# neighbors.
+# neighbors. 0.8.2 (section 11): a name kept through updates and unique per
+# tree, a patch that leaves content out, the immutable memory_id, an entry's
+# history a page at a time, English stems, lquery's `%`, JSONPath datetimes and
+# an unknown method refused, a tree filter on knowledge pages, an old page
+# version read whole, status, and a write that moves an entry to another scope.
 #
 #   bash scripts/testing/live-tests/memory-store.sh
 set -u
@@ -228,6 +232,49 @@ run_exec m19 "Kiểm thử history: (1) gọi history_search với query 'deploy
 # The turn's last request holds every tool result it had.
 check "a history search filters by kind and time" '"$PY" "$RX/history_results.py" "$D" MARKER_HISTORY filtered'
 check "history_read names the sources around it" '"$PY" "$RX/history_results.py" "$D" MARKER_HISTORY linked'
+
+echo "################ 11. 0.8.2: names per tree, patches, the immutable id, filters at parity"
+# Every check here fails on 0.8.1.
+run_exec m20 "Dùng tool memory action write với đúng các tham số: tree '/global/infra', name 'jwt-rotation', title 'JWT', content 'JWT keys rotate every 30 days.'. Không làm gì khác. Trả lời: đã ghi."
+run_exec m21 "Dùng tool memory: đọc entry jwt-rotation để lấy version, rồi write với id 'jwt-rotation', expected_version đó và content 'JWT keys rotate every 14 days.' (không đổi title, không truyền name). Trả lời: đã cập nhật."
+check "an update keeps the name it was given" 'row memory jwt-rotation | grep -q "|/global/infra|.*every 14 days"'
+run_exec m22 "Kiểm thử: dùng tool memory: đọc entry jwt-rotation để lấy version, rồi gọi write với id 'jwt-rotation', expected_version đó và chỉ meta {\"owner\": \"platform\"} - KHÔNG truyền content hay title. MARKER_PATCH. Báo kết quả của lần write."
+check "an update changes only what it gives" 'row memory jwt-rotation | grep -q "\"owner\": *\"platform\".*every 14 days" && ! tool_result MARKER_PATCH | grep -q "needs content"'
+run_exec m23 "Dùng tool memory action write với đúng các tham số: tree '/global/apps', name 'jwt-rotation', title 'JWT app', content 'The mobile app refreshes its JWT session every hour.'. Không làm gì khác. Báo id và name mà tool trả về."
+apps=$("$PY" "$MEMORY_STORE" named "$G" memory /global/apps jwt-rotation)
+check "another tree holds the same name" '[ -n "$apps" ] && [ "$apps" != "jwt-rotation" ]'
+run_exec m24 "Kiểm thử: dùng tool memory action search với query 'JWT rotate' để lấy memory_id của entry ở tree /global/infra, rồi gọi read với id là chính memory_id đó (không dùng id thường). MARKER_UUID. Báo memory_id và content đọc được."
+check "the immutable id reads an entry" 'tool_result MARKER_UUID | grep -q "\"memory_id\":\"$(row memory jwt-rotation | cut -d"|" -f1)\"" && answer m24 | grep -q "14"'
+run_exec m25 "Kiểm thử: gọi tool memory action history với id 'jwt-rotation' và limit 1. MARKER_PAGE. Báo version của phiên bản cũ được trả về và next_offset."
+check "an entry's history pages" 'tool_result MARKER_PAGE | grep -q "\"next_offset\":1"'
+"$PY" - "$G" <<'EOF'
+import json, os, sys
+def entry(key, title, content, path, meta=None):
+    return {"id": key, "kind": "memory", "title": title, "content": content, "path": path, "scope": "global",
+            "version": 1, "source": "agent", "metadata": meta or {}, "updated_at": "2026-10-20T00:00:00Z"}
+entries = {
+    "billing_release": entry("billing_release", "Billing release", "The billing service was deployed on Friday by the payments team.", "ops/release_train"),
+    "audit_due": entry("audit_due", "Security audit", "The yearly security audit is due mid November.", "ops/compliance", {"due": "2026-11-15T09:00:00Z"}),
+}
+json.dump({"schema": 1, "entries": {"memory": entries}}, open(os.path.join(sys.argv[1], "harness_state.json"), "w", encoding="utf-8"))
+EOF
+run_exec m26 "Kiểm thử: gọi tool memory action search đúng một lần với query 'deploying' và weights {\"semantic\": 0}. Không gọi tool nào khác. MARKER_STEM. Báo id các kết quả."
+check "words match by their English stem" 'tool_result MARKER_STEM | grep -q "billing_release"'
+run_exec m27 "Kiểm thử: gọi tool memory action search đúng một lần với tree '/global/ops/train%' và không có query. Không gọi tool nào khác. MARKER_WORDS. Báo id các kết quả."
+check "an lquery % word matches anywhere in a label" 'tool_result MARKER_WORDS | grep -q "billing_release"'
+run_exec m28 "Kiểm thử: gọi tool memory action search đúng một lần với meta_predicate '\$.due.datetime() < \"2026-12-01\".datetime()' và không có query. Không gọi tool nào khác. MARKER_DATETIME. Báo id các kết quả."
+check "a JSONPath predicate compares datetimes" 'tool_result MARKER_DATETIME | grep -q "audit_due"'
+run_exec m29 "Kiểm thử: gọi tool memory action search đúng một lần với meta_predicate '\$.owner.lowercase() == \"platform\"' và không có query. Không gọi tool nào khác. MARKER_METHOD. Báo nguyên văn kết quả hoặc lỗi."
+check "an unknown JSONPath method is refused" 'tool_result MARKER_METHOD | grep -q "not a method"'
+run_exec m30 "Kiểm thử: gọi tool memory action search đúng một lần với query 'deploy', sources ['memory', 'knowledge'] và tree '/knowledge/project/ops'. Không gọi tool nào khác. MARKER_KTREE. Báo nguồn và tree của từng kết quả."
+check "a tree filter reaches knowledge pages" 'tool_result MARKER_KTREE | grep -q "\"tree\":\"/knowledge/project/ops\""'
+run_exec m31 "Kiểm thử: gọi tool knowledge action history với path 'ops/deploy.md' (scope project), chọn phiên bản có operation update xảy ra sớm nhất, rồi gọi lại knowledge action history với path đó và version là id của phiên bản ấy để đọc nguyên văn trang lúc đó. MARKER_OLDPAGE. Báo nội dung trang ở phiên bản đó."
+check "an old version of a page reads whole" 'tool_result MARKER_OLDPAGE | grep -q "thứ Sáu hằng tuần"'
+run_exec m32 "Kiểm thử: gọi tool memory action status đúng một lần. Không gọi tool nào khác. MARKER_STATUS. Báo số entry mỗi scope."
+check "status says what each scope holds" 'tool_result MARKER_STATUS | grep -q "\"embedding\""'
+before=$(row memory "$apps" | cut -d'|' -f1)
+run_exec m33 "Dùng tool memory: đọc entry '$apps' để lấy version, rồi write với id '$apps', expected_version đó và chỉ tree '/local/notes' (không truyền content). Không tạo entry mới, không xóa gì. Trả lời: đã chuyển."
+check "a write to another scope moves the entry, keeping its id" '[ -n "$before" ] && [ -z "$(row memory "$apps")" ] && "$PY" -c "import glob,os,sqlite3,sys; sys.exit(0 if any(sqlite3.connect(f\"file:{p}?mode=ro\", uri=True).execute(\"select 1 from memory where id = ?\", (sys.argv[2],)).fetchone() for p in glob.glob(os.path.join(sys.argv[1], \"sessions\", \"*\", \"harness\", \"memory.sqlite3\"))) else 1)" "$D" "$before"'
 
 echo "################ 7. ha memory export"
 "$HA" memory export > "$RX/export.json" 2>"$RX/export.err"

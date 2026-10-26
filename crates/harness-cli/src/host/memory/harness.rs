@@ -56,7 +56,12 @@ pub fn local_dir(data_dir: &Path, conversation: &str) -> PathBuf {
 /// entry is skipped with a diagnostic instead of breaking the digest.
 #[derive(Clone, Debug)]
 pub struct Entry {
+    /// Its key: the id a list or a search shows.
     pub id: String,
+    /// Its name, unique in its tree: the one it was given, or its key.
+    pub name: String,
+    /// Its immutable id in the store, when the reader asked for it.
+    pub memory: Option<String>,
     pub kind: String,
     pub title: Option<String>,
     pub content: Option<String>,
@@ -147,6 +152,8 @@ pub fn parse(parsed: &Value, scope: &str, root: &str) -> State {
             };
             entries.push(Entry {
                 id: id.clone(),
+                name: super::memory_store::name_of(kind, id, raw),
+                memory: None,
                 kind: kind.to_owned(),
                 title: text("title"),
                 content: text("content"),

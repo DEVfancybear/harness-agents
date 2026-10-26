@@ -45,6 +45,9 @@ sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-toki
 # code that is synchronous. 0.39 takes libsqlite3-sys 0.37, the vendored one sqlx
 # links, so both share one bundled SQLite.
 rusqlite = { version = "=0.39.0", default-features = false }
+# Memory search stems English words as memory-engine's BM25 (Postgres'
+# `english` Snowball configuration) does: `deploying` finds `deployed`.
+rust-stemmers = "=1.2.0"
 tempfile = "=3.27.0"
 thiserror = "=2.0.20"
 toml = "=1.1.5"

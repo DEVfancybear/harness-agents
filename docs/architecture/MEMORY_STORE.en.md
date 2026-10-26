@@ -12,6 +12,12 @@ authority, not this document.
 server, integrations, console) are on hold until the maintainer resumes them.
 P1 adds only the one CLI command its tests need: `ha memory export`.
 
+0.8.2 closes what a second review against ME found missing in P1 to P4 (§13):
+a name unique per tree and kept through updates, patch updates, the immutable
+`memory_id` as an address, paged history with every field, English stemming,
+lquery's `%` as PostgreSQL has it, PostgreSQL 17's JSONPath methods, filters
+on knowledge pages, old page versions read whole, and `status`.
+
 ## 1. Goal and decisions
 
 memory-engine (ME) is a team memory server: Postgres with `ltree`, `pgvector` and
@@ -41,7 +47,9 @@ the new store.
 
 ## 2. Feature map
 
-Status today: ✅ present, 🟡 partial, ❌ missing. P1 to P7 are the phases in §12.
+Status before this work: ✅ present, 🟡 partial, ❌ missing. P1 to P7 are the
+phases in §12. Since 0.8.2 every row up to P4 is present; §13 lists what the
+review after 0.8.1 found and what 0.8.2 changed.
 
 | ME feature | Today | Phase |
 |---|---|---|
@@ -113,7 +121,8 @@ need a runtime bridge.
 CREATE TABLE memory (
   id              TEXT PRIMARY KEY,      -- UUIDv7, immutable
   kind            TEXT NOT NULL,         -- prompt|memory|skill|subagent|factory|record
-  name            TEXT NOT NULL,         -- ha's entry id (slug), unique per kind
+  key             TEXT NOT NULL,         -- ha's entry id (slug), unique per kind
+  name            TEXT,                  -- ME's name, unique in its tree (schema 3)
   tree            TEXT NOT NULL,         -- '/global/user/preferences'
   title           TEXT NOT NULL,
   content         TEXT NOT NULL,
@@ -126,16 +135,17 @@ CREATE TABLE memory (
   content_version INTEGER NOT NULL,      -- embedding guard (P3)
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL,
-  UNIQUE (kind, name)
+  UNIQUE (kind, key)
 );
 CREATE INDEX memory_tree ON memory(tree);
+CREATE INDEX memory_path ON memory(kind, tree, name);
 CREATE INDEX memory_temporal ON memory(temporal_start, temporal_end);
 
 CREATE TABLE memory_event (
   event_id     TEXT PRIMARY KEY,   -- UUIDv7: a chronological total order
   at           TEXT NOT NULL,
   memory_id    TEXT NOT NULL,      -- outlives the memory
-  kind TEXT NOT NULL, name TEXT NOT NULL, tree TEXT NOT NULL,
+  kind TEXT NOT NULL, key TEXT NOT NULL, name TEXT, tree TEXT NOT NULL,
   operation    TEXT NOT NULL,      -- insert|update|delete
   operation_id TEXT NOT NULL,      -- one per write transaction
   cause        TEXT,               -- create|update|delete|move|copy|revert|import|migrate|review|dream|curate|rollback|...
@@ -152,13 +162,19 @@ CREATE INDEX memory_event_at ON memory_event(at DESC);
 CREATE TABLE refinement (seq INTEGER PRIMARY KEY, event TEXT NOT NULL);  -- the `refinements` array
 CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);     -- `schema` and other top-level fields
 -- P3 (schema 2): memory_vector, memory_embedding_queue (§6)
+-- 0.8.2 (schema 3): the V1 `name` column renamed `key`, and `name` added (§13)
 ```
 
 How ha's entries map onto ME's record:
 
-- **name.** ha's entry id. The current rule, the title slug with aliases kept when
-  a title changes, still applies; ME's `name` regex is accepted too. Uniqueness is
-  `(kind, name)` within a scope. ME's `(tree, name)` uniqueness is weaker than this.
+- **key.** ha's entry id, the document's key, unique per kind within a store: the
+  name when it is free, else the name with a `-2`, `-3` suffix. It follows a
+  new name while the two are the same, keeping the old key as an alias.
+- **name.** ME's: unique within its tree, as ME has it since 0.8.2, so the same
+  name can sit in two trees. It is the one a write gave (ME's regex), else the
+  title's slug. A name made from the title follows a new title; a name given, or
+  one apart from the title, stays. An entry written before 0.8.2 is named by its
+  key. `<tree>/<name>` addresses it.
 - **tree.** The scope root, then the entry's `path` turned into labels:
   - each segment is accent-folded (NFKD without marks);
   - characters outside `[A-Za-z0-9_-]` become `_`;
@@ -243,19 +259,29 @@ exactly as far as the log does.
 
 The `memory` tool's `write` gains:
 
-- `name`, an explicit slug;
+- `name`, an explicit slug, unique in its tree;
 - `tree`, either absolute (`/global/...`, `/projects/<this project>/...`,
   `/local/...`, which also chooses the scope) or relative to `scope` (today's
   `path`, still accepted);
 - `meta`, an object;
 - `temporal`, `{start, end?}`;
-- `on_conflict`, `error` | `replace` | `ignore`, keyed on `(kind, name)`.
+- `on_conflict`, `error` | `replace` | `ignore`, keyed on `(kind, tree, name)`.
 
 `replace` is content-aware: an identical payload is a no-op and does not bump the
-version. ha's duplicate refusal (0.6 similarity, 85 % containment) stays ahead of
-`on_conflict` for new entries, and `distinct` still overrides it.
+version. Otherwise it takes the entry as the write says it, `meta` and
+`temporal` included, as ME does. ha's duplicate refusal (0.6 similarity, 85 %
+containment) stays ahead of `on_conflict` for new entries, and `distinct` still
+overrides it.
 
-Updates keep `expected_version`, and also accept ME's `version_hash`.
+Updates keep `expected_version`, and also accept ME's `version_hash`. An update
+is a patch (0.8.2): it changes what it gives - title, content, name, tree or
+path, meta, temporal, pinned - and keeps the rest, so `content` may be left out.
+An update that changes nothing keeps its version. An absolute `tree` in another
+scope moves the entry to that scope's store under its immutable id. A write's
+result carries the entry's `name`, `tree`, `version_hash` and `memory_id`.
+
+An entry is addressed by its key, by `<tree>/<name>`, or by its `memory_id`, the
+UUID the store gave it, which never changes; list and search show it.
 
 `restore` becomes `revert`, and `restore` stays as an alias:
 
@@ -263,7 +289,8 @@ Updates keep `expected_version`, and also accept ME's `version_hash`.
   cause `revert`;
 - reverting a deleted memory recreates it under its old id, continuing its version
   sequence;
-- reverting into a `(kind, name)` slot that is now taken is a conflict.
+- reverting into a key, or a `(tree, name)`, that another entry now holds is a
+  conflict.
 
 The digest is unchanged in P1. It also leaves out entries whose temporal range
 has ended (`temporal_end <= now`), which are history rather than current fact.
@@ -277,12 +304,13 @@ New `memory` tool actions. Children get only the read-only ones.
 |---|---|---|
 | `get` with `path` (`tree/name`) | `get_by_path` | An ambiguous name across kinds needs `kind` |
 | `tree` (`tree`, `levels`) | `me_memory_tree` | Nodes with counts, global and local together |
-| `count` (`tree` filter, `max_count`) | `me_memory_count` | |
+| `count` (`tree` filter, `max_count`) | `me_memory_count` | A tree, an lquery or an ltxtquery, as search takes it |
 | `move` (`source`, `destination`, `dry_run`) | `me_memory_mv` | Prefix replace. Moving across scope roots moves rows between stores, under one `operation_id` |
-| `copy` (`source`, `destination`, `dry_run`) | `me_memory_copy` | Copies get new ids. A clashing name gets a `-2`, `-3` suffix |
+| `copy` (`source`, `destination`, `dry_run`) | `me_memory_copy` | Copies get new ids and keep their names; a name the destination tree holds is a conflict, and nothing is copied |
 | `delete` with `path` | `delete_by_path` | |
 | `delete_tree` (`tree`, `dry_run`) | `me_memory_delete_tree` | |
-| `history` | `me_memory_history` | Scope by `id`, `path`, `tree`, `operation_id` or `since`; also `until`, `operation`, `order`, `cursor` (keyset on `event_id`), `limit` (max 1000) |
+| `history` | `me_memory_history` | With `id` (a key, a path or a `memory_id`): the entry's versions, each with its tree, name, meta, temporal, cause and `operation_id`, a page of `limit` (10, at most 100) from `offset`. Without: the feed, scoped by `tree`, `operation_id`, `memory_id` or `since`; also `until`, `operation`, `order`, `cursor` (keyset on `event_id`), `limit` (max 1000) |
+| `status` | `memory.embeddingStatus` | Entries per scope; embedded, pending and failed entries, the oldest pending, the last error |
 
 A refinement records the `operation_id` of its write, so `/refine --rollback` and
 `history operation_id=…` agree on what one review changed.
@@ -304,7 +332,10 @@ Words are ha's own tokens:
   `máy in`; one with accents reads them as written.
 
 A query word matches the words it begins, so "deploy" still finds "deploys" as
-the old substring match did.
+the old substring match did, and since 0.8.2 the words of its English stem
+(Snowball, as PostgreSQL's `english` configuration that ME uses), so
+"deploying" finds "deployed". There is no stopword list: ha judges words by
+their statistics, not by lists.
 
 The fields weigh title 3, content 1, tree and name 1, meta values 0.5. Only
 entries holding at least one query word are returned: ME's positive-match
@@ -347,7 +378,9 @@ score = w_fulltext / (60 + rank_fulltext) + w_semantic / (60 + rank_semantic)
 | `candidate_limit` per arm | 30, at least `limit`, at most 1000 |
 | `limit` | 10, at most 200 |
 
-A missing arm adds 0, and ties break by id.
+A missing arm adds 0, and ties break by id. A weight of 0 turns its arm off:
+`weights {semantic: 0}` ranks by words alone, with BM25 scores, and says when
+no word matched.
 
 Query variants (`queries`) are fused inside each arm first, by plain RRF as today.
 
@@ -372,7 +405,7 @@ the temporal index.
 
 | Filter | Semantics |
 |---|---|
-| `tree` | **Exact path:** the node and its descendants. **lquery,** when the pattern holds `* ! { } \| @ %`: `*`, `*{n}`, `*{n,m}`, `!label`, `a\|b`, `label@` (case-insensitive), `label%` (word match), `label*` (prefix). **ltxtquery,** when it holds `&`: Boolean `& \| !` over labels, with the same modifiers. Follows PostgreSQL's ltree documentation. |
+| `tree` | **Exact path:** the node and its descendants. **lquery,** when the pattern holds `* ! { } \| @ %`: `*`, `*{n}`, `*{n,m}`, `!label`, `a\|b`, `label@` (case-insensitive), `label%` (each word of the pattern matches some underscore-separated word of the label, in any order, as PostgreSQL's `compare_subnode`), `label*` (prefix). **ltxtquery,** when it holds `&`: Boolean `& \| !` over labels, with the same modifiers. Labels are joined by `/`, or by `.` as ME's ltree joins them; a pattern without a leading `/` also matches a tree read below its scope's root. |
 | `meta` | JSON containment, PostgreSQL `@>` semantics: an object matches a sub-object, an array contains the given elements. |
 | `meta_predicate` | A Boolean SQL/JSON path predicate. See below. |
 | `temporal` | `before`, `after` (strict, exclude rows without temporal), `contains`, `overlaps {start,end}`, `within {start,end}`. Multiple modes are ANDed. Bounds are `[start, end)`, and a point is `[t, t]`. |
@@ -385,11 +418,17 @@ the temporal index.
 - `== != < <= > >=`, `&& || !`, `exists( … )`, `like_regex "…" flag "i"`,
   `starts with`, `is unknown`;
 - arithmetic `+ - * / %` and unary minus;
-- the methods `.size() .type() .double() .ceiling() .floor() .abs() .keyvalue()`;
+- `.**`, and `.**{n}`, `.**{n to m}` with `last`;
+- string escapes, `\uXXXX` included;
+- the methods `.size() .type() .double() .ceiling() .floor() .abs() .keyvalue()`,
+  and PostgreSQL 17's `.datetime() .date() .timestamp() .timestamp_tz()
+  .string() .number() .decimal() .integer() .bigint() .boolean()` without
+  arguments. A date or time becomes UTC RFC 3339, so two compare in time order.
+  Any other method is refused when the predicate is parsed: one that passed and
+  matched nothing would read as no entry having the facet;
 - lax mode, as ME runs it, where structural errors are false.
 
-It is a hand-written parser and evaluator in `memory/jsonpath.rs`, tested against
-a table of PostgreSQL results.
+It is a hand-written parser and evaluator in `memory/filters.rs`.
 
 With no search text, filters browse: newest first, or by `order_by` `asc`/`desc`.
 Every response carries `total`, counted with `max_count` semantics up to 10 000.
@@ -398,8 +437,8 @@ Every response carries `total`, counted with `max_count` semantics up to 10 000.
 
 | Parameter | Behaviour |
 |---|---|
-| `select` | Fields to return: `id`, `name`, `tree`, `kind`, `title`, `meta`, `meta.<key>`, `temporal`, `version`, `version_hash`, `score`, and the content slices `content:N`, `content:M:N`, `content:M:` (characters, with `content_length` added). |
-| `format` | `json` (the tool default, compact), `compact`, or `yaml`. |
+| `select` | Fields to return: `id`, `memory_id`, `name`, `tree`, `kind`, `title`, `meta`, `meta.<key>` (under `meta`, left out when missing, as ME projects it), `temporal`, `version`, `version_hash`, `score`, `has_embedding`, and the content slices `content:N`, `content:M:N`, `content:M:` (characters, with `content_length` added). On `search`, `read` and `history`. |
+| `format` | `json` (the tool default, compact), `compact`, or `yaml`; on `search`, `read` and `history`. |
 
 `format: yaml` comes from a small emitter in `memory/search.rs`, which quotes any
 string YAML could read as something else. Reading YAML (packs, import) needs a
@@ -429,7 +468,9 @@ still be reverted to.
 
 The `knowledge` tool gains:
 
-- `history` (a page, a folder or a time feed);
+- `history` (a page, a folder or a time feed, with `since`, `until`,
+  `operation` and a per-scope `cursor`); with `version`, that version whole, to
+  read before reverting;
 - `revert` (`path`, `version` = an event id).
 
 Reverting a deleted page recreates it, subject to the same backlink rule a write
@@ -443,10 +484,15 @@ only. Knowledge hits come from the knowledge engine (BM25, or hybrid when
 configured) and are fused by RRF into one list. Each hit says `source`, plus
 `path` and the line range for a page. The CLI does the same with `--knowledge`.
 
+The filters reach the pages as ME's would read a record with no meta and no
+temporal value: a `meta`, `meta_predicate` or `temporal` filter leaves every
+page out; a `tree` filter reads a page at `/knowledge/<scope>/<its folders>`;
+`grep` reads its whole text; `select` picks its fields. The result says so.
+
 ### History tools
 
 - **`history_search`** gains:
-  - `since` and `until`: a source id is the journal event's `evt_<UUIDv7>`,
+  - `since` and `until`: a source id is the journal event's `event_<UUIDv7>`,
     whose head is its time, so a window of time is a range of ids and needs no
     new column;
   - `kind`, one journal event type or a list of them;
@@ -588,3 +634,31 @@ Before P1 the live tests read and seed `harness_state.json` directly
 P1 moves their seeding to the legacy-import rule of §3.4, and their reads to
 `ha memory export --json` (a minimal export lands in P1 for this) or to read-only
 `sqlite3` queries.
+
+## 13. The review after 0.8.1 (0.8.2)
+
+After 0.8.1 the maintainer asked for a second, independent review of P1 to P4
+against ME's source, with P5 to P7 left out. What it found, and what 0.8.2 does:
+
+| Found | 0.8.2 |
+|---|---|
+| An update renamed an entry that had a name of its own: the name followed the title on every update, so `<tree>/<name>` broke | A name follows the title only while it says the title; a given name stays (§3.2) |
+| Names were unique per store, so two trees could not share one, and a copy renamed its entries | Names are unique per tree (schema 3: `key` and `name`); a copy keeps names, a clash is a conflict (§5) |
+| `content` was required on every update | An update is a patch; one that changes nothing keeps its version (§4) |
+| The `memory_id` a feed showed could not address anything | `memory_id` reads, writes, pages history, reverts and deletes; list and search show it (§4) |
+| History of an entry showed ten versions, title and content only | Every field of each version, a page at a time (§5) |
+| An entry could not move to another scope alone | An absolute tree in another scope moves it, under its id (§4) |
+| `replace` kept the old meta and period when the write left them out | `replace` takes the entry whole, as ME (§4) |
+| A new title kept the old vector | The title is embedded with the content, and bumps `content_version` |
+| No English stemming | Snowball English, as PostgreSQL's `english` configuration (§6.1) |
+| Pure keyword search was not possible once embeddings were on | A weight of 0 turns an arm off (§6.3) |
+| `%` matched words by position; trees took only `/` | `%` as PostgreSQL's `compare_subnode`; `.` joins labels; relative trees (§6.4) |
+| An unknown JSONPath method matched nothing, silently; no `.datetime()`, `.**{n}`, `\u` | Unknown methods are refused; PostgreSQL 17's conversion methods, levels and escapes (§6.4) |
+| Combined search ignored the filters on knowledge pages | The filters reach the pages (§7) |
+| No way to read an old page version, no `until` or cursor | `history` with `version`, `until`, `operation`, `cursor` (§7) |
+| No embedding status, no `has_embedding` | `status`, and `has_embedding` in `select` (§5, §6.5) |
+| `select` and `format` only on search; `meta.<key>` flat | Also on read and history; `meta.<key>` under `meta` (§6.5) |
+
+Not taken: ME's batch create (only its importers use it; P5), ME's stopword
+list (ha does not judge text by word lists), and `strict` JSONPath mode (ME runs
+lax).

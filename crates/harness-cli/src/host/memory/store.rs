@@ -6,6 +6,11 @@
 //! temporal, a version and its hash. Every change is an event in an append-only
 //! log that says who made it and why.
 //!
+//! An entry has two names. Its key is the document's (`entries[kind][key]`):
+//! the id a list or a search shows, unique in its kind. Its name is
+//! memory-engine's, unique in its tree, and makes its `<tree>/<name>` address:
+//! the one it was given, or its key.
+//!
 //! The writers that read the whole state, change it and save it - the `memory`
 //! tool, `/refine` and the kernel's `rlm.harness` - keep doing so through
 //! [`load_document`] and [`save_document`]. A save is compared with the rows
@@ -30,7 +35,7 @@ pub const LOCK_FILE: &str = "memory.lock";
 pub const LEGACY_STATE: &str = "harness_state.json";
 /// The journal of earlier versions the event log replaced.
 pub const LEGACY_JOURNAL: &str = "memory_history.jsonl";
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 /// The embedding attempts an entry's content gets before it is left to
 /// keyword search.
 const EMBEDDING_ATTEMPTS: i64 = 3;
@@ -110,6 +115,25 @@ CREATE TABLE memory_embedding_queue (
 );
 ";
 
+/// A name unique in its tree, apart from the key: the column V1 called
+/// `name` is the key, and `name` is now memory-engine's. Every entry kept so
+/// far is named by its key.
+const SCHEMA_V3: &str = "
+ALTER TABLE memory RENAME COLUMN name TO key;
+ALTER TABLE memory ADD COLUMN name TEXT;
+UPDATE memory SET name = key;
+CREATE INDEX memory_path ON memory(kind, tree, name);
+ALTER TABLE memory_event RENAME COLUMN name TO key;
+ALTER TABLE memory_event ADD COLUMN name TEXT;
+UPDATE memory_event SET name = key;
+DROP INDEX memory_event_path;
+CREATE INDEX memory_event_path ON memory_event(tree, name);
+";
+
+/// The kinds whose entries may have a name of their own; a skill's or a
+/// subagent's is its key.
+const NAMED_KINDS: [&str; 2] = ["memory", "prompt"];
+
 /// Who changes the store and why; every event records it.
 #[derive(Clone, Debug)]
 pub struct Writer {
@@ -157,7 +181,7 @@ impl Writer {
     }
 }
 
-/// The id of each live memory of a store, by `(kind, name)`.
+/// The id of each live memory of a store, by `(kind, key)`.
 ///
 /// # Errors
 /// The store cannot be read.
@@ -167,7 +191,7 @@ pub fn ids(dir: &Path) -> Result<BTreeMap<(String, String), String>, String> {
     };
     let mut statement = store
         .conn
-        .prepare("SELECT kind, name, id FROM memory")
+        .prepare("SELECT kind, key, id FROM memory")
         .map_err(sql)?;
     let ids = statement
         .query_map([], |row| {
@@ -208,6 +232,7 @@ pub struct FeedEvent {
     pub at: String,
     pub memory: String,
     pub kind: String,
+    pub key: String,
     pub name: String,
     pub tree: String,
     pub operation: String,
@@ -274,8 +299,9 @@ pub fn feed(dir: &Path, feed: &Feed) -> Result<Vec<FeedEvent>, String> {
         values.push(event.clone());
     }
     let query = format!(
-        "SELECT event_id, at, memory_id, kind, name, tree, operation, operation_id, cause, actor,
-         version, doc FROM memory_event WHERE {} ORDER BY at {order}, event_id {order} LIMIT {}",
+        "SELECT event_id, at, memory_id, kind, key, coalesce(name, key), tree, operation,
+         operation_id, cause, actor, version, doc FROM memory_event WHERE {}
+         ORDER BY at {order}, event_id {order} LIMIT {}",
         clauses.join(" AND "),
         feed.limit.max(1)
     );
@@ -287,14 +313,15 @@ pub fn feed(dir: &Path, feed: &Feed) -> Result<Vec<FeedEvent>, String> {
                 at: row.get(1)?,
                 memory: row.get(2)?,
                 kind: row.get(3)?,
-                name: row.get(4)?,
-                tree: row.get(5)?,
-                operation: row.get(6)?,
-                operation_id: row.get(7)?,
-                cause: row.get(8)?,
-                actor: parse(&row.get::<_, String>(9)?),
-                version: row.get(10)?,
-                doc: parse(&row.get::<_, String>(11)?),
+                key: row.get(4)?,
+                name: row.get(5)?,
+                tree: row.get(6)?,
+                operation: row.get(7)?,
+                operation_id: row.get(8)?,
+                cause: row.get(9)?,
+                actor: parse(&row.get::<_, String>(10)?),
+                version: row.get(11)?,
+                doc: parse(&row.get::<_, String>(12)?),
             })
         })
         .map_err(sql)?
@@ -303,11 +330,131 @@ pub fn feed(dir: &Path, feed: &Feed) -> Result<Vec<FeedEvent>, String> {
     Ok(events)
 }
 
-/// memory-engine's `version_hash` of an entry: 32 hex characters that change
-/// whenever its tree, name, title, content, meta or temporal value does.
+/// memory-engine's `version_hash` of the entry kept under `key`: 32 hex
+/// characters that change whenever its tree, name, title, content, meta or
+/// temporal value does.
 #[must_use]
-pub fn version_hash(root: &str, kind: &str, name: &str, doc: &Value) -> String {
-    Fields::of(root, kind, name, doc).hash
+pub fn version_hash(root: &str, kind: &str, key: &str, doc: &Value) -> String {
+    Fields::of(root, kind, key, doc).hash
+}
+
+/// The name of the entry kept under `key`: the one it was given, or its key.
+#[must_use]
+pub fn name_of(kind: &str, key: &str, doc: &Value) -> String {
+    doc.get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| NAMED_KINDS.contains(&kind) && !name.is_empty())
+        .unwrap_or(key)
+        .to_owned()
+}
+
+/// The kind and key of the live memory with this immutable id.
+///
+/// # Errors
+/// The store cannot be read.
+pub fn find(dir: &Path, memory: &str) -> Result<Option<(String, String)>, String> {
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(None);
+    };
+    store
+        .conn
+        .query_row(
+            "SELECT kind, key FROM memory WHERE id = ?",
+            [memory],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(sql)
+}
+
+/// The kind and key a memory had when the log last saw it, deleted or not.
+///
+/// # Errors
+/// The store cannot be read.
+pub fn find_logged(dir: &Path, memory: &str) -> Result<Option<(String, String)>, String> {
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(None);
+    };
+    store
+        .conn
+        .query_row(
+            "SELECT kind, key FROM memory_event WHERE memory_id = ?
+             ORDER BY at DESC, rowid DESC LIMIT 1",
+            [memory],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(sql)
+}
+
+/// How far embedding has got: entries with a vector for their content in
+/// `namespace`, entries still waiting, entries whose attempts are spent, and
+/// the oldest waiting entry's last change.
+#[derive(Clone, Debug, Default)]
+pub struct EmbeddingStatus {
+    pub embedded: u64,
+    pub pending: u64,
+    pub failed: u64,
+    pub oldest_pending: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// A store's [`EmbeddingStatus`].
+///
+/// # Errors
+/// The store cannot be read.
+pub fn embedding_status(dir: &Path, namespace: &str) -> Result<EmbeddingStatus, String> {
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(EmbeddingStatus::default());
+    };
+    let count = |query: &str, parameters: &[&dyn rusqlite::ToSql]| {
+        store
+            .conn
+            .query_row(query, parameters, |row| row.get::<_, i64>(0))
+            .map(|count| u64::try_from(count).unwrap_or(0))
+            .map_err(sql)
+    };
+    let embedded = count(
+        "SELECT count(*) FROM memory m WHERE EXISTS (SELECT 1 FROM memory_vector v
+         WHERE v.memory_id = m.id AND v.namespace = ? AND v.content_version = m.content_version)",
+        &[&namespace],
+    )?;
+    let failed = count(
+        "SELECT count(*) FROM memory m WHERE EXISTS (SELECT 1 FROM memory_embedding_queue q
+         WHERE q.memory_id = m.id AND q.content_version = m.content_version AND q.attempts >= ?)",
+        &[&EMBEDDING_ATTEMPTS],
+    )?;
+    let total = count("SELECT count(*) FROM memory", &[])?;
+    let oldest_pending = store
+        .conn
+        .query_row(
+            "SELECT min(m.updated_at) FROM memory m WHERE NOT EXISTS (SELECT 1 FROM memory_vector v
+             WHERE v.memory_id = m.id AND v.namespace = ?1 AND v.content_version = m.content_version)
+             AND NOT EXISTS (SELECT 1 FROM memory_embedding_queue q WHERE q.memory_id = m.id
+             AND q.content_version = m.content_version AND q.attempts >= ?2)",
+            params![namespace, EMBEDDING_ATTEMPTS],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .map_err(sql)?;
+    let last_error = store
+        .conn
+        .query_row(
+            "SELECT last_error FROM memory_embedding_queue WHERE last_error IS NOT NULL
+             ORDER BY visible_at DESC LIMIT 1",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(sql)?
+        .flatten();
+    Ok(EmbeddingStatus {
+        embedded,
+        pending: total.saturating_sub(embedded + failed),
+        failed,
+        oldest_pending,
+        last_error,
+    })
 }
 
 /// The database of a scope directory.
@@ -689,10 +836,14 @@ pub fn vectors(dir: &Path, namespace: &str) -> Result<BTreeMap<String, Vec<f32>>
 pub struct Earlier {
     /// The memory's immutable id.
     pub memory: String,
-    /// The entry's name when it was this version.
-    pub name: String,
+    /// The entry's key when it was this version.
+    pub key: String,
     pub version: i64,
     pub doc: Value,
+    /// When it was written, and why and in which operation.
+    pub written_at: String,
+    pub cause: Option<String>,
+    pub operation_id: String,
     /// When a later version or a delete replaced it.
     pub replaced_at: Value,
     /// Who replaced it.
@@ -717,34 +868,26 @@ pub fn earlier_versions(dir: &Path, kind: &str, id: &str) -> Result<Vec<Earlier>
     let mut statement = store
         .conn
         .prepare(
-            "SELECT name, at, operation, actor, version, doc FROM memory_event
+            "SELECT key, at, operation, actor, version, doc, cause, operation_id FROM memory_event
              WHERE memory_id = ? ORDER BY at, rowid",
         )
         .map_err(sql)?;
     let events = statement
         .query_map([&memory], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-            ))
+            Ok(Event {
+                key: row.get(0)?,
+                at: row.get(1)?,
+                deleted: row.get::<_, String>(2)? == "delete",
+                actor: parse(&row.get::<_, String>(3)?),
+                version: row.get(4)?,
+                doc: parse(&row.get::<_, String>(5)?),
+                cause: row.get(6)?,
+                operation_id: row.get(7)?,
+            })
         })
         .map_err(sql)?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(sql)?
-        .into_iter()
-        .map(|(name, at, operation, actor, version, doc)| Event {
-            name,
-            at,
-            deleted: operation == "delete",
-            actor: parse(&actor),
-            version,
-            doc: parse(&doc),
-        })
-        .collect::<Vec<_>>();
+        .map_err(sql)?;
     let mut earlier = versions(&events, live);
     for version in &mut earlier {
         version.memory.clone_from(&memory);
@@ -754,12 +897,32 @@ pub fn earlier_versions(dir: &Path, kind: &str, id: &str) -> Result<Vec<Earlier>
 
 /// One event of the log, as history reads it.
 struct Event {
-    name: String,
+    key: String,
     at: String,
     deleted: bool,
     actor: Value,
     version: i64,
     doc: Value,
+    cause: Option<String>,
+    operation_id: String,
+}
+
+impl Event {
+    /// This event's version, replaced when and by whom a later event says.
+    fn earlier(&self, replaced_at: Value, by: Value, deleted: bool) -> Earlier {
+        Earlier {
+            memory: String::new(),
+            key: self.key.clone(),
+            version: self.version,
+            doc: self.doc.clone(),
+            written_at: self.at.clone(),
+            cause: self.cause.clone(),
+            operation_id: self.operation_id.clone(),
+            replaced_at,
+            by,
+            deleted,
+        }
+    }
 }
 
 /// The versions a memory's events show, newest first. Each version is
@@ -775,15 +938,7 @@ fn versions(events: &[Event], live: bool) -> Vec<Earlier> {
             let shown =
                 index > 0 && !events[index - 1].deleted && events[index - 1].doc == event.doc;
             if !shown {
-                earlier.push(Earlier {
-                    memory: String::new(),
-                    name: event.name.clone(),
-                    version: event.version,
-                    doc: event.doc.clone(),
-                    replaced_at: json!(event.at),
-                    by: event.actor.clone(),
-                    deleted: true,
-                });
+                earlier.push(event.earlier(json!(event.at), event.actor.clone(), true));
             }
             continue;
         }
@@ -798,27 +953,19 @@ fn versions(events: &[Event], live: bool) -> Vec<Earlier> {
             (None, Some(replaced_at)) if !live => (replaced_at, by.unwrap_or(Value::Null), false),
             (None, _) => continue,
         };
-        earlier.push(Earlier {
-            memory: String::new(),
-            name: event.name.clone(),
-            version: event.version,
-            doc: event.doc.clone(),
-            replaced_at,
-            by,
-            deleted,
-        });
+        earlier.push(event.earlier(replaced_at, by, deleted));
     }
     earlier.reverse();
     earlier
 }
 
-/// The memory `id` names among `kind`: a live entry by its name, then by an
+/// The memory `id` names among `kind`: a live entry by its key, then by an
 /// alias an earlier title gave it, else the last one the log knew by that
-/// name. Says whether it is live.
+/// key. Says whether it is live.
 fn resolve(conn: &Connection, kind: &str, id: &str) -> Result<Option<(String, bool)>, String> {
     if let Some(memory) = conn
         .query_row(
-            "SELECT id FROM memory WHERE kind = ? AND name = ?",
+            "SELECT id FROM memory WHERE kind = ? AND key = ?",
             params![kind, id],
             |row| row.get::<_, String>(0),
         )
@@ -842,7 +989,7 @@ fn resolve(conn: &Connection, kind: &str, id: &str) -> Result<Option<(String, bo
     }
     let logged = conn
         .query_row(
-            "SELECT memory_id FROM memory_event WHERE kind = ? AND name = ?
+            "SELECT memory_id FROM memory_event WHERE kind = ? AND key = ?
              ORDER BY at DESC, rowid DESC LIMIT 1",
             params![kind, id],
             |row| row.get::<_, String>(0),
@@ -974,6 +1121,9 @@ impl Store {
         }
         if version < 2 {
             transaction.execute_batch(SCHEMA_V2).map_err(sql)?;
+        }
+        if version < 3 {
+            transaction.execute_batch(SCHEMA_V3).map_err(sql)?;
         }
         transaction
             .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
@@ -1145,7 +1295,8 @@ fn import_journal(transaction: &Transaction<'_>, root: &str, text: &str) -> Resu
                 at: &at,
                 memory: &memory,
                 kind,
-                name,
+                key: name,
+                name: &name_of(kind, name, entry),
                 tree: &tree_for(root, entry),
                 operation: operation_kind,
                 operation_id: &operation,
@@ -1188,7 +1339,7 @@ fn document(conn: &Connection) -> Result<Value, String> {
         entries.insert(kind.to_owned(), json!({}));
     }
     let mut statement = conn
-        .prepare("SELECT kind, name, doc FROM memory ORDER BY kind, name")
+        .prepare("SELECT kind, key, doc FROM memory ORDER BY kind, key")
         .map_err(sql)?;
     let rows = statement
         .query_map([], |row| {
@@ -1200,9 +1351,9 @@ fn document(conn: &Connection) -> Result<Value, String> {
         })
         .map_err(sql)?;
     for row in rows {
-        let (kind, name, doc) = row.map_err(sql)?;
+        let (kind, key, doc) = row.map_err(sql)?;
         let records = entries.entry(kind).or_insert_with(|| json!({}));
-        records[name] = parse(&doc);
+        records[key] = parse(&doc);
     }
     top["entries"] = Value::Object(entries);
     top["refinements"] = Value::Array(refinements(conn)?);
@@ -1225,6 +1376,7 @@ fn refinements(conn: &Connection) -> Result<Vec<Value>, String> {
 struct Current {
     id: String,
     doc: Value,
+    title: String,
     content: String,
     content_version: i64,
 }
@@ -1243,31 +1395,25 @@ fn save(
     let mut current = BTreeMap::<(String, String), Current>::new();
     {
         let mut statement = transaction
-            .prepare("SELECT id, kind, name, doc, content, content_version FROM memory")
+            .prepare("SELECT id, kind, key, doc, title, content, content_version FROM memory")
             .map_err(sql)?;
         let rows = statement
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
+                    (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+                    Current {
+                        id: row.get(0)?,
+                        doc: parse(&row.get::<_, String>(3)?),
+                        title: row.get(4)?,
+                        content: row.get(5)?,
+                        content_version: row.get(6)?,
+                    },
                 ))
             })
             .map_err(sql)?;
         for row in rows {
-            let (id, kind, name, doc, content, content_version) = row.map_err(sql)?;
-            current.insert(
-                (kind, name),
-                Current {
-                    id,
-                    doc: parse(&doc),
-                    content,
-                    content_version,
-                },
-            );
+            let (key, row) = row.map_err(sql)?;
+            current.insert(key, row);
         }
     }
     let mut wanted = BTreeMap::<(String, String), &Value>::new();
@@ -1301,25 +1447,27 @@ fn save(
     let operation = writer.operation.clone();
     let at = now();
     let mut changed = 0;
-    for (key, doc) in &wanted {
-        let (kind, name) = key;
-        let fields = Fields::of(root, kind, name, doc);
+    for (wanted_key, doc) in &wanted {
+        let (kind, key) = wanted_key;
+        let fields = Fields::of(root, kind, key, doc);
         let existing = current
-            .get(key)
-            .or_else(|| renamed.get(key).and_then(|from| current.get(from)));
+            .get(wanted_key)
+            .or_else(|| renamed.get(wanted_key).and_then(|from| current.get(from)));
         let (id, operation_kind, content_version) = match existing {
-            Some(row) if current.contains_key(key) && row.doc == **doc => continue,
+            Some(row) if current.contains_key(wanted_key) && row.doc == **doc => continue,
+            // The title is embedded with the content: a new one needs a new
+            // vector as much as new content does.
             Some(row) => (
                 row.id.clone(),
                 "update",
-                if row.content == fields.content {
+                if row.content == fields.content && row.title == fields.title {
                     row.content_version
                 } else {
                     row.content_version + 1
                 },
             ),
             None => (
-                writer.keep.get(key).cloned().unwrap_or_else(new_id),
+                writer.keep.get(wanted_key).cloned().unwrap_or_else(new_id),
                 "insert",
                 1,
             ),
@@ -1327,13 +1475,14 @@ fn save(
         if operation_kind == "insert" {
             transaction
                 .execute(
-                    "INSERT INTO memory(id, kind, name, tree, title, content, meta, temporal_start,
-                     temporal_end, doc, version, version_hash, content_version, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    "INSERT INTO memory(id, kind, key, tree, title, content, meta, temporal_start,
+                     temporal_end, doc, version, version_hash, content_version, created_at, updated_at,
+                     name)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                     params![
                         id,
                         kind,
-                        name,
+                        key,
                         fields.tree,
                         fields.title,
                         fields.content,
@@ -1346,18 +1495,20 @@ fn save(
                         content_version,
                         fields.created_at,
                         fields.updated_at,
+                        fields.name,
                     ],
                 )
                 .map_err(sql)?;
         } else {
             transaction
                 .execute(
-                    "UPDATE memory SET name = ?2, tree = ?3, title = ?4, content = ?5, meta = ?6,
+                    "UPDATE memory SET key = ?2, tree = ?3, title = ?4, content = ?5, meta = ?6,
                      temporal_start = ?7, temporal_end = ?8, doc = ?9, version = ?10,
-                     version_hash = ?11, content_version = ?12, updated_at = ?13 WHERE id = ?1",
+                     version_hash = ?11, content_version = ?12, updated_at = ?13, name = ?14
+                     WHERE id = ?1",
                     params![
                         id,
-                        name,
+                        key,
                         fields.tree,
                         fields.title,
                         fields.content,
@@ -1369,6 +1520,7 @@ fn save(
                         fields.hash,
                         content_version,
                         fields.updated_at,
+                        fields.name,
                     ],
                 )
                 .map_err(sql)?;
@@ -1379,7 +1531,8 @@ fn save(
                 at: &at,
                 memory: &id,
                 kind,
-                name,
+                key,
+                name: &fields.name,
                 tree: &fields.tree,
                 operation: operation_kind,
                 operation_id: &operation,
@@ -1408,7 +1561,8 @@ fn save(
                 at: &at,
                 memory: &row.id,
                 kind: &key.0,
-                name: &key.1,
+                key: &key.1,
+                name: &name_of(&key.0, &key.1, &row.doc),
                 tree: &tree_for(root, &row.doc),
                 operation: "delete",
                 operation_id: &operation,
@@ -1490,6 +1644,7 @@ fn prune(transaction: &Transaction<'_>) -> Result<(), String> {
 
 /// The columns an entry's document gives its row.
 struct Fields {
+    name: String,
     tree: String,
     title: String,
     content: String,
@@ -1502,7 +1657,7 @@ struct Fields {
 }
 
 impl Fields {
-    fn of(root: &str, kind: &str, name: &str, doc: &Value) -> Self {
+    fn of(root: &str, kind: &str, key: &str, doc: &Value) -> Self {
         let text = |field: &str| {
             doc.get(field)
                 .and_then(Value::as_str)
@@ -1524,6 +1679,7 @@ impl Fields {
             .ok()
             .flatten();
         let tree = tree_for(root, doc);
+        let name = name_of(kind, key, doc);
         let title = text("title");
         let content = text("content");
         let hash = hex(&Sha256::digest(
@@ -1537,6 +1693,7 @@ impl Fields {
             updated_at: time("updated_at").unwrap_or_else(|| created_at.clone()),
             created_at,
             meta: meta.to_string(),
+            name,
             tree,
             title,
             content,
@@ -1552,6 +1709,7 @@ struct EventRow<'a> {
     at: &'a str,
     memory: &'a str,
     kind: &'a str,
+    key: &'a str,
     name: &'a str,
     tree: &'a str,
     operation: &'a str,
@@ -1565,15 +1723,15 @@ struct EventRow<'a> {
 fn insert_event(transaction: &Transaction<'_>, event: &EventRow<'_>) -> Result<(), String> {
     transaction
         .execute(
-            "INSERT INTO memory_event(event_id, at, memory_id, kind, name, tree, operation,
-             operation_id, cause, actor, version, doc)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO memory_event(event_id, at, memory_id, kind, key, tree, operation,
+             operation_id, cause, actor, version, doc, name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 new_id(),
                 event.at,
                 event.memory,
                 event.kind,
-                event.name,
+                event.key,
                 event.tree,
                 event.operation,
                 event.operation_id,
@@ -1581,6 +1739,7 @@ fn insert_event(transaction: &Transaction<'_>, event: &EventRow<'_>) -> Result<(
                 event.actor.to_string(),
                 event.version,
                 event.doc.to_string(),
+                event.name,
             ],
         )
         .map_err(sql)?;
@@ -1776,5 +1935,90 @@ mod tests {
         assert!(!ended(
             &json!({"temporal": {"start": "2020-01-01", "end": "2999-01-01"}})
         ));
+    }
+
+    /// The title is embedded with the content, so a new title needs a new
+    /// vector; a change of meta alone keeps the one there is.
+    #[test]
+    fn a_new_title_is_embedded_again() {
+        let directory = tempfile::tempdir().expect("dir");
+        let dir = directory.path().join("harness");
+        let mut state = empty_document();
+        state["entries"]["memory"]["queue"] = entry("Queue", "Redis Streams.", 1);
+        save_document(&dir, &state, &writer()).expect("save");
+        let pending = unembedded(&dir, "ns", 10).expect("pending");
+        assert_eq!(pending.len(), 1);
+        save_vectors(&dir, "ns", &[(pending[0].clone(), vec![1.0, 0.0])]).expect("vectors");
+        assert!(unembedded(&dir, "ns", 10).expect("none").is_empty());
+        state["entries"]["memory"]["queue"]["metadata"] = json!({"type": "decision"});
+        save_document(&dir, &state, &writer()).expect("meta");
+        assert!(unembedded(&dir, "ns", 10).expect("still none").is_empty());
+        state["entries"]["memory"]["queue"]["title"] = json!("Message queue");
+        save_document(&dir, &state, &writer()).expect("title");
+        let again = unembedded(&dir, "ns", 10).expect("again");
+        assert_eq!(again.len(), 1);
+        assert!(
+            again[0].text.starts_with("Message queue"),
+            "{:?}",
+            again[0].text
+        );
+        let status = embedding_status(&dir, "ns").expect("status");
+        assert_eq!((status.embedded, status.pending, status.failed), (0, 1, 0));
+    }
+
+    /// A store from before names had their own column comes up named by its
+    /// keys, and its events keep theirs.
+    #[test]
+    fn a_v2_store_is_migrated_to_names() {
+        let directory = tempfile::tempdir().expect("dir");
+        let dir = directory.path().join("harness");
+        std::fs::create_dir_all(&dir).expect("dir");
+        {
+            let conn = Connection::open(db_path(&dir)).expect("open");
+            conn.execute_batch(SCHEMA_V1).expect("v1");
+            conn.execute_batch(SCHEMA_V2).expect("v2");
+            conn.execute_batch("PRAGMA user_version = 2")
+                .expect("version");
+            conn.execute(
+                "INSERT INTO memory(id, kind, name, tree, title, content, doc, version, version_hash,
+                 content_version, created_at, updated_at)
+                 VALUES ('m1', 'memory', 'queue', '/global/general', 'Queue', 'Redis.',
+                 '{\"id\":\"queue\",\"title\":\"Queue\",\"content\":\"Redis.\",\"version\":1}', 1, 'h', 1,
+                 '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')",
+                [],
+            )
+            .expect("row");
+            conn.execute(
+                "INSERT INTO memory_event(event_id, at, memory_id, kind, name, tree, operation,
+                 operation_id, actor, version, doc)
+                 VALUES ('e1', '2026-10-01T00:00:00.000Z', 'm1', 'memory', 'queue', '/global/general',
+                 'insert', 'o1', '{}', 1, '{}')",
+                [],
+            )
+            .expect("event");
+        }
+        let document = load_document(&dir).expect("migrated");
+        assert_eq!(document["entries"]["memory"]["queue"]["title"], "Queue");
+        assert_eq!(
+            ids(&dir).expect("ids")[&("memory".to_owned(), "queue".to_owned())],
+            "m1"
+        );
+        let feed = feed(
+            &dir,
+            &Feed {
+                memory: Some("m1".to_owned()),
+                limit: 10,
+                ..Feed::default()
+            },
+        )
+        .expect("feed");
+        assert_eq!(
+            (feed[0].key.as_str(), feed[0].name.as_str()),
+            ("queue", "queue")
+        );
+        assert_eq!(
+            find(&dir, "m1").expect("find"),
+            Some(("memory".to_owned(), "queue".to_owned()))
+        );
     }
 }

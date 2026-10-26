@@ -666,16 +666,33 @@ impl Store {
     /// `/`), or of the library, newest first.
     pub(crate) fn history(
         &self,
-        path: Option<&str>,
-        since: Option<&str>,
+        mut window: super::history::Window,
         limit: usize,
     ) -> Result<Vec<super::history::Event>, String> {
-        let path = match path {
+        window.path = match window.path.as_deref() {
             Some(folder) if folder.ends_with('/') => Some(folder.to_owned()),
             Some(page) => Some(page_path(page)?),
             None => None,
         };
-        super::history::events(&self.root, path.as_deref(), since, limit)
+        super::history::events(&self.root, &window, limit)
+    }
+
+    /// One recorded version, with the page as it then was; of `path` when
+    /// given.
+    pub(crate) fn version(
+        &self,
+        path: Option<&str>,
+        version: &str,
+    ) -> Result<super::history::Event, String> {
+        let path = path.map(page_path).transpose()?;
+        super::history::event(&self.root, version)?
+            .filter(|event| path.as_ref().is_none_or(|path| event.path == *path))
+            .ok_or_else(|| {
+                format!(
+                    "knowledge has no version {version:?}{}; history lists them",
+                    path.map_or_else(String::new, |path| format!(" of {path}"))
+                )
+            })
     }
 
     pub(crate) fn delete(&self, path: &str, expected_hash: &str) -> Result<(), String> {
@@ -2178,6 +2195,69 @@ mod tests {
     /// Every write and delete is a version with the whole page, and revert
     /// brings one back: an earlier text of a page that exists, or a page that
     /// was deleted.
+    fn page_window(path: &str) -> super::super::history::Window {
+        super::super::history::Window {
+            path: Some(path.to_owned()),
+            ..super::super::history::Window::default()
+        }
+    }
+
+    /// A version reads back whole before a revert; a history reads a page at
+    /// a time, and between two times, of one kind of change.
+    #[test]
+    fn a_pages_old_version_reads_whole_and_history_pages() {
+        let (_dir, store) = store();
+        let first = store.write(input("c.md", "first text")).unwrap();
+        let mut update = input("c.md", "second text");
+        update.expected_hash = Some(first.hash.clone());
+        store.write(update).unwrap();
+        let history = store.history(page_window("c.md"), 10).unwrap();
+        let old = store.version(Some("c.md"), &history[1].id).unwrap();
+        assert!(
+            old.view_with_text()["content"]
+                .as_str()
+                .unwrap()
+                .contains("first text")
+        );
+        assert!(store.version(Some("other.md"), &history[1].id).is_err());
+        let newest = store.history(page_window("c.md"), 1).unwrap();
+        assert_eq!(newest.len(), 1);
+        let rest = store
+            .history(
+                super::super::history::Window {
+                    before: newest[0]
+                        .cursor()
+                        .split_once('|')
+                        .map(|(at, id)| (at.to_owned(), id.to_owned())),
+                    ..page_window("c.md")
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, history[1].id);
+        let inserts = store
+            .history(
+                super::super::history::Window {
+                    operation: Some("insert".to_owned()),
+                    ..page_window("c.md")
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(inserts.len(), 1);
+        let none = store
+            .history(
+                super::super::history::Window {
+                    until: Some(history[1].at.clone()),
+                    ..page_window("c.md")
+                },
+                10,
+            )
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
     #[test]
     fn a_pages_history_reverts_an_edit_and_a_delete() {
         let (_dir, store) = store();
@@ -2185,7 +2265,7 @@ mod tests {
         let mut update = input("a.md", "second text");
         update.expected_hash = Some(first.hash.clone());
         let second = store.write(update).unwrap();
-        let history = store.history(Some("a.md"), None, 10).unwrap();
+        let history = store.history(page_window("a.md"), 10).unwrap();
         assert_eq!(
             history
                 .iter()
@@ -2209,12 +2289,18 @@ mod tests {
         );
         // A deleted page comes back as it was.
         store.delete("a.md", &first.hash).unwrap();
-        let gone = store.history(Some("a.md"), None, 10).unwrap();
+        let gone = store.history(page_window("a.md"), 10).unwrap();
         assert_eq!(gone[0].operation, "delete");
         assert_eq!(gone[1].cause.as_deref(), Some("revert"));
         let back = store.revert("a.md", &gone[0].id, None, None).unwrap();
         assert_eq!(back.hash, first.hash);
-        assert_eq!(store.history(None, None, 50).unwrap().len(), 5);
+        assert_eq!(
+            store
+                .history(super::super::history::Window::default(), 50)
+                .unwrap()
+                .len(),
+            5
+        );
         assert!(store.revert("a.md", "no-such-version", None, None).is_err());
     }
 
@@ -2230,7 +2316,7 @@ mod tests {
         let mut update = input("b.md", "rewritten");
         update.expected_hash = Some(old.hash.clone());
         store.write(update).unwrap();
-        let history = store.history(Some("b.md"), None, 10).unwrap();
+        let history = store.history(page_window("b.md"), 10).unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[1].cause.as_deref(), Some("baseline"));
         assert_eq!(history[1].hash, old.hash);

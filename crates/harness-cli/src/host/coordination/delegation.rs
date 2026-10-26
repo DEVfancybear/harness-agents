@@ -5868,7 +5868,9 @@ pub(super) mod tests {
             .expect("memory schema");
         assert_eq!(
             schema["function"]["parameters"]["properties"]["action"]["enum"],
-            json!(["list", "search", "read", "history", "tree", "count"])
+            json!([
+                "list", "search", "read", "history", "tree", "count", "status"
+            ])
         );
         let search = json!({"action":"search","query":"tabs indentation"});
         let action = tools.resolve("memory", &search).expect("resolves");

@@ -184,6 +184,20 @@ impl KnowledgeHost {
         Ok(found["results"].as_array().cloned().unwrap_or_default())
     }
 
+    /// The whole text of the page a search hit named, for a `memory` search's
+    /// `grep` and `select`.
+    ///
+    /// # Errors
+    /// The library is off, or has no such page.
+    pub(crate) fn page_text(&self, scope: &str, path: &str) -> Result<String, String> {
+        let scope = if scope == "global" {
+            Scope::Global
+        } else {
+            Scope::Project
+        };
+        Ok(self.store(scope).document(path)?.content)
+    }
+
     pub(crate) fn console_roots(&self) -> (&Path, &Path) {
         (&self.project, &self.global)
     }
@@ -400,6 +414,9 @@ impl KnowledgeHost {
                     | "offset"
                     | "version"
                     | "since"
+                    | "until"
+                    | "operation"
+                    | "cursor"
             ) {
                 return Err(format!("knowledge does not take {key}"));
             }
@@ -485,6 +502,8 @@ impl KnowledgeHost {
         let mut results = Vec::new();
         let offset = integer(arguments, "offset", 0);
         let mut totals = Vec::new();
+        // Where each scope's next page of history starts.
+        let mut cursors = Vec::<(&str, String)>::new();
         let mut semantic = false;
         let mut warnings = Vec::new();
         for scope in scopes {
@@ -581,16 +600,44 @@ impl KnowledgeHost {
                     results.push(value);
                 }
                 "history" => {
-                    let since = arguments
-                        .get("since")
-                        .and_then(Value::as_str)
-                        .map(crate::interactive::memory_store::instant)
-                        .transpose()?;
-                    for event in store.history(
-                        arguments.get("path").and_then(Value::as_str),
-                        since.as_deref(),
-                        limit,
-                    )? {
+                    let path = arguments.get("path").and_then(Value::as_str);
+                    // A version named: that one, with the page as it was.
+                    if let Some(version) = arguments.get("version").and_then(Value::as_str) {
+                        if let Ok(event) = store.version(path, version) {
+                            let mut value = event.view_with_text();
+                            value["scope"] = json!(scope.label());
+                            results.push(value);
+                        }
+                        continue;
+                    }
+                    let time = |key: &str| {
+                        arguments
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .map(crate::interactive::memory_store::instant)
+                            .transpose()
+                    };
+                    let window = super::history::Window {
+                        path: path.map(str::to_owned),
+                        since: time("since")?,
+                        until: time("until")?,
+                        operation: arguments
+                            .get("operation")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        before: arguments
+                            .get("cursor")
+                            .and_then(Value::as_str)
+                            .and_then(|cursor| cursor.split_once('|'))
+                            .map(|(at, id)| (at.to_owned(), id.to_owned())),
+                    };
+                    let events = store.history(window, limit)?;
+                    if events.len() == limit
+                        && let Some(last) = events.last()
+                    {
+                        cursors.push((scope.label(), last.cursor()));
+                    }
+                    for event in events {
                         let mut value = event.view();
                         value["scope"] = json!(scope.label());
                         results.push(value);
@@ -668,6 +715,14 @@ impl KnowledgeHost {
                 }
             }
             payload["next_offset"] = Value::Object(continuation);
+        }
+        if action == "history" && !cursors.is_empty() {
+            payload["next_cursor"] = Value::Object(
+                cursors
+                    .into_iter()
+                    .map(|(scope, cursor)| (scope.to_owned(), json!(cursor)))
+                    .collect(),
+            );
         }
         Ok(payload)
     }
@@ -976,15 +1031,31 @@ fn quoted_in(quote: &str, text: &str) -> bool {
     squeeze(text).contains(&head)
 }
 
-/// `revert` names a page and the version to bring back; `since` is a time.
+/// `revert` names a page and the version to bring back; `since` and `until`
+/// are times; `operation` a kind of change; `cursor` where a page of
+/// history ended.
 fn check_history(action: &str, arguments: &Value) -> Result<(), String> {
     if action == "revert" {
         text(arguments, "path")?;
         text(arguments, "version")?;
     }
-    if let Some(since) = arguments.get("since") {
-        let since = since.as_str().ok_or("since must be a string")?;
-        crate::interactive::memory_store::instant(since)?;
+    for key in ["since", "until"] {
+        if let Some(time) = arguments.get(key) {
+            let time = time
+                .as_str()
+                .ok_or_else(|| format!("{key} must be a string"))?;
+            crate::interactive::memory_store::instant(time)?;
+        }
+    }
+    if let Some(operation) = arguments.get("operation")
+        && !matches!(operation.as_str(), Some("insert" | "update" | "delete"))
+    {
+        return Err("operation is insert, update or delete".to_owned());
+    }
+    if let Some(cursor) = arguments.get("cursor")
+        && !cursor.as_str().is_some_and(|cursor| cursor.contains('|'))
+    {
+        return Err("cursor is the next_cursor a history page returned".to_owned());
     }
     Ok(())
 }
@@ -1199,11 +1270,23 @@ impl ExternalToolCatalog for KnowledgeHost {
         if let Some(properties) = schema["function"]["parameters"]["properties"].as_object_mut() {
             properties.insert(
                 "version".to_owned(),
-                json!({"type":"string","description":"revert: the version history listed for this page; the page comes back as it was then (a deleted page too). An existing page also needs expected_hash."}),
+                json!({"type":"string","description":"history: the page as it was at this version, whole, to read before reverting. revert: the version history listed for this page; the page comes back as it was then (a deleted page too). An existing page also needs expected_hash."}),
             );
             properties.insert(
                 "since".to_owned(),
                 json!({"type":"string","description":"history: only changes at or after this time. history takes path for one page, a folder ending in /, or nothing for the library."}),
+            );
+            properties.insert(
+                "until".to_owned(),
+                json!({"type":"string","description":"history: only changes before this time."}),
+            );
+            properties.insert(
+                "operation".to_owned(),
+                json!({"type":"string","enum":["insert","update","delete"],"description":"history: only this kind of change."}),
+            );
+            properties.insert(
+                "cursor".to_owned(),
+                json!({"type":"string","description":"history: the next_cursor a page returned for this scope; pass scope with it."}),
             );
         }
         if self.read_only {

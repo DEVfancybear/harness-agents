@@ -189,8 +189,10 @@ fn check_presentation(arguments: &Value) -> Result<(), String> {
 }
 
 /// The fields `select` may name.
-const SELECTABLE: [&str; 17] = [
+const SELECTABLE: [&str; 19] = [
     "id",
+    "memory_id",
+    "has_embedding",
     "scope",
     "kind",
     "name",
@@ -209,7 +211,90 @@ const SELECTABLE: [&str; 17] = [
     "pinned",
 ];
 
-fn grep(pattern: &str) -> Result<regex::Regex, String> {
+/// The fields a call's `select` names, when it names any.
+#[must_use]
+pub fn selected(arguments: &Value) -> Option<Vec<String>> {
+    arguments
+        .get("select")
+        .and_then(Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+}
+
+/// Only the fields `select` names of a result already made (a read, a
+/// version in history): `meta.<key>` under `meta`, and a content slice with
+/// the whole content's length. A field the result lacks is left out.
+#[must_use]
+pub fn select_fields(value: &Value, fields: &[String]) -> Value {
+    let mut out = serde_json::Map::new();
+    let content = value["content"].as_str().unwrap_or_default();
+    for field in fields {
+        if let Some(key) = field.strip_prefix("meta.") {
+            if let Some(found) = value["meta"].get(key) {
+                if !out.get("meta").is_some_and(Value::is_object) {
+                    out.insert("meta".to_owned(), json!({}));
+                }
+                out["meta"][key] = found.clone();
+            }
+            continue;
+        }
+        if field.starts_with("content:") {
+            if let Ok((start, end)) = slice(field) {
+                out.insert(
+                    "content".to_owned(),
+                    json!(content_slice(content, start, end)),
+                );
+                out.insert("content_length".to_owned(), json!(content.chars().count()));
+            }
+            continue;
+        }
+        if field == "content_length" {
+            out.insert(field.clone(), json!(content.chars().count()));
+        } else if let Some(found) = value.get(field) {
+            out.insert(field.clone(), found.clone());
+        }
+    }
+    Value::Object(out)
+}
+
+/// A result as JSON, or as YAML text when `format` asks for it.
+#[must_use]
+pub fn formatted(value: Value, arguments: &Value) -> Value {
+    if arguments.get("format").and_then(Value::as_str) == Some("yaml") {
+        json!({"text": yaml(&value)})
+    } else {
+        value
+    }
+}
+
+/// A single result (a read) with `select` and `format` applied.
+#[must_use]
+pub fn present(value: Value, arguments: &Value) -> Value {
+    let value = match selected(arguments) {
+        Some(fields) => select_fields(&value, &fields),
+        None => value,
+    };
+    formatted(value, arguments)
+}
+
+fn content_slice(content: &str, start: usize, end: Option<usize>) -> String {
+    content
+        .chars()
+        .skip(start)
+        .take(end.map_or(usize::MAX, |end| end - start))
+        .collect()
+}
+
+/// `grep` as a case-insensitive regular expression.
+///
+/// # Errors
+/// It is not one.
+pub fn grep(pattern: &str) -> Result<regex::Regex, String> {
     regex::RegexBuilder::new(pattern)
         .case_insensitive(true)
         .size_limit(1 << 20)
@@ -324,7 +409,8 @@ pub fn search(
         };
         ranked.into_iter().take(candidates).collect::<Vec<_>>()
     };
-    let fulltext = (!queries.is_empty()).then(|| rank_words(&queries));
+    // A weight of 0 turns its arm off: `{semantic: 0}` ranks by words alone.
+    let fulltext = (!queries.is_empty() && weight("fulltext") > 0.0).then(|| rank_words(&queries));
     // The meaning arm: with embeddings configured, the semantic text - or the
     // query and its variants when none is given - against every entry's vector.
     let mut note = None;
@@ -334,7 +420,7 @@ pub fn search(
         (None, true) => Vec::new(),
     };
     let threshold = arguments.get("semantic_threshold").and_then(Value::as_f64);
-    let semantic = if meaning_texts.is_empty() {
+    let semantic = if meaning_texts.is_empty() || weight("semantic") <= 0.0 {
         None
     } else {
         match meaning(&considered, embedding_root, &meaning_texts) {
@@ -359,9 +445,12 @@ pub fn search(
             }
         }
     };
-    // Meaning asked for but not to be had: its words still search.
+    // Meaning asked for but not to be had: the words still search.
     let fulltext = match (fulltext, &semantic, &semantic_text) {
-        (None, None, Some(text)) => Some(rank_words(std::slice::from_ref(text))),
+        (None, None, Some(text)) if queries.is_empty() => {
+            Some(rank_words(std::slice::from_ref(text)))
+        }
+        (None, None, _) if !queries.is_empty() => Some(rank_words(&queries)),
         (fulltext, _, _) => fulltext,
     };
     let (mode, ranked): (&str, Vec<(usize, f64)>) = match (fulltext, semantic) {
@@ -412,13 +501,21 @@ pub fn search(
         .get("select")
         .and_then(Value::as_array)
         .map(|fields| fields.iter().filter_map(Value::as_str).collect::<Vec<_>>());
+    let embedded = if select
+        .as_ref()
+        .is_some_and(|fields| fields.contains(&"has_embedding"))
+    {
+        embedded(&considered, embedding_root)
+    } else {
+        std::collections::BTreeSet::new()
+    };
     let hits = ranked
         .iter()
         .take(limit)
         .map(|(index, score)| {
             let placed = considered[*index];
             if let Some(fields) = &select {
-                project(placed, *score, fields)
+                project(placed, *score, fields, &embedded)
             } else {
                 let mut hit = view(placed.entry);
                 hit["score"] = json!(rounded(*score, mode));
@@ -499,11 +596,48 @@ fn words(text: &str, fold: bool) -> Vec<String> {
     }
 }
 
+/// A field's words beside their English stems, as BM25 matches them.
+struct Field {
+    words: Vec<String>,
+    stems: Vec<String>,
+    weight: f64,
+}
+
+impl Field {
+    fn new(words: Vec<String>, weight: f64, stemmer: &rust_stemmers::Stemmer) -> Self {
+        Self {
+            stems: words
+                .iter()
+                .map(|word| stemmer.stem(word).into_owned())
+                .collect(),
+            words,
+            weight,
+        }
+    }
+
+    /// How often the field holds a term: a word it begins (`deploy` finds
+    /// `deploys`), or a word of the same stem (`deploying` finds `deployed`).
+    #[allow(clippy::cast_precision_loss, reason = "counts are small")]
+    fn frequency(&self, term: &str, stem: &str) -> f64 {
+        self.words
+            .iter()
+            .zip(&self.stems)
+            .filter(|(word, word_stem)| word.starts_with(term) || *word_stem == stem)
+            .count() as f64
+            * self.weight
+    }
+}
+
 /// BM25 over the considered entries, best first, only those holding at least
-/// one of the query's words (a word matches the words it begins: `deploy`
-/// finds `deploys`). Fields weigh by what they say of the entry: its title
-/// most, then its content and where it sits, then its facets.
+/// one of the query's words: the words it begins, and the words of its stem,
+/// with Snowball's English stemmer as memory-engine's Postgres configuration
+/// has it. Fields weigh by what they say of the entry: its title most, then
+/// its content and where it sits, then its facets.
 #[allow(clippy::cast_precision_loss, reason = "counts are small")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one ranking: the fields, their statistics, then each entry's score"
+)]
 fn bm25(considered: &[&Placed<'_>], query: &str) -> Vec<(usize, f64)> {
     let fold = super::knowledge::store::fold(query) == query;
     let terms = harness::query_terms(&if fold {
@@ -514,6 +648,11 @@ fn bm25(considered: &[&Placed<'_>], query: &str) -> Vec<(usize, f64)> {
     if terms.is_empty() || considered.is_empty() {
         return Vec::new();
     }
+    let stemmer = rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English);
+    let term_stems = terms
+        .iter()
+        .map(|term| stemmer.stem(term).into_owned())
+        .collect::<Vec<_>>();
     let fields = considered
         .iter()
         .map(|placed| {
@@ -533,22 +672,25 @@ fn bm25(considered: &[&Placed<'_>], query: &str) -> Vec<(usize, f64)> {
                 .collect::<Vec<_>>()
                 .join(" ");
             [
-                (
+                Field::new(
                     words(entry.title.as_deref().unwrap_or_default(), fold),
                     TITLE_WEIGHT,
+                    &stemmer,
                 ),
-                (
+                Field::new(
                     words(entry.content.as_deref().unwrap_or_default(), fold),
                     CONTENT_WEIGHT,
+                    &stemmer,
                 ),
-                (
+                Field::new(
                     words(
                         &format!("{} {}", entry.tree.replace('/', " "), entry.id),
                         fold,
                     ),
                     PATH_WEIGHT,
+                    &stemmer,
                 ),
-                (words(&facets, fold), META_WEIGHT),
+                Field::new(words(&facets, fold), META_WEIGHT, &stemmer),
             ]
         })
         .collect::<Vec<_>>();
@@ -557,26 +699,25 @@ fn bm25(considered: &[&Placed<'_>], query: &str) -> Vec<(usize, f64)> {
         .map(|fields| {
             fields
                 .iter()
-                .map(|(words, weight)| words.len() as f64 * weight)
+                .map(|field| field.words.len() as f64 * field.weight)
                 .sum::<f64>()
         })
         .collect::<Vec<_>>();
     let average = (lengths.iter().sum::<f64>() / lengths.len() as f64).max(1.0);
-    let frequency = |fields: &[(Vec<String>, f64); 4], term: &str| {
+    let frequency = |fields: &[Field; 4], term: &str, stem: &str| {
         fields
             .iter()
-            .map(|(words, weight)| {
-                words.iter().filter(|word| word.starts_with(term)).count() as f64 * weight
-            })
+            .map(|field| field.frequency(term, stem))
             .sum::<f64>()
     };
     let documents = considered.len() as u64;
     let idf = terms
         .iter()
-        .map(|term| {
+        .zip(&term_stems)
+        .map(|(term, stem)| {
             let holding = fields
                 .iter()
-                .filter(|fields| frequency(fields, term) > 0.0)
+                .filter(|fields| frequency(fields, term, stem) > 0.0)
                 .count() as u64;
             harness_types::search::bm25_idf(documents, holding)
         })
@@ -587,8 +728,8 @@ fn bm25(considered: &[&Placed<'_>], query: &str) -> Vec<(usize, f64)> {
         .filter_map(|(index, fields)| {
             let mut score = 0.0;
             let mut matched = false;
-            for (term, idf) in terms.iter().zip(&idf) {
-                let tf = frequency(fields, term);
+            for ((term, stem), idf) in terms.iter().zip(&term_stems).zip(&idf) {
+                let tf = frequency(fields, term, stem);
                 if tf > 0.0 {
                     matched = true;
                     score += idf * tf * (K1 + 1.0)
@@ -644,6 +785,33 @@ fn meaning(
         .collect::<Vec<_>>();
     similar.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     Ok(Some(similar))
+}
+
+/// The memories among `considered` that have a vector for what they say
+/// now; none when embeddings are not configured.
+fn embedded(
+    considered: &[&Placed<'_>],
+    embedding_root: &Path,
+) -> std::collections::BTreeSet<String> {
+    let Ok(config) = embedding::load_config(embedding_root) else {
+        return std::collections::BTreeSet::new();
+    };
+    let Ok(namespace) = embedding::namespace_of(&config) else {
+        return std::collections::BTreeSet::new();
+    };
+    if !config.enabled {
+        return std::collections::BTreeSet::new();
+    }
+    let mut dirs = considered
+        .iter()
+        .map(|placed| placed.dir.to_path_buf())
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs.dedup();
+    dirs.iter()
+        .filter_map(|dir| memory_store::vectors(dir, &namespace).ok())
+        .flat_map(BTreeMap::into_keys)
+        .collect()
 }
 
 /// Embed the entries of `dirs` that have no vector for their content, until
@@ -745,8 +913,16 @@ fn slice(field: &str) -> Result<(usize, Option<usize>), String> {
     }
 }
 
-/// A hit with only the fields `select` names, read from the entry as stored.
-fn project(placed: &Placed<'_>, score: f64, fields: &[&str]) -> Value {
+/// A hit with only the fields `select` names, read from the entry as stored:
+/// `meta.<key>` under `meta`, left out when the entry has no such facet, as
+/// memory-engine projects it. `embedded` holds the memories that have a
+/// vector for what they say now.
+fn project(
+    placed: &Placed<'_>,
+    score: f64,
+    fields: &[&str],
+    embedded: &std::collections::BTreeSet<String>,
+) -> Value {
     let entry = placed.entry;
     let doc = placed.doc;
     let content = entry.content.as_deref().unwrap_or_default();
@@ -758,26 +934,34 @@ fn project(placed: &Placed<'_>, score: f64, fields: &[&str]) -> Value {
     };
     for field in fields {
         if let Some(key) = field.strip_prefix("meta.") {
-            out.insert(
-                (*field).to_owned(),
-                entry.meta.get(key).cloned().unwrap_or(Value::Null),
-            );
+            if let Some(found) = entry.meta.get(key) {
+                if !out.get("meta").is_some_and(Value::is_object) {
+                    out.insert("meta".to_owned(), json!({}));
+                }
+                out["meta"][key] = found.clone();
+            }
             continue;
         }
         if field.starts_with("content:") {
             if let Ok((start, end)) = slice(field) {
-                let taken = content
-                    .chars()
-                    .skip(start)
-                    .take(end.map_or(usize::MAX, |end| end - start))
-                    .collect::<String>();
-                out.insert("content".to_owned(), json!(taken));
+                out.insert(
+                    "content".to_owned(),
+                    json!(content_slice(content, start, end)),
+                );
                 out.insert("content_length".to_owned(), json!(content.chars().count()));
             }
             continue;
         }
         let value = match *field {
-            "id" | "name" => json!(entry.id),
+            "id" => json!(entry.id),
+            "name" => json!(entry.name),
+            "memory_id" => json!(entry.memory),
+            "has_embedding" => json!(
+                entry
+                    .memory
+                    .as_ref()
+                    .is_some_and(|memory| embedded.contains(memory))
+            ),
             "scope" => json!(entry.scope),
             "kind" => json!(entry.kind),
             "title" => json!(entry.title),

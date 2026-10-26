@@ -86,6 +86,19 @@ impl Event {
             "title": self.title,
         })
     }
+
+    /// The event with the whole page as it then was: what a revert to this
+    /// version brings back.
+    pub(crate) fn view_with_text(&self) -> Value {
+        let mut view = self.view();
+        view["content"] = json!(self.text);
+        view
+    }
+
+    /// Where the next page of a history read starts.
+    pub(crate) fn cursor(&self) -> String {
+        format!("{}|{}", self.at, self.id)
+    }
 }
 
 fn open(root: &Path) -> Result<Connection, String> {
@@ -196,23 +209,30 @@ fn insert(
     Ok(())
 }
 
-/// The versions recorded of a page, or of every page under a folder
-/// (`path` ending in `/`), or of the whole library, newest first.
+/// Which recorded versions a history read selects: of a page, of every page
+/// under a folder (`path` ending in `/`), or of the whole library; at or
+/// after `since` and before `until`; of one kind of change; and past
+/// `before`, the `(at, id)` the previous page ended at. Newest first.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Window {
+    pub path: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub operation: Option<String>,
+    pub before: Option<(String, String)>,
+}
+
+/// The versions a [`Window`] selects, at most `limit`.
 ///
 /// # Errors
 /// The history cannot be read.
-pub(crate) fn events(
-    root: &Path,
-    path: Option<&str>,
-    since: Option<&str>,
-    limit: usize,
-) -> Result<Vec<Event>, String> {
+pub(crate) fn events(root: &Path, window: &Window, limit: usize) -> Result<Vec<Event>, String> {
     let Some(conn) = existing(root)? else {
         return Ok(Vec::new());
     };
     let mut clauses = vec!["1 = 1".to_owned()];
     let mut values = Vec::new();
-    match path {
+    match window.path.as_deref() {
         Some(folder) if folder.ends_with('/') => {
             clauses.push("substr(path, 1, ?) = ?".to_owned());
             values.push(folder.chars().count().to_string());
@@ -224,9 +244,22 @@ pub(crate) fn events(
         }
         None => {}
     }
-    if let Some(since) = since {
+    if let Some(since) = &window.since {
         clauses.push("at >= ?".to_owned());
-        values.push(since.to_owned());
+        values.push(since.clone());
+    }
+    if let Some(until) = &window.until {
+        clauses.push("at < ?".to_owned());
+        values.push(until.clone());
+    }
+    if let Some(operation) = &window.operation {
+        clauses.push("operation = ?".to_owned());
+        values.push(operation.clone());
+    }
+    if let Some((at, id)) = &window.before {
+        clauses.push("(at, event_id) < (?, ?)".to_owned());
+        values.push(at.clone());
+        values.push(id.clone());
     }
     let query = format!(
         "SELECT event_id, at, path, operation, cause, actor, hash, title, text FROM page_event

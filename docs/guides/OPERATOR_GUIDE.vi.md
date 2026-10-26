@@ -798,3 +798,41 @@ Bản 0.6.3 hoàn tất phần knowledge và Self-Evolution của 0.6.2.
 - **Lịch sử trang knowledge.** Mỗi lần ghi và xóa qua store giữ toàn bộ trang trong `.ha-history.sqlite3` của thư viện (30 ngày, và luôn giữ 10 phiên bản mới nhất của mỗi trang). Action `history` của tool `knowledge` liệt kê các phiên bản của một trang, một thư mục hoặc cả thư viện, và `revert` đưa một phiên bản trở lại, kể cả trang đã xóa.
 - **Bộ lọc history.** `history_search` nhận `since` và `until` (thời điểm hoặc ngày), `kind` (một loại event của journal hoặc một danh sách) và `order` (`newest` hoặc `oldest`). `history_read` nêu nguồn ngay trước và ngay sau nguồn đang đọc (`previous=`, `next=`).
 - **`ha memory export [--conversation ID]`** in toàn bộ trạng thái của một kho ra JSON. Bug report chứa số lượng và các entry của mỗi kho (`memory_store.json`), được đọc mà không thay đổi gì.
+
+### 12.16. Memory ngang memory-engine (0.8.2)
+
+0.8.2 bổ sung những gì lần rà soát thứ hai, so 0.8.1 với memory-engine, còn thấy thiếu. Danh sách nằm ở §13 của [Kho memory](../architecture/MEMORY_STORE.vi.md).
+
+- **Name và id.**
+  - Name là duy nhất trong tree, không phải trong cả kho, nên `/global/api/auth` và `/global/web/auth` có thể cùng tồn tại. Id của entry là name nếu chưa ai dùng, nếu không thì là name kèm `-2`, `-3`.
+  - Name bạn tự đặt được giữ qua các lần cập nhật. Name tạo từ title thì đi theo title mới, như id vẫn làm.
+  - Mỗi entry có một `memory_id` không bao giờ đổi. List và search hiển thị nó; `read`, `write`, `history`, `revert` và `delete` nhận nó làm id.
+  - Lần đầu 0.8.2 mở kho, schema lên 3. 0.8.1 không mở được kho ở schema 3.
+- **Cập nhật là patch.**
+  - Chỉ đổi những gì được đưa vào: riêng `meta`, riêng `tree` hay riêng `pinned`, không cần `content`.
+  - Cập nhật không đổi gì thì giữ nguyên version.
+  - `tree` tuyệt đối ở scope khác thì chuyển entry sang đó, giữ `memory_id`.
+  - `on_conflict: replace` thay entry đúng như lệnh ghi, kể cả meta và khoảng thời gian.
+- **History.**
+  - `history` theo id hiện đủ mọi trường của mỗi phiên bản (tree, name, meta, khoảng thời gian, cause, `operation_id`), mỗi lần `limit` phiên bản, bắt đầu từ `offset`.
+  - Feed nhận `memory_id`.
+- **Search.**
+  - Từ khớp theo gốc tiếng Anh: `deploying` tìm ra `deployed`.
+  - `weights: {"semantic": 0}` chỉ xếp theo từ, kể cả khi đã bật embedding.
+  - Mẫu tree:
+    - nhãn có thể nối bằng `.` như memory-engine (`team.decisions`);
+    - tree không bắt đầu bằng `/` được tính từ dưới gốc scope;
+    - `nhãn%` khớp một từ ở bất kỳ đâu trong nhãn;
+    - `count` cũng nhận mẫu.
+  - `meta_predicate`:
+    - nhận `.datetime()`, `.date()`, `.string()`, `.number()`, `.integer()`, `.boolean()` và các phép chuyển kiểu khác của PostgreSQL 17, cùng `.**{n}` và `\uXXXX`;
+    - từ chối method nó không biết, thay vì không khớp gì.
+  - `select` có thêm `memory_id`, `name` và `has_embedding`; `meta.<khóa>` trả về nằm trong `meta`. `select` và `format` dùng được cả với `read` và `history`.
+  - Khi `sources` có knowledge, bộ lọc áp lên cả trang:
+    - trang nằm ở `/knowledge/<scope>/<thư mục>`;
+    - `grep` đọc nội dung trang;
+    - bộ lọc meta hoặc temporal loại trang ra.
+- **`status`** cho biết số entry mỗi scope và tiến độ embedding: đã embed, đang chờ, thất bại, entry chờ lâu nhất và lỗi gần nhất. Đổi title thì entry được embed lại.
+- **History của knowledge.**
+  - `history` kèm `version` trả nguyên văn phiên bản đó của trang, để đọc trước khi revert.
+  - `until`, `operation` và `cursor` theo từng scope dùng để duyệt history theo trang.

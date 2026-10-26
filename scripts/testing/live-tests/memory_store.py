@@ -3,7 +3,8 @@
 A scope directory - DATA/harness, or DATA/sessions/<task>/harness - holds
 memory.sqlite3; it is opened read-only, so reading never imports or migrates.
 A harness_state.json beside it is waiting to be imported on ha's next open:
-`count` and `rows` include its entries, as the store will.
+`count` and `rows` include its entries, as the store will. An entry is named by
+its key: the `key` column since schema 3 (0.8.2), the `name` column before it.
 
 usage:
   memory_store.py entries DATA            scope kind name vN | content (global and every conversation)
@@ -12,6 +13,7 @@ usage:
   memory_store.py events DIR              operation|cause|actor type|name|vN|content of each event, oldest first
   memory_store.py document DIR            the whole state as JSON, harness_state.json's shape
   memory_store.py row DIR KIND NAME       id|tree|meta|temporal_start|temporal_end|version|content of one row
+  memory_store.py named DIR KIND TREE NAME   the key of the entry with that name in that tree (schema 3)
 """
 
 import glob
@@ -30,12 +32,19 @@ def connect(directory):
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 
 
+def key(conn, table):
+    """The column a table keeps an entry's key in."""
+    columns = [column[1] for column in conn.execute(f"pragma table_info({table})")]
+    return "key" if "key" in columns else "name"
+
+
 def stored(directory):
     """(kind, name) -> entry, the store's and a pending harness_state.json's."""
     entries = {}
     conn = connect(directory)
     if conn is not None:
-        for kind, name, doc in conn.execute("select kind, name, doc from memory order by kind, name"):
+        column = key(conn, "memory")
+        for kind, name, doc in conn.execute(f"select kind, {column}, doc from memory order by kind, {column}"):
             entries[(kind, name)] = json.loads(doc)
         conn.close()
     pending = os.path.join(directory, "harness_state.json")
@@ -82,7 +91,8 @@ def main(command, target, *kinds):
         if conn is None:
             return
         for operation, cause, actor, name, version, doc in conn.execute(
-            "select operation, cause, actor, name, version, doc from memory_event order by at, rowid"
+            f"select operation, cause, actor, {key(conn, 'memory_event')}, version, doc"
+            " from memory_event order by at, rowid"
         ):
             print("|".join([operation, str(cause), str(json.loads(actor).get("type")), name,
                             "v%s" % version, line(json.loads(doc))]))
@@ -94,7 +104,7 @@ def main(command, target, *kinds):
             return
         row = conn.execute(
             "select id, tree, meta, temporal_start, temporal_end, version, content from memory"
-            " where kind = ? and name = ?",
+            f" where kind = ? and {key(conn, 'memory')} = ?",
             (kind, name),
         ).fetchone()
         conn.close()
@@ -104,11 +114,22 @@ def main(command, target, *kinds):
         conn = connect(target)
         document = {"schema": 1, "entries": {}, "refinements": []}
         if conn is not None:
-            for kind, name, doc in conn.execute("select kind, name, doc from memory"):
+            for kind, name, doc in conn.execute(f"select kind, {key(conn, 'memory')}, doc from memory"):
                 document["entries"].setdefault(kind, {})[name] = json.loads(doc)
             document["refinements"] = [json.loads(e) for (e,) in conn.execute("select event from refinement order by seq")]
             conn.close()
         print(json.dumps(document, ensure_ascii=False))
+    elif command == "named":
+        kind, tree, name = kinds
+        conn = connect(target)
+        if conn is None or key(conn, "memory") != "key":
+            return
+        row = conn.execute(
+            "select key from memory where kind = ? and tree = ? and name = ?", (kind, tree, name)
+        ).fetchone()
+        conn.close()
+        if row:
+            print(row[0])
     else:
         raise SystemExit(__doc__)
 

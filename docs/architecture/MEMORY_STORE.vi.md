@@ -12,6 +12,20 @@ Bản 0.8.1 gồm P1 tới P4. P5 (CLI, định dạng, pack), P6 (importer) và
 server, tích hợp, console) tạm hoãn tới khi maintainer làm tiếp. P1 chỉ thêm đúng
 một lệnh CLI mà test của nó cần: `ha memory export`.
 
+Bản 0.8.2 bổ sung những gì lần rà soát thứ hai so với ME còn thiếu ở P1 tới P4
+(§13):
+
+- name duy nhất theo tree và được giữ qua các lần cập nhật;
+- cập nhật kiểu patch;
+- `memory_id` không đổi dùng làm địa chỉ;
+- history phân trang, đủ mọi trường;
+- stemming tiếng Anh;
+- `%` của lquery theo đúng PostgreSQL;
+- các method JSONPath của PostgreSQL 17;
+- bộ lọc áp lên trang knowledge;
+- đọc nguyên văn phiên bản trang cũ;
+- action `status`.
+
 ## 1. Mục tiêu và quyết định
 
 memory-engine (ME) là server memory dùng chung cho nhóm, chạy trên Postgres với
@@ -45,7 +59,9 @@ ME cố ý không có lớp tự trích xuất; ở ha lớp đó vẫn còn và
 
 ## 2. Bản đồ tính năng
 
-Trạng thái hiện tại: ✅ có, 🟡 một phần, ❌ chưa có. P1 tới P7 là các phase ở §12.
+Trạng thái trước khi làm: ✅ có, 🟡 một phần, ❌ chưa có. P1 tới P7 là các phase
+ở §12. Từ 0.8.2 mọi dòng tới P4 đều đã có; §13 liệt kê những gì lần rà soát sau
+0.8.1 tìm ra và 0.8.2 đã đổi gì.
 
 | Tính năng ME | Hiện tại | Phase |
 |---|---|---|
@@ -118,7 +134,8 @@ Code memory vốn đồng bộ, nên không cần cầu nối sang runtime async
 CREATE TABLE memory (
   id              TEXT PRIMARY KEY,      -- UUIDv7, không đổi
   kind            TEXT NOT NULL,         -- prompt|memory|skill|subagent|factory|record
-  name            TEXT NOT NULL,         -- id entry của ha (slug), duy nhất theo kind
+  key             TEXT NOT NULL,         -- id entry của ha (slug), duy nhất theo kind
+  name            TEXT,                  -- name của ME, duy nhất trong tree (schema 3)
   tree            TEXT NOT NULL,         -- '/global/user/preferences'
   title           TEXT NOT NULL,
   content         TEXT NOT NULL,
@@ -131,16 +148,17 @@ CREATE TABLE memory (
   content_version INTEGER NOT NULL,      -- chặn ghi embedding cũ (P3)
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL,
-  UNIQUE (kind, name)
+  UNIQUE (kind, key)
 );
 CREATE INDEX memory_tree ON memory(tree);
+CREATE INDEX memory_path ON memory(kind, tree, name);
 CREATE INDEX memory_temporal ON memory(temporal_start, temporal_end);
 
 CREATE TABLE memory_event (
   event_id     TEXT PRIMARY KEY,   -- UUIDv7: thứ tự thời gian tuyệt đối
   at           TEXT NOT NULL,
   memory_id    TEXT NOT NULL,      -- còn lại sau khi memory bị xóa
-  kind TEXT NOT NULL, name TEXT NOT NULL, tree TEXT NOT NULL,
+  kind TEXT NOT NULL, key TEXT NOT NULL, name TEXT, tree TEXT NOT NULL,
   operation    TEXT NOT NULL,      -- insert|update|delete
   operation_id TEXT NOT NULL,      -- một giá trị cho mỗi transaction ghi
   cause        TEXT,               -- create|update|delete|move|copy|revert|import|migrate|review|dream|curate|rollback|...
@@ -157,13 +175,23 @@ CREATE INDEX memory_event_at ON memory_event(at DESC);
 CREATE TABLE refinement (seq INTEGER PRIMARY KEY, event TEXT NOT NULL);  -- mảng `refinements`
 CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);     -- `schema` và các trường cấp gốc khác
 -- P3 (schema 2): memory_vector, memory_embedding_queue (§6)
+-- 0.8.2 (schema 3): cột `name` của V1 đổi tên thành `key`, và thêm cột `name` (§13)
 ```
 
 Entry của ha ánh xạ sang record của ME như sau:
 
-- **name.** Là id entry của ha. Quy tắc hiện tại vẫn giữ: slug từ title, đổi title
-  thì giữ alias. Tên theo regex của ME cũng được chấp nhận. Tên là duy nhất theo
-  `(kind, name)` trong một scope, chặt hơn `(tree, name)` của ME.
+- **key.** Là id entry của ha, khóa của document, duy nhất theo kind trong một
+  kho. Key là name nếu name còn trống, nếu không thì là name thêm hậu tố `-2`,
+  `-3`. Khi key và name đang trùng nhau, key đi theo name mới và giữ key cũ làm
+  alias.
+- **name.** Là name của ME. Từ 0.8.2 name duy nhất trong tree như ME, nên cùng một
+  name có thể nằm ở hai tree.
+  - Nguồn: name do lệnh ghi đưa vào (theo regex của ME), nếu không có thì là slug
+    từ title.
+  - Đổi title: name tạo từ title thì đi theo title mới; name được đặt, hoặc name
+    khác với title, thì giữ nguyên.
+  - Entry ghi trước 0.8.2 lấy key làm name.
+  - `<tree>/<name>` là địa chỉ của entry.
 - **tree.** Là gốc của scope nối với `path` của entry, đổi thành các nhãn:
   - mỗi đoạn bỏ dấu (NFKD rồi bỏ dấu);
   - ký tự ngoài `[A-Za-z0-9_-]` thành `_`;
@@ -249,25 +277,38 @@ với tới được những gì log còn giữ.
 
 Action `write` của tool `memory` có thêm:
 
-- `name`: đặt slug cụ thể;
+- `name`: đặt slug cụ thể, duy nhất trong tree;
 - `tree`: đường dẫn tuyệt đối (`/global/...`, `/projects/<project này>/...`,
   `/local/...`, đồng thời chọn luôn scope) hoặc tương đối theo `scope` (chính là
   `path` hiện nay, vẫn được chấp nhận);
 - `meta`: một object;
 - `temporal`: `{start, end?}`;
-- `on_conflict`: `error` | `replace` | `ignore`, theo khóa `(kind, name)`.
+- `on_conflict`: `error` | `replace` | `ignore`, theo khóa `(kind, tree, name)`.
 
 `replace` có so nội dung: payload y hệt thì không làm gì và không tăng version.
-Cơ chế từ chối entry trùng của ha (độ giống 0,6 hoặc chứa 85 %) vẫn chạy trước
-`on_conflict` với entry mới, và `distinct` vẫn bỏ qua được nó.
+Ngược lại, entry trở thành đúng như lệnh ghi, kể cả `meta` và `temporal`, giống
+ME. Cơ chế từ chối entry trùng của ha (độ giống 0,6 hoặc chứa 85 %) vẫn chạy
+trước `on_conflict` với entry mới, và `distinct` vẫn bỏ qua được nó.
 
-Cập nhật vẫn dùng `expected_version`, và nhận thêm `version_hash` như ME.
+Cập nhật vẫn dùng `expected_version`, và nhận thêm `version_hash` như ME. Từ
+0.8.2, cập nhật là một patch:
+
+- chỉ đổi những gì được đưa vào: title, content, name, tree hoặc path, meta,
+  temporal, pinned; phần còn lại giữ nguyên, nên có thể bỏ `content`;
+- cập nhật không đổi gì thì giữ nguyên version;
+- `tree` tuyệt đối thuộc scope khác thì chuyển entry sang kho của scope đó, giữ
+  nguyên id bất biến;
+- kết quả ghi trả về `name`, `tree`, `version_hash` và `memory_id` của entry.
+
+Có ba cách gọi tới một entry: key, `<tree>/<name>`, hoặc `memory_id`. `memory_id`
+là UUID do kho cấp, không bao giờ đổi; list và search đều hiển thị nó.
 
 `restore` đổi thành `revert`, và `restore` vẫn dùng được như một tên gọi khác:
 
 - nó áp lại một snapshot từ event log thành phiên bản mới, với cause `revert`;
 - revert một memory đã xóa sẽ tạo lại nó với id cũ, version đánh số tiếp;
-- revert vào một slot `(kind, name)` đã có entry khác là xung đột.
+- revert vào một key, hoặc một `(tree, name)`, mà entry khác đang giữ là xung
+  đột.
 
 Digest ở P1 không đổi. Chỉ thêm một điều: entry có khoảng temporal đã kết thúc
 (`temporal_end <= now`) không được đưa vào digest, vì đó là lịch sử chứ không còn
@@ -281,12 +322,13 @@ Các action mới của tool `memory`. Agent con chỉ có các action chỉ đ�
 |---|---|---|
 | `get` với `path` (`tree/name`) | `get_by_path` | Tên trùng giữa các kind thì phải ghi `kind` |
 | `tree` (`tree`, `levels`) | `me_memory_tree` | Các nút kèm số lượng, global và local gộp chung |
-| `count` (lọc `tree`, `max_count`) | `me_memory_count` | |
+| `count` (lọc `tree`, `max_count`) | `me_memory_count` | Nhận tree, lquery hoặc ltxtquery như search |
 | `move` (`source`, `destination`, `dry_run`) | `me_memory_mv` | Thay tiền tố. Chuyển giữa hai gốc scope thì chuyển dòng sang kho kia, chung một `operation_id` |
-| `copy` (`source`, `destination`, `dry_run`) | `me_memory_copy` | Bản sao có id mới; tên trùng thì thêm hậu tố `-2`, `-3` |
+| `copy` (`source`, `destination`, `dry_run`) | `me_memory_copy` | Bản sao có id mới và giữ name; tree đích đã có name đó thì xung đột và không sao chép gì |
 | `delete` với `path` | `delete_by_path` | |
 | `delete_tree` (`tree`, `dry_run`) | `me_memory_delete_tree` | |
-| `history` | `me_memory_history` | Phạm vi theo `id`, `path`, `tree`, `operation_id` hoặc `since`; thêm `until`, `operation`, `order`, `cursor` (keyset theo `event_id`), `limit` (tối đa 1000) |
+| `history` | `me_memory_history` | **Có `id`** (key, path hoặc `memory_id`): các phiên bản của entry. Mỗi phiên bản kèm tree, name, meta, temporal, cause và `operation_id`. Mỗi trang `limit` phiên bản (mặc định 10, tối đa 100), bắt đầu từ `offset`. **Không có `id`:** feed, giới hạn theo `tree`, `operation_id`, `memory_id` hoặc `since`. Thêm được `until`, `operation`, `order`, `cursor` (keyset theo `event_id`), `limit` (tối đa 1000) |
+| `status` | `memory.embeddingStatus` | Số entry mỗi scope; số entry đã embed, đang chờ, thất bại; entry chờ lâu nhất; lỗi gần nhất |
 
 Mỗi refinement ghi lại `operation_id` của lần ghi, để `/refine --rollback` và
 `history operation_id=…` khớp nhau về những gì một lượt review đã đổi.
@@ -308,7 +350,10 @@ Từ được tách theo cách của ha:
   hỏi có dấu thì đọc đúng như đã viết.
 
 Một từ trong câu hỏi khớp các từ bắt đầu bằng nó, nên "deploy" vẫn tìm ra
-"deploys" như cách khớp chuỗi con trước đây.
+"deploys" như cách khớp chuỗi con trước đây. Từ 0.8.2, nó còn khớp các từ cùng
+gốc tiếng Anh (Snowball, như cấu hình `english` của PostgreSQL mà ME dùng), nên
+"deploying" tìm ra "deployed". Không có danh sách stopword: ha đánh giá từ theo
+thống kê, không theo danh sách.
 
 Trọng số trường: title 3, content 1, tree và name 1, giá trị meta 0,5. Chỉ entry
 chứa ít nhất một từ của câu hỏi mới được trả về: điều kiện "phải thật sự khớp"
@@ -351,7 +396,9 @@ score = w_fulltext / (60 + rank_fulltext) + w_semantic / (60 + rank_semantic)
 | `candidate_limit` mỗi nhánh | 30, ít nhất bằng `limit`, tối đa 1000 |
 | `limit` | 10, tối đa 200 |
 
-Nhánh nào không có kết quả thì góp 0; điểm bằng nhau thì xếp theo id.
+Nhánh nào không có kết quả thì góp 0; điểm bằng nhau thì xếp theo id. Trọng số
+0 tắt nhánh đó: `weights {semantic: 0}` chỉ xếp theo từ, với điểm BM25, và báo
+khi không từ nào khớp.
 
 Các cách diễn đạt (`queries`) được gộp trong từng nhánh trước, bằng RRF thường
 như hiện nay.
@@ -378,7 +425,7 @@ temporal.
 
 | Bộ lọc | Ý nghĩa |
 |---|---|
-| `tree` | **Đường dẫn chính xác:** nút đó và mọi nút con. **lquery,** khi có `* ! { } \| @ %`: `*`, `*{n}`, `*{n,m}`, `!nhãn`, `a\|b`, `nhãn@` (không phân biệt hoa thường), `nhãn%` (khớp theo từ), `nhãn*` (tiền tố). **ltxtquery,** khi có `&`: Boolean `& \| !` trên các nhãn, cùng các bổ ngữ trên. Theo tài liệu ltree của PostgreSQL. |
+| `tree` | **Đường dẫn chính xác:** nút đó và mọi nút con. **lquery,** khi có `* ! { } \| @ %`: `*`, `*{n}`, `*{n,m}`, `!nhãn`, `a\|b`, `nhãn@` (không phân biệt hoa thường), `nhãn%` (mỗi từ của mẫu khớp một từ nào đó, tách bằng `_`, của nhãn, không cần đúng thứ tự, như `compare_subnode` của PostgreSQL), `nhãn*` (tiền tố). **ltxtquery,** khi có `&`: Boolean `& \| !` trên các nhãn, cùng các bổ ngữ trên. Nhãn nối bằng `/`, hoặc bằng `.` như ltree của ME; mẫu không bắt đầu bằng `/` còn khớp tree tính từ dưới gốc scope. |
 | `meta` | "Chứa" kiểu JSON, theo ngữ nghĩa `@>` của PostgreSQL: object khớp object con, mảng phải chứa các phần tử đã cho. |
 | `meta_predicate` | Vị từ Boolean SQL/JSON path, xem bên dưới. |
 | `temporal` | `before`, `after` (nghiêm ngặt, loại dòng không có temporal), `contains`, `overlaps {start,end}`, `within {start,end}`. Nhiều kiểu thì AND lại. Khoảng là `[start, end)`; một thời điểm là `[t, t]`. |
@@ -391,11 +438,19 @@ temporal.
 - `== != < <= > >=`, `&& || !`, `exists( … )`, `like_regex "…" flag "i"`,
   `starts with`, `is unknown`;
 - số học `+ - * / %` và dấu trừ một ngôi;
-- các method `.size() .type() .double() .ceiling() .floor() .abs() .keyvalue()`;
+- `.**`, và `.**{n}`, `.**{n to m}` cùng `last`;
+- escape trong chuỗi, kể cả `\uXXXX`;
+- các method `.size() .type() .double() .ceiling() .floor() .abs() .keyvalue()`.
+  Thêm các method của PostgreSQL 17, không nhận đối số: `.datetime() .date()
+  .timestamp() .timestamp_tz() .string() .number() .decimal() .integer()
+  .bigint() .boolean()`.
+  - Ngày giờ được đổi sang RFC 3339 UTC, nên hai giá trị so sánh đúng thứ tự thời
+    gian.
+  - Method khác bị từ chối ngay lúc parse. Nếu cho qua rồi không khớp gì, kết quả
+    sẽ trông như không entry nào có facet đó;
 - chế độ lax như ME dùng, trong đó lỗi cấu trúc cho kết quả false.
 
-Bộ parser và evaluator tự viết trong `memory/jsonpath.rs`, kiểm bằng một bảng kết
-quả lấy từ PostgreSQL.
+Bộ parser và evaluator tự viết trong `memory/filters.rs`.
 
 Không có văn bản search thì bộ lọc dùng để duyệt: mới nhất trước, hoặc theo
 `order_by` `asc`/`desc`. Mọi kết quả đều có `total`, đếm theo kiểu `max_count`
@@ -405,8 +460,8 @@ tới 10 000.
 
 | Tham số | Cách dùng |
 |---|---|
-| `select` | Các trường cần trả: `id`, `name`, `tree`, `kind`, `title`, `meta`, `meta.<khóa>`, `temporal`, `version`, `version_hash`, `score`, và lát cắt content `content:N`, `content:M:N`, `content:M:` (tính theo ký tự, kèm `content_length`). |
-| `format` | `json` (mặc định của tool, dạng gọn), `compact`, hoặc `yaml`. |
+| `select` | Các trường cần trả: `id`, `memory_id`, `name`, `tree`, `kind`, `title`, `meta`, `meta.<khóa>` (nằm trong `meta`; khóa không có thì bỏ, như ME), `temporal`, `version`, `version_hash`, `score`, `has_embedding`, và lát cắt content `content:N`, `content:M:N`, `content:M:` (tính theo ký tự, kèm `content_length`). Dùng được với `search`, `read` và `history`. |
+| `format` | `json` (mặc định của tool, dạng gọn), `compact`, hoặc `yaml`; dùng được với `search`, `read` và `history`. |
 
 `format: yaml` dùng một bộ xuất nhỏ trong `memory/search.rs`, đặt ngoặc kép cho
 mọi chuỗi mà YAML có thể đọc thành thứ khác. Đọc YAML (pack, import) cần một
@@ -435,7 +490,9 @@ nó thay thế (cause `baseline`), nên trang viết trước khi có lịch s�
 
 Tool `knowledge` có thêm:
 
-- `history` (một trang, một thư mục, hoặc feed theo thời gian);
+- `history`: một trang, một thư mục, hoặc feed theo thời gian. Lọc được bằng
+  `since`, `until`, `operation`, và phân trang bằng `cursor` riêng cho từng
+  scope. Kèm `version` thì trả nguyên văn phiên bản đó, để đọc trước khi revert;
 - `revert` (`path`, `version` = id của event).
 
 Revert một trang đã xóa sẽ tạo lại trang đó, theo cùng luật backlink như khi ghi.
@@ -450,10 +507,20 @@ hình) rồi gộp bằng RRF thành một danh sách. Mỗi kết quả ghi rõ
 trang knowledge thì có `path` cùng khoảng dòng. CLI làm tương tự với
 `--knowledge`.
 
+Bộ lọc áp lên trang theo cách ME đọc một record không có meta và không có
+temporal:
+
+- bộ lọc `meta`, `meta_predicate` hoặc `temporal` loại mọi trang;
+- bộ lọc `tree` coi trang nằm ở `/knowledge/<scope>/<các thư mục của nó>`;
+- `grep` đọc toàn văn trang;
+- `select` chọn trường của trang.
+
+Kết quả ghi rõ việc này.
+
 ### Tool history
 
 - **`history_search`** có thêm:
-  - `since` và `until`: ID của nguồn là `evt_<UUIDv7>` của event trong journal,
+  - `since` và `until`: ID của nguồn là `event_<UUIDv7>` của event trong journal,
     phần đầu chính là thời điểm, nên một khoảng thời gian là một khoảng ID và
     không cần thêm cột;
   - `kind`, một loại event của journal hoặc một danh sách;
@@ -589,3 +656,33 @@ Trước P1, các test live đọc và nạp thẳng `harness_state.json` (`kern
 sang quy tắc nhập file cũ ở §3.4, còn việc đọc chuyển sang
 `ha memory export --json` (P1 làm sẵn một bản export tối thiểu cho việc này) hoặc
 truy vấn `sqlite3` chỉ đọc.
+
+## 13. Lần rà soát sau 0.8.1 (0.8.2)
+
+Sau 0.8.1, maintainer yêu cầu rà soát lại lần nữa, độc lập, phần P1 tới P4 so
+với mã nguồn của ME (không tính P5 tới P7). Những gì tìm ra và 0.8.2 đã làm:
+
+| Tìm thấy | 0.8.2 |
+|---|---|
+| Cập nhật làm đổi tên entry đã có name riêng: name đi theo title ở mọi lần cập nhật, nên `<tree>/<name>` hỏng | Name chỉ đi theo title khi nó đang nói title; name được đặt thì giữ (§3.2) |
+| Name duy nhất theo kho, nên hai tree không dùng chung được, và copy đổi tên entry | Name duy nhất theo tree (schema 3: `key` và `name`); copy giữ name, trùng thì báo xung đột (§5) |
+| Cập nhật nào cũng bắt buộc `content` | Cập nhật là patch; cập nhật không đổi gì thì giữ version (§4) |
+| `memory_id` mà feed hiển thị không dùng làm địa chỉ được | `memory_id` dùng được để đọc, ghi, phân trang history, revert, xóa; list và search hiển thị nó (§4) |
+| History của entry chỉ hiện 10 phiên bản, chỉ có title và content | Đủ mọi trường của mỗi phiên bản, theo từng trang (§5) |
+| Không chuyển riêng một entry sang scope khác được | `tree` tuyệt đối ở scope khác thì chuyển entry, giữ id (§4) |
+| `replace` giữ meta và khoảng thời gian cũ khi lệnh ghi bỏ trống | `replace` thay toàn bộ entry, như ME (§4) |
+| Đổi title vẫn giữ vector cũ | Title được embed cùng content, đổi title thì tăng `content_version` |
+| Không có stemming tiếng Anh | Snowball tiếng Anh, như cấu hình `english` của PostgreSQL (§6.1) |
+| Đã bật embedding thì không tìm thuần theo từ khóa được | Trọng số 0 tắt một nhánh (§6.3) |
+| `%` khớp từ theo vị trí; tree chỉ nhận `/` | `%` theo `compare_subnode` của PostgreSQL; `.` nối nhãn; tree tương đối (§6.4) |
+| Method JSONPath lạ âm thầm không khớp gì; không có `.datetime()`, `.**{n}`, `\u` | Method lạ bị từ chối; có các method chuyển kiểu, mức độ sâu và escape của PostgreSQL 17 (§6.4) |
+| Search chung bỏ qua bộ lọc với trang knowledge | Bộ lọc áp lên cả trang (§7) |
+| Không đọc được phiên bản trang cũ, không có `until` hay cursor | `history` với `version`, `until`, `operation`, `cursor` (§7) |
+| Không có trạng thái embedding, không có `has_embedding` | `status`, và `has_embedding` trong `select` (§5, §6.5) |
+| `select` và `format` chỉ có ở search; `meta.<khóa>` nằm phẳng | Có cả ở read và history; `meta.<khóa>` nằm trong `meta` (§6.5) |
+
+Không làm:
+
+- batch create của ME, vì chỉ importer của nó dùng (để P5);
+- danh sách stopword của ME, vì ha không đánh giá văn bản theo danh sách từ;
+- chế độ JSONPath `strict`, vì ME chạy lax.

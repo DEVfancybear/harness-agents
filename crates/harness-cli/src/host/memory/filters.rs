@@ -15,9 +15,18 @@ use serde_json::{Value, json};
 /// A tree filter, its syntax detected as memory-engine detects it: a pattern
 /// holding `&` is an ltxtquery (Boolean search over labels); one holding any
 /// of `* ! { } | @ %` is an lquery; anything else is an exact path, matching
-/// that node and every one below it.
+/// that node and every one below it. Labels are joined by `/`, or by `.` as
+/// memory-engine's ltree joins them. A pattern without a leading `/` also
+/// matches a tree read below its scope's root (`team/decisions` matches
+/// `/global/team/decisions`).
 #[derive(Clone, Debug)]
-pub enum TreeFilter {
+pub struct TreeFilter {
+    pattern: Pattern,
+    relative: bool,
+}
+
+#[derive(Clone, Debug)]
+enum Pattern {
     Exact(Vec<String>),
     Lquery(Vec<Item>),
     Ltxtquery(Text),
@@ -57,26 +66,39 @@ pub enum Text {
     Or(Box<Text>, Box<Text>),
 }
 
-const TREE_SYNTAX: &str = "a tree filter is a path (/global/team), an lquery (/global/*/decisions, */!draft/*, /global/*{1}) or a label search (api & !draft)";
+const TREE_SYNTAX: &str = "a tree filter is a path (/global/team), an lquery (/global/*/decisions, */!draft/*, /global/*{1}) or a label search (api & !draft); labels are letters, digits, _ and -, joined by / or .";
 
 impl TreeFilter {
     /// # Errors
     /// The pattern is not a path, an lquery or an ltxtquery.
     pub fn parse(pattern: &str) -> Result<Self, String> {
         let pattern = pattern.trim();
+        let relative = !pattern.starts_with('/');
         if pattern.contains('&') {
-            return Ok(Self::Ltxtquery(TextParser::new(pattern).parse()?));
+            return Ok(Self {
+                pattern: Pattern::Ltxtquery(TextParser::new(pattern).parse()?),
+                relative,
+            });
         }
+        // memory-engine's `work.projects.*` is ha's `work/projects/*`.
+        let pattern = if pattern.contains('/') {
+            pattern.to_owned()
+        } else {
+            pattern.replace('.', "/")
+        };
         let body = pattern.trim_start_matches('/').trim_end_matches('/');
         if pattern
             .chars()
             .any(|character| "*!{}|@%".contains(character))
         {
-            return body
-                .split('/')
-                .map(parse_item)
-                .collect::<Result<Vec<_>, _>>()
-                .map(Self::Lquery);
+            return Ok(Self {
+                pattern: Pattern::Lquery(
+                    body.split('/')
+                        .map(parse_item)
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+                relative,
+            });
         }
         let labels = body
             .split('/')
@@ -86,7 +108,10 @@ impl TreeFilter {
         if labels.iter().any(|label| !is_label(label)) {
             return Err(TREE_SYNTAX.to_owned());
         }
-        Ok(Self::Exact(labels))
+        Ok(Self {
+            pattern: Pattern::Exact(labels),
+            relative,
+        })
     }
 
     /// Whether a tree (`/global/team/decisions`) matches.
@@ -97,15 +122,27 @@ impl TreeFilter {
             .split('/')
             .filter(|label| !label.is_empty())
             .collect::<Vec<_>>();
-        match self {
-            Self::Exact(path) => {
-                labels.len() >= path.len() && path.iter().zip(&labels).all(|(a, b)| a == b)
+        if self.matches_labels(&labels) {
+            return true;
+        }
+        // A scope's root is `/global`, `/local` or `/projects/<key>`.
+        let (["global" | "local", below @ ..] | ["projects", _, below @ ..]) = labels.as_slice()
+        else {
+            return false;
+        };
+        self.relative && !below.is_empty() && self.matches_labels(below)
+    }
+
+    fn matches_labels(&self, labels: &[&str]) -> bool {
+        match &self.pattern {
+            Pattern::Exact(path) => {
+                labels.len() >= path.len() && path.iter().zip(labels).all(|(a, b)| a == b)
             }
-            Self::Lquery(items) => {
+            Pattern::Lquery(items) => {
                 let mut memo = BTreeMap::new();
-                lquery(items, &labels, 0, 0, &mut memo)
+                lquery(items, labels, 0, 0, &mut memo)
             }
-            Self::Ltxtquery(text) => text.matches(&labels),
+            Pattern::Ltxtquery(text) => text.matches(labels),
         }
     }
 }
@@ -212,13 +249,17 @@ impl Label {
             }
         };
         if self.words {
-            let wanted = pattern.split('_').collect::<Vec<_>>();
-            let words = label.split('_').collect::<Vec<_>>();
-            wanted.len() <= words.len()
-                && wanted
-                    .iter()
-                    .zip(&words)
-                    .all(|(pattern, word)| same(pattern, word))
+            // As Postgres' `compare_subnode`: each of the pattern's
+            // underscore-separated words matches some word of the label, in
+            // any order (`bar%` matches `foo_bar`).
+            let words = label
+                .split('_')
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>();
+            pattern
+                .split('_')
+                .filter(|wanted| !wanted.is_empty())
+                .all(|wanted| words.iter().any(|word| same(wanted, word)))
         } else {
             same(&pattern, &label)
         }
@@ -517,11 +558,42 @@ enum Step {
     Key(String),
     AnyKey,
     AnyIndex,
-    Descendants,
+    /// `.**`, or `.**{n}`, `.**{n to m}` with `last` for the deepest level.
+    Descendants(Option<(Level, Level)>),
     Index(Vec<(Expr, Option<Expr>)>),
     Filter(Expr),
     Method(String),
 }
+
+/// A level of `.**{...}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Level {
+    At(usize),
+    Last,
+}
+
+/// The item methods this evaluator knows, as Postgres 17 has them without
+/// arguments. Any other is refused when the predicate is parsed: one that
+/// passed and matched nothing would read as no entry having the facet.
+const METHODS: [&str; 17] = [
+    "type",
+    "size",
+    "double",
+    "ceiling",
+    "floor",
+    "abs",
+    "keyvalue",
+    "datetime",
+    "date",
+    "timestamp",
+    "timestamp_tz",
+    "string",
+    "number",
+    "decimal",
+    "integer",
+    "bigint",
+    "boolean",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Truth {
@@ -592,6 +664,8 @@ enum Token {
     Close,
     OpenBracket,
     CloseBracket,
+    OpenBrace,
+    CloseBrace,
     Comma,
     Question,
     Op(&'static str),
@@ -657,6 +731,14 @@ fn lex(text: &str) -> Result<Vec<Token>, String> {
                 tokens.push(Token::CloseBracket);
                 at += 1;
             }
+            '{' => {
+                tokens.push(Token::OpenBrace);
+                at += 1;
+            }
+            '}' => {
+                tokens.push(Token::CloseBrace);
+                at += 1;
+            }
             ',' => {
                 tokens.push(Token::Comma);
                 at += 1;
@@ -679,10 +761,23 @@ fn lex(text: &str) -> Result<Vec<Token>, String> {
                             let escaped = characters
                                 .get(at + 1)
                                 .ok_or("meta_predicate: unterminated string")?;
+                            if *escaped == 'u' {
+                                let code = characters
+                                    .get(at + 2..at + 6)
+                                    .map(|digits| digits.iter().collect::<String>())
+                                    .and_then(|digits| u32::from_str_radix(&digits, 16).ok())
+                                    .and_then(char::from_u32)
+                                    .ok_or("meta_predicate: \\u takes four hex digits")?;
+                                text.push(code);
+                                at += 6;
+                                continue;
+                            }
                             text.push(match escaped {
                                 'n' => '\n',
                                 't' => '\t',
                                 'r' => '\r',
+                                'b' => '\u{8}',
+                                'f' => '\u{c}',
                                 other => *other,
                             });
                             at += 2;
@@ -944,13 +1039,42 @@ impl PathParser {
         })
     }
 
+    /// A level of `.**{...}`: a number or `last`.
+    fn level(&mut self) -> Result<Level, String> {
+        if self.word("last") {
+            return Ok(Level::Last);
+        }
+        match self.peek().cloned() {
+            Some(Token::Num(number)) if number >= 0.0 && number.fract() == 0.0 => {
+                self.at += 1;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "a whole, non-negative level"
+                )]
+                Ok(Level::At(number as usize))
+            }
+            other => Err(format!(
+                "meta_predicate: a .** level is a number or last, not {other:?}"
+            )),
+        }
+    }
+
     fn steps(&mut self) -> Result<Vec<Step>, String> {
         let mut steps = Vec::new();
         loop {
             match self.peek().cloned() {
                 Some(Token::DotDot) => {
                     self.at += 1;
-                    steps.push(Step::Descendants);
+                    let levels = if self.eat(&Token::OpenBrace) {
+                        let from = self.level()?;
+                        let to = if self.word("to") { self.level()? } else { from };
+                        self.expect(&Token::CloseBrace)?;
+                        Some((from, to))
+                    } else {
+                        None
+                    };
+                    steps.push(Step::Descendants(levels));
                 }
                 Some(Token::Dot) => {
                     self.at += 1;
@@ -966,7 +1090,17 @@ impl PathParser {
                         Some(Token::Word(word)) => {
                             self.at += 1;
                             if self.eat(&Token::Open) {
-                                self.expect(&Token::Close)?;
+                                if !METHODS.contains(&word.as_str()) {
+                                    return Err(format!(
+                                        "meta_predicate: .{word}() is not a method this search knows; it knows .{}()",
+                                        METHODS.join("(), .")
+                                    ));
+                                }
+                                if !self.eat(&Token::Close) {
+                                    return Err(format!(
+                                        "meta_predicate: .{word}() takes no arguments here"
+                                    ));
+                                }
                                 steps.push(Step::Method(word));
                             } else {
                                 steps.push(Step::Key(word));
@@ -1100,17 +1234,40 @@ fn apply(step: &Step, items: Vec<Value>, root: &Value) -> Items {
             }
         }
         Step::AnyIndex => out = unwrap(items),
-        Step::Descendants => {
-            fn walk(value: &Value, out: &mut Vec<Value>) {
-                out.push(value.clone());
+        Step::Descendants(levels) => {
+            /// Each value under `value` with its depth below it (0: itself).
+            fn walk(value: &Value, depth: usize, out: &mut Vec<(usize, Value)>) {
+                out.push((depth, value.clone()));
                 match value {
-                    Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
-                    Value::Object(fields) => fields.values().for_each(|item| walk(item, out)),
+                    Value::Array(items) => {
+                        for item in items {
+                            walk(item, depth + 1, out);
+                        }
+                    }
+                    Value::Object(fields) => {
+                        for item in fields.values() {
+                            walk(item, depth + 1, out);
+                        }
+                    }
                     _ => {}
                 }
             }
             for item in &items {
-                walk(item, &mut out);
+                let mut found = Vec::new();
+                walk(item, 0, &mut found);
+                let deepest = found.iter().map(|(depth, _)| *depth).max().unwrap_or(0);
+                let at = |level: Level| match level {
+                    Level::At(depth) => depth,
+                    Level::Last => deepest,
+                };
+                out.extend(
+                    found
+                        .into_iter()
+                        .filter(|(depth, _)| {
+                            levels.is_none_or(|(from, to)| (at(from)..=at(to)).contains(depth))
+                        })
+                        .map(|(_, value)| value),
+                );
             }
         }
         Step::Index(subscripts) => {
@@ -1171,6 +1328,46 @@ fn apply(step: &Step, items: Vec<Value>, root: &Value) -> Items {
                     "ceiling" => json!(numbers(&item)?.ceil()),
                     "floor" => json!(numbers(&item)?.floor()),
                     "abs" => json!(numbers(&item)?.abs()),
+                    "datetime" | "date" | "timestamp" | "timestamp_tz" => {
+                        json!(datetime(method, &item)?)
+                    }
+                    "string" => match &item {
+                        Value::String(text) => json!(text),
+                        Value::Number(number) => json!(number.to_string()),
+                        Value::Bool(value) => json!(value.to_string()),
+                        _ => return Err(()),
+                    },
+                    "number" | "decimal" => match &item {
+                        Value::Number(_) => item.clone(),
+                        Value::String(text) => json!(text.trim().parse::<f64>().map_err(|_| ())?),
+                        _ => return Err(()),
+                    },
+                    "integer" | "bigint" => {
+                        let number = match &item {
+                            Value::Number(number) => number.as_f64().ok_or(())?,
+                            Value::String(text) => text.trim().parse::<f64>().map_err(|_| ())?,
+                            _ => return Err(()),
+                        };
+                        if !number.is_finite() {
+                            return Err(());
+                        }
+                        json!(number.round() as i64)
+                    }
+                    "boolean" => match &item {
+                        Value::Bool(_) => item.clone(),
+                        Value::Number(number) => match number.as_i64() {
+                            Some(0) => json!(false),
+                            Some(_) => json!(true),
+                            None => return Err(()),
+                        },
+                        // Postgres' boolean input, which this method reads.
+                        Value::String(text) => match text.trim().to_lowercase().as_str() {
+                            "t" | "true" | "y" | "yes" | "on" | "1" => json!(true),
+                            "f" | "false" | "n" | "no" | "off" | "0" => json!(false),
+                            _ => return Err(()),
+                        },
+                        _ => return Err(()),
+                    },
                     "keyvalue" => {
                         let Value::Object(fields) = &item else {
                             return Err(());
@@ -1186,6 +1383,31 @@ fn apply(step: &Step, items: Vec<Value>, root: &Value) -> Items {
         }
     }
     Ok(out)
+}
+
+/// `.datetime()` and its kin: an ISO 8601 date or time as the store keeps
+/// times (UTC, RFC 3339 with milliseconds), so two compare as text in time
+/// order; `.date()` keeps the day.
+fn datetime(method: &str, item: &Value) -> Result<String, ()> {
+    let Value::String(text) = item else {
+        return Err(());
+    };
+    let text = text.trim();
+    let instant = super::memory_store::instant(text)
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f"))
+                .map(|time| {
+                    time.and_utc()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                })
+        })
+        .map_err(|_| ())?;
+    Ok(if method == "date" {
+        format!("{}T00:00:00.000Z", &instant[..10])
+    } else {
+        instant
+    })
 }
 
 fn compare(left: &Value, cmp: Cmp, right: &Value) -> Result<bool, ()> {
@@ -1462,5 +1684,61 @@ mod tests {
         assert!(predicate("$.** ? (@ == \"ann\") == \"ann\"", &meta));
         assert!(Predicate::parse("$.a ==").is_err());
         assert!(Predicate::parse("$x == 1").is_err());
+    }
+
+    /// Postgres 17's conversion methods, `.**` by level and `\u` escapes; a
+    /// method this evaluator does not know is refused, never read as no
+    /// match.
+    #[test]
+    fn methods_levels_and_escapes() {
+        let meta = json!({
+            "due": "2026-10-30T12:00:00Z",
+            "day": "2026-10-30",
+            "count": "42",
+            "ratio": 2.5,
+            "flag": "yes",
+            "owner": {"team": {"lead": "lan"}},
+            "name": "Café",
+        });
+        assert!(predicate(
+            "$.due.datetime() < \"2026-11-01\".datetime()",
+            &meta
+        ));
+        assert!(!predicate(
+            "$.due.datetime() < \"2026-10-30\".datetime()",
+            &meta
+        ));
+        assert!(predicate(
+            "$.day.date() == \"2026-10-30T09:00:00Z\".date()",
+            &meta
+        ));
+        assert!(predicate("$.count.number() > 40", &meta));
+        assert!(predicate("$.count.integer() == 42", &meta));
+        assert!(predicate("$.ratio.integer() == 3", &meta));
+        assert!(predicate("$.ratio.string() == \"2.5\"", &meta));
+        assert!(predicate("$.flag.boolean() == true", &meta));
+        assert!(predicate("$.owner.**{2} == \"lan\"", &meta));
+        assert!(!predicate("$.owner.**{1} == \"lan\"", &meta));
+        assert!(predicate("$.owner.**{1 to last} == \"lan\"", &meta));
+        assert!(predicate("$.name == \"Caf\\u00e9\"", &meta));
+        let unknown = Predicate::parse("$.due.timestamp_tzz() > 1").expect_err("unknown method");
+        assert!(unknown.contains("datetime()"), "{unknown}");
+        assert!(Predicate::parse("$.due.datetime(\"YYYY\") > 1").is_err());
+    }
+
+    /// `%` as Postgres has it: each word of the pattern matches some word of
+    /// the label, in any order. Labels may be joined by dots, and a pattern
+    /// without a leading slash reads a tree below its scope's root.
+    #[test]
+    fn words_dots_and_relative_trees() {
+        assert!(tree("/global/bar%", "/global/foo_bar"));
+        assert!(tree("/global/baz_foo%", "/global/foo_bar_baz"));
+        assert!(!tree("/global/qux%", "/global/foo_bar"));
+        assert!(tree("/global/ba*%", "/global/foo_bar"));
+        assert!(tree("work.projects", "/global/work/projects/api"));
+        assert!(tree("work.projects.*", "/projects/p-1/work/projects/api"));
+        assert!(tree("*.api.*", "/local/work/api/notes"));
+        assert!(!tree("/work/projects", "/global/work/projects"));
+        assert!(!tree("work.projects", "/global/team/work/projects"));
     }
 }

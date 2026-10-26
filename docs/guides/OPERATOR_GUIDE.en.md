@@ -799,3 +799,41 @@ A task of hundreds of steps passes through many compactions, and what a compacti
 - **A knowledge page's history.** Every write and delete through the store keeps the whole page in `.ha-history.sqlite3` in the library (30 days, and each page's ten newest). The `knowledge` tool's `history` lists the versions of a page, a folder or the library, and `revert` brings one back, a deleted page included.
 - **History filters.** `history_search` takes `since` and `until` (a time or a date), `kind` (one journal event type or a list) and `order` (`newest` or `oldest`). `history_read` names the sources before and after the one read (`previous=`, `next=`).
 - **`ha memory export [--conversation ID]`** prints a store's whole state as JSON. The bug report carries each store's counts and entries (`memory_store.json`), read without changing anything.
+
+### 12.16. Memory at memory-engine's level (0.8.2)
+
+0.8.2 closes what a second review of 0.8.1 against memory-engine found missing. The list is §13 of [Memory store](../architecture/MEMORY_STORE.en.md).
+
+- **Names and ids.**
+  - A name is unique in its tree, not in the whole store, so `/global/api/auth` and `/global/web/auth` can both exist. The entry's id is its name when free, else the name with `-2`, `-3`.
+  - A name you give stays through updates. A name made from the title follows a new title, as ids always have.
+  - Every entry has a `memory_id` that never changes. List and search show it, and `read`, `write`, `history`, `revert` and `delete` take it as the id.
+  - The store's schema becomes 3 the first time 0.8.2 opens it. 0.8.1 cannot open a store at schema 3.
+- **Updates are patches.**
+  - An update changes only what it gives: `meta` alone, `tree` alone or `pinned` alone, with no `content`.
+  - An update that changes nothing keeps the version.
+  - An absolute `tree` in another scope moves the entry there, keeping its `memory_id`.
+  - `on_conflict: replace` takes the entry as the write says it, meta and period included.
+- **History.**
+  - `history` with an id shows every field of each version (tree, name, meta, period, cause, `operation_id`), `limit` at a time from `offset`.
+  - The feed takes `memory_id`.
+- **Search.**
+  - Words match by their English stem: `deploying` finds `deployed`.
+  - `weights: {"semantic": 0}` ranks by words alone, even with embeddings on.
+  - Tree patterns:
+    - labels may be joined by `.` as in memory-engine (`team.decisions`);
+    - a tree without a leading `/` is read below its scope's root;
+    - `label%` matches a word anywhere in the label;
+    - `count` takes patterns too.
+  - `meta_predicate`:
+    - takes PostgreSQL 17's `.datetime()`, `.date()`, `.string()`, `.number()`, `.integer()`, `.boolean()` and the other conversions, plus `.**{n}` and `\uXXXX`;
+    - refuses a method it does not know, instead of matching nothing.
+  - `select` adds `memory_id`, `name` and `has_embedding`, and `meta.<key>` comes back under `meta`. `select` and `format` also work on `read` and `history`.
+  - With `sources` including knowledge, the filters reach the pages:
+    - a page sits at `/knowledge/<scope>/<folders>`;
+    - `grep` reads its text;
+    - a meta or temporal filter leaves pages out.
+- **`status`** shows the entries per scope and how far embedding has got: embedded, pending, failed, the oldest pending and the last error. A new title is embedded again.
+- **Knowledge history.**
+  - `history` with `version` returns that version of a page whole, to read before a revert.
+  - `until`, `operation` and a per-scope `cursor` page through the history.
