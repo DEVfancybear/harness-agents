@@ -18,6 +18,7 @@ app riêng được phát hành.
 | Jev beside the agent and the harness (plugin, off by default) / Jev bên cạnh agent và harness (plugin, mặc định tắt) | [Jev workflow](guides/JEV.en.md) · [Workflow Jev](guides/JEV.vi.md) |
 | Build, test, package and publish / Build, kiểm thử, đóng gói và phát hành | [Build and release](guides/BUILD_AND_RELEASE.md) |
 | Source ownership, dependencies and folder layout / Trách nhiệm source, dependency và bố cục | [Architecture (EN)](architecture/ARCHITECTURE_OVERVIEW.en.md) · [Kiến trúc (VI)](architecture/ARCHITECTURE_OVERVIEW.vi.md) |
+| Memory store and memory-engine parity (design) / Kho memory và tương đương memory-engine (thiết kế) | [Memory store (EN)](architecture/MEMORY_STORE.en.md) · [Kho memory (VI)](architecture/MEMORY_STORE.vi.md) |
 | Skills, extensions and MCP / Skill, extension và MCP | [Plugin architecture (EN)](architecture/PLUGIN_ARCHITECTURE.en.md) · [Kiến trúc plugin (VI)](architecture/PLUGIN_ARCHITECTURE.vi.md) |
 | Isolation limits and measured support / Giới hạn cô lập và hỗ trợ đã đo | [Strict execution support](support/STRICT_EXECUTION_SUPPORT.vi.md) |
 
