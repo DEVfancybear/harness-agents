@@ -100,7 +100,7 @@ check "the entry is gone" '[ -z "$(row memory queue-choice)" ]'
 run_exec m7 "Dùng tool memory action revert với id 'queue-choice' (scope global, không cần version) để khôi phục entry vừa bị xóa. Trả lời: đã khôi phục."
 after=$(row memory queue-choice | cut -d'|' -f1)
 check "the entry is back" '[ -n "$after" ]'
-check "under the id it had" '[ "$after" = "$before" ]'
+check "under the id it had" '[ -n "$before" ] && [ "$after" = "$before" ]'
 check "at the next version" 'row memory queue-choice | cut -d"|" -f6 | grep -q "^3$"'
 
 echo "################ 6. each change is an event naming who made it and why"
@@ -116,7 +116,7 @@ check "the model read the tree" 'answer m8 | grep -q "team/decisions\|decisions"
 before=$(row memory queue-choice | cut -d'|' -f1)
 run_exec m9 "Dùng tool memory action move với source '/global/team', destination '/global/platform', dry_run false. Không làm gì khác. Trả lời: số entry đã chuyển."
 check "the entry moved to the new tree" 'row memory queue-choice | grep -q "|/global/platform/decisions|"'
-check "and is the same memory" '[ "$(row memory queue-choice | cut -d"|" -f1)" = "$before" ]'
+check "and is the same memory" '[ -n "$before" ] && [ "$(row memory queue-choice | cut -d"|" -f1)" = "$before" ]'
 check "the move is an event by the model" 'events | grep -q "^update|move|model|queue-choice|"'
 run_exec m10 "Dùng tool memory action history với tree '/global/platform' (không truyền id) và cho biết thay đổi mới nhất ở nhánh đó là thao tác gì (operation, cause) và lúc nào."
 check "the model read the feed of that tree" 'answer m10 | grep -qi "move\|chuyển\|di chuyển"'
