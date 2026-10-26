@@ -45,6 +45,8 @@ use serde_json::json;
 enum ScriptStep {
     Events(Vec<ProviderStreamEvent>),
     Fail(ErrorCode),
+    /// A rate limit whose `Retry-After` is this long.
+    RateLimited(std::time::Duration),
 }
 
 /// Deterministic provider: one scripted step per call, recording every request.
@@ -98,6 +100,11 @@ impl ModelProvider for ScriptedProvider {
                 ScriptStep::Fail(code) => {
                     Err(ProviderError::new(code, "scripted provider failure"))
                 }
+                ScriptStep::RateLimited(wait) => Err(ProviderError::new(
+                    ErrorCode::RateLimited,
+                    "scripted usage limit",
+                )
+                .with_retry_after(Some(wait))),
                 ScriptStep::Events(mut events) => {
                     if let Some(ProviderStreamEvent::Started { request_id }) = events.first_mut() {
                         *request_id = request.request_id;
@@ -524,6 +531,53 @@ async fn m3_01_one_input_distinct_steps() {
 
     drop(driver);
     close(store).await;
+}
+
+/// Seen in a bug report: a child told "try again in ~230 min" was asked twice
+/// more, a minute apart, and failed the same way. A reset the remaining
+/// retries cannot reach ends the call at once; a short one is still waited
+/// out and retried.
+#[tokio::test]
+async fn m3_01_a_rate_limit_beyond_the_retries_is_not_retried() {
+    for (wait, calls) in [
+        (std::time::Duration::from_hours(4), 1),
+        (std::time::Duration::from_millis(200), 2),
+    ] {
+        let bench = bench();
+        let store = bench.open_store().await;
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ScriptStep::RateLimited(wait),
+            ScriptStep::Events(vec![
+                ProviderStreamEvent::started(),
+                ProviderStreamEvent::text("answered"),
+                ProviderStreamEvent::completed("stop"),
+            ]),
+        ]));
+        let (runtime, _) = runtime_for(&store, provider.clone(), None, None).await;
+        let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)));
+        let outcome = driver
+            .run_turn(
+                request(
+                    &bench.workspace,
+                    SessionId::generate(),
+                    TaskId::generate(),
+                    "fix it",
+                ),
+                options(&bench.workspace),
+                Arc::new(RecordingObserver::default()),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(provider.calls(), calls, "Retry-After {wait:?}");
+        if calls == 1 {
+            let error = outcome.expect_err("a four-hour reset fails the call");
+            assert_eq!(error.code(), ErrorCode::RateLimited);
+        } else {
+            assert_eq!(outcome.expect("retried").stop, TurnStop::Final);
+        }
+        drop(driver);
+        close(store).await;
+    }
 }
 
 #[tokio::test]

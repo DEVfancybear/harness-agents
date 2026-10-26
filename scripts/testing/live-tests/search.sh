@@ -10,7 +10,9 @@
 #   6. (0.7.8) find_files naming several files, no path holding them all,
 #      lists the files matching the most words instead of nothing;
 #   7. (0.7.9) edit_file with one edit per copy of the same text changes
-#      each copy, where every copy was refused as ambiguous.
+#      each copy, where every copy was refused as ambiguous;
+#   8. search_text on a path that is not there says it is missing and where a
+#      file of that name is, where it said "path must be a directory".
 # Every check prints PASS or FAIL; the conversation stays in $LIVE_ROOT/search
 # as evidence.
 #
@@ -79,6 +81,14 @@ echo "################ 7. one edit per copy of the same text"
 say s1 "Gọi tool edit_file đúng một lần trên dup.txt với tham số edits gồm đúng hai phần tử theo thứ tự: phần tử 1 có old_string là '    retry();' và new_string là '    retry(1);'; phần tử 2 có old_string là '    retry();' và new_string là '    retry(2);'. Không gọi tool nào khác. In nguyên văn kết quả tool." | tail -6 | sed 's/^/   /'
 cat "$P/dup.txt" | sed 's/^/   dup.txt: /'
 check "each edit took the next copy, in the file's order" '[ "$(tr -d "\r" < "$P/dup.txt")" = "$(printf "if a {\n    retry(1);\n}\nif b {\n    retry(2);\n}")" ]'
+echo "################ 8. a search in a path that is not there"
+say s1 "Gọi tool search_text đúng một lần với query 'prepare_upload' và path 'src/net/upload.rs' (không có tham số nào khác), kể cả khi bạn nghĩ đường dẫn sai. Không gọi tool nào khác. In nguyên văn toàn bộ kết quả tool, kể cả lỗi." | tail -6 | sed 's/^/   /'
+# What the tool answered, from its failure record rather than the model's copy.
+refusal=$(grep -h '"tool":"search_text"' "$HA_HOME"/data/diagnostics/*.jsonl 2>/dev/null | grep '"event":"failed"' | tail -1)
+echo "   refusal: $(echo "$refusal" | grep -o '"msg":"[^"]*"')"
+check "search_text was refused for the path (the precondition)" '[ -n "$refusal" ]'
+check "it said the path is not there, not that it must be a directory" 'echo "$refusal" | grep -q "path not found: src/net/upload.rs" && ! (echo "$refusal" | grep -q "must be a directory")'
+check "it named where a file of that name is" 'echo "$refusal" | grep -q "the workspace has: src/upload.rs"'
 "$HA" shutdown --force >/dev/null 2>&1
 
 result

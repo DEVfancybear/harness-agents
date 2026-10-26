@@ -2323,11 +2323,13 @@ impl InteractiveController {
         let mut effects = Vec::new();
         for due in self.service.due_heartbeats() {
             // The park's own resume comes due when the park ends, so it is
-            // free to run; a heartbeat before then waits for it.
+            // free to run; a heartbeat before then waits for it. What the
+            // user queued goes first, as at the end of a turn.
             let free = !self.phase.has_active_run()
                 && self.pending_approval.is_none()
                 && self.pending_question.is_none()
-                && !self.parked();
+                && !self.parked()
+                && (self.notices_held || self.queue.is_empty());
             if free && self.pending_heartbeats.is_empty() {
                 effects.extend(self.dispatch(due.text, true));
             } else if self.phase.has_active_run()
@@ -2344,8 +2346,12 @@ impl InteractiveController {
             }
         }
         // What waited for a park to end starts once it has: nothing else
-        // would, with no turn running to end and hand it on.
-        if effects.is_empty() && self.free_for_automatic_turn() {
+        // would, with no turn running to end and hand it on. The user's queue
+        // first, as at the end of a turn.
+        if effects.is_empty()
+            && self.free_for_automatic_turn()
+            && (self.notices_held || !self.run_next_queued(&mut effects))
+        {
             if let Some(text) = self.pending_heartbeats.pop_front() {
                 effects.extend(self.dispatch(text, true));
             } else if !self.notices_held
@@ -2355,6 +2361,30 @@ impl InteractiveController {
             }
         }
         effects
+    }
+
+    /// Start a turn with what the user queued next - steering, then
+    /// follow-ups - tying its receipts to that turn. False when nothing waits.
+    fn run_next_queued(&mut self, effects: &mut Vec<Effect>) -> bool {
+        let Some((text, receipts)) = self
+            .queue
+            .take_next_tracked(super::queue::Lane::Steer)
+            .or_else(|| self.queue.take_next_tracked(super::queue::Lane::FollowUp))
+        else {
+            return false;
+        };
+        effects.extend(self.dispatch(text.clone(), false));
+        for receipt in receipts {
+            if self.phase.has_active_run() {
+                self.active_deliveries.push((receipt, text.clone()));
+            } else {
+                self.record_delivery_answer(
+                    receipt,
+                    Err("the queued message could not start a turn".to_owned()),
+                );
+            }
+        }
+        true
     }
 
     /// Time-driven repaint: the spinner, the elapsed clock and the approval
@@ -3327,26 +3357,24 @@ impl InteractiveController {
                 if matches!(outcome, RunOutcome::Canceled) {
                     self.notices_held = true;
                 }
-                // What the user queued runs first: steering, then follow-ups.
-                if !self.notices_held
-                    && let Some((text, receipts)) = self
-                        .queue
-                        .take_next_tracked(super::queue::Lane::Steer)
-                        .or_else(|| self.queue.take_next_tracked(super::queue::Lane::FollowUp))
-                {
-                    self.close_run_grant();
-                    effects.extend(self.dispatch(text.clone(), false));
-                    for receipt in receipts {
-                        if self.phase.has_active_run() {
-                            self.active_deliveries.push((receipt, text.clone()));
-                        } else {
-                            self.record_delivery_answer(
-                                receipt,
-                                Err("the queued message could not start a turn".to_owned()),
-                            );
+                // What the user queued runs first: steering, then follow-ups -
+                // unless the usage limit parked the session. Seen: a steer the
+                // parked turn did not read came back into the queue, started a
+                // turn 29 ms after the park, and that turn's compaction called
+                // the provider, failed on the same limit and parked it again.
+                if !self.notices_held && !self.queue.is_empty() {
+                    if self.parked() {
+                        let message = format!(
+                            "queued messages wait for the session to resume ({})",
+                            self.resumes_at()
+                        );
+                        self.push_history(effects, HistoryItem::Notice { message });
+                    } else {
+                        self.close_run_grant();
+                        if self.run_next_queued(effects) {
+                            return;
                         }
                     }
-                    return;
                 }
                 // What a child reported while this turn ran is read now, one turn
                 // for each report - unless the usage limit parked the session:
@@ -11673,6 +11701,81 @@ Command: \"npm run build\""
         assert!(
             automatics[1..].iter().all(|automatic| *automatic),
             "the host's own input attaches nothing: {automatics:?}"
+        );
+    }
+
+    /// Seen in a bug report: a steer the parked turn had not read came back
+    /// into the queue as the turn ended and started a turn 29 ms after the
+    /// park; that turn's compaction called the provider, failed on the same
+    /// limit and parked the session a second time. The queue waits for the
+    /// park to end like everything else, then runs first.
+    #[test]
+    fn a_parked_session_holds_the_queue_until_it_resumes() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "giao cho 6 explorer");
+        harness
+            .events
+            .send(SessionEvent::QuotaParked {
+                until: chrono::Utc::now() + chrono::Duration::hours(2),
+            })
+            .expect("park");
+        harness
+            .events
+            .send(SessionEvent::UnreadMessage {
+                text: "[bash done] cargo test passed".to_owned(),
+                verbatim: false,
+            })
+            .expect("unread");
+        let _ = harness.controller.pump_events();
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Failed("rate_limited: usage limit".to_owned()),
+            })
+            .expect("terminal event");
+        let said = effects_to_plain(&harness.controller.pump_events());
+        assert_eq!(
+            submissions(&harness),
+            ["giao cho 6 explorer"],
+            "no turn starts while the session is parked"
+        );
+        assert!(
+            said.iter()
+                .any(|line| line.contains("queued messages wait for the session to resume")),
+            "{said:?}"
+        );
+        let _ = harness.controller.pump_events();
+        assert_eq!(
+            submissions(&harness).len(),
+            1,
+            "a tick starts nothing either"
+        );
+
+        // The park ends: the queued message runs before the park's resume.
+        harness.controller.parked_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        harness
+            .port
+            .heartbeats_due
+            .lock()
+            .expect("heartbeats")
+            .push(crate::interactive::heartbeat::Due {
+                text: "Continue: the usage limit has reset".to_owned(),
+                delivery: crate::interactive::heartbeat::Delivery::FollowUp,
+            });
+        let _ = harness.controller.pump_events();
+        let sent = submissions(&harness);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(
+            sent[1].contains("[bash done] cargo test passed"),
+            "{sent:?}"
+        );
+        end_with(&mut harness, RunOutcome::Done);
+        let sent = submissions(&harness);
+        assert!(
+            sent.get(2)
+                .is_some_and(|text| text.contains("usage limit has reset")),
+            "{sent:?}"
         );
     }
 

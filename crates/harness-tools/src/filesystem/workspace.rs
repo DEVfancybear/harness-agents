@@ -773,6 +773,22 @@ fn search_walk(root: &Path, requested: Option<&str>) -> Result<std::sync::Arc<Wa
         Some(path) => resolve_relative(root, path, true)?,
         None => root.to_owned(),
     };
+    // A path that is not there said "search_text path must be a directory",
+    // and the model searched on in the wrong place: say it is missing, and
+    // where a file of that name is.
+    if let Some(path) = requested
+        && !file.exists()
+    {
+        let mut message = format!("search_text path not found: {path}");
+        let found = files_named_like(root, path);
+        if found.is_empty() {
+            message.push_str("; leave path out to search the whole workspace");
+        } else {
+            message.push_str("; the workspace has: ");
+            message.push_str(&found.join(", "));
+        }
+        return Err(HarnessError::new(ErrorCode::InvalidPayload, message));
+    }
     if !file.is_file() {
         return tool_walk(root, requested, "search_text");
     }
@@ -2207,6 +2223,38 @@ mod tests {
             2
         );
         assert!(search_text(&root, "needle", Some(".env"), false, false, None, 0, false).is_err());
+    }
+
+    /// Seen in a bug report: a guessed path (`host/application/refine_budget.rs`
+    /// for `host/memory/refine_budget.rs`) was refused as "path must be a
+    /// directory". A missing path says it is missing, and where a file of that
+    /// name is.
+    #[test]
+    fn search_text_names_a_missing_path_and_where_its_file_is() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        fs::create_dir_all(directory.path().join("host/memory")).expect("memory");
+        fs::write(directory.path().join("host/memory/budget.rs"), "needle\n").expect("file");
+        let root = fs::canonicalize(directory.path()).expect("root");
+        let search = |path| {
+            search_text(&root, "needle", Some(path), false, false, None, 0, false)
+                .expect_err("a missing path")
+                .to_string()
+        };
+        let guessed = search("host/application/budget.rs");
+        assert!(
+            guessed.contains("search_text path not found: host/application/budget.rs"),
+            "{guessed}"
+        );
+        assert!(
+            guessed.contains("the workspace has: host/memory/budget.rs"),
+            "{guessed}"
+        );
+        assert!(!guessed.contains("must be a directory"), "{guessed}");
+        let folder = search("host/application");
+        assert!(
+            folder.contains("not found") && folder.contains("leave path out"),
+            "{folder}"
+        );
     }
 
     fn spec(old: &str, new: &str) -> EditSpec {
