@@ -1751,12 +1751,6 @@ impl Report {
         );
     }
 
-    /// What the jev plugin did: each harness decision, how often Jev was asked,
-    /// how often it changed what ha did, how often it failed or ran out of time
-    /// (ha then went on without it), how fast it answered and which version
-    /// answered; the agent's own `jev` calls; then the newest records with what
-    /// each decided. Every outcome record names its `decision` and whether it
-    /// `acted`, so a decision added later shows here without a change.
     /// What the trajectory regulator said, and the strategy-level measures of
     /// arXiv 2608.19072: how often a task was evaluated and stalled, how often
     /// it switched strategy, and how often a switch took an alternative a
@@ -1836,6 +1830,12 @@ impl Report {
         out.push('\n');
     }
 
+    /// What the jev plugin did: each harness decision, how often Jev was asked,
+    /// how often it changed what ha did, how often it failed or ran out of time
+    /// (ha then went on without it), how fast it answered and which version
+    /// answered; the agent's own `jev` calls; then the newest records with what
+    /// each decided. Every outcome record names its `decision` and whether it
+    /// `acted`, so a decision added later shows here without a change.
     #[allow(
         clippy::too_many_lines,
         reason = "three parts of one section, each a few lines"

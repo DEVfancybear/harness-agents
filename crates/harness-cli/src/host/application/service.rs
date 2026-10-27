@@ -7515,7 +7515,7 @@ pub(super) async fn refine_transcript(
     // into.
     let strategy =
         super::task_state::load(&local.join(super::task_state::TASK_STATE_FILE)).strategy;
-    if transcript.is_empty() || strategy.decisions.is_empty() {
+    if transcript.is_empty() || strategy.evaluations.is_empty() {
         return transcript;
     }
     format!(
@@ -8681,6 +8681,7 @@ async fn run_turn(
                 ),
             }),
             follows: None,
+            learned: refinements.then(|| data_dir.clone()),
         },
         cancellation.clone(),
     ));
@@ -9331,6 +9332,15 @@ async fn run_turn(
                 .field("score", recalled.score)
                 .field("failures", recalled.failures.len())
                 .emit();
+            // A skill put in the turn is used, as one activated is: its use
+            // keeps it from being archived as dormant, and the review judges
+            // how following it went.
+            super::learned::record_use(
+                &learning.layers,
+                &recalled.name,
+                super::learned::UseKind::Use,
+            );
+            refine_cadence.note_in_play(std::collections::BTreeSet::from([recalled.name.clone()]));
             project_blocks.push(super::skill_recall::block(&recalled));
         }
     }

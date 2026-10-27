@@ -404,6 +404,9 @@ pub struct ChildLaunch {
     /// What the child's model took from the session's defaults; `None` for
     /// a parent's own launch and for a spawn that named both.
     pub follows: Option<FollowedDefaults>,
+    /// The data directory whose learned rules and tool notes the child's calls
+    /// follow, as the root's do; `None` while harness refinements are off.
+    pub learned: Option<PathBuf>,
 }
 
 impl ChildLaunch {
@@ -3332,7 +3335,12 @@ fn compared_children(arguments: &Value) -> Result<Vec<String>, HarnessError> {
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
                 .map(str::to_owned)
-                .collect::<Vec<_>>()
+                .fold(Vec::new(), |mut kept, name| {
+                    if !kept.contains(&name) {
+                        kept.push(name);
+                    }
+                    kept
+                })
         })
         .unwrap_or_default();
     if (2..=4).contains(&children.len()) {
@@ -3340,7 +3348,7 @@ fn compared_children(arguments: &Value) -> Result<Vec<String>, HarnessError> {
     } else {
         Err(HarnessError::new(
             ErrorCode::InvalidPayload,
-            "compare_children: name two to four coder children",
+            "compare_children: name two to four different coder children",
         ))
     }
 }
@@ -3672,7 +3680,16 @@ impl DelegateTool {
                 .output()
                 .await
                 .ok()
-                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                .filter(|output| output.status.success());
+            let Some(committed) = committed else {
+                lines.push(format!(
+                    "- {}: its worktree could not be read; compare it by hand",
+                    member.name
+                ));
+                rows.push(json!({"child": member.name, "error": "worktree unreadable"}));
+                continue;
+            };
+            let committed = Some(String::from_utf8_lossy(&committed.stdout).trim().to_owned())
                 .filter(|text| !text.is_empty());
             let changes = match (committed, changed_files(&root)) {
                 (Some(committed), Some(files)) => {
@@ -5238,6 +5255,9 @@ impl WorkerBackend for InteractiveWorkerBackend {
             };
             let mut schemas = schemas;
             schemas.extend(child_tools.schemas());
+            if let Some(data_dir) = &launch.learned {
+                super::evolution::annotate(data_dir, &mut schemas);
+            }
             // The model the child calls, which `/subagent-model` can move from
             // its next call. Registered before the launch is read again, so a
             // change made in between reaches this run one way or the other.
@@ -5287,6 +5307,13 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     Arc::clone(&child_tools) as Arc<dyn ExternalToolCatalog>
                 ))
                 .with_inbox(RunInbox::new(Arc::clone(&store)));
+            // The rules learned from failed calls apply to a child's calls too.
+            let driver = match &launch.learned {
+                Some(data_dir) => {
+                    driver.with_learned_rules(Arc::new(super::evolution::rules(data_dir)))
+                }
+                None => driver,
+            };
             // An explorer reads more than anyone: its long results are judged
             // as the root's are.
             let judges = self
@@ -6553,6 +6580,7 @@ pub(super) mod tests {
             context: Vec::new(),
             digest: None,
             follows: None,
+            learned: None,
         }
     }
 

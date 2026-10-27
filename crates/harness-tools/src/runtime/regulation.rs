@@ -49,6 +49,10 @@ pub(crate) struct Failure {
     pub(crate) message: String,
     /// `code:hash` of the message without its numbers, paths and quotes.
     pub(crate) class: String,
+    /// The harness or the user refused the call (a repeat answered without
+    /// running, a learned rule, an approval or policy): not a failure of the
+    /// call itself, so neither a repeat nor evidence for the evolution.
+    pub(crate) refused: bool,
 }
 
 impl Failure {
@@ -57,10 +61,45 @@ impl Failure {
         Self {
             code: code.to_owned(),
             class: format!("{code}:{}", short_hash(&shape_of_message(&message))),
+            refused: REFUSALS.contains(&code),
             message,
         }
     }
+
+    /// A refusal the harness made itself.
+    pub(crate) fn refusal(message: &str) -> Self {
+        Self {
+            refused: true,
+            ..Self::new("refused", message)
+        }
+    }
 }
+
+/// Codes that refuse a call rather than fail it: an approval, a policy, a
+/// hook, the harness.
+const REFUSALS: [&str; 7] = [
+    "refused",
+    "policy_denied",
+    "approval_required",
+    "approval_stale",
+    "approval_consumed",
+    "approval_revoked",
+    "blocked_by_hook",
+];
+
+/// Codes of a failure that the same call may not meet again: the workspace,
+/// a lease or the provider moved on, not the call.
+const TRANSIENT: [&str; 9] = [
+    "stale_workspace",
+    "revision_conflict",
+    "task_lease_conflict",
+    "writer_locked",
+    "rate_limited",
+    "service_unavailable",
+    "provider_canceled",
+    "process_timed_out",
+    "process_canceled",
+];
 
 /// What the regulator wants the model to read, and why.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,34 +117,41 @@ pub(crate) struct Regulator {
     noted: HashSet<(String, String, usize)>,
     oscillations: HashSet<(String, String)>,
     budget_noted: bool,
+    /// The user steered since the last call: what they said may be what the
+    /// same call was waiting for.
+    steered: bool,
 }
 
 impl Regulator {
-    /// A call that would fail as it failed before: the same tool with the same
-    /// arguments, after a failure, with nothing run since that could change
-    /// the answer. Only calls whose answer depends on the workspace alone are
-    /// judged - a command, a process, a web page or another agent may answer
-    /// differently the next time.
+    /// A call that would fail as it failed just before: the same tool with the
+    /// same arguments as the call right before it, which failed. Nothing ran
+    /// between them and the user said nothing, so nothing could have changed
+    /// the answer - a read in between can (a write retried after it carries
+    /// the hash the read gave), and so can a process still running or a reply
+    /// the user sent. Only tools whose answer depends on the workspace alone
+    /// are judged, and only failures of the call itself: a refused approval,
+    /// a stale workspace or a busy provider is not the call's fault.
     pub(crate) fn repeat_of_failure(&self, tool: &str, signature: &str) -> Option<String> {
-        if !deterministic(tool) {
+        if !deterministic(tool) || self.steered {
             return None;
         }
-        for call in self.calls.iter().rev() {
-            if call.signature == signature {
-                return call.failure.as_ref().map(|failure| {
-                    format!(
-                        "not executed: this exact {tool} call already failed in this turn ({}: {}), and nothing that could change the answer has run since, so it would fail the same way. Change the arguments, or first do what the error asks.",
-                        failure.code, failure.message
-                    )
-                });
-            }
-            // A successful edit, write or command may have changed what the
-            // failed call depends on.
-            if call.failure.is_none() && call.effect != EffectClass::ReadOnly {
-                return None;
-            }
+        let last = self.calls.last()?;
+        let failure = last.failure.as_ref()?;
+        if last.signature != signature
+            || failure.refused
+            || TRANSIENT.contains(&failure.code.as_str())
+        {
+            return None;
         }
-        None
+        Some(format!(
+            "not executed: this exact {tool} call failed just before ({}: {}), and nothing has run or been said since, so it would fail the same way. Change the arguments, or first do what the error asks.",
+            failure.code, failure.message
+        ))
+    }
+
+    /// The user's message reached the turn between calls.
+    pub(crate) fn steer(&mut self) {
+        self.steered = true;
     }
 
     /// Record a settled call and say what, if anything, the trajectory shows.
@@ -115,6 +161,12 @@ impl Regulator {
         signature: &str,
         failure: Option<Failure>,
     ) -> Option<Intervention> {
+        self.steered = false;
+        // A refusal is the harness's or the user's answer, not something the
+        // call did: it neither repeats a failure nor counts toward one.
+        if failure.as_ref().is_some_and(|failure| failure.refused) {
+            return None;
+        }
         self.calls.push(Settled {
             tool: tool.to_owned(),
             signature: signature.to_owned(),
@@ -213,12 +265,13 @@ impl Regulator {
     }
 
     fn oscillation(&mut self) -> Option<Intervention> {
-        // Calls that change something, newest last: reads move between states
-        // without leaving one, so they are not counted.
+        // Edits, newest last: two that undo each other are an oscillation.
+        // Reads and commands move between states without leaving one - a
+        // test run between edits, or polling, is not undoing anything.
         let acting = self
             .calls
             .iter()
-            .filter(|call| call.effect != EffectClass::ReadOnly)
+            .filter(|call| call.effect == EffectClass::Mutating)
             .collect::<Vec<_>>();
         if acting.len() < OSCILLATION {
             return None;
@@ -284,7 +337,7 @@ fn kind_of(value: &Value) -> String {
         Value::Bool(_) => "bool".to_owned(),
         Value::Number(_) => "number".to_owned(),
         Value::String(_) => "string".to_owned(),
-        Value::Array(items) => format!("array[{}]", items.len()),
+        Value::Array(_) => "array".to_owned(),
         Value::Object(_) => "object".to_owned(),
     }
 }
@@ -324,14 +377,17 @@ fn short_hash(text: &str) -> String {
 }
 
 /// A message with what changes between attempts left out: a token holding a
-/// digit, a path separator or a quote is a value, not part of what went wrong.
+/// digit, a path separator, a quote, or a dot inside it (`foo.rs`, not the
+/// full stop ending a sentence) is a value, not part of what went wrong.
 fn shape_of_message(message: &str) -> String {
     message
         .split_whitespace()
         .map(|token| {
-            if token
-                .chars()
-                .any(|c| c.is_ascii_digit() || matches!(c, '/' | '\\' | '"' | '\'' | '`'))
+            let inner = token.trim_end_matches(['.', ',', ':', ';']);
+            if inner.contains('.')
+                || token
+                    .chars()
+                    .any(|c| c.is_ascii_digit() || matches!(c, '/' | '\\' | '"' | '\'' | '`'))
             {
                 "_"
             } else {
@@ -421,19 +477,81 @@ mod tests {
         let refusal = regulator
             .repeat_of_failure("edit_file", "edit_file|x")
             .expect("refused");
-        assert!(refusal.contains("already failed"), "{refusal}");
+        assert!(refusal.contains("failed just before"), "{refusal}");
         // Different arguments are another call.
         assert!(
             regulator
                 .repeat_of_failure("edit_file", "edit_file|y")
                 .is_none()
         );
-        // A command that ran since may have changed the workspace.
-        regulator.settle("run_shell", "run_shell|mkdir", None);
+        // The refusal itself is not a failure: the next identical call is
+        // still the repeat of the one that failed.
+        regulator.settle(
+            "edit_file",
+            "edit_file|x",
+            Some(Failure::refusal("not executed")),
+        );
         assert!(
             regulator
                 .repeat_of_failure("edit_file", "edit_file|x")
+                .is_some()
+        );
+    }
+
+    /// A write refused for a stale hash succeeds once a read gives the hash:
+    /// any call between them, a read included, lets the retry run.
+    #[test]
+    fn a_retry_after_another_call_or_the_users_word_runs() {
+        let mut regulator = Regulator::default();
+        regulator.settle("write_file", "write|x", missing("a.rs"));
+        regulator.settle("read_file", "read|a", None);
+        assert!(
+            regulator
+                .repeat_of_failure("write_file", "write|x")
                 .is_none()
+        );
+        let mut regulator = Regulator::default();
+        regulator.settle("write_file", "write|x", missing("a.rs"));
+        regulator.steer();
+        assert!(
+            regulator
+                .repeat_of_failure("write_file", "write|x")
+                .is_none()
+        );
+        // A failure that is not the call's own - a stale workspace, a refused
+        // approval - is never a reason to refuse it.
+        let mut regulator = Regulator::default();
+        regulator.settle(
+            "write_file",
+            "write|x",
+            Some(Failure::new("stale_workspace", "pass the hash")),
+        );
+        assert!(
+            regulator
+                .repeat_of_failure("write_file", "write|x")
+                .is_none()
+        );
+        regulator.settle(
+            "write_file",
+            "write|y",
+            Some(Failure::new("approval_stale", "the approval expired")),
+        );
+        assert!(
+            regulator
+                .repeat_of_failure("write_file", "write|y")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_file_name_is_a_value_in_an_error() {
+        assert_eq!(
+            Failure::new("invalid_payload", "File not found: foo.rs").class,
+            Failure::new("invalid_payload", "File not found: bar.rs").class
+        );
+        assert_ne!(
+            Failure::new("invalid_payload", "File not found.").class,
+            Failure::new("invalid_payload", "Path is a directory.").class
         );
     }
 
@@ -481,7 +599,7 @@ mod tests {
     fn arguments_are_kept_as_their_shape_and_hash() {
         assert_eq!(
             arguments_shape(r#"{"path":"a","edits":[1,2],"n":3}"#),
-            "edits:array[2],n:number,path:string"
+            "edits:array,n:number,path:string"
         );
         assert_eq!(
             arguments_hash(r#"{"a":1,"b":2}"#),

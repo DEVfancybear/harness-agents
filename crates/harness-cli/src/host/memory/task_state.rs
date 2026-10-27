@@ -24,7 +24,9 @@ use harness_tools::{
 };
 use harness_types::{ErrorCode, HarnessError};
 
-use super::strategy::{Alternative, DecisionKind, JournalKind, Standing, Strategy, StrategyState};
+use super::strategy::{
+    Alternative, DecisionKind, JournalKind, Standing, Strategy, StrategyDecision, StrategyState,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -662,23 +664,27 @@ fn apply_strategy(state: &mut TaskState, arguments: &Value) -> Result<(), Harnes
             .filter(|value| !value.is_null())
             .map(|value| strategy_of(value, "decide.strategy"))
             .transpose()?;
-        let decision = state.strategy.decide(kind, to, evidence).map_err(refused)?;
-        harness_types::diag::info("strategy", "decided")
-            .field(
-                "kind",
-                if decision.kind == DecisionKind::Switch {
-                    "switch"
-                } else {
-                    "continue"
-                },
-            )
-            .field("plateau", decision.plateau)
-            .field("proposed", decision.proposed)
-            .field("from", decision.from.clone())
-            .field("to", decision.to.clone())
-            .emit();
+        state.strategy.decide(kind, to, evidence).map_err(refused)?;
     }
     Ok(())
+}
+
+/// The record of a decision, once it is saved.
+fn record_decision(decision: &StrategyDecision) {
+    harness_types::diag::info("strategy", "decided")
+        .field(
+            "kind",
+            if decision.kind == DecisionKind::Switch {
+                "switch"
+            } else {
+                "continue"
+            },
+        )
+        .field("plateau", decision.plateau)
+        .field("proposed", decision.proposed)
+        .field("from", decision.from.clone())
+        .field("to", decision.to.clone())
+        .emit();
 }
 
 /// A strategy as an update gives it: a name, why, and what it was weighed
@@ -730,20 +736,25 @@ pub fn record_evaluation(
     source: &str,
     reached: u8,
     left: u32,
+    residue: u32,
     detail: &str,
 ) -> Option<(Standing, TaskState)> {
     let _guard = file_lock().lock().ok()?;
+    // A task whose model never used task_state is evaluated too: the agents
+    // arXiv 2608.19072 describes are the ones that never stop to plan.
     let mut state = load(path);
-    if state.is_empty() {
-        return None;
-    }
     // An unchanged workspace scores what it scored.
-    let (reached, left) = if source == "unchanged" {
-        state.strategy.last_score().unwrap_or((reached, left))
+    let (reached, left, residue) = if source == "unchanged" {
+        state
+            .strategy
+            .last_score()
+            .unwrap_or((reached, left, residue))
     } else {
-        (reached, left)
+        (reached, left, residue)
     };
-    let standing = state.strategy.evaluate(source, reached, left, detail);
+    let standing = state
+        .strategy
+        .evaluate(source, reached, left, residue, detail);
     save(path, &state).ok()?;
     harness_types::diag::info("strategy", "evaluated")
         .field("source", source.to_owned())
@@ -754,8 +765,12 @@ pub fn record_evaluation(
     Some((standing, state))
 }
 
-/// Keep the alternatives a strategist named, for the next decision.
+/// Keep the alternatives a strategist named, for the next decision. None
+/// named is not kept: the next evaluation asks again.
 pub fn record_proposals(path: &Path, proposals: Vec<Alternative>) {
+    if proposals.is_empty() {
+        return;
+    }
     let Ok(_guard) = file_lock().lock() else {
         return;
     };
@@ -847,9 +862,18 @@ impl TaskStateHost {
                 ),
             ));
         }
+        let decided = state.strategy.decisions.last().cloned();
         let notes = apply(&mut state, arguments)?;
         state.revision += 1;
         save(&self.path, &state).map_err(refused)?;
+        if let Some(decision) = state
+            .strategy
+            .decisions
+            .last()
+            .filter(|decision| Some(*decision) != decided.as_ref())
+        {
+            record_decision(decision);
+        }
         let mut payload = json!({"revision": state.revision, "state": state.render()});
         if !notes.is_empty() {
             payload["notes"] = json!(notes);
@@ -1086,7 +1110,8 @@ mod tests {
             .execute(&json!({"action": "update", "strategy": {"name": "a parser"}}))
             .expect_err("a second strategy needs a decision");
         assert!(refused.to_string().contains("decide"), "{refused}");
-        record_evaluation(host.path(), "checks", 1, 2, "check `nested` failed").expect("recorded");
+        record_evaluation(host.path(), "checks", 1, 2, 0, "check `nested` failed")
+            .expect("recorded");
         let shown = load(host.path()).render();
         assert!(shown.contains("Decision due"), "{shown}");
         host.execute(&json!({"action": "update", "decide": {"kind": "switch",

@@ -673,6 +673,7 @@ pub async fn run_with(
                     ),
                 }),
                 follows: None,
+                learned: refinements.then(|| context.paths.data_dir.clone()),
             },
             cancellation.clone(),
         )
@@ -708,6 +709,12 @@ pub async fn run_with(
         jev_host.as_ref(),
     ));
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
+    // What the harness learned from failed calls, as in the app.
+    let driver = if refinements {
+        driver.with_learned_rules(Arc::new(super::evolution::rules(&context.paths.data_dir)))
+    } else {
+        driver
+    };
     let driver =
         match &jev_decisions {
             Some(decisions) => driver
@@ -769,6 +776,9 @@ pub async fn run_with(
     let mut tool_schemas = harness_tools::coding_tool_schemas_for(hashline);
     if let Some(external) = &external_tools {
         tool_schemas.extend(super::service::in_cache_order(external.schemas()));
+    }
+    if refinements {
+        super::evolution::annotate(&context.paths.data_dir, &mut tool_schemas);
     }
     // Long extension tools are listed and reached on demand, as in the app.
     let deferrable = super::tool_tiers::deferrable(&[active_extensions

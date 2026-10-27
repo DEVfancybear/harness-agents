@@ -112,7 +112,7 @@ impl LearnedRules {
                 }
                 RuleAction::RefuseShape { reason, .. } => {
                     realized.refusal = Some(format!(
-                        "not executed: calls to {tool} with these arguments ({}) have always failed in this project. {reason}",
+                        "not executed: calls to {tool} with these arguments ({}) have always failed before. {reason}",
                         crate::regulation::arguments_shape(arguments)
                     ));
                     return realized;

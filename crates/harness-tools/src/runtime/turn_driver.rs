@@ -1856,12 +1856,13 @@ impl TurnDriver {
             // for the model under each result, and a stop for the turn.
             let mut hook_notes: std::collections::HashMap<String, crate::HookResponse> =
                 std::collections::HashMap::new();
+            // Each call's arguments as the model wrote them, unwrapped.
+            let mut written: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             for (mut call, transcript_id) in
                 result.tool_calls.clone().into_iter().zip(transcript_ids)
             {
                 tool_calls += 1;
-                // The call as the model wrote it, which the regulator compares.
-                let written_arguments = call.arguments.clone();
                 // A deferred tool is called through `use_tool`: from here on it
                 // is that tool's call, checked against its schema and gated as
                 // any call is.
@@ -1905,6 +1906,30 @@ impl TurnDriver {
                     slots.push((name.clone(), transcript_id, Slot::Answered(answer)));
                     continue;
                 }
+                // The call as the model wrote it, unwrapped from `use_tool`: what
+                // the regulator compares and the evolution reads.
+                written.insert(transcript_id.clone(), call.arguments.clone());
+                // The same call that just failed, with nothing run or said
+                // since, fails the same way: it is answered without running,
+                // before any learned rule or approval sees it.
+                if let Some(refusal) =
+                    regulator.repeat_of_failure(&name, &format!("{name}|{}", call.arguments))
+                {
+                    harness_types::diag::info("regulation", "repeat_refused")
+                        .call(&transcript_id)
+                        .field("tool", name.clone())
+                        .field(
+                            "args_hash",
+                            crate::regulation::arguments_hash(&call.arguments),
+                        )
+                        .emit();
+                    slots.push((
+                        name.clone(),
+                        transcript_id,
+                        Slot::Failed(refusal, REPEAT_REFUSED.to_owned()),
+                    ));
+                    continue;
+                }
                 // Rules learned from this project's failures: a rule in shadow
                 // only records that it would have acted, under the call's id,
                 // which the call's settled record pairs with how it went.
@@ -1925,7 +1950,7 @@ impl TurnDriver {
                         slots.push((
                             name.clone(),
                             transcript_id,
-                            Slot::Failed(refusal, "refused by a learned rule".to_owned()),
+                            Slot::Failed(refusal, RULE_REFUSED.to_owned()),
                         ));
                         continue;
                     }
@@ -1977,29 +2002,6 @@ impl TurnDriver {
                             continue;
                         }
                     }
-                }
-                // The same call that just failed, with nothing changed since,
-                // fails the same way: it is answered without running.
-                if let Some(refusal) =
-                    regulator.repeat_of_failure(&name, &format!("{name}|{written_arguments}"))
-                {
-                    harness_types::diag::info("regulation", "repeat_refused")
-                        .call(&transcript_id)
-                        .field("tool", name.clone())
-                        .field(
-                            "args_hash",
-                            crate::regulation::arguments_hash(&written_arguments),
-                        )
-                        .emit();
-                    slots.push((
-                        name.clone(),
-                        transcript_id,
-                        Slot::Failed(
-                            refusal,
-                            "the same call already failed, unchanged".to_owned(),
-                        ),
-                    ));
-                    continue;
                 }
                 if runs_alone(&name) {
                     run_ready_slots(
@@ -2243,8 +2245,13 @@ impl TurnDriver {
             // Results in call order.
             for (index, (name, transcript_id, slot)) in slots.into_iter().enumerate() {
                 let shown = announced.contains(&index);
-                let intervention =
-                    regulate(&mut regulator, &appended, &name, &transcript_id, &slot);
+                let intervention = regulate(
+                    &mut regulator,
+                    written.get(&transcript_id).map(String::as_str),
+                    &name,
+                    &transcript_id,
+                    &slot,
+                );
                 let results_before = appended.len();
                 match slot {
                     Slot::Failed(message, detail) => {
@@ -2404,6 +2411,10 @@ impl TurnDriver {
             } else {
                 (Vec::new(), None)
             };
+            // What the user said may be what a failed call waited for.
+            if !early_steering.is_empty() || !late_steering.is_empty() {
+                regulator.steer();
+            }
             appended.extend(early_steering);
             appended.extend(late_steering);
             // A tool hook that answered `continue: false` ends the turn here, with
@@ -2439,6 +2450,9 @@ impl TurnDriver {
                 appended.push(ProviderMessage::new(MessageRole::User, budget.note));
             }
             if let Some(warning) = loop_warning {
+                harness_types::diag::warn("regulation", "loop_warned")
+                    .field("step", steps)
+                    .emit();
                 observer.observe(TurnProgress::Notice(
                     "the same read repeated with nothing changed; asking the model to answer"
                         .to_owned(),
@@ -3720,12 +3734,18 @@ fn call_signature(call: &NormalizedToolCall) -> String {
     format!("{}|{}", call.name, call.arguments)
 }
 
+/// What a call refused by the regulator says it was, in its slot.
+const REPEAT_REFUSED: &str = "the same call already failed, unchanged";
+
+/// What a call refused by a learned rule says it was, in its slot.
+const RULE_REFUSED: &str = "refused by a learned rule";
+
 /// Record a settled call - what it looked like and how it failed, for the
 /// diagnostics a later look at failures reads - and ask the regulator what the
 /// trajectory now shows.
 fn regulate(
     regulator: &mut crate::regulation::Regulator,
-    appended: &[ProviderMessage],
+    written: Option<&str>,
     name: &str,
     transcript_id: &str,
     slot: &Slot,
@@ -3733,10 +3753,35 @@ fn regulate(
     use crate::regulation::{Failure, arguments_hash, arguments_shape};
     let failure = match slot {
         Slot::Ready(_) | Slot::Taken => return None,
-        Slot::Failed(_, detail) => Some(Failure::new("invalid_call", detail)),
-        Slot::Done(Ok(view)) => {
-            failure_detail(&view.output).map(|detail| Failure::new("denied", &detail))
+        Slot::Failed(_, detail) if detail == REPEAT_REFUSED || detail == RULE_REFUSED => {
+            Some(Failure::refusal(detail))
         }
+        Slot::Failed(_, detail) => Some(Failure::new("invalid_call", detail)),
+        Slot::Done(Ok(view)) => match &view.output {
+            ToolOutput::Denied { code, reason } => Some(Failure::new(code, reason)),
+            ToolOutput::OutcomeUnknown { reason } => Some(Failure::new("outcome_unknown", reason)),
+            // A command that exits with an error is the commonest loop of
+            // all: the same build or test failing again and again.
+            ToolOutput::Process {
+                exit_code: Some(code),
+                stderr,
+                capture_tail,
+                ..
+            } if *code != 0 => {
+                let tail = if stderr.trim().is_empty() {
+                    capture_tail
+                } else {
+                    stderr
+                };
+                let last = tail
+                    .lines()
+                    .rev()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or_default();
+                Some(Failure::new(&format!("exit_{code}"), last))
+            }
+            _ => None,
+        },
         Slot::Done(Err(error)) => Some(Failure::new(error.code().as_str(), error.message())),
         Slot::Answered(_) => None,
         // Several files read in one call failed only if every one did.
@@ -3747,22 +3792,23 @@ fn regulate(
             .flatten()
             .map(|error| Failure::new(error.code().as_str(), error.message())),
     };
-    let arguments = appended
-        .iter()
-        .flat_map(|message| message.tool_calls.iter())
-        .find(|call| call.call_id == transcript_id)
-        .map(|call| call.arguments.clone())
-        .unwrap_or_default();
-    let mut record = harness_types::diag::info("call", "settled")
+    let arguments = written.unwrap_or_default();
+    let level = if failure.is_some() {
+        harness_types::diag::Level::Warn
+    } else {
+        harness_types::diag::Level::Info
+    };
+    let mut record = harness_types::diag::at(level, "call", "settled")
         .call(transcript_id)
         .field("tool", name.to_owned())
         .field("ok", failure.is_none())
-        .field("args_hash", arguments_hash(&arguments))
-        .field("args_shape", arguments_shape(&arguments));
+        .field("args_hash", arguments_hash(arguments))
+        .field("args_shape", arguments_shape(arguments));
     if let Some(failure) = &failure {
         record = record
             .field("error_class", failure.class.clone())
-            .field("error_code", failure.code.clone());
+            .field("error_code", failure.code.clone())
+            .field("refused", failure.refused);
     }
     record.emit();
     let intervention = regulator.settle(name, &format!("{name}|{arguments}"), failure);

@@ -1429,7 +1429,7 @@ async fn m3_03_a_failure_repeated_is_named_and_an_unchanged_retry_is_not_run() {
     );
     let fourth = result(4, "c4");
     assert!(
-        fourth.contains("not executed: this exact read_file call already failed"),
+        fourth.contains("not executed: this exact read_file call failed just before"),
         "{fourth}"
     );
     drop(driver);

@@ -214,6 +214,7 @@ impl GoalHost {
         source: &str,
         reached: u8,
         left: u32,
+        residue: u32,
         detail: &str,
     ) -> String {
         use super::strategy::stage as stages;
@@ -221,12 +222,18 @@ impl GoalHost {
             return String::new();
         };
         let Some((standing, task)) =
-            super::task_state::record_evaluation(path, source, reached, left, detail)
+            super::task_state::record_evaluation(path, source, reached, left, residue, detail)
         else {
             return String::new();
         };
         if reached == stages::PASSED {
             return String::new();
+        }
+        if standing.plateau && (!standing.wants_proposals || check.strategist.is_none()) {
+            self.notice(format!(
+                "strategy: {} evaluations without progress under the current strategy; the agent is asked to decide whether to switch",
+                super::strategy::PLATEAU
+            ));
         }
         let mut proposals = Vec::new();
         if standing.wants_proposals
@@ -316,6 +323,7 @@ impl GoalHost {
                         "checklist",
                         super::strategy::stage::CHECKLIST,
                         u32::try_from(open).unwrap_or(u32::MAX),
+                        0,
                         &format!("{open} checklist item(s) open"),
                     )
                     .await;
@@ -328,6 +336,7 @@ impl GoalHost {
                     &check,
                     "unchanged",
                     super::strategy::stage::CHECKLIST,
+                    0,
                     0,
                     "nothing changed since the last failed verification",
                 )
@@ -363,6 +372,7 @@ impl GoalHost {
                     "checks",
                     super::strategy::stage::CHECKS,
                     u32::try_from(left).unwrap_or(u32::MAX),
+                    report.failure().map_or(0, |run| lines(&run.output)),
                     &failed_at,
                 )
                 .await;
@@ -398,6 +408,7 @@ impl GoalHost {
                                 "verifier",
                                 super::strategy::stage::VERIFIER,
                                 1,
+                                lines(&answer),
                                 "the verifier did not accept the work",
                             )
                             .await;
@@ -426,7 +437,7 @@ Fix every finding, check it yourself, then call goal_complete again.{decision}",
             return Err("The goal is NOT complete: verification was canceled.".to_owned());
         }
         let verified = format!("{summary} [verified: {evidence}]");
-        self.evaluated(&check, "passed", super::strategy::stage::PASSED, 0, "")
+        self.evaluated(&check, "passed", super::strategy::stage::PASSED, 0, 0, "")
             .await;
         self.complete(&verified);
         Ok(format!("The goal is complete and verified: {verified}"))
@@ -683,6 +694,11 @@ impl GoalState {
         lines.push("/goal pause · /goal resume · /goal clear".to_owned());
         lines
     }
+}
+
+/// How much a failure left behind: its lines with something on them.
+fn lines(text: &str) -> u32 {
+    u32::try_from(text.lines().filter(|line| !line.trim().is_empty()).count()).unwrap_or(u32::MAX)
 }
 
 /// What the strategist is asked: the goal, the strategy that stopped getting

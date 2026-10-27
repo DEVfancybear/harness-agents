@@ -70,9 +70,10 @@ pub struct Evolved {
     /// When it last ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ran: Option<chrono::DateTime<chrono::Utc>>,
-    /// Groups already shown, `tool|class`, so a run does not ask again.
+    /// Groups already shown, `tool|class`, with how many failures they had:
+    /// a group is shown again once its failures have doubled.
     #[serde(default)]
-    pub seen: BTreeSet<String>,
+    pub seen: BTreeMap<String, usize>,
 }
 
 #[must_use]
@@ -152,14 +153,23 @@ struct Call {
     message: String,
 }
 
-/// The calls of the last [`WINDOW_DAYS`] days, by call id, and the rules in
-/// shadow that would have acted on them.
-fn calls(data_dir: &Path, since_ms: i64) -> (BTreeMap<String, Call>, Vec<(String, String)>) {
-    let mut calls: BTreeMap<String, Call> = BTreeMap::new();
+/// What the records say: the calls of the last [`WINDOW_DAYS`] days, by
+/// run and call id (a provider promises a call id unique in one response
+/// only), and the rules that would have acted, or acted, on them. A call the
+/// harness or the user refused is left out: it is not evidence of how the
+/// call itself goes.
+#[derive(Debug, Default)]
+struct Records {
+    calls: BTreeMap<String, Call>,
+    shadowed: Vec<(String, String)>,
+    acted: Vec<(String, String)>,
+}
+
+fn records(data_dir: &Path, since_ms: i64) -> Records {
+    let mut found = Records::default();
     let mut messages: BTreeMap<String, String> = BTreeMap::new();
-    let mut shadowed = Vec::new();
-    let Ok(entries) = std::fs::read_dir(data_dir.join("diagnostics")) else {
-        return (calls, shadowed);
+    let Ok(entries) = std::fs::read_dir(crate::diagnostics::location(data_dir)) else {
+        return found;
     };
     for entry in entries.flatten() {
         let Ok(text) = std::fs::read_to_string(entry.path()) else {
@@ -172,14 +182,15 @@ fn calls(data_dir: &Path, since_ms: i64) -> (BTreeMap<String, Call>, Vec<(String
             if record["ms"].as_i64().unwrap_or_default() < since_ms {
                 continue;
             }
-            let Some(call) = record["call"].as_str().map(str::to_owned) else {
+            let Some(call) = record["call"].as_str() else {
                 continue;
             };
+            let key = format!("{}|{call}", record["run"].as_str().unwrap_or_default());
             let fields = &record["fields"];
             match (record["kind"].as_str(), record["event"].as_str()) {
-                (Some("call"), Some("settled")) => {
-                    calls.insert(
-                        call,
+                (Some("call"), Some("settled")) if fields["refused"] != true => {
+                    found.calls.insert(
+                        key,
                         Call {
                             tool: fields["tool"].as_str().unwrap_or_default().to_owned(),
                             shape: fields["args_shape"].as_str().unwrap_or_default().to_owned(),
@@ -194,21 +205,26 @@ fn calls(data_dir: &Path, since_ms: i64) -> (BTreeMap<String, Call>, Vec<(String
                     );
                 }
                 (Some("tool"), Some("failed")) => {
-                    messages.insert(call, record["msg"].as_str().unwrap_or_default().to_owned());
+                    messages.insert(key, record["msg"].as_str().unwrap_or_default().to_owned());
                 }
-                (Some("rule"), Some("shadowed")) => {
-                    shadowed.push((fields["rule"].as_str().unwrap_or_default().to_owned(), call));
+                (Some("rule"), Some(event @ ("shadowed" | "acted"))) => {
+                    let rule = fields["rule"].as_str().unwrap_or_default().to_owned();
+                    if event == "shadowed" {
+                        found.shadowed.push((rule, key));
+                    } else {
+                        found.acted.push((rule, key));
+                    }
                 }
                 _ => {}
             }
         }
     }
-    for (id, call) in &mut calls {
+    for (id, call) in &mut found.calls {
         if let Some(message) = messages.remove(id) {
             call.message = message;
         }
     }
-    (calls, shadowed)
+    found
 }
 
 /// What a rule would have done to the recorded calls of its tool: the
@@ -237,30 +253,40 @@ fn shape_keys(shape: &str) -> BTreeSet<&str> {
         .collect()
 }
 
-/// Promote or retire the rules in shadow on what they would have done.
-fn judge_shadows(
-    evolved: &mut Evolved,
-    calls: &BTreeMap<String, Call>,
-    shadowed: &[(String, String)],
-) -> (usize, usize) {
-    let (mut promoted, mut retired) = (0, 0);
-    for rule in evolved
-        .rules
-        .iter_mut()
-        .filter(|rule| rule.state == RuleState::Shadow)
-    {
-        let outcomes = shadowed
-            .iter()
-            .filter(|(id, _)| *id == rule.id)
-            .filter_map(|(_, call)| calls.get(call))
+/// Promote or retire rules on what they did. A rule in shadow is promoted
+/// once it would have acted [`MIN_EVIDENCE`] times, each on a call that then
+/// failed, and retired the first time it would have acted on one that worked.
+/// An active rename is retired once the calls it renamed still failed
+/// [`MIN_EVIDENCE`] times with none working: the rename did not help.
+fn judge_rules(evolved: &mut Evolved, found: &Records) -> (usize, usize) {
+    let outcomes = |list: &[(String, String)], id: &str| {
+        list.iter()
+            .filter(|(rule, _)| rule == id)
+            .filter_map(|(_, call)| found.calls.get(call))
             .map(|call| call.ok)
-            .collect::<Vec<_>>();
-        if outcomes.iter().any(|ok| *ok) {
-            rule.state = RuleState::Retired;
-            retired += 1;
-        } else if outcomes.len() >= MIN_EVIDENCE {
-            rule.state = RuleState::Active;
-            promoted += 1;
+            .collect::<Vec<_>>()
+    };
+    let (mut promoted, mut retired) = (0, 0);
+    for rule in &mut evolved.rules {
+        match rule.state {
+            RuleState::Shadow => {
+                let seen = outcomes(&found.shadowed, &rule.id);
+                if seen.iter().any(|ok| *ok) {
+                    rule.state = RuleState::Retired;
+                    retired += 1;
+                } else if seen.len() >= MIN_EVIDENCE {
+                    rule.state = RuleState::Active;
+                    promoted += 1;
+                }
+            }
+            RuleState::Active if matches!(rule.action, RuleAction::RenameArgument { .. }) => {
+                let done = outcomes(&found.acted, &rule.id);
+                if done.len() >= MIN_EVIDENCE && done.iter().all(|ok| !*ok) {
+                    rule.state = RuleState::Retired;
+                    retired += 1;
+                }
+            }
+            _ => {}
         }
     }
     (promoted, retired)
@@ -292,51 +318,105 @@ pub struct Ran {
     pub rejected: usize,
 }
 
-/// Run the evolution once: judge the rules in shadow, then mine the
-/// failures not yet shown and keep what passes replay.
+/// One run at a time across ha's processes: a lock file next to the
+/// evolution's, taken by creating it. One older than an hour was left by a
+/// run that died, and is taken over.
+struct RunLock(PathBuf);
+
+impl RunLock {
+    fn take(data_dir: &Path) -> Option<Self> {
+        let path = data_dir.join("harness-evolution.lock");
+        let stale = std::fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_hours(1));
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .ok()
+            .map(|_| Self(path))
+    }
+}
+
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Run the evolution once when it is due: judge the rules on what they did,
+/// then mine the failures not yet shown and keep what passes replay. `None`
+/// when it was not due or another process is running it.
+///
+/// The run is marked when it starts, so a turn ending while the model answers
+/// starts no second run, and a run that fails waits for the next day.
 ///
 /// # Errors
-/// The records cannot be read into a run, or the model or the save failed.
+/// The model or the save failed.
 pub async fn evolve(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
     data_dir: &Path,
-) -> Result<Ran, String> {
+) -> Result<Option<Ran>, String> {
     let now = chrono::Utc::now();
-    let since = (now - chrono::Duration::days(WINDOW_DAYS)).timestamp_millis();
-    let (calls, shadowed) = calls(data_dir, since);
+    let Some(_lock) = RunLock::take(data_dir) else {
+        return Ok(None);
+    };
     let mut evolved = load(data_dir);
-    let mut ran = Ran::default();
-    (ran.promoted, ran.retired) = judge_shadows(&mut evolved, &calls, &shadowed);
-    let groups = failure_groups(&calls, &evolved.seen);
-    ran.groups = groups.len();
-    if !groups.is_empty() {
-        let answer = super::refine::complete_json(
+    if evolved.ran.is_some_and(|ran| now - ran < EVERY) {
+        return Ok(None);
+    }
+    evolved.ran = Some(now);
+    save(data_dir, &evolved)?;
+    let since = (now - chrono::Duration::days(WINDOW_DAYS)).timestamp_millis();
+    let directory = data_dir.to_path_buf();
+    let found = tokio::task::spawn_blocking(move || records(&directory, since))
+        .await
+        .map_err(|error| format!("the records could not be read: {error}"))?;
+    let groups = failure_groups(&found.calls, &evolved.seen);
+    let answer = if groups.is_empty() {
+        Value::Null
+    } else {
+        super::refine::complete_json(
             provider,
             model,
             "harness_evolution",
             SYSTEM_PROMPT,
-            groups_text(&groups, &calls),
+            groups_text(&groups, &found.calls),
             8_192,
         )
-        .await?;
-        for change in answer["groups"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .flat_map(|group| group["changes"].as_array().cloned().unwrap_or_default())
-        {
-            match accept(&mut evolved, &change, &calls) {
+        .await?
+    };
+    // What another writer saved meanwhile stays: decide on the file as it is.
+    let mut evolved = load(data_dir);
+    let mut ran = Ran {
+        groups: groups.len(),
+        ..Ran::default()
+    };
+    (ran.promoted, ran.retired) = judge_rules(&mut evolved, &found);
+    for group in answer["groups"].as_array().into_iter().flatten() {
+        // Only an interface failure gets a harness change: degeneration is
+        // the regulator's, and reasoning the model's own.
+        let interface = matches!(group["category"].as_str(), Some("realization" | "contract"));
+        for change in group["changes"].as_array().into_iter().flatten() {
+            match interface
+                .then(|| accept(&mut evolved, change, &found.calls))
+                .flatten()
+            {
                 Some("rule") => ran.rules += 1,
                 Some(_) => ran.notes += 1,
                 None => ran.rejected += 1,
             }
         }
-        for (key, _) in &groups {
-            evolved.seen.insert(key.clone());
-        }
     }
-    evolved.ran = Some(now);
+    for (key, ids) in &groups {
+        evolved.seen.insert(key.clone(), ids.len());
+    }
     save(data_dir, &evolved)?;
     harness_types::diag::info("evolution", "ran")
         .field("groups", ran.groups)
@@ -346,14 +426,14 @@ pub async fn evolve(
         .field("retired", ran.retired)
         .field("rejected", ran.rejected)
         .emit();
-    Ok(ran)
+    Ok(Some(ran))
 }
 
 /// Failures of one tool with one class, [`MIN_EVIDENCE`] or more, not yet
 /// shown; the largest first.
 fn failure_groups(
     calls: &BTreeMap<String, Call>,
-    seen: &BTreeSet<String>,
+    seen: &BTreeMap<String, usize>,
 ) -> Vec<(String, Vec<String>)> {
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (id, call) in calls
@@ -367,7 +447,9 @@ fn failure_groups(
     }
     let mut groups = groups
         .into_iter()
-        .filter(|(key, ids)| ids.len() >= MIN_EVIDENCE && !seen.contains(key))
+        .filter(|(key, ids)| {
+            ids.len() >= MIN_EVIDENCE && seen.get(key).is_none_or(|shown| ids.len() >= 2 * shown)
+        })
         .collect::<Vec<_>>();
     groups.sort_by_key(|(_, ids)| std::cmp::Reverse(ids.len()));
     groups.truncate(MAX_GROUPS);
@@ -504,7 +586,7 @@ mod tests {
     use harness_tools::{LearnedRule, RuleAction, RuleState};
     use serde_json::{Value, json};
 
-    use super::{Call, Evolved, accept, annotate, judge_shadows, replay};
+    use super::{Call, Evolved, Records, accept, annotate, judge_rules, replay};
 
     fn call(tool: &str, shape: &str, ok: bool) -> Call {
         Call {
@@ -584,7 +666,12 @@ mod tests {
             ("young", "c0"),
         ]
         .map(|(rule, call)| (rule.to_owned(), call.to_owned()));
-        assert_eq!(judge_shadows(&mut evolved, &recorded, &shadowed), (1, 1));
+        let found = Records {
+            calls: recorded,
+            shadowed: shadowed.to_vec(),
+            acted: Vec::new(),
+        };
+        assert_eq!(judge_rules(&mut evolved, &found), (1, 1));
         let states = evolved
             .rules
             .iter()

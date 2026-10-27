@@ -100,6 +100,12 @@ pub struct Evaluation {
     pub source: String,
     pub stage: u8,
     pub left: u32,
+    /// How much the failure left behind at its stage - the lines of the
+    /// failing check's output, of the verifier's findings - lower is better.
+    /// With one check, `left` is always 1; a test run going from forty
+    /// failures to two is progress the output's length shows.
+    #[serde(default)]
+    pub residue: u32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub detail: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -109,7 +115,15 @@ pub struct Evaluation {
 impl Evaluation {
     /// Whether `self` got further than `other`.
     fn better_than(&self, other: &Self) -> bool {
-        (self.stage, std::cmp::Reverse(self.left)) > (other.stage, std::cmp::Reverse(other.left))
+        (
+            self.stage,
+            std::cmp::Reverse(self.left),
+            std::cmp::Reverse(self.residue),
+        ) > (
+            other.stage,
+            std::cmp::Reverse(other.left),
+            std::cmp::Reverse(other.residue),
+        )
     }
 }
 
@@ -199,7 +213,14 @@ impl StrategyState {
     }
 
     /// Record an evaluation the host ran and say where the task stands.
-    pub fn evaluate(&mut self, source: &str, stage: u8, left: u32, detail: &str) -> Standing {
+    pub fn evaluate(
+        &mut self,
+        source: &str,
+        stage: u8,
+        left: u32,
+        residue: u32,
+        detail: &str,
+    ) -> Standing {
         self.evaluated += 1;
         let detail = clipped(detail, 300);
         self.evaluations.push(Evaluation {
@@ -207,25 +228,32 @@ impl StrategyState {
             source: source.to_owned(),
             stage,
             left,
+            residue,
             detail,
             strategy: self.strategy_name(),
         });
         let excess = self.evaluations.len().saturating_sub(MAX_EVALUATIONS);
         self.evaluations.drain(..excess);
         let plateau = self.plateau();
+        // Asked once per plateau: not again until the alternatives were
+        // decided on, and a decision to continue gets as many evaluations
+        // as a plateau takes before it is asked again.
+        let decided = self.last_decided();
         Standing {
             plateau,
-            wants_proposals: plateau && self.proposed_after <= self.last_decided(),
+            wants_proposals: plateau
+                && self.proposed_after <= decided
+                && self.evaluated - decided >= PLATEAU,
         }
     }
 
     /// The evaluation `unchanged` repeats: the score of the last one, since a
     /// workspace nothing changed in scores what it scored.
     #[must_use]
-    pub fn last_score(&self) -> Option<(u8, u32)> {
+    pub fn last_score(&self) -> Option<(u8, u32, u32)> {
         self.evaluations
             .last()
-            .map(|evaluation| (evaluation.stage, evaluation.left))
+            .map(|evaluation| (evaluation.stage, evaluation.left, evaluation.residue))
     }
 
     /// The evaluations under the current strategy, oldest first.
@@ -291,7 +319,7 @@ impl StrategyState {
         };
         if kind == DecisionKind::Switch {
             let to = to.ok_or("task_state: a switch names the strategy it switches to")?;
-            if to.name == from {
+            if same_name(&to.name, &from) {
                 return Err(format!(
                     "task_state: {from:?} is the current strategy; continue with it, or switch to another"
                 ));
@@ -535,21 +563,21 @@ mod tests {
         state.set(named("tune the regex"));
         assert!(
             !state
-                .evaluate("checks", stage::CHECKS, 5, "5 failed")
+                .evaluate("checks", stage::CHECKS, 5, 0, "5 failed")
                 .plateau
         );
         // Getting further is progress.
         assert!(
             !state
-                .evaluate("checks", stage::CHECKS, 3, "3 failed")
+                .evaluate("checks", stage::CHECKS, 3, 0, "3 failed")
                 .plateau
         );
         assert!(
             !state
-                .evaluate("checks", stage::CHECKS, 3, "3 failed")
+                .evaluate("checks", stage::CHECKS, 3, 0, "3 failed")
                 .plateau
         );
-        let standing = state.evaluate("checks", stage::CHECKS, 4, "4 failed");
+        let standing = state.evaluate("checks", stage::CHECKS, 4, 0, "4 failed");
         assert!(standing.plateau && standing.wants_proposals);
         assert!(state.decision_due());
     }
@@ -557,9 +585,9 @@ mod tests {
     #[test]
     fn a_later_stage_is_further_than_fewer_problems_at_an_earlier_one() {
         let mut state = StrategyState::default();
-        state.evaluate("checklist", stage::CHECKLIST, 1, "");
-        state.evaluate("checks", stage::CHECKS, 9, "");
-        state.evaluate("verifier", stage::VERIFIER, 1, "");
+        state.evaluate("checklist", stage::CHECKLIST, 1, 0, "");
+        state.evaluate("checks", stage::CHECKS, 9, 0, "");
+        state.evaluate("verifier", stage::VERIFIER, 1, 0, "");
         assert!(!state.plateau(), "every evaluation got further");
     }
 
@@ -568,7 +596,7 @@ mod tests {
         let mut state = StrategyState::default();
         state.set(named("tune the regex"));
         for _ in 0..3 {
-            state.evaluate("checks", stage::CHECKS, 2, "2 failed");
+            state.evaluate("checks", stage::CHECKS, 2, 0, "2 failed");
         }
         state.propose(vec![Alternative {
             name: "Use a parser".to_owned(),
@@ -611,22 +639,45 @@ mod tests {
     fn proposals_are_asked_for_once_per_plateau() {
         let mut state = StrategyState::default();
         for _ in 0..3 {
-            state.evaluate("checks", stage::CHECKS, 2, "");
+            state.evaluate("checks", stage::CHECKS, 2, 0, "");
         }
         state.propose(vec![]);
         assert!(
             !state
-                .evaluate("checks", stage::CHECKS, 2, "")
+                .evaluate("checks", stage::CHECKS, 2, 0, "")
                 .wants_proposals
         );
         state
             .decide(DecisionKind::Continue, None, "one more try".to_owned())
             .expect("continued");
+        // A decision to continue gets a plateau's worth of evaluations
+        // before the strategist is asked again.
+        for _ in 0..2 {
+            assert!(
+                !state
+                    .evaluate("checks", stage::CHECKS, 2, 0, "")
+                    .wants_proposals
+            );
+        }
         assert!(
             state
-                .evaluate("checks", stage::CHECKS, 2, "")
+                .evaluate("checks", stage::CHECKS, 2, 0, "")
                 .wants_proposals
         );
+    }
+
+    /// One check failing every time is not a plateau when what it reports
+    /// keeps shrinking: forty failing tests, then ten, then two.
+    #[test]
+    fn a_failure_that_shrinks_is_progress() {
+        let mut state = StrategyState::default();
+        for residue in [40, 10, 2] {
+            state.evaluate("checks", stage::CHECKS, 1, residue, "");
+        }
+        assert!(!state.plateau());
+        state.evaluate("checks", stage::CHECKS, 1, 2, "");
+        state.evaluate("checks", stage::CHECKS, 1, 3, "");
+        assert!(state.plateau(), "then it stopped shrinking");
     }
 
     #[test]
@@ -638,7 +689,7 @@ mod tests {
             "the regex cannot count brackets".to_owned(),
         );
         for _ in 0..3 {
-            state.evaluate("checks", stage::CHECKS, 2, "2 checks failed");
+            state.evaluate("checks", stage::CHECKS, 2, 0, "2 checks failed");
         }
         state.propose(vec![Alternative {
             name: "use a parser".to_owned(),
