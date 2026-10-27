@@ -51,6 +51,8 @@ pub mod detector;
 pub mod doctor;
 #[path = "application/events.rs"]
 pub mod events;
+#[path = "memory/evolution.rs"]
+pub mod evolution;
 #[path = "presentation/export_html.rs"]
 pub mod export_html;
 #[path = "integrations/extensions.rs"]

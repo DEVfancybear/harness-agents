@@ -8910,9 +8910,19 @@ async fn run_turn(
         &workspace_root,
         refinements,
     )));
+    // What the harness learned from calls that failed: rules applied before a
+    // call runs, and notes in the tools' descriptions.
+    let driver = if refinements {
+        driver.with_learned_rules(Arc::new(super::evolution::rules(&data_dir)))
+    } else {
+        driver
+    };
     let mut tool_schemas = harness_tools::coding_tool_schemas_for(hashline);
     if let Some(tools) = &external_tools {
         tool_schemas.extend(in_cache_order(tools.schemas()));
+    }
+    if refinements {
+        super::evolution::annotate(&data_dir, &mut tool_schemas);
     }
     // The design notes' tiered disclosure: the tools of MCP servers and
     // extensions, when their schemas are long, are listed one per line in the
@@ -9698,6 +9708,24 @@ async fn run_turn(
     // What the turn did with learned skills counts toward whether they survive, and
     // the lifecycle archives the ones that did not earn their place.
     if let Ok(turn) = &outcome {
+        // Once a day the harness evolves by itself from the calls that
+        // failed: rules into shadow, shadows promoted or retired, notes.
+        if auto_refine
+            && refinements
+            && !cancellation.is_cancelled()
+            && super::evolution::due(&data_dir, chrono::Utc::now())
+        {
+            let provider = Arc::clone(&provider);
+            let model = config.model.clone();
+            let data_dir = data_dir.clone();
+            tokio::spawn(async move {
+                if let Err(error) = super::evolution::evolve(&provider, &model, &data_dir).await {
+                    harness_types::diag::warn("evolution", "failed")
+                        .msg(error)
+                        .emit();
+                }
+            });
+        }
         let requests = super::learned::count_request(&learning.layers);
         // Every so many requests the curator folds the learned library into
         // class-level skills, beside the conversation like the review.

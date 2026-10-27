@@ -32,6 +32,8 @@ mod process;
 mod references;
 #[path = "runtime/regulation.rs"]
 mod regulation;
+#[path = "runtime/rules.rs"]
+mod rules;
 #[path = "filesystem/search.rs"]
 mod search;
 #[path = "security/secrets.rs"]
@@ -96,6 +98,7 @@ pub use process::{
 // place the driver writes it.
 pub use harness_runtime::AcceptanceState;
 pub use hooks::{HOOK_EVENTS, HookResponse, fit_payload, hook_matches, run_hooks};
+pub use rules::{LearnedRule, LearnedRules, Realized, RuleAction, RuleState};
 pub use secrets::{HostEnvironmentSecrets, SecretResolver};
 pub use service::{
     ConfiguredToolHook, ExternalToolDispatcher, HistorySemantic, NearestFuture, PathElsewhere,

@@ -976,6 +976,8 @@ pub struct TurnDriver {
     seen: Arc<std::sync::Mutex<std::collections::HashMap<String, harness_types::ContentHash>>>,
     /// The recap and the request to save, when the host keeps a task state.
     context_hooks: Option<Arc<dyn TurnContextHooks>>,
+    /// Rules learned from this project's failures, applied before a call runs.
+    learned_rules: Arc<crate::rules::LearnedRules>,
     /// Which earlier results the current request needs, when the host judges it.
     visibility: Option<Arc<dyn ResultVisibility>>,
     admission: Option<Arc<dyn OutputAdmission>>,
@@ -1097,6 +1099,7 @@ impl TurnDriver {
             stop_event: "stop",
             seen: Arc::default(),
             context_hooks: None,
+            learned_rules: Arc::default(),
             visibility: None,
             admission: None,
             completion: None,
@@ -1108,6 +1111,13 @@ impl TurnDriver {
     #[must_use]
     pub fn with_context_hooks(mut self, hooks: Arc<dyn TurnContextHooks>) -> Self {
         self.context_hooks = Some(hooks);
+        self
+    }
+
+    /// Apply rules learned from this project's failures before calls run.
+    #[must_use]
+    pub fn with_learned_rules(mut self, rules: Arc<crate::rules::LearnedRules>) -> Self {
+        self.learned_rules = rules;
         self
     }
 
@@ -1894,6 +1904,34 @@ impl TurnDriver {
                     let answer = tool_schema_answer(&self.deferred, &call.arguments);
                     slots.push((name.clone(), transcript_id, Slot::Answered(answer)));
                     continue;
+                }
+                // Rules learned from this project's failures: a rule in shadow
+                // only records that it would have acted, under the call's id,
+                // which the call's settled record pairs with how it went.
+                if !self.learned_rules.is_empty() {
+                    let realized = self.learned_rules.realize(&name, &call.arguments);
+                    for (event, ids) in
+                        [("shadowed", &realized.shadowed), ("acted", &realized.acted)]
+                    {
+                        for id in ids {
+                            harness_types::diag::info("rule", event)
+                                .call(&transcript_id)
+                                .field("rule", id.clone())
+                                .field("tool", name.clone())
+                                .emit();
+                        }
+                    }
+                    if let Some(refusal) = realized.refusal {
+                        slots.push((
+                            name.clone(),
+                            transcript_id,
+                            Slot::Failed(refusal, "refused by a learned rule".to_owned()),
+                        ));
+                        continue;
+                    }
+                    if let Some(arguments) = realized.arguments {
+                        call.arguments = arguments;
+                    }
                 }
                 // pa-agent's `validateToolArguments` before every call: the
                 // arguments are checked against the schema the model was shown,

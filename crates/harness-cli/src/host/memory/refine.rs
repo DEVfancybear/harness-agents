@@ -1901,7 +1901,7 @@ const RETRY_MAX_OUTPUT_TOKENS: u32 = 65_536;
 /// prose, or nothing once a thinking model spent its turn reasoning - is asked
 /// for once more with the reply shown: a review used to fail outright with
 /// "the refiner did not return a JSON object".
-async fn complete_json(
+pub(crate) async fn complete_json(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
     purpose: &str,

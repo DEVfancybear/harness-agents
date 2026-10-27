@@ -1763,14 +1763,19 @@ impl Report {
     /// strategist named.
     fn summary_strategy(&self, out: &mut String) {
         let mut regulation: BTreeMap<String, usize> = BTreeMap::new();
-        for record in self
-            .records
-            .iter()
-            .filter(|record| record["kind"] == "regulation")
-        {
-            *regulation
-                .entry(record["event"].as_str().unwrap_or("?").to_owned())
-                .or_default() += 1;
+        for record in self.records.iter().filter(|record| {
+            matches!(
+                record["kind"].as_str(),
+                Some("regulation" | "rule" | "evolution")
+            )
+        }) {
+            // A learned rule's and the evolution's events read with their kind.
+            let event = record["event"].as_str().unwrap_or("?");
+            let label = match record["kind"].as_str() {
+                Some(kind) if kind != "regulation" => format!("{kind} {event}"),
+                _ => event.to_owned(),
+            };
+            *regulation.entry(label).or_default() += 1;
         }
         let evaluated = self.recorded("strategy", "evaluated");
         let decided = self.recorded("strategy", "decided");
