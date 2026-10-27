@@ -7501,14 +7501,27 @@ pub(super) async fn refine_transcript(
     local: &Path,
 ) -> String {
     let reviewed = super::refine::reviewed_through(local).and_then(|id| SessionId::parse(id).ok());
-    harness_runtime::conversation_transcript(
+    let transcript = harness_runtime::conversation_transcript(
         store,
         session,
         REFINE_TRANSCRIPT_TURNS,
         reviewed.as_ref(),
     )
     .await
-    .unwrap_or_default()
+    .unwrap_or_default();
+    // Which strategies stalled and which got further, with the evaluations
+    // that showed it: the review keeps it as a lesson for the next task's
+    // first choice of strategy, the one arXiv 2608.19072 found agents lock
+    // into.
+    let strategy =
+        super::task_state::load(&local.join(super::task_state::TASK_STATE_FILE)).strategy;
+    if transcript.is_empty() || strategy.decisions.is_empty() {
+        return transcript;
+    }
+    format!(
+        "{transcript}\n\n[The task's strategy record, kept by the host. A strategy that stalled and the one that got further are a lesson worth keeping for this project, with this record as the evidence.]\n{}",
+        super::strategy::view(&strategy).join("\n")
+    )
 }
 
 /// What `/refine` needs to write learned skills in this workspace.

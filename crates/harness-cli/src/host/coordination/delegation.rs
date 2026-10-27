@@ -3262,6 +3262,27 @@ impl ExternalToolCatalog for DelegateCatalog {
             json!({
                 "type": "function",
                 "function": {
+                    "name": COMPARE_TOOL,
+                    "description": "Compare finished coder children that tried different approaches to the same work, before integrating one: the project's [verify] checks run in each coder's own worktree, and each one's changes are measured against where it started. Nothing is merged or applied. Use it when you ran two strategies side by side - the switch arXiv 2608.19072 found agents rarely make - and integrate the one that did better.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "children": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1},
+                                "minItems": 2,
+                                "maxItems": 4,
+                                "description": "Coder children by name or id."
+                            }
+                        },
+                        "required": ["children"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
                     "name": ROOT_MESSAGE_TOOL,
                     "description": "Send a message to one of your delegated agents by name (receiver_role \"child\", the default, with receiver_name) or to all of them (\"all\"). A running child reads it at its next step; a child that finished or was stopped wakes with it and continues its own conversation where it left off, instead of starting over.",
                     "parameters": {
@@ -3280,20 +3301,49 @@ impl ExternalToolCatalog for DelegateCatalog {
     }
 
     fn resolve(&self, name: &str, arguments: &Value) -> Option<CodingToolAction> {
-        matches!(name, "delegate" | INTEGRATE_TOOL | ROOT_MESSAGE_TOOL).then(|| {
-            CodingToolAction::ExternalTool {
-                plugin_id: "delegate".to_owned(),
-                tool_name: name.to_owned(),
-                arguments: arguments.clone(),
-                parent_invocation_id: None,
-                timeout_ms: 120_000,
-            }
+        matches!(
+            name,
+            "delegate" | INTEGRATE_TOOL | COMPARE_TOOL | ROOT_MESSAGE_TOOL
+        )
+        .then(|| CodingToolAction::ExternalTool {
+            plugin_id: "delegate".to_owned(),
+            tool_name: name.to_owned(),
+            arguments: arguments.clone(),
+            parent_invocation_id: None,
+            timeout_ms: 120_000,
         })
     }
 }
 
 /// The root agent's tool that brings its coders' work back.
 const INTEGRATE_TOOL: &str = "integrate_children";
+
+/// The root agent's tool that compares its coders' work before one is chosen.
+const COMPARE_TOOL: &str = "compare_children";
+
+/// The coders `compare_children` names: two to four.
+fn compared_children(arguments: &Value) -> Result<Vec<String>, HarnessError> {
+    let children = arguments["children"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if (2..=4).contains(&children.len()) {
+        Ok(children)
+    } else {
+        Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            "compare_children: name two to four coder children",
+        ))
+    }
+}
 
 /// The root agent's tool that messages its children - and wakes a settled
 /// one. Without it the root reached them only through the Python kernel, so
@@ -3605,6 +3655,66 @@ impl DelegateTool {
         Ok(members)
     }
 
+    /// `compare_children`: each coder's work, checked where it was made.
+    async fn compare(&self, arguments: &Value) -> Result<Value, HarnessError> {
+        let selectors = compared_children(arguments)?;
+        let members = self.integration_members(Some(&selectors))?;
+        let checks = &self.launch.checks;
+        let mut lines = Vec::new();
+        let mut rows = Vec::new();
+        for member in &members {
+            let root = std::path::PathBuf::from(&member.worktree.path);
+            // What it committed since it started, and what it left
+            // uncommitted - new files included, which a diff leaves out.
+            let committed = tokio::process::Command::new("git")
+                .args(["diff", "--shortstat", &member.worktree.base_commit, "HEAD"])
+                .current_dir(&root)
+                .output()
+                .await
+                .ok()
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                .filter(|text| !text.is_empty());
+            let changes = match (committed, changed_files(&root)) {
+                (Some(committed), Some(files)) => {
+                    format!("committed: {committed}; uncommitted: {files}")
+                }
+                (Some(committed), None) => format!("committed: {committed}"),
+                (None, Some(files)) => format!("uncommitted: {files}"),
+                (None, None) => "no changes".to_owned(),
+            };
+            let (verdict, passed) = if checks.is_empty() {
+                ("no [verify] checks are configured".to_owned(), None)
+            } else {
+                let report = super::verify::run(&root, checks, &self.parent_cancellation).await;
+                let passed = report.runs.iter().filter(|run| run.passed).count();
+                let verdict = match report.failure() {
+                    Some(run) => format!(
+                        "{passed}/{} checks passed; `{}` {}",
+                        report.total, run.name, run.exit_text
+                    ),
+                    None => format!("{passed}/{} checks passed", report.total),
+                };
+                (verdict, Some(passed))
+            };
+            lines.push(format!("- {}: {verdict}; {changes}", member.name));
+            rows.push(json!({
+                "child": member.name,
+                "checks_passed": passed,
+                "checks": checks.len(),
+                "changes": changes,
+            }));
+        }
+        Ok(json!({
+            "status": "compared",
+            "text": format!(
+                "Compared {} coders, each in its own worktree (nothing was merged or applied):\n{}\nIntegrate the one that did better with integrate_children.",
+                members.len(),
+                lines.join("\n")
+            ),
+            "children": rows,
+        }))
+    }
+
     /// `integrate_children`: merge finished coders' branches in a separate
     /// integration worktree, run the project's checks on the merged revision
     /// and - when asked and the user's checkout has not moved - fast-forward
@@ -3881,6 +3991,9 @@ impl ExternalToolDispatcher for DelegateTool {
             if plugin_id == "delegate" && tool_name == INTEGRATE_TOOL {
                 return IntegrateRequest::parse(arguments).map(|_| ());
             }
+            if plugin_id == "delegate" && tool_name == COMPARE_TOOL {
+                return compared_children(arguments).map(|_| ());
+            }
             if plugin_id == "delegate" && tool_name == ROOT_MESSAGE_TOOL {
                 return root_message_request(arguments)
                     .map(|_| ())
@@ -3922,6 +4035,7 @@ impl ExternalToolDispatcher for DelegateTool {
             let payload = match (plugin_id, tool_name) {
                 ("delegate", "delegate") => self.run(arguments).await?,
                 ("delegate", INTEGRATE_TOOL) => self.integrate(arguments).await?,
+                ("delegate", COMPARE_TOOL) => self.compare(arguments).await?,
                 ("delegate", ROOT_MESSAGE_TOOL) => {
                     let request = root_message_request(arguments)
                         .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error))?;
@@ -6718,6 +6832,34 @@ pub(super) mod tests {
             agents.elsewhere("made.txt").is_empty(),
             "an integrated coder's files are in the checkout"
         );
+    }
+
+    /// Two coders that tried different approaches are compared where each
+    /// worked: the check runs in each worktree, nothing reaches the user's
+    /// checkout, and the one that passes is told apart from the one that fails.
+    #[tokio::test]
+    async fn compare_children_checks_each_coder_in_its_own_worktree() {
+        let mut bench = IntegrationBench::new();
+        let first = bench.coder("answer.txt=wrong").await;
+        let second = bench.coder("answer.txt=right").await;
+        let names =
+            [&first, &second].map(|coder| coder["name"].as_str().unwrap_or_default().to_owned());
+        let base = bench.head();
+        bench.check("git grep --untracked -q right -- answer.txt");
+        let compared = bench
+            .tool
+            .compare(&serde_json::json!({"children": names}))
+            .await
+            .expect("compared");
+        assert_eq!(compared["status"], "compared", "{compared}");
+        let rows = compared["children"].as_array().expect("rows");
+        assert_eq!(rows[0]["checks_passed"], 0, "{compared}");
+        assert_eq!(rows[1]["checks_passed"], 1, "{compared}");
+        let text = compared["text"].as_str().unwrap_or_default();
+        assert!(text.contains("uncommitted: answer.txt"), "{text}");
+        assert_eq!(bench.head(), base);
+        assert_eq!(bench.status(), "", "nothing was merged");
+        assert!(super::compared_children(&serde_json::json!({"children": ["one"]})).is_err());
     }
 
     /// Two coders that changed different files merge, the project's check runs
