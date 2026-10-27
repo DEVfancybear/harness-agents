@@ -3353,7 +3353,13 @@ mod tests {
             memories[0].content.as_deref(),
             Some("The user prefers tabs")
         );
-        std::fs::remove_file(dirs.local.join("harness_state.json")).expect("reset memory");
+        // Emptied outside the kernel, as another writer would.
+        crate::interactive::memory_store::save_document(
+            &dirs.local,
+            &crate::interactive::memory_store::empty_document(),
+            &crate::interactive::memory_store::Writer::new("test", &serde_json::json!({}), "reset"),
+        )
+        .expect("reset memory");
         assert_eq!(
             run(
                 "[entry.id for entry in rlm.harness.list('memory')]",
@@ -3362,7 +3368,7 @@ mod tests {
             )
             .await,
             "[]",
-            "the running kernel must observe removal of the memory file"
+            "the running kernel must observe the reset"
         );
         let recreated = run(
             "rlm.harness.create_memory('Formatting', 'Keep existing formatting').id",
