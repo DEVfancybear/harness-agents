@@ -9,7 +9,8 @@
 #   3. (bug report 2026-10-26) a message queued while a turn ran waits while
 #      the provider's usage limit parks the session - it started a turn 29 ms
 #      after the park, which called the provider and parked it again - and
-#      runs once the park is over;
+#      the user's own message still runs while parked (it waited forever),
+#      after the held one;
 #   4. a child told its usage limit resets in hours asks once, not three
 #      times a minute apart.
 # Sections 3 and 4 need MODEL on openai-codex: the agents reach ChatGPT through
@@ -169,16 +170,19 @@ check "no turn started while the session was parked" '[ -n "$parked" ] && ! (rec
 check "no call reached the provider while parked" '[ -n "$parked" ] && [ "$(requests "$parked" | wc -l)" -eq 0 ]'
 rm -f "$X/limit"
 before=$(now_ms)
-say q3 "Trả lời đúng một dòng: USER-OK" | tail -1 | sed 's/^/   /'
-# The user's own turn is answered, which ends the park; the queued message
-# runs after it.
+# Bounded: a parked, idle agent queued the user's message "after the active
+# run" with no run to finish, and the wait never ended.
+user_ok=$(timeout 600 "$HA" send q3 "Trả lời đúng một dòng: USER-OK" --wait 2>&1)
+echo "$user_ok" | tail -1 | sed 's/^/   /'
+# The user's message runs while parked, after the message the park held; the
+# model answering ends the park.
 ran=""
 for _ in $(seq 1 40); do
   ran=$(requests "$before" | awk -v code="$code" '$2 == 200 && $0 ~ code' | head -1)
   [ -n "$ran" ] && break
   sleep 3
 done
-check "the user's turn ran while parked" 'last | grep -q "USER-OK"'
+check "the user's message ran while parked" 'echo "$user_ok" | grep -q "USER-OK"'
 check "the queued message ran once the park was over" '[ -n "$ran" ]'
 "$HA" shutdown --force >/dev/null 2>&1
 
