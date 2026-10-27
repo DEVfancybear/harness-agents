@@ -201,7 +201,7 @@ echo "################ 8. a review that cannot take the lock leaves no page or s
 before=$(history_lines "$L/refinements.jsonl")
 touch "$RX/exec8.marker"
 hold "$L/memory.lock" 600
-run_exec e8 --resume "$T" "Lượt này đừng gọi tool memory hay knowledge, chỉ trả lời. Mình vừa chốt cách tính phí ship của cửa hàng: đơn dưới 300 nghìn tính 30 nghìn, từ 300 nghìn đến dưới 1 triệu tính 15 nghìn, từ 1 triệu trở lên miễn phí; vùng xa cộng thêm 20 nghìn. Đây là quy tắc lâu dài của cửa hàng, hãy giải thích ngắn quy tắc này cho khách."
+run_exec e8 --resume "$T" "Lượt này bạn chỉ trả lời, đừng tự gọi tool memory hay knowledge: việc lưu lại quy tắc này là phần của review harness chạy sau lượt, và mình muốn nó được lưu. Mình vừa chốt cách tính phí ship của cửa hàng: đơn dưới 300 nghìn tính 30 nghìn, từ 300 nghìn đến dưới 1 triệu tính 15 nghìn, từ 1 triệu trở lên miễn phí; vùng xa cộng thêm 20 nghìn. Đây là quy tắc lâu dài của cửa hàng, hãy giải thích ngắn quy tắc này cho khách."
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 check "the review's apply timed out on the lock" 'grep -q "refine failed: waiting for another memory write timed out" "$RX/e8.err"'
 check "no refinement was recorded" '[ "$(history_lines "$L/refinements.jsonl")" -eq "$before" ]'
