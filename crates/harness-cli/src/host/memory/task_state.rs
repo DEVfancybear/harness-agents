@@ -1099,7 +1099,11 @@ mod tests {
             Some("a parser")
         );
         assert!(!state.render().contains("Decision due"));
-        assert!(state.render().contains("[plan] extend the regex for nesting"));
+        assert!(
+            state
+                .render()
+                .contains("[plan] extend the regex for nesting")
+        );
         let missing = host
             .execute(&json!({"action": "update", "decide": {"kind": "continue"}}))
             .expect_err("a decision gives its evidence");

@@ -9293,6 +9293,24 @@ async fn run_turn(
             ),
         ));
     }
+    // The one learned skill that fits this request, with what it took for
+    // granted when it failed (LIFE-HARNESS's procedural skill layer).
+    if refinements {
+        let query = goal_objective
+            .into_iter()
+            .chain(digest_context.first().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let skills = super::learned::library(&learning.layers);
+        if let Some(recalled) = super::skill_recall::recall(&learning.layers, &skills, &query) {
+            harness_types::diag::info("skill", "recalled")
+                .field("skill", recalled.name.clone())
+                .field("score", recalled.score)
+                .field("failures", recalled.failures.len())
+                .emit();
+            project_blocks.push(super::skill_recall::block(&recalled));
+        }
+    }
     // Ranked like the digest: the goal, then what the user typed, the task's
     // recap, what they said before, the feature in progress.
     let knowledge_queries = goal_objective

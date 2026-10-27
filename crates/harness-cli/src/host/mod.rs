@@ -154,6 +154,8 @@ pub mod service_tier;
 mod session_brief;
 #[path = "application/side_question.rs"]
 pub mod side_question;
+#[path = "memory/skill_recall.rs"]
+pub mod skill_recall;
 #[path = "integrations/skill_requests.rs"]
 pub mod skill_requests;
 #[path = "integrations/skills.rs"]
