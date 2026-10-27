@@ -30,6 +30,8 @@ mod prefetch;
 mod process;
 #[path = "filesystem/references.rs"]
 mod references;
+#[path = "runtime/regulation.rs"]
+mod regulation;
 #[path = "filesystem/search.rs"]
 mod search;
 #[path = "security/secrets.rs"]

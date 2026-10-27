@@ -1345,6 +1345,8 @@ impl TurnDriver {
             std::collections::HashMap::new();
         // Whether the model has already been told it is repeating itself.
         let mut loop_warned = false;
+        // What the turn's calls are doing, judged after each one.
+        let mut regulator = crate::regulation::Regulator::default();
         // Whether a stop hook already sent this turn on: Claude Code's
         // `stop_hook_active`, so a hook can let the second stop through.
         let mut stop_hook_active = false;
@@ -1848,6 +1850,8 @@ impl TurnDriver {
                 result.tool_calls.clone().into_iter().zip(transcript_ids)
             {
                 tool_calls += 1;
+                // The call as the model wrote it, which the regulator compares.
+                let written_arguments = call.arguments.clone();
                 // A deferred tool is called through `use_tool`: from here on it
                 // is that tool's call, checked against its schema and gated as
                 // any call is.
@@ -1935,6 +1939,29 @@ impl TurnDriver {
                             continue;
                         }
                     }
+                }
+                // The same call that just failed, with nothing changed since,
+                // fails the same way: it is answered without running.
+                if let Some(refusal) =
+                    regulator.repeat_of_failure(&name, &format!("{name}|{written_arguments}"))
+                {
+                    harness_types::diag::info("regulation", "repeat_refused")
+                        .call(&transcript_id)
+                        .field("tool", name.clone())
+                        .field(
+                            "args_hash",
+                            crate::regulation::arguments_hash(&written_arguments),
+                        )
+                        .emit();
+                    slots.push((
+                        name.clone(),
+                        transcript_id,
+                        Slot::Failed(
+                            refusal,
+                            "the same call already failed, unchanged".to_owned(),
+                        ),
+                    ));
+                    continue;
                 }
                 if runs_alone(&name) {
                     run_ready_slots(
@@ -2178,6 +2205,9 @@ impl TurnDriver {
             // Results in call order.
             for (index, (name, transcript_id, slot)) in slots.into_iter().enumerate() {
                 let shown = announced.contains(&index);
+                let intervention =
+                    regulate(&mut regulator, &appended, &name, &transcript_id, &slot);
+                let results_before = appended.len();
                 match slot {
                     Slot::Failed(message, detail) => {
                         observer.observe(TurnProgress::ToolSettled {
@@ -2312,6 +2342,19 @@ impl TurnDriver {
                     }
                     Slot::Ready(_) | Slot::Taken => {}
                 }
+                // The note goes under the result of the call that showed the
+                // pattern, where the model reads what that call did.
+                if let Some(intervention) = intervention
+                    && appended.len() > results_before
+                    && let Some(result) = appended.last_mut()
+                {
+                    observer.observe(TurnProgress::Notice(format!(
+                        "regulation: {}",
+                        intervention.kind.replace('_', " ")
+                    )));
+                    result.content.push_str("\n\n");
+                    result.content.push_str(&intervention.note);
+                }
             }
 
             // pa-agent's steering poll after the tool batch: what the user sent
@@ -2344,6 +2387,19 @@ impl TurnDriver {
                 break TurnStop::Deadline;
             }
             observer.observe(TurnProgress::StepStarted { step: steps });
+            if let Some(budget) = regulator.budget(
+                steps,
+                options.limits.max_steps,
+                tool_calls,
+                options.limits.max_tool_calls,
+            ) {
+                harness_types::diag::info("regulation", "budget")
+                    .field("steps", steps)
+                    .field("tool_calls", tool_calls)
+                    .emit();
+                self.record_host_message(&result.run_id, &budget.note).await;
+                appended.push(ProviderMessage::new(MessageRole::User, budget.note));
+            }
             if let Some(warning) = loop_warning {
                 observer.observe(TurnProgress::Notice(
                     "the same read repeated with nothing changed; asking the model to answer"
@@ -3624,6 +3680,62 @@ fn summarize_arguments(arguments: &str) -> String {
 /// A stable signature of one requested tool call.
 fn call_signature(call: &NormalizedToolCall) -> String {
     format!("{}|{}", call.name, call.arguments)
+}
+
+/// Record a settled call - what it looked like and how it failed, for the
+/// diagnostics a later look at failures reads - and ask the regulator what the
+/// trajectory now shows.
+fn regulate(
+    regulator: &mut crate::regulation::Regulator,
+    appended: &[ProviderMessage],
+    name: &str,
+    transcript_id: &str,
+    slot: &Slot,
+) -> Option<crate::regulation::Intervention> {
+    use crate::regulation::{Failure, arguments_hash, arguments_shape};
+    let failure = match slot {
+        Slot::Ready(_) | Slot::Taken => return None,
+        Slot::Failed(_, detail) => Some(Failure::new("invalid_call", detail)),
+        Slot::Done(Ok(view)) => {
+            failure_detail(&view.output).map(|detail| Failure::new("denied", &detail))
+        }
+        Slot::Done(Err(error)) => Some(Failure::new(error.code().as_str(), error.message())),
+        Slot::Answered(_) => None,
+        // Several files read in one call failed only if every one did.
+        Slot::Many(parts) => parts
+            .iter()
+            .all(Result::is_err)
+            .then(|| parts.iter().find_map(|part| part.as_ref().err()))
+            .flatten()
+            .map(|error| Failure::new(error.code().as_str(), error.message())),
+    };
+    let arguments = appended
+        .iter()
+        .flat_map(|message| message.tool_calls.iter())
+        .find(|call| call.call_id == transcript_id)
+        .map(|call| call.arguments.clone())
+        .unwrap_or_default();
+    let mut record = harness_types::diag::info("call", "settled")
+        .call(transcript_id)
+        .field("tool", name.to_owned())
+        .field("ok", failure.is_none())
+        .field("args_hash", arguments_hash(&arguments))
+        .field("args_shape", arguments_shape(&arguments));
+    if let Some(failure) = &failure {
+        record = record
+            .field("error_class", failure.class.clone())
+            .field("error_code", failure.code.clone());
+    }
+    record.emit();
+    let intervention = regulator.settle(name, &format!("{name}|{arguments}"), failure);
+    if let Some(intervention) = &intervention {
+        harness_types::diag::warn("regulation", intervention.kind)
+            .call(transcript_id)
+            .field("tool", name.to_owned())
+            .msg(intervention.note.clone())
+            .emit();
+    }
+    intervention
 }
 
 /// The first call of a batch that repeats a read to the limit, counting every

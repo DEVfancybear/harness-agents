@@ -1363,6 +1363,79 @@ async fn m3_03_loop_detection() {
     close(store).await;
 }
 
+/// The same failure with different arguments is a pattern the loop check never
+/// saw: the third is answered with a note naming it, and the same failed call
+/// made again, with nothing changed, is not run (LIFE-HARNESS's trajectory
+/// regulation and action realization).
+#[tokio::test]
+async fn m3_03_a_failure_repeated_is_named_and_an_unchanged_retry_is_not_run() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let read = |id: &str, path: &str| {
+        ScriptStep::Events(vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(id, "read_file", json!({"path": path}).to_string()),
+            ProviderStreamEvent::completed("tool_calls"),
+        ])
+    };
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        read("c1", "src/a.rs"),
+        read("c2", "src/net/a.rs"),
+        read("c3", "lib/a.rs"),
+        read("c4", "lib/a.rs"),
+        ScriptStep::Events(vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("not found"),
+            ProviderStreamEvent::completed("stop"),
+        ]),
+    ]));
+    let (runtime, _) = runtime_for(&store, provider.clone(), None, None).await;
+    let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)));
+    let outcome = driver
+        .run_turn(
+            request(
+                &bench.workspace,
+                SessionId::generate(),
+                TaskId::generate(),
+                "find a.rs",
+            ),
+            options(&bench.workspace),
+            Arc::new(RecordingObserver::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn runs");
+    assert_eq!(outcome.stop, TurnStop::Final);
+    let seen = provider.seen();
+    let result = |request: usize, call: &str| {
+        seen[request]
+            .messages
+            .iter()
+            .find(|message| {
+                message.role == MessageRole::Tool && message.tool_call_id.as_deref() == Some(call)
+            })
+            .map(|message| message.content.clone())
+            .expect("the call's result")
+    };
+    assert!(
+        !result(2, "c2").contains("[harness:"),
+        "two failures are not yet a pattern"
+    );
+    let third = result(3, "c3");
+    assert!(
+        third.contains("read_file has failed 3 times")
+            && third.contains("3 different sets of arguments"),
+        "{third}"
+    );
+    let fourth = result(4, "c4");
+    assert!(
+        fourth.contains("not executed: this exact read_file call already failed"),
+        "{fourth}"
+    );
+    drop(driver);
+    close(store).await;
+}
+
 #[tokio::test]
 async fn multi_file_reads_deliver_host_context_to_the_next_provider_request() {
     struct FileContext;
