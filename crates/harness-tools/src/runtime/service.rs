@@ -1343,7 +1343,7 @@ impl ToolExecutionService {
             | CodingToolAction::EditFile { path, .. } => {
                 let _ = resolve_relative(root, path, false)?;
             }
-            CodingToolAction::ListFiles { path }
+            CodingToolAction::ListFiles { path, .. }
             | CodingToolAction::SearchText { path, .. }
             | CodingToolAction::FindFiles { path, .. }
             | CodingToolAction::GitDiff { path }
@@ -1724,18 +1724,34 @@ impl ToolExecutionService {
                     limit.unwrap_or(crate::contracts::READ_FILE_DEFAULT_LINES),
                     self.hashline,
                 )?;
+                let references = target
+                    .strip_prefix(root)
+                    .map(|relative| {
+                        crate::references::named_files(
+                            root,
+                            &crate::walk::relative_text(relative),
+                            &output.text,
+                        )
+                    })
+                    .unwrap_or_default();
                 Ok(Dispatched::plain(ToolOutput::ReadFile {
                     path: path.replace('\\', "/"),
                     content: output.text,
                     truncated: output.truncated,
                     hash,
+                    references,
                 }))
             }
-            CodingToolAction::ListFiles { path } => {
+            CodingToolAction::ListFiles { path, preview } => {
                 let (paths, truncated) = list_files(root, path.as_deref())?;
+                let previews = match preview {
+                    Some(lines) => crate::workspace::preview_files(root, path.as_deref(), *lines)?,
+                    None => Vec::new(),
+                };
                 Ok(Dispatched::plain(ToolOutput::ListFiles {
                     paths,
                     truncated,
+                    previews,
                 }))
             }
             CodingToolAction::SearchText {
@@ -3398,6 +3414,7 @@ mod tests {
                 temp.clone(),
                 CodingToolAction::ListFiles {
                     path: Some("   ".to_owned()),
+                    preview: None,
                 },
             ))
             .await

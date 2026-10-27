@@ -16,6 +16,7 @@
 //!   that can hold a match, and only those are read.
 
 use std::{
+    collections::HashMap,
     path::Path,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -250,22 +251,16 @@ fn file_matches(
     found
 }
 
-/// Search `walk` (the files of the searched folder) for `query`.
-pub(crate) fn search(
-    root: &Path,
-    walk: &Walk,
-    query: &SearchQuery<'_>,
-) -> Result<Found, HarnessError> {
-    let matchers = Matchers::new(query.query, query.use_regex, query.case_insensitive)?;
-    let file_matcher = query
-        .glob
+/// The files of `walk` a search with `glob` reads.
+fn globbed<'w>(walk: &'w Walk, glob: Option<&str>) -> Result<Vec<&'w WalkFile>, HarnessError> {
+    let file_matcher = glob
         .map(|pattern| {
             Glob::new(pattern)
                 .map(|glob| glob.compile_matcher())
                 .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error.to_string()))
         })
         .transpose()?;
-    let globbed: Vec<&WalkFile> = walk
+    Ok(walk
         .files
         .iter()
         .filter(|file| {
@@ -273,16 +268,86 @@ pub(crate) fn search(
                 .as_ref()
                 .is_none_or(|matcher| matcher.is_match(Path::new(&file.relative)))
         })
-        .collect();
+        .collect())
+}
+
+fn search_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .clamp(1, 16)
+}
+
+/// A result being filled up to the output bounds: 512 matches, 50 KB.
+#[derive(Default)]
+struct Output {
+    hits: Vec<SearchMatch>,
+    bytes: usize,
+}
+
+impl Output {
+    /// Add `hit` of `path`; `false`, adding nothing, once the result is full.
+    fn push(&mut self, path: &str, hit: RawMatch) -> bool {
+        if self.hits.len() == MAX_SEARCH_MATCHES {
+            return false;
+        }
+        let context_bytes = hit.context.iter().map(String::len).sum::<usize>();
+        let cost = hit
+            .preview
+            .len()
+            .saturating_add(context_bytes)
+            .saturating_add(path.len());
+        if self.bytes.saturating_add(cost) > DEFAULT_MAX_BYTES {
+            return false;
+        }
+        self.bytes = self.bytes.saturating_add(cost);
+        self.hits.push(SearchMatch {
+            path: path.to_owned(),
+            line: u64::try_from(hit.line.saturating_add(1)).unwrap_or(u64::MAX),
+            column: u64::try_from(hit.column.saturating_add(1)).unwrap_or(u64::MAX),
+            context_start: if hit.context.is_empty() {
+                0
+            } else {
+                u64::try_from(hit.context_start).unwrap_or(u64::MAX)
+            },
+            preview: hit.preview,
+            context: hit.context,
+            anchor: hit.anchor,
+        });
+        true
+    }
+
+    fn found(self, truncated: bool) -> Found {
+        Found {
+            matches: self.hits,
+            truncated,
+        }
+    }
+}
+
+fn root_relative(root: &Path, file: &WalkFile) -> Result<String, HarnessError> {
+    let relative = file.absolute.strip_prefix(root).map_err(|_| {
+        HarnessError::new(
+            ErrorCode::WorkspaceEscape,
+            "searched path escaped workspace root",
+        )
+    })?;
+    Ok(relative_text(relative))
+}
+
+/// Search `walk` (the files of the searched folder) for `query`.
+pub(crate) fn search(
+    root: &Path,
+    walk: &Walk,
+    query: &SearchQuery<'_>,
+) -> Result<Found, HarnessError> {
+    let matchers = Matchers::new(query.query, query.use_regex, query.case_insensitive)?;
+    let globbed = globbed(walk, query.glob)?;
     let candidates = crate::index::candidates(root, &globbed, &matchers, query.case_insensitive)
         .unwrap_or_else(|| (0..globbed.len()).collect());
     let context_lines = usize::try_from(query.context_lines).unwrap_or(0);
-    let threads = std::thread::available_parallelism()
-        .map_or(4, std::num::NonZeroUsize::get)
-        .clamp(1, 16);
+    let threads = search_threads();
     let block = threads * 16;
-    let mut hits = Vec::new();
-    let mut output_bytes = 0_usize;
+    let mut output = Output::default();
     for chunk in candidates.chunks(block) {
         let scanned = scan_block(
             &globbed,
@@ -296,54 +361,138 @@ pub(crate) fn search(
             if raw.is_empty() {
                 continue;
             }
-            let file = globbed[*file_index];
-            let relative = file.absolute.strip_prefix(root).map_err(|_| {
-                HarnessError::new(
-                    ErrorCode::WorkspaceEscape,
-                    "searched path escaped workspace root",
-                )
-            })?;
-            let path = relative_text(relative);
+            let path = root_relative(root, globbed[*file_index])?;
             for hit in raw {
-                if hits.len() == MAX_SEARCH_MATCHES {
-                    return Ok(Found {
-                        matches: hits,
-                        truncated: true,
-                    });
+                if !output.push(&path, hit) {
+                    return Ok(output.found(true));
                 }
-                let context_bytes = hit.context.iter().map(String::len).sum::<usize>();
-                let cost = hit
-                    .preview
-                    .len()
-                    .saturating_add(context_bytes)
-                    .saturating_add(path.len());
-                if output_bytes.saturating_add(cost) > DEFAULT_MAX_BYTES {
-                    return Ok(Found {
-                        matches: hits,
-                        truncated: true,
-                    });
-                }
-                output_bytes = output_bytes.saturating_add(cost);
-                hits.push(SearchMatch {
-                    path: path.clone(),
-                    line: u64::try_from(hit.line.saturating_add(1)).unwrap_or(u64::MAX),
-                    column: u64::try_from(hit.column.saturating_add(1)).unwrap_or(u64::MAX),
-                    context_start: if hit.context.is_empty() {
-                        0
-                    } else {
-                        u64::try_from(hit.context_start).unwrap_or(u64::MAX)
-                    },
-                    preview: hit.preview,
-                    context: hit.context,
-                    anchor: hit.anchor,
-                });
             }
         }
     }
-    Ok(Found {
-        matches: hits,
-        truncated: false,
-    })
+    Ok(output.found(false))
+}
+
+/// How often each word of a query occurs in one file.
+pub(crate) struct WordCounts {
+    /// The file's position in the walk.
+    pub file: usize,
+    /// Occurrences of each word (without case), in the query's order.
+    pub counts: Vec<u32>,
+}
+
+/// Every searched file holding one of `words` (lowercase), in path order,
+/// with how often each occurs; and how many files were searched. Unlike
+/// [`search`] nothing is cut at 512 matches, so a ranking sees every file: a
+/// word on every line of the first files no longer hides the file holding
+/// the rare one.
+pub(crate) fn word_counts(
+    root: &Path,
+    walk: &Walk,
+    words: &[String],
+    glob: Option<&str>,
+) -> Result<(Vec<WordCounts>, usize), HarnessError> {
+    let any = words
+        .iter()
+        .map(|word| regex::escape(word))
+        .collect::<Vec<_>>()
+        .join("|");
+    let matchers = Matchers::new(&any, true, true)?;
+    let globbed = globbed(walk, glob)?;
+    let candidates = crate::index::candidates(root, &globbed, &matchers, true)
+        .unwrap_or_else(|| (0..globbed.len()).collect());
+    let finders = words
+        .iter()
+        .map(|word| memchr::memmem::Finder::new(word.as_bytes()))
+        .collect::<Vec<_>>();
+    let next = AtomicUsize::new(0);
+    let threads = search_threads().min(candidates.len()).max(1);
+    let mut found = std::thread::scope(|scope| {
+        let handles = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut local = Vec::new();
+                    while let Some(position) = candidates.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        let file = globbed[*position];
+                        let Some(text) = searchable_text(file) else {
+                            continue;
+                        };
+                        let lower = text.to_lowercase();
+                        let counts = finders
+                            .iter()
+                            .map(|finder| {
+                                u32::try_from(finder.find_iter(lower.as_bytes()).count())
+                                    .unwrap_or(u32::MAX)
+                            })
+                            .collect::<Vec<_>>();
+                        if counts.iter().any(|count| *count > 0) {
+                            local.push((file.absolute.clone(), counts));
+                        }
+                    }
+                    local
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect::<Vec<_>>()
+    });
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    let positions = walk
+        .files
+        .iter()
+        .enumerate()
+        .map(|(position, file)| (&file.absolute, position))
+        .collect::<HashMap<_, _>>();
+    let counted = found
+        .into_iter()
+        .filter_map(|(absolute, counts)| {
+            Some(WordCounts {
+                file: *positions.get(&absolute)?,
+                counts,
+            })
+        })
+        .collect();
+    Ok((counted, globbed.len()))
+}
+
+/// The lines of `files` (positions in `walk`) that match `query`, file by
+/// file in the order given, one entry per line, a file's lines ordered by
+/// `weight` (highest first, then in file order) and at most `per_file` of
+/// them; then cut to the output bounds. The flag says whether a file had more
+/// lines than it shows.
+pub(crate) fn ranked_matches(
+    root: &Path,
+    walk: &Walk,
+    files: &[usize],
+    query: &SearchQuery<'_>,
+    per_file: usize,
+    weight: impl Fn(&str) -> u64,
+) -> Result<(Found, bool), HarnessError> {
+    let matchers = Matchers::new(query.query, query.use_regex, query.case_insensitive)?;
+    let context_lines = usize::try_from(query.context_lines).unwrap_or(0);
+    let mut output = Output::default();
+    let mut cut = false;
+    for position in files {
+        let Some(file) = walk.files.get(*position) else {
+            continue;
+        };
+        let Some(text) = searchable_text(file) else {
+            continue;
+        };
+        let mut raw = file_matches(&text, &matchers, context_lines, query.anchors, usize::MAX);
+        raw.dedup_by_key(|hit| hit.line);
+        raw.sort_by_key(|hit| std::cmp::Reverse(weight(&hit.preview)));
+        cut |= raw.len() > per_file;
+        let path = root_relative(root, file)?;
+        for hit in raw.into_iter().take(per_file) {
+            if !output.push(&path, hit) {
+                return Ok((output.found(true), cut));
+            }
+        }
+    }
+    Ok((output.found(false), cut))
 }
 
 /// The matches of each file of one block, scanned side by side, returned in

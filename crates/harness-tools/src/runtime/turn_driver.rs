@@ -3277,9 +3277,15 @@ fn summarize_action(action: &CodingToolAction) -> String {
                 limit.unwrap_or(crate::contracts::READ_FILE_DEFAULT_LINES)
             ))
         ),
-        CodingToolAction::ListFiles { path } => {
-            format!("list {}", path.as_deref().unwrap_or("."))
-        }
+        CodingToolAction::ListFiles { path, preview } => format!(
+            "list {}{}",
+            path.as_deref().unwrap_or("."),
+            if preview.is_some() {
+                " with previews"
+            } else {
+                ""
+            }
+        ),
         CodingToolAction::SearchText {
             query,
             path,
@@ -3814,6 +3820,47 @@ fn malformed_call(call: &NormalizedToolCall) -> Option<&'static str> {
     None
 }
 
+/// A `list_files` result with previews: each previewed file under a line
+/// naming it, its size and what is shown, then the listed files that were not
+/// previewed, by name.
+fn render_previews(
+    paths: &[String],
+    truncated: bool,
+    previews: &[crate::contracts::FilePreview],
+) -> String {
+    let mut out = format!(
+        "list_files{}: {} files, {} previewed (the files directly in the folder first; an outline is the lines that declare something):",
+        if truncated { " (truncated)" } else { "" },
+        paths.len(),
+        previews.len()
+    );
+    for preview in previews {
+        let size = crate::truncate::format_size(preview.bytes);
+        let measure = match preview.lines {
+            Some(lines) => format!("{lines} lines, {size}"),
+            None => size,
+        };
+        let _ = write!(out, "\n\n── {} ({measure}) {}", preview.path, preview.shows);
+        if !preview.text.is_empty() {
+            out.push_str(":\n");
+            out.push_str(&preview.text.join("\n"));
+        }
+    }
+    let previewed = previews
+        .iter()
+        .map(|preview| preview.path.as_str())
+        .collect::<HashSet<_>>();
+    let rest = paths
+        .iter()
+        .filter(|path| !previewed.contains(path.as_str()))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if !rest.is_empty() {
+        let _ = write!(out, "\n\nNot previewed: {}", rest.join(", "));
+    }
+    out
+}
+
 /// Render a bounded tool result as the message the model receives next.
 #[allow(
     clippy::too_many_lines,
@@ -3826,17 +3873,37 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             content,
             truncated,
             hash,
-        } => format!(
-            "read_file {path}{} [hash {}]:\n{}",
-            if *truncated { " (truncated)" } else { "" },
-            hash.as_str(),
-            content
-        ),
-        ToolOutput::ListFiles { paths, truncated } => format!(
+            references,
+        } => {
+            let mut text = format!(
+                "read_file {path}{} [hash {}]:\n{}",
+                if *truncated { " (truncated)" } else { "" },
+                hash.as_str(),
+                content
+            );
+            if !references.is_empty() {
+                let _ = write!(
+                    text,
+                    "\n\n[This text names other workspace files: {}. Read the ones the answer depends on before answering.]",
+                    references.join(", ")
+                );
+            }
+            text
+        }
+        ToolOutput::ListFiles {
+            paths,
+            truncated,
+            previews,
+        } if previews.is_empty() => format!(
             "list_files{}: {}",
             if *truncated { " (truncated)" } else { "" },
             paths.join(", ")
         ),
+        ToolOutput::ListFiles {
+            paths,
+            truncated,
+            previews,
+        } => render_previews(paths, *truncated, previews),
         // A count is not a result. `search_text: 1 match(es)` tells the model
         // nothing it can act on, so it searches again with another query and
         // the turn spends its bounds rediscovering what it already found. The

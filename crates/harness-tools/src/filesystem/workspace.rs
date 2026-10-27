@@ -768,7 +768,10 @@ pub(crate) fn files_named_like(root: &Path, missing: &str) -> Vec<String> {
 /// file as often as a folder (`path=README.md`), and refusing it cost a turn.
 /// The file comes out of its folder's walk, so an ignored or sensitive file is
 /// refused here exactly as a folder search would skip it.
-fn search_walk(root: &Path, requested: Option<&str>) -> Result<std::sync::Arc<Walk>, HarnessError> {
+pub(crate) fn search_walk(
+    root: &Path,
+    requested: Option<&str>,
+) -> Result<std::sync::Arc<Walk>, HarnessError> {
     let file = match requested {
         Some(path) => resolve_relative(root, path, true)?,
         None => root.to_owned(),
@@ -820,6 +823,149 @@ pub(crate) fn list_files(
         paths,
         walk.files.len() > MAX_SEARCH_MATCHES || !walk.complete,
     ))
+}
+
+/// Longest line a `list_files` preview shows, in characters.
+const PREVIEW_LINE_CHARS: usize = 200;
+
+/// What `list_files` with `preview` shows of the files under `requested`
+/// (agentic-file-search's `scan_folder`, for code): the files directly in the
+/// folder first, then each level deeper, at most
+/// [`crate::contracts::LIST_PREVIEW_MAX_FILES`] of them and 50 KB in all,
+/// read side by side.
+pub(crate) fn preview_files(
+    root: &Path,
+    requested: Option<&str>,
+    lines: u32,
+) -> Result<Vec<crate::contracts::FilePreview>, HarnessError> {
+    let walk = tool_walk(root, requested, "list_files")?;
+    let mut files = walk.files.iter().collect::<Vec<_>>();
+    files.sort_by(|a, b| {
+        a.relative
+            .matches('/')
+            .count()
+            .cmp(&b.relative.matches('/').count())
+            .then_with(|| a.relative.cmp(&b.relative))
+    });
+    files.truncate(crate::contracts::LIST_PREVIEW_MAX_FILES);
+    let lines =
+        usize::try_from(lines.min(crate::contracts::LIST_PREVIEW_MAX_LINES)).unwrap_or(usize::MAX);
+    let previews = std::thread::scope(|scope| {
+        let handles = files
+            .chunks(8)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|file| preview_file(root, file, lines))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect::<Vec<_>>()
+    });
+    let mut kept = Vec::new();
+    let mut bytes = 0_usize;
+    for preview in previews {
+        let preview = preview?;
+        let cost = preview.path.len() + preview.text.iter().map(String::len).sum::<usize>();
+        if bytes + cost > crate::truncate::DEFAULT_MAX_BYTES {
+            break;
+        }
+        bytes += cost;
+        kept.push(preview);
+    }
+    Ok(kept)
+}
+
+/// A Markdown heading: one to six `#`s and a space.
+fn is_heading(line: &str) -> bool {
+    let level = line.bytes().take_while(|byte| *byte == b'#').count();
+    (1..=6).contains(&level) && line[level..].starts_with(' ')
+}
+
+/// One file of a preview: its outline (the lines that declare something, or
+/// a Markdown file's headings) when it has one, else its first lines.
+fn preview_file(
+    root: &Path,
+    file: &WalkFile,
+    lines: usize,
+) -> Result<crate::contracts::FilePreview, HarnessError> {
+    let path = root_relative(root, file)?;
+    let preview =
+        |shows: String, count: Option<usize>, text: Vec<String>| crate::contracts::FilePreview {
+            path: path.clone(),
+            bytes: file.len,
+            lines: count.and_then(|count| u64::try_from(count).ok()),
+            shows,
+            text,
+        };
+    if file.len > MAX_TEXT_FILE_BYTES as u64 {
+        return Ok(preview(
+            format!("over {}", format_size(MAX_TEXT_FILE_BYTES as u64)),
+            None,
+            Vec::new(),
+        ));
+    }
+    let Ok(bytes) = fs::read(&file.absolute) else {
+        return Ok(preview("unreadable".to_owned(), None, Vec::new()));
+    };
+    if memchr::memchr(0, &bytes).is_some() {
+        return Ok(preview("binary".to_owned(), None, Vec::new()));
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Ok(preview("not UTF-8".to_owned(), None, Vec::new()));
+    };
+    let all = text.lines().collect::<Vec<_>>();
+    let markdown = Path::new(&file.relative)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["md", "markdown", "mdx"].contains(&extension.to_ascii_lowercase().as_str())
+        });
+    let outline = all
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| {
+            if markdown {
+                is_heading(line)
+            } else {
+                crate::lookup::declares(line)
+            }
+        })
+        .map(|(index, line)| (index, *line))
+        .collect::<Vec<_>>();
+    let (shows, chosen) = if outline.is_empty() {
+        (
+            "first lines".to_owned(),
+            all.iter()
+                .copied()
+                .enumerate()
+                .take(lines)
+                .collect::<Vec<_>>(),
+        )
+    } else if outline.len() > lines {
+        (
+            format!("outline, first {lines} of {}", outline.len()),
+            outline.into_iter().take(lines).collect(),
+        )
+    } else {
+        ("outline".to_owned(), outline)
+    };
+    let text = chosen
+        .into_iter()
+        .map(|(index, line)| {
+            format!(
+                "{}: {}",
+                index + 1,
+                crate::truncate::truncate_line(&redact_text(line), PREVIEW_LINE_CHARS).0
+            )
+        })
+        .collect();
+    Ok(preview(shows, Some(all.len()), text))
 }
 
 /// Most paths one `glob` result carries.
@@ -2395,5 +2541,65 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `list_files` with a preview: the files directly in the folder first,
+    /// a code file's outline, a Markdown file's headings, else the first
+    /// lines, and no text for a binary file.
+    #[test]
+    fn a_preview_shows_outlines_headings_and_first_lines() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let root = fs::canonicalize(directory.path()).expect("root");
+        fs::create_dir_all(root.join("src/deep")).expect("folders");
+        fs::write(
+            root.join("src/lib.rs"),
+            "//! The crate.\nuse std::fmt;\n\npub struct Config {\n    name: String,\n}\n\nimpl Config {\n    pub fn load() -> Self {\n        let name = String::new();\n        Self { name }\n    }\n}\n",
+        )
+        .expect("code");
+        fs::write(root.join("src/deep/a.rs"), "fn deep() {}\n").expect("deep");
+        fs::write(root.join("README.md"), "# Title\nintro\n## Usage\nrun it\n").expect("md");
+        fs::write(root.join("notes.txt"), "one\ntwo\nthree\nfour\n").expect("text");
+        fs::write(root.join("blob.bin"), [0_u8, 1, 2]).expect("binary");
+
+        let previews = preview_files(&root, None, 3).expect("previews");
+        let paths = previews
+            .iter()
+            .map(|preview| preview.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [
+                "README.md",
+                "blob.bin",
+                "notes.txt",
+                "src/lib.rs",
+                "src/deep/a.rs"
+            ]
+        );
+        let by = |path: &str| {
+            previews
+                .iter()
+                .find(|preview| preview.path == path)
+                .expect("previewed")
+        };
+        assert_eq!(by("src/lib.rs").shows, "outline");
+        assert_eq!(
+            by("src/lib.rs").text,
+            [
+                "4: pub struct Config {",
+                "8: impl Config {",
+                "9:     pub fn load() -> Self {"
+            ]
+        );
+        assert_eq!(by("src/lib.rs").lines, Some(13));
+        assert_eq!(by("README.md").text, ["1: # Title", "3: ## Usage"]);
+        assert_eq!(by("notes.txt").shows, "first lines");
+        assert_eq!(by("notes.txt").text, ["1: one", "2: two", "3: three"]);
+        assert_eq!(by("blob.bin").shows, "binary");
+        assert!(by("blob.bin").text.is_empty() && by("blob.bin").lines.is_none());
+
+        let previews = preview_files(&root, Some("src"), 1).expect("previews");
+        assert_eq!(previews[0].path, "src/lib.rs");
+        assert_eq!(previews[0].shows, "outline, first 1 of 3");
     }
 }

@@ -671,7 +671,7 @@ fn validate_action_shape(action: &CodingToolAction) -> Result<(), HarnessError> 
                 "tool path must not be empty",
             ))
         }
-        CodingToolAction::ListFiles { path }
+        CodingToolAction::ListFiles { path, .. }
         | CodingToolAction::SearchText { path, .. }
         | CodingToolAction::Glob { path, .. }
         | CodingToolAction::FindFiles { path, .. }

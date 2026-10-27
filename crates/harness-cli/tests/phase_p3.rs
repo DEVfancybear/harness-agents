@@ -62,7 +62,10 @@ fn review_p3_policy_cannot_be_bypassed_by_path_spelling_or_ancestor() {
             .is_some()
     );
     for action in [
-        CodingToolAction::ListFiles { path: None },
+        CodingToolAction::ListFiles {
+            path: None,
+            preview: None,
+        },
         CodingToolAction::SearchText {
             query: "x".into(),
             path: Some("src".into()),
@@ -106,6 +109,7 @@ async fn review_p3_explicit_workspace_root_can_be_listed() {
             &root,
             CodingToolAction::ListFiles {
                 path: Some(path.into()),
+                preview: None,
             },
         )
         .await;
@@ -285,7 +289,10 @@ async fn p3_a_folder_without_git_supports_the_coding_tools() {
         written.output
     );
     for action in [
-        CodingToolAction::ListFiles { path: None },
+        CodingToolAction::ListFiles {
+            path: None,
+            preview: None,
+        },
         CodingToolAction::ReadFile {
             path: "game.js".to_owned(),
             offset: None,
@@ -1045,7 +1052,10 @@ async fn p3_s03_rooted_files_search_and_patch_handle_crlf_unicode_and_stale_edit
         &session_id,
         &task_id,
         &root,
-        CodingToolAction::ListFiles { path: None },
+        CodingToolAction::ListFiles {
+            path: None,
+            preview: None,
+        },
     )
     .await;
     let listed = tools
