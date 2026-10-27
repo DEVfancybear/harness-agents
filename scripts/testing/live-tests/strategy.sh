@@ -61,7 +61,7 @@ project "$RX/p1"
 agent "$RX/p1" s1
 since=$(now_ms)
 say s1 "Kiểm thử harness, làm đúng thứ tự, mỗi bước là MỘT lời gọi tool read_file riêng (không gộp, không dùng paths): (1) path missing/a.rs (2) path missing/deep/a.rs (3) path lib/a.rs (4) lại path lib/a.rs đúng y như bước 3. Không gọi tool nào khác. Rồi in nguyên văn kết quả tool của bước 3 và bước 4, kể cả mọi dòng [harness: ...]." | tail -8 | sed 's/^/   /'
-failed=$(records call settled "$since" | grep -c '"tool": "read_file".*"ok": false')
+failed=$(records call settled "$since" | "$PY" -c "import json,sys; print(sum(1 for l in sys.stdin if (lambda f: f.get('tool')=='read_file' and f.get('ok') is False)(json.loads(l)['fields'])))")
 echo "   read_file failures recorded: $failed"
 check "four read_file calls failed (the precondition)" '[ "$failed" -ge 4 ]'
 check "the third failure was named under its call" 'records regulation repeated_failure "$since" | grep -q read_file'
@@ -148,9 +148,13 @@ for i in 1 2 3; do
 done
 project "$RX/p5"
 agent "$RX/p5" s5
+# A run marks itself when it starts and writes its rules when the model has
+# answered: wait for its record.
+evolved() { records evolution ran "$1" | grep -q '"ran"'; }
+since=$(now_ms)
 say s5 "Chỉ trả lời: OK" | tail -1 | sed 's/^/   /'
 E="$HA_HOME/data/harness-evolution.json"
-for _ in $(seq 1 30); do [ -f "$E" ] && break; sleep 5; done
+for _ in $(seq 1 60); do evolved "$since" && break; sleep 5; done
 rule=$("$PY" -c "import json,sys; d=json.load(open(sys.argv[1],encoding='utf-8')); r=[x for x in d.get('rules',[]) if x['tool']=='read_file']; print(r[0]['id'] if r else '')" "$E" 2>/dev/null)
 echo "   rule: ${rule:-none}; $(cat "$E" 2>/dev/null | head -c 600)"
 check "the run kept a rule for read_file, in shadow" '[ -n "$rule" ] && grep -q "\"state\": \"shadow\"" "$E"'
@@ -159,8 +163,9 @@ for i in 1 2 3; do
   printf '{"kind":"rule","event":"shadowed","ms":%s,"call":"seed-f%s","level":"info","fields":{"rule":"%s","tool":"read_file"}}\n' $((base+20+i)) $i "$rule" >> "$seed"
 done
 "$PY" -c "import json,sys; p=sys.argv[1]; d=json.load(open(p,encoding='utf-8')); d['ran']='2026-01-01T00:00:00Z'; json.dump(d,open(p,'w',encoding='utf-8'),indent=2)" "$E"
+since=$(now_ms)
 say s5 "Chỉ trả lời: OK" | tail -1 | sed 's/^/   /'
-for _ in $(seq 1 30); do grep -q '"state": "active"' "$E" && break; sleep 5; done
+for _ in $(seq 1 60); do evolved "$since" && break; sleep 5; done
 check "the next run promoted it on what it would have done" 'grep -q "\"state\": \"active\"" "$E"'
 since=$(now_ms)
 "$HA" shutdown --force >/dev/null 2>&1

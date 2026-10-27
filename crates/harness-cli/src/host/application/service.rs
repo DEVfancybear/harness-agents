@@ -10062,6 +10062,14 @@ async fn run_turn(
             spawn_off_workers(background.run());
         }
     }
+    // A goal's turn that ended short of it is an evaluation of the strategy,
+    // whether or not the model asked for one.
+    if let Some(host) = &goal_host
+        && outcome.is_ok()
+        && !cancellation.is_cancelled()
+    {
+        host.evaluate_turn().await;
+    }
     // A finished goal is not brought back by `/resume`.
     if goal_host
         .as_ref()

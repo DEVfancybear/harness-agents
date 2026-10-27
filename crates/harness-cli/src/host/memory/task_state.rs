@@ -765,6 +765,16 @@ pub fn record_evaluation(
     Some((standing, state))
 }
 
+/// Keep the workspace's fingerprint as a turn-end evaluation saw it.
+pub fn note_workspace(path: &Path, fingerprint: &str) {
+    let Ok(_guard) = file_lock().lock() else {
+        return;
+    };
+    let mut state = load(path);
+    fingerprint.clone_into(&mut state.strategy.workspace);
+    let _ = save(path, &state);
+}
+
 /// Keep the alternatives a strategist named, for the next decision. None
 /// named is not kept: the next evaluation asks again.
 pub fn record_proposals(path: &Path, proposals: Vec<Alternative>) {

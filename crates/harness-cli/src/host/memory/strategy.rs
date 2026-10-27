@@ -185,6 +185,10 @@ pub struct StrategyState {
     /// The evaluation after which the proposals were made.
     #[serde(default)]
     pub proposed_after: usize,
+    /// The workspace as the last turn-end evaluation saw it: a turn that
+    /// changed nothing is evaluated as unchanged without running anything.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub workspace: String,
 }
 
 /// Where the task stands after an evaluation.

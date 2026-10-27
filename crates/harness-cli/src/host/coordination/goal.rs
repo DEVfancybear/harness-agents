@@ -139,6 +139,8 @@ pub struct GoalHost {
     /// The last ask was refused for an unchanged workspace: the next one is
     /// verified again, for a failure no change fixes.
     refused_unchanged: Arc<AtomicBool>,
+    /// This turn already evaluated the strategy: the turn's end does not again.
+    evaluated_turn: Arc<AtomicBool>,
 }
 
 impl GoalHost {
@@ -150,6 +152,7 @@ impl GoalHost {
             check: None,
             failed_at: Arc::new(Mutex::new(None)),
             refused_unchanged: Arc::new(AtomicBool::new(false)),
+            evaluated_turn: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -203,6 +206,93 @@ impl GoalHost {
         self.finish_checked(summary, &mut None).await
     }
 
+    /// Evaluate the work at the end of a goal's turn that did not complete it
+    /// and asked for no verification. Seen live: an agent told not to call
+    /// `goal_complete` while its check failed ran the check itself turn after
+    /// turn, wrote "no progress" in its journal, and waited for a plateau the
+    /// host never saw - it saw no evaluation. A turn that changed nothing is
+    /// an unchanged evaluation; one that changed something runs the project's
+    /// checks, or reads the checklist when there are none.
+    pub async fn evaluate_turn(&self) {
+        use super::strategy::stage as stages;
+        let Some(check) = self.check.clone() else {
+            return;
+        };
+        if self.completed()
+            || self.evaluated_turn.swap(false, Ordering::SeqCst)
+            || check.cancellation.is_cancelled()
+        {
+            return;
+        }
+        let Some(path) = check.task_state.clone() else {
+            return;
+        };
+        let Some(snapshot) = super::autonomous::snapshot(&check.root).await else {
+            return;
+        };
+        let fingerprint = snapshot.fingerprint();
+        let state = super::task_state::load(&path);
+        if state.strategy.workspace == fingerprint {
+            self.evaluated(
+                &check,
+                "unchanged",
+                stages::CHECKLIST,
+                0,
+                0,
+                "nothing in the workspace changed this turn",
+            )
+            .await;
+            return;
+        }
+        super::task_state::note_workspace(&path, &fingerprint);
+        if check.checks.is_empty() {
+            let open = state.unfinished().len();
+            self.evaluated(
+                &check,
+                "checklist",
+                stages::CHECKLIST,
+                u32::try_from(open).unwrap_or(u32::MAX),
+                0,
+                &format!("{open} checklist item(s) open after the turn"),
+            )
+            .await;
+            return;
+        }
+        self.notice(
+            "goal: the turn ended short of the goal; running its checks to evaluate the work"
+                .to_owned(),
+        );
+        let report = super::verify::run(&check.root, &check.checks, &check.cancellation).await;
+        match report.failure() {
+            Some(run) => {
+                let left = report
+                    .total
+                    .saturating_sub(report.runs.len().saturating_sub(1));
+                self.evaluated(
+                    &check,
+                    "checks",
+                    stages::CHECKS,
+                    u32::try_from(left).unwrap_or(u32::MAX),
+                    lines(&run.output),
+                    &format!("check `{}` failed after the turn", run.name),
+                )
+                .await;
+            }
+            None if report.outcome() == Some(true) => {
+                self.evaluated(
+                    &check,
+                    "checks",
+                    stages::CHECKS,
+                    0,
+                    0,
+                    "the checks pass after the turn; the goal is not marked complete",
+                )
+                .await;
+            }
+            None => {}
+        }
+    }
+
     /// Record a verification that did not pass as an evaluation of the task's
     /// strategy, and say what the model is to decide next. At a plateau a
     /// strategist that reads the task afresh names alternatives, once per
@@ -218,6 +308,7 @@ impl GoalHost {
         detail: &str,
     ) -> String {
         use super::strategy::stage as stages;
+        self.evaluated_turn.store(true, Ordering::SeqCst);
         let Some(path) = &check.task_state else {
             return String::new();
         };
@@ -1050,6 +1141,69 @@ mod tests {
             shown.contains("Decision due") && shown.contains("PLATEAU"),
             "{shown}"
         );
+    }
+
+    /// A goal's turn that ends short of it is evaluated even when the model
+    /// never asked: the first runs the checks, the turns after it that change
+    /// nothing are unchanged, and three without progress are a plateau.
+    #[tokio::test]
+    async fn a_turn_that_ends_short_of_the_goal_is_evaluated() {
+        let root = tempfile::tempdir().expect("root");
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ][..],
+        ] {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .expect("git");
+        }
+        // The task state lives in the data directory, not in the workspace.
+        let data = tempfile::tempdir().expect("data");
+        let state = data.path().join("task_state.json");
+        let turn = || {
+            let (sender, _events) = tokio::sync::mpsc::unbounded_channel();
+            GoalHost::new(sender).with_check(super::GoalCheck {
+                root: root.path().to_owned(),
+                objective: "ship".to_owned(),
+                checks: vec![super::super::verify::Check {
+                    name: "result".to_owned(),
+                    command: "git show HEAD:missing.txt".to_owned(),
+                    hint: None,
+                    timeout_ms: 60_000,
+                }],
+                judge: None,
+                cancellation: harness_providers::CancellationToken::new(),
+                task_state: Some(state.clone()),
+                strategist: None,
+            })
+        };
+        turn().evaluate_turn().await;
+        let first = super::super::task_state::load(&state).strategy;
+        assert_eq!(first.evaluations[0].source, "checks", "{first:?}");
+        turn().evaluate_turn().await;
+        turn().evaluate_turn().await;
+        let kept = super::super::task_state::load(&state).strategy;
+        assert_eq!(kept.evaluated, 3);
+        assert_eq!(kept.evaluations[2].source, "unchanged");
+        assert!(kept.plateau());
+        // A turn that already evaluated, through goal_complete, is not
+        // evaluated again at its end.
+        let host = turn();
+        host.finish("done").await.expect_err("the check fails");
+        host.evaluate_turn().await;
+        assert_eq!(super::super::task_state::load(&state).strategy.evaluated, 4);
     }
 
     #[test]

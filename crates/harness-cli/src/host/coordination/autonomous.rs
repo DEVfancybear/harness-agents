@@ -693,6 +693,19 @@ pub(crate) async fn snapshot(root: &Path) -> Option<Snapshot> {
     })
 }
 
+impl Snapshot {
+    /// One hash of all of it, to keep and compare across turns.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        let mut hash = Sha256::new();
+        for part in [&self.head, &self.status, &self.diff, &self.untracked] {
+            hash.update(part.as_bytes());
+            hash.update([0]);
+        }
+        hex(&hash.finalize())
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut out, byte| {
         let _ = write!(out, "{byte:02x}");
