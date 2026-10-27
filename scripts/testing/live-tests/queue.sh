@@ -5,7 +5,15 @@
 #      wakes the session - it was held until the user typed again, and the
 #      goal sat idle for fifty minutes;
 #   2. a steer sent while a turn summarizes the conversation before its first
-#      step reaches that turn - it waited, queued, for the whole turn.
+#      step reaches that turn - it waited, queued, for the whole turn;
+#   3. (bug report 2026-10-26) a message queued while a turn ran waits while
+#      the provider's usage limit parks the session - it started a turn 29 ms
+#      after the park, which called the provider and parked it again - and
+#      runs once the park is over;
+#   4. a child told its usage limit resets in hours asks once, not three
+#      times a minute apart.
+# Sections 3 and 4 need MODEL on openai-codex: the agents reach ChatGPT through
+# quota_proxy.py, which answers with a usage limit while a flag file exists.
 # Every check prints PASS or FAIL; the conversation and the diagnostics stay in
 # $LIVE_ROOT/queue as evidence.
 #
@@ -95,5 +103,107 @@ for attempt in 1 2 3; do
 done
 check "the turn summarized before its first step (the precondition)" '[ "$verdict" -ne 1 ]'
 check "the steer reached that turn: read in its answer, no turn of its own" '[ "$verdict" -eq 0 ]'
+
+if [ "${MODEL#openai-codex/}" = "$MODEL" ]; then
+  echo "SKIP  sections 3 and 4 need MODEL=openai-codex/..."
+  result
+  exit $?
+fi
+X="$RX/proxy"
+mkdir -p "$X"
+"$PY" "$(dirname "$0")/quota_proxy.py" "$X" &
+PROXY=$!
+trap 'kill $PROXY 2>/dev/null' EXIT
+for _ in $(seq 1 50); do [ -s "$X/port" ] && break; sleep 0.2; done
+# The session's provider, through the proxy: no --model, which would choose
+# the endpoint itself.
+export HA_PROVIDER_ID=openai-codex HA_PROVIDER_PROTOCOL=openai_codex \
+  HA_PROVIDER_ENDPOINT="http://127.0.0.1:$(cat "$X/port")/backend-api/codex/responses" \
+  HA_PROVIDER_MODEL="${MODEL#openai-codex/}"
+proxied() {
+  (cd "$1" && "$PROBE" "$RX/$2.bin" "$HA" "wait:9000" -- chat --approval full-auto >/dev/null)
+  local id
+  id=$("$HA" list --json | "$PY" -c "import json,sys; d=json.load(sys.stdin); a=d if isinstance(d,list) else d.get('agents',d); print([x['id'] for x in a if not x.get('name')][0])")
+  "$HA" rename "$id" "$2" >/dev/null
+}
+# The proxy's log, as `ms status key body_has...`, from `since`.
+requests() {
+  "$PY" - "$X/requests.jsonl" "${1:-0}" <<'EOF'
+import json, sys
+since = int(sys.argv[2])
+try:
+    rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+except OSError:
+    rows = []
+for row in rows:
+    if row["ms"] > since:
+        print(row["ms"], row["status"], row["key"], *row["body_has"])
+EOF
+}
+now_ms() { date +%s%3N; }
+
+echo "################ 3. a parked session holds the queue until the park is over"
+proxied "$RX/p" q3
+say q3 "Trả lời đúng một dòng: PROXY-OK" | tail -1 | sed 's/^/   /'
+check "a turn ran through the proxy (the precondition)" 'last | grep -q "PROXY-OK" && requests | grep -q " 200 "'
+code="FOLLOW-$RANDOM$RANDOM"
+echo "$code" > "$X/watch"
+calls=$(requests | wc -l)
+"$HA" send q3 "Kiểm thử harness: gọi run_shell đúng một lần với command Start-Sleep -Seconds 25 và timeout_ms 60000, rồi trả lời đúng một dòng: A-DONE." >/dev/null 2>&1
+# The first call of the turn asked for the shell; the limit starts while it sleeps.
+for _ in $(seq 1 60); do [ "$(requests | wc -l)" -gt "$calls" ] && break; sleep 2; done
+sleep 5
+touch "$X/limit"
+"$HA" send q3 --follow-up "Trả lời đúng một dòng: $code" 2>&1 | sed 's/^/   follow-up: /'
+parked=""
+for _ in $(seq 1 60); do
+  parked=$(records provider | awk '$2 == "quota_parked" {print $1; exit}')
+  [ -n "$parked" ] && break
+  sleep 2
+done
+sleep 30
+records turn | sed 's/^/   /'
+requests "$parked" | sed 's/^/   proxy after the park: /'
+check "the usage limit parked the session (the precondition)" '[ -n "$parked" ]'
+check "no turn started while the session was parked" '[ -n "$parked" ] && ! (records turn | awk -v since="$parked" "\$1 > since && \$2 == \"start\"" | grep -q .)'
+check "no call reached the provider while parked" '[ -n "$parked" ] && [ "$(requests "$parked" | wc -l)" -eq 0 ]'
+rm -f "$X/limit"
+before=$(now_ms)
+say q3 "Trả lời đúng một dòng: USER-OK" | tail -1 | sed 's/^/   /'
+# The user's own turn is answered, which ends the park; the queued message
+# runs after it.
+ran=""
+for _ in $(seq 1 40); do
+  ran=$(requests "$before" | awk -v code="$code" '$2 == 200 && $0 ~ code' | head -1)
+  [ -n "$ran" ] && break
+  sleep 3
+done
+check "the user's turn ran while parked" 'last | grep -q "USER-OK"'
+check "the queued message ran once the park was over" '[ -n "$ran" ]'
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 4. a child told its limit resets in hours asks once"
+proxied "$RX/p" q4
+: > "$X/watch"
+"$HA" send q4 "Kiểm thử harness, làm đúng thứ tự: (1) dùng tool delegate với wait=false giao cho một agent role explorer nhiệm vụ: gọi run_shell đúng một lần với command Start-Sleep -Seconds 30 và timeout_ms 90000, rồi trả lời đúng CHILD-DONE. (2) Sau khi giao, tự gọi run_shell với command Start-Sleep -Seconds 120 và timeout_ms 180000. (3) Trả lời đúng một dòng: PARENT-DONE." >/dev/null 2>&1
+for _ in $(seq 1 60); do
+  records child | grep -q " started " && break
+  sleep 3
+done
+sleep 10
+limited=$(now_ms)
+touch "$X/limit"
+for _ in $(seq 1 50); do
+  records child | awk -v since="$limited" '$1 > since && ($2 == "failed" || $2 == "settled")' | grep -q . && break
+  sleep 3
+done
+sleep 5
+records child | sed 's/^/   /'
+requests "$limited" | sed 's/^/   proxy after the limit: /'
+most=$(requests "$limited" | awk '$2 == 429 {n[$3]++} END {m=0; for (k in n) if (n[k] > m) m = n[k]; print m}')
+check "the child met the limit and stopped (the precondition)" 'records child | awk -v since="$limited" "\$1 > since && \$2 == \"failed\"" | grep -q .'
+check "no conversation asked again after a limit that resets in hours" '[ "$most" -eq 1 ]'
+rm -f "$X/limit"
+"$HA" shutdown --force >/dev/null 2>&1
 
 result

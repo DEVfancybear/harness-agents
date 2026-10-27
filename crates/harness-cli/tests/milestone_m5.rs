@@ -1320,6 +1320,63 @@ async fn a_compaction_that_cannot_fall_back_says_why_the_summary_failed() {
     close(store).await;
 }
 
+/// Seen in a bug report: a usage limit parked the summarizer for four hours
+/// and the compaction failed as `mandatory_context_overflow`, as if the
+/// conversation were the problem. The limit stays the error.
+#[tokio::test]
+async fn a_compaction_stopped_by_a_usage_limit_fails_as_the_limit() {
+    struct ParkedSummary;
+    impl harness_runtime::SummaryProvider for ParkedSummary {
+        fn summarize(
+            &self,
+            _recovery: &harness_session::RecoveryView,
+        ) -> Result<String, RuntimeError> {
+            Err(RuntimeError::new(
+                ErrorCode::RateLimited,
+                "Session parked until 16:54Z and will resume automatically",
+            ))
+        }
+
+        fn summarize_conversation(
+            &self,
+            _prompt: &str,
+            _budget_tokens: u64,
+        ) -> Result<String, RuntimeError> {
+            Err(RuntimeError::new(
+                ErrorCode::RateLimited,
+                "Session parked until 16:54Z and will resume automatically",
+            ))
+        }
+    }
+    let bench = bench();
+    let store = bench.open_store().await;
+    let long = format!("constraint: keep everything {}", "word ".repeat(200_000));
+    let (session, _) = admit(&store, &bench, &long).await;
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderStreamEvent::completed("stop"),
+        ]])),
+        RuntimeConfig::default(),
+    )
+    .with_summarizer(Arc::new(ParkedSummary));
+    let error = runtime
+        .compact(&session)
+        .await
+        .expect_err("a conversation too large for the fallback keeps its checkpoint");
+    assert_eq!(error.code(), ErrorCode::RateLimited, "{error}");
+    assert!(
+        error.to_string().contains("will resume automatically"),
+        "{error}"
+    );
+    assert!(
+        !error.to_string().contains("service_unavailable"),
+        "the limit is not wrapped in another code: {error}"
+    );
+    drop(runtime);
+    close(store).await;
+}
+
 #[tokio::test]
 async fn a19_summary_failure_falls_back_to_the_mandatory_state() {
     let bench = bench();

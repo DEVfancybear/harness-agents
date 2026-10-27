@@ -667,6 +667,8 @@ impl Router {
         } else {
             format!("Retry failed after {attempts} attempts: ")
         };
+        // The reset rides along, so the runtime does not retry the parked call:
+        // it recorded two more failed attempts, seconds apart, after each park.
         let parked = ProviderError::new(
             ErrorCode::RateLimited,
             format!(
@@ -674,7 +676,8 @@ impl Router {
                 reset.as_secs(),
                 wait.max_total.as_secs()
             ),
-        );
+        )
+        .with_retry_after(Some(reset));
         if let Ok(mut kept) = self.parked.lock() {
             *kept = Some(parked.clone());
         }
@@ -1356,6 +1359,8 @@ mod tests {
                 1,
                 "{error}"
             );
+            // The reset rides along, so the runtime does not retry the call.
+            assert_eq!(error.retry_after(), Some(Duration::from_mins(204)));
         }
         assert_eq!(
             primary.calls(),

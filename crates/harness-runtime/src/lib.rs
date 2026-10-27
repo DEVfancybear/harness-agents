@@ -309,6 +309,10 @@ impl RuntimeConfig {
     }
 }
 
+/// The longest one retry waits, whatever the provider's `Retry-After` or the
+/// configured `limits.max_retry_after_seconds`.
+const RETRY_AFTER_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// prime-agent's compaction trigger: the window less the output the request
 /// asks for and the reserve, and never above 95% of the window.
 /// prime-agent's provider retry delay: 2 s for the first retry, doubling,
@@ -4551,6 +4555,15 @@ impl RuntimeService {
                     if !retryable || attempts >= config.max_attempts {
                         break;
                     }
+                    // A reset the remaining retries cannot reach is not retried:
+                    // each waits at most `RETRY_AFTER_CAP`. Seen: a child told
+                    // "try again in ~230 min" asked twice more, a minute apart,
+                    // and failed the same way.
+                    if retry_after.is_some_and(|wait| {
+                        wait > RETRY_AFTER_CAP * config.max_attempts.saturating_sub(attempts)
+                    }) {
+                        break;
+                    }
                     // The provider's `Retry-After` when it gave one, else
                     // prime-agent's backoff: 2 s doubling, with 20% jitter so
                     // retries from many sessions do not arrive together.
@@ -4558,9 +4571,10 @@ impl RuntimeService {
                     // in a row.
                     let wait = retry_after.unwrap_or_else(|| retry_backoff(attempts));
                     {
-                        let wait = wait.min(std::time::Duration::from_secs(
-                            config.max_retry_after_seconds.min(30),
-                        ));
+                        let wait = wait.min(
+                            std::time::Duration::from_secs(config.max_retry_after_seconds)
+                                .min(RETRY_AFTER_CAP),
+                        );
                         if !wait.is_zero() {
                             tokio::select! {
                                 () = tokio::time::sleep(wait) => {}
@@ -4876,7 +4890,7 @@ impl RuntimeService {
             let whole = match whole {
                 Ok(Some(text)) => Ok(text),
                 Ok(None) => Err(None),
-                Err(error) => Err(Some(error.to_string())),
+                Err(error) => Err(Some(error)),
             };
             let summary = if let Ok(text) = whole {
                 Ok(text)
@@ -4891,13 +4905,12 @@ impl RuntimeService {
             {
                 // A summary of this turn alone cannot replace earlier turns or
                 // a previous checkpoint. Preserve their transcript on failure.
-                Err(RuntimeError::new(
-                    ErrorCode::ServiceUnavailable,
-                    whole
-                        .err()
-                        .flatten()
-                        .unwrap_or_else(|| "the conversation summary was unavailable".to_owned()),
-                ))
+                Err(whole.err().flatten().unwrap_or_else(|| {
+                    RuntimeError::new(
+                        ErrorCode::ServiceUnavailable,
+                        "the conversation summary was unavailable",
+                    )
+                }))
             } else {
                 let summarizer = Arc::clone(&self.summarizer);
                 let recovery_for_summary = recovery.clone();
@@ -4926,13 +4939,14 @@ impl RuntimeService {
             let (system_policy, fallback_used, summary_source) = match summary {
                 Ok(text) if !text.trim().is_empty() => (text, false, "model".to_owned()),
                 failed => {
-                    let reason = failed.err().map_or_else(
-                        || "the summary was empty".to_owned(),
-                        |error| error.to_string(),
-                    );
+                    let error = failed.err();
+                    let reason = error
+                        .as_ref()
+                        .map_or_else(|| "the summary was empty".to_owned(), ToString::to_string);
+                    let cause = error.as_ref().map(RuntimeError::code);
                     (
                         self.deterministic_conversation_summary(
-                            session_id, &recovery, budget, &reason,
+                            session_id, &recovery, budget, &reason, cause,
                         )
                         .await?,
                         true,
@@ -5673,6 +5687,7 @@ impl RuntimeService {
         recovery: &RecoveryView,
         budget: u64,
         reason: &str,
+        cause: Option<ErrorCode>,
     ) -> Result<String, RuntimeError> {
         let history = conversation_history(&self.store, session).await?;
         let mut text = deterministic_summary(recovery, budget);
@@ -5691,8 +5706,15 @@ impl RuntimeService {
             }
         }
         if history.omitted > 0 || BudgetLedger::estimate_tokens(&text) > budget {
+            // A usage limit that stopped the summarizer stays the error, so the
+            // turn ends as the park it is: it read "compaction failed:
+            // mandatory_context_overflow" for a summarizer parked four hours.
+            let code = match cause {
+                Some(ErrorCode::RateLimited) => ErrorCode::RateLimited,
+                _ => ErrorCode::MandatoryContextOverflow,
+            };
             return Err(RuntimeError::new(
-                ErrorCode::MandatoryContextOverflow,
+                code,
                 format!(
                     "the model summary was unavailable ({reason}) and the complete conversation does not fit the summary budget; the checkpoint was kept unchanged; retry compaction when the summarizer is available"
                 ),

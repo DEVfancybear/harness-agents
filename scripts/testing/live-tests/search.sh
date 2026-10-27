@@ -11,7 +11,7 @@
 #      lists the files matching the most words instead of nothing;
 #   7. (0.7.9) edit_file with one edit per copy of the same text changes
 #      each copy, where every copy was refused as ambiguous.
-# And what 0.8.2 took from agentic-file-search:
+# And what 0.8.3 took from agentic-file-search:
 #   8. search_text with several words no line holds ranks the files by BM25:
 #      the file holding the rare word leads, where a word on every line of
 #      the first files filled the 512-match cut and the rare one was lost;
@@ -24,6 +24,9 @@
 #  12. asked what a folder of documents says, without being asked to cite,
 #      the agent follows the reference to the file that holds the answer and
 #      cites it as path:line (the system prompt's three phases and citations).
+# And from the bug report:
+#  13. search_text on a path that is not there says it is missing and where a
+#      file of that name is, where it said "path must be a directory".
 # Every check prints PASS or FAIL; the conversation stays in $LIVE_ROOT/search
 # as evidence.
 #
@@ -129,6 +132,14 @@ agent "$P" s2
 say s2 "Theo các tài liệu trong thư mục docs, phí dịch vụ hằng tháng hiện là bao nhiêu?" | tail -10 | sed 's/^/   /'
 check "the answer is the annex's figure" 'last | grep -qE "4[.,]?250"'
 check "the answer cites the annex as path:line, unasked" 'last | grep -qE "annex_q\.md:[0-9]+"'
+echo "################ 13. a search in a path that is not there"
+say s1 "Gọi tool search_text đúng một lần với query 'prepare_upload' và path 'src/net/upload.rs' (không có tham số nào khác), kể cả khi bạn nghĩ đường dẫn sai. Không gọi tool nào khác. In nguyên văn toàn bộ kết quả tool, kể cả lỗi." | tail -6 | sed 's/^/   /'
+# What the tool answered, from its failure record rather than the model's copy.
+refusal=$(grep -h '"tool":"search_text"' "$HA_HOME"/data/diagnostics/*.jsonl 2>/dev/null | grep '"event":"failed"' | tail -1)
+echo "   refusal: $(echo "$refusal" | grep -o '"msg":"[^"]*"')"
+check "search_text was refused for the path (the precondition)" '[ -n "$refusal" ]'
+check "it said the path is not there, not that it must be a directory" 'echo "$refusal" | grep -q "path not found: src/net/upload.rs" && ! (echo "$refusal" | grep -q "must be a directory")'
+check "it named where a file of that name is" 'echo "$refusal" | grep -q "the workspace has: src/upload.rs"'
 "$HA" shutdown --force >/dev/null 2>&1
 
 result
