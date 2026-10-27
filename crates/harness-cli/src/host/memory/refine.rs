@@ -2500,7 +2500,6 @@ async fn stage_skills(
             model,
             learning,
             &proposal.skill_files,
-            &proposal.skill_records,
             &proposal.skill_outcomes,
         )
         .await;
@@ -2520,32 +2519,27 @@ Return JSON only: {"skillOutcomes": [{"skill": "its name", "outcome": "worked" o
 /// The outcome of each learned skill in play that the review patched or
 /// rewrote without judging it. The fix is not the judgement: a skill repaired
 /// right after its steps broke used to be recorded as never having failed. The
-/// model is asked once, from what each landed change says.
+/// model is asked once, from what each change says, landed or refused: a
+/// refused patch leaves the skill as it was, and how following it went still
+/// counts.
 async fn judge_patched(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
     learning: &Learning,
     intents: &[Value],
-    records: &[Value],
     outcomes: &[Value],
 ) -> Vec<Value> {
     let judged = outcomes
         .iter()
         .filter_map(|outcome| outcome["skill"].as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    let landed = |name: &str| {
-        records
-            .iter()
-            .any(|record| record["id"] == name && record["applied"] == true)
-    };
     let patched = intents
         .iter()
         .filter_map(|intent| {
             let name = intent["name"].as_str()?;
             (matches!(intent["action"].as_str(), Some("patch" | "update"))
                 && learning.in_play.iter().any(|skill| skill == name)
-                && !judged.contains(name)
-                && landed(name))
+                && !judged.contains(name))
             .then(|| {
                 json!({
                     "skill": name,
@@ -5049,6 +5043,77 @@ mod tests {
         .expect("json");
         assert_eq!(usage["skills"]["build-check"]["failed"], 1, "{usage}");
         assert_eq!(usage["skills"]["build-check"]["patch"], 1, "{usage}");
+    }
+
+    /// A patch the checks refuse, and its repair too, leaves the skill as it
+    /// was: how following it went is still judged and recorded.
+    #[tokio::test]
+    async fn a_refused_patch_still_has_the_skill_judged() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let config = directory.path().join("config");
+        let skill = config.join("skills").join("build-check");
+        std::fs::create_dir_all(&skill).expect("skill dir");
+        let original = "---
+name: build-check
+description: Use to check the build.
+---
+Run `node scripts/build.js`.
+";
+        std::fs::write(skill.join("SKILL.md"), original).expect("skill");
+        std::fs::write(skill.join(".ha-learned.json"), r#"{"created_by": "ha"}"#).expect("marker");
+        let data = directory.path().join("data");
+        let workspace = directory.path().join("workspace");
+        let layers = crate::interactive::learned::Layers::new(&config, &data, &workspace, true);
+        let mut learning = super::Learning::new(layers, &workspace, None);
+        learning.in_play = vec!["build-check".to_owned()];
+        // Still naming scripts/build.js, which the skill does not ship.
+        let patch = json!({
+            "action": "patch",
+            "name": "build-check",
+            "old_string": "Run `node scripts/build.js`.",
+            "new_string": "Run `node scripts/build.js` if it is there, else the build package.json names.",
+            "reason": "scripts/build.js does not exist; package.json names the build",
+            "evidence": "Cannot find module scripts/build.js"
+        });
+        let provider = Replies::new(&[
+            json!({"summary": "the build entry point was wrong", "skillFiles": [patch]})
+                .to_string(),
+            json!({"skillFiles": [patch]}).to_string(),
+            json!({"skillOutcomes": [{
+                "skill": "build-check",
+                "outcome": "failed",
+                "evidence": "Cannot find module scripts/build.js",
+                "assumption": "the project builds with node scripts/build.js"
+            }]})
+            .to_string(),
+        ]);
+        let dynamic: std::sync::Arc<dyn harness_providers::ModelProvider> = provider.clone();
+        super::refine(
+            &dynamic,
+            "fixture-model",
+            "[User]: check the build
+[Tool]: Error: Cannot find module scripts/build.js",
+            &scopes,
+            &RefineOptions::default(),
+            Some(&learning),
+        )
+        .await
+        .expect("refined");
+        assert_eq!(
+            std::fs::read_to_string(skill.join("SKILL.md")).expect("skill"),
+            original,
+            "the patch and its repair were refused"
+        );
+        let usage: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(data.join("skill-usage").join("global.json")).expect("usage"),
+        )
+        .expect("json");
+        assert_eq!(usage["skills"]["build-check"]["failed"], 1, "{usage}");
+        assert_eq!(
+            usage["skills"]["build-check"]["failures"][0]["assumption"],
+            "the project builds with node scripts/build.js"
+        );
     }
 
     #[test]
