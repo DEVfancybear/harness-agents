@@ -185,9 +185,11 @@ check "the queued message ran once the park was over" '[ -n "$ran" ]'
 echo "################ 4. a child told its limit resets in hours asks once"
 proxied "$RX/p" q4
 : > "$X/watch"
+asked=$(now_ms)
 "$HA" send q4 "Kiểm thử harness, làm đúng thứ tự: (1) dùng tool delegate với wait=false giao cho một agent role explorer nhiệm vụ: gọi run_shell đúng một lần với command Start-Sleep -Seconds 30 và timeout_ms 90000, rồi trả lời đúng CHILD-DONE. (2) Sau khi giao, tự gọi run_shell với command Start-Sleep -Seconds 120 và timeout_ms 180000. (3) Trả lời đúng một dòng: PARENT-DONE." >/dev/null 2>&1
+# This section's child, not one an earlier section started.
 for _ in $(seq 1 60); do
-  records child | grep -q " started " && break
+  records child | awk -v since="$asked" '$1 > since && $2 == "started"' | grep -q . && break
   sleep 3
 done
 sleep 10
@@ -201,6 +203,7 @@ sleep 5
 records child | sed 's/^/   /'
 requests "$limited" | sed 's/^/   proxy after the limit: /'
 most=$(requests "$limited" | awk '$2 == 429 {n[$3]++} END {m=0; for (k in n) if (n[k] > m) m = n[k]; print m}')
+check "the child started before the limit (the precondition)" 'records child | awk -v since="$asked" "\$1 > since && \$1 < $limited && \$2 == \"started\"" | grep -q .'
 check "the child met the limit and stopped (the precondition)" 'records child | awk -v since="$limited" "\$1 > since && \$2 == \"failed\"" | grep -q .'
 check "no conversation asked again after a limit that resets in hours" '[ "$most" -eq 1 ]'
 rm -f "$X/limit"

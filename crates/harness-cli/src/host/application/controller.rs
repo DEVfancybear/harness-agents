@@ -722,7 +722,7 @@ impl InteractiveController {
         steer: bool,
         effects: &mut Vec<Effect>,
     ) -> &'static str {
-        self.deliver_external_with_receipt(text, steer, None, effects)
+        self.deliver_external_with_receipt(text, steer, None, false, effects)
     }
 
     /// A background sender waits for this delivery's turn, even when later
@@ -784,8 +784,13 @@ impl InteractiveController {
             effects.extend(produced);
             return (receipt, "delivered");
         }
-        let outcome =
-            self.deliver_external_with_receipt(text.clone(), steer, Some(receipt), effects);
+        let outcome = self.deliver_external_with_receipt(
+            text.clone(),
+            steer,
+            Some(receipt),
+            from_agent,
+            effects,
+        );
         if from_agent && outcome == "queued" {
             self.agent_messages_queued.push(text);
         }
@@ -815,9 +820,31 @@ impl InteractiveController {
         text: String,
         steer: bool,
         receipt: Option<u64>,
+        from_agent: bool,
         effects: &mut Vec<Effect>,
     ) -> &'static str {
-        if self.free_for_automatic_turn() {
+        // The user's own message runs while the usage limit parks the session,
+        // as one typed in the terminal does; another agent's waits for the
+        // park to end. Seen live: `ha send` to a parked, idle agent was queued
+        // "after the active run" with no run to finish, and never ran.
+        let user_free = !from_agent
+            && self.parked()
+            && !self.phase.has_active_run()
+            && self.pending_approval.is_none()
+            && self.pending_question.is_none();
+        if user_free && !self.queue.is_empty() {
+            // What the park held was sent first, and goes first.
+            let lane = if steer {
+                super::queue::Lane::Steer
+            } else {
+                super::queue::Lane::FollowUp
+            };
+            self.queue.push_tracked(lane, text, receipt);
+            self.close_run_grant();
+            self.run_next_queued(effects);
+            return "queued";
+        }
+        if user_free || self.free_for_automatic_turn() {
             let produced = self.submit(text.clone());
             if let Some(receipt) = receipt {
                 if self.phase.has_active_run() {
@@ -11777,6 +11804,56 @@ Command: \"npm run build\""
                 .is_some_and(|text| text.contains("usage limit has reset")),
             "{sent:?}"
         );
+    }
+
+    /// Seen live: `ha send` to a parked, idle agent said "queued: sent after
+    /// the active run finishes" with no run to finish, and never ran. The
+    /// user's own message runs while parked - after what the park held, which
+    /// was sent first - and another agent's message still waits.
+    #[test]
+    fn a_users_message_runs_while_parked_and_takes_the_held_queue_along() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        harness.controller.parked_until = Some(chrono::Utc::now() + chrono::Duration::hours(2));
+
+        let mut effects = Vec::new();
+        let (_, from_agent) = harness.controller.deliver_tracked(
+            "[agent-message from scout] done".into(),
+            false,
+            true,
+            &mut effects,
+        );
+        assert_eq!(from_agent, "queued", "another agent's message waits");
+        assert!(submissions(&harness).is_empty());
+
+        let (alone, status) =
+            harness
+                .controller
+                .deliver_tracked("USER-OK".into(), false, false, &mut effects);
+        assert_eq!(status, "queued", "behind what the park held");
+        let sent = submissions(&harness);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("[agent-message from scout]"), "{sent:?}");
+        // The model answers: the park is over, and the user's message runs.
+        harness
+            .events
+            .send(SessionEvent::PrimaryAnswered)
+            .expect("answer");
+        end_with(&mut harness, RunOutcome::Done);
+        let sent = submissions(&harness);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[1].starts_with("USER-OK"), "{sent:?}");
+        assert_eq!(harness.controller.take_delivery_answer(alone), Ok(None));
+
+        // With nothing held, the user's message runs at once.
+        end_with(&mut harness, RunOutcome::Done);
+        harness.controller.parked_until = Some(chrono::Utc::now() + chrono::Duration::hours(2));
+        let (_, status) =
+            harness
+                .controller
+                .deliver_tracked("again".into(), false, false, &mut effects);
+        assert_eq!(status, "delivered");
+        assert_eq!(submissions(&harness).len(), 3);
     }
 
     /// After a stop, the children's reports wait and then go with the user's
