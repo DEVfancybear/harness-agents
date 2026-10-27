@@ -4808,6 +4808,10 @@ impl InteractiveController {
                 Ok(lines) => self.reference("/checks", lines, &mut effects),
                 Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
             },
+            "/strategy" => match self.service.strategy() {
+                Ok(lines) => self.reference("/strategy", lines, &mut effects),
+                Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+            },
             "/doctor" => match self.service.doctor() {
                 Ok(lines) => self.reference("/doctor", lines, &mut effects),
                 Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),

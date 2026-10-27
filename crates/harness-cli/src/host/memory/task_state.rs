@@ -23,6 +23,8 @@ use harness_tools::{
     ToolDispatchAuthorization, ToolOutput,
 };
 use harness_types::{ErrorCode, HarnessError};
+
+use super::strategy::{Alternative, DecisionKind, JournalKind, Standing, Strategy, StrategyState};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -96,6 +98,10 @@ pub struct TaskState {
     pub open: Vec<String>,
     #[serde(default)]
     pub files: Vec<String>,
+    /// The strategy the task follows, its journal, the evaluations the host
+    /// ran and the decisions taken on them.
+    #[serde(default, skip_serializing_if = "StrategyState::is_empty")]
+    pub strategy: StrategyState,
     /// Bumped by every update, so the model can tell its view is current.
     #[serde(default)]
     pub revision: u64,
@@ -110,6 +116,7 @@ impl TaskState {
             && self.constraints.is_empty()
             && self.open.is_empty()
             && self.files.is_empty()
+            && self.strategy.is_empty()
     }
 
     /// The items not done yet, in order.
@@ -182,6 +189,7 @@ impl TaskState {
         if !self.files.is_empty() {
             let _ = write!(text, "\nKey files: {}", self.files.join(", "));
         }
+        self.strategy.render(&mut text);
         text
     }
 
@@ -244,6 +252,9 @@ impl TaskState {
         }
         if !self.open.is_empty() {
             let _ = write!(text, "\nOpen: {}", self.open.join("; "));
+        }
+        if let Some(strategy) = self.strategy.recap() {
+            let _ = write!(text, "\n{strategy}");
         }
         text.trim_start().to_owned()
     }
@@ -588,11 +599,173 @@ fn apply(state: &mut TaskState, arguments: &Value) -> Result<Vec<String>, Harnes
             ));
         }
     }
+    apply_strategy(state, arguments)?;
     Ok(notes)
 }
 
+/// The strategy fields of an update: the strategy named, journal entries,
+/// and a decision after an evaluation.
+fn apply_strategy(state: &mut TaskState, arguments: &Value) -> Result<(), HarnessError> {
+    if let Some(value) = arguments.get("strategy").filter(|value| !value.is_null()) {
+        let strategy = strategy_of(value, "strategy")?;
+        if state
+            .strategy
+            .current
+            .as_ref()
+            .is_some_and(|current| current.name != strategy.name)
+        {
+            return Err(refused(
+                "task_state: the task already has a strategy; to change it, decide with kind switch and the evidence",
+            ));
+        }
+        state.strategy.set(strategy);
+    }
+    if let Some(values) = arguments
+        .get("add_journal")
+        .filter(|value| !value.is_null())
+    {
+        for value in values
+            .as_array()
+            .ok_or_else(|| refused("task_state: add_journal takes a list"))?
+        {
+            let kind = match value.get("kind") {
+                None | Some(Value::Null) => JournalKind::Observation,
+                Some(kind) => serde_json::from_value(kind.clone()).map_err(|_| {
+                    refused("task_state: a journal entry's kind is plan, observation, lesson, eval or eval_analysis")
+                })?,
+            };
+            let text = value
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|text| bounded(text, MAX_TEXT_CHARS))
+                .filter(|text| !text.is_empty())
+                .ok_or_else(|| refused("task_state: every journal entry needs its text"))?;
+            state.strategy.write(kind, text);
+        }
+    }
+    if let Some(value) = arguments.get("decide").filter(|value| !value.is_null()) {
+        let kind: DecisionKind = value
+            .get("kind")
+            .cloned()
+            .and_then(|kind| serde_json::from_value(kind).ok())
+            .ok_or_else(|| refused("task_state: decide.kind is continue or switch"))?;
+        let evidence = value
+            .get("evidence")
+            .and_then(Value::as_str)
+            .map(|text| bounded(text, MAX_TEXT_CHARS))
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| {
+                refused("task_state: a decision gives its evidence - what the evaluations showed")
+            })?;
+        let to = value
+            .get("strategy")
+            .filter(|value| !value.is_null())
+            .map(|value| strategy_of(value, "decide.strategy"))
+            .transpose()?;
+        let decision = state.strategy.decide(kind, to, evidence).map_err(refused)?;
+        harness_types::diag::info("strategy", "decided")
+            .field(
+                "kind",
+                if decision.kind == DecisionKind::Switch {
+                    "switch"
+                } else {
+                    "continue"
+                },
+            )
+            .field("plateau", decision.plateau)
+            .field("proposed", decision.proposed)
+            .field("from", decision.from.clone())
+            .field("to", decision.to.clone())
+            .emit();
+    }
+    Ok(())
+}
+
+/// A strategy as an update gives it: a name, why, and what it was weighed
+/// against.
+fn strategy_of(value: &Value, key: &str) -> Result<Strategy, HarnessError> {
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(|name| bounded(name, MAX_TEXT_CHARS))
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| refused(format!("task_state: {key} needs its name")))?;
+    let why = value
+        .get("why")
+        .and_then(Value::as_str)
+        .map(|why| bounded(why, MAX_TEXT_CHARS))
+        .unwrap_or_default();
+    let alternatives = value
+        .get("alternatives")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| {
+                    let name = value.get("name").and_then(Value::as_str)?;
+                    Some(Alternative {
+                        name: bounded(name, MAX_TEXT_CHARS),
+                        why: value
+                            .get("why")
+                            .and_then(Value::as_str)
+                            .map(|why| bounded(why, MAX_TEXT_CHARS))
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Strategy {
+        name,
+        why,
+        alternatives,
+    })
+}
+
+/// Record an evaluation the host ran on the task - a goal refused, the
+/// project's checks, the verifier - and say where the task stands. `None`
+/// when the task has no state to record it in.
+pub fn record_evaluation(
+    path: &Path,
+    source: &str,
+    reached: u8,
+    left: u32,
+    detail: &str,
+) -> Option<(Standing, TaskState)> {
+    let _guard = file_lock().lock().ok()?;
+    let mut state = load(path);
+    if state.is_empty() {
+        return None;
+    }
+    // An unchanged workspace scores what it scored.
+    let (reached, left) = if source == "unchanged" {
+        state.strategy.last_score().unwrap_or((reached, left))
+    } else {
+        (reached, left)
+    };
+    let standing = state.strategy.evaluate(source, reached, left, detail);
+    save(path, &state).ok()?;
+    harness_types::diag::info("strategy", "evaluated")
+        .field("source", source.to_owned())
+        .field("stage", u64::from(reached))
+        .field("left", u64::from(left))
+        .field("plateau", standing.plateau)
+        .emit();
+    Some((standing, state))
+}
+
+/// Keep the alternatives a strategist named, for the next decision.
+pub fn record_proposals(path: &Path, proposals: Vec<Alternative>) {
+    let Ok(_guard) = file_lock().lock() else {
+        return;
+    };
+    let mut state = load(path);
+    state.strategy.propose(proposals);
+    let _ = save(path, &state);
+}
+
 const ACTIONS: [&str; 2] = ["view", "update"];
-const KEYS: [&str; 9] = [
+const KEYS: [&str; 12] = [
     "action",
     "objective",
     "items",
@@ -602,6 +775,9 @@ const KEYS: [&str; 9] = [
     "open",
     "remove",
     "expected_revision",
+    "strategy",
+    "add_journal",
+    "decide",
 ];
 
 /// The `task_state` tool of one conversation.
@@ -686,7 +862,7 @@ impl ExternalToolCatalog for TaskStateHost {
     fn schemas(&self) -> Vec<Value> {
         vec![json!({"type":"function","function":{
             "name":"task_state",
-            "description":"The state of the task you are working on, kept by the host for this conversation: the objective, a checklist with each item's status, the decisions taken and why, the user's constraints, open questions and blockers, and the key files. Every turn shows it whole, and it is never summarized away when the context is compacted, so a long task keeps its plan. Use it for any task of more than a few steps: write the checklist when you start, mark an item in_progress when you begin it and done when it is finished and checked, record each decision and each constraint the user states as it happens. update changes only the fields it names: items replaces the whole checklist (send every item, in order); add_* fields append; open replaces the list of open questions and blockers; remove deletes constraints, decisions, files or open entries by their exact text. A goal does not complete while its checklist has unfinished items.",
+            "description":"The state of the task you are working on, kept by the host for this conversation: the objective, a checklist with each item's status, the decisions taken and why, the user's constraints, open questions and blockers, and the key files. Every turn shows it whole, and it is never summarized away when the context is compacted, so a long task keeps its plan. Use it for any task of more than a few steps: write the checklist when you start, mark an item in_progress when you begin it and done when it is finished and checked, record each decision and each constraint the user states as it happens. update changes only the fields it names: items replaces the whole checklist (send every item, in order); add_* fields append; open replaces the list of open questions and blockers; remove deletes constraints, decisions, files or open entries by their exact text. A goal does not complete while its checklist has unfinished items. For work you will evaluate - a goal, checks to pass - name your strategy (the approach, and what you weighed it against) and keep a journal of plans, observations, evaluations and lessons. After the host evaluates the work and it is not done, the state says a decision is due: weigh the evidence and record decide continue or switch; when the strategy has stopped getting further, switching usually beats more of the same.",
             "parameters":{"type":"object","properties":{
                 "action":{"type":"string","enum":ACTIONS},
                 "objective":{"type":"string","description":"update: what the task is for, in a sentence or two."},
@@ -703,7 +879,27 @@ impl ExternalToolCatalog for TaskStateHost {
                 "add_files":{"type":"array","items":{"type":"string"},"description":"update: files the task centers on."},
                 "open":{"type":"array","items":{"type":"string"},"maxItems":MAX_OPEN,"description":"update: the open questions and blockers, replacing the earlier list."},
                 "remove":{"type":"array","items":{"type":"string"},"description":"update: constraints, decisions, files or open entries to delete, by exact text."},
-                "expected_revision":{"type":"integer","minimum":0,"description":"update: the revision you last saw; a newer state refuses the update."}
+                "expected_revision":{"type":"integer","minimum":0,"description":"update: the revision you last saw; a newer state refuses the update."},
+                "strategy":{"type":"object","description":"update: the strategy the task follows, set once; change it with decide.","properties":{
+                    "name":{"type":"string","description":"The approach, in a few words."},
+                    "why":{"type":"string"},
+                    "alternatives":{"type":"array","description":"Approaches weighed against it.","items":{"type":"object","properties":{
+                        "name":{"type":"string"},
+                        "why":{"type":"string","description":"Why it was not chosen."}
+                    },"required":["name"],"additionalProperties":false}}
+                },"required":["name"],"additionalProperties":false},
+                "add_journal":{"type":"array","description":"update: entries for the task's journal.","items":{"type":"object","properties":{
+                    "kind":{"type":"string","enum":["plan","observation","lesson","eval","eval_analysis"]},
+                    "text":{"type":"string"}
+                },"required":["text"],"additionalProperties":false}},
+                "decide":{"type":"object","description":"update: after an evaluation, keep the strategy or change it.","properties":{
+                    "kind":{"type":"string","enum":["continue","switch"]},
+                    "evidence":{"type":"string","description":"What the evaluations showed."},
+                    "strategy":{"type":"object","description":"switch: the strategy switched to.","properties":{
+                        "name":{"type":"string"},
+                        "why":{"type":"string"}
+                    },"required":["name"],"additionalProperties":false}
+                },"required":["kind","evidence"],"additionalProperties":false}
             },"required":["action"],"additionalProperties":false}
         }})]
     }
@@ -872,6 +1068,42 @@ mod tests {
         TaskStateHost {
             path: root.join(TASK_STATE_FILE),
         }
+    }
+
+    /// The strategy is named once, the journal grows, and a decision after an
+    /// evaluation keeps it or changes it; changing it without a decision is
+    /// refused.
+    #[test]
+    fn a_strategy_changes_only_by_a_decision() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let host = host(root.path());
+        host.execute(&json!({"action": "update", "objective": "parse configs",
+            "strategy": {"name": "patch the regex", "why": "smallest change",
+                "alternatives": [{"name": "a parser", "why": "more work"}]},
+            "add_journal": [{"kind": "plan", "text": "extend the regex for nesting"}]}))
+            .expect("named");
+        let refused = host
+            .execute(&json!({"action": "update", "strategy": {"name": "a parser"}}))
+            .expect_err("a second strategy needs a decision");
+        assert!(refused.to_string().contains("decide"), "{refused}");
+        record_evaluation(host.path(), "checks", 1, 2, "check `nested` failed").expect("recorded");
+        let shown = load(host.path()).render();
+        assert!(shown.contains("Decision due"), "{shown}");
+        host.execute(&json!({"action": "update", "decide": {"kind": "switch",
+            "evidence": "the regex cannot count brackets",
+            "strategy": {"name": "a parser"}}}))
+            .expect("switched");
+        let state = load(host.path());
+        assert_eq!(
+            state.strategy.current.as_ref().map(|s| s.name.as_str()),
+            Some("a parser")
+        );
+        assert!(!state.render().contains("Decision due"));
+        assert!(state.render().contains("[plan] extend the regex for nesting"));
+        let missing = host
+            .execute(&json!({"action": "update", "decide": {"kind": "continue"}}))
+            .expect_err("a decision gives its evidence");
+        assert!(missing.to_string().contains("evidence"), "{missing}");
     }
 
     #[test]

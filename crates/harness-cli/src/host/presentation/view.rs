@@ -184,6 +184,10 @@ pub fn help_lines() -> Vec<String> {
 /// command by name in its group; the suggestion menu shows what each one does
 /// while typing `/`, and `/help all` opens the full table.
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the card is one table of command groups"
+)]
 pub fn help_card_lines() -> Vec<String> {
     let groups: [(&str, &[&str]); 6] = [
         (
@@ -198,6 +202,7 @@ pub fn help_card_lines() -> Vec<String> {
                 "/learn",
                 "/refinements",
                 "/checks",
+                "/strategy",
                 "/context",
                 "/copy",
                 "/export",

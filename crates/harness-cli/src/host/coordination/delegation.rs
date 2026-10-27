@@ -3152,6 +3152,24 @@ impl VerifierHandle {
     /// # Errors
     /// The verifier could not start, failed, or was stopped.
     pub async fn judge(&self, brief: String, model: Option<&str>) -> Result<String, String> {
+        self.run(AgentRole::Verifier, brief, model).await
+    }
+
+    /// Run an explorer on `brief` and return its answer: a fresh context
+    /// that reads the workspace and cannot edit it, as the strategist is.
+    ///
+    /// # Errors
+    /// The explorer could not start, failed, or was stopped.
+    pub async fn consult(&self, brief: String, model: Option<&str>) -> Result<String, String> {
+        self.run(AgentRole::Explorer, brief, model).await
+    }
+
+    async fn run(
+        &self,
+        role: AgentRole,
+        brief: String,
+        model: Option<&str>,
+    ) -> Result<String, String> {
         struct Verification<'a>(&'a SessionAgents, &'a TaskId);
         impl Drop for Verification<'_> {
             fn drop(&mut self) {
@@ -3172,10 +3190,10 @@ impl VerifierHandle {
         if self.cancellation.is_cancelled() {
             return Err("the verification was canceled before it started".to_owned());
         }
-        let launch = self.launch.for_role(AgentRole::Verifier, model)?;
+        let launch = self.launch.for_role(role, model)?;
         let (task_id, _) = self
             .agents
-            .start(AgentRole::Verifier, brief, None, &launch, None)
+            .start(role, brief, None, &launch, None)
             .await
             .map_err(|error| error.to_string())?;
         let _verification = Verification(&self.agents, &task_id);

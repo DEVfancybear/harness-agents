@@ -178,4 +178,8 @@ Mỗi giai đoạn: unit test, gate, live trên gpt-6-luna ở mức max, đối
    - Agent tự đánh giá và quyết định, rồi ghi quyết định vào `task_state`. Gate không chặn tool nào.
    - Thay đổi so với A2: bỏ `decisionGate = block`. Việc nêu tên phương án (A3) giữ nguyên, vì [A] cho thấy chỉ có lời khuyên nêu được phương án mới có tác dụng.
 3. **Tiến hoá harness (B5):** chạy **tự động** theo cadence, như review. Vẫn phải qua replay và chạy bóng trước khi bật thật.
-4. **Thông báo plateau trên TUI và `/strategy`:** **bật mặc định**.
+4. **Thông báo plateau trên TUI và `/strategy`:** **bật mặc định, hoàn toàn tự động**.
+   - Người dùng không phải bấm hay chọn gì: không có nút, không có câu hỏi.
+   - Khi có plateau, strategist tự đưa ra các phương án có tên, agent tự quyết và tự đổi.
+   - Thông báo trên TUI chỉ để người dùng biết chuyện gì đã xảy ra. `/strategy` chỉ để xem strategy, journal và các quyết định, không bắt buộc dùng.
+   - Thay đổi so với A3 mục 3: bỏ việc người dùng chỉ định đổi chiến lược.

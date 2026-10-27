@@ -1036,6 +1036,7 @@ impl Report {
         self.summary_activity(&mut out);
         self.summary_memory(&mut out);
         self.summary_jev(&mut out);
+        self.summary_strategy(&mut out);
         self.summary_children(&mut out);
         self.summary_timeline(&mut out);
         out
@@ -1756,6 +1757,80 @@ impl Report {
     /// answered; the agent's own `jev` calls; then the newest records with what
     /// each decided. Every outcome record names its `decision` and whether it
     /// `acted`, so a decision added later shows here without a change.
+    /// What the trajectory regulator said, and the strategy-level measures of
+    /// arXiv 2608.19072: how often a task was evaluated and stalled, how often
+    /// it switched strategy, and how often a switch took an alternative a
+    /// strategist named.
+    fn summary_strategy(&self, out: &mut String) {
+        let mut regulation: BTreeMap<String, usize> = BTreeMap::new();
+        for record in self
+            .records
+            .iter()
+            .filter(|record| record["kind"] == "regulation")
+        {
+            *regulation
+                .entry(record["event"].as_str().unwrap_or("?").to_owned())
+                .or_default() += 1;
+        }
+        let evaluated = self.recorded("strategy", "evaluated");
+        let decided = self.recorded("strategy", "decided");
+        if regulation.is_empty() && evaluated.is_empty() && decided.is_empty() {
+            return;
+        }
+        let _ = writeln!(out, "## Strategy and regulation\n");
+        if !regulation.is_empty() {
+            let _ = writeln!(
+                out,
+                "- regulation: {}",
+                regulation
+                    .iter()
+                    .map(|(event, count)| format!("{} {count}", event.replace('_', " ")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if !evaluated.is_empty() {
+            let plateaus = evaluated
+                .iter()
+                .filter(|record| record["fields"]["plateau"] == true)
+                .count();
+            let _ = writeln!(
+                out,
+                "- evaluations: {}, at a plateau: {plateaus}; strategist asked: {}, failed: {}",
+                evaluated.len(),
+                self.recorded("strategy", "proposed").len(),
+                self.recorded("strategy", "strategist_failed").len()
+            );
+        }
+        if !decided.is_empty() {
+            let switches = decided
+                .iter()
+                .filter(|record| record["fields"]["kind"] == "switch")
+                .collect::<Vec<_>>();
+            let proposed = switches
+                .iter()
+                .filter(|record| record["fields"]["proposed"] == true)
+                .count();
+            let _ = writeln!(
+                out,
+                "- decisions: {}; switches: {} (switch rate {}%), {proposed} to a strategist's alternative",
+                decided.len(),
+                switches.len(),
+                switches.len() * 100 / decided.len()
+            );
+            for record in switches {
+                let _ = writeln!(
+                    out,
+                    "  - {}: {} -> {}",
+                    ms_text(record["ms"].as_i64().unwrap_or_default()),
+                    record["fields"]["from"].as_str().unwrap_or_default(),
+                    record["fields"]["to"].as_str().unwrap_or_default()
+                );
+            }
+        }
+        out.push('\n');
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "three parts of one section, each a few lines"

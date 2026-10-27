@@ -162,6 +162,8 @@ pub mod skills;
 pub mod status_panel;
 #[path = "application/store_lease.rs"]
 pub mod store_lease;
+#[path = "memory/strategy.rs"]
+pub mod strategy;
 #[path = "memory/task_state.rs"]
 pub mod task_state;
 #[path = "presentation/terminal.rs"]

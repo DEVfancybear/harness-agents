@@ -581,6 +581,11 @@ pub trait SessionPort: Send {
     fn checks(&mut self, _argument: Option<&str>) -> Result<Vec<String>, String> {
         Err("this backend has no workspace".to_owned())
     }
+    /// `/strategy`: the task's strategy, its evaluations and the decisions on
+    /// them. It only shows: the strategy changes by the model's decisions.
+    fn strategy(&self) -> Result<Vec<String>, String> {
+        Err("this backend keeps no task state".to_owned())
+    }
     /// Run autonomous quality gates in the workspace; the verdict arrives as
     /// [`SessionEvent::GatesChecked`].
     fn run_gates(&mut self, _job: super::autonomous::GateJob) -> Result<(), String> {
@@ -5362,6 +5367,14 @@ impl SessionPort for AgentSessionService {
         super::checks::command(&layers, &self.workspace_root, argument)
     }
 
+    fn strategy(&self) -> Result<Vec<String>, String> {
+        let state = super::task_state::load(&super::task_state::path(
+            &self.data_dir,
+            self.task_id.as_str(),
+        ));
+        Ok(super::strategy::view(&state.strategy))
+    }
+
     fn doctor(&self) -> Result<Vec<String>, String> {
         let config = self.configured()?;
         let facts = super::doctor::Facts {
@@ -8704,6 +8717,10 @@ async fn run_turn(
                     .map(|host| (host.verifier(), config.routing.verifier.clone())),
                 cancellation: cancellation.clone(),
                 task_state: Some(task_state_host.path().to_path_buf()),
+                // Named alternatives at a plateau, from a fresh context.
+                strategist: delegate_host
+                    .as_ref()
+                    .map(|host| (host.verifier(), config.routing.verifier.clone())),
             }),
         ),
         _ => None,
