@@ -85,7 +85,7 @@ EOF
 trust "$(cd "$P2" && (pwd -W 2>/dev/null || pwd))"
 agent "$P2" s2
 since=$(now_ms)
-"$HA" send s2 "/goal Kiểm thử harness về chiến lược. Mục tiêu: check [verify] của dự án phải qua. Chiến lược ban đầu bắt buộc - ghi nó vào task_state với tên 'ghi draft': mỗi lượt ghi chuỗi XONG-42 vào file draft.txt bằng write_file rồi gọi goal_complete. Giữ đúng chiến lược này, không sửa file nào khác, cho tới khi harness báo nó không còn tiến triển (PLATEAU). Khi đó đọc các phương án mà harness nêu, ghi quyết định bằng task_state decide (kind switch, có evidence), rồi làm theo phương án bạn chọn." >/dev/null 2>&1
+"$HA" send s2 "/goal Kiểm thử harness về chiến lược. Mục tiêu: check [verify] của dự án phải qua. Chiến lược ban đầu bắt buộc - ghi nó vào task_state với tên 'ghi draft': mỗi lượt ghi chuỗi XONG-42 vào file draft.txt bằng write_file rồi gọi goal_complete. Đây là bài kiểm thử cơ chế của harness nên phải giữ đúng chiến lược này, không sửa file nào khác, và mỗi khi được hỏi thì ghi decide continue - cho tới khi chính harness in chữ PLATEAU (in hoa) trong kết quả goal_complete hoặc trong task state; tự bạn nhận định là không tiến triển thì chưa tính. Khi harness đã in PLATEAU: ràng buộc 'không sửa file nào khác' hết hiệu lực; đọc các phương án harness nêu, ghi quyết định bằng task_state decide (kind switch, có evidence), rồi làm theo phương án bạn chọn, sửa file nào cần." >/dev/null 2>&1
 for _ in $(seq 1 120); do
   "$HA" send s2 "/goal status" --wait 2>&1 | grep -qi "status: *complete" && break
   [ -f "$P2/result.txt" ] && [ "$(records strategy decided "$since" | grep -c switch)" -ge 1 ] && sleep 30 && break

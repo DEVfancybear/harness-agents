@@ -240,14 +240,22 @@ impl StrategyState {
         self.evaluations.drain(..excess);
         let plateau = self.plateau();
         // Asked once per plateau: not again until the alternatives were
-        // decided on, and a decision to continue gets as many evaluations
-        // as a plateau takes before it is asked again.
-        let decided = self.last_decided();
+        // decided on, and a decision made at a plateau gets as many
+        // evaluations as a plateau takes before it is asked again. Only one
+        // made at a plateau: the decision due after every evaluation is
+        // usually "continue", and counting those, the strategist was never
+        // asked (seen live).
+        let answered = self
+            .decisions
+            .iter()
+            .rev()
+            .find(|decision| decision.plateau)
+            .map_or(0, |decision| decision.after);
         Standing {
             plateau,
             wants_proposals: plateau
-                && self.proposed_after <= decided
-                && self.evaluated - decided >= PLATEAU,
+                && self.proposed_after <= self.last_decided()
+                && self.evaluated - answered >= PLATEAU,
         }
     }
 
@@ -668,6 +676,22 @@ mod tests {
                 .evaluate("checks", stage::CHECKS, 2, 0, "")
                 .wants_proposals
         );
+    }
+
+    /// Seen live: the model answered every evaluation with "continue", as the
+    /// decision due asks, and the strategist was never asked. A decision made
+    /// before the plateau does not hold it back.
+    #[test]
+    fn continuing_before_a_plateau_does_not_hold_the_strategist_back() {
+        let mut state = StrategyState::default();
+        for _ in 0..2 {
+            state.evaluate("checks", stage::CHECKS, 1, 0, "");
+            state
+                .decide(DecisionKind::Continue, None, "keep going".to_owned())
+                .expect("continued");
+        }
+        let standing = state.evaluate("checks", stage::CHECKS, 1, 0, "");
+        assert!(standing.plateau && standing.wants_proposals);
     }
 
     /// One check failing every time is not a plateau when what it reports
