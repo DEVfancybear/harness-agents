@@ -155,4 +155,45 @@ check "the store passes the lint" '(cd "$Q" && "$HA" memory lint --quiet)'
 check "retiring strikes the rule through" '[ -n "$DEC" ] && grep -q "~~\[inferred\] Rule:" "$Q/$DEC" && grep "$DEC" "$Q/MEMORY.md" | grep -q "~~"'
 check "and the store still passes the lint" '(cd "$Q" && "$HA" memory lint --quiet)'
 
+echo "################ 7. lessons move between machines and from a project to every project (ECC v2)"
+# What the loop has kept so far, as ECC's status shows instincts.
+"$HA" learning status > "$RX/status.out"
+sed 's/^/   /' "$RX/status.out" | head -12
+check "status lists the lessons by domain, with a confidence" 'grep -qE "^## [a-z-]+ \([0-9]+\)" "$RX/status.out" && grep -qE "[0-9]+%  les_" "$RX/status.out"'
+# Another machine's export: a project lesson seen in two conversations there.
+"$PY" - "$RX/other.json" <<'EOF'
+import datetime, json, sys
+at = lambda days: (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).isoformat()
+lesson = {"id": "les_elsewhere1", "text": "when a test fails only on Windows, check line endings before the logic",
+          "kind": "resolution", "domain": "testing", "scope": "project", "project": "other",
+          "signals": [{"at": at(3), "conversation": "task_a", "against": False, "evidence": "the diff was only CRLF against LF"},
+                      {"at": at(2), "conversation": "task_b", "against": False, "evidence": "it passed after .gitattributes set eol=lf"},
+                      {"at": at(1), "conversation": "task_b", "against": False, "evidence": "line endings again: CRLF in the fixture"}]}
+rule = dict(lesson, id="les_elsewhere2", kind="correction", domain="workflow",
+            text="when the user asks for a summary, give it before the details")
+json.dump({"schema": 1, "kind": "ha-lessons", "lessons": [lesson, rule]}, open(sys.argv[1], "w", encoding="utf-8"))
+EOF
+(cd "$Q" && "$HA" learning import "$RX/other.json" --dry-run) > "$RX/import-dry.out" 2>&1
+sed 's/^/   /' "$RX/import-dry.out"
+check "a dry run says what it would add and changes nothing" 'grep -q "would add les_elsewhere1" "$RX/import-dry.out" && ! "$HA" learning list --json | grep -q elsewhere'
+(cd "$Q" && "$HA" learning import "$RX/other.json") > "$RX/import.out" 2>&1
+sed 's/^/   /' "$RX/import.out"
+check "the import adds both lessons" '[ "$(grep -c "^added les_elsewhere" "$RX/import.out")" -eq 2 ]'
+check "their signals are marked as imported" '[ "$(field "x[\"id\"]==\"les_elsewhere2\"" "sum(1 for s in x[\"signals\"] if s[\"conversation\"].startswith(\"import:\"))")" = 3 ]'
+check "a project lesson lands in this project" '[ "$(field "x[\"id\"]==\"les_elsewhere2\"" "x[\"project\"][\"name\"]")" = q ]'
+check "the project resolution is kept as a fact at once" '[ "$(state les_elsewhere1)" = promoted ] && grep -rq "les_elsewhere1" "$Q/memory/projects/"'
+check "the imported rule passes the gate into the project's store" '[ "$(state les_elsewhere2)" = promoted ] && ls "$Q"/memory/decisions/*-learned-*.md | xargs grep -l "les_elsewhere2" | grep -q .'
+(cd "$Q" && "$HA" learning import "$RX/other.json") > "$RX/import2.out" 2>&1
+check "importing the same file again adds nothing" 'grep -q "0 new, 0 merged" "$RX/import2.out"'
+"$HA" learning promote les_elsewhere1 > "$RX/promote-fact.out" 2>&1
+check "a fact stays with its project" 'grep -q "fact of project q" "$RX/promote-fact.out"'
+"$HA" learning promote les_elsewhere2 > "$RX/promote.out" 2>&1
+sed 's/^/   /' "$RX/promote.out"
+check "the project's rule becomes one for every project" '[ "$(field "x[\"id\"]==\"les_elsewhere2\"" "x.get(\"project\")")" = None ] && [ "$(state les_elsewhere2)" = promoted ]'
+check "written where a rule for every project goes" '[ "$(placement les_elsewhere2)" = memory ] && [ -n "$(entry "$(placed les_elsewhere2)")" ]'
+check "and struck through in the project's store" 'ls "$Q"/memory/decisions/*-learned-*.md | xargs grep -l "les_elsewhere2" | xargs grep -q "~~\[inferred\] Rule:"'
+check "the store still passes the lint" '(cd "$Q" && "$HA" memory lint --quiet)'
+"$HA" learning export -o "$RX/export.json" --scope global > /dev/null
+check "an export carries the rule with its quotes" '"$PY" -c "import json,sys; d=json.load(open(sys.argv[1],encoding=\"utf-8\")); l=[x for x in d[\"lessons\"] if x[\"id\"]==\"les_elsewhere2\"]; sys.exit(0 if l and len(l[0][\"signals\"])==3 and d[\"kind\"]==\"ha-lessons\" else 1)" "$RX/export.json"'
+
 result

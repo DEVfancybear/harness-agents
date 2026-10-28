@@ -149,7 +149,9 @@ mandatory blocks:
 
 The automatic review is told the project keeps a store, so it saves no fact
 about the project as a memory edit: the agent writes those in the store
-([LEARNING_LOOP.en.md](LEARNING_LOOP.en.md)).
+([LEARNING_LOOP.en.md](LEARNING_LOOP.en.md)). The `memory` tool refuses a new
+`scope: project` entry too, and its refusal points at the store: a fact kept in
+both would go stale in one.
 
 The index is read only from inside the project and never from a protected path.
 A config that cannot be read still sends the rules, and the turn is told why the

@@ -147,7 +147,9 @@ Khi có `memory-lint.json` ở gốc project, mọi lượt mang hai block bắt
 
 Review tự động được báo rằng project có kho, nên nó không lưu dữ kiện nào của
 project thành edit memory: agent ghi chúng vào kho
-([LEARNING_LOOP.vi.md](LEARNING_LOOP.vi.md)).
+([LEARNING_LOOP.vi.md](LEARNING_LOOP.vi.md)). Tool `memory` cũng từ chối tạo
+entry `scope: project` mới, và lời từ chối chỉ sang kho: một dữ kiện giữ ở cả hai
+nơi thì sẽ có một nơi bị cũ.
 
 Index chỉ được đọc từ bên trong project và không bao giờ từ đường dẫn được bảo vệ.
 Config không đọc được thì vẫn gửi luật, và lượt được báo vì sao thiếu index.

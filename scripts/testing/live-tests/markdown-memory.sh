@@ -46,6 +46,15 @@ print(found or "")
 EOF
 }
 lint() { (cd "$P" && "$HA" memory lint "$@"); }
+# Everything the model was sent in the run's requests, tool results included.
+sent() { "$PY" - "$D" <<'EOF2'
+import glob, os, sqlite3, sys
+sys.stdout.reconfigure(encoding="utf-8")
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests order by rowid"):
+        print(text)
+EOF2
+}
 commit() { (cd "$P" && git add -A && git -c user.name=t -c user.email=t@t commit -qm "$1" "${@:2}"); }
 
 echo "################ 1. init writes the store and the hook; lint passes it"
@@ -152,5 +161,12 @@ check "Lan has a person file with tagged facts" '[ -n "$lanfile" ] && grep -E "^
 check "Vega has a project file" 'ls "$M"/memory/projects/*.md 2>/dev/null | grep -qi vega'
 check "the REST to tRPC change is struck through, not lost" 'grep -rh "~~" "$M/memory/projects" "$M/memory/decisions" 2>/dev/null | grep -qi "rest"'
 check "the index routes to the new files" '[ -n "$lanfile" ] && grep -q "$lanfile" "$M/MEMORY.md" && ! grep -qi "every Vega PR needs her approval" "$M/MEMORY.md"'
+
+echo "################ 9. the memory tool keeps no project fact beside the store"
+run_exec m9 "Kiểm thử harness: gọi tool memory với action write, scope project, title Package manager, content: Orion dùng pnpm. Nếu tool từ chối thì làm đúng theo lời từ chối của nó, rồi báo lại nguyên văn lời từ chối."
+check "the project entry was refused, naming the store" 'sent | grep -q "this project keeps its memory in markdown files"'
+check "no project entry was kept" '! "$HA" memory export | "$PY" -c "import json,sys; d=json.load(sys.stdin)[\"document\"][\"entries\"][\"memory\"]; sys.exit(0 if any(\"pnpm\" in (e.get(\"content\") or \"\") and e.get(\"project\") for e in d.values()) else 1)"'
+check "the fact went into the store, tagged" 'grep -rE "^\s*[-*+] \[(stated|observed|inferred|suggested)[^]]*\].*pnpm" "$P/memory" | grep -q .'
+check "and the store passes the lint" 'lint --quiet > /dev/null'
 
 result

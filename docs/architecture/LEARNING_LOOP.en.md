@@ -40,7 +40,8 @@ its state and standing. The review answers with a `lessons` array:
 ```json
 {"lesson": "les_…, or left out for a new one",
  "text": "when <situation>, <what turned out right>",
- "kind": "correction | deviation",
+ "kind": "correction | deviation | resolution | preference",
+ "domain": "code-style | testing | git | debugging | workflow | file-patterns | other",
  "scope": "global | project",
  "against": false,
  "evidence": "a verbatim quote from the conversation"}
@@ -138,6 +139,8 @@ first sighting.
 - Without a store, it becomes a ranked memory entry of that project at
   `facts/learned`: recalled when the work touches it, not put in every turn.
 - A fact the memory already holds is that entry.
+- A `resolution` about one project (an error a tool result showed, and the fix
+  that made it go away) is kept the same way.
 - Two contrary conversations retire it, striking its line.
 - Facts count toward no rule ceiling.
 
@@ -168,10 +171,50 @@ newest quotes. It answers with:
 - `synthesis`: two or three sentences on what recurs. It is kept with the
   changes (the last 30 meditations), and the report shows the newest.
 
+- `generalize` and `evolve`: see §6.
+
 The gate runs again after it, since merged signals may pass. The conversation is
 told each change: `learning loop: meditation: merged lesson …`.
 
-## 6. `ha learning`
+## 6. From ECC's continuous-learning-v2
+
+[ECC](https://github.com/affaan-m/ECC)'s continuous-learning-v2 (read at
+`25278e7`) keeps *instincts*: atomic "when X, do Y" with a confidence, a domain
+and a project or global scope. ha's lessons already were that, so v2's features
+went into them, not beside them.
+
+| ECC v2 | ha | Why |
+|---|---|---|
+| A Haiku observer reads every tool call in the background, every 5 minutes or 20 observations | The automatic review reads the conversation, tool results included, after its turns and when a session goes quiet | One reader of the conversation, not two |
+| Four patterns: corrections, error resolutions, repeated workflows, tool preferences | Kinds `correction`, `deviation`, `resolution` (an error and the fix that made it go away), `preference` (a tool or way of working the user chose); a repeated workflow is a learned skill's | ECC's observer cannot see corrections at all (it records no prompt); ha's review does |
+| `domain` per instinct | `domain` per lesson, one of code-style, testing, git, debugging, workflow, file-patterns, other | |
+| Confidence 0.3 / 0.5 / 0.7 / 0.85 by count; +0.05 / -0.1 / decay are documented, not implemented | `confidence` from the case: weight under 3 is 0.3, 3-5 is 0.5, 6-10 is 0.7, 11+ is 0.85, each contradicting conversation 0.1 off; old signals count half | The gate still promotes; the confidence says how much the case has grown |
+| SessionStart injects instincts at 0.7+, top 6 | A promoted rule is a `constraints` entry, in every turn | |
+| `promote <id>`; auto-promote at 2+ projects and average 0.8 | `ha learning promote <id>`; the meditation's `generalize` makes one lesson for every project of the same lesson in two or more projects, which then passes the gate as any other | A model judges "the same lesson", not keyword overlap; the gate, not an average, decides |
+| `/evolve` clusters instincts by trigger keywords into skills, commands and agents written where nothing loads them | The meditation's `evolve` gathers two or more promoted rules of one workflow into a learned skill, through the learned-skill promoter and its checks, into the library the agent loads | The skill is live; the rules stay in every turn |
+| `export` / `import` (file or https), `status` | `ha learning export`, `import <file>`, `status` | Files only: an import is the user's |
+
+A rule the review writes into a learned skill (`skillFiles`) is reported with
+`saved_as: "skill:<name>"`: the lesson is that skill (placement `skill`), and
+the loop writes no rule that says it again.
+
+**Status** lists the open lessons by domain, a bar of ten for the confidence.
+**Export** writes a JSON document (`kind: ha-lessons`) of the open lessons at or
+above `--min-confidence`, by `--scope global|project|all`, each with its
+signals; the placement stays behind. **Import** reads one:
+- a lesson already here (the same id, or the same text and scope) gains the
+  signals it lacks; a new one is a candidate, and the gate runs;
+- an imported signal's conversation is `import:<id>`, so a second import of the
+  same file adds nothing;
+- a project lesson becomes the current directory's project's;
+- a text or quote with a key-shaped value is skipped;
+- `--dry-run` says what would change.
+
+**Promote** makes a project's rule one for every project: its project rule is
+taken back, and the gate writes it where a global rule goes. A fact stays with
+its project.
+
+## 7. `ha learning`
 
 | Command | Does |
 |---|---|
@@ -179,28 +222,42 @@ told each change: `learning loop: meditation: merged lesson …`.
 | `ha learning show <id>` | Its rule's placement, every signal with its quote, and its history |
 | `ha learning distill` | Runs the gate now; prints what it promoted, retired and held |
 | `ha learning retire <id> [--reason …]` | Undoes the rule: deletes the memory entry, or strikes the decision's rule line and the index line (or the fact's line) through, dated (supersession, never deletion). A `covered` lesson's entry is the user's words and stays; retiring it, or two contrary conversations, says so |
-| `ha learning report [--all] [--html FILE]` | What recurs: rules still corrected, rules, candidates by weight, facts, the counts, and the last meditation's synthesis; with `--html`, also as a standalone page |
+| `ha learning report [--all] [--html FILE]` | What recurs: rules still corrected, rules, candidates by weight, facts, the counts, and the last meditation's synthesis; with `--html`, also as a standalone page. It ends with the self-evaluations of the last 30 days ([SELF_EVALUATION.en.md](SELF_EVALUATION.en.md)) |
+| `ha learning status` | The open lessons by domain, each with its confidence |
+| `ha learning export [-o FILE] [--min-confidence N] [--scope global\|project\|all]` | The open lessons as a JSON document another machine imports |
+| `ha learning import <FILE> [--dry-run] [--min-confidence N] [--scope …]` | Merge an export: new lessons as candidates, known ones gain the signals they lack; then the gate |
+| `ha learning promote <id>` | A project's rule becomes one for every project; then the gate |
 
 The running conversation is told what a review's gate changed:
 `learning loop: learned rule les_…: …`, `learned fact …`, `retired lesson …`.
 
-## 7. Storage
+## 8. Storage
 
 `<data>/harness/lessons.json`, written whole under `lessons.lock`. Each lesson
 holds:
-- its id, text, kind and tier;
+- its id, text, kind, domain and tier;
 - its project (`key`, `name`, `root`);
 - its state (`candidate`, `promoted`, `retired`) and when it was promoted;
 - its signals (time, conversation, `against`, quote);
-- its placement: a `memory` key, a `covered` key, a `markdown` root and file, or
-  a `markdown_fact` root and file;
+- its placement: a `memory` key, a `covered` key, a `markdown` root and file, a
+  `markdown_fact` root and file, or a `skill` name;
 - its events.
 
 The file also keeps the meditations. A lesson keeps its newest 50 signals and
 100 events. A file that cannot be parsed is reported and never overwritten.
+
+**A lesson follows its entry.** Each gate run first checks that a promoted
+lesson's memory entry is still there:
+- an entry renamed is followed;
+- a `covered` entry Deep Dream merged away is found again by what it says, by
+  the duplicate refusal's measures; with none, the lesson is a candidate again;
+- a rule the loop wrote that the user deleted retires its lesson.
+
+Deep Dream does not see the loop's own entries (`source: learning`): the
+meditation keeps them.
 `lessons_meditated` beside it records the last meditation.
 
-## 8. Tests
+## 9. Tests
 
 - Unit tests in `lessons.rs` cover:
   - the gate's counting, the quote check, the ceilings and contradiction;

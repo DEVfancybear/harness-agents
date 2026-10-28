@@ -40,7 +40,8 @@ kèm trạng thái và độ vững. Review trả về mảng `lessons`:
 ```json
 {"lesson": "les_…, hoặc bỏ trống với lesson mới",
  "text": "khi <tình huống>, <điều hoá ra đúng>",
- "kind": "correction | deviation",
+ "kind": "correction | deviation | resolution | preference",
+ "domain": "code-style | testing | git | debugging | workflow | file-patterns | other",
  "scope": "global | project",
  "against": false,
  "evidence": "trích dẫn nguyên văn từ hội thoại"}
@@ -137,6 +138,8 @@ thấy.
 - Không có kho: thành entry memory được xếp hạng của project đó, tại
   `facts/learned`, được gọi ra khi công việc chạm tới, không nằm trong mọi lượt.
 - Fact mà memory đã có thì chính là entry đó.
+- Một `resolution` về một project (lỗi mà tool result cho thấy, và cách sửa đã
+  làm nó hết) cũng được giữ như vậy.
 - Hai hội thoại phản bác thì retire nó và gạch ngang dòng của nó.
 - Fact không tính vào giới hạn rule nào.
 
@@ -165,10 +168,50 @@ và các trích dẫn mới nhất. Nó trả về:
 - `synthesis`: hai ba câu về những gì lặp lại. Được giữ cùng các thay đổi (30
   meditation gần nhất), và report hiện bản mới nhất.
 
+- `generalize` và `evolve`: xem §6.
+
 Ngưỡng chạy lại sau đó, vì tín hiệu đã gộp có thể đủ điều kiện. Hội thoại được
 báo từng thay đổi: `learning loop: meditation: merged lesson …`.
 
-## 6. `ha learning`
+## 6. Từ continuous-learning-v2 của ECC
+
+Continuous-learning-v2 của [ECC](https://github.com/affaan-m/ECC) (đọc ở
+`25278e7`) giữ các *instinct*: một điều "khi X thì làm Y" kèm độ tin cậy, domain,
+và phạm vi project hoặc global. Lesson của ha vốn đã là như vậy, nên các tính
+năng của v2 được đưa vào lesson chứ không đặt thành một cơ chế bên cạnh.
+
+| ECC v2 | ha | Vì sao |
+|---|---|---|
+| Một observer Haiku chạy nền đọc mọi lời gọi tool, mỗi 5 phút hoặc mỗi 20 quan sát | Review tự động đọc hội thoại, kể cả tool result, sau các lượt và khi phiên lặng | Một bên đọc hội thoại, không phải hai |
+| Bốn mẫu: lời sửa, cách gỡ lỗi, workflow lặp lại, sở thích dùng tool | Các kind `correction`, `deviation`, `resolution` (một lỗi và cách sửa đã làm nó hết), `preference` (tool hay cách làm người dùng đã chọn); workflow lặp lại thuộc về learned skill | Observer của ECC hoàn toàn không thấy lời sửa (nó không ghi prompt); review của ha thì thấy |
+| `domain` cho mỗi instinct | `domain` cho mỗi lesson: code-style, testing, git, debugging, workflow, file-patterns, other | |
+| Độ tin cậy 0.3 / 0.5 / 0.7 / 0.85 theo số lần; +0.05 / -0.1 / suy giảm chỉ có trong tài liệu, không có trong code | `confidence` tính từ độ vững: weight dưới 3 là 0.3, 3-5 là 0.5, 6-10 là 0.7, từ 11 là 0.85, mỗi hội thoại phản bác trừ 0.1; tín hiệu cũ tính một nửa | Ngưỡng vẫn là thứ promote; confidence cho biết độ vững đã tăng bao nhiêu |
+| SessionStart chèn instinct từ 0.7, tối đa 6 | Rule đã promote là entry `constraints`, có ở mọi lượt | |
+| `promote <id>`; tự promote khi có ở 2+ project và trung bình 0.8 | `ha learning promote <id>`; `generalize` của meditation gộp cùng một lesson ở hai project trở lên thành một lesson cho mọi project, rồi lesson đó qua ngưỡng như mọi lesson khác | Model phán xét "cùng một lesson", không phải trùng từ khoá; ngưỡng quyết định, không phải trung bình |
+| `/evolve` gom instinct theo từ khoá trong trigger thành skill, command và agent, ghi vào chỗ không gì nạp | `evolve` của meditation gom hai rule đã promote trở lên của cùng một workflow thành một learned skill, qua bộ promote learned skill và các check của nó, vào thư viện agent nạp skill | Skill dùng được ngay; các rule vẫn ở mọi lượt |
+| `export` / `import` (file hoặc https), `status` | `ha learning export`, `import <file>`, `status` | Chỉ file: import là việc của người dùng |
+
+Một rule mà review ghi vào learned skill (`skillFiles`) được báo với
+`saved_as: "skill:<tên>"`: lesson chính là skill đó (placement `skill`), và loop
+không ghi thêm rule nào nói lại điều ấy.
+
+**Status** liệt kê lesson đang mở theo domain, mỗi lesson một thanh mười ô cho
+confidence. **Export** ghi một tài liệu JSON (`kind: ha-lessons`) gồm các lesson
+đang mở có confidence từ `--min-confidence`, theo `--scope global|project|all`,
+mỗi lesson kèm tín hiệu; placement không đi theo. **Import** đọc tài liệu đó:
+- lesson đã có (cùng id, hoặc cùng text và phạm vi) nhận thêm các tín hiệu nó
+  chưa có; lesson mới là candidate, rồi ngưỡng chạy;
+- hội thoại của tín hiệu nhập vào là `import:<id>`, nên nhập cùng file lần thứ
+  hai không thêm gì;
+- lesson của project thành lesson của project ở thư mục hiện tại;
+- text hay trích dẫn có giá trị trông như key thì bị bỏ qua;
+- `--dry-run` cho biết sẽ đổi gì.
+
+**Promote** biến rule của một project thành rule cho mọi project: rule của
+project được gỡ, và ngưỡng ghi nó vào chỗ dành cho rule global. Fact thì ở lại
+với project của nó.
+
+## 7. `ha learning`
 
 | Lệnh | Làm gì |
 |---|---|
@@ -176,29 +219,44 @@ báo từng thay đổi: `learning loop: meditation: merged lesson …`.
 | `ha learning show <id>` | Chỗ đặt rule, mọi tín hiệu kèm trích dẫn, và lịch sử |
 | `ha learning distill` | Chạy ngưỡng ngay; in những gì đã promote, retire và giữ lại |
 | `ha learning retire <id> [--reason …]` | Gỡ rule: xoá entry memory, hoặc gạch ngang (có ghi ngày) dòng rule trong decision và dòng trong index (hoặc dòng của fact); là thay thế, không phải xoá. Entry của lesson `covered` là lời của người dùng nên được giữ lại; khi retire, hoặc khi hai hội thoại phản bác, ha báo rõ điều đó |
-| `ha learning report [--all] [--html FILE]` | Những gì lặp lại: rule còn bị sửa, rule, candidate theo weight, fact, các con số, và phần tổng hợp của meditation gần nhất; với `--html` thì xuất thêm một trang riêng |
+| `ha learning report [--all] [--html FILE]` | Những gì lặp lại: rule còn bị sửa, rule, candidate theo weight, fact, các con số, và phần tổng hợp của meditation gần nhất; với `--html` thì xuất thêm một trang riêng. Cuối report là các lần tự đánh giá trong 30 ngày gần nhất ([SELF_EVALUATION.vi.md](SELF_EVALUATION.vi.md)) |
+| `ha learning status` | Các lesson đang mở theo domain, kèm confidence |
+| `ha learning export [-o FILE] [--min-confidence N] [--scope global\|project\|all]` | Các lesson đang mở thành một tài liệu JSON để máy khác import |
+| `ha learning import <FILE> [--dry-run] [--min-confidence N] [--scope …]` | Gộp một bản export: lesson mới thành candidate, lesson đã có nhận thêm tín hiệu còn thiếu; rồi chạy ngưỡng |
+| `ha learning promote <id>` | Rule của một project thành rule cho mọi project; rồi chạy ngưỡng |
 
 Hội thoại đang chạy được báo những gì ngưỡng vừa đổi sau review:
 `learning loop: learned rule les_…: …`, `learned fact …`, `retired lesson …`.
 
-## 7. Lưu trữ
+## 8. Lưu trữ
 
 `<data>/harness/lessons.json`, ghi nguyên file dưới khoá `lessons.lock`. Mỗi
 lesson giữ:
 
-- id, text, kind và tier;
+- id, text, kind, domain và tier;
 - project (`key`, `name`, `root`);
 - trạng thái (`candidate`, `promoted`, `retired`) và thời điểm promote;
 - tín hiệu (thời điểm, hội thoại, `against`, trích dẫn);
-- chỗ đặt rule: key `memory`, key `covered`, root và file `markdown`, hoặc root
-  và file `markdown_fact`;
+- chỗ đặt rule: key `memory`, key `covered`, root và file `markdown`, root và
+  file `markdown_fact`, hoặc tên `skill`;
 - các sự kiện.
 
 File cũng giữ các meditation. Mỗi lesson giữ 50 tín hiệu và 100 sự kiện mới
 nhất. File không parse được thì được báo lỗi và không bao giờ bị ghi đè.
+
+**Lesson đi theo entry của nó.** Mỗi lần chạy ngưỡng, trước tiên ha kiểm tra
+entry memory của lesson đã promote còn không:
+- entry đổi tên thì đi theo;
+- entry `covered` mà Deep Dream đã gộp mất thì được tìm lại theo nội dung, bằng
+  các thước đo của việc từ chối entry trùng; không tìm thấy thì lesson thành
+  candidate trở lại;
+- rule do loop ghi mà người dùng đã xoá thì lesson của nó retire.
+
+Deep Dream không thấy các entry của chính loop (`source: learning`): meditation
+lo các entry đó.
 `lessons_meditated` nằm cạnh đó ghi lần meditation gần nhất.
 
-## 8. Kiểm thử
+## 9. Kiểm thử
 
 - Unit test trong `lessons.rs` phủ:
   - cách đếm của ngưỡng, kiểm tra trích dẫn, các giới hạn và phản bác;
