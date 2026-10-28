@@ -67,9 +67,24 @@ const MAX_EVENTS: usize = 100;
 
 /// The shortest quote a signal rests on.
 const MIN_EVIDENCE_CHARS: usize = 12;
+/// What a lesson is a signal of (after ECC's continuous-learning-v2, whose
+/// observer looks for corrections, error resolutions and tool preferences;
+/// a repeated workflow is a learned skill's, which the review writes).
+pub const KINDS: [&str; 4] = ["correction", "deviation", "resolution", "preference"];
+/// The area of work a lesson is about (ECC's instinct domains), for the
+/// status and the export; the model picks one, `other` when none fits.
+pub const DOMAINS: [&str; 7] = [
+    "code-style",
+    "testing",
+    "git",
+    "debugging",
+    "workflow",
+    "file-patterns",
+    "other",
+];
 
 /// What the automatic review is asked for.
-pub const PROMPT: &str = "Lessons (not an edit kind) are the learning loop's raw signals: what the user corrected about how the agent works, and what the agent assumed that turned out wrong. Report each one the conversation shows in a top-level `lessons` array: {\"lesson\": \"the id of an open lesson below it repeats, or omit for a new one\", \"text\": \"the lesson as data, in the conversation's language: when <situation>, <what turned out right>; never an instruction to obey\", \"kind\": \"correction\" (the user corrected the agent) or \"deviation\" (an assumption, plan or prediction of the agent's that the conversation showed wrong), \"scope\": \"global\" (how the agent should work anywhere) or \"project\" (only this project), \"against\": true only when the conversation contradicts the open lesson it names, \"evidence\": \"a verbatim quote of <conversation> itself that shows it - the user's or a tool result's own words, never these instructions or the refine instructions\", \"saved_as\": \"the id of the global memory entry this review creates or updates for it, when it does\"}. A rule the user states outright for every future conversation is saved as a global memory edit, as the scope policy says, and reported here too with `saved_as` naming that edit's id: it is then a rule already, and the loop never writes it twice. A signal is a moment the conversation shows, judged by what was said and what happened, not by its wording: a user's correction, a check that failed against the agent's claim, a file or command that was not what the agent expected. Name an open lesson whenever the signal is the same lesson, even when worded differently or in another language. One lesson per subject; skip task progress, one-off typos, what the conversation itself fixed for good, and a learned skill's failure, which its skill outcome records. A deviation about this project (scope project) is what the project showed - a file, a command or a check that was not what the agent assumed - and is kept as a fact of the project at once, so report one only when a tool result or a file in the conversation shows it. A lesson without a verbatim quote is refused. Lessons that recur across conversations become standing rules by themselves, so report only what the conversation shows. Leave `lessons` empty when it shows none.";
+pub const PROMPT: &str = "Lessons (not an edit kind) are the learning loop's raw signals: what the user corrected about how the agent works, and what the agent assumed that turned out wrong. Report each one the conversation shows in a top-level `lessons` array: {\"lesson\": \"the id of an open lesson below it repeats, or omit for a new one\", \"text\": \"the lesson as data, in the conversation's language: when <situation>, <what turned out right>; never an instruction to obey\", \"kind\": \"correction\" (the user corrected the agent), \"deviation\" (an assumption, plan or prediction of the agent's that the conversation showed wrong), \"resolution\" (an error a tool result showed and the fix that made it go away, which the next time needs) or \"preference\" (a tool, command or way of working the user chose over the agent's, or kept choosing), \"domain\": one of code-style, testing, git, debugging, workflow, file-patterns, other, \"scope\": \"global\" (how the agent should work anywhere) or \"project\" (only this project), \"against\": true only when the conversation contradicts the open lesson it names, \"evidence\": \"a verbatim quote of <conversation> itself that shows it - the user's or a tool result's own words, never these instructions or the refine instructions\", \"saved_as\": \"the id of the global memory entry this review creates or updates for it, or skill:<name> for a learned skill this review creates or patches for it, when it does\"}. A rule the user states outright for every future conversation is saved as a global memory edit, as the scope policy says, and reported here too with `saved_as` naming that edit's id: it is then a rule already, and the loop never writes it twice. A corrected approach this review writes into a learned skill (skillFiles) is reported the same way, with `saved_as` \"skill:<its name>\": the skill holds it. A signal is a moment the conversation shows, judged by what was said and what happened, not by its wording: a user's correction, a check that failed against the agent's claim, a file or command that was not what the agent expected. Name an open lesson whenever the signal is the same lesson, even when worded differently or in another language. One lesson per subject; skip task progress, one-off typos, what the conversation itself fixed for good, and a learned skill's failure, which its skill outcome records. A repeated multi-step workflow is a learned skill's (skillFiles), not a lesson. A deviation or a resolution about this project (scope project) is what the project showed - a file, a command or a check that was not what the agent assumed - and is kept as a fact of the project at once, so report one only when a tool result or a file in the conversation shows it. A lesson without a verbatim quote is refused. Lessons that recur across conversations become standing rules by themselves, so report only what the conversation shows. Leave `lessons` empty when it shows none.";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -132,6 +147,11 @@ pub enum Placement {
     Covered { key: String },
     /// A fact line in a project file of a project's markdown store.
     MarkdownFact { root: String, file: String },
+    /// A learned skill the review wrote or patched for the same correction:
+    /// the skill is how the agent works now, so the loop writes no rule that
+    /// says it again. Retiring the lesson leaves the skill, which its own
+    /// outcomes and the curator judge.
+    Skill { name: String },
 }
 
 /// What a promoted lesson becomes (Agnostic-AI's ladder, its middle rungs).
@@ -159,8 +179,11 @@ pub struct Event {
 pub struct Lesson {
     pub id: String,
     pub text: String,
-    /// `correction` or `deviation`.
+    /// One of [`KINDS`].
     pub kind: String,
+    /// One of [`DOMAINS`]; empty in a lesson kept before 0.8.6, read as `other`.
+    #[serde(default)]
+    pub domain: String,
     /// `None` for a lesson about every project.
     #[serde(default)]
     pub project: Option<ProjectRef>,
@@ -233,7 +256,42 @@ impl Lesson {
     }
 
     fn is_fact(&self) -> bool {
-        self.project.is_some() && self.kind == "deviation"
+        self.project.is_some() && matches!(self.kind.as_str(), "deviation" | "resolution")
+    }
+
+    /// The area of work, `other` when the lesson names none.
+    #[must_use]
+    pub fn domain(&self) -> &str {
+        if self.domain.is_empty() {
+            "other"
+        } else {
+            &self.domain
+        }
+    }
+
+    /// How sure the loop is of the lesson, 0 to 1, on ECC's instinct scale:
+    /// 0.3 for one or two signals, 0.5 for three to five, 0.7 for six to ten,
+    /// 0.85 beyond, each contradicting conversation taking 0.1 off. A rule
+    /// is promoted by the gate, not by this number, which says how much the
+    /// case has grown since.
+    #[must_use]
+    pub fn confidence(&self, now: DateTime<Utc>) -> f64 {
+        let standing = self.standing(now);
+        let base = if standing.weight >= 11.0 {
+            0.85
+        } else if standing.weight >= 6.0 {
+            0.7
+        } else if standing.weight >= MIN_WEIGHT {
+            0.5
+        } else {
+            0.3
+        };
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "a handful of contradicting conversations"
+        )]
+        let contrary = standing.contrary as f64 * 0.1;
+        (base - contrary).max(0.0)
     }
 
     fn standing_of<'a>(signals: impl Iterator<Item = &'a Signal>, now: DateTime<Utc>) -> Standing {
@@ -522,15 +580,16 @@ pub fn uncover(dir: &Path, ids: &BTreeSet<String>) {
     });
 }
 
-/// A recorded lesson the review also saved as global memory: promoted, as
-/// that entry, so the rule is kept once.
+/// A recorded lesson the review also saved as global memory, or as a learned
+/// skill it wrote or patched (`skill:<name>`): promoted, as that entry or
+/// skill, so the rule is kept once.
 fn cover(lessons: &mut Lessons, item: &Value, record: &mut Value, saved: &BTreeSet<String>) {
     let Some(key) = item["saved_as"].as_str().filter(|key| !key.is_empty()) else {
         return;
     };
     if !saved.contains(key) {
         record["saved_as_ignored"] = json!(format!(
-            "{key} is not a global memory entry this review writes"
+            "{key} is not a global memory entry or a learned skill this review writes"
         ));
         return;
     }
@@ -538,6 +597,19 @@ fn cover(lessons: &mut Lessons, item: &Value, record: &mut Value, saved: &BTreeS
         return;
     };
     if lesson.state != LessonState::Candidate {
+        return;
+    }
+    if let Some(name) = key.strip_prefix("skill:") {
+        lesson.state = LessonState::Promoted;
+        lesson.promoted_at = Some(Utc::now().to_rfc3339());
+        lesson.placement = Some(Placement::Skill {
+            name: name.to_owned(),
+        });
+        lesson.note(
+            "promoted",
+            format!("the review wrote it into learned skill {name}"),
+        );
+        record["saved_as"] = json!(key);
         return;
     }
     // A project that keeps a markdown store keeps its rules there: a memory
@@ -626,9 +698,16 @@ fn record_one(
     if text.is_empty() {
         return refused(item, "a new lesson needs its text");
     }
-    let Some(kind @ ("correction" | "deviation")) = item["kind"].as_str() else {
-        return refused(item, "kind must be correction or deviation");
+    let Some(kind) = item["kind"].as_str().filter(|kind| KINDS.contains(kind)) else {
+        return refused(
+            item,
+            "kind must be correction, deviation, resolution or preference",
+        );
     };
+    let domain = item["domain"]
+        .as_str()
+        .filter(|domain| DOMAINS.contains(domain))
+        .unwrap_or("other");
     let project = match item["scope"].as_str() {
         Some("project") => match project {
             Some(project) => Some(project.clone()),
@@ -640,6 +719,7 @@ fn record_one(
         id: new_id(),
         text: clip(text, MAX_TEXT_CHARS),
         kind: kind.to_owned(),
+        domain: domain.to_owned(),
         project,
         state: LessonState::Candidate,
         signals: vec![signal],
@@ -701,6 +781,87 @@ pub struct Places {
     pub global: PathBuf,
 }
 
+/// The key a memory entry is kept under now: its own, or the one it was
+/// renamed to (the old key is among the entry's aliases). `None` when the
+/// entry is gone.
+fn entry_key(state: &Value, key: &str) -> Option<String> {
+    let entries = state["entries"]["memory"].as_object()?;
+    if entries.get(key).is_some_and(Value::is_object) {
+        return Some(key.to_owned());
+    }
+    entries
+        .iter()
+        .find(|(_, entry)| {
+            entry["aliases"]
+                .as_array()
+                .is_some_and(|aliases| aliases.iter().any(|alias| alias == key))
+        })
+        .map(|(id, _)| id.clone())
+}
+
+/// A promoted lesson whose memory entry is gone or renamed. Deep Dream may
+/// merge the user's entry a lesson is covered by into another, and the user
+/// may delete a learned rule with the memory tool: the lesson follows a
+/// rename, finds the entry that now says it, and is a candidate again when
+/// none does. A learned entry the user deleted retires its lesson: the user
+/// did not want that rule.
+fn reconcile(places: &Places, lessons: &mut Lessons, distilled: &mut Distilled) {
+    let state = super::refine::load_raw(&places.global);
+    for lesson in &mut lessons.lessons {
+        if lesson.state != LessonState::Promoted {
+            continue;
+        }
+        let (key, covered) = match &lesson.placement {
+            Some(Placement::Covered { key }) => (key.clone(), true),
+            Some(Placement::Memory { key }) => (key.clone(), false),
+            _ => continue,
+        };
+        if let Some(now) = entry_key(&state, &key) {
+            if now != key {
+                lesson.note("moved", format!("its memory entry {key} is now {now}"));
+                lesson.placement = Some(if covered {
+                    Placement::Covered { key: now }
+                } else {
+                    Placement::Memory { key: now }
+                });
+            }
+            continue;
+        }
+        if !covered {
+            let why = format!("its memory entry {key} was deleted outside the learning loop");
+            lesson.state = LessonState::Retired;
+            lesson.placement = None;
+            lesson.note("retired", why.clone());
+            distilled.retired.push((lesson.id.clone(), why));
+            continue;
+        }
+        let data_dir = places.global.parent().unwrap_or(&places.global);
+        let mut host = super::memory::MemoryHost::new(data_dir, "learning");
+        let scope = match &lesson.project {
+            Some(project) => {
+                host = host.with_project(Path::new(&project.root));
+                "project"
+            }
+            None => "global",
+        };
+        if let Some(found) = host.covering(scope, "memory", &lesson.text, &lesson.text) {
+            lesson.note(
+                "moved",
+                format!("its memory entry {key} was merged into {found}"),
+            );
+            lesson.placement = Some(Placement::Covered { key: found });
+        } else {
+            lesson.state = LessonState::Candidate;
+            lesson.placement = None;
+            lesson.promoted_at = None;
+            lesson.note(
+                "unplaced",
+                format!("its memory entry {key} is gone and no entry says it: a candidate again"),
+            );
+        }
+    }
+}
+
 /// Run the gate over every lesson: promote what passes, within the ceilings,
 /// and retire what two conversations contradicted.
 ///
@@ -714,6 +875,7 @@ pub struct Places {
 pub fn distill(places: &Places, now: DateTime<Utc>) -> Result<Distilled, String> {
     update(&places.global, |lessons| {
         let mut distilled = Distilled::default();
+        reconcile(places, lessons, &mut distilled);
         // Retire first: a lesson two conversations contradicted is no rule,
         // and a promoted one gives its place back.
         for lesson in &mut lessons.lessons {
@@ -1255,7 +1417,7 @@ fn strike(text: &str, marker: &str, today: &str) -> String {
 /// Undo a lesson's promotion, if it has one.
 fn unplace(places: &Places, lesson: &Lesson) -> Result<(), String> {
     match &lesson.placement {
-        None | Some(Placement::Covered { .. }) => Ok(()),
+        None | Some(Placement::Covered { .. } | Placement::Skill { .. }) => Ok(()),
         Some(Placement::MarkdownFact { root, file }) => {
             let today = date(Utc::now());
             let path = Path::new(root).join(file);
@@ -1297,7 +1459,7 @@ fn unplace(places: &Places, lesson: &Lesson) -> Result<(), String> {
 pub fn line(lesson: &Lesson, now: DateTime<Utc>) -> String {
     let standing = lesson.standing(now);
     format!(
-        "{}  {:<9}  {:<4}  {:<7}  {:<10}  weight {:.1}, {} conversation(s){}{}  {}",
+        "{}  {:<9}  {:<4}  {:<7}  {:<10}  {:<13}  weight {:.1}, {} conversation(s), confidence {:.2}{}{}  {}",
         lesson.id,
         lesson.state.as_str(),
         lesson.tier.as_str(),
@@ -1306,8 +1468,10 @@ pub fn line(lesson: &Lesson, now: DateTime<Utc>) -> String {
             .as_ref()
             .map_or_else(|| "global".to_owned(), |project| project.name.clone()),
         lesson.kind,
+        lesson.domain(),
         standing.weight,
         standing.conversations,
+        lesson.confidence(now),
         if standing.contrary > 0 {
             format!(", contradicted in {}", standing.contrary)
         } else {
@@ -1460,6 +1624,354 @@ pub fn report_html(lessons: &Lessons, now: DateTime<Utc>, all: bool) -> String {
     )
 }
 
+/// --- status, export, import and promotion (ECC's instinct CLI) ---
+
+/// The open lessons by area of work, each with a bar of its confidence:
+/// ECC's `instinct-cli status`.
+#[must_use]
+pub fn status(lessons: &Lessons, now: DateTime<Utc>) -> String {
+    let open = lessons
+        .lessons
+        .iter()
+        .filter(|lesson| lesson.state != LessonState::Retired)
+        .collect::<Vec<_>>();
+    if open.is_empty() {
+        return "no open lessons yet: the automatic review records them as conversations show them\n"
+            .to_owned();
+    }
+    let rules = open
+        .iter()
+        .filter(|lesson| lesson.state == LessonState::Promoted)
+        .count();
+    let conversations = open
+        .iter()
+        .flat_map(|lesson| lesson.signals.iter())
+        .filter(|signal| !signal.against)
+        .map(|signal| signal.conversation.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let mut out = format!(
+        "{} open lesson(s), {rules} of them rules, from {conversations} conversation(s)\n",
+        open.len()
+    );
+    let mut by_domain = std::collections::BTreeMap::<&str, Vec<&Lesson>>::new();
+    for lesson in &open {
+        by_domain.entry(lesson.domain()).or_default().push(lesson);
+    }
+    for (domain, mut list) in by_domain {
+        list.sort_by(|left, right| right.confidence(now).total_cmp(&left.confidence(now)));
+        let _ = writeln!(out, "\n## {domain} ({})", list.len());
+        for lesson in list {
+            let confidence = lesson.confidence(now);
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a confidence between 0 and 1, in tenths"
+            )]
+            let filled = (confidence * 10.0).round().clamp(0.0, 10.0) as usize;
+            let _ = writeln!(
+                out,
+                "{}{} {:>3.0}%  {}  {:<9}  {:<10}  {:<7}  {}",
+                "█".repeat(filled),
+                "░".repeat(10 - filled),
+                confidence * 100.0,
+                lesson.id,
+                lesson.state.as_str(),
+                lesson.kind,
+                lesson
+                    .project
+                    .as_ref()
+                    .map_or("global", |project| project.name.as_str()),
+                clip(&lesson.text, 100)
+            );
+        }
+    }
+    out
+}
+
+/// Which lessons an export or an import takes: every project's, one
+/// project's, or both.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScopeFilter {
+    Global,
+    Project,
+    All,
+}
+
+impl ScopeFilter {
+    fn takes(self, lesson: &Lesson) -> bool {
+        match self {
+            Self::Global => lesson.project.is_none(),
+            Self::Project => lesson.project.is_some(),
+            Self::All => true,
+        }
+    }
+}
+
+/// The open lessons as a portable document: ECC's `instinct-cli export`. A
+/// lesson keeps its quotes and dates, so an import makes the same case; its
+/// rule's placement stays behind, as it is this machine's.
+#[must_use]
+pub fn export(
+    lessons: &Lessons,
+    now: DateTime<Utc>,
+    min_confidence: f64,
+    scope: ScopeFilter,
+) -> Value {
+    let exported = lessons
+        .lessons
+        .iter()
+        .filter(|lesson| lesson.state != LessonState::Retired)
+        .filter(|lesson| scope.takes(lesson))
+        .filter(|lesson| lesson.confidence(now) >= min_confidence)
+        .map(|lesson| {
+            json!({
+                "id": lesson.id,
+                "text": lesson.text,
+                "kind": lesson.kind,
+                "domain": lesson.domain(),
+                "scope": lesson.scope(),
+                "project": lesson.project.as_ref().map(|project| project.name.clone()),
+                "confidence": lesson.confidence(now),
+                "signals": lesson.signals,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"schema": 1, "kind": "ha-lessons", "exported_at": now.to_rfc3339(), "lessons": exported})
+}
+
+/// What an import did, lesson by lesson.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Imported {
+    pub added: Vec<String>,
+    pub merged: Vec<String>,
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Bring in lessons another machine exported: ECC's `instinct-cli import`.
+/// A lesson that is already here (the same id, or the same text and scope)
+/// gains the signals it did not have; a new one is a candidate, which the
+/// gate promotes like any other. Their signals keep their conversations,
+/// marked as imported, so the same file imported twice adds nothing. A
+/// project lesson becomes `project`'s; without a project here it is skipped.
+///
+/// # Errors
+/// The document is not a lessons export, or the lessons cannot be written.
+pub fn import(
+    dir: &Path,
+    document: &Value,
+    min_confidence: f64,
+    scope: ScopeFilter,
+    project: Option<&ProjectRef>,
+    dry_run: bool,
+) -> Result<Imported, String> {
+    if document["kind"] != "ha-lessons" {
+        return Err("not a lessons export (`ha learning export` writes one)".to_owned());
+    }
+    let items = document["lessons"].as_array().cloned().unwrap_or_default();
+    let run = |lessons: &mut Lessons| import_into(lessons, &items, min_confidence, scope, project);
+    if dry_run {
+        let mut lessons = load(dir)?;
+        return Ok(run(&mut lessons));
+    }
+    update(dir, run)
+}
+
+/// The signals an exported lesson carries, as this machine keeps them: no
+/// secret, a bounded quote, and the conversation marked as imported.
+fn imported_signals(item: &Value) -> Vec<Signal> {
+    item["signals"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|signal| serde_json::from_value::<Signal>(signal.clone()).ok())
+        .filter(|signal| harness_tools::secret_values::first(&signal.evidence).is_none())
+        .map(|mut signal| {
+            if !signal.conversation.starts_with("import:") {
+                signal.conversation = format!("import:{}", signal.conversation);
+            }
+            signal.evidence = clip(&signal.evidence, MAX_EVIDENCE_CHARS);
+            signal
+        })
+        .collect()
+}
+
+/// Add to `kept` the signals of `lesson` it lacks; how many were added.
+fn merge_signals(kept: &mut Lesson, lesson: Lesson) -> usize {
+    let mut added = 0;
+    for signal in lesson.signals {
+        let known = kept.signals.iter().any(|have| {
+            have.conversation == signal.conversation
+                && have.against == signal.against
+                && normalize(&have.evidence) == normalize(&signal.evidence)
+        });
+        if !known {
+            kept.signals.push(signal);
+            added += 1;
+        }
+    }
+    if added > 0 {
+        kept.signals.sort_by(|left, right| left.at.cmp(&right.at));
+        if kept.signals.len() > MAX_SIGNALS {
+            let extra = kept.signals.len() - MAX_SIGNALS;
+            kept.signals.drain(..extra);
+        }
+    }
+    added
+}
+
+fn import_into(
+    lessons: &mut Lessons,
+    items: &[Value],
+    min_confidence: f64,
+    scope: ScopeFilter,
+    project: Option<&ProjectRef>,
+) -> Imported {
+    let now = Utc::now();
+    let mut imported = Imported::default();
+    for item in items {
+        let id = item["id"].as_str().unwrap_or("(no id)").to_owned();
+        let text = clip(
+            item["text"].as_str().unwrap_or_default().trim(),
+            MAX_TEXT_CHARS,
+        );
+        let Some(kind) = item["kind"].as_str().filter(|kind| KINDS.contains(kind)) else {
+            imported
+                .skipped
+                .push((id, "its kind is not a lesson's".to_owned()));
+            continue;
+        };
+        if text.is_empty() {
+            imported.skipped.push((id, "it has no text".to_owned()));
+            continue;
+        }
+        if let Some(shape) = harness_tools::secret_values::first(&text) {
+            imported
+                .skipped
+                .push((id, format!("its text holds what looks like a {shape}")));
+            continue;
+        }
+        let target = if item["scope"] == "project" {
+            let Some(project) = project else {
+                imported.skipped.push((
+                    id,
+                    "a project lesson, and there is no project here".to_owned(),
+                ));
+                continue;
+            };
+            Some(project.clone())
+        } else {
+            None
+        };
+        let mut lesson = Lesson {
+            id: id.clone(),
+            text,
+            kind: kind.to_owned(),
+            domain: item["domain"]
+                .as_str()
+                .filter(|domain| DOMAINS.contains(domain))
+                .unwrap_or("other")
+                .to_owned(),
+            project: target,
+            signals: imported_signals(item),
+            ..Lesson::default()
+        };
+        if !scope.takes(&lesson) {
+            imported
+                .skipped
+                .push((id, "outside the scope asked for".to_owned()));
+            continue;
+        }
+        let confidence = lesson.confidence(now);
+        if confidence < min_confidence {
+            imported.skipped.push((
+                id,
+                format!("confidence {confidence:.2} is under the minimum"),
+            ));
+            continue;
+        }
+        let text_key = normalize(&lesson.text);
+        let scope_key = lesson.scope_key().map(str::to_owned);
+        if let Some(kept) = lessons.lessons.iter_mut().find(|kept| {
+            kept.state != LessonState::Retired
+                && (kept.id == lesson.id
+                    || (normalize(&kept.text) == text_key
+                        && kept.scope_key().map(str::to_owned) == scope_key))
+        }) {
+            let added = merge_signals(kept, lesson);
+            if added > 0 {
+                kept.note("imported", format!("{added} signal(s) from an export"));
+                imported.merged.push(kept.id.clone());
+            } else {
+                imported.skipped.push((
+                    kept.id.clone(),
+                    "it brought no signal this machine lacks".to_owned(),
+                ));
+            }
+            continue;
+        }
+        if lesson.signals.is_empty() {
+            imported
+                .skipped
+                .push((id, "it has no signal to make its case".to_owned()));
+            continue;
+        }
+        if lessons.find(&lesson.id).is_some() || !lesson.id.starts_with("les_") {
+            lesson.id = new_id();
+        }
+        lesson.tier = if lesson.is_fact() {
+            Tier::Fact
+        } else {
+            Tier::Rule
+        };
+        lesson.note("imported", format!("from an export, as {id}"));
+        imported.added.push(lesson.id.clone());
+        lessons.lessons.push(lesson);
+    }
+    imported
+}
+
+/// Make a project's lesson one for every project: ECC's `instinct-cli
+/// promote <id>`. A rule written for the project is taken back; the gate's
+/// next run writes it where a rule for every project goes. A fact is what
+/// one project showed, and stays that project's.
+///
+/// # Errors
+/// There is no such open lesson, it is already for every project, it is a
+/// fact, or its project rule cannot be taken back.
+pub fn promote_global(places: &Places, id: &str) -> Result<Lesson, String> {
+    update(&places.global, |lessons| {
+        let lesson = lessons
+            .find_mut(id)
+            .ok_or_else(|| format!("no lesson {id}"))?;
+        if lesson.state == LessonState::Retired {
+            return Err(format!("lesson {id} is retired"));
+        }
+        let Some(project) = lesson.project.clone() else {
+            return Err(format!("lesson {id} is for every project already"));
+        };
+        if lesson.tier == Tier::Fact {
+            return Err(format!(
+                "lesson {id} is a fact of project {}: it holds there only",
+                project.name
+            ));
+        }
+        unplace(places, lesson)?;
+        lesson.project = None;
+        lesson.state = LessonState::Candidate;
+        lesson.placement = None;
+        lesson.promoted_at = None;
+        lesson.note(
+            "generalized",
+            format!(
+                "made a lesson for every project (it was project {}'s)",
+                project.name
+            ),
+        );
+        Ok(lesson.clone())
+    })?
+}
+
 // --- meditation ---
 
 /// When the last meditation ran, beside the lessons.
@@ -1497,7 +2009,7 @@ pub fn meditation_due(dir: &Path, now: DateTime<Utc>) -> bool {
 }
 
 /// The meditation's prompt: what to do, and each open lesson with its case.
-fn meditation_prompt(lessons: &Lessons, now: DateTime<Utc>) -> String {
+fn meditation_prompt(lessons: &Lessons, now: DateTime<Utc>, skills: bool) -> String {
     let mut open = lessons
         .lessons
         .iter()
@@ -1538,13 +2050,23 @@ fn meditation_prompt(lessons: &Lessons, now: DateTime<Utc>) -> String {
         }
     }
     format!(
-        "<lessons>\n{listed}</lessons>\n\nAnswer {{\"merge\": [...], \"reword\": [...], \"retire\": [...], \"synthesis\": \"...\"}}:\n- merge: lessons that are one lesson - the same situation and the same right answer - in other words or another language: {{\"into\": id, \"from\": [ids], \"text\": \"a clearer wording, or omit\"}}. Only lessons of the same scope and tier.\n- reword: a rule STILL CORRECTED since it became a rule, whose wording its quotes show missed the point, or a lesson that reads as an instruction rather than as data: {{\"id\": id, \"text\": \"when <situation>, <what turned out right>\", \"why\": \"...\"}}.\n- retire: a lesson its own later quotes contradict, or that no longer holds: {{\"id\": id, \"why\": \"the quote that shows it\"}}.\n- synthesis: two or three sentences on what recurs across these lessons and what it says about how the agent works, in the lessons' language.\nLeave a list empty when nothing in it is justified."
+        "<lessons>\n{listed}</lessons>\n\nAnswer {{\"merge\": [...], \"reword\": [...], \"retire\": [...], \"generalize\": [...], \"evolve\": [...], \"synthesis\": \"...\"}}:\n- merge: lessons that are one lesson - the same situation and the same right answer - in other words or another language: {{\"into\": id, \"from\": [ids], \"text\": \"a clearer wording, or omit\"}}. Only lessons of the same scope and tier.\n- reword: a rule STILL CORRECTED since it became a rule, whose wording its quotes show missed the point, or a lesson that reads as an instruction rather than as data: {{\"id\": id, \"text\": \"when <situation>, <what turned out right>\", \"why\": \"...\"}}.\n- retire: a lesson its own later quotes contradict, or that no longer holds: {{\"id\": id, \"why\": \"the quote that shows it\"}}.\n- generalize: lessons of two or more different projects that are one lesson - the same situation and the same right answer, which holds beyond any one project: {{\"from\": [ids], \"text\": \"the wording for every project\"}}. Only rules, never facts.\n{}- synthesis: two or three sentences on what recurs across these lessons and what it says about how the agent works, in the lessons' language.\nLeave a list empty when nothing in it is justified.",
+        if skills {
+            format!(
+                "- evolve: two or more PROMOTED rules that are steps of one workflow, which the agent would follow better as one learned skill: {{\"from\": [ids], \"name\": \"kebab-case-name\", \"level\": \"global\" or \"project\", \"body\": \"the whole SKILL.md\"}}, following:\n{}\n",
+                super::learned::SPEC
+            )
+        } else {
+            String::new()
+        }
     )
 }
 
 /// Read the lessons as a whole, once: merge what is one lesson, reword a rule
-/// the conversations keep correcting, retire what no longer holds; then run
-/// the gate, as merged signals may pass it. Returns what changed.
+/// the conversations keep correcting, retire what no longer holds, make one
+/// lesson of the same lesson in several projects, and gather the rules of one
+/// workflow into a learned skill; then run the gate, as merged signals may
+/// pass it. Returns what changed.
 ///
 /// # Errors
 /// The model call fails, or the lessons cannot be read or written.
@@ -1553,9 +2075,10 @@ pub async fn meditate(
     model: &str,
     places: &Places,
     now: DateTime<Utc>,
+    skills: Option<(&super::learned::Layers, &super::learned::PromoteContext)>,
 ) -> Result<Vec<String>, String> {
     let _ = std::fs::write(places.global.join(MEDITATED_FILE), now.to_rfc3339());
-    let prompt = meditation_prompt(&load(&places.global)?, now);
+    let prompt = meditation_prompt(&load(&places.global)?, now, skills.is_some());
     let answer = super::refine::complete_json(
         provider,
         model,
@@ -1566,7 +2089,11 @@ pub async fn meditate(
     )
     .await?;
     let mut changes = update(&places.global, |lessons| {
-        let changes = apply_meditation(places, lessons, &answer, now);
+        let mut changes = apply_meditation(places, lessons, &answer, now);
+        changes.extend(generalize(places, lessons, &answer));
+        if let Some((layers, context)) = skills {
+            changes.extend(evolve(lessons, &answer, layers, context));
+        }
         lessons.meditations.push(Meditation {
             at: now.to_rfc3339(),
             synthesis: answer["synthesis"]
@@ -1691,6 +2218,169 @@ fn apply_meditation(
     changes
 }
 
+/// Make one lesson for every project of the same lesson seen in two or more
+/// projects (ECC's automatic `promote`: an instinct in 2+ projects becomes
+/// global). The sources give their signals to it and are retired; the gate
+/// then decides on the merged case, as on any other. Facts stay with their
+/// project.
+fn generalize(places: &Places, lessons: &mut Lessons, answer: &Value) -> Vec<String> {
+    let mut changes = Vec::new();
+    for item in answer["generalize"].as_array().into_iter().flatten() {
+        let ids = item["from"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let sources = lessons
+            .lessons
+            .iter()
+            .filter(|lesson| ids.contains(&lesson.id))
+            .filter(|lesson| lesson.state != LessonState::Retired && lesson.tier == Tier::Rule)
+            .filter(|lesson| lesson.project.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        let projects = sources
+            .iter()
+            .filter_map(Lesson::scope_key)
+            .collect::<BTreeSet<_>>();
+        if projects.len() < 2 {
+            continue;
+        }
+        let text = item["text"]
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map_or_else(
+                || sources[0].text.clone(),
+                |text| clip(text, MAX_TEXT_CHARS),
+            );
+        let mut moved = Vec::new();
+        let mut from = Vec::new();
+        for source in &sources {
+            let Some(lesson) = lessons.find_mut(&source.id) else {
+                continue;
+            };
+            if unplace(places, lesson).is_err() {
+                continue;
+            }
+            moved.append(&mut lesson.signals);
+            lesson.state = LessonState::Retired;
+            from.push(lesson.id.clone());
+        }
+        if from.len() < 2 {
+            // Too few were taken back to make the case: give the signals back.
+            for id in &from {
+                if let Some(lesson) = lessons.find_mut(id) {
+                    lesson.state = LessonState::Candidate;
+                    lesson.placement = None;
+                    lesson.signals.extend(
+                        moved
+                            .iter()
+                            .filter(|signal| {
+                                sources
+                                    .iter()
+                                    .find(|source| &source.id == id)
+                                    .is_some_and(|source| source.signals.contains(signal))
+                            })
+                            .cloned(),
+                    );
+                }
+            }
+            continue;
+        }
+        moved.sort_by(|left, right| left.at.cmp(&right.at));
+        let excess = moved.len().saturating_sub(MAX_SIGNALS);
+        moved.drain(..excess);
+        let mut general = Lesson {
+            id: new_id(),
+            text,
+            kind: sources[0].kind.clone(),
+            domain: sources[0].domain.clone(),
+            signals: moved,
+            ..Lesson::default()
+        };
+        general.note(
+            "generalized",
+            format!("from {} in {} projects", from.join(", "), projects.len()),
+        );
+        for id in &from {
+            if let Some(lesson) = lessons.find_mut(id) {
+                lesson.note("generalized", format!("into {}", general.id));
+            }
+        }
+        changes.push(format!(
+            "generalized {} into lesson {} for every project: {}",
+            from.join(", "),
+            general.id,
+            general.text
+        ));
+        lessons.lessons.push(general);
+    }
+    changes
+}
+
+/// Gather promoted rules that are steps of one workflow into a learned skill
+/// (ECC's `/evolve`, whose skills are written where nothing loads them; this
+/// one goes through the learned-skill promoter, with its checks, into the
+/// library the agent loads skills from). The rules stay: each is shown in
+/// every turn, the skill when the work calls for it.
+fn evolve(
+    lessons: &mut Lessons,
+    answer: &Value,
+    layers: &super::learned::Layers,
+    context: &super::learned::PromoteContext,
+) -> Vec<String> {
+    let mut changes = Vec::new();
+    for item in answer["evolve"].as_array().into_iter().flatten() {
+        let ids = item["from"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|id| {
+                lessons.find(id).is_some_and(|lesson| {
+                    lesson.state == LessonState::Promoted && lesson.tier == Tier::Rule
+                })
+            })
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let (Some(name), Some(body)) = (item["name"].as_str(), item["body"].as_str()) else {
+            continue;
+        };
+        if ids.len() < 2 {
+            continue;
+        }
+        let intent = super::learned::Intent::from_value(&json!({
+            "action": "create",
+            "name": name,
+            "level": item["level"].as_str().unwrap_or("global"),
+            "body": body,
+            "reason": format!("the learning loop's rules {} are one workflow", ids.iter().cloned().collect::<Vec<_>>().join(", ")),
+            "evidence": ids.iter().filter_map(|id| lessons.find(id)).map(|lesson| lesson.text.clone()).collect::<Vec<_>>().join(" / "),
+        }));
+        let verdict = super::learned::promote(layers, &intent, context);
+        if !verdict.ok {
+            changes.push(format!(
+                "evolve into skill {name} refused: {}",
+                verdict.findings.join("; ")
+            ));
+            continue;
+        }
+        for id in &ids {
+            if let Some(lesson) = lessons.find_mut(id) {
+                lesson.note("evolved", format!("into learned skill {name}"));
+            }
+        }
+        changes.push(format!(
+            "evolved rules {} into learned skill {name}",
+            ids.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    changes
+}
+
 /// Carry a new wording to where the lesson's rule or fact is written; the old
 /// one is superseded, never deleted. An entry the loop did not write stays
 /// as the user wrote it.
@@ -1707,6 +2397,9 @@ fn reword_placement(
         None => Ok(()),
         Some(Placement::Covered { key }) => Err(format!(
             "memory entry {key} is the user's own words; the review updates it"
+        )),
+        Some(Placement::Skill { name }) => Err(format!(
+            "learned skill {name} holds it; the review patches the skill"
         )),
         // A new version of the lesson's own entry: the store keeps the old.
         Some(Placement::Memory { .. }) => match lesson.tier {
@@ -1867,7 +2560,10 @@ mod tests {
             "the evidence is not a verbatim quote of the conversation, a phrase long"
         );
         assert_eq!(records[2]["error"], "no open lesson les_missing");
-        assert_eq!(records[3]["error"], "kind must be correction or deviation");
+        assert_eq!(
+            records[3]["error"],
+            "kind must be correction, deviation, resolution or preference"
+        );
         assert_eq!(
             records[4]["applied"], false,
             "a quote of one word: {:?}",
@@ -1888,6 +2584,330 @@ mod tests {
         assert_eq!(lessons.lessons.len(), 1);
         assert_eq!(lessons.lessons[0].signals.len(), 2);
         assert!(prompt_part(dir.path(), None).contains(&id));
+    }
+
+    /// ECC's confidence scale: one or two signals 0.3, three to five 0.5, six
+    /// to ten 0.7, beyond 0.85, each contradicting conversation 0.1 off.
+    #[test]
+    fn confidence_grows_with_the_case_and_falls_with_contradiction() {
+        let signals = |count: usize| {
+            (0..count)
+                .map(|index| signal(&format!("c{index}"), &format!("quote {index}"), 1, false))
+                .collect::<Vec<_>>()
+        };
+        let now = Utc::now();
+        assert!((lesson("a", signals(2)).confidence(now) - 0.3).abs() < 1e-9);
+        assert!((lesson("b", signals(4)).confidence(now) - 0.5).abs() < 1e-9);
+        assert!((lesson("c", signals(7)).confidence(now) - 0.7).abs() < 1e-9);
+        assert!((lesson("d", signals(12)).confidence(now) - 0.85).abs() < 1e-9);
+        let mut contradicted = signals(4);
+        contradicted.push(signal("x", "not so", 1, true));
+        assert!((lesson("e", contradicted).confidence(now) - 0.4).abs() < 1e-9);
+    }
+
+    /// The review may report an error's fix and a preference, with an area of
+    /// work; a project's resolution is what it showed, a fact; an unknown
+    /// domain reads as other.
+    #[test]
+    fn a_resolution_and_a_preference_are_recorded_with_their_domain() {
+        let dir = tempfile::tempdir().expect("dir");
+        let project = ProjectRef {
+            key: "p1".to_owned(),
+            name: "orion".to_owned(),
+            root: dir.path().display().to_string(),
+        };
+        let conversation =
+            "tool: error: linker `link.exe` not found\nuser: always use rg instead of grep here";
+        let records = record(
+            dir.path(),
+            &[
+                json!({"text": "when the linker is missing, run vcvars64 first", "kind": "resolution", "scope": "project", "domain": "debugging", "evidence": "linker `link.exe` not found"}),
+                json!({"text": "when searching code, use rg", "kind": "preference", "scope": "global", "domain": "made-up", "evidence": "always use rg instead of grep"}),
+                json!({"text": "x", "kind": "guess", "scope": "global", "evidence": "always use rg instead of grep"}),
+            ],
+            conversation,
+            "c1",
+            Some(&project),
+            &BTreeSet::new(),
+        )
+        .expect("record");
+        assert_eq!(records[0]["applied"], true, "{records:?}");
+        assert_eq!(records[1]["applied"], true, "{records:?}");
+        assert_eq!(records[2]["applied"], false, "{records:?}");
+        let lessons = load(dir.path()).expect("load");
+        assert_eq!(lessons.lessons[0].tier, Tier::Fact);
+        assert_eq!(lessons.lessons[0].domain(), "debugging");
+        assert_eq!(lessons.lessons[1].tier, Tier::Rule);
+        assert_eq!(lessons.lessons[1].domain(), "other");
+        assert!(status(&lessons, Utc::now()).contains("## debugging (1)"));
+    }
+
+    /// An export carries the case; importing it on another machine adds the
+    /// lesson, importing it again adds nothing, and a project lesson needs a
+    /// project to land in.
+    #[test]
+    fn an_exported_lesson_is_imported_once() {
+        let source = tempfile::tempdir().expect("source");
+        let target = tempfile::tempdir().expect("target");
+        let root = tempfile::tempdir().expect("root");
+        seed(
+            source.path(),
+            vec![
+                lesson(
+                    "les_shared",
+                    vec![
+                        signal("c1", "a long enough quote", 2, false),
+                        signal("c2", "another quote here", 1, false),
+                    ],
+                ),
+                project_lesson(
+                    "les_local",
+                    root.path(),
+                    "correction",
+                    vec![signal("c1", "make ci, not cargo", 1, false)],
+                ),
+            ],
+        );
+        let document = export(
+            &load(source.path()).expect("load"),
+            Utc::now(),
+            0.0,
+            ScopeFilter::All,
+        );
+        assert_eq!(document["lessons"].as_array().map(Vec::len), Some(2));
+        let dry =
+            import(target.path(), &document, 0.0, ScopeFilter::All, None, true).expect("dry run");
+        assert_eq!(dry.added, vec!["les_shared".to_owned()]);
+        assert!(load(target.path()).expect("load").lessons.is_empty());
+        let first =
+            import(target.path(), &document, 0.0, ScopeFilter::All, None, false).expect("import");
+        assert_eq!(first.added, vec!["les_shared".to_owned()]);
+        assert!(
+            first
+                .skipped
+                .iter()
+                .any(|(id, why)| id == "les_local" && why.contains("no project"))
+        );
+        let kept = load(target.path()).expect("load");
+        assert!(
+            kept.lessons[0]
+                .signals
+                .iter()
+                .all(|signal| signal.conversation.starts_with("import:"))
+        );
+        let again =
+            import(target.path(), &document, 0.0, ScopeFilter::All, None, false).expect("again");
+        assert!(
+            again.added.is_empty() && again.merged.is_empty(),
+            "{again:?}"
+        );
+        assert_eq!(
+            load(target.path()).expect("load").lessons[0].signals.len(),
+            2
+        );
+    }
+
+    /// A project's rule made one for every project gives its project rule
+    /// back and waits for the gate; a fact stays with its project.
+    #[test]
+    fn a_project_lesson_is_promoted_to_every_project() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = tempfile::tempdir().expect("root");
+        seed(
+            dir.path(),
+            vec![
+                project_lesson(
+                    "les_rule",
+                    root.path(),
+                    "correction",
+                    vec![signal("c1", "make ci, not cargo", 1, false)],
+                ),
+                project_lesson(
+                    "les_fact",
+                    root.path(),
+                    "deviation",
+                    vec![signal("c1", "no such file", 1, false)],
+                ),
+            ],
+        );
+        let places = Places {
+            global: dir.path().to_path_buf(),
+        };
+        let promoted = promote_global(&places, "les_rule").expect("promote");
+        assert!(promoted.project.is_none());
+        assert_eq!(promoted.state, LessonState::Candidate);
+        assert!(promote_global(&places, "les_rule").is_err());
+        assert!(
+            promote_global(&places, "les_fact")
+                .expect_err("a fact")
+                .contains("fact")
+        );
+    }
+
+    /// The meditation makes one lesson for every project of the same rule in
+    /// two projects; one project's lesson alone is left as it is.
+    #[test]
+    fn the_same_rule_in_two_projects_is_generalized() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = tempfile::tempdir().expect("root");
+        let mut other = project_lesson(
+            "les_two",
+            root.path(),
+            "correction",
+            vec![signal("c2", "run the tests first", 1, false)],
+        );
+        if let Some(project) = other.project.as_mut() {
+            project.key = "p2".to_owned();
+            project.name = "Vega".to_owned();
+        }
+        let mut lessons = Lessons {
+            schema: 1,
+            lessons: vec![
+                project_lesson(
+                    "les_one",
+                    root.path(),
+                    "correction",
+                    vec![signal("c1", "run the tests first", 1, false)],
+                ),
+                other,
+                project_lesson(
+                    "les_alone",
+                    root.path(),
+                    "correction",
+                    vec![signal("c3", "other quote", 1, false)],
+                ),
+            ],
+            ..Lessons::default()
+        };
+        let places = Places {
+            global: dir.path().to_path_buf(),
+        };
+        let answer = json!({"generalize": [
+            {"from": ["les_one", "les_two"], "text": "when a change is done, run the tests first"},
+            {"from": ["les_alone"]},
+        ]});
+        let changes = generalize(&places, &mut lessons, &answer);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        let general = lessons
+            .lessons
+            .iter()
+            .find(|lesson| lesson.text == "when a change is done, run the tests first")
+            .expect("the general lesson");
+        assert!(general.project.is_none());
+        assert_eq!(general.signals.len(), 2);
+        let state = |id: &str| lessons.find(id).expect("lesson").state;
+        assert_eq!(state("les_one"), LessonState::Retired);
+        assert_eq!(state("les_two"), LessonState::Retired);
+        assert_eq!(state("les_alone"), LessonState::Candidate);
+    }
+
+    /// A correction the review wrote into a learned skill is that skill: the
+    /// loop writes no rule for it, and retiring it leaves the skill.
+    #[test]
+    fn a_lesson_the_review_wrote_into_a_skill_is_that_skill() {
+        let dir = tempfile::tempdir().expect("dir");
+        let conversation = "user: no, run the migration in a transaction";
+        let item = json!({"text": "when migrating, run it in a transaction", "kind": "correction", "scope": "global", "evidence": "run the migration in a transaction", "saved_as": "skill:db-migrations"});
+        let saved = BTreeSet::from(["skill:db-migrations".to_owned()]);
+        let records =
+            record(dir.path(), &[item], conversation, "c1", None, &saved).expect("record");
+        assert_eq!(records[0]["saved_as"], "skill:db-migrations", "{records:?}");
+        let lessons = load(dir.path()).expect("load");
+        assert_eq!(
+            lessons.lessons[0].placement,
+            Some(Placement::Skill {
+                name: "db-migrations".to_owned()
+            })
+        );
+        let places = Places {
+            global: dir.path().to_path_buf(),
+        };
+        retire(&places, &lessons.lessons[0].id, "test").expect("retire");
+    }
+
+    /// A lesson follows its entry: a learned rule the user deleted retires
+    /// it; a covering entry merged away is found again by what it says, and
+    /// with nothing saying it the lesson is a candidate again.
+    #[test]
+    fn a_lesson_whose_entry_is_gone_is_reconciled() {
+        // As in ha: the global store is `<data>/harness`, where the memory
+        // host looks for an entry that says the lesson.
+        let data = tempfile::tempdir().expect("dir");
+        let global = super::super::harness::global_dir(data.path());
+        std::fs::create_dir_all(&global).expect("global");
+        let places = Places {
+            global: global.clone(),
+        };
+        let mut covered = lesson("les_cov", vec![signal("c1", "a", 1, false)]);
+        covered.state = LessonState::Promoted;
+        covered.placement = Some(Placement::Covered {
+            key: "merged_away".to_owned(),
+        });
+        let mut orphan = lesson("les_orphan", vec![signal("c1", "a", 1, false)]);
+        orphan.text = "when a migration runs, back the table up first".to_owned();
+        orphan.state = LessonState::Promoted;
+        orphan.placement = Some(Placement::Covered {
+            key: "gone_too".to_owned(),
+        });
+        let mut ready = lesson(
+            "les_ready",
+            vec![
+                signal("c1", "a", 2, false),
+                signal("c1", "b", 2, false),
+                signal("c2", "c", 1, false),
+            ],
+        );
+        ready.text = "when a test is flaky, rerun it alone before changing it".to_owned();
+        seed(&global, vec![ready, covered, orphan]);
+        let mut state = super::super::refine::load_raw(&global);
+        state["entries"]["memory"]["answer_first"] = json!({
+            "id": "answer_first", "kind": "memory", "title": "Answer before changing code",
+            "content": "when the user asks a question, answer it before changing code",
+            "path": "general", "scope": "global", "version": 1,
+        });
+        super::super::refine::save_raw(
+            &global,
+            &state,
+            &super::super::memory_store::Writer::new("test", &json!({}), "test"),
+        )
+        .expect("save");
+        distill(&places, Utc::now()).expect("distill");
+        let mut state = super::super::refine::load_raw(&global);
+        state["entries"]["memory"]
+            .as_object_mut()
+            .expect("entries")
+            .remove("learned_ready");
+        super::super::refine::save_raw(
+            &global,
+            &state,
+            &super::super::memory_store::Writer::new("test", &json!({}), "test"),
+        )
+        .expect("save");
+        let distilled = distill(&places, Utc::now()).expect("distill");
+        assert!(
+            distilled
+                .retired
+                .iter()
+                .any(|(id, why)| id == "les_ready" && why.contains("deleted outside")),
+            "{distilled:?}"
+        );
+        let lessons = load(&global).expect("load");
+        let find = |id: &str| {
+            lessons
+                .lessons
+                .iter()
+                .find(|lesson| lesson.id == id)
+                .expect("lesson")
+                .clone()
+        };
+        assert_eq!(
+            find("les_cov").placement,
+            Some(Placement::Covered {
+                key: "answer_first".to_owned()
+            })
+        );
+        assert_eq!(find("les_orphan").state, LessonState::Candidate);
+        assert_eq!(find("les_orphan").placement, None);
     }
 
     #[test]

@@ -234,6 +234,14 @@ impl MemoryHost {
         }
     }
 
+    /// The project keeps its memory as markdown files (a `memory-lint.json`
+    /// at its root): its facts belong there, not in a project entry too.
+    fn keeps_markdown_store(&self) -> bool {
+        self.workspace
+            .as_ref()
+            .is_some_and(|root| root.join(super::markdown_memory::CONFIG_FILE).is_file())
+    }
+
     /// The scopes this host keeps: `project` only with a project.
     fn all_scopes(&self) -> Vec<&'static str> {
         SCOPES
@@ -1329,6 +1337,11 @@ impl MemoryHost {
         let path = self.write_path(arguments)?;
         let scope = self.new_scope(arguments)?;
         let kind = kinds(arguments)?[0];
+        if scope == "project" && kind == "memory" && self.keeps_markdown_store() {
+            return Err(
+                "this project keeps its memory in markdown files (MEMORY.md, memory/): write the fact there as a tagged line, under the store's rules; the memory tool keeps what holds across projects (scope global) and this conversation's notes (scope local)".to_owned(),
+            );
+        }
         let name = new_name(arguments, &title, kind)?;
         let tree = self.new_tree(scope, path.as_deref());
         let dir = self.dir(scope);
@@ -3570,6 +3583,29 @@ mod tests {
                 .execute(&json!({"action":"restore","id":"deploy_day"}))
                 .is_err()
         );
+    }
+
+    /// A project that keeps a markdown store keeps its facts there: a project
+    /// entry is refused and the refusal names the store; a global one is not.
+    #[test]
+    fn a_project_with_a_markdown_store_gets_no_project_entry() {
+        let directory = tempfile::tempdir().expect("dir");
+        let root = directory.path().join("shop");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join(super::super::markdown_memory::CONFIG_FILE), "{}")
+            .expect("config");
+        let shop = host(directory.path()).with_project(&root);
+        let refused = run(
+            &shop,
+            &json!({"action":"write","scope":"project","title":"Package manager","content":"This project uses pnpm."}),
+        )
+        .expect_err("refused");
+        assert!(refused.contains("markdown files"), "{refused}");
+        run(
+            &shop,
+            &json!({"action":"write","scope":"global","title":"Editor","content":"The user edits in Zed."}),
+        )
+        .expect("a global entry is kept");
     }
 
     /// After `MemClaw` (Felo): a project's fact is kept for that project and

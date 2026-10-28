@@ -354,7 +354,7 @@ Continual harness components:
 - Name tools and calls exactly as the conversation used them. When the agent delegated with the `delegate` tool, merged with `integrate_children` or messaged children with `agent_message`, a skill or subagent spec says so; use the RLM forms (`rlm.spawn`, `rlm.collect`) only when the conversation shows the Python REPL in use. A procedure that names a mechanism the agent did not have fails the next time it is followed.
 
 Scope and persistence policy:
-- The default editable continual harness store is local to the current conversation. Use it for session-specific progress, active task state, current-run coordination notes, temporary blockers, and project facts that should not affect other conversations.
+- The default editable continual harness store is local to the current conversation. Use it for current-run coordination notes and project facts that should not affect other conversations. The task's plan, checklist, progress, decisions and blockers live in task_state, which the agent keeps and every turn carries whole: never copy them into a memory edit; a local edit holds what task_state does not (a finding about the code, a constraint met mid-task).
 - A caller may explicitly request global refinement. Global edits must be stable cross-session lessons, durable user preferences, reusable skills/subagents, or tool/environment facts that should affect future conversations.
 - Entry ids in the harness overview may carry a display-only `local:` or `global:` prefix. Always use the bare id (no prefix) in edits.
 - All edits in one refinement apply only to the requested scope's store. During a local refinement, global entries are read-only context: never propose update or delete edits for them; create a local entry instead when a session-specific override is genuinely needed.
@@ -2069,7 +2069,7 @@ pub async fn refine(
     let scope_instruction = if options.global {
         "Requested refinement scope: global. Only propose stable cross-session continual harness edits, durable user preferences, reusable skills/subagents, or explicitly project-qualified facts that should affect future conversations. Do not persist session-only progress, temporary blockers, or current-run coordination globally."
     } else {
-        "Requested refinement scope: local. Prefer local continual harness edits for current task progress, temporary blockers, current-run coordination, and project facts that are not clearly reusable across conversations. Global entries in the overview are read-only context: do not propose update or delete edits for them; create a local entry instead if an override is needed."
+        "Requested refinement scope: local. Prefer local continual harness edits for current-run coordination and project facts that are not clearly reusable across conversations; the task's plan, checklist, progress, decisions and blockers live in task_state, which the agent keeps and every turn carries whole: never copy them into a memory edit; a local edit holds what task_state does not (a finding about the code, a constraint met mid-task). Global entries in the overview are read-only context: do not propose update or delete edits for them; create a local entry instead if an override is needed."
     };
     let baseline = load_raw(scopes.dir(options.global));
     // A refinement the model or the user asked for stands in for the review
@@ -2187,7 +2187,7 @@ async fn plan(
 
 /// The automatic review's scope: local by default, with memory that holds
 /// across conversations marked global.
-const AUTO_SCOPE_POLICY: &str = "Requested refinement scope: automatic review. Edits go to this conversation's local store unless marked otherwise. Mark a memory edit with \"scope\": \"global\" when it is a durable user preference, a correction of how the agent should work, or a stable fact about the user, their environment or a named project that future conversations need, and the main agent did not already save it: check the global entries in the overview, and update a global entry (with \"scope\": \"global\" and its bare id) when the conversation supersedes it instead of creating a duplicate. Never put task progress, temporary blockers or current-run coordination in global memory, nor task state such as commit ids, test counts or a done/in-progress status: keep those local, or as knowledge when worth keeping. Entries that record a state go stale (the overview shows each entry's age): when the conversation shows one changed - a goal completed, work merged, a blocker resolved, a count moved - update or delete it, a local one freely and a global one with \"scope\": \"global\". Only memory edits may be global; every other kind stays local.";
+const AUTO_SCOPE_POLICY: &str = "Requested refinement scope: automatic review. Edits go to this conversation's local store unless marked otherwise. Mark a memory edit with \"scope\": \"global\" when it is a durable user preference, a correction of how the agent should work, or a stable fact about the user, their environment or a named project that future conversations need, and the main agent did not already save it: check the global entries in the overview, and update a global entry (with \"scope\": \"global\" and its bare id) when the conversation supersedes it instead of creating a duplicate. Never put task progress, temporary blockers or current-run coordination in global memory, nor task state such as commit ids, test counts or a done/in-progress status: the task's plan, checklist, progress, decisions and blockers live in task_state, which the agent keeps and every turn carries whole: never copy them into a memory edit; a local edit holds what task_state does not (a finding about the code, a constraint met mid-task). Keep a lasting result as knowledge when worth keeping. Entries that record a state go stale (the overview shows each entry's age): when the conversation shows one changed - a goal completed, work merged, a blocker resolved, a count moved - update or delete it, a local one freely and a global one with \"scope\": \"global\". Only memory edits may be global; every other kind stays local.";
 
 /// What the automatic review may add to the knowledge library.
 const SKILL_OUTCOMES: &str = "For each learned skill in play that the conversation shows being followed, say how it went in a top-level `skillOutcomes` array: {\"skill\": \"its name\", \"outcome\": \"worked\" or \"failed\", \"evidence\": \"a verbatim quote from the conversation\", \"assumption\": \"for a failure: what the skill took for granted that turned out false\"}. Judge the skill, not the task: it failed when its own steps did not work as written - a command it gives broke, a file or path it names was missing - even when the agent then reached the goal another way, and it worked when following it as written did the job. Judge only from what the conversation shows - a check that passed or failed, a command that broke, the user confirming or correcting - and leave the array empty when it shows neither. A failure whose cause the skill could have checked first is also worth a patch to the skill that adds that check. A skill in play that you patch or update gets its outcome too: the patch fixes the skill, the outcome says how following it went.";
@@ -2754,9 +2754,9 @@ pub async fn auto_refine(
     if let Some(learning) = learning {
         proposal.skill_outcome_records = record_skill_outcomes(learning, &proposal.skill_outcomes);
     }
-    // The global memory entries this review writes: a lesson saved as one is
-    // a rule already.
-    let saved = global_edits
+    // The global memory entries and the learned skills this review writes: a
+    // lesson saved as one is a rule already.
+    let mut saved = global_edits
         .iter()
         .filter(|edit| edit.text("kind") == Some("memory"))
         .filter_map(|edit| {
@@ -2766,6 +2766,14 @@ pub async fn auto_refine(
             })
         })
         .collect::<std::collections::BTreeSet<_>>();
+    saved.extend(
+        proposal
+            .skill_records
+            .iter()
+            .filter(|record| record["applied"] == true)
+            .filter_map(|record| record["id"].as_str())
+            .map(|name| format!("skill:{name}")),
+    );
     proposal.lesson_records = super::lessons::record(
         &scopes.global,
         &proposal.lessons,
@@ -2867,7 +2875,8 @@ pub async fn auto_refine(
         let places = super::lessons::Places {
             global: scopes.global.clone(),
         };
-        match super::lessons::meditate(provider, model, &places, now).await {
+        let skills = learning.map(|learning| (&learning.layers, &learning.context));
+        match super::lessons::meditate(provider, model, &places, now, skills).await {
             Ok(changes) => refined.learned.extend(
                 changes
                     .into_iter()
@@ -3096,7 +3105,10 @@ Return JSON only:
   ]
 }"#;
 
-/// The memory entries and prompt notes of one raw state, as the curator sees them.
+/// The memory entries and prompt notes of one raw state, as the curator sees
+/// them. The learning loop's own entries are not among them: the loop's
+/// meditation merges, rewords and retires those, and a lesson names its entry,
+/// so a curator merging one away would leave the lesson pointing at nothing.
 fn memory_entries(state: &Value) -> Vec<Value> {
     ["memory", "prompt"]
         .iter()
@@ -3105,6 +3117,7 @@ fn memory_entries(state: &Value) -> Vec<Value> {
                 .as_object()
                 .into_iter()
                 .flatten()
+                .filter(|(_, entry)| entry["source"] != "learning")
                 .map(move |(id, entry)| {
                     json!({
                         "kind": kind,
@@ -3587,7 +3600,7 @@ pub async fn review(
         format!("<refinement_history>\n{}\n</refinement_history>", history_for_prompt(&history)),
         format!("<conversation>\n{}\n</conversation>", tail(conversation, REVIEW_CONVERSATION_CHARS)),
         learned,
-        "Return shouldRefine=true when the trajectory contains evidence useful to this session's future turns. Prefer local harness edits for current task progress, temporary blockers, and current-run coordination. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified facts likely to be reused in future sessions. A corrected approach or reusable technique that belongs in a learned skill (a new one, or a patch to one listed above) is also worth refining, and so is substantive reusable knowledge (a worked-out explanation, method or researched conclusion) that the agent did not save as a knowledge page. So is a moment the user corrected how the agent works, or the conversation showed an assumption of the agent's wrong: the learning loop counts each one, and one that recurs across conversations becomes a standing rule, so approve it even when the harness state already holds what the user corrected: the recurrence is the signal.".to_owned(),
+        "Return shouldRefine=true when the trajectory contains evidence useful to this session's future turns. Task progress, its blockers and its plan are task_state's, which the agent keeps: they are no reason to refine. Prefer local harness edits for current-run coordination. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified facts likely to be reused in future sessions. A corrected approach or reusable technique that belongs in a learned skill (a new one, or a patch to one listed above) is also worth refining, and so is substantive reusable knowledge (a worked-out explanation, method or researched conclusion) that the agent did not save as a knowledge page. So is a moment the user corrected how the agent works, or the conversation showed an assumption of the agent's wrong: the learning loop counts each one, and one that recurs across conversations becomes a standing rule, so approve it even when the harness state already holds what the user corrected: the recurrence is the signal.".to_owned(),
     ]
     .into_iter()
     .filter(|part| !part.is_empty())
