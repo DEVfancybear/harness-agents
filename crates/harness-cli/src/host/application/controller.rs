@@ -7567,9 +7567,12 @@ mod tests {
         .expect("draft");
         super::super::session_log::write(
             &root,
-            "task_one",
             &draft,
-            &chrono::Local::now().fixed_offset(),
+            &super::super::session_log::Stamp {
+                conversation: "task_one",
+                through: None,
+                written: &chrono::Local::now().fixed_offset(),
+            },
         )
         .expect("log");
         submit_text(&mut h.controller, "/recall 2 parser");

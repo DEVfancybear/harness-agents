@@ -257,7 +257,12 @@ pub fn preserve_request(root: &Path, focus: Option<&str>) -> String {
     );
     let name = file.unwrap_or(INSTRUCTIONS_FILES[0]);
     let archive = format!("{}-Archive.md", name.trim_end_matches(".md"));
-    let store = if root.join(super::markdown_memory::CONFIG_FILE).is_file() {
+    let has_store = root.join(super::markdown_memory::CONFIG_FILE).is_file();
+    harness_types::diag::info("session_log", "preserve_requested")
+        .field("file", file.unwrap_or("none"))
+        .field("store", has_store)
+        .emit();
+    let store = if has_store {
         "\n- decisions and facts: this project keeps a markdown memory store, so a decision goes to memory/decisions/ and a fact about a project to memory/projects/, each line tagged, as its policy says"
     } else {
         ""

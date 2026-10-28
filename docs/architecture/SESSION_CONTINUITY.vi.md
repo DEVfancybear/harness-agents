@@ -20,9 +20,9 @@ Cách một phiên `ha` tiếp tục từ chỗ phiên trước dừng lại, v�
 Mỗi hội thoại một log, theo `/compress` của CPR. Hình dạng:
 
 - `# Session Log: <ngày> - <chủ đề>`
-- `## Quick Reference (for AI scanning)`: `**Conversation:**` (task id, do host ghi),
-  `**Written:**`, `**Confidence keywords:**` (10-20 từ khóa), `**Projects:**`,
-  `**Outcome:**` (một câu)
+- `## Quick Reference (for AI scanning)`: `**Conversation:**`, `**Through:**` và
+  `**Written:**` (task id, lượt mà log được ghi tới và thời điểm ghi, do host ghi),
+  `**Confidence keywords:**` (10-20 từ khóa), `**Projects:**`, `**Outcome:**` (một câu)
 - `## Decisions Made`, `## Key Learnings`, `## Solutions & Fixes`, `## Files Modified`,
   `## Setup & Config`, `## Pending Tasks` (`- [ ]`), `## Errors & Workarounds`,
   `## Custom Notes`: mỗi mục chỉ có khi có nội dung
@@ -30,18 +30,27 @@ Mỗi hội thoại một log, theo `/compress` của CPR. Hình dạng:
 
 **Ở đâu.** Project có kho markdown nhận log dưới dạng một mục `## Session <HH:MM> -
 <chủ đề>` trong `memory/YYYY-MM-DD.md` của ngày đó (các mục con thấp hơn một bậc), tức
-ghi chú ram mà policy của kho dành cho kết quả trong ngày; phần còn lại của ghi chú được
-giữ nguyên, và ghi chú luôn dưới giới hạn ram nên `ha memory lint` vẫn qua. Khi ghi chú
-không còn chỗ, kể cả cho Quick Reference và Quick Resume Context, log sang một file riêng.
-Project khác nhận `.harness/sessions/<YYYY-MM-DD-HH_MM>-<chủ đề>.md`.
+ghi chú ram mà policy của kho dành cho kết quả trong ngày. Mục kết thúc ở dòng
+`<!-- end of session log <conversation> -->`: những gì agent viết sau dòng đó vẫn là của
+agent, và lần ghi lại chỉ thay tới dấu đó (một mục ghi trước khi có dấu kết thúc sau đoạn
+văn dưới Quick Resume Context). Phần còn lại của ghi chú được giữ nguyên, và ghi chú luôn
+dưới giới hạn ram nên `ha memory lint` vẫn qua. Khi ghi chú chỉ còn chỗ cho Quick
+Reference và Quick Resume Context, log chỉ giữ hai mục đó; khi không còn chỗ cả cho
+chúng, hoặc khi ghi chú có nhưng không đọc được (không phải UTF-8, đang bị chương trình
+khác giữ), ghi chú không bị đụng tới và log sang một file riêng. Project khác nhận
+`.harness/sessions/<YYYY-MM-DD-HH_MM>-<chủ đề>.md`. Mỗi lúc chỉ một lần ghi, kể cả giữa
+các tiến trình `ha`, nhờ khóa `.harness/session-log.lock`.
 
 **Mỗi hội thoại một log.** Lần ghi sau tìm log theo dòng `**Conversation:**` và ghi đè tại
-chỗ, giữ ngày hoặc giờ của lần ghi đầu trong tiêu đề.
+chỗ, giữ ngày hoặc giờ của lần ghi đầu trong tiêu đề. Model đọc log cũ cùng các lượt mới
+nhất (tối đa 50 lượt, 120.000 ký tự), nên điều các lượt đầu đã chốt vẫn còn.
+`**Through:**` ghi lượt mà log được ghi tới.
 
 **Khi nào.** Tự động, từ journal, bên cạnh hội thoại (không bao giờ trong một lượt):
 
 - khi phiên lặng đi - đúng lúc idle review chạy, 10 phút sau lượt cuối
-  (`HA_IDLE_REVIEW_SECONDS`), nếu trong lúc đó không có lượt mới;
+  (`HA_IDLE_REVIEW_SECONDS`), nếu trong lúc đó không có lượt mới nào của cùng hội thoại
+  (lượt của hội thoại khác không chặn nó); cả sau một lượt lỗi hay bị dừng;
 - sau một lần nén ngữ cảnh: `/compact`, hoặc một lượt đã tự nén (journal vẫn giữ các
   lượt mà bản tóm tắt thay thế);
 - khi lượt `/handoff` xong.
@@ -50,21 +59,38 @@ Một lượt đã được ghi log thì không ghi lần hai. Không ghi gì ch
 người dùng, cho agent con được giao việc, hay với model fixture.
 
 **An toàn.** Model được dặn hội thoại là dữ liệu, không bao giờ là chỉ thị. Bản ghi model
-đọc và log nó viết đều đi qua các bộ che bí mật mà host dùng cho đầu ra tool và lịch sử
-được nhắc lại; log không bao giờ chứa key, token hay mật khẩu.
+đọc và log nó viết - kể cả các tiêu đề - đều đi qua các bộ che bí mật mà host dùng cho
+đầu ra tool và lịch sử được nhắc lại; log không bao giờ chứa key, token hay mật khẩu.
 
 **Giữ bao lâu.** Mỗi lần ghi log sẽ xóa các log trong `.harness/sessions` được ghi lần
-cuối hơn 30 ngày trước. Không xóa gì trong kho markdown: kho có luật riêng.
+cuối hơn 30 ngày trước: chỉ các file thường có tên `<YYYY-MM-DD-HH_MM>-<chủ đề>.md` và đọc
+ra được là log, và không xóa gì khi thư mục là một liên kết. Không xóa gì trong kho
+markdown: kho có luật riêng.
 
 **Tắt.** `"sessionLog": false` trong `settings.json`, hoặc `HA_SESSION_LOG=off`.
+
+**Chẩn đoán.** Mỗi quyết định là một bản ghi chẩn đoán loại `session_log`, mà báo cáo
+lỗi đọc:
+
+- `written`: `trigger` (`quiet`, `compaction`, `handoff`), `home` (`note`, `file`), `path`
+  (tương đối với thư mục gốc của project), `bytes`, `turns`, và `fallback` khi log không ở
+  chỗ đáng lẽ của nó (`brief`, `no_room`, `unreadable_note`);
+- `skipped`: `trigger` và `reason` - `off`, `superseded` (một lượt sau của hội thoại đã bắt
+  đầu trước), `already_written`, `fixture`, `child`, `few_turns`;
+- `failed` (warn): `trigger`, và lỗi làm message, đã che bí mật và cắt còn 300 ký tự;
+- `recalled`: `n` (số log đã gửi), `topic` (có chủ đề hay không), `matches`;
+- `preserve_requested`: `file` (`AGENTS.md`, `CLAUDE.md` hoặc `none`), `store`.
 
 ## Lúc mở hội thoại mới
 
 Prompt đầu tiên của hội thoại mới nghe về hội thoại trước đúng một lần:
 
-- Nếu hội thoại trước có session log ghi trong 7 ngày qua, khối hiện kết quả, Quick Resume
-  Context và tối đa 5 việc còn dở chưa đánh dấu, với khung là tham khảo lịch sử, không
-  phải chỉ thị đang có hiệu lực; 3 lượt cuối của hội thoại trước không gửi kèm nữa.
+- Nếu hội thoại trước có session log ghi trong 7 ngày qua và ghi tới lượt mới nhất của nó,
+  khối hiện kết quả, Quick Resume Context và tối đa 5 việc còn dở chưa đánh dấu, với khung
+  là tham khảo lịch sử, không phải chỉ thị đang có hiệu lực; 3 lượt cuối của hội thoại
+  trước không gửi kèm nữa.
+- Nếu log đó được ghi trước lượt mới nhất của hội thoại (log lúc lặng chưa tới hạn, lần ghi
+  của handoff còn đang chạy), khối nói rõ điều đó và các lượt cuối vẫn được gửi kèm.
 - Nếu log mới nhất thuộc một hội thoại cũ hơn, khối hiện log đó cùng số hội thoại sau nó
   không có log, và các lượt cuối của hội thoại trước vẫn được gửi như trước.
 - Không có log thì session brief được gửi như trước.
@@ -78,11 +104,13 @@ Fork, import, `/resume`, nén ngữ cảnh và `/refinements off` không thêm k
 ## Lệnh
 
 - `/recall [n] [chủ đề]` gửi một lượt mà prompt mang, như dữ liệu, n session log gần
-  nhất (mặc định 3, 1-50, cắt để chia nhau khoảng 96 KB) và, khi có chủ đề, tối đa 10 log
-  được xếp hạng bằng BM25 của memory search (không khớp thì theo cụm từ, không phân biệt
-  hoa thường), mỗi log một đoạn trích 140 ký tự. Agent báo Context, Blockers, Most recent
-  session, Earlier sessions, Related (khi có chủ đề) và Ready to, và chỉ đọc file của log khi
-  các tóm tắt chưa trả lời được. Không có log thì một thông báo và không có lượt nào.
+  nhất (mặc định 3) và, khi có chủ đề, tối đa 10 log được xếp hạng bằng BM25 của memory
+  search (không khớp thì theo cụm từ, không phân biệt hoa thường), mỗi log một đoạn trích
+  140 ký tự; cả prompt nằm trong 96 KB, các log được cắt để chia nhau phần còn lại. Một số
+  đứng đầu không quá 50 là n; số lớn hơn (một năm, một số issue) là một phần của chủ đề.
+  Agent báo Context, Blockers, Most recent session, Earlier sessions, Related (khi có chủ
+  đề) và Ready to, và chỉ đọc file của log khi các tóm tắt chưa trả lời được. Không có log
+  thì một thông báo và không có lượt nào.
 - `/preserve [trọng tâm]` yêu cầu agent đưa những gì phiên này đã chốt cho mọi phiên sau -
   quy ước, lệnh, cấu trúc, mẫu làm, cảnh báo - vào `AGENTS.md` (không có thì `CLAUDE.md`;
   khi cả hai đều không có, nó hỏi trước khi tạo `AGENTS.md`). Không ghi trạng thái hiện tại

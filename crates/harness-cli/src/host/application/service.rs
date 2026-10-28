@@ -7071,7 +7071,14 @@ fn idle_review_after(environment: &LaunchEnvironment) -> std::time::Duration {
 /// Write the session log of the conversation `session` ends
 /// (`session_log`) beside the conversation, from the journal read through a
 /// reader of its own: the turn's writer is not held. With `quiet`, only after
-/// that long and when no turn started meanwhile, as the idle review waits.
+/// that long and when no later turn of this conversation started meanwhile,
+/// as the idle review waits; a turn of another conversation does not stop it.
+/// `trigger` (`quiet`, `compaction`, `handoff`) is what its diagnostics
+/// record names.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "what one write reads, handed over in one place"
+)]
 fn spawn_session_log(
     sender: UnboundedSender<SessionEvent>,
     store_dir: PathBuf,
@@ -7079,43 +7086,37 @@ fn spawn_session_log(
     session: SessionId,
     task: TaskId,
     provider: Arc<dyn ModelProvider>,
-    quiet: Option<(std::time::Duration, Arc<super::refine::Cadence>)>,
+    trigger: &'static str,
+    quiet: Option<std::time::Duration>,
 ) {
+    let latest = (task.clone(), session.clone());
     let write = async move {
-        let store = match SqliteStore::open_read_only(store_dir).await {
-            Ok(store) => store,
-            Err(error) => {
-                harness_types::diag::warn("session_log", "skipped")
-                    .task(task.as_str())
-                    .msg(error.to_string())
-                    .emit();
-                return;
+        let result = match SqliteStore::open_read_only(store_dir).await {
+            Ok(store) => {
+                let result = super::session_log::write_from_journal(
+                    &store, provider, &root, &session, &task,
+                )
+                .await;
+                let _ = store.close().await;
+                result
             }
+            Err(error) => Err(format!("the project store cannot be read: {error}")),
         };
-        let result =
-            super::session_log::write_from_journal(&store, provider, &root, &session, &task).await;
-        let _ = store.close().await;
+        super::session_log::record(&task, trigger, &root, &result);
         match result {
-            Ok(Some(path)) => {
-                let shown = path
+            Ok(super::session_log::Outcome::Written { placed, .. }) => {
+                let shown = placed
+                    .path
                     .strip_prefix(&root)
-                    .unwrap_or(&path)
+                    .unwrap_or(&placed.path)
                     .display()
                     .to_string();
-                harness_types::diag::info("session_log", "written")
-                    .task(task.as_str())
-                    .field("path", shown.clone())
-                    .emit();
                 let _ = sender.send(SessionEvent::Notice {
                     message: format!("session log written to {shown}"),
                 });
             }
-            Ok(None) => {}
+            Ok(super::session_log::Outcome::Skipped(_)) => {}
             Err(error) => {
-                harness_types::diag::warn("session_log", "failed")
-                    .task(task.as_str())
-                    .msg(error.clone())
-                    .emit();
                 let _ = sender.send(SessionEvent::Notice {
                     message: format!("the session log was not written: {error}"),
                 });
@@ -7124,12 +7125,15 @@ fn spawn_session_log(
     };
     match quiet {
         None => spawn_off_workers(write),
-        Some((after, cadence)) => {
-            let generation = cadence.generation();
+        Some(after) => {
+            let (task, session) = latest;
+            super::session_log::note_turn(&task, &session);
             tokio::spawn(async move {
                 tokio::time::sleep(after).await;
-                if cadence.generation() == generation {
+                if super::session_log::is_latest_turn(&task, &session) {
                     spawn_off_workers(write);
+                } else {
+                    super::session_log::record_skip(&task, trigger, "superseded");
                 }
             });
         }
@@ -8452,6 +8456,11 @@ async fn run_turn(
     }
     let runtime = Arc::new(runtime);
     let session_log_on = super::session_log::enabled(&config_file, &environment);
+    // This turn is now the conversation's newest: a quiet timer an earlier
+    // one armed writes nothing while it runs.
+    if session_log_on {
+        super::session_log::note_turn(&task_id, &session_id);
+    }
     let log_root = workspace_root.clone();
     if let Some(guidance) = request.compact_guidance.as_deref() {
         let result = match source.as_ref() {
@@ -8500,6 +8509,7 @@ async fn run_turn(
                 source_session.clone(),
                 task_id.clone(),
                 Arc::clone(&helper_provider),
+                "compaction",
                 None,
             );
         }
@@ -9446,35 +9456,21 @@ async fn run_turn(
         }
     }
     // What a new conversation hears of the previous one, once: its session
-    // log when it has one, else its last turns from the journal.
-    if fork_plan.is_none()
-        && request.compact_guidance.is_none()
-        && super::session_brief::fresh_conversation(&store, &task_id, source.as_ref(), refinements)
-            .await
-    {
-        let logged = if session_log_on {
-            super::session_log::start_block(
+    // log when it has one, and its last turns unless the log covers them.
+    if fork_plan.is_none() && request.compact_guidance.is_none() {
+        project_blocks.extend(
+            super::session_log::previous_conversation_blocks(
                 &store,
                 &task_id,
+                source.as_ref(),
+                refinements,
+                session_log_on,
                 &workspace_root,
                 carried.as_ref(),
                 &chrono::Local::now().fixed_offset(),
             )
-            .await
-        } else {
-            None
-        };
-        let previous_logged = logged.as_ref().is_some_and(|logged| logged.previous);
-        if let Some(logged) = logged {
-            project_blocks.push(logged.block);
-        }
-        if !previous_logged
-            && let Some(block) =
-                super::session_brief::context_block(&store, &task_id, source.as_ref(), refinements)
-                    .await
-        {
-            project_blocks.push(block);
-        }
+            .await,
+        );
     }
     // Where the project's feature list stands, and its rules.
     if let Some(block) = super::features::context_block(&workspace_root) {
@@ -10258,9 +10254,10 @@ async fn run_turn(
         }
     }
     // The conversation's session log: written at once after a handoff or a
-    // compaction, and when the session goes quiet, as the idle review does.
-    if session_log_on && outcome.is_ok() && !cancellation.is_cancelled() {
-        if log_after_turn || compacted {
+    // compaction, and when the session goes quiet, as the idle review does -
+    // after a failed or stopped turn too, which ends the conversation as well.
+    if session_log_on {
+        if (log_after_turn || compacted) && outcome.is_ok() && !cancellation.is_cancelled() {
             spawn_session_log(
                 sender.clone(),
                 store_dir.clone(),
@@ -10268,6 +10265,11 @@ async fn run_turn(
                 session_id.clone(),
                 goal_task.clone(),
                 Arc::clone(&helper_provider),
+                if log_after_turn {
+                    "handoff"
+                } else {
+                    "compaction"
+                },
                 None,
             );
         }
@@ -10278,8 +10280,11 @@ async fn run_turn(
             session_id.clone(),
             goal_task.clone(),
             Arc::clone(&helper_provider),
-            Some((idle_review_after(&environment), Arc::clone(&refine_cadence))),
+            "quiet",
+            Some(idle_review_after(&environment)),
         );
+    } else {
+        super::session_log::record_skip(&goal_task, "quiet", "off");
     }
     // A session that ended with work not yet reviewed left the review here: it runs
     // beside this conversation, on the ended one's turns and harness scope.

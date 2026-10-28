@@ -791,12 +791,13 @@ fn bm25(considered: &[&Placed<'_>], query: &str) -> Vec<(usize, f64)> {
 /// by, so it weighs words as memory search does.
 #[must_use]
 pub fn rank_documents(documents: &[(&str, &str)], query: &str) -> Vec<(usize, f64)> {
+    // No id and no tree: BM25 reads them as the entry's path, and a document's
+    // index there would match a number in the query.
     let entries = documents
         .iter()
-        .enumerate()
-        .map(|(index, (title, text))| Entry {
-            id: index.to_string(),
-            name: index.to_string(),
+        .map(|(title, text)| Entry {
+            id: String::new(),
+            name: String::new(),
             memory: None,
             kind: String::new(),
             title: Some((*title).to_owned()),
@@ -1203,5 +1204,19 @@ mod tests {
         assert_eq!(slice("content:2:5").expect("m:n"), (2, Some(5)));
         assert_eq!(slice("content:2:").expect("m:"), (2, None));
         assert!(slice("content:5:2").is_err());
+    }
+
+    #[test]
+    fn plain_documents_rank_by_their_words_and_never_by_their_place() {
+        let mut documents = vec![("Parser", "the tokenizer"), ("Release", "notes for 2026")];
+        documents.extend(std::iter::repeat_n(("Docs", "a pass"), 12));
+        let ranked = super::rank_documents(&documents, "tokenizer");
+        assert_eq!(
+            ranked.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            [0]
+        );
+        // "11" is a document's place, not a word any document holds.
+        assert!(super::rank_documents(&documents, "11").is_empty());
+        assert_eq!(super::rank_documents(&documents, "2026")[0].0, 1);
     }
 }
