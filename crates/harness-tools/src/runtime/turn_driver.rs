@@ -664,6 +664,10 @@ fn completion_nudge(changed: &[String]) -> String {
 /// (ECC's `agent-self-evaluation`: work across three or more files).
 pub const EVALUATE_AT_FILES: usize = 3;
 
+/// The longest a self-evaluation may hold a turn's end; a judge slower than
+/// this judges nothing, and the turn ends.
+const EVALUATION_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(3);
+
 /// A turn whose changes touched at least this many lines is judged at its end
 /// (ECC's fifty lines).
 pub const EVALUATE_AT_LINES: usize = 50;
@@ -712,19 +716,33 @@ pub trait TurnEvaluation: Send + Sync {
 
     /// Keep a turn that ended with an answer, for a later `/self-eval`.
     fn finished(&self, _review: TurnReview) {}
+
+    /// A turn began: what a later `/self-eval` judges is this one's, once it
+    /// ends with an answer, and nothing before.
+    fn started(&self) {}
 }
 
-/// About how many lines one change touched: the `+` and `-` lines of an
-/// edit's diff, or every line of a whole-file write (an upper bound when it
+/// About how many lines one change touched: the more of an edit's added and
+/// removed lines (a line changed in place is one `-` and one `+`, and counts
+/// once), or every line of a whole-file write (an upper bound when it
 /// rewrote a file that existed). `None` for a call that changed no file.
 fn changed_lines<'a>(output: &'a ToolOutput, arguments: &str) -> Option<(&'a str, usize)> {
     match output {
-        ToolOutput::EditFile { path, diff, .. } => Some((
-            path,
-            diff.lines()
-                .filter(|line| line.starts_with('+') || line.starts_with('-'))
-                .count(),
-        )),
+        ToolOutput::EditFile { path, diff, .. } => {
+            let body = diff
+                .lines()
+                .filter(|line| !line.starts_with("+++") && !line.starts_with("---"));
+            let (added, removed) = body.fold((0, 0), |(added, removed), line| {
+                if line.starts_with('+') {
+                    (added + 1, removed)
+                } else if line.starts_with('-') {
+                    (added, removed + 1)
+                } else {
+                    (added, removed)
+                }
+            });
+            Some((path, usize::max(added, removed)))
+        }
         ToolOutput::WriteFile { path, .. } | ToolOutput::ApplyPatch { path, .. } => {
             let value = serde_json::from_str::<Value>(arguments).unwrap_or_default();
             let text = value
@@ -1596,6 +1614,11 @@ impl TurnDriver {
         // its end was already evaluated: once per turn, as the reminder.
         let mut changed_files: Vec<ChangedFile> = Vec::new();
         let mut evaluated = false;
+        // A turn that does not end with an answer leaves nothing for a later
+        // `/self-eval`: what was kept is an older turn's.
+        if let Some(evaluation) = &self.evaluation {
+            evaluation.started();
+        }
         // The step the task was last recited at, and whether the model was
         // already asked to save before a summary.
         let mut recited_at = 1_u32;
@@ -1984,8 +2007,14 @@ impl TurnDriver {
                                     results: review_results(&transcript),
                                     changed: changed_files.clone(),
                                 };
+                                observer.observe(TurnProgress::Notice(format!(
+                                    "self-evaluation: judging the turn ({trigger})"
+                                )));
+                                // The judge is a model call with its own retries:
+                                // bounded, so a slow provider does not hold the
+                                // turn's end for long.
                                 let feedback = tokio::select! {
-                                    feedback = evaluation.evaluate(review) => feedback,
+                                    feedback = tokio::time::timeout(EVALUATION_TIMEOUT, evaluation.evaluate(review)) => feedback.unwrap_or(None),
                                     () = cancellation.cancelled() => None,
                                 };
                                 feedback.map(|feedback| {
@@ -2023,6 +2052,10 @@ impl TurnDriver {
                         .await
                         .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
                     continue 'turn;
+                }
+                // Cancelled while a judge was deciding: the turn did not finish.
+                if cancellation.is_cancelled() {
+                    break TurnStop::Canceled;
                 }
                 break TurnStop::Final;
             }
@@ -5097,9 +5130,10 @@ mod tool_output_render_tests {
         assert_eq!(
             files,
             vec![
+                // Each edit added two lines and removed one: two lines, twice.
                 super::ChangedFile {
                     path: "a.rs".to_owned(),
-                    lines: 6
+                    lines: 4
                 },
                 super::ChangedFile {
                     path: "b.rs".to_owned(),

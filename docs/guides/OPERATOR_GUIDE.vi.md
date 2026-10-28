@@ -691,6 +691,7 @@ Bản 0.6.1 ghi lại những gì đã xảy ra, để tìm bug từ một file 
   - log, journal và descriptor của các worker, không có token;
   - từ store của mỗi project: run, step, lần gọi provider, command lỗi, lease, checkpoint và setting;
   - các file harness của từng hội thoại: trạng thái task, lịch sử memory, refinement đã áp dụng, watermark review và stderr của kernel;
+  - `lessons.json` của learning loop (trích dẫn và lịch sử của từng lesson) và `evaluations.jsonl` của self-evaluation (phần cuối);
   - `env.json` (phiên bản, nền tảng, terminal, biến `HA_*`), file cấu hình, `settings.json` và `models.json`, mọi secret đều bị bỏ ra;
   - log của REPL dùng chung, và danh sách thư mục của các agent con (tên và dung lượng).
 
@@ -709,6 +710,7 @@ Bản 0.6.1 ghi lại những gì đã xảy ra, để tìm bug từ một file 
   - các tool, theo số lần gọi, số lần lỗi và thời gian - cả các lần gọi của agent con (bản ghi của chúng ghi hội thoại của agent con);
   - thời gian chờ trước khi lần gọi chạy: các lần phê duyệt bạn đã trả lời (bao nhiêu, tổng thời gian chờ, lần lâu nhất và tool của nó) và mọi lần gọi mà bước gate mất từ một giây trở lên, kèm bước nó đã chờ (`prepare`, `guard`, `hooks`, `approval`, `intent`). Các lần gọi trong một batch chỉ chạy khi tất cả đã qua gate, nên lần chờ của một lần gọi là lần chờ của mọi lần gọi;
   - memory: chi phí duy trì - các lần gọi model của review và Deep Dream theo mục đích (`review_gate`, `review_plan`, `deep_dream`, `skill_curation`, `skill_repair`), kèm token và thời gian - đặt cạnh số lần agent đọc memory, knowledge và bản ghi thô (`history_search`, `history_read`), làm thước đo để quyết định nên review thường xuyên đến đâu;
+  - learning loop, self-evaluation và session log: các lesson hiện có (theo trạng thái, kind và domain), cùng từng event của chúng trong khoảng thời gian, kèm số lần và nội dung của event mới nhất - rule được promote, retire, chuyển chỗ hay gỡ, một lần import, generalize, evolve (`learning.*`); một lượt được chấm và có bị trả lại không (`self_eval.*`); session log được ghi, bị bỏ qua và vì sao, bị lỗi, một lần `/recall`, một lần `/preserve` (`session_log.*`);
   - các agent con: vai trò, model (mọi model mà các lần gọi của nó dùng, theo thứ tự, nếu nó chạy trên hơn một model), trạng thái, thời gian, số tool call và lỗi của từng agent con bị lỗi, lấy từ ledger delegation (`delegation/ledger/` trong file zip);
   - một timeline gộp.
 

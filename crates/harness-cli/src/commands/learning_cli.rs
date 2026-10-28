@@ -113,6 +113,7 @@ fn failed(error: String) -> HarnessError {
 /// # Errors
 /// The data directory cannot be resolved, the lessons cannot be read or
 /// written, or there is no such lesson.
+#[allow(clippy::too_many_lines, reason = "one arm per `ha learning` command")]
 pub fn run(command: LearningCommand) -> Result<(), HarnessError> {
     let global = harness::global_dir(&cli_extras::current_data_dir()?);
     let places = lessons::Places {

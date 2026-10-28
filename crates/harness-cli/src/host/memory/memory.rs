@@ -37,6 +37,9 @@ const TREE_LABELS: &str =
 /// The kinds this tool keeps: plain entries with no Python contract.
 const KINDS: [&str; 2] = ["memory", "prompt"];
 const SCOPES: [&str; 3] = ["local", "global", "project"];
+
+/// Why a project entry is refused when the project keeps a markdown store.
+const STORE_KEEPS_PROJECT_FACTS: &str = "this project keeps its memory in markdown files (MEMORY.md, memory/): write the fact there as a tagged line, under the store's rules; the memory tool keeps what holds across projects (scope global) and this conversation's notes (scope local)";
 const ON_CONFLICT: [&str; 3] = ["error", "replace", "ignore"];
 /// memory-engine's name: a filename-like slug.
 const MAX_NAME_CHARS: usize = 128;
@@ -232,6 +235,15 @@ impl MemoryHost {
         } else {
             &self.global
         }
+    }
+
+    /// No project memory entry is added beside a markdown store, written or
+    /// moved there: a fact kept in both would go stale in one.
+    fn refuse_beside_store(&self, scope: &str, kind: &str) -> Result<(), String> {
+        if scope == "project" && kind == "memory" && self.keeps_markdown_store() {
+            return Err(STORE_KEEPS_PROJECT_FACTS.to_owned());
+        }
+        Ok(())
     }
 
     /// The project keeps its memory as markdown files (a `memory-lint.json`
@@ -1201,6 +1213,7 @@ impl MemoryHost {
             .into_iter()
             .find(|known| *known == target)
             .ok_or("this conversation has no project, so no project entries")?;
+        self.refuse_beside_store(target, kind)?;
         let (from, to) = (
             self.dir(scope).to_path_buf(),
             self.dir(target).to_path_buf(),
@@ -1337,11 +1350,7 @@ impl MemoryHost {
         let path = self.write_path(arguments)?;
         let scope = self.new_scope(arguments)?;
         let kind = kinds(arguments)?[0];
-        if scope == "project" && kind == "memory" && self.keeps_markdown_store() {
-            return Err(
-                "this project keeps its memory in markdown files (MEMORY.md, memory/): write the fact there as a tagged line, under the store's rules; the memory tool keeps what holds across projects (scope global) and this conversation's notes (scope local)".to_owned(),
-            );
-        }
+        self.refuse_beside_store(scope, kind)?;
         let name = new_name(arguments, &title, kind)?;
         let tree = self.new_tree(scope, path.as_deref());
         let dir = self.dir(scope);
@@ -2084,6 +2093,9 @@ impl MemoryHost {
             let (Some(scope), path) = self.parse_tree(&tree)? else {
                 return Err("destination is an absolute tree".to_owned());
             };
+            if entry.scope != scope {
+                self.refuse_beside_store(scope, &entry.kind)?;
+            }
             plans.push((entry, tree, scope, path));
         }
         let listing = plans

@@ -2771,6 +2771,13 @@ pub async fn auto_refine(
             .skill_records
             .iter()
             .filter(|record| record["applied"] == true)
+            // A skill the review removed holds no lesson.
+            .filter(|record| {
+                matches!(
+                    record["action"].as_str(),
+                    Some("create" | "update" | "patch")
+                )
+            })
             .filter_map(|record| record["id"].as_str())
             .map(|name| format!("skill:{name}")),
     );
@@ -2849,9 +2856,9 @@ pub async fn auto_refine(
             .lesson_records
             .iter()
             .filter(|record| {
-                record["saved_as"]
-                    .as_str()
-                    .is_some_and(|key| kept["entries"]["memory"][key].is_null())
+                record["saved_as"].as_str().is_some_and(|key| {
+                    !key.starts_with("skill:") && kept["entries"]["memory"][key].is_null()
+                })
             })
             .filter_map(|record| record["id"].as_str().map(str::to_owned))
             .collect();
@@ -2863,6 +2870,14 @@ pub async fn auto_refine(
         let places = super::lessons::Places {
             global: scopes.global.clone(),
         };
+        // A lesson kept as a learned skill that is gone may need its rule.
+        if let Some(learning) = learning {
+            let skills = super::learned::library(&learning.layers)
+                .into_iter()
+                .map(|skill| skill.name)
+                .collect();
+            super::lessons::reconcile_skills(&places, &skills);
+        }
         refined.learned = match super::lessons::distill(&places, chrono::Utc::now()) {
             Ok(distilled) => distilled.lines(),
             Err(error) => vec![format!("the learning loop did not run: {error}")],

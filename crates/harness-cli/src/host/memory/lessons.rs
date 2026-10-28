@@ -67,6 +67,8 @@ const MAX_EVENTS: usize = 100;
 
 /// The shortest quote a signal rests on.
 const MIN_EVIDENCE_CHARS: usize = 12;
+/// The most lessons one import takes.
+pub const MAX_IMPORTED: usize = 1_000;
 /// What a lesson is a signal of (after ECC's continuous-learning-v2, whose
 /// observer looks for corrections, error resolutions and tool preferences;
 /// a repeated workflow is a learned skill's, which the review writes).
@@ -269,9 +271,10 @@ impl Lesson {
         }
     }
 
-    /// How sure the loop is of the lesson, 0 to 1, on ECC's instinct scale:
-    /// 0.3 for one or two signals, 0.5 for three to five, 0.7 for six to ten,
-    /// 0.85 beyond, each contradicting conversation taking 0.1 off. A rule
+    /// How sure the loop is of the lesson, 0 to 1, on ECC's instinct scale,
+    /// read off the gate's weight (a signal older than 30 days counts half):
+    /// 0.3 under 3, 0.5 from 3, 0.7 from 6, 0.85 from 11, each contradicting
+    /// conversation taking 0.1 off. A rule
     /// is promoted by the gate, not by this number, which says how much the
     /// case has grown since.
     #[must_use]
@@ -565,15 +568,23 @@ pub fn uncover(dir: &Path, ids: &BTreeSet<String>) {
     }
     let _ = update(dir, |lessons| {
         for lesson in &mut lessons.lessons {
-            if matches!(lesson.placement, Some(Placement::Covered { .. }))
-                && ids.contains(&lesson.id)
+            if matches!(
+                lesson.placement,
+                Some(Placement::Covered { .. } | Placement::Skill { .. })
+            ) && ids.contains(&lesson.id)
                 && lesson.state == LessonState::Promoted
             {
                 lesson.placement = None;
                 lesson.state = LessonState::Candidate;
+                lesson.promoted_at = None;
                 lesson.note(
                     "uncovered",
-                    "the review did not write the memory entry it saved the lesson as",
+                    "the review did not write the memory entry or the skill it saved the lesson as",
+                );
+                trace(
+                    "uncovered",
+                    &lesson.id,
+                    "the review did not write what it saved the lesson as",
                 );
             }
         }
@@ -751,7 +762,29 @@ pub struct Distilled {
     pub held: Vec<(String, String)>,
 }
 
+/// One event of the learning loop in the diagnostics, for the bug report.
+fn trace(event: &'static str, lesson: &str, why: &str) {
+    harness_types::diag::info("learning", event)
+        .field("lesson", lesson)
+        .msg(clip(why, 300))
+        .emit();
+}
+
 impl Distilled {
+    /// Each change of a gate run in the diagnostics.
+    fn trace(&self) {
+        for (event, list) in [
+            ("promoted", &self.promoted),
+            ("fact", &self.facts),
+            ("retired", &self.retired),
+            ("held", &self.held),
+        ] {
+            for (id, why) in list {
+                trace(event, id, why);
+            }
+        }
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.promoted.is_empty() && self.facts.is_empty() && self.retired.is_empty()
@@ -806,7 +839,22 @@ fn entry_key(state: &Value, key: &str) -> Option<String> {
 /// none does. A learned entry the user deleted retires its lesson: the user
 /// did not want that rule.
 fn reconcile(places: &Places, lessons: &mut Lessons, distilled: &mut Distilled) {
-    let state = super::refine::load_raw(&places.global);
+    // A store that cannot be read, or reads empty, says nothing about what
+    // was deleted: no lesson is touched then.
+    let state = match super::memory_store::load_document(&places.global) {
+        Ok(state)
+            if state["entries"]["memory"]
+                .as_object()
+                .is_some_and(|entries| !entries.is_empty()) =>
+        {
+            state
+        }
+        Ok(_) => return,
+        Err(error) => {
+            trace("reconcile_skipped", "", &error);
+            return;
+        }
+    };
     for lesson in &mut lessons.lessons {
         if lesson.state != LessonState::Promoted {
             continue;
@@ -818,7 +866,9 @@ fn reconcile(places: &Places, lessons: &mut Lessons, distilled: &mut Distilled) 
         };
         if let Some(now) = entry_key(&state, &key) {
             if now != key {
-                lesson.note("moved", format!("its memory entry {key} is now {now}"));
+                let why = format!("its memory entry {key} is now {now}");
+                trace("moved", &lesson.id, &why);
+                lesson.note("moved", why);
                 lesson.placement = Some(if covered {
                     Placement::Covered { key: now }
                 } else {
@@ -845,21 +895,42 @@ fn reconcile(places: &Places, lessons: &mut Lessons, distilled: &mut Distilled) 
             None => "global",
         };
         if let Some(found) = host.covering(scope, "memory", &lesson.text, &lesson.text) {
-            lesson.note(
-                "moved",
-                format!("its memory entry {key} was merged into {found}"),
-            );
+            let why = format!("its memory entry {key} was merged into {found}");
+            trace("moved", &lesson.id, &why);
+            lesson.note("moved", why);
             lesson.placement = Some(Placement::Covered { key: found });
         } else {
+            let why =
+                format!("its memory entry {key} is gone and no entry says it: a candidate again");
+            trace("unplaced", &lesson.id, &why);
             lesson.state = LessonState::Candidate;
             lesson.placement = None;
             lesson.promoted_at = None;
-            lesson.note(
-                "unplaced",
-                format!("its memory entry {key} is gone and no entry says it: a candidate again"),
-            );
+            lesson.note("unplaced", why);
         }
     }
+}
+
+/// A lesson kept as a learned skill that is no longer in the library (the
+/// curator removed it, or the user did) is a candidate again: the gate may
+/// then write its rule.
+pub fn reconcile_skills(places: &Places, skills: &BTreeSet<String>) {
+    let _ = update(&places.global, |lessons| {
+        for lesson in &mut lessons.lessons {
+            let Some(Placement::Skill { name }) = &lesson.placement else {
+                continue;
+            };
+            if lesson.state != LessonState::Promoted || skills.contains(name) {
+                continue;
+            }
+            let why = format!("its learned skill {name} is gone: a candidate again");
+            trace("unplaced", &lesson.id, &why);
+            lesson.state = LessonState::Candidate;
+            lesson.placement = None;
+            lesson.promoted_at = None;
+            lesson.note("unplaced", why);
+        }
+    });
 }
 
 /// Run the gate over every lesson: promote what passes, within the ceilings,
@@ -999,6 +1070,7 @@ pub fn distill(places: &Places, now: DateTime<Utc>) -> Result<Distilled, String>
                 }
             }
         }
+        distilled.trace();
         distilled
     })
 }
@@ -1624,7 +1696,7 @@ pub fn report_html(lessons: &Lessons, now: DateTime<Utc>, all: bool) -> String {
     )
 }
 
-/// --- status, export, import and promotion (ECC's instinct CLI) ---
+// --- status, export, import and promotion (ECC's instinct CLI) ---
 
 /// The open lessons by area of work, each with a bar of its confidence:
 /// ECC's `instinct-cli status`.
@@ -1769,31 +1841,60 @@ pub fn import(
         return Err("not a lessons export (`ha learning export` writes one)".to_owned());
     }
     let items = document["lessons"].as_array().cloned().unwrap_or_default();
+    if items.len() > MAX_IMPORTED {
+        return Err(format!(
+            "the export holds {} lessons, more than the {MAX_IMPORTED} an import takes",
+            items.len()
+        ));
+    }
     let run = |lessons: &mut Lessons| import_into(lessons, &items, min_confidence, scope, project);
     if dry_run {
         let mut lessons = load(dir)?;
         return Ok(run(&mut lessons));
     }
-    update(dir, run)
+    let imported = update(dir, run)?;
+    harness_types::diag::info("learning", "imported")
+        .field("added", imported.added.len())
+        .field("merged", imported.merged.len())
+        .field("skipped", imported.skipped.len())
+        .emit();
+    Ok(imported)
 }
 
 /// The signals an exported lesson carries, as this machine keeps them: no
 /// secret, a bounded quote, and the conversation marked as imported.
 fn imported_signals(item: &Value) -> Vec<Signal> {
-    item["signals"]
+    let now = Utc::now();
+    let mut signals = item["signals"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|signal| serde_json::from_value::<Signal>(signal.clone()).ok())
+        // The review's own measures: a phrase, no secret, a time that parses.
+        .filter(|signal| normalize(&signal.evidence).chars().count() >= MIN_EVIDENCE_CHARS)
         .filter(|signal| harness_tools::secret_values::first(&signal.evidence).is_none())
-        .map(|mut signal| {
+        .filter(|signal| !signal.conversation.trim().is_empty())
+        .filter_map(|mut signal| {
+            let at = day_of(&signal.at)?;
+            // A signal from the future would never age.
+            signal.at = at.min(now).to_rfc3339();
             if !signal.conversation.starts_with("import:") {
                 signal.conversation = format!("import:{}", signal.conversation);
             }
             signal.evidence = clip(&signal.evidence, MAX_EVIDENCE_CHARS);
-            signal
+            Some(signal)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    signals.sort_by(|left, right| left.at.cmp(&right.at));
+    let excess = signals.len().saturating_sub(MAX_SIGNALS);
+    signals.drain(..excess);
+    signals
+}
+
+/// A conversation as an import marks it, and as this machine wrote it: the
+/// same moment either way.
+fn bare_conversation(conversation: &str) -> &str {
+    conversation.strip_prefix("import:").unwrap_or(conversation)
 }
 
 /// Add to `kept` the signals of `lesson` it lacks; how many were added.
@@ -1801,7 +1902,7 @@ fn merge_signals(kept: &mut Lesson, lesson: Lesson) -> usize {
     let mut added = 0;
     for signal in lesson.signals {
         let known = kept.signals.iter().any(|have| {
-            have.conversation == signal.conversation
+            bare_conversation(&have.conversation) == bare_conversation(&signal.conversation)
                 && have.against == signal.against
                 && normalize(&have.evidence) == normalize(&signal.evidence)
         });
@@ -1820,6 +1921,10 @@ fn merge_signals(kept: &mut Lesson, lesson: Lesson) -> usize {
     added
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exported lesson's checks, in the order an import applies them"
+)]
 fn import_into(
     lessons: &mut Lessons,
     items: &[Value],
@@ -1851,15 +1956,19 @@ fn import_into(
                 .push((id, format!("its text holds what looks like a {shape}")));
             continue;
         }
+        // A project's lesson lands only in that project: run the import there.
         let target = if item["scope"] == "project" {
-            let Some(project) = project else {
-                imported.skipped.push((
-                    id,
-                    "a project lesson, and there is no project here".to_owned(),
-                ));
-                continue;
-            };
-            Some(project.clone())
+            let from = item["project"].as_str().unwrap_or_default();
+            match project {
+                Some(project) if project.name == from => Some(project.clone()),
+                _ => {
+                    imported.skipped.push((
+                        id,
+                        format!("a lesson of project {from:?}: import it inside that project"),
+                    ));
+                    continue;
+                }
+            }
         } else {
             None
         };
@@ -1892,12 +2001,27 @@ fn import_into(
         }
         let text_key = normalize(&lesson.text);
         let scope_key = lesson.scope_key().map(str::to_owned);
-        if let Some(kept) = lessons.lessons.iter_mut().find(|kept| {
-            kept.state != LessonState::Retired
-                && (kept.id == lesson.id
-                    || (normalize(&kept.text) == text_key
-                        && kept.scope_key().map(str::to_owned) == scope_key))
-        }) {
+        let same = |kept: &Lesson| {
+            kept.id == lesson.id
+                || (normalize(&kept.text) == text_key
+                    && kept.scope_key().map(str::to_owned) == scope_key)
+        };
+        // A lesson retired here stays retired: an export does not bring it back.
+        if lessons
+            .lessons
+            .iter()
+            .any(|kept| kept.state == LessonState::Retired && same(kept))
+        {
+            imported
+                .skipped
+                .push((id, "it was retired here".to_owned()));
+            continue;
+        }
+        if let Some(kept) = lessons
+            .lessons
+            .iter_mut()
+            .find(|kept| kept.state != LessonState::Retired && same(kept))
+        {
             let added = merge_signals(kept, lesson);
             if added > 0 {
                 kept.note("imported", format!("{added} signal(s) from an export"));
@@ -1916,9 +2040,8 @@ fn import_into(
                 .push((id, "it has no signal to make its case".to_owned()));
             continue;
         }
-        if lessons.find(&lesson.id).is_some() || !lesson.id.starts_with("les_") {
-            lesson.id = new_id();
-        }
+        // The id is this machine's to give: an exported one may be any text.
+        lesson.id = new_id();
         lesson.tier = if lesson.is_fact() {
             Tier::Fact
         } else {
@@ -1956,18 +2079,30 @@ pub fn promote_global(places: &Places, id: &str) -> Result<Lesson, String> {
                 project.name
             ));
         }
+        match &lesson.placement {
+            Some(Placement::Covered { key }) => {
+                return Err(format!(
+                    "lesson {id} is memory entry {key}, the user's own words: move that entry to every project instead"
+                ));
+            }
+            Some(Placement::Skill { name }) => {
+                return Err(format!(
+                    "lesson {id} is learned skill {name}: make that skill global instead"
+                ));
+            }
+            _ => {}
+        }
         unplace(places, lesson)?;
         lesson.project = None;
         lesson.state = LessonState::Candidate;
         lesson.placement = None;
         lesson.promoted_at = None;
-        lesson.note(
-            "generalized",
-            format!(
-                "made a lesson for every project (it was project {}'s)",
-                project.name
-            ),
+        let why = format!(
+            "made a lesson for every project (it was project {}'s)",
+            project.name
         );
+        trace("generalized", &lesson.id, &why);
+        lesson.note("generalized", why);
         Ok(lesson.clone())
     })?
 }
@@ -2092,7 +2227,7 @@ pub async fn meditate(
         let mut changes = apply_meditation(places, lessons, &answer, now);
         changes.extend(generalize(places, lessons, &answer));
         if let Some((layers, context)) = skills {
-            changes.extend(evolve(lessons, &answer, layers, context));
+            changes.extend(evolve(places, lessons, &answer, layers, context));
         }
         lessons.meditations.push(Meditation {
             at: now.to_rfc3339(),
@@ -2222,7 +2357,13 @@ fn apply_meditation(
 /// projects (ECC's automatic `promote`: an instinct in 2+ projects becomes
 /// global). The sources give their signals to it and are retired; the gate
 /// then decides on the merged case, as on any other. Facts stay with their
-/// project.
+/// project, and a lesson the user's entry or a learned skill holds is not
+/// moved. When a lesson for every project already says it, the signals go
+/// to that one.
+#[allow(
+    clippy::too_many_lines,
+    reason = "take the sources back, then merge them into one lesson or its twin"
+)]
 fn generalize(places: &Places, lessons: &mut Lessons, answer: &Value) -> Vec<String> {
     let mut changes = Vec::new();
     for item in answer["generalize"].as_array().into_iter().flatten() {
@@ -2239,13 +2380,22 @@ fn generalize(places: &Places, lessons: &mut Lessons, answer: &Value) -> Vec<Str
             .filter(|lesson| ids.contains(&lesson.id))
             .filter(|lesson| lesson.state != LessonState::Retired && lesson.tier == Tier::Rule)
             .filter(|lesson| lesson.project.is_some())
+            .filter(|lesson| {
+                !matches!(
+                    lesson.placement,
+                    Some(Placement::Covered { .. } | Placement::Skill { .. })
+                )
+            })
             .cloned()
             .collect::<Vec<_>>();
-        let projects = sources
-            .iter()
-            .filter_map(Lesson::scope_key)
-            .collect::<BTreeSet<_>>();
-        if projects.len() < 2 {
+        let projects = |lessons: &[&Lesson]| {
+            lessons
+                .iter()
+                .filter_map(|lesson| lesson.scope_key())
+                .collect::<BTreeSet<_>>()
+                .len()
+        };
+        if projects(&sources.iter().collect::<Vec<_>>()) < 2 {
             continue;
         }
         let text = item["text"]
@@ -2256,67 +2406,92 @@ fn generalize(places: &Places, lessons: &mut Lessons, answer: &Value) -> Vec<Str
                 || sources[0].text.clone(),
                 |text| clip(text, MAX_TEXT_CHARS),
             );
+        // Take each source's rule back; only those taken back move.
         let mut moved = Vec::new();
-        let mut from = Vec::new();
         for source in &sources {
-            let Some(lesson) = lessons.find_mut(&source.id) else {
-                continue;
-            };
-            if unplace(places, lesson).is_err() {
-                continue;
+            if let Some(lesson) = lessons.find_mut(&source.id)
+                && unplace(places, lesson).is_ok()
+            {
+                moved.push(source.clone());
             }
-            moved.append(&mut lesson.signals);
-            lesson.state = LessonState::Retired;
-            from.push(lesson.id.clone());
         }
-        if from.len() < 2 {
-            // Too few were taken back to make the case: give the signals back.
-            for id in &from {
-                if let Some(lesson) = lessons.find_mut(id) {
+        let projects_moved = projects(&moved.iter().collect::<Vec<_>>());
+        if projects_moved < 2 {
+            // Too few to make the case: the ones taken back are candidates,
+            // and the gate writes their rules again.
+            for source in &moved {
+                if let Some(lesson) = lessons.find_mut(&source.id) {
                     lesson.state = LessonState::Candidate;
                     lesson.placement = None;
-                    lesson.signals.extend(
-                        moved
-                            .iter()
-                            .filter(|signal| {
-                                sources
-                                    .iter()
-                                    .find(|source| &source.id == id)
-                                    .is_some_and(|source| source.signals.contains(signal))
-                            })
-                            .cloned(),
-                    );
+                    lesson.promoted_at = None;
                 }
             }
             continue;
         }
-        moved.sort_by(|left, right| left.at.cmp(&right.at));
-        let excess = moved.len().saturating_sub(MAX_SIGNALS);
-        moved.drain(..excess);
-        let mut general = Lesson {
-            id: new_id(),
-            text,
-            kind: sources[0].kind.clone(),
-            domain: sources[0].domain.clone(),
-            signals: moved,
-            ..Lesson::default()
-        };
-        general.note(
-            "generalized",
-            format!("from {} in {} projects", from.join(", "), projects.len()),
-        );
+        let mut signals = moved
+            .iter()
+            .flat_map(|source| source.signals.iter().cloned())
+            .collect::<Vec<_>>();
+        signals.sort_by(|left, right| left.at.cmp(&right.at));
+        let excess = signals.len().saturating_sub(MAX_SIGNALS);
+        signals.drain(..excess);
+        let from = moved
+            .iter()
+            .map(|source| source.id.clone())
+            .collect::<Vec<_>>();
         for id in &from {
             if let Some(lesson) = lessons.find_mut(id) {
-                lesson.note("generalized", format!("into {}", general.id));
+                lesson.signals.clear();
+                lesson.state = LessonState::Retired;
+                lesson.placement = None;
             }
         }
-        changes.push(format!(
-            "generalized {} into lesson {} for every project: {}",
-            from.join(", "),
-            general.id,
-            general.text
-        ));
-        lessons.lessons.push(general);
+        let key = normalize(&text);
+        let into = if let Some(twin) = lessons.lessons.iter_mut().find(|lesson| {
+            lesson.project.is_none()
+                && lesson.state != LessonState::Retired
+                && normalize(&lesson.text) == key
+        }) {
+            twin.signals.extend(signals);
+            twin.signals.sort_by(|left, right| left.at.cmp(&right.at));
+            let excess = twin.signals.len().saturating_sub(MAX_SIGNALS);
+            twin.signals.drain(..excess);
+            twin.note(
+                "generalized",
+                format!(
+                    "{} came into it from {projects_moved} projects",
+                    from.join(", ")
+                ),
+            );
+            twin.id.clone()
+        } else {
+            let mut general = Lesson {
+                id: new_id(),
+                text: text.clone(),
+                kind: moved[0].kind.clone(),
+                domain: moved[0].domain.clone(),
+                signals,
+                ..Lesson::default()
+            };
+            general.note(
+                "generalized",
+                format!("from {} in {projects_moved} projects", from.join(", ")),
+            );
+            let id = general.id.clone();
+            lessons.lessons.push(general);
+            id
+        };
+        for id in &from {
+            if let Some(lesson) = lessons.find_mut(id) {
+                lesson.note("generalized", format!("into {into}"));
+            }
+        }
+        let change = format!(
+            "generalized {} into lesson {into} for every project: {text}",
+            from.join(", ")
+        );
+        trace("generalized", &into, &change);
+        changes.push(change);
     }
     changes
 }
@@ -2324,9 +2499,12 @@ fn generalize(places: &Places, lessons: &mut Lessons, answer: &Value) -> Vec<Str
 /// Gather promoted rules that are steps of one workflow into a learned skill
 /// (ECC's `/evolve`, whose skills are written where nothing loads them; this
 /// one goes through the learned-skill promoter, with its checks, into the
-/// library the agent loads skills from). The rules stay: each is shown in
-/// every turn, the skill when the work calls for it.
+/// library the agent loads skills from). The rules must hold where the skill
+/// will: all for every project (a global skill), or all one project's (that
+/// project's skill). Each rule then is the skill: its own entry or decision
+/// line is taken back, so the workflow is kept in one place.
 fn evolve(
+    places: &Places,
     lessons: &mut Lessons,
     answer: &Value,
     layers: &super::learned::Layers,
@@ -2334,31 +2512,59 @@ fn evolve(
 ) -> Vec<String> {
     let mut changes = Vec::new();
     for item in answer["evolve"].as_array().into_iter().flatten() {
-        let ids = item["from"]
+        let rules = item["from"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .filter(|id| {
-                lessons.find(id).is_some_and(|lesson| {
-                    lesson.state == LessonState::Promoted && lesson.tier == Tier::Rule
-                })
+            .filter_map(|id| lessons.find(id))
+            .filter(|lesson| lesson.state == LessonState::Promoted && lesson.tier == Tier::Rule)
+            .filter(|lesson| {
+                !matches!(
+                    lesson.placement,
+                    Some(Placement::Covered { .. } | Placement::Skill { .. })
+                )
             })
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
+            .cloned()
+            .collect::<Vec<_>>();
         let (Some(name), Some(body)) = (item["name"].as_str(), item["body"].as_str()) else {
             continue;
         };
-        if ids.len() < 2 {
+        if rules.len() < 2 {
             continue;
         }
+        let scopes = rules
+            .iter()
+            .map(|lesson| lesson.scope_key().map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        if scopes.len() != 1 {
+            changes.push(format!(
+                "evolve into skill {name} refused: its rules hold in different scopes"
+            ));
+            continue;
+        }
+        let level = if rules[0].project.is_some() {
+            if layers.project.is_none() {
+                changes.push(format!(
+                    "evolve into skill {name} refused: its rules are a project's, and the project's skills are not available"
+                ));
+                continue;
+            }
+            "project"
+        } else {
+            "global"
+        };
+        let ids = rules
+            .iter()
+            .map(|lesson| lesson.id.clone())
+            .collect::<Vec<_>>();
         let intent = super::learned::Intent::from_value(&json!({
             "action": "create",
             "name": name,
-            "level": item["level"].as_str().unwrap_or("global"),
+            "level": level,
             "body": body,
-            "reason": format!("the learning loop's rules {} are one workflow", ids.iter().cloned().collect::<Vec<_>>().join(", ")),
-            "evidence": ids.iter().filter_map(|id| lessons.find(id)).map(|lesson| lesson.text.clone()).collect::<Vec<_>>().join(" / "),
+            "reason": format!("the learning loop's rules {} are one workflow", ids.join(", ")),
+            "evidence": rules.iter().map(|lesson| lesson.text.clone()).collect::<Vec<_>>().join(" / "),
         }));
         let verdict = super::learned::promote(layers, &intent, context);
         if !verdict.ok {
@@ -2370,13 +2576,20 @@ fn evolve(
         }
         for id in &ids {
             if let Some(lesson) = lessons.find_mut(id) {
+                // Its own rule is taken back: the skill says it now.
+                if let Err(error) = unplace(places, lesson) {
+                    lesson.note("not evolved", error);
+                    continue;
+                }
+                lesson.placement = Some(Placement::Skill {
+                    name: name.to_owned(),
+                });
                 lesson.note("evolved", format!("into learned skill {name}"));
             }
         }
-        changes.push(format!(
-            "evolved rules {} into learned skill {name}",
-            ids.into_iter().collect::<Vec<_>>().join(", ")
-        ));
+        let change = format!("evolved rules {} into learned skill {name}", ids.join(", "));
+        trace("evolved", &ids.join(","), &change);
+        changes.push(change);
     }
     changes
 }
@@ -2646,6 +2859,7 @@ mod tests {
     /// lesson, importing it again adds nothing, and a project lesson needs a
     /// project to land in.
     #[test]
+    #[allow(clippy::too_many_lines, reason = "one export, imported four ways")]
     fn an_exported_lesson_is_imported_once() {
         let source = tempfile::tempdir().expect("source");
         let target = tempfile::tempdir().expect("target");
@@ -2658,6 +2872,7 @@ mod tests {
                     vec![
                         signal("c1", "a long enough quote", 2, false),
                         signal("c2", "another quote here", 1, false),
+                        signal("c2", "short", 1, false),
                     ],
                 ),
                 project_lesson(
@@ -2677,24 +2892,41 @@ mod tests {
         assert_eq!(document["lessons"].as_array().map(Vec::len), Some(2));
         let dry =
             import(target.path(), &document, 0.0, ScopeFilter::All, None, true).expect("dry run");
-        assert_eq!(dry.added, vec!["les_shared".to_owned()]);
+        assert_eq!(dry.added.len(), 1, "{dry:?}");
         assert!(load(target.path()).expect("load").lessons.is_empty());
-        let first =
-            import(target.path(), &document, 0.0, ScopeFilter::All, None, false).expect("import");
-        assert_eq!(first.added, vec!["les_shared".to_owned()]);
+        // Another project's lesson does not land here.
+        let elsewhere = ProjectRef {
+            key: "p9".to_owned(),
+            name: "elsewhere".to_owned(),
+            root: root.path().display().to_string(),
+        };
+        let first = import(
+            target.path(),
+            &document,
+            0.0,
+            ScopeFilter::All,
+            Some(&elsewhere),
+            false,
+        )
+        .expect("import");
+        assert_eq!(first.added.len(), 1, "{first:?}");
+        assert_ne!(first.added[0], "les_shared", "the id is this machine's");
         assert!(
             first
                 .skipped
                 .iter()
-                .any(|(id, why)| id == "les_local" && why.contains("no project"))
+                .any(|(id, why)| id == "les_local" && why.contains("project \"Orion\"")),
+            "{first:?}"
         );
         let kept = load(target.path()).expect("load");
         assert!(
             kept.lessons[0]
                 .signals
                 .iter()
-                .all(|signal| signal.conversation.starts_with("import:"))
+                .all(|signal| signal.conversation.starts_with("import:")),
         );
+        // The quote under a phrase was dropped, as the review drops it.
+        assert_eq!(kept.lessons[0].signals.len(), 2);
         let again =
             import(target.path(), &document, 0.0, ScopeFilter::All, None, false).expect("again");
         assert!(
@@ -2704,6 +2936,39 @@ mod tests {
         assert_eq!(
             load(target.path()).expect("load").lessons[0].signals.len(),
             2
+        );
+        // An export of these, imported back where they came from, adds no case.
+        let back = export(
+            &load(target.path()).expect("load"),
+            Utc::now(),
+            0.0,
+            ScopeFilter::All,
+        );
+        let home =
+            import(source.path(), &back, 0.0, ScopeFilter::All, None, false).expect("back home");
+        assert!(home.added.is_empty() && home.merged.is_empty(), "{home:?}");
+        assert_eq!(
+            load(source.path())
+                .expect("load")
+                .find("les_shared")
+                .expect("lesson")
+                .signals
+                .len(),
+            3
+        );
+        // A lesson retired here stays retired.
+        let places = Places {
+            global: target.path().to_path_buf(),
+        };
+        retire(&places, &kept.lessons[0].id, "not wanted").expect("retire");
+        let retired =
+            import(target.path(), &document, 0.0, ScopeFilter::All, None, false).expect("retired");
+        assert!(retired.added.is_empty(), "{retired:?}");
+        assert!(
+            retired
+                .skipped
+                .iter()
+                .any(|(_, why)| why.contains("retired here"))
         );
     }
 
@@ -2822,6 +3087,18 @@ mod tests {
         let places = Places {
             global: dir.path().to_path_buf(),
         };
+        // A lesson whose skill is gone is a candidate again; one whose skill
+        // is there stays the skill.
+        reconcile_skills(&places, &BTreeSet::from(["db-migrations".to_owned()]));
+        assert_eq!(
+            load(dir.path()).expect("load").lessons[0].state,
+            LessonState::Promoted
+        );
+        reconcile_skills(&places, &BTreeSet::new());
+        let lessons = load(dir.path()).expect("load");
+        assert_eq!(lessons.lessons[0].state, LessonState::Candidate);
+        assert_eq!(lessons.lessons[0].placement, None);
+        // Retiring a lesson a skill held leaves nothing to undo.
         retire(&places, &lessons.lessons[0].id, "test").expect("retire");
     }
 

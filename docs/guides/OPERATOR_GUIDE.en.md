@@ -692,6 +692,7 @@ A task of hundreds of steps passes through many compactions, and what a compacti
   - the workers' logs, journals and descriptors, without their token;
   - from each project store: runs, steps, provider attempts, failed commands, leases, checkpoints and settings;
   - each conversation's harness files: task state, memory history, applied refinements, the review watermark and kernel stderr;
+  - the learning loop's `lessons.json` (each lesson's quotes and history) and the self-evaluations' `evaluations.jsonl` (its tail);
   - `env.json` (version, platform, terminal, `HA_*` variables), the configuration, `settings.json` and `models.json` with every secret withheld;
   - the shared REPL's logs, and the delegated children's directories (names and sizes).
 
@@ -710,6 +711,7 @@ A task of hundreds of steps passes through many compactions, and what a compacti
   - the tools, by calls, failures and time - the delegated children's calls too (their records name the child's conversation);
   - the waits before calls ran: the approvals you answered (how many, the time waited, the longest and its tool) and every call whose gate took a second or more, with the step it waited in (`prepare`, `guard`, `hooks`, `approval`, `intent`). The calls of a batch run once all of them are through their gates, so one call's wait is every call's;
   - memory: what its upkeep cost - the reviews' and Deep Dream's model calls by purpose (`review_gate`, `review_plan`, `deep_dream`, `skill_curation`, `skill_repair`), with tokens and time - beside how often the agent read memory, knowledge and the raw record (`history_search`, `history_read`), the measure for deciding how often to review;
+  - the learning loop, the self-evaluation and the session logs: the lessons as they stand (by state, kind and domain), and each of their events in the window counted with what the newest said - a rule promoted, retired, moved or unplaced, an import, a generalization, an evolution (`learning.*`); a turn judged and whether it was sent back (`self_eval.*`); a session log written, skipped and why, failed, a `/recall`, a `/preserve` (`session_log.*`);
   - the delegated children: role, model (every model its calls named, in order, when it ran on more than one), state, time, tool calls and the error of each one that failed, from the delegation ledger (`delegation/ledger/` in the zip);
   - one merged timeline.
 

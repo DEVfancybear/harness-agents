@@ -883,9 +883,18 @@ impl Report {
             "memory_changes",
             "memory_consolidated_changes",
             "memory_consolidation_failed",
+            // The learning loop's lessons, with their quotes and history.
+            "lessons.json",
+            "lessons_meditated",
         ] {
             self.copy_file(&global.join(name), &format!("harness/global/{name}"), false);
         }
+        // The self-evaluations, newest last.
+        self.copy_file(
+            &global.join("evaluations.jsonl"),
+            "harness/global/evaluations.jsonl",
+            true,
+        );
         let usage = self.data_dir.join("skill-usage");
         if let Ok(entries) = std::fs::read_dir(&usage) {
             for entry in entries.filter_map(Result::ok) {
@@ -1035,6 +1044,7 @@ impl Report {
         self.summary_parks(&mut out);
         self.summary_activity(&mut out);
         self.summary_memory(&mut out);
+        self.summary_learning(&mut out);
         self.summary_jev(&mut out);
         self.summary_strategy(&mut out);
         self.summary_children(&mut out);
@@ -1749,6 +1759,105 @@ impl Report {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+    }
+
+    /// What the learning loop, the self-evaluation and the session logs did
+    /// in the window, from their diagnostics, with the lessons as they stand:
+    /// enough to trace why a rule appeared or went, why a turn was sent back,
+    /// and why a conversation has no log.
+    fn summary_learning(&self, out: &mut String) {
+        let events = |kind: &str| {
+            let mut counted: BTreeMap<String, (usize, String)> = BTreeMap::new();
+            for record in self.records.iter().filter(|record| record["kind"] == kind) {
+                let entry = counted
+                    .entry(record["event"].as_str().unwrap_or("?").to_owned())
+                    .or_default();
+                entry.0 += 1;
+                let detail = [
+                    record["fields"]["lesson"].as_str(),
+                    record["fields"]["trigger"].as_str(),
+                    record["fields"]["reason"].as_str(),
+                    record["fields"]["verdict"].as_str(),
+                    record["msg"].as_str(),
+                ]
+                .into_iter()
+                .flatten()
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+                if !detail.is_empty() {
+                    entry.1 = clip(&detail, 120);
+                }
+            }
+            counted
+        };
+        let learning = events("learning");
+        let evaluations = events("self_eval");
+        let logs = events("session_log");
+        let lessons = crate::interactive::lessons::load(&crate::interactive::harness::global_dir(
+            &self.data_dir,
+        ))
+        .unwrap_or_default();
+        if learning.is_empty()
+            && evaluations.is_empty()
+            && logs.is_empty()
+            && lessons.lessons.is_empty()
+        {
+            return;
+        }
+        let _ = writeln!(out, "## Learning, self-evaluation and session logs\n");
+        if !lessons.lessons.is_empty() {
+            let mut states: BTreeMap<String, usize> = BTreeMap::new();
+            for lesson in &lessons.lessons {
+                let state = serde_json::to_value(lesson.state)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                *states
+                    .entry(format!("{state} {} {}", lesson.kind, lesson.domain()))
+                    .or_default() += 1;
+            }
+            let _ = writeln!(
+                out,
+                "Lessons now ({} in `harness/global/lessons.json`): {}.\n",
+                lessons.lessons.len(),
+                states
+                    .iter()
+                    .map(|(what, count)| format!("{count} {what}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        for (title, counted) in [
+            ("learning loop", &learning),
+            ("self-evaluation", &evaluations),
+            ("session log", &logs),
+        ] {
+            if counted.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "| {title} event | count | the newest says |");
+            let _ = writeln!(out, "|---|---|---|");
+            for (event, (count, detail)) in counted {
+                let _ = writeln!(
+                    out,
+                    "| {event} | {count} | {} |",
+                    detail.replace('|', "\\|")
+                );
+            }
+            let _ = writeln!(out);
+        }
+        let sent_back = self
+            .recorded("self_eval", "evaluated")
+            .iter()
+            .filter(|record| record["fields"]["sent_back"] == true)
+            .count();
+        if sent_back > 0 {
+            let _ = writeln!(
+                out,
+                "{sent_back} turn(s) sent back by the self-evaluation; `harness/global/evaluations.jsonl` has each one's scores.\n"
+            );
+        }
     }
 
     /// What the trajectory regulator said, and the strategy-level measures of

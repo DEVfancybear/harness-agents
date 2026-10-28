@@ -5385,8 +5385,9 @@ impl SessionPort for AgentSessionService {
         let last = Arc::clone(&self.live.last_turn);
         let focus = focus.map(str::to_owned);
         let sender = self.sender.clone();
+        let conversation = self.task_id.as_str().to_owned();
         handle.spawn(async move {
-            let lines = super::self_eval::on_demand(&last, focus.as_deref())
+            let lines = super::self_eval::on_demand(&last, focus.as_deref(), &conversation)
                 .await
                 .unwrap_or_else(|error| vec![format!("self-evaluation failed: {error}")]);
             let _ = sender.send(SessionEvent::SelfEvaluated { lines });

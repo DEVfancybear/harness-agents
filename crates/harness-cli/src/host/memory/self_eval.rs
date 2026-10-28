@@ -35,6 +35,15 @@ pub const AXES: [(&str, &str); 5] = [
 /// Where the evaluations are kept, under the global harness directory.
 pub const LOG_FILE: &str = "evaluations.jsonl";
 
+/// Held while the log is appended to or rotated.
+const LOCK_FILE: &str = "evaluations.lock";
+
+/// How a provider's failure is told from an evaluation out of shape.
+const PROVIDER_FAILED: &str = "the judge's model call failed: ";
+
+/// The most of an error a log line keeps.
+const ERROR_CHARS: usize = 300;
+
 /// The log is moved aside to `evaluations.jsonl.old` past this size, as the
 /// kernel's stderr log is.
 pub const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
@@ -324,7 +333,8 @@ impl Judge {
             prompt(review, focus),
             MAX_OUTPUT_TOKENS,
         )
-        .await?;
+        .await
+        .map_err(|error| format!("{PROVIDER_FAILED}{error}"))?;
         parse(&value)
     }
 
@@ -371,12 +381,22 @@ impl Judge {
                     .field("sent_back", sent_back)
             }
             Err(error) => {
+                // Kept short and without secrets: a provider's error may quote
+                // what it was sent.
+                let shown = head(&super::learned::redact(error), ERROR_CHARS);
+                let kind = if error.starts_with(PROVIDER_FAILED) {
+                    "provider"
+                } else {
+                    "invalid"
+                };
                 line["valid"] = json!(false);
-                line["error"] = json!(super::learned::redact(error));
+                line["error_kind"] = json!(kind);
+                line["error"] = json!(shown);
                 harness_types::diag::warn("self_eval", "invalid")
                     .task(&self.conversation)
                     .field("trigger", trigger)
-                    .msg(error.clone())
+                    .field("error_kind", kind)
+                    .msg(shown)
             }
         };
         if let Err(error) = append(&self.dir, &line) {
@@ -387,21 +407,51 @@ impl Judge {
     }
 }
 
-/// Append one line to the log, moving a full log aside first.
+/// Append one line to the log, moving a full log aside first. Under a lock,
+/// as sessions of one machine share the log: two appends never interleave,
+/// and one rotation never removes the log another just moved aside.
 pub fn append(dir: &Path, line: &Value) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|error| format!("evaluations: {error}"))?;
+    let _lock = lock(dir)?;
     let path = dir.join(LOG_FILE);
     if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > MAX_LOG_BYTES) {
         let old = dir.join(format!("{LOG_FILE}.old"));
         let _ = std::fs::remove_file(&old);
         std::fs::rename(&path, &old).map_err(|error| format!("evaluations: {error}"))?;
     }
+    let mut text = serde_json::to_string(line).map_err(|error| format!("evaluations: {error}"))?;
+    text.push('\n');
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
-        .and_then(|mut file| writeln!(file, "{line}"))
+        .and_then(|mut file| file.write_all(text.as_bytes()))
         .map_err(|error| format!("evaluations: {error}"))
+}
+
+fn lock(dir: &Path) -> Result<std::fs::File, String> {
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(LOCK_FILE))
+        .map_err(|error| format!("evaluations lock: {error}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err("evaluations: waiting for another write timed out".to_owned());
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(format!("evaluations lock: {error}"));
+            }
+        }
+    }
 }
 
 /// What the model is told when the evaluation sends the turn back: the axes
@@ -545,6 +595,12 @@ impl LastTurn {
         }
     }
 
+    fn clear(&self) {
+        if let Ok(mut kept) = self.0.lock() {
+            *kept = None;
+        }
+    }
+
     /// The last finished turn, when there is one.
     #[must_use]
     pub fn get(&self) -> Option<(Judge, TurnReview)> {
@@ -554,10 +610,15 @@ impl LastTurn {
 
 /// `/self-eval [focus]`: judge the last finished turn and render the report.
 /// It sends nothing back to the agent: the report is for the user.
-pub async fn on_demand(last: &LastTurn, focus: Option<&str>) -> Result<Vec<String>, String> {
+pub async fn on_demand(
+    last: &LastTurn,
+    focus: Option<&str>,
+    conversation: &str,
+) -> Result<Vec<String>, String> {
     let (judge, review) = last
         .get()
-        .ok_or("no finished turn to evaluate yet: /self-eval judges the last turn that ended with an answer")?;
+        .filter(|(judge, _)| judge.conversation == conversation)
+        .ok_or("no finished turn to evaluate in this conversation yet: /self-eval judges the last turn that ended with an answer")?;
     let outcome = judge.evaluate(&review, focus).await;
     judge.record("manual", &review, &outcome, false);
     outcome.map(|evaluation| report(&evaluation))
@@ -602,6 +663,10 @@ impl harness_tools::TurnEvaluation for Evaluator {
     fn finished(&self, review: TurnReview) {
         self.last.keep(self.judge.clone(), review);
     }
+
+    fn started(&self) {
+        self.last.clear();
+    }
 }
 
 /// The evaluations of the last thirty days: per axis the mean and the count,
@@ -634,14 +699,18 @@ pub fn stats(dir: &Path, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
         .iter()
         .filter(|record| record["valid"].as_bool() == Some(true))
         .collect::<Vec<_>>();
-    let invalid = records.len() - valid.len();
+    let failed = records
+        .iter()
+        .filter(|record| record["error_kind"] == "provider")
+        .count();
+    let invalid = records.len() - valid.len() - failed;
     let sent_back = valid
         .iter()
         .filter(|record| record["sent_back"].as_bool() == Some(true))
         .count();
     let percent = |part: usize, whole: usize| (part * 100).checked_div(whole).unwrap_or(0);
     lines.push(format!(
-        "  {} evaluated, {invalid} refused as invalid; {sent_back} sent back ({}%)",
+        "  {} evaluated, {invalid} refused as invalid, {failed} not judged (the model call failed); {sent_back} sent back ({}%)",
         valid.len(),
         percent(sent_back, valid.len())
     ));
@@ -884,10 +953,15 @@ mod tests {
         let message = evaluator.evaluate(review()).await.expect("sent back");
         assert!(message.contains("accuracy 2/5"), "{message}");
         evaluator.finished(review());
-        let report = super::on_demand(&last, Some("the claim"))
+        // Another conversation's /self-eval does not see this turn.
+        assert!(super::on_demand(&last, None, "task_2").await.is_err());
+        let report = super::on_demand(&last, Some("the claim"), "task_1")
             .await
             .expect("report");
         assert_eq!(report[0], "AGENT SELF-EVALUATION REPORT");
+        // A new turn begins: what was kept is gone until it ends.
+        harness_tools::TurnEvaluation::started(&evaluator);
+        assert!(super::on_demand(&last, None, "task_1").await.is_err());
         let log = std::fs::read_to_string(directory.path().join(super::LOG_FILE)).expect("log");
         let records = log
             .lines()
@@ -901,7 +975,7 @@ mod tests {
         assert_eq!(records[1]["trigger"], "manual");
         assert_eq!(records[1]["sent_back"], false);
         let request = records[0]["request"].as_str().expect("request");
-        assert!(request.chars().count() <= 260, "{request}");
+        assert!(request.chars().count() <= super::REQUEST_CHARS, "{request}");
         assert!(!request.contains(&"a".repeat(40)), "{request}");
     }
 
@@ -933,7 +1007,7 @@ mod tests {
     /// `/self-eval` with no finished turn says so.
     #[tokio::test]
     async fn self_eval_without_a_turn_says_so() {
-        let error = super::on_demand(&super::LastTurn::default(), None)
+        let error = super::on_demand(&super::LastTurn::default(), None, "task_1")
             .await
             .expect_err("nothing to judge");
         assert!(error.starts_with("no finished turn"), "{error}");
@@ -963,12 +1037,15 @@ mod tests {
             record(2, [5, 5, 5, 5, 2], true),
             record(40, [1, 1, 1, 1, 1], true),
             json!({"at": now.to_rfc3339(), "valid": false, "error": "bad"}),
+            json!({"at": now.to_rfc3339(), "valid": false, "error_kind": "provider", "error": "timed out"}),
         ] {
             super::append(directory.path(), &line).expect("append");
         }
         let text = super::stats(directory.path(), now).join("\n");
         assert!(
-            text.contains("2 evaluated, 1 refused as invalid; 1 sent back (50%)"),
+            text.contains(
+                "2 evaluated, 1 refused as invalid, 1 not judged (the model call failed); 1 sent back (50%)"
+            ),
             "{text}"
         );
         assert!(text.contains("Accuracy       4.5  (2)"), "{text}");

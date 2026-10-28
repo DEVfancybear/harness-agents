@@ -710,6 +710,151 @@ fn a_bug_report_sets_memory_upkeep_beside_its_reads() {
     );
 }
 
+/// The learning loop, the self-evaluation and the session logs leave their
+/// trail in the report: each event counted with what the newest said, the
+/// lessons as they stand, and the files they keep.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one report's records, written and read back"
+)]
+fn a_bug_report_traces_the_learning_loop_and_the_self_evaluation() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path();
+    let now = chrono::Utc::now().timestamp_millis() - 600_000;
+    let record = |offset: i64, kind: &str, event: &str, msg: &str, fields: serde_json::Value| {
+        let ms = now + offset;
+        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        serde_json::json!({"v":1,"ms":ms,"ts":ts,"pid":9,"role":"worker","level":"info","kind":kind,"event":event,"msg":msg,"fields":fields}).to_string()
+    };
+    let records = [
+        record(
+            0,
+            "learning",
+            "promoted",
+            "when asked, answer briefly",
+            serde_json::json!({"lesson": "les_a1"}),
+        ),
+        record(
+            1_000,
+            "learning",
+            "retired",
+            "its memory entry learned_a1 was deleted outside the learning loop",
+            serde_json::json!({"lesson": "les_a1"}),
+        ),
+        record(
+            2_000,
+            "self_eval",
+            "evaluated",
+            "",
+            serde_json::json!({"trigger": "files", "mean": 3.2, "min_axis": "accuracy", "min_score": 2, "verdict": "redo", "sent_back": true}),
+        ),
+        record(
+            3_000,
+            "session_log",
+            "written",
+            "",
+            serde_json::json!({"trigger": "quiet", "home": "file", "path": ".harness/sessions/x.md"}),
+        ),
+        record(
+            4_000,
+            "session_log",
+            "skipped",
+            "",
+            serde_json::json!({"reason": "few_turns"}),
+        ),
+    ];
+    let data = home.join("data");
+    let diagnostics = data.join("diagnostics");
+    std::fs::create_dir_all(&diagnostics).unwrap();
+    std::fs::write(
+        diagnostics.join("20260101-worker-1.jsonl"),
+        records.join("\n") + "\n",
+    )
+    .unwrap();
+    let global = data.join("harness");
+    std::fs::create_dir_all(&global).unwrap();
+    std::fs::write(
+        global.join("lessons.json"),
+        serde_json::json!({"schema": 1, "lessons": [
+            {"id": "les_a1", "text": "when asked, answer briefly", "kind": "correction", "domain": "workflow", "state": "retired"},
+            {"id": "les_b2", "text": "when a test is flaky, rerun it alone", "kind": "resolution", "state": "candidate"}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        global.join("evaluations.jsonl"),
+        "{\"at\":\"2026-01-01T00:00:00Z\",\"trigger\":\"files\",\"valid\":true}\n",
+    )
+    .unwrap();
+    let out = home.join("report.zip");
+    let report = ha(
+        home,
+        &[
+            "bug-report",
+            "--since",
+            "1h",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let entries = entries(&std::fs::read(&out).unwrap());
+    let summary = &entries[0].1;
+    let section = summary
+        .split("## Learning, self-evaluation and session logs")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .unwrap_or_else(|| panic!("a learning section: {summary}"));
+    assert!(
+        section.contains("Lessons now (2 in `harness/global/lessons.json`)"),
+        "{section}"
+    );
+    assert!(
+        section.contains("1 retired correction workflow"),
+        "{section}"
+    );
+    assert!(
+        section.contains("1 candidate resolution other"),
+        "{section}"
+    );
+    assert!(
+        section.contains("| promoted | 1 | les_a1 when asked, answer briefly |"),
+        "{section}"
+    );
+    assert!(
+        section.contains("| retired | 1 | les_a1 its memory entry"),
+        "{section}"
+    );
+    assert!(
+        section.contains("| evaluated | 1 | files redo |"),
+        "{section}"
+    );
+    assert!(section.contains("| written | 1 | quiet |"), "{section}");
+    assert!(section.contains("| skipped | 1 | few_turns |"), "{section}");
+    assert!(
+        section.contains("1 turn(s) sent back by the self-evaluation"),
+        "{section}"
+    );
+    let names = entries
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"harness/global/lessons.json"), "{names:?}");
+    assert!(
+        names.contains(&"harness/global/evaluations.jsonl"),
+        "{names:?}"
+    );
+}
+
 /// The session a bug report was traced from: a `ChatGPT` plan's limit parked
 /// it ("~32 min"), the user typed again and the model answered while it was
 /// parked, the park's resume came due inside that running turn, and a child
