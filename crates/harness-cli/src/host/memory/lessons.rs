@@ -153,7 +153,13 @@ pub enum Placement {
     /// the skill is how the agent works now, so the loop writes no rule that
     /// says it again. Retiring the lesson leaves the skill, which its own
     /// outcomes and the curator judge.
-    Skill { name: String },
+    Skill {
+        name: String,
+        /// The project whose skills hold it, when the skill is a project's:
+        /// only a conversation of that project sees the skill.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+    },
 }
 
 /// What a promoted lesson becomes (Agnostic-AI's ladder, its middle rungs).
@@ -552,7 +558,7 @@ pub fn record(
             .map(|item| {
                 let mut record = record_one(lessons, item, &haystack, conversation, project);
                 if record["applied"] == true {
-                    cover(lessons, item, &mut record, saved);
+                    cover(lessons, item, &mut record, saved, project);
                 }
                 record
             })
@@ -594,7 +600,13 @@ pub fn uncover(dir: &Path, ids: &BTreeSet<String>) {
 /// A recorded lesson the review also saved as global memory, or as a learned
 /// skill it wrote or patched (`skill:<name>`): promoted, as that entry or
 /// skill, so the rule is kept once.
-fn cover(lessons: &mut Lessons, item: &Value, record: &mut Value, saved: &BTreeSet<String>) {
+fn cover(
+    lessons: &mut Lessons,
+    item: &Value,
+    record: &mut Value,
+    saved: &BTreeSet<String>,
+    project: Option<&ProjectRef>,
+) {
     let Some(key) = item["saved_as"].as_str().filter(|key| !key.is_empty()) else {
         return;
     };
@@ -613,8 +625,13 @@ fn cover(lessons: &mut Lessons, item: &Value, record: &mut Value, saved: &BTreeS
     if let Some(name) = key.strip_prefix("skill:") {
         lesson.state = LessonState::Promoted;
         lesson.promoted_at = Some(Utc::now().to_rfc3339());
+        // `skill-project:<name>`: the review wrote it into the project's skills.
+        let in_project = saved.contains(&format!("skill-project:{name}"));
         lesson.placement = Some(Placement::Skill {
             name: name.to_owned(),
+            project: project
+                .filter(|_| in_project)
+                .map(|project| project.key.clone()),
         });
         lesson.note(
             "promoted",
@@ -841,15 +858,11 @@ fn entry_key(state: &Value, key: &str) -> Option<String> {
 fn reconcile(places: &Places, lessons: &mut Lessons, distilled: &mut Distilled) {
     // A store that cannot be read, or reads empty, says nothing about what
     // was deleted: no lesson is touched then.
+    if !places.global.join(super::memory_store::DB_FILE).is_file() {
+        return;
+    }
     let state = match super::memory_store::load_document(&places.global) {
-        Ok(state)
-            if state["entries"]["memory"]
-                .as_object()
-                .is_some_and(|entries| !entries.is_empty()) =>
-        {
-            state
-        }
-        Ok(_) => return,
+        Ok(state) => state,
         Err(error) => {
             trace("reconcile_skipped", "", &error);
             return;
@@ -914,13 +927,17 @@ fn reconcile(places: &Places, lessons: &mut Lessons, distilled: &mut Distilled) 
 /// A lesson kept as a learned skill that is no longer in the library (the
 /// curator removed it, or the user did) is a candidate again: the gate may
 /// then write its rule.
-pub fn reconcile_skills(places: &Places, skills: &BTreeSet<String>) {
+pub fn reconcile_skills(places: &Places, skills: &BTreeSet<String>, current: Option<&str>) {
     let _ = update(&places.global, |lessons| {
         for lesson in &mut lessons.lessons {
-            let Some(Placement::Skill { name }) = &lesson.placement else {
+            let Some(Placement::Skill { name, project }) = &lesson.placement else {
                 continue;
             };
-            if lesson.state != LessonState::Promoted || skills.contains(name) {
+            // A project's skill is seen only from that project.
+            if lesson.state != LessonState::Promoted
+                || skills.contains(name)
+                || project.as_deref().is_some_and(|key| Some(key) != current)
+            {
                 continue;
             }
             let why = format!("its learned skill {name} is gone: a candidate again");
@@ -2006,22 +2023,24 @@ fn import_into(
                 || (normalize(&kept.text) == text_key
                     && kept.scope_key().map(str::to_owned) == scope_key)
         };
-        // A lesson retired here stays retired: an export does not bring it back.
-        if lessons
+        let active = lessons
             .lessons
             .iter()
-            .any(|kept| kept.state == LessonState::Retired && same(kept))
+            .position(|kept| kept.state != LessonState::Retired && same(kept));
+        if active.is_none()
+            && lessons
+                .lessons
+                .iter()
+                .any(|kept| kept.state == LessonState::Retired && same(kept))
         {
+            // A lesson retired here, and not learned again, stays retired.
             imported
                 .skipped
                 .push((id, "it was retired here".to_owned()));
             continue;
         }
-        if let Some(kept) = lessons
-            .lessons
-            .iter_mut()
-            .find(|kept| kept.state != LessonState::Retired && same(kept))
-        {
+        if let Some(index) = active {
+            let kept = &mut lessons.lessons[index];
             let added = merge_signals(kept, lesson);
             if added > 0 {
                 kept.note("imported", format!("{added} signal(s) from an export"));
@@ -2085,7 +2104,7 @@ pub fn promote_global(places: &Places, id: &str) -> Result<Lesson, String> {
                     "lesson {id} is memory entry {key}, the user's own words: move that entry to every project instead"
                 ));
             }
-            Some(Placement::Skill { name }) => {
+            Some(Placement::Skill { name, .. }) => {
                 return Err(format!(
                     "lesson {id} is learned skill {name}: make that skill global instead"
                 ));
@@ -2543,6 +2562,13 @@ fn evolve(
             ));
             continue;
         }
+        let here = super::memory::ProjectTag::of(&context.workspace).key;
+        if rules[0].scope_key().is_some_and(|key| key != here) {
+            changes.push(format!(
+                "evolve into skill {name} refused: its rules are another project's"
+            ));
+            continue;
+        }
         let level = if rules[0].project.is_some() {
             if layers.project.is_none() {
                 changes.push(format!(
@@ -2583,6 +2609,7 @@ fn evolve(
                 }
                 lesson.placement = Some(Placement::Skill {
                     name: name.to_owned(),
+                    project: (level == "project").then(|| here.clone()),
                 });
                 lesson.note("evolved", format!("into learned skill {name}"));
             }
@@ -2611,7 +2638,7 @@ fn reword_placement(
         Some(Placement::Covered { key }) => Err(format!(
             "memory entry {key} is the user's own words; the review updates it"
         )),
-        Some(Placement::Skill { name }) => Err(format!(
+        Some(Placement::Skill { name, .. }) => Err(format!(
             "learned skill {name} holds it; the review patches the skill"
         )),
         // A new version of the lesson's own entry: the store keeps the old.
@@ -2956,6 +2983,32 @@ mod tests {
                 .len(),
             3
         );
+        // In its own project, the project's lesson lands there.
+        let orion = ProjectRef {
+            key: "p1".to_owned(),
+            name: "Orion".to_owned(),
+            root: root.path().display().to_string(),
+        };
+        let own = import(
+            target.path(),
+            &document,
+            0.0,
+            ScopeFilter::Project,
+            Some(&orion),
+            false,
+        )
+        .expect("in its project");
+        assert_eq!(own.added.len(), 1, "{own:?}");
+        let landed = load(target.path()).expect("load");
+        let local = landed
+            .lessons
+            .iter()
+            .find(|lesson| lesson.id == own.added[0])
+            .expect("the project lesson");
+        assert_eq!(
+            local.project.as_ref().map(|project| project.key.as_str()),
+            Some("p1")
+        );
         // A lesson retired here stays retired.
         let places = Places {
             global: target.path().to_path_buf(),
@@ -3081,7 +3134,8 @@ mod tests {
         assert_eq!(
             lessons.lessons[0].placement,
             Some(Placement::Skill {
-                name: "db-migrations".to_owned()
+                name: "db-migrations".to_owned(),
+                project: None,
             })
         );
         let places = Places {
@@ -3089,12 +3143,26 @@ mod tests {
         };
         // A lesson whose skill is gone is a candidate again; one whose skill
         // is there stays the skill.
-        reconcile_skills(&places, &BTreeSet::from(["db-migrations".to_owned()]));
+        reconcile_skills(&places, &BTreeSet::from(["db-migrations".to_owned()]), None);
         assert_eq!(
             load(dir.path()).expect("load").lessons[0].state,
             LessonState::Promoted
         );
-        reconcile_skills(&places, &BTreeSet::new());
+        // A project's skill is not judged from another project, which cannot
+        // see that project's skills.
+        update(dir.path(), |lessons| {
+            lessons.lessons[0].placement = Some(Placement::Skill {
+                name: "db-migrations".to_owned(),
+                project: Some("p1".to_owned()),
+            });
+        })
+        .expect("update");
+        reconcile_skills(&places, &BTreeSet::new(), Some("p2"));
+        assert_eq!(
+            load(dir.path()).expect("load").lessons[0].state,
+            LessonState::Promoted
+        );
+        reconcile_skills(&places, &BTreeSet::new(), Some("p1"));
         let lessons = load(dir.path()).expect("load");
         assert_eq!(lessons.lessons[0].state, LessonState::Candidate);
         assert_eq!(lessons.lessons[0].placement, None);

@@ -204,4 +204,14 @@ check "the store still passes the lint" '(cd "$Q" && "$HA" memory lint --quiet)'
 check "an export carries the rule with its quotes" '"$PY" -c "import json,sys; d=json.load(open(sys.argv[1],encoding=\"utf-8\")); l=[x for x in d[\"lessons\"] if x[\"id\"]==sys.argv[2]]; sys.exit(0 if l and len(l[0][\"signals\"])==3 and d[\"kind\"]==\"ha-lessons\" else 1)" "$RX/export.json" "$RULE"'
 check "the diagnostics traced the loop" 'grep -rh "\"kind\":\"learning\"" "$HA_HOME/data/diagnostics" | grep -q "\"event\":\"imported\"" && grep -rh "\"kind\":\"learning\"" "$HA_HOME/data/diagnostics" | grep -q "\"event\":\"generalized\""'
 
+echo "################ 8. the bug report traces the loop"
+"$HA" bug-report --since 3h --out "$RX/report.zip" > /dev/null 2>&1
+"$PY" - "$RX/report.zip" "$RX/report" <<'EOF'
+import sys, zipfile
+zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])
+EOF
+check "the summary has the learning section" 'grep -q "^## Learning, self-evaluation and session logs" "$RX/report/SUMMARY.md"'
+check "with the loop's promotions and its import" 'sed -n "/^## Learning, self-evaluation/,/^## [A-Z]/p" "$RX/report/SUMMARY.md" | grep -q "| promoted |" && sed -n "/^## Learning, self-evaluation/,/^## [A-Z]/p" "$RX/report/SUMMARY.md" | grep -q "| imported |"'
+check "and the lessons file" '[ -f "$RX/report/harness/global/lessons.json" ]'
+
 result

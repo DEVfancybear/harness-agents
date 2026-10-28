@@ -2014,7 +2014,13 @@ impl TurnDriver {
                                 // bounded, so a slow provider does not hold the
                                 // turn's end for long.
                                 let feedback = tokio::select! {
-                                    feedback = tokio::time::timeout(EVALUATION_TIMEOUT, evaluation.evaluate(review)) => feedback.unwrap_or(None),
+                                    feedback = tokio::time::timeout(EVALUATION_TIMEOUT, evaluation.evaluate(review)) => feedback.unwrap_or_else(|_| {
+                                        harness_types::diag::warn("self_eval", "timeout")
+                                            .field("trigger", trigger)
+                                            .field("after_s", EVALUATION_TIMEOUT.as_secs())
+                                            .emit();
+                                        None
+                                    }),
                                     () = cancellation.cancelled() => None,
                                 };
                                 feedback.map(|feedback| {

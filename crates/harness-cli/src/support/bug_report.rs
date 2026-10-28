@@ -1768,7 +1768,14 @@ impl Report {
     fn summary_learning(&self, out: &mut String) {
         let events = |kind: &str| {
             let mut counted: BTreeMap<String, (usize, String)> = BTreeMap::new();
-            for record in self.records.iter().filter(|record| record["kind"] == kind) {
+            // In time order, so the newest one's detail is what stays.
+            let mut records = self
+                .records
+                .iter()
+                .filter(|record| record["kind"] == kind)
+                .collect::<Vec<_>>();
+            records.sort_by_key(|record| record["ms"].as_i64().unwrap_or_default());
+            for record in records {
                 let entry = counted
                     .entry(record["event"].as_str().unwrap_or("?").to_owned())
                     .or_default();

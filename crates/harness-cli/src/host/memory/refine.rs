@@ -2778,8 +2778,18 @@ pub async fn auto_refine(
                     Some("create" | "update" | "patch")
                 )
             })
-            .filter_map(|record| record["id"].as_str())
-            .map(|name| format!("skill:{name}")),
+            .filter_map(|record| {
+                record["id"]
+                    .as_str()
+                    .map(|name| (name, record["level"] == "project"))
+            })
+            .flat_map(|(name, project)| {
+                let mut keys = vec![format!("skill:{name}")];
+                if project {
+                    keys.push(format!("skill-project:{name}"));
+                }
+                keys
+            }),
     );
     proposal.lesson_records = super::lessons::record(
         &scopes.global,
@@ -2876,7 +2886,8 @@ pub async fn auto_refine(
                 .into_iter()
                 .map(|skill| skill.name)
                 .collect();
-            super::lessons::reconcile_skills(&places, &skills);
+            let here = lesson_project(Some(learning)).map(|project| project.key);
+            super::lessons::reconcile_skills(&places, &skills, here.as_deref());
         }
         refined.learned = match super::lessons::distill(&places, chrono::Utc::now()) {
             Ok(distilled) => distilled.lines(),
