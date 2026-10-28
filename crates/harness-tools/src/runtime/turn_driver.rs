@@ -660,6 +660,169 @@ fn completion_nudge(changed: &[String]) -> String {
     )
 }
 
+/// A turn that changed at least this many files is judged at its end
+/// (ECC's `agent-self-evaluation`: work across three or more files).
+pub const EVALUATE_AT_FILES: usize = 3;
+
+/// A turn whose changes touched at least this many lines is judged at its end
+/// (ECC's fifty lines).
+pub const EVALUATE_AT_LINES: usize = 50;
+
+/// How many of a turn's last tool results the judge reads, and how much of each.
+const REVIEW_RESULTS: usize = 12;
+const REVIEW_RESULT_CHARS: usize = 1_500;
+
+/// One file a turn changed, and about how many lines its changes touched.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct ChangedFile {
+    pub path: String,
+    pub lines: usize,
+}
+
+/// What a judge of a finished turn reads: the request, the last answer, the
+/// end of what the tools returned, and what the turn changed.
+#[derive(Clone, Debug, Default)]
+pub struct TurnReview {
+    /// Why the turn is judged: `files`, `lines` or `goal`; `finished` when it
+    /// is only kept for a later `/self-eval`.
+    pub trigger: &'static str,
+    pub query: String,
+    pub answer: String,
+    /// The turn's last tool results, oldest first, each named by its tool and
+    /// cut to its end.
+    pub results: Vec<String>,
+    pub changed: Vec<ChangedFile>,
+}
+
+/// A host's evaluation of a finished turn by a model call of its own, not the
+/// agent grading itself in its turn (ECC's `agent-self-evaluation`). It answers
+/// the message that sends the model back once, or `None` when the turn may
+/// end. It runs after the verify reminder, and not when a completion check
+/// (jev) judges the turn's end.
+pub trait TurnEvaluation: Send + Sync {
+    /// Whether this turn is judged whatever its size: it finished a goal.
+    fn wanted(&self) -> bool {
+        false
+    }
+
+    fn evaluate(
+        &self,
+        review: TurnReview,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>>;
+
+    /// Keep a turn that ended with an answer, for a later `/self-eval`.
+    fn finished(&self, _review: TurnReview) {}
+}
+
+/// About how many lines one change touched: the `+` and `-` lines of an
+/// edit's diff, or every line of a whole-file write (an upper bound when it
+/// rewrote a file that existed). `None` for a call that changed no file.
+fn changed_lines<'a>(output: &'a ToolOutput, arguments: &str) -> Option<(&'a str, usize)> {
+    match output {
+        ToolOutput::EditFile { path, diff, .. } => Some((
+            path,
+            diff.lines()
+                .filter(|line| line.starts_with('+') || line.starts_with('-'))
+                .count(),
+        )),
+        ToolOutput::WriteFile { path, .. } | ToolOutput::ApplyPatch { path, .. } => {
+            let value = serde_json::from_str::<Value>(arguments).unwrap_or_default();
+            let text = value
+                .get("content")
+                .or_else(|| value.get("replacement"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Some((path, text.lines().count()))
+        }
+        _ => None,
+    }
+}
+
+/// Count one change into the turn's changed files.
+fn note_change(changed: &mut Vec<ChangedFile>, output: &ToolOutput, arguments: &str) {
+    let Some((path, lines)) = changed_lines(output, arguments) else {
+        return;
+    };
+    match changed.iter_mut().find(|file| file.path == path) {
+        Some(file) => file.lines += lines,
+        None => changed.push(ChangedFile {
+            path: path.to_owned(),
+            lines,
+        }),
+    }
+}
+
+/// What already happened at a turn's end, for whether it is evaluated.
+#[derive(Clone, Copy, Debug, Default)]
+struct EndOfTurn {
+    /// A completion check (jev) judges this turn's end instead.
+    judged_by_completion: bool,
+    /// The verify reminder or the completion check already sent it back.
+    reminded: bool,
+    /// It was already evaluated.
+    evaluated: bool,
+}
+
+/// Why a turn that is ending is evaluated, or `None`: a structural gate, so a
+/// model is asked only of a turn that did enough to be worth judging. The
+/// deterministic checks come first: a turn the verify reminder sent back, or
+/// one jev judges, is not evaluated too, and no turn is evaluated twice.
+fn evaluation_trigger(
+    end: EndOfTurn,
+    wanted: bool,
+    changed: &[ChangedFile],
+) -> Option<&'static str> {
+    if end.judged_by_completion || end.reminded || end.evaluated {
+        return None;
+    }
+    if wanted {
+        Some("goal")
+    } else if changed.len() >= EVALUATE_AT_FILES {
+        Some("files")
+    } else if changed.iter().map(|file| file.lines).sum::<usize>() >= EVALUATE_AT_LINES {
+        Some("lines")
+    } else {
+        None
+    }
+}
+
+/// The turn's last tool results, each named by the tool that returned it and
+/// cut to its end, where a run says how it went.
+fn review_results(transcript: &[ProviderMessage]) -> Vec<String> {
+    let name_of = |id: &str| {
+        transcript
+            .iter()
+            .flat_map(|message| message.tool_calls.iter())
+            .find(|call| call.call_id == id)
+            .map_or_else(|| "tool".to_owned(), |call| call.name.clone())
+    };
+    let mut results = transcript
+        .iter()
+        .rev()
+        .filter(|message| message.role == MessageRole::Tool)
+        .take(REVIEW_RESULTS)
+        .map(|message| {
+            let name = message
+                .tool_call_id
+                .as_deref()
+                .map_or_else(|| "tool".to_owned(), name_of);
+            let count = message.content.chars().count();
+            let tail = message
+                .content
+                .chars()
+                .skip(count.saturating_sub(REVIEW_RESULT_CHARS))
+                .collect::<String>();
+            if count > REVIEW_RESULT_CHARS {
+                format!("[{name}] ...{tail}")
+            } else {
+                format!("[{name}] {tail}")
+            }
+        })
+        .collect::<Vec<_>>();
+    results.reverse();
+    results
+}
+
 /// A tool result at least this long is offered to the admission judge before
 /// it enters the transcript (about 4k tokens).
 const ADMIT_AT_BYTES: usize = 16_000;
@@ -1018,6 +1181,11 @@ pub struct TurnDriver {
     /// Without a completion check: remind the model, once, to check a change
     /// of code it ran nothing after (Agnostic-AI's forced-verify stop gate).
     verify_reminder: bool,
+    /// The host's evaluation of a finished turn, and whether a turn that
+    /// qualifies is judged on its own (`selfEvaluation: auto`) or only kept
+    /// for `/self-eval` (`manual`).
+    evaluation: Option<Arc<dyn TurnEvaluation>>,
+    evaluate_automatically: bool,
     /// The tools listed in the roster but not sent, reached through
     /// `tool_schema` and `use_tool`.
     deferred: Arc<Vec<Value>>,
@@ -1140,6 +1308,8 @@ impl TurnDriver {
             admission: None,
             completion: None,
             verify_reminder: false,
+            evaluation: None,
+            evaluate_automatically: false,
             deferred: Arc::default(),
         }
     }
@@ -1186,6 +1356,20 @@ impl TurnDriver {
     #[must_use]
     pub const fn with_verify_reminder(mut self, remind: bool) -> Self {
         self.verify_reminder = remind;
+        self
+    }
+
+    /// Hand each turn that ends with an answer to `evaluation`; with
+    /// `automatically`, a turn that qualifies is judged before it ends and
+    /// may be sent back once.
+    #[must_use]
+    pub fn with_turn_evaluation(
+        mut self,
+        evaluation: Arc<dyn TurnEvaluation>,
+        automatically: bool,
+    ) -> Self {
+        self.evaluation = Some(evaluation);
+        self.evaluate_automatically = automatically;
         self
     }
 
@@ -1408,6 +1592,10 @@ impl TurnDriver {
         let mut stop_hook_active = false;
         // The completion check sends the model back once per turn.
         let mut completion_checked = false;
+        // The files this turn changed and about how many lines, and whether
+        // its end was already evaluated: once per turn, as the reminder.
+        let mut changed_files: Vec<ChangedFile> = Vec::new();
+        let mut evaluated = false;
         // The step the task was last recited at, and whether the model was
         // already asked to save before a summary.
         let mut recited_at = 1_u32;
@@ -1770,6 +1958,47 @@ impl TurnDriver {
                     ))
                 } else {
                     None
+                };
+                // Last in the chain, ECC's self-evaluation: a turn that did
+                // enough to be worth judging, that nothing above sent back, is
+                // judged by a model call of the host's, once. A weak axis
+                // sends it back with the evidence; a sound turn ends.
+                let reminder = match (reminder, &self.evaluation) {
+                    (None, Some(evaluation))
+                        if self.evaluate_automatically
+                            && steps < options.limits.max_steps
+                            && !cancellation.is_cancelled() =>
+                    {
+                        let end = EndOfTurn {
+                            judged_by_completion: self.completion.is_some(),
+                            reminded: completion_checked,
+                            evaluated,
+                        };
+                        match evaluation_trigger(end, evaluation.wanted(), &changed_files) {
+                            Some(trigger) => {
+                                evaluated = true;
+                                let review = TurnReview {
+                                    trigger,
+                                    query: request.text.clone(),
+                                    answer: result.response.clone(),
+                                    results: review_results(&transcript),
+                                    changed: changed_files.clone(),
+                                };
+                                let feedback = tokio::select! {
+                                    feedback = evaluation.evaluate(review) => feedback,
+                                    () = cancellation.cancelled() => None,
+                                };
+                                feedback.map(|feedback| {
+                                    (
+                                        feedback,
+                                        "self-evaluation: an axis scored low; asking for a fix",
+                                    )
+                                })
+                            }
+                            None => None,
+                        }
+                    }
+                    (reminder, _) => reminder,
                 };
                 if let Some((nudge, notice)) = reminder {
                     steps += 1;
@@ -2377,6 +2606,7 @@ impl TurnDriver {
                             ProviderMessage::tool_result(transcript_id, rendered)
                                 .with_attachments(tool_output_images(&view.output)),
                         );
+                        note_change(&mut changed_files, &view.output, &arguments);
                         executions.push(view);
                     }
                     Slot::Done(Err(error)) => {
@@ -2415,6 +2645,7 @@ impl TurnDriver {
                                         failures.push(detail);
                                     }
                                     texts.push(render_tool_output(&name, &view.output));
+                                    note_change(&mut changed_files, &view.output, "");
                                     executions.push(view);
                                 }
                                 Err(error) => {
@@ -2657,6 +2888,18 @@ impl TurnDriver {
                 no_progress,
                 stop: Some(stop),
                 missing: goal.required_ids(),
+            });
+        }
+        // A turn that ended with an answer is kept for `/self-eval`, judged or not.
+        if stop == TurnStop::Final
+            && let Some(evaluation) = &self.evaluation
+        {
+            evaluation.finished(TurnReview {
+                trigger: "finished",
+                query: request.text.clone(),
+                answer: result.response.clone(),
+                results: review_results(&transcript),
+                changed: changed_files,
             });
         }
         // The accepted M0 reducer owns the run state vocabulary; M3 adds no
@@ -4775,6 +5018,117 @@ mod tool_output_render_tests {
         assert!(super::is_document("notes.TXT"));
         assert!(!super::is_document("src/main.rs"));
         assert!(!super::is_document("Makefile"));
+    }
+
+    fn changed(count: usize, lines: usize) -> Vec<super::ChangedFile> {
+        (0..count)
+            .map(|index| super::ChangedFile {
+                path: format!("src/f{index}.rs"),
+                lines,
+            })
+            .collect()
+    }
+
+    /// A turn is evaluated when it did enough: three files, fifty lines, or
+    /// a finished goal. One small change, or none, is not judged.
+    #[test]
+    fn a_turn_is_evaluated_only_when_it_did_enough() {
+        let end = super::EndOfTurn::default();
+        assert_eq!(super::evaluation_trigger(end, false, &[]), None);
+        assert_eq!(super::evaluation_trigger(end, false, &changed(2, 10)), None);
+        assert_eq!(
+            super::evaluation_trigger(end, false, &changed(3, 1)),
+            Some("files")
+        );
+        assert_eq!(
+            super::evaluation_trigger(end, false, &changed(2, 25)),
+            Some("lines")
+        );
+        assert_eq!(super::evaluation_trigger(end, true, &[]), Some("goal"));
+    }
+
+    /// The deterministic checks come first: a turn the verify reminder sent
+    /// back is not judged too, jev judges in its place when it is on, and no
+    /// turn is evaluated twice.
+    #[test]
+    fn the_reminder_and_jev_come_first_and_a_turn_is_judged_once() {
+        let big = changed(5, 40);
+        let reminded = super::EndOfTurn {
+            reminded: true,
+            ..super::EndOfTurn::default()
+        };
+        let jev = super::EndOfTurn {
+            judged_by_completion: true,
+            ..super::EndOfTurn::default()
+        };
+        let again = super::EndOfTurn {
+            evaluated: true,
+            ..super::EndOfTurn::default()
+        };
+        for end in [reminded, jev, again] {
+            assert_eq!(super::evaluation_trigger(end, true, &big), None, "{end:?}");
+        }
+    }
+
+    /// An edit counts its diff's changed lines, a whole-file write its lines,
+    /// and one file changed twice is one file.
+    #[test]
+    fn changed_lines_are_counted_per_file() {
+        let mut files = Vec::new();
+        let edit = ToolOutput::EditFile {
+            path: "a.rs".to_owned(),
+            before_hash: ContentHash::from_bytes(b"a"),
+            after_hash: ContentHash::from_bytes(b"b"),
+            replacements: 1,
+            diff: "   ...\n 8 keep\n-9 old\n+9 new\n+10 more".to_owned(),
+        };
+        let write = ToolOutput::WriteFile {
+            path: "b.rs".to_owned(),
+            before_hash: ContentHash::from_bytes(b"a"),
+            after_hash: ContentHash::from_bytes(b"b"),
+        };
+        super::note_change(&mut files, &edit, "");
+        super::note_change(&mut files, &edit, "");
+        super::note_change(
+            &mut files,
+            &write,
+            &serde_json::json!({"path": "b.rs", "content": "1\n2\n3\n"}).to_string(),
+        );
+        assert_eq!(
+            files,
+            vec![
+                super::ChangedFile {
+                    path: "a.rs".to_owned(),
+                    lines: 6
+                },
+                super::ChangedFile {
+                    path: "b.rs".to_owned(),
+                    lines: 3
+                },
+            ]
+        );
+    }
+
+    /// The judge reads the turn's last tool results by tool name, each cut to
+    /// its end.
+    #[test]
+    fn the_review_names_each_result_by_its_tool_and_keeps_its_end() {
+        use harness_providers::{MessageRole, ProviderMessage, ProviderToolCall};
+        let mut call = ProviderMessage::new(MessageRole::Assistant, String::new());
+        call.tool_calls = vec![ProviderToolCall::new("c1", "run_shell", "{}")];
+        let transcript = vec![
+            call,
+            ProviderMessage::tool_result("c1", format!("{}test result: FAILED", "x".repeat(3_000))),
+        ];
+        let results = super::review_results(&transcript);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].starts_with("[run_shell] ..."), "{}", results[0]);
+        assert!(
+            results[0].ends_with("test result: FAILED"),
+            "{}",
+            results[0]
+        );
+        assert!(results[0].chars().count() < 1_600);
     }
 
     #[test]

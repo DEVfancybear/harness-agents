@@ -237,6 +237,7 @@ pub fn help_card_lines() -> Vec<String> {
                 "/handoff",
                 "/verify",
                 "/review",
+                "/self-eval",
                 "/features",
                 "/factory",
                 "/jev",

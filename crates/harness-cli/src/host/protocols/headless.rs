@@ -739,6 +739,30 @@ pub async fn run_with(
                 ),
             None => driver,
         };
+    // The self-evaluation as in the app; `ha exec` has no `/self-eval`, so
+    // only `auto` attaches it. The mock profile calls no model to judge with.
+    let driver = match &provider_config {
+        Some(config)
+            if super::self_eval::mode(&context.paths.config_file, environment)
+                == super::self_eval::Mode::Auto =>
+        {
+            driver.with_turn_evaluation(
+                Arc::new(super::self_eval::Evaluator::new(
+                    super::self_eval::Judge::new(
+                        Arc::clone(&provider),
+                        config.model.clone(),
+                        super::harness::global_dir(&context.paths.data_dir),
+                        task_id.as_str().to_owned(),
+                        super::bootstrap::project_key_of(&context.project.root),
+                    ),
+                    Arc::default(),
+                    None,
+                )),
+                true,
+            )
+        }
+        _ => driver,
+    };
     let external_tools = super::mcp::combined_tools_with_delegate(
         None,
         active_extensions.as_ref(),

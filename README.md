@@ -92,6 +92,7 @@ ha                         open the app
 | Redirect a running turn | `/steer <text>`, or just type while it runs |
 | Work until something is done | `/goal <objective>`, `/goal status\|pause\|resume\|clear` |
 | Check the work | `/verify`, `/review`, `/features` |
+| Score the last turn on five quality axes (ECC's agent-self-evaluation) | `/self-eval [focus]`; a turn that changed 3+ files or 50+ lines is judged at its end on its own; `"selfEvaluation": "auto"\|"manual"\|"off"` or `HA_SELF_EVAL`; `ha learning report` shows the last 30 days |
 | Hand over to the next session | `/handoff`, `/handoff --reset` |
 | Keep a lesson as a skill | `/learn [focus]`, then `/skills` |
 | Tune memory, skills and checks | `/refine [instructions]`, `/refine --global`, `/refine --curate`, `/refine --history [N]`, `/refine --rollback <id>`; `/refinements off` turns the whole harness off (saved state is kept) |
@@ -241,6 +242,7 @@ ha                         mở app
 | Chỉnh hướng lượt đang chạy | `/steer <text>`, hoặc gõ luôn khi nó đang chạy |
 | Làm tới khi xong việc | `/goal <mục tiêu>`, `/goal status\|pause\|resume\|clear` |
 | Kiểm tra kết quả | `/verify`, `/review`, `/features` |
+| Chấm lượt vừa xong trên năm trục chất lượng (agent-self-evaluation của ECC) | `/self-eval [trọng tâm]`; lượt đổi từ 3 file hoặc 50 dòng trở lên tự được chấm khi kết thúc; `"selfEvaluation": "auto"\|"manual"\|"off"` hoặc `HA_SELF_EVAL`; `ha learning report` cho xem 30 ngày gần nhất |
 | Bàn giao cho phiên sau | `/handoff`, `/handoff --reset` |
 | Giữ bài học thành skill | `/learn [trọng tâm]`, rồi `/skills` |
 | Tinh chỉnh memory, skill và check | `/refine [chỉ dẫn]`, `/refine --global`, `/refine --curate`, `/refine --history [N]`, `/refine --rollback <id>`; `/refinements off` tắt toàn bộ harness (state đã lưu được giữ) |

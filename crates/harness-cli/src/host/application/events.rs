@@ -1324,6 +1324,10 @@ pub enum SessionEvent {
         passed: bool,
         lines: Vec<String>,
     },
+    /// `/self-eval` judged the last finished turn: its report.
+    SelfEvaluated {
+        lines: Vec<String>,
+    },
     /// The autonomous quality gates ran: their verdict and what they remember.
     GatesChecked {
         result: super::autonomous::GateResult,

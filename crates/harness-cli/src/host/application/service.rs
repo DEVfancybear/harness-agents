@@ -586,6 +586,11 @@ pub trait SessionPort: Send {
     fn strategy(&self) -> Result<Vec<String>, String> {
         Err("this backend keeps no task state".to_owned())
     }
+    /// `/self-eval [focus]`: judge the last finished turn; the report arrives
+    /// as [`SessionEvent::SelfEvaluated`]. It sends nothing back to the agent.
+    fn self_eval(&mut self, _focus: Option<&str>) -> Result<(), String> {
+        Err("this backend keeps no finished turn to evaluate".to_owned())
+    }
     /// Run autonomous quality gates in the workspace; the verdict arrives as
     /// [`SessionEvent::GatesChecked`].
     fn run_gates(&mut self, _job: super::autonomous::GateJob) -> Result<(), String> {
@@ -1684,6 +1689,8 @@ pub struct LiveTurn {
     auto_compaction_off: std::sync::atomic::AtomicBool,
     /// prime-agent's `retry.enabled: false`: a failed model call is not retried.
     auto_retry_off: std::sync::atomic::AtomicBool,
+    /// The last turn that ended with an answer, for `/self-eval`.
+    last_turn: Arc<super::self_eval::LastTurn>,
 }
 
 /// The model and the thinking level a running turn's next call uses.
@@ -5352,6 +5359,29 @@ impl SessionPort for AgentSessionService {
         Ok(())
     }
 
+    fn self_eval(&mut self, focus: Option<&str>) -> Result<(), String> {
+        if super::self_eval::mode(&self.config_file, &self.environment)
+            == super::self_eval::Mode::Off
+        {
+            return Err(
+                "self-evaluation is off: set selfEvaluation to auto or manual in settings.json, or HA_SELF_EVAL"
+                    .to_owned(),
+            );
+        }
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        let last = Arc::clone(&self.live.last_turn);
+        let focus = focus.map(str::to_owned);
+        let sender = self.sender.clone();
+        handle.spawn(async move {
+            let lines = super::self_eval::on_demand(&last, focus.as_deref())
+                .await
+                .unwrap_or_else(|error| vec![format!("self-evaluation failed: {error}")]);
+            let _ = sender.send(SessionEvent::SelfEvaluated { lines });
+        });
+        Ok(())
+    }
+
     fn clean_state(&self) -> Vec<String> {
         super::lifecycle::clean_state(&self.workspace_root)
     }
@@ -8930,6 +8960,28 @@ async fn run_turn(
                 ),
             None => driver,
         };
+    // Last in the end-of-turn chain, after the verify reminder and jev: a
+    // model call of the helper's judges a turn that did enough, and the turn
+    // is kept for `/self-eval` (`docs/architecture/SELF_EVALUATION.en.md`).
+    let self_evaluation = super::self_eval::mode(&config_file, &environment);
+    let driver = if self_evaluation == super::self_eval::Mode::Off {
+        driver
+    } else {
+        driver.with_turn_evaluation(
+            Arc::new(super::self_eval::Evaluator::new(
+                super::self_eval::Judge::new(
+                    Arc::clone(&helper_provider),
+                    helper_model.clone(),
+                    super::harness::global_dir(&data_dir),
+                    task_id.as_str().to_owned(),
+                    super::bootstrap::project_key_of(&workspace_root),
+                ),
+                Arc::clone(&live.last_turn),
+                goal_host.clone(),
+            )),
+            self_evaluation == super::self_eval::Mode::Auto,
+        )
+    };
     let external_tools = super::mcp::combined_tools_with_delegate(
         active_mcp.as_ref(),
         active_extensions.as_ref(),

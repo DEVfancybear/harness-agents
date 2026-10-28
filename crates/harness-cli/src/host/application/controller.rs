@@ -3158,6 +3158,9 @@ impl InteractiveController {
                     effects,
                 );
             }
+            SessionEvent::SelfEvaluated { lines } => {
+                self.reference("/self-eval", lines, effects);
+            }
             SessionEvent::GatesChecked { result, state } => {
                 self.gates_pending = false;
                 // A turn the user started meanwhile owns the session now; the gates'
@@ -4858,6 +4861,22 @@ impl InteractiveController {
                 } else {
                     self.continuations = 0;
                     effects.extend(self.dispatch(Self::review_request(raw_argument), false));
+                }
+            }
+            "/self-eval" => {
+                // A report for the user on the last finished turn: the running
+                // turn is judged at its own end, if it qualifies.
+                if self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "/self-eval judges the last finished turn; run it when this one has ended".to_owned(),
+                    });
+                } else {
+                    match self.service.self_eval(raw_argument) {
+                        Ok(()) => self.push_history(&mut effects, HistoryItem::Notice {
+                            message: "self-evaluation: judging the last turn...".to_owned(),
+                        }),
+                        Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                    }
                 }
             }
             "/effort" => {

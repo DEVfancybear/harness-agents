@@ -3,7 +3,7 @@
 use clap::{Args, Subcommand};
 use harness_types::{ErrorCode, HarnessError};
 
-use crate::interactive::{cli_extras, harness, lessons, memory};
+use crate::interactive::{cli_extras, harness, lessons, memory, self_eval};
 
 #[derive(Debug, Args)]
 pub struct LearningCommand {
@@ -36,7 +36,8 @@ enum LearningSubcommand {
         reason: String,
     },
     /// What recurs: rules still corrected, rules and whether they worked,
-    /// candidates by how often they recur, and facts.
+    /// candidates by how often they recur, and facts; then the last thirty
+    /// days of self-evaluations.
     Report {
         /// Retired lessons too.
         #[arg(long)]
@@ -193,6 +194,12 @@ pub fn run(command: LearningCommand) -> Result<(), HarnessError> {
         LearningSubcommand::Report { all, html } => {
             let kept = lessons::load(&global).map_err(failed)?;
             print!("{}", lessons::report(&kept, now, all));
+            // Beside the lessons, not among them: the agent's own work judged by a
+            // model is not an independent signal, so it never becomes one.
+            println!();
+            for line in self_eval::stats(&global, now) {
+                println!("{line}");
+            }
             if let Some(path) = html {
                 std::fs::write(&path, lessons::report_html(&kept, now, all))
                     .map_err(|error| failed(format!("cannot write {}: {error}", path.display())))?;
