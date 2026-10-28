@@ -111,11 +111,12 @@ pub use service::{
     VectorsFuture, git_diff_from, git_head_commit,
 };
 pub use turn_driver::{
-    ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CompletionCheck,
-    ExternalToolCatalog, ExternalTools, FLUSH_PREFIX, GoalReport, OutputAdmission, QuestionHost,
-    RECAP_EVERY_STEPS, RECAP_PREFIX, ResultSummary, ResultVisibility, TOOL_SCHEMA_TOOL,
-    TurnContextHooks, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnOutcome, TurnProgress,
-    TurnStop, USE_TOOL_TOOL, Visibility, execute_action_with_approval, tier_tool_schemas,
+    ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ChangedFile, CompletionCheck,
+    EVALUATE_AT_FILES, EVALUATE_AT_LINES, ExternalToolCatalog, ExternalTools, FLUSH_PREFIX,
+    GoalReport, OutputAdmission, QuestionHost, RECAP_EVERY_STEPS, RECAP_PREFIX, ResultSummary,
+    ResultVisibility, TOOL_SCHEMA_TOOL, TurnContextHooks, TurnDriver, TurnEvaluation, TurnLimits,
+    TurnObserver, TurnOptions, TurnOutcome, TurnProgress, TurnReview, TurnStop, USE_TOOL_TOOL,
+    Visibility, execute_action_with_approval, tier_tool_schemas,
 };
 pub use workspace::{
     git_branch, is_sensitive_workspace_path, observe_workspace, observed_file_hash,

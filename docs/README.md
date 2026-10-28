@@ -21,6 +21,7 @@ app riêng được phát hành.
 | Memory store and memory-engine parity (design) / Kho memory và tương đương memory-engine (thiết kế) | [Memory store (EN)](architecture/MEMORY_STORE.en.md) · [Kho memory (VI)](architecture/MEMORY_STORE.vi.md) |
 | A project's memory as markdown files, `ha memory init` and `lint` / Memory của project dạng file markdown, `ha memory init` và `lint` | [Markdown memory (EN)](architecture/MARKDOWN_MEMORY.en.md) · [Memory markdown (VI)](architecture/MARKDOWN_MEMORY.vi.md) |
 | Lessons from corrections and wrong assumptions, `ha learning` / Bài học từ lời sửa và giả định sai, `ha learning` | [Learning loop (EN)](architecture/LEARNING_LOOP.en.md) · [Vòng học (VI)](architecture/LEARNING_LOOP.vi.md) |
+| Scoring a finished turn on five quality axes, `/self-eval` / Chấm một lượt đã xong trên năm trục chất lượng, `/self-eval` | [Self-evaluation (EN)](architecture/SELF_EVALUATION.en.md) · [Tự đánh giá (VI)](architecture/SELF_EVALUATION.vi.md) |
 | What a command or file write may never do / Những gì một lệnh hay lần ghi file không được làm | [Guards (EN)](architecture/GUARDS.en.md) · [Guard (VI)](architecture/GUARDS.vi.md) |
 | Skills, extensions and MCP / Skill, extension và MCP | [Plugin architecture (EN)](architecture/PLUGIN_ARCHITECTURE.en.md) · [Kiến trúc plugin (VI)](architecture/PLUGIN_ARCHITECTURE.vi.md) |
 | Isolation limits and measured support / Giới hạn cô lập và hỗ trợ đã đo | [Strict execution support](support/STRICT_EXECUTION_SUPPORT.vi.md) |

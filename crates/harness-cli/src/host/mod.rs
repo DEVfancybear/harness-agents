@@ -152,6 +152,8 @@ pub mod routing;
 pub mod rpc;
 #[path = "coordination/schedules.rs"]
 pub mod schedules;
+#[path = "memory/self_eval.rs"]
+pub mod self_eval;
 #[path = "application/service.rs"]
 pub mod service;
 #[path = "models/service_tier.rs"]

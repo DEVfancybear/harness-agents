@@ -5260,3 +5260,149 @@ async fn g09_pre_tool_use_json_deny_blocks_with_its_reason() {
         result.content
     );
 }
+
+/// A judge of finished turns that sends the turn back with `feedback` and
+/// remembers what it was handed.
+struct CountingEvaluation {
+    feedback: Option<String>,
+    judged: Mutex<Vec<harness_tools::TurnReview>>,
+    finished: AtomicUsize,
+}
+
+impl harness_tools::TurnEvaluation for CountingEvaluation {
+    fn evaluate(
+        &self,
+        review: harness_tools::TurnReview,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
+        self.judged.lock().expect("judged").push(review);
+        let feedback = self.feedback.clone();
+        Box::pin(async move { feedback })
+    }
+
+    fn finished(&self, _review: harness_tools::TurnReview) {
+        self.finished.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Three files written and one more call after them.
+fn three_writes(extension: &str) -> Vec<ProviderStreamEvent> {
+    let mut events = vec![ProviderStreamEvent::started()];
+    for index in 0..3 {
+        events.push(ProviderStreamEvent::tool_delta(
+            format!("c-{index}"),
+            "write_file",
+            format!(r#"{{"path":"notes/f{index}.{extension}","content":"line\n"}}"#),
+        ));
+    }
+    events.push(ProviderStreamEvent::completed("tool_calls"));
+    events
+}
+
+async fn evaluated_turn(
+    bench: &Bench,
+    extension: &str,
+    evaluation: Arc<CountingEvaluation>,
+) -> (TurnOutcome, Vec<ProviderRequest>) {
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        three_writes(extension),
+        answer("first answer"),
+        answer("second answer"),
+        answer("third answer"),
+    ]));
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let driver = TurnDriver::new(
+        Arc::clone(&runtime),
+        ToolExecutionService::new(Arc::clone(&store)),
+    )
+    .with_verify_reminder(true)
+    .with_turn_evaluation(evaluation, true);
+    let request = RunRequest::new(
+        SessionId::generate(),
+        TaskId::generate(),
+        InputId::generate(),
+        "write the notes",
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("workspace"),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    let options = TurnOptions {
+        workspace_root: bench.workspace.clone(),
+        actor_id: "self_eval.test".to_owned(),
+        approvals: ApprovalMode::Auto,
+        limits: TurnLimits::default(),
+    };
+    let outcome = driver
+        .run_turn(
+            request,
+            options,
+            Arc::new(SilentObserver),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn succeeds");
+    let seen = provider.seen();
+    drop(driver);
+    drop(runtime);
+    drop(provider);
+    close(store).await;
+    (outcome, seen)
+}
+
+/// A turn that changed three files is evaluated at its end, once: a weak
+/// axis sends it back with the evaluation's message, and the answer after
+/// it ends the turn without a second evaluation. The finished turn is kept.
+#[tokio::test]
+async fn self_evaluation_sends_a_qualifying_turn_back_once() {
+    let bench = bench();
+    let evaluation = Arc::new(CountingEvaluation {
+        feedback: Some("Before you finish: a self-evaluation scored accuracy 2/5.".to_owned()),
+        judged: Mutex::new(Vec::new()),
+        finished: AtomicUsize::new(0),
+    });
+    let (outcome, seen) = evaluated_turn(&bench, "txt", Arc::clone(&evaluation)).await;
+    assert_eq!(outcome.stop, TurnStop::Final);
+    assert_eq!(outcome.final_text, "second answer");
+    assert_eq!(seen.len(), 3, "one send-back, no loop");
+    let judged = evaluation.judged.lock().expect("judged").clone();
+    assert_eq!(judged.len(), 1);
+    assert_eq!(judged[0].trigger, "files");
+    assert_eq!(judged[0].answer, "first answer");
+    assert_eq!(judged[0].changed.len(), 3);
+    assert!(
+        judged[0]
+            .results
+            .iter()
+            .all(|result| result.starts_with("[write_file]"))
+    );
+    let last = seen[2].messages.last().expect("the feedback");
+    assert_eq!(last.role, MessageRole::User);
+    assert!(last.content.contains("accuracy 2/5"), "{}", last.content);
+    assert_eq!(evaluation.finished.load(Ordering::SeqCst), 1);
+}
+
+/// The verify reminder comes first: a turn it sent back for unchecked code
+/// is not evaluated too.
+#[tokio::test]
+async fn self_evaluation_waits_behind_the_verify_reminder() {
+    let bench = bench();
+    let evaluation = Arc::new(CountingEvaluation {
+        feedback: Some("sent back".to_owned()),
+        judged: Mutex::new(Vec::new()),
+        finished: AtomicUsize::new(0),
+    });
+    let (outcome, seen) = evaluated_turn(&bench, "rs", Arc::clone(&evaluation)).await;
+    assert_eq!(outcome.final_text, "second answer");
+    assert_eq!(seen.len(), 3);
+    assert!(
+        seen[2].messages.last().is_some_and(|message| message
+            .content
+            .contains("ran no command after the last change")),
+        "the reminder, not the evaluation, sent it back"
+    );
+    assert!(evaluation.judged.lock().expect("judged").is_empty());
+    assert_eq!(evaluation.finished.load(Ordering::SeqCst), 1);
+}
