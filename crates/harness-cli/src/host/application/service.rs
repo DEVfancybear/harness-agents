@@ -439,6 +439,9 @@ pub trait SessionPort: Send {
     fn unpark(&mut self) -> Option<String> {
         None
     }
+    /// `/handoff`: once the next turn has finished, the conversation's session
+    /// log is written from its journal (`session_log`).
+    fn plan_session_log(&mut self) {}
     /// `/tree <n> --summarize [focus]`: the next turn summarises the turns the
     /// switch leaves. Called before [`Self::switch_to`].
     fn plan_branch_summary(&mut self, _focus: Option<String>) -> Result<(), String> {
@@ -2530,6 +2533,8 @@ pub struct AgentSessionService {
     fork_plan: Option<ForkPlan>,
     /// The branch summary the next turn writes, set by `/tree <n> --summarize`.
     branch_plan: Option<super::branch_summary::BranchPlan>,
+    /// The next turn writes the session log as it ends, set by `/handoff`.
+    session_log_next: bool,
     /// Held by a turn for as long as it owns the project store, and by `/rename` while
     /// it writes, so the two never want the writer at the same time.
     writer_gate: Arc<tokio::sync::Mutex<()>>,
@@ -3130,14 +3135,14 @@ mod resume_list_tests {
 /// Newest first. `created_at` has one-second resolution, so turns taken in the same
 /// second tie on it; session ids are time-ordered and break the tie the right way.
 /// The task state the newest earlier conversation of this project keeps,
-/// with that conversation's title, when its checklist has open items: the
+/// with that conversation's task and title, when its checklist has open items: the
 /// newest conversation that kept a task state decides, and one whose work is
 /// done shows nothing.
 async fn earlier_task_state(
     store: &SqliteStore,
     data_dir: &Path,
     current: &TaskId,
-) -> Option<(Option<String>, super::task_state::TaskState)> {
+) -> Option<(TaskId, Option<String>, super::task_state::TaskState)> {
     /// How many earlier conversations are looked through.
     const LOOKED_AT: usize = 20;
     let mut sessions = user_conversation_sessions(store, store.list_sessions().await.ok()?).await;
@@ -3163,7 +3168,7 @@ async fn earlier_task_state(
             .await
             .ok()
             .flatten();
-        return Some((title, state));
+        return Some((session.task_id, title, state));
     }
     None
 }
@@ -3689,6 +3694,7 @@ impl AgentSessionService {
             side_thread: Arc::new(Mutex::new(Vec::new())),
             fork_plan: None,
             branch_plan: None,
+            session_log_next: false,
             writer_gate,
             goal: None,
             goal_forgotten: false,
@@ -4257,6 +4263,7 @@ impl SessionPort for AgentSessionService {
         let agents = Arc::clone(&self.agents);
         let fork_plan = self.fork_plan.take();
         let branch_plan = self.branch_plan.take();
+        let log_after_turn = std::mem::take(&mut self.session_log_next);
         let task_id = self.task_id.clone();
         let previous_session = Arc::clone(&self.previous_session);
         let session_start = Arc::clone(&self.session_start);
@@ -4305,6 +4312,7 @@ impl SessionPort for AgentSessionService {
                 agents,
                 fork_plan,
                 branch_plan,
+                log_after_turn,
                 session_id,
                 task_id,
                 previous_session,
@@ -4716,6 +4724,10 @@ impl SessionPort for AgentSessionService {
             ],
             Err(error) => vec![format!("The bug report could not be written: {error}")],
         }
+    }
+
+    fn plan_session_log(&mut self) {
+        self.session_log_next = true;
     }
 
     fn plan_branch_summary(&mut self, focus: Option<String>) -> Result<(), String> {
@@ -7043,6 +7055,87 @@ const COMPACTION_REVIEW_COOLDOWN: chrono::TimeDelta = chrono::TimeDelta::minutes
 /// reviewed (`HA_IDLE_REVIEW_SECONDS` sets it).
 const IDLE_REVIEW_AFTER: std::time::Duration = std::time::Duration::from_mins(10);
 
+/// How long a session is quiet before its idle review runs and its session
+/// log is written: [`IDLE_REVIEW_AFTER`], or `HA_IDLE_REVIEW_SECONDS`.
+fn idle_review_after(environment: &LaunchEnvironment) -> std::time::Duration {
+    environment
+        .value("HA_IDLE_REVIEW_SECONDS")
+        .and_then(|value| {
+            value
+                .to_str()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+        })
+        .map_or(IDLE_REVIEW_AFTER, std::time::Duration::from_secs)
+}
+
+/// Write the session log of the conversation `session` ends
+/// (`session_log`) beside the conversation, from the journal read through a
+/// reader of its own: the turn's writer is not held. With `quiet`, only after
+/// that long and when no turn started meanwhile, as the idle review waits.
+fn spawn_session_log(
+    sender: UnboundedSender<SessionEvent>,
+    store_dir: PathBuf,
+    root: PathBuf,
+    session: SessionId,
+    task: TaskId,
+    provider: Arc<dyn ModelProvider>,
+    quiet: Option<(std::time::Duration, Arc<super::refine::Cadence>)>,
+) {
+    let write = async move {
+        let store = match SqliteStore::open_read_only(store_dir).await {
+            Ok(store) => store,
+            Err(error) => {
+                harness_types::diag::warn("session_log", "skipped")
+                    .task(task.as_str())
+                    .msg(error.to_string())
+                    .emit();
+                return;
+            }
+        };
+        let result =
+            super::session_log::write_from_journal(&store, provider, &root, &session, &task).await;
+        let _ = store.close().await;
+        match result {
+            Ok(Some(path)) => {
+                let shown = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                harness_types::diag::info("session_log", "written")
+                    .task(task.as_str())
+                    .field("path", shown.clone())
+                    .emit();
+                let _ = sender.send(SessionEvent::Notice {
+                    message: format!("session log written to {shown}"),
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                harness_types::diag::warn("session_log", "failed")
+                    .task(task.as_str())
+                    .msg(error.clone())
+                    .emit();
+                let _ = sender.send(SessionEvent::Notice {
+                    message: format!("the session log was not written: {error}"),
+                });
+            }
+        }
+    };
+    match quiet {
+        None => spawn_off_workers(write),
+        Some((after, cadence)) => {
+            let generation = cadence.generation();
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                if cadence.generation() == generation {
+                    spawn_off_workers(write);
+                }
+            });
+        }
+    }
+}
+
 /// One automatic refine review, and the refinement it approves, run off the turn.
 struct AutoRefine {
     sender: UnboundedSender<SessionEvent>,
@@ -7775,6 +7868,7 @@ async fn run_turn(
     agents: Arc<super::delegation::SessionAgents>,
     fork_plan: Option<ForkPlan>,
     branch_plan: Option<super::branch_summary::BranchPlan>,
+    log_after_turn: bool,
     session_id: SessionId,
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
@@ -8357,6 +8451,8 @@ async fn run_turn(
         )));
     }
     let runtime = Arc::new(runtime);
+    let session_log_on = super::session_log::enabled(&config_file, &environment);
+    let log_root = workspace_root.clone();
     if let Some(guidance) = request.compact_guidance.as_deref() {
         let result = match source.as_ref() {
             Some(source_session) => runtime
@@ -8390,6 +8486,22 @@ async fn run_turn(
         drop(runtime);
         if let Ok(store) = Arc::try_unwrap(store) {
             let _ = store.close().await;
+        }
+        // The summary now stands for the turns the model is sent; the journal
+        // keeps them, and the session log is written from it.
+        if result.is_ok()
+            && session_log_on
+            && let Some(source_session) = &source
+        {
+            spawn_session_log(
+                sender.clone(),
+                store_dir.clone(),
+                workspace_root.clone(),
+                source_session.clone(),
+                task_id.clone(),
+                Arc::clone(&helper_provider),
+                None,
+            );
         }
         // prime-agent's `_syncKernelStateAfterCompaction`: the kernel's namespace is
         // snapshotted and the variables too large to snapshot are removed with it;
@@ -9312,6 +9424,8 @@ async fn run_turn(
     if let GoalRecord::Active(objective) = &goal {
         project_blocks.push(super::goal::goal_block(objective));
     }
+    // The earlier conversation whose task state this one is shown.
+    let mut carried = None;
     if let Some(block) = super::task_state::context_block(task_state_host.path()) {
         project_blocks.push(block);
     } else {
@@ -9324,18 +9438,43 @@ async fn run_turn(
             None => 0,
         };
         if turns < super::task_state::EARLIER_STATE_TURNS
-            && let Some((title, state)) = earlier_task_state(&store, &data_dir, &task_id).await
+            && let Some((task, title, state)) =
+                earlier_task_state(&store, &data_dir, &task_id).await
         {
             project_blocks.push(super::task_state::earlier_block(&state, title.as_deref()));
+            carried = Some(task);
         }
     }
+    // What a new conversation hears of the previous one, once: its session
+    // log when it has one, else its last turns from the journal.
     if fork_plan.is_none()
         && request.compact_guidance.is_none()
-        && let Some(block) =
-            super::session_brief::context_block(&store, &task_id, source.as_ref(), refinements)
-                .await
+        && super::session_brief::fresh_conversation(&store, &task_id, source.as_ref(), refinements)
+            .await
     {
-        project_blocks.push(block);
+        let logged = if session_log_on {
+            super::session_log::start_block(
+                &store,
+                &task_id,
+                &workspace_root,
+                carried.as_ref(),
+                &chrono::Local::now().fixed_offset(),
+            )
+            .await
+        } else {
+            None
+        };
+        let previous_logged = logged.as_ref().is_some_and(|logged| logged.previous);
+        if let Some(logged) = logged {
+            project_blocks.push(logged.block);
+        }
+        if !previous_logged
+            && let Some(block) =
+                super::session_brief::context_block(&store, &task_id, source.as_ref(), refinements)
+                    .await
+        {
+            project_blocks.push(block);
+        }
     }
     // Where the project's feature list stands, and its rules.
     if let Some(block) = super::features::context_block(&workspace_root) {
@@ -10083,14 +10222,7 @@ async fn run_turn(
             let conversation = refine_transcript(&store, &session_id, &scopes.local).await;
             let generation = refine_cadence.generation();
             let cadence = Arc::clone(&refine_cadence);
-            let quiet = environment
-                .value("HA_IDLE_REVIEW_SECONDS")
-                .and_then(|value| {
-                    value
-                        .to_str()
-                        .and_then(|text| text.trim().parse::<u64>().ok())
-                })
-                .map_or(IDLE_REVIEW_AFTER, std::time::Duration::from_secs);
+            let quiet = idle_review_after(&environment);
             let mut background = AutoRefine {
                 sender: sender.clone(),
                 helper_provider: Arc::clone(&helper_provider),
@@ -10124,6 +10256,30 @@ async fn run_turn(
                 cadence.release();
             });
         }
+    }
+    // The conversation's session log: written at once after a handoff or a
+    // compaction, and when the session goes quiet, as the idle review does.
+    if session_log_on && outcome.is_ok() && !cancellation.is_cancelled() {
+        if log_after_turn || compacted {
+            spawn_session_log(
+                sender.clone(),
+                store_dir.clone(),
+                log_root.clone(),
+                session_id.clone(),
+                goal_task.clone(),
+                Arc::clone(&helper_provider),
+                None,
+            );
+        }
+        spawn_session_log(
+            sender.clone(),
+            store_dir.clone(),
+            log_root.clone(),
+            session_id.clone(),
+            goal_task.clone(),
+            Arc::clone(&helper_provider),
+            Some((idle_review_after(&environment), Arc::clone(&refine_cadence))),
+        );
     }
     // A session that ended with work not yet reviewed left the review here: it runs
     // beside this conversation, on the ended one's turns and harness scope.
