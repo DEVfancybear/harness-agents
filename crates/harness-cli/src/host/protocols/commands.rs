@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 68] = [
+pub const SLASH_COMMANDS: [SlashCommand; 70] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -198,6 +198,16 @@ pub const SLASH_COMMANDS: [SlashCommand; 68] = [
         "/handoff",
         "[--reset] [focus]",
         "Write the handoff for the next session to .harness/progress.md; --reset continues in a fresh conversation",
+    ),
+    command(
+        "/recall",
+        "[n] [topic]",
+        "Report what the last n session logs (3 by default) and the logs about a topic left",
+    ),
+    command(
+        "/preserve",
+        "[focus]",
+        "Fold what this session settled into AGENTS.md (or CLAUDE.md), within 200 lines",
     ),
     command(
         "/verify",

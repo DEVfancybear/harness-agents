@@ -785,6 +785,49 @@ fn bm25(considered: &[&Placed<'_>], query: &str) -> Vec<(usize, f64)> {
     ranked
 }
 
+/// Memory search's BM25 over plain documents, each a title and a text: their
+/// indexes, best first, only those holding one of the query's words. What a
+/// search over files that are not memory entries - the session logs - ranks
+/// by, so it weighs words as memory search does.
+#[must_use]
+pub fn rank_documents(documents: &[(&str, &str)], query: &str) -> Vec<(usize, f64)> {
+    let entries = documents
+        .iter()
+        .enumerate()
+        .map(|(index, (title, text))| Entry {
+            id: index.to_string(),
+            name: index.to_string(),
+            memory: None,
+            kind: String::new(),
+            title: Some((*title).to_owned()),
+            content: Some((*text).to_owned()),
+            path: String::new(),
+            scope: String::new(),
+            version: 0,
+            reference: serde_json::Map::new(),
+            arguments: serde_json::Map::new(),
+            pinned: false,
+            updated_at: None,
+            project: None,
+            aliases: Vec::new(),
+            tree: String::new(),
+            meta: serde_json::Map::new(),
+            temporal: None,
+            ended: false,
+        })
+        .collect::<Vec<_>>();
+    let doc = Value::Null;
+    let placed = entries
+        .iter()
+        .map(|entry| Placed {
+            entry,
+            dir: Path::new(""),
+            doc: &doc,
+        })
+        .collect::<Vec<_>>();
+    bm25(&placed.iter().collect::<Vec<_>>(), query)
+}
+
 /// The entries' cosine similarity to the nearest of `texts`, best first, or
 /// `None` when embeddings are not configured. Entries not yet embedded are
 /// embedded first, for up to [`EMBED_WAIT`].

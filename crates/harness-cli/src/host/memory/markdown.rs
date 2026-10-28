@@ -1574,6 +1574,30 @@ fn write_new(
     Ok(())
 }
 
+/// The cap the store at `root` puts on the ram file `path` (relative,
+/// `/`-separated), in the unit the lint counts (UTF-16 code units): `None`
+/// when the store's config cannot be read, the file is in no ram tier, or the
+/// tier has no cap. A host that writes a ram file keeps under it, so the
+/// store's lint still passes.
+#[must_use]
+pub fn ram_cap(root: &Path, path: &str) -> Option<usize> {
+    let config = Config::load(root, None).ok()?;
+    let tier = config.ram?;
+    if !is_ram_file(path, &tier) {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    tier.max_chars
+        .filter(|cap| *cap >= 1.0)
+        .map(|cap| cap.min(1e9) as usize)
+}
+
+/// A text's length as the lint counts it against a cap.
+#[must_use]
+pub fn lint_chars(text: &str) -> usize {
+    char_count(text)
+}
+
 // --- the turn ---
 
 /// The store's policy and its index, for every turn of a project that keeps a

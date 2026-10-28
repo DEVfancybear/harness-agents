@@ -4844,8 +4844,45 @@ impl InteractiveController {
                         });
                     }
                     self.continuations = 0;
+                    // The handoff turn's end is the session's end: its log
+                    // is written then too.
+                    self.service.plan_session_log();
                     effects.extend(self.dispatch(
                         super::lifecycle::handoff_request(Some(&focus)),
+                        false,
+                    ));
+                }
+            }
+            "/recall" => {
+                if self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "the session logs are recalled when the running turn has finished".to_owned(),
+                    });
+                } else {
+                    let (count, topic) = super::session_log::recall_arguments(raw_argument.unwrap_or_default());
+                    match super::session_log::recall_request(&self.context.project.root, count, topic.as_deref()) {
+                        Some(request) => {
+                            self.continuations = 0;
+                            effects.extend(self.dispatch(request, false));
+                        }
+                        None => self.push_history(&mut effects, HistoryItem::Notice {
+                            message: format!(
+                                "this project has no session log yet: one is written when a conversation goes quiet, compacts or hands off ({} or the markdown store's daily note)",
+                                super::session_log::SESSIONS_DIR
+                            ),
+                        }),
+                    }
+                }
+            }
+            "/preserve" => {
+                if self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "the instructions are updated when the running turn has finished".to_owned(),
+                    });
+                } else {
+                    self.continuations = 0;
+                    effects.extend(self.dispatch(
+                        super::lifecycle::preserve_request(&self.context.project.root, raw_argument),
                         false,
                     ));
                 }
@@ -7495,6 +7532,46 @@ mod tests {
     fn submit_text(controller: &mut InteractiveController, text: &str) -> Vec<Effect> {
         type_text(controller, text);
         controller.handle_key(Key::Enter)
+    }
+
+    #[test]
+    fn recall_sends_the_session_logs_and_preserve_the_instructions_request() {
+        let mut h = bench(true);
+        h.controller.boot_lines();
+        let root = h.controller.context.project.root.clone();
+        let rendered = effects_to_plain(&submit_text(&mut h.controller, "/recall")).join("\n");
+        assert!(rendered.contains("no session log yet"), "{rendered}");
+        assert!(h.port.submissions.lock().expect("submissions").is_empty());
+        let draft = super::super::session_log::Draft::parse(
+            "# Session Log: 2026-10-28 - Parser wiring\n## Quick Reference\n**Outcome:** wired\n## Quick Resume Context\nNext: tests.",
+        )
+        .expect("draft");
+        super::super::session_log::write(
+            &root,
+            "task_one",
+            &draft,
+            &chrono::Local::now().fixed_offset(),
+        )
+        .expect("log");
+        submit_text(&mut h.controller, "/recall 2 parser");
+        let sent = h.port.submissions.lock().expect("submissions").clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(
+            sent[0].contains("<session-logs>") && sent[0].contains("**Conversation:** task_one")
+        );
+        h.events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("done");
+        h.controller.pump_events();
+        submit_text(&mut h.controller, "/preserve the build");
+        let sent = h.port.submissions.lock().expect("submissions").clone();
+        assert!(
+            sent[1].starts_with("Preserve what this session settled"),
+            "{sent:?}"
+        );
+        assert!(sent[1].ends_with("Focus on: the build"), "{sent:?}");
     }
 
     #[test]

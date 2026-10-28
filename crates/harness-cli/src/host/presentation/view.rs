@@ -235,6 +235,8 @@ pub fn help_card_lines() -> Vec<String> {
             &[
                 "/goal",
                 "/handoff",
+                "/recall",
+                "/preserve",
                 "/verify",
                 "/review",
                 "/features",

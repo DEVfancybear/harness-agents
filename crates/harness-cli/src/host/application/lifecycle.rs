@@ -233,6 +233,46 @@ pub fn handoff_request(focus: Option<&str>) -> String {
     )
 }
 
+/// The instructions files `/preserve` keeps, in the order it prefers them.
+const INSTRUCTIONS_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+
+/// The line count `/preserve` keeps an instructions file within (`ha doctor`'s
+/// advice for the entry file).
+const INSTRUCTIONS_MAX_LINES: usize = 200;
+
+/// What `/preserve [focus]` asks the agent, after CPR's `/preserve`: fold what
+/// this session settled for every future session into the project's
+/// instructions file, in place and within 200 lines, archiving what is
+/// finished. The current state and the next step are the handoff's, and a
+/// markdown store's decisions and facts are its own: neither goes there.
+#[must_use]
+pub fn preserve_request(root: &Path, focus: Option<&str>) -> String {
+    let file = INSTRUCTIONS_FILES
+        .iter()
+        .find(|name| root.join(name).is_file())
+        .copied();
+    let target = file.map_or_else(
+        || "Neither AGENTS.md nor CLAUDE.md exists in the project root. Ask the user whether to create AGENTS.md, and create nothing until they say yes; then write it as below.".to_owned(),
+        |name| format!("The project's instructions file is {name}."),
+    );
+    let name = file.unwrap_or(INSTRUCTIONS_FILES[0]);
+    let archive = format!("{}-Archive.md", name.trim_end_matches(".md"));
+    let store = if root.join(super::markdown_memory::CONFIG_FILE).is_file() {
+        "\n- decisions and facts: this project keeps a markdown memory store, so a decision goes to memory/decisions/ and a fact about a project to memory/projects/, each line tagged, as its policy says"
+    } else {
+        ""
+    };
+    let focus = focus
+        .map(str::trim)
+        .filter(|focus| !focus.is_empty())
+        .map(|focus| format!("\n\nFocus on: {focus}"))
+        .unwrap_or_default();
+    let today = chrono::Local::now().format("%Y-%m-%d");
+    format!(
+        "Preserve what this session settled in the project's instructions, for every future session. {target}\n\nAdd what every later session needs and would otherwise rediscover: conventions, commands (build, test, run, a focused debug command), the structure of the code, patterns to follow, warnings about what breaks. Not here:\n- the current state, what is in progress and the next step: that is {PROGRESS_FILE}, which /handoff writes{store}\n\nEdit the file in place: update a section that says something outdated instead of adding another, state each thing once, and keep what is still true. Keep the file at most {INSTRUCTIONS_MAX_LINES} lines. If it would be longer, move whole sections to {archive}, each under `## Archived: {today}`: `## Session Notes (<date>)` sections older than 7 days, `## Completed Projects`, and headings marked `(ARCHIVABLE)`. Never archive a heading marked `(PROTECTED)` or a core section: the approach, paths, structure, commands, conventions and key references. Write nothing you did not verify in this session. End by saying the file's line count.{focus}"
+    )
+}
+
 /// What would trip the next session, one line each; empty when nothing would.
 #[must_use]
 pub fn clean_state(root: &Path) -> Vec<String> {
@@ -424,6 +464,40 @@ mod tests {
         assert!(text.contains(PROGRESS_FILE));
         assert!(text.contains("## Next step"));
         assert!(text.contains("Focus on: the parser"));
+    }
+
+    #[test]
+    fn the_preserve_request_names_the_instructions_file_and_its_archive() {
+        let root = tempfile::tempdir().expect("root");
+        let none = super::preserve_request(root.path(), None);
+        assert!(
+            none.contains("Ask the user whether to create AGENTS.md"),
+            "{none}"
+        );
+        assert!(none.contains("AGENTS-Archive.md"), "{none}");
+        std::fs::write(root.path().join("CLAUDE.md"), "# rules\n").expect("claude");
+        let claude = super::preserve_request(root.path(), Some("the build"));
+        assert!(
+            claude.contains("instructions file is CLAUDE.md"),
+            "{claude}"
+        );
+        assert!(claude.contains("CLAUDE-Archive.md") && claude.contains("(PROTECTED)"));
+        assert!(claude.contains(PROGRESS_FILE) && claude.contains("at most 200 lines"));
+        assert!(!claude.contains("memory/decisions/"), "{claude}");
+        assert!(claude.ends_with("Focus on: the build"), "{claude}");
+        std::fs::write(root.path().join("AGENTS.md"), "# rules\n").expect("agents");
+        std::fs::write(
+            root.path()
+                .join(crate::interactive::markdown_memory::CONFIG_FILE),
+            "{}",
+        )
+        .expect("store");
+        let agents = super::preserve_request(root.path(), None);
+        assert!(
+            agents.contains("instructions file is AGENTS.md"),
+            "{agents}"
+        );
+        assert!(agents.contains("memory/decisions/"), "{agents}");
     }
 
     #[test]

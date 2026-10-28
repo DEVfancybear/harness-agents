@@ -158,6 +158,8 @@ pub mod service;
 pub mod service_tier;
 #[path = "memory/session_brief.rs"]
 mod session_brief;
+#[path = "memory/session_log.rs"]
+pub mod session_log;
 #[path = "application/side_question.rs"]
 pub mod side_question;
 #[path = "memory/skill_recall.rs"]

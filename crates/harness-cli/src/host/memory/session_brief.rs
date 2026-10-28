@@ -11,23 +11,37 @@ const RECENT_TURNS: usize = 3;
 const FIELD_BYTES: usize = 640;
 const BRIEF_BYTES: usize = 8_000;
 
-pub(super) async fn context_block(
+/// Whether `current` is a fresh conversation that may hear of the previous
+/// one: its first turn, with refinements on, neither a fork nor an import.
+pub(super) async fn fresh_conversation(
     store: &SqliteStore,
     current: &TaskId,
     source: Option<&SessionId>,
     refinements: bool,
-) -> Option<ContextBlock> {
+) -> bool {
     if !refinements || source.is_some() {
-        return None;
+        return false;
     }
     // Imports and forks explicitly select their history, like a resume.
     for key in [
         harness_runtime::FORKED_FROM_SETTING,
         harness_runtime::session_file::IMPORTED_HISTORY_SETTING,
     ] {
-        if store.session_setting(current, key).await.ok()?.is_some() {
-            return None;
+        if !matches!(store.session_setting(current, key).await, Ok(None)) {
+            return false;
         }
+    }
+    true
+}
+
+pub(super) async fn context_block(
+    store: &SqliteStore,
+    current: &TaskId,
+    source: Option<&SessionId>,
+    refinements: bool,
+) -> Option<ContextBlock> {
+    if !fresh_conversation(store, current, source, refinements).await {
+        return None;
     }
     let sessions =
         super::service::user_conversation_sessions(store, store.list_sessions().await.ok()?).await;
