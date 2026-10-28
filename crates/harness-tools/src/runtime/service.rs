@@ -65,6 +65,49 @@ pub(crate) fn tool_hook_payload(prepared: &PreparedToolRequest, event: &str) -> 
     )
 }
 
+/// Lifts the guard on writing a secret-shaped value into a file.
+const ALLOW_SECRET_WRITES: &str = "HA_ALLOW_SECRET_WRITES";
+
+/// The kind of the first secret-shaped value a file write brings in that the
+/// file does not already hold (`secret_values`). A key already in the file is
+/// the user's to move; refusing every edit of that file would help nobody.
+fn introduced_secret(root: &Path, action: &CodingToolAction) -> Option<&'static str> {
+    let (path, written) = match action {
+        CodingToolAction::WriteFile { path, content, .. } => (path, vec![content.clone()]),
+        CodingToolAction::ApplyPatch {
+            path, replacement, ..
+        } => (path, vec![replacement.clone()]),
+        CodingToolAction::EditFile { path, .. } => (
+            path,
+            action
+                .edit_specs()
+                .into_iter()
+                .map(|spec| spec.new_string)
+                .collect(),
+        ),
+        _ => return None,
+    };
+    let found = written
+        .iter()
+        .flat_map(|text| {
+            crate::secret_values::find(text)
+                .into_iter()
+                .map(move |found| (text[found.start..found.end].to_owned(), found.kind))
+        })
+        .collect::<Vec<_>>();
+    if found.is_empty() {
+        return None;
+    }
+    let current = resolve_relative(root, path, false)
+        .ok()
+        .and_then(|target| std::fs::read_to_string(target).ok())
+        .unwrap_or_default();
+    found
+        .into_iter()
+        .find(|(value, _)| !current.contains(value.as_str()))
+        .map(|(_, kind)| kind)
+}
+
 fn redact_hook_arguments(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -249,6 +292,9 @@ pub struct ToolExecutionService {
     guard: Option<Arc<dyn ToolGuard>>,
     /// History search by meaning beside its words (the host's embeddings).
     history_semantic: Option<Arc<dyn HistorySemantic>>,
+    /// What judges the agent and must not be changed through a command: the
+    /// host's configuration and state directories (`command_guard`).
+    protected_dirs: Vec<std::path::PathBuf>,
 }
 
 /// History search by meaning beside its words: the host's embeddings, when it
@@ -332,7 +378,16 @@ impl ToolExecutionService {
             elsewhere: None,
             guard: None,
             history_semantic: None,
+            protected_dirs: Vec::new(),
         }
+    }
+
+    /// Refuse a command that changes these directories: the host's
+    /// configuration, hooks and state. The workspace's `.harness` always is.
+    #[must_use]
+    pub fn with_protected_dirs(mut self, dirs: Vec<std::path::PathBuf>) -> Self {
+        self.protected_dirs = dirs;
+        self
     }
 
     /// Show `read_file` and `search_text` lines with their hashline anchors
@@ -1336,6 +1391,16 @@ impl ToolExecutionService {
         action: &CodingToolAction,
         check_content: bool,
     ) -> Result<(), HarnessError> {
+        if let Some(kind) = introduced_secret(root, action)
+            && !crate::command_guard::lifted(ALLOW_SECRET_WRITES)
+        {
+            return Err(HarnessError::new(
+                ErrorCode::PolicyDenied,
+                format!(
+                    "[secret-write] Refusing to write what looks like a real {kind} into a file: a key in a file ends up in git, logs and backups. Read it from the environment or a secret:// reference instead, and write a placeholder where an example needs one. The user can lift this guard by starting ha with {ALLOW_SECRET_WRITES}=1."
+                ),
+            ));
+        }
         match action {
             CodingToolAction::ReadFile { path, .. }
             | CodingToolAction::ApplyPatch { path, .. }
@@ -1921,6 +1986,22 @@ impl ToolExecutionService {
                 isolation,
                 ..
             } => {
+                // The same guards as a shell command: a program can be a shell.
+                if let Some(refusal) = crate::command_guard::process_refusal(
+                    root,
+                    executable,
+                    args,
+                    &self.protected_dirs,
+                    cancellation.clone(),
+                    &self.spool,
+                )
+                .await
+                {
+                    return Ok(Dispatched::plain(ToolOutput::Denied {
+                        code: ErrorCode::PolicyDenied.as_str().to_owned(),
+                        reason: format!("[{}] {}", refusal.guard, refusal.reason),
+                    }));
+                }
                 let lease = self
                     .begin_backend_lease(prepared, action, *timeout_ms, *isolation, execution_id)
                     .await?;
@@ -1942,6 +2023,23 @@ impl ToolExecutionService {
                 isolation,
                 ..
             } => {
+                // What a command must never do in any mode: delete what cannot
+                // be had back, kill by name, search a whole drive, touch a
+                // secret file or what judges the agent (`command_guard`).
+                if let Some(refusal) = crate::command_guard::shell_refusal(
+                    root,
+                    command,
+                    &self.protected_dirs,
+                    cancellation.clone(),
+                    &self.spool,
+                )
+                .await
+                {
+                    return Ok(Dispatched::plain(ToolOutput::Denied {
+                        code: ErrorCode::PolicyDenied.as_str().to_owned(),
+                        reason: format!("[{}] {}", refusal.guard, refusal.reason),
+                    }));
+                }
                 // prime-agent's dirty-tree guard: a git discard that would
                 // throw away uncommitted work is refused before it runs.
                 if let Some(reason) =

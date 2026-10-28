@@ -85,8 +85,12 @@ pub mod keybindings;
 pub mod knowledge;
 #[path = "memory/learned.rs"]
 pub mod learned;
+#[path = "memory/lessons.rs"]
+pub mod lessons;
 #[path = "application/lifecycle.rs"]
 pub mod lifecycle;
+#[path = "memory/markdown.rs"]
+pub mod markdown_memory;
 #[path = "integrations/mcp.rs"]
 pub mod mcp;
 #[path = "integrations/mcp_catalog.rs"]

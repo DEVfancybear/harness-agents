@@ -1294,6 +1294,9 @@ where
 {
     let mut writer = SpoolWriter::create(&root, limits, label)?;
     let mut redactor = Redactor::new(&secrets);
+    // Then any value shaped like a key, granted or not: `env` printing a key
+    // the host never handed out is the case this catches.
+    let mut shaped = crate::secret_values::LineRedactor::default();
     let mut buffer = [0_u8; 8 * 1024];
     loop {
         let read = stream
@@ -1303,7 +1306,7 @@ where
         if read == 0 {
             break;
         }
-        let safe = redactor.push(&buffer[..read]);
+        let safe = shaped.push(&redactor.push(&buffer[..read]));
         writer.write(&safe)?;
         if let Some(progress) = &progress
             && !safe.is_empty()
@@ -1311,7 +1314,8 @@ where
             progress(&safe);
         }
     }
-    let tail = redactor.finish();
+    let mut tail = shaped.push(&redactor.finish());
+    tail.extend(shaped.finish());
     writer.write(&tail)?;
     if let Some(progress) = &progress
         && !tail.is_empty()

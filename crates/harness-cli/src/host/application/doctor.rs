@@ -404,7 +404,58 @@ fn state(root: &Path) -> Subsystem {
             }
         }
     }
+    markdown_memory(root, &mut subsystem);
     subsystem
+}
+
+/// A markdown memory store, when the project keeps one: the lint's file checks
+/// (caps and index links; the diff checks belong to the commit hook).
+fn markdown_memory(root: &Path, subsystem: &mut Subsystem) {
+    use super::markdown_memory::{DiffMode, LintOptions, Status, lint};
+    if !root.join(super::markdown_memory::CONFIG_FILE).is_file() {
+        return;
+    }
+    let options = LintOptions {
+        root: root.to_path_buf(),
+        config: None,
+        mode: DiffMode::None,
+    };
+    let report = match lint(&options) {
+        Ok(report) => report,
+        Err(error) => {
+            subsystem.short(
+                Level::Fail,
+                format!("markdown memory: {error}"),
+                format!("fix {}", super::markdown_memory::CONFIG_FILE),
+            );
+            return;
+        }
+    };
+    for check in report
+        .checks
+        .iter()
+        .filter(|check| check.status != Status::Skip)
+    {
+        let first = check
+            .details
+            .first()
+            .map(|detail| format!(" ({}: {})", detail.path, detail.reason))
+            .unwrap_or_default();
+        let text = format!("markdown memory {}: {}{first}", check.name, check.summary);
+        match check.status {
+            Status::Fail => subsystem.short(
+                Level::Fail,
+                text,
+                "`ha memory lint --no-diff` lists every failure; consolidate an over-cap file and fix or remove a dead path",
+            ),
+            Status::Warn => subsystem.short(
+                Level::Warn,
+                text,
+                "`ha memory lint --no-diff` lists them; compact an over-cap working file the next time it is touched",
+            ),
+            Status::Pass | Status::Skip => subsystem.pass(text),
+        }
+    }
 }
 
 fn feedback(root: &Path, facts: &Facts) -> Subsystem {
@@ -613,6 +664,37 @@ mod tests {
             root.path(),
         );
         assert_eq!(broken, ["missing.md"]);
+    }
+
+    #[test]
+    fn a_markdown_memory_store_is_audited_and_none_is_not_mentioned() {
+        let root = tempfile::tempdir().expect("root");
+        let audited = |root: &std::path::Path| {
+            lines(
+                root,
+                &audit(&std::path::PathBuf::new(), root, root, &Facts::default()),
+            )
+            .join("\n")
+        };
+        assert!(!audited(root.path()).contains("markdown memory"));
+        crate::interactive::markdown_memory::init(root.path(), false).expect("init");
+        let text = audited(root.path());
+        assert!(
+            text.contains("✓ markdown memory index-links: 5 links checked"),
+            "{text}"
+        );
+        assert!(text.contains("✓ markdown memory rom-caps"), "{text}");
+        assert!(
+            !text.contains("disk-provenance"),
+            "a skipped diff check is left out: {text}"
+        );
+        std::fs::write(root.path().join("MEMORY.md"), "- `memory/people/gone.md`\n")
+            .expect("index");
+        let text = audited(root.path());
+        assert!(
+            text.contains("✗ markdown memory index-links: 1 links checked (MEMORY.md: link target not found: memory/people/gone.md)"),
+            "{text}"
+        );
     }
 }
 

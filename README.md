@@ -97,6 +97,9 @@ ha                         open the app
 | Tune memory, skills and checks | `/refine [instructions]`, `/refine --global`, `/refine --curate`, `/refine --history [N]`, `/refine --rollback <id>`; `/refinements off` turns the whole harness off (saved state is kept) |
 | prime-agent's factories (state machines of child agents) | `/factory on`, `/factory off`, `/factory status` |
 | Search or manage saved research | `/knowledge`, `/knowledge search <query>`, `/knowledge read <path>`; `ha knowledge serve` opens the local console |
+| Keep a project's memory as markdown files in Git (markdown-agent-memory) | `ha memory init [--hook] [--examples]`, `ha memory migrate` for a flat `MEMORY.md`, then `ha memory lint [--staged\|--no-diff]`; the rules and `MEMORY.md` reach every turn |
+| See what the agent learned from corrections, and undo a rule | `ha learning list`, `ha learning show <id>`, `ha learning report [--html FILE]`, `ha learning retire <id>`; a correction seen in two conversations becomes a rule by itself, a project's wrong assumption a fact, and a daily meditation merges and rewords them |
+| Let a guarded command through (deletes, kills by name, secret files, whole-drive searches) | Start ha with `HA_ALLOW_RECURSIVE_DELETE=1`, `HA_ALLOW_KILL_BY_NAME=1`, `HA_ALLOW_SECRET_PATHS=1`, `HA_ALLOW_ROOT_SEARCH=1`, `HA_ALLOW_HARNESS_WRITES=1` or `HA_ALLOW_SECRET_WRITES=1` |
 | Shrink a long conversation | `/compact [what to keep]` |
 | Connect services | `/plugins`, `/mcp add`, `/mcp login <service>`, `@server:uri` to attach a resource |
 | Trust this project's config, hooks and MCP | `/trust`, then `/trust yes` |
@@ -243,6 +246,9 @@ ha                         mở app
 | Tinh chỉnh memory, skill và check | `/refine [chỉ dẫn]`, `/refine --global`, `/refine --curate`, `/refine --history [N]`, `/refine --rollback <id>`; `/refinements off` tắt toàn bộ harness (state đã lưu được giữ) |
 | Factory của prime-agent (máy trạng thái gồm các agent con) | `/factory on`, `/factory off`, `/factory status` |
 | Tìm hoặc quản lý nghiên cứu đã lưu | `/knowledge`, `/knowledge search <query>`, `/knowledge read <path>`; `ha knowledge serve` mở console cục bộ |
+| Giữ memory của project bằng file markdown trong Git (markdown-agent-memory) | `ha memory init [--hook] [--examples]`, `ha memory migrate` cho một `MEMORY.md` phẳng, rồi `ha memory lint [--staged\|--no-diff]`; luật và `MEMORY.md` có mặt ở mọi lượt |
+| Xem agent đã học gì từ lời sửa, và gỡ một rule | `ha learning list`, `ha learning show <id>`, `ha learning report [--html FILE]`, `ha learning retire <id>`; lời sửa thấy ở hai hội thoại tự thành rule, giả định sai về một project thành fact, và meditation hằng ngày gộp và sửa câu chữ của chúng |
+| Cho một lệnh bị guard chặn chạy (xoá, kill theo tên, file bí mật, tìm cả ổ đĩa) | Khởi động ha với `HA_ALLOW_RECURSIVE_DELETE=1`, `HA_ALLOW_KILL_BY_NAME=1`, `HA_ALLOW_SECRET_PATHS=1`, `HA_ALLOW_ROOT_SEARCH=1`, `HA_ALLOW_HARNESS_WRITES=1` hoặc `HA_ALLOW_SECRET_WRITES=1` |
 | Rút gọn hội thoại dài | `/compact [điều cần giữ]` |
 | Kết nối dịch vụ | `/plugins`, `/mcp add`, `/mcp login <service>`, `@server:uri` để đính kèm resource |
 | Trust config, hook và MCP của project | `/trust`, rồi `/trust yes` |

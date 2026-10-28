@@ -8,6 +8,8 @@
 
 #[path = "processes/capture.rs"]
 mod capture;
+#[path = "security/command_guard.rs"]
+mod command_guard;
 mod contracts;
 #[path = "filesystem/edit_diff.rs"]
 mod edit_diff;
@@ -36,6 +38,8 @@ mod regulation;
 mod rules;
 #[path = "filesystem/search.rs"]
 mod search;
+#[path = "security/secret_values.rs"]
+pub mod secret_values;
 #[path = "security/secrets.rs"]
 mod secrets;
 #[path = "runtime/service.rs"]
@@ -96,6 +100,7 @@ pub use process::{
 };
 // Re-exported so a CLI that drives the loop reads acceptance from the same
 // place the driver writes it.
+pub use command_guard::protect_host_dirs;
 pub use harness_runtime::AcceptanceState;
 pub use hooks::{HOOK_EVENTS, HookResponse, fit_payload, hook_matches, run_hooks};
 pub use rules::{LearnedRule, LearnedRules, Realized, RuleAction, RuleState};

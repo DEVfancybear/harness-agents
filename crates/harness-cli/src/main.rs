@@ -11,6 +11,8 @@ mod diagnostics;
 mod extension_cli;
 #[path = "host/mod.rs"]
 mod interactive;
+#[path = "commands/learning_cli.rs"]
+mod learning_cli;
 #[path = "commands/maintenance_cli.rs"]
 mod maintenance_cli;
 #[path = "commands/mcp_cli.rs"]
@@ -193,8 +195,12 @@ enum Command {
     Extensions(extension_cli::ExtensionCommand),
     /// Configure and inspect MCP servers.
     Mcp(mcp_cli::McpCommand),
-    /// The memory stores: export what they hold.
+    /// The memory stores: export what they hold; a project's markdown memory
+    /// store: write one (`init`) and check it (`lint`).
     Memory(memory_cli::MemoryCommand),
+    /// The learning loop: lessons from corrections and wrong assumptions, and
+    /// the rules they became.
+    Learning(learning_cli::LearningCommand),
     /// P7 recovery hardening: doctor, backup, restore, retention, GC and release matrix.
     Maintenance(maintenance_cli::MaintenanceCommand),
     /// The models of the catalog you can call (prime-agent's `model list`).
@@ -1305,6 +1311,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
         // cheaper than reshaping the dispatch.
         Some(Command::Mcp(command)) => mcp_cli::run(command),
         Some(Command::Memory(command)) => memory_cli::run(command),
+        Some(Command::Learning(command)) => learning_cli::run(command),
         Some(Command::Init { data_dir, json }) => init_store(&data_dir, json).await,
         Some(Command::Package(command)) => package_cli::run(command),
         Some(Command::Config(ConfigCommand { command: None })) => {

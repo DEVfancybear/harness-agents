@@ -1619,6 +1619,29 @@ impl MemoryHost {
         Ok(())
     }
 
+    /// The kept entry a new one in `scope` would repeat, by the measures the
+    /// duplicate refusal uses: its id, when there is one. The learning loop
+    /// asks before it writes a rule the memory may already hold.
+    pub(crate) fn covering(
+        &self,
+        scope: &str,
+        kind: &'static str,
+        title: &str,
+        content: &str,
+    ) -> Option<String> {
+        let close = self.close_entries(scope, kind, title, content);
+        close
+            .iter()
+            .find(|(_, likeness, _)| *likeness >= DUPLICATE_SIMILARITY)
+            .or_else(|| {
+                close
+                    .iter()
+                    .filter(|(_, _, contained)| *contained >= CONTAINED_SHARE)
+                    .max_by(|a, b| a.2.total_cmp(&b.2))
+            })
+            .map(|(entry, _, _)| entry.id.clone())
+    }
+
     /// Refuse a new entry that repeats a kept one - alike as a whole, or held
     /// whole inside a longer one - unless the call says it is `distinct`.
     pub(crate) fn refuse_duplicate(

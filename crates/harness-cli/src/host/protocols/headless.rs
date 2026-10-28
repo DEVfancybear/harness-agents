@@ -568,6 +568,18 @@ pub async fn run_with(
         "{}/{}",
         resolved_config.provider.id, resolved_config.provider.model
     ));
+    // ha's configuration and state decide what the agent may do; no command
+    // changes them (`docs/architecture/GUARDS.en.md`).
+    harness_tools::protect_host_dirs(
+        context
+            .paths
+            .config_file
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .into_iter()
+            .chain([context.paths.data_dir.clone()])
+            .collect(),
+    );
     let mut tools = ToolExecutionService::new(Arc::clone(&store))
         .with_hashline(hashline)
         .with_policy(tool_policy)
@@ -708,7 +720,9 @@ pub async fn run_with(
         ),
         jev_host.as_ref(),
     ));
-    let driver = TurnDriver::new(Arc::clone(&runtime), tools);
+    let driver = TurnDriver::new(Arc::clone(&runtime), tools).with_verify_reminder(
+        super::service::verify_reminder_enabled(&context.paths.config_file, environment),
+    );
     // What the harness learned from failed calls, as in the app.
     let driver = if refinements {
         driver.with_learned_rules(Arc::new(super::evolution::rules(&context.paths.data_dir)))
@@ -941,6 +955,14 @@ pub async fn run_with(
     {
         project_blocks.push(block);
     }
+    // A project's markdown memory store reaches this run as it reaches the
+    // app's turns: its rules and its index (`docs/architecture/MARKDOWN_MEMORY.en.md`).
+    let (markdown_memory, markdown_notices) =
+        super::markdown_memory::context_blocks(&context.project.root);
+    for notice in markdown_notices {
+        eprintln!("{notice}");
+    }
+    project_blocks.extend(markdown_memory);
     let run_request = run_request.with_project_rules(project_blocks);
     // A resumed conversation that went cold starts fresh, as in the app.
     let run_request =

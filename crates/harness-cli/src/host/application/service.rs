@@ -7122,6 +7122,15 @@ impl AutoRefine {
                         message: format!("auto-refine: {error}; the local refinement stands"),
                     });
                 }
+                for line in refined.learned {
+                    harness_types::diag::info("learning", "changed")
+                        .task(&self.task)
+                        .msg(line.clone())
+                        .emit();
+                    send(SessionEvent::Notice {
+                        message: format!("learning loop: {line}"),
+                    });
+                }
             }
             Err(error) => {
                 review_record("failed", &self.task, Err(error.as_str())).emit();
@@ -7131,6 +7140,36 @@ impl AutoRefine {
             }
         }
     }
+}
+
+/// Whether a turn that changed code and ran nothing after it is reminded to
+/// check it (`docs/architecture/GUARDS.en.md`): on unless the `verifyReminder`
+/// setting is `false` or `HA_VERIFY_REMINDER` is off.
+pub(super) fn verify_reminder_enabled(config_file: &Path, environment: &LaunchEnvironment) -> bool {
+    let off = |value: &str| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    };
+    super::config::load_setting(config_file, "verifyReminder")
+        .and_then(|setting| setting.as_bool())
+        .unwrap_or(true)
+        && !environment
+            .value("HA_VERIFY_REMINDER")
+            .and_then(|value| value.to_str())
+            .is_some_and(off)
+}
+
+/// [`verify_reminder_enabled`] for a child, which has the process's
+/// environment and no settings file of its own.
+pub(super) fn verify_reminder_by_environment() -> bool {
+    !std::env::var("HA_VERIFY_REMINDER").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    })
 }
 
 /// prime-agent's `autoRefine.enabled` setting, which `HA_AUTO_REFINE=off` still
@@ -8832,6 +8871,9 @@ async fn run_turn(
         }
         _ => None,
     };
+    // ha's configuration and state decide what the agent may do; no command
+    // changes them (`docs/architecture/GUARDS.en.md`).
+    harness_tools::protect_host_dirs(vec![global_config_dir.clone(), data_dir.clone()]);
     let mut tools = ToolExecutionService::new(Arc::clone(&store))
         .with_hashline(hashline)
         .with_policy(tool_policy)
@@ -8876,7 +8918,8 @@ async fn run_turn(
         ),
         jev_host.as_ref(),
     ));
-    let driver = TurnDriver::new(Arc::clone(&runtime), tools);
+    let driver = TurnDriver::new(Arc::clone(&runtime), tools)
+        .with_verify_reminder(verify_reminder_enabled(&config_file, &environment));
     let driver =
         match &jev_decisions {
             Some(decisions) => driver
@@ -9062,6 +9105,13 @@ async fn run_turn(
             message: format!("AGENTS.md: {} files", loaded_instructions.files.len()),
         });
     }
+    // A project that keeps a markdown memory store has its rules and its index
+    // in every turn, as the store's boot path reads them.
+    let (markdown_memory, markdown_notices) =
+        super::markdown_memory::context_blocks(&workspace_root);
+    for notice in markdown_notices {
+        send(SessionEvent::Notice { message: notice });
+    }
     let (git_branch, changed_files) = git_facts.await.unwrap_or_default();
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let shell = if cfg!(windows) {
@@ -9199,6 +9249,7 @@ async fn run_turn(
         )
         .await,
     );
+    project_blocks.extend(markdown_memory);
     if let Ok(active) = active_skills.lock() {
         project_blocks.extend(
             active

@@ -608,6 +608,39 @@ fn unchecked_changes(executions: &[ToolExecutionView]) -> Vec<String> {
     changed
 }
 
+/// A path a change to which no check verifies: prose, not code.
+fn is_document(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "md" | "markdown" | "txt" | "rst" | "adoc"
+            )
+        })
+}
+
+/// What the model is told, without a judge, when a turn changed code and ran
+/// nothing after its last change.
+fn verify_nudge(changed: &[String]) -> String {
+    let shown = changed
+        .iter()
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = changed.len().saturating_sub(8);
+    format!(
+        "Before you finish: this turn changed {shown}{} and ran no command after the last change. Run the project's check on what changed (its tests, build or linter) and report the result. If it cannot be checked here, or you already said the change is not verified, say so in one line and finish.",
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        }
+    )
+}
+
 /// What the model is told when its answer claims an unchecked change works.
 fn completion_nudge(changed: &[String]) -> String {
     let shown = changed
@@ -982,6 +1015,9 @@ pub struct TurnDriver {
     visibility: Option<Arc<dyn ResultVisibility>>,
     admission: Option<Arc<dyn OutputAdmission>>,
     completion: Option<Arc<dyn CompletionCheck>>,
+    /// Without a completion check: remind the model, once, to check a change
+    /// of code it ran nothing after (Agnostic-AI's forced-verify stop gate).
+    verify_reminder: bool,
     /// The tools listed in the roster but not sent, reached through
     /// `tool_schema` and `use_tool`.
     deferred: Arc<Vec<Value>>,
@@ -1103,6 +1139,7 @@ impl TurnDriver {
             visibility: None,
             admission: None,
             completion: None,
+            verify_reminder: false,
             deferred: Arc::default(),
         }
     }
@@ -1140,6 +1177,15 @@ impl TurnDriver {
     #[must_use]
     pub fn with_completion_check(mut self, completion: Arc<dyn CompletionCheck>) -> Self {
         self.completion = Some(completion);
+        self
+    }
+
+    /// Without a completion check, remind the model once when a turn changed
+    /// code and ran nothing after its last change: check it, or say it is not
+    /// checked. A turn that changed only documents is left alone.
+    #[must_use]
+    pub const fn with_verify_reminder(mut self, remind: bool) -> Self {
+        self.verify_reminder = remind;
         self
     }
 
@@ -1697,42 +1743,57 @@ impl TurnDriver {
                 } else {
                     unchecked_changes(&executions)
                 };
-                if let (Some(check), false) = (&self.completion, changed.is_empty()) {
+                // With a judge, only an answer that claims the change works is
+                // sent back; without one, any change of code is, once.
+                let reminder = if changed.is_empty() {
+                    None
+                } else if let Some(check) = &self.completion {
                     completion_checked = true;
                     let claims = tokio::select! {
                         claims = check.claims_unchecked_success(&request.text, &result.response, &changed) => claims,
                         () = cancellation.cancelled() => false,
                     };
-                    if claims {
-                        steps += 1;
-                        observer.observe(TurnProgress::StepStarted { step: steps });
-                        if !result.response.trim().is_empty() {
-                            transcript.push(
-                                ProviderMessage::new(
-                                    MessageRole::Assistant,
-                                    result.response.clone(),
-                                )
+                    claims.then(|| {
+                        (
+                            completion_nudge(&changed),
+                            "jev: the answer says the change works, but nothing ran after it; asking for a check",
+                        )
+                    })
+                } else if self.verify_reminder
+                    && changed.iter().any(|path| !is_document(path))
+                    && !cancellation.is_cancelled()
+                {
+                    completion_checked = true;
+                    Some((
+                        verify_nudge(&changed),
+                        "verify reminder: code changed and nothing ran after it; asking for a check",
+                    ))
+                } else {
+                    None
+                };
+                if let Some((nudge, notice)) = reminder {
+                    steps += 1;
+                    observer.observe(TurnProgress::StepStarted { step: steps });
+                    if !result.response.trim().is_empty() {
+                        transcript.push(
+                            ProviderMessage::new(MessageRole::Assistant, result.response.clone())
                                 .with_reasoning(result.reasoning.clone()),
-                            );
-                        }
-                        let nudge = completion_nudge(&changed);
-                        observer.observe(TurnProgress::Notice(
-                            "jev: the answer says the change works, but nothing ran after it; asking for a check".to_owned(),
-                        ));
-                        self.record_host_message(&result.run_id, &nudge).await;
-                        transcript.push(ProviderMessage::new(MessageRole::User, nudge));
-                        result = self
-                            .runtime
-                            .continue_run(
-                                &request,
-                                &transcript,
-                                cancellation.clone(),
-                                Some(sink_with(&observer, prefetcher.clone())),
-                            )
-                            .await
-                            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
-                        continue 'turn;
+                        );
                     }
+                    observer.observe(TurnProgress::Notice(notice.to_owned()));
+                    self.record_host_message(&result.run_id, &nudge).await;
+                    transcript.push(ProviderMessage::new(MessageRole::User, nudge));
+                    result = self
+                        .runtime
+                        .continue_run(
+                            &request,
+                            &transcript,
+                            cancellation.clone(),
+                            Some(sink_with(&observer, prefetcher.clone())),
+                        )
+                        .await
+                        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+                    continue 'turn;
                 }
                 break TurnStop::Final;
             }
@@ -4700,6 +4761,20 @@ mod tool_output_render_tests {
         );
         let nudge = super::completion_nudge(&["b.rs".to_owned()]);
         assert!(nudge.contains("changed b.rs and ran no command"), "{nudge}");
+        // Without a judge: a change of code is reminded of, prose is not.
+        let reminder = super::verify_nudge(&["b.rs".to_owned()]);
+        assert!(
+            reminder.contains("changed b.rs and ran no command"),
+            "{reminder}"
+        );
+        assert!(
+            reminder.contains("already said the change is not verified"),
+            "{reminder}"
+        );
+        assert!(super::is_document("docs/GUIDE.md"));
+        assert!(super::is_document("notes.TXT"));
+        assert!(!super::is_document("src/main.rs"));
+        assert!(!super::is_document("Makefile"));
     }
 
     #[test]
