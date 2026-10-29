@@ -458,29 +458,11 @@ fn lock_wait() -> std::time::Duration {
 /// # Errors
 /// The lock cannot be opened, or another writer kept it past 30 seconds.
 pub fn lock_state(dir: &Path) -> Result<std::fs::File, String> {
-    std::fs::create_dir_all(dir).map_err(|error| format!("harness state directory: {error}"))?;
-    let file = std::fs::File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join(super::memory_store::LOCK_FILE))
-        .map_err(|error| format!("harness state lock: {error}"))?;
-    let deadline = std::time::Instant::now() + lock_wait();
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err("waiting for another memory write timed out".to_owned());
-            }
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(format!("harness state lock: {error}"));
-            }
-        }
-    }
+    super::files::hold(
+        &dir.join(super::memory_store::LOCK_FILE),
+        lock_wait(),
+        "memory write",
+    )
 }
 
 /// How long ago an entry was written, as `updated 3d ago`: an entry that

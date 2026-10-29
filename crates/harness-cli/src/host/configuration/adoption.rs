@@ -173,27 +173,11 @@ fn record(
 }
 
 fn lock(data_dir: &Path) -> Result<std::fs::File, String> {
-    std::fs::create_dir_all(data_dir).map_err(|error| error.to_string())?;
-    let file = std::fs::File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(data_dir.join(LOCK_FILE))
-        .map_err(|error| error.to_string())?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err("another adoption kept the lock past 10 seconds".to_owned());
-            }
-            Err(std::fs::TryLockError::Error(error)) => return Err(error.to_string()),
-        }
-    }
+    super::files::hold(
+        &data_dir.join(LOCK_FILE),
+        std::time::Duration::from_secs(10),
+        "adoption",
+    )
 }
 
 /// What holds the store at `dir`, if anything does: a writer (its
