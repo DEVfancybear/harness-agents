@@ -219,6 +219,8 @@ pub struct RuntimeConfig {
     pub compaction_reserve_tokens: u64,
     pub protocol_overhead_tokens: u64,
     pub safety_margin_tokens: u64,
+    /// The most tokens the optional blocks of a packet take together; see
+    /// [`OPTIONAL_TOKEN_BUDGET`].
     pub optional_token_budget: u64,
     pub max_attempts: u32,
     pub max_retry_after_seconds: u64,
@@ -247,6 +249,17 @@ pub const COMPACTION_THRESHOLD_PERCENT: f64 = 95.0;
 /// session compacts as it would at the end of a smaller window.
 pub const COMPACTION_CEILING_TOKENS: u64 = 200_000;
 
+/// The default [`RuntimeConfig::optional_token_budget`].
+///
+/// The host's optional blocks - the memory digest (capped at about 3K) and
+/// what a new conversation hears of where things stand: the earlier task
+/// state, the startup brief and its handoff, the session log or the last
+/// turns of the previous conversation (about 6K together, each capped) - fit
+/// in it at once; the knowledge catalog and a recalled skill compete for what
+/// they leave by relevance. 2048 was never applied: every host block was sent
+/// as if mandatory, and a new conversation could carry ~60K tokens of them.
+pub const OPTIONAL_TOKEN_BUDGET: u64 = 9_000;
+
 /// The range a measured estimate scale is kept within: one odd response (an
 /// image, a cache quirk) must not make the next request look empty or full.
 const ESTIMATE_SCALE_RANGE: (f64, f64) = (0.6, 2.5);
@@ -259,7 +272,7 @@ impl Default for RuntimeConfig {
             compaction_reserve_tokens: 16_384,
             protocol_overhead_tokens: 128,
             safety_margin_tokens: 128,
-            optional_token_budget: 2048,
+            optional_token_budget: OPTIONAL_TOKEN_BUDGET,
             max_attempts: 3,
             max_retry_after_seconds: 30,
             config_revision: 1,
@@ -818,17 +831,23 @@ fn history_summary_budget(config: &RuntimeConfig) -> u64 {
 /// How the summary that replaces the earlier turns introduces itself. It
 /// names the tools that read those turns: the journal keeps them word for
 /// word, but a model shown only the summary took it for all there was, and a
-/// reader cannot recover what the summary's writer left out.
-const COMPACTED_PREFIX: &str = "[The conversation before this point was compacted to fit the context window; history_search and history_read still read its turns word for word. Summary of it:]";
+/// reader cannot recover what the summary's writer left out. It ranks itself
+/// by pointing to the host's one precedence rule, "Where things stand" in the
+/// system prompt, instead of stating a rule of its own.
+const COMPACTED_PREFIX: &str = "[The conversation before this point was compacted to fit the context window; history_search and history_read still read its turns word for word. Summary of it (a record that may be stale: it ranks last in \"Where things stand\"):]";
+
+/// The prefix of 0.7.9 to 0.8.7, still recognized in a conversation compacted then.
+const COMPACTED_PREFIX_087: &str = "[The conversation before this point was compacted to fit the context window; history_search and history_read still read its turns word for word. Summary of it:]";
 
 /// The prefix before 0.7.9, still recognized in a conversation compacted then.
 const COMPACTED_PREFIX_BEFORE: &str =
     "[The conversation before this point was compacted to fit the context window. Summary of it:]";
 
 /// The summary a compacted conversation's first message carries, under
-/// either prefix.
+/// any of the prefixes.
 fn compacted_summary(text: &str) -> Option<&str> {
     text.strip_prefix(COMPACTED_PREFIX)
+        .or_else(|| text.strip_prefix(COMPACTED_PREFIX_087))
         .or_else(|| text.strip_prefix(COMPACTED_PREFIX_BEFORE))
 }
 
@@ -4150,6 +4169,17 @@ impl RuntimeService {
         let packet_key = format!("{}|{}", request.session_id, request.input_id);
         let packet = {
             let fresh = appended.is_empty() || continuation_context.is_some();
+            // What the budget cut or left out of the packet that is sent, once
+            // per packet: a block cut to its cap or dropped for the optional
+            // budget is otherwise invisible to a bug report.
+            if fresh && (!built.cut_block_ids.is_empty() || !built.omitted_optional.is_empty()) {
+                harness_types::diag::info("context", "budget")
+                    .field("cut", built.cut_block_ids.clone())
+                    .field("dropped", built.omitted_optional.clone())
+                    .field("mandatory_tokens", built.mandatory_tokens)
+                    .field("optional_tokens", built.optional_tokens)
+                    .emit();
+            }
             match self.turn_packets.lock() {
                 Ok(mut packets) if fresh => {
                     if packets.len() >= 64 {
@@ -7084,10 +7114,10 @@ mod long_task_compaction_tests {
     use harness_providers::{MessageRole, ProviderMessage};
 
     use super::{
-        COMPACTED_PREFIX, COMPACTED_PREFIX_BEFORE, CONVERSATION_MAX_BYTES, CONVERSATION_MAX_TURNS,
-        ConversationHistory, InputId, RunRequest, SessionId, TaskId, USER_MESSAGES_MAX_CHARS,
-        carry_forward, dropped_facts, format_user_messages, listed_user_messages,
-        omitted_user_messages, strip_appended_blocks, user_messages,
+        COMPACTED_PREFIX, COMPACTED_PREFIX_087, COMPACTED_PREFIX_BEFORE, CONVERSATION_MAX_BYTES,
+        CONVERSATION_MAX_TURNS, ConversationHistory, InputId, RunRequest, SessionId, TaskId,
+        USER_MESSAGES_MAX_CHARS, carry_forward, dropped_facts, format_user_messages,
+        listed_user_messages, omitted_user_messages, strip_appended_blocks, user_messages,
     };
 
     /// The summary says where the turns it stands for are still read; one
@@ -7096,7 +7126,13 @@ mod long_task_compaction_tests {
     fn a_summary_names_the_tools_that_read_its_turns() {
         assert!(COMPACTED_PREFIX.contains("history_search"));
         assert!(COMPACTED_PREFIX.contains("history_read"));
-        for prefix in [COMPACTED_PREFIX, COMPACTED_PREFIX_BEFORE] {
+        // It ranks itself by the host's precedence rule, not a rule of its own.
+        assert!(COMPACTED_PREFIX.contains("\"Where things stand\""));
+        for prefix in [
+            COMPACTED_PREFIX,
+            COMPACTED_PREFIX_087,
+            COMPACTED_PREFIX_BEFORE,
+        ] {
             let text = format!(
                 "{prefix}
 
