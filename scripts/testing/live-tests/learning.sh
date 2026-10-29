@@ -15,12 +15,15 @@
 #   bash scripts/testing/live-tests/learning.sh
 set -u
 source "$(dirname "$0")/env.sh"
-fresh learning
-D=$HA_HOME/data
-G=$D/harness
-P=$RX/p
-project "$P"
-cat > "$P/calc.py" <<'EOF'
+# A fresh store with calc.py, reviewed after every turn: set up again for a
+# retry of section 1, whose review is the model's to judge.
+setup() {
+  fresh learning
+  D=$HA_HOME/data
+  G=$D/harness
+  P=$RX/p
+  project "$P"
+  cat > "$P/calc.py" <<'EOF'
 def add(a, b):
     return a + b
 
@@ -28,16 +31,18 @@ def add(a, b):
 def sub(a, b):
     return a - b
 EOF
-(cd "$P" && git add -A && git -c user.name=t -c user.email=t@t commit -qm calc)
-# Review after every turn, keeping the thinking level fresh() set.
-"$PY" - "$HA_HOME/settings.json" <<'EOF'
+  (cd "$P" && git add -A && git -c user.name=t -c user.email=t@t commit -qm calc)
+  # Review after every turn, keeping the thinking level fresh() set.
+  "$PY" - "$HA_HOME/settings.json" <<'EOF'
 import json, os, sys
 path = sys.argv[1]
 settings = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}
 settings["autoRefine"] = {"turnInterval": 1}
 json.dump(settings, open(path, "w", encoding="utf-8"))
 EOF
-unset HA_AUTO_REFINE
+  unset HA_AUTO_REFINE
+}
+setup
 
 run_exec() {
   local name="$1" dir="$2"; shift 2
@@ -75,11 +80,30 @@ learned_count() { "$HA" memory export | "$PY" -c "import json,sys; print(sum(1 f
 echo "################ 1. a correction in the moment is recorded as a lesson, with its quote"
 # Not a rule the user states: a reaction to an answer, which the review keeps
 # as a lesson rather than as a preference.
-run_exec a1 "$P" "Giải thích thật chi tiết từng dòng của calc.py."
-A=$(task_of a1)
-run_exec a2 "$P" --resume "$A" "Dài quá, mình đọc không nổi. Hàm sub làm gì? 1-2 câu thôi."
+# The precondition: the review kept the reaction as a lesson about every
+# project. It is the model's call (it may keep a preference of this
+# conversation instead, on 0.8.7 as on 0.8.8), so a miss is retried on a fresh
+# store; an attempt's evidence is kept beside the run.
+ID=""
+for attempt in 1 2 3; do
+  if [ "$attempt" -gt 1 ]; then
+    rm -rf "$RX-attempt-$((attempt - 1))"
+    cp -r "$RX" "$RX-attempt-$((attempt - 1))"
+    setup
+  fi
+  run_exec a1 "$P" "Giải thích thật chi tiết từng dòng của calc.py."
+  A=$(task_of a1)
+  run_exec a2 "$P" --resume "$A" "Dài quá, mình đọc không nổi. Hàm sub làm gì? 1-2 câu thôi."
+  ID=$(field "x['project'] is None" "x['id']")
+  [ -n "$ID" ] && [ "$(kind "$ID")" = correction ] && break
+  echo "   attempt $attempt: the review kept no correction about every project ($(grep -E 'Created|Changed|Updated' "$RX/a2.err" | tr -s ' ' | tr '\n' ';')); retrying on a fresh store"
+  ID=""
+done
+if [ -z "$ID" ]; then
+  echo "PRECONDITION FAILED: in 3 attempts the review kept no correction about every project (see $RX-attempt-*); rerun"
+  exit 2
+fi
 check "the run reviewed its turns" 'grep -q "auto-refine" "$RX/a2.err"'
-ID=$(field "x['project'] is None" "x['id']")
 check "a lesson about every project was recorded" '[ -n "$ID" ]'
 echo "   lesson: $ID $(field "x['id']=='$ID'" "x['text']")"
 check "it is a correction" '[ "$(kind "$ID")" = correction ]'
