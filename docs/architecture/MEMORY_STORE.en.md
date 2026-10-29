@@ -352,8 +352,12 @@ invariant. The query's variants (`queries`) are fused by RRF within the arm.
 Search matches words, not meaning. An empty result says which queries were
 searched and to search again with other words - a synonym, the other language
 the project uses, a shorter or broader term, a name or path from the code -
-before saying it is not remembered. The model picks the words; ha keeps no
-synonym table.
+before saying it is not remembered. It also lists, as `branches`, the trees the
+searched entries sit in (at most 12, the fullest first): their names are the
+store's own words, so the model sees which language the store is written in
+and can browse a branch with `tree` and no query. A question asked in English
+of a store kept in Vietnamese was retried with English synonyms only until the
+branches were shown. The model picks the words; ha keeps no synonym table.
 
 ### 6.2 Semantic (removed in 0.8.8)
 

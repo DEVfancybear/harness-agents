@@ -940,6 +940,7 @@ impl MemoryHost {
         });
         if shown.is_empty() {
             result["note"] = json!(super::memory_search::miss_note(&[query]));
+            super::memory_search::missed_branches(&mut result, &considered);
         }
         Ok(super::memory_search::formatted(result, arguments))
     }
@@ -4288,6 +4289,14 @@ mod tests {
         assert!(
             note.contains("not meaning: search again with other words"),
             "{note}"
+        );
+        // A miss lists where the searched entries sit, in the store's words.
+        assert!(
+            words["branches"].as_array().is_some_and(|branches| branches
+                .iter()
+                .any(|branch| branch["tree"] == "/global/general"
+                    && branch["entries"].as_u64() >= Some(1))),
+            "{words}"
         );
         let projected = run(
             &host,

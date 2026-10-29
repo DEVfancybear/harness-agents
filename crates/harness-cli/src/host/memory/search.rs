@@ -427,6 +427,7 @@ pub fn search(
     let mut result = json!({"hits": hits, "total": total, "limit": limit, "mode": mode, "searched": considered.len()});
     if hits_empty(&result) {
         result["note"] = json!(miss_note(&queries));
+        missed_branches(&mut result, &considered);
     }
     Ok(match text("format") {
         Some("yaml") => json!({"text": yaml(&result)}),
@@ -449,8 +450,31 @@ pub fn miss_note(queries: &[String]) -> String {
             .join(", ")
     };
     format!(
-        "No memory matched {searched}. Search matches words (stems, prefixes, accents folded), not meaning: search again with other words - a synonym, the other language the project uses, a shorter or broader term, a name or path from the code - or fewer filters, before saying it is not remembered."
+        "No memory matched {searched}. Search matches words (stems, prefixes, accents folded), not meaning: search again with other words - a synonym, the other language the project uses, a shorter or broader term, a name or path from the code - or fewer filters, before saying it is not remembered. `branches` lists where the searched entries sit, named in the store's own words and language: search in that language, or browse a branch with `tree` and no query."
     )
+}
+
+/// The most branches a missed search lists.
+const MISSED_BRANCHES: usize = 12;
+
+/// A missed search's `branches`: the trees the searched entries sit in, with
+/// how many each holds, the fullest first, so the model sees the words and
+/// the language the store is written in. Nothing when nothing was searched.
+pub fn missed_branches(result: &mut Value, considered: &[&Placed<'_>]) {
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for placed in considered {
+        *counts.entry(placed.entry.tree.as_str()).or_default() += 1;
+    }
+    if counts.is_empty() {
+        return;
+    }
+    let mut branches = counts.into_iter().collect::<Vec<_>>();
+    branches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    result["branches"] = branches
+        .into_iter()
+        .take(MISSED_BRANCHES)
+        .map(|(tree, entries)| json!({"tree": tree, "entries": entries}))
+        .collect();
 }
 
 /// Count the entries a search returned as a hit of each, in its store.

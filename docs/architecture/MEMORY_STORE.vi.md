@@ -370,7 +370,12 @@ của ME. Các cách diễn đạt (`queries`) được gộp bằng RRF ngay tr
 Search khớp theo từ, không theo nghĩa. Kết quả rỗng ghi rõ các query đã tìm và
 khuyên tìm lại bằng từ khác - từ đồng nghĩa, ngôn ngữ còn lại mà project dùng,
 một từ ngắn hơn hoặc rộng hơn, một tên hay đường dẫn trong code - trước khi nói
-là không nhớ. Model tự chọn từ; ha không giữ bảng từ đồng nghĩa nào.
+là không nhớ. Kết quả rỗng còn liệt kê `branches`: các nhánh cây chứa những entry
+đã được tìm (tối đa 12, nhánh nhiều entry nhất trước). Tên nhánh là từ của chính
+kho, nên model thấy kho được viết bằng ngôn ngữ nào và có thể duyệt một nhánh
+bằng `tree` mà không cần query. Một câu hỏi bằng tiếng Anh vào kho ghi bằng
+tiếng Việt chỉ được tìm lại bằng từ đồng nghĩa tiếng Anh, cho đến khi các nhánh
+được hiện ra. Model tự chọn từ; ha không giữ bảng từ đồng nghĩa nào.
 
 ### 6.2 Theo nghĩa (bỏ ở 0.8.8)
 
