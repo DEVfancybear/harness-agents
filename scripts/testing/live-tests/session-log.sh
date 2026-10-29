@@ -164,4 +164,48 @@ check "the next start wrote the owed log" '[ -n "$KLOG" ] && grep -qi "orchid" "
 check "and it is no longer owed" '[ -n "$OWEDF" ] && [ ! -e "$OWEDF" ]'
 "$HA" shutdown --force >/dev/null 2>&1
 
+# Section 10 fails on 0.8.7: a new conversation was offered the task state of
+# a conversation still open in another agent, an abandoned task state was
+# offered to every new conversation however many had passed it by, and no
+# request carried one precedence rule for where things stand. Only the first
+# turn needs the model (to keep a task state); the rest is the host's choice.
+echo "################ 10. only a task that was left is offered, three times at most"
+W=$RX/w
+project "$W"
+# The earlier task state's own words, in 0.8.7 and since.
+OFFER="left its task unfinished"
+# The precedence rule's own words.
+RULE="When records of the work disagree"
+offered() { printf "%s" "$1" | grep -q "$OFFER"; }
+zstates() { grep -l "Zephyr" "$D"/sessions/*/harness/task_state.json 2>/dev/null | wc -l; }
+HA_IDLE_REVIEW_SECONDS=3600 agent "$W" w1
+say w1 "Dùng tool task_state để lưu một task, không làm gì khác: objective 'Viết parser cho định dạng Zephyr', checklist ba mục đều pending: lexer, grammar, tests. Chưa làm mục nào. Trả lời ngắn." | tail -1 | sed 's/^/   /'
+ZSTATE=$(grep -l "Zephyr" "$D"/sessions/*/harness/task_state.json 2>/dev/null | head -1)
+check "precondition: the first conversation kept a task state with open items" '[ -n "$ZSTATE" ] && grep -q "\"pending\"" "$ZSTATE"'
+# A second conversation while the first is still open (its agent runs).
+HA_IDLE_REVIEW_SECONDS=3600 agent "$W" w2
+say w2 "Trả lời đúng một từ: táo" > /dev/null
+RW2=$(request "Trả lời đúng một từ: táo")
+check "the second conversation's request was found" '[ -n "$RW2" ]'
+check "it is not offered the open conversation's task state" '[ -n "$RW2" ] && ! offered "$RW2"'
+check "the request carries the precedence rule once" '[ "$(printf "%s" "$RW2" | grep -o "$RULE" | wc -l)" -eq 1 ]'
+"$HA" shutdown --force >/dev/null 2>&1
+# The first conversation is left now: it is offered to new conversations,
+# three of them, and then no more.
+for n in 1 2 3; do
+  HA_IDLE_REVIEW_SECONDS=3600 agent "$W" "w3$n"
+  say "w3$n" "Trả lời đúng một từ: lê$n" > /dev/null
+  RW3=$(request "Trả lời đúng một từ: lê$n")
+  check "precondition: new conversation $n is offered the left task" '[ -n "$RW3" ] && offered "$RW3"'
+  "$HA" shutdown --force >/dev/null 2>&1
+done
+check "precondition: no later conversation adopted the task" '[ "$(zstates)" -eq 1 ]'
+HA_IDLE_REVIEW_SECONDS=3600 agent "$W" w4
+say w4 "Trả lời đúng một từ: mận" > /dev/null
+RW4=$(request "Trả lời đúng một từ: mận")
+check "the fourth new conversation's request was found" '[ -n "$RW4" ]'
+check "an abandoned task is not offered a fourth time" '[ -n "$RW4" ] && ! offered "$RW4"'
+check "the earlier conversations were shown it three times, as counted" '[ -n "$ZSTATE" ] && [ "$(tr -cd , < "$(dirname "$ZSTATE")/task_state.offered.json" 2>/dev/null | wc -c)" -eq 2 ]'
+"$HA" shutdown --force >/dev/null 2>&1
+
 result
