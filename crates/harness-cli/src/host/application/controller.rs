@@ -4853,7 +4853,7 @@ impl InteractiveController {
                     // is written then too.
                     self.service.plan_session_log();
                     effects.extend(self.dispatch(
-                        super::lifecycle::handoff_request(Some(&focus)),
+                        super::lifecycle::handoff_request(&self.context.project.root, Some(&focus)),
                         false,
                     ));
                 }

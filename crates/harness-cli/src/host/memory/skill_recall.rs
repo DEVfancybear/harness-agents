@@ -171,7 +171,12 @@ pub fn block(recalled: &Recalled) -> ContextBlock {
         text.push_str("\nCheck those before relying on it.");
     }
     ContextBlock::mandatory("recalled-skill", ContextBlockKind::Instruction, text)
+        .with_max_tokens(RECALLED_TOKENS)
+        .with_rest_at(format!("the learned skill {}", recalled.name))
 }
+
+/// The most tokens a recalled skill takes in a turn's context.
+const RECALLED_TOKENS: u64 = 1_500;
 
 #[cfg(test)]
 mod tests {

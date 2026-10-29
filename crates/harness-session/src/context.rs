@@ -131,6 +131,15 @@ pub struct ContextBlock {
     pub supersedes: Vec<String>,
     /// Digest of `text`, so a freeze can prove what was compiled.
     pub digest: ContentHash,
+    /// The most tokens this block may take in the request. A longer block is
+    /// cut at a line boundary, with a note saying so, before it is admitted:
+    /// an optional one competes for the budget at its cut size, and a
+    /// mandatory one is sent cut rather than overflowing the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    /// Where the part a cut leaves out can be read, named in the cut's note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rest_at: Option<String>,
 }
 
 impl ContextBlock {
@@ -153,6 +162,8 @@ impl ContextBlock {
             authority: channel.default_authority(),
             provenance: Vec::new(),
             supersedes: Vec::new(),
+            max_tokens: None,
+            rest_at: None,
         }
     }
     #[must_use]
@@ -175,6 +186,8 @@ impl ContextBlock {
             authority: channel.default_authority(),
             provenance: Vec::new(),
             supersedes: Vec::new(),
+            max_tokens: None,
+            rest_at: None,
         }
     }
 
@@ -198,6 +211,20 @@ impl ContextBlock {
     #[must_use]
     pub fn superseding(mut self, superseded: impl IntoIterator<Item = String>) -> Self {
         self.supersedes = superseded.into_iter().collect();
+        self
+    }
+
+    /// Bound the block to `tokens` in the request; see [`Self::max_tokens`].
+    #[must_use]
+    pub fn with_max_tokens(mut self, tokens: u64) -> Self {
+        self.max_tokens = Some(tokens);
+        self
+    }
+
+    /// Name where the rest of a cut block can be read; see [`Self::rest_at`].
+    #[must_use]
+    pub fn with_rest_at(mut self, location: impl Into<String>) -> Self {
+        self.rest_at = Some(location.into());
         self
     }
 }
@@ -308,6 +335,8 @@ pub struct ContextBuildResult {
     pub mandatory_block_ids: Vec<String>,
     pub optional_block_ids: Vec<String>,
     pub omitted_optional: Vec<String>,
+    /// Blocks sent cut to their [`ContextBlock::max_tokens`].
+    pub cut_block_ids: Vec<String>,
     /// Blocks that were replaced by a block claiming to supersede them.
     pub superseded_block_ids: Vec<String>,
     pub mandatory_tokens: u64,
@@ -324,6 +353,8 @@ pub struct ContextBlockUsage {
     pub token_estimate: u64,
     pub included: bool,
     pub drop_reason: Option<String>,
+    /// The block's size before it was cut to its cap, when it was.
+    pub cut_from_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -451,7 +482,6 @@ impl ContextBuilder {
             - request.protocol_overhead_tokens
             - request.safety_margin_tokens;
         let fixed_bytes = request.fixed_request_bytes;
-        let mut mandatory = Vec::<ContextBlock>::new();
         let mut source_manifest = vec![request.recovery.working_state.objective_ref.clone()];
         source_manifest.extend(
             request
@@ -462,33 +492,67 @@ impl ContextBuilder {
                 .cloned(),
         );
         source_manifest.extend(request.recovery.working_state.decision_refs.iter().cloned());
+        // Each mandatory block with whether it goes ahead of the optional ones:
+        // the project's rules and the host's facts do, and the user's
+        // instruction, the working state and the tail come after them, so the
+        // request still ends with what this turn is about.
+        let mut mandatory = Vec::<(ContextBlock, bool)>::new();
+        let mut optional = request.optional_blocks;
         // The system policy is not a block here: the runtime already sends it as the
         // conversation's system message, and repeating it inside the request text
         // gave the model two copies of one policy and pushed its own instruction into
         // a wall of quoted blocks.
+        //
+        // A host block that is not mandatory - its producer said so, or its
+        // channel cannot be - competes for the optional budget by relevance
+        // like any optional block. It used to be sent whatever its size, as if
+        // it were mandatory, so the budget and the ranking never ran.
         for mut block in request.project_rules {
             block.mandatory = block.mandatory && block.channel.may_be_mandatory();
-            mandatory.push(block);
+            if block.mandatory {
+                mandatory.push((block, true));
+            } else {
+                optional.push(block);
+            }
         }
         for (index, text) in request.recovery.instruction_texts.iter().enumerate() {
-            mandatory.push(ContextBlock::mandatory(
-                format!("instruction-{index}"),
-                ContextBlockKind::Instruction,
-                text.clone(),
+            mandatory.push((
+                ContextBlock::mandatory(
+                    format!("instruction-{index}"),
+                    ContextBlockKind::Instruction,
+                    text.clone(),
+                ),
+                false,
             ));
         }
         let state_text = render_working_state(&request.recovery.working_state);
         if !state_text.is_empty() {
-            mandatory.push(ContextBlock::mandatory(
-                "working-state",
-                ContextBlockKind::WorkingState,
-                state_text,
+            mandatory.push((
+                ContextBlock::mandatory(
+                    "working-state",
+                    ContextBlockKind::WorkingState,
+                    state_text,
+                ),
+                false,
             ));
         }
         for block in request.recent_tail {
             let mut block = block;
             block.mandatory = block.mandatory && block.channel.may_be_mandatory();
-            mandatory.push(block);
+            mandatory.push((block, false));
+        }
+        // A block over its cap is cut before anything is admitted: an optional
+        // one competes at its cut size, and a mandatory one is sent cut
+        // instead of overflowing the window.
+        let mut cuts = std::collections::BTreeMap::<String, u64>::new();
+        for block in mandatory
+            .iter_mut()
+            .map(|(block, _)| block)
+            .chain(optional.iter_mut())
+        {
+            if let Some(before) = cut_to_cap(block) {
+                cuts.insert(block.id.clone(), before);
+            }
         }
 
         // An effective instruction replaces the one it supersedes: sending both
@@ -502,10 +566,12 @@ impl ContextBuilder {
         // instruction in `supersedes` would otherwise delete it.
         let superseded_ids = mandatory
             .iter()
+            .map(|(by, _)| by)
             .flat_map(|by| {
                 mandatory
                     .iter()
-                    .chain(request.optional_blocks.iter())
+                    .map(|(target, _)| target)
+                    .chain(optional.iter())
                     .filter(move |target| {
                         target.id != by.id
                             && by.supersedes.contains(&target.id)
@@ -516,17 +582,16 @@ impl ContextBuilder {
             .collect::<std::collections::BTreeSet<_>>();
         let mut superseded_block_ids = Vec::new();
         let mut block_usage = Vec::new();
-        mandatory.retain(|block| {
+        mandatory.retain(|(block, _)| {
             let replaced = superseded_ids.contains(&block.id);
             if replaced {
                 superseded_block_ids.push(block.id.clone());
-                block_usage.push(ContextBlockUsage {
-                    block_id: block.id.clone(),
-                    channel: block.channel,
-                    token_estimate: estimate_bytes(render_block(block).len()),
-                    included: false,
-                    drop_reason: Some("superseded by a newer block".to_owned()),
-                });
+                block_usage.push(usage(
+                    block,
+                    render_block(block).len(),
+                    false,
+                    Some(SUPERSEDED),
+                ));
             }
             !replaced
         });
@@ -539,35 +604,32 @@ impl ContextBuilder {
                     .any(|earlier| earlier.contains(&rendered))
             }
         };
-        mandatory.retain(|block| {
+        mandatory.retain(|(block, _)| {
             let sent = sent_earlier(block);
             if sent {
-                block_usage.push(ContextBlockUsage {
-                    block_id: block.id.clone(),
-                    channel: block.channel,
-                    token_estimate: estimate_bytes(render_block(block).len()),
-                    included: false,
-                    drop_reason: Some(SENT_EARLIER.to_owned()),
-                });
+                block_usage.push(usage(
+                    block,
+                    render_block(block).len(),
+                    false,
+                    Some(SENT_EARLIER),
+                ));
             }
             !sent
         });
-        for block in &mandatory {
-            block_usage.push(ContextBlockUsage {
-                block_id: block.id.clone(),
-                channel: block.channel,
-                token_estimate: estimate_bytes(render_block(block).len()),
-                included: true,
-                drop_reason: None,
-            });
+        let mandatory_rendered = mandatory
+            .iter()
+            .map(|(block, head)| (render_block(block), *head))
+            .collect::<Vec<_>>();
+        for ((block, _), (rendered, _)) in mandatory.iter().zip(&mandatory_rendered) {
+            block_usage.push(usage(block, rendered.len(), true, None));
         }
 
-        let mut content = mandatory
+        let mandatory_bytes = mandatory_rendered
             .iter()
-            .map(render_block)
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let mandatory_tokens = estimate_bytes(fixed_bytes.saturating_add(content.len()));
+            .map(|(rendered, _)| rendered.len())
+            .sum::<usize>()
+            .saturating_add(2 * mandatory_rendered.len().saturating_sub(1));
+        let mandatory_tokens = estimate_bytes(fixed_bytes.saturating_add(mandatory_bytes));
         if mandatory_tokens > available {
             return Err(ContextError::new(
                 harness_types::ErrorCode::MandatoryContextOverflow,
@@ -577,7 +639,6 @@ impl ContextBuilder {
             ));
         }
 
-        let mut optional = request.optional_blocks;
         // A derived block is optional whatever its producer claimed, and a block
         // that was superseded is not sent at all.
         for block in &mut optional {
@@ -587,24 +648,22 @@ impl ContextBuilder {
         }
         optional.retain(|block| {
             if sent_earlier(block) {
-                block_usage.push(ContextBlockUsage {
-                    block_id: block.id.clone(),
-                    channel: block.channel,
-                    token_estimate: estimate_bytes(render_block(block).len()),
-                    included: false,
-                    drop_reason: Some(SENT_EARLIER.to_owned()),
-                });
+                block_usage.push(usage(
+                    block,
+                    render_block(block).len(),
+                    false,
+                    Some(SENT_EARLIER),
+                ));
                 return false;
             }
             if superseded_ids.contains(&block.id) {
                 superseded_block_ids.push(block.id.clone());
-                block_usage.push(ContextBlockUsage {
-                    block_id: block.id.clone(),
-                    channel: block.channel,
-                    token_estimate: estimate_bytes(render_block(block).len()),
-                    included: false,
-                    drop_reason: Some("superseded by a newer block".to_owned()),
-                });
+                block_usage.push(usage(
+                    block,
+                    render_block(block).len(),
+                    false,
+                    Some(SUPERSEDED),
+                ));
                 false
             } else {
                 true
@@ -621,7 +680,7 @@ impl ContextBuilder {
             .optional_token_budget
             .min(available - mandatory_tokens);
         let mut selected = Vec::<(ContextBlock, String)>::new();
-        let mut selected_bytes = content.len();
+        let mut selected_bytes = mandatory_bytes;
         for block in optional {
             let rendered = render_block(&block);
             let candidate_bytes = selected_bytes
@@ -634,13 +693,7 @@ impl ContextBuilder {
                 selected_bytes = candidate_bytes;
                 selected.push((block, rendered));
             } else {
-                block_usage.push(ContextBlockUsage {
-                    block_id: block.id.clone(),
-                    channel: block.channel,
-                    token_estimate: estimate_bytes(rendered.len()),
-                    included: false,
-                    drop_reason: Some("optional token budget".to_owned()),
-                });
+                block_usage.push(usage(&block, rendered.len(), false, Some(OVER_BUDGET)));
                 omitted_optional.push(block.id);
             }
         }
@@ -661,29 +714,32 @@ impl ContextBuilder {
             })
             .collect::<std::collections::BTreeSet<_>>();
         let mut optional_kept = Vec::new();
+        let mut optional_rendered = Vec::new();
         for (block, rendered) in selected {
             if retired_by_optional.contains(&block.id) {
                 superseded_block_ids.push(block.id.clone());
-                block_usage.push(ContextBlockUsage {
-                    block_id: block.id.clone(),
-                    channel: block.channel,
-                    token_estimate: estimate_bytes(rendered.len()),
-                    included: false,
-                    drop_reason: Some("superseded by a newer block".to_owned()),
-                });
+                block_usage.push(usage(&block, rendered.len(), false, Some(SUPERSEDED)));
                 continue;
             }
-            content.push_str("\n\n");
-            content.push_str(&rendered);
-            block_usage.push(ContextBlockUsage {
-                block_id: block.id.clone(),
-                channel: block.channel,
-                token_estimate: estimate_bytes(rendered.len()),
-                included: true,
-                drop_reason: None,
-            });
+            block_usage.push(usage(&block, rendered.len(), true, None));
+            optional_rendered.push(rendered);
             optional_kept.push(block);
         }
+        // The rules and facts, then the optional blocks by rank, then the
+        // instruction, the working state and the tail.
+        let content = mandatory_rendered
+            .iter()
+            .filter(|(_, head)| *head)
+            .map(|(rendered, _)| rendered.as_str())
+            .chain(optional_rendered.iter().map(String::as_str))
+            .chain(
+                mandatory_rendered
+                    .iter()
+                    .filter(|(_, head)| !*head)
+                    .map(|(rendered, _)| rendered.as_str()),
+            )
+            .collect::<Vec<_>>()
+            .join("\n\n");
         let optional_tokens = if optional_kept.is_empty() {
             0
         } else {
@@ -693,7 +749,7 @@ impl ContextBuilder {
         let channel_digest = ContentHash::from_canonical_json(&serde_json::json!({
             "mandatory": mandatory
                 .iter()
-                .map(|block| serde_json::json!({
+                .map(|(block, _)| serde_json::json!({
                     "id": block.id,
                     "channel": block.channel.as_str(),
                     "authority": block.authority,
@@ -749,15 +805,27 @@ impl ContextBuilder {
         packet.validate().map_err(|error| {
             ContextError::new(error.code(), format!("context packet is invalid: {error}"))
         })?;
+        for entry in &mut block_usage {
+            entry.cut_from_tokens = cuts.get(&entry.block_id).copied();
+        }
         block_usage.sort_by(|left, right| left.block_id.cmp(&right.block_id));
         let degradation =
             (!omitted_optional.is_empty()).then(|| "optional_context_omitted".to_owned());
+        let cut_block_ids = block_usage
+            .iter()
+            .filter(|entry| entry.included && entry.cut_from_tokens.is_some())
+            .map(|entry| entry.block_id.clone())
+            .collect();
         Ok(ContextBuildResult {
             packet,
             manifest,
-            mandatory_block_ids: mandatory.iter().map(|block| block.id.clone()).collect(),
+            mandatory_block_ids: mandatory
+                .iter()
+                .map(|(block, _)| block.id.clone())
+                .collect(),
             optional_block_ids: optional_kept.iter().map(|block| block.id.clone()).collect(),
             omitted_optional,
+            cut_block_ids,
             superseded_block_ids,
             mandatory_tokens,
             optional_tokens,
@@ -901,6 +969,75 @@ fn may_supersede(by: &ContextBlock, target: &ContextBlock) -> bool {
 /// Why a block a turn already sent is left out of a later packet.
 const SENT_EARLIER: &str = "already sent earlier in the conversation";
 
+/// Why a block another block replaced is left out.
+const SUPERSEDED: &str = "superseded by a newer block";
+
+/// Why an optional block that did not fit is left out.
+const OVER_BUDGET: &str = "optional token budget";
+
+/// One block's line in the packet's accounting; a cut is added once the
+/// packet is built.
+fn usage(
+    block: &ContextBlock,
+    rendered_bytes: usize,
+    included: bool,
+    drop_reason: Option<&str>,
+) -> ContextBlockUsage {
+    ContextBlockUsage {
+        block_id: block.id.clone(),
+        channel: block.channel,
+        token_estimate: estimate_bytes(rendered_bytes),
+        included,
+        drop_reason: drop_reason.map(str::to_owned),
+        cut_from_tokens: None,
+    }
+}
+
+/// Cut `block` to its [`ContextBlock::max_tokens`], when it is over it, and
+/// return the tokens it took before.
+///
+/// The cut falls at the last line boundary that fits, so no line is sent
+/// half; a block that is one long line is cut at a character boundary. A
+/// note at the end says the block was cut and, when the producer named it,
+/// where the rest is, so the model reads a cut block as part of something
+/// and can go and read the rest.
+fn cut_to_cap(block: &mut ContextBlock) -> Option<u64> {
+    let cap = block.max_tokens?;
+    let before = estimate_bytes(render_block(block).len());
+    if before <= cap {
+        return None;
+    }
+    let note = block.rest_at.as_deref().map_or_else(
+        || format!("[cut to about {cap} of {before} tokens; the rest is left out]"),
+        |rest| format!("[cut to about {cap} of {before} tokens; the rest is in {rest}]"),
+    );
+    // `[label]\n`, the text, then `\n` and the note.
+    let frame = block.label().len() + 3 + 1 + note.len();
+    let room = usize::try_from(cap)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(4)
+        .saturating_sub(frame)
+        .min(block.text.len());
+    let mut end = room;
+    while !block.text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let kept = &block.text[..end];
+    let kept = if block.text[end..].starts_with('\n') {
+        kept
+    } else {
+        kept.rfind('\n').map_or(kept, |line_end| &kept[..line_end])
+    };
+    let text = if kept.trim().is_empty() {
+        note
+    } else {
+        format!("{}\n{note}", kept.trim_end())
+    };
+    block.digest = ContentHash::from_bytes(text.as_bytes());
+    block.text = text;
+    Some(before)
+}
+
 fn render_block(block: &ContextBlock) -> String {
     format!("[{}]\n{}", block.label(), block.text)
 }
@@ -955,42 +1092,50 @@ mod tests {
     /// Compile one packet over the user instruction `fix the parser` and return
     /// the ids that were sent and the ids that were superseded.
     fn compile(optional: Vec<ContextBlock>, optional_budget: u64) -> (Vec<String>, Vec<String>) {
-        let state = working_state();
-        let built = ContextBuilder::new()
-            .build(ContextBuildRequest {
-                session_id: state.session_id.clone(),
-                task_id: state.task_id.clone(),
-                checkpoint_id: "checkpoint-1".to_owned(),
-                through_event_seq: 1,
-                recovery: crate::RecoveryView {
-                    working_state: state,
-                    receipts: Vec::new(),
-                    instruction_texts: vec!["fix the parser".to_owned()],
-                    snapshot_sequence: None,
-                    replayed_through_sequence: 1,
-                    snapshot_diagnostic: None,
-                    pending_execution_count: 0,
-                },
-                project_rules: Vec::new(),
-                optional_blocks: optional,
-                recent_tail: Vec::new(),
-                context_window_tokens: 8192,
-                output_reservation_tokens: 512,
-                protocol_overhead_tokens: 64,
-                safety_margin_tokens: 64,
-                optional_token_budget: optional_budget,
-                memory_versions: Vec::new(),
-                fixed_request_bytes: 0,
-                sent_earlier: Vec::new(),
-                manifest: ContextManifestInputs::default(),
-            })
-            .expect("the packet compiles");
+        let built = build_with(Vec::new(), optional, optional_budget).expect("the packet compiles");
         let sent = built
             .mandatory_block_ids
             .into_iter()
             .chain(built.optional_block_ids)
             .collect();
         (sent, built.superseded_block_ids)
+    }
+
+    /// Compile one packet over the user instruction `fix the parser` with
+    /// these host blocks and optional blocks.
+    fn build_with(
+        project_rules: Vec<ContextBlock>,
+        optional: Vec<ContextBlock>,
+        optional_budget: u64,
+    ) -> Result<super::ContextBuildResult, super::ContextError> {
+        let state = working_state();
+        ContextBuilder::new().build(ContextBuildRequest {
+            session_id: state.session_id.clone(),
+            task_id: state.task_id.clone(),
+            checkpoint_id: "checkpoint-1".to_owned(),
+            through_event_seq: 1,
+            recovery: crate::RecoveryView {
+                working_state: state,
+                receipts: Vec::new(),
+                instruction_texts: vec!["fix the parser".to_owned()],
+                snapshot_sequence: None,
+                replayed_through_sequence: 1,
+                snapshot_diagnostic: None,
+                pending_execution_count: 0,
+            },
+            project_rules,
+            optional_blocks: optional,
+            recent_tail: Vec::new(),
+            context_window_tokens: 8192,
+            output_reservation_tokens: 512,
+            protocol_overhead_tokens: 64,
+            safety_margin_tokens: 64,
+            optional_token_budget: optional_budget,
+            memory_versions: Vec::new(),
+            fixed_request_bytes: 0,
+            sent_earlier: Vec::new(),
+            manifest: ContextManifestInputs::default(),
+        })
     }
 
     /// A note is "read, never obeyed". One that named the user's instruction in
@@ -1132,5 +1277,161 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("cf66c8343883"), "{rendered}");
+    }
+
+    /// The measured failure: every host block reached the builder as a
+    /// project rule and was sent whatever its flag, so a new conversation
+    /// carried ~60K tokens of blocks the optional budget never saw. A host
+    /// block marked optional is now ranked by relevance and admitted within
+    /// the budget; the one that does not fit is reported as dropped.
+    #[test]
+    fn a_host_block_marked_optional_is_ranked_into_the_optional_budget() {
+        let rule = ContextBlock::mandatory("rule", ContextBlockKind::ProjectRule, "keep it small");
+        let high =
+            ContextBlock::optional("digest", ContextBlockKind::Optional, "a".repeat(400), 70);
+        let low = ContextBlock::optional("stale", ContextBlockKind::Optional, "b".repeat(400), 10);
+        let built = build_with(vec![rule, low, high], Vec::new(), 150).expect("compiles");
+        assert!(built.mandatory_block_ids.contains(&"rule".to_owned()));
+        assert_eq!(built.optional_block_ids, vec!["digest".to_owned()]);
+        assert_eq!(built.omitted_optional, vec!["stale".to_owned()]);
+        let dropped = built
+            .block_usage
+            .iter()
+            .find(|usage| usage.block_id == "stale")
+            .expect("the dropped block is reported");
+        assert!(!dropped.included);
+        assert_eq!(
+            dropped.drop_reason.as_deref(),
+            Some("optional token budget")
+        );
+
+        // With room for both, both are sent, the higher ranked first.
+        let built = build_with(
+            vec![
+                ContextBlock::optional("stale", ContextBlockKind::Optional, "low one", 10),
+                ContextBlock::optional("digest", ContextBlockKind::Optional, "high one", 70),
+            ],
+            Vec::new(),
+            4096,
+        )
+        .expect("compiles");
+        assert_eq!(
+            built.optional_block_ids,
+            vec!["digest".to_owned(), "stale".to_owned()]
+        );
+        let content = &built.packet.content;
+        assert!(
+            content.find("high one") < content.find("low one"),
+            "{content}"
+        );
+    }
+
+    /// The optional blocks are sent after the rules and before the user's
+    /// instruction, so the request still ends with what the turn is about.
+    #[test]
+    fn the_users_instruction_comes_after_the_optional_blocks() {
+        let rule = ContextBlock::mandatory("rule", ContextBlockKind::ProjectRule, "the rule");
+        let optional =
+            ContextBlock::optional("reference", ContextBlockKind::Optional, "the reference", 40);
+        let built = build_with(vec![rule, optional], Vec::new(), 4096).expect("compiles");
+        let content = &built.packet.content;
+        let rule_at = content.find("the rule").expect("rule");
+        let reference_at = content.find("the reference").expect("reference");
+        let instruction_at = content.find("fix the parser").expect("instruction");
+        assert!(
+            rule_at < reference_at && reference_at < instruction_at,
+            "{content}"
+        );
+        assert_eq!(
+            built.packet.token_estimate,
+            super::estimate_bytes(content.len())
+        );
+    }
+
+    /// A block over its cap is cut at a line boundary, before admission,
+    /// with a note naming where the rest is, and the cut is reported.
+    #[test]
+    fn a_block_over_its_cap_is_cut_at_a_line_with_a_note() {
+        let text = (0..200)
+            .map(|line| format!("line {line} of the session log"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = ContextBlock::optional("session-log", ContextBlockKind::Optional, text, 30)
+            .with_max_tokens(100)
+            .with_rest_at(".harness/sessions/log.md");
+        let built = build_with(vec![block], Vec::new(), 4096).expect("compiles");
+        assert_eq!(built.optional_block_ids, vec!["session-log".to_owned()]);
+        assert_eq!(built.cut_block_ids, vec!["session-log".to_owned()]);
+        let usage = built
+            .block_usage
+            .iter()
+            .find(|usage| usage.block_id == "session-log")
+            .expect("usage");
+        assert!(usage.included);
+        assert!(usage.token_estimate <= 100, "{usage:?}");
+        assert!(
+            usage.cut_from_tokens.is_some_and(|before| before > 100),
+            "{usage:?}"
+        );
+        let content = &built.packet.content;
+        let start = content.find("[reference session-log]").expect("block");
+        let rendered = &content[start
+            ..content[start..]
+                .find("\n\n")
+                .map_or(content.len(), |end| start + end)];
+        assert!(
+            rendered.contains("the rest is in .harness/sessions/log.md]"),
+            "{rendered}"
+        );
+        // Every line kept is whole.
+        for line in rendered.lines().skip(1) {
+            assert!(
+                line.ends_with("of the session log") || line.starts_with("[cut to about 100 of "),
+                "a line was cut in half: {line:?}"
+            );
+        }
+        assert!(!rendered.contains("line 199 "), "{rendered}");
+    }
+
+    /// A mandatory block over its cap is sent cut instead of failing the
+    /// whole request with an overflow.
+    #[test]
+    fn a_mandatory_block_over_its_cap_is_cut_instead_of_overflowing() {
+        let huge = "a line of the task state\n".repeat(2_000);
+        let uncapped = ContextBlock::mandatory("task-state", ContextBlockKind::Instruction, &*huge);
+        let error = build_with(vec![uncapped], Vec::new(), 0).expect_err("overflows");
+        assert_eq!(
+            error.code(),
+            harness_types::ErrorCode::MandatoryContextOverflow
+        );
+        let capped = ContextBlock::mandatory("task-state", ContextBlockKind::Instruction, huge)
+            .with_max_tokens(1_000);
+        let built = build_with(vec![capped], Vec::new(), 0).expect("cut, not overflowed");
+        assert!(built.mandatory_block_ids.contains(&"task-state".to_owned()));
+        assert_eq!(built.cut_block_ids, vec!["task-state".to_owned()]);
+        assert!(
+            built.mandatory_tokens <= 1_100,
+            "{}",
+            built.mandatory_tokens
+        );
+        assert!(
+            built.packet.content.contains("; the rest is left out]"),
+            "a cut with nowhere named says the rest is left out"
+        );
+    }
+
+    /// A block within its cap is sent as it is.
+    #[test]
+    fn a_block_within_its_cap_is_not_cut() {
+        let block = ContextBlock::optional("small", ContextBlockKind::Optional, "short\ntext", 1)
+            .with_max_tokens(100);
+        let built = build_with(vec![block], Vec::new(), 4096).expect("compiles");
+        assert!(built.cut_block_ids.is_empty());
+        assert!(
+            built
+                .packet
+                .content
+                .contains("[reference small]\nshort\ntext")
+        );
     }
 }

@@ -37,6 +37,8 @@ pub mod commands;
 pub mod config;
 #[path = "configuration/config_selector.rs"]
 pub mod config_selector;
+#[path = "memory/continuity.rs"]
+pub mod continuity;
 #[path = "application/controller.rs"]
 pub mod controller;
 #[path = "presentation/cost.rs"]

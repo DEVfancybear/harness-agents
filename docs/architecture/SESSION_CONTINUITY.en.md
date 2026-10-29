@@ -5,15 +5,44 @@ English | [Tiếng Việt](SESSION_CONTINUITY.vi.md)
 How a session of `ha` picks up where the last one stopped, and where each kind of
 information lives. Every mechanism below has its own job. Some overlap where
 they record the same moment from different sides (a decision can be in the task
-state, the handoff and a session log); when they disagree, the live task state
-wins, then the project's markdown store, then the newest session log, then the
-handoff, and each block that carries one says so.
+state, the handoff and a session log). When they disagree, one rule says which
+wins: "Where things stand" (below), which the system prompt carries once per
+request. Every other text that carries a record points to it by that name
+instead of stating its own order.
+
+## Where things stand
+
+The rule, as `WHERE_THINGS_STAND` in `crates/harness-cli/src/host/memory/continuity.rs`
+holds it (this list is kept in sync with that constant):
+
+1. the user's current message;
+2. this conversation's live task state (`task_state`);
+3. the project's markdown memory files (`memory/`, in a project that keeps them);
+4. the newest session log (`.harness/sessions`);
+5. `.harness/progress.md`, the handoff;
+6. a compaction summary.
+
+Everything below 2 is a record of earlier work that may be stale - and so are the memory
+digest and an earlier conversation's task state or turns, which rank with the session
+log: the agent checks one against the repository before acting on it. A new decision goes
+to `task_state` for this task and, in a project with markdown memory, to
+`memory/decisions/`.
+
+The rule is appended to the system prompt (after a `--system-prompt` or `SYSTEM.md` too),
+the part of the request that stays cached, so it is sent once per request. The texts that
+used to rank themselves point to it in one line: the session log's start block, the
+session brief, the earlier task state, the startup brief's handoff, `/handoff --reset`'s
+prompt, the compaction summary's prefix, the memory digest and the `memory` tool's
+guidance. The markdown store's policy says its files are the truth for durable project
+facts and decisions while the live `task_state` governs the current task. `/handoff` in a
+project with a markdown store sends decisions to `memory/decisions/` instead of a section
+of its own, as `/preserve` does.
 
 | Mechanism | Holds | Written by | Read by |
 | --- | --- | --- | --- |
 | Journal (project store) | Every turn verbatim: the user's words, the model's text, each tool call and result | The runtime, as the turn runs | `/resume`, `/tree`, forks, `history_search` / `history_read`, the session log, the session brief |
-| Task state (`task_state`) | One conversation's exact checklist: objective, steps done and open, decisions, constraints | The agent, through the `task_state` tool | Every turn of that conversation; the first 3 turns of the next conversation while items are open |
-| Handoff (`.harness/progress.md`) | The current state of the project: branch, verification, what is in progress, blocked, the next step, the commands | The agent, on `/handoff` | The first prompt of every session (first 6 KB), `/doctor`, the exit check |
+| Task state (`task_state`) | One conversation's exact checklist: objective, steps done and open, decisions, constraints | The agent, through the `task_state` tool | Every turn of that conversation (within about 4K tokens); the first 3 turns of a new conversation while items are open, as a short recap (see below) |
+| Handoff (`.harness/progress.md`) | The current state of the project: branch, verification, what is in progress, blocked, the next step, the commands | The agent, on `/handoff` | The first prompt of every session (within about 1.5K tokens, as a reference), `/doctor`, the exit check |
 | Session log | What one conversation settled: decisions with reasons, learnings, fixes, files changed, exact setup values, pending tasks, errors and workarounds, a resume paragraph | The host, with one model call from the journal | A new conversation's start (a short block), `/recall` |
 | Session brief | The previous conversation's last 3 turns, bounded excerpts | The host, from the journal, no model call | A new conversation's first turn, when the previous conversation has no session log |
 | Project instructions (`AGENTS.md`, else `CLAUDE.md`) | What every session needs: conventions, commands, structure, patterns, warnings | The user, or the agent on `/preserve` | Every turn |
@@ -133,10 +162,58 @@ The first prompt of a new conversation hears of the previous one once:
 - With no log, the session brief is sent as before.
 - When the previous conversation's task state is carried over (its checklist is exact),
   the log's pending tasks are left out so the steps are not listed twice.
-- The handoff stays in the startup brief as it is. When the log is newer than
-  `.harness/progress.md`, the block says so in one line.
+- The handoff is its own block of the startup brief (`session-handoff`), on the reference
+  channel. When the log is newer than `.harness/progress.md`, the block says so in one
+  line.
 
 Forks, imports, `/resume`, compaction and `/refinements off` add no such block.
+
+**Only a conversation that was left.** A conversation still open is not "the previous
+one": another pane of the same ha, a background agent, or a conversation another live ha
+process runs. Each turn holds its conversation open in a registry of the process (until
+the pane's next turn is of another conversation, or the pane goes) and leaves a mark under
+the project store (`open-conversations/<task>`, naming the process); a conversation whose
+log is owed by a live process counts as open too. The session log's start block, the
+session brief and the earlier task state all pass over an open conversation.
+
+**The earlier task state.** A new conversation's first 3 turns hear of the task the newest
+conversation with a task state left unfinished, as an optional reference block
+(`earlier-task-state`): the state's recap and up to 10 open items, within about 1.5K
+tokens, and a pointer to `/resume`. It is not offered when that state is older than 7 days
+(by its file's time), nor once 3 other new conversations were shown it and none adopted it
+(a conversation that adopts it keeps a state of its own, which is newer); the
+conversations shown it are kept in `task_state.offered.json` beside the state.
+
+## The context budget
+
+Every block a turn's context carries has a place in one budget
+(`ContextBuilder`, `crates/harness-session/src/context.rs`):
+
+- A host block that is not mandatory goes through the optional path: optional blocks are
+  ranked by relevance and admitted while they fit `RuntimeConfig::optional_token_budget`
+  (`OPTIONAL_TOKEN_BUDGET`, 9,000 tokens: the digest's 3K and the start blocks' 6K fit
+  together). One that does not fit is left out.
+- A block may carry `max_tokens`. One over it is cut at a line boundary, before
+  admission, with a note at its end saying it was cut and where the rest is; a mandatory
+  block over its cap is cut instead of overflowing the window.
+- The rules and the host's facts come first, then the optional blocks by rank, then the
+  user's message, the working state and the tail, so the request ends with what the turn
+  is about.
+- `/context` shows each block's size, and for a cut one the size it was cut from; a block
+  left out says why. The diagnostics record `context` `budget` (`cut`, `dropped`,
+  `mandatory_tokens`, `optional_tokens`) for a packet that cut or dropped a block.
+
+| Block | Mandatory | Cap (tokens) | Rank |
+| --- | --- | --- | --- |
+| `task-state` (this conversation's) | yes | 4,000 (done items as a count, the newest decisions) | - |
+| `recalled-skill` | yes | 1,500 | - |
+| `harness_state` (the memory digest) | no | 3,000 | 70 |
+| `session-start` (commits, uncommitted, the baseline check) | no | 800 | 55 |
+| `earlier-task-state` | no | 1,500 | 50 |
+| `session-log` | no | 1,500 | 42 |
+| `knowledge-catalog` | no | 1,500 | 40 |
+| `session-handoff` | no | 1,500 | 38 |
+| `recent-session` (the session brief) | no | 1,500 | 30 |
 
 ## Commands
 

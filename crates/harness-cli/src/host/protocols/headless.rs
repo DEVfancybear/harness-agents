@@ -921,6 +921,12 @@ pub async fn run_with(
             super::prompt::volatile_facts(&prompt_environment),
         )
     };
+    // The precedence rule for where things stand, once, as in the app.
+    let mut system_prompt = system_prompt;
+    super::continuity::with_rule(&mut system_prompt);
+    // The run's conversation is open while it runs: an app conversation
+    // started meanwhile is not offered its task state or its turns.
+    let _open = super::continuity::OpenConversation::hold(&context.project_store_dir(), &task_id);
     let run_request = RunRequest::new(
         session_id.clone(),
         task_id.clone(),

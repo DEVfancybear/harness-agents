@@ -4,8 +4,8 @@
 //!
 //! - Start: the first prompt of a session carries a brief the harness gathers
 //!   itself - the latest commits, what is uncommitted, and the handoff the last
-//!   session wrote in `.harness/progress.md` - so the agent does not rediscover
-//!   the project's state.
+//!   session wrote in `.harness/progress.md`, a record the agent checks
+//!   against the repository, as "Where things stand" ranks it.
 //! - Handoff: `/handoff [focus]` has the agent write that file in a fixed shape
 //!   (state, verification, decisions, next step); `/handoff --reset` then opens
 //!   a fresh conversation that starts from it, the context reset the lectures
@@ -18,13 +18,21 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Command;
 
-use harness_session::{ContextBlock, ContextBlockKind};
+use harness_session::{ContextBlock, ContextBlockKind, ContextChannel};
 
 /// The handoff file, relative to the workspace root.
 pub const PROGRESS_FILE: &str = ".harness/progress.md";
 
-/// How much of the handoff a session's first prompt carries.
-const HANDOFF_BRIEF_BYTES: usize = 6 * 1024;
+/// How much of the handoff is read for a session's first prompt; the block
+/// that carries it is cut to [`HANDOFF_TOKENS`].
+const HANDOFF_BRIEF_BYTES: usize = 16 * 1024;
+
+/// The most tokens the handoff takes in a session's first prompt.
+const HANDOFF_TOKENS: u64 = 1_500;
+
+/// The most tokens the rest of the startup brief - the commits, what is
+/// uncommitted, the baseline check - takes.
+const START_TOKENS: u64 = 800;
 
 /// Commits the brief shows.
 const BRIEF_COMMITS: usize = 5;
@@ -57,7 +65,7 @@ pub fn handoff_stamp(root: &Path) -> Option<HandoffStamp> {
 }
 
 /// What `/handoff --reset` asks the fresh conversation.
-pub const CONTINUE_FROM_HANDOFF: &str = "Continue from the handoff the previous session left in .harness/progress.md (shown in the session brief): check its current state against the repository, then carry on with its next step.";
+pub const CONTINUE_FROM_HANDOFF: &str = "Continue from the handoff the previous session left in .harness/progress.md (shown in the session brief). It is a record that may be stale (\"Where things stand\" ranks it): check its current state against the repository, then carry on with its next step where it still holds.";
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
@@ -119,8 +127,13 @@ fn concerns_project(prompt: &str, documents: &[&str]) -> bool {
 /// The brief a session's first prompt carries, when there is anything to say.
 /// It asks for a baseline check outright when the prompt concerns the project,
 /// and leaves the call to the model otherwise.
+///
+/// Two optional blocks: `session-start`, what the harness read of the
+/// repository just now, and `session-handoff`, the handoff the last session
+/// left, on the reference channel - a record that may be stale, ranked by
+/// "Where things stand", not an instruction.
 #[must_use]
-pub fn startup_brief(root: &Path, prompt: &str) -> Option<ContextBlock> {
+pub fn startup_brief(root: &Path, prompt: &str) -> Vec<ContextBlock> {
     let mut text = String::new();
     // The reads are independent; each is a process start on Windows, so they
     // run side by side.
@@ -186,24 +199,31 @@ pub fn startup_brief(root: &Path, prompt: &str) -> Option<ContextBlock> {
         documents.extend(handoff.lines().filter(|line| !line.trim().is_empty()));
     }
     let baseline = concerns_project(prompt, &documents);
-    if let Some((handoff, cut)) = handoff {
-        let _ = write!(
-            text,
-            "\nHandoff from the last session ({PROGRESS_FILE}):\n{}{}\n",
-            handoff.trim_end(),
-            if cut {
-                "\n[cut: read the file for the rest]"
-            } else {
-                ""
-            }
-        );
-    }
-    if text.is_empty() {
-        return None;
+    let handoff = handoff.map(|(handoff, cut)| {
+        ContextBlock::optional(
+            "session-handoff",
+            ContextBlockKind::Optional,
+            format!(
+                "Handoff from the last session ({PROGRESS_FILE}) - a record that may be stale (\"Where things stand\" ranks it): check it against the repository before acting on it.\n{}{}",
+                handoff.trim_end(),
+                if cut {
+                    "\n[cut: read the file for the rest]"
+                } else {
+                    ""
+                }
+            ),
+            38,
+        )
+        .on_channel(ContextChannel::Reference)
+        .with_max_tokens(HANDOFF_TOKENS)
+        .with_rest_at(PROGRESS_FILE)
+    });
+    if text.is_empty() && handoff.is_none() {
+        return Vec::new();
     }
     text.insert_str(
         0,
-        "Session start - the harness gathered where the project stands, so you need not rediscover it:\n\n",
+        "Session start - what the harness read of the project just now:\n\n",
     );
     // A shared term settles it; without one the prompt may still be a task
     // written in other words or another language than the project's, so the
@@ -213,23 +233,39 @@ pub fn startup_brief(root: &Path, prompt: &str) -> Option<ContextBlock> {
     } else {
         text.push_str("\nIf this request asks you to change the project, first check that the starting state is sound (the project's checks pass) and fix a broken baseline before building on it. If it is a greeting or a question, answer it directly without running the checks.");
     }
-    Some(ContextBlock::mandatory(
-        "session-start",
-        ContextBlockKind::Instruction,
-        text,
-    ))
+    std::iter::once(
+        ContextBlock::optional("session-start", ContextBlockKind::Instruction, text, 55)
+            .with_max_tokens(START_TOKENS),
+    )
+    .chain(handoff)
+    .collect()
 }
 
-/// What `/handoff [focus]` asks the agent.
+/// What `/handoff [focus]` asks the agent. In a project that keeps a
+/// markdown memory store, the decisions go to its `memory/decisions/`, as
+/// `/preserve` sends them, and the handoff has no section of its own for them:
+/// two homes for one decision is how they came to disagree.
 #[must_use]
-pub fn handoff_request(focus: Option<&str>) -> String {
+pub fn handoff_request(root: &Path, focus: Option<&str>) -> String {
     let focus = focus
         .map(str::trim)
         .filter(|focus| !focus.is_empty())
         .map(|focus| format!("\n\nFocus on: {focus}"))
         .unwrap_or_default();
+    let has_store = root.join(super::markdown_memory::CONFIG_FILE).is_file();
+    let (decisions, store) = if has_store {
+        (
+            "",
+            "\n\nThis project keeps a markdown memory store: write each decision this session took to memory/decisions/, tagged as its policy says, not in the handoff.",
+        )
+    } else {
+        (
+            "## Decisions (what was chosen, and why the alternatives were not)\n",
+            "",
+        )
+    };
     format!(
-        "Write the session handoff to {PROGRESS_FILE} now. The next session - possibly another agent with none of this conversation - starts from that file alone. Replace the file's \"Current state\" part and keep any older session log below it, adding one entry for this session. Use this shape:\n\n# Progress\n\n## Current state\n- Branch and last commit:\n- Verification: which checks ran and their result (run the project's checks now if you are not sure)\n- Active feature or task:\n\n## Done this session\n## In progress\n## Blocked or known issues\n## Decisions (what was chosen, and why the alternatives were not)\n## Next step (one concrete action)\n## Commands (start, verify, a focused debug command)\n\n## Session log\n- <date>: <one line on what this session did>\n\nBe specific - paths, commands, exact error messages - and write nothing you did not verify. Then say in one line what the next step is.{focus}"
+        "Write the session handoff to {PROGRESS_FILE} now. The next session - possibly another agent with none of this conversation - starts from that file alone. Replace the file's \"Current state\" part and keep any older session log below it, adding one entry for this session. Use this shape:\n\n# Progress\n\n## Current state\n- Branch and last commit:\n- Verification: which checks ran and their result (run the project's checks now if you are not sure)\n- Active feature or task:\n\n## Done this session\n## In progress\n## Blocked or known issues\n{decisions}## Next step (one concrete action)\n## Commands (start, verify, a focused debug command)\n\n## Session log\n- <date>: <one line on what this session did>\n\nBe specific - paths, commands, exact error messages - and write nothing you did not verify. Then say in one line what the next step is.{store}{focus}"
     )
 }
 
@@ -383,16 +419,40 @@ mod tests {
             "# Progress\n## Next step\nwire the parser into main",
         )
         .expect("handoff");
-        let brief = startup_brief(root.path(), "wire the parser")
-            .expect("a brief")
-            .text;
+        let blocks = startup_brief(root.path(), "wire the parser");
+        let ids = blocks
+            .iter()
+            .map(|block| block.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["session-start", "session-handoff"]);
+        let brief = &blocks[0].text;
         assert!(brief.contains("add the parser"), "{brief}");
-        assert!(brief.contains("wire the parser into main"), "{brief}");
         assert!(brief.contains("Uncommitted (1 file(s))"), "{brief}");
         assert!(brief.contains("Before new work"), "{brief}");
+        assert!(!brief.contains("need not rediscover"), "{brief}");
+        // The handoff is a record on the reference channel, ranked by the
+        // precedence rule, and both blocks compete in the optional budget.
+        let handoff = &blocks[1];
+        assert!(
+            handoff.text.contains("wire the parser into main"),
+            "{}",
+            handoff.text
+        );
+        assert!(
+            handoff.text.contains("\"Where things stand\""),
+            "{}",
+            handoff.text
+        );
+        assert_eq!(handoff.channel, harness_session::ContextChannel::Reference);
+        assert_eq!(handoff.rest_at.as_deref(), Some(PROGRESS_FILE));
+        assert!(
+            blocks
+                .iter()
+                .all(|block| !block.mandatory && block.max_tokens.is_some())
+        );
         let empty = tempfile::tempdir().expect("empty");
         assert!(
-            startup_brief(empty.path(), "wire the parser").is_none(),
+            startup_brief(empty.path(), "wire the parser").is_empty(),
             "nothing to say"
         );
     }
@@ -418,7 +478,11 @@ mod tests {
             // A task in words the project does not use: the model decides.
             ("thêm tính năng thanh toán", false),
         ] {
-            let brief = startup_brief(root.path(), prompt).expect("a brief").text;
+            let brief = startup_brief(root.path(), prompt)
+                .into_iter()
+                .next()
+                .expect("a brief")
+                .text;
             assert!(brief.contains("Recent commits"), "{prompt}: {brief}");
             assert_eq!(brief.contains("Before new work"), asks, "{prompt}: {brief}");
             assert_eq!(
@@ -465,10 +529,29 @@ mod tests {
 
     #[test]
     fn the_handoff_request_names_the_file_and_the_shape() {
-        let text = handoff_request(Some("the parser"));
+        let root = tempfile::tempdir().expect("root");
+        let text = handoff_request(root.path(), Some("the parser"));
         assert!(text.contains(PROGRESS_FILE));
         assert!(text.contains("## Next step"));
+        assert!(text.contains("## Decisions"));
         assert!(text.contains("Focus on: the parser"));
+        // A markdown store keeps the decisions; the handoff points there.
+        std::fs::write(
+            root.path().join(super::super::markdown_memory::CONFIG_FILE),
+            "{}",
+        )
+        .expect("store");
+        let text = handoff_request(root.path(), None);
+        assert!(!text.contains("## Decisions"), "{text}");
+        assert!(text.contains("memory/decisions/"), "{text}");
+    }
+
+    /// `/handoff --reset` ranks the handoff by the precedence rule instead
+    /// of telling the fresh conversation to carry on with it as it is.
+    #[test]
+    fn continuing_from_the_handoff_points_to_the_rule() {
+        assert!(super::CONTINUE_FROM_HANDOFF.contains("\"Where things stand\""));
+        assert!(super::CONTINUE_FROM_HANDOFF.contains("against the repository"));
     }
 
     #[test]

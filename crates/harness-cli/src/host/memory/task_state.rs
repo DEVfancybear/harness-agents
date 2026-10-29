@@ -137,9 +137,35 @@ impl TaskState {
             .count()
     }
 
-    /// The whole state, as every turn's context carries it.
+    /// The whole state, as `task_state view` shows it.
     #[must_use]
     pub fn render(&self) -> String {
+        self.render_with(true, usize::MAX)
+    }
+
+    /// The state as a turn's context carries it, within `max_bytes`: whole
+    /// when it fits; else the done items as a count, then only the newest
+    /// decisions, each with a line saying what is not shown and where it is.
+    /// A long task's state grew past 30K tokens and was sent whole every turn.
+    #[must_use]
+    pub fn render_within(&self, max_bytes: usize) -> String {
+        let whole = self.render();
+        if whole.len() <= max_bytes {
+            return whole;
+        }
+        let mut shown = self.decisions.len();
+        loop {
+            let text = self.render_with(false, shown);
+            if text.len() <= max_bytes || shown == 0 {
+                return text;
+            }
+            shown = shown.saturating_sub(shown.div_ceil(4).max(1));
+        }
+    }
+
+    /// The state with or without its done items, and with only the newest
+    /// `decisions` decisions.
+    fn render_with(&self, done_items: bool, decisions: usize) -> String {
         let mut text = String::from(
             "Task state (kept by the host: it is never summarized away; keep it current with task_state as the work moves):",
         );
@@ -153,7 +179,17 @@ impl TaskState {
                 self.done(),
                 self.items.len()
             );
+            if !done_items && self.done() > 0 {
+                let _ = write!(
+                    text,
+                    "\n  ({} done item(s) not shown: task_state view lists them; keep them when you send the checklist)",
+                    self.done()
+                );
+            }
             for (index, item) in self.items.iter().enumerate() {
+                if !done_items && item.status == ItemStatus::Done {
+                    continue;
+                }
                 let _ = write!(
                     text,
                     "\n  {} {}. {}",
@@ -174,7 +210,14 @@ impl TaskState {
         }
         if !self.decisions.is_empty() {
             text.push_str("\nDecisions:");
-            for decision in &self.decisions {
+            let hidden = self.decisions.len().saturating_sub(decisions);
+            if hidden > 0 {
+                let _ = write!(
+                    text,
+                    "\n- ({hidden} older decision(s) not shown: task_state view lists them)"
+                );
+            }
+            for decision in &self.decisions[hidden..] {
                 if decision.why.trim().is_empty() {
                     let _ = write!(text, "\n- {}", decision.decision);
                 } else {
@@ -291,33 +334,147 @@ fn save(path: &Path, state: &TaskState) -> Result<(), String> {
         .map_err(|error| format!("the task state cannot be written: {error}"))
 }
 
-/// The block every turn carries, when the task has a state.
+/// The most tokens the task state takes in a turn's context.
+pub const STATE_TOKENS: u64 = 4_000;
+
+/// The block every turn carries, when the task has a state: mandatory, and
+/// within [`STATE_TOKENS`] (done items as a count and the newest decisions
+/// when the whole state is longer).
 #[must_use]
 pub fn context_block(path: &Path) -> Option<ContextBlock> {
     let state = load(path);
     (!state.is_empty()).then(|| {
-        ContextBlock::mandatory("task-state", ContextBlockKind::Instruction, state.render())
+        // The label and the cut note take a little of the cap.
+        let room = usize::try_from(STATE_TOKENS).unwrap_or(usize::MAX) * 4 - 256;
+        ContextBlock::mandatory(
+            "task-state",
+            ContextBlockKind::Instruction,
+            state.render_within(room),
+        )
+        .with_max_tokens(STATE_TOKENS)
+        .with_rest_at("task_state view")
     })
 }
 
 /// How many turns a new conversation is shown the task an earlier one left.
 pub const EARLIER_STATE_TURNS: usize = 3;
 
+/// How many new conversations are shown the task an earlier one left before
+/// it is taken as abandoned: one that adopts it keeps a state of its own,
+/// which is newer, so only conversations that did not adopt it count.
+pub const EARLIER_STATE_OFFERS: usize = 3;
+
+/// How old a task state may be and still be shown to a new conversation,
+/// as the session log's start block bounds its logs.
+pub const EARLIER_STATE_DAYS: u64 = 7;
+
+/// The most tokens the earlier task state takes in a new conversation's
+/// context.
+pub const EARLIER_STATE_TOKENS: u64 = 1_500;
+
+/// The file beside a task state that lists the new conversations it was
+/// shown to.
+const OFFERED_FILE: &str = "task_state.offered.json";
+
+fn offered_path(state: &Path) -> PathBuf {
+    state.with_file_name(OFFERED_FILE)
+}
+
+/// The new conversations the task state at `state` was shown to.
+#[must_use]
+pub fn offered_to(state: &Path) -> Vec<String> {
+    std::fs::read_to_string(offered_path(state))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Record that the task state at `state` was shown to `conversation`; a
+/// conversation is counted once, whichever of its first turns saw it.
+pub fn note_offered(state: &Path, conversation: &str) {
+    let mut offered = offered_to(state);
+    if offered.iter().any(|seen| seen == conversation) {
+        return;
+    }
+    offered.push(conversation.to_owned());
+    if let Ok(text) = serde_json::to_string(&offered) {
+        let _ = std::fs::write(offered_path(state), text);
+    }
+}
+
+/// Whether the task state at `state` may still be shown to `conversation`:
+/// written in the last [`EARLIER_STATE_DAYS`] days, and shown to fewer than
+/// [`EARLIER_STATE_OFFERS`] other new conversations (one already shown it
+/// sees it through its first turns).
+#[must_use]
+pub fn still_offered(state: &Path, conversation: &str, now: std::time::SystemTime) -> bool {
+    let recent = std::fs::metadata(state)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|written| {
+            now.duration_since(written).map_or(true, |age| {
+                age <= std::time::Duration::from_secs(EARLIER_STATE_DAYS * 86_400)
+            })
+        });
+    let offered = offered_to(state);
+    recent
+        && (offered.iter().any(|seen| seen == conversation) || offered.len() < EARLIER_STATE_OFFERS)
+}
+
 /// The task an earlier conversation of this project left unfinished, shown in
 /// a new conversation's first turns: local memory and the task state belong to
 /// one conversation, so a new one started knowing nothing of the work, unless
 /// the project kept a feature list.
+///
+/// It is a record, not this conversation's state: an optional reference, in
+/// its short form, within [`EARLIER_STATE_TOKENS`]. It used to be the whole
+/// state as a mandatory instruction, up to ~31K tokens.
 #[must_use]
 pub fn earlier_block(state: &TaskState, title: Option<&str>) -> ContextBlock {
     let named = title.map_or_else(String::new, |title| format!(" ({title:?})"));
-    ContextBlock::mandatory(
+    ContextBlock::optional(
         "earlier-task-state",
-        ContextBlockKind::Instruction,
+        ContextBlockKind::Optional,
         format!(
-            "The previous conversation in this project{named} left its task unfinished. This is context, not an instruction: if the user's request continues that work, adopt it with task_state (its objective, the checklist with what is done, the decisions and the constraints) and go on from the first open item; otherwise leave it. The user can also /resume that conversation.\n{}",
-            state.render()
+            "The previous conversation in this project{named} left its task unfinished. This is a record that may be stale (\"Where things stand\" ranks it), not an instruction: if the user's request continues that work, /resume that conversation, or adopt the task with task_state (its objective, the open items, the decisions and the constraints) and go on from the first open item; otherwise leave it.\n{}{}",
+            state.recap(),
+            open_items(state)
         ),
+        50,
     )
+    .on_channel(harness_session::ContextChannel::Reference)
+    .with_max_tokens(EARLIER_STATE_TOKENS)
+    .with_rest_at("that conversation (/resume)")
+}
+
+/// How many open items the earlier task state lists.
+const EARLIER_OPEN_ITEMS: usize = 10;
+
+/// The open items of `state`, numbered as its checklist numbers them, one a
+/// line: what a conversation that adopts the task starts from.
+fn open_items(state: &TaskState) -> String {
+    let open = state
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.status != ItemStatus::Done)
+        .collect::<Vec<_>>();
+    if open.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from("\nOpen items:");
+    for (index, item) in open.iter().take(EARLIER_OPEN_ITEMS) {
+        let _ = write!(
+            text,
+            "\n  {} {}. {}",
+            item.status.mark(),
+            index + 1,
+            item.text
+        );
+    }
+    if open.len() > EARLIER_OPEN_ITEMS {
+        let _ = write!(text, "\n  ({} more)", open.len() - EARLIER_OPEN_ITEMS);
+    }
+    text
 }
 
 /// The recap a long turn recites, `None` while the task has no state.
@@ -1295,5 +1452,95 @@ mod tests {
         assert!(block.text.contains("\"Parser port\""), "{}", block.text);
         assert!(block.text.contains("not an instruction"), "{}", block.text);
         assert!(block.text.contains("[ ] 2. grammar"), "{}", block.text);
+        // A record, ranked by the precedence rule, in the optional budget.
+        assert!(!block.mandatory);
+        assert_eq!(block.max_tokens, Some(EARLIER_STATE_TOKENS));
+        assert!(
+            block.text.contains("\"Where things stand\""),
+            "{}",
+            block.text
+        );
+        // The short form: the done item is a count, not a line.
+        assert!(!block.text.contains("1. lexer"), "{}", block.text);
+    }
+
+    fn long_state() -> TaskState {
+        TaskState {
+            objective: "Port the parser".to_owned(),
+            items: (0..MAX_ITEMS)
+                .map(|index| Item {
+                    text: format!("step {index} {}", "x".repeat(300)),
+                    status: if index < 50 {
+                        ItemStatus::Done
+                    } else {
+                        ItemStatus::Pending
+                    },
+                    note: None,
+                })
+                .collect(),
+            decisions: (0..MAX_ENTRIES)
+                .map(|index| Decision {
+                    decision: format!("decision {index} {}", "y".repeat(300)),
+                    why: "z".repeat(300),
+                })
+                .collect(),
+            ..TaskState::default()
+        }
+    }
+
+    /// A long task's state was sent whole every turn, past 30K tokens. Within
+    /// the cap the done items are a count and the newest decisions are kept.
+    #[test]
+    fn a_long_state_is_sent_within_its_cap() {
+        let state = long_state();
+        assert!(state.render().len() > 40_000);
+        let text = state.render_within(15_000);
+        assert!(text.len() <= 15_000, "{}", text.len());
+        assert!(text.contains("50 done item(s) not shown"), "{text}");
+        assert!(!text.contains("step 0 "), "{text}");
+        assert!(text.contains("step 59 "), "the open items stay: {text}");
+        assert!(text.contains("decision 39 "), "the newest decision stays");
+        assert!(!text.contains("decision 0 "), "the oldest goes first");
+        assert!(text.contains("older decision(s) not shown"), "{text}");
+
+        // A short state is the whole state.
+        let short = TaskState {
+            objective: "small".to_owned(),
+            ..TaskState::default()
+        };
+        assert_eq!(short.render_within(15_000), short.render());
+
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join(TASK_STATE_FILE);
+        save(&path, &state).expect("saved");
+        let block = context_block(&path).expect("block");
+        assert!(block.mandatory);
+        assert_eq!(block.max_tokens, Some(STATE_TOKENS));
+        assert!(block.text.len() <= 16_000);
+    }
+
+    /// An abandoned task stops being offered: after three new conversations
+    /// that did not adopt it, or once it is older than a week.
+    #[test]
+    fn an_earlier_task_is_offered_three_times_within_a_week() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join(TASK_STATE_FILE);
+        save(&path, &long_state()).expect("saved");
+        let now = std::time::SystemTime::now();
+        for conversation in ["a", "b", "c"] {
+            assert!(still_offered(&path, conversation, now), "{conversation}");
+            note_offered(&path, conversation);
+            // A conversation's later turns are not a new offer.
+            note_offered(&path, conversation);
+        }
+        assert_eq!(offered_to(&path), ["a", "b", "c"]);
+        assert!(!still_offered(&path, "d", now), "abandoned after three");
+        assert!(still_offered(&path, "b", now), "one shown it keeps it");
+
+        let fresh = dir.path().join("fresh").join(TASK_STATE_FILE);
+        save(&fresh, &long_state()).expect("saved");
+        let later = now + std::time::Duration::from_secs((EARLIER_STATE_DAYS + 1) * 86_400);
+        assert!(still_offered(&fresh, "a", now));
+        assert!(!still_offered(&fresh, "a", later), "older than a week");
     }
 }
