@@ -3,7 +3,11 @@
 [English](SESSION_CONTINUITY.en.md) | Tiếng Việt
 
 Cách một phiên `ha` tiếp tục từ chỗ phiên trước dừng lại, và mỗi loại thông tin nằm ở
-đâu. Mỗi cơ chế dưới đây có một việc riêng; không cơ chế nào giữ bản sao của cơ chế khác.
+đâu. Mỗi cơ chế dưới đây có một việc riêng. Có chỗ chồng lên nhau khi chúng ghi cùng
+một khoảnh khắc từ các phía khác nhau (một quyết định có thể nằm trong task state,
+handoff và một session log); khi chúng khác nhau, task state đang chạy thắng, rồi
+đến kho markdown của project, rồi session log mới nhất, rồi handoff, và khối nào
+mang một cơ chế thì nói rõ điều đó.
 
 | Cơ chế | Giữ gì | Ai ghi | Ai đọc |
 | --- | --- | --- | --- |

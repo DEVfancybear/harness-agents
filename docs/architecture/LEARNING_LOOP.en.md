@@ -49,8 +49,16 @@ its state and standing. The review answers with a `lessons` array:
 
 The host checks each signal:
 
-- The evidence must occur in the conversation, whitespace and case aside, and
-  be a phrase (12 characters or more): a word or two is found anywhere.
+- The evidence must occur in the turns not reviewed yet, whitespace and case
+  aside, and be a phrase (12 characters or more): a word or two is found
+  anywhere.
+- It must be said by whom its kind needs: a correction or a preference in the
+  user's words; a wrong assumption or an error's fix in a tool result or the
+  user's words. The agent's own text is never evidence, and neither is what it
+  read back from its memory (`memory`, `knowledge`, `history_*` results).
+- No secret, in the text or the quote.
+- One conversation gives a lesson at most 2 of its weight, so the gate's 3
+  always needs a second conversation.
 - A signal that names a lesson must name one that exists, is not retired, and
   is this project's when it is a project's.
 - A new lesson needs its text, a kind, and a project when its scope is `project`.
@@ -191,7 +199,7 @@ went into them, not beside them.
 | Confidence 0.3 / 0.5 / 0.7 / 0.85 by count; +0.05 / -0.1 / decay are documented, not implemented | `confidence` from the case: weight under 3 is 0.3, 3-5 is 0.5, 6-10 is 0.7, 11+ is 0.85, each contradicting conversation 0.1 off; old signals count half | The gate still promotes; the confidence says how much the case has grown |
 | SessionStart injects instincts at 0.7+, top 6 | A promoted rule is a `constraints` entry, in every turn | |
 | `promote <id>`; auto-promote at 2+ projects and average 0.8 | `ha learning promote <id>`; the meditation's `generalize` makes one lesson for every project of the same lesson in two or more projects, which then passes the gate as any other | A model judges "the same lesson", not keyword overlap; the gate, not an average, decides |
-| `/evolve` clusters instincts by trigger keywords into skills, commands and agents written where nothing loads them | The meditation's `evolve` gathers two or more promoted rules of one workflow into a learned skill, through the learned-skill promoter and its checks, into the library the agent loads | The skill is live; the rules stay in every turn |
+| `/evolve` clusters instincts by trigger keywords into skills, commands and agents written where nothing loads them | The meditation's `evolve` gathers two or more promoted rules of one workflow into a learned skill, through the learned-skill promoter and its checks, into the library the agent loads | The skill is live, and holds the rules: each rule's own entry or decision line is taken back (placement `skill`), so the workflow is kept in one place. Its rules must hold where the skill does: all for every project, or all this project's |
 | `export` / `import` (file or https), `status` | `ha learning export`, `import <file>`, `status` | Files only: an import is the user's |
 
 A rule the review writes into a learned skill (`skillFiles`) is reported with

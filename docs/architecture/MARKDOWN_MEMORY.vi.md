@@ -32,7 +32,7 @@ viết dòng đó, `diff` là việc thay thế.
 |---|---|---|
 | Nằm ở | `<data>/harness/memory.sqlite3`, theo hội thoại và global | Các file trong project, trong Git |
 | Giữ | Sở thích và quyết định của người dùng xuyên project, trạng thái việc | Người, quyết định, trạng thái và bài học của project này |
-| Ai ghi | Tool `memory`, lượt review, Deep Dream | Tool file của agent, và người dùng bằng editor |
+| Ai ghi | Tool `memory`, lượt review, Deep Dream | Tool file của agent và người dùng bằng editor; cả host: decision và fact của learning loop, và phần của session log trong daily note |
 | Đọc | Digest ở mọi lượt, tìm bằng `memory` | `MEMORY.md` ở mọi lượt; các file khi index chỉ tới |
 
 ## 3. Lệnh

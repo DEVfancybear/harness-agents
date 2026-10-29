@@ -49,8 +49,16 @@ kèm trạng thái và độ vững. Review trả về mảng `lessons`:
 
 Host kiểm tra từng tín hiệu:
 
-- Evidence phải xuất hiện trong hội thoại (bỏ qua khoảng trắng và hoa thường)
-  và phải là một cụm từ (từ 12 ký tự trở lên): một hai chữ thì ở đâu cũng có.
+- Evidence phải xuất hiện trong các lượt chưa được review (bỏ qua khoảng trắng
+  và hoa thường) và phải là một cụm từ (từ 12 ký tự trở lên): một hai chữ thì ở
+  đâu cũng có.
+- Nó phải do đúng người nói theo kind của nó: lời sửa hay sở thích thì là lời
+  của người dùng; giả định sai hay cách sửa lỗi thì là tool result hoặc lời của
+  người dùng. Lời của chính agent không bao giờ là bằng chứng, và những gì nó đọc
+  lại từ memory của mình (kết quả `memory`, `knowledge`, `history_*`) cũng vậy.
+- Không có secret, trong text hay trong trích dẫn.
+- Một hội thoại góp tối đa 2 vào weight của một lesson, nên ngưỡng 3 luôn cần
+  một hội thoại thứ hai.
 - Tín hiệu chỉ tới một lesson thì lesson đó phải tồn tại, chưa bị retire, và
   phải thuộc project này nếu là lesson của project.
 - Lesson mới cần có text, kind, và project khi scope là `project`. Text là dữ
@@ -188,7 +196,7 @@ năng của v2 được đưa vào lesson chứ không đặt thành một cơ c
 | Độ tin cậy 0.3 / 0.5 / 0.7 / 0.85 theo số lần; +0.05 / -0.1 / suy giảm chỉ có trong tài liệu, không có trong code | `confidence` tính từ độ vững: weight dưới 3 là 0.3, 3-5 là 0.5, 6-10 là 0.7, từ 11 là 0.85, mỗi hội thoại phản bác trừ 0.1; tín hiệu cũ tính một nửa | Ngưỡng vẫn là thứ promote; confidence cho biết độ vững đã tăng bao nhiêu |
 | SessionStart chèn instinct từ 0.7, tối đa 6 | Rule đã promote là entry `constraints`, có ở mọi lượt | |
 | `promote <id>`; tự promote khi có ở 2+ project và trung bình 0.8 | `ha learning promote <id>`; `generalize` của meditation gộp cùng một lesson ở hai project trở lên thành một lesson cho mọi project, rồi lesson đó qua ngưỡng như mọi lesson khác | Model phán xét "cùng một lesson", không phải trùng từ khoá; ngưỡng quyết định, không phải trung bình |
-| `/evolve` gom instinct theo từ khoá trong trigger thành skill, command và agent, ghi vào chỗ không gì nạp | `evolve` của meditation gom hai rule đã promote trở lên của cùng một workflow thành một learned skill, qua bộ promote learned skill và các check của nó, vào thư viện agent nạp skill | Skill dùng được ngay; các rule vẫn ở mọi lượt |
+| `/evolve` gom instinct theo từ khoá trong trigger thành skill, command và agent, ghi vào chỗ không gì nạp | `evolve` của meditation gom hai rule đã promote trở lên của cùng một workflow thành một learned skill, qua bộ promote learned skill và các check của nó, vào thư viện agent nạp skill | Skill dùng được ngay và giữ các rule: entry hay dòng decision riêng của từng rule được gỡ ra (placement `skill`), nên workflow chỉ nằm ở một chỗ. Các rule phải có hiệu lực ở cùng chỗ với skill: tất cả cho mọi project, hoặc tất cả của project này |
 | `export` / `import` (file hoặc https), `status` | `ha learning export`, `import <file>`, `status` | Chỉ file: import là việc của người dùng |
 
 Một rule mà review ghi vào learned skill (`skillFiles`) được báo với

@@ -3,8 +3,11 @@
 English | [Tiếng Việt](SESSION_CONTINUITY.vi.md)
 
 How a session of `ha` picks up where the last one stopped, and where each kind of
-information lives. Every mechanism below has its own job; none keeps a copy of
-another's.
+information lives. Every mechanism below has its own job. Some overlap where
+they record the same moment from different sides (a decision can be in the task
+state, the handoff and a session log); when they disagree, the live task state
+wins, then the project's markdown store, then the newest session log, then the
+handoff, and each block that carries one says so.
 
 | Mechanism | Holds | Written by | Read by |
 | --- | --- | --- | --- |

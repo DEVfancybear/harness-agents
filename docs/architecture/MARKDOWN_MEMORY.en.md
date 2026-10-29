@@ -31,7 +31,7 @@ Git is the store's history: `log` is when a fact held, `blame` who wrote a line,
 |---|---|---|
 | Where | `<data>/harness/memory.sqlite3`, per conversation and global | Files in the project, in Git |
 | Holds | The user's preferences and decisions across projects, task state | This project's people, decisions, state and lessons |
-| Written by | The `memory` tool, the review, Deep Dream | The agent's file tools, and people with an editor |
+| Written by | The `memory` tool, the review, Deep Dream | The agent's file tools and people with an editor; the host too: the learning loop's decisions and facts, and the session log's section of the day's note |
 | Read | The digest in every turn, `memory` search | `MEMORY.md` in every turn; the files when the index routes there |
 
 ## 3. Commands
