@@ -33,6 +33,8 @@ use regex::Regex;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
+use super::files::write_atomic;
+
 /// Marks a skill folder as written by ha.
 pub const MARKER_FILE: &str = ".ha-learned.json";
 /// Why each change to a learned skill was made.
@@ -1632,24 +1634,6 @@ fn append_ledger(directory: &Path, entry: &Value) {
         .append(true)
         .open(directory.join(LEDGER_FILE))
         .and_then(|mut file| file.write_all(line.as_bytes()));
-}
-
-/// Write `text` to a temporary file beside `path`, then rename it into place.
-fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{} has no parent", path.display()))?;
-    std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
-    let file_name = path
-        .file_name()
-        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    std::fs::write(&temporary, text)
-        .map_err(|error| format!("{}: {error}", temporary.display()))?;
-    std::fs::rename(&temporary, path).map_err(|error| {
-        let _ = std::fs::remove_file(&temporary);
-        format!("{}: {error}", path.display())
-    })
 }
 
 /// A subfile path inside `directory`, checked against a link that escapes it.

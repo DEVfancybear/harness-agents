@@ -323,32 +323,22 @@ async fn list_lock(root: &Path, cancellation: &CancellationToken) -> Result<std:
     #[cfg(windows)]
     let identity = identity.to_lowercase();
     let key = ContentHash::from_bytes(identity.as_bytes());
-    let directory = std::env::temp_dir().join("harness-feature-locks");
-    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    let file = std::fs::File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(directory.join(format!("{}.lock", key.as_str().replace(':', "-"))))
-        .map_err(|error| format!("the feature list lock could not be opened: {error}"))?;
+    let path = std::env::temp_dir()
+        .join("harness-feature-locks")
+        .join(format!("{}.lock", key.as_str().replace(':', "-")));
+    let file = super::files::open_lock(&path, "the feature list")?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if cancellation.is_cancelled() {
             return Err("the feature operation was canceled".to_owned());
         }
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err("waiting for another feature operation timed out".to_owned());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(format!("the feature list could not be locked: {error}"));
-            }
+        if super::files::try_take(&file, "the feature list")? {
+            return Ok(file);
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("waiting for another feature operation timed out".to_owned());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
