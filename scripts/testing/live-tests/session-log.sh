@@ -129,6 +129,10 @@ NCONV=$( [ -n "$NLOG" ] && sed -n 's/^\*\*Conversation:\*\* //p' "$NLOG" | head 
 check "nothing is owed for it any more" '[ -n "$NCONV" ] && [ -z "$(ls "$D"/projects/*/session-log/owed/"$NCONV" 2>/dev/null)" ]'
 check ".harness/.gitignore lists sessions/ and the lock" 'grep -qx "sessions/" "$N/.harness/.gitignore" && grep -qx "\*.lock" "$N/.harness/.gitignore"'
 check "the host's files are not the project's changes" '! (cd "$N" && git status --porcelain --untracked-files=all) | grep -qE "\.harness/(sessions|session-log\.lock)"'
+# A coder started before the log is written finds the checkout it started
+# from only when the .gitignore the host created is hidden too (0.8.7's first
+# candidate listed it, and integrate_children refused the coder's work).
+check "the .gitignore the host created is not a change either" '[ -z "$(cd "$N" && git ls-files --others --exclude-standard -- .harness)" ]'
 "$HA" shutdown --force >/dev/null 2>&1
 
 echo "################ 8. a one-request task with several tool calls gets a log"

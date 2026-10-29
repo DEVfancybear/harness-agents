@@ -97,7 +97,9 @@ removed: it keeps its own rules.
 **Not the project's changes.** Before the host writes into `.harness`, it makes `.harness/.gitignore`
 list `sessions/` and `*.lock` (creating the file, or appending a missing line; nothing the
 user wrote there is removed), so the file logs and the lock never show as
-uncommitted in the startup brief or on exit. A log inside the markdown store's daily note
+uncommitted in the startup brief or on exit. A `.gitignore` the host creates lists itself
+too: a log written while a coder works leaves the checkout as the coder found it, and
+`integrate_children` still applies the coder's work. A log inside the markdown store's daily note
 stays tracked: it is the store's.
 
 **Off.** `"sessionLog": false` in `settings.json`, or `HA_SESSION_LOG=off`.

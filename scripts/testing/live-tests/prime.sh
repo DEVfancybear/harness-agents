@@ -125,22 +125,27 @@ cat > "$HA_HOME/models.json" <<EOF
 EOF
 echo '{"compaction": {"thresholdPercent": 20}}' > "$HA_HOME/settings.json"
 agent "$RX/p" r10
-# Six turns of about 7.5k tokens each (an earlier turn replays a result up to
-# 32,000 characters): past 20% of the 200k window (40k), far below the default
-# 95%. The summary of the earlier turns is kept in the store.
-for i in 0 1 2 3 4 5; do
-  say r10 "Trong python_repl chạy đúng một cell: print(open('big.txt', encoding='utf-8').read()[$((i * 30000)):$(((i + 1) * 30000))]) rồi trả lời đúng một từ: XONG$i" | tail -1
-done
-say r10 "Trả lời đúng một từ: PONG" | tail -1
-summaries() { "$PY" - "$HA_HOME/data/projects" <<'EOF'
+# Turns of about 5k tokens each (an earlier turn replays a result up to
+# 32,000 characters) until the summary is kept in the store. 20% of the 200k
+# window is 40k, but the trigger never sits below the kept recent end and two
+# summary passes (20,000 + 2 x 16,384 + 1 = 52,769), so it takes about eight.
+summaries() { "$PY" - "$HA_HOME/data/projects" <<'PYEOF'
 import glob, os, sqlite3, sys
 count = 0
 for db in glob.glob(os.path.join(sys.argv[1], "*", "harness.sqlite3")):
     c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     count += c.execute("select count(*) from session_settings where setting_key='rolling_summary'").fetchone()[0]
 print(count)
-EOF
+PYEOF
 }
+# The largest request the provider measured, in tokens.
+largest() { cat "$HA_HOME"/data/diagnostics/*.jsonl 2>/dev/null | grep -o '"event":"call","fields":{[^}]*"input":[0-9]*' | grep -o '"input":[0-9]*$' | cut -d: -f2 | sort -n | tail -1; }
+for i in 0 1 2 3 4 5 6 7 8 9 10 11; do
+  say r10 "Trong python_repl chạy đúng một cell: print(open('big.txt', encoding='utf-8').read()[$((i * 30000)):$(((i + 1) * 30000))]) rồi trả lời đúng một từ: XONG$i" | tail -1
+  [ "$(summaries)" -gt 0 ] && break
+done
+say r10 "Trả lời đúng một từ: PONG" | tail -1
+echo "   largest request: $(largest) tokens"
 check "the session compacted at 20% of the window" "[ \"\$(summaries)\" -gt 0 ]"
 check "it still answers after compacting" "last | grep -q 'PONG'"
 "$HA" shutdown --force >/dev/null 2>&1

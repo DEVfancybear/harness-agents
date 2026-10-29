@@ -93,7 +93,9 @@ markdown: kho có luật riêng.
 **Không thuộc thay đổi của project.** Trước khi host ghi vào `.harness`, nó đảm bảo
 `.harness/.gitignore` có `sessions/` và `*.lock` (tạo file, hoặc thêm dòng còn thiếu; không
 xóa gì người dùng đã viết), nên file log và khóa không bao giờ hiện là chưa commit
-trong tóm tắt lúc mở phiên hay lúc thoát. Log trong ghi chú hằng ngày của kho markdown vẫn
+trong tóm tắt lúc mở phiên hay lúc thoát. File `.gitignore` do host tạo cũng liệt kê chính
+nó: log ghi trong lúc một coder đang làm không đổi checkout mà coder đã bắt đầu từ đó, và
+`integrate_children` vẫn áp dụng được việc của coder. Log trong ghi chú hằng ngày của kho markdown vẫn
 được theo dõi: nó thuộc về kho.
 
 **Tắt.** `"sessionLog": false` trong `settings.json`, hoặc `HA_SESSION_LOG=off`.

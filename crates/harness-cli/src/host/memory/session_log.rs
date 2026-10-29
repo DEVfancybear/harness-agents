@@ -180,18 +180,20 @@ fn lock(root: &Path) -> Result<std::fs::File, String> {
 }
 
 /// Make `.harness/.gitignore` list the host's own files, before the host
-/// writes one: the file is created when absent, a missing line is appended,
-/// and nothing the user wrote is removed. A file that cannot be read is left
-/// alone.
+/// writes one: a missing line is appended, and nothing the user wrote is
+/// removed. A file the host creates lists itself too, so writing a log adds
+/// nothing to the project's changes: a coder started before it still finds
+/// the checkout it started from. A file that cannot be read is left alone.
 fn ignore_host_files(root: &Path) {
     let path = root.join(".harness/.gitignore");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let (text, created) = match std::fs::read_to_string(&path) {
+        Ok(text) => (text, false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), true),
         Err(_) => return,
     };
     let missing = IGNORED
         .iter()
+        .chain(created.then_some(&".gitignore"))
         .filter(|line| !text.lines().any(|kept| kept.trim() == **line))
         .collect::<Vec<_>>();
     if missing.is_empty() {
@@ -2678,6 +2680,28 @@ mod tests {
         assert!(!status.contains("sessions/"), "{status}");
         assert!(!status.contains(".lock"), "{status}");
         assert!(status.contains(".harness/.gitignore"), "{status}");
+        // A file the host creates hides itself: a log written while a coder
+        // runs leaves the checkout as the coder found it.
+        let fresh = tempfile::tempdir().expect("fresh");
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(fresh.path())
+            .status()
+            .expect("git");
+        assert!(init.success());
+        put(
+            fresh.path(),
+            "task_1",
+            &draft(),
+            "2026-10-28T14:05:00+07:00",
+        );
+        let changes = std::process::Command::new("git")
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .current_dir(fresh.path())
+            .output()
+            .expect("git");
+        let changes = String::from_utf8_lossy(&changes.stdout).into_owned();
+        assert!(changes.trim().is_empty(), "{changes}");
         // The markdown store's note stays the store's, tracked.
         let store = tempfile::tempdir().expect("store");
         let note = self::store(store.path());
