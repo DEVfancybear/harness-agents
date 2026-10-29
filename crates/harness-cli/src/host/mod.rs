@@ -7,6 +7,8 @@
 
 #[path = "protocols/acp.rs"]
 pub mod acp;
+#[path = "configuration/adoption.rs"]
+pub mod adoption;
 #[path = "coordination/agents/mod.rs"]
 pub mod agents;
 #[path = "presentation/agents_view.rs"]
@@ -782,5 +784,24 @@ mod tests {
             named.project.key, via_canonical.project.key,
             "a canonical spelling must resolve the same project as the typed one"
         );
+
+        // Since keys follow the repository, a subdirectory of a repository is
+        // that repository's project, whichever way it is reached; and every
+        // key made from the launch directory (`project_key_of`, which memory,
+        // lessons and the history vectors use) is the launch's own.
+        std::fs::create_dir(root.join(".git")).expect("repository");
+        let sub = root.join("src").join("module");
+        std::fs::create_dir_all(&sub).expect("subdirectory");
+        let named_sub = base(Some(sub.clone()), temp.path().to_path_buf());
+        let started_in_sub = base(None, sub.clone());
+        let at_root = base(None, root.clone());
+        assert_eq!(named_sub.project.key, started_in_sub.project.key);
+        assert_eq!(named_sub.project.key, at_root.project.key);
+        assert_eq!(named_sub.project_store_dir(), at_root.project_store_dir());
+        assert_eq!(
+            bootstrap::project_key_of(&started_in_sub.project.root),
+            at_root.project.key
+        );
+        assert_eq!(bootstrap::project_key_of(&sub), at_root.project.key);
     }
 }

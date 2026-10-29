@@ -128,6 +128,52 @@ pub struct ProjectRef {
     pub root: String,
 }
 
+/// Give the lessons about the project once keyed `from` the key `to` and its
+/// name: the project's data moved to the key of its repository
+/// (`docs/architecture/PROJECT_IDENTITY.en.md`). A lesson's `root` stays
+/// where it was seen. Returns how many lessons changed; with none, the file
+/// is not written.
+///
+/// # Errors
+/// The lessons cannot be read or written.
+pub fn retag_project(dir: &Path, from: &str, to: &str, name: &str) -> Result<usize, String> {
+    let about = |lesson: &Lesson| {
+        lesson
+            .project
+            .as_ref()
+            .is_some_and(|project| project.key == from)
+            || matches!(
+                &lesson.placement,
+                Some(Placement::Skill { project: Some(key), .. }) if key == from
+            )
+    };
+    if !dir.join(FILE).is_file() || !load(dir)?.lessons.iter().any(about) {
+        return Ok(0);
+    }
+    update(dir, |lessons| {
+        let mut changed = 0;
+        for lesson in lessons.lessons.iter_mut().filter(|lesson| about(lesson)) {
+            if let Some(project) = lesson
+                .project
+                .as_mut()
+                .filter(|project| project.key == from)
+            {
+                to.clone_into(&mut project.key);
+                name.clone_into(&mut project.name);
+            }
+            if let Some(Placement::Skill {
+                project: Some(key), ..
+            }) = &mut lesson.placement
+                && key == from
+            {
+                to.clone_into(key);
+            }
+            changed += 1;
+        }
+        changed
+    })
+}
+
 /// One moment a conversation showed the lesson, or contradicted it.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Signal {

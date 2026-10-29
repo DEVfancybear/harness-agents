@@ -1268,7 +1268,9 @@ fn stalling_endpoint() -> (
     )
 }
 
-/// The single per-project store the app created under `HA_HOME`.
+/// The single per-project store the app created under `HA_HOME`: the tests
+/// that use it run in one directory (outside any repository, so it is its own
+/// project), and a store is a directory under `projects/`.
 fn only_project_store(sandbox: &Sandbox) -> PathBuf {
     let projects = sandbox.path().join("data").join("projects");
     let mut stores: Vec<PathBuf> = std::fs::read_dir(&projects)
@@ -1551,7 +1553,9 @@ fn i04_the_binary_installed_under_a_unicode_path_follows_the_caller_directory() 
     }
 
     // The project store follows the caller directory - not the install path and
-    // not the build tree - so two caller directories own two stores.
+    // not the build tree - so two caller directories own two stores. Neither is
+    // in a repository (asserted above), so each is its own project; two
+    // directories of one repository would share the repository's store.
     let projects = sandbox.path().join("data").join("projects");
     let mut stores: Vec<String> = std::fs::read_dir(&projects)
         .expect("the app created per-project stores")

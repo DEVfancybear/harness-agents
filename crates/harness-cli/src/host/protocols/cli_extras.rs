@@ -253,6 +253,7 @@ pub fn doctor(cwd: Option<&Path>, json: bool) -> Result<ExitCode, HarnessError> 
         judge: config.verify.judge,
         hooks: config.hooks.len(),
         mcp_servers: config.mcp_servers.len(),
+        other_stores: super::adoption::other_stores_of(&paths.data_dir, &root),
     };
     let global_config_dir = paths
         .config_file
