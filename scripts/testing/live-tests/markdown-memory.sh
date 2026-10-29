@@ -187,9 +187,9 @@ project "$L"
 "$PY" - "$RX/rules.json" "$(basename "$L")" <<'EOF'
 import datetime, json, sys
 at = lambda days: (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).isoformat()
-signals = [{"at": at(3), "conversation": "task_a", "against": False, "evidence": "先给结论"},
-           {"at": at(2), "conversation": "task_b", "against": False, "evidence": "又是先给结论"},
-           {"at": at(1), "conversation": "task_b", "against": False, "evidence": "请先给结论"}]
+signals = [{"at": at(3), "conversation": "task_a", "against": False, "evidence": "总结的时候请先给出结论再说细节"},
+           {"at": at(2), "conversation": "task_b", "against": False, "evidence": "又说一遍：总结时先给出结论再列细节"},
+           {"at": at(1), "conversation": "task_b", "against": False, "evidence": "请记住，每次总结都先给出结论再列细节"}]
 first = {"id": "les_zh1", "kind": "correction", "domain": "communication", "scope": "project", "project": sys.argv[2], "signals": signals,
          "text": "当用户要求总结一份很长的文档时，先用一两句话给出结论，然后再分点列出细节，最后附上每一条结论所依据的原文段落和对应的页码，方便用户自己逐条核对"}
 second = dict(first, id="les_zh2", domain="workflow",

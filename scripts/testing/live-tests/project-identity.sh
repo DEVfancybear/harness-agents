@@ -45,6 +45,7 @@ project_key_of_entry() { "$HA" memory export | "$PY" -c "
 import json, sys
 code = sys.argv[1]
 state = json.load(sys.stdin)
+state = state.get('document', state)
 for entry in state.get('entries', {}).get('memory', {}).values():
     project = entry.get('project')
     key = project.get('key') if isinstance(project, dict) else project
