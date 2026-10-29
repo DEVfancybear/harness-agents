@@ -119,8 +119,20 @@ echo '{"created_by": "ha", "created": "2026-10-01T00:00:00Z"}' > "$HA_HOME/skill
 echo '{"autoRefine": {"turnInterval": 1}}' > "$HA_HOME/settings.json"
 unset HA_AUTO_REFINE
 agent "$RX/p-skill" k1
+since10=$(date +%s)
 say k1 "Dùng skill build-check để kiểm tra dự án này build được không. Làm đúng theo skill trước, nếu hỏng thì tìm cách build đúng của dự án." | tail -6
-sleep 90
+# The review runs in the background after the turn; at thinking max its plan
+# can take minutes. Wait for it to finish (a review record after the turn),
+# at most five minutes.
+for _ in $(seq 1 60); do
+  cat "$D"/diagnostics/*.jsonl 2>/dev/null | "$PY" -c "
+import json, sys
+since = int(sys.argv[1]) * 1000
+done = any(r.get('kind') == 'review' and r.get('event') in ('applied', 'nothing', 'skipped', 'failed') and r.get('ms', 0) > since
+           for r in (json.loads(l) for l in sys.stdin if l.strip()))
+sys.exit(0 if done else 1)" "$since10" && break
+  sleep 5
+done
 U=$D/skill-usage/global.json
 echo "-- skill usage:"; "$PY" -c "import json,sys; d=json.load(open(sys.argv[1],encoding='utf-8')); print(json.dumps(d.get('skills',{}).get('build-check',{}),ensure_ascii=False,indent=1))" "$U" | sed 's/^/   /'
 check "the review judged the skill failed" "\"$PY\" -c \"import json,sys; s=json.load(open(sys.argv[1],encoding='utf-8'))['skills']['build-check']; exit(0 if s.get('failed',0)>=1 else 1)\" '$U'"
