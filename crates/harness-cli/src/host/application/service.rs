@@ -4741,7 +4741,7 @@ impl SessionPort for AgentSessionService {
         {
             return;
         }
-        let owed = super::session_log::owed(&self.workspace_root);
+        let owed = super::session_log::owed(&self.store_dir, None);
         if owed.is_empty() {
             return;
         }
@@ -8506,30 +8506,31 @@ async fn run_turn(
     let runtime = Arc::new(runtime);
     let session_log_on = super::session_log::enabled(&config_file, &environment);
     // This turn is now the conversation's newest: a quiet timer an earlier
-    // one armed writes nothing while it runs.
+    // one armed writes nothing while it runs, nor does a trigger read its
+    // mark while the turn is half done.
+    let _running_turn = super::session_log::RunningTurn::begin(&task_id);
     if session_log_on {
         super::session_log::note_turn(&task_id, &session_id);
         // Owed from the start, so a kill during the turn or right after its
         // answer leaves the log to the next start. A compaction or a
         // `/refine` is no turn of the conversation's own.
         if request.compact_guidance.is_none() && request.refine.is_none() {
-            super::session_log::owe(&workspace_root, &task_id, &session_id);
+            super::session_log::owe(&store_dir, &task_id, &session_id);
         }
         // A log another conversation still owes - ha was killed, crashed or
-        // quit before writing it - is written now, beside this turn.
-        for (task, session) in super::session_log::owed(&workspace_root) {
-            if task != task_id {
-                spawn_session_log(
-                    sender.clone(),
-                    store_dir.clone(),
-                    workspace_root.clone(),
-                    session,
-                    task,
-                    Arc::clone(&helper_provider),
-                    "owed",
-                    None,
-                );
-            }
+        // quit before writing it - is written now, beside this turn; not one
+        // another live ha runs, nor one with a turn running here.
+        for (task, session) in super::session_log::owed(&store_dir, Some(&task_id)) {
+            spawn_session_log(
+                sender.clone(),
+                store_dir.clone(),
+                workspace_root.clone(),
+                session,
+                task,
+                Arc::clone(&helper_provider),
+                "owed",
+                None,
+            );
         }
     }
     let log_root = workspace_root.clone();
@@ -10332,7 +10333,7 @@ async fn run_turn(
     // The log is owed until then, on disk, so an exit or a kill before it is
     // written leaves it to the next start.
     if session_log_on {
-        super::session_log::owe(&log_root, &goal_task, &session_id);
+        super::session_log::owe(&store_dir, &goal_task, &session_id);
         if (log_after_turn || compacted) && outcome.is_ok() && !cancellation.is_cancelled() {
             spawn_session_log(
                 sender.clone(),
@@ -12690,23 +12691,73 @@ mod tests {
         }
     }
 
-    /// `/new` leaves a conversation: the log it owes is written then, not by a
-    /// quiet timer the next conversation's turns may never let run.
+    /// `/new` leaves a conversation: the log it owes is written then, through
+    /// the configured model, not by a quiet timer the next conversation's
+    /// turns may never let run.
     #[tokio::test(flavor = "multi_thread")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a project, its journal, a model that answers, and the leave"
+    )]
     async fn leaving_a_conversation_writes_the_log_it_owes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let temp = tempfile::tempdir().expect("temp root");
         let home = temp.path().join("home");
         let project = temp.path().join("project");
         std::fs::create_dir_all(&home).expect("home");
         std::fs::create_dir_all(&project).expect("project");
+        // A model that answers every request with a session log.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback");
+        let address = listener.local_addr().expect("address");
+        let served = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&served);
+        tokio::spawn(async move {
+            let log = "# Session Log: 2026-10-29 - Parser wiring\n\n## Quick Reference (for AI scanning)\n**Outcome:** The parser is wired into main.\n\n## Quick Resume Context\nNext: error recovery.";
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                // The head, then as much body as it announces.
+                while let Ok(read) = socket.read(&mut buffer).await {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break;
+                        }
+                    }
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                let delta = serde_json::json!({
+                    "choices": [{"delta": {"content": log}, "finish_reason": null}]
+                });
+                let body = format!("data: {delta}\n\ndata: [DONE]\n\n");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
         let environment = LaunchEnvironment::from_pairs([
             ("HA_HOME", home.to_string_lossy().into_owned()),
             (
                 ENDPOINT_VARIABLE,
-                "http://127.0.0.1:9/chat/completions".to_owned(),
+                format!("http://{address}/chat/completions"),
             ),
-            (MODEL_VARIABLE, "fixture-model".to_owned()),
-            ("DEEPSEEK_API_KEY", "fixture-secret".to_owned()),
+            (MODEL_VARIABLE, "log-writer".to_owned()),
         ]);
         let context = bootstrap::resolve(LaunchRequest {
             cwd: None,
@@ -12716,32 +12767,95 @@ mod tests {
             explicit_data_dir: None,
         })
         .expect("launch context");
-        SqliteStore::open_writer(WriterOpenOptions::new(
-            context.project_store_dir(),
-            harness_types::HostId::generate(),
-        ))
-        .await
-        .expect("store")
-        .close()
-        .await
-        .expect("closed");
-        let root = context.project.root.clone();
+        // The conversation being left: two typed turns in the journal.
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                context.project_store_dir(),
+                harness_types::HostId::generate(),
+            ))
+            .await
+            .expect("store"),
+        );
         let left = harness_types::TaskId::generate();
-        super::super::session_log::owe(&root, &left, &harness_types::SessionId::generate());
-        let channel = SessionChannel::new();
+        let workspace = harness_tools::observe_workspace(
+            harness_types::ProjectId::generate(),
+            &context.project.root,
+        )
+        .expect("workspace");
+        let first = harness_types::SessionId::generate();
+        let runtime = harness_runtime::RuntimeService::new(
+            Arc::clone(&store),
+            Arc::new(harness_providers::MockProvider::text("wired")),
+            harness_runtime::RuntimeConfig::default(),
+        );
+        runtime
+            .run(harness_runtime::RunRequest::new(
+                first.clone(),
+                left.clone(),
+                InputId::generate(),
+                "wire the parser",
+                workspace.clone(),
+            ))
+            .await
+            .expect("first turn");
+        store.release_task_lease(&left).await.expect("lease");
+        let second = harness_types::SessionId::generate();
+        runtime
+            .continue_task(
+                &first,
+                harness_runtime::RunRequest::new(
+                    second.clone(),
+                    left.clone(),
+                    InputId::generate(),
+                    "now error recovery",
+                    workspace,
+                ),
+            )
+            .await
+            .expect("second turn");
+        drop(runtime);
+        Arc::try_unwrap(store)
+            .expect("one owner")
+            .close()
+            .await
+            .expect("closed");
+        let marks = context.project_store_dir();
+        let root = context.project.root.clone();
+        super::super::session_log::owe(&marks, &left, &second);
+        // The loopback model's key, saved as `/login` saves one: the
+        // environment's credential reads the process's own variables.
+        credentials::save(
+            &credentials::resolve_file(&environment, &context.paths.data_dir),
+            "deepseek",
+            &credentials::Credential::api_key("session-log-fixture-only"),
+        )
+        .expect("the key is saved");
+        let mut channel = SessionChannel::new();
         let mut service = AgentSessionService::new(&context, environment, channel.sender());
         service.resume(None).expect("a new conversation");
-        // The leaving conversation's log is settled: a conversation with no
-        // turns in the journal has nothing to log, and owes nothing after.
-        for _ in 0..100 {
-            if super::super::session_log::owed(&root).is_empty() {
+        for _ in 0..200 {
+            if super::super::session_log::find(&root, left.as_str()).is_some()
+                && super::super::session_log::owed(&marks, None).is_empty()
+            {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let log = super::super::session_log::find(&root, left.as_str()).unwrap_or_else(|| {
+            panic!(
+                "the left conversation's log was written: {:?}",
+                channel.drain()
+            )
+        });
+        assert_eq!(log.through.as_deref(), Some(second.as_str()));
+        assert_eq!(
+            log.outcome().as_deref(),
+            Some("The parser is wired into main.")
+        );
+        assert!(served.load(Ordering::SeqCst) >= 1, "the model wrote it");
         assert!(
-            super::super::session_log::owed(&root).is_empty(),
-            "the log owed was written when the conversation was left"
+            super::super::session_log::owed(&marks, None).is_empty(),
+            "and nothing is owed after"
         );
     }
 

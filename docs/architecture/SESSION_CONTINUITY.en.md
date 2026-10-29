@@ -57,7 +57,7 @@ through.
 - when the conversation is left: `/new`, `/resume` of another, `/fork` or `/clone`, and
   the chat's exit (`/quit`, Ctrl-D) - at once, so the next conversation's start may already
   find it (if it is still being written, the start falls back to the last turns);
-- at the end of an `ha exec` run, before the process exits;
+- at the end of an `ha exec` run, before the process exits (waiting at most 30 seconds; a log that takes longer stays owed);
 - when the session goes quiet - the moment the idle review runs, 10 minutes after the
   last turn (`HA_IDLE_REVIEW_SECONDS`), when no later turn of the same conversation
   started meanwhile (a turn of another conversation does not stop it); after a failed or
@@ -67,10 +67,16 @@ through.
 - when the `/handoff` turn finishes.
 
 **Owed logs.** Every turn, from its start, marks its conversation as owing a log, in
-`.harness/sessions/owed/<conversation id>` (holding the turn it is owed through), and
-writing that log - or finding there is nothing to write - removes the mark; a later turn
-marks it again. A log a crash, a kill (`ha shutdown --force`), a worker restart or an exit
-cut off is therefore written by the next start of ha in that project, beside its first turn.
+`session-log/owed/<conversation id>` under the project's store directory in ha's data
+directory - beside the journal that holds the conversation, never in the project - with
+the turn it is owed through and the process running it. Writing that log, or finding in
+the journal that nothing is owed, removes the mark; a later turn marks it again. A log a
+crash, a kill (`ha shutdown --force`), a worker restart or an exit cut off is therefore
+written by the next start of ha in that project, beside its first turn. A start or a leave
+writes only marks no other live ha process owns and whose conversation has no turn running
+in this one, so two ha processes in one project never log each other's turns half done. A
+fixture model leaves a mark as it is, and a mark whose writes failed 3 times in a row is
+tried again only once an hour. The project's `.harness` is written only for a log.
 
 A turn already logged, or one whose log is being written, is not logged twice. Nothing
 is written for a delegated child, with a fixture model, or for a conversation that did too
@@ -90,7 +96,7 @@ removed: it keeps its own rules.
 
 **Not the project's changes.** Before the host writes into `.harness`, it makes `.harness/.gitignore`
 list `sessions/` and `*.lock` (creating the file, or appending a missing line; nothing the
-user wrote there is removed), so the file logs, the owed marks and the lock never show as
+user wrote there is removed), so the file logs and the lock never show as
 uncommitted in the startup brief or on exit. A log inside the markdown store's daily note
 stays tracked: it is the store's.
 
@@ -103,7 +109,7 @@ bug report reads:
   (relative to the project root), `bytes`, `turns`, and `fallback` when the log is not
   where it would go (`brief`, `no_room`, `unreadable_note`);
 - `skipped`: `trigger` and `reason` - `off`, `superseded` (a later turn of the conversation
-  started first), `already_written`, `in_progress`, `fixture`, `child`, `few_turns`;
+  started first), `already_written`, `in_progress`, `fixture`, `child`, `few_turns`, `not_in_store`, `timed_out` (`ha exec`);
 - `failed` (warn): `trigger`, and the error as its message, redacted and cut to 300
   characters;
 - `recalled`: `n` (logs sent), `topic` (whether one was given), `matches`;

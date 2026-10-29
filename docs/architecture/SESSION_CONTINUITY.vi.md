@@ -55,7 +55,7 @@ nhất (tối đa 50 lượt, 120.000 ký tự), nên điều các lượt đầ
 - khi rời một hội thoại: `/new`, `/resume` sang hội thoại khác, `/fork` hay `/clone`, và
   khi thoát chat (`/quit`, Ctrl-D) - ngay lập tức, nên lúc mở hội thoại sau có thể đã thấy
   log (nếu log còn đang được ghi, lúc mở quay về dùng các lượt cuối);
-- khi một lần chạy `ha exec` kết thúc, trước khi tiến trình thoát;
+- khi một lần chạy `ha exec` kết thúc, trước khi tiến trình thoát (chờ tối đa 30 giây; log lâu hơn vẫn còn nợ);
 - khi phiên lặng đi - đúng lúc idle review chạy, 10 phút sau lượt cuối
   (`HA_IDLE_REVIEW_SECONDS`), nếu trong lúc đó không có lượt mới nào của cùng hội thoại
   (lượt của hội thoại khác không chặn nó); cả sau một lượt lỗi hay bị dừng;
@@ -64,10 +64,16 @@ nhất (tối đa 50 lượt, 120.000 ký tự), nên điều các lượt đầ
 - khi lượt `/handoff` xong.
 
 **Log còn nợ.** Từ đầu mỗi lượt, hội thoại được đánh dấu là còn nợ một log, trong
-`.harness/sessions/owed/<id hội thoại>` (ghi lượt mà log được nợ tới), và việc ghi log
-đó - hoặc thấy không có gì để ghi - xóa dấu; lượt sau lại đánh dấu. Vì vậy log bị cắt
-ngang bởi crash, bị kill (`ha shutdown --force`), worker khởi động lại hay thoát, sẽ được
-lần mở ha kế tiếp trong project đó ghi, bên cạnh lượt đầu tiên.
+`session-log/owed/<id hội thoại>` dưới thư mục kho của project trong thư mục dữ liệu của
+ha - cạnh journal giữ hội thoại, không bao giờ trong project - kèm lượt mà log được nợ tới
+và tiến trình đang chạy nó. Việc ghi log đó, hoặc thấy trong journal là không nợ gì, xóa
+dấu; lượt sau lại đánh dấu. Vì vậy log bị cắt ngang bởi crash, bị kill
+(`ha shutdown --force`), worker khởi động lại hay thoát, sẽ được lần mở ha kế tiếp trong
+project đó ghi, bên cạnh lượt đầu tiên. Lần mở hay lần rời chỉ ghi các dấu không thuộc một
+tiến trình ha khác còn sống và có hội thoại không có lượt nào đang chạy trong tiến trình
+này, nên hai tiến trình ha trong một project không bao giờ ghi log lượt dở dang của nhau.
+Model fixture để nguyên dấu, và một dấu mà việc ghi đã lỗi 3 lần liền chỉ được thử lại mỗi
+giờ một lần. `.harness` của project chỉ được ghi khi có log.
 
 Một lượt đã được ghi log, hoặc đang được ghi, thì không ghi lần hai. Không ghi gì cho agent
 con được giao việc, với model fixture, hay cho hội thoại làm quá ít: log cần 2 lượt người
@@ -86,7 +92,7 @@ markdown: kho có luật riêng.
 
 **Không thuộc thay đổi của project.** Trước khi host ghi vào `.harness`, nó đảm bảo
 `.harness/.gitignore` có `sessions/` và `*.lock` (tạo file, hoặc thêm dòng còn thiếu; không
-xóa gì người dùng đã viết), nên file log, dấu nợ và khóa không bao giờ hiện là chưa commit
+xóa gì người dùng đã viết), nên file log và khóa không bao giờ hiện là chưa commit
 trong tóm tắt lúc mở phiên hay lúc thoát. Log trong ghi chú hằng ngày của kho markdown vẫn
 được theo dõi: nó thuộc về kho.
 
@@ -99,7 +105,7 @@ lỗi đọc:
   (tương đối với thư mục gốc của project), `bytes`, `turns`, và `fallback` khi log không ở
   chỗ đáng lẽ của nó (`brief`, `no_room`, `unreadable_note`);
 - `skipped`: `trigger` và `reason` - `off`, `superseded` (một lượt sau của hội thoại đã bắt
-  đầu trước), `already_written`, `in_progress`, `fixture`, `child`, `few_turns`;
+  đầu trước), `already_written`, `in_progress`, `fixture`, `child`, `few_turns`, `not_in_store`, `timed_out` (`ha exec`);
 - `failed` (warn): `trigger`, và lỗi làm message, đã che bí mật và cắt còn 300 ký tự;
 - `recalled`: `n` (số log đã gửi), `topic` (có chủ đề hay không), `matches`;
 - `preserve_requested`: `file` (`AGENTS.md`, `CLAUDE.md` hoặc `none`), `store`.

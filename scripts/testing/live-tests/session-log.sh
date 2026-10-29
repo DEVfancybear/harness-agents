@@ -126,7 +126,7 @@ wait_for "$N/.harness/sessions/*.md" 120; sleep 2
 NLOG=$(ls "$N"/.harness/sessions/*.md 2>/dev/null | head -1)
 check "/new wrote the left conversation's log" '[ -n "$NLOG" ] && grep -q "8081" "$NLOG"'
 NCONV=$( [ -n "$NLOG" ] && sed -n 's/^\*\*Conversation:\*\* //p' "$NLOG" | head -1)
-check "nothing is owed for it any more" '[ -n "$NCONV" ] && [ ! -e "$N/.harness/sessions/owed/$NCONV" ]'
+check "nothing is owed for it any more" '[ -n "$NCONV" ] && [ -z "$(ls "$D"/projects/*/session-log/owed/"$NCONV" 2>/dev/null)" ]'
 check ".harness/.gitignore lists sessions/ and the lock" 'grep -qx "sessions/" "$N/.harness/.gitignore" && grep -qx "\*.lock" "$N/.harness/.gitignore"'
 check "the host's files are not the project's changes" '! (cd "$N" && git status --porcelain --untracked-files=all) | grep -qE "\.harness/(sessions|session-log\.lock)"'
 "$HA" shutdown --force >/dev/null 2>&1
@@ -145,18 +145,19 @@ check "the one-request task got a log" '[ "$MADE" -lt 5 ] || [ -n "$(ls "$T"/.ha
 echo "################ 9. a chat killed right after a turn gets its log on the next start"
 K=$RX/k
 project "$K"
+touch "$RX/k.stamp"; sleep 1
 HA_IDLE_REVIEW_SECONDS=3600 agent "$K" l9
 say l9 "Ghi nhớ: tên mã của bản phát hành tới là Orchid. Trả lời ngắn." | tail -1 | sed 's/^/   /'
 say l9 "Việc còn lại: viết release notes cho Orchid. Chưa làm, chỉ ghi nhận. Trả lời ngắn." | tail -1 | sed 's/^/   /'
 "$HA" shutdown --force >/dev/null 2>&1
-OWED=$(ls "$K"/.harness/sessions/owed/ 2>/dev/null | head -1)
+OWEDF=$(find "$D"/projects/*/session-log/owed -type f -newer "$RX/k.stamp" 2>/dev/null | head -1); OWED=$(basename "${OWEDF:-}" 2>/dev/null)
 check "precondition: killed with the log owed and none written" '[ -n "$OWED" ] && [ -z "$(ls "$K"/.harness/sessions/*.md 2>/dev/null)" ]'
 HA_IDLE_REVIEW_SECONDS=3600 agent "$K" l9b
 say l9b "Trả lời đúng một từ: chào" > /dev/null
 wait_for "$K/.harness/sessions/*.md" 120; sleep 2
 KLOG=$(ls "$K"/.harness/sessions/*.md 2>/dev/null | head -1)
 check "the next start wrote the owed log" '[ -n "$KLOG" ] && grep -qi "orchid" "$KLOG" && grep -q "Conversation:\*\* $OWED" "$KLOG"'
-check "and it is no longer owed" '[ ! -e "$K/.harness/sessions/owed/$OWED" ]'
+check "and it is no longer owed" '[ -n "$OWEDF" ] && [ ! -e "$OWEDF" ]'
 "$HA" shutdown --force >/dev/null 2>&1
 
 result

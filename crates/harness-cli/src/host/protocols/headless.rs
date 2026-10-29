@@ -1447,13 +1447,19 @@ pub async fn run_with(
     // The run's end leaves the conversation: its session log is written
     // before the process exits, when the conversation did enough for one. It
     // is owed first, so a run killed while it writes leaves it to the next
-    // start of ha in this project.
+    // start of ha in this project. The exit waits at most
+    // `SESSION_LOG_EXIT_WAIT` for it; a log that takes longer stays owed.
     if provider_config.is_some()
         && !cancellation.is_cancelled()
         && super::session_log::enabled(&context.paths.config_file, environment)
     {
+        const SESSION_LOG_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
         let root = &context.project.root;
-        super::session_log::owe(root, &outcome.task_id, &outcome.session_id);
+        super::session_log::owe(
+            &context.project_store_dir(),
+            &outcome.task_id,
+            &outcome.session_id,
+        );
         let logged = async {
             match SqliteStore::open_read_only(context.project_store_dir()).await {
                 Ok(store) => {
@@ -1471,8 +1477,9 @@ pub async fn run_with(
                 Err(error) => Err(format!("the project store cannot be read: {error}")),
             }
         };
+        let logged = tokio::time::timeout(SESSION_LOG_EXIT_WAIT, logged);
         tokio::select! {
-            result = logged => {
+            waited = logged => if let Ok(result) = waited {
                 super::session_log::record(&outcome.task_id, "exit", root, &result);
                 match result {
                     Ok(super::session_log::Outcome::Written { placed, .. }) => out.stderr(&format!(
@@ -1482,7 +1489,10 @@ pub async fn run_with(
                     Err(error) => out.stderr(&format!("the session log was not written: {error}")),
                     Ok(super::session_log::Outcome::Skipped(_)) => {}
                 }
-            }
+            } else {
+                super::session_log::record_skip(&outcome.task_id, "exit", "timed_out");
+                out.stderr("the session log took too long; the next start of ha in this project writes it");
+            },
             () = cancellation.cancelled() => {
                 out.stderr("the session log was cut off; the next start of ha in this project writes it");
             }

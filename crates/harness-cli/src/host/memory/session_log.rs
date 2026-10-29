@@ -57,14 +57,21 @@ const MIN_USER_TURNS: usize = 2;
 const MIN_TOOL_CALLS: usize = 5;
 const MIN_MODEL_STEPS: usize = 4;
 
-/// Where a conversation's owed log is marked, relative to the project root:
-/// one file per conversation, named by its id and holding its newest turn,
-/// armed as each turn ends and removed once that turn's log is written, so a
-/// start after a crash, a kill or a quit writes what was owed.
-const OWED_DIR: &str = ".harness/sessions/owed";
+/// Where a conversation's owed log is marked, relative to the project store's
+/// directory (the store whose journal holds the conversation, so a mark is
+/// never read by an ha with another store): one file per conversation, named
+/// by its id, holding its newest turn and the process that runs it, armed as
+/// each turn starts and ends and removed once that turn's log is written, so
+/// a start after a crash, a kill or a quit writes what was owed.
+const OWED_DIR: &str = "session-log/owed";
+
+/// A mark whose writes keep failing is tried again after this many failures
+/// only once an hour.
+const OWED_FAILURES: u32 = 3;
+const OWED_RETRY: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
 /// The `.harness/.gitignore` lines that keep the host's own files out of the
-/// project's changes: the file logs, the owed marks and the lock.
+/// project's changes: the file logs and the lock.
 const IGNORED: [&str; 2] = ["sessions/", "*.lock"];
 
 /// The newest turns the model reads, and how much of their transcript: the
@@ -201,33 +208,130 @@ fn ignore_host_files(root: &Path) {
     let _ = write_file(&path, &updated);
 }
 
-/// Mark that `task` owes the log of its turn `session`: written as a turn
-/// ends, before its log is, so a log a crash, a kill or an exit cut off is
-/// written by the next start.
-pub fn owe(root: &Path, task: &TaskId, session: &SessionId) {
-    ignore_host_files(root);
-    let _ = write_file(&root.join(OWED_DIR).join(task.as_str()), session.as_str());
+/// This process, as an owed mark names its owner: its id and when it
+/// started, so a later process given the same id is not taken for it.
+static PROCESS: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{}:{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    )
+});
+
+/// The conversations with a turn running in this process: their logs are
+/// not written from a turn half done.
+static RUNNING: LazyLock<Mutex<std::collections::HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// A turn of a conversation running in this process, from its start to its
+/// end however it ends: while it is held, no trigger writes the
+/// conversation's log from its marks.
+pub struct RunningTurn(String);
+
+impl RunningTurn {
+    #[must_use]
+    pub fn begin(task: &TaskId) -> Self {
+        if let Ok(mut set) = RUNNING.lock() {
+            set.insert(task.as_str().to_owned());
+        }
+        Self(task.as_str().to_owned())
+    }
 }
 
-/// The conversations that owe a log, each with the turn it is owed through.
+impl Drop for RunningTurn {
+    fn drop(&mut self) {
+        if let Ok(mut set) = RUNNING.lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// One conversation's owed log, as its mark keeps it.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct Mark {
+    /// The turn the log is owed through.
+    session: String,
+    /// The process running the conversation ([`PROCESS`]); empty in a mark
+    /// from before the field, which no live process owns.
+    #[serde(default)]
+    owner: String,
+    /// Writes that failed in a row, and when the next may run.
+    #[serde(default)]
+    failures: u32,
+    #[serde(default)]
+    retry_after: Option<DateTime<chrono::Utc>>,
+}
+
+impl Mark {
+    fn read(path: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&text).ok().or_else(|| {
+            // A mark that is not JSON: the session id alone.
+            Some(Self {
+                session: text.trim().to_owned(),
+                ..Self::default()
+            })
+        })
+    }
+
+    fn write(&self, path: &Path) {
+        if let Ok(text) = serde_json::to_string(self) {
+            let _ = write_file(path, &text);
+        }
+    }
+
+    /// Whether its owner is a process still running other than this one.
+    fn owned_elsewhere(&self) -> bool {
+        if self.owner == *PROCESS {
+            return false;
+        }
+        self.owner
+            .split_once(':')
+            .and_then(|(pid, _)| pid.parse::<u32>().ok())
+            .is_some_and(|pid| {
+                pid != std::process::id() && super::agents::registry::process_is_alive(pid)
+            })
+    }
+}
+
+fn mark_path(marks: &Path, task: &TaskId) -> PathBuf {
+    marks.join(OWED_DIR).join(task.as_str())
+}
+
+/// Mark that `task` owes the log of its turn `session`, under the project
+/// store's directory `marks`: written as a turn starts and ends, so a log a
+/// crash, a kill or an exit cut off is written by the next start.
+pub fn owe(marks: &Path, task: &TaskId, session: &SessionId) {
+    Mark {
+        session: session.as_str().to_owned(),
+        owner: PROCESS.clone(),
+        ..Mark::default()
+    }
+    .write(&mark_path(marks, task));
+}
+
+/// The conversations under `marks` whose owed log this process may write
+/// now, each with the turn it is owed through: not one another live process
+/// runs, not one with a turn running here, not `except`, and not one whose
+/// writes failed lately ([`OWED_FAILURES`]).
 #[must_use]
-pub fn owed(root: &Path) -> Vec<(TaskId, SessionId)> {
-    let Ok(entries) = std::fs::read_dir(root.join(OWED_DIR)) else {
+pub fn owed(marks: &Path, except: Option<&TaskId>) -> Vec<(TaskId, SessionId)> {
+    let Ok(entries) = std::fs::read_dir(marks.join(OWED_DIR)) else {
         return Vec::new();
     };
+    let running = RUNNING.lock().map(|set| set.clone()).unwrap_or_default();
+    let now = chrono::Utc::now();
     let mut owed = entries
         .flatten()
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
         .filter_map(|entry| {
             let task = TaskId::parse(entry.file_name().to_str()?.to_owned()).ok()?;
-            let session = SessionId::parse(
-                std::fs::read_to_string(entry.path())
-                    .ok()?
-                    .trim()
-                    .to_owned(),
-            )
-            .ok()?;
-            Some((task, session))
+            let mark = Mark::read(&entry.path())?;
+            let due = mark.retry_after.is_none_or(|after| now >= after);
+            let mine =
+                except.is_none_or(|except| *except != task) && !running.contains(task.as_str());
+            (due && mine && !mark.owned_elsewhere())
+                .then_some((task, SessionId::parse(mark.session).ok()?))
         })
         .collect::<Vec<_>>();
     owed.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
@@ -236,10 +340,23 @@ pub fn owed(root: &Path) -> Vec<(TaskId, SessionId)> {
 
 /// The owed log of `task` is settled through `session`: its mark goes, unless
 /// a later turn has armed it again.
-fn settle(root: &Path, task: &TaskId, session: &SessionId) {
-    let path = root.join(OWED_DIR).join(task.as_str());
-    if std::fs::read_to_string(&path).is_ok_and(|owed| owed.trim() == session.as_str()) {
+fn settle(marks: &Path, task: &TaskId, session: &SessionId) {
+    let path = mark_path(marks, task);
+    if Mark::read(&path).is_some_and(|mark| mark.session == session.as_str()) {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+/// A write of the owed log of `task` through `session` failed: counted, and
+/// after [`OWED_FAILURES`] in a row put off for [`OWED_RETRY`].
+fn failed(marks: &Path, task: &TaskId, session: &SessionId) {
+    let path = mark_path(marks, task);
+    if let Some(mut mark) = Mark::read(&path).filter(|mark| mark.session == session.as_str()) {
+        mark.failures += 1;
+        if mark.failures >= OWED_FAILURES {
+            mark.retry_after = Some(chrono::Utc::now() + OWED_RETRY);
+        }
+        mark.write(&path);
     }
 }
 
@@ -992,8 +1109,8 @@ pub struct Placed {
 pub enum Outcome {
     /// Written, from a conversation of `turns` turns.
     Written { placed: Placed, turns: usize },
-    /// Nothing to write, and why: `few_turns`, `child`, `fixture`,
-    /// `already_written`.
+    /// Nothing to write, and why: `few_turns`, `not_in_store`, `child`,
+    /// `fixture`, `already_written`, `in_progress`.
     Skipped(&'static str),
 }
 
@@ -1113,8 +1230,11 @@ fn tail(text: &str, limit: usize) -> String {
 /// one call to `provider`. [`Outcome::Skipped`] when there is nothing to
 /// write: a log already written through this turn or being written now, a
 /// fixture model, a delegated child's task, or too little work
-/// ([`MIN_USER_TURNS`]). Any outcome but an error and `in_progress` settles
-/// the log owed through `session`.
+/// ([`MIN_USER_TURNS`]), or a turn the journal never received. A log written,
+/// or one the journal shows nothing is owed for, settles the mark owed
+/// through `session` (marks live with the store, so its journal is the one
+/// that knows); a fixture model and a write already running leave it, and an
+/// error counts against it ([`OWED_FAILURES`]).
 ///
 /// # Errors
 /// The journal cannot be read, the model's log has not the shape, or it
@@ -1130,8 +1250,16 @@ pub async fn write_from_journal(
         return Ok(Outcome::Skipped("in_progress"));
     };
     let outcome = log_conversation(store, provider, root, session, task).await;
-    if outcome.is_ok() {
-        settle(root, task, session);
+    let marks = &store.paths().data_dir;
+    match &outcome {
+        Ok(
+            Outcome::Written { .. }
+            | Outcome::Skipped("already_written" | "child" | "few_turns" | "not_in_store"),
+        ) => {
+            settle(marks, task, session);
+        }
+        Ok(Outcome::Skipped(_)) => {}
+        Err(_) => failed(marks, task, session),
     }
     outcome
 }
@@ -1166,6 +1294,11 @@ async fn log_conversation(
     let turns = harness_runtime::conversation_turns(store, session)
         .await
         .map_err(|error| error.to_string())?;
+    // A mark another store's ha armed, or one whose turn never reached the
+    // journal: this store cannot say what is owed.
+    if turns.is_empty() {
+        return Ok(Outcome::Skipped("not_in_store"));
+    }
     let typed = user_turns(store, &turns).await;
     let (tools, steps) = if typed >= MIN_USER_TURNS {
         (0, 0)
@@ -2356,21 +2489,38 @@ mod tests {
     async fn a_log_owed_is_marked_settled_and_written_by_the_next_start() {
         let mut journal = Journal::new().await;
         let root = journal.root.clone();
+        let marks = journal.store.paths().data_dir.clone();
         let task = TaskId::generate();
         let first = journal.turn(&task, None, "wire the parser").await;
         let second = journal
             .turn(&task, Some(&first), "add error recovery")
             .await;
-        // The turn ends: the log is owed before anything writes it.
-        owe(&root, &task, &second);
-        assert_eq!(owed(&root), [(task.clone(), second.clone())]);
+        // The turn ends: the log is owed before anything writes it, under the
+        // store, and the project is not touched for it.
+        owe(&marks, &task, &second);
+        assert_eq!(owed(&marks, None), [(task.clone(), second.clone())]);
+        assert!(
+            !root.join(".harness").exists(),
+            "a mark writes nothing in the project"
+        );
+        assert!(
+            owed(&marks, Some(&task)).is_empty(),
+            "the running conversation's own"
+        );
+        {
+            let _running = RunningTurn::begin(&task);
+            assert!(
+                owed(&marks, None).is_empty(),
+                "a turn half done is not logged"
+            );
+        }
 
         // The process was killed before it wrote the log. The next start
         // finds what is owed and writes it.
-        let (owing, through) = owed(&root).pop().expect("owed");
+        let (owing, through) = owed(&marks, None).pop().expect("owed");
         let result = write_from_journal(&journal.store, writer(), &root, &through, &owing).await;
         assert!(matches!(result, Ok(Outcome::Written { .. })), "{result:?}");
-        assert!(owed(&root).is_empty(), "written: no longer owed");
+        assert!(owed(&marks, None).is_empty(), "written: no longer owed");
         assert_eq!(
             find(&root, task.as_str()).and_then(|log| log.through),
             Some(second.as_str().to_owned())
@@ -2378,24 +2528,76 @@ mod tests {
 
         // A later turn owes again; settling an older turn leaves that mark.
         let third = journal.turn(&task, Some(&second), "and the docs").await;
-        owe(&root, &task, &third);
-        settle(&root, &task, &second);
-        assert_eq!(owed(&root), [(task.clone(), third.clone())]);
-        // Nothing to write is settled too: no start writes it again.
+        owe(&marks, &task, &third);
+        settle(&marks, &task, &second);
+        assert_eq!(owed(&marks, None), [(task.clone(), third.clone())]);
+        // Nothing to write, by this store's own journal, is settled too.
         let quick = TaskId::generate();
         let only = journal.turn(&quick, None, "hello").await;
-        owe(&root, &quick, &only);
+        owe(&marks, &quick, &only);
         assert_eq!(
             write_from_journal(&journal.store, writer(), &root, &only, &quick).await,
             Ok(Outcome::Skipped("few_turns"))
         );
-        assert_eq!(owed(&root), [(task.clone(), third)]);
-        // A write already running for the conversation is not started twice.
-        let _writing = Writing::begin(&task).expect("first");
+        let gone = TaskId::generate();
+        let never = SessionId::generate();
+        owe(&marks, &gone, &never);
         assert_eq!(
-            write_from_journal(&journal.store, writer(), &root, &first, &task).await,
-            Ok(Outcome::Skipped("in_progress"))
+            write_from_journal(&journal.store, writer(), &root, &never, &gone).await,
+            Ok(Outcome::Skipped("not_in_store"))
         );
+        assert_eq!(owed(&marks, None), [(task.clone(), third.clone())]);
+        // A fixture model writes nothing, and the log stays owed.
+        let fixture: Arc<dyn ModelProvider> =
+            Arc::new(harness_providers::MockProvider::text(MODEL_LOG));
+        assert_eq!(
+            write_from_journal(&journal.store, fixture, &root, &third, &task).await,
+            Ok(Outcome::Skipped("fixture"))
+        );
+        assert_eq!(owed(&marks, None), [(task.clone(), third.clone())]);
+        // A write already running for the conversation is not started twice.
+        {
+            let _writing = Writing::begin(&task).expect("first");
+            assert_eq!(
+                write_from_journal(&journal.store, writer(), &root, &third, &task).await,
+                Ok(Outcome::Skipped("in_progress"))
+            );
+        }
+        // Writes that keep failing are put off.
+        for _ in 0..OWED_FAILURES {
+            failed(&marks, &task, &third);
+        }
+        assert!(owed(&marks, None).is_empty(), "retried only after an hour");
+    }
+
+    #[test]
+    fn a_mark_another_live_process_owns_is_left_to_it() {
+        let marks = tempfile::tempdir().expect("marks");
+        let task = TaskId::generate();
+        // A process that stays alive until its input closes.
+        let mut other = std::process::Command::new("git")
+            .args(["hash-object", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("a live process");
+        Mark {
+            session: SessionId::generate().as_str().to_owned(),
+            owner: format!("{}:1", other.id()),
+            ..Mark::default()
+        }
+        .write(&mark_path(marks.path(), &task));
+        assert!(owed(marks.path(), None).is_empty(), "its owner runs it");
+        let _ = other.kill();
+        let _ = other.wait();
+        assert_eq!(owed(marks.path(), None).len(), 1, "its owner is gone");
+        // A mark from before the owner was kept is no live process's.
+        std::fs::write(
+            mark_path(marks.path(), &task),
+            SessionId::generate().as_str(),
+        )
+        .expect("plain mark");
+        assert_eq!(owed(marks.path(), None).len(), 1);
     }
 
     #[tokio::test]
@@ -2463,7 +2665,6 @@ mod tests {
         std::fs::create_dir_all(root.path().join(".harness")).expect("dir");
         std::fs::write(root.path().join(".harness/.gitignore"), "my-own/").expect("ignore");
         put(root.path(), "task_1", &draft(), "2026-10-28T14:05:00+07:00");
-        owe(root.path(), &TaskId::generate(), &SessionId::generate());
         let ignore =
             std::fs::read_to_string(root.path().join(".harness/.gitignore")).expect("ignore");
         assert_eq!(
