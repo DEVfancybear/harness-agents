@@ -29,6 +29,10 @@ use sha2::{Digest as _, Sha256};
 
 /// The database a scope directory holds.
 pub const DB_FILE: &str = "memory.sqlite3";
+
+/// Set on a document read from a store that could not be read; a save of such
+/// a document is refused.
+pub const UNREADABLE: &str = "__unreadable";
 /// The lock a read-modify-write of a scope holds.
 pub const LOCK_FILE: &str = "memory.lock";
 /// The state file the store replaced; one found beside a store is imported.
@@ -651,6 +655,14 @@ pub fn load_document(dir: &Path) -> Result<Value, String> {
 /// # Errors
 /// The store cannot be opened or written; nothing is then changed.
 pub fn save_document(dir: &Path, state: &Value, writer: &Writer) -> Result<usize, String> {
+    // A document read from a store that could not be read is empty, and
+    // saving it would delete every entry: nothing is written from it.
+    if let Some(error) = state[UNREADABLE].as_str() {
+        return Err(format!(
+            "the memory store at {} could not be read ({error}); nothing was written, so nothing it holds is lost",
+            dir.display()
+        ));
+    }
     let mut store = Store::open(dir)?;
     let root = store.root;
     let transaction = store.begin()?;
@@ -2020,5 +2032,22 @@ mod tests {
             find(&dir, "m1").expect("find"),
             Some(("memory".to_owned(), "queue".to_owned()))
         );
+    }
+
+    /// A store that cannot be read is never overwritten from the empty
+    /// document a reader gets: the save is refused and the entries stay.
+    #[test]
+    fn an_unreadable_store_is_never_saved_over() {
+        let directory = tempfile::tempdir().expect("dir");
+        let dir = directory.path();
+        let mut state = empty_document();
+        state["entries"]["memory"]["kept"] =
+            json!({"title": "Kept", "content": "a fact worth keeping"});
+        save_document(dir, &state, &writer()).expect("create");
+        let mut unreadable = empty_document();
+        unreadable[UNREADABLE] = json!("database is locked");
+        let refused = save_document(dir, &unreadable, &writer()).expect_err("refused");
+        assert!(refused.contains("nothing was written"), "{refused}");
+        assert!(load_document(dir).expect("load")["entries"]["memory"]["kept"].is_object());
     }
 }

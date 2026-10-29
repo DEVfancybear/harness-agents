@@ -9250,8 +9250,10 @@ async fn run_turn(
     // What the user typed, kept with the turn: the admitted input is the prompt
     // composed below (notices, attached files, hook context), and a summary of
     // the conversation keeps the user's own words. A turn the host started - a
-    // goal's continuation - has none.
-    let typed = if super::goal::is_host_text(&request.text) {
+    // goal's continuation, a child's report or message, a heartbeat, a park's
+    // resume - has none: its text is not the user's, and a summary that kept
+    // it as the user's words would rank it above everything else.
+    let typed = if request.automatic || super::goal::is_host_text(&request.text) {
         String::new()
     } else {
         request.text.clone()

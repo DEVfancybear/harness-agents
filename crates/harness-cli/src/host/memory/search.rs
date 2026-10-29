@@ -638,36 +638,89 @@ fn words(text: &str, fold: bool) -> Vec<String> {
     }
 }
 
-/// A field's words beside their English stems, as BM25 matches them.
+/// A field's words as BM25 matches them: each distinct word once, sorted,
+/// with how often it occurs, and the words of each English stem. A term's
+/// frequency is then a binary search for the words it begins and a lookup of
+/// its stem's words, not a pass over every word of every field.
 struct Field {
-    words: Vec<String>,
-    stems: Vec<String>,
+    /// Distinct words in byte order, each with its count: the words a term
+    /// begins sit together, from where the term would sort.
+    words: Vec<(String, f64)>,
+    /// Indexes into `words` of the words of each stem.
+    stems: std::collections::HashMap<String, Vec<usize>>,
+    /// How many words the field holds, repeats counted: its length.
+    total: usize,
     weight: f64,
 }
 
 impl Field {
     fn new(words: Vec<String>, weight: f64, stemmer: &rust_stemmers::Stemmer) -> Self {
+        let total = words.len();
+        let mut counts = BTreeMap::<String, f64>::new();
+        for word in words {
+            *counts.entry(word).or_default() += 1.0;
+        }
+        let words = counts.into_iter().collect::<Vec<_>>();
+        let mut stems = std::collections::HashMap::<String, Vec<usize>>::new();
+        for (index, (word, _)) in words.iter().enumerate() {
+            stems
+                .entry(stemmer.stem(word).into_owned())
+                .or_default()
+                .push(index);
+        }
         Self {
-            stems: words
-                .iter()
-                .map(|word| stemmer.stem(word).into_owned())
-                .collect(),
             words,
+            stems,
+            total,
             weight,
         }
     }
 
     /// How often the field holds a term: a word it begins (`deploy` finds
-    /// `deploys`), or a word of the same stem (`deploying` finds `deployed`).
-    #[allow(clippy::cast_precision_loss, reason = "counts are small")]
+    /// `deploys`), or a word of the same stem (`deploying` finds `deployed`),
+    /// each word counted once.
     fn frequency(&self, term: &str, stem: &str) -> f64 {
-        self.words
+        let start = self.words.partition_point(|(word, _)| word.as_str() < term);
+        let mut count = self.words[start..]
             .iter()
-            .zip(&self.stems)
-            .filter(|(word, word_stem)| word.starts_with(term) || *word_stem == stem)
-            .count() as f64
-            * self.weight
+            .take_while(|(word, _)| word.starts_with(term))
+            .map(|(_, count)| count)
+            .sum::<f64>();
+        if let Some(indexes) = self.stems.get(stem) {
+            count += indexes
+                .iter()
+                .map(|index| &self.words[*index])
+                .filter(|(word, _)| !word.starts_with(term))
+                .map(|(_, count)| count)
+                .sum::<f64>();
+        }
+        count * self.weight
     }
+}
+
+/// From how many entries BM25 builds and scores them on several threads: below
+/// it, starting the threads costs more than they save.
+const PARALLEL_FROM: usize = 512;
+
+/// `f` over `items`, in order, on as many threads as the machine has when
+/// there are enough items to share; on this thread otherwise.
+fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    if items.len() < PARALLEL_FROM || threads < 2 {
+        return items.iter().map(f).collect();
+    }
+    let chunk = items.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let f = &f;
+        let handles = items
+            .chunks(chunk)
+            .map(|part| scope.spawn(move || part.iter().map(f).collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    })
 }
 
 /// BM25 over the considered entries, best first, only those holding at least
@@ -675,110 +728,129 @@ impl Field {
 /// with Snowball's English stemmer as memory-engine's Postgres configuration
 /// has it. Fields weigh by what they say of the entry: its title most, then
 /// its content and where it sits, then its facets.
-#[allow(clippy::cast_precision_loss, reason = "counts are small")]
-#[allow(
-    clippy::too_many_lines,
-    reason = "one ranking: the fields, their statistics, then each entry's score"
-)]
 fn bm25(considered: &[&Placed<'_>], query: &str) -> Vec<(usize, f64)> {
-    let fold = super::knowledge::store::fold(query) == query;
-    let terms = harness::query_terms(&if fold {
-        super::knowledge::store::fold(query)
-    } else {
-        query.to_owned()
-    });
-    if terms.is_empty() || considered.is_empty() {
+    let entries = considered
+        .iter()
+        .map(|placed| placed.entry)
+        .collect::<Vec<_>>();
+    let terms = harness::query_terms(query)
+        .into_iter()
+        .map(|term| (term, 1.0))
+        .collect::<Vec<_>>();
+    bm25_weighted(&entries, &terms)
+}
+
+/// One entry's fields as BM25 reads them, its words as written and folded.
+struct Fields {
+    written: [Field; 4],
+    folded: [Field; 4],
+}
+
+impl Fields {
+    fn new(entry: &Entry, stemmer: &rust_stemmers::Stemmer) -> Self {
+        let facets = entry
+            .meta
+            .iter()
+            .filter(|(key, _)| key.as_str() != "pinned")
+            .map(|(key, value)| {
+                format!(
+                    "{key} {}",
+                    value
+                        .as_str()
+                        .map_or_else(|| value.to_string(), str::to_owned)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let place = format!("{} {}", entry.tree.replace('/', " "), entry.id);
+        let texts = [
+            (entry.title.as_deref().unwrap_or_default(), TITLE_WEIGHT),
+            (entry.content.as_deref().unwrap_or_default(), CONTENT_WEIGHT),
+            (place.as_str(), PATH_WEIGHT),
+            (facets.as_str(), META_WEIGHT),
+        ];
+        let fields =
+            |fold: bool| texts.map(|(text, weight)| Field::new(words(text, fold), weight, stemmer));
+        Self {
+            written: fields(false),
+            folded: fields(true),
+        }
+    }
+
+    /// How often the entry holds a term, in the form the term is in: a term
+    /// without accents reads the entry without its accents, so `may in` finds
+    /// `máy in`; one with accents reads it as written.
+    fn frequency(&self, term: &str, stem: &str, fold: bool) -> f64 {
+        let fields = if fold { &self.folded } else { &self.written };
+        fields.iter().map(|field| field.frequency(term, stem)).sum()
+    }
+
+    #[allow(clippy::cast_precision_loss, reason = "counts are small")]
+    fn length(&self) -> f64 {
+        self.written
+            .iter()
+            .map(|field| field.total as f64 * field.weight)
+            .sum()
+    }
+}
+
+/// [`bm25`] for a query whose terms weigh differently - the turn's digest
+/// weighs a goal's words above an earlier message's - over plain entries.
+/// The indexes of the entries holding a term, best first.
+#[allow(clippy::cast_precision_loss, reason = "counts are small")]
+pub fn bm25_weighted(entries: &[&Entry], terms: &[(String, f64)]) -> Vec<(usize, f64)> {
+    if terms.is_empty() || entries.is_empty() {
         return Vec::new();
     }
     let stemmer = rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English);
-    let term_stems = terms
+    let terms = terms
         .iter()
-        .map(|term| stemmer.stem(term).into_owned())
-        .collect::<Vec<_>>();
-    let fields = considered
-        .iter()
-        .map(|placed| {
-            let entry = placed.entry;
-            let facets = entry
-                .meta
-                .iter()
-                .filter(|(key, _)| key.as_str() != "pinned")
-                .map(|(key, value)| {
-                    format!(
-                        "{key} {}",
-                        value
-                            .as_str()
-                            .map_or_else(|| value.to_string(), str::to_owned)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            [
-                Field::new(
-                    words(entry.title.as_deref().unwrap_or_default(), fold),
-                    TITLE_WEIGHT,
-                    &stemmer,
-                ),
-                Field::new(
-                    words(entry.content.as_deref().unwrap_or_default(), fold),
-                    CONTENT_WEIGHT,
-                    &stemmer,
-                ),
-                Field::new(
-                    words(
-                        &format!("{} {}", entry.tree.replace('/', " "), entry.id),
-                        fold,
-                    ),
-                    PATH_WEIGHT,
-                    &stemmer,
-                ),
-                Field::new(words(&facets, fold), META_WEIGHT, &stemmer),
-            ]
+        .map(|(term, weight)| {
+            let fold = super::knowledge::store::fold(term) == *term;
+            let stem = stemmer.stem(term).into_owned();
+            (term.as_str(), stem, fold, *weight)
         })
         .collect::<Vec<_>>();
-    let lengths = fields
-        .iter()
-        .map(|fields| {
-            fields
-                .iter()
-                .map(|field| field.words.len() as f64 * field.weight)
-                .sum::<f64>()
-        })
-        .collect::<Vec<_>>();
+    // Each entry's fields are tokenized, stemmed and indexed on its own: the
+    // part that grows with the store, shared across threads for a large one.
+    let fields = parallel_map(entries, |entry| {
+        Fields::new(
+            entry,
+            &rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English),
+        )
+    });
+    let lengths = fields.iter().map(Fields::length).collect::<Vec<_>>();
     let average = (lengths.iter().sum::<f64>() / lengths.len() as f64).max(1.0);
-    let frequency = |fields: &[Field; 4], term: &str, stem: &str| {
-        fields
+    let documents = entries.len() as u64;
+    // Each term's frequency in each entry, once: the document frequencies and
+    // the scores both read it.
+    let frequencies = parallel_map(&fields, |fields| {
+        terms
             .iter()
-            .map(|field| field.frequency(term, stem))
-            .sum::<f64>()
-    };
-    let documents = considered.len() as u64;
-    let idf = terms
-        .iter()
-        .zip(&term_stems)
-        .map(|(term, stem)| {
-            let holding = fields
+            .map(|(term, stem, fold, _)| fields.frequency(term, stem, *fold))
+            .collect::<Vec<_>>()
+    });
+    let idf = (0..terms.len())
+        .map(|term| {
+            let holding = frequencies
                 .iter()
-                .filter(|fields| frequency(fields, term, stem) > 0.0)
+                .filter(|frequencies| frequencies[term] > 0.0)
                 .count() as u64;
             harness_types::search::bm25_idf(documents, holding)
         })
         .collect::<Vec<_>>();
-    let mut ranked = fields
+    let mut ranked = frequencies
         .iter()
         .enumerate()
-        .filter_map(|(index, fields)| {
+        .filter_map(|(index, frequencies)| {
             let mut score = 0.0;
-            let mut matched = false;
-            for ((term, stem), idf) in terms.iter().zip(&term_stems).zip(&idf) {
-                let tf = frequency(fields, term, stem);
-                if tf > 0.0 {
-                    matched = true;
-                    score += idf * tf * (K1 + 1.0)
+            for ((tf, (_, _, _, weight)), idf) in frequencies.iter().zip(&terms).zip(&idf) {
+                if *tf > 0.0 {
+                    score += weight * idf * tf * (K1 + 1.0)
                         / (tf + K1 * (1.0 - B + B * lengths[index] / average));
                 }
             }
-            (matched && score > 0.0).then_some((index, score))
+            (score > 0.0).then_some((index, score))
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -815,6 +887,7 @@ pub fn rank_documents(documents: &[(&str, &str)], query: &str) -> Vec<(usize, f6
             meta: serde_json::Map::new(),
             temporal: None,
             ended: false,
+            source: None,
         })
         .collect::<Vec<_>>();
     let doc = Value::Null;
@@ -1186,6 +1259,83 @@ fn inline(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The indexed field counts a term as a pass over its words would: the
+    /// words it begins and the words of its stem, each occurrence once.
+    #[test]
+    fn an_indexed_field_counts_as_a_pass_over_its_words() {
+        let stemmer = rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English);
+        let words = "deploy deploys deploying deployed redeploy deploy staging stage"
+            .split(' ')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let field = Field::new(words.clone(), 2.0, &stemmer);
+        for term in ["deploy", "deployed", "stag", "stage", "x", "re"] {
+            let stem = stemmer.stem(term).into_owned();
+            #[allow(clippy::cast_precision_loss, reason = "a few words")]
+            let expected = words
+                .iter()
+                .filter(|word| word.starts_with(term) || stemmer.stem(word) == stem)
+                .count() as f64
+                * 2.0;
+            assert!(
+                (field.frequency(term, &stem) - expected).abs() < 1e-9,
+                "{term}: {} != {expected}",
+                field.frequency(term, &stem)
+            );
+        }
+        assert_eq!(field.total, words.len());
+    }
+
+    /// Many entries are built and scored on several threads, in the order
+    /// one thread gives; run with `--ignored` to see the time it takes.
+    #[test]
+    #[ignore = "a timing, not a check"]
+    fn bm25_over_ten_thousand_entries() {
+        let entries = (0..10_000)
+            .map(|index| Entry {
+                id: format!("e{index}"),
+                name: format!("e{index}"),
+                memory: None,
+                kind: "memory".to_owned(),
+                title: Some(format!("Note {index} about the parser and deploys")),
+                content: Some(format!(
+                    "entry {index}: the build of service {} runs cargo test before a deploy to staging; máy in số {}",
+                    index % 97,
+                    index % 13
+                )),
+                path: "general".to_owned(),
+                scope: "global".to_owned(),
+                version: 1,
+                reference: serde_json::Map::new(),
+                arguments: serde_json::Map::new(),
+                pinned: false,
+                updated_at: None,
+                project: None,
+                aliases: Vec::new(),
+                tree: "/global/general".to_owned(),
+                meta: serde_json::Map::new(),
+                temporal: None,
+                ended: false,
+                source: None,
+            })
+            .collect::<Vec<_>>();
+        let refs = entries.iter().collect::<Vec<_>>();
+        let terms = harness::weighted_terms(
+            Some("fix the deploy of service 42"),
+            &["may in so 7 bi loi", "the parser fails on staging"],
+        );
+        let started = std::time::Instant::now();
+        let ranked = bm25_weighted(&refs, &terms);
+        eprintln!(
+            "bm25 over {} entries, {} terms: {:?}, {} ranked",
+            entries.len(),
+            terms.len(),
+            started.elapsed(),
+            ranked.len()
+        );
+        assert!(!ranked.is_empty());
+    }
 
     #[test]
     fn yaml_quotes_what_would_read_as_something_else() {

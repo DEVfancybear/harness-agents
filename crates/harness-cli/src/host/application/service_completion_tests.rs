@@ -348,6 +348,9 @@ async fn resume_flow() {
         ),
         (MODEL_VARIABLE, "fixture-model".to_owned()),
         ("HA_API_KEY", "completion-fixture-only".to_owned()),
+        // Leaving the conversation writes its session log through the same
+        // provider; this test counts the provider's calls, so logs are off.
+        ("HA_SESSION_LOG", "off".to_owned()),
     ]);
     let mut channel = SessionChannel::new();
     let mut service = AgentSessionService::new(&context, environment, channel.sender());

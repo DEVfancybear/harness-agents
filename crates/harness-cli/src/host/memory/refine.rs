@@ -583,10 +583,19 @@ impl HarnessScopes {
 }
 
 /// The raw state of one scope, as one document (`memory_store`); unknown
-/// fields are kept through a save. An unreadable store reads as empty.
+/// fields are kept through a save. An unreadable store reads as empty for a
+/// reader, marked so (`UNREADABLE`) that no write is made from it: a save of
+/// that empty document would delete every entry the store holds.
 pub(super) fn load_raw(dir: &Path) -> Value {
-    let mut state = super::memory_store::load_document(dir)
-        .unwrap_or_else(|_| super::memory_store::empty_document());
+    let mut state = super::memory_store::load_document(dir).unwrap_or_else(|error| {
+        harness_types::diag::warn("memory", "store_unreadable")
+            .field("dir", dir.display().to_string())
+            .field("error", error.clone())
+            .emit();
+        let mut empty = super::memory_store::empty_document();
+        empty[super::memory_store::UNREADABLE] = json!(error);
+        empty
+    });
     for kind in KINDS {
         if !state["entries"][kind].is_object() {
             state["entries"][kind] = json!({});
