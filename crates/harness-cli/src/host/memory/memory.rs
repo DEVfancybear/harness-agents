@@ -513,9 +513,8 @@ impl MemoryHost {
             ));
         }
         // Every later turn reads memory: text that would steer the agent -
-        // ignore its instructions, send a secret, run a destructive command -
-        // is not kept, as a learned skill's is not.
-        let unsafe_hits = super::learned::unsafe_hits(&format!("{title}\n{content}"));
+        // ignore its instructions, send a secret away - is not kept.
+        let unsafe_hits = super::learned::steering_hits(&format!("{title}\n{content}"));
         if !unsafe_hits.is_empty() {
             return Err(format!(
                 "memory keeps no {} text: write the fact without it",
@@ -3629,6 +3628,12 @@ mod tests {
             &json!({"action":"write","scope":"global","title":"Shell","content":"The user works in PowerShell."}),
         )
         .expect("a plain fact is kept");
+        // A rule that forbids a dangerous command names it, and is kept.
+        run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Databases","content":"Never run DROP DATABASE on prod; backups run from the user's crontab."}),
+        )
+        .expect("a prohibition is kept");
     }
 
     /// A project that keeps a markdown store keeps its facts there: a project

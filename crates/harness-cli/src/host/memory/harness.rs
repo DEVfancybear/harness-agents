@@ -669,12 +669,18 @@ pub fn format_digest_recalled(
         // The constraints come first, up to their own limit, and the ranked
         // entries keep their places beside them: a list of rules never
         // pushes the entries the request is about out of the digest.
-        let shown = entries
+        let visible = entries
             .iter()
             .filter(|entry| is_constraint(entry))
-            .count()
-            .min(CONSTRAINT_LIMIT)
-            + DEFAULT_ENTRY_LIMIT;
+            .take(CONSTRAINT_LIMIT)
+            .chain(
+                entries
+                    .iter()
+                    .filter(|entry| !is_constraint(entry))
+                    .take(DEFAULT_ENTRY_LIMIT),
+            )
+            .collect::<Vec<_>>();
+        let shown = visible.len();
         total += kept;
         if pinned > 0 {
             lines.push(format!("{kind}: {kept} ({pinned} pinned above)"));
@@ -694,7 +700,7 @@ pub fn format_digest_recalled(
                 "(entries ranked by relevance to the current task; see harness.search)".to_owned()
             });
         }
-        for entry in entries.iter().take(shown) {
+        for entry in visible {
             let (Some(title), Some(content)) = (&entry.title, &entry.content) else {
                 let reason = if entry.content.is_none() {
                     "content not a string"
@@ -1236,13 +1242,13 @@ mod tests {
         );
     }
 
-    /// Many rules do not take the ranked entries' places: with eight
+    /// Many rules do not take the ranked entries' places: with twenty
     /// constraints, the entries the request is about are still shown.
     #[test]
     fn constraints_are_shown_beside_the_ranked_entries() {
         let directory = tempfile::tempdir().expect("state");
         let mut memories = serde_json::Map::new();
-        for number in 0..8 {
+        for number in 0..20 {
             memories.insert(
                 format!("rule-{number}"),
                 json!({"title": format!("Rule {number}"), "content": format!("house rule {number}"), "path": "constraints/house"}),
@@ -1258,7 +1264,8 @@ mod tests {
             DigestOptions::default(),
             &weighted_terms(None, &["fix the parser tokens"]),
         );
-        assert!(digest.contains("house rule 7"), "{digest}");
+        // Twelve of the twenty rules, and the entry the request is about.
+        assert_eq!(digest.matches("house rule ").count(), 12, "{digest}");
         assert!(digest.contains("the parser handles tokens"), "{digest}");
     }
 

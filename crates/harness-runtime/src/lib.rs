@@ -2992,8 +2992,17 @@ pub async fn conversation_transcript(
     }
     let mut index = 0_usize;
     for (session, question) in turns.iter().skip(turns.len().saturating_sub(max_turns)) {
+        // A turn the host started - a child's report, a heartbeat, a goal's
+        // continuation - is not the user's: a review must not quote it as
+        // what the user said.
         if !question.trim().is_empty() {
-            parts.push(format!("[User]: {question}"));
+            let host = typed_input(store, session)
+                .await
+                .is_some_and(|typed| typed.trim().is_empty());
+            parts.push(format!(
+                "{} {question}",
+                if host { HOST_LABEL } else { USER_LABEL }
+            ));
         }
         let decoded = decoded_attempts(store, session).await?;
         let attempts = attempts_in(&decoded, &["completed", "canceled"]);
@@ -3054,6 +3063,11 @@ pub async fn conversation_transcript(
     }
     Ok(parts.join("\n\n"))
 }
+
+/// How the transcript a review reads labels the user's turn.
+pub const USER_LABEL: &str = "[User]:";
+/// How it labels a turn the host started: its text is not the user's words.
+pub const HOST_LABEL: &str = "[Host]:";
 
 /// The transcript line after which the turns are new to refinement.
 pub const REVIEWED_MARKER: &str =

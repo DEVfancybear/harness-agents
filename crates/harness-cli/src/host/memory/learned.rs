@@ -1099,6 +1099,17 @@ static UNSAFE_RULES: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     .collect()
 });
 
+/// The families of [`unsafe_hits`] that steer the agent - injection and
+/// exfiltration - which memory refuses. A memory may well name a destructive
+/// or persistent command: "never run DROP DATABASE on prod" is the rule that
+/// forbids it.
+pub(crate) fn steering_hits(text: &str) -> Vec<&'static str> {
+    unsafe_hits(text)
+        .into_iter()
+        .filter(|family| matches!(*family, "injection" | "exfiltration"))
+        .collect()
+}
+
 pub(crate) fn unsafe_hits(text: &str) -> Vec<&'static str> {
     let mut families = UNSAFE_RULES
         .iter()

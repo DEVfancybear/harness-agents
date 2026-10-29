@@ -718,7 +718,13 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
             .collect::<Vec<_>>();
         handles
             .into_iter()
-            .flat_map(|handle| handle.join().unwrap_or_default())
+            .flat_map(|handle| {
+                // A chunk that panicked is not dropped: its results would leave
+                // every later index pointing at another entry.
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
             .collect()
     })
 }

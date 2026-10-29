@@ -389,6 +389,7 @@ JSON only with this exact shape:
       "title": "required for create/update except delete",
       "content": "required for create/update except delete",
       "path": "optional grouping path",
+      "about": "for memory and prompt edits: user (the user, their preferences), environment (their machine and tools) or project (one project's facts and rules)",
       "reference": {"type": "python", "import": "package.module", "callable": "function_name", "call_pattern": "await function_name(...)"},
       "arguments": {"name": {"type": "string", "required": true, "description": "accepted input"}},
       "metadata": {},
@@ -1039,9 +1040,9 @@ fn memory_refusal(
         ));
     }
     // Memory reaches every later turn: what reads as an attempt to steer the
-    // agent (ignore its instructions, send a secret, run a destructive
-    // command) is not kept, whoever proposed it.
-    let unsafe_hits = super::learned::unsafe_hits(&format!("{title}\n{content}"));
+    // agent (ignore its instructions, send a secret away) is not kept,
+    // whoever proposed it.
+    let unsafe_hits = super::learned::steering_hits(&format!("{title}\n{content}"));
     if !unsafe_hits.is_empty() {
         return Some(format!(
             "the harness keeps no {} text in memory",
@@ -2257,9 +2258,11 @@ const KNOWLEDGE_PROPOSALS: &str = "Knowledge (not an edit kind) is the user's li
 const MARKDOWN_STORE_REFUSAL: &str = "this project keeps its memory in markdown files (MEMORY.md, memory/): a fact or rule about it is written there, not as a memory edit";
 
 impl Edit {
-    /// A memory or prompt edit about `project`: it names the project (as a
-    /// whole word, for a name long enough to be one), its folder, or carries
-    /// it in its metadata.
+    /// A memory or prompt edit about `project`: the review says so (`about`),
+    /// it carries the project in its metadata or tag, it names the project's
+    /// folder as a whole path, or its tree files it under the project. A word
+    /// it shares with the project's name is not enough: a project called
+    /// `docs` does not make "the user likes terse docs" its fact.
     fn about_project(&self, project: &super::lessons::ProjectRef) -> bool {
         if !matches!(self.text("kind"), Some("memory" | "prompt")) {
             return false;
@@ -2276,23 +2279,39 @@ impl Edit {
         {
             return true;
         }
+        // The review says what each memory edit is about; one about this
+        // project is the store's.
+        if self.text("about") == Some("project") {
+            return true;
+        }
+        // The project's folder, as a whole path: `c:/work/orion` and not
+        // `c:/work/orion-tools`.
+        let root = project.root.replace('\\', "/").to_lowercase();
+        let root = root.trim_end_matches('/');
         let text = ["title", "content", "path"]
             .iter()
             .filter_map(|field| self.text(field))
             .collect::<Vec<_>>()
             .join(" ")
+            .replace('\\', "/")
             .to_lowercase();
-        let root = project.root.replace('\\', "/").to_lowercase();
-        if !root.is_empty() && text.replace('\\', "/").contains(&root) {
+        if !root.is_empty()
+            && text.match_indices(root).any(|(at, _)| {
+                text[at + root.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|next| !(next.is_alphanumeric() || next == '-' || next == '_'))
+            })
+        {
             return true;
         }
+        // A tree that files it under the project (`projects/orion/...`).
         let name = project.name.to_lowercase();
-        name.chars().count() >= 3
-            && text
-                .split(|character: char| {
-                    !(character.is_alphanumeric() || character == '-' || character == '_')
-                })
-                .any(|word| word == name)
+        self.text("path").is_some_and(|path| {
+            path.to_lowercase()
+                .split(['/', '\\'])
+                .any(|segment| segment == name)
+        })
     }
 
     /// An automatic review's memory edit meant for every conversation.
@@ -2694,7 +2713,7 @@ pub struct AutoRefined {
 
 /// What the review is told about a project that keeps a markdown memory store
 /// (`docs/architecture/MARKDOWN_MEMORY.en.md`).
-const MARKDOWN_STORE_POLICY: &str = "<markdown_memory>\nThis project keeps its memory in markdown files at its root (MEMORY.md and memory/), which the agent writes. Do not save a fact or rule about this project as a memory edit, local or global, even one that names the project, which the scope policy would otherwise allow: it belongs in those files. Facts about the user across projects stay memory edits, and a lesson about this project goes in `lessons` with scope project.\n</markdown_memory>";
+const MARKDOWN_STORE_POLICY: &str = "<markdown_memory>\nThis project keeps its memory in markdown files at its root (MEMORY.md and memory/), which the agent writes. Do not save a fact or rule about this project as a memory edit, local or global, even one that names the project, which the scope policy would otherwise allow: it belongs in those files. Say in each memory edit's `about` what it is about; an edit about this project is refused. Facts about the user across projects stay memory edits, and a lesson about this project goes in `lessons` with scope project.\n</markdown_memory>";
 
 /// The lessons a review's records say it saved as a global memory entry.
 fn covered_lessons(records: &[Value]) -> std::collections::BTreeSet<String> {
@@ -3773,9 +3792,29 @@ mod tests {
     };
     use serde_json::json;
 
+    /// A store file that is not a database reads as empty for a reader,
+    /// marked so, and a save of what was read is refused: the file is left
+    /// as it was.
+    #[test]
+    fn a_corrupt_store_is_read_as_unreadable_and_never_saved_over() {
+        let directory = tempfile::tempdir().expect("dir");
+        let file = directory.path().join(super::super::memory_store::DB_FILE);
+        std::fs::write(&file, "this is not a sqlite database").expect("garbage");
+        let state = load_raw(directory.path());
+        assert!(
+            state[super::super::memory_store::UNREADABLE].is_string(),
+            "{state}"
+        );
+        assert!(super::save_raw(directory.path(), &state, &test_writer()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "this is not a sqlite database"
+        );
+    }
+
     /// A memory edit about a project that keeps a markdown store is told by
-    /// its name, its folder or its metadata; another project's, or one about
-    /// the user, is not.
+    /// what the review says it is about, its metadata, its folder or its
+    /// tree; a user's fact that shares a word with the project is not.
     #[test]
     fn an_edit_about_the_store_project_is_known() {
         let project = super::super::lessons::ProjectRef {
@@ -3785,15 +3824,15 @@ mod tests {
         };
         let edit =
             |value: serde_json::Value| super::Edit(value.as_object().expect("an edit").clone());
-        assert!(edit(serde_json::json!({"kind": "memory", "title": "Orion build", "content": "In project orion, build with make ci."})).about_project(&project));
+        assert!(edit(serde_json::json!({"kind": "memory", "title": "Orion build", "content": "In project orion, build with make ci.", "about": "project"})).about_project(&project));
         assert!(edit(serde_json::json!({"kind": "memory", "title": "Build", "content": "C:/work/orion builds with make ci"})).about_project(&project));
         assert!(edit(serde_json::json!({"kind": "memory", "title": "Build", "content": "make ci", "metadata": {"project": "orion"}})).about_project(&project));
+        assert!(edit(serde_json::json!({"kind": "memory", "title": "Build", "content": "make ci", "path": "projects/orion"})).about_project(&project));
+        // A user's fact that shares a word with the project is the user's.
+        assert!(!edit(serde_json::json!({"kind": "memory", "title": "Orion docs", "content": "The user likes terse orion docs.", "about": "user"})).about_project(&project));
+        assert!(!edit(serde_json::json!({"kind": "memory", "title": "Tools", "content": "C:/work/orion-tools holds the scripts"})).about_project(&project));
         assert!(!edit(serde_json::json!({"kind": "memory", "title": "Editor", "content": "The user edits in Zed."})).about_project(&project));
-        assert!(!edit(serde_json::json!({"kind": "memory", "title": "Vega", "content": "orionid is a word of vega"})).about_project(&project));
-        assert!(
-            !edit(serde_json::json!({"kind": "skill", "title": "orion", "content": "orion"}))
-                .about_project(&project)
-        );
+        assert!(!edit(serde_json::json!({"kind": "skill", "title": "orion", "content": "orion", "about": "project"})).about_project(&project));
     }
 
     fn test_writer() -> super::super::memory_store::Writer {

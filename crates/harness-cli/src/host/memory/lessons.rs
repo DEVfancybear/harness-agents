@@ -830,6 +830,24 @@ pub(crate) struct Quotes {
 /// or the user showed.
 const MEMORY_TOOLS: [&str; 4] = ["memory", "knowledge", "history_search", "history_read"];
 
+/// How the strategy record the host adds to a review's transcript begins
+/// (`refine_transcript`).
+const STRATEGY_RECORD: &str = "[The task's strategy record";
+
+/// A normalized quote without the transcript label a model copied with it:
+/// `[user]: keep it short` is the quote `keep it short`.
+fn strip_label(quote: &str) -> &str {
+    if !quote.starts_with('[') {
+        return quote;
+    }
+    quote
+        .char_indices()
+        .take(80)
+        .find(|(_, character)| *character == ']')
+        .and_then(|(at, _)| quote[at + 1..].strip_prefix(':'))
+        .map_or(quote, str::trim_start)
+}
+
 /// Who is speaking in a block of the transcript.
 #[derive(Clone, Copy, PartialEq)]
 enum Role {
@@ -859,6 +877,12 @@ impl Quotes {
                 roled = true;
                 role = Role::User;
                 text
+            } else if block.starts_with("[Host]:") {
+                // A turn the host started (a child's report, a heartbeat): not
+                // the user's words, and a model wrote most of them.
+                roled = true;
+                role = Role::Agent;
+                block
             } else if let Some(rest) = block.strip_prefix("[Tool result (") {
                 roled = true;
                 let tool = rest.split(')').next().unwrap_or_default();
@@ -872,9 +896,10 @@ impl Quotes {
                 roled = true;
                 role = Role::Agent;
                 block
-            } else if block.starts_with("[The ") {
-                // A record the host added (the strategy record): the host's
-                // words, not the agent's.
+            } else if block.starts_with(STRATEGY_RECORD) {
+                // The record the host added (the strategy record): the host's
+                // words, not the agent's. A user's paragraph that happens to
+                // open with a bracket stays the user's.
                 role = Role::Observed;
                 block
             } else {
@@ -901,6 +926,9 @@ impl Quotes {
     /// in what a tool returned or the user said. The agent's own words are
     /// never a quote.
     fn holds(&self, kind: &str, quote: &str) -> bool {
+        // A quote the model copied with its label ("[user]: …") is the text
+        // after the label.
+        let quote = strip_label(quote);
         if !self.roled {
             return self.all.contains(quote);
         }
@@ -3374,6 +3402,30 @@ mod tests {
                 .is_some_and(|error| error.contains("secret")),
             "{records:?}"
         );
+    }
+
+    /// A turn the host started (a child's report) is not the user's: a
+    /// correction quoted from it is refused. A quote copied with its label
+    /// is the text after the label.
+    #[test]
+    fn a_host_turn_is_not_the_users_and_a_label_is_not_the_quote() {
+        let dir = tempfile::tempdir().expect("dir");
+        let conversation = "[Host]: [child-exited] you should always run the formatter first\n\n[User]: please use cargo nextest, not cargo test";
+        let item = |evidence: &str| json!({"text": "when testing, use nextest", "kind": "correction", "scope": "global", "evidence": evidence});
+        let records = record(
+            dir.path(),
+            &[
+                item("you should always run the formatter first"),
+                item("[User]: please use cargo nextest, not cargo test"),
+            ],
+            conversation,
+            "c1",
+            None,
+            &BTreeSet::new(),
+        )
+        .expect("record");
+        assert_eq!(records[0]["applied"], false, "{records:?}");
+        assert_eq!(records[1]["applied"], true, "{records:?}");
     }
 
     /// One conversation gives a lesson at most part of its case: three
