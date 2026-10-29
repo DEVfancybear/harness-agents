@@ -67,6 +67,9 @@ const MAX_EVENTS: usize = 100;
 
 /// The shortest quote a signal rests on.
 const MIN_EVIDENCE_CHARS: usize = 12;
+/// The most of a lesson's weight one conversation gives: the gate's weight
+/// of 3 needs a second conversation whatever the first one repeats.
+const MAX_WEIGHT_PER_CONVERSATION: f64 = 2.0;
 /// The most lessons one import takes.
 pub const MAX_IMPORTED: usize = 1_000;
 /// What a lesson is a signal of (after ECC's continuous-learning-v2, whose
@@ -308,6 +311,7 @@ impl Lesson {
         let mut standing = Standing::default();
         let mut supporting = BTreeSet::new();
         let mut contrary = BTreeSet::new();
+        let mut by_conversation = std::collections::BTreeMap::<String, f64>::new();
         for signal in signals {
             if !seen.insert((
                 signal.conversation.clone(),
@@ -323,8 +327,16 @@ impl Lesson {
             supporting.insert(signal.conversation.clone());
             let old =
                 day_of(&signal.at).is_some_and(|at| now - at > chrono::Duration::days(DECAY_DAYS));
-            standing.weight += if old { 0.5 } else { 1.0 };
+            *by_conversation
+                .entry(signal.conversation.clone())
+                .or_default() += if old { 0.5 } else { 1.0 };
         }
+        // One conversation makes at most a part of the case: quoted again in
+        // other words, the same moment does not pass the gate alone.
+        standing.weight = by_conversation
+            .values()
+            .map(|weight: &f64| weight.min(MAX_WEIGHT_PER_CONVERSATION))
+            .sum();
         standing.conversations = supporting.len();
         standing.contrary = contrary.len();
         standing
@@ -551,12 +563,12 @@ pub fn record(
     if reported.is_empty() {
         return Ok(Vec::new());
     }
-    let haystack = normalize(conversation_text);
+    let quotes = Quotes::new(conversation_text);
     update(dir, |lessons| {
         reported
             .iter()
             .map(|item| {
-                let mut record = record_one(lessons, item, &haystack, conversation, project);
+                let mut record = record_one(lessons, item, &quotes, conversation, project);
                 if record["applied"] == true {
                     cover(lessons, item, &mut record, saved, project);
                 }
@@ -671,18 +683,37 @@ fn refused(item: &Value, error: &str) -> Value {
 fn record_one(
     lessons: &mut Lessons,
     item: &Value,
-    haystack: &str,
+    quotes: &Quotes,
     conversation: &str,
     project: Option<&ProjectRef>,
 ) -> Value {
     let text = item["text"].as_str().map(str::trim).unwrap_or_default();
     let evidence = item["evidence"].as_str().map(str::trim).unwrap_or_default();
-    // A quote of a word or two is found anywhere; a moment needs a phrase.
-    let quoted = normalize(evidence);
-    if quoted.chars().count() < MIN_EVIDENCE_CHARS || !haystack.contains(&quoted) {
+    // A lesson is written into memory every turn sees, and into the repo's
+    // markdown store: no secret goes there, in its text or its quote.
+    if let Some(shape) = harness_tools::secret_values::first(text)
+        .or_else(|| harness_tools::secret_values::first(evidence))
+    {
         return refused(
             item,
-            "the evidence is not a verbatim quote of the conversation, a phrase long",
+            &format!("a lesson holds no secret, and this one holds what looks like a {shape}"),
+        );
+    }
+    // The kind the quote must show: the named lesson's, or the new one's.
+    let kind = item["lesson"]
+        .as_str()
+        .and_then(|id| lessons.find(id))
+        .map_or_else(
+            || item["kind"].as_str().unwrap_or_default().to_owned(),
+            |lesson| lesson.kind.clone(),
+        );
+    // A quote of a word or two is found anywhere; a moment needs a phrase,
+    // from the turns not reviewed yet, said by whom the kind needs.
+    let quoted = normalize(evidence);
+    if quoted.chars().count() < MIN_EVIDENCE_CHARS || !quotes.holds(&kind, &quoted) {
+        return refused(
+            item,
+            "the evidence is not a verbatim quote of the turns under review, a phrase long, in the user's words for a correction or a preference and in a tool result or the user's words for what the project showed",
         );
     }
     let against = item["against"].as_bool().unwrap_or(false);
@@ -764,6 +795,105 @@ fn record_one(
     let text = lesson.text.clone();
     lessons.lessons.push(lesson);
     json!({"action": "create", "kind": "lesson", "id": id, "applied": true, "text": text})
+}
+
+/// The conversation a review read, by who said what, normalized for quotes:
+/// a signal's quote must be in the part its kind is shown by.
+pub(crate) struct Quotes {
+    /// The user's own turns.
+    user: String,
+    /// Tool results and the host's records, but not what the agent read back
+    /// from its own memory: a rule it recalls is not a new sighting of it.
+    observed: String,
+    /// Everything, for a transcript that marks no roles.
+    all: String,
+    /// Whether the transcript marks its roles.
+    roled: bool,
+}
+
+/// The tools whose results are the agent's own memory, not what the project
+/// or the user showed.
+const MEMORY_TOOLS: [&str; 4] = ["memory", "knowledge", "history_search", "history_read"];
+
+/// Who is speaking in a block of the transcript.
+#[derive(Clone, Copy, PartialEq)]
+enum Role {
+    User,
+    Observed,
+    Agent,
+}
+
+impl Quotes {
+    /// The turns a review learns from: after the line that says the turns
+    /// above were reviewed already, so a moment is not counted twice.
+    pub(crate) fn new(conversation: &str) -> Self {
+        let fresh = conversation
+            .rfind(harness_runtime::REVIEWED_MARKER)
+            .map_or(conversation, |at| {
+                &conversation[at + harness_runtime::REVIEWED_MARKER.len()..]
+            });
+        let mut user = String::new();
+        let mut observed = String::new();
+        let mut roled = false;
+        // A block that starts with no label continues the one before it: a
+        // message of several paragraphs.
+        let mut role = Role::User;
+        for block in fresh.split("\n\n") {
+            let block = block.trim_start();
+            let text = if let Some(text) = block.strip_prefix("[User]: ") {
+                roled = true;
+                role = Role::User;
+                text
+            } else if let Some(rest) = block.strip_prefix("[Tool result (") {
+                roled = true;
+                let tool = rest.split(')').next().unwrap_or_default();
+                role = if MEMORY_TOOLS.contains(&tool) {
+                    Role::Agent
+                } else {
+                    Role::Observed
+                };
+                rest
+            } else if block.starts_with("[Assistant") {
+                roled = true;
+                role = Role::Agent;
+                block
+            } else if block.starts_with("[The ") {
+                // A record the host added (the strategy record): the host's
+                // words, not the agent's.
+                role = Role::Observed;
+                block
+            } else {
+                block
+            };
+            let into = match role {
+                Role::User => &mut user,
+                Role::Observed => &mut observed,
+                Role::Agent => continue,
+            };
+            into.push_str(text);
+            into.push('\n');
+        }
+        Self {
+            user: normalize(&user),
+            observed: normalize(&observed),
+            all: normalize(fresh),
+            roled,
+        }
+    }
+
+    /// Whether `quote` is where a signal of `kind` is shown: a correction or
+    /// a preference in the user's words; a wrong assumption or an error's fix
+    /// in what a tool returned or the user said. The agent's own words are
+    /// never a quote.
+    fn holds(&self, kind: &str, quote: &str) -> bool {
+        if !self.roled {
+            return self.all.contains(quote);
+        }
+        match kind {
+            "correction" | "preference" => self.user.contains(quote),
+            _ => self.observed.contains(quote) || self.user.contains(quote),
+        }
+    }
 }
 
 // --- distill ---
@@ -2231,7 +2361,10 @@ pub async fn meditate(
     now: DateTime<Utc>,
     skills: Option<(&super::learned::Layers, &super::learned::PromoteContext)>,
 ) -> Result<Vec<String>, String> {
-    let _ = std::fs::write(places.global.join(MEDITATED_FILE), now.to_rfc3339());
+    // Claimed for an hour before the call, so a review beside this one does
+    // not meditate too; a failure is tried again then, not put off a day.
+    let claim = now - MEDITATE_EVERY + chrono::Duration::hours(1);
+    let _ = std::fs::write(places.global.join(MEDITATED_FILE), claim.to_rfc3339());
     let prompt = meditation_prompt(&load(&places.global)?, now, skills.is_some());
     let answer = super::refine::complete_json(
         provider,
@@ -2242,6 +2375,7 @@ pub async fn meditate(
         4096,
     )
     .await?;
+    let _ = std::fs::write(places.global.join(MEDITATED_FILE), now.to_rfc3339());
     let mut changes = update(&places.global, |lessons| {
         let mut changes = apply_meditation(places, lessons, &answer, now);
         changes.extend(generalize(places, lessons, &answer));
@@ -2795,9 +2929,11 @@ mod tests {
         )
         .expect("record");
         assert_eq!(records[0]["applied"], true, "{records:?}");
-        assert_eq!(
-            records[1]["error"],
-            "the evidence is not a verbatim quote of the conversation, a phrase long"
+        assert!(
+            records[1]["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("the evidence is not a verbatim quote")),
+            "{records:?}"
         );
         assert_eq!(records[2]["error"], "no open lesson les_missing");
         assert_eq!(
@@ -3168,6 +3304,85 @@ mod tests {
         assert_eq!(lessons.lessons[0].placement, None);
         // Retiring a lesson a skill held leaves nothing to undo.
         retire(&places, &lessons.lessons[0].id, "test").expect("retire");
+    }
+
+    /// A quote is checked where its kind is shown: a correction in the
+    /// user's words, never the agent's own; a fact in a tool result, but not
+    /// one the agent read back from its memory; only turns not yet reviewed;
+    /// and never a secret.
+    #[test]
+    fn a_quote_must_come_from_who_shows_its_kind() {
+        let dir = tempfile::tempdir().expect("dir");
+        let conversation = format!(
+            "[User]: an old correction: keep answers short please
+
+{}
+
+[User]: no, run the tests before you commit anything
+
+[Assistant]: I always run the linter before pushing code
+
+[Tool result (run_shell) #1]: error: ninja not found on this machine
+
+[Tool result (memory) #2]: rule: deploy only on fridays please",
+            harness_runtime::REVIEWED_MARKER
+        );
+        let item = |text: &str, kind: &str, evidence: &str| json!({"text": text, "kind": kind, "scope": "global", "evidence": evidence});
+        let records = record(
+            dir.path(),
+            &[
+                item("when committing, run the tests first", "correction", "run the tests before you commit anything"),
+                item("when pushing, lint first", "correction", "I always run the linter before pushing code"),
+                item("when building, ninja may be missing", "deviation", "error: ninja not found on this machine"),
+                item("deploy on fridays", "correction", "deploy only on fridays please"),
+                item("keep answers short", "correction", "keep answers short please"),
+                item("when deploying, use the key", "correction", "run the tests before you commit anything sk-proj-AbCdEfGhIjKlMnOpQrStUvWx123456"),
+            ],
+            &conversation,
+            "c1",
+            None,
+            &BTreeSet::new(),
+        )
+        .expect("record");
+        let applied = records
+            .iter()
+            .map(|record| record["applied"] == true)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            applied,
+            [true, false, true, false, false, false],
+            "{records:?}"
+        );
+        assert!(
+            records[5]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("secret")),
+            "{records:?}"
+        );
+    }
+
+    /// One conversation gives a lesson at most part of its case: three
+    /// quotes from one conversation do not pass the gate's weight of 3.
+    #[test]
+    fn one_conversation_gives_at_most_two_of_the_weight() {
+        let one = lesson(
+            "les_one",
+            vec![
+                signal("c1", "a", 1, false),
+                signal("c1", "b", 1, false),
+                signal("c1", "c", 1, false),
+            ],
+        );
+        assert!((one.standing(Utc::now()).weight - 2.0).abs() < 1e-9);
+        let two = lesson(
+            "les_two",
+            vec![
+                signal("c1", "a", 1, false),
+                signal("c1", "b", 1, false),
+                signal("c2", "c", 1, false),
+            ],
+        );
+        assert!((two.standing(Utc::now()).weight - 3.0).abs() < 1e-9);
     }
 
     /// A lesson follows its entry: a learned rule the user deleted retires

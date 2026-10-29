@@ -1038,6 +1038,16 @@ fn memory_refusal(
             hits.join(", ")
         ));
     }
+    // Memory reaches every later turn: what reads as an attempt to steer the
+    // agent (ignore its instructions, send a secret, run a destructive
+    // command) is not kept, whoever proposed it.
+    let unsafe_hits = super::learned::unsafe_hits(&format!("{title}\n{content}"));
+    if !unsafe_hits.is_empty() {
+        return Some(format!(
+            "the harness keeps no {} text in memory",
+            unsafe_hits.join(", ")
+        ));
+    }
     if title.chars().count() > super::memory::MAX_TITLE_CHARS {
         return Some(format!(
             "a title is at most {} characters",
@@ -1999,13 +2009,27 @@ async fn complete_once(
         ],
     )
     .with_max_output_tokens(max_tokens);
+    // A call that failed or timed out is in the diagnostics too: the bug
+    // report's upkeep table counts what memory upkeep cost, failures included.
+    let failed = |error: String| {
+        harness_types::diag::warn("refine", "call_failed")
+            .field("purpose", purpose)
+            .field("model", model)
+            .field(
+                "duration_ms",
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            )
+            .msg(error.clone())
+            .emit();
+        error
+    };
     let events = tokio::time::timeout(
         std::time::Duration::from_mins(5),
         provider.stream(request, CancellationToken::new()),
     )
     .await
-    .map_err(|_| "the refinement model call timed out".to_owned())?
-    .map_err(|error| format!("the refinement model call failed: {error}"))?;
+    .map_err(|_| failed("the refinement model call timed out".to_owned()))?
+    .map_err(|error| failed(format!("the refinement model call failed: {error}")))?;
     let usage = events.iter().rev().find_map(|event| match event {
         harness_providers::ProviderStreamEvent::Usage {
             prompt_tokens,
@@ -2229,7 +2253,48 @@ fn record_skill_outcomes(learning: &Learning, outcomes: &[Value]) -> Vec<Value> 
 
 const KNOWLEDGE_PROPOSALS: &str = "Knowledge (not an edit kind) is the user's library of topical Markdown pages shared across conversations. When the conversation produced substantive reusable knowledge the main agent did not save - a researched conclusion, a method or concept worked out, a source the user shared to study - propose it in a top-level `knowledge` array: {\"scope\": \"project\" or \"global\", \"path\": \"concepts/short-name.md\", \"title\": \"...\", \"summary\": \"one line\", \"content\": \"Markdown, in the material's language\", \"sources\": [\"URLs or documents it came from\"], \"evidence\": \"a verbatim quote from the conversation that the page rests on\", \"reason\": \"why\"}. Use project scope unless the knowledge is explicitly shared across projects; use sources/, concepts/, entities/ or analysis/ for the path. Only new subjects: never a page listed below, nor one on the same subject under another name - a page already there is the agent's to update. A page without a verbatim quote from the conversation as its evidence is refused. Skip trivial exchanges, task progress, secrets, personal facts (memory) and procedures (learned skills). Weigh this whatever the review's instructions focus on. Leave `knowledge` empty when nothing meets the bar.";
 
+/// Why a memory edit about a project with a markdown store is refused.
+const MARKDOWN_STORE_REFUSAL: &str = "this project keeps its memory in markdown files (MEMORY.md, memory/): a fact or rule about it is written there, not as a memory edit";
+
 impl Edit {
+    /// A memory or prompt edit about `project`: it names the project (as a
+    /// whole word, for a name long enough to be one), its folder, or carries
+    /// it in its metadata.
+    fn about_project(&self, project: &super::lessons::ProjectRef) -> bool {
+        if !matches!(self.text("kind"), Some("memory" | "prompt")) {
+            return false;
+        }
+        let field = |outer: &str, inner: &str| {
+            self.0
+                .get(outer)
+                .and_then(|value| value.get(inner))
+                .and_then(Value::as_str)
+        };
+        if field("metadata", "project")
+            .is_some_and(|named| named.eq_ignore_ascii_case(&project.name) || named == project.key)
+            || field("project", "key") == Some(project.key.as_str())
+        {
+            return true;
+        }
+        let text = ["title", "content", "path"]
+            .iter()
+            .filter_map(|field| self.text(field))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        let root = project.root.replace('\\', "/").to_lowercase();
+        if !root.is_empty() && text.replace('\\', "/").contains(&root) {
+            return true;
+        }
+        let name = project.name.to_lowercase();
+        name.chars().count() >= 3
+            && text
+                .split(|character: char| {
+                    !(character.is_alphanumeric() || character == '-' || character == '_')
+                })
+                .any(|word| word == name)
+    }
+
     /// An automatic review's memory edit meant for every conversation.
     fn wants_global(&self) -> bool {
         self.text("kind") == Some("memory")
@@ -2752,7 +2817,33 @@ pub async fn auto_refine(
                     .text("evidence")
                     .is_some_and(|evidence| !evidence.trim().is_empty())
         });
-    proposal.edits = local_edits;
+    // A project that keeps a markdown store keeps its facts in it: a memory
+    // edit about that project, global or local, would be the same fact in a
+    // second place. The prompt says so; this holds when the model does not.
+    let store_project = project.as_ref().filter(|project| {
+        Path::new(&project.root)
+            .join(super::markdown_memory::CONFIG_FILE)
+            .is_file()
+    });
+    let mut beside_store = Vec::new();
+    let mut keep = |edits: Vec<Edit>| {
+        edits
+            .into_iter()
+            .filter(|edit| {
+                let about = store_project.is_some_and(|project| edit.about_project(project));
+                if about {
+                    beside_store.push(json!({
+                        "action": edit.text("action"), "kind": edit.text("kind"), "id": edit.text("id"),
+                        "title": edit.text("title"), "applied": false,
+                        "error": MARKDOWN_STORE_REFUSAL,
+                    }));
+                }
+                !about
+            })
+            .collect::<Vec<_>>()
+    };
+    let global_edits = keep(global_edits);
+    proposal.edits = keep(local_edits);
     let id = refinement_id();
     let mut pending = Pending::begin(&scopes.local, &id, learning)?;
     stage_skills(provider, model, learning, &mut proposal, &mut pending).await;
@@ -2811,6 +2902,8 @@ pub async fn auto_refine(
     .unwrap_or_else(|error| {
         vec![json!({"action": "lesson", "kind": "lesson", "applied": false, "error": error})]
     });
+    // The refused edits are kept with the refinement, each saying why.
+    proposal.lesson_records.extend(beside_store);
     let local = match apply(
         scopes,
         &proposal,
@@ -3477,7 +3570,13 @@ pub async fn consolidate_memory(
         Some(&baseline),
         None,
     );
-    mark_consolidated(&scopes.global);
+    // Done only when it applied: a pass whose writes failed is tried again
+    // after a while, as one whose model call failed is.
+    if refinement.is_ok() {
+        mark_consolidated(&scopes.global);
+    } else {
+        mark_consolidation_failed(&scopes.global);
+    }
     refinement
 }
 
@@ -3537,7 +3636,13 @@ pub async fn consolidate_local(
         Some(&baseline),
         None,
     );
-    mark_consolidated(&scopes.local);
+    // Done only when it applied: a pass whose writes failed is tried again
+    // after a while, as one whose model call failed is.
+    if refinement.is_ok() {
+        mark_consolidated(&scopes.local);
+    } else {
+        mark_consolidation_failed(&scopes.local);
+    }
     refinement
 }
 
@@ -3667,6 +3772,29 @@ mod tests {
         slug,
     };
     use serde_json::json;
+
+    /// A memory edit about a project that keeps a markdown store is told by
+    /// its name, its folder or its metadata; another project's, or one about
+    /// the user, is not.
+    #[test]
+    fn an_edit_about_the_store_project_is_known() {
+        let project = super::super::lessons::ProjectRef {
+            key: "project-abc".to_owned(),
+            name: "orion".to_owned(),
+            root: r"C:\work\orion".to_owned(),
+        };
+        let edit =
+            |value: serde_json::Value| super::Edit(value.as_object().expect("an edit").clone());
+        assert!(edit(serde_json::json!({"kind": "memory", "title": "Orion build", "content": "In project orion, build with make ci."})).about_project(&project));
+        assert!(edit(serde_json::json!({"kind": "memory", "title": "Build", "content": "C:/work/orion builds with make ci"})).about_project(&project));
+        assert!(edit(serde_json::json!({"kind": "memory", "title": "Build", "content": "make ci", "metadata": {"project": "orion"}})).about_project(&project));
+        assert!(!edit(serde_json::json!({"kind": "memory", "title": "Editor", "content": "The user edits in Zed."})).about_project(&project));
+        assert!(!edit(serde_json::json!({"kind": "memory", "title": "Vega", "content": "orionid is a word of vega"})).about_project(&project));
+        assert!(
+            !edit(serde_json::json!({"kind": "skill", "title": "orion", "content": "orion"}))
+                .about_project(&project)
+        );
+    }
 
     fn test_writer() -> super::super::memory_store::Writer {
         super::super::memory_store::Writer::new("test", &json!({}), "test")
