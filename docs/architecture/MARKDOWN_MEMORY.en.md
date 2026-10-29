@@ -30,7 +30,7 @@ Git is the store's history: `log` is when a fact held, `blame` who wrote a line,
 | | ha's `memory` tool | The markdown store |
 |---|---|---|
 | Where | `<data>/harness/memory.sqlite3`, per conversation and global | Files in the project, in Git |
-| Holds | The user's preferences and decisions across projects, task state | This project's people, decisions, state and lessons |
+| Holds | The user's preferences and decisions across projects, and a conversation's own notes (local scope); never task state, which is `task_state`'s | This project's people, decisions, state and lessons |
 | Written by | The `memory` tool, the review, Deep Dream | The agent's file tools and people with an editor; the host too: the learning loop's decisions and facts, and the session log's section of the day's note |
 | Read | The digest in every turn, `memory` search | `MEMORY.md` in every turn; the files when the index routes there |
 
@@ -126,7 +126,7 @@ mandatory blocks:
 
 - `markdown-memory:policy`: the package's operating policy, whole, in ha's terms
   (`assets/markdown-memory/policy.md`, about 1,100 words). It covers:
-  - the source of truth, and the tiers;
+  - the source of truth (the files, for durable project facts and decisions; the live `task_state` governs the current task, as "Where things stand" ranks them), and the tiers;
   - when and where to write: decisions, state changes, blockers, mistakes,
     lessons, stable preferences, "remember this";
   - the provenance tags, with the origin test for decisions and the warning

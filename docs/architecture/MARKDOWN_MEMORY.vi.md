@@ -31,7 +31,7 @@ viết dòng đó, `diff` là việc thay thế.
 | | Tool `memory` của ha | Kho markdown |
 |---|---|---|
 | Nằm ở | `<data>/harness/memory.sqlite3`, theo hội thoại và global | Các file trong project, trong Git |
-| Giữ | Sở thích và quyết định của người dùng xuyên project, trạng thái việc | Người, quyết định, trạng thái và bài học của project này |
+| Giữ | Sở thích và quyết định của người dùng xuyên project, và ghi chú riêng của một hội thoại (scope local); không bao giờ là trạng thái việc, thứ thuộc về `task_state` | Người, quyết định, trạng thái và bài học của project này |
 | Ai ghi | Tool `memory`, lượt review, Deep Dream | Tool file của agent và người dùng bằng editor; cả host: decision và fact của learning loop, và phần của session log trong daily note |
 | Đọc | Digest ở mọi lượt, tìm bằng `memory` | `MEMORY.md` ở mọi lượt; các file khi index chỉ tới |
 
@@ -125,7 +125,7 @@ Khi có `memory-lint.json` ở gốc project, mọi lượt mang hai block bắt
 
 - `markdown-memory:policy`: toàn bộ policy vận hành của package, diễn đạt theo
   ha (`assets/markdown-memory/policy.md`, khoảng 1.100 từ). Gồm:
-  - nguồn sự thật và các tầng;
+  - nguồn sự thật (các file, cho fact và quyết định lâu dài của project; `task_state` đang chạy quyết định task hiện tại, như "Where things stand" xếp hạng), và các tầng;
   - khi nào và ghi vào đâu: quyết định, thay đổi trạng thái, vướng mắc, lỗi, bài
     học, sở thích ổn định, "nhớ cái này";
   - tag nguồn gốc, kèm phép thử nguồn gốc cho quyết định và lưu ý về bản tóm tắt;

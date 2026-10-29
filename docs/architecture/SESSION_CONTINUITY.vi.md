@@ -5,15 +5,43 @@
 Cách một phiên `ha` tiếp tục từ chỗ phiên trước dừng lại, và mỗi loại thông tin nằm ở
 đâu. Mỗi cơ chế dưới đây có một việc riêng. Có chỗ chồng lên nhau khi chúng ghi cùng
 một khoảnh khắc từ các phía khác nhau (một quyết định có thể nằm trong task state,
-handoff và một session log); khi chúng khác nhau, task state đang chạy thắng, rồi
-đến kho markdown của project, rồi session log mới nhất, rồi handoff, và khối nào
-mang một cơ chế thì nói rõ điều đó.
+handoff và một session log). Khi chúng khác nhau, một luật duy nhất nói cái nào
+thắng: "Where things stand" (dưới đây), mà system prompt mang đúng một lần mỗi
+request. Mọi đoạn văn khác mang một bản ghi đều trỏ tới luật đó bằng tên của nó
+thay vì tự nêu thứ tự riêng.
+
+## Where things stand
+
+Luật, đúng như hằng `WHERE_THINGS_STAND` trong
+`crates/harness-cli/src/host/memory/continuity.rs` giữ (danh sách này được giữ khớp với
+hằng đó):
+
+1. tin nhắn hiện tại của người dùng;
+2. task state đang chạy của hội thoại này (`task_state`);
+3. các file markdown memory của project (`memory/`, ở project có giữ chúng);
+4. session log mới nhất (`.harness/sessions`);
+5. `.harness/progress.md`, tức handoff;
+6. một bản tóm tắt nén ngữ cảnh.
+
+Mọi thứ dưới mục 2 là bản ghi của công việc trước đó và có thể đã cũ - digest của memory
+và task state hay các lượt của một hội thoại trước cũng vậy, xếp ngang session log: agent
+đối chiếu với repository trước khi làm theo. Một quyết định mới vào `task_state` cho task
+này và, ở project có markdown memory, vào `memory/decisions/`.
+
+Luật được nối vào cuối system prompt (cả sau `--system-prompt` hay `SYSTEM.md`), phần của
+request được cache, nên mỗi request chỉ gửi một lần. Các đoạn văn trước đây tự xếp hạng
+giờ trỏ tới nó trong một dòng: khối mở đầu của session log, session brief, task state của
+hội thoại trước, phần handoff của startup brief, prompt của `/handoff --reset`, tiền tố của
+bản tóm tắt nén ngữ cảnh, digest của memory và hướng dẫn của tool `memory`. Policy của kho
+markdown nói các file của nó là sự thật cho fact và quyết định lâu dài của project, còn
+`task_state` đang chạy quyết định task hiện tại. `/handoff` ở project có kho markdown đưa
+quyết định vào `memory/decisions/` thay vì một mục riêng, như `/preserve`.
 
 | Cơ chế | Giữ gì | Ai ghi | Ai đọc |
 | --- | --- | --- | --- |
 | Journal (kho của project) | Từng lượt nguyên văn: lời người dùng, chữ của model, mỗi lần gọi tool và kết quả | Runtime, trong lúc lượt chạy | `/resume`, `/tree`, fork, `history_search` / `history_read`, session log, session brief |
-| Task state (`task_state`) | Checklist chính xác của một hội thoại: mục tiêu, bước đã xong và còn mở, quyết định, ràng buộc | Agent, qua tool `task_state` | Mọi lượt của hội thoại đó; 3 lượt đầu của hội thoại kế tiếp khi còn mục mở |
-| Handoff (`.harness/progress.md`) | Trạng thái hiện tại của project: nhánh, kiểm chứng, việc đang làm, bị chặn, bước kế, các lệnh | Agent, khi `/handoff` | Prompt đầu tiên của mọi phiên (6 KB đầu), `/doctor`, kiểm tra lúc thoát |
+| Task state (`task_state`) | Checklist chính xác của một hội thoại: mục tiêu, bước đã xong và còn mở, quyết định, ràng buộc | Agent, qua tool `task_state` | Mọi lượt của hội thoại đó (trong khoảng 4K token); 3 lượt đầu của một hội thoại mới khi còn mục mở, dưới dạng recap ngắn (xem dưới) |
+| Handoff (`.harness/progress.md`) | Trạng thái hiện tại của project: nhánh, kiểm chứng, việc đang làm, bị chặn, bước kế, các lệnh | Agent, khi `/handoff` | Prompt đầu tiên của mọi phiên (trong khoảng 1,5K token, dạng tham khảo), `/doctor`, kiểm tra lúc thoát |
 | Session log | Những gì một hội thoại đã chốt: quyết định kèm lý do, bài học, cách sửa, file đã đổi, giá trị cấu hình chính xác, việc còn dở, lỗi và cách vượt, một đoạn để tiếp tục | Host, bằng một lần gọi model từ journal | Lúc mở hội thoại mới (một khối ngắn), `/recall` |
 | Session brief | 3 lượt cuối của hội thoại trước, trích đoạn có giới hạn | Host, từ journal, không gọi model | Lượt đầu của hội thoại mới, khi hội thoại trước không có session log |
 | Chỉ dẫn của project (`AGENTS.md`, không có thì `CLAUDE.md`) | Điều mọi phiên cần: quy ước, lệnh, cấu trúc, mẫu làm, cảnh báo | Người dùng, hoặc agent khi `/preserve` | Mọi lượt |
@@ -127,10 +155,56 @@ Prompt đầu tiên của hội thoại mới nghe về hội thoại trước �
 - Không có log thì session brief được gửi như trước.
 - Khi task state của hội thoại trước được mang sang (checklist của nó là chính xác), việc
   còn dở trong log bị bỏ ra để các bước không bị liệt kê hai lần.
-- Handoff vẫn nằm trong startup brief như cũ. Khi log mới hơn `.harness/progress.md`,
-  khối nói điều đó trong một dòng.
+- Handoff là một khối riêng của startup brief (`session-handoff`), trên kênh reference.
+  Khi log mới hơn `.harness/progress.md`, khối nói điều đó trong một dòng.
 
 Fork, import, `/resume`, nén ngữ cảnh và `/refinements off` không thêm khối này.
+
+**Chỉ hội thoại đã rời.** Một hội thoại còn mở không phải là "hội thoại trước": một pane
+khác của cùng ha, một agent nền, hay một hội thoại mà một tiến trình ha khác còn sống đang
+chạy. Mỗi lượt giữ hội thoại của nó mở trong một sổ đăng ký của tiến trình (tới khi lượt
+kế của pane là của hội thoại khác, hoặc pane mất đi) và để một dấu dưới kho của project
+(`open-conversations/<task>`, ghi tên tiến trình); hội thoại mà một tiến trình còn sống
+đang nợ log cũng được coi là mở. Khối mở đầu của session log, session brief và task state
+của hội thoại trước đều bỏ qua hội thoại còn mở.
+
+**Task state của hội thoại trước.** 3 lượt đầu của một hội thoại mới nghe về task mà hội
+thoại mới nhất có task state để dở, dưới dạng một khối tham khảo optional
+(`earlier-task-state`): recap của state và tối đa 10 mục còn mở, trong khoảng 1,5K token,
+kèm gợi ý `/resume`. Nó không được đưa ra khi state đó cũ hơn 7 ngày (theo thời gian của
+file), hoặc khi đã đưa cho 3 hội thoại mới khác mà không hội thoại nào nhận lấy (hội thoại
+nhận lấy sẽ giữ state của riêng nó, mới hơn); các hội thoại đã được đưa được giữ trong
+`task_state.offered.json` cạnh state.
+
+## Ngân sách ngữ cảnh
+
+Mọi khối trong ngữ cảnh của một lượt đều có chỗ trong một ngân sách
+(`ContextBuilder`, `crates/harness-session/src/context.rs`):
+
+- Khối của host không bắt buộc đi đường optional: các khối optional được xếp theo
+  relevance và nhận vào khi còn vừa `RuntimeConfig::optional_token_budget`
+  (`OPTIONAL_TOKEN_BUDGET`, 9.000 token: 3K của digest và 6K của các khối mở đầu vừa cùng
+  lúc). Khối không vừa bị bỏ ra.
+- Một khối có thể mang `max_tokens`. Khối vượt mức bị cắt ở ranh giới dòng, trước khi
+  nhận vào, kèm một ghi chú ở cuối nói nó đã bị cắt và phần còn lại ở đâu; khối bắt buộc
+  vượt mức bị cắt thay vì làm tràn cửa sổ ngữ cảnh.
+- Luật và fact của host đi trước, rồi các khối optional theo hạng, rồi tin nhắn của người
+  dùng, working state và phần đuôi, nên request kết thúc bằng điều lượt này cần làm.
+- `/context` hiện kích thước từng khối, và với khối bị cắt thì kích thước trước khi cắt;
+  khối bị bỏ nói lý do. Chẩn đoán ghi `context` `budget` (`cut`, `dropped`,
+  `mandatory_tokens`, `optional_tokens`) cho một packet có cắt hay bỏ khối.
+
+| Khối | Bắt buộc | Mức trần (token) | Hạng |
+| --- | --- | --- | --- |
+| `task-state` (của hội thoại này) | có | 4.000 (mục đã xong thành một con số, các quyết định mới nhất) | - |
+| `recalled-skill` | có | 1.500 | - |
+| `harness_state` (digest của memory) | không | 3.000 | 70 |
+| `session-start` (commit, chưa commit, kiểm tra baseline) | không | 800 | 55 |
+| `earlier-task-state` | không | 1.500 | 50 |
+| `session-log` | không | 1.500 | 42 |
+| `knowledge-catalog` | không | 1.500 | 40 |
+| `session-handoff` | không | 1.500 | 38 |
+| `recent-session` (session brief) | không | 1.500 | 30 |
 
 ## Lệnh
 
