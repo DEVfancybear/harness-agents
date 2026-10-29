@@ -264,16 +264,6 @@ impl Store {
         })
     }
 
-    pub(crate) fn corpus(&self) -> Result<Vec<(PageSummary, String)>, String> {
-        self.with_lock(|root| {
-            require_enabled(root)?;
-            Ok(scan(root)?
-                .into_iter()
-                .map(|page| (page.summary, page.text))
-                .collect())
-        })
-    }
-
     #[cfg(test)]
     pub(crate) fn read(
         &self,
@@ -2519,7 +2509,6 @@ mod tests {
         assert!(store.document("../long.md").is_err());
         store.set_enabled(false).unwrap();
         assert!(store.document("long.md").is_err());
-        assert!(store.corpus().is_err());
     }
 
     #[test]

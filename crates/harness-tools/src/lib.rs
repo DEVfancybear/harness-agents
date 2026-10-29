@@ -106,9 +106,9 @@ pub use hooks::{HOOK_EVENTS, HookResponse, fit_payload, hook_matches, run_hooks}
 pub use rules::{LearnedRule, LearnedRules, Realized, RuleAction, RuleState};
 pub use secrets::{HostEnvironmentSecrets, SecretResolver};
 pub use service::{
-    ConfiguredToolHook, ExternalToolDispatcher, HistorySemantic, NearestFuture, PathElsewhere,
-    ToolDispatchAuthorization, ToolExecutionService, ToolGuard, ToolObserver, ToolResultContext,
-    VectorsFuture, git_diff_from, git_head_commit,
+    ConfiguredToolHook, ExternalToolDispatcher, PathElsewhere, ToolDispatchAuthorization,
+    ToolExecutionService, ToolGuard, ToolObserver, ToolResultContext, git_diff_from,
+    git_head_commit,
 };
 pub use turn_driver::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ChangedFile, CompletionCheck,

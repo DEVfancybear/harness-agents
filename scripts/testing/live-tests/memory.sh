@@ -2,7 +2,9 @@
 # Long-memory evaluation with a real model, after LongMemEval: extraction,
 # project isolation, knowledge update, temporal recall through history,
 # abstention, duplicates, delete and restore, provenance, renamed ids, judged
-# skill outcomes and the harness refinements switch. Several conversations over
+# skill outcomes and the harness refinements switch; and (0.8.8) usage kept
+# apart from the entries, unmatched entries newest first, and a miss searched
+# again with other words. Several conversations over
 # three projects; every check prints PASS or FAIL, and the conversation and
 # the state on disk stay in $LIVE_ROOT/memory as evidence.
 #
@@ -199,5 +201,124 @@ done
 check "the quiet session's work was reviewed" "find '$D/sessions' -name review_watermark -newer '$RX/quiet.marker' | grep -q ."
 "$HA" shutdown --force >/dev/null 2>&1
 unset HA_IDLE_REVIEW_SECONDS
+
+echo "################ 15. ranking by words, recency and use; a miss searched again (0.8.8)"
+# Every check here fails on 0.8.7: it kept no usage, ordered the entries no word
+# matched alphabetically, and (for the last) had the same retry advice, so that
+# one may pass on 0.8.7 too. Headless runs in a project of their own, so the
+# digest holds the global entries only.
+export HA_AUTO_REFINE=off
+P15="$RX/p-rank"
+project "$P15"
+run_exec() {
+  local name="$1"; shift
+  printf '\n## %s (ha exec %s)\n\n> %s\n\n' "$(date +%H:%M:%S)" "$name" "${*: -1}" >> "$LOG"
+  (cd "$P15" && "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto --output-format json "$@" >"$RX/$name.json" 2>"$RX/$name.err")
+  "$PY" -c "import json,sys; print(json.load(open(sys.argv[1],encoding='utf-8')).get('response',''))" "$RX/$name.json" >> "$LOG" 2>/dev/null
+}
+answer15() { "$PY" -c "import json,sys; print(json.load(open(sys.argv[1],encoding='utf-8')).get('response',''))" "$RX/$1.json" 2>/dev/null; }
+# What the tools answered, in order, in the run whose prompt holds $1.
+cat > "$RX/receipts.py" <<'EOF'
+import glob, json, os, sqlite3, sys
+sys.stdout.reconfigure(encoding="utf-8")
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    rows = sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute(
+        "select session_id, event_json from events order by session_id, sequence").fetchall()
+    sessions = {session for session, text in rows
+                if json.loads(text)["event_type"] == "input.admitted" and sys.argv[2] in text}
+    for session, text in rows:
+        event = json.loads(text)
+        if session in sessions and event["event_type"] == "receipt.recorded":
+            print((event["payload"].get("model_view") or {}).get("text", "").replace("\n", "\\n"))
+EOF
+receipts() { "$PY" "$RX/receipts.py" "$D" "$1"; }
+# The request a turn sent, found by a phrase of its prompt.
+request15() { "$PY" - "$D" "$1" <<'EOF'
+import glob, os, sqlite3, sys
+sys.stdout.reconfigure(encoding="utf-8")
+found = None
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests order by rowid"):
+        if sys.argv[2] in text:
+            found = text
+print(found or "")
+EOF
+}
+# A count from the global store: `usage <key> reads|shown|hits`, or `events <key>`.
+store15() { "$PY" - "$D/harness/memory.sqlite3" "$@" <<'EOF'
+import sqlite3, sys
+db, what, key = sys.argv[1], sys.argv[2], sys.argv[3]
+c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+try:
+    if what == "events":
+        row = c.execute("select count(*) from memory_event where key = ?", (key,)).fetchone()
+    else:
+        column = {"reads": "reads", "shown": "shown", "hits": "hits"}[sys.argv[4]]
+        row = c.execute(f"select u.{column} from memory m join memory_usage u on u.memory_id = m.id where m.key = ?", (key,)).fetchone()
+except sqlite3.OperationalError as error:
+    print(f"0 ({error})")
+    raise SystemExit
+print(row[0] if row else 0)
+EOF
+}
+# Seeds: ten old notes, one written now (keyed to sort last by name), a probe to
+# read, and a fact in Vietnamese older than all of them.
+"$PY" - "$D" <<'EOF'
+import datetime, json, os, sys
+now = datetime.datetime.now(datetime.timezone.utc)
+def at(days):
+    return (now - datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+path = os.path.join(sys.argv[1], "harness", "harness_state.json")
+state = {"schema": 1, "entries": {"memory": {}}}
+memory = state["entries"]["memory"]
+def put(key, title, content, path_, days):
+    memory[key] = {"id": key, "kind": "memory", "title": title, "content": content,
+                   "path": path_, "scope": "global", "version": 1, "source": "agent",
+                   "created_at": at(days), "updated_at": at(days)}
+for index in range(10):
+    put(f"aa_old_{index}", f"Archive shelf {index}", f"Shelf {index} of the archive holds binder {index + 40}.", "archive", 400 + index)
+put("zz_newest", "Kiwi tag", "The newest note: the build tag is kiwi-31.", "zz", 0)
+put("usage_probe", "Usage probe", "The staging bucket is named orchid-77.", "probe", 200)
+put("zz_coffee", "Máy pha cà phê", "Máy pha cà phê của văn phòng nằm ở tầng ba, cạnh phòng họp Sen.", "van_phong", 900)
+os.makedirs(os.path.dirname(path), exist_ok=True)
+json.dump(state, open(path, "w", encoding="utf-8"), ensure_ascii=False)
+EOF
+
+# (a) A read through the memory tool is counted apart from the entry.
+for attempt in 1 2; do
+  run_exec u1 "Kiểm thử: gọi tool memory action read đúng một lần với id 'usage_probe'. Không gọi tool nào khác. MARKER_READ15. Báo nguyên văn content."
+  receipts MARKER_READ15 | grep -q "orchid-77" && break
+done
+if receipts MARKER_READ15 | grep -q "orchid-77"; then
+  check "a memory read is counted in memory_usage" '[ "$(store15 usage usage_probe reads | cut -d" " -f1)" -ge 1 ]'
+  check "and is neither an event nor a version of the entry" '[ "$(store15 events usage_probe)" = 1 ] && "$PY" "$MEMORY_STORE" rows "$D/harness" memory | grep "^usage_probe|" | grep -q "|1|"'
+else
+  echo "precondition not met: the model never read usage_probe through the memory tool (see $RX/u1.json)"
+  check "a memory read is counted in memory_usage (precondition: the model read the entry)" 'false'
+fi
+
+# (b) With no word of the request in them, the newest entries come first.
+run_exec u2 "Lượt này không dùng tool nào. Reply with exactly one word: MARKER_RECENT15"
+R=$(request15 MARKER_RECENT15)
+if printf '%s' "$R" | grep -q "more memory entries"; then
+  check "the digest shows the newest unmatched entry, not the alphabetically first" 'printf "%s" "$R" | grep -q "global:zz_newest\]" && ! printf "%s" "$R" | grep -q "global:aa_old_9\]"'
+  check "and puts it before the older ones" '"$PY" -c "import sys; t=sys.argv[1]; a=t.find(\"global:zz_newest]\"); b=t.find(\"global:aa_old_\"); sys.exit(0 if a >= 0 and (b < 0 or a < b) else 1)" "$R"'
+  check "what the digest showed is counted" '[ "$(store15 usage zz_newest shown | cut -d" " -f1)" -ge 1 ]'
+else
+  echo "precondition not met: the digest of u2 showed every entry, so no order was chosen (see $RX/u2.json)"
+  check "the digest orders unmatched entries newest first (precondition: more entries than shown)" 'false'
+fi
+
+# (c) A fact kept in Vietnamese, asked for in English: the first search by the
+# English words misses, and the model searches again with other words.
+run_exec u3 "Using only your memory tool (search it; do not guess), where is the office coffee machine? If a search finds nothing, follow its advice. MARKER_COFFEE15"
+first=$(receipts MARKER_COFFEE15 | grep '"hits"' | head -1)
+if printf '%s' "$first" | grep -q "No memory matched"; then
+  check "after the first search missed, the answer carries the fact" 'answer15 u3 | grep -qi "tầng ba\|third floor\|3rd floor\|floor 3" && answer15 u3 | grep -qi "sen"'
+  check "it searched more than once" '[ "$(receipts MARKER_COFFEE15 | grep -c "\"hits\"")" -ge 2 ]'
+else
+  echo "precondition not met: the first memory search was not a miss (${first:0:200}); the check judges only a retry after a miss"
+  check "a miss is searched again (precondition: the first search missed)" 'false'
+fi
 
 result

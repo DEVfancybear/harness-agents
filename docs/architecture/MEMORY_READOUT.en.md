@@ -2,7 +2,8 @@
 
 English | [Tiếng Việt](MEMORY_READOUT.vi.md)
 
-**Status:** shipped in 0.8.3. This adapts MEMORILLA (Fallahpour, Idehpour,
+**Status:** shipped in 0.8.3; since 0.8.8 it reads words only (embeddings were
+removed, see [Memory store §14](MEMORY_STORE.en.md)). This adapts MEMORILLA (Fallahpour, Idehpour,
 Kothapalli et al., "Latent semantic memory for LLMs", arXiv 2610.21375,
 Stanford) to ha. The code is the authority.
 
@@ -56,38 +57,33 @@ tokens:
 
 | MEMORILLA | ha |
 |---|---|
-| Frozen encoder, store computed once | The vectors the memory store already keeps (`memory_vector`, per content version), and the history embedding cache; a query is embedded once per read. Without embeddings configured, TF-IDF vectors of the words: weights from the store, no word list. |
-| `K` slots, conditioned on the query | Up to `K` slots (8 for a turn's digest, 1 to 16 for a tool call), each conditioned on the query. |
+| Frozen encoder, store computed once | TF-IDF vectors of the words, computed per read: weights from the store, no word list. Until 0.8.7 the embeddings the user configured, when there were any. |
+| `K` slots, conditioned on the query | Up to `K` slots (1 to 16 for a tool call, 8 by default), each conditioned on the query. |
 | Distinct slot identities (learned `Q0`) | Each slot reads what the slots before it left of the query: the query's residual after their reads (Gram-Schmidt). A query about two things puts them in two slots. |
 | Cross-attention over every document, `L_ref = 2` | Softmax attention over every vector by cosine similarity (temperature 0.05), two rounds, the query as the residual connection. |
 | `K` tokens, whatever the store's size | At most `K` slots, each rendered as the documents carrying 80 % of its attention (at most 3), each document in one slot only. A document is rendered only when its similarity stands one standard deviation above the store's mean: a statistic of the store, so it holds for any encoder's scale. |
-| Hybrid with retrieval (future work) | The digest fuses the readout with its ranking by words through RRF. |
+| Hybrid with retrieval (future work) | Until 0.8.7 the digest fused a readout by meaning with its ranking by words; since 0.8.8 the digest ranks by words, recency and use. |
 
 ## 4. Where it runs
 
-- **The digest every turn carries.** With embeddings configured, the request
-  (the goal, what the user typed, the task's recap, their earlier messages) is
-  read over every memory and prompt note, global, this project's and local.
-  The entries the readout recalls are fused with the ranking by words.
-  - An entry recalled with no word of the request in it is marked
-    `[recalled by meaning]`.
-  - The entries not yet embedded are embedded in the background, for the next
-    turn.
-  - Without embeddings, the digest is unchanged.
+- **The digest every turn carries.** Not any more: until 0.8.7, with
+  embeddings configured, the digest fused a readout by meaning with its ranking
+  by words and marked such an entry `[recalled by meaning]`. 0.8.8 removed that
+  with the embeddings.
 - **The `memory` tool, `search` with `mode: readout`.** The same read over the
   entries the filters (`tree`, `meta`, `meta_predicate`, `temporal`, `grep`)
   let through, in `slots` slots (default 8).
   - Each slot lists its entries with their `attention`.
-  - The result says which encoder read: `embeddings`, or `words` when none are
-    configured.
+  - The result says `encoder: words`; one that recalls nothing says which
+    query it read and to search again with other words.
+  - The entries it shows are counted as hits (`memory_usage`).
   - It reads memory only; knowledge is searched with `mode: rank`.
 - **`history_search` with `mode: readout`.** The paper's continual setting: the
   conversation's past turns, user and assistant messages and tool results, are
   the documents.
   - The newest 1,500 sources in scope are read, the first 1,500 characters of
     each, with the same window and kind filters.
-  - The vectors come from the history embedding cache, mean-pooled over a
-    source's passages.
+  - The vectors are TF-IDF vectors of each source's words.
   - Each hit names its `slot` and `attention`, so what was tried, decided or
     seen across a long conversation comes back together, its compacted turns
     included.
@@ -107,15 +103,9 @@ tokens:
 - **Unit tests** cover:
   - the read itself: slots split a two-part query, a fixed budget over 500
     documents, the standout statistic;
-  - the digest fusion: an entry with no shared word reaches the digest, marked;
   - the tool's readout: a two-part request finds both entries and not an
     unrelated one;
-  - the history readout: two sources that share no word with the question come
-    back in slots, an unrelated one does not, and words read without
-    embeddings.
-- **Live**, `memory-store.sh` section 12 runs on a fake embedding server:
-  - the digest recalls an entry by meaning;
-  - a readout splits a two-part request;
-  - `history_search` reads a conversation.
-
-  Each check fails on 0.8.2.
+  - the history readout: the sources behind each part of the question come back
+    in slots, an unrelated one does not.
+- **Live**, `memory-store.sh` section 12 ran on a fake embedding server until
+  0.8.7; 0.8.8 keeps its word checks: a readout splits a two-part request.

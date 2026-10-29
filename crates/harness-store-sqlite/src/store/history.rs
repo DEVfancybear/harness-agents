@@ -158,8 +158,8 @@ pub struct HistoryHit {
     pub started: String,
 }
 
-/// One source as semantic search embeds it: its id, kind and hash, and the
-/// head of its text.
+/// One source as a readout reads it: its id, kind and hash, and the head of
+/// its text.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoryText {
     pub source_id: String,
@@ -913,8 +913,8 @@ impl SqliteStore {
             .collect()
     }
 
-    /// The newest sources of a scope as semantic search embeds them: each
-    /// one's head, at most `chars` characters, newest first.
+    /// The newest sources of a scope as a readout reads them: each one's
+    /// head, at most `chars` characters, newest first.
     pub async fn history_texts(
         &self,
         scope: &HistoryScope,
@@ -954,8 +954,8 @@ impl SqliteStore {
             .collect()
     }
 
-    /// The hits for sources found by meaning rather than by words, in scope:
-    /// they hold none of `query`'s terms the search counted (`matched=0/n`).
+    /// The hits for these sources, in scope, as a search of `query` shows
+    /// them: a readout's sources may hold none of its terms (`matched=0/n`).
     pub async fn history_hits(
         &self,
         scope: &HistoryScope,

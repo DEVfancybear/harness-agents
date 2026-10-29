@@ -6,8 +6,9 @@
 //! `rlm/harness.py`), and the host never guesses what is worth keeping. The entries
 //! live in memory stores (`store.rs`): a global one shared by every conversation, and
 //! a local one per conversation. Before each turn the host reads both, ranks each
-//! kind's entries by relevance to the task, and hands the model a compact digest
-//! inside `<harness_state>`, as prime-agent's harness digest message does.
+//! kind's entries by relevance to the task - its words, then how recently and how
+//! much each was used - and hands the model a compact digest inside
+//! `<harness_state>`, as prime-agent's harness digest message does.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -20,6 +21,10 @@ use unicode_normalization::UnicodeNormalization as _;
 /// The entry kinds, in the order prime-agent renders them.
 const KINDS: [&str; 4] = ["prompt", "memory", "skill", "subagent"];
 const DEFAULT_ENTRY_LIMIT: usize = 6;
+/// How many of the best word matches recency and use may reorder: twice what
+/// is shown, so a recent, well-used entry close behind the shown ones can
+/// take a place, and one the words barely reached cannot.
+const RERANK_POOL: usize = 2 * DEFAULT_ENTRY_LIMIT;
 const DEFAULT_REFINEMENT_LIMIT: usize = 5;
 const DEFAULT_CONTENT_LIMIT: usize = 180;
 /// The most query terms one digest ranks by (prime-agent caps at 48).
@@ -60,7 +65,7 @@ pub struct Entry {
     pub id: String,
     /// Its name, unique in its tree: the one it was given, or its key.
     pub name: String,
-    /// Its immutable id in the store, when the reader asked for it.
+    /// Its immutable id in the store, when it was read from one.
     pub memory: Option<String>,
     pub kind: String,
     pub title: Option<String>,
@@ -90,6 +95,9 @@ pub struct Entry {
     /// Who wrote it last: `agent` (the memory tool), `refine` (the review),
     /// `learning` (the learning loop); none for an entry kept before.
     pub source: Option<String>,
+    /// How it has been used (`memory_usage`): what ranking reads beside its
+    /// words. Never part of its document.
+    pub usage: super::memory_store::Usage,
 }
 
 /// The merged state of one turn.
@@ -120,8 +128,20 @@ pub fn load(dir: &Path, scope: &str) -> State {
     } else {
         super::memory_store::root_of(dir)
     };
-    match super::memory_store::load_document(dir) {
-        Ok(document) => parse(&document, scope, root),
+    match super::memory_store::load_with_usage(dir) {
+        Ok((document, rows)) => {
+            let mut state = parse(&document, scope, root);
+            for entries in state.entries.values_mut() {
+                for entry in entries {
+                    if let Some((memory, usage)) = rows.get(&(entry.kind.clone(), entry.id.clone()))
+                    {
+                        entry.memory = Some(memory.clone());
+                        entry.usage = usage.clone();
+                    }
+                }
+            }
+            state
+        }
         Err(error) => {
             harness_types::diag::warn("memory", "store_unreadable")
                 .field("dir", dir.display().to_string())
@@ -203,6 +223,7 @@ pub fn parse(parsed: &Value, scope: &str, root: &str) -> State {
                 .flatten()
                 .map(|bounds| super::memory_store::temporal_value(&bounds)),
                 ended: super::memory_store::ended(raw),
+                usage: super::memory_store::Usage::default(),
             });
         }
     }
@@ -540,25 +561,79 @@ pub struct DigestOptions {
 /// `formatHarnessStateForPrompt`.
 #[must_use]
 pub fn format_digest(state: &State, options: DigestOptions, terms: &[(String, f64)]) -> String {
-    format_digest_recalled(state, options, terms, &[])
+    render_digest(state, options, terms).text
 }
 
-/// [`format_digest`] with the entries the memory readout recalled for the
-/// request (`(kind, id)`, in the readout's order: [`super::memory_readout`]).
-/// Each kind's entries are ranked by the request's words and by the readout,
-/// the two fused by RRF, so an entry recalled by meaning reaches the turn
-/// though it shares no word with the request; such a line says so.
+/// One entry a digest showed: its scope and its immutable id, for counting
+/// the exposure ([`record_shown`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Shown {
+    pub scope: String,
+    pub kind: String,
+    /// Its key as the digest named it, `local:` prefix and all.
+    pub id: String,
+    pub memory: Option<String>,
+}
+
+/// A rendered digest and the entries it showed.
+#[derive(Clone, Debug, Default)]
+pub struct Digest {
+    pub text: String,
+    pub shown: Vec<Shown>,
+}
+
+/// One group of a kind's entries (its constraints, or the rest) in the order
+/// the digest shows them; `scores` holds each one's BM25 score by its index,
+/// those above zero only. Among those the request's words reached, the
+/// best [`RERANK_POOL`] are fused by RRF with two lighter arms - how
+/// recently each was written or read, and how much it was read
+/// ([`super::memory_search::reranked`]); the rest of the matched follow by
+/// their words. Entries nothing matched come after every matched one, the
+/// most recently written or read first - and so does everything when there
+/// are no words. Ties go to the entry's path, title and key.
+fn ranked<'a>(entries: &[&'a Entry], scores: &BTreeMap<usize, f64>) -> Vec<&'a Entry> {
+    let now = chrono::Utc::now().timestamp();
+    let touched = entries
+        .iter()
+        .map(|entry| super::memory_search::last_touched(entry))
+        .collect::<Vec<_>>();
+    let identities = entries
+        .iter()
+        .map(|entry| identity(entry))
+        .collect::<Vec<_>>();
+    let mut matched = scores
+        .iter()
+        .map(|(index, score)| (*index, *score))
+        .collect::<Vec<_>>();
+    matched.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| identities[a.0].cmp(&identities[b.0]))
+    });
+    let matched = super::memory_search::reranked(entries, matched, RERANK_POOL, now);
+    let mut unmatched = (0..entries.len())
+        .filter(|index| !scores.contains_key(index))
+        .collect::<Vec<_>>();
+    unmatched.sort_by(|a, b| {
+        touched[*b]
+            .cmp(&touched[*a])
+            .then_with(|| identities[*a].cmp(&identities[*b]))
+    });
+    matched
+        .into_iter()
+        .map(|(index, _)| index)
+        .chain(unmatched)
+        .map(|index| entries[index])
+        .collect()
+}
+
+/// [`format_digest`] with the entries it showed. Each kind's entries are
+/// ranked by [`ranked`]: the request's words first, then recency and use.
 #[must_use]
 #[allow(
     clippy::too_many_lines,
     reason = "one render, told in prime-agent's order"
 )]
-pub fn format_digest_recalled(
-    state: &State,
-    options: DigestOptions,
-    terms: &[(String, f64)],
-    recalled: &[(String, String)],
-) -> String {
+pub fn render_digest(state: &State, options: DigestOptions, terms: &[(String, f64)]) -> Digest {
     // An entry whose period is over records what was, not what is: search
     // still finds it, the digest leaves it out.
     let current;
@@ -608,7 +683,7 @@ pub fn format_digest_recalled(
             ],
         );
     }
-    pinned_lines(state, &mut lines);
+    let mut shown_entries = pinned_lines(state, &mut lines);
     let mut total = 0;
     for kind in KINDS {
         let mut entries = state.entries.get(kind).cloned().unwrap_or_default();
@@ -616,69 +691,42 @@ pub fn format_digest_recalled(
         // A pinned entry is shown whole above; the ranked list is the rest.
         entries.retain(|entry| !entry.pinned);
         let pinned = kept - entries.len();
-        // Memory search's BM25, the request's terms weighed as they came:
-        // whole words, their stems, and a word without accents matching one
-        // with them. Scored once per kind, not inside the sort.
-        let weights = if terms.is_empty() {
-            BTreeMap::new()
-        } else {
-            super::memory_search::bm25_weighted(&entries.iter().collect::<Vec<_>>(), terms)
-                .into_iter()
-                .map(|(index, score)| (identity(&entries[index]), score))
-                .collect::<BTreeMap<_, _>>()
-        };
-        let score = |entry: &Entry| weights.get(&identity(entry)).copied().unwrap_or(0.0);
         // A constraint the user set is in view in every turn, ahead of the
         // ranked entries: ranked by the request, "never touch vendor/" fell
         // out of the six shown whenever the request was about something else.
-        entries.sort_by(|a, b| {
-            is_constraint(b).cmp(&is_constraint(a)).then_with(|| {
-                if terms.is_empty() {
-                    return identity(a).cmp(&identity(b));
-                }
-                score(b)
-                    .total_cmp(&score(a))
-                    .then_with(|| identity(a).cmp(&identity(b)))
-            })
-        });
-        let by_meaning = recalled
-            .iter()
-            .filter(|(recalled_kind, _)| recalled_kind == kind)
-            .map(|(_, id)| (id.clone(), 1.0))
-            .collect::<Vec<_>>();
-        if !by_meaning.is_empty() {
-            let by_words = entries
-                .iter()
-                .map(|entry| (entry.id.clone(), score(entry)))
-                .filter(|(_, score)| *score > 0.0)
-                .collect::<Vec<_>>();
-            let fused =
-                harness_types::search::weighted_rrf(&[(&by_words, 1.0), (&by_meaning, 1.0)])
-                    .into_iter()
-                    .enumerate()
-                    .map(|(rank, (id, _))| (id, rank))
-                    .collect::<BTreeMap<_, _>>();
-            // Stable: the rest keep their order by words.
-            entries.sort_by_key(|entry| {
-                (
-                    !is_constraint(entry),
-                    fused.get(&entry.id).copied().unwrap_or(usize::MAX),
-                )
-            });
-        }
         // The constraints come first, up to their own limit, and the ranked
         // entries keep their places beside them: a list of rules never
         // pushes the entries the request is about out of the digest.
-        let visible = entries
-            .iter()
-            .filter(|entry| is_constraint(entry))
+        // Memory search's BM25, the request's terms weighed as they came:
+        // whole words, their stems, and a word without accents matching one
+        // with them. Scored once per kind, over the whole kind, not inside
+        // the sort.
+        let all = entries.iter().collect::<Vec<_>>();
+        let scores = if terms.is_empty() {
+            Vec::new()
+        } else {
+            super::memory_search::bm25_weighted(&all, terms)
+        };
+        let group = |constraint: bool| {
+            let places = (0..all.len())
+                .filter(|index| is_constraint(all[*index]) == constraint)
+                .collect::<Vec<_>>();
+            let place_of = places
+                .iter()
+                .enumerate()
+                .map(|(place, index)| (*index, place))
+                .collect::<BTreeMap<_, _>>();
+            let group_scores = scores
+                .iter()
+                .filter_map(|(index, score)| place_of.get(index).map(|place| (*place, *score)))
+                .collect::<BTreeMap<_, _>>();
+            let members = places.iter().map(|index| all[*index]).collect::<Vec<_>>();
+            ranked(&members, &group_scores)
+        };
+        let visible = group(true)
+            .into_iter()
             .take(CONSTRAINT_LIMIT)
-            .chain(
-                entries
-                    .iter()
-                    .filter(|entry| !is_constraint(entry))
-                    .take(DEFAULT_ENTRY_LIMIT),
-            )
+            .chain(group(false).into_iter().take(DEFAULT_ENTRY_LIMIT))
             .collect::<Vec<_>>();
         let shown = visible.len();
         total += kept;
@@ -734,10 +782,12 @@ pub fn format_digest_recalled(
                     )
                 );
             }
-            // An entry no word of the request reached was recalled by meaning.
-            if by_meaning.iter().any(|(id, _)| *id == entry.id) && score(entry) <= 0.0 {
-                extra.push_str(" [recalled by meaning]");
-            }
+            shown_entries.push(Shown {
+                scope: entry.scope.clone(),
+                kind: entry.kind.clone(),
+                id: entry.id.clone(),
+                memory: entry.memory.clone(),
+            });
             lines.push(format!(
                 "- [{}:{}] {} ({}, v{}{}){extra}: {}",
                 entry.scope,
@@ -821,19 +871,73 @@ pub fn format_digest_recalled(
     if skip > 0 {
         lines.push(format!("- +{skip} older refinement events"));
     }
-    lines.join("\n").trim().to_owned()
+    Digest {
+        text: lines.join("\n").trim().to_owned(),
+        shown: shown_entries,
+    }
+}
+
+/// Count the entries a turn's digest showed ([`Shown`]) in their stores, in
+/// the background: an exposure count, which ranking never reads (it would
+/// feed itself). A local entry is the conversation's; any other the global
+/// store's. The `local:` prefix the merge gives a local entry whose key a
+/// global one holds is taken off before its id is looked up.
+pub fn record_shown_soon(global: PathBuf, local: PathBuf, shown: Vec<Shown>) {
+    if shown.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || record_shown(&global, &local, &shown));
+}
+
+/// [`record_shown_soon`] on this thread.
+pub fn record_shown(global: &Path, local: &Path, shown: &[Shown]) {
+    for (dir, is_local) in [(global, false), (local, true)] {
+        let entries = shown
+            .iter()
+            .filter(|entry| (entry.scope == "local") == is_local)
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            continue;
+        }
+        let mut memories = entries
+            .iter()
+            .filter_map(|entry| entry.memory.clone())
+            .collect::<Vec<_>>();
+        if entries.iter().any(|entry| entry.memory.is_none())
+            && let Ok(ids) = super::memory_store::ids(dir)
+        {
+            memories.extend(
+                entries
+                    .iter()
+                    .filter(|entry| entry.memory.is_none())
+                    .filter_map(|entry| {
+                        let key = entry.id.strip_prefix("local:").unwrap_or(&entry.id);
+                        ids.get(&(entry.kind.clone(), key.to_owned())).cloned()
+                    }),
+            );
+        }
+        if let Err(error) =
+            super::memory_store::record_use(dir, super::memory_store::Use::Shown, &memories)
+        {
+            harness_types::diag::debug("memory", "usage_not_recorded")
+                .field("dir", dir.display().to_string())
+                .field("error", error)
+                .emit();
+        }
+    }
 }
 
 /// The pinned entries, whole, within [`PINNED_BUDGET`]; what does not fit is
 /// counted so the model knows to search for it.
-fn pinned_lines(state: &State, lines: &mut Vec<String>) {
+fn pinned_lines(state: &State, lines: &mut Vec<String>) -> Vec<Shown> {
+    let mut shown = Vec::new();
     let pinned = KINDS
         .iter()
         .flat_map(|kind| state.entries.get(kind).into_iter().flatten())
         .filter(|entry| entry.pinned && entry.title.is_some() && entry.content.is_some())
         .collect::<Vec<_>>();
     if pinned.is_empty() {
-        return;
+        return shown;
     }
     lines.push("pinned (always shown in full; they hold whatever the request):".to_owned());
     let mut used = 0;
@@ -863,6 +967,12 @@ fn pinned_lines(state: &State, lines: &mut Vec<String>) {
         }
         used += size;
         lines.push(line);
+        shown.push(Shown {
+            scope: entry.scope.clone(),
+            kind: entry.kind.clone(),
+            id: entry.id.clone(),
+            memory: entry.memory.clone(),
+        });
     }
     if left_out > 0 {
         lines.push(format!(
@@ -870,6 +980,7 @@ fn pinned_lines(state: &State, lines: &mut Vec<String>) {
         ));
     }
     lines.push(String::new());
+    shown
 }
 
 /// The digest as the context block a turn carries, wrapped the way prime-agent's
@@ -1273,42 +1384,203 @@ mod tests {
         assert!(digest.contains("the parser handles tokens"), "{digest}");
     }
 
-    /// An entry the memory readout recalls by meaning reaches the digest
-    /// though no word of the request is in it, fused with the entries the
-    /// words rank, and its line says how it came.
+    fn at(days_ago: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::days(days_ago)).to_rfc3339()
+    }
+
+    fn order(digest: &str, ids: &[&str]) -> Vec<usize> {
+        ids.iter()
+            .map(|id| {
+                digest
+                    .find(&format!("[local:{id}]"))
+                    .unwrap_or_else(|| panic!("{id} not shown: {digest}"))
+            })
+            .collect()
+    }
+
+    /// With no words to rank by, the entries most recently written come
+    /// first, not the alphabetically first: "zeta", written today, is shown
+    /// and "alpha-*", written a year ago, fill the rest.
     #[test]
-    fn an_entry_recalled_by_meaning_joins_the_ranked_ones() {
+    fn with_no_words_the_newest_entries_come_first() {
         let directory = tempfile::tempdir().expect("state");
         let mut memories = serde_json::Map::new();
         for number in 0..10 {
             memories.insert(
-                format!("run-{number}"),
-                json!({"title": format!("Running log {number}"), "content": "a long run on the river path"}),
+                format!("alpha-{number}"),
+                json!({"title": format!("Alpha {number}"), "content": "old", "updated_at": at(365 + number)}),
             );
         }
         memories.insert(
-            "anaemia".to_owned(),
-            json!({"title": "Health", "content": "The user has iron-deficiency anaemia."}),
+            "zeta".to_owned(),
+            json!({"title": "Zeta", "content": "new", "updated_at": at(0)}),
+        );
+        memories.insert(
+            "middle".to_owned(),
+            json!({"title": "Middle", "content": "newer", "updated_at": at(3)}),
         );
         write(directory.path(), &json!({"entries":{"memory":memories}}));
-        let state = load(directory.path(), "local");
-        let terms = weighted_terms(None, &["what should I eat before a long run"]);
-        let by_words = format_digest(&state, DigestOptions::default(), &terms);
-        assert!(!by_words.contains("anaemia"), "{by_words}");
-        let digest = super::format_digest_recalled(
-            &state,
+        let digest = format_digest(
+            &load(directory.path(), "local"),
             DigestOptions::default(),
-            &terms,
-            &[("memory".to_owned(), "anaemia".to_owned())],
+            &[],
         );
+        let places = order(&digest, &["zeta", "middle", "alpha-0"]);
+        assert!(places[0] < places[1] && places[1] < places[2], "{digest}");
+        assert!(!digest.contains("[local:alpha-9]"), "{digest}");
+    }
+
+    /// An entry the words reached is never passed by one they did not, however
+    /// recent; among the unmatched, the newest comes first.
+    #[test]
+    fn an_unmatched_entry_never_passes_a_matched_one() {
+        let directory = tempfile::tempdir().expect("state");
+        write(
+            directory.path(),
+            &json!({"entries":{"memory":{
+                "parser": {"title": "Parser", "content": "the parser handles tokens", "updated_at": at(400)},
+                "fresh": {"title": "Fresh", "content": "something else", "updated_at": at(0)},
+                "stale": {"title": "Stale", "content": "older else", "updated_at": at(30)}
+            }}}),
+        );
+        let digest = format_digest(
+            &load(directory.path(), "local"),
+            DigestOptions::default(),
+            &weighted_terms(None, &["fix the parser"]),
+        );
+        let places = order(&digest, &["parser", "fresh", "stale"]);
+        assert!(places[0] < places[1] && places[1] < places[2], "{digest}");
+    }
+
+    /// Among entries the words match alike, the one read often and lately
+    /// ranks first; a read also makes an entry recent. Showing an entry in a
+    /// digest is counted, but never ranks it.
+    #[test]
+    fn among_close_matches_the_used_one_ranks_first() {
+        let directory = tempfile::tempdir().expect("state");
+        let mut memories = serde_json::Map::new();
+        for number in 0..8 {
+            memories.insert(
+                format!("deploy-{number}"),
+                json!({"title": format!("Deploy note {number}"), "content": "deploys go through the release script", "updated_at": at(200)}),
+            );
+        }
+        write(directory.path(), &json!({"entries":{"memory":memories}}));
+        let mut state = load(directory.path(), "local");
+        let terms = weighted_terms(None, &["how do deploys work"]);
+        let before = format_digest(&state, DigestOptions::default(), &terms);
         assert!(
-            digest.contains("[local:anaemia] Health (, v1) [recalled by meaning]"),
-            "{digest}"
+            before.contains("[local:deploy-0]") && !before.contains("[local:deploy-7]"),
+            "equal matches keep their stable order: {before}"
         );
-        assert!(
-            digest.contains("[local:run-"),
-            "the words' entries stay: {digest}"
+        // Shown a hundred times: still not ranked by it.
+        for entry in state.entries.get_mut("memory").expect("memory") {
+            if entry.id == "deploy-5" {
+                entry.usage.shown = 100;
+                entry.usage.last_shown_at = Some(at(0));
+            }
+        }
+        assert_eq!(
+            format_digest(&state, DigestOptions::default(), &terms),
+            before
         );
+        for entry in state.entries.get_mut("memory").expect("memory") {
+            if entry.id == "deploy-7" {
+                entry.usage.reads = 5;
+                entry.usage.last_read_at = Some(at(1));
+            }
+        }
+        let after = format_digest(&state, DigestOptions::default(), &terms);
+        let places = order(&after, &["deploy-7", "deploy-0"]);
+        assert!(places[0] < places[1], "{after}");
+        assert_eq!(
+            format_digest(&state, DigestOptions::default(), &terms),
+            after,
+            "the same state ranks the same"
+        );
+    }
+
+    /// The digest says which entries it showed, by their ids in the store,
+    /// and counting them changes neither the entries nor the next digest.
+    #[test]
+    fn the_entries_shown_are_counted() {
+        let directory = tempfile::tempdir().expect("data");
+        let global = super::global_dir(directory.path());
+        let local = super::local_dir(directory.path(), "task-1");
+        write(
+            &global,
+            &json!({"entries":{"memory":{"tabs": {"title": "Tabs", "content": "The user prefers tabs"}}}}),
+        );
+        write(
+            &local,
+            &json!({"entries":{"memory":{"tabs": {"title": "Local tabs", "content": "This task uses spaces"}}}}),
+        );
+        let state = merge(load(&global, "global"), load(&local, "local"));
+        let digest = super::render_digest(&state, DigestOptions::default(), &[]);
+        assert_eq!(digest.shown.len(), 2, "{:?}", digest.shown);
+        assert!(digest.shown.iter().all(|shown| shown.memory.is_some()));
+        super::record_shown(&global, &local, &digest.shown);
+        // A shown entry whose id was not known is found by its key.
+        let mut unknown = digest.shown.clone();
+        for shown in &mut unknown {
+            shown.memory = None;
+        }
+        super::record_shown(&global, &local, &unknown);
+        let again = merge(load(&global, "global"), load(&local, "local"));
+        for entry in &again.entries["memory"] {
+            assert_eq!(entry.usage.shown, 2, "{}: {:?}", entry.id, entry.usage);
+        }
+        assert_eq!(
+            super::render_digest(&again, DigestOptions::default(), &[]).text,
+            digest.text
+        );
+    }
+
+    /// The digest over ten thousand entries with times and reads: BM25 plus
+    /// the reordering and the recency sort; run with `--ignored` to see the
+    /// time it takes beside `bm25_over_ten_thousand_entries`.
+    #[test]
+    #[ignore = "a timing, not a check"]
+    fn the_digest_over_ten_thousand_entries() {
+        let mut memories = serde_json::Map::new();
+        for index in 0..10_000 {
+            memories.insert(
+                format!("e{index}"),
+                json!({
+                    "title": format!("Note {index} about the parser and deploys"),
+                    "content": format!("entry {index}: the build of service {} runs cargo test before a deploy to staging; máy in số {}", index % 97, index % 13),
+                    "updated_at": at(index % 400),
+                }),
+            );
+        }
+        let mut state = super::parse(&json!({"entries": {"memory": memories}}), "local", "/local");
+        for (index, entry) in state
+            .entries
+            .get_mut("memory")
+            .expect("memory")
+            .iter_mut()
+            .enumerate()
+        {
+            if index % 7 == 0 {
+                entry.usage.reads = i64::try_from(index % 5).expect("small");
+                entry.usage.last_read_at = Some(at(i64::try_from(index % 90).expect("small")));
+            }
+        }
+        let terms = weighted_terms(
+            Some("fix the deploy of service 42"),
+            &["may in so 7 bi loi", "the parser fails on staging"],
+        );
+        let started = std::time::Instant::now();
+        let digest = super::render_digest(&state, DigestOptions::default(), &terms);
+        eprintln!("digest over 10000 entries: {:?}", started.elapsed());
+        assert_eq!(digest.shown.len(), 6);
+        let started = std::time::Instant::now();
+        let digest = super::render_digest(&state, DigestOptions::default(), &[]);
+        eprintln!(
+            "digest over 10000 entries, no words: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(digest.shown.len(), 6);
     }
 
     /// A child's digest is ranked for its brief, not by name.

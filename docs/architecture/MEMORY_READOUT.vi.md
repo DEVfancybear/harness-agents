@@ -2,7 +2,8 @@
 
 [English](MEMORY_READOUT.en.md) | Tiếng Việt
 
-**Trạng thái:** có từ 0.8.3. Tài liệu này mô tả cách chuyển thể MEMORILLA
+**Trạng thái:** có từ 0.8.3; từ 0.8.8 chỉ đọc theo từ (embedding đã bị bỏ, xem
+[Kho memory §14](MEMORY_STORE.vi.md)). Tài liệu này mô tả cách chuyển thể MEMORILLA
 (Fallahpour, Idehpour, Kothapalli và cộng sự, "Latent semantic memory for LLMs",
 arXiv 2610.21375, Stanford) cho ha. Code là chuẩn.
 
@@ -54,37 +55,32 @@ số.
 
 | MEMORILLA | ha |
 |---|---|
-| Encoder đóng băng, kho tính một lần | Dùng vector mà kho memory đã giữ (`memory_vector`, theo phiên bản nội dung) và cache embedding của lịch sử; câu hỏi được nhúng một lần mỗi lần đọc. Khi chưa cấu hình embedding thì dùng vector TF-IDF của từ: trọng số lấy từ kho, không có danh sách từ. |
-| `K` ô điều kiện theo câu hỏi | Tối đa `K` ô (8 cho digest mỗi lượt, 1 tới 16 cho lời gọi tool), mỗi ô điều kiện theo câu hỏi. |
+| Encoder đóng băng, kho tính một lần | Vector TF-IDF của từ, tính mỗi lần đọc: trọng số lấy từ kho, không có danh sách từ. Đến 0.8.7 thì dùng embedding người dùng đã cấu hình, nếu có. |
+| `K` ô điều kiện theo câu hỏi | Tối đa `K` ô (1 tới 16 cho lời gọi tool, mặc định 8), mỗi ô điều kiện theo câu hỏi. |
 | Ô có danh tính riêng (`Q0` đã học) | Mỗi ô đọc phần của câu hỏi mà các ô trước còn để lại: phần dư của câu hỏi sau khi trừ các lần đọc trước (Gram-Schmidt). Câu hỏi về hai việc sẽ chia vào hai ô. |
 | Cross-attention trên mọi tài liệu, `L_ref = 2` | Attention softmax trên mọi vector theo cosine (nhiệt độ 0,05), hai vòng, dùng câu hỏi làm kết nối dư. |
 | `K` token bất kể kho lớn cỡ nào | Tối đa `K` ô, mỗi ô thể hiện bằng các tài liệu mang 80 % attention của nó (tối đa 3), mỗi tài liệu chỉ thuộc một ô. Tài liệu chỉ được hiện khi độ tương đồng cao hơn trung bình của kho một độ lệch chuẩn: đây là thống kê của kho, nên đúng với mọi thang đo của encoder. |
-| Kết hợp với truy xuất (việc tương lai) | Digest kết hợp kết quả đọc với xếp hạng theo từ bằng RRF. |
+| Kết hợp với truy xuất (việc tương lai) | Đến 0.8.7 digest kết hợp phép đọc theo nghĩa với xếp hạng theo từ; từ 0.8.8 digest xếp theo từ, độ mới và mức dùng. |
 
 ## 4. Chạy ở đâu
 
-- **Digest của mỗi lượt.** Khi đã cấu hình embedding, ha đọc yêu cầu trên mọi
-  memory và prompt note: toàn cục, của project này và cục bộ. Yêu cầu gồm mục
-  tiêu, câu người dùng gõ, tóm tắt của task và các tin nhắn trước của họ.
-  - Các entry được nhớ lại được kết hợp với xếp hạng theo từ.
-  - Entry được nhớ lại mà không chứa từ nào của yêu cầu sẽ được đánh dấu
-    `[recalled by meaning]`.
-  - Entry chưa được nhúng sẽ được nhúng ở nền, cho lượt sau.
-  - Khi chưa có embedding, digest giữ nguyên như cũ.
+- **Digest của mỗi lượt.** Không còn nữa: đến 0.8.7, khi đã cấu hình
+  embedding, digest kết hợp phép đọc theo nghĩa với xếp hạng theo từ và đánh dấu
+  entry như vậy là `[recalled by meaning]`. 0.8.8 bỏ phần đó cùng embedding.
 - **Tool `memory`, `search` với `mode: readout`.** Cùng cách đọc đó, trên các
   entry mà bộ lọc (`tree`, `meta`, `meta_predicate`, `temporal`, `grep`) giữ
   lại, chia vào `slots` ô (mặc định 8).
   - Mỗi ô liệt kê entry của nó kèm `attention`.
-  - Kết quả cho biết encoder nào đã đọc: `embeddings`, hoặc `words` khi chưa
-    cấu hình embedding.
+  - Kết quả ghi `encoder: words`; khi không nhớ lại được gì, nó ghi câu hỏi đã
+    đọc và khuyên tìm lại bằng từ khác.
+  - Các entry nó hiện được đếm là hit (`memory_usage`).
   - Chế độ này chỉ đọc memory; knowledge tìm bằng `mode: rank`.
 - **`history_search` với `mode: readout`.** Đây là thiết lập học liên tục của
   bài báo: các lượt cũ của cuộc trò chuyện là tài liệu, gồm tin nhắn của người
   dùng, của trợ lý và kết quả công cụ.
   - Đọc 1.500 nguồn mới nhất trong phạm vi, mỗi nguồn 1.500 ký tự đầu, với cùng
     bộ lọc khoảng thời gian và loại nguồn.
-  - Vector lấy từ cache embedding của lịch sử, mean-pool trên các đoạn của mỗi
-    nguồn.
+  - Vector là vector TF-IDF của từ trong mỗi nguồn.
   - Mỗi hit ghi `slot` và `attention` của nó, nên những gì đã thử, đã quyết
     hoặc đã thấy trong một cuộc trò chuyện dài trở lại cùng nhau, kể cả các
     lượt đã bị compaction.
@@ -103,15 +99,9 @@ số.
 - **Unit test** bao quát:
   - chính phép đọc: các ô chia câu hỏi hai vế, ngân sách cố định trên 500 tài
     liệu, thống kê "nổi bật";
-  - việc digest kết hợp: entry không chung từ nào vẫn vào digest, có đánh dấu;
   - readout của tool: yêu cầu hai vế tìm ra cả hai entry và không lấy entry
     không liên quan;
-  - readout của lịch sử: hai nguồn không chung từ nào với câu hỏi trở lại trong
-    các ô, nguồn không liên quan thì không, và không có embedding thì đọc theo
-    từ.
-- **Live**, `memory-store.sh` mục 12 chạy với một server embedding giả:
-  - digest nhớ lại một entry theo nghĩa;
-  - readout chia một yêu cầu hai vế;
-  - `history_search` đọc lại một cuộc trò chuyện.
-
-  Mọi check đều trượt trên 0.8.2.
+  - readout của lịch sử: các nguồn ứng với từng vế của câu hỏi trở lại trong
+    các ô, nguồn không liên quan thì không.
+- **Live**, `memory-store.sh` mục 12 chạy với một server embedding giả đến
+  0.8.7; 0.8.8 giữ các check theo từ: readout chia một yêu cầu hai vế.

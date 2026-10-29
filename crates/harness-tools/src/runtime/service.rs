@@ -290,61 +290,7 @@ pub struct ToolExecutionService {
     elsewhere: Option<Arc<dyn PathElsewhere>>,
     /// A host's check before a command runs (the jev plugin's command guard).
     guard: Option<Arc<dyn ToolGuard>>,
-    /// History search by meaning beside its words (the host's embeddings).
-    history_semantic: Option<Arc<dyn HistorySemantic>>,
 }
-
-/// History search by meaning beside its words: the host's embeddings, when it
-/// has them configured. `nearest` answers the ids of `texts` nearest
-/// `query`, nearest first, with their similarity; `corpus` names the set the
-/// texts are (a conversation, or the project) so their vectors are kept
-/// apart. Words alone miss what the record says another way or in another
-/// language; an error or a slow answer leaves the search to words.
-/// What [`HistorySemantic::nearest`] answers: source ids with their
-/// similarity, nearest first.
-pub type NearestFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<Vec<(String, f64)>, String>> + Send + 'a>,
->;
-
-pub trait HistorySemantic: Send + Sync {
-    /// Whether embeddings are configured now (`/knowledge semantic`): off,
-    /// the search reads no texts for them.
-    fn enabled(&self) -> bool;
-    fn nearest<'a>(
-        &'a self,
-        corpus: &'a str,
-        texts: Vec<harness_store_sqlite::HistoryText>,
-        query: &'a str,
-        limit: usize,
-    ) -> NearestFuture<'a>;
-    /// How the two rankings are fused: the weight of meaning, of words, and
-    /// the lowest fused score kept.
-    fn weights(&self) -> (f64, f64, Option<f64>);
-    /// Each text's vector, by source id, and the query's: what a readout
-    /// (`mode: readout`) reads. Embedded as [`Self::nearest`] embeds, the
-    /// vectors kept. A host that cannot give them says so, and the readout
-    /// reads words.
-    fn vectors<'a>(
-        &'a self,
-        corpus: &'a str,
-        texts: Vec<harness_store_sqlite::HistoryText>,
-        query: &'a str,
-    ) -> VectorsFuture<'a> {
-        let _ = (corpus, texts, query);
-        Box::pin(async { Err("this host gives no vectors".to_owned()) })
-    }
-}
-
-/// The vectors a [`HistorySemantic`] gives a readout: each source's, by id,
-/// and the query's.
-pub type VectorsFuture<'a> = std::pin::Pin<
-    Box<
-        dyn std::future::Future<
-                Output = Result<(std::collections::BTreeMap<String, Vec<f32>>, Vec<f32>), String>,
-            > + Send
-            + 'a,
-    >,
->;
 
 /// A host's own check before a command runs, after the policy allowed it:
 /// `Some(reason)` refuses the command with that reason, which the model reads;
@@ -374,7 +320,6 @@ impl ToolExecutionService {
             hashline: false,
             elsewhere: None,
             guard: None,
-            history_semantic: None,
         }
     }
 
@@ -404,13 +349,6 @@ impl ToolExecutionService {
     #[must_use]
     pub fn with_guard(mut self, guard: Arc<dyn ToolGuard>) -> Self {
         self.guard = Some(guard);
-        self
-    }
-
-    /// Search history by meaning too ([`HistorySemantic`]).
-    #[must_use]
-    pub fn with_history_semantic(mut self, semantic: Arc<dyn HistorySemantic>) -> Self {
-        self.history_semantic = Some(semantic);
         self
     }
 
@@ -2152,15 +2090,7 @@ impl ToolExecutionService {
         let scope = self.history_scope(prepared, project).await?;
         if let Some(slots) = readout {
             return self
-                .history_readout(
-                    prepared,
-                    &scope,
-                    query,
-                    project,
-                    slots,
-                    filter,
-                    caught.behind,
-                )
+                .history_readout(prepared, &scope, query, slots, filter, caught.behind)
                 .await;
         }
         let wanted = limit.unwrap_or(HISTORY_SEARCH_DEFAULT_LIMIT);
@@ -2169,26 +2099,6 @@ impl ToolExecutionService {
             .history_search_filtered(&scope, query, usize::try_from(wanted).unwrap_or(10), filter)
             .await
             .map_err(store_error)?;
-        let hits = match &self.history_semantic {
-            Some(semantic) if semantic.enabled() => {
-                let corpus = if project {
-                    "project"
-                } else {
-                    prepared.request.task_id.as_str()
-                };
-                self.with_meaning(
-                    semantic.as_ref(),
-                    &scope,
-                    query,
-                    corpus,
-                    hits,
-                    usize::try_from(wanted).unwrap_or(10),
-                    filter,
-                )
-                .await
-            }
-            _ => hits,
-        };
         let truncated = hits.len() >= usize::try_from(wanted).unwrap_or(10);
         Ok(ToolOutput::HistorySearch {
             hits: hits
@@ -2207,23 +2117,17 @@ impl ToolExecutionService {
     /// sources carrying most of its attention, a later slot reading what the
     /// earlier ones left of the query - so what was tried, decided or seen
     /// across a long conversation comes back together, its compacted turns
-    /// included. By meaning when embeddings are configured, else by words.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one readout: its scope, query, corpus, slots, filter and index state"
-    )]
+    /// included, by their words.
     async fn history_readout(
         &self,
         prepared: &PreparedToolRequest,
         scope: &harness_store_sqlite::HistoryScope,
         query: &str,
-        project: bool,
         slots: u32,
         filter: &harness_store_sqlite::HistoryFilter,
         unindexed: u64,
     ) -> Result<ToolOutput, HarnessError> {
-        /// The newest sources read, and how much of each, as search by
-        /// meaning embeds them.
+        /// The newest sources read, and how much of each.
         const SOURCES: usize = 1_500;
         const CHARS: usize = 1_500;
         use harness_types::readout;
@@ -2241,12 +2145,11 @@ impl ToolExecutionService {
                     && !text.text.trim().is_empty()
             })
             .collect::<Vec<_>>();
-        let corpus = if project {
-            "project"
-        } else {
-            prepared.request.task_id.as_str()
-        };
-        let (vectors, query_vector, by_meaning) = self.readout_vectors(corpus, &texts, query).await;
+        let documents = texts
+            .iter()
+            .map(|text| readout::words(&text.text))
+            .collect::<Vec<_>>();
+        let (vectors, query_vector) = readout::word_vectors(&documents, &readout::words(query));
         let recalled =
             readout::recall(&vectors, &query_vector, usize::try_from(slots).unwrap_or(8));
         let placed = recalled
@@ -2270,7 +2173,6 @@ impl ToolExecutionService {
         harness_types::diag::info("history", "readout")
             .field("sources", texts.len())
             .field("slots", recalled.len())
-            .field("by_meaning", by_meaning)
             .emit();
         let hits = placed
             .iter()
@@ -2297,134 +2199,6 @@ impl ToolExecutionService {
             truncated: false,
             unindexed,
         })
-    }
-
-    /// The vectors a readout reads, one per text, and the query's: the
-    /// embeddings when they are configured and answer within 20 s, else the
-    /// texts' words; says whether they were the embeddings.
-    async fn readout_vectors(
-        &self,
-        corpus: &str,
-        texts: &[harness_store_sqlite::HistoryText],
-        query: &str,
-    ) -> (Vec<Vec<f32>>, Vec<f32>, bool) {
-        const WAIT: std::time::Duration = std::time::Duration::from_secs(20);
-        use harness_types::readout;
-        if let Some(semantic) = self
-            .history_semantic
-            .as_ref()
-            .filter(|semantic| semantic.enabled())
-        {
-            let why =
-                match tokio::time::timeout(WAIT, semantic.vectors(corpus, texts.to_vec(), query))
-                    .await
-                {
-                    Ok(Ok((vectors, query_vector))) if !query_vector.is_empty() => {
-                        let vectors = texts
-                            .iter()
-                            .map(|text| vectors.get(&text.source_id).cloned().unwrap_or_default())
-                            .collect();
-                        return (vectors, query_vector, true);
-                    }
-                    Ok(Ok(_)) => "no query vector".to_owned(),
-                    Ok(Err(error)) => error,
-                    Err(_) => "the embeddings took longer than 20 s".to_owned(),
-                };
-            harness_types::diag::warn("history", "readout_vectors_failed")
-                .field("why", why)
-                .emit();
-        }
-        let documents = texts
-            .iter()
-            .map(|text| readout::words(&text.text))
-            .collect::<Vec<_>>();
-        let (vectors, query_vector) = readout::word_vectors(&documents, &readout::words(query));
-        (vectors, query_vector, false)
-    }
-
-    /// The word hits fused with the sources nearest the query by meaning
-    /// (`hybrid_fuse`, as knowledge search fuses its pages); a source found
-    /// by meaning only holds none of the query's words (`matched=0/n`). The
-    /// newest sources are embedded, a head of each; the vectors are kept, so
-    /// a search embeds only what is new. Words alone when the embeddings fail
-    /// or take too long, and the record says why.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one search: its scope, query, corpus, word hits, size and filter"
-    )]
-    async fn with_meaning(
-        &self,
-        semantic: &dyn HistorySemantic,
-        scope: &harness_store_sqlite::HistoryScope,
-        query: &str,
-        corpus: &str,
-        words: Vec<harness_store_sqlite::HistoryHit>,
-        wanted: usize,
-        filter: &harness_store_sqlite::HistoryFilter,
-    ) -> Vec<harness_store_sqlite::HistoryHit> {
-        /// The newest sources embedded, and how much of each.
-        const SOURCES: usize = 1_500;
-        const CHARS: usize = 1_500;
-        /// How long the embeddings may take before words answer alone; the
-        /// vectors made meanwhile are kept for the next search.
-        const WAIT: std::time::Duration = std::time::Duration::from_secs(20);
-        let failed = |why: String| {
-            harness_types::diag::warn("history", "semantic_failed")
-                .field("why", why)
-                .emit();
-        };
-        let texts = match self.store.history_texts(scope, SOURCES, CHARS).await {
-            Ok(texts) => texts,
-            Err(error) => {
-                failed(error.to_string());
-                return words;
-            }
-        };
-        let near =
-            match tokio::time::timeout(WAIT, semantic.nearest(corpus, texts, query, wanted * 2))
-                .await
-            {
-                Ok(Ok(near)) => near,
-                Ok(Err(error)) => {
-                    failed(error);
-                    return words;
-                }
-                Err(_) => {
-                    failed("the embeddings took longer than 20 s".to_owned());
-                    return words;
-                }
-            };
-        let (meaning, wording, lowest) = semantic.weights();
-        let ranked_words = words
-            .iter()
-            .map(|hit| (hit.source_id.clone(), 1.0))
-            .collect::<Vec<_>>();
-        let fused =
-            harness_types::search::hybrid_fuse(&ranked_words, &near, meaning, wording, lowest);
-        let by_meaning = fused
-            .iter()
-            .take(wanted)
-            .filter(|(id, _)| !words.iter().any(|hit| &hit.source_id == id))
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        let mut found = words;
-        match self.store.history_hits(scope, query, &by_meaning).await {
-            // A source found by meaning holds to the same window and kinds.
-            Ok(hits) => found.extend(
-                hits.into_iter()
-                    .filter(|hit| filter.admits(&hit.source_id, &hit.kind)),
-            ),
-            Err(error) => failed(error.to_string()),
-        }
-        harness_types::diag::info("history", "semantic")
-            .field("near", near.len())
-            .field("by_meaning", by_meaning.len())
-            .emit();
-        fused
-            .into_iter()
-            .filter_map(|(id, _)| found.iter().find(|hit| hit.source_id == id).cloned())
-            .take(wanted)
-            .collect()
     }
 
     /// Read one exact page of an indexed source.

@@ -1627,185 +1627,9 @@ async fn m5_03_index_rebuild_is_identical_and_scope_is_a_filter() {
     close(store).await;
 }
 
-/// Embeddings that put one source nearest every query: the one whose text
-/// holds `near`, or none.
-struct NearestTo(Option<&'static str>);
-
-impl harness_tools::HistorySemantic for NearestTo {
-    fn enabled(&self) -> bool {
-        true
-    }
-
-    fn weights(&self) -> (f64, f64, Option<f64>) {
-        (0.7, 0.3, None)
-    }
-
-    fn nearest<'a>(
-        &'a self,
-        _corpus: &'a str,
-        texts: Vec<harness_store_sqlite::HistoryText>,
-        _query: &'a str,
-        _limit: usize,
-    ) -> harness_tools::NearestFuture<'a> {
-        Box::pin(async move {
-            let Some(near) = self.0 else {
-                return Err("the embedding provider failed".to_owned());
-            };
-            Ok(texts
-                .into_iter()
-                .filter(|text| text.text.contains(near))
-                .map(|text| (text.source_id, 0.9))
-                .collect())
-        })
-    }
-}
-
-/// With embeddings configured, a source that says the query another way -
-/// none of its words - is found by meaning beside the word hits, and shows
-/// `matched=0/n`; when the embeddings fail, words answer alone.
-#[tokio::test]
-async fn m5_03_history_search_finds_by_meaning_beside_words() {
-    let bench = bench();
-    let store = bench.open_store().await;
-    let (session, task) = admit(&store, &bench, "the first turn").await;
-    append_note(
-        &store,
-        &session,
-        &task,
-        "the parser crashed on the durian fixture",
-    )
-    .await;
-    append_note(&store, &session, &task, "sầu riêng có gai, mùi rất nồng").await;
-    append_note(&store, &session, &task, "an unrelated note about the build").await;
-    let search = |tools: ToolExecutionService| {
-        let (session, task, workspace) = (session.clone(), task.clone(), bench.workspace.clone());
-        async move {
-            let prepared = tools
-                .prepare(ToolRequest::new(
-                    session,
-                    task,
-                    "actor.semantic",
-                    &workspace,
-                    CodingToolAction::HistorySearch {
-                        query: "durian".to_owned(),
-                        limit: None,
-                        project: false,
-                        filter: harness_tools::HistorySearchFilter::default(),
-                    },
-                ))
-                .await
-                .expect("prepares");
-            let grant = tools.approve(&prepared).await.expect("approved");
-            let view = tools.execute(prepared, Some(grant)).await.expect("search");
-            let ToolOutput::HistorySearch { hits, .. } = view.output else {
-                panic!("hits: {:?}", view.output);
-            };
-            hits
-        }
-    };
-
-    let hits = search(
-        ToolExecutionService::new(Arc::clone(&store))
-            .with_history_semantic(Arc::new(NearestTo(Some("sầu riêng")))),
-    )
-    .await;
-    let previews = hits
-        .iter()
-        .map(|hit| hit.preview.as_str())
-        .collect::<Vec<_>>();
-    assert!(
-        previews.contains(&"the parser crashed on the durian fixture"),
-        "the word hit stays: {previews:?}"
-    );
-    let by_meaning = hits
-        .iter()
-        .find(|hit| hit.preview.starts_with("sầu riêng"))
-        .unwrap_or_else(|| panic!("the source that says it in Vietnamese: {previews:?}"));
-    assert_eq!((by_meaning.matched_terms, by_meaning.query_terms), (0, 1));
-    assert!(
-        !previews.iter().any(|preview| preview.contains("unrelated")),
-        "{previews:?}"
-    );
-
-    let hits = search(
-        ToolExecutionService::new(Arc::clone(&store))
-            .with_history_semantic(Arc::new(NearestTo(None))),
-    )
-    .await;
-    // The first search's own result is in the journal now and holds the word.
-    let previews = hits
-        .iter()
-        .map(|hit| hit.preview.as_str())
-        .collect::<Vec<_>>();
-    assert!(
-        previews.contains(&"the parser crashed on the durian fixture"),
-        "{previews:?}"
-    );
-    assert!(
-        hits.iter().all(|hit| hit.matched_terms > 0),
-        "failed embeddings leave the word hits alone: {previews:?}"
-    );
-    close(store).await;
-}
-
-/// Embeddings that place a text by the themes it names: the staging
-/// credentials, the durian, or neither.
-struct Themes;
-
-impl Themes {
-    fn vector(text: &str) -> Vec<f32> {
-        let text = text.to_lowercase();
-        if text.contains("password") || text.contains("credential") || text.contains("log in") {
-            vec![1.0, 0.0, 0.0]
-        } else if text.contains("durian") || text.contains("sầu riêng") {
-            vec![0.0, 1.0, 0.0]
-        } else {
-            vec![0.0, 0.0, 1.0]
-        }
-    }
-}
-
-impl harness_tools::HistorySemantic for Themes {
-    fn enabled(&self) -> bool {
-        true
-    }
-
-    fn weights(&self) -> (f64, f64, Option<f64>) {
-        (0.7, 0.3, None)
-    }
-
-    fn nearest<'a>(
-        &'a self,
-        _corpus: &'a str,
-        _texts: Vec<harness_store_sqlite::HistoryText>,
-        _query: &'a str,
-        _limit: usize,
-    ) -> harness_tools::NearestFuture<'a> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn vectors<'a>(
-        &'a self,
-        _corpus: &'a str,
-        texts: Vec<harness_store_sqlite::HistoryText>,
-        query: &'a str,
-    ) -> harness_tools::VectorsFuture<'a> {
-        Box::pin(async move {
-            Ok((
-                texts
-                    .into_iter()
-                    .map(|text| (text.source_id, Self::vector(&text.text)))
-                    .collect(),
-                Self::vector(query),
-            ))
-        })
-    }
-}
-
-/// A readout reads the whole conversation for a question: the sources behind
-/// it come back in slots, each with its share of the slot's attention, though
-/// they share no word with the question; an unrelated one does not. Without
-/// embeddings, the words read.
+/// A readout reads the whole conversation for a question by its words: the
+/// sources behind each part of it come back in slots, each with its share of
+/// the slot's attention; an unrelated one does not.
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // a conversation, then the questions read against it
 async fn m5_03_a_readout_recalls_the_conversation_for_a_question() {
@@ -1876,8 +1700,8 @@ async fn m5_03_a_readout_recalls_the_conversation_for_a_question() {
         }
     };
     let hits = readout(
-        ToolExecutionService::new(Arc::clone(&store)).with_history_semantic(Arc::new(Themes)),
-        "why could we not log in to staging",
+        ToolExecutionService::new(Arc::clone(&store)),
+        "the staging password and the credentials",
     )
     .await;
     let previews = hits
@@ -1910,7 +1734,7 @@ async fn m5_03_a_readout_recalls_the_conversation_for_a_question() {
     assert!(
         hits.first()
             .is_some_and(|hit| hit.preview.contains("durian") && hit.slot == Some(1)),
-        "words read without embeddings: {hits:?}"
+        "the words read: {hits:?}"
     );
     close(store).await;
 }

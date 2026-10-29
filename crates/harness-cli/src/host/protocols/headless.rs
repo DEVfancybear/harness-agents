@@ -600,9 +600,6 @@ pub async fn run_with(
     }
     let knowledge_host =
         super::knowledge::KnowledgeHost::new(&context.project.root, &context.paths.data_dir);
-    tools = tools.with_history_semantic(Arc::new(
-        knowledge_host.history_embeddings(&context.paths.data_dir, &context.project.root),
-    ));
     // prime-agent 9eec445a: `ha exec` delegates as the app does, and the run
     // waits for its children. Nobody can answer an approval here, so a gated
     // action a child asks for is refused, as the root's is.
@@ -965,26 +962,21 @@ pub async fn run_with(
     );
     // With harness refinements off, no saved entry reaches the model.
     if refinements {
-        // The memory readout recalls entries by meaning for this prompt.
-        let recalled = super::memory_readout::digest_recall_async(
+        let digest = super::harness::render_digest(
+            &harness_state,
+            super::harness::DigestOptions {
+                memory_tool: true,
+                ..super::harness::DigestOptions::default()
+            },
+            &super::harness::weighted_terms(None, &[request.prompt.as_str()]),
+        );
+        // What it showed is counted off the run's path.
+        super::harness::record_shown_soon(
             super::harness::global_dir(&context.paths.data_dir),
             super::harness::local_dir(&context.paths.data_dir, task_id.as_str()),
-            Some(super::bootstrap::project_key_of(&context.project.root)),
-            context.paths.data_dir.join("knowledge"),
-            request.prompt.clone(),
-        )
-        .await;
-        project_blocks.push(super::harness::digest_block(
-            &super::harness::format_digest_recalled(
-                &harness_state,
-                super::harness::DigestOptions {
-                    memory_tool: true,
-                    ..super::harness::DigestOptions::default()
-                },
-                &super::harness::weighted_terms(None, &[request.prompt.as_str()]),
-                &recalled,
-            ),
-        ));
+            digest.shown,
+        );
+        project_blocks.push(super::harness::digest_block(&digest.text));
     }
     if let Some(block) = super::knowledge::context_block(&knowledge_host, &[(&request.prompt, 1.0)])
     {

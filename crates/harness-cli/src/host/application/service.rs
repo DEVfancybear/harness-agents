@@ -9187,10 +9187,7 @@ async fn run_turn(
             &caller_dir,
             task_id.as_str(),
             nested_instructions,
-        )))
-        .with_history_semantic(Arc::new(
-            knowledge_host.history_embeddings(&data_dir, &workspace_root),
-        ));
+        )));
     if let Some(decisions) = &jev_decisions {
         tools = tools.with_guard(Arc::clone(decisions) as Arc<dyn harness_tools::ToolGuard>);
     }
@@ -9700,38 +9697,29 @@ async fn run_turn(
     };
     // With harness refinements off, no saved entry reaches the model.
     if refinements {
-        // The memory readout recalls entries by meaning for this request.
-        let recalled = super::memory_readout::digest_recall_async(
+        let digest = super::harness::render_digest(
+            &harness_state,
+            super::harness::DigestOptions {
+                repl: repl_host.is_some(),
+                refine: repl_host.is_some()
+                    && kernel_skill_imports.iter().any(|name| name == "refine"),
+                memory_tool: true,
+            },
+            &super::harness::weighted_terms(
+                goal_objective,
+                &digest_context
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            ),
+        );
+        // What it showed is counted off the turn's path.
+        super::harness::record_shown_soon(
             super::harness::global_dir(&data_dir),
             super::harness::local_dir(&data_dir, task_id.as_str()),
-            memory_host.project_key().map(str::to_owned),
-            data_dir.join("knowledge"),
-            goal_objective
-                .into_iter()
-                .chain(digest_context.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-        .await;
-        project_blocks.push(super::harness::digest_block(
-            &super::harness::format_digest_recalled(
-                &harness_state,
-                super::harness::DigestOptions {
-                    repl: repl_host.is_some(),
-                    refine: repl_host.is_some()
-                        && kernel_skill_imports.iter().any(|name| name == "refine"),
-                    memory_tool: true,
-                },
-                &super::harness::weighted_terms(
-                    goal_objective,
-                    &digest_context
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>(),
-                ),
-                &recalled,
-            ),
-        ));
+            digest.shown,
+        );
+        project_blocks.push(super::harness::digest_block(&digest.text));
     }
     // The one learned skill that fits this request, with what it took for
     // granted when it failed (LIFE-HARNESS's procedural skill layer).
@@ -11761,7 +11749,7 @@ impl SessionPort for FixtureService {
 
 /// Run a background review on a blocking thread, not on one of the runtime's
 /// workers. A review takes the harness lock (a spin of `std::thread::sleep`
-/// for up to 30 s) and reads the embedding index synchronously; on a worker
+/// for up to 30 s) and reads the stores synchronously; on a worker
 /// that wait blocked the task that returns the store's one connection to its
 /// pool - queued on that same worker - and every other store call of the
 /// session waited 30 s and failed (`pool timed out while waiting for an open

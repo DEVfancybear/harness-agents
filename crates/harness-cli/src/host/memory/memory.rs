@@ -93,7 +93,7 @@ pub const GUIDANCE: &str = concat!(
     "The harness digest each turn shows only the few entries that rank highest for the request, cut short; the rest are found with memory search. ",
     "Before answering about an earlier decision, preference, person, plan or past piece of work you do not see in context, search memory first; when it has nothing, say so instead of guessing. ",
     "Search matches words, not meaning: when the wording or language may differ from the entries (the user writes Vietnamese, an entry may be in English), pass up to four variants in queries in the same search - synonyms and a translation - instead of searching again. ",
-    "When the answer is spread over several entries, or the request shares no word with what you kept, search with mode readout: it reads every entry for the request into a few slots, each the entries behind one part of it, by meaning when embeddings are configured; entries the digest marks [recalled by meaning] came the same way. ",
+    "When the answer is spread over several entries, search with mode readout: it reads every entry for the request into a few slots, each the entries behind one part of it. ",
     "When the user asks you to remember something, states a lasting preference or corrects how you work, or a decision is reached that later work depends on, write it in the same turn without asking. Use scope global for what holds across conversations and projects (the user's preferences, how they like to work), project for a stable fact about this project (its stack, conventions, where things live; it never reaches another project), and local for this conversation's state. ",
     "Search before writing and update the matching entry with its id and expected_version instead of adding a near-duplicate (a write that reads as an entry already kept is refused with that entry's id); when a write returns related entries, update or delete one the new fact replaces or contradicts. Delete an entry that turned out wrong. One fact or rule per entry, short and self-contained. Never store secrets, credentials or tokens. ",
     "An update by id changes only what it gives: leave content out to retag, move or re-time an entry. An update or a delete keeps the earlier version: history shows an entry's earlier versions (also of a deleted one), and revert brings one back. ",
@@ -710,18 +710,7 @@ impl MemoryHost {
     fn execute(&self, arguments: &Value) -> Result<Value, String> {
         self.check(arguments)?;
         let action = text(arguments, "action")?;
-        let result = self.run_action(action, arguments)?;
-        // A change is embedded in the background when embeddings are on, so
-        // the next search by meaning finds it without waiting.
-        if WRITES.contains(&action)
-            && arguments.get("dry_run").and_then(Value::as_bool) != Some(true)
-        {
-            super::memory_search::embed_soon(
-                vec![self.global.clone(), self.local.clone()],
-                &self.embedding_root(),
-            );
-        }
-        Ok(result)
+        self.run_action(action, arguments)
     }
 
     fn run_action(&self, action: &str, arguments: &Value) -> Result<Value, String> {
@@ -734,7 +723,7 @@ impl MemoryHost {
             "history" => self.history_feed(arguments),
             "tree" => self.tree(arguments),
             "count" => self.count(arguments),
-            "status" => self.status(),
+            "status" => Ok(self.status()),
             "move" => self.relocate(arguments, false),
             "copy" => self.relocate(arguments, true),
             "delete_tree" => self.delete_tree(arguments),
@@ -791,7 +780,7 @@ impl MemoryHost {
             json!({"hits": [], "total": 0, "mode": "knowledge"})
         };
         let limit = integer(arguments, "limit", 10).clamp(1, 200);
-        let mut queries = arguments
+        let queries = arguments
             .get("query")
             .and_then(Value::as_str)
             .into_iter()
@@ -805,11 +794,6 @@ impl MemoryHost {
             )
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        if queries.is_empty()
-            && let Some(semantic) = arguments.get("semantic").and_then(Value::as_str)
-        {
-            queries.push(semantic.to_owned());
-        }
         let host = match (&self.workspace, self.global.parent()) {
             (Some(workspace), Some(data)) => {
                 let host = super::knowledge::KnowledgeHost::new(workspace, data);
@@ -882,12 +866,11 @@ impl MemoryHost {
     /// through, in at most `slots` slots. Each slot reads all of them and is
     /// shown by the entries carrying most of its attention; a later slot reads
     /// what the earlier ones left of the query, so the slots together answer
-    /// a request whose parts sit in different entries. By the embeddings the
-    /// user configured, else by the entries' words.
+    /// a request whose parts sit in different entries. By the entries' words.
+    /// The entries it shows are counted as hits.
     fn readout(&self, arguments: &Value) -> Result<Value, String> {
         let kinds = kinds(arguments)?;
         let mut rows = Vec::new();
-        let mut dirs = Vec::new();
         for scope in self.scopes(arguments)? {
             let dir = self.dir(scope).to_path_buf();
             let state = super::refine::load_raw(&dir);
@@ -895,18 +878,16 @@ impl MemoryHost {
                 let doc = state["entries"][&entry.kind][&entry.id].clone();
                 rows.push((entry, dir.clone(), doc));
             }
-            dirs.push(dir);
         }
-        dirs.dedup();
-        super::memory_search::embed_before_reading(&dirs, &self.embedding_root());
         let placed = rows
             .iter()
             .map(|(entry, dir, doc)| super::memory_search::Placed { entry, dir, doc })
             .collect::<Vec<_>>();
         let considered = super::memory_search::filtered(&placed, arguments)?;
-        let query = ["query", "semantic"]
-            .iter()
-            .filter_map(|key| arguments.get(*key).and_then(Value::as_str))
+        let query = arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .into_iter()
             .chain(
                 arguments
                     .get("queries")
@@ -921,13 +902,17 @@ impl MemoryHost {
             .clamp(1, super::memory_search::MAX_SLOTS);
         let entries = considered
             .iter()
-            .map(|placed| (placed.entry, placed.dir))
+            .map(|placed| placed.entry)
             .collect::<Vec<_>>();
-        let recalled =
-            super::memory_readout::recall(&entries, &self.embedding_root(), &query, slots, true)?;
+        let slots = super::memory_readout::recall(&entries, &query, slots);
         let rounded = |value: f64| (value * 1e4).round() / 1e4;
-        let (encoder, slots) =
-            recalled.unwrap_or((super::memory_readout::Encoder::Words, Vec::new()));
+        super::memory_search::record_hits(
+            &slots
+                .iter()
+                .flat_map(|slot| slot.documents.iter())
+                .map(|(entry, _)| considered[*entry])
+                .collect::<Vec<_>>(),
+        );
         let shown = slots
             .iter()
             .enumerate()
@@ -949,18 +934,12 @@ impl MemoryHost {
             .collect::<Vec<_>>();
         let mut result = json!({
             "mode": "readout",
-            "encoder": encoder.label(),
+            "encoder": "words",
             "searched": considered.len(),
             "slots": shown,
         });
         if shown.is_empty() {
-            result["note"] = json!(
-                "Nothing stood out from the rest for this request: memory may not hold it. Search with mode rank, or say it is not remembered."
-            );
-        } else if encoder == super::memory_readout::Encoder::Words {
-            result["note"] = json!(
-                "Read by words, as no embeddings are configured (/knowledge semantic --global turns meaning on)."
-            );
+            result["note"] = json!(super::memory_search::miss_note(&[query]));
         }
         Ok(super::memory_search::formatted(result, arguments))
     }
@@ -981,17 +960,7 @@ impl MemoryHost {
             .iter()
             .map(|(entry, dir, doc)| super::memory_search::Placed { entry, dir, doc })
             .collect::<Vec<_>>();
-        super::memory_search::search(&placed, &self.embedding_root(), arguments, &|entry| {
-            view(entry, SNIPPET_CHARS)
-        })
-    }
-
-    /// The knowledge library whose embedding configuration memory uses: the
-    /// global one, `<data>/knowledge`.
-    fn embedding_root(&self) -> PathBuf {
-        self.global
-            .parent()
-            .map_or_else(|| self.global.clone(), |data| data.join("knowledge"))
+        super::memory_search::search(&placed, arguments, &|entry| view(entry, SNIPPET_CHARS))
     }
 
     /// The scopes an id may be in, and the id itself: a `global:`, `local:`
@@ -1143,6 +1112,17 @@ impl MemoryHost {
         }
         if let Some(memory) = super::memory_store::ids(dir)?.get(&(kind.clone(), id.clone())) {
             read["memory_id"] = json!(memory);
+            // A read is the use ranking weighs most; failing to count it
+            // never fails the read.
+            if let Err(error) = super::memory_store::record_use(
+                dir,
+                super::memory_store::Use::Read,
+                std::slice::from_ref(memory),
+            ) {
+                harness_types::diag::debug("memory", "usage_not_recorded")
+                    .field("error", error)
+                    .emit();
+            }
         }
         Ok(super::memory_search::present(read, arguments))
     }
@@ -2082,9 +2062,8 @@ impl MemoryHost {
         Ok(counted)
     }
 
-    /// `status`: how many entries each scope holds, and how far embedding has
-    /// got - memory-engine's `embeddingStatus`.
-    fn status(&self) -> Result<Value, String> {
+    /// `status`: how many entries each scope holds.
+    fn status(&self) -> Value {
         let mut scopes = serde_json::Map::new();
         for scope in self.all_scopes() {
             scopes.insert(
@@ -2092,43 +2071,15 @@ impl MemoryHost {
                 json!(self.entries(&[scope], &KINDS).len()),
             );
         }
-        let mut status = json!({"entries": scopes});
-        let config = super::knowledge::embedding::load_config(&self.embedding_root())?;
-        if !config.enabled {
-            status["embedding"] = json!({
-                "configured": false,
-                "note": "search ranks by words alone; /knowledge semantic --global turns meaning on",
-            });
-            return Ok(status);
+        let mut status = json!({"entries": scopes, "search": "words"});
+        if let Some(note) = self
+            .global
+            .parent()
+            .and_then(super::knowledge::retired_embedding_note)
+        {
+            status["note"] = json!(note);
         }
-        let namespace = super::knowledge::embedding::namespace_of(&config)?;
-        let mut total = super::memory_store::EmbeddingStatus::default();
-        let mut dirs = vec![self.global.clone(), self.local.clone()];
-        dirs.dedup();
-        for dir in &dirs {
-            let one = super::memory_store::embedding_status(dir, &namespace)?;
-            total.embedded += one.embedded;
-            total.pending += one.pending;
-            total.failed += one.failed;
-            if one.oldest_pending.is_some()
-                && (total.oldest_pending.is_none() || one.oldest_pending < total.oldest_pending)
-            {
-                total.oldest_pending = one.oldest_pending;
-            }
-            if total.last_error.is_none() {
-                total.last_error = one.last_error;
-            }
-        }
-        status["embedding"] = json!({
-            "configured": true,
-            "model": config.model,
-            "embedded": total.embedded,
-            "pending": total.pending,
-            "failed": total.failed,
-            "oldest_pending": total.oldest_pending,
-            "last_error": total.last_error,
-        });
-        Ok(status)
+        status
     }
 
     /// `move` and `copy`: every entry under `source` to the same place under
@@ -2977,20 +2928,17 @@ fn organizing_properties() -> serde_json::Map<String, Value> {
 }
 
 /// The `memory` tool's search arguments beside `query`/`queries`:
-/// memory-engine's meaning arm, fusion, filters and presentation.
+/// memory-engine's candidates, filters and presentation.
 fn search_properties() -> serde_json::Map<String, Value> {
     let properties = json!({
-        "semantic":{"type":"string","description":"search: what you mean, in words, ranked by meaning when embeddings are configured (with query, the two are fused). Without it, query is also searched by meaning when they are."},
-        "weights":{"type":"object","properties":{"fulltext":{"type":"number","minimum":0,"maximum":1},"semantic":{"type":"number","minimum":0,"maximum":1}},"description":"search: how much each arm weighs when both rank (default 1 and 1); 0 turns an arm off, so {\"semantic\": 0} ranks by words alone and says when no word matched."},
-        "candidate_limit":{"type":"integer","minimum":1,"maximum":1000,"description":"search: candidates per arm before fusion (default 30)."},
-        "semantic_threshold":{"type":"number","minimum":0,"maximum":1,"description":"search: the least cosine similarity a meaning hit needs."},
+        "candidate_limit":{"type":"integer","minimum":1,"maximum":1000,"description":"search: candidates ranked before the page is cut (default 30)."},
         "meta_predicate":{"type":"string","description":"search: a SQL/JSON path predicate on meta, such as $.priority >= 3 && !exists($.archivedAt) or exists($.tags[*] ? (@ == \"auth\"))."},
         "grep":{"type":"string","description":"search: a case-insensitive regular expression the content must match; give it with a query or a tree, meta or temporal filter."},
         "order_by":{"type":"string","enum":["asc","desc"],"description":"search by filters alone: oldest or newest (default) first."},
-        "select":{"type":"array","items":{"type":"string"},"description":"search, read, history: only these fields of each hit or version: id, memory_id, name, scope, kind, title, tree, path, meta, meta.<key>, temporal, version, version_hash, content, content:N, content:M:N, content_length, score, has_embedding, created_at, updated_at, pinned."},
+        "select":{"type":"array","items":{"type":"string"},"description":"search, read, history: only these fields of each hit or version: id, memory_id, name, scope, kind, title, tree, path, meta, meta.<key>, temporal, version, version_hash, content, content:N, content:M:N, content_length, score, created_at, updated_at, pinned."},
         "format":{"type":"string","enum":["json","compact","yaml"],"description":"search, read, history: the result as JSON (default) or YAML text."},
         "sources":{"type":"array","items":{"type":"string","enum":["memory","knowledge"]},"description":"search: what to search, memory (default) and/or the knowledge libraries' pages; with both, one ranking of entries and pages, each hit naming its source."},
-        "mode":{"type":"string","enum":["rank","readout"],"description":"search: rank (default) lists the best hits; readout reads every entry for the request into a few slots, each the entries that answer one part of it - for a request whose answer is spread over several entries or shares no word with them."},
+        "mode":{"type":"string","enum":["rank","readout"],"description":"search: rank (default) lists the best hits; readout reads every entry for the request into a few slots, each the entries that answer one part of it - for a request whose answer is spread over several entries."},
         "slots":{"type":"integer","minimum":1,"maximum":16,"description":"search, mode readout: at most this many slots (default 8)."}
     });
     properties.as_object().cloned().unwrap_or_default()
@@ -3012,7 +2960,7 @@ impl ExternalToolCatalog for MemoryHost {
                 "description":"Read-only recall of the memory the root agent keeps: memory entries (facts, the user's preferences and decisions) and prompt notes (narrow rules), global, for this project or for this conversation. list and search show entries with id and version; read returns one whole; history shows an entry's earlier versions. Search before relying on an earlier decision or preference you do not see in your brief. You cannot write or delete entries: report what should be kept in your answer to the parent.",
                 "parameters":{"type":"object","properties":{
                     "action":{"type":"string","enum":["list","search","read","history","tree","count","status"]},
-                    "query":{"type":"string","description":"search: key words of what you are looking for."},
+                    "query":{"type":"string","description":"search: key words of what you are looking for. Matches words (stems, prefixes, accents folded), not meaning: after a miss, search again with other words - a synonym, the other language, a broader term, a name or path from the code."},
                     "queries":{"type":"array","items":{"type":"string"},"maxItems":MAX_VARIANTS,"description":"search: up to four other wordings of the same need, such as synonyms and a translation into the language the entries may be in; all are searched at once."},
                     "kind":{"type":"string","enum":KINDS},
                     "scope":{"type":"string","enum":scopes},
@@ -3049,8 +2997,8 @@ impl ExternalToolCatalog for MemoryHost {
             "name":"memory",
             "description":"Your persistent memory across turns and conversations: memory entries (facts, the user's preferences and decisions) and prompt notes (narrow behavioral rules). list and search show entries with id, tree and version; read returns one whole. Search before answering about earlier decisions or preferences you do not see in context. Write without asking when the user asks you to remember something, states a lasting preference or correction, or a decision is reached; search first and update the matching entry (id + expected_version) rather than duplicating. A new entry needs scope (or an absolute tree): global for what holds across conversations and projects, project for a fact about this project, local for this conversation. An update or delete keeps the earlier version: history lists them, revert brings one back. Never store secrets.",
             "parameters":{"type":"object","properties":{
-                "action":{"type":"string","enum":["list","search","read","write","delete","history","revert","tree","count","status","move","copy","delete_tree"],"description":"tree: the entries' tree with counts; count: entries a tree or tree pattern matches; status: entries per scope and how far embedding has got; move/copy: every entry under source to the same place under destination; delete_tree: every entry under a tree (history keeps them). history with an id (or memory_id) shows that entry's versions, a page at a time; without one, the changes under a tree, of one operation_id or memory_id, or since a time."},
-                "query":{"type":"string","description":"search: key words of what you are looking for."},
+                "action":{"type":"string","enum":["list","search","read","write","delete","history","revert","tree","count","status","move","copy","delete_tree"],"description":"tree: the entries' tree with counts; count: entries a tree or tree pattern matches; status: entries per scope; move/copy: every entry under source to the same place under destination; delete_tree: every entry under a tree (history keeps them). history with an id (or memory_id) shows that entry's versions, a page at a time; without one, the changes under a tree, of one operation_id or memory_id, or since a time."},
+                "query":{"type":"string","description":"search: key words of what you are looking for. Matches words (stems, prefixes, accents folded), not meaning: after a miss, search again with other words - a synonym, the other language, a broader term, a name or path from the code."},
                 "queries":{"type":"array","items":{"type":"string"},"maxItems":MAX_VARIANTS,"description":"search: up to four other wordings of the same need, such as synonyms and a translation into the language the entries may be in; all are searched at once."},
                 "kind":{"type":"string","enum":KINDS,"description":"memory (default for write) or prompt; list and search cover both when omitted."},
                 "scope":{"type":"string","enum":scopes,"description":"global: every conversation and project; project: this project's conversations; local: this one. Required to create; list, search and read cover them all when omitted."},
@@ -4289,7 +4237,7 @@ mod tests {
         assert_eq!(read["content"], "Tokens rotate weekly.");
         let status = run(&host, &json!({"action":"status"})).expect("status");
         assert_eq!(status["entries"], json!({"local":1,"global":2}), "{status}");
-        assert_eq!(status["embedding"]["configured"], false);
+        assert_eq!(status["search"], "words");
     }
 
     /// memory-engine's replace takes the entry as the write says it, its
@@ -4314,9 +4262,9 @@ mod tests {
     }
 
     /// Words match by their English stem as memory-engine's BM25 does; a
-    /// semantic weight of 0 ranks by words alone and says when none matched.
+    /// miss says what was searched and to search again with other words.
     #[test]
-    fn search_stems_words_and_a_zero_weight_turns_an_arm_off() {
+    fn search_stems_words_and_a_miss_says_to_search_again() {
         let directory = tempfile::tempdir().expect("dir");
         let host = host(directory.path());
         run(
@@ -4328,20 +4276,27 @@ mod tests {
         assert_eq!(found["hits"][0]["id"], "release", "{found}");
         let words = run(
             &host,
-            &json!({"action":"search","query":"kubernetes","weights":{"semantic":0}}),
+            &json!({"action":"search","query":"kubernetes","queries":["k8s cluster"]}),
         )
         .expect("words alone");
         assert_eq!(words["mode"], "fulltext");
-        assert!(words["note"].is_string(), "{words}");
+        let note = words["note"].as_str().expect("a miss says so");
+        assert!(
+            note.starts_with("No memory matched \"kubernetes\", \"k8s cluster\"."),
+            "{note}"
+        );
+        assert!(
+            note.contains("not meaning: search again with other words"),
+            "{note}"
+        );
         let projected = run(
             &host,
-            &json!({"action":"search","query":"deployed","select":["id","name","memory_id","has_embedding"]}),
+            &json!({"action":"search","query":"deployed","select":["id","name","memory_id"]}),
         )
         .expect("projected");
         let hit = &projected["hits"][0];
         assert_eq!(hit["name"], "release");
         assert!(hit["memory_id"].is_string(), "{hit}");
-        assert_eq!(hit["has_embedding"], false);
     }
 
     /// A readout reads every entry for the request into slots, the later
@@ -4593,13 +4548,6 @@ mod tests {
         );
         assert!(run(&host, &json!({"action":"search","grep":"redis"})).is_err());
         assert!(run(&host, &json!({"action":"search","meta_predicate":"$.a =="})).is_err());
-        assert!(
-            run(
-                &host,
-                &json!({"action":"search","query":"x","semantic_threshold":2})
-            )
-            .is_err()
-        );
         // Filters alone browse, newest first; order_by asc reverses.
         let browse = search(json!({"action":"search","meta":{"type":"decision"},"order_by":"asc"}));
         assert_eq!(browse["mode"], "filter");
@@ -4621,14 +4569,6 @@ mod tests {
                 .expect("yaml text")
                 .contains("hits:\n- id: db\n"),
             "{yaml}"
-        );
-        // Without embeddings, a semantic text is searched by its words.
-        let semantic = search(json!({"action":"search","semantic":"postgres orders"}));
-        assert_eq!(semantic["mode"], "fulltext");
-        assert!(
-            semantic["semantic"]
-                .as_str()
-                .is_some_and(|note| note.contains("not configured"))
         );
     }
 

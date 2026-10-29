@@ -30,7 +30,8 @@ The maintainer decided:
 | Topic | Decision |
 |---|---|
 | Sharing | **Out of scope for now.** ha stays local and single-user: no spaces, principals, groups, grants, API keys, login, invites or remote backend. To be revisited later. |
-| Memory storage | **One SQLite store per scope** with ME's record model: tree, name, meta, temporal, version, an event log, FTS5 and vectors. It replaces `harness_state.json`. |
+| Memory storage | **One SQLite store per scope** with ME's record model: tree, name, meta, temporal, version and an event log. It replaces `harness_state.json`. |
+| Meaning | **No embeddings (0.8.8).** Search and the digest rank by words, then by how recently and how much an entry was used (§14). Nothing waits on a network call, and nothing leaves the machine. |
 | Knowledge | **Stays Markdown files** that people can edit by hand. It gains page history and revert, and shares one search with memory. |
 | Filters | **Full parity:** tree exact/lquery/ltxtquery, `meta` containment, a JSONPath `metaPredicate`, five temporal modes and `grep`. |
 
@@ -64,8 +65,8 @@ review after 0.8.1 found and what 0.8.2 changed.
 | Time-based retention (30 days) | ❌ | P1 |
 | `tree` (counts per node), `count`, `mv`, `copy`, `delete_tree`, get/delete by path | ❌ | P2 |
 | BM25 with the positive-match invariant | 🟡 | P3 |
-| Semantic search on memory with a background embedding queue | ❌ | P3 |
-| Weighted RRF hybrid; `weights`, `candidateLimit`, `semanticThreshold` per call | 🟡 | P3 |
+| Semantic search on memory with a background embedding queue | ❌ | P3 · removed in 0.8.8 (§14) |
+| Weighted RRF hybrid; `weights`, `candidateLimit`, `semanticThreshold` per call | 🟡 | P3 · only `candidate_limit` since 0.8.8 |
 | Filters `tree`, `meta`, `metaPredicate`, `temporal`, `grep`; filter-only browse with `order_by` | ❌ | P3 |
 | `select` projection and `format` yaml/json/compact | 🟡 | P3 |
 | Knowledge page history, revert and undelete | ❌ | P4 |
@@ -132,7 +133,7 @@ CREATE TABLE memory (
   doc             TEXT NOT NULL,         -- the whole entry as ha writes it (lossless)
   version         INTEGER NOT NULL,
   version_hash    TEXT NOT NULL,         -- 32 hex of SHA-256 over the canonical payload
-  content_version INTEGER NOT NULL,      -- embedding guard (P3)
+  content_version INTEGER NOT NULL,      -- grows when the title or content does
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL,
   UNIQUE (kind, key)
@@ -161,8 +162,15 @@ CREATE INDEX memory_event_at ON memory_event(at DESC);
 
 CREATE TABLE refinement (seq INTEGER PRIMARY KEY, event TEXT NOT NULL);  -- the `refinements` array
 CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);     -- `schema` and other top-level fields
--- P3 (schema 2): memory_vector, memory_embedding_queue (§6)
+-- P3 (schema 2): memory_vector, memory_embedding_queue (dropped by schema 4)
 -- 0.8.2 (schema 3): the V1 `name` column renamed `key`, and `name` added (§13)
+-- 0.8.8 (schema 4): memory_usage added, the two embedding tables dropped (§14)
+CREATE TABLE memory_usage (
+  memory_id     TEXT PRIMARY KEY,   -- removed with its memory
+  reads         INTEGER NOT NULL DEFAULT 0,  last_read_at  TEXT,
+  hits          INTEGER NOT NULL DEFAULT 0,  last_hit_at   TEXT,
+  shown         INTEGER NOT NULL DEFAULT 0,  last_shown_at TEXT
+);
 ```
 
 How ha's entries map onto ME's record:
@@ -310,7 +318,7 @@ New `memory` tool actions. Children get only the read-only ones.
 | `delete` with `path` | `delete_by_path` | |
 | `delete_tree` (`tree`, `dry_run`) | `me_memory_delete_tree` | |
 | `history` | `me_memory_history` | With `id` (a key, a path or a `memory_id`): the entry's versions, each with its tree, name, meta, temporal, cause and `operation_id`, a page of `limit` (10, at most 100) from `offset`. Without: the feed, scoped by `tree`, `operation_id`, `memory_id` or `since`; also `until`, `operation`, `order`, `cursor` (keyset on `event_id`), `limit` (max 1000) |
-| `status` | `memory.embeddingStatus` | Entries per scope; embedded, pending and failed entries, the oldest pending, the last error |
+| `status` | `memory.embeddingStatus` | Entries per scope, and `search: words`; a note when an old `.ha-embedding.json` is left (0.8.8) |
 
 A refinement records the `operation_id` of its write, so `/refine --rollback` and
 `history operation_id=…` agree on what one review changed.
@@ -341,7 +349,17 @@ The fields weigh title 3, content 1, tree and name 1, meta values 0.5. Only
 entries holding at least one query word are returned: ME's positive-match
 invariant. The query's variants (`queries`) are fused by RRF within the arm.
 
-### 6.2 Semantic
+Search matches words, not meaning. An empty result says which queries were
+searched and to search again with other words - a synonym, the other language
+the project uses, a shorter or broader term, a name or path from the code -
+before saying it is not remembered. The model picks the words; ha keeps no
+synonym table.
+
+### 6.2 Semantic (removed in 0.8.8)
+
+What follows is how 0.8.1 to 0.8.7 searched by meaning. 0.8.8 removed it: the
+tables are dropped (§14), and `semantic`, `semantic_threshold`, `weights` and
+`has_embedding` are gone from the tool.
 
 Memory uses the embedding endpoint configured for the global knowledge library
 (`/knowledge semantic --global`). Nothing is embedded until the user configures
@@ -364,9 +382,9 @@ Scoring is exact cosine over every vector: ha's stores are small enough that ME'
 HNSW recall caveats do not arise. The result is cosine similarity in `[-1, 1]`.
 `semantic_threshold` is in `[0, 1]`; a value outside it is refused, not clamped.
 
-### 6.3 Hybrid
+### 6.3 Hybrid (removed in 0.8.8)
 
-Weighted Reciprocal Rank Fusion, as in ME:
+Until 0.8.7, weighted Reciprocal Rank Fusion, as in ME:
 
 ```text
 score = w_fulltext / (60 + rank_fulltext) + w_semantic / (60 + rank_semantic)
@@ -396,6 +414,9 @@ Each score keeps its mode's meaning, as in ME:
 | semantic | cosine |
 | hybrid | RRF |
 | filter-only | -1 |
+
+Since 0.8.8 a search's modes are `fulltext` (BM25, its order also weighing
+recency and use, §14) and `filter`.
 
 ### 6.4 Filters
 
@@ -437,17 +458,15 @@ Every response carries `total`, counted with `max_count` semantics up to 10 000.
 
 | Parameter | Behaviour |
 |---|---|
-| `select` | Fields to return: `id`, `memory_id`, `name`, `tree`, `kind`, `title`, `meta`, `meta.<key>` (under `meta`, left out when missing, as ME projects it), `temporal`, `version`, `version_hash`, `score`, `has_embedding`, and the content slices `content:N`, `content:M:N`, `content:M:` (characters, with `content_length` added). On `search`, `read` and `history`. |
+| `select` | Fields to return: `id`, `memory_id`, `name`, `tree`, `kind`, `title`, `meta`, `meta.<key>` (under `meta`, left out when missing, as ME projects it), `temporal`, `version`, `version_hash`, `score`, and the content slices `content:N`, `content:M:N`, `content:M:` (characters, with `content_length` added). On `search`, `read` and `history`. |
 | `format` | `json` (the tool default, compact), `compact`, or `yaml`; on `search`, `read` and `history`. |
 
 `format: yaml` comes from a small emitter in `memory/search.rs`, which quotes any
 string YAML could read as something else. Reading YAML (packs, import) needs a
 parser: a pinned serde YAML crate is chosen when P5 resumes.
 
-`semantic` names what is meant. Without it, `query` is also searched by meaning
-whenever embeddings are configured, as knowledge search already does. A
-`semantic` given without embeddings is searched by its words, and the result
-says why.
+Until 0.8.7 `semantic` named what was meant, searched by meaning; 0.8.8
+removed it with the embeddings.
 
 ## 7. Knowledge and history (P4)
 
@@ -480,8 +499,8 @@ each page always kept.
 ### One search over both
 
 `memory` search accepts `sources: ["memory", "knowledge"]`; the default is memory
-only. Knowledge hits come from the knowledge engine (BM25, or hybrid when
-configured) and are fused by RRF into one list. Each hit says `source`, plus
+only. Knowledge hits come from the knowledge engine (BM25) and are fused by
+RRF into one list. Each hit says `source`, plus
 `path` and the line range for a page. The CLI does the same with `--knowledge`.
 
 The filters reach the pages as ME's would read a record with no meta and no
@@ -498,7 +517,6 @@ page out; a `tree` filter reads a page at `/knowledge/<scope>/<its folders>`;
   - `kind`, one journal event type or a list of them;
   - `order`, `newest` (the default) or `oldest` first among equal scores.
 
-  A source found by meaning keeps to the same window and kinds.
 - **`history_read`** returns `previous_source_id` and `next_source_id` within the
   same session, by `sequence`, so a reader can walk the thread without searching
   again.
@@ -597,8 +615,8 @@ knowledge page already is. The shared search of §7 reaches them either way.
   browsing, search with filters, an entry's history with revert, and
   previous/next along `$prev`.
 - **`ha doctor`.** Gains a memory section: the stores and their schema versions,
-  entry and event counts, legacy files still waiting, embedding queue status, and
-  installed integrations.
+  entry and event counts, legacy files still waiting, and installed
+  integrations.
 
 ## 11. Compatibility rules
 
@@ -623,7 +641,7 @@ stay with the maintainer.
 |---|---|---|
 | **P1 Core** | §3, §4: SQLite stores, document view, migration, event log with actor/cause/operation, retention, `name`/`tree`/`meta`/`temporal`/`on_conflict`, revert on the log, digest temporal rule | memory, kernel, knowledge, compaction, session-continuity, children, memory-store |
 | **P2 Organize** | §5: get/delete by path, tree, count, move, copy, delete_tree, history feed | memory, children, memory-store |
-| **P3 Search** | §6: FTS5 BM25, memory vectors and queue, weighted RRF (also for knowledge and history), every filter, JSONPath, select/format, YAML crate | memory, knowledge, memory-store |
+| **P3 Search** | §6: FTS5 BM25, memory vectors and queue (removed in 0.8.8), weighted RRF (also for knowledge and history), every filter, JSONPath, select/format, YAML crate | memory, knowledge, memory-store |
 | **P4 Knowledge and history** | §7: page history and revert, unified search, history filters and thread links | knowledge, session-continuity, memory-store |
 | **P5 CLI** | §8: `ha memory`, four formats, `--legacy`, packs | memory-store |
 | **P6 Importers** | §9: docs, git, Claude, Codex and OpenCode sessions, `record` kind | memory-store |
@@ -662,3 +680,51 @@ against ME's source, with P5 to P7 left out. What it found, and what 0.8.2 does:
 Not taken: ME's batch create (only its importers use it; P5), ME's stopword
 list (ha does not judge text by word lists), and `strict` JSONPath mode (ME runs
 lax).
+
+The rows about vectors and `has_embedding` describe 0.8.2; 0.8.8 removed both
+(§14).
+
+## 14. Words, recency and use (0.8.8)
+
+0.8.8 removes semantic search everywhere: memory search, the digest's
+by-meaning arm, the readout's meaning recall, knowledge search, history search,
+the embedding cache and `/knowledge semantic`. It was off unless the user
+configured an endpoint, and when on it could stall a turn on the provider and
+retire entries for good during an outage. What ranks instead:
+
+**Usage.** Schema 4 adds `memory_usage`: per memory id, `reads` and
+`last_read_at` (the memory tool's `read`), `hits` and `last_hit_at` (the
+results a memory `search` returns, in either mode), and `shown` and
+`last_shown_at` (the entries a turn's digest showed, pinned ones included). Each
+batch is one upsert in its own transaction, only for ids the store holds; the
+row goes with its entry. A use never touches the entry's document or the event
+log, so it is never a version and never pushes a revertable one out. The digest
+records what it showed off the turn's path, in a background thread.
+
+**Ranking.** The digest and memory search rank the same way:
+
+1. Constraints first (the digest), pinned entries outside the ranking.
+2. Entries the words match (BM25 above zero), best first. The best of them -
+   twice what is shown: 12 in the digest, twice the `limit` in search - are
+   fused by weighted RRF with two lighter arms (weight 0.3 each, the words 1):
+   - **recency**: the later of the entry's `updated_at` and `last_read_at`;
+   - **use**: `reads`, halving in weight every 30 days after the last read.
+
+   An entry with no time or no reads is left out of that arm. The rest of the
+   matched entries follow in their words' order, so an entry the words barely
+   reached never passes the best of them.
+3. Entries nothing matched come after every matched one, the most recently
+   written or read first; with no words at all, every entry is ordered so. They
+   used to be alphabetical.
+
+`hits` and `shown` are counted but never ranked on: they record what was put in
+front of the model, not what it used, and ranking by them would feed itself.
+Ties go to the earlier place (path, title and key in the digest), so the same
+state always ranks the same. A search hit's `score` stays its BM25 score.
+
+**Upgrade.** A store opens at schema 4: `memory_vector` and
+`memory_embedding_queue` are dropped, and nothing else changes. A knowledge
+library's `.ha-embedding.json` and `.ha-embedding.sqlite`, and
+`<data>/history-embedding/`, are left on disk and never read. `memory status`
+and `/knowledge status` say when a `.ha-embedding.json` is still there, and the
+diagnostics record `knowledge.embedding_config_ignored` once.

@@ -39,10 +39,7 @@ pub const LOCK_FILE: &str = "memory.lock";
 pub const LEGACY_STATE: &str = "harness_state.json";
 /// The journal of earlier versions the event log replaced.
 pub const LEGACY_JOURNAL: &str = "memory_history.jsonl";
-const SCHEMA_VERSION: i32 = 3;
-/// The embedding attempts an entry's content gets before it is left to
-/// keyword search.
-const EMBEDDING_ATTEMPTS: i64 = 3;
+const SCHEMA_VERSION: i32 = 4;
 /// Events older than this are dropped...
 const RETAIN_DAYS: i64 = 30;
 /// ...except each memory's newest ones, so a memory that has not changed for a
@@ -98,27 +95,6 @@ CREATE TABLE refinement (seq INTEGER PRIMARY KEY, event TEXT NOT NULL);
 CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
-/// Semantic search: one vector per memory, for the content version and the
-/// endpoint and model (`namespace`) it was made from; and the attempts an
-/// entry's content has failed, so a provider error is retried a few times
-/// and a rate limit waits.
-const SCHEMA_V2: &str = "
-CREATE TABLE memory_vector (
-  memory_id       TEXT PRIMARY KEY,
-  content_version INTEGER NOT NULL,
-  namespace       TEXT NOT NULL,
-  vector          BLOB NOT NULL
-);
-CREATE TABLE memory_embedding_queue (
-  memory_id       TEXT NOT NULL,
-  content_version INTEGER NOT NULL,
-  attempts        INTEGER NOT NULL DEFAULT 0,
-  visible_at      TEXT NOT NULL,
-  last_error      TEXT,
-  PRIMARY KEY (memory_id, content_version)
-);
-";
-
 /// A name unique in its tree, apart from the key: the column V1 called
 /// `name` is the key, and `name` is now memory-engine's. Every entry kept so
 /// far is named by its key.
@@ -132,6 +108,25 @@ ALTER TABLE memory_event ADD COLUMN name TEXT;
 UPDATE memory_event SET name = key;
 DROP INDEX memory_event_path;
 CREATE INDEX memory_event_path ON memory_event(tree, name);
+";
+
+/// How each memory has been used, apart from what it says: read through the
+/// memory tool, returned by a search, shown in a turn's digest - each a count
+/// and the last time. Kept out of the entry's document, so a use is never a
+/// version of it and never an event. And the tables semantic search kept,
+/// which ha no longer has, dropped.
+const SCHEMA_V4: &str = "
+CREATE TABLE memory_usage (
+  memory_id     TEXT PRIMARY KEY,
+  reads         INTEGER NOT NULL DEFAULT 0,
+  last_read_at  TEXT,
+  hits          INTEGER NOT NULL DEFAULT 0,
+  last_hit_at   TEXT,
+  shown         INTEGER NOT NULL DEFAULT 0,
+  last_shown_at TEXT
+);
+DROP TABLE IF EXISTS memory_vector;
+DROP TABLE IF EXISTS memory_embedding_queue;
 ";
 
 /// The kinds whose entries may have a name of their own; a skill's or a
@@ -392,73 +387,119 @@ pub fn find_logged(dir: &Path, memory: &str) -> Result<Option<(String, String)>,
         .map_err(sql)
 }
 
-/// How far embedding has got: entries with a vector for their content in
-/// `namespace`, entries still waiting, entries whose attempts are spent, and
-/// the oldest waiting entry's last change.
-#[derive(Clone, Debug, Default)]
-pub struct EmbeddingStatus {
-    pub embedded: u64,
-    pub pending: u64,
-    pub failed: u64,
-    pub oldest_pending: Option<String>,
-    pub last_error: Option<String>,
+/// How a memory has been used ([`record_use`]): each count with the last
+/// time it grew, as the store keeps times.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Usage {
+    pub reads: i64,
+    pub last_read_at: Option<String>,
+    pub hits: i64,
+    pub last_hit_at: Option<String>,
+    pub shown: i64,
+    pub last_shown_at: Option<String>,
 }
 
-/// A store's [`EmbeddingStatus`].
+/// One way a memory is used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Use {
+    /// Read whole through the memory tool's `read`.
+    Read,
+    /// Returned by a search (the memory tool's `search`, either mode).
+    Hit,
+    /// Shown in a turn's digest: an exposure, never a sign of use.
+    Shown,
+}
+
+impl Use {
+    const fn columns(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Read => ("reads", "last_read_at"),
+            Self::Hit => ("hits", "last_hit_at"),
+            Self::Shown => ("shown", "last_shown_at"),
+        }
+    }
+}
+
+/// Count one use of each of `memories` (immutable ids), now: one upsert in
+/// its own transaction, for the ids the store holds. Neither the entry's
+/// document nor its events change, and a scope without a store gets none.
+/// Returns how many were counted.
 ///
 /// # Errors
-/// The store cannot be read.
-pub fn embedding_status(dir: &Path, namespace: &str) -> Result<EmbeddingStatus, String> {
+/// The store cannot be written.
+pub fn record_use(dir: &Path, kind: Use, memories: &[String]) -> Result<usize, String> {
+    let mut memories = memories.to_vec();
+    memories.sort();
+    memories.dedup();
+    if memories.is_empty() {
+        return Ok(0);
+    }
+    let Some(mut store) = Store::existing(dir)? else {
+        return Ok(0);
+    };
+    let (count, at) = kind.columns();
+    let holes = (2..=memories.len() + 1)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // The WHERE keeps SQLite from reading ON CONFLICT as a join's.
+    let statement = format!(
+        "INSERT INTO memory_usage(memory_id, {count}, {at})
+         SELECT id, 1, ?1 FROM memory WHERE id IN ({holes})
+         ON CONFLICT(memory_id) DO UPDATE SET {count} = {count} + 1, {at} = excluded.{at}"
+    );
+    let mut values = vec![now()];
+    values.extend(memories);
+    let transaction = store.begin()?;
+    let counted = transaction
+        .execute(&statement, rusqlite::params_from_iter(values.iter()))
+        .map_err(sql)?;
+    transaction.commit().map_err(sql)?;
+    Ok(counted)
+}
+
+/// [`load_document`] with each live memory's immutable id and [`Usage`], by
+/// `(kind, key)`: what the digest and the memory tool rank by.
+///
+/// # Errors
+/// The store cannot be opened or read.
+#[allow(clippy::type_complexity, reason = "a document and its rows")]
+pub fn load_with_usage(
+    dir: &Path,
+) -> Result<(Value, BTreeMap<(String, String), (String, Usage)>), String> {
     let Some(store) = Store::existing(dir)? else {
-        return Ok(EmbeddingStatus::default());
+        return Ok((empty_document(), BTreeMap::new()));
     };
-    let count = |query: &str, parameters: &[&dyn rusqlite::ToSql]| {
-        store
-            .conn
-            .query_row(query, parameters, |row| row.get::<_, i64>(0))
-            .map(|count| u64::try_from(count).unwrap_or(0))
-            .map_err(sql)
-    };
-    let embedded = count(
-        "SELECT count(*) FROM memory m WHERE EXISTS (SELECT 1 FROM memory_vector v
-         WHERE v.memory_id = m.id AND v.namespace = ? AND v.content_version = m.content_version)",
-        &[&namespace],
-    )?;
-    let failed = count(
-        "SELECT count(*) FROM memory m WHERE EXISTS (SELECT 1 FROM memory_embedding_queue q
-         WHERE q.memory_id = m.id AND q.content_version = m.content_version AND q.attempts >= ?)",
-        &[&EMBEDDING_ATTEMPTS],
-    )?;
-    let total = count("SELECT count(*) FROM memory", &[])?;
-    let oldest_pending = store
+    let document = document(&store.conn)?;
+    let mut statement = store
         .conn
-        .query_row(
-            "SELECT min(m.updated_at) FROM memory m WHERE NOT EXISTS (SELECT 1 FROM memory_vector v
-             WHERE v.memory_id = m.id AND v.namespace = ?1 AND v.content_version = m.content_version)
-             AND NOT EXISTS (SELECT 1 FROM memory_embedding_queue q WHERE q.memory_id = m.id
-             AND q.content_version = m.content_version AND q.attempts >= ?2)",
-            params![namespace, EMBEDDING_ATTEMPTS],
-            |row| row.get::<_, Option<String>>(0),
+        .prepare(
+            "SELECT m.kind, m.key, m.id, coalesce(u.reads, 0), u.last_read_at, coalesce(u.hits, 0),
+             u.last_hit_at, coalesce(u.shown, 0), u.last_shown_at
+             FROM memory m LEFT JOIN memory_usage u ON u.memory_id = m.id",
         )
         .map_err(sql)?;
-    let last_error = store
-        .conn
-        .query_row(
-            "SELECT last_error FROM memory_embedding_queue WHERE last_error IS NOT NULL
-             ORDER BY visible_at DESC LIMIT 1",
-            [],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                (
+                    row.get::<_, String>(2)?,
+                    Usage {
+                        reads: row.get(3)?,
+                        last_read_at: row.get(4)?,
+                        hits: row.get(5)?,
+                        last_hit_at: row.get(6)?,
+                        shown: row.get(7)?,
+                        last_shown_at: row.get(8)?,
+                    },
+                ),
+            ))
+        })
         .map_err(sql)?
-        .flatten();
-    Ok(EmbeddingStatus {
-        embedded,
-        pending: total.saturating_sub(embedded + failed),
-        failed,
-        oldest_pending,
-        last_error,
-    })
+        .collect::<Result<BTreeMap<_, _>, _>>()
+        .map_err(sql)?;
+    Ok((document, rows))
 }
 
 /// The database of a scope directory.
@@ -669,177 +710,6 @@ pub fn save_document(dir: &Path, state: &Value, writer: &Writer) -> Result<usize
     let changed = save(&transaction, root, state, writer)?;
     transaction.commit().map_err(sql)?;
     Ok(changed)
-}
-
-/// An entry to embed: its id, the content version it is for, and its text.
-#[derive(Clone, Debug)]
-pub struct Unembedded {
-    pub memory: String,
-    pub content_version: i64,
-    pub text: String,
-}
-
-/// Entries with no vector in `namespace` for their current content, at most
-/// `limit`: those whose attempts are spent, or which wait out a rate limit,
-/// are left for later.
-///
-/// # Errors
-/// The store cannot be read.
-pub fn unembedded(dir: &Path, namespace: &str, limit: usize) -> Result<Vec<Unembedded>, String> {
-    let Some(store) = Store::existing(dir)? else {
-        return Ok(Vec::new());
-    };
-    let mut statement = store
-        .conn
-        .prepare(
-            "SELECT m.id, m.content_version, m.title, m.content FROM memory m
-             WHERE NOT EXISTS (SELECT 1 FROM memory_vector v WHERE v.memory_id = m.id
-                 AND v.namespace = ?1 AND v.content_version = m.content_version)
-             AND NOT EXISTS (SELECT 1 FROM memory_embedding_queue q WHERE q.memory_id = m.id
-                 AND q.content_version = m.content_version
-                 AND (q.attempts >= ?2 OR q.visible_at > ?3))
-             ORDER BY m.updated_at DESC LIMIT ?4",
-        )
-        .map_err(sql)?;
-    let rows = statement
-        .query_map(
-            params![
-                namespace,
-                EMBEDDING_ATTEMPTS,
-                now(),
-                i64::try_from(limit).unwrap_or(i64::MAX)
-            ],
-            |row| {
-                Ok(Unembedded {
-                    memory: row.get(0)?,
-                    content_version: row.get(1)?,
-                    text: format!("{}\n{}", row.get::<_, String>(2)?, row.get::<_, String>(3)?),
-                })
-            },
-        )
-        .map_err(sql)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(sql)?;
-    Ok(rows)
-}
-
-/// Keep vectors made for `namespace`. A vector made for content that has
-/// changed since is dropped: it no longer says what the entry says.
-///
-/// # Errors
-/// The store cannot be written.
-pub fn save_vectors(
-    dir: &Path,
-    namespace: &str,
-    vectors: &[(Unembedded, Vec<f32>)],
-) -> Result<usize, String> {
-    let mut store = Store::open(dir)?;
-    let transaction = store.begin()?;
-    let mut kept = 0;
-    for (entry, vector) in vectors {
-        kept += transaction
-            .execute(
-                "INSERT INTO memory_vector(memory_id, content_version, namespace, vector)
-                 SELECT ?1, ?2, ?3, ?4 WHERE EXISTS
-                     (SELECT 1 FROM memory WHERE id = ?1 AND content_version = ?2)
-                 ON CONFLICT(memory_id) DO UPDATE SET content_version = excluded.content_version,
-                     namespace = excluded.namespace, vector = excluded.vector",
-                params![
-                    entry.memory,
-                    entry.content_version,
-                    namespace,
-                    super::knowledge::embedding::vector_bytes(vector),
-                ],
-            )
-            .map_err(sql)?;
-        transaction
-            .execute(
-                "DELETE FROM memory_embedding_queue WHERE memory_id = ? AND content_version <= ?",
-                params![entry.memory, entry.content_version],
-            )
-            .map_err(sql)?;
-    }
-    transaction.commit().map_err(sql)?;
-    Ok(kept)
-}
-
-/// Record that embedding these entries failed: each attempt counts, and the
-/// entry waits a minute per attempt; a rate limit waits a minute without
-/// spending an attempt.
-///
-/// # Errors
-/// The store cannot be written.
-pub fn embedding_failed(
-    dir: &Path,
-    entries: &[Unembedded],
-    error: &str,
-    rate_limited: bool,
-) -> Result<(), String> {
-    let mut store = Store::open(dir)?;
-    let transaction = store.begin()?;
-    for entry in entries {
-        let attempts = transaction
-            .query_row(
-                "SELECT attempts FROM memory_embedding_queue WHERE memory_id = ? AND content_version = ?",
-                params![entry.memory, entry.content_version],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(sql)?
-            .unwrap_or(0)
-            + i64::from(!rate_limited);
-        let wait = chrono::Duration::minutes(attempts.max(1));
-        transaction
-            .execute(
-                "INSERT INTO memory_embedding_queue(memory_id, content_version, attempts, visible_at, last_error)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(memory_id, content_version) DO UPDATE SET attempts = excluded.attempts,
-                     visible_at = excluded.visible_at, last_error = excluded.last_error",
-                params![
-                    entry.memory,
-                    entry.content_version,
-                    attempts,
-                    stamp(chrono::Utc::now() + wait),
-                    error,
-                ],
-            )
-            .map_err(sql)?;
-    }
-    transaction.commit().map_err(sql)?;
-    Ok(())
-}
-
-/// The vectors of a store made in `namespace` for its entries' current
-/// content, by memory id.
-///
-/// # Errors
-/// The store cannot be read.
-pub fn vectors(dir: &Path, namespace: &str) -> Result<BTreeMap<String, Vec<f32>>, String> {
-    let Some(store) = Store::existing(dir)? else {
-        return Ok(BTreeMap::new());
-    };
-    let mut statement = store
-        .conn
-        .prepare(
-            "SELECT v.memory_id, v.vector FROM memory_vector v
-             JOIN memory m ON m.id = v.memory_id AND m.content_version = v.content_version
-             WHERE v.namespace = ?",
-        )
-        .map_err(sql)?;
-    let rows = statement
-        .query_map([namespace], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })
-        .map_err(sql)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(sql)?;
-    let mut vectors = BTreeMap::new();
-    for (memory, bytes) in rows {
-        if let Ok(vector) = super::knowledge::embedding::vector_from_bytes(&bytes) {
-            vectors.insert(memory, vector);
-        }
-    }
-    Ok(vectors)
 }
 
 /// One earlier version of an entry, as `history` shows it and `restore`
@@ -1131,11 +1001,11 @@ impl Store {
         if version < 1 {
             transaction.execute_batch(SCHEMA_V1).map_err(sql)?;
         }
-        if version < 2 {
-            transaction.execute_batch(SCHEMA_V2).map_err(sql)?;
-        }
         if version < 3 {
             transaction.execute_batch(SCHEMA_V3).map_err(sql)?;
+        }
+        if version < 4 {
+            transaction.execute_batch(SCHEMA_V4).map_err(sql)?;
         }
         transaction
             .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
@@ -1467,8 +1337,7 @@ fn save(
             .or_else(|| renamed.get(wanted_key).and_then(|from| current.get(from)));
         let (id, operation_kind, content_version) = match existing {
             Some(row) if current.contains_key(wanted_key) && row.doc == **doc => continue,
-            // The title is embedded with the content: a new one needs a new
-            // vector as much as new content does.
+            // The title counts with the content: a new one is new content.
             Some(row) => (
                 row.id.clone(),
                 "update",
@@ -1562,8 +1431,7 @@ fn save(
         }
         for statement in [
             "DELETE FROM memory WHERE id = ?",
-            "DELETE FROM memory_vector WHERE memory_id = ?",
-            "DELETE FROM memory_embedding_queue WHERE memory_id = ?",
+            "DELETE FROM memory_usage WHERE memory_id = ?",
         ] {
             transaction.execute(statement, [&row.id]).map_err(sql)?;
         }
@@ -1949,37 +1817,71 @@ mod tests {
         ));
     }
 
-    /// The title is embedded with the content, so a new title needs a new
-    /// vector; a change of meta alone keeps the one there is.
+    /// A use is counted in its own table: reading an entry neither makes a
+    /// version of it nor an event, an id the store does not hold is not
+    /// counted, and a deleted entry takes its counts with it.
     #[test]
-    fn a_new_title_is_embedded_again() {
+    fn a_use_is_counted_apart_from_the_entry() {
         let directory = tempfile::tempdir().expect("dir");
         let dir = directory.path().join("harness");
         let mut state = empty_document();
         state["entries"]["memory"]["queue"] = entry("Queue", "Redis Streams.", 1);
         save_document(&dir, &state, &writer()).expect("save");
-        let pending = unembedded(&dir, "ns", 10).expect("pending");
-        assert_eq!(pending.len(), 1);
-        save_vectors(&dir, "ns", &[(pending[0].clone(), vec![1.0, 0.0])]).expect("vectors");
-        assert!(unembedded(&dir, "ns", 10).expect("none").is_empty());
-        state["entries"]["memory"]["queue"]["metadata"] = json!({"type": "decision"});
-        save_document(&dir, &state, &writer()).expect("meta");
-        assert!(unembedded(&dir, "ns", 10).expect("still none").is_empty());
-        state["entries"]["memory"]["queue"]["title"] = json!("Message queue");
-        save_document(&dir, &state, &writer()).expect("title");
-        let again = unembedded(&dir, "ns", 10).expect("again");
-        assert_eq!(again.len(), 1);
-        assert!(
-            again[0].text.starts_with("Message queue"),
-            "{:?}",
-            again[0].text
+        let id = ids(&dir).expect("ids")[&("memory".to_owned(), "queue".to_owned())].clone();
+        let events = || {
+            feed(
+                &dir,
+                &Feed {
+                    memory: Some(id.clone()),
+                    limit: 50,
+                    ..Feed::default()
+                },
+            )
+            .expect("feed")
+            .len()
+        };
+        let before = events();
+        assert_eq!(
+            record_use(
+                &dir,
+                Use::Read,
+                &[id.clone(), id.clone(), "gone".to_owned()]
+            )
+            .expect("read"),
+            1
         );
-        let status = embedding_status(&dir, "ns").expect("status");
-        assert_eq!((status.embedded, status.pending, status.failed), (0, 1, 0));
+        record_use(&dir, Use::Read, std::slice::from_ref(&id)).expect("read again");
+        record_use(&dir, Use::Hit, std::slice::from_ref(&id)).expect("hit");
+        record_use(&dir, Use::Shown, std::slice::from_ref(&id)).expect("shown");
+        let (document, rows) = load_with_usage(&dir).expect("load");
+        assert_eq!(document, load_document(&dir).expect("document"));
+        let (memory, usage) = &rows[&("memory".to_owned(), "queue".to_owned())];
+        assert_eq!(memory, &id);
+        assert_eq!((usage.reads, usage.hits, usage.shown), (2, 1, 1));
+        assert!(usage.last_read_at.is_some() && usage.last_shown_at.is_some());
+        assert_eq!(events(), before, "a use is not an event");
+        assert_eq!(document["entries"]["memory"]["queue"]["version"], 1);
+        state["entries"]["memory"]
+            .as_object_mut()
+            .expect("kind")
+            .remove("queue");
+        save_document(&dir, &state, &writer()).expect("delete");
+        let conn = Connection::open(db_path(&dir)).expect("open");
+        let left = conn
+            .query_row("SELECT count(*) FROM memory_usage", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count");
+        assert_eq!(left, 0);
+        // A scope without a store is not given one by a use.
+        let none = directory.path().join("none");
+        assert_eq!(record_use(&none, Use::Read, &[id]).expect("none"), 0);
+        assert!(!none.exists());
     }
 
     /// A store from before names had their own column comes up named by its
-    /// keys, and its events keep theirs.
+    /// keys, and its events keep theirs; the tables semantic search kept are
+    /// dropped, and the usage table is there.
     #[test]
     fn a_v2_store_is_migrated_to_names() {
         let directory = tempfile::tempdir().expect("dir");
@@ -1988,7 +1890,15 @@ mod tests {
         {
             let conn = Connection::open(db_path(&dir)).expect("open");
             conn.execute_batch(SCHEMA_V1).expect("v1");
-            conn.execute_batch(SCHEMA_V2).expect("v2");
+            conn.execute_batch(
+                "CREATE TABLE memory_vector (memory_id TEXT PRIMARY KEY, content_version INTEGER NOT NULL,
+                   namespace TEXT NOT NULL, vector BLOB NOT NULL);
+                 CREATE TABLE memory_embedding_queue (memory_id TEXT NOT NULL,
+                   content_version INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                   visible_at TEXT NOT NULL, last_error TEXT, PRIMARY KEY (memory_id, content_version));
+                 INSERT INTO memory_vector VALUES ('m1', 1, 'ns', x'0000803f');",
+            )
+            .expect("v2");
             conn.execute_batch("PRAGMA user_version = 2")
                 .expect("version");
             conn.execute(
@@ -2031,6 +1941,26 @@ mod tests {
         assert_eq!(
             find(&dir, "m1").expect("find"),
             Some(("memory".to_owned(), "queue".to_owned()))
+        );
+        let conn = Connection::open(db_path(&dir)).expect("open");
+        let tables = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .expect("tables")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("names");
+        assert!(tables.contains(&"memory_usage".to_owned()), "{tables:?}");
+        assert!(
+            !tables
+                .iter()
+                .any(|table| table.contains("vector") || table.contains("embedding")),
+            "{tables:?}"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .expect("version"),
+            SCHEMA_VERSION
         );
     }
 

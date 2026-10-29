@@ -242,7 +242,7 @@ pub fn words(text: &str) -> Vec<String> {
 
 /// TF-IDF vectors of the documents' words and of the query's, over the words
 /// the documents hold: each word weighed by how rare it is among them. The
-/// encoder when no embeddings are configured.
+/// encoder every readout reads with.
 #[must_use]
 pub fn word_vectors(documents: &[Vec<String>], query: &[String]) -> (Vec<Vec<f32>>, Vec<f32>) {
     let mut vocabulary = std::collections::BTreeMap::<&str, usize>::new();

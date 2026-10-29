@@ -7,8 +7,8 @@
 # conversation; a review whose apply cannot take the state's lock leaving no
 # page, skill or refinement behind; a failed global part leaving the local one
 # standing; a page's age in the catalog; a conversation's own memory
-# consolidated past forty entries; hybrid search embedding every query variant
-# (against a fake embedding server). Every check prints PASS or FAIL;
+# consolidated past forty entries; and (0.8.8) an old embedding configuration
+# that is no longer read. Every check prints PASS or FAIL;
 # the conversation and the state stay in $LIVE_ROOT/knowledge as evidence.
 #
 #   bash scripts/testing/live-tests/knowledge.sh
@@ -258,27 +258,21 @@ else
 fi
 check "it left fewer entries" '[ "$after" -lt "$seeded" ]'
 
-echo "################ 12. hybrid search embeds every query variant"
+echo "################ 12. an old embedding configuration is ignored (0.8.8)"
+# 0.8.8 removed semantic search. A library's .ha-embedding.json from before is
+# never read: no request reaches the endpoint it names, the search ranks by
+# words, and /knowledge status names the file. A fake server logs any request.
 export HA_AUTO_REFINE=off
 cat > "$RX/embed.py" <<'EOF'
 import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 port_file, log_file = sys.argv[1], sys.argv[2]
-def vector(text):
-    t = text.lower()
-    if "sầu riêng" in t or "có gai" in t:
-        return [1.0, 0.0, 0.0]
-    if "zzqx" in t:
-        return [0.0, 1.0, 0.0]
-    return [0.0, 0.0, 1.0]
 class Fake(BaseHTTPRequestHandler):
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        with open(log_file, "a", encoding="utf-8") as log:
-            for text in body["input"]:
-                log.write(json.dumps(text, ensure_ascii=False) + "\n")
-        data = [{"index": i, "embedding": vector(text)} for i, text in enumerate(body["input"])]
-        out = json.dumps({"data": data}).encode()
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        with open(log_file, "ab") as log:
+            log.write(body + b"\n")
+        out = json.dumps({"data": []}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out)))
@@ -290,55 +284,19 @@ server = HTTPServer(("127.0.0.1", 0), Fake)
 open(port_file, "w").write(str(server.server_address[1]))
 server.serve_forever()
 EOF
+: > "$RX/embed.log"
 "$PY" "$RX/embed.py" "$RX/embed.port" "$RX/embed.log" &
 embedder=$!
 for _ in $(seq 1 50); do [ -s "$RX/embed.port" ] && break; sleep 0.2; done
 printf '# Sầu riêng\n\nSầu riêng thu hoạch vào tháng sáu ở miền Tây.\n' > "$K/concepts/durian.md"
 printf '{"schema_version":1,"enabled":true,"endpoint":"http://127.0.0.1:%s/v1/embeddings","model":"fake-embed"}' "$(cat "$RX/embed.port")" > "$K/.ha-embedding.json"
-run_exec e12 "Kiểm thử: gọi tool knowledge action search đúng một lần, với queries là hai biến thể: 'zzqx' và 'trái cây có gai'. Không gọi tool nào khác. In nguyên văn path và matched_queries của từng kết quả."
-# The request after e12's search, taken before the history search below
-# sends the same words in a request of its own.
+run_exec e12 "Kiểm thử: gọi tool knowledge action search đúng một lần, với query 'sầu riêng' và queries là một biến thể: 'trái cây có gai'. Không gọi tool nào khác. In nguyên văn path của từng kết quả."
 request "trái cây có gai" > "$RX/e12.request"
-# (0.7.9) History search by meaning with the same configuration: a turn names
-# a durian without any word of the later query, and the query finds it.
-run_exec e13 "Trả lời đúng một dòng: Món tôi thích nhất là sầu riêng Ri6."
-run_exec e14 "Kiểm thử: gọi tool history_search đúng một lần với query 'trái cây có gai' và scope 'project'. Không gọi tool nào khác. In nguyên văn toàn bộ kết quả tool."
+"$HA" knowledge status --cwd "$P" > "$RX/e12.status" 2>&1
 kill "$embedder" 2>/dev/null
-check "the second variant was embedded" 'grep -q "\"trái cây có gai\"" "$RX/embed.log"'
-check "history search embedded the turn that named the durian" 'grep -q "Ri6" "$RX/embed.log"'
-check "history search found it by meaning, with none of the query words" 'grep -q "matched=0/" "$RX/e14.json" && grep -q "Ri6" "$RX/e14.json"'
-cat > "$RX/matched.py" <<'EOF'
-import json, sys
-# The search result, as the next request carried it: the durian page is in it,
-# found by the second variant (index 1).
-found = False
-def walk(value):
-    global found
-    if isinstance(value, str):
-        # A tool result reads "knowledge: {...}".
-        start = value.find("{")
-        if start < 0:
-            return
-        try:
-            value = json.JSONDecoder().raw_decode(value[start:])[0]
-        except ValueError:
-            return
-    if isinstance(value, dict):
-        if value.get("retrieval") == "hybrid":
-            for hit in value.get("results", []):
-                if hit.get("path") == "concepts/durian.md" and 1 in hit.get("matched_queries", []):
-                    found = True
-        for item in value.values():
-            walk(item)
-    elif isinstance(value, list):
-        for item in value:
-            walk(item)
-text = open(sys.argv[1], encoding="utf-8").read().strip()
-if text:
-    walk(json.loads(text))
-sys.exit(0 if found else 1)
-EOF
-check "the search ran hybrid, and found the page only the second variant's vector is near" '"$PY" "$RX/matched.py" "$RX/e12.request"'
+check "no request reached the old configuration's endpoint" '[ ! -s "$RX/embed.log" ]'
+check "the search ranked by words and found the page" 'grep -q "keyword_rrf" "$RX/e12.request" && grep -q "concepts/durian.md" "$RX/e12.request" && ! grep -q "\"retrieval\":\"hybrid\"" "$RX/e12.request"'
+check "/knowledge status names the file that is no longer read" 'grep -q "ha-embedding.json is no longer read" "$RX/e12.status"'
 rm -f "$K/.ha-embedding.json" "$HA_HOME/settings.json"
 unset HA_AUTO_REFINE
 
