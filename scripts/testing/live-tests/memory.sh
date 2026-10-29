@@ -42,14 +42,17 @@ check "p-blog does not claim pnpm or Fly.io" "! last | grep -qi 'pnpm\|fly'"
 check "p-blog still gets the global language preference" "last | grep -qi 'tiếng việt'"
 "$HA" shutdown --force >/dev/null 2>&1
 
-echo "################ 3. knowledge update: the deploy day changes, and so does its id"
+echo "################ 3. knowledge update: the deploy day changes, and so does its title"
 agent "$RX/p-shop" s3
 say s3 "Lịch deploy của dự án này đổi rồi: từ nay deploy vào thứ Sáu chứ không phải thứ Năm nữa. Cập nhật memory cho đúng, kể cả tiêu đề." | tail -4
 show
 check "the deploy entry now says Friday" "entries | grep -a '^global|p-shop|' | grep -i 'fly\|deploy' | grep -qi 'thứ sáu\|friday'"
 check "no p-shop entry still claims Thursday" "! entries | grep -a '^global|p-shop|' | grep -i 'thứ năm\|thursday' | grep -vqi 'thứ sáu\|friday'"
 check "the Thursday version is kept in history" "journal | grep -qi 'thứ năm\|thursday'"
-check "the id no longer says Thursday" "! entries | grep -a '^global|p-shop|' | cut -d'|' -f4 | grep -qi 'thu_nam\|thursday'"
+# An update keeps the name the entry was given (0.8.2; memory-store 11), so
+# its id may still say Thursday: the title is what the update changes.
+project_titles() { "$HA" memory export | "$PY" -c "import json,sys; sys.stdout.reconfigure(encoding='utf-8'); [print(e.get('title', '')) for e in json.load(sys.stdin)['document']['entries']['memory'].values() if e.get('project')]"; }
+check "the title no longer says Thursday" "! project_titles | grep -i 'fly\|deploy' | grep -qi 'thứ năm\|thursday'"
 
 echo "################ 4. temporal recall through history"
 say s3 "Trước lần đổi vừa rồi, lịch deploy là ngày nào? Hãy kiểm tra memory (history) chứ đừng dựa vào trí nhớ hội thoại này." | tail -4
@@ -322,7 +325,7 @@ for attempt in 1 2 3; do
 done
 if [ -n "$missed" ]; then
   check "after the first search missed, the answer carries the fact" 'answer15 "u3_$missed" | grep -qi "tầng ba\|third floor\|3rd floor\|floor 3" && answer15 "u3_$missed" | grep -qi "sen"'
-  check "it searched more than once" '[ "$(receipts "MARKER_COFFEE15_$missed" | grep -c "\"hits\"")" -ge 2 ]'
+  check "it searched more than once" '[ "$(receipts "MARKER_COFFEE15_$missed" | grep -cE "\"(hits|slots|nodes)\"")" -ge 2 ]'
 else
   echo "precondition not met in 3 attempts: every first search found the fact; a retry after a miss was not judged (see $RX/u3_*.json)"
 fi

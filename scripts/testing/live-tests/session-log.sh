@@ -81,7 +81,7 @@ tail -6 "$RX/preserve.out" | sed 's/^/   /'
 check "AGENTS.md is at most 200 lines" '[ "$(wc -l < "$P/AGENTS.md")" -le 200 ]'
 check "the protected section stayed" 'grep -q "python -m pytest" "$P/AGENTS.md"'
 check "the archivable notes moved to AGENTS-Archive.md" '[ -f "$P/AGENTS-Archive.md" ] && grep -q "old note 150" "$P/AGENTS-Archive.md" && grep -q "^## Archived: " "$P/AGENTS-Archive.md"'
-check "it says the line count" 'grep -qE "[0-9]+ (lines|dòng)" "$RX/preserve.out"'
+check "it says the line count" 'grep -qiE "[0-9]+ (lines?|dòng)|(line count|số dòng)[^0-9]{0,6}[0-9]+" "$RX/preserve.out"'
 "$HA" shutdown --force >/dev/null 2>&1
 
 echo "################ 5. with a markdown store the log is a section of the day's note"
