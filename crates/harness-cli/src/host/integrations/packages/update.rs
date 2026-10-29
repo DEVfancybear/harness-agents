@@ -59,53 +59,6 @@ impl PackageManager {
         self.update_configured_sources(update_sources)
     }
 
-    /// Packages (across both scopes) with an available update; project
-    /// entries win over user entries for the same package.
-    pub fn check_for_available_updates(&mut self) -> Vec<PackageUpdate> {
-        if super::is_offline_mode_enabled() {
-            return Vec::new();
-        }
-        let mut seen = std::collections::HashSet::new();
-        let mut updates = Vec::new();
-        // Project first so its entries win the identity dedupe.
-        for scope in [UserOrProject::Project, UserOrProject::User] {
-            for entry in self.packages_for_scope(scope).unwrap_or_default() {
-                let (source, _) = super::manager::split_entry(&entry);
-                if !seen.insert(self.get_source_match_key_for_settings(&source, scope)) {
-                    continue;
-                }
-                match parse_source(&source) {
-                    ParsedSource::Npm(parsed) if !parsed.pinned => {
-                        if let Some(installed) = self.get_installed_path(&source, scope) {
-                            if self.npm_has_available_update(&parsed, &installed) {
-                                updates.push(PackageUpdate {
-                                    source,
-                                    display_name: parsed.name,
-                                    kind: "npm",
-                                    scope,
-                                });
-                            }
-                        }
-                    }
-                    ParsedSource::Git(parsed) if !parsed.pinned => {
-                        if let Some(installed) = self.get_installed_path(&source, scope) {
-                            if super::git::git_has_available_update(&installed) {
-                                updates.push(PackageUpdate {
-                                    source,
-                                    display_name: format!("{}/{}", parsed.host, parsed.path),
-                                    kind: "git",
-                                    scope,
-                                });
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        updates
-    }
-
     fn update_configured_sources(&mut self, sources: Vec<(String, UserOrProject)>) -> Result<()> {
         if super::is_offline_mode_enabled() || sources.is_empty() {
             return Ok(());

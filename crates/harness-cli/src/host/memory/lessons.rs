@@ -680,24 +680,24 @@ fn refused(item: &Value, error: &str) -> Value {
     json!({"action": "lesson", "kind": "lesson", "id": item["lesson"], "applied": false, "error": error, "lesson": item})
 }
 
-fn record_one(
-    lessons: &mut Lessons,
+/// Why a reported signal is not kept, before it is: a secret in it, or a
+/// quote that is not where its kind is shown.
+fn unfit(
+    lessons: &Lessons,
     item: &Value,
     quotes: &Quotes,
-    conversation: &str,
-    project: Option<&ProjectRef>,
-) -> Value {
-    let text = item["text"].as_str().map(str::trim).unwrap_or_default();
-    let evidence = item["evidence"].as_str().map(str::trim).unwrap_or_default();
+    text: &str,
+    evidence: &str,
+) -> Option<Value> {
     // A lesson is written into memory every turn sees, and into the repo's
     // markdown store: no secret goes there, in its text or its quote.
     if let Some(shape) = harness_tools::secret_values::first(text)
         .or_else(|| harness_tools::secret_values::first(evidence))
     {
-        return refused(
+        return Some(refused(
             item,
             &format!("a lesson holds no secret, and this one holds what looks like a {shape}"),
-        );
+        ));
     }
     // The kind the quote must show: the named lesson's, or the new one's.
     let kind = item["lesson"]
@@ -709,12 +709,27 @@ fn record_one(
         );
     // A quote of a word or two is found anywhere; a moment needs a phrase,
     // from the turns not reviewed yet, said by whom the kind needs.
-    let quoted = normalize(evidence);
-    if quoted.chars().count() < MIN_EVIDENCE_CHARS || !quotes.holds(&kind, &quoted) {
-        return refused(
+    let phrase = normalize(evidence);
+    if phrase.chars().count() < MIN_EVIDENCE_CHARS || !quotes.holds(&kind, &phrase) {
+        return Some(refused(
             item,
             "the evidence is not a verbatim quote of the turns under review, a phrase long, in the user's words for a correction or a preference and in a tool result or the user's words for what the project showed",
-        );
+        ));
+    }
+    None
+}
+
+fn record_one(
+    lessons: &mut Lessons,
+    item: &Value,
+    quotes: &Quotes,
+    conversation: &str,
+    project: Option<&ProjectRef>,
+) -> Value {
+    let text = item["text"].as_str().map(str::trim).unwrap_or_default();
+    let evidence = item["evidence"].as_str().map(str::trim).unwrap_or_default();
+    if let Some(refusal) = unfit(lessons, item, quotes, text, evidence) {
+        return refusal;
     }
     let against = item["against"].as_bool().unwrap_or(false);
     let signal = Signal {

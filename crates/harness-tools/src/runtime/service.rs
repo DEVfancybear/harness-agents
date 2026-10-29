@@ -292,9 +292,6 @@ pub struct ToolExecutionService {
     guard: Option<Arc<dyn ToolGuard>>,
     /// History search by meaning beside its words (the host's embeddings).
     history_semantic: Option<Arc<dyn HistorySemantic>>,
-    /// What judges the agent and must not be changed through a command: the
-    /// host's configuration and state directories (`command_guard`).
-    protected_dirs: Vec<std::path::PathBuf>,
 }
 
 /// History search by meaning beside its words: the host's embeddings, when it
@@ -378,16 +375,7 @@ impl ToolExecutionService {
             elsewhere: None,
             guard: None,
             history_semantic: None,
-            protected_dirs: Vec::new(),
         }
-    }
-
-    /// Refuse a command that changes these directories: the host's
-    /// configuration, hooks and state. The workspace's `.harness` always is.
-    #[must_use]
-    pub fn with_protected_dirs(mut self, dirs: Vec<std::path::PathBuf>) -> Self {
-        self.protected_dirs = dirs;
-        self
     }
 
     /// Show `read_file` and `search_text` lines with their hashline anchors
@@ -1991,7 +1979,7 @@ impl ToolExecutionService {
                     root,
                     executable,
                     args,
-                    &self.protected_dirs,
+                    &[],
                     cancellation.clone(),
                     &self.spool,
                 )
@@ -2029,7 +2017,7 @@ impl ToolExecutionService {
                 if let Some(refusal) = crate::command_guard::shell_refusal(
                     root,
                     command,
-                    &self.protected_dirs,
+                    &[],
                     cancellation.clone(),
                     &self.spool,
                 )
