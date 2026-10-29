@@ -924,6 +924,9 @@ pub async fn run_with(
     // The run's conversation is open while it runs: an app conversation
     // started meanwhile is not offered its task state or its turns.
     let _open = super::continuity::OpenConversation::hold(&context.project_store_dir(), &task_id);
+    // Its checkout, as an app turn keeps it: a run in a linked worktree is
+    // not the main checkout's previous conversation.
+    super::service::note_checkout(&store, &task_id, &context.project.root).await;
     let run_request = RunRequest::new(
         session_id.clone(),
         task_id.clone(),
@@ -970,11 +973,12 @@ pub async fn run_with(
             },
             &super::harness::weighted_terms(None, &[request.prompt.as_str()]),
         );
-        // What it showed is counted off the run's path.
-        super::harness::record_shown_soon(
-            super::harness::global_dir(&context.paths.data_dir),
-            super::harness::local_dir(&context.paths.data_dir, task_id.as_str()),
-            digest.shown,
+        // What it showed is counted now: a run can exit before a thread of
+        // its own would have.
+        super::harness::record_shown(
+            &super::harness::global_dir(&context.paths.data_dir),
+            &super::harness::local_dir(&context.paths.data_dir, task_id.as_str()),
+            &digest.shown,
         );
         project_blocks.push(super::harness::digest_block(&digest.text));
     }

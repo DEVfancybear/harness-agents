@@ -214,9 +214,9 @@ Every block a turn's context carries has a place in one budget
 | `harness_state` (the memory digest) | no | 3,000 | 70 |
 | `session-start` (commits, uncommitted, the baseline check) | no | 800 | 55 |
 | `earlier-task-state` | no | 1,500 | 50 |
+| `session-handoff` (after `/handoff --reset`, the one record of where things stand) | no | 1,500 | 48 |
 | `session-log` | no | 1,500 | 42 |
 | `knowledge-catalog` | no | 1,500 | 40 |
-| `session-handoff` | no | 1,500 | 38 |
 | `recent-session` (the session brief) | no | 1,500 | 30 |
 
 ## Commands

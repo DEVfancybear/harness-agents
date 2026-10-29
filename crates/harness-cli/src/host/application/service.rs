@@ -3177,15 +3177,18 @@ async fn earlier_task_state(
     const LOOKED_AT: usize = 20;
     let mut sessions = user_conversation_sessions(store, store.list_sessions().await.ok()?).await;
     sort_newest_first(&mut sessions);
+    // Each conversation once; another checkout's is passed over uncounted.
     let mut seen = std::collections::HashSet::new();
+    let mut looked_at = 0;
     for session in sessions {
         if session.task_id == *current
-            || !of_checkout(store, &session.task_id, checkout).await
             || !seen.insert(session.task_id.as_str().to_owned())
+            || !of_checkout(store, &session.task_id, checkout).await
         {
             continue;
         }
-        if seen.len() > LOOKED_AT {
+        looked_at += 1;
+        if looked_at > LOOKED_AT {
             break;
         }
         let path = super::task_state::path(data_dir, session.task_id.as_str());
@@ -3214,6 +3217,35 @@ async fn earlier_task_state(
 
 /// The setting that names the checkout a conversation was started in.
 pub(super) const CHECKOUT_SETTING: &str = "checkout";
+
+/// Where `task`'s session log is written from a launch at `root`: in the
+/// checkout it was started in when that is another one still on disk - an
+/// owed log of a linked worktree's conversation belongs in that worktree,
+/// not in the checkout that happens to write it - and at `root` otherwise.
+async fn log_root(store: &SqliteStore, task: &TaskId, root: PathBuf) -> PathBuf {
+    match store.session_setting(task, CHECKOUT_SETTING).await {
+        Ok(Some(started))
+            if Path::new(&started) != super::bootstrap::checkout_root(&root)
+                && Path::new(&started).is_dir() =>
+        {
+            PathBuf::from(started)
+        }
+        _ => root,
+    }
+}
+
+/// Keep the checkout `task` was started in, on its first turn.
+pub(super) async fn note_checkout(store: &SqliteStore, task: &TaskId, root: &Path) {
+    if matches!(
+        store.session_setting(task, CHECKOUT_SETTING).await,
+        Ok(None)
+    ) {
+        let checkout = super::bootstrap::checkout_root(root);
+        let _ = store
+            .set_session_setting(task, CHECKOUT_SETTING, &checkout.to_string_lossy())
+            .await;
+    }
+}
 
 /// Whether `task` was started in `checkout`. A conversation from before the
 /// setting was kept is the key root's: a store then held only the
@@ -7216,8 +7248,10 @@ fn spawn_session_log(
 ) {
     let latest = (task.clone(), session.clone());
     let write = async move {
+        let mut root = root;
         let result = match SqliteStore::open_read_only(store_dir).await {
             Ok(store) => {
+                root = log_root(&store, &task, root).await;
                 let result = super::session_log::write_from_journal(
                     &store, provider, &root, &session, &task,
                 )
@@ -9345,15 +9379,7 @@ async fn run_turn(
     // A project's linked worktrees share its store: the checkout a
     // conversation was started in keeps another checkout's new conversations
     // from hearing of it.
-    if matches!(
-        store.session_setting(&task_id, CHECKOUT_SETTING).await,
-        Ok(None)
-    ) {
-        let checkout = super::bootstrap::checkout_root(&workspace_root);
-        let _ = store
-            .set_session_setting(&task_id, CHECKOUT_SETTING, &checkout.to_string_lossy())
-            .await;
-    }
+    note_checkout(&store, &task_id, &workspace_root).await;
     // Content the message names rides with it: images as blocks the model is shown, files
     // as text the model reads. A candidate that cannot be attached is said out loud: a
     // reader who is not told why cannot tell it from a bug.
@@ -9602,6 +9628,7 @@ async fn run_turn(
     }
     // The earlier conversation whose task state this one is shown.
     let mut carried = None;
+    let offered_to = task_id.as_str().to_owned();
     if let Some(block) = super::task_state::context_block(task_state_host.path()) {
         project_blocks.push(block);
     } else {
@@ -9623,10 +9650,7 @@ async fn run_turn(
             .await
         {
             project_blocks.push(super::task_state::earlier_block(&state, title.as_deref()));
-            super::task_state::note_offered(
-                &super::task_state::path(&data_dir, task.as_str()),
-                task_id.as_str(),
-            );
+            // Counted as offered once the request carried it (after the run).
             carried = Some(task);
         }
     }
@@ -10057,6 +10081,19 @@ async fn run_turn(
     }
 
     if let Some(built) = runtime.context_result(&session_id) {
+        // The earlier task is offered when the model was shown it: a block the
+        // budget left out is no offer, and three such would retire the task
+        // unseen.
+        if let Some(task) = &carried
+            && built.block_usage.iter().any(|block| {
+                block.block_id == super::task_state::EARLIER_BLOCK_ID && block.included
+            })
+        {
+            super::task_state::note_offered(
+                &super::task_state::path(&data_dir, task.as_str()),
+                &offered_to,
+            );
+        }
         // `Label: value` lines, so the panel lines the blocks up as fields.
         let mut lines = vec![
             format!("Packet: built for {}", built.manifest.model_id),
@@ -12243,6 +12280,51 @@ mod tests {
             .close()
             .await
             .expect("close store");
+    }
+
+    /// A conversation keeps the checkout it was started in, once; its owed
+    /// log is written there when a launch from another checkout writes it, and
+    /// where the launch is when that checkout is gone or is the launch's own.
+    #[tokio::test]
+    async fn an_owed_log_is_written_in_the_checkout_its_conversation_was_started_in() {
+        use super::{CHECKOUT_SETTING, log_root, note_checkout, of_checkout};
+        use harness_types::TaskId;
+        let temp = tempfile::tempdir().expect("temporary root");
+        let main = temp.path().join("main");
+        let linked = temp.path().join("linked");
+        for checkout in [&main, &linked] {
+            std::fs::create_dir_all(checkout.join(".git")).expect("checkout");
+        }
+        let store = SqliteStore::open_writer(WriterOpenOptions::new(
+            temp.path().join("data"),
+            harness_types::HostId::generate(),
+        ))
+        .await
+        .expect("store opens");
+        let task = TaskId::generate();
+        note_checkout(&store, &task, &linked.join("src")).await;
+        note_checkout(&store, &task, &main).await;
+        let kept = store
+            .session_setting(&task, CHECKOUT_SETTING)
+            .await
+            .expect("setting")
+            .expect("kept");
+        let linked = super::super::bootstrap::checkout_root(&linked);
+        assert_eq!(std::path::Path::new(&kept), linked, "the first turn's");
+        assert!(of_checkout(&store, &task, &linked).await);
+        assert!(
+            !of_checkout(
+                &store,
+                &task,
+                &super::super::bootstrap::checkout_root(&main)
+            )
+            .await
+        );
+        assert_eq!(log_root(&store, &task, main.clone()).await, linked);
+        let sub = linked.join("src");
+        assert_eq!(log_root(&store, &task, sub.clone()).await, sub, "its own");
+        std::fs::remove_dir_all(&linked).expect("gone");
+        assert_eq!(log_root(&store, &task, main.clone()).await, main, "gone");
     }
 
     /// A message that lands in a turn's inbox after its last step - or is still

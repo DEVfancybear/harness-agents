@@ -1430,6 +1430,30 @@ pub(super) async fn previous_conversation_blocks(
     blocks
 }
 
+/// The last [`START_CONVERSATIONS`] earlier conversations of `root`'s
+/// checkout that are not still open, newest first: a linked worktree shares
+/// the project's store, not its conversations.
+async fn last_left_here(
+    store: &SqliteStore,
+    current: &TaskId,
+    root: &Path,
+) -> Vec<(String, String)> {
+    let checkout = super::bootstrap::checkout_root(root);
+    let mut conversations = Vec::new();
+    for (conversation, newest) in earlier_conversations(store, current).await {
+        if let Ok(task) = TaskId::parse(conversation.clone())
+            && !super::continuity::is_live(&task)
+            && super::service::of_checkout(store, &task, &checkout).await
+        {
+            conversations.push((conversation, newest));
+            if conversations.len() == START_CONVERSATIONS {
+                break;
+            }
+        }
+    }
+    conversations
+}
+
 /// What a new conversation hears of the newest session log, when one of the
 /// last conversations has one written in the last week: its outcome, its
 /// Quick Resume Context and up to five pending tasks, as historical
@@ -1449,13 +1473,7 @@ pub(super) async fn start_block(
     if logs.is_empty() {
         return None;
     }
-    let conversations = earlier_conversations(store, current)
-        .await
-        .into_iter()
-        .filter(|(conversation, _)| {
-            TaskId::parse(conversation.clone()).is_ok_and(|task| !super::continuity::is_live(&task))
-        })
-        .collect::<Vec<_>>();
+    let conversations = last_left_here(store, current, root).await;
     let (later, log, newest) = conversations
         .iter()
         .take(START_CONVERSATIONS)

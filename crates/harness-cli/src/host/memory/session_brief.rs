@@ -52,24 +52,32 @@ pub(super) async fn context_block(
     if !fresh_conversation(store, current, source, refinements).await {
         return None;
     }
-    let sessions =
+    let mut sessions =
         super::service::user_conversation_sessions(store, store.list_sessions().await.ok()?).await;
+    sessions.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.session_id.as_str().cmp(left.session_id.as_str()))
+    });
     // A conversation still open - in another pane, or another live ha - is
-    // that conversation's work in progress, not the previous one.
-    let mut earlier = Vec::new();
+    // that conversation's work in progress, not the previous one. The newest
+    // session of a conversation of this checkout's that is not is the one.
+    let mut passed_over = std::collections::HashSet::new();
+    let mut previous = None;
     for session in sessions {
-        if session.task_id != *current
-            && !super::continuity::is_live(&session.task_id)
+        if session.task_id == *current || passed_over.contains(session.task_id.as_str()) {
+            continue;
+        }
+        if !super::continuity::is_live(&session.task_id)
             && super::service::of_checkout(store, &session.task_id, checkout).await
         {
-            earlier.push(session);
+            previous = Some(session);
+            break;
         }
+        passed_over.insert(session.task_id.as_str().to_owned());
     }
-    let previous = earlier.into_iter().max_by(|left, right| {
-        left.created_at
-            .cmp(&right.created_at)
-            .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
-    })?;
+    let previous = previous?;
     let (turns, omitted) =
         harness_runtime::resumed_turns(store, &previous.session_id, RECENT_TURNS)
             .await

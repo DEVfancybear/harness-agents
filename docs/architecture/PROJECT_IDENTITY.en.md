@@ -5,8 +5,7 @@ English | [Tiếng Việt](PROJECT_IDENTITY.vi.md)
 ha keeps a project's data under a key: its store (`<data>/projects/<key>/`,
 the journal of every conversation, artifacts, leases, deferred reviews and
 session-log marks), the global memory entries kept for it
-(`/projects/<key>/...`), its lessons and its history vectors
-(`<data>/history-embedding/<key>`). Since 0.8.8 the key follows the Git
+(`/projects/<key>/...`) and its lessons. Since 0.8.8 the key follows the Git
 repository, so ha started in a subdirectory of a repository, or in one of its
 linked worktrees, opens the same project as ha started at its root.
 
@@ -67,8 +66,7 @@ resolves the repository's key adopts it:
    repository's name, through the memory store's own save under its lock: each
    is one event of the `migration` writer with cause `adopt`, and keeps its id.
    The lessons about the old key (and a learned skill's project) get the new
-   key; `<data>/history-embedding/<old key>` is renamed when the new key has
-   none; the old store's worker journal is removed (it would restart agents on
+   key; the old store's worker journal is removed (it would restart agents on
    the old path) and its agent names move with it.
 3. `<data>/projects/<new key>/project.json` records the key root and, under
    `adopted`, the old keys it took.

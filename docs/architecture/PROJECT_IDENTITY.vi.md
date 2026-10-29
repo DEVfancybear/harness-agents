@@ -5,8 +5,7 @@
 ha giữ dữ liệu của một project dưới một key: store của nó
 (`<data>/projects/<key>/`, gồm journal của mọi hội thoại, artifact, lease,
 review hoãn lại và dấu session log), các entry memory toàn cục giữ cho nó
-(`/projects/<key>/...`), lesson và vector lịch sử
-(`<data>/history-embedding/<key>`). Từ 0.8.8 key đi theo Git repository: chạy
+(`/projects/<key>/...`) và lesson. Từ 0.8.8 key đi theo Git repository: chạy
 ha trong một thư mục con của repository, hay trong một linked worktree của nó,
 mở cùng project với khi chạy ha ở gốc repository.
 
@@ -63,9 +62,7 @@ sẽ nhận lại dữ liệu:
 2. Các entry memory toàn cục giữ cho key cũ nhận key mới và tên repository, qua
    đường lưu của chính memory store dưới lock của nó: mỗi entry là một event của
    writer `migration` với cause `adopt`, và giữ nguyên id. Lesson về key cũ (và
-   project của một learned skill) nhận key mới;
-   `<data>/history-embedding/<key cũ>` được đổi tên khi key mới chưa có; journal
-   worker của store cũ bị bỏ (nó sẽ khởi động lại agent trên đường dẫn cũ) và
+   project của một learned skill) nhận key mới; journal worker của store cũ bị bỏ (nó sẽ khởi động lại agent trên đường dẫn cũ) và
    tên agent được chuyển theo.
 3. `<data>/projects/<key mới>/project.json` ghi key root và, trong `adopted`,
    các key cũ nó đã nhận.

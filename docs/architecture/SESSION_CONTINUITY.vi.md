@@ -204,9 +204,9 @@ Mọi khối trong ngữ cảnh của một lượt đều có chỗ trong một
 | `harness_state` (digest của memory) | không | 3.000 | 70 |
 | `session-start` (commit, chưa commit, kiểm tra baseline) | không | 800 | 55 |
 | `earlier-task-state` | không | 1.500 | 50 |
+| `session-handoff` (sau `/handoff --reset`, bản ghi duy nhất về việc đang ở đâu) | không | 1.500 | 48 |
 | `session-log` | không | 1.500 | 42 |
 | `knowledge-catalog` | không | 1.500 | 40 |
-| `session-handoff` | không | 1.500 | 38 |
 | `recent-session` (session brief) | không | 1.500 | 30 |
 
 ## Lệnh

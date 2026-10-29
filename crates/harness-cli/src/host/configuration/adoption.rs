@@ -6,7 +6,7 @@
 //! store of its own. Now the key is the repository's: the first launch that
 //! resolves the new key finds the store the old key named and moves it into
 //! place, when nothing else holds it and the new key has no store yet. The
-//! project memory, lessons and history vectors kept under the old key are
+//! project memory and lessons kept under the old key are
 //! given the new one. Two stores that both hold data are never merged: the
 //! older one is left where it is and named in a notice, and `ha doctor`
 //! lists it.
@@ -214,7 +214,7 @@ fn move_store(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::rename(from, to).map_err(|error| error.to_string())
 }
 
-/// Give the project's memory, lessons, history vectors and agent names the
+/// Give the project's memory, lessons and agent names the
 /// new key, and drop the worker journal that would restart agents on the old
 /// store. Each part is retried by the next launch that finds the old store,
 /// and is a no-op once done.
@@ -243,14 +243,6 @@ fn retag(
         &tag.name,
     ) {
         warn("lessons", error);
-    }
-    let vectors = data_dir.join("history-embedding");
-    let (old_vectors, new_vectors) = (vectors.join(legacy), vectors.join(key));
-    if old_vectors.is_dir()
-        && !new_vectors.exists()
-        && let Err(error) = std::fs::rename(&old_vectors, &new_vectors)
-    {
-        warn("history vectors", error.to_string());
     }
     // A store left apart keeps its own worker files: its agents still run on it.
     if has_store(legacy_dir) {
@@ -444,8 +436,6 @@ mod tests {
         let old_worker = registry::project_key(&legacy_dir);
         std::fs::create_dir_all(&workers).expect("workers");
         std::fs::write(registry::journal_path(&workers, &old_worker), "{}").expect("journal");
-        let vectors = data.join("history-embedding");
-        std::fs::create_dir_all(vectors.join(&legacy)).expect("vectors");
 
         let context = project.resolve(&project.sub);
         let store_dir = context.project_store_dir();
@@ -476,7 +466,6 @@ mod tests {
             project.sub,
             "where it was seen stays"
         );
-        assert!(vectors.join(&context.project.key).is_dir());
         assert!(!registry::journal_path(&workers, &old_worker).exists());
         // The moved store opens where the key says.
         let store = SqliteStore::open_read_only(store_dir.clone())

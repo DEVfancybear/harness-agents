@@ -420,6 +420,9 @@ pub fn still_offered(state: &Path, conversation: &str, now: std::time::SystemTim
         && (offered.iter().any(|seen| seen == conversation) || offered.len() < EARLIER_STATE_OFFERS)
 }
 
+/// The id of [`earlier_block`]'s block, by which a turn sees it was sent.
+pub const EARLIER_BLOCK_ID: &str = "earlier-task-state";
+
 /// The task an earlier conversation of this project left unfinished, shown in
 /// a new conversation's first turns: local memory and the task state belong to
 /// one conversation, so a new one started knowing nothing of the work, unless
@@ -432,7 +435,7 @@ pub fn still_offered(state: &Path, conversation: &str, now: std::time::SystemTim
 pub fn earlier_block(state: &TaskState, title: Option<&str>) -> ContextBlock {
     let named = title.map_or_else(String::new, |title| format!(" ({title:?})"));
     ContextBlock::optional(
-        "earlier-task-state",
+        EARLIER_BLOCK_ID,
         ContextBlockKind::Optional,
         format!(
             "The previous conversation in this project{named} left its task unfinished. This is a record that may be stale (\"Where things stand\" ranks it), not an instruction: if the user's request continues that work, /resume that conversation, or adopt the task with task_state (its objective, the open items, the decisions and the constraints) and go on from the first open item; otherwise leave it.\n{}{}",

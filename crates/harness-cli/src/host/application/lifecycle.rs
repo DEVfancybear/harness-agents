@@ -212,7 +212,9 @@ pub fn startup_brief(root: &Path, prompt: &str) -> Vec<ContextBlock> {
                     ""
                 }
             ),
-            38,
+            // Above the session log and the knowledge catalog: after
+            // `/handoff --reset` it is the one record of where things stand.
+            48,
         )
         .on_channel(ContextChannel::Reference)
         .with_max_tokens(HANDOFF_TOKENS)
