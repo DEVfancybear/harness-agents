@@ -1080,6 +1080,39 @@ impl SqliteStore {
         .transpose()
     }
 
+    /// Every registered canonical root with its project identity, by root.
+    ///
+    /// A store keyed by a repository holds the registrations of the
+    /// directories ha ran in; a directory seen for the first time looks here
+    /// for the identity its repository already has.
+    pub async fn registered_roots(&self) -> Result<Vec<(String, ProjectId)>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT canonical_root, project_id FROM project_registrations ORDER BY canonical_root",
+        )
+        .fetch_all(&self.readers)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "read registered project roots",
+                error,
+            )
+        })?;
+        rows.iter()
+            .map(|row| {
+                let root = row_get::<String>(row, "canonical_root")?;
+                let id =
+                    ProjectId::parse(row_get::<String>(row, "project_id")?).map_err(|error| {
+                        StoreError::new(
+                            ErrorCode::ProjectIdentityConflict,
+                            format!("stored project identity is invalid: {error}"),
+                        )
+                    })?;
+                Ok((root, id))
+            })
+            .collect()
+    }
+
     /// Consume a bound approval and record the pre-side-effect intent in the
     /// same durable transaction.
     #[allow(clippy::too_many_lines)]

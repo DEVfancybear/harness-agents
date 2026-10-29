@@ -94,7 +94,7 @@ A scope directory holds `memory.sqlite3` in place of `harness_state.json`:
 
 | Scope | Directory | Tree root of its records |
 |---|---|---|
-| global | `<data>/harness/` | `/global/...`; a project-qualified entry goes under `/projects/<project_key>/...` |
+| global | `<data>/harness/` | `/global/...`; a project-qualified entry goes under `/projects/<project_key>/...`, the key of the project's repository ([project identity](PROJECT_IDENTITY.en.md)) |
 | local (one conversation) | `<data>/sessions/<task>/harness/` | `/local/...` |
 
 There is one database per scope directory, not one for all of ha:

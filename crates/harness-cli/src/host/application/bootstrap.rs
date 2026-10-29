@@ -2,8 +2,11 @@
 //!
 //! Resolution is deliberate and cheap: read the caller directory, the project
 //! identity, the Git root, the user paths and the non-secret configuration. It
-//! never opens the store, never resolves a model, and never makes a network
-//! call, so opening the app cannot start work or block on a provider.
+//! never opens the project store, never resolves a model, never starts a
+//! process and never makes a network call, so opening the app cannot start
+//! work or block on a provider. The one thing it may write is the adoption of
+//! a store this project kept under an older key ([`super::adoption`]), and
+//! only when there is one.
 
 use std::path::{Path, PathBuf};
 
@@ -35,9 +38,18 @@ pub struct LaunchRequest {
 /// Stable identity of the opened project.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectIdentity {
+    /// The directory ha was started in (or `--cwd` named), canonical: the
+    /// tools' working directory, where the `AGENTS.md` walk ends and where
+    /// session logs and trust are kept.
     pub root: PathBuf,
+    /// The project's key, `project-` and 16 hex digits of the hash of
+    /// [`Self::key_root`].
     pub key: String,
     pub digest: ContentHash,
+    /// The directory the key names ([`project_root`]): the main checkout's
+    /// top level for any directory of a Git repository or of one of its
+    /// linked worktrees, the launch directory otherwise.
+    pub key_root: PathBuf,
 }
 
 /// Whether a provider credential source exists at launch.
@@ -62,6 +74,9 @@ pub struct LaunchContext {
     pub config: ConfigState,
     pub provider: ProviderState,
     pub setup_required: bool,
+    /// One line each about this project's data that the user should know:
+    /// another store of the same project that was left apart.
+    pub notices: Vec<String>,
 }
 
 impl LaunchContext {
@@ -115,6 +130,11 @@ impl LaunchContext {
             ),
             format!("Store:   {}", self.project_store_dir().display()),
         ]);
+        lines.extend(
+            self.notices
+                .iter()
+                .map(|notice| format!("Note:    {notice}")),
+        );
         lines
     }
 
@@ -258,7 +278,6 @@ pub fn resolve(request: LaunchRequest) -> Result<LaunchContext, HarnessError> {
         )
     })?;
     let root = displayable(&canonical);
-    let digest = ContentHash::from_bytes(root.to_string_lossy().as_bytes());
     let git_root = find_git_root(&canonical);
 
     let paths = paths::resolve(&PathRequest {
@@ -266,6 +285,19 @@ pub fn resolve(request: LaunchRequest) -> Result<LaunchContext, HarnessError> {
         environment: &request.environment,
         explicit_data_dir: request.explicit_data_dir.as_deref(),
     })?;
+    // What a key root must never be is known before the first key is made:
+    // every key this process makes, here or through `project_key_of`,
+    // refuses the same directories.
+    note_refused(&request.environment, &paths.data_dir);
+    let key_root = project_root(&root);
+    let digest = ContentHash::from_bytes(key_root.to_string_lossy().as_bytes());
+    let key = project_key(digest.as_str());
+    let legacy = legacy_key_of(&root);
+    let notices = if legacy == key {
+        Vec::new()
+    } else {
+        super::adoption::adopt(&paths.data_dir, &key_root, &key, &legacy)
+    };
     let config = config::load(&paths.config_file)?;
     let provider = provider_state(&request.environment, &paths.data_dir);
     let setup_required = matches!(provider, ProviderState::SetupRequired { .. });
@@ -273,8 +305,9 @@ pub fn resolve(request: LaunchRequest) -> Result<LaunchContext, HarnessError> {
     Ok(LaunchContext {
         project: ProjectIdentity {
             root,
-            key: project_key(digest.as_str()),
+            key,
             digest,
+            key_root,
         },
         caller_dir: request.caller_dir,
         git_root,
@@ -282,13 +315,182 @@ pub fn resolve(request: LaunchRequest) -> Result<LaunchContext, HarnessError> {
         config,
         provider,
         setup_required,
+        notices,
     })
 }
 
-/// The key of the project rooted at `root` (as the launch resolved it).
+/// The key of the project a directory belongs to: the hash of its
+/// [`project_root`]. Callers pass the launch directory; a launch from a
+/// repository's root hashes the same string it always did, so its key is
+/// the one it had before keys followed the repository.
 #[must_use]
 pub fn project_key_of(root: &Path) -> String {
-    project_key(ContentHash::from_bytes(root.to_string_lossy().as_bytes()).as_str())
+    project_key(ContentHash::from_bytes(project_root(root).to_string_lossy().as_bytes()).as_str())
+}
+
+/// The key a launch from `root` had before keys followed the repository:
+/// the hash of the launch directory itself. Only the adoption of a store
+/// kept under that key uses it.
+#[must_use]
+pub(crate) fn legacy_key_of(root: &Path) -> String {
+    project_key(
+        ContentHash::from_bytes(canonical_or_given(root).to_string_lossy().as_bytes()).as_str(),
+    )
+}
+
+/// `path` as `resolve` spells a launch directory: canonical, without the
+/// Windows verbatim prefix; as given when it cannot be resolved.
+#[must_use]
+pub fn canonical_or_given(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).map_or_else(|_| path.to_path_buf(), |path| displayable(&path))
+}
+
+/// Directories a key root must never be: the user's home (and what is above
+/// it), and anything under an ha data directory. Each launch adds its own;
+/// the process's environment gives the rest.
+fn refused() -> &'static std::sync::Mutex<Refused> {
+    static REFUSED: std::sync::OnceLock<std::sync::Mutex<Refused>> = std::sync::OnceLock::new();
+    REFUSED.get_or_init(|| {
+        let mut refused = Refused::default();
+        let environment = paths::LaunchEnvironment::capture();
+        refused.add_homes(&environment);
+        if let Ok(paths) = paths::resolve(&PathRequest {
+            platform: HostPlatform::current(),
+            environment: &environment,
+            explicit_data_dir: None,
+        }) {
+            refused.add_data_dir(&paths.data_dir);
+        }
+        std::sync::Mutex::new(refused)
+    })
+}
+
+#[derive(Default)]
+struct Refused {
+    homes: Vec<PathBuf>,
+    data_dirs: Vec<PathBuf>,
+}
+
+impl Refused {
+    fn add_homes(&mut self, environment: &paths::LaunchEnvironment) {
+        for name in ["USERPROFILE", "HOME"] {
+            if let Some(home) = environment.value(name).filter(|value| !value.is_empty()) {
+                let home = canonical_or_given(Path::new(home));
+                if !self.homes.contains(&home) {
+                    self.homes.push(home);
+                }
+            }
+        }
+    }
+
+    fn add_data_dir(&mut self, data_dir: &Path) {
+        let data_dir = canonical_or_given(data_dir);
+        if !self.data_dirs.contains(&data_dir) {
+            self.data_dirs.push(data_dir);
+        }
+    }
+
+    /// Whether `candidate` cannot key the project launched from `launch`.
+    fn refuses(&self, candidate: &Path, launch: &Path) -> bool {
+        candidate.parent().is_none()
+            || self.homes.iter().any(|home| home.starts_with(candidate))
+            || self
+                .data_dirs
+                .iter()
+                .any(|data| candidate.starts_with(data) || launch.starts_with(data))
+    }
+}
+
+fn note_refused(environment: &paths::LaunchEnvironment, data_dir: &Path) {
+    if let Ok(mut refused) = refused().lock() {
+        refused.add_homes(environment);
+        refused.add_data_dir(data_dir);
+    }
+}
+
+/// The directory a project is keyed by, for a directory ha runs in.
+///
+/// Read from the repository's files; no process is started. The nearest
+/// ancestor with a `.git` entry is the repository's top level. A `.git`
+/// directory makes that top level the root. A `.git` file names the git
+/// directory; when that directory's `commondir` is a main checkout's own
+/// `.git`, the directory is a linked worktree and the main checkout's top
+/// level is the root. Any other `.git` file - a submodule, a worktree of a
+/// bare clone such as a delegated coder's - keeps its own top level. Outside
+/// a repository the directory is its own root.
+///
+/// A root that is the user's home or above it, a drive's root, or under an ha
+/// data directory is refused: the launch directory keys the project then,
+/// as it did before keys followed the repository.
+///
+/// The repository walk is remembered per directory for the process.
+#[must_use]
+pub fn project_root(path: &Path) -> PathBuf {
+    let launch = canonical_or_given(path);
+    let found = repository_root_memoised(&launch);
+    let Some(found) = found else {
+        return launch;
+    };
+    let refuses = refused()
+        .lock()
+        .map_or(true, |refused| refused.refuses(&found, &launch));
+    if refuses { launch } else { found }
+}
+
+fn repository_root_memoised(launch: &Path) -> Option<PathBuf> {
+    type Walks = std::collections::HashMap<(PathBuf, bool), Option<PathBuf>>;
+    static WALKS: std::sync::OnceLock<std::sync::Mutex<Walks>> = std::sync::OnceLock::new();
+    // A repository created in the directory itself (`git init` after a first
+    // launch) is seen; one created above it is seen by the next process.
+    let key = (launch.to_path_buf(), launch.join(".git").exists());
+    let walks = WALKS.get_or_init(|| std::sync::Mutex::new(Walks::new()));
+    if let Some(found) = walks.lock().ok().and_then(|walks| walks.get(&key).cloned()) {
+        return found;
+    }
+    let found = repository_root(launch);
+    if let Ok(mut walks) = walks.lock() {
+        walks.insert(key, found.clone());
+    }
+    found
+}
+
+fn repository_root(start: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(directory) = current {
+        let dot_git = directory.join(".git");
+        if let Ok(metadata) = std::fs::metadata(&dot_git) {
+            if metadata.is_file() {
+                return Some(
+                    main_checkout_of_worktree(directory, &dot_git)
+                        .unwrap_or_else(|| directory.to_path_buf()),
+                );
+            }
+            return Some(directory.to_path_buf());
+        }
+        current = directory.parent();
+    }
+    None
+}
+
+/// The main checkout of the linked worktree at `top`, read from its `.git`
+/// file and its git directory's `commondir`; none for anything else.
+fn main_checkout_of_worktree(top: &Path, dot_git: &Path) -> Option<PathBuf> {
+    let pointer = std::fs::read_to_string(dot_git).ok()?;
+    let target = pointer
+        .lines()
+        .next()?
+        .trim()
+        .strip_prefix("gitdir:")?
+        .trim();
+    let git_dir = top.join(target);
+    let common = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let common = std::fs::canonicalize(git_dir.join(common.trim())).ok()?;
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    let main = common.parent()?;
+    let own = std::fs::canonicalize(main.join(".git")).ok()?;
+    (own == common && own.is_dir()).then(|| displayable(main))
 }
 
 /// Short, filesystem-safe project key derived from the identity digest.
@@ -397,12 +599,154 @@ fn displayable(path: &Path) -> PathBuf {
 mod tests {
     use super::{
         CREDENTIAL_VARIABLES, LaunchRequest, ProviderState, displayable, git_branch, git_worktree,
-        place_lines, resolve,
+        legacy_key_of, place_lines, project_key, project_key_of, project_root, resolve,
     };
     use crate::interactive::credentials::{self, CredentialSource};
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
     use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
-    use harness_types::{ErrorCode, HostId};
+    use harness_types::{ContentHash, ErrorCode, HostId};
+    use std::path::{Path, PathBuf};
+
+    fn canonical(path: &Path) -> PathBuf {
+        displayable(&std::fs::canonicalize(path).expect("canonical"))
+    }
+
+    /// A repository as Git leaves one on disk, without running Git: a main
+    /// checkout with a subdirectory, and a linked worktree beside it whose
+    /// `.git` file names its git directory, whose `commondir` is the main
+    /// checkout's `.git`.
+    pub(crate) fn repository(base: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let repo = base.join("repo");
+        let sub = repo.join("crates").join("inner");
+        let git_dir = repo.join(".git").join("worktrees").join("tree");
+        std::fs::create_dir_all(&git_dir).expect("worktree git dir");
+        std::fs::create_dir_all(&sub).expect("subdirectory");
+        std::fs::write(git_dir.join("commondir"), "../..\n").expect("commondir");
+        let tree = base.join("tree");
+        std::fs::create_dir_all(&tree).expect("worktree");
+        std::fs::write(
+            tree.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .expect("worktree pointer");
+        (repo, sub, tree)
+    }
+
+    #[test]
+    fn a_subdirectory_and_a_linked_worktree_are_keyed_by_the_main_checkout() {
+        let fixture = Fixture::new("unused");
+        let (repo, sub, tree) = repository(fixture.temp.path());
+        let environment = fixture.environment(&[]);
+        let at = |directory: &Path| {
+            resolve(LaunchRequest {
+                cwd: Some(directory.to_path_buf()),
+                ..fixture.request(&environment)
+            })
+            .expect("context resolves")
+        };
+        let (root, inner, linked) = (at(&repo), at(&sub), at(&tree));
+        let repo_text = canonical(&repo);
+
+        assert_eq!(root.project.key_root, repo_text);
+        assert_eq!(inner.project.key_root, repo_text);
+        assert_eq!(linked.project.key_root, repo_text);
+        assert_eq!(inner.project.key, root.project.key, "a subdirectory");
+        assert_eq!(linked.project.key, root.project.key, "a linked worktree");
+        assert_eq!(inner.project_store_dir(), root.project_store_dir());
+        assert_eq!(linked.project_store_dir(), root.project_store_dir());
+        // The launch directory stays what the tools work in.
+        assert_eq!(inner.project.root, canonical(&sub));
+        assert_eq!(linked.project.root, canonical(&tree));
+        // The repository's root keeps the exact key it had: the same string is
+        // hashed, so nothing of a launch from the root moves.
+        assert_eq!(
+            root.project.key,
+            project_key(ContentHash::from_bytes(repo_text.to_string_lossy().as_bytes()).as_str())
+        );
+        assert_eq!(root.project.key, legacy_key_of(&repo));
+        assert_ne!(inner.project.key, legacy_key_of(&sub));
+        // The one choke point: every other key agrees with the launch's.
+        assert_eq!(project_key_of(&sub), root.project.key);
+        assert_eq!(project_key_of(&tree), root.project.key);
+        assert_eq!(project_key_of(&canonical(&sub)), root.project.key);
+    }
+
+    #[test]
+    fn a_submodule_and_a_worktree_of_a_bare_clone_keep_their_own_key() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (repo, _, _) = repository(temp.path());
+        // A submodule's `.git` file names a git directory with no `commondir`.
+        let module = repo.join("vendor").join("lib");
+        std::fs::create_dir_all(repo.join(".git").join("modules").join("lib")).expect("module");
+        std::fs::create_dir_all(&module).expect("submodule");
+        std::fs::write(module.join(".git"), "gitdir: ../../.git/modules/lib\n").expect("pointer");
+        assert_eq!(project_root(&module), canonical(&module));
+        assert_eq!(project_root(&module.join(".")), canonical(&module));
+
+        // A delegated coder's worktree comes from the host's bare clone: its
+        // common directory is not a main checkout's `.git`.
+        let bare = temp.path().join("source.git");
+        let git_dir = bare.join("worktrees").join("coder");
+        std::fs::create_dir_all(&git_dir).expect("bare clone");
+        std::fs::write(git_dir.join("commondir"), "../..\n").expect("commondir");
+        let coder = temp.path().join("coder");
+        std::fs::create_dir_all(coder.join("src")).expect("coder worktree");
+        std::fs::write(
+            coder.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .expect("pointer");
+        assert_eq!(project_root(&coder.join("src")), canonical(&coder));
+
+        let plain = temp.path().join("plain");
+        std::fs::create_dir_all(&plain).expect("plain");
+        assert_eq!(project_root(&plain), canonical(&plain), "no repository");
+    }
+
+    #[test]
+    fn a_home_that_is_a_repository_and_the_data_directory_never_key_a_project() {
+        let fixture = Fixture::new("unused");
+        // A home kept in Git (dotfiles): a folder in it is not that repository.
+        let user = fixture.temp.path().join("user");
+        let notes = user.join("notes").join("today");
+        std::fs::create_dir_all(user.join(".git")).expect("home repository");
+        std::fs::create_dir_all(&notes).expect("folder in home");
+        let user_text = user.to_string_lossy().into_owned();
+        let environment =
+            fixture.environment(&[("HOME", user_text.as_str()), ("USERPROFILE", &user_text)]);
+        let context = resolve(LaunchRequest {
+            cwd: Some(notes.clone()),
+            ..fixture.request(&environment)
+        })
+        .expect("context resolves");
+        assert_eq!(context.project.key_root, canonical(&notes));
+        assert_eq!(context.project.key, legacy_key_of(&notes));
+
+        // A data directory inside a repository: what runs under it is never
+        // the repository, and the repository's other folders still are.
+        let repo = fixture.temp.path().join("checkout");
+        std::fs::create_dir_all(repo.join(".git")).expect("repository");
+        let ha_home = repo.join("ha-home");
+        let worktree = ha_home
+            .join("data")
+            .join("delegation")
+            .join("worktrees")
+            .join("child");
+        std::fs::create_dir_all(&worktree).expect("under the data dir");
+        std::fs::create_dir_all(repo.join("src")).expect("source");
+        let environment =
+            LaunchEnvironment::from_pairs([("HA_HOME", ha_home.to_string_lossy().into_owned())]);
+        let at = |directory: &Path| {
+            resolve(LaunchRequest {
+                cwd: Some(directory.to_path_buf()),
+                ..fixture.request(&environment)
+            })
+            .expect("context resolves")
+        };
+        assert_eq!(at(&worktree).project.key_root, canonical(&worktree));
+        assert_eq!(at(&repo.join("src")).project.key_root, canonical(&repo));
+        assert_eq!(project_root(&worktree), canonical(&worktree));
+    }
 
     #[test]
     fn the_branch_is_read_from_head_in_a_repository_and_a_worktree() {
@@ -510,6 +854,8 @@ mod tests {
         let context = resolve(fixture.request(&environment)).expect("context resolves");
 
         assert_eq!(context.project.root, fixture.canonical_project);
+        // Outside a repository the caller directory is also what the key names.
+        assert_eq!(context.project.key_root, fixture.canonical_project);
         assert!(context.project.key.starts_with("project-"));
         assert!(context.project.digest.as_str().starts_with("sha256:"));
         assert_eq!(context.caller_dir, fixture.project);
@@ -574,6 +920,8 @@ mod tests {
             context.git_root.as_deref(),
             Some(fixture.canonical_project.as_path())
         );
+        // The tools work in the nested directory; the project is the repository.
+        assert_eq!(context.project.key_root, fixture.canonical_project);
         assert!(context.header_lines().join("\n").contains("repository at"));
 
         let plain = fixture.temp.path().join("no-git-project");
@@ -745,6 +1093,9 @@ mod tests {
             "project state stays under the resolved data root"
         );
 
+        // A directory outside any repository is a project of its own; two
+        // directories of one repository are one project (see
+        // `a_subdirectory_and_a_linked_worktree_are_keyed_by_the_main_checkout`).
         let other = fixture.temp.path().join("another-project");
         std::fs::create_dir_all(&other).expect("other project");
         let elsewhere = resolve(LaunchRequest {

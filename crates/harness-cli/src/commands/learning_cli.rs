@@ -3,7 +3,7 @@
 use clap::{Args, Subcommand};
 use harness_types::{ErrorCode, HarnessError};
 
-use crate::interactive::{cli_extras, harness, lessons, memory, self_eval};
+use crate::interactive::{bootstrap, cli_extras, harness, lessons, memory, self_eval};
 
 #[derive(Debug, Args)]
 pub struct LearningCommand {
@@ -93,9 +93,11 @@ fn scope_filter(scope: &str) -> Result<lessons::ScopeFilter, HarnessError> {
     }
 }
 
-/// The project the current directory is, for a project lesson brought in.
+/// The project the current directory is, for a project lesson brought in:
+/// the directory spelled as a launch from it resolves it, so the key is the
+/// one a chat started here keeps its lessons under.
 fn current_project() -> Option<lessons::ProjectRef> {
-    let root = std::env::current_dir().ok()?;
+    let root = bootstrap::canonical_or_given(&std::env::current_dir().ok()?);
     let tag = memory::ProjectTag::of(&root);
     Some(lessons::ProjectRef {
         key: tag.key,

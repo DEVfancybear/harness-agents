@@ -20,6 +20,8 @@ pub struct Facts {
     pub judge: bool,
     pub hooks: usize,
     pub mcp_servers: usize,
+    /// Older stores of this project kept apart ([`super::adoption::other_stores`]).
+    pub other_stores: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -339,7 +341,7 @@ fn environment(root: &Path) -> Subsystem {
     subsystem
 }
 
-fn state(root: &Path) -> Subsystem {
+fn state(root: &Path, facts: &Facts) -> Subsystem {
     let mut subsystem = Subsystem {
         name: "State",
         findings: Vec::new(),
@@ -404,8 +406,27 @@ fn state(root: &Path) -> Subsystem {
             }
         }
     }
+    other_stores(facts, &mut subsystem);
     markdown_memory(root, &mut subsystem);
     subsystem
+}
+
+/// Older stores of this project that were left apart: a launch from a
+/// subdirectory or a linked worktree kept one before 0.8.8, and the
+/// repository's key had a store too. Nothing is said when there is none.
+fn other_stores(facts: &Facts, subsystem: &mut Subsystem) {
+    if facts.other_stores.is_empty() {
+        return;
+    }
+    subsystem.short(
+        Level::Warn,
+        format!(
+            "{} older store(s) of this project kept apart: {}",
+            facts.other_stores.len(),
+            facts.other_stores.join(", ")
+        ),
+        "both held data, so neither was merged; their conversations stay readable with `ha sessions list --data-dir <store>`, and a store no longer needed can be moved out of the data directory",
+    );
 }
 
 /// A markdown memory store, when the project keeps one: the lint's file checks
@@ -503,7 +524,7 @@ pub fn audit(global_config_dir: &Path, root: &Path, cwd: &Path, facts: &Facts) -
         instructions(global_config_dir, root, cwd),
         tools(root, facts),
         environment(root),
-        state(root),
+        state(root, facts),
         feedback(root, facts),
     ]
 }

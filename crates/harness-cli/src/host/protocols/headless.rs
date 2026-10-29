@@ -435,6 +435,11 @@ pub async fn run_with(
     // Name the directory that could not be opened: an operator has to know which
     // path failed, and the typed code must survive the extra context.
     let store_dir = context.project_store_dir();
+    // What the launch found about the project's data goes to stderr, where it
+    // never mixes with the run's output.
+    for notice in &context.notices {
+        eprintln!("ha: note: {notice}");
+    }
     // A worker's run leases the store its agents share; the lease is held until
     // the run is done.
     // A run of its own opens the project's shared store, the one its delegated

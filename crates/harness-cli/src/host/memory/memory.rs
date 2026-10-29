@@ -29,7 +29,7 @@ use harness_types::{ErrorCode, HarnessError};
 use serde_json::{Value, json};
 
 use super::harness::{self, Entry};
-use super::memory_store::Writer;
+use super::memory_store::{self, Writer};
 
 const TREE_LABELS: &str =
     "a tree is labels of letters, digits, _ and - joined by /, such as user/preferences";
@@ -142,11 +142,22 @@ pub struct ProjectTag {
 }
 
 impl ProjectTag {
-    /// The project rooted at `root`.
+    /// The project ha runs in at `root`: its key and the name of the folder
+    /// the key names, so a subdirectory or a linked worktree of a repository
+    /// is tagged as the repository.
     #[must_use]
     pub fn of(root: &Path) -> Self {
+        Self::named(
+            super::bootstrap::project_key_of(root),
+            &super::bootstrap::project_root(root),
+        )
+    }
+
+    /// The tag of the project keyed `key`, whose key root is `root`.
+    #[must_use]
+    pub fn named(key: String, root: &Path) -> Self {
         Self {
-            key: super::bootstrap::project_key_of(root),
+            key,
             name: root.file_name().map_or_else(
                 || root.display().to_string(),
                 |name| name.to_string_lossy().into_owned(),
@@ -157,6 +168,46 @@ impl ProjectTag {
     fn value(&self) -> Value {
         json!({"key": self.key, "name": self.name})
     }
+}
+
+/// Give the global store's entries kept for the project once keyed `from`
+/// this tag, through the store's own read-modify-write under its lock: each
+/// entry moved is one event of the migration, and its id stays. Returns how
+/// many entries moved; with none, nothing is written.
+///
+/// # Errors
+/// The store cannot be locked, read or written.
+pub fn retag_project(data_dir: &Path, from: &str, to: &ProjectTag) -> Result<usize, String> {
+    let global = harness::global_dir(data_dir);
+    if !memory_store::db_path(&global).is_file()
+        && !global.join(memory_store::LEGACY_STATE).is_file()
+    {
+        return Ok(0);
+    }
+    let _lock = harness::lock_state(&global)?;
+    let mut document = memory_store::load_document(&global)?;
+    let mut moved = 0;
+    if let Some(kinds) = document["entries"].as_object_mut() {
+        for entry in kinds
+            .values_mut()
+            .filter_map(Value::as_object_mut)
+            .flat_map(|entries| entries.values_mut())
+            .filter_map(Value::as_object_mut)
+        {
+            if harness::project_key(entry.get("project")).as_deref() == Some(from) {
+                entry.insert("project".to_owned(), to.value());
+                moved += 1;
+            }
+        }
+    }
+    if moved > 0 {
+        memory_store::save_document(
+            &global,
+            &document,
+            &Writer::new("migration", &json!({"via": "project key"}), "adopt"),
+        )?;
+    }
+    Ok(moved)
 }
 
 impl MemoryHost {

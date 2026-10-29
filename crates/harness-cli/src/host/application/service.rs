@@ -5470,6 +5470,7 @@ impl SessionPort for AgentSessionService {
             judge: config.verify.judge,
             hooks: config.hooks.len(),
             mcp_servers: config.mcp_servers.len(),
+            other_stores: super::adoption::other_stores_of(&self.data_dir, &self.workspace_root),
         };
         let subsystems = super::doctor::audit(
             &self.global_config_dir,

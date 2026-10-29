@@ -119,7 +119,7 @@ Explicit `#[path]` declarations preserve the logical `crate::interactive::*` nam
 
 ### 5.1 Startup
 
-1. `harness-cli` parses the command and resolves configuration. Launch resolution reads the caller directory, project identity, Git root, user paths and non-secret configuration; it opens no store, resolves no model and makes no network call.
+1. `harness-cli` parses the command and resolves configuration. Launch resolution reads the caller directory, project identity, Git root, user paths and non-secret configuration; it opens no project store, starts no process, resolves no model and makes no network call. The project is keyed by its repository: a subdirectory or a linked worktree of a Git repository is the main checkout's project ([project identity](PROJECT_IDENTITY.en.md)); the one write launch may make is moving a store this project kept under its older key into place.
 2. The host opens the selected SQLite data directory and obtains the single-writer ownership/fencing boundary.
 3. The CLI creates the application services it needs: session, runtime, tools, orchestrator, extensions and maintenance.
 4. The kernel validates required service contracts before work is admitted. A missing required provider or incompatible generation is a composition error, not a degraded successful run.
