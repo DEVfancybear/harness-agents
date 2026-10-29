@@ -117,7 +117,7 @@ check "deleted by the model" 'events | grep -q "^delete|delete|model|queue-choic
 check "reverted by the model" 'events | grep -q "^insert|revert|model|queue-choice|v3|"'
 
 echo "################ 8. P2: the tree, a move that keeps each entry, the history feed"
-run_exec m8 "Dùng tool memory action tree (không cần tham số khác) rồi liệt kê ngắn các nhánh cây trong global và mỗi nhánh có bao nhiêu entry."
+run_exec m8 "Dùng tool memory action tree (không cần tham số khác) rồi liệt kê mọi nhánh cây trong global, kể cả nhánh con, mỗi nhánh bằng đường dẫn đầy đủ của nó và số entry."
 check "the model read the tree" 'answer m8 | grep -q "team/decisions\|decisions"'
 before=$(row memory queue-choice | cut -d'|' -f1)
 run_exec m9 "Dùng tool memory action move với source '/global/team', destination '/global/platform', dry_run false. Không làm gì khác. Trả lời: số entry đã chuyển."

@@ -279,7 +279,7 @@ for index in range(10):
     put(f"aa_old_{index}", f"Archive shelf {index}", f"Shelf {index} of the archive holds binder {index + 40}.", "archive", 400 + index)
 put("zz_newest", "Kiwi tag", "The newest note: the build tag is kiwi-31.", "zz", 0)
 put("usage_probe", "Usage probe", "The staging bucket is named orchid-77.", "probe", 200)
-put("zz_coffee", "Máy pha cà phê", "Máy pha cà phê của văn phòng nằm ở tầng ba, cạnh phòng họp Sen.", "van_phong", 900)
+put("zz_mpcp", "Máy pha cà phê", "Máy pha cà phê của văn phòng nằm ở tầng ba, cạnh phòng họp Sen.", "van_phong", 900)
 os.makedirs(os.path.dirname(path), exist_ok=True)
 json.dump(state, open(path, "w", encoding="utf-8"), ensure_ascii=False)
 EOF
