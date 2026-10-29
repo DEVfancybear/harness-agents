@@ -43,7 +43,8 @@ Maintainer đã quyết:
 | Chủ đề | Quyết định |
 |---|---|
 | Chia sẻ | **Chưa làm.** ha chỉ chạy cục bộ, một người dùng: không có space, principal, group, grant, API key, login, invite hay backend từ xa. Tính lại sau. |
-| Lưu memory | **Mỗi scope một kho SQLite**, theo mô hình record của ME: tree, name, meta, temporal, version, event log, FTS5, vector. Thay cho `harness_state.json`. |
+| Lưu memory | **Mỗi scope một kho SQLite**, theo mô hình record của ME: tree, name, meta, temporal, version, event log. Thay cho `harness_state.json`. |
+| Theo nghĩa | **Không dùng embedding (0.8.8).** Search và digest xếp theo từ, rồi theo entry được dùng gần đây và nhiều đến đâu (§14). Không gì phải chờ một lần gọi mạng, và không gì rời khỏi máy. |
 | Knowledge | **Vẫn là file Markdown**, người dùng sửa tay được. Có thêm lịch sử trang và revert, và dùng chung một search với memory. |
 | Bộ lọc | **Đủ như ME:** tree theo đường dẫn chính xác, lquery và ltxtquery; `meta` kiểu "chứa"; `metaPredicate` (JSONPath); temporal 5 kiểu; `grep`. |
 
@@ -76,8 +77,8 @@ Trạng thái trước khi làm: ✅ có, 🟡 một phần, ❌ chưa có. P1 t
 | Giữ log theo thời gian (30 ngày) | ❌ | P1 |
 | `tree` (số lượng mỗi nút), `count`, `mv`, `copy`, `delete_tree`, get/delete theo path | ❌ | P2 |
 | BM25, chỉ trả kết quả thật sự khớp từ khóa | 🟡 | P3 |
-| Semantic cho memory, với hàng đợi embedding chạy nền | ❌ | P3 |
-| Hybrid RRF có trọng số; `weights`, `candidateLimit`, `semanticThreshold` theo từng lần gọi | 🟡 | P3 |
+| Semantic cho memory, với hàng đợi embedding chạy nền | ❌ | P3 · bỏ ở 0.8.8 (§14) |
+| Hybrid RRF có trọng số; `weights`, `candidateLimit`, `semanticThreshold` theo từng lần gọi | 🟡 | P3 · từ 0.8.8 chỉ còn `candidate_limit` |
 | Bộ lọc `tree`, `meta`, `metaPredicate`, `temporal`, `grep`; duyệt chỉ bằng lọc, có `order_by` | ❌ | P3 |
 | `select` (chọn trường) và `format` yaml/json/compact | 🟡 | P3 |
 | Lịch sử trang knowledge, revert, undelete | ❌ | P4 |
@@ -145,7 +146,7 @@ CREATE TABLE memory (
   doc             TEXT NOT NULL,         -- toàn bộ entry như ha ghi (không mất trường nào)
   version         INTEGER NOT NULL,
   version_hash    TEXT NOT NULL,         -- 32 ký tự hex của SHA-256 trên payload chuẩn hóa
-  content_version INTEGER NOT NULL,      -- chặn ghi embedding cũ (P3)
+  content_version INTEGER NOT NULL,      -- tăng khi title hoặc content đổi
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL,
   UNIQUE (kind, key)
@@ -174,8 +175,15 @@ CREATE INDEX memory_event_at ON memory_event(at DESC);
 
 CREATE TABLE refinement (seq INTEGER PRIMARY KEY, event TEXT NOT NULL);  -- mảng `refinements`
 CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);     -- `schema` và các trường cấp gốc khác
--- P3 (schema 2): memory_vector, memory_embedding_queue (§6)
+-- P3 (schema 2): memory_vector, memory_embedding_queue (schema 4 xóa đi)
 -- 0.8.2 (schema 3): cột `name` của V1 đổi tên thành `key`, và thêm cột `name` (§13)
+-- 0.8.8 (schema 4): thêm memory_usage, xóa hai bảng embedding (§14)
+CREATE TABLE memory_usage (
+  memory_id     TEXT PRIMARY KEY,   -- xóa cùng memory của nó
+  reads         INTEGER NOT NULL DEFAULT 0,  last_read_at  TEXT,
+  hits          INTEGER NOT NULL DEFAULT 0,  last_hit_at   TEXT,
+  shown         INTEGER NOT NULL DEFAULT 0,  last_shown_at TEXT
+);
 ```
 
 Entry của ha ánh xạ sang record của ME như sau:
@@ -328,7 +336,7 @@ Các action mới của tool `memory`. Agent con chỉ có các action chỉ đ�
 | `delete` với `path` | `delete_by_path` | |
 | `delete_tree` (`tree`, `dry_run`) | `me_memory_delete_tree` | |
 | `history` | `me_memory_history` | **Có `id`** (key, path hoặc `memory_id`): các phiên bản của entry. Mỗi phiên bản kèm tree, name, meta, temporal, cause và `operation_id`. Mỗi trang `limit` phiên bản (mặc định 10, tối đa 100), bắt đầu từ `offset`. **Không có `id`:** feed, giới hạn theo `tree`, `operation_id`, `memory_id` hoặc `since`. Thêm được `until`, `operation`, `order`, `cursor` (keyset theo `event_id`), `limit` (tối đa 1000) |
-| `status` | `memory.embeddingStatus` | Số entry mỗi scope; số entry đã embed, đang chờ, thất bại; entry chờ lâu nhất; lỗi gần nhất |
+| `status` | `memory.embeddingStatus` | Số entry mỗi scope, và `search: words`; một ghi chú khi còn sót `.ha-embedding.json` cũ (0.8.8) |
 
 Mỗi refinement ghi lại `operation_id` của lần ghi, để `/refine --rollback` và
 `history operation_id=…` khớp nhau về những gì một lượt review đã đổi.
@@ -359,7 +367,16 @@ Trọng số trường: title 3, content 1, tree và name 1, giá trị meta 0,5
 chứa ít nhất một từ của câu hỏi mới được trả về: điều kiện "phải thật sự khớp"
 của ME. Các cách diễn đạt (`queries`) được gộp bằng RRF ngay trong nhánh này.
 
-### 6.2 Theo nghĩa
+Search khớp theo từ, không theo nghĩa. Kết quả rỗng ghi rõ các query đã tìm và
+khuyên tìm lại bằng từ khác - từ đồng nghĩa, ngôn ngữ còn lại mà project dùng,
+một từ ngắn hơn hoặc rộng hơn, một tên hay đường dẫn trong code - trước khi nói
+là không nhớ. Model tự chọn từ; ha không giữ bảng từ đồng nghĩa nào.
+
+### 6.2 Theo nghĩa (bỏ ở 0.8.8)
+
+Phần dưới là cách 0.8.1 đến 0.8.7 tìm theo nghĩa. 0.8.8 đã bỏ: các bảng bị xóa
+(§14), và `semantic`, `semantic_threshold`, `weights`, `has_embedding` không còn
+trong tool.
 
 Memory dùng endpoint embedding đã cấu hình cho thư viện knowledge global
 (`/knowledge semantic --global`). Chưa cấu hình thì không embed gì.
@@ -382,9 +399,9 @@ hạn độ phủ của HNSW như ME. Kết quả là độ tương đồng cosi
 `semantic_threshold` nằm trong `[0, 1]`; giá trị ngoài khoảng bị từ chối chứ
 không bị kẹp lại.
 
-### 6.3 Hybrid
+### 6.3 Hybrid (bỏ ở 0.8.8)
 
-Reciprocal Rank Fusion có trọng số, giống ME:
+Đến 0.8.7, Reciprocal Rank Fusion có trọng số, giống ME:
 
 ```text
 score = w_fulltext / (60 + rank_fulltext) + w_semantic / (60 + rank_semantic)
@@ -416,6 +433,9 @@ nhánh lại thắng kết quả mà cả hai nhánh cùng tìm thấy.
 | semantic | cosine |
 | hybrid | RRF |
 | chỉ lọc | -1 |
+
+Từ 0.8.8 search chỉ còn hai mode: `fulltext` (BM25, thứ tự có tính cả độ mới và
+mức dùng, §14) và `filter`.
 
 ### 6.4 Bộ lọc
 
@@ -460,16 +480,14 @@ tới 10 000.
 
 | Tham số | Cách dùng |
 |---|---|
-| `select` | Các trường cần trả: `id`, `memory_id`, `name`, `tree`, `kind`, `title`, `meta`, `meta.<khóa>` (nằm trong `meta`; khóa không có thì bỏ, như ME), `temporal`, `version`, `version_hash`, `score`, `has_embedding`, và lát cắt content `content:N`, `content:M:N`, `content:M:` (tính theo ký tự, kèm `content_length`). Dùng được với `search`, `read` và `history`. |
+| `select` | Các trường cần trả: `id`, `memory_id`, `name`, `tree`, `kind`, `title`, `meta`, `meta.<khóa>` (nằm trong `meta`; khóa không có thì bỏ, như ME), `temporal`, `version`, `version_hash`, `score`, và lát cắt content `content:N`, `content:M:N`, `content:M:` (tính theo ký tự, kèm `content_length`). Dùng được với `search`, `read` và `history`. |
 | `format` | `json` (mặc định của tool, dạng gọn), `compact`, hoặc `yaml`; dùng được với `search`, `read` và `history`. |
 
 `format: yaml` dùng một bộ xuất nhỏ trong `memory/search.rs`, đặt ngoặc kép cho
 mọi chuỗi mà YAML có thể đọc thành thứ khác. Đọc YAML (pack, import) cần một
 parser: crate YAML cho serde sẽ được chọn và ghim khi làm tiếp P5.
 
-`semantic` là điều muốn tìm theo nghĩa. Không có nó, `query` cũng được tìm theo
-nghĩa mỗi khi đã cấu hình embedding, như search knowledge vẫn làm. Một `semantic`
-mà chưa có embedding thì được tìm theo từ, và kết quả ghi rõ lý do.
+Đến 0.8.7 `semantic` là điều muốn tìm theo nghĩa; 0.8.8 bỏ nó cùng embedding.
 
 ## 7. Knowledge và history (P4)
 
@@ -502,8 +520,7 @@ trang.
 ### Một search cho cả hai
 
 `search` của memory nhận `sources: ["memory", "knowledge"]`; mặc định chỉ tìm
-memory. Kết quả knowledge lấy từ engine knowledge (BM25, hoặc hybrid nếu đã cấu
-hình) rồi gộp bằng RRF thành một danh sách. Mỗi kết quả ghi rõ `source`, và với
+memory. Kết quả knowledge lấy từ engine knowledge (BM25) rồi gộp bằng RRF thành một danh sách. Mỗi kết quả ghi rõ `source`, và với
 trang knowledge thì có `path` cùng khoảng dòng. CLI làm tương tự với
 `--knowledge`.
 
@@ -525,8 +542,6 @@ Kết quả ghi rõ việc này.
     không cần thêm cột;
   - `kind`, một loại event của journal hoặc một danh sách;
   - `order`, `newest` (mặc định) hoặc `oldest` trước khi điểm bằng nhau.
-
-  Kết quả tìm theo nghĩa cũng phải nằm trong cùng khoảng thời gian và loại đó.
 - **`history_read`** trả thêm `previous_source_id` và `next_source_id` trong cùng
   phiên, theo `sequence`, để đọc nối tiếp mà không phải tìm lại.
 
@@ -623,7 +638,7 @@ liệu. Search chung ở §7 tìm tới được chúng dù nằm ở đâu.
 - **`ha memory serve`.** Web console knowledge, mở rộng thêm memory: duyệt cây,
   search có bộ lọc, lịch sử một entry kèm revert, và nút trước/sau theo `$prev`.
 - **`ha doctor`.** Thêm phần memory: các kho và phiên bản schema, số entry và
-  event, file cũ còn chờ nhập, trạng thái hàng đợi embedding, các tích hợp đã cài.
+  event, file cũ còn chờ nhập, các tích hợp đã cài.
 
 ## 11. Quy tắc tương thích
 
@@ -645,7 +660,7 @@ và lần chạy đối chứng đó được báo cáo. Bump version và releas
 |---|---|---|
 | **P1 Lõi** | §3, §4: kho SQLite, lớp document, chuyển dữ liệu, event log có actor/cause/operation, thời gian giữ log, `name`/`tree`/`meta`/`temporal`/`on_conflict`, revert dựa trên log, luật temporal cho digest | memory, kernel, knowledge, compaction, session-continuity, children, memory-store |
 | **P2 Sắp xếp** | §5: get/delete theo path, tree, count, move, copy, delete_tree, feed lịch sử | memory, children, memory-store |
-| **P3 Tìm kiếm** | §6: FTS5 BM25, vector và hàng đợi cho memory, RRF có trọng số (cả knowledge và history), mọi bộ lọc, JSONPath, select/format, crate YAML | memory, knowledge, memory-store |
+| **P3 Tìm kiếm** | §6: FTS5 BM25, vector và hàng đợi cho memory (bỏ ở 0.8.8), RRF có trọng số (cả knowledge và history), mọi bộ lọc, JSONPath, select/format, crate YAML | memory, knowledge, memory-store |
 | **P4 Knowledge và history** | §7: lịch sử trang và revert, search chung, bộ lọc history và liên kết thread | knowledge, session-continuity, memory-store |
 | **P5 CLI** | §8: `ha memory`, bốn định dạng, `--legacy`, pack | memory-store |
 | **P6 Importer** | §9: docs, git, phiên Claude, Codex, OpenCode, kind `record` | memory-store |
@@ -686,3 +701,52 @@ Không làm:
 - batch create của ME, vì chỉ importer của nó dùng (để P5);
 - danh sách stopword của ME, vì ha không đánh giá văn bản theo danh sách từ;
 - chế độ JSONPath `strict`, vì ME chạy lax.
+
+Các dòng về vector và `has_embedding` mô tả 0.8.2; 0.8.8 đã bỏ cả hai (§14).
+
+## 14. Từ khóa, độ mới và mức dùng (0.8.8)
+
+0.8.8 bỏ semantic search ở mọi nơi: search memory, nhánh theo nghĩa của digest,
+phần recall theo nghĩa của readout, search knowledge, search history, cache
+embedding và `/knowledge semantic`. Nó vốn tắt nếu người dùng chưa cấu hình
+endpoint, và khi bật thì có thể làm một lượt đứng chờ provider, hoặc loại vĩnh
+viễn entry khi provider tạm hỏng. Thay vào đó, thứ hạng dựa vào:
+
+**Mức dùng.** Schema 4 thêm `memory_usage`: theo memory id, `reads` và
+`last_read_at` (`read` của tool memory), `hits` và `last_hit_at` (các kết quả một
+lần `search` memory trả về, cả hai mode), `shown` và `last_shown_at` (các entry
+digest của một lượt đã hiện, kể cả entry pinned). Mỗi đợt là một upsert trong
+transaction riêng, chỉ cho id kho đang giữ; dòng bị xóa cùng entry. Một lần dùng
+không bao giờ đụng document của entry hay event log, nên không thành một version
+và không đẩy version có thể revert ra ngoài. Digest ghi các entry đã hiện ở một
+thread nền, ngoài đường đi của lượt.
+
+**Xếp hạng.** Digest và search memory xếp như nhau:
+
+1. Constraint trước (ở digest), entry pinned đứng ngoài thứ hạng.
+2. Entry khớp từ (BM25 lớn hơn 0), tốt nhất trước. Nhóm đầu - gấp đôi số được
+   hiện: 12 ở digest, gấp đôi `limit` ở search - được gộp bằng RRF có trọng số
+   với hai nhánh nhẹ hơn (mỗi nhánh 0,3, nhánh từ là 1):
+   - **độ mới**: thời điểm muộn hơn giữa `updated_at` và `last_read_at`;
+   - **mức dùng**: `reads`, giảm một nửa trọng số sau mỗi 30 ngày kể từ lần đọc
+     cuối.
+
+   Entry không có thời điểm hoặc chưa được đọc thì không vào nhánh đó. Phần còn
+   lại của các entry khớp giữ thứ tự theo từ, nên entry chỉ vừa khớp không bao
+   giờ vượt được nhóm tốt nhất.
+3. Entry không khớp gì đứng sau mọi entry khớp, entry được ghi hoặc đọc gần nhất
+   trước; khi không có từ nào, mọi entry xếp như vậy. Trước đây chúng xếp theo
+   thứ tự chữ cái.
+
+`hits` và `shown` được đếm nhưng không bao giờ dùng để xếp: chúng ghi lại cái
+đã đặt trước model, không phải cái model đã dùng, và xếp theo chúng sẽ tự khuếch
+đại. Khi bằng nhau, vị trí trước thắng (path, title và key ở digest), nên cùng
+một trạng thái luôn xếp như nhau. `score` của một kết quả search vẫn là điểm
+BM25.
+
+**Nâng cấp.** Kho mở lên schema 4: `memory_vector` và `memory_embedding_queue`
+bị xóa, ngoài ra không đổi gì. `.ha-embedding.json`, `.ha-embedding.sqlite` của
+thư viện knowledge và `<data>/history-embedding/` được để nguyên trên đĩa và
+không bao giờ được đọc. `memory status` và `/knowledge status` báo khi vẫn còn
+`.ha-embedding.json`, và diagnostics ghi `knowledge.embedding_config_ignored`
+một lần.
