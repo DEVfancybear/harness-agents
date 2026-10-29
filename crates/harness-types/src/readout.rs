@@ -35,6 +35,12 @@ pub struct Slot {
     pub attention: Vec<(usize, f64)>,
     /// Cosine similarity of the slot's read to the query.
     pub relevance: f64,
+    /// What of the query the slot read for, of unit length: the whole query
+    /// for the first slot, what the earlier slots left of it for a later one.
+    pub condition: Vec<f64>,
+    /// How much of the query the slot's read explains: the length of what it
+    /// took off the residual, the query being of unit length.
+    pub explained: f64,
 }
 
 impl Slot {
@@ -126,6 +132,8 @@ pub fn readout(documents: &[Vec<f32>], query: &[f32], slots: usize) -> Vec<Slot>
         out.push(Slot {
             attention: ranked,
             relevance,
+            condition,
+            explained,
         });
         // A slot that explained nothing would repeat itself forever.
         if explained.abs() < 1e-9 {
@@ -157,15 +165,22 @@ pub struct Recalled {
 }
 
 /// [`readout`], rendered: each slot by the documents that carry most of its
-/// attention and stand out from the store, each document recalled by one slot
-/// only; a slot left with none is dropped.
+/// attention and stand out from the store for what the slot read for: the
+/// whole query for the first slot, the part the earlier ones left for a later
+/// one (the second part of a two-part request shares fewer of its words, and
+/// the whole query's statistic would drown it). A later slot that explains
+/// less than [`RESIDUAL_FLOOR`] of the query read what is left of it after
+/// its parts, its common words, and recalls nothing. Each document is
+/// recalled by one slot only; a slot left with none is dropped.
 #[must_use]
 pub fn recall(documents: &[Vec<f32>], query: &[f32], slots: usize) -> Vec<Recalled> {
-    let standing = standouts(documents, query);
     let mut taken = std::collections::BTreeSet::new();
     readout(documents, query, slots)
         .iter()
-        .filter_map(|slot| {
+        .enumerate()
+        .filter(|(index, slot)| *index == 0 || slot.explained >= RESIDUAL_FLOOR)
+        .filter_map(|(_, slot)| {
+            let standing = standing_out(documents, &slot.condition, STANDOUT);
             let carried = slot
                 .carriers(CARRIED_SHARE, CARRIERS)
                 .into_iter()
@@ -182,9 +197,33 @@ pub fn recall(documents: &[Vec<f32>], query: &[f32], slots: usize) -> Vec<Recall
 /// The documents whose similarity to the query stands out from the store's.
 #[must_use]
 pub fn standouts(documents: &[Vec<f32>], query: &[f32]) -> std::collections::BTreeSet<usize> {
+    standing_out(
+        documents,
+        &query
+            .iter()
+            .map(|value| f64::from(*value))
+            .collect::<Vec<_>>(),
+        STANDOUT,
+    )
+}
+
+/// The documents at least `deviations` standard deviations above the store's
+/// mean similarity to `query`, a query in `f64` as a slot keeps what it read
+/// for.
+fn standing_out(
+    documents: &[Vec<f32>],
+    query: &[f64],
+    deviations: f64,
+) -> std::collections::BTreeSet<usize> {
     let similarities = documents
         .iter()
-        .map(|document| cosine(document, query))
+        .map(|document| {
+            let document = document
+                .iter()
+                .map(|value| f64::from(*value))
+                .collect::<Vec<_>>();
+            cosine64(&document, query)
+        })
         .collect::<Vec<_>>();
     let known = similarities.iter().flatten().copied().collect::<Vec<_>>();
     if known.len() < STATISTIC_FROM {
@@ -205,7 +244,7 @@ pub fn standouts(documents: &[Vec<f32>], query: &[f32]) -> std::collections::BTr
         .iter()
         .enumerate()
         .filter(|(_, similarity)| {
-            similarity.is_some_and(|similarity| similarity >= mean + STANDOUT * deviation)
+            similarity.is_some_and(|similarity| similarity >= mean + deviations * deviation)
         })
         .map(|(index, _)| index)
         .collect()
@@ -214,9 +253,6 @@ pub fn standouts(documents: &[Vec<f32>], query: &[f32]) -> std::collections::BTr
 /// Cosine similarity of two vectors of one dimension.
 #[must_use]
 pub fn cosine(left: &[f32], right: &[f32]) -> Option<f64> {
-    if left.len() != right.len() || left.is_empty() {
-        return None;
-    }
     let left = left
         .iter()
         .map(|value| f64::from(*value))
@@ -225,8 +261,15 @@ pub fn cosine(left: &[f32], right: &[f32]) -> Option<f64> {
         .iter()
         .map(|value| f64::from(*value))
         .collect::<Vec<_>>();
-    let product = norm(&left) * norm(&right);
-    (product > 1e-12).then(|| dot(&left, &right) / product)
+    cosine64(&left, &right)
+}
+
+fn cosine64(left: &[f64], right: &[f64]) -> Option<f64> {
+    if left.len() != right.len() || left.is_empty() {
+        return None;
+    }
+    let product = norm(left) * norm(right);
+    (product > 1e-12).then(|| dot(left, right) / product)
 }
 
 /// A text's words for [`word_vectors`]: lower case, runs of letters and
@@ -401,6 +444,38 @@ mod tests {
         let recalled = recall(&documents, &[1.0, 0.1], 4);
         assert_eq!(recalled.len(), 1, "{recalled:?}");
         assert_eq!(recalled[0].documents[0].0, 3);
+    }
+
+    /// A later slot's document stands out for the part of the request that
+    /// slot read for, though not for the whole request: the second part of a
+    /// two-part request shares fewer of its words.
+    #[test]
+    fn a_later_slot_judges_by_the_part_it_read_for() {
+        let documents = [
+            words("Deploy day Deploys go out on Fridays"),
+            words("Spring sale SPRING10 takes ten percent off any order"),
+            words("Queue The team moved to NATS JetStream"),
+            words("JWT keys rotate every 14 days"),
+            words("Security audit The yearly security audit is due mid November"),
+            words(
+                "Billing release The billing service was deployed on Friday by the payments team",
+            ),
+            words("Health The user has iron deficiency anaemia they avoid tea with meals"),
+        ];
+        let (vectors, query) = word_vectors(
+            &documents,
+            &words("the user health and anaemia and which day deploys go out"),
+        );
+        assert!(!standouts(&vectors, &query).contains(&6), "the premise");
+        let recalled = recall(&vectors, &query, 4)
+            .iter()
+            .flat_map(|slot| slot.documents.iter().map(|(index, _)| *index))
+            .collect::<Vec<_>>();
+        assert!(
+            recalled.contains(&0) && recalled.contains(&6),
+            "{recalled:?}"
+        );
+        assert_eq!(recalled.len(), 2, "{recalled:?}");
     }
 
     #[test]

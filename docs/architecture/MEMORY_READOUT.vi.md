@@ -59,7 +59,7 @@ số.
 | `K` ô điều kiện theo câu hỏi | Tối đa `K` ô (1 tới 16 cho lời gọi tool, mặc định 8), mỗi ô điều kiện theo câu hỏi. |
 | Ô có danh tính riêng (`Q0` đã học) | Mỗi ô đọc phần của câu hỏi mà các ô trước còn để lại: phần dư của câu hỏi sau khi trừ các lần đọc trước (Gram-Schmidt). Câu hỏi về hai việc sẽ chia vào hai ô. |
 | Cross-attention trên mọi tài liệu, `L_ref = 2` | Attention softmax trên mọi vector theo cosine (nhiệt độ 0,05), hai vòng, dùng câu hỏi làm kết nối dư. |
-| `K` token bất kể kho lớn cỡ nào | Tối đa `K` ô, mỗi ô thể hiện bằng các tài liệu mang 80 % attention của nó (tối đa 3), mỗi tài liệu chỉ thuộc một ô. Tài liệu chỉ được hiện khi độ tương đồng cao hơn trung bình của kho một độ lệch chuẩn: đây là thống kê của kho, nên đúng với mọi thang đo của encoder. |
+| `K` token bất kể kho lớn cỡ nào | Tối đa `K` ô, mỗi ô thể hiện bằng các tài liệu mang 80 % attention của nó (tối đa 3), mỗi tài liệu chỉ thuộc một ô. Tài liệu chỉ được hiện khi độ tương đồng với phần mà ô của nó đọc (cả yêu cầu với ô đầu, phần các ô trước còn để lại với ô sau) cao hơn trung bình của kho một độ lệch chuẩn: đây là thống kê của kho, nên đúng với mọi thang đo của encoder. Phần thứ hai của một yêu cầu hai phần chung ít từ hơn, nên nếu xét theo cả yêu cầu thì entry của nó sẽ không nổi bật. Một ô sau giải thích được ít hơn ngưỡng phần dư (0.2) của yêu cầu thì chỉ đọc phần còn lại sau các phần chính, tức các từ phổ biến, nên không hiện gì. |
 | Kết hợp với truy xuất (việc tương lai) | Đến 0.8.7 digest kết hợp phép đọc theo nghĩa với xếp hạng theo từ; từ 0.8.8 digest xếp theo từ, độ mới và mức dùng. |
 
 ## 4. Chạy ở đâu
