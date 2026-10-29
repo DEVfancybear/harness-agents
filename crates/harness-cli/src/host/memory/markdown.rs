@@ -16,7 +16,10 @@
 //!   for one works with the other;
 //! - [`init`] writes an empty store and, when asked, the pre-commit hook;
 //! - [`context_blocks`] puts the store's policy and its index in every turn of a
-//!   project that keeps one, as the package's boot path reads only the index.
+//!   project that keeps one, as the package's boot path reads only the index;
+//! - [`edit`] is the one way the host writes a store file (`init`, the
+//!   migration's archive, the session log's sections, the learning loop's
+//!   rules and facts): under one lock, re-read before it is replaced, whole.
 
 // `.md` is matched case-sensitively, as the package matches it: a store read
 // the same way by both checkers.
@@ -1254,6 +1257,15 @@ fn link_tokens(line: &str) -> Vec<(String, Option<char>)> {
     tokens
 }
 
+/// Whether the lint checks a path-shaped token of an index line: not a
+/// template's `YYYY` placeholder or a URL, and not a bare prose word (no `/`,
+/// and not opened by a backtick or a parenthesis).
+fn checked_link(token: &str, opener: Option<char>) -> bool {
+    !token.contains("YYYY")
+        && !token.starts_with("http")
+        && (token.contains('/') || matches!(opener, Some('`' | '(')))
+}
+
 fn check_index_links(config: &Config, root: &Path) -> Check {
     const NAME: &str = "index-links";
     let Some(index) = &config.index else {
@@ -1273,11 +1285,7 @@ fn check_index_links(config: &Config, root: &Path) -> Check {
     let mut checked = 0_usize;
     for (number, line) in split_lines(&content).into_iter().enumerate() {
         for (token, opener) in link_tokens(line) {
-            if token.contains("YYYY") || token.starts_with("http") {
-                continue;
-            }
-            // A bare prose word, not a path.
-            if !token.contains('/') && !matches!(opener, Some('`' | '(')) {
+            if !checked_link(&token, opener) {
                 continue;
             }
             checked += 1;
@@ -1483,18 +1491,26 @@ pub fn archive_for_migration(root: &Path, source: &Path) -> Result<String, Strin
     let date = chrono::Utc::now().format("%Y-%m-%d");
     let mut relative = format!("memory/archive/{date}-{stem}.flat.md");
     let mut copy = 2;
-    while root.join(&relative).exists() {
+    // A new archive file each time: one that is there is never written over.
+    while root.join(&relative).exists()
+        || !edit(root, &relative, |current| {
+            current.is_none().then(|| text.clone())
+        })?
+    {
         relative = format!("memory/archive/{date}-{stem}-{copy}.flat.md");
         copy += 1;
     }
-    let path = root.join(&relative);
-    std::fs::create_dir_all(path.parent().unwrap_or(root))
-        .and_then(|()| std::fs::write(&path, &text))
-        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-    // A flat index is replaced by an empty one, which the migration fills.
-    if source == root.join(DEFAULT_INDEX) {
-        std::fs::write(source, TEMPLATE_INDEX)
-            .map_err(|error| format!("cannot write {}: {error}", source.display()))?;
+    // A flat index is replaced by an empty one, which the migration fills:
+    // only while it still holds what was archived.
+    if source == root.join(DEFAULT_INDEX)
+        && !edit(root, DEFAULT_INDEX, |current| {
+            (current == Some(text.as_str())).then(|| TEMPLATE_INDEX.to_owned())
+        })?
+    {
+        return Err(format!(
+            "{} changed while it was archived as {relative}; run the migration again",
+            source.display()
+        ));
     }
     Ok(relative)
 }
@@ -1558,18 +1574,19 @@ fn write_new(
     outcome: &mut InitOutcome,
 ) -> Result<(), String> {
     for (relative, content) in files {
-        let path = root.join(&relative);
-        if path.exists() {
+        if root.join(&relative).exists() {
             outcome.kept.push(relative);
             continue;
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        // Written only while it is not there: one the agent or another ha
+        // wrote meanwhile is kept.
+        if edit(root, &relative, |current| {
+            current.is_none().then(|| content.clone())
+        })? {
+            outcome.written.push(relative);
+        } else {
+            outcome.kept.push(relative);
         }
-        std::fs::write(&path, content)
-            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-        outcome.written.push(relative);
     }
     Ok(())
 }
@@ -1596,6 +1613,174 @@ pub fn ram_cap(root: &Path, path: &str) -> Option<usize> {
 #[must_use]
 pub fn lint_chars(text: &str) -> usize {
     char_count(text)
+}
+
+// --- the host's writes ---
+
+/// The lock every host write into a store holds, relative to the store's
+/// root. It is the innermost lock the host takes: a writer may hold its own
+/// (the session log's, the lessons') around it, and nothing takes another
+/// lock while holding it.
+pub const LOCK_FILE: &str = ".harness/markdown-memory.lock";
+
+/// How long one host write waits for another.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many times a write reads a file again that changed between its read
+/// and its replace, before it gives up and leaves the file as it is.
+const EDIT_ATTEMPTS: usize = 5;
+
+/// Why a host write into the store did not happen.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EditError {
+    /// The file is there but cannot be read as text (not UTF-8, held by
+    /// another program): it is never written over.
+    Unreadable(String),
+    /// The path is not a store file, the lock or the write failed, or the file
+    /// kept changing under the write.
+    Failed(String),
+}
+
+impl std::fmt::Display for EditError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(message) | Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<EditError> for String {
+    fn from(error: EditError) -> Self {
+        error.to_string()
+    }
+}
+
+/// The file `relative` names inside the store at `root`: a plain relative
+/// path, never one that leaves the root or goes through a hidden directory
+/// (`.git`, `.harness`). A file's own name is the host's to choose: a rule
+/// about secrets is named after them.
+fn store_path(root: &Path, relative: &str) -> Result<PathBuf, EditError> {
+    let path = Path::new(relative);
+    let components = path.components().collect::<Vec<_>>();
+    let plain = !components.is_empty()
+        && components.iter().enumerate().all(|(index, component)| {
+            matches!(component, std::path::Component::Normal(name)
+                if index + 1 == components.len() || !name.to_string_lossy().starts_with('.'))
+        });
+    if !plain {
+        return Err(EditError::Failed(format!(
+            "{relative} is not a file of the markdown memory store"
+        )));
+    }
+    Ok(root.join(path))
+}
+
+/// A store file's text as a write reads it: `None` when it is not there.
+fn read_current(path: &Path, relative: &str) -> Result<Option<String>, EditError> {
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| {
+            EditError::Unreadable(format!(
+                "{relative} is not UTF-8 text; ha leaves it as it is"
+            ))
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(EditError::Unreadable(format!(
+            "cannot read {relative}: {error}; ha leaves it as it is"
+        ))),
+    }
+}
+
+/// The one way the host writes a file of the store at `root`: under the
+/// store's lock ([`LOCK_FILE`]), `change` maps the file's text (`None` when it
+/// is not there) to its new text (`None`: no change). Just before the new text
+/// replaces the file, the file is read again: when the agent or the user wrote
+/// it in between, `change` runs again on what they wrote, so nothing they
+/// wrote is lost. The file is replaced whole, through a temporary file beside
+/// it. Returns whether the file was written.
+///
+/// # Errors
+/// [`EditError::Unreadable`]: the file cannot be read, and is left as it is.
+/// [`EditError::Failed`]: `relative` is not a store file, the lock or the write
+/// failed, or the file kept changing under the write.
+pub fn edit(
+    root: &Path,
+    relative: &str,
+    mut change: impl FnMut(Option<&str>) -> Option<String>,
+) -> Result<bool, EditError> {
+    let path = store_path(root, relative)?;
+    super::session_log::ignore_host_files(root);
+    let _lock = super::files::hold(&root.join(LOCK_FILE), LOCK_WAIT, "markdown memory write")
+        .map_err(EditError::Failed)?;
+    let mut current = read_current(&path, relative)?;
+    for _ in 0..EDIT_ATTEMPTS {
+        let Some(updated) = change(current.as_deref()) else {
+            return Ok(false);
+        };
+        if current.as_deref() == Some(updated.as_str()) {
+            return Ok(false);
+        }
+        let mut changed = None;
+        let written = super::files::write_atomic_checked(&path, &updated, || {
+            let now = read_current(&path, relative);
+            if matches!(&now, Ok(text) if *text == current) {
+                return Ok(());
+            }
+            changed = Some(now);
+            Err(format!("{relative} changed under the write"))
+        });
+        match (written, changed) {
+            (Ok(()), _) => return Ok(true),
+            (Err(_), Some(now)) => current = now?,
+            (Err(error), None) => return Err(EditError::Failed(error)),
+        }
+    }
+    Err(EditError::Failed(format!(
+        "{relative} kept changing while ha wrote it; ha left it as it is"
+    )))
+}
+
+/// The store's index file, relative to `root`: the one its config names, or
+/// `MEMORY.md`.
+///
+/// # Errors
+/// The config names an index outside the project or on a protected path,
+/// which the turn does not read and the host never writes.
+pub fn index_file(root: &Path) -> Result<String, String> {
+    let index = Config::load(root, None)
+        .ok()
+        .and_then(|config| config.index)
+        .unwrap_or_else(|| DEFAULT_INDEX.to_owned());
+    if store_path(root, &index).is_err() || is_sensitive_workspace_path(Path::new(&index)) {
+        return Err(format!(
+            "the markdown memory index {index} is outside the project or protected"
+        ));
+    }
+    Ok(index)
+}
+
+/// A short title for a line the host writes into the index: `text` on one
+/// line, cut at `limit` characters (a whole character), and with nothing in it
+/// the lint would read as a link to check: the line's own path is its only
+/// link.
+#[must_use]
+pub fn index_title(text: &str, limit: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut title = if text.chars().count() > limit {
+        format!("{}...", text.chars().take(limit).collect::<String>())
+    } else {
+        text
+    };
+    if link_tokens(&title)
+        .iter()
+        .any(|(token, opener)| checked_link(token, *opener))
+    {
+        title = title
+            .replace('`', "'")
+            .replace('(', "[")
+            .replace(')', "]")
+            .replace('/', " / ");
+    }
+    title
 }
 
 // --- the turn ---
@@ -2107,6 +2292,169 @@ mod tests {
         assert!(
             notices[0].contains("outside the project or protected"),
             "{notices:?}"
+        );
+    }
+
+    /// Append `line` to the note through the store's writer.
+    fn append(root: &Path, relative: &str, line: &str) -> Result<bool, EditError> {
+        edit(root, relative, |current| {
+            Some(format!("{}{line}\n", current.unwrap_or("# note\n")))
+        })
+    }
+
+    #[test]
+    fn two_writers_on_one_note_both_land() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let threads = (0..2)
+            .map(|writer| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    for line in 0..15 {
+                        append(
+                            &root,
+                            "memory/2026-10-29.md",
+                            &format!("- w{writer} {line}"),
+                        )
+                        .expect("write");
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("writer");
+        }
+        let note = std::fs::read_to_string(root.join("memory/2026-10-29.md")).expect("note");
+        for writer in 0..2 {
+            for line in 0..15 {
+                assert!(note.contains(&format!("- w{writer} {line}\n")), "{note}");
+            }
+        }
+        // The lock sits in `.harness`, which keeps it out of the changes.
+        let ignore = std::fs::read_to_string(root.join(".harness/.gitignore")).expect("ignore");
+        assert!(ignore.lines().any(|line| line == "*.lock"), "{ignore}");
+    }
+
+    #[test]
+    fn what_the_agent_writes_between_the_read_and_the_replace_is_kept() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write(dir.path(), "memory/note.md", "# note\n");
+        let path = dir.path().join("memory/note.md");
+        let mut seen = Vec::new();
+        let written = edit(dir.path(), "memory/note.md", |current| {
+            seen.push(current.map(str::to_owned));
+            if seen.len() == 1 {
+                // The agent writes the file after the host read it.
+                std::fs::write(&path, "# note\n- the agent's line\n").expect("agent");
+            }
+            Some(format!(
+                "{}- the host's line\n",
+                current.unwrap_or_default()
+            ))
+        })
+        .expect("edit");
+        assert!(written);
+        assert_eq!(seen.len(), 2, "the change ran again on the new text");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("note"),
+            "# note\n- the agent's line\n- the host's line\n"
+        );
+    }
+
+    #[test]
+    fn a_write_that_cannot_land_leaves_the_file_whole() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write(dir.path(), "memory/note.md", "# note\n");
+        let path = dir.path().join("memory/note.md");
+        // A file that changes under every attempt is left as its writer left it.
+        let mut round = 0;
+        let error = edit(dir.path(), "memory/note.md", |_| {
+            round += 1;
+            std::fs::write(&path, format!("# note\n- agent {round}\n")).expect("agent");
+            Some("# the host's\n".to_owned())
+        })
+        .expect_err("kept changing");
+        assert!(
+            matches!(&error, EditError::Failed(message) if message.contains("memory/note.md")),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("note"),
+            format!("# note\n- agent {round}\n")
+        );
+        // A file that is not text is never written over.
+        std::fs::write(&path, [0xff, 0xfe, b'x']).expect("binary");
+        assert!(matches!(
+            append(dir.path(), "memory/note.md", "- host"),
+            Err(EditError::Unreadable(_))
+        ));
+        assert_eq!(std::fs::read(&path).expect("kept"), [0xff, 0xfe, b'x']);
+        // No temporary file is left beside it.
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("memory"))
+                .expect("list")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_writer_keeps_to_the_store_and_leaves_an_unchanged_file_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for path in [
+            "../outside.md",
+            "",
+            ".git/config",
+            ".harness/x.md",
+            "/etc/x.md",
+        ] {
+            assert!(
+                matches!(append(dir.path(), path, "- x"), Err(EditError::Failed(_))),
+                "{path}"
+            );
+        }
+        // A name is the host's to choose: a rule about secrets is named so.
+        assert!(append(dir.path(), "memory/decisions/rotate-secrets.md", "- x").expect("named"));
+        write(dir.path(), "MEMORY.md", "# index\n");
+        assert!(
+            !edit(dir.path(), "MEMORY.md", |current| current
+                .map(str::to_owned))
+            .expect("same")
+        );
+        assert!(!edit(dir.path(), "MEMORY.md", |_| None).expect("none"));
+    }
+
+    #[test]
+    fn the_index_is_the_one_the_config_names() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert_eq!(index_file(dir.path()).expect("default"), "MEMORY.md");
+        write(dir.path(), CONFIG_FILE, r#"{"index":"docs/INDEX.md"}"#);
+        assert_eq!(index_file(dir.path()).expect("named"), "docs/INDEX.md");
+        for outside in ["../MEMORY.md", ".harness/config.toml", ".env"] {
+            write(
+                dir.path(),
+                CONFIG_FILE,
+                &format!(r#"{{"index":"{outside}"}}"#),
+            );
+            assert!(index_file(dir.path()).is_err(), "{outside}");
+        }
+    }
+
+    #[test]
+    fn an_index_title_is_short_whole_and_no_link() {
+        let title = index_title("dùng   pnpm\nthay cho npm ở mọi nơi trong dự án này", 12);
+        assert_eq!(title, "dùng pnpm th...");
+        let title = index_title("see `docs/release.md` and (notes.md) first", 80);
+        assert!(
+            link_tokens(&title)
+                .iter()
+                .all(|(token, opener)| !checked_link(token, *opener)),
+            "{title}"
+        );
+        assert_eq!(
+            index_title("the build is `make ci`", 80),
+            "the build is `make ci`",
+            "a title with no link stays as it is"
         );
     }
 }

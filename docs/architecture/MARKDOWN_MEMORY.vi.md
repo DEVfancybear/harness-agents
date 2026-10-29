@@ -158,18 +158,70 @@ Project không có `memory-lint.json` thì không nhận block nào. Chat và
 `ha exec` mang các block này; child được giao việc thì không, vì agent giao việc
 là bên giữ memory.
 
-## 5. `ha doctor`
+## 5. Host ghi gì, và ghi thế nào
+
+Agent ghi kho bằng các tool file của nó, người dùng thì bằng trình soạn thảo. Host
+cũng ghi:
+
+| Bên ghi | File |
+|---|---|
+| `ha memory init` | `MEMORY.md`, `memory-lint.json`, `.gitkeep` của mỗi tầng, các file mẫu: chỉ những file chưa có |
+| `ha memory migrate` | Bản sao của file phẳng trong `memory/archive/` (mỗi lần một tên mới), rồi index rỗng thay cho một `MEMORY.md` phẳng |
+| Session log ([SESSION_CONTINUITY.vi.md](SESSION_CONTINUITY.vi.md)) | Mục của nó trong ghi chú ngày `memory/YYYY-MM-DD.md` |
+| Learning loop ([LEARNING_LOOP.vi.md](LEARNING_LOOP.vi.md)) | File decision của một rule và con trỏ của nó trong index; dòng của một fact trong `memory/projects/<project>.md` và hàng của nó trong index; dòng gạch ngang khi một rule bị retire hay đổi lời |
+
+Tất cả đi qua một bộ ghi duy nhất (`markdown_memory::edit`):
+
+- **Một khóa.** Bộ ghi giữ `.harness/markdown-memory.lock` ở gốc của kho trong
+  lúc đọc và thay một file, kể cả giữa các tiến trình. Đây là khóa trong cùng:
+  session log giữ khóa riêng của nó bên ngoài, learning loop giữ khóa lessons
+  bên ngoài, và không ai lấy thêm khóa nào khi đang giữ nó. `.harness/.gitignore`
+  có dòng `*.lock`, nên khóa không bao giờ thành thay đổi của project.
+- **Đọc lại trước khi thay.** Bộ ghi đọc file, làm thay đổi của nó, rồi đọc lại
+  file ngay trước khi thay. Nếu agent hay người dùng đã ghi file ở giữa, thay đổi
+  được làm lại trên nội dung họ ghi, nên những gì họ ghi không bao giờ mất; một
+  file cứ thay đổi mãi thì sau năm lần thử được để nguyên, kèm lỗi nêu tên file.
+- **Thay nguyên cả file, hoặc không thay.** Nội dung mới vào một file có tên duy
+  nhất bên cạnh file đích, được sync, rồi rename đè lên: người đọc thấy file cũ
+  hoặc file mới, và một lần ghi hỏng để file cũ nguyên vẹn.
+- **Không bao giờ ghi đè file không đọc được.** File không phải text UTF-8, hoặc
+  đang bị chương trình khác giữ, thì không bị ghi. Session log khi đó ghi log vào
+  file riêng.
+- **Trong kho.** Bộ ghi chỉ nhận đường dẫn tương đối thuần, không bao giờ một
+  đường dẫn ra khỏi gốc hay đi qua thư mục ẩn. Index là file mà config chỉ định
+  (`MEMORY.md` khi config không nêu); index nằm ngoài project hay ở đường dẫn
+  được bảo vệ thì không bao giờ bị ghi.
+
+Các tool file của agent kiểm hash của file trước khi thay, nên một lần host ghi
+xen giữa lúc agent đọc và lúc agent ghi sẽ bị bắt ở đó.
+
+**Index chỉ giữ con trỏ.** Dòng của một rule đã học trong `## Current Decisions`
+là `` - <tiêu đề> (learned <ngày>, <lesson>) - `<file>` ``: tiêu đề tối đa 60 ký
+tự, cắt ở ranh giới một ký tự trọn vẹn, và file decision giữ rule. Tiêu đề nào
+lint sẽ đọc thành đường dẫn (`docs/x.md`, hay một dấu backtick hoặc ngoặc đơn bao
+quanh nó) được ghi bỏ dạng đó đi, nên file decision là link duy nhất của dòng và
+`index-links` vẫn qua. Các dòng learning loop ghi trước 0.8.8 giữ tới 160 ký tự
+của rule; chúng vẫn bị gạch khi rule của chúng bị retire hay đổi lời.
+
+## 6. `ha doctor`
 
 Phần State có thêm một dòng cho mỗi check lint chạy với `--no-diff` (giới hạn và
 link của index; các check theo diff thuộc về hook commit): FAIL và WARN đúng như
 lint chấm, kèm chi tiết đầu tiên và cách sửa. Project không có kho thì không có
 dòng nào.
 
-## 6. Kiểm thử
+## 7. Kiểm thử
 
 - Unit test trong `markdown.rs` phủ mọi check, báo cáo text và JSON, `init`, các
   block của lượt, giới hạn của index và việc từ chối đường dẫn. Giá trị mong đợi
-  là những gì `memory-lint.mjs` in ra trên cùng các kho.
+  là những gì `memory-lint.mjs` in ra trên cùng các kho. Chúng cũng phủ bộ ghi:
+  hai bên cùng ghi một ghi chú đều giữ được phần của mình, một lần ghi xen giữa
+  lúc đọc và lúc thay được giữ, một lần ghi hỏng để file nguyên vẹn, file không
+  phải text không bao giờ bị ghi. Test của learning loop trong `lessons.rs` kiểm
+  rằng dòng index là con trỏ, hai rule không có ASCII trong cùng ngày ra hai file,
+  dòng index kiểu cũ vẫn bị gạch, và kho vẫn qua lint.
 - Live suite `scripts/testing/live-tests/markdown-memory.sh` chạy `ha` với model
   thật: agent ghi một dữ kiện có tag, thay một quyết định bằng cách gạch ngang,
-  trả lời từ index, và hook chặn một dữ kiện thiếu tag.
+  trả lời từ index, và hook chặn một dữ kiện thiếu tag. Mục cuối của nó import hai
+  rule tiếng Việt bằng `ha learning import` (không cần model) và kiểm hai file
+  decision cùng các dòng con trỏ.

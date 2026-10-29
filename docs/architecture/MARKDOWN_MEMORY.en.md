@@ -160,18 +160,73 @@ index is missing. A project without `memory-lint.json` gets neither block. The
 chat and `ha exec` carry them; a delegated child does not, since the agent that
 delegates keeps the memory.
 
-## 5. `ha doctor`
+## 5. What the host writes, and how
+
+The agent writes the store with its file tools, and so do people with an editor.
+The host writes it too:
+
+| Writer | Files |
+|---|---|
+| `ha memory init` | `MEMORY.md`, `memory-lint.json`, the `.gitkeep` of each tier, the examples: only those not there yet |
+| `ha memory migrate` | The flat file's copy in `memory/archive/` (a new name each time), then the empty index in place of a flat `MEMORY.md` |
+| The session log ([SESSION_CONTINUITY.en.md](SESSION_CONTINUITY.en.md)) | Its section of the day's note `memory/YYYY-MM-DD.md` |
+| The learning loop ([LEARNING_LOOP.en.md](LEARNING_LOOP.en.md)) | A rule's decision file and its index pointer; a fact's line in `memory/projects/<project>.md` and its index row; the strike when one is retired or reworded |
+
+Every one of them goes through one writer (`markdown_memory::edit`):
+
+- **One lock.** It holds `.harness/markdown-memory.lock` at the store's root
+  while it reads and replaces a file, across processes. It is the innermost lock:
+  the session log holds its own lock around it and the learning loop its
+  lessons' lock, and nothing takes another lock while holding it.
+  `.harness/.gitignore` lists `*.lock`, so the lock is never one of the
+  project's changes.
+- **Read again before the replace.** The writer reads the file, makes its
+  change, and reads the file again just before it replaces it. When the agent or
+  the user wrote it in between, the change is made again on what they wrote, so
+  their write is never lost; a file that keeps changing is left as it is after
+  five tries, with an error that names it.
+- **Whole or not at all.** The new text goes to a uniquely named file beside the
+  target, is synced, and is renamed over it: a reader sees the old file or the
+  new one, and a failed write leaves the old one whole.
+- **Never over a file it cannot read.** A file that is not UTF-8 text, or that
+  another program holds, is not written. The session log puts its log in a file
+  of its own instead.
+- **Inside the store.** The writer takes plain relative paths only, never one
+  that leaves the root or goes through a hidden directory. The index is the one
+  the config names (`MEMORY.md` when it names none); an index outside the
+  project or on a protected path is never written.
+
+The agent's own file tools check the file's hash before they replace it, so a
+host write between the agent's read and its write is caught there.
+
+**The index holds pointers.** A learned rule's line in `## Current Decisions` is
+`` - <title> (learned <date>, <lesson>) - `<file>` ``: a title of at most 60
+characters, cut at a whole character, and the decision file that holds the
+rule. A title that would read as a path to the lint (`docs/x.md`, a backtick or
+a parenthesis around one) is written without it, so the decision file is the
+line's only link and `index-links` passes. Lines the learning loop wrote before
+0.8.8 held up to 160 characters of the rule; they are still struck when their
+rule is retired or reworded.
+
+## 6. `ha doctor`
 
 The State subsystem gains one finding per lint check that ran with `--no-diff`
 (the caps and the index links; the diff checks belong to the commit hook): FAIL
 and WARN as the lint grades them, with the first detail and how to fix it. A
 project without a store gets no finding.
 
-## 6. Tests
+## 7. Tests
 
 - Unit tests in `markdown.rs` cover every check, the report's text and JSON,
   `init`, the turn's blocks, the index cap and the path refusal. The expected
-  values are what `memory-lint.mjs` printed on the same stores.
+  values are what `memory-lint.mjs` printed on the same stores. They also cover
+  the writer: two writers on one note both land, a write between the read and
+  the replace is kept, a failed write leaves the file whole, a file that is not
+  text is never written. The learning loop's tests in `lessons.rs` check that an
+  index line is a pointer, that two non-ASCII rules of one day get two files,
+  that an old index line is struck, and that the store passes the lint.
 - The live suite `scripts/testing/live-tests/markdown-memory.sh` drives `ha`
   against a real model: the agent writes a tagged fact, supersedes a decision by
-  striking it, answers from the index, and the hook blocks an untagged fact.
+  striking it, answers from the index, and the hook blocks an untagged fact. Its
+  last section imports two Vietnamese rules with `ha learning import` (no model)
+  and checks the two decision files and the pointer lines.
