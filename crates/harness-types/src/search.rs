@@ -140,26 +140,6 @@ pub fn weighted_rrf(arms: &[(&[(String, f64)], f64)]) -> Vec<(String, f64)> {
     hits
 }
 
-/// Fuse two rankings of the same items - by words and by meaning - for
-/// knowledge and history search: [`weighted_rrf`] of the two, the meaning
-/// arm holding only hits at or above `min_score` (a cosine similarity).
-#[must_use]
-pub fn hybrid_fuse(
-    lexical: &[(String, f64)],
-    vectors: &[(String, f64)],
-    vector_weight: f64,
-    keyword_weight: f64,
-    min_score: Option<f64>,
-) -> Vec<(String, f64)> {
-    let minimum = min_score.filter(|score| score.is_finite());
-    let near = vectors
-        .iter()
-        .filter(|(_, score)| minimum.is_none_or(|minimum| *score >= minimum))
-        .cloned()
-        .collect::<Vec<_>>();
-    weighted_rrf(&[(lexical, keyword_weight), (&near, vector_weight)])
-}
-
 /// BM25's inverse document frequency of a term that `matching` of
 /// `documents` hold: a rare term weighs more than a common one.
 #[must_use]

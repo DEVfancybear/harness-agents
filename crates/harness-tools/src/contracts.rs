@@ -596,7 +596,7 @@ pub fn history_tool_schemas() -> Vec<Value> {
                 "until": {"type": "string", "description": "Only sources written before this time."},
                 "kind": {"description": "Only these kinds of sources (the kind a hit shows, such as a user or assistant message): one or a list.", "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
                 "order": {"type": "string", "enum": ["newest", "oldest"], "description": "Which come first among equally good hits (default newest)."},
-                "mode": {"type": "string", "enum": ["rank", "readout"], "description": "rank (default) lists the best hits. readout reads every source in scope for the query into a few slots, each the sources behind one part of it (by meaning when embeddings are configured, else by words): to recall what was tried, decided or seen across a long conversation, its compacted turns included."},
+                "mode": {"type": "string", "enum": ["rank", "readout"], "description": "rank (default) lists the best hits. readout reads every source in scope for the query into a few slots, each the sources behind one part of it (by their words): to recall what was tried, decided or seen across a long conversation, its compacted turns included."},
                 "slots": {"type": "integer", "minimum": 1, "maximum": 16, "description": "mode readout: at most this many slots (default 8)."}
             }),
             &["query"],

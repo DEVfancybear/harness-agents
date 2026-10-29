@@ -1,7 +1,8 @@
 //! Memory search as memory-engine has it (`docs/architecture/MEMORY_STORE.en.md`
-//! §6): BM25 over the words, cosine similarity over embeddings when the user
-//! configured them, the two fused by weighted Reciprocal Rank Fusion, every
-//! filter composable with either, and browsing by filters alone.
+//! §6): BM25 over the words, the best matches reordered by how recently and
+//! how much each entry was used (weighted Reciprocal Rank Fusion), every
+//! filter composable with it, and browsing by filters alone. Words, not
+//! meaning: a miss is searched again with other words, which the model picks.
 //!
 //! ha's stores are small, so ranking runs over the entries a search
 //! considers, after the filters, with the statistics of exactly those: a
@@ -9,13 +10,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::Path;
 
 use serde_json::{Value, json};
 
 use super::harness::{self, Entry};
-use super::knowledge::embedding;
 use super::memory_filters::{Predicate, Temporal, TreeFilter, contains};
 use super::memory_store;
 
@@ -25,10 +24,13 @@ const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 200;
 const DEFAULT_CANDIDATES: usize = 30;
 const MAX_CANDIDATES: usize = 1_000;
-/// How long a search waits for entries to be embedded before ranking.
-const EMBED_WAIT: Duration = Duration::from_secs(20);
-/// Entries embedded per request.
-const EMBED_BATCH: usize = 16;
+/// What recency and use weigh beside the words (weight 1) when they reorder
+/// the best word matches: lighter, so they settle what the words leave close.
+pub const RECENCY_WEIGHT: f64 = 0.3;
+pub const USAGE_WEIGHT: f64 = 0.3;
+/// How fast reads stop counting: their weight halves every 30 days after the
+/// last one.
+const USAGE_HALF_LIFE_DAYS: f64 = 30.0;
 /// BM25's parameters, and how much each field of an entry weighs.
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
@@ -87,8 +89,7 @@ pub fn check(arguments: &Value) -> Result<(), String> {
         || arguments
             .get("queries")
             .and_then(Value::as_array)
-            .is_some_and(|queries| !queries.is_empty())
-        || text("semantic").is_some();
+            .is_some_and(|queries| !queries.is_empty());
     let given = |key: &str| arguments.get(key).is_some_and(|value| !value.is_null());
     sources(arguments)?;
     if arguments
@@ -105,9 +106,7 @@ pub fn check(arguments: &Value) -> Result<(), String> {
         Some(mode) if mode == "rank" => {}
         Some(mode) if mode == "readout" => {
             if !searches {
-                return Err(
-                    "a readout reads for a query: give query, queries or semantic".to_owned(),
-                );
+                return Err("a readout reads for a query: give query or queries".to_owned());
             }
             if sources(arguments)?.contains(&"knowledge") {
                 return Err(
@@ -124,7 +123,7 @@ pub fn check(arguments: &Value) -> Result<(), String> {
         }
     }
     if !searches && !FILTERS.iter().any(|key| given(key)) {
-        return Err("search needs a query (or queries, or semantic), or a filter: tree, meta, meta_predicate, temporal or grep".to_owned());
+        return Err("search needs a query (or queries), or a filter: tree, meta, meta_predicate, temporal or grep".to_owned());
     }
     if given("grep") && !searches && !["tree", "meta", "temporal"].iter().any(|key| given(key)) {
         return Err(
@@ -148,27 +147,6 @@ pub fn check(arguments: &Value) -> Result<(), String> {
     }
     if let Some(pattern) = text("grep") {
         grep(pattern)?;
-    }
-    if let Some(threshold) = arguments
-        .get("semantic_threshold")
-        .filter(|value| !value.is_null())
-    {
-        let threshold = threshold
-            .as_f64()
-            .ok_or("semantic_threshold is a number in [0, 1]")?;
-        if !(0.0..=1.0).contains(&threshold) {
-            return Err("semantic_threshold is a cosine similarity in [0, 1]; it is refused, not clamped, outside".to_owned());
-        }
-    }
-    if let Some(weights) = arguments.get("weights").filter(|value| !value.is_null()) {
-        for key in ["fulltext", "semantic"] {
-            if let Some(weight) = weights.get(key).filter(|value| !value.is_null()) {
-                let weight = weight.as_f64().ok_or("weights are numbers in [0, 1]")?;
-                if !(0.0..=1.0).contains(&weight) {
-                    return Err("weights are numbers in [0, 1]".to_owned());
-                }
-            }
-        }
     }
     check_presentation(arguments)
 }
@@ -212,10 +190,9 @@ fn check_presentation(arguments: &Value) -> Result<(), String> {
 }
 
 /// The fields `select` may name.
-const SELECTABLE: [&str; 19] = [
+const SELECTABLE: [&str; 18] = [
     "id",
     "memory_id",
-    "has_embedding",
     "scope",
     "kind",
     "name",
@@ -333,19 +310,18 @@ pub struct Placed<'a> {
     pub doc: &'a Value,
 }
 
-/// Run a search over `placed`, the entries of the scopes and kinds asked.
-/// `embedding_root` is the knowledge library whose embedding configuration
-/// memory uses; `view` renders a hit as a search result.
+/// Run a search over `placed`, the entries of the scopes and kinds asked;
+/// `view` renders a hit as a search result. The hits it returns are counted
+/// as a use of each ([`memory_store::Use::Hit`]).
 ///
 /// # Errors
 /// The arguments are malformed, or a store cannot be read.
 #[allow(
     clippy::too_many_lines,
-    reason = "one search: filter, rank each arm, fuse, present"
+    reason = "one search: filter, rank the words, reorder, present"
 )]
 pub fn search(
     placed: &[Placed<'_>],
-    embedding_root: &Path,
     arguments: &Value,
     view: &dyn Fn(&Entry) -> Value,
 ) -> Result<Value, String> {
@@ -362,16 +338,27 @@ pub fn search(
     let candidates =
         number(arguments, "candidate_limit", DEFAULT_CANDIDATES).clamp(limit, MAX_CANDIDATES);
     let queries = queries(arguments);
-    let semantic_text = text("semantic").map(str::to_owned);
-    let weights = arguments.get("weights");
-    let weight = |key: &str| {
-        weights
-            .and_then(|weights| weights.get(key))
-            .and_then(Value::as_f64)
-            .unwrap_or(1.0)
-    };
-    // The words' arm: every variant ranked by BM25, the variants fused.
-    let rank_words = |queries: &[String]| {
+    let (mode, ranked): (&str, Vec<(usize, f64)>) = if queries.is_empty() {
+        // Filters alone browse, newest first unless order_by says.
+        let ascending = text("order_by") == Some("asc");
+        let mut order = (0..considered.len()).collect::<Vec<_>>();
+        let created = |index: &usize| {
+            considered[*index].doc["created_at"]
+                .as_str()
+                .and_then(|time| memory_store::instant(time).ok())
+                .unwrap_or_default()
+        };
+        order.sort_by_key(created);
+        if !ascending {
+            order.reverse();
+        }
+        (
+            "filter",
+            order.into_iter().map(|index| (index, -1.0)).collect(),
+        )
+    } else {
+        // Every variant ranked by BM25, the variants fused, then the best
+        // reordered by recency and use.
         let rankings = queries
             .iter()
             .map(|query| bm25(&considered, query))
@@ -397,135 +384,185 @@ pub fn search(
                 .filter_map(|(key, score)| key.parse::<usize>().ok().map(|index| (index, score)))
                 .collect()
         };
-        ranked.into_iter().take(candidates).collect::<Vec<_>>()
-    };
-    // A weight of 0 turns its arm off: `{semantic: 0}` ranks by words alone.
-    let fulltext = (!queries.is_empty() && weight("fulltext") > 0.0).then(|| rank_words(&queries));
-    // The meaning arm: with embeddings configured, the semantic text - or the
-    // query and its variants when none is given - against every entry's vector.
-    let mut note = None;
-    let meaning_texts = match (&semantic_text, queries.is_empty()) {
-        (Some(text), _) => vec![text.clone()],
-        (None, false) => queries.clone(),
-        (None, true) => Vec::new(),
-    };
-    let threshold = arguments.get("semantic_threshold").and_then(Value::as_f64);
-    let semantic = if meaning_texts.is_empty() || weight("semantic") <= 0.0 {
-        None
-    } else {
-        match meaning(&considered, embedding_root, &meaning_texts) {
-            Ok(Some(similar)) => Some(
-                similar
-                    .into_iter()
-                    .filter(|(_, score)| threshold.is_none_or(|threshold| *score >= threshold))
-                    .take(candidates)
-                    .collect::<Vec<_>>(),
+        let entries = considered
+            .iter()
+            .map(|placed| placed.entry)
+            .collect::<Vec<_>>();
+        let ranked = ranked.into_iter().take(candidates).collect::<Vec<_>>();
+        (
+            "fulltext",
+            reranked(
+                &entries,
+                ranked,
+                limit.saturating_mul(2),
+                chrono::Utc::now().timestamp(),
             ),
-            Ok(None) => {
-                if semantic_text.is_some() {
-                    note = Some("semantic search is not configured (/knowledge semantic --global), so words alone ranked this".to_owned());
-                }
-                None
-            }
-            Err(error) => {
-                note = Some(format!(
-                    "semantic search failed ({error}), so words alone ranked this"
-                ));
-                None
-            }
-        }
-    };
-    // Meaning asked for but not to be had: the words still search.
-    let fulltext = match (fulltext, &semantic, &semantic_text) {
-        (None, None, Some(text)) if queries.is_empty() => {
-            Some(rank_words(std::slice::from_ref(text)))
-        }
-        (None, None, _) if !queries.is_empty() => Some(rank_words(&queries)),
-        (fulltext, _, _) => fulltext,
-    };
-    let (mode, ranked): (&str, Vec<(usize, f64)>) = match (fulltext, semantic) {
-        (Some(words), Some(similar)) if semantic_text.is_some() || !similar.is_empty() => {
-            let key = |ranking: &[(usize, f64)]| {
-                ranking
-                    .iter()
-                    .map(|(index, score)| (format!("{index:08}"), *score))
-                    .collect::<Vec<_>>()
-            };
-            let (words, similar) = (key(&words), key(&similar));
-            let fused = harness_types::search::weighted_rrf(&[
-                (&words, weight("fulltext")),
-                (&similar, weight("semantic")),
-            ]);
-            (
-                "hybrid",
-                fused
-                    .into_iter()
-                    .filter_map(|(key, score)| key.parse().ok().map(|index| (index, score)))
-                    .collect(),
-            )
-        }
-        (Some(words), _) => ("fulltext", words),
-        (None, Some(similar)) => ("semantic", similar),
-        (None, None) => {
-            // Filters alone browse, newest first unless order_by says.
-            let ascending = text("order_by") == Some("asc");
-            let mut order = (0..considered.len()).collect::<Vec<_>>();
-            let created = |index: &usize| {
-                considered[*index].doc["created_at"]
-                    .as_str()
-                    .and_then(|time| memory_store::instant(time).ok())
-                    .unwrap_or_default()
-            };
-            order.sort_by_key(created);
-            if !ascending {
-                order.reverse();
-            }
-            (
-                "filter",
-                order.into_iter().map(|index| (index, -1.0)).collect(),
-            )
-        }
+        )
     };
     let total = ranked.len();
     let select = arguments
         .get("select")
         .and_then(Value::as_array)
         .map(|fields| fields.iter().filter_map(Value::as_str).collect::<Vec<_>>());
-    let embedded = if select
-        .as_ref()
-        .is_some_and(|fields| fields.contains(&"has_embedding"))
-    {
-        embedded(&considered, embedding_root)
-    } else {
-        std::collections::BTreeSet::new()
-    };
-    let hits = ranked
+    let shown = ranked.iter().take(limit).collect::<Vec<_>>();
+    record_hits(
+        &shown
+            .iter()
+            .map(|(index, _)| considered[*index])
+            .collect::<Vec<_>>(),
+    );
+    let hits = shown
         .iter()
-        .take(limit)
         .map(|(index, score)| {
             let placed = considered[*index];
             if let Some(fields) = &select {
-                project(placed, *score, fields, &embedded)
+                project(placed, *score, fields)
             } else {
                 let mut hit = view(placed.entry);
-                hit["score"] = json!(rounded(*score, mode));
+                hit["score"] = json!(rounded(*score));
                 hit
             }
         })
         .collect::<Vec<_>>();
     let mut result = json!({"hits": hits, "total": total, "limit": limit, "mode": mode, "searched": considered.len()});
     if hits_empty(&result) {
-        result["note"] = json!(
-            "No memory matched. Memory holds only what was written before; if the answer matters and you have not yet, search once more with variants in queries (synonyms, a translation) or fewer filters; otherwise say it is not remembered."
-        );
-    }
-    if let Some(note) = note {
-        result["semantic"] = json!(note);
+        result["note"] = json!(miss_note(&queries));
     }
     Ok(match text("format") {
         Some("yaml") => json!({"text": yaml(&result)}),
         _ => result,
     })
+}
+
+/// What an empty search says: what was searched, that search matches words
+/// and not meaning, and to search again with other words before saying it
+/// is not remembered.
+#[must_use]
+pub fn miss_note(queries: &[String]) -> String {
+    let searched = if queries.is_empty() {
+        "these filters".to_owned()
+    } else {
+        queries
+            .iter()
+            .map(|query| format!("{query:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "No memory matched {searched}. Search matches words (stems, prefixes, accents folded), not meaning: search again with other words - a synonym, the other language the project uses, a shorter or broader term, a name or path from the code - or fewer filters, before saying it is not remembered."
+    )
+}
+
+/// Count the entries a search returned as a hit of each, in its store.
+pub fn record_hits(placed: &[&Placed<'_>]) {
+    let mut by_dir = BTreeMap::<&Path, Vec<String>>::new();
+    for placed in placed {
+        if let Some(memory) = &placed.entry.memory {
+            by_dir.entry(placed.dir).or_default().push(memory.clone());
+        }
+    }
+    for (dir, memories) in by_dir {
+        if let Err(error) = memory_store::record_use(dir, memory_store::Use::Hit, &memories) {
+            harness_types::diag::debug("memory", "usage_not_recorded")
+                .field("dir", dir.display().to_string())
+                .field("error", error)
+                .emit();
+        }
+    }
+}
+
+/// Seconds since the epoch of a time as ha writes one (`@<seconds>` or
+/// RFC 3339).
+#[must_use]
+pub fn epoch(time: &str) -> Option<i64> {
+    match time.strip_prefix('@') {
+        Some(seconds) => seconds.parse().ok(),
+        None => chrono::DateTime::parse_from_rfc3339(time)
+            .ok()
+            .map(|time| time.timestamp()),
+    }
+}
+
+/// When an entry was last written or read: its recency.
+#[must_use]
+pub fn last_touched(entry: &Entry) -> Option<i64> {
+    let written = entry.updated_at.as_deref().and_then(epoch);
+    let read = entry.usage.last_read_at.as_deref().and_then(epoch);
+    written.max(read)
+}
+
+/// How much an entry is used: its reads, weighing half as much for every
+/// [`USAGE_HALF_LIFE_DAYS`] since the last. Search hits and digest showings
+/// are not counted: they say what was put in front of the model, not what it
+/// went on to use, and ranking by them would feed itself.
+#[must_use]
+#[allow(clippy::cast_precision_loss, reason = "counts and ages are small")]
+pub fn usage_score(entry: &Entry, now: i64) -> f64 {
+    if entry.usage.reads <= 0 {
+        return 0.0;
+    }
+    let age_days = entry
+        .usage
+        .last_read_at
+        .as_deref()
+        .and_then(epoch)
+        .map_or(f64::INFINITY, |read| (now - read).max(0) as f64 / 86_400.0);
+    entry.usage.reads as f64 * 0.5_f64.powf(age_days / USAGE_HALF_LIFE_DAYS)
+}
+
+/// `ranked` - indexes into `entries` with their scores, best first - with
+/// its first `pool` fused by weighted RRF with two lighter arms: recency
+/// ([`last_touched`], [`RECENCY_WEIGHT`]) and use ([`usage_score`],
+/// [`USAGE_WEIGHT`]); an entry with no time or no reads is left out of that
+/// arm. The rest keep their order after the pool, so an entry the words
+/// barely reached never passes the best of them. Each keeps its own score.
+/// Ties go to the earlier place in `ranked`.
+#[must_use]
+pub fn reranked(
+    entries: &[&Entry],
+    ranked: Vec<(usize, f64)>,
+    pool: usize,
+    now: i64,
+) -> Vec<(usize, f64)> {
+    let pool = pool.min(ranked.len());
+    if pool < 2 {
+        return ranked;
+    }
+    let mut rest = ranked;
+    let head = rest.drain(..pool).collect::<Vec<_>>();
+    // Keyed by place, so a tie keeps the words' order.
+    let key = |place: usize| format!("{place:08}");
+    let by_words = (0..head.len())
+        .map(|place| (key(place), 1.0))
+        .collect::<Vec<_>>();
+    let mut recent = (0..head.len())
+        .filter_map(|place| last_touched(entries[head[place].0]).map(|time| (place, time)))
+        .collect::<Vec<_>>();
+    recent.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let by_recency = recent
+        .into_iter()
+        .map(|(place, _)| (key(place), 1.0))
+        .collect::<Vec<_>>();
+    let mut used = (0..head.len())
+        .map(|place| (place, usage_score(entries[head[place].0], now)))
+        .filter(|(_, score)| *score > 0.0)
+        .collect::<Vec<_>>();
+    used.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let by_use = used
+        .into_iter()
+        .map(|(place, _)| (key(place), 1.0))
+        .collect::<Vec<_>>();
+    let mut fused = harness_types::search::weighted_rrf(&[
+        (&by_words, 1.0),
+        (&by_recency, RECENCY_WEIGHT),
+        (&by_use, USAGE_WEIGHT),
+    ])
+    .into_iter()
+    .filter_map(|(key, _)| key.parse::<usize>().ok())
+    .map(|place| head[place])
+    .collect::<Vec<_>>();
+    fused.append(&mut rest);
+    fused
 }
 
 /// The entries every filter a search gives - `tree`, `meta`,
@@ -584,11 +621,9 @@ fn hits_empty(result: &Value) -> bool {
     result["hits"].as_array().is_none_or(Vec::is_empty)
 }
 
-/// A score as a result shows it: BM25 and cosine to four places, RRF's small
-/// fused values to six.
-fn rounded(score: f64, mode: &str) -> f64 {
-    let places = if mode == "hybrid" { 1e6 } else { 1e4 };
-    (score * places).round() / places
+/// A score as a result shows it: to four places.
+fn rounded(score: f64) -> f64 {
+    (score * 1e4).round() / 1e4
 }
 
 fn number(arguments: &Value, key: &str, default: usize) -> usize {
@@ -894,6 +929,7 @@ pub fn rank_documents(documents: &[(&str, &str)], query: &str) -> Vec<(usize, f6
             temporal: None,
             ended: false,
             source: None,
+            usage: memory_store::Usage::default(),
         })
         .collect::<Vec<_>>();
     let doc = Value::Null;
@@ -908,173 +944,10 @@ pub fn rank_documents(documents: &[(&str, &str)], query: &str) -> Vec<(usize, f6
     bm25(&placed.iter().collect::<Vec<_>>(), query)
 }
 
-/// The entries' cosine similarity to the nearest of `texts`, best first, or
-/// `None` when embeddings are not configured. Entries not yet embedded are
-/// embedded first, for up to [`EMBED_WAIT`].
-fn meaning(
-    considered: &[&Placed<'_>],
-    embedding_root: &Path,
-    texts: &[String],
-) -> Result<Option<Vec<(usize, f64)>>, String> {
-    let config = embedding::load_config(embedding_root)?;
-    if !config.enabled {
-        return Ok(None);
-    }
-    let namespace = embedding::namespace_of(&config)?;
-    let mut dirs = considered
-        .iter()
-        .map(|placed| placed.dir.to_path_buf())
-        .collect::<Vec<_>>();
-    dirs.sort();
-    dirs.dedup();
-    embed_pending(&dirs, &config, &namespace, Instant::now() + EMBED_WAIT);
-    let queries = embedding::embed_sync(&config, texts)?;
-    let mut vectors = BTreeMap::new();
-    let mut ids = BTreeMap::new();
-    for dir in &dirs {
-        vectors.insert(dir.clone(), memory_store::vectors(dir, &namespace)?);
-        ids.insert(dir.clone(), memory_store::ids(dir)?);
-    }
-    let mut similar = considered
-        .iter()
-        .enumerate()
-        .filter_map(|(index, placed)| {
-            let id = ids[placed.dir].get(&(placed.entry.kind.clone(), placed.entry.id.clone()))?;
-            let vector = vectors[placed.dir].get(id)?;
-            let best = queries
-                .iter()
-                .filter_map(|query| embedding::similarity(query, vector).ok())
-                .fold(f64::NEG_INFINITY, f64::max);
-            best.is_finite().then_some((index, best))
-        })
-        .collect::<Vec<_>>();
-    similar.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    Ok(Some(similar))
-}
-
-/// The memories among `considered` that have a vector for what they say
-/// now; none when embeddings are not configured.
-fn embedded(
-    considered: &[&Placed<'_>],
-    embedding_root: &Path,
-) -> std::collections::BTreeSet<String> {
-    let Ok(config) = embedding::load_config(embedding_root) else {
-        return std::collections::BTreeSet::new();
-    };
-    let Ok(namespace) = embedding::namespace_of(&config) else {
-        return std::collections::BTreeSet::new();
-    };
-    if !config.enabled {
-        return std::collections::BTreeSet::new();
-    }
-    let mut dirs = considered
-        .iter()
-        .map(|placed| placed.dir.to_path_buf())
-        .collect::<Vec<_>>();
-    dirs.sort();
-    dirs.dedup();
-    dirs.iter()
-        .filter_map(|dir| memory_store::vectors(dir, &namespace).ok())
-        .flat_map(BTreeMap::into_keys)
-        .collect()
-}
-
-/// Embed the entries of `dirs` that have no vector for their content, until
-/// `deadline`: memory-engine's queue, drained by whoever needs it. A failure
-/// is recorded against the entries it was for; a rate limit waits without
-/// spending an attempt.
-pub fn embed_pending(
-    dirs: &[PathBuf],
-    config: &embedding::EmbeddingConfig,
-    namespace: &str,
-    deadline: Instant,
-) {
-    for dir in dirs {
-        while Instant::now() < deadline {
-            let Ok(batch) = memory_store::unembedded(dir, namespace, EMBED_BATCH) else {
-                break;
-            };
-            if batch.is_empty() {
-                break;
-            }
-            let texts = batch
-                .iter()
-                .map(|entry| entry.text.clone())
-                .collect::<Vec<_>>();
-            match embedding::embed_sync(config, &texts) {
-                Ok(vectors) if vectors.len() == batch.len() => {
-                    let made = batch.into_iter().zip(vectors).collect::<Vec<_>>();
-                    if memory_store::save_vectors(dir, namespace, &made).is_err() {
-                        break;
-                    }
-                }
-                Ok(_) => {
-                    let _ = memory_store::embedding_failed(
-                        dir,
-                        &batch,
-                        "the provider returned the wrong number of vectors",
-                        false,
-                    );
-                    break;
-                }
-                Err(error) => {
-                    let _ = memory_store::embedding_failed(
-                        dir,
-                        &batch,
-                        &error,
-                        error.contains("HTTP 429"),
-                    );
-                    harness_types::diag::warn("memory", "embedding_failed")
-                        .field("error", error)
-                        .emit();
-                    break;
-                }
-            }
-        }
-    }
-}
-
-/// Embed what `dirs` hold that has no vector yet, waiting at most as long as
-/// a search by meaning waits, when embeddings are configured.
-pub fn embed_before_reading(dirs: &[PathBuf], embedding_root: &Path) {
-    let Ok(config) = embedding::load_config(embedding_root) else {
-        return;
-    };
-    if !config.enabled {
-        return;
-    }
-    let Ok(namespace) = embedding::namespace_of(&config) else {
-        return;
-    };
-    embed_pending(dirs, &config, &namespace, Instant::now() + EMBED_WAIT);
-}
-
 /// The slots a `readout` search reads by default, and at most: MEMORILLA's
 /// `K` is 16.
 pub const DEFAULT_SLOTS: usize = 8;
 pub const MAX_SLOTS: usize = 16;
-
-/// Embed what `dirs` hold in the background, when embeddings are configured:
-/// a write does not wait for its vector.
-pub fn embed_soon(dirs: Vec<PathBuf>, embedding_root: &Path) {
-    let Ok(config) = embedding::load_config(embedding_root) else {
-        return;
-    };
-    if !config.enabled {
-        return;
-    }
-    let Ok(namespace) = embedding::namespace_of(&config) else {
-        return;
-    };
-    std::thread::spawn(move || {
-        embed_pending(
-            &dirs,
-            &config,
-            &namespace,
-            Instant::now() + Duration::from_mins(1),
-        );
-    });
-}
 
 /// `content:N`, `content:M:N` or `content:M:` as a character range.
 fn slice(field: &str) -> Result<(usize, Option<usize>), String> {
@@ -1100,14 +973,8 @@ fn slice(field: &str) -> Result<(usize, Option<usize>), String> {
 
 /// A hit with only the fields `select` names, read from the entry as stored:
 /// `meta.<key>` under `meta`, left out when the entry has no such facet, as
-/// memory-engine projects it. `embedded` holds the memories that have a
-/// vector for what they say now.
-fn project(
-    placed: &Placed<'_>,
-    score: f64,
-    fields: &[&str],
-    embedded: &std::collections::BTreeSet<String>,
-) -> Value {
+/// memory-engine projects it.
+fn project(placed: &Placed<'_>, score: f64, fields: &[&str]) -> Value {
     let entry = placed.entry;
     let doc = placed.doc;
     let content = entry.content.as_deref().unwrap_or_default();
@@ -1141,12 +1008,6 @@ fn project(
             "id" => json!(entry.id),
             "name" => json!(entry.name),
             "memory_id" => json!(entry.memory),
-            "has_embedding" => json!(
-                entry
-                    .memory
-                    .as_ref()
-                    .is_some_and(|memory| embedded.contains(memory))
-            ),
             "scope" => json!(entry.scope),
             "kind" => json!(entry.kind),
             "title" => json!(entry.title),
@@ -1324,6 +1185,7 @@ mod tests {
                 temporal: None,
                 ended: false,
                 source: None,
+                usage: memory_store::Usage::default(),
             })
             .collect::<Vec<_>>();
         let refs = entries.iter().collect::<Vec<_>>();
