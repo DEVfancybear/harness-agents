@@ -119,7 +119,7 @@ Khai báo `#[path]` giữ namespace logic `crate::interactive::*` và test selec
 
 ### 5.1 Khởi động
 
-1. `harness-cli` parse command và resolve configuration. Bước resolve launch đọc thư mục gọi, project identity, Git root, user paths và cấu hình không bí mật; nó không mở store, không resolve model và không gọi mạng.
+1. `harness-cli` parse command và resolve configuration. Bước resolve launch đọc thư mục gọi, project identity, Git root, user paths và cấu hình không bí mật; nó không mở project store, không chạy process nào, không resolve model và không gọi mạng. Project được định danh theo repository: thư mục con hay linked worktree của một Git repository là project của main checkout ([định danh project](PROJECT_IDENTITY.vi.md)); việc ghi duy nhất launch có thể làm là chuyển store mà project này giữ dưới key cũ về đúng chỗ.
 2. Host mở data directory SQLite đã chọn và nhận ranh giới single-writer ownership/fencing.
 3. CLI tạo các application service cần dùng: session, runtime, tools, orchestrator, extensions và maintenance.
 4. Kernel validate required service contracts trước khi nhận việc. Provider bắt buộc bị thiếu hoặc generation không tương thích là composition error, không phải một run thành công ở chế độ degraded.

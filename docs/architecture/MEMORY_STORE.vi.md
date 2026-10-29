@@ -108,7 +108,7 @@ Mỗi thư mục scope có `memory.sqlite3` thay cho `harness_state.json`:
 
 | Scope | Thư mục | Gốc tree của record |
 |---|---|---|
-| global | `<data>/harness/` | `/global/...`; entry gắn với một project nằm ở `/projects/<project_key>/...` |
+| global | `<data>/harness/` | `/global/...`; entry gắn với một project nằm ở `/projects/<project_key>/...`, key của repository chứa project ([định danh project](PROJECT_IDENTITY.vi.md)) |
 | local (một cuộc trò chuyện) | `<data>/sessions/<task>/harness/` | `/local/...` |
 
 Mỗi thư mục scope một database, không phải một database chung cho cả ha, vì:
