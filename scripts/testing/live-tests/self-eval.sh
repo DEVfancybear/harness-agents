@@ -70,11 +70,16 @@ check "and nothing was judged" '[ "$(evaluations)" -eq "$before" ]'
 echo "################ 5. /self-eval reports the last turn as ECC's template"
 agent "$P" s5
 say s5 "Giải thích ngắn gọn calc/add.py làm gì, trong một câu." | tail -2 | sed 's/^/   /'
+before=$(evaluations)
 "$HA" send s5 "/self-eval" --wait > "$RX/report.out" 2>&1
-sed 's/^/   /' "$RX/report.out" | head -24
-check "the report has ECC's headings" 'grep -q "AGENT SELF-EVALUATION REPORT" "$RX/report.out" && grep -q "OVERALL" "$RX/report.out" && grep -q "VERDICT" "$RX/report.out"'
-check "every axis with a bar" '[ "$(grep -cE "(Accuracy|Completeness|Clarity|Actionability|Conciseness).*[█░]+" "$RX/report.out")" -eq 5 ]'
-check "it was kept as a manual evaluation" '[ "$(latest trigger)" = manual ]'
+sed 's/^/   /' "$RX/report.out" | head -4
+# The judge is a model call of its own: /self-eval says it started, and the
+# report comes when it is done (the report's template is unit-tested).
+for _ in $(seq 1 120); do [ "$(evaluations)" -gt "$before" ] && break; sleep 1; done
+check "/self-eval says it is judging" 'grep -q "self-evaluation: judging the last turn" "$RX/report.out"'
+check "it judged that turn and kept it as a manual evaluation" '[ "$(evaluations)" -gt "$before" ] && [ "$(latest trigger)" = manual ] && [ "$(latest valid)" = True ]'
+check "on the five axes" 'tail -1 "$LOGFILE" | "$PY" -c "import json,sys; s=json.load(sys.stdin)[\"scores\"]; sys.exit(0 if sorted(s)==[\"accuracy\",\"actionability\",\"clarity\",\"completeness\",\"conciseness\"] else 1)"'
+check "the lookup is traced" 'grep -rh "\"self_eval\"" "$D/diagnostics" | grep -q "\"on_demand\""'
 "$HA" shutdown --force >/dev/null 2>&1
 "$HA" learning report > "$RX/learning-report.out" 2>&1
 check "ha learning report shows the last 30 days" 'grep -q "Self-evaluations, last 30 days" "$RX/learning-report.out"'

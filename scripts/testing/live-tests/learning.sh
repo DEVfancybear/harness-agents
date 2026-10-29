@@ -156,10 +156,6 @@ check "retiring strikes the rule through" '[ -n "$DEC" ] && grep -q "~~\[inferre
 check "and the store still passes the lint" '(cd "$Q" && "$HA" memory lint --quiet)'
 
 echo "################ 7. lessons move between machines and from a project to every project (ECC v2)"
-# What the loop has kept so far, as ECC's status shows instincts.
-"$HA" learning status > "$RX/status.out"
-sed 's/^/   /' "$RX/status.out" | head -12
-check "status lists the lessons by domain, with a confidence" 'grep -qE "^## [a-z-]+ \([0-9]+\)" "$RX/status.out" && grep -qE "[0-9]+%  les_" "$RX/status.out"'
 # Another machine's export, of this same project q: a resolution and a rule
 # seen in two conversations there, and one of another project.
 "$PY" - "$RX/other.json" <<'EOF'
@@ -190,6 +186,11 @@ check "their signals are marked as imported" '[ "$(field "x[\"id\"]==\"$RULE\"" 
 check "a project lesson lands in this project" '[ "$(field "x[\"id\"]==\"$RULE\"" "x[\"project\"][\"name\"]")" = q ]'
 check "the project resolution is kept as a fact at once" '[ "$(state "$FACT")" = promoted ] && grep -rq "$FACT" "$Q/memory/projects/"'
 check "the imported rule passes the gate into the project's store" '[ "$(state "$RULE")" = promoted ] && ls "$Q"/memory/decisions/*-learned-*.md | xargs grep -l "$RULE" | grep -q .'
+# What the loop keeps now (the earlier sections retired theirs), as ECC's
+# status shows instincts.
+"$HA" learning status > "$RX/status.out"
+sed 's/^/   /' "$RX/status.out" | head -12
+check "status lists the lessons by domain, with a confidence" 'grep -qE "^## (testing|workflow) \([0-9]+\)" "$RX/status.out" && grep -qE "[0-9]+%  $RULE" "$RX/status.out"'
 (cd "$Q" && "$HA" learning import "$RX/other.json") > "$RX/import2.out" 2>&1
 check "importing the same file again adds nothing" 'grep -q "0 new, 0 merged" "$RX/import2.out"'
 "$HA" learning promote "$FACT" > "$RX/promote-fact.out" 2>&1

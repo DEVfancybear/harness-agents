@@ -615,8 +615,14 @@ pub async fn on_demand(
     focus: Option<&str>,
     conversation: &str,
 ) -> Result<Vec<String>, String> {
-    let (judge, review) = last
-        .get()
+    let kept = last.get();
+    let found = kept.as_ref().map(|(judge, _)| judge.conversation.clone());
+    harness_types::diag::info("self_eval", "on_demand")
+        .task(conversation)
+        .field("kept", found.is_some())
+        .field("kept_for", found.as_deref().unwrap_or_default())
+        .emit();
+    let (judge, review) = kept
         .filter(|(judge, _)| judge.conversation == conversation)
         .ok_or("no finished turn to evaluate in this conversation yet: /self-eval judges the last turn that ended with an answer")?;
     let outcome = judge.evaluate(&review, focus).await;

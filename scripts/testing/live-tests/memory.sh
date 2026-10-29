@@ -190,7 +190,12 @@ for index in 01 02 03 04 05 06 07 08 09 10 11 12; do echo "note $index: the cart
 agent "$RX/p-shop" q1
 touch "$RX/quiet.marker"
 say q1 "Đọc từng file trong thư mục notes bằng read_file, mỗi lần một file (12 lần gọi), rồi tóm tắt chúng trong một câu." | tail -2
-sleep 75
+# Quiet for HA_IDLE_REVIEW_SECONDS, then a review of its own model calls: wait
+# for its watermark rather than a fixed time, as a long turn ends it later.
+for _ in $(seq 1 240); do
+  find "$D/sessions" -name review_watermark -newer "$RX/quiet.marker" | grep -q . && break
+  sleep 1
+done
 check "the quiet session's work was reviewed" "find '$D/sessions' -name review_watermark -newer '$RX/quiet.marker' | grep -q ."
 "$HA" shutdown --force >/dev/null 2>&1
 unset HA_IDLE_REVIEW_SECONDS
