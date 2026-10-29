@@ -442,6 +442,11 @@ pub trait SessionPort: Send {
     /// `/handoff`: once the next turn has finished, the conversation's session
     /// log is written from its journal (`session_log`).
     fn plan_session_log(&mut self) {}
+    /// The conversation is being left - `/new`, `/resume` of another, a
+    /// fork, the chat's exit: the session logs owed are written now, beside
+    /// whatever comes next, instead of waiting for a quiet timer that may
+    /// never run.
+    fn conversation_left(&mut self) {}
     /// `/tree <n> --summarize [focus]`: the next turn summarises the turns the
     /// switch leaves. Called before [`Self::switch_to`].
     fn plan_branch_summary(&mut self, _focus: Option<String>) -> Result<(), String> {
@@ -4730,6 +4735,42 @@ impl SessionPort for AgentSessionService {
         self.session_log_next = true;
     }
 
+    fn conversation_left(&mut self) {
+        if !super::session_log::enabled(&self.config_file, &self.environment)
+            || tokio::runtime::Handle::try_current().is_err()
+        {
+            return;
+        }
+        let owed = super::session_log::owed(&self.workspace_root);
+        if owed.is_empty() {
+            return;
+        }
+        let Ok(config) = self.configured() else {
+            return;
+        };
+        let level = self
+            .thinking
+            .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
+            .unwrap_or_default();
+        let Ok(provider) =
+            LiveProvider::build(&config, level, self.task_id.as_ref(), &self.data_dir)
+        else {
+            return;
+        };
+        for (task, session) in owed {
+            spawn_session_log(
+                self.sender.clone(),
+                self.store_dir.clone(),
+                self.workspace_root.clone(),
+                session,
+                task,
+                Arc::clone(&provider),
+                "left",
+                None,
+            );
+        }
+    }
+
     fn plan_branch_summary(&mut self, focus: Option<String>) -> Result<(), String> {
         let leaf = self
             .previous_session
@@ -6027,6 +6068,8 @@ impl SessionPort for AgentSessionService {
         let (source, task) = selection.map_or((None, None), |(session, task)| {
             (Some(session), Some(task.as_str().to_owned()))
         });
+        // The conversation being left gets its session log now.
+        self.conversation_left();
         let mut previous = self
             .previous_session
             .lock()
@@ -6907,6 +6950,8 @@ impl AgentSessionService {
     fn start_fork(&mut self, plan: ForkPlan) -> Result<(), String> {
         let next_task = TaskId::generate();
         self.agents.claim_conversation(next_task.as_str())?;
+        // The conversation being left gets its session log now.
+        self.conversation_left();
         if let Ok(mut previous) = self.previous_session.lock() {
             *previous = None;
             if let Ok(mut resumed) = self.resumed_task.lock() {
@@ -8464,6 +8509,28 @@ async fn run_turn(
     // one armed writes nothing while it runs.
     if session_log_on {
         super::session_log::note_turn(&task_id, &session_id);
+        // Owed from the start, so a kill during the turn or right after its
+        // answer leaves the log to the next start. A compaction or a
+        // `/refine` is no turn of the conversation's own.
+        if request.compact_guidance.is_none() && request.refine.is_none() {
+            super::session_log::owe(&workspace_root, &task_id, &session_id);
+        }
+        // A log another conversation still owes - ha was killed, crashed or
+        // quit before writing it - is written now, beside this turn.
+        for (task, session) in super::session_log::owed(&workspace_root) {
+            if task != task_id {
+                spawn_session_log(
+                    sender.clone(),
+                    store_dir.clone(),
+                    workspace_root.clone(),
+                    session,
+                    task,
+                    Arc::clone(&helper_provider),
+                    "owed",
+                    None,
+                );
+            }
+        }
     }
     let log_root = workspace_root.clone();
     if let Some(guidance) = request.compact_guidance.as_deref() {
@@ -10260,7 +10327,10 @@ async fn run_turn(
     // The conversation's session log: written at once after a handoff or a
     // compaction, and when the session goes quiet, as the idle review does -
     // after a failed or stopped turn too, which ends the conversation as well.
+    // The log is owed until then, on disk, so an exit or a kill before it is
+    // written leaves it to the next start.
     if session_log_on {
+        super::session_log::owe(&log_root, &goal_task, &session_id);
         if (log_after_turn || compacted) && outcome.is_ok() && !cancellation.is_cancelled() {
             spawn_session_log(
                 sender.clone(),
@@ -12616,6 +12686,61 @@ mod tests {
             read_only: true,
             ..proposal(request_id)
         }
+    }
+
+    /// `/new` leaves a conversation: the log it owes is written then, not by a
+    /// quiet timer the next conversation's turns may never let run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leaving_a_conversation_writes_the_log_it_owes() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&project).expect("project");
+        let environment = LaunchEnvironment::from_pairs([
+            ("HA_HOME", home.to_string_lossy().into_owned()),
+            (
+                ENDPOINT_VARIABLE,
+                "http://127.0.0.1:9/chat/completions".to_owned(),
+            ),
+            (MODEL_VARIABLE, "fixture-model".to_owned()),
+            ("DEEPSEEK_API_KEY", "fixture-secret".to_owned()),
+        ]);
+        let context = bootstrap::resolve(LaunchRequest {
+            cwd: None,
+            caller_dir: project,
+            platform: HostPlatform::current(),
+            environment: environment.clone(),
+            explicit_data_dir: None,
+        })
+        .expect("launch context");
+        SqliteStore::open_writer(WriterOpenOptions::new(
+            context.project_store_dir(),
+            harness_types::HostId::generate(),
+        ))
+        .await
+        .expect("store")
+        .close()
+        .await
+        .expect("closed");
+        let root = context.project.root.clone();
+        let left = harness_types::TaskId::generate();
+        super::super::session_log::owe(&root, &left, &harness_types::SessionId::generate());
+        let channel = SessionChannel::new();
+        let mut service = AgentSessionService::new(&context, environment, channel.sender());
+        service.resume(None).expect("a new conversation");
+        // The leaving conversation's log is settled: a conversation with no
+        // turns in the journal has nothing to log, and owes nothing after.
+        for _ in 0..100 {
+            if super::super::session_log::owed(&root).is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            super::super::session_log::owed(&root).is_empty(),
+            "the log owed was written when the conversation was left"
+        );
     }
 
     /// K05: `/status` can name the project scope the store is keyed by.

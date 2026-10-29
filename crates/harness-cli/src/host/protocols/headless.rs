@@ -1444,6 +1444,50 @@ pub async fn run_with(
             }
         }
     }
+    // The run's end leaves the conversation: its session log is written
+    // before the process exits, when the conversation did enough for one. It
+    // is owed first, so a run killed while it writes leaves it to the next
+    // start of ha in this project.
+    if provider_config.is_some()
+        && !cancellation.is_cancelled()
+        && super::session_log::enabled(&context.paths.config_file, environment)
+    {
+        let root = &context.project.root;
+        super::session_log::owe(root, &outcome.task_id, &outcome.session_id);
+        let logged = async {
+            match SqliteStore::open_read_only(context.project_store_dir()).await {
+                Ok(store) => {
+                    let result = super::session_log::write_from_journal(
+                        &store,
+                        Arc::clone(&provider),
+                        root,
+                        &outcome.session_id,
+                        &outcome.task_id,
+                    )
+                    .await;
+                    let _ = store.close().await;
+                    result
+                }
+                Err(error) => Err(format!("the project store cannot be read: {error}")),
+            }
+        };
+        tokio::select! {
+            result = logged => {
+                super::session_log::record(&outcome.task_id, "exit", root, &result);
+                match result {
+                    Ok(super::session_log::Outcome::Written { placed, .. }) => out.stderr(&format!(
+                        "session log written to {}",
+                        placed.path.strip_prefix(root).unwrap_or(&placed.path).display()
+                    )),
+                    Err(error) => out.stderr(&format!("the session log was not written: {error}")),
+                    Ok(super::session_log::Outcome::Skipped(_)) => {}
+                }
+            }
+            () = cancellation.cancelled() => {
+                out.stderr("the session log was cut off; the next start of ha in this project writes it");
+            }
+        }
+    }
     // prime-agent's print-mode autonomous contract applies to every output.
     if let Some(line) = autonomous.exit_stderr(std::time::Instant::now()) {
         out.stderr(&line);

@@ -109,4 +109,54 @@ sleep 60
 check "no log was written" '[ -z "$(ls "$O"/.harness/sessions/*.md 2>/dev/null)" ]'
 "$HA" shutdown --force >/dev/null 2>&1
 
+# Sections 7-10 fail on 0.8.6: it wrote a log only on a quiet timer inside the
+# running process (lost on /new, an exit or a kill), skipped a one-request task
+# as too few turns, and left .harness/sessions out of .gitignore. The quiet
+# timer is pushed out of reach here, so only the new triggers can write.
+
+echo "################ 7. /new leaves a log for the conversation it leaves, at once"
+N=$RX/n
+project "$N"
+HA_IDLE_REVIEW_SECONDS=3600 agent "$N" l7
+say l7 "Ghi nhớ: cổng mặc định của dịch vụ này là 8081. Trả lời ngắn." | tail -1 | sed 's/^/   /'
+say l7 "Việc còn lại: viết healthcheck cho cổng đó. Chưa làm, chỉ ghi nhận. Trả lời ngắn." | tail -1 | sed 's/^/   /'
+check "no log before the conversation is left (the quiet timer is out of reach)" '[ -z "$(ls "$N"/.harness/sessions/*.md 2>/dev/null)" ]'
+"$HA" send l7 "/new -- Trả lời đúng một từ: xong" --wait > "$RX/new.out" 2>&1
+wait_for "$N/.harness/sessions/*.md" 120; sleep 2
+NLOG=$(ls "$N"/.harness/sessions/*.md 2>/dev/null | head -1)
+check "/new wrote the left conversation's log" '[ -n "$NLOG" ] && grep -q "8081" "$NLOG"'
+NCONV=$( [ -n "$NLOG" ] && sed -n 's/^\*\*Conversation:\*\* //p' "$NLOG" | head -1)
+check "nothing is owed for it any more" '[ -n "$NCONV" ] && [ ! -e "$N/.harness/sessions/owed/$NCONV" ]'
+check ".harness/.gitignore lists sessions/ and the lock" 'grep -qx "sessions/" "$N/.harness/.gitignore" && grep -qx "\*.lock" "$N/.harness/.gitignore"'
+check "the host's files are not the project's changes" '! (cd "$N" && git status --porcelain --untracked-files=all) | grep -qE "\.harness/(sessions|session-log\.lock)"'
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 8. a one-request task with several tool calls gets a log"
+T=$RX/t
+project "$T"
+agent "$T" l8
+say l8 "Tạo năm file n1.txt đến n5.txt, mỗi file chứa đúng tên của nó, mỗi file bằng một lần gọi tool riêng; rồi đọc lại từng file bằng một lần gọi tool riêng. Trả lời ngắn." | tail -1 | sed 's/^/   /'
+MADE=$(ls "$T"/n[1-5].txt 2>/dev/null | wc -l)
+check "precondition: the one request ran its tool calls (5 files made)" '[ "$MADE" -eq 5 ]'
+wait_for "$T/.harness/sessions/*.md" 120
+check "the one-request task got a log" '[ "$MADE" -lt 5 ] || [ -n "$(ls "$T"/.harness/sessions/*.md 2>/dev/null)" ]'
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 9. a chat killed right after a turn gets its log on the next start"
+K=$RX/k
+project "$K"
+HA_IDLE_REVIEW_SECONDS=3600 agent "$K" l9
+say l9 "Ghi nhớ: tên mã của bản phát hành tới là Orchid. Trả lời ngắn." | tail -1 | sed 's/^/   /'
+say l9 "Việc còn lại: viết release notes cho Orchid. Chưa làm, chỉ ghi nhận. Trả lời ngắn." | tail -1 | sed 's/^/   /'
+"$HA" shutdown --force >/dev/null 2>&1
+OWED=$(ls "$K"/.harness/sessions/owed/ 2>/dev/null | head -1)
+check "precondition: killed with the log owed and none written" '[ -n "$OWED" ] && [ -z "$(ls "$K"/.harness/sessions/*.md 2>/dev/null)" ]'
+HA_IDLE_REVIEW_SECONDS=3600 agent "$K" l9b
+say l9b "Trả lời đúng một từ: chào" > /dev/null
+wait_for "$K/.harness/sessions/*.md" 120; sleep 2
+KLOG=$(ls "$K"/.harness/sessions/*.md 2>/dev/null | head -1)
+check "the next start wrote the owed log" '[ -n "$KLOG" ] && grep -qi "orchid" "$KLOG" && grep -q "Conversation:\*\* $OWED" "$KLOG"'
+check "and it is no longer owed" '[ ! -e "$K/.harness/sessions/owed/$OWED" ]'
+"$HA" shutdown --force >/dev/null 2>&1
+
 result

@@ -48,8 +48,24 @@ pub const SESSIONS_DIR: &str = ".harness/sessions";
 const SETTING: &str = "sessionLog";
 const VARIABLE: &str = "HA_SESSION_LOG";
 
-/// A conversation with fewer user turns than this has nothing to log.
+/// A conversation is worth a log by its work: this many typed user turns, or,
+/// for one request carried out by a goal or a long turn, this many tool calls
+/// or model steps across its turns, the host's own turns included (a goal's
+/// continuations, a child's report). Below all three it is a question and an
+/// answer, which the journal keeps.
 const MIN_USER_TURNS: usize = 2;
+const MIN_TOOL_CALLS: usize = 5;
+const MIN_MODEL_STEPS: usize = 4;
+
+/// Where a conversation's owed log is marked, relative to the project root:
+/// one file per conversation, named by its id and holding its newest turn,
+/// armed as each turn ends and removed once that turn's log is written, so a
+/// start after a crash, a kill or a quit writes what was owed.
+const OWED_DIR: &str = ".harness/sessions/owed";
+
+/// The `.harness/.gitignore` lines that keep the host's own files out of the
+/// project's changes: the file logs, the owed marks and the lock.
+const IGNORED: [&str; 2] = ["sessions/", "*.lock"];
 
 /// The newest turns the model reads, and how much of their transcript: the
 /// end of a long conversation is where it stands.
@@ -126,6 +142,7 @@ pub fn is_latest_turn(task: &TaskId, session: &SessionId) -> bool {
 /// Hold the project's session-log lock, waiting up to 30 seconds for another
 /// process's write to finish.
 fn lock(root: &Path) -> Result<std::fs::File, String> {
+    ignore_host_files(root);
     let path = root.join(LOCK_FILE);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -151,6 +168,102 @@ fn lock(root: &Path) -> Result<std::fs::File, String> {
             Err(std::fs::TryLockError::Error(error)) => {
                 return Err(format!("session log lock: {error}"));
             }
+        }
+    }
+}
+
+/// Make `.harness/.gitignore` list the host's own files, before the host
+/// writes one: the file is created when absent, a missing line is appended,
+/// and nothing the user wrote is removed. A file that cannot be read is left
+/// alone.
+fn ignore_host_files(root: &Path) {
+    let path = root.join(".harness/.gitignore");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return,
+    };
+    let missing = IGNORED
+        .iter()
+        .filter(|line| !text.lines().any(|kept| kept.trim() == **line))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return;
+    }
+    let mut updated = text;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    for line in missing {
+        updated.push_str(line);
+        updated.push('\n');
+    }
+    let _ = write_file(&path, &updated);
+}
+
+/// Mark that `task` owes the log of its turn `session`: written as a turn
+/// ends, before its log is, so a log a crash, a kill or an exit cut off is
+/// written by the next start.
+pub fn owe(root: &Path, task: &TaskId, session: &SessionId) {
+    ignore_host_files(root);
+    let _ = write_file(&root.join(OWED_DIR).join(task.as_str()), session.as_str());
+}
+
+/// The conversations that owe a log, each with the turn it is owed through.
+#[must_use]
+pub fn owed(root: &Path) -> Vec<(TaskId, SessionId)> {
+    let Ok(entries) = std::fs::read_dir(root.join(OWED_DIR)) else {
+        return Vec::new();
+    };
+    let mut owed = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let task = TaskId::parse(entry.file_name().to_str()?.to_owned()).ok()?;
+            let session = SessionId::parse(
+                std::fs::read_to_string(entry.path())
+                    .ok()?
+                    .trim()
+                    .to_owned(),
+            )
+            .ok()?;
+            Some((task, session))
+        })
+        .collect::<Vec<_>>();
+    owed.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+    owed
+}
+
+/// The owed log of `task` is settled through `session`: its mark goes, unless
+/// a later turn has armed it again.
+fn settle(root: &Path, task: &TaskId, session: &SessionId) {
+    let path = root.join(OWED_DIR).join(task.as_str());
+    if std::fs::read_to_string(&path).is_ok_and(|owed| owed.trim() == session.as_str()) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The conversations whose log is being written in this process: a second
+/// trigger for one of them waits for nothing and calls no model.
+static WRITING: LazyLock<Mutex<std::collections::HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// A conversation's place in [`WRITING`], given up when the write ends.
+struct Writing(String);
+
+impl Writing {
+    fn begin(task: &TaskId) -> Option<Self> {
+        let mut writing = WRITING.lock().ok()?;
+        writing
+            .insert(task.as_str().to_owned())
+            .then(|| Self(task.as_str().to_owned()))
+    }
+}
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        if let Ok(mut writing) = WRITING.lock() {
+            writing.remove(&self.0);
         }
     }
 }
@@ -953,6 +1066,33 @@ async fn user_turns(store: &SqliteStore, turns: &[(SessionId, String)]) -> usize
     count
 }
 
+/// What a conversation's turns did, from the journal: tool calls that ran
+/// and model steps taken, every turn counted, the host's own too.
+async fn work(store: &SqliteStore, turns: &[(SessionId, String)]) -> (usize, usize) {
+    let mut tools = 0;
+    let mut steps = 0;
+    for (session, _) in turns {
+        tools += store
+            .recovered_tool_results(session)
+            .await
+            .map_or(0, |results| results.len());
+        steps += store
+            .provider_attempts_mark(session)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|(count, _, _)| usize::try_from(count).ok())
+            .unwrap_or(0);
+    }
+    (tools, steps)
+}
+
+/// Whether a conversation did enough to be worth a log: see
+/// [`MIN_USER_TURNS`].
+const fn worth_a_log(user_turns: usize, tool_calls: usize, model_steps: usize) -> bool {
+    user_turns >= MIN_USER_TURNS || tool_calls >= MIN_TOOL_CALLS || model_steps >= MIN_MODEL_STEPS
+}
+
 /// The end of a transcript, at most `limit` characters, cut at a line.
 fn tail(text: &str, limit: usize) -> String {
     let count = text.chars().count();
@@ -971,13 +1111,32 @@ fn tail(text: &str, limit: usize) -> String {
 
 /// Write the log of the conversation `session` ends, from its journal, with
 /// one call to `provider`. [`Outcome::Skipped`] when there is nothing to
-/// write: a log already written through this turn, a fixture model, a
-/// delegated child's task, or fewer than two user turns.
+/// write: a log already written through this turn or being written now, a
+/// fixture model, a delegated child's task, or too little work
+/// ([`MIN_USER_TURNS`]). Any outcome but an error and `in_progress` settles
+/// the log owed through `session`.
 ///
 /// # Errors
 /// The journal cannot be read, the model's log has not the shape, or it
 /// cannot be stored.
 pub async fn write_from_journal(
+    store: &SqliteStore,
+    provider: Arc<dyn ModelProvider>,
+    root: &Path,
+    session: &SessionId,
+    task: &TaskId,
+) -> Result<Outcome, String> {
+    let Some(_writing) = Writing::begin(task) else {
+        return Ok(Outcome::Skipped("in_progress"));
+    };
+    let outcome = log_conversation(store, provider, root, session, task).await;
+    if outcome.is_ok() {
+        settle(root, task, session);
+    }
+    outcome
+}
+
+async fn log_conversation(
     store: &SqliteStore,
     provider: Arc<dyn ModelProvider>,
     root: &Path,
@@ -1007,7 +1166,13 @@ pub async fn write_from_journal(
     let turns = harness_runtime::conversation_turns(store, session)
         .await
         .map_err(|error| error.to_string())?;
-    if user_turns(store, &turns).await < MIN_USER_TURNS {
+    let typed = user_turns(store, &turns).await;
+    let (tools, steps) = if typed >= MIN_USER_TURNS {
+        (0, 0)
+    } else {
+        work(store, &turns).await
+    };
+    if !worth_a_log(typed, tools, steps) {
         return Ok(Outcome::Skipped("few_turns"));
     }
     let transcript =
@@ -2178,6 +2343,153 @@ mod tests {
             "a delegated child writes no log"
         );
         assert_eq!(list(&root).len(), 1);
+    }
+
+    fn writer() -> Arc<dyn ModelProvider> {
+        Arc::new(Writer {
+            reply: harness_providers::MockProvider::text(MODEL_LOG),
+            prompts: Mutex::new(Vec::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_log_owed_is_marked_settled_and_written_by_the_next_start() {
+        let mut journal = Journal::new().await;
+        let root = journal.root.clone();
+        let task = TaskId::generate();
+        let first = journal.turn(&task, None, "wire the parser").await;
+        let second = journal
+            .turn(&task, Some(&first), "add error recovery")
+            .await;
+        // The turn ends: the log is owed before anything writes it.
+        owe(&root, &task, &second);
+        assert_eq!(owed(&root), [(task.clone(), second.clone())]);
+
+        // The process was killed before it wrote the log. The next start
+        // finds what is owed and writes it.
+        let (owing, through) = owed(&root).pop().expect("owed");
+        let result = write_from_journal(&journal.store, writer(), &root, &through, &owing).await;
+        assert!(matches!(result, Ok(Outcome::Written { .. })), "{result:?}");
+        assert!(owed(&root).is_empty(), "written: no longer owed");
+        assert_eq!(
+            find(&root, task.as_str()).and_then(|log| log.through),
+            Some(second.as_str().to_owned())
+        );
+
+        // A later turn owes again; settling an older turn leaves that mark.
+        let third = journal.turn(&task, Some(&second), "and the docs").await;
+        owe(&root, &task, &third);
+        settle(&root, &task, &second);
+        assert_eq!(owed(&root), [(task.clone(), third.clone())]);
+        // Nothing to write is settled too: no start writes it again.
+        let quick = TaskId::generate();
+        let only = journal.turn(&quick, None, "hello").await;
+        owe(&root, &quick, &only);
+        assert_eq!(
+            write_from_journal(&journal.store, writer(), &root, &only, &quick).await,
+            Ok(Outcome::Skipped("few_turns"))
+        );
+        assert_eq!(owed(&root), [(task.clone(), third)]);
+        // A write already running for the conversation is not started twice.
+        let _writing = Writing::begin(&task).expect("first");
+        assert_eq!(
+            write_from_journal(&journal.store, writer(), &root, &first, &task).await,
+            Ok(Outcome::Skipped("in_progress"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_one_request_task_is_logged_by_its_work_and_host_turns_are_not_user_turns() {
+        assert!(!worth_a_log(1, 0, 3));
+        assert!(worth_a_log(2, 0, 0));
+        assert!(worth_a_log(1, MIN_TOOL_CALLS, 0));
+        assert!(worth_a_log(1, 0, MIN_MODEL_STEPS));
+
+        let mut journal = Journal::new().await;
+        let root = journal.root.clone();
+        let one = TaskId::generate();
+        let only = journal.turn(&one, None, "what is this repo?").await;
+        assert_eq!(
+            write_from_journal(&journal.store, writer(), &root, &only, &one).await,
+            Ok(Outcome::Skipped("few_turns")),
+            "a question and its answer"
+        );
+
+        // One request, carried on by host turns - a goal's continuations -
+        // whose typed input is empty.
+        let task = TaskId::generate();
+        let mut head = journal.turn(&task, None, "migrate the schema").await;
+        for _ in 0..3 {
+            head = journal.turn(&task, Some(&head), "continue the goal").await;
+            journal
+                .store
+                .set_session_setting(
+                    &task,
+                    &format!("{}{head}", harness_runtime::TYPED_INPUT_SETTING),
+                    "",
+                )
+                .await
+                .expect("host turn");
+        }
+        let turns = harness_runtime::conversation_turns(&journal.store, &head)
+            .await
+            .expect("turns");
+        assert_eq!(
+            user_turns(&journal.store, &turns).await,
+            1,
+            "host turns are not the user's"
+        );
+        assert_eq!(
+            work(&journal.store, &turns).await.1,
+            4,
+            "one model step a turn"
+        );
+        let result = write_from_journal(&journal.store, writer(), &root, &head, &task).await;
+        assert!(matches!(result, Ok(Outcome::Written { .. })), "{result:?}");
+    }
+
+    #[test]
+    fn the_hosts_files_stay_out_of_the_projects_changes() {
+        let root = tempfile::tempdir().expect("root");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", "user.email=ha@example.invalid", "-c", "user.name=ha"])
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(root.path().join(".harness")).expect("dir");
+        std::fs::write(root.path().join(".harness/.gitignore"), "my-own/").expect("ignore");
+        put(root.path(), "task_1", &draft(), "2026-10-28T14:05:00+07:00");
+        owe(root.path(), &TaskId::generate(), &SessionId::generate());
+        let ignore =
+            std::fs::read_to_string(root.path().join(".harness/.gitignore")).expect("ignore");
+        assert_eq!(
+            ignore, "my-own/\nsessions/\n*.lock\n",
+            "the user's line kept, ours added once"
+        );
+        let status = String::from_utf8_lossy(
+            &git(&["status", "--porcelain", "--untracked-files=all"]).stdout,
+        )
+        .into_owned();
+        assert!(!status.contains("sessions/"), "{status}");
+        assert!(!status.contains(".lock"), "{status}");
+        assert!(status.contains(".harness/.gitignore"), "{status}");
+        // The markdown store's note stays the store's, tracked.
+        let store = tempfile::tempdir().expect("store");
+        let note = self::store(store.path());
+        put(
+            store.path(),
+            "task_1",
+            &draft(),
+            "2026-10-28T14:05:00+07:00",
+        );
+        assert!(note.is_file());
+        let ignore =
+            std::fs::read_to_string(store.path().join(".harness/.gitignore")).expect("ignore");
+        assert!(!ignore.contains("memory"), "{ignore}");
     }
 
     fn ids(blocks: &[ContextBlock]) -> Vec<&str> {

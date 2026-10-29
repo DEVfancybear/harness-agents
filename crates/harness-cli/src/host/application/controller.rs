@@ -4298,6 +4298,8 @@ impl InteractiveController {
                     effects.push(Effect::Redraw);
                     return effects;
                 }
+                // Leaving: the conversation's session log is written now.
+                self.service.conversation_left();
                 self.phase = AppPhase::Closed;
                 effects.push(Effect::Exit(EXIT_SUCCESS));
                 return effects;
@@ -6666,6 +6668,8 @@ impl InteractiveController {
     fn finish_pending_exit(&mut self, effects: &mut Vec<Effect>) {
         if self.exit_after_run {
             self.exit_after_run = false;
+            // Leaving: the conversation's session log is written now.
+            self.service.conversation_left();
             self.phase = AppPhase::Closed;
             effects.push(Effect::Exit(EXIT_SUCCESS));
         }

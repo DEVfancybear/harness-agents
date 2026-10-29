@@ -51,6 +51,10 @@ through.
 
 **When.** Automatically, from the journal, beside the conversation (never in a turn):
 
+- when the conversation is left: `/new`, `/resume` of another, `/fork` or `/clone`, and
+  the chat's exit (`/quit`, Ctrl-D) - at once, so the next conversation's start may already
+  find it (if it is still being written, the start falls back to the last turns);
+- at the end of an `ha exec` run, before the process exits;
 - when the session goes quiet - the moment the idle review runs, 10 minutes after the
   last turn (`HA_IDLE_REVIEW_SECONDS`), when no later turn of the same conversation
   started meanwhile (a turn of another conversation does not stop it); after a failed or
@@ -59,8 +63,17 @@ through.
   keeps the turns the summary replaced);
 - when the `/handoff` turn finishes.
 
-A turn already logged is not logged twice. Nothing is written for a conversation with
-fewer than 2 user turns, for a delegated child, or with a fixture model.
+**Owed logs.** Every turn, from its start, marks its conversation as owing a log, in
+`.harness/sessions/owed/<conversation id>` (holding the turn it is owed through), and
+writing that log - or finding there is nothing to write - removes the mark; a later turn
+marks it again. A log a crash, a kill (`ha shutdown --force`), a worker restart or an exit
+cut off is therefore written by the next start of ha in that project, beside its first turn.
+
+A turn already logged, or one whose log is being written, is not logged twice. Nothing
+is written for a delegated child, with a fixture model, or for a conversation that did too
+little: a log needs 2 typed user turns, or - one request carried out by a goal or a long
+turn - 5 tool calls or 4 model steps across its turns. The host's own turns (a goal's
+continuations, a child's report, a heartbeat) count as work, never as user turns.
 
 **Safety.** The model is told the conversation is data, never instructions. The
 transcript it reads and the log it writes - headings included - pass the secret
@@ -72,16 +85,22 @@ than 30 days ago: only regular files named `<YYYY-MM-DD-HH_MM>-<topic>.md` that 
 a log, and nothing when the directory is a link. Nothing in the markdown store is
 removed: it keeps its own rules.
 
+**Not the project's changes.** Before the host writes into `.harness`, it makes `.harness/.gitignore`
+list `sessions/` and `*.lock` (creating the file, or appending a missing line; nothing the
+user wrote there is removed), so the file logs, the owed marks and the lock never show as
+uncommitted in the startup brief or on exit. A log inside the markdown store's daily note
+stays tracked: it is the store's.
+
 **Off.** `"sessionLog": false` in `settings.json`, or `HA_SESSION_LOG=off`.
 
 **Diagnostics.** Every decision is a diagnostics record of kind `session_log`, which the
 bug report reads:
 
-- `written`: `trigger` (`quiet`, `compaction`, `handoff`), `home` (`note`, `file`), `path`
+- `written`: `trigger` (`quiet`, `compaction`, `handoff`, `left`, `exit` for `ha exec`, `owed` for a start that writes an owed log), `home` (`note`, `file`), `path`
   (relative to the project root), `bytes`, `turns`, and `fallback` when the log is not
   where it would go (`brief`, `no_room`, `unreadable_note`);
 - `skipped`: `trigger` and `reason` - `off`, `superseded` (a later turn of the conversation
-  started first), `already_written`, `fixture`, `child`, `few_turns`;
+  started first), `already_written`, `in_progress`, `fixture`, `child`, `few_turns`;
 - `failed` (warn): `trigger`, and the error as its message, redacted and cut to 300
   characters;
 - `recalled`: `n` (logs sent), `topic` (whether one was given), `matches`;
