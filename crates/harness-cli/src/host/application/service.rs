@@ -1699,6 +1699,9 @@ pub struct LiveTurn {
     auto_retry_off: std::sync::atomic::AtomicBool,
     /// The last turn that ended with an answer, for `/self-eval`.
     last_turn: Arc<super::self_eval::LastTurn>,
+    /// The conversation this session's turns last ran, held open
+    /// ([`super::continuity::OpenConversation`]) until a turn of another one.
+    open: Mutex<Option<super::continuity::OpenConversation>>,
 }
 
 /// The model and the thinking level a running turn's next call uses.
@@ -1721,6 +1724,21 @@ impl LiveTurn {
             auto_compaction_off: std::sync::atomic::AtomicBool::new(off("compaction")),
             auto_retry_off: std::sync::atomic::AtomicBool::new(off("retry")),
             ..Self::default()
+        }
+    }
+
+    /// Hold `task` open as this session's conversation, letting go of the
+    /// one an earlier turn held: after `/new` the conversation left is no
+    /// longer open, so the new one may hear of it.
+    fn hold_conversation(&self, store_dir: &Path, task: &TaskId) {
+        if let Ok(mut open) = self.open.lock() {
+            if open
+                .as_ref()
+                .is_some_and(|held| held.task() == task.as_str())
+            {
+                return;
+            }
+            *open = Some(super::continuity::OpenConversation::hold(store_dir, task));
         }
     }
 
@@ -3143,6 +3161,12 @@ mod resume_list_tests {
 /// with that conversation's task and title, when its checklist has open items: the
 /// newest conversation that kept a task state decides, and one whose work is
 /// done shows nothing.
+///
+/// A conversation still open - in another pane, or in another live ha - is
+/// passed over: its state is that conversation's live work, not a task left.
+/// The newest state that decides shows nothing either once it is older than
+/// a week, or once three other new conversations were shown it and none
+/// adopted it ([`super::task_state::still_offered`]).
 async fn earlier_task_state(
     store: &SqliteStore,
     data_dir: &Path,
@@ -3160,12 +3184,18 @@ async fn earlier_task_state(
         if seen.len() > LOOKED_AT {
             break;
         }
-        let state =
-            super::task_state::load(&super::task_state::path(data_dir, session.task_id.as_str()));
-        if state.is_empty() {
+        let path = super::task_state::path(data_dir, session.task_id.as_str());
+        let state = super::task_state::load(&path);
+        if state.is_empty() || super::continuity::is_live(&session.task_id) {
             continue;
         }
-        if state.unfinished().is_empty() {
+        if state.unfinished().is_empty()
+            || !super::task_state::still_offered(
+                &path,
+                current.as_str(),
+                std::time::SystemTime::now(),
+            )
+        {
             return None;
         }
         let title = store
@@ -3176,6 +3206,32 @@ async fn earlier_task_state(
         return Some((session.task_id, title, state));
     }
     None
+}
+
+/// One block's line in `/context`: its size and channel, whether it was sent,
+/// why not, and the size it was cut from.
+fn context_usage_line(block: &harness_session::ContextBlockUsage) -> String {
+    format!(
+        "{}: {} tokens · {} · {}{}{}",
+        block.block_id,
+        super::cost::format_tokens(block.token_estimate),
+        block.channel.as_str(),
+        if block.included {
+            "included"
+        } else {
+            "omitted"
+        },
+        block
+            .drop_reason
+            .as_ref()
+            .map_or_else(String::new, |reason| format!(" ({reason})")),
+        block
+            .cut_from_tokens
+            .map_or_else(String::new, |before| format!(
+                " (cut from {} tokens)",
+                super::cost::format_tokens(before)
+            ))
+    )
 }
 
 fn sort_newest_first(sessions: &mut [harness_store_sqlite::SessionSummary]) {
@@ -8509,6 +8565,9 @@ async fn run_turn(
     // one armed writes nothing while it runs, nor does a trigger read its
     // mark while the turn is half done.
     let _running_turn = super::session_log::RunningTurn::begin(&task_id);
+    // The pane's conversation is open from here until the pane moves on: no
+    // other conversation is offered its task state, its log or its turns.
+    live.hold_conversation(&store_dir, &task_id);
     if session_log_on {
         super::session_log::note_turn(&task_id, &session_id);
         // Owed from the start, so a kill during the turn or right after its
@@ -9411,6 +9470,10 @@ async fn run_turn(
     {
         built_prompt.text = custom;
     }
+    // The one precedence rule for where things stand, in the stable part of
+    // the prompt - once per request, and cached - whatever replaced the
+    // static layers: every block that carries a record points to it.
+    super::continuity::with_rule(&mut built_prompt.text);
     if repl_host.is_some()
         && let Some(block) = super::prompt::python_skills_block(&kernel_skill_imports)
     {
@@ -9526,6 +9589,10 @@ async fn run_turn(
                 earlier_task_state(&store, &data_dir, &task_id).await
         {
             project_blocks.push(super::task_state::earlier_block(&state, title.as_deref()));
+            super::task_state::note_offered(
+                &super::task_state::path(&data_dir, task.as_str()),
+                task_id.as_str(),
+            );
             carried = Some(task);
         }
     }
@@ -9552,9 +9619,9 @@ async fn run_turn(
     }
     // A session's first prompt starts from where the last one left the project.
     if let Some(brief) = startup_brief
-        && let Ok(Some(block)) = brief.await
+        && let Ok(blocks) = brief.await
     {
-        project_blocks.push(block);
+        project_blocks.extend(blocks);
     }
     // Memory is prime-agent's continual harness state: the model keeps it through
     // `rlm.harness`, and every turn carries a digest of it ranked for this task.
@@ -9976,23 +10043,7 @@ async fn run_turn(
             ),
             String::new(),
         ];
-        lines.extend(built.block_usage.iter().map(|block| {
-            format!(
-                "{}: {} tokens · {} · {}{}",
-                block.block_id,
-                super::cost::format_tokens(block.token_estimate),
-                block.channel.as_str(),
-                if block.included {
-                    "included"
-                } else {
-                    "omitted"
-                },
-                block
-                    .drop_reason
-                    .as_ref()
-                    .map_or_else(String::new, |reason| format!(" ({reason})"))
-            )
-        }));
+        lines.extend(built.block_usage.iter().map(context_usage_line));
         if let Ok(mut current) = context_summary.lock() {
             *current = lines;
         }

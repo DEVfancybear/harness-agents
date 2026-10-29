@@ -4,7 +4,7 @@ This project keeps its memory in markdown files at the project root, under markd
 
 ## Source of truth
 
-- The files are the truth: not the conversation, not a summary, not your `memory` tool. Your `memory` tool still holds what is about the user across projects; what belongs to this project - its people, decisions, state and lessons - goes here.
+- The files are the truth for this project's durable facts and decisions: not the conversation, not a summary, not your `memory` tool. The current task is governed by the live task_state, and the user's current message wins over both ("Where things stand" in the system prompt gives the whole order). Your `memory` tool still holds what is about the user across projects; what belongs to this project - its people, decisions, state and lessons - goes here.
 - `MEMORY.md` is the routing index: pointers only (tables of name -> file -> trigger keywords), never facts. It is in this turn below; keep it under its cap (about 15,000 characters).
 - `memory/people/<name>.md`, `memory/projects/<name>.md`, `memory/decisions/<date>-<slug>.md` hold durable facts; `memory/YYYY-MM-DD.md` is the day's raw log; `memory/context/` holds the current working context.
 - A search index (yours or ha's) is a locator only: it finds the file; the answer comes from reading its lines.

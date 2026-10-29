@@ -37,13 +37,15 @@ pub fn context_block(host: &KnowledgeHost, queries: &[(&str, f64)]) -> Option<Co
         Ok(text) => text,
         Err(error) => format!("Knowledge catalog unavailable: {error}"),
     };
-    Some(ContextBlock::optional(
-        "knowledge-catalog",
-        ContextBlockKind::Optional,
-        text,
-        40,
-    ))
+    Some(
+        ContextBlock::optional("knowledge-catalog", ContextBlockKind::Optional, text, 40)
+            .with_max_tokens(CATALOG_TOKENS)
+            .with_rest_at("knowledge search"),
+    )
 }
+
+/// The most tokens the knowledge catalog takes in a turn's context.
+const CATALOG_TOKENS: u64 = 1_500;
 
 /// Add native knowledge without changing the contracts of the other tool hosts.
 pub fn with_tools(inner: Option<ExternalTools>, host: &KnowledgeHost) -> ExternalTools {
