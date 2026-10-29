@@ -127,11 +127,21 @@ A lesson's standing at a given time:
   lesson was seen in, [MARKDOWN_MEMORY.en.md](MARKDOWN_MEMORY.en.md)):
   - `memory/decisions/<date>-learned-<slug>.md`, whose lines are tagged
     `[inferred]` (the rule, why, the review trigger) and `[observed]` (each
-    quote);
-  - a line under the index's `## Current Decisions`, which replaces its
-    `(none yet)` placeholder. The index is in every turn, so the rule is too.
+    quote). The slug is the rule's ASCII letters and digits; a rule with none
+    (Vietnamese, Chinese) is named by its lesson id. A name another file holds
+    takes `-2`, `-3` and so on, so a rule never overwrites another; the
+    lesson's own file is found again when it is placed again;
+  - a pointer under `## Current Decisions` of the index the store's config
+    names (`MEMORY.md` by default), which replaces its `(none yet)`
+    placeholder: `` - <title> (learned <date>, <lesson>) - `<file>` ``, the
+    title the rule's first 60 characters. The rule's text stays in its
+    decision file: the index is in every turn and routes the agent there.
+    Retiring or rewording strikes the line that names the file, in this shape
+    or in the longer one 0.8.7 and before wrote.
 
-  The store passes `ha memory lint`.
+  Both go through the store's one writer
+  ([MARKDOWN_MEMORY.en.md](MARKDOWN_MEMORY.en.md), section 5). The store
+  passes `ha memory lint`.
 - **One project without a store:** a global memory entry like the first, marked
   as that project's, so only its turns show it.
 

@@ -430,28 +430,11 @@ pub fn append(dir: &Path, line: &Value) -> Result<(), String> {
 }
 
 fn lock(dir: &Path) -> Result<std::fs::File, String> {
-    let file = std::fs::File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join(LOCK_FILE))
-        .map_err(|error| format!("evaluations lock: {error}"))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err("evaluations: waiting for another write timed out".to_owned());
-            }
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(format!("evaluations lock: {error}"));
-            }
-        }
-    }
+    super::files::hold(
+        &dir.join(LOCK_FILE),
+        std::time::Duration::from_secs(10),
+        "evaluations write",
+    )
 }
 
 /// What the model is told when the evaluation sends the turn back: the axes

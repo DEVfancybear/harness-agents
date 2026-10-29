@@ -126,11 +126,20 @@ của nó đã ghi lại.
   thấy, xem [MARKDOWN_MEMORY.vi.md](MARKDOWN_MEMORY.vi.md)):
   - file `memory/decisions/<ngày>-learned-<slug>.md`, mỗi dòng mang tag
     `[inferred]` (rule, lý do, khi nào xem lại) hoặc `[observed]` (từng trích
-    dẫn);
-  - một dòng dưới `## Current Decisions` của index, thay cho placeholder
-    `(none yet)`. Index có mặt ở mọi lượt, nên rule cũng vậy.
+    dẫn). Slug là các chữ cái và chữ số ASCII của rule; rule không có ký tự
+    nào như vậy (tiếng Việt, tiếng Trung) lấy id của lesson làm tên. Tên đã có
+    file khác giữ thì thêm `-2`, `-3`..., nên rule không bao giờ ghi đè rule
+    khác; đặt lại cùng một lesson thì tìm lại đúng file của nó;
+  - một con trỏ dưới `## Current Decisions` của index mà config của kho chỉ
+    định (mặc định `MEMORY.md`), thay cho placeholder `(none yet)`:
+    `` - <tiêu đề> (learned <ngày>, <lesson>) - `<file>` ``, tiêu đề là 60 ký
+    tự đầu của rule. Nội dung rule nằm trong file decision: index có mặt ở
+    mọi lượt và dẫn agent tới đó. Retire hay đổi lời rule sẽ gạch dòng nhắc
+    tới file đó, ở dạng này hay ở dạng dài hơn mà 0.8.7 trở về trước đã ghi.
 
-  Kho vẫn qua `ha memory lint`.
+  Cả hai đi qua bộ ghi duy nhất của kho
+  ([MARKDOWN_MEMORY.vi.md](MARKDOWN_MEMORY.vi.md), mục 5). Kho vẫn qua
+  `ha memory lint`.
 - **Một project không có kho:** entry memory global như trường hợp đầu, đánh dấu
   thuộc project đó, nên chỉ các lượt của project đó thấy.
 

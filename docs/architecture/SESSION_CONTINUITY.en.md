@@ -73,7 +73,11 @@ has room only for the Quick Reference and the Quick Resume Context, the log is c
 those; with no room even for them, or when the note exists but cannot be read (not
 UTF-8, held by another program), the note is left untouched and the log goes to a file.
 Any other project gets `.harness/sessions/<YYYY-MM-DD-HH_MM>-<topic>.md`. One write at a
-time, across `ha` processes, holds `.harness/session-log.lock`.
+time, across `ha` processes, holds `.harness/session-log.lock`. The note itself is written
+through the store's one writer ([MARKDOWN_MEMORY.en.md](MARKDOWN_MEMORY.en.md), section
+5): under the store's lock, read again just before it is replaced, so what the agent
+wrote into the note meanwhile is kept, and replaced whole. A log's own file is replaced
+whole too.
 
 **One per conversation.** A later write finds the log by its `**Conversation:**` line and
 rewrites it where it is, keeping the first write's date or time in its title. The model

@@ -3,10 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use harness_types::ContentHash;
 use serde::{Deserialize, Serialize};
@@ -1716,26 +1716,7 @@ fn lock(root: &Path) -> Result<File, String> {
     validate_existing(&directory)?;
     let path = directory.join(format!("{}.lock", hash(&identity).replace(':', "-")));
     validate_existing(&path)?;
-    let file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .map_err(error)?;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(fs::TryLockError::WouldBlock) => {
-                return Err("waiting for another knowledge operation timed out".to_owned());
-            }
-            Err(fs::TryLockError::Error(e)) => return Err(error(e)),
-        }
-    }
+    super::super::files::hold(&path, Duration::from_secs(30), "knowledge operation")
 }
 
 fn unique_id() -> String {
@@ -1757,24 +1738,9 @@ fn atomic_write(root: &Path, path: &str, content: &str) -> Result<(), String> {
         .ok_or("knowledge destination has no parent")?;
     fs::create_dir_all(parent).map_err(error)?;
     validate_existing(parent)?;
-    let staging = parent.join(format!(".ha-stage-{}", unique_id()));
-    let result = (|| {
-        let mut file = File::options()
-            .write(true)
-            .create_new(true)
-            .open(&staging)
-            .map_err(error)?;
-        file.write_all(content.as_bytes()).map_err(error)?;
-        file.sync_all().map_err(error)?;
-        drop(file);
-        validate_existing(&destination)?;
-        fs::rename(&staging, &destination).map_err(error)?;
-        sync_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&staging);
-    }
-    result
+    super::super::files::write_atomic_checked(&destination, content, || {
+        validate_existing(&destination)
+    })
 }
 
 #[cfg_attr(

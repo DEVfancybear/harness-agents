@@ -150,33 +150,11 @@ pub fn is_latest_turn(task: &TaskId, session: &SessionId) -> bool {
 /// process's write to finish.
 fn lock(root: &Path) -> Result<std::fs::File, String> {
     ignore_host_files(root);
-    let path = root.join(LOCK_FILE);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-    }
-    let file = std::fs::File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|error| format!("session log lock: {error}"))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err("waiting for another session log write timed out".to_owned());
-            }
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(format!("session log lock: {error}"));
-            }
-        }
-    }
+    super::files::hold(
+        &root.join(LOCK_FILE),
+        std::time::Duration::from_secs(30),
+        "session log write",
+    )
 }
 
 /// Make `.harness/.gitignore` list the host's own files, before the host
@@ -184,7 +162,8 @@ fn lock(root: &Path) -> Result<std::fs::File, String> {
 /// removed. A file the host creates lists itself too, so writing a log adds
 /// nothing to the project's changes: a coder started before it still finds
 /// the checkout it started from. A file that cannot be read is left alone.
-fn ignore_host_files(root: &Path) {
+/// The markdown store's writer calls it too, for its lock in `.harness`.
+pub(super) fn ignore_host_files(root: &Path) {
     let path = root.join(".harness/.gitignore");
     let (text, created) = match std::fs::read_to_string(&path) {
         Ok(text) => (text, false),
@@ -900,12 +879,10 @@ fn slug(topic: &str) -> String {
     }
 }
 
+/// Write one of the host's own files outside the markdown store (a log in
+/// [`SESSIONS_DIR`], `.harness/.gitignore`): whole or not at all.
 fn write_file(path: &Path, text: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-    }
-    std::fs::write(path, text).map_err(|error| format!("cannot write {}: {error}", path.display()))
+    super::files::write_atomic(path, text)
 }
 
 /// Whether `name` is a log's file name as [`write`] makes it:
@@ -961,16 +938,24 @@ fn prune(root: &Path, keep: &Path) {
     }
 }
 
-/// Take the log out of the daily note it is a section of.
-fn remove_from_note(log: &SessionLog) -> Result<(), String> {
-    let note = std::fs::read_to_string(&log.path)
-        .map_err(|error| format!("cannot read {}: {error}", log.path.display()))?;
-    if let Some((_, (start, end))) = note_logs(&log.path, &note)
-        .into_iter()
-        .find(|(found, _)| found.conversation == log.conversation)
-    {
-        write_file(&log.path, &format!("{}{}", &note[..start], &note[end..]))?;
-    }
+/// A daily note's path as the store names it: relative to `root`, with `/`.
+fn note_relative(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Take the log out of the daily note it is a section of, through the
+/// store's writer.
+fn remove_from_note(root: &Path, log: &SessionLog) -> Result<(), String> {
+    super::markdown_memory::edit(root, &note_relative(root, &log.path), |note| {
+        let note = note?;
+        let (_, (start, end)) = note_logs(&log.path, note)
+            .into_iter()
+            .find(|(found, _)| found.conversation == log.conversation)?;
+        Some(format!("{}{}", &note[..start], &note[end..]))
+    })?;
     Ok(())
 }
 
@@ -1024,48 +1009,57 @@ pub fn write(root: &Path, draft: &Draft, stamp: &Stamp<'_>) -> Result<Placed, St
             },
             |log| (log.path.clone(), log.label.clone()),
         );
-        // Only a note that is not there yet starts empty: one that cannot be
-        // read - not UTF-8, held by another program - is left alone, and the
-        // log goes to a file instead.
-        let note = match std::fs::read_to_string(&path) {
-            Ok(note) => Some(note),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Some(format!("# {}\n", now.format("%Y-%m-%d")))
-            }
-            Err(_) => {
-                fallback = Some("unreadable_note");
-                None
-            }
-        };
-        if let Some(note) = note {
-            let relative = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let cap = super::markdown_memory::ram_cap(root, &relative);
-            let fits =
-                |text: &str| cap.is_none_or(|cap| super::markdown_memory::lint_chars(text) <= cap);
-            for candidate in [draft.clone(), draft.brief()] {
-                let section = candidate.render(stamp, &label, 2);
-                let updated = with_section(&note, &path, conversation, &section);
+        let relative = note_relative(root, &path);
+        let cap = super::markdown_memory::ram_cap(root, &relative);
+        let fits =
+            |text: &str| cap.is_none_or(|cap| super::markdown_memory::lint_chars(text) <= cap);
+        let brief = draft.brief();
+        let candidates = [draft, &brief].map(|candidate| {
+            (
+                candidate.render(stamp, &label, 2),
+                candidate.sections.len() < draft.sections.len(),
+            )
+        });
+        // Through the store's writer, which reads the note again before it
+        // replaces it: what the agent wrote meanwhile stays. Only a note that
+        // is not there yet starts empty.
+        let mut chosen = None;
+        let written = super::markdown_memory::edit(root, &relative, |note| {
+            let note =
+                note.map_or_else(|| format!("# {}\n", now.format("%Y-%m-%d")), str::to_owned);
+            chosen = None;
+            for (index, (section, _)) in candidates.iter().enumerate() {
+                let updated = with_section(&note, &path, conversation, section);
                 if fits(&updated) {
-                    write_file(&path, &updated)?;
+                    chosen = Some(index);
+                    return Some(updated);
+                }
+            }
+            None
+        });
+        match written {
+            Ok(_) => {
+                if let Some((section, brief)) = chosen.map(|index| &candidates[index]) {
                     return Ok(Placed {
                         path,
                         in_store: true,
-                        fallback: (candidate.sections.len() < draft.sections.len())
-                            .then_some("brief"),
+                        fallback: brief.then_some("brief"),
                         bytes: section.len(),
                     });
                 }
+                // The note has no room left: the log goes to a file of its
+                // own, and leaves the note it was in.
+                fallback = Some("no_room");
+                if let Some(log) = &existing {
+                    remove_from_note(root, log)?;
+                }
             }
-            // The note has no room left: the log goes to a file of its own,
-            // and leaves the note it was in.
-            fallback = Some("no_room");
-            if let Some(log) = &existing {
-                remove_from_note(log)?;
+            // A note that cannot be read - not UTF-8, held by another
+            // program - is left alone, and the log goes to a file instead.
+            Err(super::markdown_memory::EditError::Unreadable(_)) => {
+                fallback = Some("unreadable_note");
             }
+            Err(error) => return Err(error.into()),
         }
     }
     let (path, label) = if let Some(log) = existing.filter(|log| !log.in_store) {

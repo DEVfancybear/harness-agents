@@ -61,22 +61,9 @@ fn load(path: &Path) -> Result<Store, String> {
 }
 
 fn save(path: &Path, store: &Store) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
     let mut text = serde_json::to_string_pretty(store).map_err(|error| error.to_string())?;
     text.push('\n');
-    write_atomic(path, &text)
-}
-
-fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
-    let temporary = path.with_extension(format!("{}.tmp", harness_types::RequestId::generate()));
-    std::fs::write(&temporary, text)
-        .and_then(|()| std::fs::rename(&temporary, path))
-        .map_err(|error| {
-            let _ = std::fs::remove_file(&temporary);
-            format!("{}: {error}", path.display())
-        })
+    super::files::write_atomic(path, &text)
 }
 
 fn valid_name(name: &str) -> bool {

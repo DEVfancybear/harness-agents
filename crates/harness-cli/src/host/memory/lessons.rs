@@ -470,29 +470,11 @@ fn clip(text: &str, limit: usize) -> String {
 /// Hold the lessons' lock, so a review and the CLI never interleave a
 /// read-modify-write.
 fn lock(dir: &Path) -> Result<std::fs::File, String> {
-    std::fs::create_dir_all(dir).map_err(|error| format!("lessons directory: {error}"))?;
-    let file = std::fs::File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join(LOCK_FILE))
-        .map_err(|error| format!("lessons lock: {error}"))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err("waiting for another lessons write timed out".to_owned());
-            }
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(format!("lessons lock: {error}"));
-            }
-        }
-    }
+    super::files::hold(
+        &dir.join(LOCK_FILE),
+        std::time::Duration::from_secs(30),
+        "lessons write",
+    )
 }
 
 /// The lessons kept in `dir`; none when there is no file yet.
@@ -1501,25 +1483,22 @@ fn place_fact(places: &Places, lesson: &Lesson) -> Result<Placement, String> {
 /// project in the index's Projects table when it is not there yet.
 fn place_markdown_fact(root: &Path, name: &str, lesson: &Lesson) -> Result<Placement, String> {
     let today = date(Utc::now());
-    let file = format!("memory/projects/{}.md", slug(name));
-    let path = root.join(&file);
-    let current =
-        std::fs::read_to_string(&path).unwrap_or_else(|_| format!("# {name}\n\n## Facts\n"));
+    let index = super::markdown_memory::index_file(root)?;
+    let file = format!("memory/projects/{}.md", slug(name, "lesson"));
     let line = format!(
         "- [observed] {} ({today}, {})",
         lesson.text.replace('\n', " "),
         lesson.id
     );
-    std::fs::create_dir_all(path.parent().unwrap_or(root))
-        .and_then(|()| std::fs::write(&path, under_heading(&current, "## Facts", &line)))
-        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-    let index = root.join("MEMORY.md");
-    let text = std::fs::read_to_string(&index).unwrap_or_default();
-    if !text.contains(&file) {
-        let row = format!("| {name} | `{file}` | {name} |");
-        std::fs::write(&index, with_project_row(&text, &row))
-            .map_err(|error| format!("cannot write {}: {error}", index.display()))?;
-    }
+    super::markdown_memory::edit(root, &file, |current| {
+        let current = current.map_or_else(|| format!("# {name}\n\n## Facts\n"), str::to_owned);
+        Some(under_heading(&current, "## Facts", &line))
+    })?;
+    let row = format!("| {name} | `{file}` | {name} |");
+    super::markdown_memory::edit(root, &index, |current| {
+        let current = current.unwrap_or_default();
+        (!current.contains(&file)).then(|| with_project_row(current, &row))
+    })?;
     Ok(Placement::MarkdownFact {
         root: root.display().to_string(),
         file,
@@ -1598,7 +1577,9 @@ fn with_project_row(index: &str, row: &str) -> String {
     text
 }
 
-fn slug(text: &str) -> String {
+/// A file name's stem from `text`: its ASCII letters and digits, joined by
+/// `-`, at most 40; `fallback` when none is left.
+fn slug(text: &str, fallback: &str) -> String {
     let mut slug = String::new();
     for character in text.chars().flat_map(char::to_lowercase) {
         if character.is_ascii_alphanumeric() {
@@ -1612,7 +1593,7 @@ fn slug(text: &str) -> String {
     }
     let slug = slug.trim_end_matches('-').to_owned();
     if slug.is_empty() {
-        "lesson".to_owned()
+        fallback.to_owned()
     } else {
         slug
     }
@@ -1621,13 +1602,46 @@ fn slug(text: &str) -> String {
 /// The heading the index lists behavior-changing defaults under.
 const DECISIONS_HEADING: &str = "## Current Decisions";
 
-/// A decision file whose every line carries its tag, and a line in the
-/// index's Current Decisions: the index is in every turn, so the rule is.
+/// How long a learned rule's title in the index may be, in characters.
+const INDEX_TITLE_CHARS: usize = 60;
+
+/// How many decision files of one day may share a slug before a placement
+/// gives up looking for a free name.
+const MAX_SAME_NAME: usize = 100;
+
+/// A learned rule's line in the index: a pointer, its title and the decision
+/// file that holds the rule. The rule's text stays in that file.
+fn index_line(text: &str, today: &str, id: &str, file: &str) -> String {
+    format!(
+        "- {} (learned {today}, {id}) - `{file}`",
+        super::markdown_memory::index_title(text, INDEX_TITLE_CHARS)
+    )
+}
+
+/// A decision file whose every line carries its tag, and a pointer to it in
+/// the index's Current Decisions: the index is in every turn, so the agent
+/// knows the rule is there and reads it when it applies.
+///
+/// The file is named by the day and the rule: when that name holds another
+/// file, `-2`, `-3` and so on; the lesson's own file, from an earlier
+/// placement, is found again. A rule with no ASCII letter or digit is named by
+/// its lesson's id.
 fn place_markdown(root: &Path, lesson: &Lesson, standing: &Standing) -> Result<Placement, String> {
     let now = Utc::now();
     let today = date(now);
-    let file = format!("memory/decisions/{today}-learned-{}.md", slug(&lesson.text));
-    let path = root.join(&file);
+    let index = super::markdown_memory::index_file(root)?;
+    let mut by_id = lesson
+        .id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        .collect::<String>();
+    if by_id.is_empty() {
+        "lesson".clone_into(&mut by_id);
+    }
+    let stem = format!(
+        "memory/decisions/{today}-learned-{}",
+        slug(&lesson.text, &by_id)
+    );
     let mut text = format!(
         "# Decision: {}\n\n- [inferred] Rule: {} ({today})\n- [inferred] Why: {}.\n- [inferred] Review trigger: retire it with `ha learning retire {}` once it no longer holds.\n\n## Evidence\n\n",
         clip(&lesson.text, 80),
@@ -1644,18 +1658,30 @@ fn place_markdown(root: &Path, lesson: &Lesson, standing: &Standing) -> Result<P
             signal.at.get(..10).unwrap_or(&signal.at)
         );
     }
-    std::fs::create_dir_all(path.parent().unwrap_or(root))
-        .and_then(|()| std::fs::write(&path, text))
-        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-    let index = root.join("MEMORY.md");
-    let line = format!(
-        "- {} (learned {today}, {}) - `{file}`",
-        clip(&lesson.text, 160).replace('\n', " "),
-        lesson.id
-    );
-    let current = std::fs::read_to_string(&index).unwrap_or_default();
-    std::fs::write(&index, with_decision(&current, &line))
-        .map_err(|error| format!("cannot write {}: {error}", index.display()))?;
+    let mut file = None;
+    for serial in 1..=MAX_SAME_NAME {
+        let candidate = if serial == 1 {
+            format!("{stem}.md")
+        } else {
+            format!("{stem}-{serial}.md")
+        };
+        let mut own = false;
+        super::markdown_memory::edit(root, &candidate, |current| {
+            own = current.is_none_or(|current| current.contains(&lesson.id));
+            own.then(|| text.clone())
+        })?;
+        if own {
+            file = Some(candidate);
+            break;
+        }
+    }
+    let file = file.ok_or_else(|| {
+        format!("{MAX_SAME_NAME} decision files are named {stem}.md already: none is free")
+    })?;
+    let line = index_line(&lesson.text, &today, &lesson.id, &file);
+    super::markdown_memory::edit(root, &index, |current| {
+        Some(with_decision(current.unwrap_or_default(), &file, &line))
+    })?;
     Ok(Placement::Markdown {
         root: root.display().to_string(),
         file,
@@ -1663,8 +1689,11 @@ fn place_markdown(root: &Path, lesson: &Lesson, standing: &Standing) -> Result<P
 }
 
 /// The index with `line` listed under Current Decisions, the placeholder it
-/// replaces gone; a section is added when the index has none.
-fn with_decision(index: &str, line: &str) -> String {
+/// replaces gone, and so is a line that points at `file` and is not struck: a
+/// rule placed again is listed once. A section is added when the index has
+/// none.
+fn with_decision(index: &str, file: &str, line: &str) -> String {
+    let pointer = format!("`{file}`");
     let lines = index.lines().collect::<Vec<_>>();
     let Some(heading) = lines
         .iter()
@@ -1686,6 +1715,7 @@ fn with_decision(index: &str, line: &str) -> String {
         lines[heading + 1..end]
             .iter()
             .filter(|text| text.trim() != "- (none yet)")
+            .filter(|text| !text.contains(&pointer) || text.contains("~~"))
             .map(|text| (*text).to_owned()),
     );
     while out.last().is_some_and(|text| text.trim().is_empty()) {
@@ -1728,11 +1758,9 @@ fn unplace(places: &Places, lesson: &Lesson) -> Result<(), String> {
         None | Some(Placement::Covered { .. } | Placement::Skill { .. }) => Ok(()),
         Some(Placement::MarkdownFact { root, file }) => {
             let today = date(Utc::now());
-            let path = Path::new(root).join(file);
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                std::fs::write(&path, strike(&text, &lesson.id, &today))
-                    .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-            }
+            super::markdown_memory::edit(Path::new(root), file, |current| {
+                current.map(|text| strike(text, &lesson.id, &today))
+            })?;
             Ok(())
         }
         Some(Placement::Memory { key }) => {
@@ -1747,16 +1775,15 @@ fn unplace(places: &Places, lesson: &Lesson) -> Result<(), String> {
         Some(Placement::Markdown { root, file }) => {
             let today = date(Utc::now());
             let root = Path::new(root);
-            let decision = root.join(file);
-            if let Ok(text) = std::fs::read_to_string(&decision) {
-                std::fs::write(&decision, strike(&text, "[inferred] Rule:", &today))
-                    .map_err(|error| format!("cannot write {}: {error}", decision.display()))?;
-            }
-            let index = root.join("MEMORY.md");
-            if let Ok(text) = std::fs::read_to_string(&index) {
-                std::fs::write(&index, strike(&text, file, &today))
-                    .map_err(|error| format!("cannot write {}: {error}", index.display()))?;
-            }
+            let index = super::markdown_memory::index_file(root)?;
+            super::markdown_memory::edit(root, file, |current| {
+                current.map(|text| strike(text, "[inferred] Rule:", &today))
+            })?;
+            // The index line names the file, in the pointer it is written as
+            // now and in the longer line of 0.8.7 and before.
+            super::markdown_memory::edit(root, &index, |current| {
+                current.map(|text| strike(text, file, &today))
+            })?;
             Ok(())
         }
     }
@@ -2871,41 +2898,44 @@ fn reword_placement(
         }
         .map(|_| ()),
         Some(Placement::Markdown { root, file }) => {
-            let path = Path::new(root).join(file);
-            let current = std::fs::read_to_string(&path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-            let struck = strike(&current, "[inferred] Rule:", &today);
+            let root = Path::new(root);
+            let index = super::markdown_memory::index_file(root)?;
             let line = format!("- [inferred] Rule: {text} ({today})");
-            std::fs::write(
-                &path,
-                insert_after_struck(&struck, "[inferred] Rule:", &line),
-            )
-            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-            let index = Path::new(root).join("MEMORY.md");
-            if let Ok(current) = std::fs::read_to_string(&index) {
-                let struck = strike(&current, file, &today);
-                let line = format!(
-                    "- {} (learned {today}, {}) - `{file}`",
-                    clip(text, 160).replace('\n', " "),
-                    lesson.id
-                );
-                std::fs::write(&index, with_decision(&struck, &line))
-                    .map_err(|error| format!("cannot write {}: {error}", index.display()))?;
+            let mut found = false;
+            super::markdown_memory::edit(root, file, |current| {
+                found = current.is_some();
+                let struck = strike(current?, "[inferred] Rule:", &today);
+                Some(insert_after_struck(&struck, "[inferred] Rule:", &line))
+            })?;
+            if !found {
+                return Err(format!("{file} is not there to reword"));
             }
+            // The index's line is struck in either shape, the pointer or the
+            // longer line of 0.8.7 and before, and a pointer added.
+            let pointer = index_line(text, &today, &lesson.id, file);
+            super::markdown_memory::edit(root, &index, |current| {
+                let struck = strike(current?, file, &today);
+                Some(with_decision(&struck, file, &pointer))
+            })?;
             Ok(())
         }
         Some(Placement::MarkdownFact { root, file }) => {
-            let path = Path::new(root).join(file);
-            let current = std::fs::read_to_string(&path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-            let struck = strike(&current, &lesson.id, &today);
             let line = format!(
                 "- [observed] {} ({today}, {})",
                 text.replace('\n', " "),
                 lesson.id
             );
-            std::fs::write(&path, under_heading(&struck, "## Facts", &line))
-                .map_err(|error| format!("cannot write {}: {error}", path.display()))
+            let mut found = false;
+            super::markdown_memory::edit(Path::new(root), file, |current| {
+                found = current.is_some();
+                let struck = strike(current?, &lesson.id, &today);
+                Some(under_heading(&struck, "## Facts", &line))
+            })?;
+            if found {
+                Ok(())
+            } else {
+                Err(format!("{file} is not there to reword"))
+            }
         }
     }
 }
@@ -3991,6 +4021,222 @@ mod tests {
         retire(&places, "les_fact", "the project moved to cargo").expect("retire");
         let text = std::fs::read_to_string(&file).expect("project file");
         assert!(text.contains("- ~~[observed] when building"), "{text}");
+    }
+
+    fn lint_passes(root: &Path) {
+        let report =
+            super::super::markdown_memory::lint(&super::super::markdown_memory::LintOptions {
+                root: root.to_path_buf(),
+                config: None,
+                mode: super::super::markdown_memory::DiffMode::None,
+            })
+            .expect("lint");
+        assert!(report.passed(), "{}", report.text(false));
+    }
+
+    fn ready_rule(id: &str, root: &Path, text: &str) -> Lesson {
+        let mut lesson = project_lesson(
+            id,
+            root,
+            "correction",
+            vec![
+                signal("c1", "a", 1, false),
+                signal("c2", "b", 1, false),
+                signal("c3", "c", 1, false),
+            ],
+        );
+        text.clone_into(&mut lesson.text);
+        lesson
+    }
+
+    fn placed_file(dir: &Path, id: &str) -> String {
+        let lessons = load(dir).expect("load");
+        match &lessons.find(id).expect("lesson").placement {
+            Some(Placement::Markdown { file, .. }) => file.clone(),
+            other => panic!("placed in markdown: {other:?}"),
+        }
+    }
+
+    /// The index routes to the rule; the rule's text is in its decision file,
+    /// and two rules of one day with no ASCII to name them get two files.
+    #[test]
+    fn a_learned_rule_is_a_pointer_in_the_index_and_never_overwrites_another() {
+        let dir = tempfile::tempdir().expect("dir");
+        let project = tempfile::tempdir().expect("project");
+        super::super::markdown_memory::init(project.path(), false).expect("init");
+        // Vietnamese keeps few ASCII letters: both rules come to one slug.
+        let first = "khi người dùng hỏi tóm tắt một tài liệu dài, luôn trả lời bằng một hai câu ngắn trước rồi mới đi vào chi tiết, kèm đường dẫn docs/summary.md";
+        let second = "khi người dùng hỏi tóm tắt một tài liệu dài, luôn nêu rõ nguồn của từng ý";
+        seed(
+            dir.path(),
+            vec![
+                ready_rule("les_vi1", project.path(), first),
+                ready_rule("les_vi2", project.path(), second),
+            ],
+        );
+        let places = Places {
+            global: dir.path().to_path_buf(),
+        };
+        let distilled = distill(&places, Utc::now()).expect("distill");
+        assert_eq!(distilled.promoted.len(), 2, "{distilled:?}");
+        let (one, two) = (
+            placed_file(dir.path(), "les_vi1"),
+            placed_file(dir.path(), "les_vi2"),
+        );
+        assert_eq!(two, one.replace(".md", "-2.md"));
+        for (file, rule) in [(&one, first), (&two, second)] {
+            let decision = std::fs::read_to_string(project.path().join(file)).expect("decision");
+            assert!(decision.contains(rule), "{decision}");
+        }
+        let index = std::fs::read_to_string(project.path().join("MEMORY.md")).expect("index");
+        for (file, rule) in [(&one, first), (&two, second)] {
+            let line = index
+                .lines()
+                .find(|line| line.contains(&format!("`{file}`")))
+                .expect("a line for the rule");
+            assert!(!line.contains(rule), "a pointer, not the rule: {line}");
+            let title = line
+                .strip_prefix("- ")
+                .and_then(|rest| rest.split(" (learned ").next())
+                .expect("a title");
+            assert!(
+                title.chars().count() <= INDEX_TITLE_CHARS + "...".len(),
+                "a short title: {line}"
+            );
+        }
+        lint_passes(project.path());
+        // Placed again, a rule finds its own file and keeps one index line.
+        let lesson = load(dir.path())
+            .expect("load")
+            .find("les_vi2")
+            .cloned()
+            .expect("lesson");
+        let again =
+            place_markdown(project.path(), &lesson, &lesson.standing(Utc::now())).expect("again");
+        assert!(
+            matches!(&again, Placement::Markdown { file, .. } if *file == two),
+            "{again:?}"
+        );
+        let index = std::fs::read_to_string(project.path().join("MEMORY.md")).expect("index");
+        assert_eq!(index.matches(&format!("`{two}`")).count(), 1, "{index}");
+        lint_passes(project.path());
+    }
+
+    /// A decision file of the same name that is another's is left alone.
+    #[test]
+    fn a_name_another_file_holds_takes_a_number() {
+        let project = tempfile::tempdir().expect("project");
+        super::super::markdown_memory::init(project.path(), false).expect("init");
+        let lesson = ready_rule("les_n", project.path(), "always run make ci before a push");
+        let today = date(Utc::now());
+        let taken = format!("memory/decisions/{today}-learned-always-run-make-ci-before-a-push.md");
+        let theirs = "# Decision: the user's own\n\n- [stated] Rule: theirs\n";
+        std::fs::write(project.path().join(&taken), theirs).expect("theirs");
+        let placed =
+            place_markdown(project.path(), &lesson, &lesson.standing(Utc::now())).expect("placed");
+        let Placement::Markdown { file, .. } = placed else {
+            panic!("{placed:?}");
+        };
+        assert_eq!(file, taken.replace(".md", "-2.md"));
+        assert_eq!(
+            std::fs::read_to_string(project.path().join(&taken)).expect("kept"),
+            theirs
+        );
+        // A rule with no ASCII letter or digit is named by its lesson.
+        for id in ["les_zh1", "les_zh2"] {
+            let lesson = ready_rule(id, project.path(), "修改界面后先在手机上测试再报告完成");
+            let placed = place_markdown(project.path(), &lesson, &lesson.standing(Utc::now()))
+                .expect("placed");
+            assert!(
+                matches!(&placed, Placement::Markdown { file, .. }
+                    if *file == format!("memory/decisions/{today}-learned-{id}.md")),
+                "{placed:?}"
+            );
+        }
+        lint_passes(project.path());
+    }
+
+    /// An index written by 0.8.7 and before holds the rule's text in its
+    /// line: retiring and rewording still strike that line.
+    #[test]
+    fn an_index_line_of_the_old_shape_is_struck() {
+        let dir = tempfile::tempdir().expect("dir");
+        let project = tempfile::tempdir().expect("project");
+        super::super::markdown_memory::init(project.path(), false).expect("init");
+        let file = "memory/decisions/2026-10-01-learned-use-make-ci.md";
+        std::fs::write(
+            project.path().join(file),
+            "# Decision: use make ci\n\n- [inferred] Rule: when building, use make ci and never cargo build directly (2026-10-01)\n",
+        )
+        .expect("decision");
+        let index_path = project.path().join("MEMORY.md");
+        let old = format!(
+            "- when building, use make ci and never cargo build directly (learned 2026-10-01, les_old) - `{file}`"
+        );
+        let index = std::fs::read_to_string(&index_path).expect("index");
+        std::fs::write(&index_path, with_decision(&index, file, &old)).expect("old index");
+        let mut lesson = ready_rule("les_old", project.path(), "when building, use make ci");
+        lesson.state = LessonState::Promoted;
+        lesson.placement = Some(Placement::Markdown {
+            root: project.path().display().to_string(),
+            file: file.to_owned(),
+        });
+        let places = Places {
+            global: dir.path().to_path_buf(),
+        };
+        reword_placement(&places, &lesson, "when building, run make ci", Utc::now())
+            .expect("reword");
+        let index = std::fs::read_to_string(&index_path).expect("index");
+        let lines = index
+            .lines()
+            .filter(|line| line.contains(file))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2, "{index}");
+        assert!(
+            lines[0].starts_with("- ~~when building, use make ci and never"),
+            "{index}"
+        );
+        assert!(
+            lines[1].starts_with("- when building, run make ci (learned"),
+            "{index}"
+        );
+        lint_passes(project.path());
+        unplace(&places, &lesson).expect("retire");
+        let index = std::fs::read_to_string(&index_path).expect("index");
+        assert!(
+            index
+                .lines()
+                .filter(|line| line.contains(file))
+                .all(|line| line.contains("~~")),
+            "{index}"
+        );
+    }
+
+    /// The index the store's config names is the one a rule is listed in.
+    #[test]
+    fn a_rule_goes_to_the_index_the_config_names() {
+        let project = tempfile::tempdir().expect("project");
+        super::super::markdown_memory::init(project.path(), false).expect("init");
+        let config = project
+            .path()
+            .join(super::super::markdown_memory::CONFIG_FILE);
+        let text = std::fs::read_to_string(&config).expect("config");
+        std::fs::write(
+            &config,
+            text.replace("\"index\": \"MEMORY.md\"", "\"index\": \"INDEX.md\""),
+        )
+        .expect("config");
+        std::fs::copy(
+            project.path().join("MEMORY.md"),
+            project.path().join("INDEX.md"),
+        )
+        .expect("index");
+        let lesson = ready_rule("les_ix", project.path(), "always run make ci before a push");
+        place_markdown(project.path(), &lesson, &lesson.standing(Utc::now())).expect("placed");
+        let named = std::fs::read_to_string(project.path().join("INDEX.md")).expect("named");
+        assert!(named.contains("les_ix"), "{named}");
+        let default = std::fs::read_to_string(project.path().join("MEMORY.md")).expect("default");
+        assert!(!default.contains("les_ix"), "{default}");
     }
 
     #[test]

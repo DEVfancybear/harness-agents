@@ -8,7 +8,10 @@
 # the index routes to; it writes a new fact as a tagged line in a person file
 # and routes the index to it; it supersedes a decision by striking the old line
 # through; the hook blocks a commit with an untagged fact and lets a tagged one
-# through; `ha doctor` reports the store and a dead index path.
+# through; `ha doctor` reports the store and a dead index path. Section 10
+# needs no model: two rules the learning loop places land in two decision
+# files, and the index holds a pointer to each, not its text (both fail on
+# 0.8.7).
 #
 #   bash scripts/testing/live-tests/markdown-memory.sh
 set -u
@@ -171,5 +174,56 @@ check "the project entry was refused, naming the store" 'sent | grep -q "this pr
 check "no project entry was kept" '! "$HA" memory export | "$PY" -c "import json,sys; d=json.load(sys.stdin)[\"document\"][\"entries\"][\"memory\"]; sys.exit(0 if any(\"pnpm\" in (e.get(\"content\") or \"\") and e.get(\"project\") for e in d.values()) else 1)"'
 check "the fact went into the store, tagged" 'grep -rE "^\s*[-*+] \[(stated|observed|inferred|suggested)[^]]*\].*pnpm" "$P/memory" | grep -q .'
 check "and the store passes the lint" 'lint --quiet > /dev/null'
+
+echo "################ 10. the learning loop writes a pointer, and two rules of one day two files"
+# No model: `ha learning import` places what passes the gate into the store of
+# the project it runs in. Two rules, seen in two conversations each, in
+# Chinese: no ASCII letter names either, and both are longer than an index
+# title. On 0.8.7 both went to memory/decisions/<today>-learned-lesson.md, the
+# second over the first, and each index line held the rule's text.
+L=$RX/l
+project "$L"
+(cd "$L" && "$HA" memory init) > /dev/null 2>&1
+"$PY" - "$RX/rules.json" "$(basename "$L")" <<'EOF'
+import datetime, json, sys
+at = lambda days: (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).isoformat()
+signals = [{"at": at(3), "conversation": "task_a", "against": False, "evidence": "先给结论"},
+           {"at": at(2), "conversation": "task_b", "against": False, "evidence": "又是先给结论"},
+           {"at": at(1), "conversation": "task_b", "against": False, "evidence": "请先给结论"}]
+first = {"id": "les_zh1", "kind": "correction", "domain": "communication", "scope": "project", "project": sys.argv[2], "signals": signals,
+         "text": "当用户要求总结一份很长的文档时，先用一两句话给出结论，然后再分点列出细节，最后附上每一条结论所依据的原文段落和对应的页码，方便用户自己逐条核对"}
+second = dict(first, id="les_zh2", domain="workflow",
+              text="修改任何界面之后，必须先在手机和平板两种尺寸的屏幕上分别实际运行并检查一遍布局与交互，确认没有错位、遮挡或者无法点击的按钮，然后才能向用户报告这项工作已经完成")
+json.dump({"schema": 1, "kind": "ha-lessons", "lessons": [first, second]}, open(sys.argv[1], "w", encoding="utf-8"), ensure_ascii=False)
+EOF
+(cd "$L" && "$HA" learning import "$RX/rules.json") > "$RX/rules-import.out" 2>&1
+sed 's/^/   /' "$RX/rules-import.out"
+# Each rule placed in this store, as `<id>\t<decision file>\t<its text>`.
+"$HA" learning list --all --json > "$RX/rules-list.json"
+"$PY" - "$RX/rules-list.json" "$(basename "$L")" > "$RX/rules.tsv" <<'EOF'
+import json, os, sys
+sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+for x in json.load(open(sys.argv[1], encoding="utf-8")):
+    p = x.get("placement") or {}
+    if p.get("target") == "markdown" and os.path.basename(os.path.normpath(p.get("root", ""))) == sys.argv[2]:
+        print(x["id"], p["file"], x["text"], sep="\t")
+EOF
+sed 's/^/   /' "$RX/rules.tsv"
+# each_rule <test>: <test> <id> <file> <text> holds for every rule placed.
+each_rule() { local id file text; while IFS=$'\t' read -r id file text; do "$1" "$id" "$file" "$text" || return 1; done < "$RX/rules.tsv"; }
+holds_rule() { grep -qF "$3" "$L/$2" && grep -qF "$1" "$L/$2"; }
+pointed_once() { [ "$(grep -cF "\`$2\`" "$L/MEMORY.md")" -eq 1 ]; }
+pointer_only() { ! grep -F "\`$2\`" "$L/MEMORY.md" | grep -qF "$3"; }
+check "both rules passed the gate into the store" '[ "$(wc -l < "$RX/rules.tsv")" -eq 2 ]'
+check "two rules of one day land in two decision files" '[ "$(cut -f2 "$RX/rules.tsv" | sort -u | wc -l)" -eq 2 ] && [ "$(ls "$L"/memory/decisions/*-learned-*.md | wc -l)" -eq 2 ]'
+check "each decision file holds its own rule" 'each_rule holds_rule'
+check "the index points at each file once" 'each_rule pointed_once'
+check "a learned rule's index line holds no rule text" 'each_rule pointer_only'
+check "the store passes the lint after the loop wrote it" '(cd "$L" && "$HA" memory lint --quiet)'
+RID=$(head -1 "$RX/rules.tsv" | cut -f1)
+RFILE=$(head -1 "$RX/rules.tsv" | cut -f2)
+"$HA" learning retire "$RID" --reason "live test" > /dev/null 2>&1
+check "retiring strikes the pointer and the rule" '[ -n "$RFILE" ] && grep -F "\`$RFILE\`" "$L/MEMORY.md" | grep -q "~~" && grep -q "~~\[inferred\] Rule:" "$L/$RFILE"'
+check "and the store still passes the lint" '(cd "$L" && "$HA" memory lint --quiet)'
 
 result

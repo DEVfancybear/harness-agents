@@ -2577,31 +2577,19 @@ mod venv {
             return Err("the kernel venv must be an absolute kernel-venv directory".to_owned());
         }
         let parent = venv.parent().ok_or("the kernel venv has no parent")?;
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        let file = std::fs::File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(parent.join("kernel-venv.lock"))
-            .map_err(|error| format!("the kernel venv lock could not be opened: {error}"))?;
+        let lock = parent.join("kernel-venv.lock");
+        let file = crate::interactive::files::open_lock(&lock, "the kernel venv")?;
         let deadline = tokio::time::Instant::now() + STEP_TIMEOUT * 3;
         loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(file),
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(
-                            "waiting for another session to build the kernel venv timed out"
-                                .to_owned(),
-                        );
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(std::fs::TryLockError::Error(error)) => {
-                    return Err(format!("the kernel venv could not be locked: {error}"));
-                }
+            if crate::interactive::files::try_take(&file, "the kernel venv")? {
+                return Ok(file);
             }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(
+                    "waiting for another session to build the kernel venv timed out".to_owned(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 }

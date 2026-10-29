@@ -65,6 +65,8 @@ pub mod extensions;
 pub mod external_editor;
 #[path = "memory/features.rs"]
 pub mod features;
+#[path = "memory/files.rs"]
+pub mod files;
 #[path = "application/frontend.rs"]
 pub mod frontend;
 #[path = "coordination/goal.rs"]

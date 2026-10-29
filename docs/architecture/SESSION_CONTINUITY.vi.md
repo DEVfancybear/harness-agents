@@ -71,7 +71,10 @@ Reference và Quick Resume Context, log chỉ giữ hai mục đó; khi không c
 chúng, hoặc khi ghi chú có nhưng không đọc được (không phải UTF-8, đang bị chương trình
 khác giữ), ghi chú không bị đụng tới và log sang một file riêng. Project khác nhận
 `.harness/sessions/<YYYY-MM-DD-HH_MM>-<chủ đề>.md`. Mỗi lúc chỉ một lần ghi, kể cả giữa
-các tiến trình `ha`, nhờ khóa `.harness/session-log.lock`.
+các tiến trình `ha`, nhờ khóa `.harness/session-log.lock`. Bản thân ghi chú được ghi qua
+bộ ghi duy nhất của kho ([MARKDOWN_MEMORY.vi.md](MARKDOWN_MEMORY.vi.md), mục 5): dưới khóa
+của kho, đọc lại ngay trước khi thay, nên những gì agent vừa viết vào ghi chú vẫn được
+giữ, và thay nguyên cả file. File riêng của một log cũng được thay nguyên cả file.
 
 **Mỗi hội thoại một log.** Lần ghi sau tìm log theo dòng `**Conversation:**` và ghi đè tại
 chỗ, giữ ngày hoặc giờ của lần ghi đầu trong tiêu đề. Model đọc log cũ cùng các lượt mới
