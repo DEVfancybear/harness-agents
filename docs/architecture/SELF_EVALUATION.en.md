@@ -58,6 +58,10 @@ an analysis" and "debugging that took 3 attempts" would need the text judged to
 detect them. The maintainer's rule is that no word list may judge text, so
 these are left to `/self-eval`.
 
+The run `ha memory migrate` starts is not judged either: the store's lint checks
+it right after, and a judge that reads only the last tool results sent a whole
+migration back for a read it could not see.
+
 ## 3. The end-of-turn chain
 
 When a turn's answer has no tool call, the checks run in order, and at most one

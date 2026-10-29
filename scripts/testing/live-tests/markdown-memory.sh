@@ -155,6 +155,9 @@ EOF
 migrated=$?
 tail -12 "$RX/migrate.out" | sed 's/^/   /'
 check "the migration finished and the store passes the lint" '[ $migrated -eq 0 ] && grep -q "^RESULT PASS" "$RX/migrate.out"'
+# The lint is the migration's check: a self-evaluation that saw only the last
+# tool results sent a whole migration back on 0.8.7's first candidate.
+check "no self-evaluation judges the migration" '! grep -q "self-evaluation: judging" "$RX/migrate.out"'
 check "the flat file is kept whole in the archive" 'grep -lq "every Vega PR needs her approval" "$M"/memory/archive/*.flat.md'
 lanfile=$(cd "$M" && ls memory/people/*.md 2>/dev/null | grep -i lan | head -1)
 check "Lan has a person file with tagged facts" '[ -n "$lanfile" ] && grep -E "^\s*[-*+] \[(stated|observed|inferred|suggested)" "$M/$lanfile" | grep -qi "review"'

@@ -201,9 +201,15 @@ fn migrate(args: MigrateArgs) -> Result<(), HarnessError> {
     let mut command = std::process::Command::new(
         std::env::current_exe().map_err(|error| failed(error.to_string()))?,
     );
-    command
-        .current_dir(&root)
-        .args(["exec", "--approval", args.approval.as_str()]);
+    // The lint below checks the migration. A self-evaluation of it reads only
+    // the turn's last tool results: it sent a whole migration back for an
+    // archive read it could not see, and the second pass reached for a tool
+    // the run's approval refuses.
+    command.current_dir(&root).env("HA_SELF_EVAL", "off").args([
+        "exec",
+        "--approval",
+        args.approval.as_str(),
+    ]);
     if let Some(model) = &args.model {
         command.args(["--model", model]);
     }

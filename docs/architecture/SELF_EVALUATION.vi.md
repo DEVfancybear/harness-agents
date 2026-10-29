@@ -59,6 +59,10 @@ Một lượt chỉ trò chuyện, hoặc chỉ có một thay đổi nhỏ, th�
 chữ mới nhận ra được. Quy tắc của maintainer là không danh sách từ nào được
 dùng để phán đoán chữ, nên các trường hợp này để cho `/self-eval`.
 
+Lượt chạy do `ha memory migrate` khởi động cũng không được chấm: lint của kho
+kiểm tra nó ngay sau đó, và một bộ chấm chỉ đọc các tool result cuối đã trả về
+nguyên một lần migrate vì một lần đọc nó không thấy.
+
 ## 3. Chuỗi kiểm tra cuối lượt
 
 Khi câu trả lời của lượt không có lời gọi tool, các bước kiểm chạy theo thứ tự,

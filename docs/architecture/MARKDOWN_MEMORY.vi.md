@@ -72,7 +72,8 @@ Bước đầu tiên của install prompt: biến một file memory phẳng thà
    - dựng lại `MEMORY.md` thành index thuần, với các đường dẫn có thật;
    - chỉ bỏ những gì suy lại được.
 
-   Luật của kho có mặt trong các lượt của lần chạy đó.
+   Luật của kho có mặt trong các lượt của lần chạy đó. Lượt chạy này không qua
+   self-evaluation: lint ở bước 4 là phần kiểm tra của nó.
 4. Kho được lint so với working tree. Có lỗi thì exit 1, kèm tên file đã lưu
    trữ.
 

@@ -72,7 +72,8 @@ The install prompt's first step: a flat memory file becomes the store.
    - rebuild `MEMORY.md` as a pure index whose paths exist;
    - leave out only what can be re-derived.
 
-   The store's rules are in that run's turns.
+   The store's rules are in that run's turns. The run is not self-evaluated:
+   the lint in step 4 is its check.
 4. The store is linted against the working tree. A failure exits 1, and the
    archived file is named.
 
