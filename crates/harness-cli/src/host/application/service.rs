@@ -3171,6 +3171,7 @@ async fn earlier_task_state(
     store: &SqliteStore,
     data_dir: &Path,
     current: &TaskId,
+    checkout: &Path,
 ) -> Option<(TaskId, Option<String>, super::task_state::TaskState)> {
     /// How many earlier conversations are looked through.
     const LOOKED_AT: usize = 20;
@@ -3178,7 +3179,10 @@ async fn earlier_task_state(
     sort_newest_first(&mut sessions);
     let mut seen = std::collections::HashSet::new();
     for session in sessions {
-        if session.task_id == *current || !seen.insert(session.task_id.as_str().to_owned()) {
+        if session.task_id == *current
+            || !of_checkout(store, &session.task_id, checkout).await
+            || !seen.insert(session.task_id.as_str().to_owned())
+        {
             continue;
         }
         if seen.len() > LOOKED_AT {
@@ -3206,6 +3210,21 @@ async fn earlier_task_state(
         return Some((session.task_id, title, state));
     }
     None
+}
+
+/// The setting that names the checkout a conversation was started in.
+pub(super) const CHECKOUT_SETTING: &str = "checkout";
+
+/// Whether `task` was started in `checkout`. A conversation from before the
+/// setting was kept is the key root's: a store then held only the
+/// conversations of the directory it was keyed by, so it belongs to a
+/// checkout that is its own project's root, never to a linked worktree.
+pub(super) async fn of_checkout(store: &SqliteStore, task: &TaskId, checkout: &Path) -> bool {
+    match store.session_setting(task, CHECKOUT_SETTING).await {
+        Ok(Some(started)) => Path::new(&started) == checkout,
+        Ok(None) => super::bootstrap::project_root(checkout) == checkout,
+        Err(_) => false,
+    }
 }
 
 /// One block's line in `/context`: its size and channel, whether it was sent,
@@ -9326,6 +9345,18 @@ async fn run_turn(
             &typed,
         )
         .await;
+    // A project's linked worktrees share its store: the checkout a
+    // conversation was started in keeps another checkout's new conversations
+    // from hearing of it.
+    if matches!(
+        store.session_setting(&task_id, CHECKOUT_SETTING).await,
+        Ok(None)
+    ) {
+        let checkout = super::bootstrap::checkout_root(&workspace_root);
+        let _ = store
+            .set_session_setting(&task_id, CHECKOUT_SETTING, &checkout.to_string_lossy())
+            .await;
+    }
     // Content the message names rides with it: images as blocks the model is shown, files
     // as text the model reads. A candidate that cannot be attached is said out loud: a
     // reader who is not told why cannot tell it from a bug.
@@ -9586,8 +9617,13 @@ async fn run_turn(
             None => 0,
         };
         if turns < super::task_state::EARLIER_STATE_TURNS
-            && let Some((task, title, state)) =
-                earlier_task_state(&store, &data_dir, &task_id).await
+            && let Some((task, title, state)) = earlier_task_state(
+                &store,
+                &data_dir,
+                &task_id,
+                &super::bootstrap::checkout_root(&workspace_root),
+            )
+            .await
         {
             project_blocks.push(super::task_state::earlier_block(&state, title.as_deref()));
             super::task_state::note_offered(

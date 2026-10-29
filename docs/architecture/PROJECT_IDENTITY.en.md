@@ -90,8 +90,14 @@ key did not change does nothing beyond two file checks.
 ## 4. What it changes
 
 - Conversations started in a subdirectory or a linked worktree are in the
-  repository's store: `/resume`, `history_search` and a new conversation's view
-  of the previous one see them from any directory of the repository.
+  repository's store: `/resume` and `history_search` see them from any
+  directory of the repository.
+- A new conversation hears only of its own checkout's earlier ones. Each
+  conversation keeps the checkout it was started in (the nearest directory
+  with a `.git` entry), and the previous conversation's turns and the task it
+  left are taken from that checkout's: a linked worktree on another branch is
+  not shown the main checkout's last task, nor the main checkout the
+  worktree's. A conversation from before 0.8.8 is the key root's.
 - One background worker serves the repository.
 - `ha maintenance --cwd <dir>` and `ha sessions list` from a subdirectory open
   the repository's store.

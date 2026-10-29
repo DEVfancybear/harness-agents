@@ -1422,8 +1422,14 @@ pub(super) async fn previous_conversation_blocks(
     let covered = logged.as_ref().is_some_and(|logged| logged.previous);
     let mut blocks = logged.map(|logged| vec![logged.block]).unwrap_or_default();
     if !covered
-        && let Some(block) =
-            super::session_brief::context_block(store, current, source, refinements).await
+        && let Some(block) = super::session_brief::context_block(
+            store,
+            current,
+            source,
+            refinements,
+            &super::bootstrap::checkout_root(root),
+        )
+        .await
     {
         blocks.push(block);
     }

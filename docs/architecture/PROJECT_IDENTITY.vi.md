@@ -86,8 +86,14 @@ lần hay từ nhiều lần chạy cùng lúc đều an toàn. Lần chạy t�
 ## 4. Những gì thay đổi
 
 - Hội thoại bắt đầu trong thư mục con hay linked worktree nằm trong store của
-  repository: `/resume`, `history_search` và phần một hội thoại mới thấy về hội
-  thoại trước đều thấy chúng từ bất kỳ thư mục nào của repository.
+  repository: `/resume` và `history_search` thấy chúng từ bất kỳ thư mục nào của
+  repository.
+- Một hội thoại mới chỉ nghe về các hội thoại trước của chính checkout nó. Mỗi
+  hội thoại giữ checkout nơi nó bắt đầu (thư mục gần nhất có `.git`), và các
+  lượt của hội thoại trước cùng task nó bỏ dở được lấy từ checkout đó: một
+  linked worktree ở branch khác không được cho xem task cuối của main checkout,
+  và main checkout cũng không thấy của worktree. Hội thoại từ trước 0.8.8 thuộc
+  về key root.
 - Một worker nền phục vụ cả repository.
 - `ha maintenance --cwd <dir>` và `ha sessions list` từ thư mục con mở store của
   repository.

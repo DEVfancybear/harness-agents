@@ -437,6 +437,15 @@ pub fn project_root(path: &Path) -> PathBuf {
     if refuses { launch } else { found }
 }
 
+/// The checkout a directory is in: the nearest ancestor with a `.git` entry,
+/// so a linked worktree is its own checkout though it shares its main
+/// checkout's project; outside a repository, the directory itself.
+#[must_use]
+pub fn checkout_root(path: &Path) -> PathBuf {
+    let launch = canonical_or_given(path);
+    find_git_root(&launch).unwrap_or(launch)
+}
+
 fn repository_root_memoised(launch: &Path) -> Option<PathBuf> {
     type Walks = std::collections::HashMap<(PathBuf, bool), Option<PathBuf>>;
     static WALKS: std::sync::OnceLock<std::sync::Mutex<Walks>> = std::sync::OnceLock::new();

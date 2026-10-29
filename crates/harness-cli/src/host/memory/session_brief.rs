@@ -3,6 +3,8 @@
 //! Committed turns already survive an interrupted run. This projection needs
 //! neither an end hook, a model call, nor a second transcript store.
 
+use std::path::Path;
+
 use harness_session::{ContextBlock, ContextBlockKind, ContextChannel};
 use harness_store_sqlite::SqliteStore;
 use harness_types::{SessionId, TaskId};
@@ -38,11 +40,14 @@ pub(super) async fn fresh_conversation(
     true
 }
 
+/// The newest earlier conversation of `checkout`'s, as a brief: a linked
+/// worktree shares its project's store, not its conversations.
 pub(super) async fn context_block(
     store: &SqliteStore,
     current: &TaskId,
     source: Option<&SessionId>,
     refinements: bool,
+    checkout: &Path,
 ) -> Option<ContextBlock> {
     if !fresh_conversation(store, current, source, refinements).await {
         return None;
@@ -51,16 +56,20 @@ pub(super) async fn context_block(
         super::service::user_conversation_sessions(store, store.list_sessions().await.ok()?).await;
     // A conversation still open - in another pane, or another live ha - is
     // that conversation's work in progress, not the previous one.
-    let previous = sessions
-        .into_iter()
-        .filter(|session| {
-            session.task_id != *current && !super::continuity::is_live(&session.task_id)
-        })
-        .max_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
-        })?;
+    let mut earlier = Vec::new();
+    for session in sessions {
+        if session.task_id != *current
+            && !super::continuity::is_live(&session.task_id)
+            && super::service::of_checkout(store, &session.task_id, checkout).await
+        {
+            earlier.push(session);
+        }
+    }
+    let previous = earlier.into_iter().max_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
+    })?;
     let (turns, omitted) =
         harness_runtime::resumed_turns(store, &previous.session_id, RECENT_TURNS)
             .await
@@ -144,6 +153,50 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+
+    /// The brief of a checkout that is its project's root, as these
+    /// fixtures' untagged conversations are.
+    async fn context_block(
+        store: &SqliteStore,
+        current: &TaskId,
+        source: Option<&SessionId>,
+        refinements: bool,
+    ) -> Option<ContextBlock> {
+        let checkout = super::super::bootstrap::checkout_root(&std::env::temp_dir());
+        super::context_block(store, current, source, refinements, &checkout).await
+    }
+
+    /// A linked worktree shares its project's store: a new conversation there
+    /// is not shown the main checkout's, nor the main checkout the worktree's.
+    #[tokio::test]
+    async fn another_checkouts_conversation_is_not_the_previous_one() {
+        let mut f = Fixture::new().await;
+        let linked = TaskId::generate();
+        f.turn(&linked, None, "linked question", "linked answer")
+            .await;
+        let main = TaskId::generate();
+        f.turn(&main, None, "main question", "main answer").await;
+        let worktree = f.project.join("linked");
+        let root = super::super::bootstrap::checkout_root(&std::env::temp_dir());
+        for (task, checkout) in [(&linked, &worktree), (&main, &root)] {
+            f.store
+                .set_session_setting(
+                    task,
+                    super::super::service::CHECKOUT_SETTING,
+                    &checkout.to_string_lossy(),
+                )
+                .await
+                .expect("tag");
+        }
+        let block = context_block(&f.store, &TaskId::generate(), None, true)
+            .await
+            .expect("main checkout's brief");
+        assert_eq!(record(&block)["task_id"], main.as_str());
+        let block = super::context_block(&f.store, &TaskId::generate(), None, true, &worktree)
+            .await
+            .expect("worktree's brief");
+        assert_eq!(record(&block)["task_id"], linked.as_str());
+    }
 
     struct Fixture {
         _temp: tempfile::TempDir,
