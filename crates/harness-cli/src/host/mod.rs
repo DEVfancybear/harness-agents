@@ -176,6 +176,8 @@ pub mod skill_recall;
 pub mod skill_requests;
 #[path = "integrations/skills.rs"]
 pub mod skills;
+#[path = "memory/sleep.rs"]
+pub mod sleep;
 #[path = "application/status_panel.rs"]
 pub mod status_panel;
 #[path = "application/store_lease.rs"]

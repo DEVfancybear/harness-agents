@@ -4182,15 +4182,17 @@ impl Drop for AgentSessionService {
                 .and_then(|session| session.as_ref().map(ToString::to_string))
             && let Some(turns) = self.refine_cadence.take_tail()
         {
-            let _ = super::refine::defer_review(
+            let job = super::sleep::Job::review(
                 &self.store_dir,
-                &super::refine::DeferredReview {
-                    task: self.task_id.as_str().to_owned(),
-                    session,
-                    turns,
-                    in_play: self.refine_cadence.take_in_play(),
-                },
+                self.task_id.as_str(),
+                &session,
+                "session_end",
+                turns,
+                self.refine_cadence.take_in_play(),
             );
+            if !enqueue_review(&self.data_dir, job) {
+                self.refine_cadence.put_back(turns);
+            }
         }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
@@ -5578,6 +5580,7 @@ impl SessionPort for AgentSessionService {
             hooks: config.hooks.len(),
             mcp_servers: config.mcp_servers.len(),
             other_stores: super::adoption::other_stores_of(&self.data_dir, &self.workspace_root),
+            sleep: super::sleep::summary(&self.data_dir),
         };
         let subsystems = super::doctor::audit(
             &self.global_config_dir,
@@ -7323,7 +7326,10 @@ struct AutoRefine {
 }
 
 impl AutoRefine {
-    async fn run(self) {
+    /// Run the review and the refinement it approves. An error is the job's
+    /// to keep: the review gate or the refinement failed, and the queue tries
+    /// the same turns again later (`sleep`).
+    async fn run(self) -> Result<(), String> {
         let send = |event| {
             let _ = self.sender.send(event);
         };
@@ -7358,14 +7364,16 @@ impl AutoRefine {
                 send(SessionEvent::Notice {
                     message: format!("auto-refine: nothing to refine ({})", review.rationale),
                 });
-                return;
+                return Ok(());
             }
             Err(error) => {
                 review_record("skipped", &self.task, Err(error.as_str())).emit();
                 send(SessionEvent::Notice {
-                    message: format!("auto-refine review skipped: {error}"),
+                    message: format!(
+                        "auto-refine review skipped: {error}; its turns stay queued and are reviewed later"
+                    ),
                 });
-                return;
+                return Err(error);
             }
         };
         // Like `CowAgent`'s Self-Evolution, the review reaches past this
@@ -7417,12 +7425,16 @@ impl AutoRefine {
                         message: format!("learning loop: {line}"),
                     });
                 }
+                Ok(())
             }
             Err(error) => {
                 review_record("failed", &self.task, Err(error.as_str())).emit();
                 send(SessionEvent::Notice {
-                    message: format!("refine failed: {error}"),
+                    message: format!(
+                        "refine failed: {error}; its turns stay queued and are reviewed later"
+                    ),
                 });
+                Err(error)
             }
         }
     }
@@ -7488,45 +7500,196 @@ pub(super) fn auto_refine_interval(config_file: &Path) -> u32 {
         .unwrap_or(super::refine::AUTO_REFINE_TURN_INTERVAL)
 }
 
-/// The automatic review as `ha exec` runs it: the app's review, run to its end
-/// before the process exits, with what it said returned instead of shown.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "what one review reads, as the app's AutoRefine holds it"
-)]
-pub(super) async fn review_now(
-    provider: Arc<dyn ModelProvider>,
-    model: String,
-    conversation: String,
-    task: String,
-    scopes: super::refine::HarnessScopes,
-    learning: super::refine::Learning,
-    turns: u32,
-    reviewed: Option<String>,
-    knowledge: super::knowledge::KnowledgeHost,
-) -> Vec<SessionEvent> {
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    AutoRefine {
-        sender,
-        helper_provider: Arc::clone(&provider),
-        helper_model: model.clone(),
-        provider,
-        model,
-        conversation,
-        task,
-        scopes,
-        learning,
-        turns,
-        reviewed,
-        knowledge,
+/// What the review jobs of one project run with (`sleep`): the providers, the
+/// data and project store directories, and what a review reads besides the
+/// conversation. Every trigger - a turn's count, a compaction, a session gone
+/// quiet, a session's end, `ha exec`'s exit - writes a job first and runs the
+/// due ones through this, so a review whose model call fails stays in the
+/// queue for the next, instead of its turns being forgotten.
+#[derive(Clone)]
+pub(super) struct Reviews {
+    pub(super) sender: UnboundedSender<SessionEvent>,
+    pub(super) helper_provider: Arc<dyn ModelProvider>,
+    pub(super) helper_model: String,
+    pub(super) provider: Arc<dyn ModelProvider>,
+    pub(super) model: String,
+    pub(super) data_dir: PathBuf,
+    pub(super) store_dir: PathBuf,
+    pub(super) learning: super::refine::Learning,
+    pub(super) knowledge: super::knowledge::KnowledgeHost,
+}
+
+impl Reviews {
+    /// Write `job` to the queue. `false` when it could not be written: the
+    /// caller keeps its count of the turns, so they are reviewed later.
+    pub(super) fn enqueue(&self, job: super::sleep::Job) -> bool {
+        enqueue_review(&self.data_dir, job)
     }
-    .run()
-    .await;
+
+    /// Whether `job` is a review of this project (of `task`, when given).
+    fn picks(&self, job: &super::sleep::Job, task: Option<&str>) -> bool {
+        is_review_of(job, &self.store_dir, task)
+    }
+
+    /// Run this project's due review jobs (`task`'s alone, when given), one
+    /// after another, until none is due. A job another process runs is left
+    /// to it; one that fails stays queued with its backoff. Reviews an older
+    /// ha left in the project (`refine-pending/`) join the queue first.
+    pub(super) async fn run_due(&self, task: Option<&str>) {
+        super::sleep::import_legacy(&self.data_dir, &self.store_dir);
+        loop {
+            let claimed = match super::sleep::claim(&self.data_dir, |job| self.picks(job, task)) {
+                Ok(Some(claimed)) => claimed,
+                Ok(None) => return,
+                Err(error) => {
+                    harness_types::diag::warn("sleep", "claim_failed")
+                        .msg(error)
+                        .emit();
+                    return;
+                }
+            };
+            match self.run_job(&claimed.job).await {
+                Ok(()) => claimed.done(),
+                Err(error) => claimed.failed(&error),
+            }
+        }
+    }
+
+    /// One review job: the conversation read from the project's journal
+    /// (through a reader of its own: the turn's writer is not held), then the
+    /// review. A job with nothing to read is done.
+    async fn run_job(&self, job: &super::sleep::Job) -> Result<(), String> {
+        let (Some(task), Some(session)) = (
+            job.task.clone(),
+            job.session
+                .clone()
+                .and_then(|session| SessionId::parse(session).ok()),
+        ) else {
+            return Ok(());
+        };
+        let local = super::harness::local_dir(&self.data_dir, &task);
+        let store = SqliteStore::open_read_only(self.store_dir.clone())
+            .await
+            .map_err(|error| format!("the project store cannot be read: {error}"))?;
+        let conversation = refine_transcript(&store, &session, &local).await;
+        let _ = store.close().await;
+        if conversation.is_empty() {
+            return Ok(());
+        }
+        if let Some(message) = review_notice(job) {
+            let _ = self.sender.send(SessionEvent::Notice { message });
+        }
+        let mut learning = self.learning.clone();
+        learning.in_play.clone_from(&job.in_play);
+        AutoRefine {
+            sender: self.sender.clone(),
+            helper_provider: Arc::clone(&self.helper_provider),
+            helper_model: self.helper_model.clone(),
+            provider: Arc::clone(&self.provider),
+            model: self.model.clone(),
+            conversation,
+            task,
+            scopes: super::refine::HarnessScopes {
+                global: super::harness::global_dir(&self.data_dir),
+                local,
+            },
+            learning,
+            turns: job.turns.max(1),
+            reviewed: if job.whole {
+                job.session.clone()
+            } else {
+                job.before.clone()
+            },
+            knowledge: self.knowledge.clone(),
+        }
+        .run()
+        .await
+    }
+}
+
+/// Whether `job` is a review of the project whose store is `store_dir` (of
+/// `task`, when given).
+fn is_review_of(job: &super::sleep::Job, store_dir: &Path, task: Option<&str>) -> bool {
+    job.kind == super::sleep::Kind::Review
+        && job
+            .project
+            .as_deref()
+            .is_some_and(|project| Path::new(project) == store_dir)
+        && task.is_none_or(|task| job.task.as_deref() == Some(task))
+}
+
+/// The turns the review jobs of `task` in the project whose store is
+/// `store_dir` cover, when one is due now.
+pub(super) fn due_review_turns(data_dir: &Path, store_dir: &Path, task: &str) -> Option<u32> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let due = super::sleep::jobs(data_dir)
+        .into_iter()
+        .filter(|job| {
+            !job.gave_up && job.next_at <= now && is_review_of(job, store_dir, Some(task))
+        })
+        .collect::<Vec<_>>();
+    (!due.is_empty()).then(|| due.iter().map(|job| job.turns.max(1)).sum())
+}
+
+/// Write a review's job to the queue under `data_dir`; `false` (and a
+/// diagnostics record) when it could not be written.
+pub(super) fn enqueue_review(data_dir: &Path, job: super::sleep::Job) -> bool {
+    match super::sleep::enqueue(data_dir, job) {
+        Ok(_) => true,
+        Err(error) => {
+            harness_types::diag::warn("sleep", "enqueue_failed")
+                .msg(error)
+                .emit();
+            false
+        }
+    }
+}
+
+/// What a review job says as it starts, by what asked for it; a review at a
+/// turn's end says nothing until it has a result.
+fn review_notice(job: &super::sleep::Job) -> Option<String> {
+    let turns = job.turns.max(1);
+    if job.attempts > 0 {
+        return Some(format!(
+            "auto-refine: reviewing again the last {turns} turn(s) an earlier review could not finish ({} failed attempt(s))",
+            job.attempts
+        ));
+    }
+    match job.trigger.as_str() {
+        "compaction" => Some("auto-refine: the context was summarized; reviewing what this turn learned so far in the background".to_owned()),
+        "idle" => Some(format!(
+            "auto-refine: the session is quiet; reviewing its last {turns} turn(s) in the background"
+        )),
+        "session_end" => Some(format!(
+            "auto-refine: reviewing the last {turns} turn(s) of an earlier session in the background"
+        )),
+        _ => None,
+    }
+}
+
+/// The review jobs of `task` as `ha exec` runs them: to their end before the
+/// process exits, with what they said returned instead of shown.
+pub(super) async fn review_queued_now(reviews: Reviews, task: &str) -> Vec<SessionEvent> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    Reviews { sender, ..reviews }.run_due(Some(task)).await;
     let mut events = Vec::new();
     while let Ok(event) = receiver.try_recv() {
         events.push(event);
     }
     events
+}
+
+/// How long after one compaction's review a compaction's review waits
+/// ([`COMPACTION_REVIEW_COOLDOWN`], or `HA_COMPACTION_REVIEW_SECONDS`).
+fn compaction_review_cooldown(environment: &LaunchEnvironment) -> chrono::TimeDelta {
+    environment
+        .value("HA_COMPACTION_REVIEW_SECONDS")
+        .and_then(|value| {
+            value
+                .to_str()
+                .and_then(|text| text.trim().parse::<i64>().ok())
+        })
+        .map_or(COMPACTION_REVIEW_COOLDOWN, chrono::TimeDelta::seconds)
 }
 
 /// What a child stopped by Ctrl-C reports to its parent.
@@ -7762,20 +7925,29 @@ mod review_record_tests {
             .build()
             .expect("runtime");
         let records = harness_types::diag::capture(|| {
-            runtime.block_on(super::review_now(
-                provider,
-                "fixture-model".to_owned(),
-                transcript.clone(),
-                "task_01review".to_owned(),
-                scopes,
-                learning,
-                1,
-                None,
-                crate::interactive::knowledge::KnowledgeHost::new(
-                    &workspace,
-                    &directory.path().join("data"),
-                ),
-            ));
+            let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+            runtime
+                .block_on(
+                    super::AutoRefine {
+                        sender,
+                        helper_provider: std::sync::Arc::clone(&provider),
+                        helper_model: "fixture-model".to_owned(),
+                        provider,
+                        model: "fixture-model".to_owned(),
+                        conversation: transcript.clone(),
+                        task: "task_01review".to_owned(),
+                        scopes,
+                        learning,
+                        turns: 1,
+                        reviewed: None,
+                        knowledge: crate::interactive::knowledge::KnowledgeHost::new(
+                            &workspace,
+                            &directory.path().join("data"),
+                        ),
+                    }
+                    .run(),
+                )
+                .expect("reviewed");
         });
         let review = records
             .iter()
@@ -7895,16 +8067,21 @@ pub(super) async fn consolidate_local_event(
     model: &str,
     scopes: &super::refine::HarnessScopes,
     conversation: &str,
+    claimed: super::sleep::Claimed,
 ) -> SessionEvent {
     match super::refine::consolidate_local(provider, model, scopes).await {
         Ok(refinement) => {
+            claimed.done();
             review_record("consolidated", conversation, Ok(&refinement)).emit();
             refined_event(&refinement)
         }
         Err(error) => {
+            claimed.failed(&error);
             review_record("consolidated", conversation, Err(error.as_str())).emit();
             SessionEvent::Notice {
-                message: format!("memory: this conversation's consolidation skipped: {error}"),
+                message: format!(
+                    "memory: this conversation's consolidation skipped: {error}; it is tried again later"
+                ),
             }
         }
     }
@@ -9925,6 +10102,18 @@ async fn run_turn(
     // handle of its own, the watcher kept the store open past the turn's
     // lease, and the next turn could not open the project (`writer_locked`).
     let watched_store = Arc::new(tokio::sync::Mutex::new(Some(Arc::clone(&store))));
+    // This project's review jobs, run beside the conversation (`sleep`).
+    let reviews = Reviews {
+        sender: sender.clone(),
+        helper_provider: Arc::clone(&helper_provider),
+        helper_model: helper_model.clone(),
+        provider: Arc::clone(&provider),
+        model: config.model.clone(),
+        data_dir: data_dir.clone(),
+        store_dir: store_dir.clone(),
+        learning: learning.clone(),
+        knowledge: knowledge_host.clone(),
+    };
     if auto_refine && refinements {
         // The count alone: the runtime holds the store, and a watcher holding
         // the runtime kept the store - and its writer lock - for as long as
@@ -9942,17 +10131,8 @@ async fn run_turn(
         let task = goal_task.clone();
         let cadence = Arc::clone(&refine_cadence);
         let running = Arc::clone(&turn_running);
-        let sender = sender.clone();
-        let helper_provider = Arc::clone(&helper_provider);
-        let helper_model = helper_model.clone();
-        let provider = Arc::clone(&provider);
-        let model = config.model.clone();
-        let mut learning = learning.clone();
-        let knowledge = knowledge_host.clone();
-        let scopes = super::refine::HarnessScopes {
-            global: super::harness::global_dir(&data_dir),
-            local: super::harness::local_dir(&data_dir, goal_task.as_str()),
-        };
+        let reviews = reviews.clone();
+        let cooldown = compaction_review_cooldown(&environment);
         tokio::spawn(async move {
             let start = compactions.load(std::sync::atomic::Ordering::SeqCst);
             loop {
@@ -9968,8 +10148,15 @@ async fn run_turn(
             let Some(store) = slot.as_ref() else {
                 return;
             };
-            // One compaction's review at a time, twenty minutes apart.
-            let reviewed_lately = store
+            // A compaction's review starts at most every twenty minutes. One
+            // inside that spacing is not skipped: what it summarized stays in
+            // the journal, and its review waits in the queue until the spacing
+            // is over, one job with any other review of the conversation
+            // meanwhile. Skipped, the turns of a second compaction were never
+            // reviewed (the Sleep paper's rule: consolidate a span before the
+            // faster tier is overwritten).
+            let now = chrono::Utc::now();
+            let not_before = store
                 .session_setting(&task, REVIEW_STARTED_SETTING)
                 .await
                 .ok()
@@ -9980,55 +10167,54 @@ async fn run_turn(
                         .as_str()
                         .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
                 })
-                .is_some_and(|at| {
-                    chrono::Utc::now().signed_duration_since(at) < COMPACTION_REVIEW_COOLDOWN
-                });
-            if reviewed_lately {
-                return;
-            }
+                .map(|at| at.with_timezone(&chrono::Utc) + cooldown)
+                .filter(|at| *at > now);
             let Some(turns) = cadence.claim_now() else {
                 return;
             };
-            // Kept with the task, so it can be told when and why a review ran.
-            let _ = store
-                .set_session_setting(
-                    &task,
-                    REVIEW_STARTED_SETTING,
-                    &serde_json::json!({
-                        "why": "compaction",
-                        "session": session.as_str(),
-                        "at": chrono::Utc::now().to_rfc3339(),
-                    })
-                    .to_string(),
-                )
-                .await;
-            let conversation = refine_transcript(store, &session, &scopes.local).await;
-            drop(slot);
-            if conversation.is_empty() {
+            let in_play = cadence.take_in_play();
+            let job = super::sleep::Job::review(
+                &reviews.store_dir,
+                task.as_str(),
+                session.as_str(),
+                "compaction",
+                turns,
+                in_play.clone(),
+            )
+            .partial(reviewed_before);
+            let job = match not_before {
+                Some(at) => job.not_before(at),
+                None => job,
+            };
+            // The count restarts only once the job is on disk.
+            if !reviews.enqueue(job) {
+                cadence.put_back(turns);
+                cadence.note_in_play(in_play.into_iter().collect());
                 cadence.release();
                 return;
             }
-            learning.in_play = cadence.take_in_play();
-            let _ = sender.send(SessionEvent::Notice {
-                message: "auto-refine: the context was summarized; reviewing what this turn learned so far in the background".to_owned(),
-            });
-            AutoRefine {
-                sender,
-                helper_provider,
-                helper_model,
-                provider,
-                model,
-                conversation,
-                task: task.as_str().to_owned(),
-                scopes,
-                learning,
-                turns,
-                reviewed: reviewed_before,
-                knowledge,
-            }
-            .run()
-            .await;
             cadence.release();
+            if not_before.is_none() {
+                // Kept with the task, so it can be told when and why a review ran.
+                let _ = store
+                    .set_session_setting(
+                        &task,
+                        REVIEW_STARTED_SETTING,
+                        &serde_json::json!({
+                            "why": "compaction",
+                            "session": session.as_str(),
+                            "at": now.to_rfc3339(),
+                        })
+                        .to_string(),
+                    )
+                    .await;
+            }
+            drop(slot);
+            if let Some(at) = not_before {
+                tokio::time::sleep((at - now).to_std().unwrap_or_default()).await;
+            }
+            let task = task.as_str().to_owned();
+            spawn_off_workers(async move { reviews.run_due(Some(&task)).await });
         });
     }
     // A follow-up turn continues the previous session; the first turn starts one.
@@ -10158,19 +10344,27 @@ async fn run_turn(
     if let Ok(turn) = &outcome {
         // Once a day the harness evolves by itself from the calls that
         // failed: rules into shadow, shadows promoted or retired, notes.
+        // Its job in the queue keeps a failed run: tried again after a
+        // backoff, given up after so many failures (`sleep`).
         if auto_refine
             && refinements
             && !cancellation.is_cancelled()
             && super::evolution::due(&data_dir, chrono::Utc::now())
+            && let Some(claimed) =
+                super::sleep::claim_upkeep(&data_dir, super::sleep::Job::evolution())
         {
             let provider = Arc::clone(&provider);
             let model = config.model.clone();
             let data_dir = data_dir.clone();
             tokio::spawn(async move {
-                if let Err(error) = super::evolution::evolve(&provider, &model, &data_dir).await {
-                    harness_types::diag::warn("evolution", "failed")
-                        .msg(error)
-                        .emit();
+                match super::evolution::evolve(&provider, &model, &data_dir).await {
+                    Ok(_) => claimed.done(),
+                    Err(error) => {
+                        harness_types::diag::warn("evolution", "failed")
+                            .msg(error.clone())
+                            .emit();
+                        claimed.failed(&error);
+                    }
                 }
             });
         }
@@ -10221,12 +10415,17 @@ async fn run_turn(
         // and the temporary removed, as `CowAgent`'s Deep Dream does nightly -
         // but through the same validated, recorded and reversible edits as a
         // refinement, where Deep Dream overwrites `MEMORY.md` unchecked.
+        // One consolidation at a time across ha's processes; a failed one
+        // waits in the queue (doubling, at most a day) and gives up after so
+        // many failures, where it was tried every hour forever.
         let global = super::harness::global_dir(&data_dir);
         if auto_refine
             && refinements
             && !cancellation.is_cancelled()
             && super::refine::memory_consolidation_due(&global)
-            && let Some(consolidating) = super::refine::Consolidating::try_begin()
+            && let Some(consolidating) = super::refine::Consolidating::try_begin(&global)
+            && let Some(claimed) =
+                super::sleep::claim_upkeep(&data_dir, super::sleep::Job::consolidation(&global))
         {
             let sender = sender.clone();
             let provider = Arc::clone(&provider);
@@ -10244,13 +10443,17 @@ async fn run_turn(
                     .await
                 {
                     Ok(refinement) => {
+                        claimed.done();
                         review_record("consolidated", &conversation, Ok(&refinement)).emit();
                         refined_event(&refinement)
                     }
                     Err(error) => {
+                        claimed.failed(&error);
                         review_record("consolidated", &conversation, Err(error.as_str())).emit();
                         SessionEvent::Notice {
-                            message: format!("memory: consolidation skipped: {error}"),
+                            message: format!(
+                                "memory: consolidation skipped: {error}; it is tried again later"
+                            ),
                         }
                     }
                 };
@@ -10265,7 +10468,10 @@ async fn run_turn(
             && refinements
             && !cancellation.is_cancelled()
             && super::refine::local_consolidation_due(&local)
-            && let Some(consolidating) = super::refine::Consolidating::try_begin()
+            && let Some(consolidating) =
+                super::refine::Consolidating::try_begin(&super::harness::global_dir(&data_dir))
+            && let Some(claimed) =
+                super::sleep::claim_upkeep(&data_dir, super::sleep::Job::consolidation(&local))
         {
             let sender = sender.clone();
             let provider = Arc::clone(&provider);
@@ -10281,7 +10487,8 @@ async fn run_turn(
             });
             tokio::spawn(async move {
                 let event =
-                    consolidate_local_event(&provider, &model, &scopes, &conversation).await;
+                    consolidate_local_event(&provider, &model, &scopes, &conversation, claimed)
+                        .await;
                 drop(consolidating);
                 let _ = sender.send(event);
             });
@@ -10337,10 +10544,10 @@ async fn run_turn(
                 global: super::harness::global_dir(&data_dir),
                 local: super::harness::local_dir(&data_dir, goal_task.as_str()),
             };
-            let conversation = refine_transcript(&store, &session_id, &scopes.local).await;
             let mut learning = learning.clone();
             learning.in_play = refine_cadence.take_in_play();
             if let Some(options) = requested {
+                let conversation = refine_transcript(&store, &session_id, &scopes.local).await;
                 // The user asked: the refinement is part of the turn, and it covers
                 // the review that came due with it. It is a model call after the
                 // answer; the status line says so instead of "Writing".
@@ -10371,72 +10578,62 @@ async fn run_turn(
             } else if let Some(turns) = review {
                 // The automatic review runs beside the conversation, not in the
                 // turn: the user is not kept waiting on it, and in the background
-                // agent it finishes after the terminal is closed.
-                let background = AutoRefine {
-                    sender: sender.clone(),
-                    helper_provider: Arc::clone(&helper_provider),
-                    helper_model: helper_model.clone(),
-                    provider: Arc::clone(&provider),
-                    model: config.model.clone(),
-                    conversation,
-                    task: goal_task.as_str().to_owned(),
-                    scopes,
-                    learning,
+                // agent it finishes after the terminal is closed. It is a job
+                // first: the count restarts only once the job is on disk, and a
+                // review whose model call fails stays queued. The queue runs
+                // it below, with the project's other due reviews.
+                let job = super::sleep::Job::review(
+                    &store_dir,
+                    goal_task.as_str(),
+                    session_id.as_str(),
+                    "turn",
                     turns,
-                    reviewed: Some(session_id.as_str().to_owned()),
-                    knowledge: knowledge_host.clone(),
-                };
-                let cadence = Arc::clone(&refine_cadence);
-                spawn_off_workers(async move {
-                    background.run().await;
-                    cadence.release();
-                });
+                    learning.in_play.clone(),
+                );
+                if !reviews.enqueue(job) {
+                    refine_cadence.put_back(turns);
+                    refine_cadence.note_in_play(learning.in_play.iter().cloned().collect());
+                }
+                refine_cadence.release();
             }
         } else if auto_refine && refinements && refine_cadence.has_tail() {
             // The session's end, reviewed when it goes quiet: a session that
             // ended left its review for the next turn in the project, and
             // with no next turn it never ran. A background agent lives on
             // after its terminal closes, so the review runs then; an agent
-            // stopped sooner still leaves it to the next turn.
-            let scopes = super::refine::HarnessScopes {
-                global: super::harness::global_dir(&data_dir),
-                local: super::harness::local_dir(&data_dir, goal_task.as_str()),
-            };
-            let conversation = refine_transcript(&store, &session_id, &scopes.local).await;
+            // stopped sooner still leaves it to the next turn. A job, as at
+            // a turn's end: a failed one stays queued.
             let generation = refine_cadence.generation();
             let cadence = Arc::clone(&refine_cadence);
             let quiet = idle_review_after(&environment);
-            let mut background = AutoRefine {
-                sender: sender.clone(),
-                helper_provider: Arc::clone(&helper_provider),
-                helper_model: helper_model.clone(),
-                provider: Arc::clone(&provider),
-                model: config.model.clone(),
-                conversation,
-                task: goal_task.as_str().to_owned(),
-                scopes,
-                learning: learning.clone(),
-                turns: 0,
-                reviewed: Some(session_id.as_str().to_owned()),
-                knowledge: knowledge_host.clone(),
-            };
+            let reviews = reviews.clone();
+            let session = session_id.as_str().to_owned();
+            let task = goal_task.as_str().to_owned();
             spawn_off_workers(async move {
                 tokio::time::sleep(quiet).await;
-                if cadence.generation() != generation || background.conversation.is_empty() {
+                if cadence.generation() != generation {
                     return;
                 }
                 let Some(turns) = cadence.claim_tail() else {
                     return;
                 };
-                background.turns = turns;
-                background.learning.in_play = cadence.take_in_play();
-                let _ = background.sender.send(SessionEvent::Notice {
-                    message: format!(
-                        "auto-refine: the session is quiet; reviewing its last {turns} turn(s) in the background"
-                    ),
-                });
-                background.run().await;
+                let in_play = cadence.take_in_play();
+                let job = super::sleep::Job::review(
+                    &reviews.store_dir,
+                    &task,
+                    &session,
+                    "idle",
+                    turns,
+                    in_play.clone(),
+                );
+                if !reviews.enqueue(job) {
+                    cadence.put_back(turns);
+                    cadence.note_in_play(in_play.into_iter().collect());
+                    cadence.release();
+                    return;
+                }
                 cadence.release();
+                reviews.run_due(Some(&task)).await;
             });
         }
     }
@@ -10476,45 +10673,12 @@ async fn run_turn(
     } else {
         super::session_log::record_skip(&goal_task, "quiet", "off");
     }
-    // A session that ended with work not yet reviewed left the review here: it runs
-    // beside this conversation, on the ended one's turns and harness scope.
+    // The project's due reviews run beside this conversation: this turn's, one
+    // a session left as it ended (on the ended one's turns and harness scope),
+    // and one that failed earlier and waited out its backoff.
     if auto_refine && refinements && outcome.is_ok() && !cancellation.is_cancelled() {
-        for deferred in super::refine::take_deferred_reviews(&store_dir) {
-            let Ok(ended) = SessionId::parse(deferred.session.clone()) else {
-                continue;
-            };
-            let local = super::harness::local_dir(&data_dir, &deferred.task);
-            let conversation = refine_transcript(&store, &ended, &local).await;
-            if conversation.is_empty() {
-                continue;
-            }
-            let mut ended_learning = learning.clone();
-            ended_learning.in_play.clone_from(&deferred.in_play);
-            let background = AutoRefine {
-                sender: sender.clone(),
-                helper_provider: Arc::clone(&helper_provider),
-                helper_model: helper_model.clone(),
-                provider: Arc::clone(&provider),
-                model: config.model.clone(),
-                conversation,
-                task: deferred.task.clone(),
-                scopes: super::refine::HarnessScopes {
-                    global: super::harness::global_dir(&data_dir),
-                    local,
-                },
-                learning: ended_learning,
-                turns: deferred.turns,
-                reviewed: Some(deferred.session.clone()),
-                knowledge: knowledge_host.clone(),
-            };
-            send(SessionEvent::Notice {
-                message: format!(
-                    "auto-refine: reviewing the last {} turn(s) of an earlier session in the background",
-                    deferred.turns
-                ),
-            });
-            spawn_off_workers(background.run());
-        }
+        let reviews = reviews.clone();
+        spawn_off_workers(async move { reviews.run_due(None).await });
     }
     // A goal's turn that ended short of it is an evaluation of the strategy,
     // whether or not the model asked for one.

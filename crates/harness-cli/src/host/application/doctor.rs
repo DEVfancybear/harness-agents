@@ -22,6 +22,9 @@ pub struct Facts {
     pub mcp_servers: usize,
     /// Older stores of this project kept apart ([`super::adoption::other_stores`]).
     pub other_stores: Vec<String>,
+    /// The background memory passes waiting, failed or given up
+    /// ([`super::sleep::summary`]).
+    pub sleep: super::sleep::Summary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -407,8 +410,47 @@ fn state(root: &Path, facts: &Facts) -> Subsystem {
         }
     }
     other_stores(facts, &mut subsystem);
+    sleep(facts, &mut subsystem);
     markdown_memory(root, &mut subsystem);
     subsystem
+}
+
+/// The background memory passes (`sleep`): how many wait, which failed and
+/// wait to be tried again, and which gave up and are no longer tried by
+/// themselves. Nothing is said of an empty queue.
+fn sleep(facts: &Facts, subsystem: &mut Subsystem) {
+    let queue = &facts.sleep;
+    if queue.waiting > 0 {
+        subsystem.pass(format!(
+            "{} background memory pass(es) queued (reviews, consolidation, evolution)",
+            queue.waiting
+        ));
+    }
+    if !queue.retrying.is_empty() {
+        subsystem.short(
+            Level::Warn,
+            format!(
+                "{} background memory pass(es) failed and wait to be tried again: {}",
+                queue.retrying.len(),
+                queue.retrying.join("; ")
+            ),
+            "they are tried again after a backoff; the bug report's Sleep section shows the errors",
+        );
+    }
+    if !queue.gave_up.is_empty() {
+        subsystem.short(
+            Level::Warn,
+            format!(
+                "{} background memory pass(es) gave up after failing again and again: {}",
+                queue.gave_up.len(),
+                queue.gave_up.join("; ")
+            ),
+            format!(
+                "they are no longer tried by themselves; fix what failed (the provider, its credentials, a limit), then remove the job's file under {} to let it run again",
+                queue.dir.display()
+            ),
+        );
+    }
 }
 
 /// Older stores of this project that were left apart: a launch from a
@@ -716,6 +758,46 @@ mod tests {
             text.contains("✗ markdown memory index-links: 1 links checked (MEMORY.md: link target not found: memory/people/gone.md)"),
             "{text}"
         );
+    }
+
+    /// The doctor names a background pass that gave up, and says nothing of
+    /// an empty queue.
+    #[test]
+    fn a_background_pass_that_gave_up_is_named() {
+        let root = tempfile::tempdir().expect("root");
+        let audited = |facts: &Facts| {
+            lines(
+                root.path(),
+                &audit(&std::path::PathBuf::new(), root.path(), root.path(), facts),
+            )
+            .join("\n")
+        };
+        assert!(!audited(&Facts::default()).contains("background memory"));
+        let facts = Facts {
+            sleep: crate::interactive::sleep::Summary {
+                waiting: 1,
+                retrying: vec!["review of task-1 (1 failed, timeout)".to_owned()],
+                gave_up: vec!["consolidation (6 failures, rate_limited: limit)".to_owned()],
+                dir: root.path().join("sleep"),
+            },
+            ..Facts::default()
+        };
+        let text = audited(&facts);
+        assert!(
+            text.contains("✓ 1 background memory pass(es) queued"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "! 1 background memory pass(es) failed and wait to be tried again: review of task-1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("! 1 background memory pass(es) gave up after failing again and again: consolidation (6 failures, rate_limited"),
+            "{text}"
+        );
+        assert!(text.contains("no longer tried by themselves"), "{text}");
     }
 }
 

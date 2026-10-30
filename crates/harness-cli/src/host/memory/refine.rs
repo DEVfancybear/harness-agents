@@ -144,7 +144,14 @@ impl Cadence {
         Some(turns)
     }
 
-    /// The claimed review finished.
+    /// A claimed review could not be written to the queue: its turns count
+    /// toward the next one again, so none is lost.
+    pub fn put_back(&self, turns: u32) {
+        self.turns
+            .fetch_add(turns, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The claimed review finished, or was handed to the queue.
     pub fn release(&self) {
         self.running
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -173,21 +180,6 @@ impl Cadence {
 /// reviewed: fewer is a conversation, not a stretch of work to learn from.
 pub const TAIL_MIN_TURNS: u32 = 5;
 pub const TAIL_MIN_TOOL_CALLS: u32 = 10;
-
-/// Where a session that ended with work not yet reviewed leaves it, in the
-/// project's data directory.
-const DEFERRED_DIR: &str = "refine-pending";
-
-/// A review a session handed off as it ended. Exiting does not wait for a model
-/// call; the next turn in the project runs the review in the background.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeferredReview {
-    pub task: String,
-    pub session: String,
-    pub turns: u32,
-    /// Learned skills the ended session used since its last review.
-    pub in_play: Vec<String>,
-}
 
 /// The file in a conversation's local harness scope naming the last session an
 /// automatic review read.
@@ -221,15 +213,18 @@ const EXEC_CADENCE_FILE: &str = "review_cadence.json";
 /// review. When what it did since the last one is enough for a session's end to
 /// be reviewed in the app ([`TAIL_MIN_TURNS`] or [`TAIL_MIN_TOOL_CALLS`]), or
 /// reaches `autoRefine.turnInterval` (`turn_interval`), or the run compacted its
-/// context after doing anything, the review is claimed: the count restarts and
-/// the turns it covers are returned.
-#[must_use]
+/// context after doing anything, the review is due: `enqueue` is handed the
+/// turns it covers, and the count restarts only once it wrote the review's job
+/// (`sleep`). A review that cannot be queued leaves the count to grow, and one
+/// queued but failed stays in the queue: the turns are never forgotten before
+/// a review read them. Returns the turns queued.
 pub fn exec_review_due(
     local: &Path,
     turns: u32,
     tool_calls: u32,
     compacted: bool,
     turn_interval: u32,
+    enqueue: impl FnOnce(u32) -> Result<(), String>,
 ) -> Option<u32> {
     let path = local.join(EXEC_CADENCE_FILE);
     let earlier = std::fs::read_to_string(&path)
@@ -248,87 +243,23 @@ pub fn exec_review_due(
         && (turns >= TAIL_MIN_TURNS.min(turn_interval.max(1))
             || calls >= TAIL_MIN_TOOL_CALLS
             || compacted);
-    let kept = if due {
+    let queued = due && enqueue(turns).is_ok();
+    let kept = if queued {
         json!({"turns": 0, "tool_calls": 0, "reviewed_at": now()})
     } else {
         json!({"turns": turns, "tool_calls": calls})
     };
-    if std::fs::create_dir_all(local).is_ok() {
-        let temporary = local.join(format!("{EXEC_CADENCE_FILE}.tmp"));
-        if std::fs::write(&temporary, kept.to_string()).is_ok() {
-            let _ = std::fs::rename(&temporary, &path);
-        }
-    }
-    due.then_some(turns)
+    let _ = super::files::write_atomic(&path, &kept.to_string());
+    queued.then_some(turns)
 }
 
-/// Leave a review for the next turn in this project.
-pub fn defer_review(project_dir: &Path, review: &DeferredReview) -> Result<(), String> {
-    let dir = project_dir.join(DEFERRED_DIR);
-    std::fs::create_dir_all(&dir).map_err(|error| format!("deferred review: {error}"))?;
-    let name = slug(&review.task, "task");
-    let temporary = dir.join(format!(".{name}.tmp"));
-    let text =
-        json!({"task": review.task, "session": review.session, "turns": review.turns, "in_play": review.in_play, "at": now()})
-            .to_string();
-    std::fs::write(&temporary, text).map_err(|error| format!("deferred review: {error}"))?;
-    std::fs::rename(&temporary, dir.join(format!("{name}.json")))
-        .map_err(|error| format!("deferred review: {error}"))
-}
-
-/// Take every review left in this project. Each is removed as it is read, so two
-/// sessions never run the same one; one lost to a crash is simply not reviewed.
-#[must_use]
-pub fn take_deferred_reviews(project_dir: &Path) -> Vec<DeferredReview> {
-    let dir = project_dir.join(DEFERRED_DIR);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut reviews = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|extension| extension != "json") {
-            continue;
-        }
-        let claimed = path.with_extension(format!("claimed-{}", std::process::id()));
-        if std::fs::rename(&path, &claimed).is_err() {
-            continue; // another session took it first
-        }
-        let value = std::fs::read_to_string(&claimed)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-        let _ = std::fs::remove_file(&claimed);
-        if let Some(value) = value
-            && let (Some(task), Some(session)) = (value["task"].as_str(), value["session"].as_str())
-        {
-            reviews.push(DeferredReview {
-                task: task.to_owned(),
-                session: session.to_owned(),
-                turns: value["turns"]
-                    .as_u64()
-                    .and_then(|turns| u32::try_from(turns).ok())
-                    .unwrap_or(0),
-                in_play: value["in_play"]
-                    .as_array()
-                    .map(|names| {
-                        names
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            });
-        }
-    }
-    reviews.sort_by(|left, right| left.task.cmp(&right.task));
-    reviews
-}
 const REFINEMENT_MAX_OUTPUT_TOKENS: u32 = 8192;
 const REVIEW_MAX_OUTPUT_TOKENS: u32 = 4096;
 const CONVERSATION_CHARS: usize = 80_000;
 const REVIEW_CONVERSATION_CHARS: usize = 40_000;
-const TRUNCATED_JSON_ERROR: &str = "the model stopped before completing its JSON object. This usually means the output budget was exhausted; retry with a smaller request.";
+pub(crate) const TRUNCATED_JSON_ERROR: &str = "the model stopped before completing its JSON object. This usually means the output budget was exhausted; retry with a smaller request.";
+/// What an upkeep model call that ran out of time fails with.
+pub(crate) const CALL_TIMED_OUT: &str = "the refinement model call timed out";
 
 const REFINEMENT_SYSTEM_PROMPT: &str = r#"You are the /refine continual harness subsystem of ha, a coding agent.
 
@@ -2010,8 +1941,9 @@ async fn complete_once(
         ],
     )
     .with_max_output_tokens(max_tokens);
-    // A call that failed or timed out is in the diagnostics too: the bug
-    // report's upkeep table counts what memory upkeep cost, failures included.
+    // A call that failed or timed out is in the diagnostics too, with its
+    // error's class: the bug report's upkeep table counts what memory upkeep
+    // cost, failures included.
     let failed = |error: String| {
         harness_types::diag::warn("refine", "call_failed")
             .field("purpose", purpose)
@@ -2020,6 +1952,7 @@ async fn complete_once(
                 "duration_ms",
                 u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             )
+            .field("class", super::sleep::error_class(&error))
             .msg(error.clone())
             .emit();
         error
@@ -2029,8 +1962,11 @@ async fn complete_once(
         provider.stream(request, CancellationToken::new()),
     )
     .await
-    .map_err(|_| failed("the refinement model call timed out".to_owned()))?
+    .map_err(|_| failed(CALL_TIMED_OUT.to_owned()))?
     .map_err(|error| failed(format!("the refinement model call failed: {error}")))?;
+    // A provider that streams its refusal fails here, not above.
+    let response = harness_providers::assemble_stream(&events)
+        .map_err(|error| failed(format!("the refinement model call failed: {error}")))?;
     let usage = events.iter().rev().find_map(|event| match event {
         harness_providers::ProviderStreamEvent::Usage {
             prompt_tokens,
@@ -2051,8 +1987,6 @@ async fn complete_once(
         .field("output", usage.map(|usage| usage.1))
         .field("cached", usage.map(|usage| usage.2))
         .emit();
-    let response =
-        harness_providers::assemble_stream(&events).map_err(|error| error.to_string())?;
     if response.finish_reason.as_deref() == Some("length") {
         return Err(TRUNCATED_JSON_ERROR.to_owned());
     }
@@ -3097,7 +3031,7 @@ pub async fn curate(
 ) -> Result<Refinement, String> {
     let baseline = load_raw(&scopes.global);
     // Not beside a running consolidation: the skills are curated alone then.
-    let consolidating = Consolidating::try_begin();
+    let consolidating = Consolidating::try_begin(&scopes.global);
     let memory =
         if consolidating.is_some() && memory_entries(&baseline).len() >= CONSOLIDATE_MIN_ENTRIES {
             Some(memory_edits(provider, model, &baseline, instructions, true).await?)
@@ -3215,10 +3149,9 @@ pub const CONSOLIDATE_AFTER_CHANGES: u64 = 15;
 const CONSOLIDATED_FILE: &str = "memory_consolidated_changes";
 /// The change count of a state directory's memory, ever.
 const CHANGES_FILE: &str = "memory_changes";
-/// When the last consolidation failed, in seconds since the epoch.
-const CONSOLIDATE_FAILED_FILE: &str = "memory_consolidation_failed";
-/// How long a failed consolidation waits before it is tried again.
-const CONSOLIDATE_RETRY_SECONDS: i64 = 3_600;
+/// Where ha before 0.8.9 marked a failed consolidation; the queue keeps the
+/// failure now, and a consolidation that succeeds removes the old mark.
+const LEGACY_CONSOLIDATE_FAILED_FILE: &str = "memory_consolidation_failed";
 
 const MEMORY_CURATOR_SYSTEM_PROMPT: &str = r#"You are the memory curator of ha, a coding agent. After CowAgent's Deep Dream.
 
@@ -3332,19 +3265,13 @@ fn memory_changes(dir: &Path) -> u64 {
 }
 
 /// Whether the global memory is large enough and has changed enough since
-/// its last consolidation for an automatic one, and no failed pass is waiting
-/// out its retry.
+/// its last consolidation for an automatic one. A pass that failed is not
+/// marked: its job in the queue (`sleep`) waits out a backoff and gives up
+/// after so many failures.
 #[must_use]
 pub fn memory_consolidation_due(global: &Path) -> bool {
     let state = load_raw(global);
     if memory_entries(&state).len() < CONSOLIDATE_MIN_ENTRIES {
-        return false;
-    }
-    let failed_recently = std::fs::read_to_string(global.join(CONSOLIDATE_FAILED_FILE))
-        .ok()
-        .and_then(|text| text.trim().parse::<i64>().ok())
-        .is_some_and(|at| chrono::Utc::now().timestamp() - at < CONSOLIDATE_RETRY_SECONDS);
-    if failed_recently {
         return false;
     }
     let mark = std::fs::read_to_string(global.join(CONSOLIDATED_FILE))
@@ -3355,42 +3282,37 @@ pub fn memory_consolidation_due(global: &Path) -> bool {
 }
 
 /// Remember the memory as it was consolidated, so the next automatic pass
-/// waits for new changes.
+/// waits for new changes. The mark an earlier ha left for a failed pass goes.
 fn mark_consolidated(global: &Path) {
     let _ = std::fs::write(
         global.join(CONSOLIDATED_FILE),
         memory_changes(global).to_string(),
     );
-    let _ = std::fs::remove_file(global.join(CONSOLIDATE_FAILED_FILE));
+    let _ = std::fs::remove_file(global.join(LEGACY_CONSOLIDATE_FAILED_FILE));
 }
 
-/// A pass that failed (a timeout, a provider error) is tried again after
-/// [`CONSOLIDATE_RETRY_SECONDS`], not after a whole cycle of new changes.
-fn mark_consolidation_failed(global: &Path) {
-    let _ = std::fs::write(
-        global.join(CONSOLIDATE_FAILED_FILE),
-        chrono::Utc::now().timestamp().to_string(),
-    );
-}
+/// The lock file of [`Consolidating`], in the global harness directory.
+const CONSOLIDATING_LOCK: &str = "consolidation.lock";
 
-/// One memory consolidation at a time in the process: Deep Dream and the
-/// skill curator's memory pass worked from the same baseline at once, and a
-/// merged fact could land in both survivors.
-pub struct Consolidating(());
-
-static CONSOLIDATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// One memory consolidation at a time, across ha's processes: Deep Dream and
+/// the skill curator's memory pass worked from the same baseline at once, and
+/// a merged fact could land in both survivors; two ha processes, each with a
+/// flag of its own, consolidated the one global memory at once. The lock is
+/// the OS's on a file beside the global memory, so a process that dies lets
+/// go of it.
+pub struct Consolidating(#[allow(dead_code, reason = "held for its lock")] std::fs::File);
 
 impl Consolidating {
-    /// The right to consolidate, unless a pass is already running.
+    /// The right to consolidate, unless a pass is already running in this
+    /// process or another; `global` is the global harness directory.
     #[must_use]
-    pub fn try_begin() -> Option<Self> {
-        (!CONSOLIDATING.swap(true, std::sync::atomic::Ordering::SeqCst)).then_some(Self(()))
-    }
-}
-
-impl Drop for Consolidating {
-    fn drop(&mut self) {
-        CONSOLIDATING.store(false, std::sync::atomic::Ordering::SeqCst);
+    pub fn try_begin(global: &Path) -> Option<Self> {
+        let what = "memory consolidation";
+        let file = super::files::open_lock(&global.join(CONSOLIDATING_LOCK), what).ok()?;
+        super::files::try_take(&file, what)
+            .ok()
+            .filter(|taken| *taken)
+            .map(|_| Self(file))
     }
 }
 
@@ -3563,23 +3485,17 @@ async fn memory_edits(
 }
 
 /// Consolidate the global memory alone: the automatic pass, when it has grown
-/// and changed enough ([`memory_consolidation_due`]).
+/// and changed enough ([`memory_consolidation_due`]). It is marked done only
+/// when it applied: a pass whose model call or writes failed is the queue's
+/// to try again (`sleep`); marked done, one timeout put it off until fifteen
+/// more changes.
 pub async fn consolidate_memory(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
     scopes: &HarnessScopes,
 ) -> Result<Refinement, String> {
     let baseline = load_raw(&scopes.global);
-    let proposal = memory_edits(provider, model, &baseline, None, true).await;
-    // A failed pass is tried again after a while; marked as done, one
-    // timeout put it off until fifteen more changes.
-    let proposal = match proposal {
-        Ok(proposal) => proposal,
-        Err(error) => {
-            mark_consolidation_failed(&scopes.global);
-            return Err(error);
-        }
-    };
+    let proposal = memory_edits(provider, model, &baseline, None, true).await?;
     let refinement = apply(
         scopes,
         &proposal,
@@ -3589,12 +3505,8 @@ pub async fn consolidate_memory(
         Some(&baseline),
         None,
     );
-    // Done only when it applied: a pass whose writes failed is tried again
-    // after a while, as one whose model call failed is.
     if refinement.is_ok() {
         mark_consolidated(&scopes.global);
-    } else {
-        mark_consolidation_failed(&scopes.global);
     }
     refinement
 }
@@ -3609,18 +3521,11 @@ pub const LOCAL_CONSOLIDATE_ENTRIES: usize = 40;
 const LOCAL_SCOPE_NOTE: &str = "These are the entries of one conversation's local store, not the global memory: they reach only this conversation's turns. Every rule above holds, with one change: the state of the task in progress (where it stands, what is next, a blocker still open) may stay - one entry per subject, the latest - while the states it superseded and the leftovers of finished work are deleted.";
 
 /// Whether a conversation's local store has outgrown
-/// [`LOCAL_CONSOLIDATE_ENTRIES`] and changed since its last consolidation, and
-/// no failed pass is waiting out its retry.
+/// [`LOCAL_CONSOLIDATE_ENTRIES`] and changed since its last consolidation. A
+/// failed pass waits in the queue, as the global one does.
 #[must_use]
 pub fn local_consolidation_due(local: &Path) -> bool {
     if memory_entries(&load_raw(local)).len() <= LOCAL_CONSOLIDATE_ENTRIES {
-        return false;
-    }
-    let failed_recently = std::fs::read_to_string(local.join(CONSOLIDATE_FAILED_FILE))
-        .ok()
-        .and_then(|text| text.trim().parse::<i64>().ok())
-        .is_some_and(|at| chrono::Utc::now().timestamp() - at < CONSOLIDATE_RETRY_SECONDS);
-    if failed_recently {
         return false;
     }
     // A pass that kept more than the threshold waits for new changes.
@@ -3632,20 +3537,15 @@ pub fn local_consolidation_due(local: &Path) -> bool {
 
 /// Consolidate a conversation's local store, as [`consolidate_memory`] does
 /// the global one: the same curator and guard rails, recorded as a local
-/// refinement that rolls back like any other.
+/// refinement that rolls back like any other, and marked done only when it
+/// applied.
 pub async fn consolidate_local(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
     scopes: &HarnessScopes,
 ) -> Result<Refinement, String> {
     let baseline = load_raw(&scopes.local);
-    let proposal = match memory_edits(provider, model, &baseline, None, false).await {
-        Ok(proposal) => proposal,
-        Err(error) => {
-            mark_consolidation_failed(&scopes.local);
-            return Err(error);
-        }
-    };
+    let proposal = memory_edits(provider, model, &baseline, None, false).await?;
     let refinement = apply(
         scopes,
         &proposal,
@@ -3655,12 +3555,8 @@ pub async fn consolidate_local(
         Some(&baseline),
         None,
     );
-    // Done only when it applied: a pass whose writes failed is tried again
-    // after a while, as one whose model call failed is.
     if refinement.is_ok() {
         mark_consolidated(&scopes.local);
-    } else {
-        mark_consolidation_failed(&scopes.local);
     }
     refinement
 }
@@ -4483,11 +4379,31 @@ mod tests {
         assert!(refused.contains("nothing to curate"), "{refused}");
     }
 
+    /// One consolidation at a time across processes: a lock another process
+    /// holds (here a handle of its own on the lock file) keeps this one from
+    /// starting. 0.8.8's flag lived in one process and saw no other.
+    #[test]
+    fn a_consolidation_another_process_runs_is_not_started_again() {
+        let directory = tempfile::tempdir().expect("dir");
+        let global = directory.path().join("global");
+        let path = global.join(super::CONSOLIDATING_LOCK);
+        let other = crate::interactive::files::open_lock(&path, "test").expect("lock file");
+        assert!(crate::interactive::files::try_take(&other, "test").expect("taken"));
+        assert!(super::Consolidating::try_begin(&global).is_none());
+        drop(other);
+        let running = super::Consolidating::try_begin(&global).expect("free again");
+        assert!(
+            super::Consolidating::try_begin(&global).is_none(),
+            "one at a time"
+        );
+        drop(running);
+    }
+
     /// Deep Dream keeps to organizing: a constraint keeps its path through a
     /// merge, a pinned entry is not deleted with nothing pinned keeping it,
     /// nothing is created, and one pass deletes at most half the entries. A
-    /// failed pass is tried again after a while, not after a cycle of changes,
-    /// and a create and a delete both count as changes.
+    /// failed pass is not marked done (the queue tries it again), and a create
+    /// and a delete both count as changes.
     #[tokio::test]
     async fn the_consolidation_keeps_its_guard_rails_and_retries_a_failure() {
         let directory = tempfile::tempdir().expect("dir");
@@ -4516,7 +4432,8 @@ mod tests {
         .expect("state");
         assert!(super::memory_consolidation_due(&scopes.global));
 
-        // A failure is tried again later, not put off by fifteen changes.
+        // A failure is not marked done: it is still due, and the queue's
+        // backoff decides when it runs again.
         let broken: std::sync::Arc<dyn harness_providers::ModelProvider> =
             Replies::new(&["not json".to_owned()]);
         assert!(
@@ -4524,13 +4441,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(!super::memory_consolidation_due(&scopes.global), "waits");
-        std::fs::write(
-            scopes.global.join(super::CONSOLIDATE_FAILED_FILE),
-            (chrono::Utc::now().timestamp() - super::CONSOLIDATE_RETRY_SECONDS - 1).to_string(),
-        )
-        .expect("an hour ago");
-        assert!(super::memory_consolidation_due(&scopes.global), "due again");
+        assert!(super::memory_consolidation_due(&scopes.global), "still due");
 
         let mut edits = vec![
             json!({"action": "update", "kind": "memory", "id": "webp", "title": "Ảnh", "content": "Mọi ảnh mới phải là WebP, tối đa 200 KB", "path": "blog", "reason": "merge"}),
@@ -5312,20 +5223,48 @@ mod tests {
                 calls,
                 compacted,
                 super::AUTO_REFINE_TURN_INTERVAL,
+                |_| Ok(()),
             )
         };
         // Short runs add up across `ha exec --resume`.
         assert_eq!(due(1, 3, false), None);
         assert_eq!(due(1, 3, false), None);
         assert_eq!(due(1, 4, false), Some(3));
-        // Claimed: the count restarts.
+        // Queued: the count restarts.
         assert_eq!(due(4, 0, false), None);
         assert_eq!(due(1, 0, false), Some(5));
         // A run that compacted is reviewed after any work; one that did none is not.
         assert_eq!(due(0, 0, true), None);
         assert_eq!(due(1, 1, true), Some(1));
         // `autoRefine.turnInterval: 1` reviews every run.
-        assert_eq!(super::exec_review_due(&local, 1, 0, false, 1), Some(1));
+        assert_eq!(
+            super::exec_review_due(&local, 1, 0, false, 1, |_| Ok(())),
+            Some(1)
+        );
+    }
+
+    /// The count restarts only once the review is in the queue: a review that
+    /// could not be queued leaves its turns counted for the next run, where
+    /// 0.8.8 zeroed them as it claimed the review.
+    #[test]
+    fn a_headless_review_that_cannot_be_queued_keeps_its_turns() {
+        let directory = tempfile::tempdir().expect("dir");
+        let local = directory.path().join("local");
+        let interval = super::AUTO_REFINE_TURN_INTERVAL;
+        assert_eq!(
+            super::exec_review_due(&local, 5, 0, false, interval, |_| Err("full".to_owned())),
+            None
+        );
+        let mut handed = None;
+        assert_eq!(
+            super::exec_review_due(&local, 1, 0, false, interval, |turns| {
+                handed = Some(turns);
+                Ok(())
+            }),
+            Some(6),
+            "the next run reviews the turns the failed one could not queue"
+        );
+        assert_eq!(handed, Some(6));
     }
 
     #[test]
@@ -5346,7 +5285,8 @@ mod tests {
     }
 
     /// A session's end hands its unreviewed work to the next turn once, and only
-    /// when there was enough of it.
+    /// when there was enough of it; a hand-off that could not be written puts
+    /// the turns back.
     #[test]
     fn a_session_end_leaves_its_tail_for_the_next_turn_once() {
         let cadence = super::Cadence::default();
@@ -5359,20 +5299,8 @@ mod tests {
         assert_eq!(cadence.turn_finished(super::TAIL_MIN_TOOL_CALLS), None);
         assert_eq!(cadence.take_tail(), Some(2));
         assert_eq!(cadence.take_tail(), None, "handed off once");
-
-        let directory = tempfile::tempdir().expect("dir");
-        let review = super::DeferredReview {
-            task: "task-1".to_owned(),
-            session: "session-9".to_owned(),
-            turns: 2,
-            in_play: vec!["rust-testing".to_owned()],
-        };
-        super::defer_review(directory.path(), &review).expect("deferred");
-        assert_eq!(super::take_deferred_reviews(directory.path()), vec![review]);
-        assert!(
-            super::take_deferred_reviews(directory.path()).is_empty(),
-            "a deferred review is taken by one turn only"
-        );
+        cadence.put_back(super::TAIL_MIN_TURNS);
+        assert_eq!(cadence.take_tail(), Some(super::TAIL_MIN_TURNS));
     }
 
     /// A refinement the agent asks for stands in for the review that came due,
