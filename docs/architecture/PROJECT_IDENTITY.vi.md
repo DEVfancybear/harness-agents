@@ -118,8 +118,8 @@ trong repository thì không có danh tính.
 
 **Store bị chuyển được tìm lại.** Khi key của một lần chạy chưa có store, các
 store dưới `<data>/projects/` có manifest cùng root commit (ít nhất một), cùng
-remote (hoặc cả hai đều không có), và có root đã ghi không còn tồn tại, chính là
-repository này trước khi bị chuyển:
+remote (hoặc cả hai đều không có), và có root đã ghi không còn tồn tại trong khi
+thư mục chứa nó vẫn còn, chính là repository này trước khi bị chuyển:
 
 - đúng một store: nó được nhận như một store dưới key cũ (§3): chuyển sang key
   mới dưới `<data>/adoption.lock` khi không có gì giữ nó, memory toàn cục và
@@ -130,8 +130,16 @@ repository này trước khi bị chuyển:
   chuyển store cần giữ.
 
 Một fork có cùng root commit nhưng remote khác, nên không bao giờ khớp. Một bản
-clone thứ hai vẫn còn tồn tại không bao giờ bị lấy: root của nó vẫn còn đó. Hai
-store đều có dữ liệu thì không bao giờ bị gộp.
+clone thứ hai vẫn còn tồn tại không bao giờ bị lấy: root của nó vẫn còn đó. Một
+bản clone ngoài tầm với - trên ổ chưa mount, trên share chưa kết nối - cũng mất
+luôn thư mục chứa nó, nên cũng không bị lấy. Hai store đều có dữ liệu thì không
+bao giờ bị gộp.
+
+Những gì ha không thấy vẫn là một giới hạn: một thư mục dữ liệu dùng chung giữa
+nhiều máy (một home được đồng bộ) thấy bản clone của máy khác là đã mất khi
+đường dẫn của nó không có trên máy này, và một bản clone mới của cùng
+repository và remote ở đây có thể lấy store của nó. Hãy giữ thư mục dữ liệu
+riêng cho mỗi máy, hoặc chuyển store bằng tay với `ha project rekey`.
 
 **Bằng tay.** `ha project rekey <đường dẫn hoặc key cũ> [--cwd DIR]` chuyển
 store đang giữ dưới key khác sang key của thư mục hiện tại (hoặc `--cwd`), cũng

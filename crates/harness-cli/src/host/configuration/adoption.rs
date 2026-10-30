@@ -483,8 +483,16 @@ fn remember(data_dir: &Path, store_dir: &Path, root: &Path, identity: Identity) 
     }
 }
 
+/// Whether a recorded root is gone from where it was, not out of reach: the
+/// directory is not there, and the one it was in is. A root on a drive that is
+/// not mounted, or on a share that is not connected, has no parent either, and
+/// is never taken for a repository that moved.
+fn gone(root: &Path) -> bool {
+    !root.as_os_str().is_empty() && !root.exists() && root.parent().is_some_and(Path::is_dir)
+}
+
 /// The keys of the stores whose manifest names this repository and whose
-/// recorded root is gone.
+/// recorded root is gone ([`gone`]).
 fn moved_stores(data_dir: &Path, key: &str, identity: &Identity) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(data_dir.join("projects")) else {
         return Vec::new();
@@ -499,7 +507,7 @@ fn moved_stores(data_dir: &Path, key: &str, identity: &Identity) -> Vec<String> 
                 .identity
                 .as_ref()
                 .is_some_and(|other| other.same_repository(identity));
-            (same && !kept.root.is_empty() && !Path::new(&kept.root).exists())
+            (same && gone(Path::new(&kept.root)))
                 .then(|| entry.file_name().to_string_lossy().into_owned())
         })
         .collect::<Vec<_>>();
@@ -1095,6 +1103,41 @@ mod tests {
         // Back where it was, the repository opens its own store.
         std::fs::rename(&aside, &upstream).expect("back");
         assert_eq!(project.resolve(&upstream).project_store_dir(), store);
+    }
+
+    /// A clone whose directory is out of reach (its drive not mounted: the
+    /// directory it was in is gone too) is not taken for one that moved.
+    #[tokio::test]
+    async fn a_clone_out_of_reach_is_never_taken_for_one_that_moved() {
+        let project = Project::new();
+        let origin = "https://example.invalid/team/repo.git";
+        let drive = project.temp.path().join("drive");
+        let away = drive.join("repo");
+        repository(&away, origin);
+        let away_store = launch_with_store(&project, &away).await.project_store_dir();
+        let fresh = project.temp.path().join("fresh");
+        git(
+            project.temp.path(),
+            &[
+                "clone",
+                "-q",
+                &away.display().to_string(),
+                &fresh.display().to_string(),
+            ],
+        );
+        git(&fresh, &["remote", "set-url", "origin", origin]);
+        // The drive goes: the repository and the directory it was in.
+        let unmounted = project.temp.path().join("unmounted");
+        std::fs::rename(&drive, &unmounted).expect("unmount");
+        let context = project.resolve(&fresh);
+        assert!(
+            away_store.join("harness.sqlite3").is_file(),
+            "left where it is"
+        );
+        assert!(!context.project_store_dir().join("harness.sqlite3").exists());
+        // Back, it opens its own store.
+        std::fs::rename(&unmounted, &drive).expect("mount");
+        assert_eq!(project.resolve(&away).project_store_dir(), away_store);
     }
 
     #[tokio::test]
