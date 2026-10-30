@@ -446,10 +446,12 @@ fn file_lists(
                 .is_some_and(|id| cells.contains(id))
         {
             let (opened, written) = cell_files(&message.content);
-            opened.into_iter().for_each(|path| touch(&mut read, path));
-            written
-                .into_iter()
-                .for_each(|path| touch(&mut modified, path));
+            for path in opened {
+                touch(&mut read, path);
+            }
+            for path in written {
+                touch(&mut modified, path);
+            }
         }
         for call in &message.tool_calls {
             let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments) else {
@@ -477,10 +479,12 @@ fn file_lists(
                 "run_shell" | "run_process" | "bash" | "shell" => {
                     if let Some(root) = root.as_deref() {
                         let (named, redirected) = shell_files(&arguments, root);
-                        named.into_iter().for_each(|path| touch(&mut read, path));
-                        redirected
-                            .into_iter()
-                            .for_each(|path| touch(&mut modified, path));
+                        for path in named {
+                            touch(&mut read, path);
+                        }
+                        for path in redirected {
+                            touch(&mut modified, path);
+                        }
                     }
                 }
                 _ => {}
@@ -617,7 +621,6 @@ fn shell_words(command: &str) -> Vec<(String, bool)> {
     for character in command.chars() {
         match (quote, character) {
             (Some(open), _) if character == open => quote = None,
-            (Some(_), _) => word.push(character),
             (None, '"' | '\'' | '`') => quote = Some(character),
             (None, '>') => {
                 flush(&mut word, &mut redirect, &mut words);
@@ -630,7 +633,8 @@ fn shell_words(command: &str) -> Vec<(String, bool)> {
             (None, blank) if blank.is_whitespace() => {
                 flush(&mut word, &mut redirect, &mut words);
             }
-            (None, _) => word.push(character),
+            // Inside quotes, or any other character outside them.
+            _ => word.push(character),
         }
     }
     flush(&mut word, &mut redirect, &mut words);
