@@ -138,7 +138,7 @@ before=$(store_hash)
 "$HA" memory purge "$PKEY" >"$RX/purge-list.out" 2>&1
 sed 's/^/   /' "$RX/purge-list.out"
 check "without --yes the purge lists the entry and the reviews it rewrites" 'grep -q "would purge.*$PKEY" "$RX/purge-list.out" && grep -q "1 refinement summary(ies), 1 record(s) of refinements.jsonl" "$RX/purge-list.out"'
-check "and changes no file of the store" '[ "$(store_hash)" = "$before" ] && [ -n "$(key_of "$PCODE")" ]'
+check "and changes no file of the store" 'grep -q "would purge.*$PKEY" "$RX/purge-list.out" && [ "$(store_hash)" = "$before" ] && [ -n "$(key_of "$PCODE")" ]'
 "$HA" memory purge "$PKEY" --yes >"$RX/purge.out" 2>&1
 sed 's/^/   /' "$RX/purge.out"
 check "the entry is gone" '[ -z "$(key_of "$PCODE")" ]'
