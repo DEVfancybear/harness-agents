@@ -774,6 +774,11 @@ entry and every trace of its content:
 - its row, every event of it (all versions), its `memory_usage` row;
 - in `refinements.jsonl`, each refinement's edit of it is cut to its action,
   kind and outcome, with no title, content, `before` or `after`;
+- each refinement that changed it - its summary in the store (`refinement`),
+  its record in `refinements.jsonl`, its copy in the imported legacy state -
+  loses its words (trigger, evidence, outcome; summary, rationale, expected
+  outcome) for a note that it changed a purged memory, and the key its changes
+  name becomes `[purged]`: a review's summary says what it recorded;
 - its record in `harness_state.json.imported` and its lines in
   `memory_history.jsonl.imported`;
 - one event remains: operation `purge`, cause `purge`, actor `cli`, with the
@@ -796,6 +801,18 @@ holds none now loses only the versions that held one, and keeps its current
 state; a deleted entry whose log holds one is purged whole. It also redacts the
 secret values left in the refinement table, `refinements.jsonl` and the
 imported legacy files. The listing names each secret's kind, never its value.
+
+A scope bounds what a purge touches: with `--scope`, `--secrets` purges the
+scope's entries and their own copies, and leaves the secret values of other
+entries' reviews and of the imported files alone; only `--secrets` with no
+scope redacts every one. `--conversation` names a conversation's store, so it
+goes with `--scope local` or no scope.
+
+The dry run reads the store read-only: no migration, no import, no file
+changed. It lists, beside each entry, how many refinement summaries,
+`refinements.jsonl` records and imported legacy lines or entries `--yes`
+rewrites, and names a legacy file still waiting to be imported, which it does
+not read.
 
 | Command | Does |
 |---|---|

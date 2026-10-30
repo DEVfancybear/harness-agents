@@ -257,10 +257,18 @@ with the edit itself as the diff (its added and removed lines, numbered as
 struck through and stayed in the index, read in every turn. When a host write
 of the index would leave more than 20 struck lines (`INDEX_STRUCK_CAP`), they
 move whole to a new file of the archive, `memory/archive/index-<year>.md`, then
-`index-<year>-2.md` and so on: a tape file enters whole and is never edited. The
-archive file is written first, so a line is never in neither, and
-`memory/markdown_index_archived` records the move. A store without a tape tier
-keeps its lines.
+`index-<year>-2.md` and so on: a tape file enters whole and is never edited.
+
+- A struck line is one struck through as a whole: a list item whose text opens
+  a struck span (`- ~~...~~ retired <date>`). A live line that strikes a word
+  (`- Use pnpm (not ~~npm~~)`) stays and does not count.
+- The index edit and the archive file are linted together, and the archive is
+  written only when both pass, before the index: a refused edit leaves no
+  archive, and a line is never in neither.
+- A line a file of the archive holds already only leaves the index: a move
+  that was cut short is never archived twice.
+- `memory/markdown_index_archived` records the move. A store without a tape
+  tier keeps its lines.
 
 **A struck line moved to the archive is kept.** `disk-history` fails a struck
 line removed with no matching addition. A struck line whose text a file of the

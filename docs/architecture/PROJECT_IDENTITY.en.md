@@ -124,7 +124,8 @@ outside a repository has no identity.
 **A moved store is found again.** When a launch's key has no store yet, the
 stores under `<data>/projects/` whose manifest has the same root commits, at
 least one, and the same remote (or none for both), and whose recorded root no
-longer exists, are this repository before it moved:
+longer exists while the directory it was in still does, are this repository
+before it moved:
 
 - exactly one: it is adopted as a store under an older key is (§3): moved to
   the new key under `<data>/adoption.lock` when nothing holds it, its global
@@ -136,8 +137,16 @@ longer exists, are this repository before it moved:
   one to keep.
 
 A fork has the same root commits under another remote, and never matches. A
-second clone that still exists is never taken: its root is there. Two stores
-that both hold data are never merged.
+second clone that still exists is never taken: its root is there. A clone out
+of reach - on a drive that is not mounted, a share that is not connected - has
+lost the directory it was in too, and is not taken either. Two stores that
+both hold data are never merged.
+
+What ha cannot see stays a limit: a data directory shared between machines (a
+synced home) sees another machine's clone as gone when its path is not on this
+one, and one fresh clone of the same repository and remote here could take its
+store. Keep the data directory per machine, or move a store with
+`ha project rekey` by hand.
 
 **By hand.** `ha project rekey <old path or key> [--cwd DIR]` moves the store
 kept under another key to the key of the current directory (or `--cwd`), with
