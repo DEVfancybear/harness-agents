@@ -353,8 +353,11 @@ impl Drop for RunLock {
 /// then mine the failures not yet shown and keep what passes replay. `None`
 /// when it was not due or another process is running it.
 ///
-/// The run is marked when it starts, so a turn ending while the model answers
-/// starts no second run, and a run that fails waits for the next day.
+/// The run is marked only once it saved: a run that fails is tried again by
+/// its job in the queue (`sleep`), which waits out a backoff and gives up
+/// after so many failures. Marked when it started, one failed call put the
+/// evolution off a whole day. While it runs, its lock (and the job's claim)
+/// keeps a turn ending meanwhile from starting a second run.
 ///
 /// # Errors
 /// The model or the save failed.
@@ -367,12 +370,10 @@ pub async fn evolve(
     let Some(_lock) = RunLock::take(data_dir) else {
         return Ok(None);
     };
-    let mut evolved = load(data_dir);
+    let evolved = load(data_dir);
     if evolved.ran.is_some_and(|ran| now - ran < EVERY) {
         return Ok(None);
     }
-    evolved.ran = Some(now);
-    save(data_dir, &evolved)?;
     let since = (now - chrono::Duration::days(WINDOW_DAYS)).timestamp_millis();
     let directory = data_dir.to_path_buf();
     let found = tokio::task::spawn_blocking(move || records(&directory, since))
@@ -417,6 +418,7 @@ pub async fn evolve(
     for (key, ids) in &groups {
         evolved.seen.insert(key.clone(), ids.len());
     }
+    evolved.ran = Some(now);
     save(data_dir, &evolved)?;
     harness_types::diag::info("evolution", "ran")
         .field("groups", ran.groups)
@@ -713,6 +715,34 @@ mod tests {
                 .pointer("/function/description")
                 .and_then(Value::as_str),
             Some("Read.")
+        );
+    }
+
+    /// A run whose model call fails is not marked as run: it is still due, and
+    /// the queue tries it again. Marked as it started, it waited a day.
+    #[tokio::test]
+    async fn a_run_whose_model_call_fails_is_not_marked() {
+        let root = tempfile::tempdir().expect("dir");
+        let data = root.path();
+        let dir = crate::diagnostics::location(data);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let now = chrono::Utc::now().timestamp_millis();
+        let lines = (0..super::MIN_EVIDENCE)
+            .map(|n| {
+                json!({"ms": now, "kind": "call", "event": "settled", "run": "r1", "call": format!("c{n}"),
+                    "fields": {"tool": "read_file", "args_shape": "file:string", "ok": false, "error_class": "invalid_call:x"}})
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("records.jsonl"), lines).expect("records");
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> =
+            std::sync::Arc::new(harness_providers::MockProvider::text("not json"));
+        assert!(super::due(data, chrono::Utc::now()));
+        assert!(super::evolve(&provider, "m", data).await.is_err());
+        assert!(
+            super::due(data, chrono::Utc::now()),
+            "a failed run is tried again"
         );
     }
 }

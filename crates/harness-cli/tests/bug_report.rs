@@ -627,6 +627,20 @@ fn a_bug_report_sets_memory_upkeep_beside_its_reads() {
             call("review_gate", 1000, 8000, 200),
         ),
         record(3_000, "refine", "call", call("deep_dream", 4000, 6000, 900)),
+        // A failed call is counted, with its class: it cost time, and it is a
+        // review that never landed.
+        record(
+            3_500,
+            "refine",
+            "call_failed",
+            serde_json::json!({"purpose": "review_gate", "model": "m", "duration_ms": 500, "class": "service_unavailable"}),
+        ),
+        record(
+            3_600,
+            "sleep",
+            "gave_up",
+            serde_json::json!({"job": "consolidation", "key": "consolidation:x", "attempts": 6, "class": "rate_limited"}),
+        ),
         record(4_000, "tool", "ok", tool("memory")),
         record(5_000, "tool", "ok", tool("history_search")),
         record(6_000, "tool", "ok", tool("read_file")),
@@ -681,16 +695,25 @@ fn a_bug_report_sets_memory_upkeep_beside_its_reads() {
         .and_then(|rest| rest.split("\n## ").next())
         .unwrap_or_else(|| panic!("a Memory section: {summary}"));
     assert!(
-        memory.contains("| review_gate | 2 | 17000 | 500 | 3.0s |"),
+        memory.contains("| review_gate | 3 | 1 (service_unavailable 1) | 17000 | 500 | 3.5s |"),
         "{memory}"
     );
     assert!(
-        memory.contains("| review_plan | 1 | 20000 | 1500 | 9.0s |"),
+        memory.contains("| review_plan | 1 | 0 | 20000 | 1500 | 9.0s |"),
         "{memory}"
     );
     assert!(
-        memory.contains("| deep_dream | 1 | 6000 | 900 | 4.0s |"),
+        memory.contains("| deep_dream | 1 | 0 | 6000 | 900 | 4.0s |"),
         "{memory}"
+    );
+    let sleep = summary
+        .split("## Sleep (background memory passes)")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .unwrap_or_else(|| panic!("a Sleep section: {summary}"));
+    assert!(
+        sleep.contains("gave_up `consolidation` - (attempt 6, rate_limited)"),
+        "{sleep}"
     );
     assert!(
         memory.contains(

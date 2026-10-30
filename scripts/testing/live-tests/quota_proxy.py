@@ -6,11 +6,14 @@ usage limit, for the live tests of a quota park.
 It listens on 127.0.0.1 (the port is written to <dir>/port) and forwards every
 request to https://chatgpt.com unchanged. While <dir>/limit exists, a request
 is answered instead with HTTP 429 and ChatGPT's `usage_limit_reached` body,
-resetting four hours from now. Each request is logged to <dir>/requests.jsonl
-as {"ms", "status", "key", "body_has"} - `key` is the request's
-prompt_cache_key (one per conversation), `body_has` the words of <dir>/watch
-that the request body holds. Nothing of the request (its credentials
-included) is written anywhere else.
+resetting four hours from now. A request whose body holds one of the lines of
+<dir>/fail (a phrase of a system prompt, say) is answered with HTTP 503, as a
+provider that is down: a test fails one kind of call and lets the others
+through. Each request is logged to <dir>/requests.jsonl as {"ms", "status",
+"key", "body_has"} - `key` is the request's prompt_cache_key (one per
+conversation), `body_has` the words of <dir>/watch and the lines of
+<dir>/fail that the request body holds. Nothing of the request (its
+credentials included) is written anywhere else.
 """
 
 import http.server
@@ -42,6 +45,7 @@ def main() -> None:
                 watch = handle.read().split()
         except OSError:
             pass
+        watch += failing()
         text = body.decode("utf-8", errors="replace")
         row = {
             "ms": int(time.time() * 1000),
@@ -51,6 +55,13 @@ def main() -> None:
         }
         with open(os.path.join(directory, "requests.jsonl"), "a", encoding="utf-8") as handle:
             handle.write(json.dumps(row) + "\n")
+
+    def failing():
+        try:
+            with open(os.path.join(directory, "fail"), encoding="utf-8") as handle:
+                return [line.strip() for line in handle if line.strip()]
+        except OSError:
+            return []
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
@@ -75,6 +86,18 @@ def main() -> None:
                 ).encode()
                 log(429, body)
                 self.send_response(429)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(answer)))
+                self.end_headers()
+                self.wfile.write(answer)
+                return
+            text = body.decode("utf-8", errors="replace")
+            if any(phrase in text for phrase in failing()):
+                answer = json.dumps(
+                    {"error": {"type": "server_error", "message": "The server is temporarily unavailable"}}
+                ).encode()
+                log(503, body)
+                self.send_response(503)
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(answer)))
                 self.end_headers()

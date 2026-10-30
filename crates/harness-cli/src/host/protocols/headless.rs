@@ -1327,32 +1327,36 @@ pub async fn run_with(
 
     // The automatic review, as the app runs one at a session's end: what the
     // conversation's runs did since its last review is counted, and when it is
-    // enough the review reads the conversation while the store is still open.
-    // A run that answered nothing (a mock, a cancel) is not reviewed.
-    let review = if provider_config.is_some()
+    // enough a review job is written for it (`sleep`). The count restarts only
+    // once the job is on disk, and a job whose review fails stays queued: the
+    // next run in the conversation reviews those turns. A run that answered
+    // nothing (a mock, a cancel) queues and runs no review.
+    let reviewing = provider_config.is_some()
         && refinements
         && super::service::auto_refine_enabled(&context.paths.config_file, environment)
         && !cancellation.is_cancelled()
-        && outcome.stop != harness_tools::TurnStop::Canceled
-    {
-        let local = super::harness::local_dir(&context.paths.data_dir, outcome.task_id.as_str());
-        match super::refine::exec_review_due(
+        && outcome.stop != harness_tools::TurnStop::Canceled;
+    let local = super::harness::local_dir(&context.paths.data_dir, outcome.task_id.as_str());
+    if reviewing {
+        let _ = super::refine::exec_review_due(
             &local,
             turns_run,
             tool_calls_run,
             runtime.compactions() > 0,
             super::service::auto_refine_interval(&context.paths.config_file),
-        ) {
-            Some(turns) => {
-                let conversation =
-                    super::service::refine_transcript(&store, &outcome.session_id, &local).await;
-                (!conversation.is_empty()).then_some((turns, conversation, local))
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
+            |turns| {
+                let job = super::sleep::Job::review(
+                    &context.project_store_dir(),
+                    outcome.task_id.as_str(),
+                    outcome.session_id.as_str(),
+                    "exec",
+                    turns,
+                    Vec::new(),
+                );
+                super::sleep::enqueue(&context.paths.data_dir, job).map(|_| ())
+            },
+        );
+    }
 
     drop(driver);
     // Stop the extension processes this turn started, before the writer is released.
@@ -1383,10 +1387,21 @@ pub async fn run_with(
         }
         out.stdout(output["response"].as_str().unwrap_or_default());
     }
-    // The answer is out; the review runs before the process exits, since no
-    // process is left to run it beside the conversation. What it says goes to
-    // stderr, and Ctrl-C cuts it off (whatever it wrote is undone).
-    if let Some((turns, conversation, local)) = review {
+    // The answer is out; the conversation's due reviews - this run's, and one
+    // an earlier run could not finish - run before the process exits, since no
+    // process is left to run them beside the conversation. What they say goes
+    // to stderr, and Ctrl-C cuts them off (whatever one wrote is undone, and
+    // its job waits for the next run).
+    let due = reviewing
+        .then(|| {
+            super::service::due_review_turns(
+                &context.paths.data_dir,
+                &context.project_store_dir(),
+                outcome.task_id.as_str(),
+            )
+        })
+        .flatten();
+    if let Some(turns) = due {
         out.stderr(&format!(
             "auto-refine: reviewing the last {turns} turn(s) of this conversation before exiting (HA_AUTO_REFINE=off skips it)"
         ));
@@ -1402,31 +1417,40 @@ pub async fn run_with(
             environment,
             resolved_config.project_trusted,
         );
-        let scopes = super::refine::HarnessScopes {
-            global: super::harness::global_dir(&context.paths.data_dir),
-            local,
-        };
         let model = provider_config
             .as_ref()
             .map(|config| config.model.clone())
             .unwrap_or_default();
-        let reviewed = async {
-            let mut events = super::service::review_now(
-                Arc::clone(&provider),
-                model.clone(),
-                conversation,
-                outcome.task_id.as_str().to_owned(),
-                scopes.clone(),
-                learning,
-                turns,
-                Some(outcome.session_id.as_str().to_owned()),
-                knowledge_host.clone(),
-            )
-            .await;
+        let reviews = super::service::Reviews {
+            sender: tokio::sync::mpsc::unbounded_channel().0,
+            helper_provider: Arc::clone(&provider),
+            helper_model: model.clone(),
+            provider: Arc::clone(&provider),
+            model,
+            data_dir: context.paths.data_dir.clone(),
+            store_dir: context.project_store_dir(),
+            learning,
+            knowledge: knowledge_host.clone(),
+        };
+        let scopes = super::refine::HarnessScopes {
+            global: super::harness::global_dir(&context.paths.data_dir),
+            local,
+        };
+        let model = reviews.model.clone();
+        // Boxed: the review's future is large, and the run's own is already.
+        let reviewed = Box::pin(async {
+            let mut events =
+                super::service::review_queued_now(reviews, outcome.task_id.as_str()).await;
             // A conversation's store that outgrew forty entries is
-            // consolidated too, as the app does after a turn.
+            // consolidated too, as the app does after a turn: one pass at a
+            // time across processes, a failed one waiting in the queue.
             if super::refine::local_consolidation_due(&scopes.local)
-                && let Some(_consolidating) = super::refine::Consolidating::try_begin()
+                && let Some(_consolidating) =
+                    super::refine::Consolidating::try_begin(&scopes.global)
+                && let Some(claimed) = super::sleep::claim_upkeep(
+                    &context.paths.data_dir,
+                    super::sleep::Job::consolidation(&scopes.local),
+                )
             {
                 events.push(
                     super::service::consolidate_local_event(
@@ -1434,12 +1458,13 @@ pub async fn run_with(
                         &model,
                         &scopes,
                         outcome.task_id.as_str(),
+                        claimed,
                     )
                     .await,
                 );
             }
             events
-        };
+        });
         tokio::select! {
             events = reviewed => {
                 for event in events {
