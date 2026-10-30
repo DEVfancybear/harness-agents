@@ -876,6 +876,20 @@ impl Report {
 
     /// The harness files of each conversation in scope, and the global ones.
     fn harness_files(&mut self) {
+        // The background memory passes waiting, failed or given up.
+        let queue = crate::interactive::sleep::dir(&self.data_dir);
+        if let Ok(entries) = std::fs::read_dir(&queue) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+                {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    self.copy_file(&path, &format!("sleep/{name}"), false);
+                }
+            }
+        }
         let global = crate::interactive::harness::global_dir(&self.data_dir);
         self.memory_store(&global, "harness/global");
         for name in [
@@ -1044,6 +1058,7 @@ impl Report {
         self.summary_parks(&mut out);
         self.summary_activity(&mut out);
         self.summary_memory(&mut out);
+        self.summary_sleep(&mut out);
         self.summary_learning(&mut out);
         self.summary_jev(&mut out);
         self.summary_strategy(&mut out);
@@ -1694,15 +1709,18 @@ impl Report {
     }
 
     /// What keeping memory cost beside what read it: the model calls of the
-    /// reviews and Deep Dream (`refine.call`, by purpose, with their tokens)
+    /// reviews and Deep Dream (`refine.call`, by purpose, with their tokens),
+    /// the ones that failed (`refine.call_failed`, with their error classes)
     /// and the agent's calls of the tools that read memory and the raw
     /// record. A store written ahead of any question pays off only when it is
     /// read (`MemoryTax`, arXiv 2610.29823); this is the measure for deciding how
-    /// often to review.
+    /// often to review. A failed call costs too, and is what a review that
+    /// never landed looks like.
     fn summary_memory(&self, out: &mut String) {
         /// The tools that read what memory kept, or the turns themselves.
         const READERS: [&str; 4] = ["memory", "knowledge", "history_search", "history_read"];
-        let calls = self.recorded("refine", "call");
+        let mut calls = self.recorded("refine", "call");
+        calls.extend(self.recorded("refine", "call_failed"));
         let mut reads = [0_usize; READERS.len()];
         for event in ["ok", "failed"] {
             for record in self.recorded("tool", event) {
@@ -1723,27 +1741,68 @@ impl Report {
 "
         );
         if !calls.is_empty() {
-            let mut purposes: BTreeMap<String, (usize, u64, u64, u64)> = BTreeMap::new();
+            #[derive(Default)]
+            struct Purpose {
+                calls: usize,
+                failed: usize,
+                input: u64,
+                output: u64,
+                ms: u64,
+                /// The failed calls by error class.
+                classes: BTreeMap<String, usize>,
+            }
+            let mut purposes: BTreeMap<String, Purpose> = BTreeMap::new();
             for record in &calls {
                 let fields = &record["fields"];
                 let entry = purposes
                     .entry(fields["purpose"].as_str().unwrap_or("?").to_owned())
                     .or_default();
-                entry.0 += 1;
-                entry.1 += fields["input"].as_u64().unwrap_or_default();
-                entry.2 += fields["output"].as_u64().unwrap_or_default();
-                entry.3 += fields["duration_ms"].as_u64().unwrap_or_default();
+                entry.calls += 1;
+                entry.input += fields["input"].as_u64().unwrap_or_default();
+                entry.output += fields["output"].as_u64().unwrap_or_default();
+                entry.ms += fields["duration_ms"].as_u64().unwrap_or_default();
+                if record["event"] == "call_failed" {
+                    entry.failed += 1;
+                    // A record from before 0.8.9 has no class: it is read
+                    // from the message, as ha writes it.
+                    let class = fields["class"].as_str().map_or_else(
+                        || {
+                            crate::interactive::sleep::error_class(
+                                record["msg"].as_str().unwrap_or_default(),
+                            )
+                        },
+                        str::to_owned,
+                    );
+                    *entry.classes.entry(class).or_default() += 1;
+                }
             }
             let _ = writeln!(
                 out,
-                "| upkeep call | calls | input tokens | output tokens | time |"
+                "| upkeep call | calls | failed | input tokens | output tokens | time |"
             );
-            let _ = writeln!(out, "|---|---|---|---|---|");
-            for (purpose, (count, input, output, ms)) in &purposes {
+            let _ = writeln!(out, "|---|---|---|---|---|---|");
+            for (name, purpose) in &purposes {
+                let failed = if purpose.failed == 0 {
+                    "0".to_owned()
+                } else {
+                    format!(
+                        "{} ({})",
+                        purpose.failed,
+                        purpose
+                            .classes
+                            .iter()
+                            .map(|(class, count)| format!("{class} {count}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
                 let _ = writeln!(
                     out,
-                    "| {purpose} | {count} | {input} | {output} | {:.1}s |",
-                    seconds(*ms)
+                    "| {name} | {} | {failed} | {} | {} | {:.1}s |",
+                    purpose.calls,
+                    purpose.input,
+                    purpose.output,
+                    seconds(purpose.ms)
                 );
             }
             let _ = writeln!(out);
@@ -1759,6 +1818,82 @@ impl Report {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+    }
+
+    /// The background memory passes (`sleep`): the jobs on disk now - waiting,
+    /// failed or given up, each with its attempts and its last error - and
+    /// the window's failures from the diagnostics. A review that failed is
+    /// there until it ran, so a pass that keeps failing is seen here, not lost.
+    fn summary_sleep(&self, out: &mut String) {
+        let jobs = crate::interactive::sleep::jobs(&self.data_dir);
+        let mut failures = self.recorded("sleep", "failed");
+        failures.extend(self.recorded("sleep", "gave_up"));
+        failures.sort_by_key(|record| record["ms"].as_i64().unwrap_or_default());
+        let done = self.recorded("sleep", "done").len();
+        if jobs.is_empty() && failures.is_empty() && done == 0 {
+            return;
+        }
+        let _ = writeln!(out, "## Sleep (background memory passes)\n");
+        let _ = writeln!(
+            out,
+            "{} queued now, {done} done and {} failed in the window.\n",
+            jobs.len(),
+            failures.len()
+        );
+        if !jobs.is_empty() {
+            let _ = writeln!(
+                out,
+                "| job | conversation | trigger | turns | attempts | state | last error |"
+            );
+            let _ = writeln!(out, "|---|---|---|---|---|---|---|");
+            for job in &jobs {
+                let state = if job.gave_up {
+                    "gave up".to_owned()
+                } else if job.claimed.is_some() {
+                    "running or left by a process that died".to_owned()
+                } else {
+                    chrono::DateTime::from_timestamp_millis(job.next_at).map_or_else(
+                        || "waiting".to_owned(),
+                        |at| format!("waiting until {}", at.format("%Y-%m-%d %H:%M:%S UTC")),
+                    )
+                };
+                let error = job.last_error.as_deref().map_or_else(String::new, |error| {
+                    format!(
+                        "{}: {}",
+                        job.error_class.as_deref().unwrap_or("other"),
+                        clip(error, 120)
+                    )
+                });
+                let _ = writeln!(
+                    out,
+                    "| {} | {} | {} | {} | {} | {state} | {} |",
+                    job.kind.as_str(),
+                    job.task.as_deref().unwrap_or("-"),
+                    job.trigger,
+                    job.turns,
+                    job.attempts,
+                    self.clip_cell(&error)
+                );
+            }
+            let _ = writeln!(out);
+        }
+        for record in failures.iter().rev().take(10).rev() {
+            let fields = &record["fields"];
+            let _ = writeln!(
+                out,
+                "- {} {} `{}` {} (attempt {}, {}): {}",
+                record["ts"].as_str().unwrap_or("?"),
+                record["event"].as_str().unwrap_or("?"),
+                fields["job"].as_str().unwrap_or("?"),
+                record["task"].as_str().unwrap_or("-"),
+                fields["attempts"].as_u64().unwrap_or_default(),
+                fields["class"].as_str().unwrap_or("other"),
+                self.clip_cell(record["msg"].as_str().unwrap_or_default())
+            );
+        }
+        if !failures.is_empty() {
+            let _ = writeln!(out);
+        }
     }
 
     /// What the learning loop, the self-evaluation and the session logs did
