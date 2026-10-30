@@ -230,3 +230,40 @@ project without a store gets no finding.
   striking it, answers from the index, and the hook blocks an untagged fact. Its
   last section imports two Vietnamese rules with `ha learning import` (no model)
   and checks the two decision files and the pointer lines.
+
+## 8. The host's writes are linted, and the index sheds struck lines (0.8.9)
+
+**Linted before they land.** Until 0.8.8 the writer held the lock and read the
+file again, but never ran the store's lint: the learning loop could push the
+index past its cap, and nothing caught it until the commit hook. Now
+`markdown_memory::edit` lints the store in-process just before it replaces a
+file, without running git: the store as it is, and the store with the new text,
+with the edit itself as the diff (its added and removed lines, numbered as
+`git diff` numbers them).
+
+- The caps (`rom-caps`, `ram-caps`) and `index-links` are read before and
+  after; the diff checks (`disk-provenance`, `disk-history`, `tape-frozen`)
+  read the edit.
+- Only a failure the edit adds refuses it: a store that fails a check already
+  is not blocked by it. A file over its cap stays one failure as it grows.
+- A refused write leaves the file as it is, records
+  `memory/markdown_write_refused` with the failures, and returns an error
+  (`EditError::Refused`) its caller reports: the learning loop's import and
+  promotion say it; the session log writes its section to a file of its own,
+  as it does for a note it cannot read.
+- A project without `memory-lint.json` is not linted.
+
+**The index sheds struck lines.** A retired or reworded rule's pointer is
+struck through and stayed in the index, read in every turn. When a host write
+of the index would leave more than 20 struck lines (`INDEX_STRUCK_CAP`), they
+move whole to a new file of the archive, `memory/archive/index-<year>.md`, then
+`index-<year>-2.md` and so on: a tape file enters whole and is never edited. The
+archive file is written first, so a line is never in neither, and
+`memory/markdown_index_archived` records the move. A store without a tape tier
+keeps its lines.
+
+**A struck line moved to the archive is kept.** `disk-history` fails a struck
+line removed with no matching addition. A struck line whose text a file of the
+archive holds, as it is now, is kept, not lost: the move passes in the diff
+that makes it and after the archive was committed on its own. This is a
+deliberate difference from `memory-lint.mjs`, which reads only the diff.

@@ -225,3 +225,39 @@ dòng nào.
   trả lời từ index, và hook chặn một dữ kiện thiếu tag. Mục cuối của nó import hai
   rule tiếng Việt bằng `ha learning import` (không cần model) và kiểm hai file
   decision cùng các dòng con trỏ.
+
+## 8. Lệnh ghi của host được lint, và index bỏ bớt dòng gạch (0.8.9)
+
+**Lint trước khi ghi.** Tới 0.8.8, writer giữ lock và đọc lại file, nhưng
+không bao giờ chạy lint của store: learning loop có thể đẩy index vượt cap, và
+không gì phát hiện cho tới commit hook. Giờ `markdown_memory::edit` lint store
+ngay trong process trước khi thay một file, không chạy git: store như hiện tại,
+và store với nội dung mới, lấy chính lần sửa làm diff (các dòng thêm và bớt,
+đánh số như `git diff` đánh số).
+
+- Các cap (`rom-caps`, `ram-caps`) và `index-links` được đọc trước và sau;
+  các check theo diff (`disk-provenance`, `disk-history`, `tape-frozen`) đọc
+  lần sửa.
+- Chỉ một lỗi mà lần sửa thêm vào mới khiến nó bị từ chối: store đã sai một
+  check từ trước thì không bị check đó chặn mãi. Một file vượt cap vẫn chỉ là
+  một lỗi khi nó dài thêm.
+- Lần ghi bị từ chối để nguyên file, ghi `memory/markdown_write_refused` kèm
+  các lỗi, và trả về một lỗi (`EditError::Refused`) để nơi gọi báo lại: lệnh
+  import và promote của learning loop nói ra; session log ghi phần của nó vào
+  một file riêng, như khi nó không đọc được note.
+- Project không có `memory-lint.json` thì không lint.
+
+**Index bỏ bớt dòng gạch.** Con trỏ của một rule đã rút lại hay viết lại bị
+gạch ngang và nằm mãi trong index, được đọc ở mọi lượt. Khi một lần host ghi
+index sẽ để lại hơn 20 dòng gạch (`INDEX_STRUCK_CAP`), chúng được chuyển nguyên
+vẹn sang một file mới của archive, `memory/archive/index-<năm>.md`, rồi
+`index-<năm>-2.md` và tiếp tục như vậy: một file tape vào nguyên vẹn và không
+bao giờ bị sửa. File archive được ghi trước, nên một dòng không bao giờ mất ở
+cả hai nơi, và `memory/markdown_index_archived` ghi lại việc chuyển. Store không
+có tầng tape thì giữ các dòng của nó.
+
+**Dòng gạch đã chuyển vào archive được tính là còn giữ.** `disk-history` báo
+lỗi một dòng gạch bị bỏ mà không có dòng thêm khớp. Một dòng gạch mà một file
+của archive, như hiện tại, chứa nguyên văn thì được tính là còn giữ, không mất:
+việc chuyển qua được cả trong diff tạo ra nó lẫn sau khi archive đã được commit
+riêng. Đây là một khác biệt có chủ ý so với `memory-lint.mjs`, vốn chỉ đọc diff.

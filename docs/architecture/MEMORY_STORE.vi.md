@@ -755,3 +755,72 @@ thư viện knowledge và `<data>/history-embedding/` được để nguyên tr�
 không bao giờ được đọc. `memory status` và `/knowledge status` báo khi vẫn còn
 `.ha-embedding.json`, và diagnostics ghi `knowledge.embedding_config_ignored`
 một lần.
+
+## 15. Chỉ mục để xếp hạng, và quên (0.8.9)
+
+**Từ được lập chỉ mục một lần.** Tới 0.8.8, digest và memory search tách từ,
+lấy gốc từ và bỏ dấu cho mọi entry ở mỗi lần gọi, rồi sắp xếp mọi kết quả khớp:
+khoảng 0,4 s mỗi lượt với 10.000 entry và 2 s với 50.000. Giờ:
+
+- Entry của mỗi store được lập chỉ mục một lần cho mỗi process
+  (`memory/search.rs`, `Corpus`): mỗi từ của bốn trường, viết nguyên và bỏ
+  dấu, trỏ tới các entry chứa nó (chỉ mục đảo), cùng gốc từ tiếng Anh của nó.
+- Một entry được giữ trong chỉ mục của store dưới key và `version_hash` của
+  nó; hash đổi mỗi khi tree, name, title, content, meta hay temporal đổi, nên
+  mọi lần ghi, revert, move, import hay purge đều được thấy ở lần đọc sau; chỉ
+  các entry đã đổi được lập chỉ mục lại. Entry không đọc từ store (các session
+  log mà `rank_documents` xếp hạng) được lập chỉ mục cho riêng lần gọi đó.
+- Entry của một term là postings của các từ nó mở đầu và các từ cùng gốc, nên
+  chỉ entry chứa từ của truy vấn mới được tính điểm. Thống kê vẫn là của đúng
+  các entry lần gọi xét tới, nên điểm giống hệt trước, tới từng bit; một test
+  so chỉ mục với cách duyệt cũ trên các store ngẫu nhiên.
+- Digest chỉ lấy vài entry nó hiện, và search có một truy vấn chỉ lấy các ứng
+  viên của nó, mà không sắp xếp phần còn lại.
+- Chỉ mục của một store có số slot vượt hai lần số entry lớn nhất một lần gọi
+  đọc từ nó (cộng 1.024) bị bỏ và dựng lại; giữ tối đa 32 store.
+
+Đo bằng `ranking_cost_over_large_stores` (`cargo test --release -p
+harness-cli --bin ha -- --ignored ranking_cost --nocapture`) trên một máy;
+"giờ" là lần gọi thứ hai và thứ ba trong ba lần trên cùng một state đã nạp:
+
+| Entry | Digest trước | Digest giờ | Search trước | Search giờ |
+|---|---|---|---|---|
+| 10.000 | 380 ms | 20 ms (225 ms ở lần đầu) | 330 ms | 6 ms |
+| 50.000 | 2,1 s | 125 ms (1,1 s ở lần đầu) | 2,0 s | 45 ms |
+
+**Purge.** Trước đây không gì quên được: các phiên bản của entry đã xoá nằm
+trong event log 30 ngày, mười phiên bản mới nhất thì mãi mãi, và một secret lọt
+qua bộ lọc khi ghi cũng nằm đó. `ha memory purge` xoá một entry và mọi dấu vết
+nội dung của nó:
+
+- row của nó, mọi event của nó (mọi phiên bản), row `memory_usage` của nó;
+- trong `refinements.jsonl`, mỗi edit của refinement về nó bị rút lại còn
+  action, kind và kết quả, không còn title, content, `before` hay `after`;
+- bản ghi của nó trong `harness_state.json.imported` và các dòng của nó trong
+  `memory_history.jsonl.imported`;
+- còn lại một event: operation `purge`, cause `purge`, actor `cli`, với kind
+  và id của memory, tree là root của store, không có name, memory id thay cho
+  key (key có thể được tạo từ một title chứa nội dung đó), và document rỗng.
+  History và revert không bao giờ đưa nó ra như một phiên bản.
+
+Các row bị xoá được ghi đè (`secure_delete`), cơ sở dữ liệu được dựng lại
+(`VACUUM`) và log của nó được làm rỗng (`wal_checkpoint(TRUNCATE)`), nên nội
+dung không còn trong file nào của store. Khi một process khác đang đọc store,
+việc dựng lại hay checkpoint có thể chưa xong: purge vẫn có hiệu lực, và lệnh
+báo rằng log còn giữ nội dung tới khi process đó đóng store. Journal riêng của
+hội thoại, nơi ghi lượt đã viết entry, không phải memory và không bị đổi.
+
+`--secrets` tìm những gì chứa giá trị secret, theo các dạng mà đường ghi từ
+chối (`harness_tools::secret_values`), trong store toàn cục và store của mọi
+hội thoại: entry đang sống chứa secret bị purge toàn bộ; entry đang sống giờ
+không còn chứa thì chỉ mất các phiên bản từng chứa, và giữ trạng thái hiện tại;
+entry đã xoá mà log còn chứa secret thì bị purge toàn bộ. Nó cũng che các giá
+trị secret còn lại trong bảng refinement, `refinements.jsonl` và các file
+legacy đã import. Danh sách nêu loại của mỗi secret, không bao giờ nêu giá trị.
+
+| Lệnh | Làm gì |
+|---|---|
+| `ha memory purge <id hoặc key>` | Liệt kê các entry mà memory id hay key đó chỉ tới, còn sống hay đã xoá, và không đổi gì |
+| `... --yes` | Purge chúng |
+| `--scope global`, `project`, `local` | Chỉ entry toàn cục, của project này (`--cwd`), hoặc của một hội thoại (`--conversation`) |
+| `ha memory purge --secrets [--yes]` | Như trên cho mọi thứ chứa giá trị secret |

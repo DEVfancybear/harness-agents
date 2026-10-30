@@ -96,3 +96,48 @@ lần hay từ nhiều lần chạy cùng lúc đều an toàn. Lần chạy t�
   repository.
 - `ha learning` cũng gắn lesson project được import vào repository, từ thư mục
   hiện tại được viết đúng như một lần chạy từ đó resolve ra.
+
+## 5. Repository bị chuyển chỗ (0.8.9)
+
+Key là hash của một đường dẫn, nên repository bị chuyển chỗ hay đổi tên sẽ có
+key mới. Trước 0.8.9, lần chạy đầu tiên ở chỗ mới bắt đầu một store rỗng, và
+memory của nó nằm lại dưới key cũ.
+
+**Danh tính của nó được ghi lại.** Lần chạy nào có key root là một repository
+cũng ghi danh tính của repository vào `<data>/projects/<key>/project.json`,
+dưới `identity`:
+
+- `roots`: các root commit (commit không có cha), lấy bằng một lần
+  `git rev-list --max-parents=0 HEAD`, chạy một lần rồi giữ lại: lần chạy sau
+  đọc từ manifest và không khởi động process nào;
+- `origin`: URL của remote `origin`, đọc từ file `config` của repository ở mỗi
+  lần chạy (không cần process), bỏ `/` và `.git` ở cuối.
+
+Repository chưa có commit nào thì chưa ghi gì cho tới khi có. Thư mục không nằm
+trong repository thì không có danh tính.
+
+**Store bị chuyển được tìm lại.** Khi key của một lần chạy chưa có store, các
+store dưới `<data>/projects/` có manifest cùng root commit (ít nhất một), cùng
+remote (hoặc cả hai đều không có), và có root đã ghi không còn tồn tại, chính là
+repository này trước khi bị chuyển:
+
+- đúng một store: nó được nhận như một store dưới key cũ (§3): chuyển sang key
+  mới dưới `<data>/adoption.lock` khi không có gì giữ nó, memory toàn cục và
+  lesson của nó được gán key mới và tên mới của repository, key cũ được ghi vào
+  `adopted`, và diagnostics ghi `project/store_followed`;
+- nhiều store: không store nào được chuyển, lần chạy báo điều đó bằng một
+  notice, và `project/store_follow_ambiguous` nêu tên chúng; `ha project rekey`
+  chuyển store cần giữ.
+
+Một fork có cùng root commit nhưng remote khác, nên không bao giờ khớp. Một bản
+clone thứ hai vẫn còn tồn tại không bao giờ bị lấy: root của nó vẫn còn đó. Hai
+store đều có dữ liệu thì không bao giờ bị gộp.
+
+**Bằng tay.** `ha project rekey <đường dẫn hoặc key cũ> [--cwd DIR]` chuyển
+store đang giữ dưới key khác sang key của thư mục hiện tại (hoặc `--cwd`), cũng
+bằng cách chuyển và gán lại như trên. Store cũ được gọi bằng key của nó
+(`project-` và 16 chữ số hex) hoặc bằng thư mục project từng ở: key thư mục đó
+có, key nó có trước 0.8.8, hoặc store mà manifest hay các thư mục đã đăng ký
+nêu tên thư mục đó (dấu phân cách và, trên Windows, chữ hoa thường không quan
+trọng). Lệnh bị từ chối khi key hiện tại đã có store riêng, hoặc có gì đó đang
+giữ store cũ.

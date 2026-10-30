@@ -255,6 +255,8 @@ platform is green.
 | `ha maintenance release-matrix` | Report platforms, capabilities and benchmark honesty | Never; it reports what is unverified |
 | `ha bug-report` | Gather the diagnostics, workers' logs, store records and harness files of a window into one zip with a `SUMMARY.md`, secrets redacted ([12.12](#1212-diagnostics-and-bug-reports)). Use this bundle to debug | The window is not a number followed by `s`, `m`, `h` or `d` |
 | `ha diag path`, `ha diag timeline` | Show where the diagnostics log is; print the merged timeline | Never |
+| `ha memory purge` | Forget a memory entry for good, or with `--secrets` everything that holds a secret value ([12.18](#1218-ranking-from-an-index-forgetting-and-a-repository-that-moves-089)) | Without `--yes`: it only lists; `--scope local` without `--conversation` |
+| `ha project rekey` | Move a project store kept under another key to this directory's key ([12.18](#1218-ranking-from-an-index-forgetting-and-a-repository-that-moves-089)) | This key has a store of its own; something holds the old one |
 | `ha maintenance support-bundle` | Write a bounded, redacted bundle (metadata, counts, schema revisions, correlation references; with `--config <FILE>` the redacted config) for a host you cannot reach; every redaction is counted in its manifest. Environment names only, never values; excludes credentials, raw transcripts, artifact bytes and provider requests/responses. Redaction checks secret-looking field names and values. | The `--into` directory already holds files |
 
 Other top-level commands are covered where they belong: `ha`/`ha chat`/`ha exec`
@@ -860,3 +862,11 @@ A task of hundreds of steps passes through many compactions, and what a compacti
   - An entry the words did not match never passes one they did.
   - With no words, or among the unmatched, the newest come first; they were alphabetical.
   - Hits and showings are never ranked on.
+
+### 12.18. Ranking from an index, forgetting, and a repository that moves (0.8.9)
+
+- **Ranking reads an index.** The digest and memory search index each store's words once per process and re-read only the entries that changed, scoring only those that hold a query word. Rankings are the same as before; a turn on a 10,000-entry store spends about 20 ms on them instead of 400 ms ([Memory store](../architecture/MEMORY_STORE.en.md) §15).
+- **`ha memory purge <id or key> [--scope global|project|local] [--conversation ID] [--cwd DIR] --yes`** forgets an entry for good: the entry, every version the log kept, its use counts, its copies in `refinements.jsonl` and the imported legacy files. One event saying it was purged, with no content, remains, and the text is in none of the store's files. Without `--yes` it lists what it would remove and changes nothing.
+- **`ha memory purge --secrets [--yes]`** does the same for every entry and version that holds a secret value (a key, a token, a private key), in the global store and every conversation's: an entry clean now loses only the versions that held one. The listing names the kind of each secret, never its value.
+- **The markdown store's host writes are linted.** The learning loop's rules and facts and the session log's section are linted before they land; one that would make the store fail a check it passes is refused and reported (`memory/markdown_write_refused`). Past 20 struck lines, the index moves them to a new `memory/archive/index-<year>.md` ([Markdown memory](../architecture/MARKDOWN_MEMORY.en.md) §8).
+- **A repository that moves keeps its store.** `project.json` records the repository's root commits and origin remote. A repository moved or renamed finds its store again on its first launch at the new place, with its project memory; a fork or a clone that still exists never takes another's store. **`ha project rekey <old path or key> [--cwd DIR]`** moves a store by hand, refused when both hold data ([Project identity](../architecture/PROJECT_IDENTITY.en.md) §5).

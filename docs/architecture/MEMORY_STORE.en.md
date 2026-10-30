@@ -732,3 +732,74 @@ library's `.ha-embedding.json` and `.ha-embedding.sqlite`, and
 `<data>/history-embedding/`, are left on disk and never read. `memory status`
 and `/knowledge status` say when a `.ha-embedding.json` is still there, and the
 diagnostics record `knowledge.embedding_config_ignored` once.
+
+## 15. An index for ranking, and forgetting (0.8.9)
+
+**The words are indexed once.** Until 0.8.8 the digest and memory search
+tokenized, stemmed and folded every entry on every call, then sorted every
+match: about 0.4 s a turn on 10,000 entries and 2 s on 50,000. Now:
+
+- Each store's entries are indexed once per process (`memory/search.rs`,
+  `Corpus`): every word of the four fields, as written and folded, points at
+  the entries that hold it (an inverted index), with each word's English stem.
+- An entry is kept in its store's index under its key and its `version_hash`,
+  which changes whenever its tree, name, title, content, meta or temporal value
+  does, so any write, revert, move, import or purge is seen on the next read;
+  only the entries that changed are indexed again. Entries not read from a
+  store (the session logs `rank_documents` ranks) are indexed for the call.
+- A term's entries are the postings of the words it begins and of its stem's
+  words, so only the entries that hold a query word are scored. The
+  statistics are still those of exactly the entries a call considers, so the
+  scores are the same as before, to the bit; a test checks the index against
+  the old pass over random stores.
+- The digest takes the few it shows, and a search with one query its
+  candidates, without sorting the rest.
+- A store's index whose slots pass twice the most entries one call read from
+  it (plus 1,024) is dropped and built again; at most 32 stores are kept.
+
+Measured with `ranking_cost_over_large_stores` (`cargo test --release -p
+harness-cli --bin ha -- --ignored ranking_cost --nocapture`) on one machine;
+"now" is the second and third of three calls on one loaded state:
+
+| Entries | Digest before | Digest now | Search before | Search now |
+|---|---|---|---|---|
+| 10,000 | 380 ms | 20 ms (225 ms on the first call) | 330 ms | 6 ms |
+| 50,000 | 2.1 s | 125 ms (1.1 s on the first call) | 2.0 s | 45 ms |
+
+**Purge.** Nothing could be forgotten: a deleted entry's versions stayed in
+the event log for 30 days and its ten newest for good, and a secret that
+slipped past the write filter stayed with them. `ha memory purge` removes an
+entry and every trace of its content:
+
+- its row, every event of it (all versions), its `memory_usage` row;
+- in `refinements.jsonl`, each refinement's edit of it is cut to its action,
+  kind and outcome, with no title, content, `before` or `after`;
+- its record in `harness_state.json.imported` and its lines in
+  `memory_history.jsonl.imported`;
+- one event remains: operation `purge`, cause `purge`, actor `cli`, with the
+  memory's kind and id, the store's root as its tree, no name, the memory id in
+  place of the key (a key may be made from a title that held the text), and an
+  empty document. History and revert never offer it as a version.
+
+The deleted rows are overwritten (`secure_delete`), and the database is
+rebuilt (`VACUUM`) and its log emptied (`wal_checkpoint(TRUNCATE)`), so the
+text is in none of the store's files. While another process reads the store,
+the rebuild or the checkpoint may not finish: the purge stands, and the
+command says the log keeps the text until that process closes the store. The
+conversation's own journal, which recorded the turn that wrote the entry, is
+not memory and is not changed.
+
+`--secrets` finds what holds a secret value, by the shapes the write path
+refuses (`harness_tools::secret_values`), in the global store and every
+conversation's: a live entry that holds one is purged whole; a live entry that
+holds none now loses only the versions that held one, and keeps its current
+state; a deleted entry whose log holds one is purged whole. It also redacts the
+secret values left in the refinement table, `refinements.jsonl` and the
+imported legacy files. The listing names each secret's kind, never its value.
+
+| Command | Does |
+|---|---|
+| `ha memory purge <id or key>` | Lists the entries that memory id or key names, live or deleted, and changes nothing |
+| `... --yes` | Purges them |
+| `--scope global`, `project`, `local` | Only the global entries, this project's (`--cwd`), or a conversation's (`--conversation`) |
+| `ha memory purge --secrets [--yes]` | The same for everything that holds a secret value |

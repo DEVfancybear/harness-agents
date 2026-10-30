@@ -101,3 +101,49 @@ key did not change does nothing beyond two file checks.
   the repository's store.
 - `ha learning` keys a project lesson brought in by the repository too, from
   the current directory spelled as a launch from it resolves it.
+
+## 5. A repository that moves (0.8.9)
+
+The key is the hash of a path, so a repository moved or renamed gets a new
+key. Before 0.8.9 its first launch at the new place started an empty store,
+and its memory stayed under the old key.
+
+**Its identity is recorded.** A launch whose key root is a repository writes
+its identity into `<data>/projects/<key>/project.json`, under `identity`:
+
+- `roots`: its root commits (the commits without a parent), from one
+  `git rev-list --max-parents=0 HEAD`, run once and kept: a later launch reads
+  them from the manifest and starts no process;
+- `origin`: the URL of its `origin` remote, read from the repository's
+  `config` file on each launch (no process), trimmed of a trailing `/` and
+  `.git`.
+
+A repository without a commit records nothing until it has one. A directory
+outside a repository has no identity.
+
+**A moved store is found again.** When a launch's key has no store yet, the
+stores under `<data>/projects/` whose manifest has the same root commits, at
+least one, and the same remote (or none for both), and whose recorded root no
+longer exists, are this repository before it moved:
+
+- exactly one: it is adopted as a store under an older key is (§3): moved to
+  the new key under `<data>/adoption.lock` when nothing holds it, its global
+  memory and lessons given the new key and the repository's new name, the old
+  key recorded under `adopted`, and the diagnostics record
+  `project/store_followed`;
+- several: none moves, the launch says so in a notice, and
+  `project/store_follow_ambiguous` names them; `ha project rekey` moves the
+  one to keep.
+
+A fork has the same root commits under another remote, and never matches. A
+second clone that still exists is never taken: its root is there. Two stores
+that both hold data are never merged.
+
+**By hand.** `ha project rekey <old path or key> [--cwd DIR]` moves the store
+kept under another key to the key of the current directory (or `--cwd`), with
+the same move and retag. The old store is named by its key (`project-` and 16
+hex digits) or by the directory the project was at: the key that directory
+had, the key it had before 0.8.8, or the store whose manifest or registered
+directories name it (separators and, on Windows, case do not matter). It is
+refused when the current key has a store of its own, or something holds the
+old one.
