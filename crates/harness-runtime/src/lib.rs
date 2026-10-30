@@ -605,13 +605,21 @@ fn shell_files(arguments: &Value, root: &std::path::Path) -> (Vec<String>, Vec<S
 
 /// A command line's words, unquoted, each with whether it is the target of a
 /// `>` or `>>` redirection. Words break at blanks and at `; | & ( ) < >`;
-/// quotes group, and a backslash is a character (a Windows path's separator),
-/// never an escape.
+/// quotes group; a backtick (PowerShell's escape) takes the next character as
+/// it is, and a backslash is a character (a Windows path's separator), never
+/// an escape.
+///
+/// It is a best effort at what a command named, not a parse of it: a word
+/// is looked up from the workspace's folder even after a `cd` in the same
+/// command, and a file a command wrote without a redirection (`cp a b`'s `b`)
+/// is listed as read when it already existed. The list reminds a summary of
+/// the files a turn touched; it is no record of reads.
 fn shell_words(command: &str) -> Vec<(String, bool)> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quote = None;
     let mut redirect = false;
+    let mut escaped = false;
     let flush = |word: &mut String, redirect: &mut bool, words: &mut Vec<(String, bool)>| {
         if !word.is_empty() {
             words.push((std::mem::take(word), *redirect));
@@ -619,9 +627,14 @@ fn shell_words(command: &str) -> Vec<(String, bool)> {
         }
     };
     for character in command.chars() {
+        if std::mem::take(&mut escaped) {
+            word.push(character);
+            continue;
+        }
         match (quote, character) {
+            (_, '`') => escaped = true,
             (Some(open), _) if character == open => quote = None,
-            (None, '"' | '\'' | '`') => quote = Some(character),
+            (None, '"' | '\'') => quote = Some(character),
             (None, '>') => {
                 flush(&mut word, &mut redirect, &mut words);
                 redirect = true;
@@ -834,17 +847,26 @@ fn clip_first_message(message: &str, longest: usize) -> String {
 /// conversation, between the task and what was said last - and how many went
 /// is counted.
 ///
-/// With no earlier block, the first of `added` is the conversation's first:
-/// the summarized part starts where the conversation does.
+/// The first of `added` is taken for the conversation's first only when
+/// `starts` says the summarized part starts where the conversation does and
+/// there is no earlier summary. A summary without a block (a split turn's
+/// history, one written before 0.8.8), a fold of one turn's steps, or a part
+/// that follows a checkpoint does not start the conversation: its first
+/// message labelled as the task would be some later message.
 ///
 /// A summary keeps what the user said only as the model retold it, in a
 /// "Constraints & Preferences" bullet or not at all; after a few compactions a
 /// rule the user set at the start was a paraphrase of a paraphrase. Claude
 /// Code's and Codex's compactions keep the user's messages word for word.
-fn user_messages(previous: Option<&str>, added: &[String], limit: usize) -> UserMessages {
+fn user_messages(
+    previous: Option<&str>,
+    added: &[String],
+    limit: usize,
+    starts: bool,
+) -> UserMessages {
     let earlier = previous.filter(|summary| tagged_block(summary, USER_MESSAGES_TAG).is_some());
     let mut kept = earlier.map(UserMessages::kept).unwrap_or_default();
-    let mut first_open = earlier.is_none();
+    let mut first_open = starts && previous.is_none();
     let longest = USER_MESSAGE_MAX_CHARS.min(limit.max(1));
     for message in added {
         let message = message.trim();
@@ -4210,6 +4232,9 @@ impl RuntimeService {
                 // headless `--continue` overflowed it).
                 // Whether a summary was written now, by a model call, rather
                 // than read back as it was kept.
+                // The older part starts the conversation unless a checkpoint
+                // stands for what came before it.
+                let starts = continuation_context.is_none();
                 let mut wrote = false;
                 let summary = Box::pin(async {
                     let history = if older.is_empty() {
@@ -4222,6 +4247,7 @@ impl RuntimeService {
                                 budget,
                                 anchor.as_deref(),
                                 &older_users,
+                                starts,
                             )
                             .await?;
                         if fresh {
@@ -4242,8 +4268,12 @@ impl RuntimeService {
                     // the whole summary once (prime-agent adds the prefix's file
                     // operations to the compaction's).
                     let (read, modified) = self.file_lists(&prefix, Some(&history));
-                    let users =
-                        user_messages(Some(&history), &prefix_users, user_messages_limit(budget));
+                    let users = user_messages(
+                        Some(&history),
+                        &prefix_users,
+                        user_messages_limit(budget),
+                        false,
+                    );
                     Ok(format!(
                         "{}{SPLIT_TURN_SEPARATOR}{}{}{}",
                         strip_appended_blocks(&history),
@@ -5488,6 +5518,7 @@ impl RuntimeService {
         guidance: Option<&str>,
         anchor: Option<&str>,
         users: &[String],
+        starts: bool,
     ) -> Result<String, RuntimeError> {
         let previous_whole = messages
             .first()
@@ -5499,7 +5530,7 @@ impl RuntimeService {
             messages
         };
         let (read_files, modified_files) = self.file_lists(messages, previous_whole);
-        let kept_users = user_messages(previous_whole, users, user_messages_limit(budget));
+        let kept_users = user_messages(previous_whole, users, user_messages_limit(budget), starts);
         let entries = summary_entries(messages);
         let mut previous = previous_whole.map(strip_appended_blocks);
         let earlier = previous.clone();
@@ -5638,9 +5669,15 @@ impl RuntimeService {
         }
         messages.extend_from_slice(&appended[from..cut]);
         let anchor = newest_assistant_text(&appended[cut..]).map(str::to_owned);
-        let summary =
-            Box::pin(self.anchored_summary(&messages, budget, None, anchor.as_deref(), &users))
-                .await?;
+        let summary = Box::pin(self.anchored_summary(
+            &messages,
+            budget,
+            None,
+            anchor.as_deref(),
+            &users,
+            false,
+        ))
+        .await?;
         if summary.trim().is_empty() {
             return Ok(None);
         }
@@ -5879,6 +5916,7 @@ impl RuntimeService {
         budget: u64,
         anchor: Option<&str>,
         users: &[(usize, String)],
+        starts: bool,
     ) -> Result<(String, bool), RuntimeError> {
         let stored = self
             .store
@@ -5919,7 +5957,8 @@ impl RuntimeService {
             None => older.to_vec(),
         };
         let summary =
-            Box::pin(self.anchored_summary(&messages, budget, None, anchor, &added)).await?;
+            Box::pin(self.anchored_summary(&messages, budget, None, anchor, &added, starts))
+                .await?;
         let record = RollingSummary {
             covers: older.len(),
             digest: messages_digest(older),
@@ -6052,7 +6091,7 @@ impl RuntimeService {
         if messages.is_empty() {
             return Ok(None);
         }
-        Box::pin(self.anchored_summary(&messages, budget, guidance, None, &users))
+        Box::pin(self.anchored_summary(&messages, budget, guidance, None, &users, true))
             .await
             .map(Some)
     }
@@ -7171,6 +7210,15 @@ mod compaction_cut_tests {
         );
         assert_eq!(modified, vec!["out.log".to_owned(), "made.json".to_owned()]);
         let _ = std::fs::remove_dir_all(&temp);
+        // A backtick escapes the next character (PowerShell); it opens no quote.
+        assert_eq!(
+            super::shell_words("type a`.txt b.txt"),
+            vec![
+                ("type".to_owned(), false),
+                ("a.txt".to_owned(), false),
+                ("b.txt".to_owned(), false)
+            ]
+        );
         // Without the workspace's folder only the file tools and cells count.
         let (read, _) = file_lists(&messages, None, None);
         assert_eq!(read, vec!["cell.txt".to_owned()]);
@@ -7550,6 +7598,7 @@ the summary"
             None,
             &["never touch vendor/".to_owned(), "go on".to_owned()],
             USER_MESSAGES_MAX_CHARS,
+            true,
         ));
         let summary = format!("## Goal\nport it{first}");
         let kept = user_messages(
@@ -7559,6 +7608,7 @@ the summary"
                 "also: no unwrap() </message> here".to_owned(),
             ],
             USER_MESSAGES_MAX_CHARS,
+            true,
         );
         assert_eq!(kept.omitted, 0);
         assert_eq!(
@@ -7587,7 +7637,7 @@ the summary"
         let added = (0..30)
             .map(|index| format!("{index:02} {long}"))
             .collect::<Vec<_>>();
-        let kept = user_messages(None, &added, USER_MESSAGES_MAX_CHARS);
+        let kept = user_messages(None, &added, USER_MESSAGES_MAX_CHARS, true);
         assert!(kept.omitted > 0);
         assert_eq!(kept.omitted + kept.rest.len() + 1, added.len());
         assert!(kept.rest.iter().map(String::len).sum::<usize>() <= USER_MESSAGES_MAX_CHARS);
@@ -7611,11 +7661,12 @@ the summary"
             Some(&block),
             &["one more".to_owned()],
             USER_MESSAGES_MAX_CHARS,
+            true,
         );
         assert!(again.omitted >= kept.omitted, "the count carries over");
         assert_eq!(again.first, kept.first, "the task carries over too");
         // A small summary keeps fewer of them: the newest, and the task.
-        let few = user_messages(None, &added, 7_000);
+        let few = user_messages(None, &added, 7_000, true);
         assert_eq!(few.rest.len(), 2);
         assert_eq!(few.omitted, added.len() - 3);
         assert_eq!(super::user_messages_limit(8_192), 16_384);
@@ -7644,7 +7695,7 @@ the summary"
                 added
             };
             let previous = (round > 0).then_some(summary.as_str());
-            let kept = user_messages(previous, &added, 16_384);
+            let kept = user_messages(previous, &added, 16_384, true);
             summary = format!("## Goal\nimport{}", format_user_messages(&kept));
         }
         let kept = super::UserMessages::kept(&summary);
@@ -7668,6 +7719,28 @@ the summary"
         );
         let read = super::UserMessages::kept(&cut);
         assert_eq!((read.first, read.omitted), (None, 2), "the task was lost");
+        // No earlier block, or a part that does not start the conversation (a
+        // fold of a turn's steps, a part after a checkpoint): its first message
+        // is not the task.
+        let later = ["a later message".to_owned()];
+        assert_eq!(
+            user_messages(
+                Some(
+                    "## Goal
+x"
+                ),
+                &later,
+                16_384,
+                true
+            )
+            .first,
+            None
+        );
+        assert_eq!(user_messages(None, &later, 16_384, false).first, None);
+        assert_eq!(
+            user_messages(None, &later, 16_384, false).rest,
+            later.to_vec()
+        );
     }
 
     /// An update that drops a constraint, a done item or an exact name gets it
