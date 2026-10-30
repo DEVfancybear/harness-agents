@@ -1240,10 +1240,11 @@ pub fn bm25_scores(entries: &[&Entry], terms: &[(String, f64)]) -> Vec<(usize, f
     let average = (lengths.iter().sum::<f64>() / lengths.len() as f64).max(1.0);
     let documents = entries.len() as u64;
     let mut counts = vec![[0.0_f64; 4]; entries.len()];
+    let mut counting = vec![false; entries.len()];
     let mut touched = Vec::new();
     let mut scores = vec![0.0_f64; entries.len()];
     let mut marked = vec![false; entries.len()];
-    let mut scored = Vec::new();
+    let mut holding = Vec::new();
     for term in &terms {
         for (at, (_, corpus)) in corpora.iter().enumerate() {
             for word in corpus.matching(&term.text, &term.stem) {
@@ -1258,7 +1259,8 @@ pub fn bm25_scores(entries: &[&Entry], terms: &[(String, f64)]) -> Vec<(usize, f
                         continue;
                     }
                     let index = index as usize;
-                    if counts[index] == [0.0; 4] {
+                    if !counting[index] {
+                        counting[index] = true;
                         touched.push(index);
                     }
                     counts[index][usize::from(posting.field)] += f64::from(times);
@@ -1281,12 +1283,13 @@ pub fn bm25_scores(entries: &[&Entry], terms: &[(String, f64)]) -> Vec<(usize, f
             .collect::<Vec<_>>();
         for index in touched.drain(..) {
             counts[index] = [0.0; 4];
+            counting[index] = false;
         }
         let idf = harness_types::search::bm25_idf(documents, frequencies.len() as u64);
         for (index, tf) in frequencies {
             if !marked[index] {
                 marked[index] = true;
-                scored.push(index);
+                holding.push(index);
             }
             scores[index] += term.weight * idf * tf * (K1 + 1.0)
                 / (tf + K1 * (1.0 - B + B * lengths[index] / average));
@@ -1316,8 +1319,8 @@ pub fn bm25_scores(entries: &[&Entry], terms: &[(String, f64)]) -> Vec<(usize, f
         cache.remove(&oldest);
     }
     drop(cache);
-    scored.sort_unstable();
-    scored
+    holding.sort_unstable();
+    holding
         .into_iter()
         .map(|index| (index, scores[index]))
         .filter(|(_, score)| *score > 0.0)
@@ -1681,7 +1684,12 @@ mod tests {
             id: format!("k{index}"),
             name: format!("k{index}"),
             memory: None,
-            kind: if index % 7 == 0 { "prompt" } else { "memory" }.to_owned(),
+            kind: if index.is_multiple_of(7) {
+                "prompt"
+            } else {
+                "memory"
+            }
+            .to_owned(),
             title: Some(prose.words(title_words)),
             content: Some(prose.words(content_words)),
             path: "general".to_owned(),
@@ -1734,7 +1742,7 @@ mod tests {
                     let text = prose.words(count);
                     let mut terms = harness::query_terms(&text)
                         .into_iter()
-                        .map(|term| (term, 1.0 + prose.below(3) as f64 * 0.5))
+                        .map(|term| (term, [1.0, 1.5, 2.0][prose.below(3)]))
                         .collect::<Vec<_>>();
                     // Prefixes and folded forms: `dep`, `may`.
                     terms.push(("dep".to_owned(), 1.0));

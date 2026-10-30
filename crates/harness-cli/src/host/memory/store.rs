@@ -473,6 +473,7 @@ pub struct Row {
 ///
 /// # Errors
 /// The store cannot be opened or read.
+#[allow(clippy::type_complexity, reason = "a document and its rows")]
 pub fn load_with_usage(dir: &Path) -> Result<(Value, BTreeMap<(String, String), Row>), String> {
     let Some(store) = Store::existing(dir)? else {
         return Ok((empty_document(), BTreeMap::new()));
@@ -759,7 +760,7 @@ pub fn earlier_versions(dir: &Path, kind: &str, id: &str) -> Result<Vec<Earlier>
         .conn
         .prepare(
             "SELECT key, at, operation, actor, version, doc, cause, operation_id FROM memory_event
-             WHERE memory_id = ? ORDER BY at, rowid",
+             WHERE memory_id = ? AND operation != 'purge' ORDER BY at, rowid",
         )
         .map_err(sql)?;
     let events = statement
@@ -1608,6 +1609,510 @@ struct EventRow<'a> {
     doc: &'a Value,
 }
 
+/// A memory a purge removes from a store, whole or some of its versions.
+#[derive(Clone, Debug)]
+pub struct PurgeTarget {
+    /// The memory's immutable id.
+    pub memory: String,
+    pub kind: String,
+    /// Its key, as it is or as the log last knew it.
+    pub key: String,
+    /// The entry is live: a whole purge deletes it.
+    pub live: bool,
+    /// Its document as it is, or as the log last held it: which project it
+    /// was kept for.
+    pub doc: Value,
+    /// Every trace of it goes; else only `events`.
+    pub whole: bool,
+    /// The events a purge of some versions removes (a whole purge removes
+    /// every event of the memory).
+    pub events: Vec<String>,
+    /// How many events the memory has in the log.
+    pub logged: usize,
+}
+
+/// The memories `target` names in a store: the one with that immutable id,
+/// or those kept under that key in any kind, live or deleted. Each is a whole
+/// purge.
+///
+/// # Errors
+/// The store cannot be read.
+pub fn purge_targets(dir: &Path, target: &str) -> Result<Vec<PurgeTarget>, String> {
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(Vec::new());
+    };
+    let mut found = BTreeMap::<String, PurgeTarget>::new();
+    let mut statement = store
+        .conn
+        .prepare("SELECT id, kind, key, doc FROM memory WHERE id = ?1 OR key = ?1")
+        .map_err(sql)?;
+    let rows = statement
+        .query_map([target], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(sql)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql)?;
+    for (memory, kind, key, doc) in rows {
+        found.insert(
+            memory.clone(),
+            PurgeTarget {
+                memory,
+                kind,
+                key,
+                live: true,
+                doc: parse(&doc),
+                whole: true,
+                events: Vec::new(),
+                logged: 0,
+            },
+        );
+    }
+    let mut statement = store
+        .conn
+        .prepare(
+            "SELECT memory_id, kind, key, doc FROM memory_event
+             WHERE (memory_id = ?1 OR key = ?1) AND operation != 'purge' ORDER BY at, rowid",
+        )
+        .map_err(sql)?;
+    let rows = statement
+        .query_map([target], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(sql)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql)?;
+    for (memory, kind, key, doc) in rows {
+        let entry = found.entry(memory.clone()).or_insert_with(|| PurgeTarget {
+            memory,
+            kind: kind.clone(),
+            key: key.clone(),
+            live: false,
+            doc: Value::Null,
+            whole: true,
+            events: Vec::new(),
+            logged: 0,
+        });
+        if !entry.live {
+            // The last the log knew of a deleted one.
+            entry.kind = kind;
+            entry.key = key;
+            entry.doc = parse(&doc);
+        }
+    }
+    for entry in found.values_mut() {
+        entry.logged = count_events(&store.conn, &entry.memory)?;
+    }
+    Ok(found.into_values().collect())
+}
+
+fn count_events(conn: &Connection, memory: &str) -> Result<usize, String> {
+    conn.query_row(
+        "SELECT count(*) FROM memory_event WHERE memory_id = ? AND operation != 'purge'",
+        [memory],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| usize::try_from(count).unwrap_or_default())
+    .map_err(sql)
+}
+
+/// The memories of a store that hold a secret value
+/// ([`harness_tools::secret_values::first`], what a write is refused for):
+/// a live entry holding one is purged whole; a live entry that holds none
+/// now loses only the versions that held one; a deleted entry whose log
+/// holds one is purged whole. Each comes with the kind of secret it holds.
+///
+/// # Errors
+/// The store cannot be read.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scan: the live entries, then the log"
+)]
+pub fn secret_targets(dir: &Path) -> Result<Vec<(PurgeTarget, &'static str)>, String> {
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(Vec::new());
+    };
+    let mut found = BTreeMap::<String, (PurgeTarget, &'static str)>::new();
+    let mut statement = store
+        .conn
+        .prepare("SELECT id, kind, key, doc FROM memory")
+        .map_err(sql)?;
+    let live = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(sql)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql)?;
+    let mut clean = BTreeMap::new();
+    for (memory, kind, key, doc) in live {
+        let holds = harness_tools::secret_values::first(&doc);
+        let target = PurgeTarget {
+            memory: memory.clone(),
+            kind,
+            key,
+            live: true,
+            doc: parse(&doc),
+            whole: true,
+            events: Vec::new(),
+            logged: 0,
+        };
+        match holds {
+            Some(shape) => {
+                found.insert(memory, (target, shape));
+            }
+            None => {
+                clean.insert(memory, target);
+            }
+        }
+    }
+    let mut statement = store
+        .conn
+        .prepare(
+            "SELECT event_id, memory_id, kind, key, doc FROM memory_event
+             WHERE operation != 'purge' ORDER BY at, rowid",
+        )
+        .map_err(sql)?;
+    let events = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(sql)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql)?;
+    for (event, memory, kind, key, doc) in events {
+        let Some(shape) = harness_tools::secret_values::first(&doc) else {
+            continue;
+        };
+        if found.contains_key(&memory) {
+            continue;
+        }
+        if let Some(target) = clean.get(&memory) {
+            let entry = found
+                .entry(format!("{memory}\nversions"))
+                .or_insert_with(|| {
+                    let mut target = target.clone();
+                    target.whole = false;
+                    (target, shape)
+                });
+            entry.0.events.push(event);
+            continue;
+        }
+        found.insert(
+            memory.clone(),
+            (
+                PurgeTarget {
+                    memory,
+                    kind,
+                    key,
+                    live: false,
+                    doc: parse(&doc),
+                    whole: true,
+                    events: Vec::new(),
+                    logged: 0,
+                },
+                shape,
+            ),
+        );
+    }
+    // A memory purged whole needs no purge of its versions.
+    let whole = found
+        .values()
+        .filter(|(target, _)| target.whole)
+        .map(|(target, _)| target.memory.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut targets = found
+        .into_values()
+        .filter(|(target, _)| target.whole || !whole.contains(&target.memory))
+        .collect::<Vec<_>>();
+    for (target, _) in &mut targets {
+        target.logged = count_events(&store.conn, &target.memory)?;
+    }
+    Ok(targets)
+}
+
+/// What a purge left of one memory: the one event that says it was purged.
+const PURGE_CAUSE: &str = "purge";
+
+/// Purge `targets` from the store at `dir`: a whole target's row, every
+/// event of it, its use counts, and its copies in the files beside the store
+/// (`refinements.jsonl`'s before and after, the imported legacy state and
+/// journal); a target of some versions, those events only. Each memory keeps
+/// one event that says it was purged, holding no content: its kind and
+/// immutable id, the store's root as its tree, no name and an empty
+/// document. Deleted rows are overwritten (`secure_delete`), and the database
+/// is rebuilt and its log emptied, so the text is in none of its files.
+/// `secrets` also redacts every secret value left in those files. The caller
+/// holds the scope's lock.
+///
+/// # Errors
+/// The store cannot be written; nothing is then changed in it.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one purge: the rows, the log, then the files"
+)]
+pub fn purge(
+    dir: &Path,
+    targets: &[PurgeTarget],
+    writer: &Writer,
+    secrets: bool,
+) -> Result<Purged, String> {
+    let mut store = Store::open(dir)?;
+    let root = store.root;
+    store
+        .conn
+        .execute_batch("PRAGMA secure_delete = ON")
+        .map_err(sql)?;
+    let at = now();
+    let mut removed = 0;
+    let transaction = store.begin()?;
+    for target in targets {
+        let version = transaction
+            .query_row(
+                "SELECT max(version) FROM memory_event WHERE memory_id = ?",
+                [&target.memory],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(sql)?
+            .unwrap_or(0);
+        if target.whole {
+            removed += transaction
+                .execute(
+                    "DELETE FROM memory_event WHERE memory_id = ?",
+                    [&target.memory],
+                )
+                .map_err(sql)?;
+            transaction
+                .execute(
+                    "DELETE FROM memory_usage WHERE memory_id = ?",
+                    [&target.memory],
+                )
+                .map_err(sql)?;
+            transaction
+                .execute("DELETE FROM memory WHERE id = ?", [&target.memory])
+                .map_err(sql)?;
+        } else {
+            for event in &target.events {
+                removed += transaction
+                    .execute(
+                        "DELETE FROM memory_event WHERE event_id = ? AND memory_id = ?",
+                        params![event, target.memory],
+                    )
+                    .map_err(sql)?;
+            }
+        }
+        let mut actor = writer.actor.clone();
+        actor["purged"] = json!(if target.whole { "entry" } else { "versions" });
+        insert_event(
+            &transaction,
+            &EventRow {
+                at: &at,
+                memory: &target.memory,
+                kind: &target.kind,
+                // A whole purge keeps not even the key: it may have been made
+                // from the title.
+                key: if target.whole {
+                    &target.memory
+                } else {
+                    &target.key
+                },
+                name: "",
+                tree: root,
+                operation: "purge",
+                operation_id: &writer.operation,
+                cause: PURGE_CAUSE,
+                actor: &actor,
+                version,
+                doc: &json!({}),
+            },
+        )?;
+    }
+    if secrets {
+        let mut statement = transaction
+            .prepare("SELECT seq, event FROM refinement")
+            .map_err(sql)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql)?;
+        drop(statement);
+        for (seq, event) in rows {
+            let redacted = harness_tools::secret_values::redact(&event);
+            if redacted != event {
+                transaction
+                    .execute(
+                        "UPDATE refinement SET event = ? WHERE seq = ?",
+                        params![redacted.as_ref(), seq],
+                    )
+                    .map_err(sql)?;
+            }
+        }
+    }
+    transaction.commit().map_err(sql)?;
+    // Rebuilt, so no free page keeps an old row; the log emptied, so no frame
+    // of it does.
+    // A reader in another process can keep either from finishing: the purge
+    // stands, and the result says the files may still hold the text.
+    let vacuumed = store.conn.execute_batch("VACUUM").is_ok();
+    let busy = store
+        .conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or(1);
+    drop(store);
+    scrub_files(dir, targets, secrets)?;
+    Ok(Purged {
+        removed,
+        settled: vacuumed && busy == 0,
+    })
+}
+
+/// What [`purge`] did.
+#[derive(Clone, Copy, Debug)]
+pub struct Purged {
+    /// The events it removed.
+    pub removed: usize,
+    /// The database's log was emptied: false while another process reads the
+    /// store, whose log may still hold the purged text until it closes.
+    pub settled: bool,
+}
+
+/// The copies of purged entries in the files beside a store: each
+/// refinement's edit of one (in `refinements.jsonl`) is cut to what it did,
+/// with no title, content, before or after; the imported legacy state loses
+/// the entry and the imported journal its lines. `secrets` also redacts every
+/// secret value those files hold.
+#[allow(clippy::too_many_lines, reason = "three files, each its own shape")]
+fn scrub_files(dir: &Path, targets: &[PurgeTarget], secrets: bool) -> Result<(), String> {
+    let whole = targets
+        .iter()
+        .filter(|target| target.whole)
+        .map(|target| (target.kind.as_str(), target.key.as_str()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let named = |kind: &Value, key: &Value| {
+        kind.as_str()
+            .zip(key.as_str())
+            .is_some_and(|pair| whole.contains(&pair))
+    };
+    let rewrite = |path: &Path, change: &dyn Fn(&str) -> Option<String>| -> Result<(), String> {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Ok(());
+        };
+        let mut out = String::with_capacity(text.len());
+        for line in text.split_inclusive('\n') {
+            if let Some(kept) = change(line) {
+                out.push_str(&kept);
+            }
+        }
+        if secrets {
+            out = harness_tools::secret_values::redact(&out).into_owned();
+        }
+        if out != text {
+            super::files::write_atomic(path, &out)?;
+        }
+        Ok(())
+    };
+    rewrite(&dir.join("refinements.jsonl"), &|line| {
+        let Ok(mut record) = serde_json::from_str::<Value>(line.trim()) else {
+            return Some(line.to_owned());
+        };
+        let mut changed = false;
+        if let Some(edits) = record["appliedEdits"].as_array_mut() {
+            for edit in edits {
+                if named(&edit["kind"], &edit["id"])
+                    || secrets
+                        && ["before", "after", "title", "content"].iter().any(|field| {
+                            harness_tools::secret_values::first(&edit[field].to_string()).is_some()
+                        })
+                {
+                    *edit = json!({
+                        "action": edit["action"],
+                        "kind": edit["kind"],
+                        "applied": edit["applied"],
+                        "purged": true,
+                    });
+                    changed = true;
+                }
+            }
+        }
+        Some(if changed {
+            format!("{record}\n")
+        } else {
+            line.to_owned()
+        })
+    })?;
+    rewrite(&dir.join(format!("{LEGACY_JOURNAL}.imported")), &|line| {
+        let Ok(record) = serde_json::from_str::<Value>(line.trim()) else {
+            return Some(line.to_owned());
+        };
+        let key = if record["id"].is_string() {
+            &record["id"]
+        } else {
+            &record["entry"]["id"]
+        };
+        let tainted = secrets && harness_tools::secret_values::first(line).is_some();
+        (!named(&record["kind"], key) && !tainted).then(|| line.to_owned())
+    })?;
+    let state = dir.join(format!("{LEGACY_STATE}.imported"));
+    if let Ok(text) = std::fs::read_to_string(&state)
+        && let Ok(mut legacy) = serde_json::from_str::<Value>(&text)
+    {
+        let mut changed = false;
+        if let Some(kinds) = legacy["entries"].as_object_mut() {
+            for (kind, records) in kinds.iter_mut() {
+                if let Some(records) = records.as_object_mut() {
+                    let before = records.len();
+                    records.retain(|key, entry| {
+                        let gone = whole.contains(&(kind.as_str(), key.as_str()))
+                            || secrets
+                                && harness_tools::secret_values::first(&entry.to_string())
+                                    .is_some();
+                        !gone
+                    });
+                    changed |= records.len() != before;
+                }
+            }
+        }
+        let mut out = if changed {
+            legacy.to_string()
+        } else {
+            text.clone()
+        };
+        if secrets {
+            out = harness_tools::secret_values::redact(&out).into_owned();
+        }
+        if out != text {
+            super::files::write_atomic(&state, &out)?;
+        }
+    }
+    Ok(())
+}
+
 fn insert_event(transaction: &Transaction<'_>, event: &EventRow<'_>) -> Result<(), String> {
     transaction
         .execute(
@@ -1987,5 +2492,176 @@ mod tests {
         let refused = save_document(dir, &unreadable, &writer()).expect_err("refused");
         assert!(refused.contains("nothing was written"), "{refused}");
         assert!(load_document(dir).expect("load")["entries"]["memory"]["kept"].is_object());
+    }
+
+    /// The bytes of every file beside a store: the database, its log, the
+    /// refinement history and the imported legacy files.
+    fn store_bytes(dir: &Path) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("dir").flatten() {
+            if entry.path().is_file() {
+                bytes.extend(std::fs::read(entry.path()).expect("file"));
+            }
+        }
+        bytes
+    }
+
+    fn holds(bytes: &[u8], text: &str) -> bool {
+        bytes
+            .windows(text.len())
+            .any(|window| window == text.as_bytes())
+    }
+
+    #[test]
+    fn a_purged_entry_leaves_one_event_and_its_text_nowhere() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = dir.path().join("harness");
+        let code = "ZEBRA-PURGE-7Q2";
+        // Its first versions came through the old journal, and the legacy
+        // state it was imported from is kept beside the store.
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join(LEGACY_STATE),
+            json!({"schema": 1, "entries": {"memory": {
+                "door": entry("door", &format!("the door code is {code}-v2"), 2),
+                "kept": entry("kept", "the user edits in Zed", 1),
+            }}})
+            .to_string(),
+        )
+        .expect("state");
+        std::fs::write(
+            dir.join(LEGACY_JOURNAL),
+            format!(
+                "{}\n",
+                json!({"action": "update", "kind": "memory", "id": "door", "at": "2026-10-01T00:00:00Z",
+                       "entry": entry("door", &format!("the door code is {code}-v1"), 1)})
+            ),
+        )
+        .expect("journal");
+        let mut state = load_document(&dir).expect("import");
+        state["entries"]["memory"]["door"]["content"] =
+            json!(format!("the door code is {code}-v3"));
+        state["entries"]["memory"]["door"]["version"] = json!(3);
+        save_document(&dir, &state, &writer()).expect("update");
+        let memory = ids(&dir).expect("ids")[&("memory".to_owned(), "door".to_owned())].clone();
+        record_use(&dir, Use::Read, std::slice::from_ref(&memory)).expect("use");
+        std::fs::write(
+            dir.join("refinements.jsonl"),
+            format!(
+                "{}\n",
+                json!({"id": "ref_1", "summary": "tidy", "appliedEdits": [
+                    {"action": "update", "kind": "memory", "id": "door", "content": format!("{code}-v3"),
+                     "before": entry("door", &format!("{code}-v2"), 2), "after": entry("door", &format!("{code}-v3"), 3), "applied": true},
+                    {"action": "update", "kind": "memory", "id": "kept", "content": "Zed", "applied": true}]})
+            ),
+        )
+        .expect("refinements");
+        assert!(holds(&store_bytes(&dir), code), "the text is there before");
+
+        let targets = purge_targets(&dir, "door").expect("targets");
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].live && targets[0].whole && targets[0].logged >= 3);
+        assert_eq!(
+            purge_targets(&dir, &memory).expect("by id")[0].memory,
+            memory
+        );
+        let writer = Writer::new("cli", &json!({"via": "test"}), "purge");
+        let purged = purge(&dir, &targets, &writer, false).expect("purge");
+        assert!(purged.removed >= 3 && purged.settled, "{purged:?}");
+
+        assert!(!holds(&store_bytes(&dir), code), "the text is in no file");
+        let document = load_document(&dir).expect("document");
+        assert!(document["entries"]["memory"]["door"].is_null());
+        assert!(
+            document["entries"]["memory"]["kept"].is_object(),
+            "the rest stays"
+        );
+        let left = feed(
+            &dir,
+            &Feed {
+                memory: Some(memory.clone()),
+                limit: 10,
+                ..Feed::default()
+            },
+        )
+        .expect("feed");
+        assert_eq!(left.len(), 1, "one event says it was purged");
+        assert_eq!(left[0].operation, "purge");
+        assert_eq!(left[0].doc, json!({}));
+        assert_eq!(left[0].key, memory, "not even its key");
+        assert!(
+            earlier_versions(&dir, "memory", "door")
+                .expect("history")
+                .is_empty()
+        );
+        assert!(
+            earlier_versions(&dir, "memory", &memory)
+                .expect("history")
+                .is_empty()
+        );
+        let usage = load_with_usage(&dir).expect("rows").1;
+        assert!(usage.values().all(|row| row.memory != memory));
+        let refinements = std::fs::read_to_string(dir.join("refinements.jsonl")).expect("kept");
+        assert!(refinements.contains("Zed"), "another entry's edit stays");
+        assert!(refinements.contains("\"purged\":true"), "{refinements}");
+        // Nothing is left to purge, and nothing is found by its old key.
+        assert!(purge_targets(&dir, "door").expect("again").is_empty());
+    }
+
+    #[test]
+    fn a_secret_in_an_old_version_is_purged_and_the_entry_kept() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = dir.path().join("harness");
+        let secret = "sk-Q7vX2mN9pL4kR8tW1yZ6bC3dF5gH0jSa";
+        let mut state = json!({"schema": 1, "entries": {"memory": {
+            "deploy": entry("deploy", &format!("deploy with the key {secret}"), 1),
+            "leaked": entry("leaked", &format!("token {secret}"), 1),
+            "clean": entry("clean", "nothing secret", 1),
+        }}, "refinements": [{"id": "ref_1", "trigger": format!("saw {secret}")}]});
+        save_document(&dir, &state, &writer()).expect("create");
+        state["entries"]["memory"]["deploy"]["content"] =
+            json!("deploy with the key from the vault");
+        state["entries"]["memory"]["deploy"]["version"] = json!(2);
+        save_document(&dir, &state, &writer()).expect("update");
+        assert!(holds(&store_bytes(&dir), secret));
+
+        let found = secret_targets(&dir).expect("scan");
+        assert_eq!(found.len(), 2, "{found:?}");
+        let deploy = found
+            .iter()
+            .find(|(target, _)| target.key == "deploy")
+            .expect("the old version");
+        assert!(!deploy.0.whole && deploy.0.events.len() == 1, "{found:?}");
+        assert_eq!(deploy.1, "API key (sk-)");
+        assert!(
+            found
+                .iter()
+                .any(|(target, _)| target.key == "leaked" && target.whole)
+        );
+        let targets = found
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect::<Vec<_>>();
+        purge(
+            &dir,
+            &targets,
+            &Writer::new("cli", &json!({}), "purge"),
+            true,
+        )
+        .expect("purge");
+
+        assert!(
+            !holds(&store_bytes(&dir), secret),
+            "the secret is in no file"
+        );
+        let document = load_document(&dir).expect("document");
+        assert_eq!(
+            document["entries"]["memory"]["deploy"]["content"],
+            "deploy with the key from the vault",
+            "the entry as it is now stays"
+        );
+        assert!(document["entries"]["memory"]["leaked"].is_null());
+        assert!(document["entries"]["memory"]["clean"].is_object());
+        assert!(secret_targets(&dir).expect("again").is_empty());
     }
 }
