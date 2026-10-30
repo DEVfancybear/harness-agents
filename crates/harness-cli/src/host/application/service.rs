@@ -7627,6 +7627,9 @@ impl Reviews {
         let store = SqliteStore::open_read_only(self.store_dir.clone())
             .await
             .map_err(|error| format!("the project store cannot be read: {error}"))?;
+        // The children's findings the transcript carries are marked given only
+        // once the review succeeded: a failed one's retry is given them again.
+        let findings = super::delegation::findings_pending_through(&local);
         let conversation = refine_transcript(&store, &session, &local).await;
         let _ = store.close().await;
         if conversation.is_empty() {
@@ -7647,7 +7650,7 @@ impl Reviews {
             task,
             scopes: super::refine::HarnessScopes {
                 global: super::harness::global_dir(&self.data_dir),
-                local,
+                local: local.clone(),
             },
             learning,
             turns: job.turns.max(1),
@@ -7660,6 +7663,11 @@ impl Reviews {
         }
         .run()
         .await
+        .inspect(|()| {
+            if let Some(through) = findings {
+                super::delegation::findings_given(&local, through);
+            }
+        })
     }
 }
 
@@ -8011,6 +8019,101 @@ mod review_record_tests {
             .expect("the review is recorded");
         assert_eq!(review.event, "nothing", "{review:?}");
         assert_eq!(review.ids.task.as_deref(), Some("task_01review"));
+    }
+
+    /// A child's finding the review was given is marked given only once that
+    /// review succeeded: a review that failed - its job kept for a retry -
+    /// leaves it for the retry.
+    #[tokio::test]
+    async fn a_failed_review_leaves_the_childrens_findings_for_its_retry() {
+        use std::sync::Arc;
+        let directory = tempfile::tempdir().expect("directory");
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let data = directory.path().join("data");
+        let store_dir = directory.path().join("store");
+        let (session, task) = (
+            harness_types::SessionId::generate(),
+            harness_types::TaskId::generate(),
+        );
+        let store = Arc::new(
+            harness_store_sqlite::SqliteStore::open_writer(
+                harness_store_sqlite::WriterOpenOptions::new(
+                    store_dir.clone(),
+                    harness_types::HostId::generate(),
+                ),
+            )
+            .await
+            .expect("store"),
+        );
+        let runtime = harness_runtime::RuntimeService::new(
+            Arc::clone(&store),
+            Arc::new(harness_providers::MockProvider::text("the answer")),
+            harness_runtime::RuntimeConfig::default(),
+        );
+        runtime
+            .run(harness_runtime::RunRequest::new(
+                session.clone(),
+                task.clone(),
+                harness_types::InputId::generate(),
+                "check the deploy config",
+                harness_tools::observe_workspace(harness_types::ProjectId::generate(), &workspace)
+                    .expect("workspace"),
+            ))
+            .await
+            .expect("a turn");
+        drop(runtime);
+        Arc::try_unwrap(store)
+            .expect("store owner")
+            .close()
+            .await
+            .expect("close");
+        let local = crate::interactive::harness::local_dir(&data, task.as_str());
+        std::fs::create_dir_all(&local).expect("local");
+        std::fs::write(
+            local.join(crate::interactive::delegation::CHILD_FINDINGS_FILE),
+            "{\"seq\":1,\"at_ms\":1,\"child\":\"explorer-1\",\"role\":\"explorer\",\"fact\":\"the channel is amber\",\"evidence\":\"channel = amber\"}\n",
+        )
+        .expect("finding");
+        let reviews = |answer: &str| super::Reviews {
+            sender: tokio::sync::mpsc::unbounded_channel().0,
+            helper_provider: Arc::new(harness_providers::MockProvider::text(answer)),
+            helper_model: "fixture-model".to_owned(),
+            provider: Arc::new(harness_providers::MockProvider::text(answer)),
+            model: "fixture-model".to_owned(),
+            data_dir: data.clone(),
+            store_dir: store_dir.clone(),
+            learning: crate::interactive::refine::Learning::new(
+                crate::interactive::learned::Layers::new(
+                    &directory.path().join("config"),
+                    &data,
+                    &workspace,
+                    true,
+                ),
+                &workspace,
+                None,
+            ),
+            knowledge: crate::interactive::knowledge::KnowledgeHost::new(&workspace, &data),
+        };
+        let job = crate::interactive::sleep::Job::review(
+            &store_dir,
+            task.as_str(),
+            session.as_str(),
+            "turn",
+            1,
+            Vec::new(),
+        );
+        let waiting = || crate::interactive::delegation::findings_for_review(&local);
+        assert!(
+            reviews("not a review").run_job(&job).await.is_err(),
+            "the review failed"
+        );
+        assert!(waiting().is_some(), "the retry is given the finding");
+        reviews(r#"{"shouldRefine": false, "rationale": "nothing new"}"#)
+            .run_job(&job)
+            .await
+            .expect("reviewed");
+        assert_eq!(waiting(), None, "given once a review succeeded");
     }
 }
 
