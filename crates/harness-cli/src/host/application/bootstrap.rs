@@ -431,6 +431,9 @@ pub fn project_root(path: &Path) -> PathBuf {
     let Some(found) = found else {
         return launch;
     };
+    // Found from the launch as given when it does not exist (yet): spelled
+    // canonically, so one checkout is one key however it was reached.
+    let found = canonical_or_given(&found);
     let refuses = refused()
         .lock()
         .map_or(true, |refused| refused.refuses(&found, &launch));
@@ -439,11 +442,13 @@ pub fn project_root(path: &Path) -> PathBuf {
 
 /// The checkout a directory is in: the nearest ancestor with a `.git` entry,
 /// so a linked worktree is its own checkout though it shares its main
-/// checkout's project; outside a repository, the directory itself.
+/// checkout's project; outside a repository, the directory itself. Spelled
+/// canonically even for a directory that does not exist, whose ancestors are
+/// walked as given (an 8.3 short name, `..`): one checkout is one value.
 #[must_use]
 pub fn checkout_root(path: &Path) -> PathBuf {
     let launch = canonical_or_given(path);
-    find_git_root(&launch).unwrap_or(launch)
+    find_git_root(&launch).map_or(launch, |root| canonical_or_given(&root))
 }
 
 fn repository_root_memoised(launch: &Path) -> Option<PathBuf> {
@@ -607,8 +612,9 @@ fn displayable(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        CREDENTIAL_VARIABLES, LaunchRequest, ProviderState, displayable, git_branch, git_worktree,
-        legacy_key_of, place_lines, project_key, project_key_of, project_root, resolve,
+        CREDENTIAL_VARIABLES, LaunchRequest, ProviderState, checkout_root, displayable, git_branch,
+        git_worktree, legacy_key_of, place_lines, project_key, project_key_of, project_root,
+        resolve,
     };
     use crate::interactive::credentials::{self, CredentialSource};
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
@@ -710,6 +716,21 @@ mod tests {
         let plain = temp.path().join("plain");
         std::fs::create_dir_all(&plain).expect("plain");
         assert_eq!(project_root(&plain), canonical(&plain), "no repository");
+    }
+
+    /// A directory that does not exist yet is not canonicalized, so its
+    /// ancestors are walked as it was spelled - `..` here, an 8.3 short name
+    /// on a Windows runner (`RUNNER~1`): the root found is spelled canonically
+    /// still, the same value as from the checkout itself.
+    #[test]
+    fn a_root_found_from_a_missing_directory_is_spelled_canonically() {
+        let temp = tempfile::tempdir().expect("temp");
+        let checkout = temp.path().join("linked");
+        std::fs::create_dir_all(checkout.join(".git")).expect("checkout");
+        let missing = checkout.join("..").join("linked").join("src");
+        assert_eq!(checkout_root(&missing), canonical(&checkout));
+        assert_eq!(checkout_root(&missing), checkout_root(&checkout));
+        assert_eq!(project_root(&missing), canonical(&checkout));
     }
 
     #[test]
