@@ -98,6 +98,9 @@ pub struct Entry {
     /// How it has been used (`memory_usage`): what ranking reads beside its
     /// words. Never part of its document.
     pub usage: super::memory_store::Usage,
+    /// Where its words are indexed for ranking, when it was read from a
+    /// store: they are read again only when it changes.
+    pub indexed: Option<super::memory_search::Indexed>,
 }
 
 /// The merged state of one turn.
@@ -131,12 +134,22 @@ pub fn load(dir: &Path, scope: &str) -> State {
     match super::memory_store::load_with_usage(dir) {
         Ok((document, rows)) => {
             let mut state = parse(&document, scope, root);
+            // One store, read under one root: what its entries are indexed by.
+            let store: std::sync::Arc<str> = format!(
+                "{}
+{root}",
+                dir.display()
+            )
+            .into();
             for entries in state.entries.values_mut() {
                 for entry in entries {
-                    if let Some((memory, usage)) = rows.get(&(entry.kind.clone(), entry.id.clone()))
-                    {
-                        entry.memory = Some(memory.clone());
-                        entry.usage = usage.clone();
+                    if let Some(row) = rows.get(&(entry.kind.clone(), entry.id.clone())) {
+                        entry.memory = Some(row.memory.clone());
+                        entry.usage = row.usage.clone();
+                        entry.indexed = Some(super::memory_search::Indexed {
+                            store: store.clone(),
+                            hash: row.hash.clone(),
+                        });
                     }
                 }
             }
@@ -224,6 +237,7 @@ pub fn parse(parsed: &Value, scope: &str, root: &str) -> State {
                 .map(|bounds| super::memory_store::temporal_value(&bounds)),
                 ended: super::memory_store::ended(raw),
                 usage: super::memory_store::Usage::default(),
+                indexed: None,
             });
         }
     }
@@ -506,13 +520,19 @@ fn age_suffix(entry: &Entry) -> String {
     age_label(entry).map_or_else(|| origin.to_owned(), |age| format!(", {age}{origin}"))
 }
 
-fn identity(entry: &Entry) -> String {
-    format!(
-        "{}\0{}\0{}",
-        entry.path,
-        entry.title.as_deref().unwrap_or_default(),
-        entry.id
-    )
+/// The order of two entries' places: path, title and key, compared as the
+/// three joined by NUL would be, without joining them.
+fn identity_order(a: &Entry, b: &Entry) -> std::cmp::Ordering {
+    fn bytes(entry: &Entry) -> impl Iterator<Item = u8> + '_ {
+        entry
+            .path
+            .bytes()
+            .chain(std::iter::once(0))
+            .chain(entry.title.as_deref().unwrap_or_default().bytes())
+            .chain(std::iter::once(0))
+            .chain(entry.id.bytes())
+    }
+    bytes(a).cmp(bytes(b))
 }
 
 /// `compactText`: whitespace folded, cut with `...` past `limit` characters.
@@ -564,48 +584,63 @@ pub struct Digest {
     pub shown: Vec<Shown>,
 }
 
-/// One group of a kind's entries (its constraints, or the rest) in the order
-/// the digest shows them; `scores` holds each one's BM25 score by its index,
-/// those above zero only. Among those the request's words reached, the
-/// best [`RERANK_POOL`] are fused by RRF with two lighter arms - how
-/// recently each was written or read, and how much it was read
+/// The first `limit` of one group of a kind's entries (its constraints, or
+/// the rest; `members` are their indexes in `entries`) in the order the
+/// digest shows them; `scores` holds each entry's BM25 score, those above
+/// zero only. Among those the request's words reached, the best
+/// [`RERANK_POOL`] are fused by RRF with two lighter arms - how recently each
+/// was written or read, and how much it was read
 /// ([`super::memory_search::reranked`]); the rest of the matched follow by
 /// their words. Entries nothing matched come after every matched one, the
 /// most recently written or read first - and so does everything when there
-/// are no words. Ties go to the entry's path, title and key.
-fn ranked<'a>(entries: &[&'a Entry], scores: &BTreeMap<usize, f64>) -> Vec<&'a Entry> {
+/// are no words. Ties go to the entry's path, title and key. Only what is
+/// shown is ordered: the rest of a large store is never sorted.
+fn ranked<'a>(
+    entries: &[&'a Entry],
+    members: &[usize],
+    scores: &[Option<f64>],
+    limit: usize,
+) -> Vec<&'a Entry> {
     let now = chrono::Utc::now().timestamp();
-    let touched = entries
-        .iter()
-        .map(|entry| super::memory_search::last_touched(entry))
-        .collect::<Vec<_>>();
-    let identities = entries
-        .iter()
-        .map(|entry| identity(entry))
-        .collect::<Vec<_>>();
-    let mut matched = scores
-        .iter()
-        .map(|(index, score)| (*index, *score))
-        .collect::<Vec<_>>();
-    matched.sort_by(|a, b| {
+    let by_words = |a: &(usize, f64), b: &(usize, f64)| {
         b.1.total_cmp(&a.1)
-            .then_with(|| identities[a.0].cmp(&identities[b.0]))
-    });
-    let matched = super::memory_search::reranked(entries, matched, RERANK_POOL, now);
-    let mut unmatched = (0..entries.len())
-        .filter(|index| !scores.contains_key(index))
+            .then_with(|| identity_order(entries[a.0], entries[b.0]))
+    };
+    let mut matched = members
+        .iter()
+        .filter_map(|index| scores[*index].map(|score| (*index, score)))
         .collect::<Vec<_>>();
-    unmatched.sort_by(|a, b| {
-        touched[*b]
-            .cmp(&touched[*a])
-            .then_with(|| identities[*a].cmp(&identities[*b]))
-    });
-    matched
+    let head = RERANK_POOL.max(limit);
+    if matched.len() > head {
+        matched.select_nth_unstable_by(head - 1, by_words);
+        matched.truncate(head);
+    }
+    matched.sort_by(by_words);
+    let matched = super::memory_search::reranked(entries, matched, RERANK_POOL, now);
+    let mut shown = matched
         .into_iter()
-        .map(|(index, _)| index)
-        .chain(unmatched)
-        .map(|index| entries[index])
-        .collect()
+        .take(limit)
+        .map(|(index, _)| entries[index])
+        .collect::<Vec<_>>();
+    let wanted = limit - shown.len();
+    if wanted > 0 {
+        let mut unmatched = members
+            .iter()
+            .filter(|index| scores[**index].is_none())
+            .map(|index| (*index, super::memory_search::last_touched(entries[*index])))
+            .collect::<Vec<_>>();
+        let by_time = |a: &(usize, Option<i64>), b: &(usize, Option<i64>)| {
+            b.1.cmp(&a.1)
+                .then_with(|| identity_order(entries[a.0], entries[b.0]))
+        };
+        if unmatched.len() > wanted {
+            unmatched.select_nth_unstable_by(wanted - 1, by_time);
+            unmatched.truncate(wanted);
+        }
+        unmatched.sort_by(by_time);
+        shown.extend(unmatched.into_iter().map(|(index, _)| entries[index]));
+    }
+    shown
 }
 
 /// [`format_digest`] with the entries it showed. Each kind's entries are
@@ -684,31 +719,21 @@ pub fn render_digest(state: &State, options: DigestOptions, terms: &[(String, f6
         // with them. Scored once per kind, over the whole kind, not inside
         // the sort.
         let all = entries.iter().collect::<Vec<_>>();
-        let scores = if terms.is_empty() {
-            Vec::new()
-        } else {
-            super::memory_search::bm25_weighted(&all, terms)
-        };
-        let group = |constraint: bool| {
-            let places = (0..all.len())
+        let mut scores = vec![None; all.len()];
+        if !terms.is_empty() {
+            for (index, score) in super::memory_search::bm25_scores(&all, terms) {
+                scores[index] = Some(score);
+            }
+        }
+        let group = |constraint: bool, limit: usize| {
+            let members = (0..all.len())
                 .filter(|index| is_constraint(all[*index]) == constraint)
                 .collect::<Vec<_>>();
-            let place_of = places
-                .iter()
-                .enumerate()
-                .map(|(place, index)| (*index, place))
-                .collect::<BTreeMap<_, _>>();
-            let group_scores = scores
-                .iter()
-                .filter_map(|(index, score)| place_of.get(index).map(|place| (*place, *score)))
-                .collect::<BTreeMap<_, _>>();
-            let members = places.iter().map(|index| all[*index]).collect::<Vec<_>>();
-            ranked(&members, &group_scores)
+            ranked(&all, &members, &scores, limit)
         };
-        let visible = group(true)
+        let visible = group(true, CONSTRAINT_LIMIT)
             .into_iter()
-            .take(CONSTRAINT_LIMIT)
-            .chain(group(false).into_iter().take(DEFAULT_ENTRY_LIMIT))
+            .chain(group(false, DEFAULT_ENTRY_LIMIT))
             .collect::<Vec<_>>();
         let shown = visible.len();
         total += kept;
@@ -1589,5 +1614,101 @@ mod tests {
         }
         .child_block("run the database migrations, then the tests");
         assert!(block.text.contains("run sqlx migrate"), "{}", block.text);
+    }
+
+    /// The digest orders only what it shows, and shows what a sort of the
+    /// whole group showed: the best words first (their best reordered by
+    /// recency and use), then the unmatched by time; ties by path, title and
+    /// key.
+    #[test]
+    fn the_shown_entries_are_those_a_sort_of_every_entry_shows() {
+        let mut seed = 0x9e37_79b9_u64;
+        let mut next = |bound: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % bound
+        };
+        let mut records = serde_json::Map::new();
+        for index in 0..300 {
+            let mut entry = json!({
+                "id": format!("k{index}"),
+                "title": format!("t{}", next(20)),
+                "content": "c",
+                "path": format!("p{}", next(3)),
+                "updated_at": format!("@{}", 1_700_000_000 + next(5) * 60),
+            });
+            if next(4) == 0 {
+                entry.as_object_mut().expect("entry").remove("updated_at");
+            }
+            records.insert(format!("k{index}"), entry);
+        }
+        let state = super::parse(
+            &json!({"entries": {"memory": records}}),
+            "global",
+            "/global",
+        );
+        let entries = state.entries["memory"].iter().collect::<Vec<_>>();
+        let scores = entries
+            .iter()
+            .map(|_| match next(6) {
+                0 | 1 => None,
+                score => Some(f64::from(u32::try_from(score).unwrap_or(1)) / 2.0),
+            })
+            .collect::<Vec<_>>();
+        let identity = |entry: &super::Entry| {
+            format!(
+                "{}\0{}\0{}",
+                entry.path,
+                entry.title.as_deref().unwrap_or_default(),
+                entry.id
+            )
+        };
+        for members in [
+            (0..entries.len()).collect::<Vec<_>>(),
+            (0..entries.len()).filter(|index| index % 3 == 1).collect(),
+        ] {
+            // What the digest did before: every entry of the group sorted.
+            let mut matched = members
+                .iter()
+                .filter_map(|index| scores[*index].map(|score| (*index, score)))
+                .collect::<Vec<_>>();
+            matched.sort_by(|a, b| {
+                b.1.total_cmp(&a.1)
+                    .then_with(|| identity(entries[a.0]).cmp(&identity(entries[b.0])))
+            });
+            let matched = crate::interactive::memory_search::reranked(
+                &entries,
+                matched,
+                super::RERANK_POOL,
+                chrono::Utc::now().timestamp(),
+            );
+            let mut unmatched = members
+                .iter()
+                .copied()
+                .filter(|index| scores[*index].is_none())
+                .collect::<Vec<_>>();
+            unmatched.sort_by(|a, b| {
+                let touched =
+                    |index: usize| crate::interactive::memory_search::last_touched(entries[index]);
+                touched(*b)
+                    .cmp(&touched(*a))
+                    .then_with(|| identity(entries[*a]).cmp(&identity(entries[*b])))
+            });
+            let everything = matched
+                .into_iter()
+                .map(|(index, _)| index)
+                .chain(unmatched)
+                .map(|index| entries[index].id.clone())
+                .collect::<Vec<_>>();
+            for limit in [1, 6, 12, 13, 40, 400] {
+                let shown = super::ranked(&entries, &members, &scores, limit)
+                    .into_iter()
+                    .map(|entry| entry.id.clone())
+                    .collect::<Vec<_>>();
+                let expected = everything.iter().take(limit).cloned().collect::<Vec<_>>();
+                assert_eq!(shown, expected, "limit {limit}");
+            }
+        }
     }
 }

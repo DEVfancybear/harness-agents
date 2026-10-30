@@ -458,15 +458,22 @@ pub fn record_use(dir: &Path, kind: Use, memories: &[String]) -> Result<usize, S
     Ok(counted)
 }
 
-/// [`load_document`] with each live memory's immutable id and [`Usage`], by
-/// `(kind, key)`: what the digest and the memory tool rank by.
+/// A live memory as ranking reads it beside its document: its immutable id,
+/// its [`Usage`], and its `version_hash`, which changes whenever what it holds
+/// does.
+#[derive(Clone, Debug)]
+pub struct Row {
+    pub memory: String,
+    pub usage: Usage,
+    pub hash: String,
+}
+
+/// [`load_document`] with each live memory's [`Row`], by `(kind, key)`: what
+/// the digest and the memory tool rank by.
 ///
 /// # Errors
 /// The store cannot be opened or read.
-#[allow(clippy::type_complexity, reason = "a document and its rows")]
-pub fn load_with_usage(
-    dir: &Path,
-) -> Result<(Value, BTreeMap<(String, String), (String, Usage)>), String> {
+pub fn load_with_usage(dir: &Path) -> Result<(Value, BTreeMap<(String, String), Row>), String> {
     let Some(store) = Store::existing(dir)? else {
         return Ok((empty_document(), BTreeMap::new()));
     };
@@ -475,7 +482,7 @@ pub fn load_with_usage(
         .conn
         .prepare(
             "SELECT m.kind, m.key, m.id, coalesce(u.reads, 0), u.last_read_at, coalesce(u.hits, 0),
-             u.last_hit_at, coalesce(u.shown, 0), u.last_shown_at
+             u.last_hit_at, coalesce(u.shown, 0), u.last_shown_at, m.version_hash
              FROM memory m LEFT JOIN memory_usage u ON u.memory_id = m.id",
         )
         .map_err(sql)?;
@@ -483,9 +490,9 @@ pub fn load_with_usage(
         .query_map([], |row| {
             Ok((
                 (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                (
-                    row.get::<_, String>(2)?,
-                    Usage {
+                Row {
+                    memory: row.get::<_, String>(2)?,
+                    usage: Usage {
                         reads: row.get(3)?,
                         last_read_at: row.get(4)?,
                         hits: row.get(5)?,
@@ -493,7 +500,8 @@ pub fn load_with_usage(
                         shown: row.get(7)?,
                         last_shown_at: row.get(8)?,
                     },
-                ),
+                    hash: row.get::<_, String>(9)?,
+                },
             ))
         })
         .map_err(sql)?
@@ -1855,7 +1863,7 @@ mod tests {
         record_use(&dir, Use::Shown, std::slice::from_ref(&id)).expect("shown");
         let (document, rows) = load_with_usage(&dir).expect("load");
         assert_eq!(document, load_document(&dir).expect("document"));
-        let (memory, usage) = &rows[&("memory".to_owned(), "queue".to_owned())];
+        let Row { memory, usage, .. } = &rows[&("memory".to_owned(), "queue".to_owned())];
         assert_eq!(memory, &id);
         assert_eq!((usage.reads, usage.hits, usage.shown), (2, 1, 1));
         assert!(usage.last_read_at.is_some() && usage.last_shown_at.is_some());
