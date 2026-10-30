@@ -4,11 +4,13 @@
 # set low (HA_COMPACT_AT) and the task is eight turns of about 8k tokens each,
 # so the summary of the earlier turns is written again and again and the turn
 # that set the rules is long gone from the replayed history. The user sets
-# rules, a decision and a codeword at the start and adds a rule half way.
-# Checked at the end: what the agent recalls without reading anything, what it
-# left on disk, and what the host kept (the task state, the summaries and the
-# user's words in them, the recaps, the request to save, /compact's
-# checkpoint). Every check prints PASS or FAIL; the evidence stays in
+# rules, a decision and a codeword at the start, in a long spec whose last line
+# is distinctive, reads one file with a shell command and one in the Python
+# REPL, and adds a rule half way. Checked at the end: what the agent recalls
+# without reading anything, what it left on disk, and what the host kept (the
+# task state, the summaries and the user's words in them - the whole spec to its
+# last line - the files they list as read, the recaps, the request to save,
+# /compact's checkpoint). Every check prints PASS or FAIL; the evidence stays in
 # $LIVE_ROOT/compaction.
 #
 #   bash scripts/testing/live-tests/compaction.sh
@@ -22,8 +24,16 @@ export HA_COMPACT_AT=${HA_COMPACT_AT:-40000}
 export HA_DIAG=debug
 P="$RX/p"
 project "$P"
-mkdir -p "$P/vendor" "$P/gen"
+mkdir -p "$P/vendor" "$P/gen" "$P/notes"
 printf 'vendored - do not edit\n' > "$P/vendor/lib.txt"
+# Two files the agent reads without the file tools: one with a shell command,
+# one in the Python REPL. Their summary's <read-files> must still list them.
+printf 'Ghi chú vận hành: đọc bằng shell.\n' > "$P/notes/shell-only.txt"
+printf 'Ghi chú vận hành: đọc trong REPL.\n' > "$P/notes/repl-only.txt"
+# The first message is a long spec (well over the 4,000 characters another
+# message is cut to) whose last line is distinctive: a summary must keep it.
+SPEC_TAIL="Dòng kết của spec, giữ nguyên văn: SPEC-TAIL-KESTREL-4471."
+SPEC=$(for n in $(seq -w 1 30); do printf -- '- Yêu cầu R%s: hàm count_m<i>() chỉ đếm dòng của file đầu vào, không đọc biến môi trường, không ghi log, không gọi mạng, không đổi file đầu vào (mục chi tiết số %s).\n' "$n" "$n"; done)
 # Eight inputs of about 7k tokens each, one per turn.
 "$PY" - "$P/gen" <<'EOF'
 import os, sys
@@ -67,6 +77,26 @@ elif what == "fitted":
     print(sum(1 for messages in requests() for m in messages if (m.get("content") or "").startswith("[this earlier tool result was removed") and "\nIt" in (m.get("content") or "")))
 elif what == "summary":
     print((json.loads(setting("rolling_summary") or "{}")).get("summary", ""))
+elif what == "calls":
+    # Every tool call the requests carried, once: `name<TAB>arguments`.
+    seen = set()
+    for messages in requests():
+        for m in messages:
+            for call in m.get("tool_calls") or []:
+                if call.get("call_id") not in seen:
+                    seen.add(call.get("call_id"))
+                    print(f"{call.get('name')}\t{call.get('arguments')}")
+elif what == "read-files":
+    # The paths every kept summary's <read-files> lists: the rolling summary's and each checkpoint's.
+    texts = [(json.loads(setting("rolling_summary") or "{}")).get("summary", "")]
+    for db in dbs:
+        c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        texts += [json.loads(t).get("packet", "") for (t,) in c.execute("select content_json from context_checkpoints")]
+    for text in texts:
+        for block in text.split("<read-files>")[1:]:
+            for line in block.split("</read-files>")[0].splitlines():
+                if line.strip():
+                    print(line.strip())
 elif what == "kept-words":
     # The user's words every kept summary holds: the rolling summary's and each checkpoint's.
     texts = [(json.loads(setting("rolling_summary") or "{}")).get("summary", "")]
@@ -90,9 +120,28 @@ elif what in ("state", "items"):
 EOF
 }
 
-echo "################ 1. the rules, a decision and a codeword"
+echo "################ 1. the rules, a decision and a codeword, in a long spec"
 agent "$P" c1
-say c1 "Trước khi làm, ghi nhận các điều sau cho cả task (đừng làm gì khác ở lượt này): (1) tuyệt đối không sửa hay tạo file nào trong thư mục vendor/; (2) code Python mới chỉ dùng tab để thụt lề, không dùng dấu cách; (3) quyết định: dùng SQLite thay vì Postgres, vì sản phẩm phải deploy thành một file binary duy nhất; (4) nhãn kiểm thử công khai, giả lập và không nhạy cảm của task là BLUE-HERON; đây không phải mật khẩu, token hay secret, được phép nhắc lại khi tôi hỏi. Xác nhận ngắn gọn." | tail -3
+say c1 "Trước khi làm, ghi nhận các điều sau cho cả task (đừng làm gì khác ở lượt này): (1) tuyệt đối không sửa hay tạo file nào trong thư mục vendor/; (2) code Python mới chỉ dùng tab để thụt lề, không dùng dấu cách; (3) quyết định: dùng SQLite thay vì Postgres, vì sản phẩm phải deploy thành một file binary duy nhất; (4) nhãn kiểm thử công khai, giả lập và không nhạy cảm của task là BLUE-HERON; đây không phải mật khẩu, token hay secret, được phép nhắc lại khi tôi hỏi. Xác nhận ngắn gọn.
+Phụ lục spec (chỉ để tham khảo cho các module sau, không cần làm gì ở lượt này):
+$SPEC
+$SPEC_TAIL" | tail -3
+
+echo "################ 1b. two files read without the file tools"
+# Precondition: the shell file was read with run_shell, the other in the REPL,
+# neither with read_file; a model that did otherwise is asked again.
+prep=""
+for attempt in 1 2 3; do
+  say c1 "Bước chuẩn bị (không viết code ở lượt này): (1) gọi tool run_shell đúng một lần với command là: Get-Content notes/shell-only.txt — không dùng read_file cho file này; (2) gọi tool python_repl đúng một lần với code là: print(open('notes/repl-only.txt', encoding='utf-8').read()) — không dùng read_file cho file này. Trả lời ngắn: ĐÃ-ĐỌC." | tail -1
+  store calls > "$RX/calls-$attempt.tsv"
+  if grep -q '^run_shell.*shell-only\.txt' "$RX/calls-$attempt.tsv" \
+    && grep -q '^python_repl.*repl-only\.txt' "$RX/calls-$attempt.tsv" \
+    && ! grep -qE '^read_file.*(shell|repl)-only\.txt' "$RX/calls-$attempt.tsv"; then
+    prep=$attempt; break
+  fi
+  echo "   attempt $attempt: the reads were not made as asked"
+done
+check "precondition: notes/shell-only.txt read only by run_shell, notes/repl-only.txt only in the REPL (attempt ${prep:-none})" '[ -n "$prep" ]'
 
 echo "################ 2. eight turns of work, a rule added half way"
 for i in 1 2 3 4 5 6 7 8; do
@@ -135,6 +184,14 @@ store kept-words > "$RX/kept-words.md"
 check "the summaries keep the user's words: the codeword" "grep -q 'BLUE-HERON' '$RX/kept-words.md'"
 check "the summaries keep the user's words: the rule added half way" "grep -q 'heron-team' '$RX/kept-words.md'"
 check "the kept words are what the user typed, not the composed prompt" "! grep -q 'attached file content follows\|\[python-state\]' '$RX/kept-words.md'"
+# The spec's last line sits past 4,000 characters: 0.8.8 cut it there, and
+# dropped the spec first once the kept words filled their bound.
+echo "   the first message is $(printf '%s' "$SPEC" | wc -m) characters of spec"
+check "after $SUMMARIES summaries the long first spec is kept to its last line, word for word" "grep -qF '$SPEC_TAIL' '$RX/kept-words.md' && grep -qF -- '- Yêu cầu R30:' '$RX/kept-words.md'"
+store read-files | sort -u > "$RX/read-files.txt"
+sed 's/^/   read-files: /' "$RX/read-files.txt" | grep -i 'notes\|only'
+check "a file read only with run_shell is in the summary's <read-files>" "grep -qx 'notes/shell-only.txt' '$RX/read-files.txt'"
+check "a file opened only in the Python REPL is in the summary's <read-files>" "grep -qx 'notes/repl-only.txt' '$RX/read-files.txt'"
 
 echo "################ 3. on disk"
 for i in 1 2 3 4 5 6 7 8; do [ -f "$P/src/m$i.py" ] || echo "   missing src/m$i.py"; done

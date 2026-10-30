@@ -866,6 +866,7 @@ impl ReplShared {
         }
         let outcome = kernel.execute(code, timeout, true).await;
         let images = std::mem::take(&mut kernel.images);
+        let files = kernel.files.take();
         let (text, worked) = match outcome {
             Ok(cell) => cell,
             Err(dead) => {
@@ -880,7 +881,9 @@ impl ReplShared {
         if worked {
             self.schedule_snapshot();
         }
-        let notes = [notice, setup_note]
+        // The files come first: a result shortened to fit the window keeps
+        // its start, and a summary's file lists read them from there.
+        let notes = [files, notice, setup_note]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
@@ -1642,6 +1645,9 @@ struct Kernel {
     harness: Option<KernelContext>,
     /// The images the last cell loaded.
     images: Vec<Value>,
+    /// The note naming the workspace files the last cell opened, when it
+    /// opened any (its `done` frame's `files`).
+    files: Option<String>,
     /// Where this kernel's namespace is snapshotted.
     snapshot: Option<SnapshotTarget>,
     /// The saved namespace could not be revived, so the snapshot on disk is fresher
@@ -1651,6 +1657,28 @@ struct Kernel {
     stderr_task: Option<JoinHandle<()>>,
     /// ha's `settings.json`, for the kernel's `rlm.harness` switch.
     settings: Option<PathBuf>,
+}
+
+/// The note a cell's result opens with, naming the workspace files the cell
+/// read and wrote as its `done` frame reports them
+/// ([`harness_runtime::cell_files_note`]); `None` when it opened none. A path
+/// that would break the note's lines is left out.
+fn opened_files(done: &Value) -> Option<String> {
+    let paths = |kind: &str| {
+        done["files"][kind]
+            .as_array()
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|path| !path.is_empty() && !path.contains(['\n', '\r']))
+                    .take(harness_runtime::CELL_FILES_MAX)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    harness_runtime::cell_files_note(&paths("read"), &paths("written"))
 }
 
 /// One request's events up to its `done`.
@@ -1678,6 +1706,7 @@ impl Kernel {
                 in_flight: None,
                 harness: None,
                 images: Vec::new(),
+                files: None,
                 snapshot,
                 pending_restore: false,
                 journal: None,
@@ -1951,6 +1980,7 @@ impl Kernel {
             text.background = self.link.take_background();
         }
         self.images = std::mem::take(&mut text.images);
+        self.files = opened_files(&done);
         let worked = done["status"] == "ok" && text.error.is_empty();
         Ok((text.render(), worked))
     }
@@ -3164,6 +3194,55 @@ mod tests {
             Duration::from_secs(30), Arc::new(NoHostRequests), Some(&context),
         ).await.expect("cell");
         assert_eq!(output.text, "skill removed\n");
+        shared.dispose().await;
+    }
+
+    /// A cell's result names the workspace files it read and wrote, first, as
+    /// a summary's file lists read them; an import, a file outside the
+    /// workspace and a read that found nothing are not named, and a cell that
+    /// opened nothing has no note.
+    #[tokio::test]
+    async fn a_cell_names_the_workspace_files_it_opened() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let Some(python) = super::find_python(None).await else {
+            eprintln!("skipped: no Python 3.11+ on this machine");
+            return;
+        };
+        let workspace = directory.path().join("work");
+        std::fs::create_dir_all(workspace.join("notes")).expect("workspace");
+        std::fs::write(workspace.join("notes").join("spec.txt"), "SPEC").expect("spec");
+        std::fs::write(workspace.join("helper_mod.py"), "VALUE = 1\n").expect("module");
+        std::fs::write(directory.path().join("outside.txt"), "x").expect("outside");
+        let shared = Arc::new(ReplShared::new(
+            &directory.path().join("data"),
+            &workspace,
+            Some(python.display().to_string()),
+            super::default_shell(),
+        ));
+        let run = |code: &'static str| {
+            let shared = Arc::clone(&shared);
+            async move {
+                shared
+                    .execute(code, Duration::from_mins(1), Arc::new(NoHostRequests), None)
+                    .await
+                    .expect("cell")
+                    .text
+            }
+        };
+        let text = run("import sys, os\nsys.path.insert(0, os.getcwd())\nimport helper_mod\nprint(open('notes/spec.txt').read())\nopen('out.json', 'w').write('{}')\nopen('../outside.txt').read()\ntry:\n    open('missing.txt')\nexcept OSError:\n    pass").await;
+        assert!(
+            text.starts_with(&format!(
+                "{}\nread notes/spec.txt\nwrote out.json\n",
+                harness_runtime::CELL_FILES_HEADER
+            )),
+            "{text}"
+        );
+        assert!(text.contains("SPEC"), "{text}");
+        assert!(
+            !text.contains("helper_mod") && !text.contains("missing.txt"),
+            "{text}"
+        );
+        assert_eq!(run("print(1 + 1)").await, "2\n");
         shared.dispose().await;
     }
 

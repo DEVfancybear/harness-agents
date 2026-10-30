@@ -25,7 +25,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -364,6 +364,137 @@ pub const DELEGATED_CHILD_SETTING: &str = "delegated_child";
 /// How the app frames a child's first input, prime-agent's `[task from parent]`.
 pub const CHILD_PROMPT_HEAD: &str = "[task from parent]";
 
+/// The file in the root conversation's local harness folder keeping what its
+/// children found ([`ChildFinding`]), one JSON object a line.
+pub const CHILD_FINDINGS_FILE: &str = "child_findings.jsonl";
+
+/// The file beside it naming the newest finding a review was given.
+const FINDINGS_OFFERED_FILE: &str = "child_findings.offered";
+
+/// The longest a finding's fact may be.
+const FINDING_FACT_CHARS: usize = 400;
+
+/// The longest a finding's evidence may be.
+const FINDING_EVIDENCE_CHARS: usize = 600;
+
+/// The shortest evidence that can show anything.
+const FINDING_EVIDENCE_MIN_CHARS: usize = 8;
+
+/// How many findings one run of a child may keep.
+const FINDINGS_PER_RUN: usize = 8;
+
+/// How many findings the file keeps, the newest.
+const FINDINGS_KEPT: usize = 200;
+
+/// How many findings one review is given, the newest.
+const FINDINGS_PER_REVIEW: usize = 12;
+
+/// What a child's system text says of `note_finding`.
+const FINDINGS_LINE: &str = " When a tool result shows a lasting fact about the project worth knowing after this task - where something is configured, what a check needs, how a part works - record it with note_finding, quoting the tool result's words that show it: you cannot write memory, and your parent's review keeps what you note. Note only what a tool result showed, never a guess or this task's progress.";
+
+/// A fact a child found, with the words of its tool result that show it.
+#[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+pub struct ChildFinding {
+    /// When it was kept, in milliseconds; increasing, so a review is given
+    /// each finding once.
+    pub at_ms: u64,
+    pub child: String,
+    pub role: String,
+    pub fact: String,
+    pub evidence: String,
+}
+
+/// Text on one line, its runs of blanks one space: how a finding is kept
+/// and how its evidence is found in a tool result.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Keep `finding` in the file at `path`, the newest [`FINDINGS_KEPT`].
+fn keep_finding(path: &Path, mut finding: ChildFinding) -> Result<(), String> {
+    use std::io::Write as _;
+    static WRITING: Mutex<u64> = Mutex::new(0);
+    let mut last = WRITING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    finding.at_ms = finding.at_ms.max(*last + 1);
+    *last = finding.at_ms;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let line = serde_json::to_string(&finding).map_err(|error| error.to_string())?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| writeln!(file, "{line}"))
+        .map_err(|error| format!("the finding could not be kept: {error}"))?;
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.len() > FINDINGS_KEPT {
+        let kept = lines[lines.len() - FINDINGS_KEPT..].join("\n");
+        let temporary = path.with_extension("jsonl.tmp");
+        std::fs::write(&temporary, format!("{kept}\n"))
+            .and_then(|()| std::fs::rename(&temporary, path))
+            .map_err(|error| format!("the findings could not be trimmed: {error}"))?;
+    }
+    Ok(())
+}
+
+/// The findings the children of the conversation whose local harness folder
+/// is `local` kept since the last review was given them, as the block a
+/// review's transcript ends with, one per child; `None` when there are none.
+/// Reading them marks them given: the next review is given only newer ones.
+///
+/// Each block is labelled as a tool result's, which is what a finding is -
+/// what the project showed a child - so a review never takes one for the
+/// user's words (`lessons::Quotes`).
+#[must_use]
+pub fn findings_for_review(local: &Path) -> Option<String> {
+    let offered = local.join(FINDINGS_OFFERED_FILE);
+    let since = std::fs::read_to_string(&offered)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let findings = std::fs::read_to_string(local.join(CHILD_FINDINGS_FILE))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<ChildFinding>(line).ok())
+        .filter(|finding| finding.at_ms > since)
+        .collect::<Vec<_>>();
+    let newest = findings.iter().map(|finding| finding.at_ms).max()?;
+    let _ = std::fs::write(&offered, newest.to_string());
+    let given = &findings[findings.len().saturating_sub(FINDINGS_PER_REVIEW)..];
+    let mut children = Vec::<(&str, Vec<&ChildFinding>)>::new();
+    for finding in given {
+        match children
+            .iter_mut()
+            .find(|(child, _)| *child == finding.child)
+        {
+            Some((_, list)) => list.push(finding),
+            None => children.push((&finding.child, vec![finding])),
+        }
+    }
+    let blocks = children
+        .into_iter()
+        .map(|(child, list)| {
+            let mut block = format!(
+                "[Tool result (child findings, from {child})]: [Child findings, from {child}] Facts this delegated child found in tool results only it saw, each with the words of the tool result that show it: what the project showed, not the user's words."
+            );
+            for finding in list {
+                let _ = write!(
+                    block,
+                    "\n- {} (evidence: \"{}\")",
+                    one_line(&finding.fact),
+                    one_line(&finding.evidence)
+                );
+            }
+            block
+        })
+        .collect::<Vec<_>>();
+    Some(blocks.join("\n\n"))
+}
+
 #[derive(Clone)]
 pub struct ChildLaunch {
     /// The parent's model; a child runs on it unless it asks for another.
@@ -407,6 +538,16 @@ pub struct ChildLaunch {
     /// The data directory whose learned rules and tool notes the child's calls
     /// follow, as the root's do; `None` while harness refinements are off.
     pub learned: Option<PathBuf>,
+    /// The root conversation's local harness folder. Every child, at every
+    /// depth, is given the constraints and decisions of the task state kept
+    /// there at each of its turns ([`super::task_state::child_block`]), and
+    /// the findings a child reports with `note_finding` are kept there
+    /// ([`CHILD_FINDINGS_FILE`]) for the root's review: only the root keeps
+    /// memory, and what a child learned used to end with it.
+    pub conversation_dir: Option<PathBuf>,
+    /// Whether the root reviews its conversation (harness refinements on), so
+    /// a child is offered `note_finding`.
+    pub keep_findings: bool,
 }
 
 impl ChildLaunch {
@@ -4301,6 +4442,11 @@ fn verifier_schemas() -> Vec<Value> {
 struct ChildTools {
     shared: Arc<AgentsShared>,
     task_id: TaskId,
+    /// Where this child's findings are kept for the root's review
+    /// ([`CHILD_FINDINGS_FILE`]); `None` when nothing keeps them.
+    findings: Option<PathBuf>,
+    /// How many findings this run has kept, bounded by [`FINDINGS_PER_RUN`].
+    noted: AtomicUsize,
     web: Option<ChildWebTools>,
     knowledge: Option<super::knowledge::KnowledgeHost>,
     memory: Option<super::memory::MemoryHost>,
@@ -4421,6 +4567,100 @@ impl ChildTools {
             }),
         ]
     }
+
+    fn finding_schema() -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "note_finding",
+                "description": "Keep a lasting fact about the project that a tool result showed you, for your parent's memory: you cannot write memory, and your parent's review reads what you note with its conversation. `evidence` quotes the tool result's own words that show the fact, as the tool returned them; a quote no tool result of yours holds is refused. Not for guesses, this task's progress or what your answer already says.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "fact": {"type": "string", "minLength": 1, "maxLength": FINDING_FACT_CHARS, "description": "The fact itself, anchored to where it holds (\"in this project the deploy port is set in ops/deploy.toml\")."},
+                        "evidence": {"type": "string", "minLength": FINDING_EVIDENCE_MIN_CHARS, "maxLength": FINDING_EVIDENCE_CHARS, "description": "The words of a tool result you received that show it."}
+                    },
+                    "required": ["fact", "evidence"],
+                    "additionalProperties": false
+                }
+            }
+        })
+    }
+
+    /// Keep a finding for the root's review once its evidence is found in a
+    /// tool result of this run.
+    async fn note_finding(&self, arguments: &Value) -> Result<Value, String> {
+        let Some(path) = &self.findings else {
+            return Err("findings are not kept for this child".to_owned());
+        };
+        let field = |key: &str, longest: usize| {
+            let value = one_line(arguments.get(key).and_then(Value::as_str).unwrap_or(""));
+            if value.is_empty() {
+                Err(format!("note_finding needs `{key}`"))
+            } else if value.chars().count() > longest {
+                Err(format!(
+                    "`{key}` is longer than {longest} characters: say it shorter"
+                ))
+            } else {
+                Ok(value)
+            }
+        };
+        let fact = field("fact", FINDING_FACT_CHARS)?;
+        let evidence = field("evidence", FINDING_EVIDENCE_CHARS)?;
+        if evidence.chars().count() < FINDING_EVIDENCE_MIN_CHARS {
+            return Err(format!(
+                "`evidence` quotes at least {FINDING_EVIDENCE_MIN_CHARS} characters of the tool result"
+            ));
+        }
+        if self.noted.load(Ordering::SeqCst) >= FINDINGS_PER_RUN {
+            return Err(format!(
+                "this run kept {FINDINGS_PER_RUN} findings already; say the rest in your answer"
+            ));
+        }
+        let (session, child, role) = self
+            .shared
+            .update(&self.task_id, |child| {
+                (
+                    child.session_id.clone(),
+                    child.name.clone(),
+                    child.role.as_str().to_owned(),
+                )
+            })
+            .ok_or("the child's record is gone")?;
+        let session = session.ok_or("the child's run has no session yet")?;
+        let lease = self
+            .shared
+            .store
+            .lease()
+            .await
+            .map_err(|error| error.to_string())?;
+        let results = lease
+            .store()
+            .recovered_tool_results(&session)
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(lease);
+        if !results
+            .iter()
+            .any(|result| one_line(&result.text).contains(&evidence))
+        {
+            return Err("no tool result of yours holds this evidence: quote the words a tool returned, as it returned them".to_owned());
+        }
+        keep_finding(
+            path,
+            ChildFinding {
+                at_ms: harness_runtime::now_unix_ms(),
+                child,
+                role,
+                fact,
+                evidence,
+            },
+        )?;
+        self.noted.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({
+            "text": "kept: your parent's review reads it with the conversation and keeps what lasts",
+        }))
+    }
 }
 
 impl ExternalToolCatalog for ChildTools {
@@ -4428,6 +4668,9 @@ impl ExternalToolCatalog for ChildTools {
         let mut schemas = Self::agent_schemas();
         if self.spawn.is_some() {
             schemas.push(Self::delegate_schema());
+        }
+        if self.findings.is_some() {
+            schemas.push(Self::finding_schema());
         }
         if let Some((catalog, _)) = &self.web {
             schemas.extend(catalog.schemas());
@@ -4451,7 +4694,9 @@ impl ExternalToolCatalog for ChildTools {
                 timeout_ms: 120_000,
             });
         }
-        if matches!(name, "agent_message" | "progress_note") {
+        if matches!(name, "agent_message" | "progress_note")
+            || (name == "note_finding" && self.findings.is_some())
+        {
             return Some(CodingToolAction::ExternalTool {
                 plugin_id: "agent".to_owned(),
                 tool_name: name.to_owned(),
@@ -4618,6 +4863,7 @@ impl ExternalToolDispatcher for ChildTools {
             let result = match tool_name {
                 "agent_message" => self.shared.send_from_child(&self.task_id, arguments).await,
                 "progress_note" => self.shared.progress_note(&self.task_id, arguments),
+                "note_finding" => self.note_finding(arguments).await,
                 _ => Err(format!("unknown agent tool {tool_name:?}")),
             };
             let payload =
@@ -5116,13 +5362,23 @@ impl WorkerBackend for InteractiveWorkerBackend {
             } else {
                 ""
             };
+            let findings = launch
+                .conversation_dir
+                .as_ref()
+                .filter(|_| launch.keep_findings)
+                .map(|dir| dir.join(CHILD_FINDINGS_FILE));
+            let findings_line = if findings.is_some() {
+                FINDINGS_LINE
+            } else {
+                ""
+            };
             let (workspace_root, policy, schemas, system_policy) = match request.brief.role {
                 AgentRole::Explorer => (
                     launch.workspace_root.clone(),
                     child_policy(&launch.parent_policy),
                     harness_tools::coding_tool_schemas_for(hashline),
                     format!(
-                        "You are a child agent spawned by your parent agent. Task prompts are labeled `[task from parent]`.{} Use agent_message to tell your parent what you found when it helps before you finish. Once your task is done, a message that wakes you again sends your parent no notice when you stop: answer it with agent_message when it asks for something, and send nothing when you would only repeat a status it already has.",
+                        "You are a child agent spawned by your parent agent. Task prompts are labeled `[task from parent]`.{} Use agent_message to tell your parent what you found when it helps before you finish. Once your task is done, a message that wakes you again sends your parent no notice when you stop: answer it with agent_message when it asks for something, and send nothing when you would only repeat a status it already has.{findings_line}",
                         if can_spawn {
                             spawn_line
                         } else {
@@ -5134,7 +5390,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     launch.workspace_root.clone(),
                     verifier_policy(&child_policy(&launch.parent_policy)),
                     verifier_schemas(),
-                    super::verify::VERIFIER_POLICY.to_owned(),
+                    format!("{}{findings_line}", super::verify::VERIFIER_POLICY),
                 ),
                 AgentRole::Coder => {
                     let Some(worktree) = request.worktree.as_ref() else {
@@ -5163,7 +5419,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                         child_policy(&launch.parent_policy),
                         harness_tools::coding_tool_schemas_for(hashline),
                         format!(
-                            "You are a delegated coder. Work only in the assigned isolated M8-03 worktree and follow the brief. Tool calls use the host approval and policy service. Leave your changes in that worktree (committed or not) and report what changed, with paths; do not merge, push or copy them into the user's checkout and do not claim they are there - your parent brings them in with integrate_children, which merges every coder's branch, runs the project checks on the result and applies it only if the user's checkout has not changed.{spawn_line}"
+                            "You are a delegated coder. Work only in the assigned isolated M8-03 worktree and follow the brief. Tool calls use the host approval and policy service. Leave your changes in that worktree (committed or not) and report what changed, with paths; do not merge, push or copy them into the user's checkout and do not claim they are there - your parent brings them in with integrate_children, which merges every coder's branch, runs the project checks on the result and applies it only if the user's checkout has not changed.{spawn_line}{findings_line}"
                         ),
                     )
                 }
@@ -5227,6 +5483,8 @@ impl WorkerBackend for InteractiveWorkerBackend {
             let child_tools = Arc::new(ChildTools {
                 shared: Arc::clone(&self.shared),
                 task_id: task_id.clone(),
+                findings,
+                noted: AtomicUsize::new(0),
                 web: launch.web.clone(),
                 knowledge: launch
                     .knowledge
@@ -5274,11 +5532,15 @@ impl WorkerBackend for InteractiveWorkerBackend {
             {
                 live.set(current);
             }
-            let runtime = Arc::new(RuntimeService::new(
-                Arc::clone(&store),
-                Arc::clone(&live) as Arc<dyn ModelProvider>,
-                launch.runtime_config.clone(),
-            ));
+            // Its summaries look a shell call's files up where its tools work.
+            let runtime = Arc::new(
+                RuntimeService::new(
+                    Arc::clone(&store),
+                    Arc::clone(&live) as Arc<dyn ModelProvider>,
+                    launch.runtime_config.clone(),
+                )
+                .with_workspace_root(&workspace_root),
+            );
             // The child's task is the parent's work, not a conversation of the
             // user's: `/resume` and "latest" leave it out.
             let _ = store
@@ -5389,6 +5651,13 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 let mut project_rules = launch.context.clone();
                 if let Some(source) = &launch.digest {
                     project_rules.insert(0, source.child_block(&request.brief.objective));
+                }
+                // Read at each turn: the parent may record a constraint after
+                // it delegated, and its next message wakes this child.
+                if let Some(block) = launch.conversation_dir.as_ref().and_then(|dir| {
+                    super::task_state::child_block(&dir.join(super::task_state::TASK_STATE_FILE))
+                }) {
+                    project_rules.push(block);
                 }
                 if let Some(knowledge) = &launch.knowledge
                     && let Some(block) = super::knowledge::context_block(
@@ -6015,6 +6284,8 @@ pub(super) mod tests {
             shared: shared(sender),
             // The child's own task: memory still reads the root's conversation.
             task_id: TaskId::generate(),
+            findings: None,
+            noted: std::sync::atomic::AtomicUsize::new(0),
             web: None,
             knowledge: None,
             // The writable root host: the boundary makes it read-only.
@@ -6079,6 +6350,8 @@ pub(super) mod tests {
         let tools = ChildTools {
             shared: shared(sender),
             task_id: TaskId::generate(),
+            findings: None,
+            noted: std::sync::atomic::AtomicUsize::new(0),
             web: None,
             // Deliberately pass the writable root host: the child boundary must
             // enforce read-only even if a caller forgets to make it so.
@@ -6582,6 +6855,8 @@ pub(super) mod tests {
             digest: None,
             follows: None,
             learned: None,
+            conversation_dir: None,
+            keep_findings: false,
         }
     }
 
@@ -9448,6 +9723,122 @@ mod real_worker_tests {
                 .any(|line| line.starts_with("  ")),
             "/agents shows the grandchild under its parent"
         );
+    }
+
+    /// The constraints and decisions of the root's task state reach its child
+    /// and the child's own child, not its plan. A fact a child found is kept
+    /// for the root's review only with the words of a tool result of its own
+    /// as evidence, and the review is given it once, labelled as a tool
+    /// result's, never as the user's words.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "one subtree, checked in order")]
+    async fn children_hear_the_roots_constraints_and_hand_back_findings() {
+        let mut bench = bench();
+        bench.agents.set_max_depth(2, super::MaxDepthSource::Chat);
+        std::fs::write(bench.repo.join("ops.txt"), "deploy port = 48213\n").expect("ops");
+        let local = bench.repo.with_file_name("root-local");
+        std::fs::create_dir_all(&local).expect("local");
+        std::fs::write(
+            local.join(crate::interactive::task_state::TASK_STATE_FILE),
+            json!({
+                "objective": "ship the importer",
+                "items": [{"text": "PLAN-ITEM-7 write the parser"}],
+                "constraints": ["never edit vendor/"],
+                "decisions": [{"decision": "SQLite over Postgres", "why": "one binary"}]
+            })
+            .to_string(),
+        )
+        .expect("task state");
+        let provider = Routed::new(|request| {
+            if is_child(request, "inner task") {
+                if tool_results(request) == 0 {
+                    // Nothing it read says so.
+                    Reply::Tool(
+                        "note_finding",
+                        json!({"fact": "the port is 1", "evidence": "deploy port = 1 everywhere"}),
+                    )
+                } else {
+                    Reply::Text("inner answer")
+                }
+            } else {
+                match tool_results(request) {
+                    0 => Reply::Tool("read_file", json!({"path": "ops.txt"})),
+                    1 => Reply::Tool(
+                        "note_finding",
+                        json!({"fact": "In this project the deploy port is 48213", "evidence": "deploy port = 48213"}),
+                    ),
+                    2 => Reply::Tool(
+                        "delegate",
+                        json!({"role": "explorer", "brief": "inner task"}),
+                    ),
+                    _ => Reply::Text("outer answer"),
+                }
+            }
+        });
+        let mut launch = super::tests::launch_for(&bench.repo, provider.clone());
+        launch.conversation_dir = Some(local.clone());
+        launch.keep_findings = true;
+        let host = DelegateHost::new(&bench.agents, launch, CancellationToken::new());
+        spawn(&host, "outer", "outer task").await;
+        match next_child_event(&mut bench.events).await {
+            SessionEvent::ChildSettled { notice, .. } => {
+                assert!(notice.contains("outer answer"), "{notice}");
+            }
+            other => panic!("expected the child's notice: {other:?}"),
+        }
+        let text = |requests: &[ProviderRequest]| {
+            requests
+                .iter()
+                .flat_map(|request| request.messages.iter())
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let outer = provider.requests_of("outer task");
+        let inner = provider.requests_of("inner task");
+        for (who, requests) in [("child", &outer), ("grandchild", &inner)] {
+            let seen = text(requests);
+            assert!(seen.contains("never edit vendor/"), "{who}: {seen}");
+            assert!(
+                seen.contains("SQLite over Postgres (why: one binary)"),
+                "{who}"
+            );
+            assert!(!seen.contains("PLAN-ITEM-7"), "{who} is not given the plan");
+        }
+        assert!(offers(&outer[0], "note_finding"));
+        assert!(
+            last_text(inner.last().expect("inner requests")).contains("no tool result of yours"),
+            "a finding no tool result shows is refused"
+        );
+        let review = super::findings_for_review(&local).expect("the review is given the finding");
+        assert!(
+            review.starts_with(
+                "[Tool result (child findings, from outer)]: [Child findings, from outer]"
+            ),
+            "{review}"
+        );
+        assert!(
+            review.contains(
+                "In this project the deploy port is 48213 (evidence: \"deploy port = 48213\")"
+            ),
+            "{review}"
+        );
+        assert!(!review.contains("the port is 1"), "{review}");
+        assert!(
+            !review.contains("\n\n"),
+            "one block: the review's quote rules read it whole"
+        );
+        assert_eq!(super::findings_for_review(&local), None, "given once");
+        // Without a review to read them, a child is not offered the tool.
+        let mut launch = super::tests::launch_for(&bench.repo, provider.clone());
+        launch.conversation_dir = Some(local.clone());
+        let host = DelegateHost::new(&bench.agents, launch, CancellationToken::new());
+        spawn(&host, "plain", "plain task").await;
+        let _ = next_child_event(&mut bench.events).await;
+        assert!(!offers(
+            &provider.requests_of("plain task")[0],
+            "note_finding"
+        ));
     }
 
     /// A child whose own child runs past its turn is not finished: it waits,

@@ -699,6 +699,112 @@ async def _run_guarded(task: asyncio.Task[Any], rid: str) -> tuple[str, Any, dic
             _active["rid"] = None
 
 
+# The workspace files a cell opened, read and written, which its `done` frame
+# reports for the host to list in a summary's file lists: a file read only in
+# the REPL was forgotten at the first compaction. Seen through the `open`
+# audit event (builtin open, io.open_code, os.open), so a library the cell
+# calls counts too; an import does not, nor a file of the kernel's own runtime
+# or interpreter. At most _CELL_FILES_MAX of each kind.
+_CELL_FILES_MAX = 20
+_cell_files: contextvars.ContextVar[dict[str, list[str]] | None] = contextvars.ContextVar(
+    "_cell_files", default=None
+)
+_workspace_root: str | None = None
+# Folders whose files are the kernel's or the interpreter's, never the cell's.
+_own_roots: list[str] = []
+_audit_guard = threading.local()
+_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
+
+
+def _inside(path: str, root: str) -> bool:
+    """Whether `path` is `root` or below it, compared as the file system does."""
+    path, root = os.path.normcase(path), os.path.normcase(root)
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:  # another drive
+        return False
+
+
+def _cell_opened(frame: types.FrameType | None) -> bool:
+    """Whether the open was the cell's: a cell's code is on the stack and the
+    import system is not between it and the open."""
+    depth = 0
+    while frame is not None and depth < 200:
+        filename = frame.f_code.co_filename
+        if filename.startswith("<cell-"):
+            return True
+        if filename.startswith("<frozen importlib"):
+            return False
+        frame = frame.f_back
+        depth += 1
+    return False
+
+
+def _note_open(files: dict[str, list[str]], args: tuple[Any, ...]) -> None:
+    path, mode, flags = (tuple(args) + (None, None, None))[:3]
+    if path is None or isinstance(path, int) or _workspace_root is None:
+        return
+    path = os.fsdecode(os.fspath(path))
+    full = os.path.realpath(os.path.join(os.getcwd(), path))
+    if not _inside(full, _workspace_root) or "__pycache__" in full.split(os.sep):
+        return
+    if any(_inside(full, root) for root in _own_roots):
+        return
+    written = (isinstance(mode, str) and any(flag in mode for flag in "wax+")) or (
+        isinstance(flags, int) and bool(flags & _WRITE_FLAGS)
+    )
+    kind = files["written" if written else "read"]
+    seen = {os.path.normcase(kept) for kept in kind}
+    if os.path.normcase(full) not in seen and len(kind) < _CELL_FILES_MAX:
+        kind.append(full)
+
+
+def _audit_open(event: str, args: tuple[Any, ...]) -> None:
+    if event != "open":
+        return
+    files = _cell_files.get()
+    if files is None or getattr(_audit_guard, "busy", False):
+        return
+    _audit_guard.busy = True
+    try:
+        if _cell_opened(sys._getframe(1)):
+            _note_open(files, args)
+    except Exception:  # noqa: BLE001 - an audit hook must never fail the cell's open
+        pass
+    finally:
+        _audit_guard.busy = False
+
+
+def _install_file_audit() -> None:
+    """Watch the cell's opens, inside the folder the kernel started in."""
+    global _workspace_root
+    _workspace_root = os.path.realpath(os.getcwd())
+    roots = {os.path.dirname(os.path.dirname(os.path.abspath(__file__))), sys.prefix, sys.base_prefix}
+    if os.environ.get("PRIME_AGENT_CODING_AGENT_DIR"):
+        roots.add(os.environ["PRIME_AGENT_CODING_AGENT_DIR"])
+    # A folder that holds the whole workspace would hide all of it.
+    _own_roots.extend(
+        real for real in (os.path.realpath(root) for root in roots if root) if not _inside(_workspace_root, real)
+    )
+    sys.addaudithook(_audit_open)
+
+
+def _cell_files_report(files: dict[str, list[str]]) -> dict[str, list[str]] | None:
+    """The files a cell opened, relative to the workspace with `/`; a read
+    that found no file is left out."""
+    root = _workspace_root
+    assert root is not None
+
+    def rel(full: str) -> str:
+        return os.path.relpath(full, root).replace(os.sep, "/")
+
+    report = {
+        "read": [rel(full) for full in files["read"] if os.path.isfile(full)],
+        "written": [rel(full) for full in files["written"] if os.path.exists(full)],
+    }
+    return report if report["read"] or report["written"] else None
+
+
 async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
     global _cell_counter
     cell_id = req["id"]
@@ -707,6 +813,8 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
     execution = _CellExecution()
     cell_token = _current_cell.set(cell_id)
     execution_token = _current_cell_execution.set(execution)
+    files: dict[str, list[str]] = {"read": [], "written": []}
+    files_token = _cell_files.set(files)
     try:
         codes, has_trailing = _compile_cell(req["code"], filename)
         assert _loop is not None
@@ -736,10 +844,18 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
             _send({"event": "result", "id": cell_id, "text": result_text})
         if error is not None:
             _send(error)
-        _send({"event": "done", "id": cell_id, "status": status})
+        done: dict[str, Any] = {"event": "done", "id": cell_id, "status": status}
+        try:
+            opened = _cell_files_report(files) if _workspace_root is not None else None
+        except Exception:  # noqa: BLE001 - the report is a convenience, the cell's end is not
+            opened = None
+        if opened is not None:
+            done["files"] = opened
+        _send(done)
     finally:
         execution.owner = None
         execution.finished.set()
+        _cell_files.reset(files_token)
         _current_cell_execution.reset(execution_token)
         _current_cell.reset(cell_token)
 
@@ -1779,6 +1895,7 @@ def main() -> None:
     global _loop, _serve_task
     stdin_fd = _setup_fds()
     _start_owner_watchdog()
+    _install_file_audit()
 
     # Alias the executing module so an in-cell `from rlm.repl import emit`
     # binds the live module, not a second copy.

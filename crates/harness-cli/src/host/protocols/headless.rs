@@ -529,7 +529,8 @@ pub async fn run_with(
             ),
             ..RuntimeConfig::default()
         },
-    );
+    )
+    .with_workspace_root(&context.project.root);
     // A token budget is an explicit account the run reserves against; without
     // one the run has no token bound to promise.
     if let Some(limit) = request.options.budget_tokens {
@@ -688,6 +689,11 @@ pub async fn run_with(
                 }),
                 follows: None,
                 learned: refinements.then(|| context.paths.data_dir.clone()),
+                conversation_dir: Some(super::harness::local_dir(
+                    &context.paths.data_dir,
+                    task_id.as_str(),
+                )),
+                keep_findings: refinements,
             },
             cancellation.clone(),
         )
