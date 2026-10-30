@@ -422,7 +422,7 @@ pub fn follow(data_dir: &Path, root: &Path, key: &str) -> Vec<String> {
         }
         let identity = identity_of(root, known);
         if known != Some(&identity) || !rooted {
-            remember(&store_dir, root, identity);
+            remember(data_dir, &store_dir, root, identity);
         }
         return Vec::new();
     }
@@ -432,7 +432,7 @@ pub fn follow(data_dir: &Path, root: &Path, key: &str) -> Vec<String> {
     }
     if known != Some(&identity) || !rooted {
         // Kept before the store exists, so the next launch runs no git.
-        remember(&store_dir, root, identity.clone());
+        remember(data_dir, &store_dir, root, identity.clone());
     }
     let candidates = moved_stores(data_dir, key, &identity);
     match candidates.as_slice() {
@@ -456,7 +456,17 @@ pub fn follow(data_dir: &Path, root: &Path, key: &str) -> Vec<String> {
 }
 
 /// Record `identity` and `root` in the store directory's manifest.
-fn remember(store_dir: &Path, root: &Path, identity: Identity) {
+/// Under the adoption lock, so an adoption's own record is never lost.
+fn remember(data_dir: &Path, store_dir: &Path, root: &Path, identity: Identity) {
+    let _lock = match lock(data_dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            harness_types::diag::warn("project", "manifest_unwritten")
+                .msg(format!("the adoption lock could not be taken: {error}"))
+                .emit();
+            return;
+        }
+    };
     let mut manifest = manifest(store_dir).unwrap_or_else(|| Manifest {
         schema_version: SCHEMA_VERSION,
         ..Manifest::default()
