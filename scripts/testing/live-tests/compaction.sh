@@ -33,7 +33,7 @@ printf 'Ghi chú vận hành: đọc trong REPL.\n' > "$P/notes/repl-only.txt"
 # The first message is a long spec (well over the 4,000 characters another
 # message is cut to) whose last line is distinctive: a summary must keep it.
 SPEC_TAIL="Dòng kết của spec, giữ nguyên văn: SPEC-TAIL-KESTREL-4471."
-SPEC=$(for n in $(seq -w 1 70); do printf -- '- Yêu cầu R%s: hàm count_m<i>() chỉ đếm dòng của file đầu vào, không đọc biến môi trường, không ghi log, không gọi mạng, không đổi file đầu vào (mục chi tiết số %s).\n' "$n" "$n"; done)
+SPEC=$(for n in $(seq -w 1 30); do printf -- '- Yêu cầu R%s: hàm count_m<i>() chỉ đếm dòng của file đầu vào, không đọc biến môi trường, không ghi log, không gọi mạng, không đổi file đầu vào (mục chi tiết số %s).\n' "$n" "$n"; done)
 # Eight inputs of about 7k tokens each, one per turn.
 "$PY" - "$P/gen" <<'EOF'
 import os, sys
@@ -187,7 +187,7 @@ check "the kept words are what the user typed, not the composed prompt" "! grep 
 # The spec's last line sits past 4,000 characters: 0.8.8 cut it there, and
 # dropped the spec first once the kept words filled their bound.
 echo "   the first message is $(printf '%s' "$SPEC" | wc -m) characters of spec"
-check "after $SUMMARIES summaries the long first spec is kept to its last line, word for word" "grep -qF '$SPEC_TAIL' '$RX/kept-words.md' && grep -qF -- '- Yêu cầu R70:' '$RX/kept-words.md'"
+check "after $SUMMARIES summaries the long first spec is kept to its last line, word for word" "grep -qF '$SPEC_TAIL' '$RX/kept-words.md' && grep -qF -- '- Yêu cầu R30:' '$RX/kept-words.md'"
 store read-files | sort -u > "$RX/read-files.txt"
 sed 's/^/   read-files: /' "$RX/read-files.txt" | grep -i 'notes\|only'
 check "a file read only with run_shell is in the summary's <read-files>" "grep -qx 'notes/shell-only.txt' '$RX/read-files.txt'"

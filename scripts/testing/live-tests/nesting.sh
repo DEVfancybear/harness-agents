@@ -115,33 +115,40 @@ check "ha's commits carry Harness Agents" 'echo "$authors" | grep -q "^Harness A
 check "no commit carries harness-p5" '! (echo "$authors" | grep -q "harness-p5")'
 "$HA" shutdown --force >/dev/null 2>&1
 
-# The delegate calls the root made (in requests without `[task from parent]`),
-# with the child's answer: `{"brief", "result", "root_calls"}` per call as
-# JSON lines, `root_calls` being every call of the root's (`name args`).
+# The newest delegate call a root conversation (a task that is no delegated
+# child) made with a brief holding $1, with the child's answer, as one JSON
+# object: `{"brief", "result", "root_calls"}`, `root_calls` being every call
+# that conversation made (`name args`). Requests are stored as deltas, so a
+# call and its result are joined by the conversation's task.
 delegations() {
-  "$PY" - "$HA_HOME/data" <<'EOF'
+  "$PY" - "$HA_HOME/data" "$1" <<'EOF'
 import glob, json, os, sqlite3, sys
 sys.stdout.reconfigure(encoding="utf-8")
-calls, results, root_calls = {}, {}, {}
+found = None
 for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
-    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests"):
-        messages = json.loads(text).get("messages", [])
-        child = any("[task from parent]" in (m.get("content") or "") for m in messages)
-        if child:
+    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    children = {task for (task,) in c.execute("select task_id from session_settings where setting_key='delegated_child'")}
+    tasks = {}
+    for (task, text) in c.execute("select task_id, request_json from frozen_requests order by rowid"):
+        if task in children:
             continue
-        for m in messages:
+        calls, results, root_calls = tasks.setdefault(task, ({}, {}, {}))
+        for m in json.loads(text).get("messages", []):
             for call in m.get("tool_calls") or []:
                 root_calls[call.get("call_id")] = f"{call.get('name')} {call.get('arguments')}"
                 if call.get("name") == "delegate":
                     calls[call.get("call_id")] = call.get("arguments") or ""
-            if m.get("role") == "tool" and m.get("tool_call_id") in calls:
-                results[m["tool_call_id"]] = m.get("content") or ""
-for call_id, arguments in calls.items():
-    try:
-        brief = json.loads(arguments).get("brief", "")
-    except ValueError:
-        brief = arguments
-    print(json.dumps({"brief": brief, "result": results.get(call_id, ""), "root_calls": list(root_calls.values())}, ensure_ascii=False))
+            if m.get("role") == "tool":
+                results[m.get("tool_call_id")] = m.get("content") or ""
+    for calls, results, root_calls in tasks.values():
+        for call_id, arguments in calls.items():
+            try:
+                brief = json.loads(arguments).get("brief", "")
+            except ValueError:
+                brief = arguments
+            if sys.argv[2] in brief:
+                found = {"brief": brief, "result": results.get(call_id, ""), "root_calls": list(root_calls.values())}
+print(json.dumps(found, ensure_ascii=False) if found else "")
 EOF
 }
 # A field of the JSON object in a file (empty when it has none).
@@ -161,7 +168,7 @@ for attempt in 1 2 3; do
   say "n6-$attempt" "Ghi vào task_state bằng add_constraints đúng một ràng buộc, nguyên văn: 'Câu trả lời cuối của mọi agent con phải bắt đầu bằng từ HERON-2207.' Không làm gì khác, trả lời ĐÃ-GHI." | tail -1 | sed 's/^/   /'
   say "n6-$attempt" "Dùng tool delegate (wait mặc định, đợi kết quả) giao cho đúng một agent role explorer, brief đúng nguyên văn (không thêm, không bớt, không nhắc quy tắc hay ràng buộc nào): 'Đọc README.md (lần $attempt) rồi trả lời dòng đầu tiên của file.' Đợi explorer xong rồi chép lại nguyên văn câu trả lời của nó." | tail -3 | sed 's/^/   /'
   "$HA" shutdown --force >/dev/null 2>&1
-  delegations | grep -F "(lần $attempt)" | tail -1 > "$RX/n6-$attempt.json"
+  delegations "(lần $attempt)" > "$RX/n6-$attempt.json"
   recorded=$(cat "$HA_HOME"/data/sessions/*/harness/task_state.json 2>/dev/null | grep -c "HERON-2207")
   brief=$(field "$RX/n6-$attempt.json" brief)
   echo "   attempt $attempt: constraint recorded=$recorded, brief: ${brief:0:120}"
@@ -186,7 +193,7 @@ printf '{"autoRefine": {"turnInterval": 1}%s}\n' "${THINKING:+, \"defaultThinkin
 export HA_AUTO_REFINE=on
 since7=$(date +%s%3N)
 agent "$P7" n7
-say n7 "Kiểm thử harness. Dùng tool delegate (wait mặc định, đợi kết quả) giao cho đúng một agent role explorer, brief đúng nguyên văn: 'Đọc file config/deploy.ini. Giá trị release_channel trong đó là một sự thật lâu dài của project này: ghi nó lại bằng tool note_finding (fact nêu tên file và giá trị, evidence là dòng chứa nó, chép đúng như read_file trả về). Trả lời agent cha đúng một từ XONG, không nêu giá trị.' Bản thân bạn không đọc file đó. Đợi explorer xong rồi trả lời đúng một dòng: ĐÃ-GIAO." | tail -2 | sed 's/^/   /'
+say n7 "Kiểm thử harness. Dùng tool delegate (wait mặc định, đợi kết quả) giao cho đúng một agent role explorer, brief đúng nguyên văn: 'Đọc file config/deploy.ini, tìm giá trị release_channel và ghi lại bằng tool note_finding (evidence là dòng chứa nó, chép đúng như read_file trả về). Trả lời agent cha đúng một từ XONG, không nêu giá trị.' Bản thân bạn không đọc file đó. Đợi explorer xong rồi trả lời đúng một dòng: ĐÃ-GIAO." | tail -2 | sed 's/^/   /'
 # The review runs in the background after the turn: wait for its record, at
 # most ten minutes.
 reviewed=""
@@ -204,7 +211,7 @@ for line in sys.stdin:
 done
 "$HA" shutdown --force >/dev/null 2>&1
 echo "   review: ${reviewed:-none}"
-delegations | grep -F "config/deploy.ini" | tail -1 > "$RX/n7.json"
+delegations "config/deploy.ini" > "$RX/n7.json"
 "$PY" - "$RX/n7.json" > "$RX/n7.pre" <<'EOF'
 import json, sys
 text = open(sys.argv[1], encoding="utf-8").read().strip()
