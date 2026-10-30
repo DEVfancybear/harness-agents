@@ -365,7 +365,10 @@ pub const CHILD_STATE_TOKENS: u64 = 1_500;
 /// every constraint that fits, then the newest decisions, with a line saying
 /// how many are not shown and who holds them. A child was sent its brief
 /// alone, and a rule the user had set for the whole task ("never touch
-/// vendor/") was unknown to it unless the brief happened to repeat it.
+/// vendor/") was unknown to it unless the brief happened to repeat it. The
+/// brief wins over a constraint it seems to break: a live parent recorded
+/// "do not read config/deploy.ini" about itself and delegated the reading,
+/// and its child, told every constraint held for it too, refused the task.
 #[must_use]
 pub fn child_block(path: &Path) -> Option<ContextBlock> {
     let state = load(path);
@@ -404,7 +407,7 @@ pub fn child_block(path: &Path) -> Option<ContextBlock> {
     let hidden =
         state.constraints.len() + state.decisions.len() - constraints.len() - decisions.len();
     let mut text = String::from(
-        "The task your parent works on, as its task state records it: these hold for your part of it too.",
+        "The task your parent works on, as its task state records it. The user's constraints hold for your part of it too. Your parent wrote your brief knowing them: where the brief asks for something one of them seems to rule out (a rule about what your parent itself does), follow the brief and say so in your answer.",
     );
     if !constraints.is_empty() {
         text.push_str("\nConstraints (from the user; they hold for the whole task):");
