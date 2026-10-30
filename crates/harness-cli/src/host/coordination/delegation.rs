@@ -368,8 +368,16 @@ pub const CHILD_PROMPT_HEAD: &str = "[task from parent]";
 /// children found ([`ChildFinding`]), one JSON object a line.
 pub const CHILD_FINDINGS_FILE: &str = "child_findings.jsonl";
 
-/// The file beside it naming the newest finding a review was given.
+/// The file beside it naming the last finding a review that succeeded was
+/// given (its [`ChildFinding::seq`]).
 const FINDINGS_OFFERED_FILE: &str = "child_findings.offered";
+
+/// The lock file beside them: every process that keeps a finding or moves
+/// the cursor holds it.
+const FINDINGS_LOCK_FILE: &str = "child_findings.lock";
+
+/// How long a writer waits for another process holding [`FINDINGS_LOCK_FILE`].
+const FINDINGS_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// The longest a finding's fact may be.
 const FINDING_FACT_CHARS: usize = 400;
@@ -386,7 +394,7 @@ const FINDINGS_PER_RUN: usize = 8;
 /// How many findings the file keeps, the newest.
 const FINDINGS_KEPT: usize = 200;
 
-/// How many findings one review is given, the newest.
+/// How many findings one review is given, the oldest not given yet.
 const FINDINGS_PER_REVIEW: usize = 12;
 
 /// What a child's system text says of `note_finding`.
@@ -395,8 +403,12 @@ const FINDINGS_LINE: &str = " When a tool result shows a lasting fact about the 
 /// A fact a child found, with the words of its tool result that show it.
 #[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
 pub struct ChildFinding {
-    /// When it was kept, in milliseconds; increasing, so a review is given
-    /// each finding once.
+    /// Its place among the conversation's findings, one more than the last
+    /// one kept (or than the cursor), given under the lock: the order a review
+    /// is given them in, whichever process kept them.
+    #[serde(default)]
+    pub seq: u64,
+    /// When it was kept, in milliseconds.
     pub at_ms: u64,
     pub child: String,
     pub role: String,
@@ -410,63 +422,110 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Keep `finding` in the file at `path`, the newest [`FINDINGS_KEPT`].
-fn keep_finding(path: &Path, mut finding: ChildFinding) -> Result<(), String> {
-    use std::io::Write as _;
-    static WRITING: Mutex<u64> = Mutex::new(0);
-    let mut last = WRITING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    finding.at_ms = finding.at_ms.max(*last + 1);
-    *last = finding.at_ms;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+/// The findings kept in the folder `local`, oldest first.
+fn kept_findings(local: &Path) -> Vec<ChildFinding> {
+    std::fs::read_to_string(local.join(CHILD_FINDINGS_FILE))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<ChildFinding>(line).ok())
+        .collect()
+}
+
+/// The last finding a review that succeeded was given.
+fn findings_cursor(local: &Path) -> u64 {
+    std::fs::read_to_string(local.join(FINDINGS_OFFERED_FILE))
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Keep `finding` in the folder `local`, the newest [`FINDINGS_KEPT`]: under
+/// the lock every process takes, numbered after the last one kept and after
+/// the cursor, and the file replaced whole, so a finding another process
+/// keeps at the same time is neither lost nor given a place a review has
+/// already passed.
+fn keep_finding(local: &Path, mut finding: ChildFinding) -> Result<(), String> {
+    let _lock = super::files::hold(
+        &local.join(FINDINGS_LOCK_FILE),
+        FINDINGS_LOCK_WAIT,
+        "child findings",
+    )?;
+    let mut findings = kept_findings(local);
+    finding.seq = findings
+        .iter()
+        .map(|kept| kept.seq)
+        .max()
+        .unwrap_or(0)
+        .max(findings_cursor(local))
+        + 1;
+    findings.push(finding);
+    let excess = findings.len().saturating_sub(FINDINGS_KEPT);
+    let mut text = String::new();
+    for kept in &findings[excess..] {
+        text.push_str(&serde_json::to_string(kept).map_err(|error| error.to_string())?);
+        text.push('\n');
     }
-    let line = serde_json::to_string(&finding).map_err(|error| error.to_string())?;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut file| writeln!(file, "{line}"))
-        .map_err(|error| format!("the finding could not be kept: {error}"))?;
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    let lines = text.lines().collect::<Vec<_>>();
-    if lines.len() > FINDINGS_KEPT {
-        let kept = lines[lines.len() - FINDINGS_KEPT..].join("\n");
-        let temporary = path.with_extension("jsonl.tmp");
-        std::fs::write(&temporary, format!("{kept}\n"))
-            .and_then(|()| std::fs::rename(&temporary, path))
-            .map_err(|error| format!("the findings could not be trimmed: {error}"))?;
+    super::files::write_atomic(&local.join(CHILD_FINDINGS_FILE), &text)
+        .map_err(|error| format!("the finding could not be kept: {error}"))
+}
+
+/// The findings a review of the conversation whose local harness folder is
+/// `local` is given: those after the cursor, oldest first, at most
+/// [`FINDINGS_PER_REVIEW`].
+fn pending_findings(local: &Path) -> Vec<ChildFinding> {
+    let since = findings_cursor(local);
+    let mut findings = kept_findings(local)
+        .into_iter()
+        .filter(|finding| finding.seq > since)
+        .collect::<Vec<_>>();
+    findings.sort_by_key(|finding| finding.seq);
+    findings.truncate(FINDINGS_PER_REVIEW);
+    findings
+}
+
+/// The place of the last finding a review starting now is given, to mark
+/// them given with [`findings_given`] once that review succeeded; `None` when
+/// none is waiting. Taken before the review's transcript is read: a finding
+/// kept in between is in the transcript but not marked, and is given again,
+/// never lost.
+#[must_use]
+pub fn findings_pending_through(local: &Path) -> Option<u64> {
+    pending_findings(local).last().map(|finding| finding.seq)
+}
+
+/// Mark the findings up to `through` given: the review that carried them
+/// succeeded. A review that failed (a provider error, a stop) marks nothing,
+/// and its retry is given them again.
+pub fn findings_given(local: &Path, through: u64) {
+    let Ok(_lock) = super::files::hold(
+        &local.join(FINDINGS_LOCK_FILE),
+        FINDINGS_LOCK_WAIT,
+        "child findings",
+    ) else {
+        return;
+    };
+    if through > findings_cursor(local) {
+        let _ =
+            super::files::write_atomic(&local.join(FINDINGS_OFFERED_FILE), &through.to_string());
     }
-    Ok(())
 }
 
 /// The findings the children of the conversation whose local harness folder
-/// is `local` kept since the last review was given them, as the block a
+/// is `local` kept that no successful review was given yet, as the block a
 /// review's transcript ends with, one per child; `None` when there are none.
-/// Reading them marks them given: the next review is given only newer ones.
+/// Reading them marks nothing ([`findings_given`] does, after the review).
 ///
 /// Each block is labelled as a tool result's, which is what a finding is -
 /// what the project showed a child - so a review never takes one for the
 /// user's words (`lessons::Quotes`).
 #[must_use]
 pub fn findings_for_review(local: &Path) -> Option<String> {
-    let offered = local.join(FINDINGS_OFFERED_FILE);
-    let since = std::fs::read_to_string(&offered)
-        .ok()
-        .and_then(|text| text.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    let findings = std::fs::read_to_string(local.join(CHILD_FINDINGS_FILE))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| serde_json::from_str::<ChildFinding>(line).ok())
-        .filter(|finding| finding.at_ms > since)
-        .collect::<Vec<_>>();
-    let newest = findings.iter().map(|finding| finding.at_ms).max()?;
-    let _ = std::fs::write(&offered, newest.to_string());
-    let given = &findings[findings.len().saturating_sub(FINDINGS_PER_REVIEW)..];
+    let given = pending_findings(local);
+    if given.is_empty() {
+        return None;
+    }
     let mut children = Vec::<(&str, Vec<&ChildFinding>)>::new();
-    for finding in given {
+    for finding in &given {
         match children
             .iter_mut()
             .find(|(child, _)| *child == finding.child)
@@ -4442,8 +4501,9 @@ fn verifier_schemas() -> Vec<Value> {
 struct ChildTools {
     shared: Arc<AgentsShared>,
     task_id: TaskId,
-    /// Where this child's findings are kept for the root's review
-    /// ([`CHILD_FINDINGS_FILE`]); `None` when nothing keeps them.
+    /// The root conversation's local harness folder, where this child's
+    /// findings are kept for the root's review ([`CHILD_FINDINGS_FILE`]);
+    /// `None` when nothing keeps them.
     findings: Option<PathBuf>,
     /// How many findings this run has kept, bounded by [`FINDINGS_PER_RUN`].
     noted: AtomicUsize,
@@ -4649,6 +4709,7 @@ impl ChildTools {
         keep_finding(
             path,
             ChildFinding {
+                seq: 0,
                 at_ms: harness_runtime::now_unix_ms(),
                 child,
                 role,
@@ -5366,7 +5427,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 .conversation_dir
                 .as_ref()
                 .filter(|_| launch.keep_findings)
-                .map(|dir| dir.join(CHILD_FINDINGS_FILE));
+                .cloned();
             let findings_line = if findings.is_some() {
                 FINDINGS_LINE
             } else {
@@ -6259,6 +6320,61 @@ pub(super) mod tests {
         assert_eq!(
             delegate["function"]["parameters"]["properties"]["role"]["enum"],
             serde_json::json!(["explorer"])
+        );
+    }
+
+    /// The findings cursor cannot skip one: each finding is numbered under the
+    /// lock after the last kept and after the cursor, a review is given the
+    /// oldest waiting ones, and only a review that succeeded moves the cursor.
+    #[test]
+    fn a_finding_is_given_until_a_review_that_carried_it_succeeds() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let local = temp.path().join("harness");
+        let finding = |fact: &str| super::ChildFinding {
+            seq: 0,
+            at_ms: 1,
+            child: "explorer-1".to_owned(),
+            role: "explorer".to_owned(),
+            fact: fact.to_owned(),
+            evidence: format!("{fact} as the tool said"),
+        };
+        super::keep_finding(&local, finding("fact one")).expect("kept");
+        let through = super::findings_pending_through(&local).expect("waiting");
+        // Another process keeps one while the review runs: it is numbered
+        // after, so the cursor the review moves does not pass it.
+        super::keep_finding(&local, finding("fact two")).expect("kept");
+        super::findings_given(&local, through);
+        let next = super::findings_for_review(&local).expect("the newer one waits");
+        assert!(
+            next.contains("fact two") && !next.contains("fact one"),
+            "{next}"
+        );
+        // A file trimmed or lost below the cursor numbers past the cursor.
+        let through = super::findings_pending_through(&local).expect("waiting");
+        super::findings_given(&local, through);
+        std::fs::remove_file(local.join(super::CHILD_FINDINGS_FILE)).expect("removed");
+        super::keep_finding(&local, finding("fact three")).expect("kept");
+        assert!(
+            super::findings_for_review(&local).is_some_and(|text| text.contains("fact three")),
+            "numbered past the cursor"
+        );
+        // More than a review takes: the oldest first, the rest after.
+        for index in 0..super::FINDINGS_PER_REVIEW + 3 {
+            super::keep_finding(&local, finding(&format!("many {index:02}"))).expect("kept");
+        }
+        let first = super::findings_for_review(&local).expect("given");
+        assert!(
+            first.contains("fact three") && !first.contains("many 14"),
+            "{first}"
+        );
+        super::findings_given(
+            &local,
+            super::findings_pending_through(&local).expect("waiting"),
+        );
+        let rest = super::findings_for_review(&local).expect("the rest");
+        assert!(
+            rest.contains("many 14") && !rest.contains("fact three"),
+            "{rest}"
         );
     }
 
@@ -9828,7 +9944,19 @@ mod real_worker_tests {
             !review.contains("\n\n"),
             "one block: the review's quote rules read it whole"
         );
-        assert_eq!(super::findings_for_review(&local), None, "given once");
+        // Reading marks nothing: a review that failed is given them again.
+        let through = super::findings_pending_through(&local).expect("one is waiting");
+        assert_eq!(
+            super::findings_for_review(&local),
+            Some(review),
+            "a retry gets them"
+        );
+        super::findings_given(&local, through);
+        assert_eq!(
+            super::findings_for_review(&local),
+            None,
+            "given once it succeeded"
+        );
         // Without a review to read them, a child is not offered the tool.
         let mut launch = super::tests::launch_for(&bench.repo, provider.clone());
         launch.conversation_dir = Some(local.clone());
