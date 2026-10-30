@@ -112,13 +112,38 @@ if [ -z "$PKEY" ]; then
 fi
 PID=$(events | awk -F'\t' -v code="$PCODE" 'index($3, code) {print $1; exit}')
 echo "precondition: the entry $PKEY ($PID) holds the code, and so do the store's files: $(in_store_files "$PCODE" && echo yes || echo no)"
+# A review that recorded it names its content and its key, in the store's
+# refinement summary (brought in as the old state brings one) and in the
+# history: a purge leaves neither saying it.
+"$PY" - "$G" "$PCODE" "$PKEY" <<'PYEOF'
+import json, os, sys
+g, code, key = sys.argv[1:4]
+review = {"id": "ref_live", "trigger": f"Recorded the tea blend {code}", "changes": [f"create memory:{key}"],
+          "evidence": f"the user named {code}", "outcome": "kept", "created_at": "2026-10-01T00:00:00Z"}
+with open(os.path.join(g, "harness_state.json"), "w", encoding="utf-8") as f:
+    json.dump({"schema": 1, "entries": {}, "refinements": [review]}, f)
+with open(os.path.join(g, "refinements.jsonl"), "a", encoding="utf-8") as f:
+    f.write(json.dumps({"id": "ref_live", "summary": f"Recorded the tea blend {code}", "rationale": f"{code} was named",
+                        "appliedEdits": [{"action": "create", "kind": "memory", "id": key, "content": code, "applied": True}]}) + "\n")
+PYEOF
+"$HA" memory export > /dev/null 2>&1
+# The store's files, as a dry run must leave them: what a reader maps aside
+# (the shared-memory index, an empty log) left out.
+store_hash() { for f in "$G"/*; do case "$f" in *-shm) continue;; *-wal) [ -s "$f" ] || continue;; esac; [ -f "$f" ] && sha256sum "$f"; done | sha256sum; }
+if ! "$HA" memory export | grep -q "Recorded the tea blend $PCODE"; then
+  echo "PRECONDITION FAILED: the planted review is not in the store; rerun"
+  exit 2
+fi
+before=$(store_hash)
 "$HA" memory purge "$PKEY" >"$RX/purge-list.out" 2>&1
 sed 's/^/   /' "$RX/purge-list.out"
-check "without --yes the purge lists the entry and changes nothing" 'grep -q "would purge.*$PKEY" "$RX/purge-list.out" && [ -n "$(key_of "$PCODE")" ]'
+check "without --yes the purge lists the entry and the reviews it rewrites" 'grep -q "would purge.*$PKEY" "$RX/purge-list.out" && grep -q "1 refinement summary(ies), 1 record(s) of refinements.jsonl" "$RX/purge-list.out"'
+check "and changes no file of the store" '[ "$(store_hash)" = "$before" ] && [ -n "$(key_of "$PCODE")" ]'
 "$HA" memory purge "$PKEY" --yes >"$RX/purge.out" 2>&1
 sed 's/^/   /' "$RX/purge.out"
 check "the entry is gone" '[ -z "$(key_of "$PCODE")" ]'
-check "its content is in no file of the store" '! in_store_files "$PCODE"'
+check "its content is in no file of the store, the review's words included" '! in_store_files "$PCODE"'
+check "nor is its key in the review that wrote it" '! grep -qF "memory:$PKEY" "$G/refinements.jsonl" && ! "$HA" memory export | grep -qF "memory:$PKEY"'
 # The events of one memory, as `<operation> <doc>` lines.
 events_of() { events | awk -F'	' -v id="$1" '$1 == id {print $2, $3}'; }
 check "one event remains for it, a purge with no content" '[ -n "$PID" ] && [ "$(events_of "$PID")" = "purge {}" ]'

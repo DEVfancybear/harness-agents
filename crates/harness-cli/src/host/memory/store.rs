@@ -19,7 +19,7 @@
 //! it and renamed: that is how an upgrade migrates, and how a test or a person
 //! drops entries in.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1638,12 +1638,11 @@ pub struct PurgeTarget {
 /// # Errors
 /// The store cannot be read.
 pub fn purge_targets(dir: &Path, target: &str) -> Result<Vec<PurgeTarget>, String> {
-    let Some(store) = Store::existing(dir)? else {
+    let Some(conn) = read_only(dir)? else {
         return Ok(Vec::new());
     };
     let mut found = BTreeMap::<String, PurgeTarget>::new();
-    let mut statement = store
-        .conn
+    let mut statement = conn
         .prepare("SELECT id, kind, key, doc FROM memory WHERE id = ?1 OR key = ?1")
         .map_err(sql)?;
     let rows = statement
@@ -1673,8 +1672,7 @@ pub fn purge_targets(dir: &Path, target: &str) -> Result<Vec<PurgeTarget>, Strin
             },
         );
     }
-    let mut statement = store
-        .conn
+    let mut statement = conn
         .prepare(
             "SELECT memory_id, kind, key, doc FROM memory_event
              WHERE (memory_id = ?1 OR key = ?1) AND operation != 'purge' ORDER BY at, rowid",
@@ -1711,7 +1709,7 @@ pub fn purge_targets(dir: &Path, target: &str) -> Result<Vec<PurgeTarget>, Strin
         }
     }
     for entry in found.values_mut() {
-        entry.logged = count_events(&store.conn, &entry.memory)?;
+        entry.logged = count_events(&conn, &entry.memory)?;
     }
     Ok(found.into_values().collect())
 }
@@ -1739,12 +1737,11 @@ fn count_events(conn: &Connection, memory: &str) -> Result<usize, String> {
     reason = "one scan: the live entries, then the log"
 )]
 pub fn secret_targets(dir: &Path) -> Result<Vec<(PurgeTarget, &'static str)>, String> {
-    let Some(store) = Store::existing(dir)? else {
+    let Some(conn) = read_only(dir)? else {
         return Ok(Vec::new());
     };
     let mut found = BTreeMap::<String, (PurgeTarget, &'static str)>::new();
-    let mut statement = store
-        .conn
+    let mut statement = conn
         .prepare("SELECT id, kind, key, doc FROM memory")
         .map_err(sql)?;
     let live = statement
@@ -1781,8 +1778,7 @@ pub fn secret_targets(dir: &Path) -> Result<Vec<(PurgeTarget, &'static str)>, St
             }
         }
     }
-    let mut statement = store
-        .conn
+    let mut statement = conn
         .prepare(
             "SELECT event_id, memory_id, kind, key, doc FROM memory_event
              WHERE operation != 'purge' ORDER BY at, rowid",
@@ -1847,7 +1843,7 @@ pub fn secret_targets(dir: &Path) -> Result<Vec<(PurgeTarget, &'static str)>, St
         .filter(|(target, _)| target.whole || !whole.contains(&target.memory))
         .collect::<Vec<_>>();
     for (target, _) in &mut targets {
-        target.logged = count_events(&store.conn, &target.memory)?;
+        target.logged = count_events(&conn, &target.memory)?;
     }
     Ok(targets)
 }
@@ -1863,8 +1859,11 @@ const PURGE_CAUSE: &str = "purge";
 /// immutable id, the store's root as its tree, no name and an empty
 /// document. Deleted rows are overwritten (`secure_delete`), and the database
 /// is rebuilt and its log emptied, so the text is in none of its files.
-/// `secrets` also redacts every secret value left in those files. The caller
-/// holds the scope's lock.
+/// A refinement that changed a memory purged whole loses its text (its
+/// summary, rationale and the key its changes name); one that changed a memory
+/// that lost some versions, the secret values it holds. `redact_all` (a purge
+/// of every secret, with no scope) redacts every secret value of the store and
+/// its files. The caller holds the scope's lock.
 ///
 /// # Errors
 /// The store cannot be written; nothing is then changed in it.
@@ -1876,7 +1875,7 @@ pub fn purge(
     dir: &Path,
     targets: &[PurgeTarget],
     writer: &Writer,
-    secrets: bool,
+    redact_all: bool,
 ) -> Result<Purged, String> {
     let mut store = Store::open(dir)?;
     let root = store.root;
@@ -1948,29 +1947,15 @@ pub fn purge(
             },
         )?;
     }
-    if secrets {
-        let mut statement = transaction
-            .prepare("SELECT seq, event FROM refinement")
+    let scrub = Scrub::of(targets, redact_all);
+    let plan = scrub.plan(dir, &refinement_rows(&transaction)?);
+    for (seq, event) in &plan.rows {
+        transaction
+            .execute(
+                "UPDATE refinement SET event = ? WHERE seq = ?",
+                params![event, seq],
+            )
             .map_err(sql)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(sql)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(sql)?;
-        drop(statement);
-        for (seq, event) in rows {
-            let redacted = harness_tools::secret_values::redact(&event);
-            if redacted != event {
-                transaction
-                    .execute(
-                        "UPDATE refinement SET event = ? WHERE seq = ?",
-                        params![redacted.as_ref(), seq],
-                    )
-                    .map_err(sql)?;
-            }
-        }
     }
     transaction.commit().map_err(sql)?;
     // Rebuilt, so no free page keeps an old row; the log emptied, so no frame
@@ -1985,11 +1970,31 @@ pub fn purge(
         })
         .unwrap_or(1);
     drop(store);
-    scrub_files(dir, targets, secrets)?;
+    for (path, text) in &plan.files {
+        super::files::write_atomic(path, text)?;
+    }
     Ok(Purged {
         removed,
         settled: vacuumed && busy == 0,
+        rewritten: plan.counts(),
     })
+}
+
+/// What [`purge`] would rewrite beside the rows of `targets`, read without
+/// changing anything: the dry run lists it.
+///
+/// # Errors
+/// The store cannot be read.
+pub fn purge_plan(
+    dir: &Path,
+    targets: &[PurgeTarget],
+    redact_all: bool,
+) -> Result<Rewritten, String> {
+    let rows = match read_only(dir)? {
+        Some(conn) => refinement_rows(&conn)?,
+        None => Vec::new(),
+    };
+    Ok(Scrub::of(targets, redact_all).plan(dir, &rows).counts())
 }
 
 /// What [`purge`] did.
@@ -2000,117 +2005,326 @@ pub struct Purged {
     /// The database's log was emptied: false while another process reads the
     /// store, whose log may still hold the purged text until it closes.
     pub settled: bool,
+    pub rewritten: Rewritten,
 }
 
-/// The copies of purged entries in the files beside a store: each
-/// refinement's edit of one (in `refinements.jsonl`) is cut to what it did,
-/// with no title, content, before or after; the imported legacy state loses
-/// the entry and the imported journal its lines. `secrets` also redacts every
-/// secret value those files hold.
-#[allow(clippy::too_many_lines, reason = "three files, each its own shape")]
-fn scrub_files(dir: &Path, targets: &[PurgeTarget], secrets: bool) -> Result<(), String> {
-    let whole = targets
-        .iter()
-        .filter(|target| target.whole)
-        .map(|target| (target.kind.as_str(), target.key.as_str()))
-        .collect::<std::collections::BTreeSet<_>>();
-    let named = |kind: &Value, key: &Value| {
+/// The copies a purge rewrites beside the rows.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Rewritten {
+    /// Refinement summaries (the store's `refinement` rows).
+    pub refinements: usize,
+    /// Records of `refinements.jsonl`.
+    pub history: usize,
+    /// Lines of the imported legacy journal, and entries of the imported
+    /// legacy state.
+    pub legacy: usize,
+}
+
+impl Rewritten {
+    #[must_use]
+    pub const fn any(&self) -> bool {
+        self.refinements + self.history + self.legacy > 0
+    }
+}
+
+/// What a refinement that changed a purged memory says of it instead.
+const PURGED_TEXT: &str = "[purged: this refinement changed a memory that was purged]";
+
+/// How a purge rewrites the copies beside the rows: what names a memory
+/// purged whole loses its text; what names a memory that lost some versions
+/// loses the secret values those held; with `redact_all` (a purge of every
+/// secret, with no scope), every secret value goes.
+struct Scrub {
+    whole: BTreeSet<(String, String)>,
+    versions: BTreeSet<(String, String)>,
+    redact_all: bool,
+}
+
+/// The rewritten rows and files of a [`Scrub`].
+#[derive(Default)]
+struct Plan {
+    rows: Vec<(i64, String)>,
+    files: Vec<(PathBuf, String)>,
+    counts: Rewritten,
+}
+
+impl Plan {
+    const fn counts(&self) -> Rewritten {
+        self.counts
+    }
+}
+
+fn refinement_rows(conn: &Connection) -> Result<Vec<(i64, String)>, String> {
+    let mut statement = conn
+        .prepare("SELECT seq, event FROM refinement ORDER BY seq")
+        .map_err(sql)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(sql)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql)?;
+    Ok(rows)
+}
+
+fn holds_secret(text: &str) -> bool {
+    harness_tools::secret_values::first(text).is_some()
+}
+
+fn redacted(text: &str) -> String {
+    harness_tools::secret_values::redact(text).into_owned()
+}
+
+impl Scrub {
+    fn of(targets: &[PurgeTarget], redact_all: bool) -> Self {
+        let pairs = |whole: bool| {
+            targets
+                .iter()
+                .filter(|target| target.whole == whole)
+                .map(|target| (target.kind.clone(), target.key.clone()))
+                .collect()
+        };
+        Self {
+            whole: pairs(true),
+            versions: pairs(false),
+            redact_all,
+        }
+    }
+
+    fn names(set: &BTreeSet<(String, String)>, kind: &Value, key: &Value) -> bool {
         kind.as_str()
             .zip(key.as_str())
-            .is_some_and(|pair| whole.contains(&pair))
-    };
-    let rewrite = |path: &Path, change: &dyn Fn(&str) -> Option<String>| -> Result<(), String> {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Ok(());
-        };
-        let mut out = String::with_capacity(text.len());
-        for line in text.split_inclusive('\n') {
-            if let Some(kept) = change(line) {
-                out.push_str(&kept);
+            .is_some_and(|(kind, key)| set.contains(&(kind.to_owned(), key.to_owned())))
+    }
+
+    /// The `(kind, key)` a refinement summary's change names: `update
+    /// memory:door`.
+    fn change_names(change: &str) -> Option<(String, String)> {
+        let (_, target) = change.split_once(' ')?;
+        let (kind, key) = target.split_once(':')?;
+        Some((kind.to_owned(), key.to_owned()))
+    }
+
+    /// A refinement summary (`{id, trigger, changes, evidence, outcome}`) as
+    /// the purge leaves it, or `None` when it stays.
+    fn summary(&self, text: &str) -> Option<String> {
+        let mut event = serde_json::from_str::<Value>(text).ok()?;
+        let named = event["changes"]
+            .as_array()
+            .map(|changes| {
+                changes
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(Self::change_names)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut out = text.to_owned();
+        if named.iter().any(|pair| self.whole.contains(pair)) {
+            for field in ["trigger", "evidence", "outcome"] {
+                if event.get(field).is_some_and(|value| !value.is_null()) {
+                    event[field] = json!(PURGED_TEXT);
+                }
             }
+            if let Some(changes) = event["changes"].as_array_mut() {
+                for change in changes {
+                    let Some(text) = change.as_str() else {
+                        continue;
+                    };
+                    if let Some(pair) = Self::change_names(text)
+                        && self.whole.contains(&pair)
+                    {
+                        let action = text.split_once(' ').map_or("", |(action, _)| action);
+                        *change = json!(format!("{action} {}:[purged]", pair.0));
+                    }
+                }
+            }
+            out = event.to_string();
         }
-        if secrets {
-            out = harness_tools::secret_values::redact(&out).into_owned();
+        if self.redact_all || named.iter().any(|pair| self.versions.contains(pair)) {
+            out = redacted(&out);
         }
-        if out != text {
-            super::files::write_atomic(path, &out)?;
-        }
-        Ok(())
-    };
-    rewrite(&dir.join("refinements.jsonl"), &|line| {
-        let Ok(mut record) = serde_json::from_str::<Value>(line.trim()) else {
-            return Some(line.to_owned());
-        };
-        let mut changed = false;
+        (out != text).then_some(out)
+    }
+
+    /// A record of `refinements.jsonl` as the purge leaves it.
+    fn history(&self, line: &str) -> Option<String> {
+        let mut record = serde_json::from_str::<Value>(line.trim()).ok()?;
+        let mut whole = false;
+        let mut versions = false;
         if let Some(edits) = record["appliedEdits"].as_array_mut() {
             for edit in edits {
-                if named(&edit["kind"], &edit["id"])
-                    || secrets
-                        && ["before", "after", "title", "content"].iter().any(|field| {
-                            harness_tools::secret_values::first(&edit[field].to_string()).is_some()
-                        })
-                {
+                let of_whole = Self::names(&self.whole, &edit["kind"], &edit["id"]);
+                let of_versions = Self::names(&self.versions, &edit["kind"], &edit["id"]);
+                whole |= of_whole;
+                versions |= of_versions;
+                let secret = (of_versions || self.redact_all)
+                    && ["before", "after", "title", "content"]
+                        .iter()
+                        .any(|field| holds_secret(&edit[*field].to_string()));
+                if of_whole || secret {
                     *edit = json!({
                         "action": edit["action"],
                         "kind": edit["kind"],
                         "applied": edit["applied"],
                         "purged": true,
                     });
-                    changed = true;
                 }
             }
         }
-        Some(if changed {
-            format!("{record}\n")
-        } else {
-            line.to_owned()
-        })
-    })?;
-    rewrite(&dir.join(format!("{LEGACY_JOURNAL}.imported")), &|line| {
+        if whole {
+            for field in ["summary", "rationale", "expectedOutcome"] {
+                if record.get(field).is_some_and(|value| !value.is_null()) {
+                    record[field] = json!(PURGED_TEXT);
+                }
+            }
+        }
+        let mut out = format!("{record}\n");
+        if versions || self.redact_all {
+            out = redacted(&out);
+        }
+        let same = serde_json::from_str::<Value>(out.trim()).ok()
+            == serde_json::from_str::<Value>(line.trim()).ok();
+        (!same).then_some(out)
+    }
+
+    /// Whether a line of the imported legacy journal goes.
+    fn drops_journal_line(&self, line: &str) -> bool {
         let Ok(record) = serde_json::from_str::<Value>(line.trim()) else {
-            return Some(line.to_owned());
+            return false;
         };
         let key = if record["id"].is_string() {
             &record["id"]
         } else {
             &record["entry"]["id"]
         };
-        let tainted = secrets && harness_tools::secret_values::first(line).is_some();
-        (!named(&record["kind"], key) && !tainted).then(|| line.to_owned())
-    })?;
-    let state = dir.join(format!("{LEGACY_STATE}.imported"));
-    if let Ok(text) = std::fs::read_to_string(&state)
-        && let Ok(mut legacy) = serde_json::from_str::<Value>(&text)
-    {
-        let mut changed = false;
-        if let Some(kinds) = legacy["entries"].as_object_mut() {
-            for (kind, records) in kinds.iter_mut() {
-                if let Some(records) = records.as_object_mut() {
-                    let before = records.len();
-                    records.retain(|key, entry| {
-                        let gone = whole.contains(&(kind.as_str(), key.as_str()))
-                            || secrets
-                                && harness_tools::secret_values::first(&entry.to_string())
-                                    .is_some();
-                        !gone
-                    });
-                    changed |= records.len() != before;
-                }
+        Self::names(&self.whole, &record["kind"], key)
+            || (self.redact_all || Self::names(&self.versions, &record["kind"], key))
+                && holds_secret(line)
+    }
+
+    fn plan(&self, dir: &Path, rows: &[(i64, String)]) -> Plan {
+        let mut plan = Plan::default();
+        for (seq, event) in rows {
+            if let Some(out) = self.summary(event) {
+                plan.rows.push((*seq, out));
+                plan.counts.refinements += 1;
             }
         }
-        let mut out = if changed {
-            legacy.to_string()
-        } else {
-            text.clone()
-        };
-        if secrets {
-            out = harness_tools::secret_values::redact(&out).into_owned();
+        let history = dir.join("refinements.jsonl");
+        if let Ok(text) = std::fs::read_to_string(&history) {
+            let mut out = String::with_capacity(text.len());
+            for line in text.split_inclusive('\n') {
+                match self.history(line) {
+                    Some(kept) => {
+                        out.push_str(&kept);
+                        plan.counts.history += 1;
+                    }
+                    None => out.push_str(line),
+                }
+            }
+            if out != text {
+                plan.files.push((history, out));
+            }
         }
-        if out != text {
-            super::files::write_atomic(&state, &out)?;
+        let journal = dir.join(format!("{LEGACY_JOURNAL}.imported"));
+        if let Ok(text) = std::fs::read_to_string(&journal) {
+            let mut out = String::with_capacity(text.len());
+            for line in text.split_inclusive('\n') {
+                if self.drops_journal_line(line) {
+                    plan.counts.legacy += 1;
+                } else {
+                    out.push_str(line);
+                }
+            }
+            if out != text {
+                plan.files.push((journal, out));
+            }
         }
+        let state = dir.join(format!("{LEGACY_STATE}.imported"));
+        if let Ok(text) = std::fs::read_to_string(&state)
+            && let Ok(mut legacy) = serde_json::from_str::<Value>(&text)
+        {
+            let mut gone = 0;
+            if let Some(kinds) = legacy["entries"].as_object_mut() {
+                for (kind, records) in kinds.iter_mut() {
+                    if let Some(records) = records.as_object_mut() {
+                        let before = records.len();
+                        records.retain(|key, entry| {
+                            let pair = (kind.clone(), key.clone());
+                            let drop = self.whole.contains(&pair)
+                                || (self.redact_all || self.versions.contains(&pair))
+                                    && holds_secret(&entry.to_string());
+                            !drop
+                        });
+                        gone += before - records.len();
+                    }
+                }
+            }
+            // Its refinements are summaries as the store's are.
+            if let Some(events) = legacy["refinements"].as_array_mut() {
+                for event in events {
+                    if let Some(out) = self.summary(&event.to_string())
+                        && let Ok(scrubbed) = serde_json::from_str::<Value>(&out)
+                    {
+                        *event = scrubbed;
+                        gone += 1;
+                    }
+                }
+            }
+            let mut out = if gone > 0 {
+                legacy.to_string()
+            } else {
+                text.clone()
+            };
+            if self.redact_all {
+                out = redacted(&out);
+            }
+            if out != text {
+                plan.counts.legacy += gone.max(1);
+                plan.files.push((state, out));
+            }
+        }
+        plan
     }
-    Ok(())
+}
+
+/// A store's database opened read-only: a dry run changes nothing, not even
+/// a migration or an import. `None` when the scope has no database.
+///
+/// # Errors
+/// It cannot be opened, or was written by another schema than this ha reads
+/// (any `ha memory` command that writes migrates it first).
+fn read_only(dir: &Path) -> Result<Option<Connection>, String> {
+    let path = db_path(dir);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(sql)?;
+    conn.busy_timeout(Duration::from_secs(5)).map_err(sql)?;
+    let schema = conn
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+        .map_err(sql)?;
+    if schema != SCHEMA_VERSION {
+        return Err(format!(
+            "the memory store at {} is at schema {schema}, not {SCHEMA_VERSION}: it is migrated by the next ha that writes it",
+            dir.display()
+        ));
+    }
+    Ok(Some(conn))
+}
+
+/// The legacy files beside a store that wait to be imported: a read-only
+/// search does not see what they hold until a write opens the store.
+#[must_use]
+pub fn pending_legacy(dir: &Path) -> Vec<String> {
+    [LEGACY_STATE, LEGACY_JOURNAL]
+        .iter()
+        .filter(|name| dir.join(name).is_file())
+        .map(|name| (*name).to_owned())
+        .collect()
 }
 
 fn insert_event(transaction: &Transaction<'_>, event: &EventRow<'_>) -> Result<(), String> {
@@ -2663,5 +2877,148 @@ mod tests {
         assert!(document["entries"]["memory"]["leaked"].is_null());
         assert!(document["entries"]["memory"]["clean"].is_object());
         assert!(secret_targets(&dir).expect("again").is_empty());
+    }
+
+    /// A review that wrote an entry says what it held, in its summary and in
+    /// the history's record: a purge leaves neither saying it. A review of
+    /// another entry keeps its words.
+    #[test]
+    fn a_purge_leaves_no_review_naming_what_the_entry_held() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = dir.path().join("harness");
+        let code = "ZEBRA-REVIEW-41K";
+        let state = json!({"schema": 1, "entries": {"memory": {
+            "door": entry("door", &format!("the door code is {code}"), 1),
+            "editor": entry("editor", "the user edits in Zed", 1),
+        }}, "refinements": [
+            {"id": "ref_1", "trigger": format!("Recorded the door code {code}"), "changes": ["create memory:door"],
+             "evidence": format!("the user said the code is {code}"), "outcome": "kept"},
+            {"id": "ref_2", "trigger": "Recorded the editor", "changes": ["create memory:editor"], "evidence": "Zed", "outcome": "kept"},
+        ]});
+        save_document(&dir, &state, &writer()).expect("create");
+        std::fs::write(
+            dir.join("refinements.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"id": "ref_1", "summary": format!("Recorded the door code {code}"), "rationale": format!("{code} was stated"),
+                       "appliedEdits": [{"action": "create", "kind": "memory", "id": "door", "content": code, "applied": true}]}),
+                json!({"id": "ref_2", "summary": "Recorded the editor", "rationale": "Zed",
+                       "appliedEdits": [{"action": "create", "kind": "memory", "id": "editor", "content": "Zed", "applied": true}]})
+            ),
+        )
+        .expect("history");
+        // The legacy state it was imported from kept the review too.
+        std::fs::write(
+            dir.join(format!("{LEGACY_STATE}.imported")),
+            json!({"schema": 1, "entries": {}, "refinements": [
+                {"id": "ref_1", "trigger": format!("Recorded the door code {code}"), "changes": ["create memory:door"]}]})
+            .to_string(),
+        )
+        .expect("legacy");
+        let targets = purge_targets(&dir, "door").expect("targets");
+        let plan = purge_plan(&dir, &targets, false).expect("plan");
+        assert_eq!(
+            (plan.refinements, plan.history, plan.legacy),
+            (1, 1, 1),
+            "{plan:?}"
+        );
+        let purged = purge(
+            &dir,
+            &targets,
+            &Writer::new("cli", &json!({}), "purge"),
+            false,
+        )
+        .expect("purge");
+        assert_eq!(purged.rewritten, plan, "the dry run said what changed");
+        assert!(!holds(&store_bytes(&dir), code), "no review names it");
+        assert!(!holds(&store_bytes(&dir), "memory:door"), "nor its key");
+        let document = load_document(&dir).expect("document");
+        assert_eq!(document["refinements"][1]["trigger"], "Recorded the editor");
+        let history = std::fs::read_to_string(dir.join("refinements.jsonl")).expect("history");
+        assert!(history.contains("Recorded the editor"), "{history}");
+    }
+
+    /// A dry run reads without changing anything, a pending legacy file
+    /// included; a purge bounded to one memory's versions leaves the secret
+    /// values of other entries' reviews and of the imported files alone.
+    #[test]
+    fn a_dry_run_changes_nothing_and_a_bounded_purge_touches_only_its_targets() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = dir.path().join("harness");
+        let secret = "sk-Q7vX2mN9pL4kR8tW1yZ6bC3dF5gH0jSa";
+        let other = "ghp_Zx8Kq2Lm9Np4Rt7Vw1Yb3Cd6Ef0Gh5Jk2Ls8";
+        let mut state = json!({"schema": 1, "entries": {"memory": {
+            "deploy": entry("deploy", &format!("deploy with the key {secret}"), 1),
+        }}, "refinements": [
+            {"id": "ref_2", "trigger": format!("saw {other}"), "changes": ["update memory:unrelated"]},
+        ]});
+        save_document(&dir, &state, &writer()).expect("create");
+        state["entries"]["memory"]["deploy"]["content"] = json!("deploy with the vault");
+        state["entries"]["memory"]["deploy"]["version"] = json!(2);
+        save_document(&dir, &state, &writer()).expect("update");
+        std::fs::write(
+            dir.join(format!("{LEGACY_JOURNAL}.imported")),
+            format!(
+                "{}\n",
+                json!({"kind": "memory", "id": "unrelated", "entry": entry("unrelated", other, 1)})
+            ),
+        )
+        .expect("journal");
+        std::fs::write(
+            dir.join(LEGACY_STATE),
+            json!({"entries": {"memory": {"late": entry("late", "x", 1)}}}).to_string(),
+        )
+        .expect("pending");
+        // The files as they are: what a reader maps aside (the shared-memory
+        // index, an empty log) holds nothing.
+        let files = || {
+            let mut files = std::fs::read_dir(&dir)
+                .expect("dir")
+                .flatten()
+                .map(|entry| {
+                    (
+                        entry.file_name(),
+                        std::fs::read(entry.path()).expect("file"),
+                    )
+                })
+                .filter(|(name, bytes)| {
+                    let name = name.to_string_lossy();
+                    let mapped =
+                        name.ends_with("-shm") || name.ends_with("-wal") && bytes.is_empty();
+                    !mapped
+                })
+                .collect::<Vec<_>>();
+            files.sort();
+            files
+        };
+        let before = files();
+        let targets = secret_targets(&dir)
+            .expect("scan")
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), 1);
+        purge_targets(&dir, "deploy").expect("by key");
+        let bounded = purge_plan(&dir, &targets, false).expect("bounded");
+        let everything = purge_plan(&dir, &targets, true).expect("everything");
+        assert_eq!(bounded, Rewritten::default());
+        assert_eq!((everything.refinements, everything.legacy), (1, 1));
+        assert!(files() == before, "nothing changed, nothing imported");
+        assert!(dir.join(LEGACY_STATE).is_file());
+        assert_eq!(pending_legacy(&dir), [LEGACY_STATE]);
+
+        purge(
+            &dir,
+            &targets,
+            &Writer::new("cli", &json!({}), "purge"),
+            false,
+        )
+        .expect("purge");
+        let after = store_bytes(&dir);
+        assert!(!holds(&after, secret), "its own versions are gone");
+        assert!(
+            holds(&after, other),
+            "another entry's copies are not this purge's"
+        );
     }
 }

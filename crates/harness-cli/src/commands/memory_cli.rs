@@ -270,16 +270,17 @@ struct PurgeArgs {
     /// private key), in the global store and every conversation's.
     #[arg(long)]
     secrets: bool,
-    /// Only these entries.
+    /// Only these entries, and only their own copies: with a scope,
+    /// --secrets leaves other entries' reviews and the imported files alone.
     #[arg(long, value_enum)]
     scope: Option<PurgeScope>,
-    /// A conversation's own store.
+    /// A conversation's own store (with --scope local, or no scope).
     #[arg(long)]
     conversation: Option<String>,
     /// The project, for `--scope project`; the working directory when left out.
     #[arg(long)]
     cwd: Option<PathBuf>,
-    /// Purge; without it, list what would go and change nothing.
+    /// Purge; without it, list what would go, reading the store read-only.
     #[arg(long)]
     yes: bool,
 }
@@ -296,6 +297,17 @@ fn purge(args: &PurgeArgs) -> Result<(), HarnessError> {
             "--scope local needs --conversation <id>",
         ));
     }
+    if args.conversation.is_some()
+        && matches!(args.scope, Some(PurgeScope::Global | PurgeScope::Project))
+    {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            "--conversation names a conversation's own store: it goes with --scope local, or no scope",
+        ));
+    }
+    // Every secret value of a store's files is redacted only when no scope
+    // bounds the purge: a scope purges its own entries' copies and no others.
+    let redact_all = args.secrets && args.scope.is_none();
     let project = match args.scope {
         Some(PurgeScope::Project) => {
             let cwd = match &args.cwd {
@@ -358,8 +370,19 @@ fn purge(args: &PurgeArgs) -> Result<(), HarnessError> {
             .into_iter()
             .filter(|(target, _)| in_scope(label, &target.doc))
             .collect::<Vec<_>>();
-        if !targets.is_empty() {
-            found.push((label.clone(), dir.clone(), targets));
+        let plain = targets
+            .iter()
+            .map(|(target, _)| target.clone())
+            .collect::<Vec<_>>();
+        let copies = memory_store::purge_plan(dir, &plain, redact_all)
+            .map_err(|error| HarnessError::new(ErrorCode::StorageOpenFailed, error))?;
+        for file in memory_store::pending_legacy(dir) {
+            println!(
+                "[{label}] {file} waits to be imported: it is not read here, and the next write to the store imports it"
+            );
+        }
+        if !targets.is_empty() || copies.any() {
+            found.push((label.clone(), dir.clone(), targets, copies));
         }
     }
     if found.is_empty() {
@@ -376,7 +399,13 @@ fn purge(args: &PurgeArgs) -> Result<(), HarnessError> {
         ));
     }
     let verb = if args.yes { "purge" } else { "would purge" };
-    for (label, _, targets) in &found {
+    for (label, _, targets, plan) in &found {
+        if plan.any() {
+            println!(
+                "{verb} [{label}] copies beside the store: {} refinement summary(ies), {} record(s) of refinements.jsonl, {} imported legacy line(s) or entr(ies)",
+                plan.refinements, plan.history, plan.legacy
+            );
+        }
         for (target, shape) in targets {
             // A key may be made from a title that held the secret.
             let key = harness_tools::secret_values::redact(&target.key);
@@ -413,17 +442,20 @@ fn purge(args: &PurgeArgs) -> Result<(), HarnessError> {
         &serde_json::json!({"via": "ha memory purge"}),
         "purge",
     );
-    for (label, dir, targets) in &found {
+    for (label, dir, targets, _) in &found {
         let _lock = harness::lock_state(dir).map_err(failed)?;
         let targets = targets
             .iter()
             .map(|(target, _)| target.clone())
             .collect::<Vec<_>>();
-        let purged = memory_store::purge(dir, &targets, &writer, args.secrets).map_err(failed)?;
+        let purged = memory_store::purge(dir, &targets, &writer, redact_all).map_err(failed)?;
         println!(
-            "[{label}] purged {} memory(ies), {} event(s) removed; one purge event each remains",
+            "[{label}] purged {} memory(ies), {} event(s) removed; one purge event each remains; {} refinement summary(ies), {} record(s) of refinements.jsonl and {} imported legacy line(s) or entr(ies) rewritten",
             targets.len(),
-            purged.removed
+            purged.removed,
+            purged.rewritten.refinements,
+            purged.rewritten.history,
+            purged.rewritten.legacy
         );
         if !purged.settled {
             println!(

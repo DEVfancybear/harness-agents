@@ -796,6 +796,12 @@ nội dung của nó:
 - row của nó, mọi event của nó (mọi phiên bản), row `memory_usage` của nó;
 - trong `refinements.jsonl`, mỗi edit của refinement về nó bị rút lại còn
   action, kind và kết quả, không còn title, content, `before` hay `after`;
+- mỗi refinement đã thay đổi nó - bản tóm tắt trong store (`refinement`),
+  bản ghi trong `refinements.jsonl`, bản sao trong legacy state đã import -
+  mất phần chữ (trigger, evidence, outcome; summary, rationale, expected
+  outcome), thay bằng một ghi chú rằng nó đã đổi một memory bị purge, và key mà
+  các change của nó nêu thành `[purged]`: tóm tắt của một lần review nói nó đã
+  ghi gì;
 - bản ghi của nó trong `harness_state.json.imported` và các dòng của nó trong
   `memory_history.jsonl.imported`;
 - còn lại một event: operation `purge`, cause `purge`, actor `cli`, với kind
@@ -817,6 +823,17 @@ không còn chứa thì chỉ mất các phiên bản từng chứa, và giữ t
 entry đã xoá mà log còn chứa secret thì bị purge toàn bộ. Nó cũng che các giá
 trị secret còn lại trong bảng refinement, `refinements.jsonl` và các file
 legacy đã import. Danh sách nêu loại của mỗi secret, không bao giờ nêu giá trị.
+
+Scope giới hạn những gì một lần purge chạm tới: với `--scope`, `--secrets`
+purge các entry của scope đó và các bản sao của chính chúng, để nguyên giá trị
+secret trong review của entry khác và trong các file đã import; chỉ `--secrets`
+không có scope mới che tất cả. `--conversation` chỉ store của một hội thoại, nên
+đi với `--scope local` hoặc không có scope.
+
+Lần chạy thử đọc store ở chế độ chỉ đọc: không migrate, không import, không
+đổi file nào. Nó liệt kê, bên cạnh mỗi entry, số bản tóm tắt refinement, bản
+ghi `refinements.jsonl` và dòng hay entry legacy đã import mà `--yes` sẽ viết
+lại, và nêu file legacy còn chờ import, thứ nó không đọc.
 
 | Lệnh | Làm gì |
 |---|---|
