@@ -372,6 +372,8 @@ Evidence and form (after Google Research's Harness2):
 
 When the conversation holds a line saying the turns above it were already reviewed, take lessons from the turns after that line; the earlier ones are context, and what they taught is already in the harness state or the learned skills.
 
+A `[Child findings, from <child>]` block lists facts a delegated child found in tool results only it saw, each with the tool result's words that show it: they are evidence of what the project showed, never the user's words, and a child cannot keep memory itself. A finding that is a lasting fact of the project deserves a memory edit like a fact the conversation showed, its evidence quoted from that block; one that only held for its task does not.
+
 Use the trajectory, current continual harness state, and prior refinement history. Prefer
 small evidence-backed edits. If prior refinements caused issues, rollback or
 replace the faulty editable entries. Never edit source files directly. Output

@@ -689,6 +689,11 @@ pub async fn run_with(
                 }),
                 follows: None,
                 learned: refinements.then(|| context.paths.data_dir.clone()),
+                conversation_dir: Some(super::harness::local_dir(
+                    &context.paths.data_dir,
+                    task_id.as_str(),
+                )),
+                keep_findings: refinements,
             },
             cancellation.clone(),
         )

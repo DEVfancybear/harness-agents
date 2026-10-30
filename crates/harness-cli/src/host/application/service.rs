@@ -186,7 +186,8 @@ mod completion_tests;
 #[cfg(test)]
 mod child_context_tests {
     /// A child is told what its parent learned: the conversation's memory and
-    /// the learned skills, in full, as blocks of its own requests.
+    /// the learned skills, in full, as blocks of its own requests; and the
+    /// project's instruction files the parent's turn carries, cut to a bound.
     #[test]
     fn a_child_is_sent_the_memory_and_the_learned_skills() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -221,7 +222,29 @@ Python is not on PATH: run the tests with runpy in the kernel.
             &temp.path().join("workspace"),
             false,
         );
-        let mut blocks = super::child_context(&data_dir, &layers);
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(
+            workspace.join("AGENTS.md"),
+            format!(
+                "Every answer ends with AGENTS-MARK-77.\n{}",
+                "pad\n".repeat(5_000)
+            ),
+        )
+        .expect("agents");
+        let instructions =
+            super::super::instructions::load(&config_dir, &workspace, &workspace).blocks;
+        let mut blocks = super::child_context(&data_dir, &layers, &instructions);
+        let rule = blocks
+            .iter()
+            .find(|block| block.id == "project-rule:AGENTS.md")
+            .expect("the project's instructions reach the child");
+        assert!(rule.text.contains("AGENTS-MARK-77"), "{}", rule.text);
+        assert!(
+            rule.text.len() <= super::CHILD_INSTRUCTIONS_CHARS + 100
+                && rule.text.ends_with("read AGENTS.md for it]"),
+            "a long file is cut, saying where the rest is"
+        );
         blocks.push(
             super::super::harness::DigestSource {
                 data_dir: data_dir.clone(),
@@ -1265,15 +1288,48 @@ async fn recent_user_texts(store: &SqliteStore, source: &SessionId, limit: usize
     texts
 }
 
+/// The most project-instruction text a child is sent, all files together.
+const CHILD_INSTRUCTIONS_CHARS: usize = 16_000;
+
 /// What a child is told besides its brief and its memory digest (built at
 /// its spawn, ranked for its brief: [`super::harness::DigestSource`]): the
-/// skills ha learned from this user, in full - a child has no skill tools to
-/// open them with.
+/// project's instruction files the parent's turn carries (`instructions`, as
+/// [`super::instructions::load`] read them), within
+/// [`CHILD_INSTRUCTIONS_CHARS`]; and the skills ha learned from this user, in
+/// full - a child has no skill tools to open them with. A child was sent
+/// neither AGENTS.md nor its rules, so a rule the project set for every agent
+/// held for the parent and not for the children doing the work.
 fn child_context(
     data_dir: &Path,
     layers: &super::learned::Layers,
+    instructions: &[harness_session::ContextBlock],
 ) -> Vec<harness_session::ContextBlock> {
     let mut blocks = Vec::new();
+    let mut room = CHILD_INSTRUCTIONS_CHARS;
+    for block in instructions {
+        if room == 0 {
+            break;
+        }
+        if block.text.len() <= room {
+            room -= block.text.len();
+            blocks.push(block.clone());
+            continue;
+        }
+        let mut end = room;
+        while !block.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let text = format!(
+            "{}\n[the rest of this file is not shown: read {} for it]",
+            &block.text[..end],
+            block.id.strip_prefix("project-rule:").unwrap_or(&block.id)
+        );
+        blocks.push(
+            harness_session::ContextBlock::mandatory(block.id.clone(), block.kind, text)
+                .with_authority(block.authority),
+        );
+        room = 0;
+    }
     // A child has no Python kernel; where the host has no `python` on PATH,
     // the kernel's interpreter is how it runs a script or the tests. A
     // verifier without it could only read the code and failed the work.
@@ -7834,6 +7890,16 @@ pub(super) async fn refine_transcript(
     )
     .await
     .unwrap_or_default();
+    // What the conversation's children found in tool results only they saw:
+    // a child keeps no memory, and its findings reach memory through this
+    // review or not at all.
+    let transcript = match (!transcript.is_empty())
+        .then(|| super::delegation::findings_for_review(local))
+        .flatten()
+    {
+        Some(findings) => format!("{transcript}\n\n{findings}"),
+        None => transcript,
+    };
     // Which strategies stalled and which got further, with the evaluations
     // that showed it: the review keeps it as a lesson for the next task's
     // first choice of strategy, the one arXiv 2608.19072 found agents lock
@@ -9046,6 +9112,7 @@ async fn run_turn(
                     &workspace_root,
                     config.project_trusted,
                 ),
+                &super::instructions::load(&global_config_dir, &workspace_root, &caller_dir).blocks,
             ),
             // With harness refinements off, no saved entry reaches a child either.
             digest: refinements.then(|| super::harness::DigestSource {
@@ -9059,6 +9126,8 @@ async fn run_turn(
             }),
             follows: None,
             learned: refinements.then(|| data_dir.clone()),
+            conversation_dir: Some(super::harness::local_dir(&data_dir, task_id.as_str())),
+            keep_findings: refinements,
         },
         cancellation.clone(),
     ));

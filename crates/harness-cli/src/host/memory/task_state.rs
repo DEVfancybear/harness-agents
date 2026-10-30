@@ -356,6 +356,80 @@ pub fn context_block(path: &Path) -> Option<ContextBlock> {
     })
 }
 
+/// The most tokens the constraints and decisions a child is shown take.
+pub const CHILD_STATE_TOKENS: u64 = 1_500;
+
+/// The block a delegated child is given from the task state at `path`, its
+/// root conversation's: the user's constraints and the decisions taken, not
+/// the plan, which is the parent's to follow. Within [`CHILD_STATE_TOKENS`]:
+/// every constraint that fits, then the newest decisions, with a line saying
+/// how many are not shown and who holds them. A child was sent its brief
+/// alone, and a rule the user had set for the whole task ("never touch
+/// vendor/") was unknown to it unless the brief happened to repeat it.
+#[must_use]
+pub fn child_block(path: &Path) -> Option<ContextBlock> {
+    let state = load(path);
+    if state.constraints.is_empty() && state.decisions.is_empty() {
+        return None;
+    }
+    let room = usize::try_from(CHILD_STATE_TOKENS).unwrap_or(usize::MAX) * 4 - 512;
+    let mut used = 0;
+    let mut fits = |line: &str| {
+        let fit = used + line.len() < room;
+        if fit {
+            used += line.len() + 1;
+        }
+        fit
+    };
+    let constraints = state
+        .constraints
+        .iter()
+        .map(|constraint| format!("- {constraint}"))
+        .filter(|line| fits(line))
+        .collect::<Vec<_>>();
+    let mut decisions = state
+        .decisions
+        .iter()
+        .rev()
+        .map(|decision| {
+            if decision.why.trim().is_empty() {
+                format!("- {}", decision.decision)
+            } else {
+                format!("- {} (why: {})", decision.decision, decision.why)
+            }
+        })
+        .take_while(|line| fits(line))
+        .collect::<Vec<_>>();
+    decisions.reverse();
+    let hidden =
+        state.constraints.len() + state.decisions.len() - constraints.len() - decisions.len();
+    let mut text = String::from(
+        "The task your parent works on, as its task state records it: these hold for your part of it too.",
+    );
+    if !constraints.is_empty() {
+        text.push_str("\nConstraints (from the user; they hold for the whole task):");
+        for line in &constraints {
+            let _ = write!(text, "\n{line}");
+        }
+    }
+    if !decisions.is_empty() {
+        text.push_str("\nDecisions:");
+        for line in &decisions {
+            let _ = write!(text, "\n{line}");
+        }
+    }
+    if hidden > 0 {
+        let _ = write!(
+            text,
+            "\n({hidden} more constraint(s) or decision(s) not shown: your parent's task state holds them; ask it with agent_message when your work may touch them)"
+        );
+    }
+    Some(
+        ContextBlock::mandatory("parent-task-state", ContextBlockKind::Instruction, text)
+            .with_max_tokens(CHILD_STATE_TOKENS),
+    )
+}
+
 /// How many turns a new conversation is shown the task an earlier one left.
 pub const EARLIER_STATE_TURNS: usize = 3;
 
