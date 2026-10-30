@@ -7,7 +7,12 @@
 #   3. a DeepSeek key the API refuses hands the search to the next API, and the
 #      answer says so, naming /login deepseek;
 #   4. the Python websearch skill does the same in the REPL;
-#   5. a coder's commits carry the name `Harness Agents`, not `harness-p5`.
+#   5. a coder's commits carry the name `Harness Agents`, not `harness-p5`;
+# and what 0.8.9 changed:
+#   6. a child obeys a rule only AGENTS.md states and a constraint only the
+#      parent's task state holds (0.8.8 sent it neither);
+#   7. a fact a child found in a file only it read, handed back with
+#      note_finding, becomes the parent's memory through the parent's review.
 # Every check prints PASS or FAIL; the conversation and the diagnostics stay in
 # $LIVE_ROOT/nesting as evidence. The DeepSeek key comes from the credential
 # file in HA_CREDENTIALS_DIR (`deepseek`), never printed.
@@ -109,5 +114,111 @@ check "the work was integrated" '[ -f "$RX/p/who.txt" ]'
 check "ha's commits carry Harness Agents" 'echo "$authors" | grep -q "^Harness Agents <harness-agents@localhost>"'
 check "no commit carries harness-p5" '! (echo "$authors" | grep -q "harness-p5")'
 "$HA" shutdown --force >/dev/null 2>&1
+
+# The delegate calls the root made (in requests without `[task from parent]`),
+# with the child's answer: `{"brief", "result", "root_calls"}` per call as
+# JSON lines, `root_calls` being every call of the root's (`name args`).
+delegations() {
+  "$PY" - "$HA_HOME/data" <<'EOF'
+import glob, json, os, sqlite3, sys
+sys.stdout.reconfigure(encoding="utf-8")
+calls, results, root_calls = {}, {}, {}
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests"):
+        messages = json.loads(text).get("messages", [])
+        child = any("[task from parent]" in (m.get("content") or "") for m in messages)
+        if child:
+            continue
+        for m in messages:
+            for call in m.get("tool_calls") or []:
+                root_calls[call.get("call_id")] = f"{call.get('name')} {call.get('arguments')}"
+                if call.get("name") == "delegate":
+                    calls[call.get("call_id")] = call.get("arguments") or ""
+            if m.get("role") == "tool" and m.get("tool_call_id") in calls:
+                results[m["tool_call_id"]] = m.get("content") or ""
+for call_id, arguments in calls.items():
+    try:
+        brief = json.loads(arguments).get("brief", "")
+    except ValueError:
+        brief = arguments
+    print(json.dumps({"brief": brief, "result": results.get(call_id, ""), "root_calls": list(root_calls.values())}, ensure_ascii=False))
+EOF
+}
+# A field of the JSON object in a file (empty when it has none).
+field() { "$PY" -c "import json,sys; t=open(sys.argv[1],encoding='utf-8').read().strip(); print(json.loads(t).get(sys.argv[2],'') if t else '')" "$1" "$2"; }
+
+echo "################ 6. a child hears AGENTS.md and the task state's constraints"
+# A rule only AGENTS.md states and a constraint only the parent's task state
+# holds; the brief names neither. 0.8.8 sent a child its brief, memory and
+# skills, never the project's instructions nor the task's constraints.
+P6="$RX/p6"
+project "$P6"
+printf '# Quy tắc của project\n\n## Cho agent con được giao việc (delegate)\nMọi agent con, khi trả lời cuối cùng cho agent cha, kết thúc câu trả lời bằng một dòng riêng đúng là: ORIOLE-9134\n' > "$P6/AGENTS.md"
+(cd "$P6" && git add -A && git -c user.name=t -c user.email=t@t commit -qm rules)
+held=""
+for attempt in 1 2 3; do
+  agent "$P6" "n6-$attempt"
+  say "n6-$attempt" "Ghi vào task_state bằng add_constraints đúng một ràng buộc, nguyên văn: 'Câu trả lời cuối của mọi agent con phải bắt đầu bằng từ HERON-2207.' Không làm gì khác, trả lời ĐÃ-GHI." | tail -1 | sed 's/^/   /'
+  say "n6-$attempt" "Dùng tool delegate (wait mặc định, đợi kết quả) giao cho đúng một agent role explorer, brief đúng nguyên văn (không thêm, không bớt, không nhắc quy tắc hay ràng buộc nào): 'Đọc README.md (lần $attempt) rồi trả lời dòng đầu tiên của file.' Đợi explorer xong rồi chép lại nguyên văn câu trả lời của nó." | tail -3 | sed 's/^/   /'
+  "$HA" shutdown --force >/dev/null 2>&1
+  delegations | grep -F "(lần $attempt)" | tail -1 > "$RX/n6-$attempt.json"
+  recorded=$(cat "$HA_HOME"/data/sessions/*/harness/task_state.json 2>/dev/null | grep -c "HERON-2207")
+  brief=$(field "$RX/n6-$attempt.json" brief)
+  echo "   attempt $attempt: constraint recorded=$recorded, brief: ${brief:0:120}"
+  if [ "$recorded" -ge 1 ] && [ -n "$brief" ] && ! echo "$brief" | grep -qE "ORIOLE|HERON"; then held=$attempt; break; fi
+done
+check "precondition: the constraint is in the task state, the brief names neither marker (attempt ${held:-none})" '[ -n "$held" ]'
+answer=$(field "$RX/n6-${held:-1}.json" result)
+echo "$answer" | tail -4 | sed 's/^/   child: /'
+check "the child obeyed a rule only AGENTS.md states" '[ -n "$held" ] && echo "$answer" | grep -q "ORIOLE-9134"'
+check "the child obeyed a constraint only the parent's task state holds" '[ -n "$held" ] && echo "$answer" | grep -q "HERON-2207"'
+
+echo "################ 7. what a child found becomes the parent's memory"
+# The fact is in a file only the child reads, and the child hands it back with
+# note_finding, not in its answer: the parent's review is what keeps it.
+P7="$RX/p7"
+project "$P7"
+mkdir -p "$P7/config"
+printf '[release]\nrelease_channel = amber-falcon-38\n' > "$P7/config/deploy.ini"
+(cd "$P7" && git add -A && git -c user.name=t -c user.email=t@t commit -qm config)
+# A review after every turn (the thinking level kept).
+printf '{"autoRefine": {"turnInterval": 1}%s}\n' "${THINKING:+, \"defaultThinkingLevel\": \"$THINKING\"}" > "$HA_HOME/settings.json"
+export HA_AUTO_REFINE=on
+since7=$(date +%s%3N)
+agent "$P7" n7
+say n7 "Kiểm thử harness. Dùng tool delegate (wait mặc định, đợi kết quả) giao cho đúng một agent role explorer, brief đúng nguyên văn: 'Đọc file config/deploy.ini. Giá trị release_channel trong đó là một sự thật lâu dài của project này: ghi nó lại bằng tool note_finding (fact nêu tên file và giá trị, evidence là dòng chứa nó, chép đúng như read_file trả về). Trả lời agent cha đúng một từ XONG, không nêu giá trị.' Bản thân bạn không đọc file đó. Đợi explorer xong rồi trả lời đúng một dòng: ĐÃ-GIAO." | tail -2 | sed 's/^/   /'
+# The review runs in the background after the turn: wait for its record, at
+# most ten minutes.
+reviewed=""
+for _ in $(seq 1 120); do
+  reviewed=$(cat "$D"/*.jsonl 2>/dev/null | "$PY" -c "
+import json, sys
+since = int(sys.argv[1])
+for line in sys.stdin:
+    try: r = json.loads(line)
+    except ValueError: continue
+    if r.get('kind') == 'review' and r.get('event') in ('applied', 'nothing', 'skipped', 'failed') and r.get('ms', 0) > since:
+        print(r.get('event'), (r.get('msg') or '')[:160].replace(chr(10), ' '))" "$since7" | head -1)
+  [ -n "$reviewed" ] && break
+  sleep 5
+done
+"$HA" shutdown --force >/dev/null 2>&1
+echo "   review: ${reviewed:-none}"
+delegations | grep -F "config/deploy.ini" | tail -1 > "$RX/n7.json"
+"$PY" - "$RX/n7.json" > "$RX/n7.pre" <<'EOF'
+import json, sys
+text = open(sys.argv[1], encoding="utf-8").read().strip()
+d = json.loads(text) if text else {}
+leaked = "amber-falcon-38" in d.get("result", "")
+read = any("deploy.ini" in call and not call.startswith("delegate ") for call in d.get("root_calls", []))
+print("delegated" if d else "not-delegated", "leaked" if leaked else "kept", "parent-read" if read else "parent-blind")
+EOF
+echo "   precondition: $(cat "$RX/n7.pre")"
+check "precondition: the parent delegated and read no deploy.ini, the child's answer does not hold the value" 'grep -qx "delegated kept parent-blind" "$RX/n7.pre"'
+check "the child kept its finding for the parent" 'cat "$HA_HOME"/data/sessions/*/harness/child_findings.jsonl 2>/dev/null | grep -q "amber-falcon-38"'
+check "the parent's review ran after the turn (${reviewed:-none})" 'echo "$reviewed" | grep -qE "^(applied|nothing)"'
+"$PY" "$MEMORY_STORE" entries "$HA_HOME/data" > "$RX/n7-memory.txt" 2>&1
+grep -i "amber-falcon" "$RX/n7-memory.txt" | sed 's/^/   memory: /'
+check "the fact the child found is in the parent's memory" 'grep -q "amber-falcon-38" "$RX/n7-memory.txt"'
 
 result
