@@ -103,8 +103,8 @@ for key, entry in state.get('entries', {}).get('memory', {}).items():
 in_store_files() { grep -rqaF "$1" "$G"; }
 
 echo "################ 5. a purged entry's content is nowhere in the store's files (0.8.9)"
-PCODE="LOCKER-$("$PY" -c 'import secrets; print(secrets.token_hex(5).upper())')"
-run_exec s7 "Kiểm thử harness: gọi tool memory đúng một lần với action write, scope global, title 'Locker', content: The locker code is $PCODE. Không làm gì khác."
+PCODE="TEAPOT-$("$PY" -c 'import secrets; print(secrets.token_hex(5).upper())')"
+run_exec s7 "Harness test: call the memory tool exactly once with action write, scope global, title 'Tea order', content: The team orders the tea blend $PCODE every Friday. Do nothing else, then answer DONE."
 PKEY=$(key_of "$PCODE")
 if [ -z "$PKEY" ]; then
   echo "PRECONDITION FAILED: the model kept no entry with $PCODE (see $RX/s7.json); rerun"
@@ -145,11 +145,11 @@ fi
 echo "precondition: an old event holds the key"
 "$HA" memory purge --secrets >"$RX/secrets-list.out" 2>&1
 sed 's/^/   /' "$RX/secrets-list.out"
-check "--secrets lists the version holding the key, without printing it" 'grep -q "would purge.*deploy-notes.*1 of its .* version(s), holds a secret value (API key" "$RX/secrets-list.out" && ! grep -qF "$SECRET" "$RX/secrets-list.out"'
+check "--secrets lists the version holding the key, without printing it" 'grep -q "would purge.*deploy-notes.*1 of its .* version(s): holds a secret value (API key" "$RX/secrets-list.out" && ! grep -qF "$SECRET" "$RX/secrets-list.out"'
 "$HA" memory purge --secrets --yes >"$RX/secrets.out" 2>&1
 sed 's/^/   /' "$RX/secrets.out"
 check "the key is in no file of the store" '! in_store_files "$SECRET"'
-check "the entry as it is now stays" '"$HA" memory export | grep -q "deploy with the key from the vault"'
+check "the entry as it is now stays, without the key" '! in_store_files "$SECRET" && "$HA" memory export | grep -q "deploy with the key from the vault"'
 check "a second scan finds nothing" '"$HA" memory purge --secrets 2>&1 | grep -q "No entry or event"'
 
 result

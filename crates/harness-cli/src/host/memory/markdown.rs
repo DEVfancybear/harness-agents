@@ -25,7 +25,7 @@
 // the same way by both checkers.
 #![allow(clippy::case_sensitive_file_extension_comparisons)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1940,10 +1940,15 @@ fn edit_diff(relative: &str, before: Option<&str>, after: &str) -> Diff {
 }
 
 /// The failures of every check that reads `view`, and of the diff checks on
-/// `diff`, each as what it says: its check, its file and its reason, the
-/// numbers left out of a cap's (a file over its cap stays one failure as it
-/// grows).
-fn failures(config: &Config, view: &View<'_>, diff: &Diff, diff_checks: bool) -> BTreeSet<String> {
+/// `diff`, each by what it is - its check, its file and its reason, a cap's
+/// without its numbers (a file over its cap stays one failure as it grows) -
+/// with what it says.
+fn failures(
+    config: &Config,
+    view: &View<'_>,
+    diff: &Diff,
+    diff_checks: bool,
+) -> BTreeMap<String, String> {
     let mut checks = vec![
         check_rom_caps(config, view),
         check_ram_caps(config, view, diff),
@@ -1972,7 +1977,10 @@ fn failures(config: &Config, view: &View<'_>, diff: &Diff, diff_checks: bool) ->
                     } else {
                         detail.reason.clone()
                     };
-                    format!("{}: {}: {reason}", check.name, detail.path)
+                    (
+                        format!("{}: {}: {reason}", check.name, detail.path),
+                        format!("{}: {}: {}", check.name, detail.path, detail.reason),
+                    )
                 })
                 .collect::<Vec<_>>()
         })
@@ -2002,9 +2010,11 @@ fn refuse_new_failures(
         root,
         overlay: Some((relative, after)),
     };
+    let was = failures(&config, &was, &diff, false);
     let new = failures(&config, &will, &diff, true)
-        .difference(&failures(&config, &was, &diff, false))
-        .cloned()
+        .into_iter()
+        .filter(|(key, _)| !was.contains_key(key))
+        .map(|(_, said)| said)
         .collect::<Vec<_>>();
     if new.is_empty() {
         return Ok(());

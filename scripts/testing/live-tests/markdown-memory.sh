@@ -266,7 +266,15 @@ rules_for "$RX/full-rules.json" "$(basename "$F")" les_full1 "Run the formatter 
 sed 's/^/   /' "$RX/full-import.out"
 check "the index stays within its cap" '[ "$(chars "$F/MEMORY.md")" -le 15000 ]'
 check "the store still passes the lint" '(cd "$F" && "$HA" memory lint --quiet)'
-check "the refusal is in the diagnostics, naming the check" 'grep -rh "\"markdown_write_refused\"" "$D/diagnostics" | grep -q "rom-caps"'
+check "the refusal is in the diagnostics, naming the check" 'grep -rh "\"markdown_write_refused\"" "$D/diagnostics" | grep -q "rom-caps: MEMORY.md: 15,"'
+# The lesson is held, and says why: the next import or review tries again.
+held_why() { "$PY" -c "
+import json, sys
+for lesson in json.load(open(sys.argv[1], encoding='utf-8')).get('lessons', []):
+    if lesson.get('project', {}).get('name') == sys.argv[2]:
+        print(*[event.get('why', '') for event in lesson.get('events', []) if event.get('what') == 'held'], sep=chr(10))
+" "$D/harness/lessons.json" "$(basename "$F")"; }
+check "the rule is held, its lesson saying the store would fail its lint" 'held_why | grep -q "would fail its lint (rom-caps"'
 
 echo "################ 12. struck index lines past the cap move to the archive"
 # No model: the index holds 21 struck pointers of retired rules; the next host
@@ -292,8 +300,8 @@ ARCH=$(ls "$S"/memory/archive/index-*.md 2>/dev/null | head -1)
 all_archived() { while IFS= read -r line; do grep -qxF -- "$line" "$ARCH" || return 1; done < "$RX/struck-before.txt"; }
 check "the index holds no struck line, and the new rule's pointer" '! grep -q "~~" "$S/MEMORY.md" && grep -q "learned-" "$S/MEMORY.md"'
 check "every struck line is in a new archive file, whole" '[ -n "$ARCH" ] && all_archived'
-check "the lint passes with the move" '(cd "$S" && "$HA" memory lint --quiet)'
+check "the lint passes with the move" '[ -n "$ARCH" ] && (cd "$S" && "$HA" memory lint --quiet)'
 (cd "$S" && git add -A && git -c user.name=t -c user.email=t@t commit -qm moved)
-check "and once it is committed" '(cd "$S" && "$HA" memory lint --quiet)'
+check "and once it is committed" '[ -n "$ARCH" ] && (cd "$S" && "$HA" memory lint --quiet)'
 
 result
