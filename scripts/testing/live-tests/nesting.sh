@@ -227,7 +227,10 @@ echo "   precondition: $(cat "$RX/n7.pre")"
 check "precondition: the parent delegated and read no deploy.ini, the child's answer does not hold the value" 'grep -qx "delegated kept parent-blind" "$RX/n7.pre"'
 check "the child kept its finding for the parent" 'cat "$HA_HOME"/data/sessions/*/harness/child_findings.jsonl 2>/dev/null | grep -q "amber-falcon-38"'
 check "the parent's review ran after the turn (${reviewed:-none})" 'echo "$reviewed" | grep -qE "^(applied|nothing)"'
-"$PY" "$MEMORY_STORE" entries "$HA_HOME/data" > "$RX/n7-memory.txt" 2>&1
+# Each scope's entries whole (`entries` cuts their content short).
+for scope in "$HA_HOME/data/harness" "$HA_HOME"/data/sessions/*/harness; do
+  [ -d "$scope" ] && "$PY" "$MEMORY_STORE" rows "$scope" memory 2>/dev/null
+done > "$RX/n7-memory.txt"
 grep -i "amber-falcon" "$RX/n7-memory.txt" | sed 's/^/   memory: /'
 check "the fact the child found is in the parent's memory" 'grep -q "amber-falcon-38" "$RX/n7-memory.txt"'
 
