@@ -193,7 +193,7 @@ printf '{"autoRefine": {"turnInterval": 1}%s}\n' "${THINKING:+, \"defaultThinkin
 export HA_AUTO_REFINE=on
 since7=$(date +%s%3N)
 agent "$P7" n7
-say n7 "Kiểm thử harness. Dùng tool delegate (wait mặc định, đợi kết quả) giao cho đúng một agent role explorer, brief đúng nguyên văn: 'Đọc file config/deploy.ini, tìm giá trị release_channel và ghi lại bằng tool note_finding (evidence là dòng chứa nó, chép đúng như read_file trả về). Trả lời agent cha đúng một từ XONG, không nêu giá trị.' Bản thân bạn không đọc file đó. Đợi explorer xong rồi trả lời đúng một dòng: ĐÃ-GIAO." | tail -2 | sed 's/^/   /'
+say n7 "Dùng tool delegate (wait mặc định, đợi kết quả) giao cho đúng một agent role explorer, brief đúng nguyên văn: 'Kiểm tra file config/deploy.ini có đúng cú pháp INI không. Kênh phát hành (release_channel) mà project này dùng là điều cần nhớ về project: ghi nó lại bằng tool note_finding, evidence là dòng chứa nó, chép đúng như read_file trả về. Trả lời agent cha đúng một dòng: HỢP-LỆ hoặc KHÔNG-HỢP-LỆ, không nêu giá trị nào.' Bản thân bạn không đọc file đó. Đợi explorer xong rồi báo lại kết quả kiểm tra trong một dòng." | tail -2 | sed 's/^/   /'
 # The review runs in the background after the turn: wait for its record, at
 # most ten minutes.
 reviewed=""
