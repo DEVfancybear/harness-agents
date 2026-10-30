@@ -446,7 +446,7 @@ fn sleep(facts: &Facts, subsystem: &mut Subsystem) {
                 queue.gave_up.join("; ")
             ),
             format!(
-                "they are no longer tried by themselves; fix what failed (the provider, its credentials, a limit), then remove the job's file under {} to let it run again",
+                "they are no longer tried by themselves; fix what failed (the provider, its credentials, a limit), then remove the job's file under {} to let it run again; one whose pass then succeeds another way (`/refine --curate` for the memory) is forgotten by itself",
                 queue.dir.display()
             ),
         );

@@ -17,7 +17,11 @@
 //!   waits for the job (its `next_at`) instead of being skipped;
 //! - a claim holds the key's lock file for as long as the pass runs: a second
 //!   process skips the key, and a claim whose process died is claimable again
-//!   because its lock went with it; a claim older than [`LEASE`] is too;
+//!   because its lock went with it. A running claim renews its [`LEASE`]
+//!   every [`RENEW_EVERY`], up to [`MAX_RUN`]; a claim whose lease lapsed (a
+//!   process that hung) is taken over, and the pass it was running can then
+//!   neither remove nor rewrite the job: its done and its failure act only
+//!   on the claim they hold;
 //! - a pass that succeeded removes its job; one that failed keeps it, counts
 //!   the attempt and waits a doubling backoff (capped at a day); after
 //!   [`max_attempts`] failures in a row it gives up, stays on disk for
@@ -38,13 +42,23 @@ pub const DIR: &str = "sleep";
 /// The lock every change to the queue holds for a moment.
 const QUEUE_LOCK: &str = "queue.lock";
 
-/// How long a change waits for another process's change to the queue.
-const QUEUE_WAIT: Duration = Duration::from_secs(10);
+/// How long a change waits for another process's change to the queue. A
+/// change holds the lock for a listing and a write; a wait this long means
+/// the holder hung.
+const QUEUE_WAIT: Duration = Duration::from_secs(3);
 
-/// How long a claim stands without its process letting it go. A review is two
-/// model calls of at most five minutes each; a claim this old is taken over
-/// even while its lock is held, by a process that hung.
+/// How long a claim stands unless it is renewed. A running claim renews it
+/// every [`RENEW_EVERY`]; one that lapsed is taken over even while its lock
+/// is held, by a process that hung.
 pub const LEASE: chrono::TimeDelta = chrono::TimeDelta::minutes(30);
+
+/// How often a running claim renews its lease.
+const RENEW_EVERY: Duration = Duration::from_mins(5);
+
+/// How long a pass may run before its claim stops renewing: a review retries
+/// a model call of at most five minutes a few times, and longer than this is
+/// a pass that hung.
+const MAX_RUN: Duration = Duration::from_hours(2);
 
 /// How many failures in a row a job takes before it gives up
 /// (`HA_SLEEP_MAX_ATTEMPTS` sets it).
@@ -94,6 +108,10 @@ pub struct Claim {
     pub pid: u32,
     /// When the claim lapses, in milliseconds since the epoch.
     pub until: i64,
+    /// This claim, among the claims of the job: what its done and its failure
+    /// check before they touch the job.
+    #[serde(default)]
+    pub token: String,
 }
 
 /// One background pass waiting to run, running, or given up.
@@ -227,6 +245,12 @@ impl Job {
             self.before.clone_from(&other.before);
             self.trigger.clone_from(&other.trigger);
         }
+        // The newer job names the store as it is now: a store that moved
+        // (`ha project rekey`, a repository found again) left this job its
+        // old directory.
+        if other.enqueued_at >= self.enqueued_at && other.project.is_some() {
+            self.project.clone_from(&other.project);
+        }
         self.turns = self.turns.saturating_add(other.turns);
         for name in &other.in_play {
             if !self.in_play.contains(name) {
@@ -264,6 +288,33 @@ impl Job {
     }
 }
 
+/// Whether `job` is of the project whose store is `store_dir`: it names that
+/// directory, or one this store took over (its manifest's `adopted` keys,
+/// beside it) that no longer holds a store. A store moved after its job was
+/// written is found again, so its job is not stranded.
+#[must_use]
+pub fn belongs_to(job: &Job, store_dir: &Path) -> bool {
+    let Some(project) = job.project.as_deref().map(Path::new) else {
+        return false;
+    };
+    if project == store_dir {
+        return true;
+    }
+    let (Some(parent), Some(name)) = (project.parent(), project.file_name()) else {
+        return false;
+    };
+    store_dir.parent() == Some(parent)
+        && !project
+            .join(harness_store_sqlite::DATABASE_FILE_NAME)
+            .is_file()
+        && super::adoption::manifest(store_dir).is_some_and(|manifest| {
+            manifest
+                .adopted
+                .iter()
+                .any(|key| std::ffi::OsStr::new(key) == name)
+        })
+}
+
 /// The queue's directory under `data_dir`.
 #[must_use]
 pub fn dir(data_dir: &Path) -> PathBuf {
@@ -275,11 +326,11 @@ fn job_path(data_dir: &Path, id: &str) -> PathBuf {
 }
 
 /// A file name for `key`: its letters and digits, with a hash that keeps two
-/// keys apart when they spell alike.
+/// keys apart when they spell alike. The hash is SHA-256, the same in every
+/// ha build: two builds name one key's lock alike.
 fn key_name(key: &str) -> String {
-    use std::hash::{Hash as _, Hasher as _};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
+    let hash = harness_types::ContentHash::from_bytes(key.as_bytes());
+    let digits = hash.as_str().trim_start_matches("sha256:");
     let readable = key
         .chars()
         .rev()
@@ -289,7 +340,7 @@ fn key_name(key: &str) -> String {
         .chars()
         .rev()
         .collect::<String>();
-    format!("{readable}-{:016x}", hasher.finish())
+    format!("{readable}-{}", &digits[..16])
 }
 
 fn key_lock(data_dir: &Path, key: &str) -> PathBuf {
@@ -401,6 +452,16 @@ pub fn enqueue(data_dir: &Path, job: Job) -> Result<Job, String> {
     {
         return Ok(given_up.clone());
     }
+    // An upkeep pass is one pass: asked for again while it runs, the running
+    // one stands for it. A second job written then waited a day behind it,
+    // reported by `ha doctor` though nothing was owed.
+    if job.kind != Kind::Review
+        && let Some(running) = same
+            .iter()
+            .find(|other| !claim_is_free(data_dir, other, now_ms()))
+    {
+        return Ok(running.clone());
+    }
     let waiting = same
         .into_iter()
         .find(|other| !other.gave_up && claim_is_free(data_dir, other, now_ms()));
@@ -447,7 +508,71 @@ fn key_free(data_dir: &Path, key: &str) -> bool {
 pub struct Claimed {
     pub job: Job,
     data_dir: PathBuf,
-    _lock: Option<File>,
+    token: String,
+    lock: Option<File>,
+    /// Set when the claim ends, which stops its renewal.
+    ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for Claimed {
+    fn drop(&mut self) {
+        self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Renew the lease of the claim `token` holds on job `id`, while it is still
+/// that claim. `false` when the job is gone or another claim took it.
+fn renew(data_dir: &Path, id: &str, token: &str) -> bool {
+    let Ok(_queue) = lock_queue(data_dir) else {
+        return true; // try again at the next renewal
+    };
+    let Some(mut job) = read_job(data_dir, id) else {
+        return false;
+    };
+    match job.claimed.as_mut() {
+        Some(claim) if claim.token == token => {
+            claim.until = now_ms() + LEASE.num_milliseconds();
+            save(data_dir, &job).is_ok()
+        }
+        _ => false,
+    }
+}
+
+fn read_job(data_dir: &Path, id: &str) -> Option<Job> {
+    let job =
+        serde_json::from_str::<Job>(&std::fs::read_to_string(job_path(data_dir, id)).ok()?).ok()?;
+    Some(Job {
+        id: id.to_owned(),
+        ..job
+    })
+}
+
+/// Renew the claim's lease every [`RENEW_EVERY`] until it ends, it is no
+/// longer this claim, or [`MAX_RUN`] passed: a thread of its own, so a pass
+/// that waits on a model call keeps its claim without asking.
+fn keep_renewed(
+    data_dir: PathBuf,
+    id: String,
+    token: String,
+    ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let started = std::time::Instant::now();
+    let _ = std::thread::Builder::new()
+        .name("sleep-lease".to_owned())
+        .spawn(move || {
+            let mut last = std::time::Instant::now();
+            while !ended.load(std::sync::atomic::Ordering::SeqCst) && started.elapsed() < MAX_RUN {
+                std::thread::sleep(Duration::from_millis(500));
+                if last.elapsed() >= RENEW_EVERY {
+                    last = std::time::Instant::now();
+                    if ended.load(std::sync::atomic::Ordering::SeqCst)
+                        || !renew(&data_dir, &id, &token)
+                    {
+                        return;
+                    }
+                }
+            }
+        });
 }
 
 /// Claim the first due job `pick` accepts, of a key nobody else runs: due
@@ -479,17 +604,32 @@ pub fn claim(data_dir: &Path, pick: impl Fn(&Job) -> bool) -> Result<Option<Clai
             skipped.insert(job.key.clone());
             continue;
         };
+        let token = format!(
+            "{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
         job.claimed = Some(Claim {
             pid: std::process::id(),
             until: now + LEASE.num_milliseconds(),
+            token: token.clone(),
         });
         save(data_dir, &job)?;
         job.record(harness_types::diag::info("sleep", "claimed"))
             .emit();
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        keep_renewed(
+            data_dir.to_path_buf(),
+            job.id.clone(),
+            token.clone(),
+            std::sync::Arc::clone(&ended),
+        );
         return Ok(Some(Claimed {
             job,
             data_dir: data_dir.to_path_buf(),
-            _lock: lock,
+            token,
+            lock,
+            ended,
         }));
     }
     Ok(None)
@@ -516,22 +656,48 @@ pub fn claim_upkeep(data_dir: &Path, job: Job) -> Option<Claimed> {
 }
 
 impl Claimed {
-    /// The pass succeeded (or found nothing to do): the job is removed.
-    pub fn done(self) {
+    /// Whether the job on disk is still held by this claim: `None` when it is
+    /// gone, `Some(false)` when another claim took it over.
+    fn still_mine(&self) -> Option<bool> {
+        read_job(&self.data_dir, &self.job.id)
+            .map(|job| job.claimed.is_some_and(|claim| claim.token == self.token))
+    }
+
+    /// The pass succeeded (or found nothing to do): the job is removed, unless
+    /// another claim took it over meanwhile (then that one decides). The key's
+    /// lock file goes with the key's last job.
+    pub fn done(mut self) {
+        self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
         let removed = lock_queue(&self.data_dir).and_then(|_queue| {
-            std::fs::remove_file(job_path(&self.data_dir, &self.job.id))
-                .or_else(|error| {
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        Ok(())
-                    } else {
-                        Err(error)
-                    }
-                })
-                .map_err(|error| error.to_string())
+            let outcome = match self.still_mine() {
+                Some(false) => Ok(false),
+                None => Ok(true),
+                Some(true) => std::fs::remove_file(job_path(&self.data_dir, &self.job.id))
+                    .or_else(|error| {
+                        if error.kind() == std::io::ErrorKind::NotFound {
+                            Ok(())
+                        } else {
+                            Err(error)
+                        }
+                    })
+                    .map(|()| true)
+                    .map_err(|error| error.to_string()),
+            };
+            // The lock file is opened only under the queue's lock, so once
+            // this handle lets go nobody holds it.
+            drop(self.lock.take());
+            if !jobs(&self.data_dir)
+                .iter()
+                .any(|other| other.key == self.job.key)
+            {
+                let _ = std::fs::remove_file(key_lock(&self.data_dir, &self.job.key));
+            }
+            outcome
         });
         let record = self.job.record(harness_types::diag::info("sleep", "done"));
         match removed {
-            Ok(()) => record.emit(),
+            Ok(true) => record.emit(),
+            Ok(false) => record.field("superseded", true).emit(),
             Err(error) => record.field("kept", true).msg(error).emit(),
         }
     }
@@ -541,6 +707,7 @@ impl Claimed {
     /// of its key that came in meanwhile takes this one's span, keeping this
     /// one's backoff.
     pub fn failed(self, error: &str) {
+        self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut job = self.job.clone();
         job.claimed = None;
         job.attempts = job.attempts.saturating_add(1);
@@ -553,6 +720,11 @@ impl Claimed {
             job.next_at = now_ms() + backoff(job.kind, job.attempts).num_milliseconds();
         }
         let result = lock_queue(&self.data_dir).and_then(|_queue| {
+            // Taken over (this claim lapsed) or done by the claim that took
+            // it: that claim decides, and this failure writes nothing.
+            if self.still_mine() != Some(true) {
+                return Err("superseded by another claim".to_owned());
+            }
             let newer = (!gave_up)
                 .then(|| {
                     jobs(&self.data_dir).into_iter().find(|other| {
@@ -587,6 +759,53 @@ impl Claimed {
             Err(write) => record.field("write_error", write).emit(),
         }
     }
+}
+
+/// Remove a job of `key` that gave up: its pass is no longer owed (it is not
+/// due, so it succeeded another way, `/refine --curate` say), and the
+/// doctor's warning goes with it.
+pub fn forget_given_up(data_dir: &Path, key: &str) {
+    let given_up = jobs(data_dir)
+        .into_iter()
+        .filter(|job| job.key == key && job.gave_up)
+        .collect::<Vec<_>>();
+    if given_up.is_empty() {
+        return;
+    }
+    let Ok(_queue) = lock_queue(data_dir) else {
+        return;
+    };
+    for job in given_up {
+        if std::fs::remove_file(job_path(data_dir, &job.id)).is_ok() {
+            job.record(harness_types::diag::info("sleep", "forgotten"))
+                .emit();
+        }
+    }
+}
+
+/// [`enqueue`] without waiting: when another process holds the queue's lock,
+/// the job is written as a new file of its own (to coalesce at the next
+/// change), so a caller that cannot wait - a session ending - loses nothing.
+///
+/// # Errors
+/// The job cannot be written.
+pub fn enqueue_now(data_dir: &Path, job: Job) -> Result<(), String> {
+    let lock = super::files::open_lock(&dir(data_dir).join(QUEUE_LOCK), "background memory queue")?;
+    if super::files::try_take(&lock, "background memory queue")? {
+        drop(lock);
+        return enqueue(data_dir, job).map(|_| ());
+    }
+    let id = format!(
+        "{}-{}",
+        key_name(&job.key),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let job = Job { id, ..job };
+    save(data_dir, &job)?;
+    job.record(harness_types::diag::info("sleep", "enqueued"))
+        .field("coalesced", false)
+        .emit();
+    Ok(())
 }
 
 /// Where a session that ended before 0.8.9 left its review, in the project's
@@ -881,5 +1100,175 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    fn store(projects: &std::path::Path, key: &str, adopted: &[&str]) -> std::path::PathBuf {
+        let dir = projects.join(key);
+        std::fs::create_dir_all(&dir).expect("store");
+        std::fs::write(dir.join(harness_store_sqlite::DATABASE_FILE_NAME), "").expect("db");
+        std::fs::write(
+            dir.join("project.json"),
+            serde_json::json!({"schema_version": 1, "root": "r", "adopted": adopted}).to_string(),
+        )
+        .expect("manifest");
+        dir
+    }
+
+    /// A store moved under a new key (`ha project rekey`) keeps its review
+    /// jobs: the store that took it over finds them, and a later review of the
+    /// conversation coalesced into one names the store as it is now. They
+    /// were stranded, and swallowed every later review.
+    #[test]
+    fn a_review_of_a_store_that_moved_follows_it() {
+        let directory = tempfile::tempdir().expect("dir");
+        let data = directory.path();
+        let projects = data.join("projects");
+        let old = projects.join("project-0000000000000old");
+        enqueue(
+            data,
+            Job::review(&old, "task-1", "s1", "turn", 2, Vec::new()),
+        )
+        .expect("queued");
+        let new = store(
+            &projects,
+            "project-0000000000000new",
+            &["project-0000000000000old"],
+        );
+        let other = store(&projects, "project-00000000000other", &[]);
+        let job = jobs(data).remove(0);
+        assert!(super::belongs_to(&job, &new), "the store that took it over");
+        assert!(!super::belongs_to(&job, &other));
+        enqueue(
+            data,
+            Job::review(&new, "task-1", "s2", "turn", 1, Vec::new()),
+        )
+        .expect("more");
+        let kept = jobs(data);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].project.as_deref(),
+            Some(new.display().to_string().as_str())
+        );
+        assert_eq!(kept[0].turns, 3);
+    }
+
+    /// A claim that lapsed is taken over; the pass it was running can then
+    /// neither remove the job the new claim runs nor write its failure over it.
+    #[test]
+    fn a_lapsed_claim_acts_only_on_itself() {
+        let directory = tempfile::tempdir().expect("dir");
+        let data = directory.path();
+        enqueue(data, review("task-1", "s1", 1)).expect("queued");
+        let first = claim(data, |_| true).expect("claim").expect("due");
+        // Its lease lapsed (a process that hung).
+        let mut lapsed = jobs(data).remove(0);
+        if let Some(claim) = lapsed.claimed.as_mut() {
+            claim.until = 0;
+        }
+        super::save(data, &lapsed).expect("lapsed");
+        let second = claim(data, |_| true).expect("claim").expect("taken over");
+        assert!(
+            !super::renew(data, &first.job.id, &first.token),
+            "no longer its claim"
+        );
+        first.done();
+        assert_eq!(jobs(data).len(), 1, "the taken-over job stays");
+        assert!(super::renew(data, &second.job.id, &second.token));
+        let second_token = second.token.clone();
+        // The first claim's failure writes nothing over the second's claim.
+        let mut third = jobs(data).remove(0);
+        third.claimed.as_mut().expect("claimed").until = 0;
+        super::save(data, &third).expect("lapsed again");
+        let mut kept = jobs(data).remove(0);
+        kept.claimed.as_mut().expect("claimed").until = i64::MAX;
+        super::save(data, &kept).expect("restored");
+        let stale = super::Claimed {
+            job: kept.clone(),
+            data_dir: data.to_path_buf(),
+            token: "an-old-claim".to_owned(),
+            lock: None,
+            ended: std::sync::Arc::default(),
+        };
+        stale.failed("the refinement model call timed out");
+        let now = jobs(data).remove(0);
+        assert_eq!(
+            now.attempts, 0,
+            "the failure of a lapsed claim is not counted"
+        );
+        assert_eq!(now.claimed.expect("claimed").token, second_token);
+        second.done();
+        assert!(jobs(data).is_empty());
+    }
+
+    /// A running claim renews its lease, so a long pass is not taken over.
+    #[test]
+    fn a_running_claim_renews_its_lease() {
+        let directory = tempfile::tempdir().expect("dir");
+        let data = directory.path();
+        enqueue(data, review("task-1", "s1", 1)).expect("queued");
+        let running = claim(data, |_| true).expect("claim").expect("due");
+        let mut lapsing = jobs(data).remove(0);
+        lapsing.claimed.as_mut().expect("claimed").until = 1;
+        super::save(data, &lapsing).expect("about to lapse");
+        assert!(super::renew(data, &running.job.id, &running.token));
+        assert!(jobs(data)[0].claimed.as_ref().expect("claimed").until > 1);
+        assert!(
+            claim(data, |_| true).expect("claim").is_none(),
+            "still running"
+        );
+    }
+
+    /// An upkeep pass asked for again while it runs writes no second job,
+    /// which waited a day and was reported though nothing was owed.
+    #[test]
+    fn an_upkeep_pass_asked_for_while_it_runs_writes_no_second_job() {
+        let directory = tempfile::tempdir().expect("dir");
+        let data = directory.path();
+        let running = super::claim_upkeep(data, Job::evolution()).expect("claimed");
+        assert!(super::claim_upkeep(data, Job::evolution()).is_none());
+        assert_eq!(jobs(data).len(), 1);
+        running.done();
+        assert!(jobs(data).is_empty());
+    }
+
+    /// The last job of a key takes its lock file with it; the lock name is
+    /// the same in every build (SHA-256, not the standard library's hasher).
+    #[test]
+    fn a_key_lock_goes_with_its_last_job_and_is_named_alike_by_every_build() {
+        let directory = tempfile::tempdir().expect("dir");
+        let data = directory.path();
+        assert_eq!(
+            super::key_name("review:task-1"),
+            "reviewtask1-d3ec0bc7dc516cb1"
+        );
+        enqueue(data, review("task-1", "s1", 1)).expect("queued");
+        claim(data, |_| true).expect("claim").expect("due").done();
+        assert!(!super::key_lock(data, "review:task-1").exists());
+    }
+
+    /// A job that gave up is forgotten once its pass is no longer owed.
+    #[test]
+    fn a_job_that_gave_up_can_be_forgotten() {
+        let directory = tempfile::tempdir().expect("dir");
+        let data = directory.path();
+        let mut job = Job::evolution();
+        job.id = "evolution-1".to_owned();
+        job.gave_up = true;
+        super::save(data, &job).expect("gave up");
+        super::forget_given_up(data, "evolution");
+        assert!(jobs(data).is_empty());
+    }
+
+    /// A session that ends while another process changes the queue still
+    /// leaves its review, as a job of its own.
+    #[test]
+    fn a_review_written_while_the_queue_is_busy_is_not_lost() {
+        let directory = tempfile::tempdir().expect("dir");
+        let data = directory.path();
+        let busy = super::lock_queue(data).expect("busy");
+        super::enqueue_now(data, review("task-1", "s1", 4)).expect("written");
+        drop(busy);
+        assert_eq!(jobs(data).len(), 1);
+        assert_eq!(jobs(data)[0].turns, 4);
     }
 }

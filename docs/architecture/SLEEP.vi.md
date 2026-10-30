@@ -41,7 +41,17 @@ ngày, và Deep Dream hỏng bị thử lại mỗi giờ mãi mãi. Từ 0.8.9 
   key của job suốt lúc lượt chạy, nên mỗi lúc chỉ một job của một hội thoại
   (và một Deep Dream, một lượt tiến hoá) chạy, trên mọi process của ha. Process
   chết thì khoá mất theo, và job của nó lại nhận được mà không tính thêm lần
-  thử; một lần nhận quá 30 phút cũng bị nhận lại.
+  thử. Lần nhận đang chạy tự gia hạn thời hạn 30 phút của nó mỗi 5 phút, tối đa
+  hai giờ; lần nhận hết hạn (process bị treo) bị nhận lại, và lượt nó đang chạy
+  khi đó không thể xoá job hay ghi đè lỗi của nó lên: xong và hỏng chỉ tác động
+  lên đúng lần nhận chúng giữ. Một lần hợp nhất hay tiến hoá là một lượt: được
+  yêu cầu lại trong lúc đang chạy thì không ghi job thứ hai. Job cuối cùng của
+  một key mang file khoá của key đi theo.
+- **Store đã chuyển chỗ vẫn giữ job của nó.** Job review ghi thư mục store của
+  project. Khi store chuyển sang key khác (`ha project rekey`, repository được
+  tìm lại), store đã nhận nó (`project.json` liệt kê key cũ trong adopted)
+  chạy job đó, và review sau của hội thoại gộp vào nó sẽ ghi store như hiện
+  tại.
 - **Xong thì job bị xoá; hỏng thì job ở lại.** Lượt hỏng đếm thêm một lần thử,
   ghi lỗi và loại lỗi (mã lỗi ổn định của provider, `timeout`, `truncated`
   hoặc `other`), rồi chờ: 5 phút với review, một giờ với hợp nhất hay tiến
@@ -51,7 +61,9 @@ ngày, và Deep Dream hỏng bị thử lại mỗi giờ mãi mãi. Từ 0.8.9 
 - **Sau 6 lần hỏng liên tiếp job bỏ cuộc.** Nó vẫn nằm trên đĩa, không tự được
   thử lại nữa, và `ha doctor` cùng bug report nói ra điều đó. Lượt mới của một
   hội thoại là một job review mới; một lần hợp nhất hay tiến hoá đã bỏ cuộc thì
-  không nhận job mới cho tới khi file của nó bị xoá.
+  không nhận job mới cho tới khi file của nó bị xoá, hoặc cho tới khi lượt đó
+  không còn đến hạn vì đã thành công theo cách khác (`/refine --curate` cũng
+  hợp nhất memory): khi đó job được bỏ đi.
 
 ## Các điểm kích hoạt
 
@@ -70,7 +82,8 @@ hạn.
 - **Session im lặng** (mười phút, `HA_IDLE_REVIEW_SECONDS`): một job cho phần
   việc từ lần review trước, chạy ngay lúc đó.
 - **Session kết thúc**: một job cho phần đuôi chưa review, được lượt kế tiếp
-  trong project chạy. File `refine-pending/` mà ha cũ để lại trong project vào
+  trong project chạy. Session kết thúc không chờ thay đổi của process khác
+  trên hàng đợi: lúc đó job được ghi thành một file riêng, gộp lại sau. File `refine-pending/` mà ha cũ để lại trong project vào
   hàng đợi ngay lần đầu hàng đợi được đọc ở đó.
 - **`ha exec` thoát**: một job khi các lần chạy của hội thoại đã làm đủ; rồi các
   job review đến hạn của hội thoại chạy trước khi process thoát. Một lần chạy
@@ -88,7 +101,7 @@ thành công; nó không nằm trong hàng đợi.
 ## Những gì cho thấy nó
 
 - **Diagnostics**: bản ghi `sleep` với `enqueued` (kèm `coalesced`),
-  `claimed`, `done`, `failed` và `gave_up`, mỗi bản ghi có loại job, key, điểm
+  `claimed`, `done` (kèm `superseded` khi một lần nhận khác đã lấy job), `failed`, `gave_up` và `forgotten`, mỗi bản ghi có loại job, key, điểm
   kích hoạt, số lần thử, số lượt và span, và với lần hỏng thì loại lỗi cùng thời
   điểm thử lại. Bản ghi `refine.call_failed` có thêm `class` của lỗi.
 - **`ha doctor`** (State): bao nhiêu lượt đang xếp hàng, lượt nào hỏng và chờ

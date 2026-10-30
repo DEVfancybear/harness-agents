@@ -1344,24 +1344,40 @@ pub async fn run_with(
         && outcome.stop != harness_tools::TurnStop::Canceled;
     let local = super::harness::local_dir(&context.paths.data_dir, outcome.task_id.as_str());
     if reviewing {
-        let _ = super::refine::exec_review_due(
-            &local,
-            turns_run,
-            tool_calls_run,
-            runtime.compactions() > 0,
-            super::service::auto_refine_interval(&context.paths.config_file),
-            |turns| {
-                let job = super::sleep::Job::review(
-                    &context.project_store_dir(),
-                    outcome.task_id.as_str(),
-                    outcome.session_id.as_str(),
-                    "exec",
-                    turns,
-                    Vec::new(),
-                );
-                super::sleep::enqueue(&context.paths.data_dir, job).map(|_| ())
-            },
+        // On a blocking thread: the queue's lock may wait for another
+        // process's change.
+        let (local, data_dir, store_dir) = (
+            local.clone(),
+            context.paths.data_dir.clone(),
+            context.project_store_dir(),
         );
+        let (task, session) = (
+            outcome.task_id.as_str().to_owned(),
+            outcome.session_id.as_str().to_owned(),
+        );
+        let compacted = runtime.compactions() > 0;
+        let interval = super::service::auto_refine_interval(&context.paths.config_file);
+        let _ = tokio::task::spawn_blocking(move || {
+            super::refine::exec_review_due(
+                &local,
+                turns_run,
+                tool_calls_run,
+                compacted,
+                interval,
+                |turns| {
+                    let job = super::sleep::Job::review(
+                        &store_dir,
+                        &task,
+                        &session,
+                        "exec",
+                        turns,
+                        Vec::new(),
+                    );
+                    super::sleep::enqueue(&data_dir, job).map(|_| ())
+                },
+            )
+        })
+        .await;
     }
 
     drop(driver);
@@ -1453,10 +1469,14 @@ pub async fn run_with(
             if super::refine::local_consolidation_due(&scopes.local)
                 && let Some(_consolidating) =
                     super::refine::Consolidating::try_begin(&scopes.global)
-                && let Some(claimed) = super::sleep::claim_upkeep(
-                    &context.paths.data_dir,
-                    super::sleep::Job::consolidation(&scopes.local),
-                )
+                && let Some(claimed) = {
+                    let data_dir = context.paths.data_dir.clone();
+                    let job = super::sleep::Job::consolidation(&scopes.local);
+                    tokio::task::spawn_blocking(move || super::sleep::claim_upkeep(&data_dir, job))
+                        .await
+                        .ok()
+                        .flatten()
+                }
             {
                 events.push(
                     super::service::consolidate_local_event(
