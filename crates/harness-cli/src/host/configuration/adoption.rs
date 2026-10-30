@@ -569,27 +569,36 @@ pub fn store_named(data_dir: &Path, old: &str) -> Option<String> {
     if is_key {
         return has_store(&projects.join(old)).then(|| old.to_owned());
     }
-    let path = Path::new(old);
+    // Spelled with the platform's separators, as a launch spelled it.
+    let path = Path::new(old).components().collect::<PathBuf>();
     let keys = [
-        super::bootstrap::project_key_of(path),
-        super::bootstrap::legacy_key_of(path),
+        super::bootstrap::project_key_of(&path),
+        super::bootstrap::legacy_key_of(&path),
     ];
     if let Some(key) = keys.iter().find(|key| has_store(&projects.join(key))) {
         return Some(key.clone());
     }
-    let spelled = super::bootstrap::canonical_or_given(path);
-    let same = |root: &str| {
-        let root = Path::new(root);
-        root == path
-            || root == spelled
-            || cfg!(windows)
-                && root.to_string_lossy().to_lowercase() == spelled.to_string_lossy().to_lowercase()
+    let spelled = super::bootstrap::canonical_or_given(&path);
+    let fold = |path: &Path| {
+        let text = path.components().collect::<PathBuf>().display().to_string();
+        if cfg!(windows) {
+            text.to_lowercase()
+        } else {
+            text
+        }
     };
+    let wanted = fold(&spelled);
+    // A store names the directory in its manifest, or registered it.
     let mut found = std::fs::read_dir(&projects)
         .ok()?
         .filter_map(Result::ok)
         .filter(|entry| has_store(&entry.path()))
-        .filter(|entry| manifest(&entry.path()).is_some_and(|kept| same(&kept.root)))
+        .filter(|entry| {
+            manifest(&entry.path()).is_some_and(|kept| fold(Path::new(&kept.root)) == wanted)
+                || registered_roots(&entry.path())
+                    .iter()
+                    .any(|root| fold(Path::new(root)) == wanted)
+        })
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     found.sort();
@@ -1099,6 +1108,11 @@ mod tests {
             Some(old_key.clone())
         );
         assert_eq!(super::store_named(&data, &old_key), Some(old_key.clone()));
+        // Typed with the other separator, as a shell may.
+        assert_eq!(
+            super::store_named(&data, &old.display().to_string().replace('\\', "/")),
+            Some(old_key.clone())
+        );
         super::take_over(
             &data,
             &bootstrap::project_root(&here),

@@ -396,7 +396,7 @@ fn purge(args: &PurgeArgs) -> Result<(), HarnessError> {
             let held = if shape.is_empty() {
                 String::new()
             } else {
-                format!(", holding a {shape}")
+                format!(": holds a secret value ({shape})")
             };
             println!(
                 "{verb} [{label}] {}:{key} ({}): {what}{held}",
