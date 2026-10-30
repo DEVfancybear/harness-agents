@@ -1458,9 +1458,17 @@ async fn p5_s07_cli_run_agents_reports_ownership_and_result_revisions() {
         // dependency revision it checked; the explorer reports its base.
         match task["role"].as_str() {
             Some("coder" | "verifier") => {
-                assert_ne!(result["base_revision"], result["result_revision"]);
+                assert_ne!(
+                    result["base_revision"], result["result_revision"],
+                    "{task:#}"
+                );
             }
-            Some("explorer") => assert_eq!(result["base_revision"], result["result_revision"]),
+            Some("explorer") => {
+                assert_eq!(
+                    result["base_revision"], result["result_revision"],
+                    "{task:#}"
+                );
+            }
             role => panic!("unexpected delegated role: {role:?}"),
         }
     }

@@ -4,7 +4,13 @@
 //! the same single-writer store the rest of the harness uses, and it never
 //! fabricates a result: only host-recorded durable state is printed.
 
-use std::{collections::BTreeMap, future::Future, path::PathBuf, pin::Pin, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+};
 
 use clap::{Args, Subcommand};
 use harness_orchestrator::{
@@ -506,8 +512,15 @@ async fn run_delegation(
         .admit(&plan)
         .await
         .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
-    dispatch_plan(&store, &workspace, &scheduler, &plan, &snapshot).await?;
-    let outcomes = collect_outcomes(&coordinator, &plan, &scheduler).await?;
+    let outcomes = run_plan(
+        &store,
+        &workspace,
+        &scheduler,
+        &coordinator,
+        &plan,
+        &snapshot,
+    )
+    .await?;
     let deliveries = store
         .pending_deliveries(&coordinator_task)
         .await
@@ -604,13 +617,19 @@ async fn resolve_snapshot(
     }
 }
 
-async fn dispatch_plan(
+/// Run the plan: a task is dispatched once every task it depends on has
+/// settled, so a verifier reads the commit its coder made rather than the
+/// base the coder started from (dispatched together, the verifier could read
+/// the coder's worktree before the commit), and each outcome is settled as it
+/// arrives.
+async fn run_plan(
     store: &Arc<SqliteStore>,
     workspace: &Arc<WorkspaceManager>,
     scheduler: &Arc<WorkerScheduler>,
+    coordinator: &DelegationCoordinator,
     plan: &TaskPlan,
     snapshot: &VerifiedSnapshot,
-) -> Result<(), HarnessError> {
+) -> Result<Vec<harness_orchestrator::StepOutcome>, HarnessError> {
     let coordinator_session = store
         .list_sessions()
         .await
@@ -620,67 +639,109 @@ async fn dispatch_plan(
         .ok_or_else(|| {
             HarnessError::new(ErrorCode::InvalidPayload, "no coordinator session exists")
         })?;
-    let coordinator = DelegationCoordinator::new(Arc::clone(store), Arc::clone(scheduler), 1);
-    let mut dispatched: Vec<TaskId> = Vec::new();
+    let mut lease = scheduler
+        .acquire_lease()
+        .await
+        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+    let mut dispatched = BTreeSet::new();
+    let mut settled = BTreeSet::new();
     let mut task_worktrees = BTreeMap::new();
-    for task_id in &plan.topological_order {
-        let node = plan
-            .node(task_id)
-            .ok_or_else(|| HarnessError::new(ErrorCode::TaskNotFound, "the plan lost a node"))?;
-        if node
-            .depends_on
-            .iter()
-            .any(|dependency| !dispatched.contains(dependency))
-        {
-            return Err(HarnessError::new(
-                ErrorCode::TaskNotReady,
-                format!("task {task_id} was dispatched before its dependencies ran"),
-            ));
+    let mut outcomes = Vec::new();
+    loop {
+        for task_id in &plan.topological_order {
+            let node = plan.node(task_id).ok_or_else(|| {
+                HarnessError::new(ErrorCode::TaskNotFound, "the plan lost a node")
+            })?;
+            if dispatched.contains(task_id)
+                || !node
+                    .depends_on
+                    .iter()
+                    .all(|dependency| settled.contains(dependency))
+            {
+                continue;
+            }
+            dispatch_task(
+                store,
+                workspace,
+                scheduler,
+                coordinator,
+                &coordinator_session,
+                node,
+                snapshot,
+                &mut task_worktrees,
+            )
+            .await?;
+            dispatched.insert(task_id.clone());
         }
-        let worker = WorkerRef {
-            profile_id: AgentProfileId::generate(),
-            run_id: AgentRunId::generate(),
-            role: node.role,
-            generation: 1,
+        let Ok((task_id, outcome)) = coordinator.await_next(&mut lease).await else {
+            break;
         };
-        let mut worktree = None;
-        if node.role.default_edit_capable() {
-            let record = workspace
-                .create_worktree(
-                    snapshot,
-                    task_id,
-                    &worker.run_id,
-                    &node.brief.grants.write_scope,
-                    1,
-                )
-                .await
-                .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
-            upsert_worktree(store, &record).await?;
-            task_worktrees.insert(task_id.clone(), record.clone());
-            worktree = Some(record);
-        } else if node.role == AgentRole::Verifier {
-            worktree = node
-                .depends_on
-                .iter()
-                .find_map(|dependency| task_worktrees.get(dependency).cloned());
-        }
-        coordinator
-            .claim(task_id, &worker, &coordinator_session)
+        let step = coordinator
+            .settle(plan, &task_id, outcome)
             .await
             .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
-        scheduler
-            .dispatch(WorkerRequest {
-                task_id: task_id.clone(),
-                run_id: worker.run_id.clone(),
-                generation: worker.generation,
-                depth: node.depth,
-                brief: node.brief.clone(),
-                worktree,
-                cancellation: CancellationToken::new(),
-            })
-            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
-        dispatched.push(task_id.clone());
+        settled.insert(task_id);
+        outcomes.push(step);
     }
+    Ok(outcomes)
+}
+
+/// Claim one task and hand it to a worker: an editing role in a worktree of
+/// its own, a verifier in the worktree of the task it depends on.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_task(
+    store: &Arc<SqliteStore>,
+    workspace: &Arc<WorkspaceManager>,
+    scheduler: &Arc<WorkerScheduler>,
+    coordinator: &DelegationCoordinator,
+    coordinator_session: &SessionId,
+    node: &TaskNode,
+    snapshot: &VerifiedSnapshot,
+    task_worktrees: &mut BTreeMap<TaskId, harness_orchestrator::WorktreeRecord>,
+) -> Result<(), HarnessError> {
+    let task_id = &node.task_id;
+    let worker = WorkerRef {
+        profile_id: AgentProfileId::generate(),
+        run_id: AgentRunId::generate(),
+        role: node.role,
+        generation: 1,
+    };
+    let mut worktree = None;
+    if node.role.default_edit_capable() {
+        let record = workspace
+            .create_worktree(
+                snapshot,
+                task_id,
+                &worker.run_id,
+                &node.brief.grants.write_scope,
+                1,
+            )
+            .await
+            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+        upsert_worktree(store, &record).await?;
+        task_worktrees.insert(task_id.clone(), record.clone());
+        worktree = Some(record);
+    } else if node.role == AgentRole::Verifier {
+        worktree = node
+            .depends_on
+            .iter()
+            .find_map(|dependency| task_worktrees.get(dependency).cloned());
+    }
+    coordinator
+        .claim(task_id, &worker, coordinator_session)
+        .await
+        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+    scheduler
+        .dispatch(WorkerRequest {
+            task_id: task_id.clone(),
+            run_id: worker.run_id.clone(),
+            generation: worker.generation,
+            depth: node.depth,
+            brief: node.brief.clone(),
+            worktree,
+            cancellation: CancellationToken::new(),
+        })
+        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
     Ok(())
 }
 
@@ -706,29 +767,6 @@ async fn upsert_worktree(
         })
         .await
         .map_err(store_error)
-}
-
-async fn collect_outcomes(
-    coordinator: &DelegationCoordinator,
-    plan: &TaskPlan,
-    scheduler: &Arc<WorkerScheduler>,
-) -> Result<Vec<harness_orchestrator::StepOutcome>, HarnessError> {
-    let mut lease = scheduler
-        .acquire_lease()
-        .await
-        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
-    let mut outcomes = Vec::new();
-    loop {
-        let Ok((task_id, outcome)) = coordinator.await_next(&mut lease).await else {
-            break;
-        };
-        let step = coordinator
-            .settle(plan, &task_id, outcome)
-            .await
-            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
-        outcomes.push(step);
-    }
-    Ok(outcomes)
 }
 
 fn build_demo_plan(
