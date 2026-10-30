@@ -529,7 +529,8 @@ pub async fn run_with(
             ),
             ..RuntimeConfig::default()
         },
-    );
+    )
+    .with_workspace_root(&context.project.root);
     // A token budget is an explicit account the run reserves against; without
     // one the run has no token bound to promise.
     if let Some(limit) = request.options.budget_tokens {

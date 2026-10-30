@@ -8600,7 +8600,8 @@ async fn run_turn(
             estimate_scale: carried_scale,
             ..RuntimeConfig::default()
         },
-    );
+    )
+    .with_workspace_root(&workspace_root);
     if let Some((auxiliary, entry)) = &auxiliary {
         runtime = runtime.with_summarizer(Arc::new(super::routing::AuxiliarySummary::new(
             entry.reference(),

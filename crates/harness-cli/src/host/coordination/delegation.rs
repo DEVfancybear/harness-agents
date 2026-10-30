@@ -5274,11 +5274,15 @@ impl WorkerBackend for InteractiveWorkerBackend {
             {
                 live.set(current);
             }
-            let runtime = Arc::new(RuntimeService::new(
-                Arc::clone(&store),
-                Arc::clone(&live) as Arc<dyn ModelProvider>,
-                launch.runtime_config.clone(),
-            ));
+            // Its summaries look a shell call's files up where its tools work.
+            let runtime = Arc::new(
+                RuntimeService::new(
+                    Arc::clone(&store),
+                    Arc::clone(&live) as Arc<dyn ModelProvider>,
+                    launch.runtime_config.clone(),
+                )
+                .with_workspace_root(&workspace_root),
+            );
             // The child's task is the parent's work, not a conversation of the
             // user's: `/resume` and "latest" leave it out.
             let _ = store

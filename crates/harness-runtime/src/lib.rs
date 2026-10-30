@@ -413,36 +413,78 @@ const KERNEL_PERSIST_SUMMARY_NOTE: &str = "Note: the Python kernel keeps running
 /// Each list is in the order its files were last touched, oldest first, and
 /// the cap keeps the newest: sorted by name, a long task's cap dropped the
 /// files it was working on whenever their names sorted late.
-fn file_lists(messages: &[ProviderMessage], previous: Option<&str>) -> (Vec<String>, Vec<String>) {
+///
+/// Files reached another way are listed too. A shell or process call's
+/// arguments that name an existing file inside `root` (the folder the tools
+/// work in) were read, and the target of a `>` or `>>` redirection was
+/// changed ([`shell_files`]); a Python cell's result names the workspace files
+/// the cell opened ([`CELL_FILES_HEADER`]). Without them a task that read its
+/// inputs with `type` or in the REPL forgot them at the first compaction.
+fn file_lists(
+    messages: &[ProviderMessage],
+    previous: Option<&str>,
+    root: Option<&std::path::Path>,
+) -> (Vec<String>, Vec<String>) {
     let (mut read, mut modified) = previous.map(listed_files).unwrap_or_default();
     let touch = |list: &mut Vec<String>, path: String| {
         list.retain(|kept| *kept != path);
         list.push(path);
     };
-    for call in messages.iter().flat_map(|message| &message.tool_calls) {
-        let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments) else {
-            continue;
-        };
-        // `read_file` takes one `path` or several `paths`.
-        let paths = arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .into_iter()
-            .chain(
-                arguments
-                    .get("paths")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str),
-            )
-            .map(str::to_owned);
-        match call.name.as_str() {
-            "read_file" => paths.for_each(|path| touch(&mut read, path)),
-            "write_file" | "edit_file" | "apply_patch" => {
-                paths.for_each(|path| touch(&mut modified, path));
+    // Resolved once: every argument is compared with it.
+    let root = root.and_then(|root| root.canonicalize().ok());
+    let cells = messages
+        .iter()
+        .flat_map(|message| &message.tool_calls)
+        .filter(|call| is_repl_call(&call.name))
+        .map(|call| call.call_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for message in messages {
+        if message.role == MessageRole::Tool
+            && message
+                .tool_call_id
+                .as_deref()
+                .is_some_and(|id| cells.contains(id))
+        {
+            let (opened, written) = cell_files(&message.content);
+            opened.into_iter().for_each(|path| touch(&mut read, path));
+            written
+                .into_iter()
+                .for_each(|path| touch(&mut modified, path));
+        }
+        for call in &message.tool_calls {
+            let Ok(arguments) = serde_json::from_str::<Value>(&call.arguments) else {
+                continue;
+            };
+            // `read_file` takes one `path` or several `paths`.
+            let paths = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .into_iter()
+                .chain(
+                    arguments
+                        .get("paths")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str),
+                )
+                .map(str::to_owned);
+            match call.name.as_str() {
+                "read_file" => paths.for_each(|path| touch(&mut read, path)),
+                "write_file" | "edit_file" | "apply_patch" => {
+                    paths.for_each(|path| touch(&mut modified, path));
+                }
+                "run_shell" | "run_process" | "bash" | "shell" => {
+                    if let Some(root) = root.as_deref() {
+                        let (named, redirected) = shell_files(&arguments, root);
+                        named.into_iter().for_each(|path| touch(&mut read, path));
+                        redirected
+                            .into_iter()
+                            .for_each(|path| touch(&mut modified, path));
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
     read.retain(|path| !modified.contains(path));
@@ -456,6 +498,171 @@ fn file_lists(messages: &[ProviderMessage], previous: Option<&str>) -> (Vec<Stri
 
 /// How many paths each file list keeps (prime-agent's cap).
 const FILE_LIST_MAX: usize = 200;
+
+/// Whether a call is the Python REPL's, under its name or the ones it had.
+fn is_repl_call(name: &str) -> bool {
+    matches!(name, "python_repl" | "ipython" | "python")
+}
+
+/// The line a Python cell's result starts with when the cell opened files of
+/// the workspace, followed by one `read <path>` or `wrote <path>` line each.
+/// The host writes it ([`cell_files_note`]); a summary's file lists read it
+/// back from the result, which is all a conversation keeps of a call.
+pub const CELL_FILES_HEADER: &str = "[workspace files this cell opened]";
+
+/// The most files of each kind a cell's note names, and a summary reads back.
+pub const CELL_FILES_MAX: usize = 20;
+
+/// The note a cell's result starts with, naming the workspace files it read
+/// and wrote (each path relative to the workspace, at most
+/// [`CELL_FILES_MAX`] of each); `None` when it opened none.
+#[must_use]
+pub fn cell_files_note(read: &[String], written: &[String]) -> Option<String> {
+    if read.is_empty() && written.is_empty() {
+        return None;
+    }
+    let mut note = CELL_FILES_HEADER.to_owned();
+    for path in read.iter().take(CELL_FILES_MAX) {
+        let _ = write!(note, "\nread {path}");
+    }
+    for path in written.iter().take(CELL_FILES_MAX) {
+        let _ = write!(note, "\nwrote {path}");
+    }
+    Some(note)
+}
+
+/// The files a cell's result says it read and wrote ([`cell_files_note`]).
+/// A line a shortened result cut (ending in `…`) is not a path.
+fn cell_files(content: &str) -> (Vec<String>, Vec<String>) {
+    let (mut read, mut written) = (Vec::new(), Vec::new());
+    let Some(at) = content.find(CELL_FILES_HEADER) else {
+        return (read, written);
+    };
+    for line in content[at + CELL_FILES_HEADER.len()..]
+        .lines()
+        .skip(1)
+        .take(2 * CELL_FILES_MAX)
+    {
+        if line.ends_with('…') {
+            break;
+        }
+        if let Some(path) = line.strip_prefix("read ") {
+            read.push(path.trim().to_owned());
+        } else if let Some(path) = line.strip_prefix("wrote ") {
+            written.push(path.trim().to_owned());
+        } else {
+            break;
+        }
+    }
+    (read, written)
+}
+
+/// How many words of one shell or process call are looked up as files.
+const SHELL_WORDS_MAX: usize = 64;
+
+/// The workspace files a shell or process call names: `command`'s words
+/// ([`shell_words`]), `executable` and each of `args`. A word that resolves to
+/// an existing file inside `root` was read, unless it follows a `>` or `>>`,
+/// which changed it. No command is recognised by name: a path to a file of
+/// the workspace is what the call worked on, whatever ran it.
+fn shell_files(arguments: &Value, root: &std::path::Path) -> (Vec<String>, Vec<String>) {
+    let mut words = arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .map(shell_words)
+        .unwrap_or_default();
+    words.extend(
+        arguments
+            .get("executable")
+            .and_then(Value::as_str)
+            .into_iter()
+            .chain(
+                arguments
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            )
+            .map(|word| (word.to_owned(), false)),
+    );
+    let (mut read, mut changed) = (Vec::new(), Vec::new());
+    for (word, redirected) in words.into_iter().take(SHELL_WORDS_MAX) {
+        let Some(path) = workspace_file(root, &word) else {
+            continue;
+        };
+        let list = if redirected { &mut changed } else { &mut read };
+        if !list.contains(&path) {
+            list.push(path);
+        }
+    }
+    (read, changed)
+}
+
+/// A command line's words, unquoted, each with whether it is the target of a
+/// `>` or `>>` redirection. Words break at blanks and at `; | & ( ) < >`;
+/// quotes group, and a backslash is a character (a Windows path's separator),
+/// never an escape.
+fn shell_words(command: &str) -> Vec<(String, bool)> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut redirect = false;
+    let flush = |word: &mut String, redirect: &mut bool, words: &mut Vec<(String, bool)>| {
+        if !word.is_empty() {
+            words.push((std::mem::take(word), *redirect));
+            *redirect = false;
+        }
+    };
+    for character in command.chars() {
+        match (quote, character) {
+            (Some(open), _) if character == open => quote = None,
+            (Some(_), _) => word.push(character),
+            (None, '"' | '\'' | '`') => quote = Some(character),
+            (None, '>') => {
+                flush(&mut word, &mut redirect, &mut words);
+                redirect = true;
+            }
+            (None, ';' | '|' | '&' | '(' | ')' | '<') => {
+                flush(&mut word, &mut redirect, &mut words);
+                redirect = false;
+            }
+            (None, blank) if blank.is_whitespace() => {
+                flush(&mut word, &mut redirect, &mut words);
+            }
+            (None, _) => word.push(character),
+        }
+    }
+    flush(&mut word, &mut redirect, &mut words);
+    words
+}
+
+/// `word` as a path relative to `root` (already canonical), with `/`
+/// separators, when it names an existing file inside it.
+fn workspace_file(root: &std::path::Path, word: &str) -> Option<String> {
+    let word = word.trim();
+    // A flag, a glob or a URL is not one file.
+    if word.is_empty()
+        || word.len() > 260
+        || word.starts_with('-')
+        || word.contains(['*', '?'])
+        || word.contains("://")
+    {
+        return None;
+    }
+    let path = std::path::Path::new(word);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    if !candidate.is_file() {
+        return None;
+    }
+    let relative = candidate.canonicalize().ok()?;
+    let relative = relative.strip_prefix(root).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
 
 /// The paths a summary's `<read-files>` and `<modified-files>` blocks list, in
 /// their order.
@@ -541,25 +748,107 @@ fn user_messages_limit(budget: u64) -> usize {
 /// The longest one kept user message may be.
 const USER_MESSAGE_MAX_CHARS: usize = 4_000;
 
+/// The most of the conversation's first user message - the task as the user
+/// set it, often a long spec - a summary keeps word for word, in characters.
+/// It is kept in a budget of its own, besides [`user_messages_limit`]: cut to
+/// [`USER_MESSAGE_MAX_CHARS`] and the first to go once the others filled the
+/// bound, a spec lost its end at the first compaction and the rest of it a few
+/// compactions later.
+const FIRST_MESSAGE_MAX_CHARS: usize = 16_000;
+
+/// How much of the end of a first message longer than
+/// [`FIRST_MESSAGE_MAX_CHARS`] is kept, after its head: a spec's last lines
+/// (what done means, what to hand back) matter as much as its first.
+const FIRST_MESSAGE_TAIL_CHARS: usize = 4_000;
+
+/// How the block says its first message is the conversation's first. A block
+/// without it (0.8.8 wrote none) has the conversation's first message first
+/// only while no message was left out.
+const FIRST_MESSAGE_NOTE: &str = "The first message is the task as the user first set it: it is kept whatever else is left out, and any message left out came after it.";
+
 /// How the block says older messages were left out.
 const USER_MESSAGES_OMITTED: &str = "older message(s) left out";
 
-/// The user's messages a summary carries, oldest first, cumulative: those an
-/// earlier summary listed, then `added`. A message said again is kept once, at
-/// its newest place (a goal's continuations repeat one text); past the bound
-/// the oldest go first, and how many went is counted.
+/// The user's messages a summary carries: the conversation's first, kept on
+/// its own, then the others oldest first, and how many of those were left out.
+#[derive(Debug, Default, PartialEq)]
+struct UserMessages {
+    first: Option<String>,
+    rest: Vec<String>,
+    omitted: usize,
+}
+
+impl UserMessages {
+    /// What a summary's block kept.
+    fn kept(summary: &str) -> Self {
+        let mut rest = listed_user_messages(summary);
+        let omitted = omitted_user_messages(summary);
+        let marked = tagged_block(summary, USER_MESSAGES_TAG)
+            .and_then(|block| block.split("<message>").next())
+            .is_some_and(|head| head.contains(FIRST_MESSAGE_NOTE));
+        let first = (!rest.is_empty() && (marked || omitted == 0)).then(|| rest.remove(0));
+        Self {
+            first,
+            rest,
+            omitted,
+        }
+    }
+
+    /// Every message kept, the first one first.
+    #[cfg(test)]
+    fn all(&self) -> Vec<String> {
+        self.first.iter().chain(&self.rest).cloned().collect()
+    }
+}
+
+/// A first message within [`FIRST_MESSAGE_MAX_CHARS`]: whole when it fits;
+/// else its head and its last [`FIRST_MESSAGE_TAIL_CHARS`], with a line where
+/// the middle was saying how to read it whole.
+fn clip_first_message(message: &str) -> String {
+    let total = message.chars().count();
+    if total <= FIRST_MESSAGE_MAX_CHARS {
+        return message.to_owned();
+    }
+    let head = FIRST_MESSAGE_MAX_CHARS - FIRST_MESSAGE_TAIL_CHARS;
+    let left_out = total - head - FIRST_MESSAGE_TAIL_CHARS;
+    format!(
+        "{}\n[... {left_out} characters of this message left out here: history_search finds the message and history_read reads it whole ...]\n{}",
+        message.chars().take(head).collect::<String>(),
+        message
+            .chars()
+            .skip(total - FIRST_MESSAGE_TAIL_CHARS)
+            .collect::<String>()
+    )
+}
+
+/// The user's messages a summary carries, cumulative: those an earlier
+/// summary listed, then `added`. The conversation's first message is kept on
+/// its own (see [`FIRST_MESSAGE_MAX_CHARS`]); of the others a message said
+/// again is kept once, at its newest place (a goal's continuations repeat one
+/// text), and past the bound the oldest of them go first - the middle of the
+/// conversation, between the task and what was said last - and how many went
+/// is counted.
+///
+/// With no earlier block, the first of `added` is the conversation's first:
+/// the summarized part starts where the conversation does.
 ///
 /// A summary keeps what the user said only as the model retold it, in a
 /// "Constraints & Preferences" bullet or not at all; after a few compactions a
 /// rule the user set at the start was a paraphrase of a paraphrase. Claude
 /// Code's and Codex's compactions keep the user's messages word for word.
-fn user_messages(previous: Option<&str>, added: &[String], limit: usize) -> (Vec<String>, usize) {
-    let mut messages = previous.map(listed_user_messages).unwrap_or_default();
-    let mut omitted = previous.map_or(0, omitted_user_messages);
+fn user_messages(previous: Option<&str>, added: &[String], limit: usize) -> UserMessages {
+    let earlier = previous.filter(|summary| tagged_block(summary, USER_MESSAGES_TAG).is_some());
+    let mut kept = earlier.map(UserMessages::kept).unwrap_or_default();
+    let mut first_open = earlier.is_none();
     let longest = USER_MESSAGE_MAX_CHARS.min(limit.max(1));
     for message in added {
         let message = message.trim();
         if message.is_empty() {
+            continue;
+        }
+        if first_open {
+            first_open = false;
+            kept.first = Some(clip_first_message(message));
             continue;
         }
         let message = if message.chars().count() > longest {
@@ -569,29 +858,41 @@ fn user_messages(previous: Option<&str>, added: &[String], limit: usize) -> (Vec
         } else {
             message.to_owned()
         };
-        messages.retain(|kept| *kept != message);
-        messages.push(message);
+        // The task said again (a goal's continuation) stays where it was.
+        if kept.first.as_deref() == Some(message.as_str()) {
+            continue;
+        }
+        kept.rest.retain(|earlier| *earlier != message);
+        kept.rest.push(message);
     }
-    let mut total = messages.iter().map(String::len).sum::<usize>();
-    while total > limit && !messages.is_empty() {
-        total -= messages.remove(0).len();
-        omitted += 1;
+    let mut total = kept.rest.iter().map(String::len).sum::<usize>();
+    while total > limit && !kept.rest.is_empty() {
+        total -= kept.rest.remove(0).len();
+        kept.omitted += 1;
     }
-    (messages, omitted)
+    kept
 }
 
 /// The user's messages as a summary carries them, after its file lists.
-fn format_user_messages(messages: &[String], omitted: usize) -> String {
-    if messages.is_empty() {
+fn format_user_messages(kept: &UserMessages) -> String {
+    let UserMessages {
+        first,
+        rest,
+        omitted,
+    } = kept;
+    if first.is_none() && rest.is_empty() {
         return String::new();
     }
     let mut text = format!(
         "\n\n<{USER_MESSAGES_TAG}>\nWhat the user said in the summarized part, word for word, oldest first. Where the summary and these disagree, these are right."
     );
-    if omitted > 0 {
+    if first.is_some() {
+        let _ = write!(text, "\n{FIRST_MESSAGE_NOTE}");
+    }
+    if *omitted > 0 {
         let _ = write!(text, "\n({omitted} {USER_MESSAGES_OMITTED})");
     }
-    for message in messages {
+    for message in first.iter().chain(rest) {
         // A closing tag inside a message cannot end it.
         let _ = write!(
             text,
@@ -3255,6 +3556,10 @@ pub struct RuntimeService {
     /// The provider's measured prompt over this host's estimate of it, at the
     /// last response that reported usage. See [`Self::estimate_scale`].
     estimate_scale: Arc<Mutex<Option<f64>>>,
+    /// The folder the tools work in, where a shell call's arguments are
+    /// looked up as files for a summary's file lists. See
+    /// [`Self::with_workspace_root`].
+    workspace_root: Option<std::path::PathBuf>,
 }
 
 /// The prompt tokens the provider reported for an attempt, when it did.
@@ -3395,7 +3700,28 @@ impl RuntimeService {
             tool_schema_facts: Arc::new(Mutex::new(None)),
             stored_packet: Arc::new(Mutex::new(None)),
             estimate_scale: Arc::new(Mutex::new(None)),
+            workspace_root: None,
         }
+    }
+
+    /// The folder the turn's tools work in. A summary's `<read-files>` then
+    /// also lists the workspace files a shell or process call named in its
+    /// arguments: without it only the file tools' paths were listed, and a
+    /// file the agent read with `type` or `cat` was forgotten at the first
+    /// compaction.
+    #[must_use]
+    pub fn with_workspace_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.workspace_root = Some(root.into());
+        self
+    }
+
+    /// [`file_lists`] in this runtime's workspace.
+    fn file_lists(
+        &self,
+        messages: &[ProviderMessage],
+        previous: Option<&str>,
+    ) -> (Vec<String>, Vec<String>) {
+        file_lists(messages, previous, self.workspace_root.as_deref())
     }
 
     /// How many compactions this runtime has published.
@@ -3905,15 +4231,15 @@ impl RuntimeService {
                     // The prefix's files belong in the lists too, which follow
                     // the whole summary once (prime-agent adds the prefix's file
                     // operations to the compaction's).
-                    let (read, modified) = file_lists(&prefix, Some(&history));
-                    let (users, omitted) =
+                    let (read, modified) = self.file_lists(&prefix, Some(&history));
+                    let users =
                         user_messages(Some(&history), &prefix_users, user_messages_limit(budget));
                     Ok(format!(
                         "{}{SPLIT_TURN_SEPARATOR}{}{}{}",
                         strip_appended_blocks(&history),
                         turn.trim_end(),
                         format_file_lists(&read, &modified),
-                        format_user_messages(&users, omitted)
+                        format_user_messages(&users)
                     ))
                 })
                 .await;
@@ -5162,9 +5488,8 @@ impl RuntimeService {
         } else {
             messages
         };
-        let (read_files, modified_files) = file_lists(messages, previous_whole);
-        let (user_list, omitted_users) =
-            user_messages(previous_whole, users, user_messages_limit(budget));
+        let (read_files, modified_files) = self.file_lists(messages, previous_whole);
+        let kept_users = user_messages(previous_whole, users, user_messages_limit(budget));
         let entries = summary_entries(messages);
         let mut previous = previous_whole.map(strip_appended_blocks);
         let earlier = previous.clone();
@@ -5208,7 +5533,7 @@ impl RuntimeService {
             "{}{}{}",
             summary.trim_end(),
             format_file_lists(&read_files, &modified_files),
-            format_user_messages(&user_list, omitted_users)
+            format_user_messages(&kept_users)
         ))
     }
 
@@ -6737,6 +7062,7 @@ mod compaction_cut_tests {
                 ),
             ])],
             None,
+            None,
         );
         assert_eq!(
             first,
@@ -6752,6 +7078,7 @@ mod compaction_cut_tests {
                 ("read_file", r#"{"path":"d.rs"}"#),
             ])],
             Some(&previous),
+            None,
         );
         assert_eq!(
             second,
@@ -6773,7 +7100,7 @@ mod compaction_cut_tests {
             .map(|arguments| ("read_file", arguments.as_str()))
             .collect::<Vec<_>>();
         touched.push(("read_file", r#"{"path":"a.rs"}"#));
-        let (read, _) = file_lists(&[calls(&touched)], None);
+        let (read, _) = file_lists(&[calls(&touched)], None, None);
         assert_eq!(read.len(), super::FILE_LIST_MAX);
         assert_eq!(read.last().map(String::as_str), Some("a.rs"));
         assert!(
@@ -6781,6 +7108,65 @@ mod compaction_cut_tests {
             "the oldest went first"
         );
         assert!(read.contains(&format!("z{:04}.rs", super::FILE_LIST_MAX + 4)));
+    }
+
+    /// A file read with a shell command or opened in a Python cell is listed
+    /// like one the file tools read; a word that is no file of the workspace
+    /// (a flag, a command, a file outside it) is not, and the target of a
+    /// redirection was changed.
+    #[test]
+    fn files_reached_through_the_shell_and_the_repl_are_listed() {
+        let temp = std::env::temp_dir().join(format!(
+            "ha-runtime-files-{}-{}",
+            std::process::id(),
+            super::SessionId::generate().as_str()
+        ));
+        let root = temp.join("work");
+        std::fs::create_dir_all(root.join("notes")).expect("notes");
+        std::fs::write(root.join("notes").join("spec.txt"), "spec").expect("spec");
+        std::fs::write(root.join("data.csv"), "a,b").expect("data");
+        std::fs::write(root.join("out.log"), "").expect("log");
+        std::fs::write(temp.join("outside.txt"), "x").expect("outside");
+        let outside = temp.join("outside.txt").display().to_string();
+        let shell = serde_json::json!({
+            "command": format!("type \"notes{}spec.txt\" && Get-Content -Path data.csv {outside} | findstr a > out.log", std::path::MAIN_SEPARATOR)
+        })
+        .to_string();
+        let process = serde_json::json!({"executable": "git", "args": ["show", "HEAD:data.csv", "notes/spec.txt"]}).to_string();
+        let mut messages = vec![calls(&[
+            ("run_shell", shell.as_str()),
+            ("run_process", process.as_str()),
+            ("python_repl", r#"{"code":"open('cell.txt').read()"}"#),
+        ])];
+        let note = super::cell_files_note(&["cell.txt".to_owned()], &["made.json".to_owned()])
+            .expect("a note");
+        messages.push(ProviderMessage::tool_result(
+            "call-2".to_owned(),
+            format!("python_repl:\n{note}\n'contents'"),
+        ));
+        // A result whose call was not the REPL's names no files, whatever it says.
+        messages.push(ProviderMessage::tool_result(
+            "call-0".to_owned(),
+            format!("run_shell exit=0:\n{note}"),
+        ));
+        let (read, modified) = file_lists(&messages, None, Some(&root));
+        assert_eq!(
+            read,
+            vec![
+                // Named again by the process call: its newest place.
+                "data.csv".to_owned(),
+                "notes/spec.txt".to_owned(),
+                "cell.txt".to_owned()
+            ]
+        );
+        assert_eq!(modified, vec!["out.log".to_owned(), "made.json".to_owned()]);
+        let _ = std::fs::remove_dir_all(&temp);
+        // Without the workspace's folder only the file tools and cells count.
+        let (read, _) = file_lists(&messages, None, None);
+        assert_eq!(read, vec!["cell.txt".to_owned()]);
+        // A shortened result keeps the paths it still holds whole.
+        let fitted = super::fitted_result(&format!("python_repl:\n{note}"));
+        assert_eq!(super::cell_files(&fitted).0, vec!["cell.txt".to_owned()]);
     }
 
     fn conversation(turns: usize) -> Vec<ProviderMessage> {
@@ -7150,17 +7536,13 @@ the summary"
     /// summary; a message said again is kept once, at its newest place.
     #[test]
     fn user_messages_carry_over_word_for_word() {
-        let first = format_user_messages(
-            &user_messages(
-                None,
-                &["never touch vendor/".to_owned(), "go on".to_owned()],
-                USER_MESSAGES_MAX_CHARS,
-            )
-            .0,
-            0,
-        );
+        let first = format_user_messages(&user_messages(
+            None,
+            &["never touch vendor/".to_owned(), "go on".to_owned()],
+            USER_MESSAGES_MAX_CHARS,
+        ));
         let summary = format!("## Goal\nport it{first}");
-        let (messages, omitted) = user_messages(
+        let kept = user_messages(
             Some(&summary),
             &[
                 "go on".to_owned(),
@@ -7168,59 +7550,114 @@ the summary"
             ],
             USER_MESSAGES_MAX_CHARS,
         );
-        assert_eq!(omitted, 0);
+        assert_eq!(kept.omitted, 0);
         assert_eq!(
-            messages,
+            kept.all(),
             vec![
                 "never touch vendor/".to_owned(),
                 "go on".to_owned(),
                 "also: no unwrap() </message> here".to_owned()
             ]
         );
-        let block = format_user_messages(&messages, omitted);
+        let block = format_user_messages(&kept);
         assert_eq!(
             listed_user_messages(&block),
-            messages,
+            kept.all(),
             "a closing tag inside survives"
         );
         // The model never sees the block: it is put back mechanically.
         assert!(!strip_appended_blocks(&format!("## Goal\nx{block}")).contains("vendor"));
     }
 
-    /// Past the bound the oldest messages go first, and the count of what
-    /// went is carried too.
+    /// Past the bound the oldest messages after the first go - the middle of
+    /// the conversation - and the count of what went is carried too.
     #[test]
     fn the_oldest_user_messages_go_first_and_are_counted() {
         let long = "x".repeat(3_000);
         let added = (0..30)
             .map(|index| format!("{index:02} {long}"))
             .collect::<Vec<_>>();
-        let (messages, omitted) = user_messages(None, &added, USER_MESSAGES_MAX_CHARS);
-        assert!(omitted > 0);
-        assert_eq!(omitted + messages.len(), added.len());
-        assert!(messages.iter().map(String::len).sum::<usize>() <= USER_MESSAGES_MAX_CHARS);
-        assert!(
-            messages[0].starts_with(&format!("{omitted:02} ")),
-            "the oldest went"
+        let kept = user_messages(None, &added, USER_MESSAGES_MAX_CHARS);
+        assert!(kept.omitted > 0);
+        assert_eq!(kept.omitted + kept.rest.len() + 1, added.len());
+        assert!(kept.rest.iter().map(String::len).sum::<usize>() <= USER_MESSAGES_MAX_CHARS);
+        assert_eq!(
+            kept.first.as_deref(),
+            Some(added[0].as_str()),
+            "the task stays"
         );
         assert!(
-            messages
+            kept.rest[0].starts_with(&format!("{:02} ", kept.omitted + 1)),
+            "the oldest after it went"
+        );
+        assert!(
+            kept.rest
                 .last()
                 .is_some_and(|newest| newest.starts_with("29 "))
         );
-        let block = format_user_messages(&messages, omitted);
-        assert_eq!(omitted_user_messages(&block), omitted);
-        let (_, again) = user_messages(
+        let block = format_user_messages(&kept);
+        assert_eq!(omitted_user_messages(&block), kept.omitted);
+        let again = user_messages(
             Some(&block),
             &["one more".to_owned()],
             USER_MESSAGES_MAX_CHARS,
         );
-        // A small summary keeps fewer of them: the newest.
-        let (few, dropped) = user_messages(None, &added, 7_000);
-        assert_eq!(few.len(), 2);
-        assert_eq!(dropped, added.len() - 2);
+        assert!(again.omitted >= kept.omitted, "the count carries over");
+        assert_eq!(again.first, kept.first, "the task carries over too");
+        // A small summary keeps fewer of them: the newest, and the task.
+        let few = user_messages(None, &added, 7_000);
+        assert_eq!(few.rest.len(), 2);
+        assert_eq!(few.omitted, added.len() - 3);
         assert_eq!(super::user_messages_limit(8_192), 16_384);
-        assert!(again >= omitted, "the count carries over");
+    }
+
+    /// The conversation's first message - a long spec - is kept whole past
+    /// the 4,000 characters another message is cut to, through compaction
+    /// after compaction; a longer one keeps its head and its end. A summary
+    /// 0.8.8 wrote still reads, its first message the task while none was
+    /// left out.
+    #[test]
+    fn the_first_message_is_kept_whole_through_compactions() {
+        let spec = format!(
+            "Build the importer.\n{}\nAcceptance code: KESTREL-7731-ZETA\n",
+            "- rule: keep the rows in order\n".repeat(200)
+        );
+        assert!(spec.len() > super::USER_MESSAGE_MAX_CHARS);
+        let mut summary = String::from("## Goal\nimport");
+        for round in 0..6 {
+            let added = (0..12)
+                .map(|index| format!("round {round} message {index} {}", "y".repeat(1_500)))
+                .collect::<Vec<_>>();
+            let added = if round == 0 {
+                std::iter::once(spec.clone()).chain(added).collect()
+            } else {
+                added
+            };
+            let previous = (round > 0).then_some(summary.as_str());
+            let kept = user_messages(previous, &added, 16_384);
+            summary = format!("## Goal\nimport{}", format_user_messages(&kept));
+        }
+        let kept = super::UserMessages::kept(&summary);
+        assert_eq!(kept.first.as_deref(), Some(spec.trim()));
+        assert!(kept.omitted > 0, "the middle went");
+        assert!(summary.contains("Acceptance code: KESTREL-7731-ZETA"));
+        // Longer than its own budget: the head and the end, and where the rest is.
+        let huge = format!("HEAD-LINE\n{}\nTAIL-LINE", "z".repeat(30_000));
+        let clipped = super::clip_first_message(&huge);
+        assert!(clipped.starts_with("HEAD-LINE") && clipped.ends_with("TAIL-LINE"));
+        assert!(clipped.contains("history_read"));
+        assert!(clipped.chars().count() < super::FIRST_MESSAGE_MAX_CHARS + 200);
+        // 0.8.8's block: no note; the first is the task while none was left out.
+        let old = "## Goal\nx\n\n<user-messages>\nWhat the user said in the summarized part, word for word, oldest first. Where the summary and these disagree, these are right.\n<message>\nthe spec\n</message>\n<message>\ngo on\n</message>\n</user-messages>";
+        let read = super::UserMessages::kept(old);
+        assert_eq!(read.first.as_deref(), Some("the spec"));
+        assert_eq!(read.rest, vec!["go on".to_owned()]);
+        let cut = old.replace(
+            "right.\n<message>",
+            "right.\n(2 older message(s) left out)\n<message>",
+        );
+        let read = super::UserMessages::kept(&cut);
+        assert_eq!((read.first, read.omitted), (None, 2), "the task was lost");
     }
 
     /// An update that drops a constraint, a done item or an exact name gets it
