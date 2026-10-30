@@ -32,7 +32,10 @@ regulation* section counts all of it.
 ### Evolution, by itself
 
 `memory/evolution.rs` runs at most once a day, after a turn. It holds a lock,
-so one process runs it at a time, and marks the run when it starts.
+so one process runs it at a time, and marks the run only once it saved: a run
+that fails is tried again by its job in the queue of background passes
+([Sleep](SLEEP.en.md)) after a backoff, and gives up after 6 failures. Before
+0.8.9 it was marked when it started, and one failed call put it off a day.
 
 1. It judges the rules on what they did. A rule in shadow is promoted once it
    would have acted three times, each on a call that failed, and retired the

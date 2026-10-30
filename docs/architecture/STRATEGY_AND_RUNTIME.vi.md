@@ -31,7 +31,11 @@ regulation* đếm tất cả những thứ này.
 ### Tiến hoá tự động
 
 `memory/evolution.rs` chạy tối đa một lần mỗi ngày, sau một turn. Nó giữ khoá
-để mỗi lúc chỉ một process chạy, và đánh dấu lần chạy ngay khi bắt đầu.
+để mỗi lúc chỉ một process chạy, và chỉ đánh dấu lần chạy khi đã lưu xong:
+lượt hỏng được job của nó trong hàng đợi các lượt chạy nền
+([Sleep](SLEEP.vi.md)) thử lại sau một thời gian chờ, và bỏ cuộc sau 6 lần
+hỏng. Trước 0.8.9 nó được đánh dấu ngay khi bắt đầu, và một lần gọi hỏng làm
+nó phải chờ một ngày.
 
 1. Chấm các luật theo những gì chúng đã làm. Luật đang chạy bóng được bật khi
    lẽ ra đã tác động đủ 3 lần, mà cả 3 lần lời gọi đều hỏng. Nó bị bỏ ngay lần
