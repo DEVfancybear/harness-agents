@@ -1110,6 +1110,7 @@ const NO_ENTRY: u32 = u32::MAX;
 /// [`bm25`] for a query whose terms weigh differently - the turn's digest
 /// weighs a goal's words above an earlier message's - over plain entries.
 /// The indexes of the entries holding a term, best first.
+#[cfg(test)]
 #[must_use]
 pub fn bm25_weighted(entries: &[&Entry], terms: &[(String, f64)]) -> Vec<(usize, f64)> {
     best(bm25_scores(entries, terms), usize::MAX)

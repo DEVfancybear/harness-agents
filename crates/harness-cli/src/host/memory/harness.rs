@@ -703,7 +703,10 @@ pub fn render_digest(state: &State, options: DigestOptions, terms: &[(String, f6
     let mut shown_entries = pinned_lines(state, &mut lines);
     let mut total = 0;
     for kind in KINDS {
-        let mut entries = state.entries.get(kind).cloned().unwrap_or_default();
+        let mut entries = state
+            .entries
+            .get(kind)
+            .map_or_else(Vec::new, |entries| entries.iter().collect::<Vec<_>>());
         let kept = entries.len();
         // A pinned entry is shown whole above; the ranked list is the rest.
         entries.retain(|entry| !entry.pinned);
@@ -718,7 +721,7 @@ pub fn render_digest(state: &State, options: DigestOptions, terms: &[(String, f6
         // whole words, their stems, and a word without accents matching one
         // with them. Scored once per kind, over the whole kind, not inside
         // the sort.
-        let all = entries.iter().collect::<Vec<_>>();
+        let all = entries.clone();
         let mut scores = vec![None; all.len()];
         if !terms.is_empty() {
             for (index, score) in super::memory_search::bm25_scores(&all, terms) {
