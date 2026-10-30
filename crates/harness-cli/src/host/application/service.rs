@@ -4246,8 +4246,14 @@ impl Drop for AgentSessionService {
                 turns,
                 self.refine_cadence.take_in_play(),
             );
-            if !enqueue_review(&self.data_dir, job) {
-                self.refine_cadence.put_back(turns);
+            // The session ends: it neither waits for another process's
+            // change to the queue nor has a cadence to put the turns back on,
+            // so the job is written as a file of its own when the queue is
+            // busy.
+            if let Err(error) = super::sleep::enqueue_now(&self.data_dir, job) {
+                harness_types::diag::warn("sleep", "enqueue_failed")
+                    .msg(error)
+                    .emit();
             }
         }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -7582,9 +7588,13 @@ impl Reviews {
         enqueue_review(&self.data_dir, job)
     }
 
-    /// Whether `job` is a review of this project (of `task`, when given).
-    fn picks(&self, job: &super::sleep::Job, task: Option<&str>) -> bool {
-        is_review_of(job, &self.store_dir, task)
+    /// [`Reviews::enqueue`] from async code: on a blocking thread, as the
+    /// queue's lock may wait for another process's change.
+    pub(super) async fn enqueue_async(&self, job: super::sleep::Job) -> bool {
+        let data_dir = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || enqueue_review(&data_dir, job))
+            .await
+            .unwrap_or(false)
     }
 
     /// Run this project's due review jobs (`task`'s alone, when given), one
@@ -7593,8 +7603,22 @@ impl Reviews {
     /// ha left in the project (`refine-pending/`) join the queue first.
     pub(super) async fn run_due(&self, task: Option<&str>) {
         super::sleep::import_legacy(&self.data_dir, &self.store_dir);
+        // A job runs once per call: one whose file could not be removed is
+        // claimable again, and was run again and again.
+        let mut ran = std::collections::BTreeSet::new();
         loop {
-            let claimed = match super::sleep::claim(&self.data_dir, |job| self.picks(job, task)) {
+            // The queue's lock may wait for another process's change: on a
+            // blocking thread, not on the runtime's workers.
+            let (data_dir, store_dir) = (self.data_dir.clone(), self.store_dir.clone());
+            let (task_owned, skip) = (task.map(str::to_owned), ran.clone());
+            let claimed = tokio::task::spawn_blocking(move || {
+                super::sleep::claim(&data_dir, |job| {
+                    !skip.contains(&job.id) && is_review_of(job, &store_dir, task_owned.as_deref())
+                })
+            })
+            .await
+            .unwrap_or_else(|error| Err(error.to_string()));
+            let claimed = match claimed {
                 Ok(Some(claimed)) => claimed,
                 Ok(None) => return,
                 Err(error) => {
@@ -7604,10 +7628,15 @@ impl Reviews {
                     return;
                 }
             };
-            match self.run_job(&claimed.job).await {
+            ran.insert(claimed.job.id.clone());
+            // The review succeeded (or had nothing to read) when `run_job`
+            // returns `Ok`.
+            let result = self.run_job(&claimed.job).await;
+            let _ = tokio::task::spawn_blocking(move || match result {
                 Ok(()) => claimed.done(),
                 Err(error) => claimed.failed(&error),
-            }
+            })
+            .await;
         }
     }
 
@@ -7667,10 +7696,7 @@ impl Reviews {
 /// `task`, when given).
 fn is_review_of(job: &super::sleep::Job, store_dir: &Path, task: Option<&str>) -> bool {
     job.kind == super::sleep::Kind::Review
-        && job
-            .project
-            .as_deref()
-            .is_some_and(|project| Path::new(project) == store_dir)
+        && super::sleep::belongs_to(job, store_dir)
         && task.is_none_or(|task| job.task.as_deref() == Some(task))
 }
 
@@ -7685,6 +7711,34 @@ pub(super) fn due_review_turns(data_dir: &Path, store_dir: &Path, task: &str) ->
         })
         .collect::<Vec<_>>();
     (!due.is_empty()).then(|| due.iter().map(|job| job.turns.max(1)).sum())
+}
+
+/// [`super::sleep::claim_upkeep`] from async code, on a blocking thread.
+async fn claim_upkeep_async(
+    data_dir: &Path,
+    job: super::sleep::Job,
+) -> Option<super::sleep::Claimed> {
+    let data_dir = data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || super::sleep::claim_upkeep(&data_dir, job))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// An upkeep pass that gave up is forgotten once it is no longer due: it
+/// succeeded another way (`/refine --curate`, a manual Deep Dream), and the
+/// doctor stops warning of it.
+fn forget_upkeep_not_due(data_dir: &Path, local: &Path) {
+    let global = super::harness::global_dir(data_dir);
+    if !super::evolution::due(data_dir, chrono::Utc::now()) {
+        super::sleep::forget_given_up(data_dir, &super::sleep::Job::evolution().key);
+    }
+    if !super::refine::memory_consolidation_due(&global) {
+        super::sleep::forget_given_up(data_dir, &super::sleep::Job::consolidation(&global).key);
+    }
+    if !super::refine::local_consolidation_due(local) {
+        super::sleep::forget_given_up(data_dir, &super::sleep::Job::consolidation(local).key);
+    }
 }
 
 /// Write a review's job to the queue under `data_dir`; `false` (and a
@@ -10257,7 +10311,7 @@ async fn run_turn(
                 None => job,
             };
             // The count restarts only once the job is on disk.
-            if !reviews.enqueue(job) {
+            if !reviews.enqueue_async(job).await {
                 cadence.put_back(turns);
                 cadence.note_in_play(in_play.into_iter().collect());
                 cadence.release();
@@ -10416,12 +10470,18 @@ async fn run_turn(
         // failed: rules into shadow, shadows promoted or retired, notes.
         // Its job in the queue keeps a failed run: tried again after a
         // backoff, given up after so many failures (`sleep`).
+        if auto_refine && refinements {
+            let data_dir = data_dir.clone();
+            let local = super::harness::local_dir(&data_dir, goal_task.as_str());
+            let _ =
+                tokio::task::spawn_blocking(move || forget_upkeep_not_due(&data_dir, &local)).await;
+        }
         if auto_refine
             && refinements
             && !cancellation.is_cancelled()
             && super::evolution::due(&data_dir, chrono::Utc::now())
             && let Some(claimed) =
-                super::sleep::claim_upkeep(&data_dir, super::sleep::Job::evolution())
+                claim_upkeep_async(&data_dir, super::sleep::Job::evolution()).await
         {
             let provider = Arc::clone(&provider);
             let model = config.model.clone();
@@ -10495,7 +10555,7 @@ async fn run_turn(
             && super::refine::memory_consolidation_due(&global)
             && let Some(consolidating) = super::refine::Consolidating::try_begin(&global)
             && let Some(claimed) =
-                super::sleep::claim_upkeep(&data_dir, super::sleep::Job::consolidation(&global))
+                claim_upkeep_async(&data_dir, super::sleep::Job::consolidation(&global)).await
         {
             let sender = sender.clone();
             let provider = Arc::clone(&provider);
@@ -10541,7 +10601,7 @@ async fn run_turn(
             && let Some(consolidating) =
                 super::refine::Consolidating::try_begin(&super::harness::global_dir(&data_dir))
             && let Some(claimed) =
-                super::sleep::claim_upkeep(&data_dir, super::sleep::Job::consolidation(&local))
+                claim_upkeep_async(&data_dir, super::sleep::Job::consolidation(&local)).await
         {
             let sender = sender.clone();
             let provider = Arc::clone(&provider);
@@ -10660,7 +10720,7 @@ async fn run_turn(
                     turns,
                     learning.in_play.clone(),
                 );
-                if !reviews.enqueue(job) {
+                if !reviews.enqueue_async(job).await {
                     refine_cadence.put_back(turns);
                     refine_cadence.note_in_play(learning.in_play.iter().cloned().collect());
                 }

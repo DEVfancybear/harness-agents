@@ -40,8 +40,19 @@ a failed Deep Dream was tried every hour forever. Since 0.8.9 every pass is a
 - **A claim holds a lock.** Claiming a job holds its key's lock file for as long
   as the pass runs, so one job of a conversation (and one Deep Dream, one
   evolution) runs at a time across ha's processes. A process that dies lets go
-  of the lock with it, and its job is claimable again with no attempt counted;
-  a claim older than 30 minutes is taken over too.
+  of the lock with it, and its job is claimable again with no attempt counted.
+  A running claim renews its 30-minute lease every 5 minutes, for up to two
+  hours; a claim whose lease lapsed (a process that hung) is taken over, and
+  the pass it was running can then neither remove the job nor write its
+  failure over it: done and failure act only on the claim they hold. One
+  consolidation or evolution is one pass: asked for again while it runs, it
+  writes no second job. The last job of a key takes the key's lock file with
+  it.
+- **A store that moved keeps its jobs.** A review job names the project's
+  store directory. When the store moves under another key (`ha project
+  rekey`, a repository found again), the store that took it over (its
+  `project.json` lists the old key as adopted) runs the job, and a later
+  review of the conversation coalesced into it names the store as it is now.
 - **Done removes the job; a failure keeps it.** A failed pass counts the
   attempt, records the error and its class (the provider's stable error code,
   `timeout`, `truncated` or `other`), and waits: 5 minutes for a review, an
@@ -51,7 +62,9 @@ a failed Deep Dream was tried every hour forever. Since 0.8.9 every pass is a
 - **After 6 failures in a row a job gives up.** It stays on disk, is no longer
   tried by itself, and `ha doctor` and the bug report say so. A conversation's
   new turns are a new review job; a consolidation or evolution that gave up
-  takes no new job until its file is removed.
+  takes no new job until its file is removed, or until its pass is no longer
+  due because it succeeded another way (`/refine --curate` consolidates the
+  memory too): then the job is forgotten.
 
 ## The triggers
 
@@ -69,7 +82,8 @@ The triggers are the ones ha had; each writes a job and then runs the due ones.
 - **A session gone quiet** (ten minutes, `HA_IDLE_REVIEW_SECONDS`): a job for
   the work since the last review, run then.
 - **A session's end**: a job for its unreviewed tail, run by the next turn in
-  the project. A `refine-pending/` file an older ha left in the project joins
+  the project. A session ending does not wait for another process's change to
+  the queue: the job is written as a file of its own then, coalesced later. A `refine-pending/` file an older ha left in the project joins
   the queue the first time the queue is read there.
 - **`ha exec`'s exit**: a job when the conversation's runs did enough; then the
   conversation's due review jobs run before the process exits. A run that is
@@ -87,7 +101,7 @@ itself only after success; it is not in the queue.
 ## What shows it
 
 - **Diagnostics**: `sleep` records `enqueued` (with `coalesced`), `claimed`,
-  `done`, `failed` and `gave_up`, each with the job's kind, key, trigger,
+  `done` (with `superseded` when another claim took the job over), `failed`, `gave_up` and `forgotten`, each with the job's kind, key, trigger,
   attempts, turns and span, and for a failure its class and next time.
   `refine.call_failed` records carry the error's `class`.
 - **`ha doctor`** (State): how many passes are queued, which failed and wait

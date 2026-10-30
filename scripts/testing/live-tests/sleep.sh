@@ -214,12 +214,22 @@ for attempt in 1 2; do
   done
   records sleep | awk -v since="$first" '$1 > since' | sed 's/^/   sleep: /'
   records review | awk -v since="$first" '$1 > since' | sed 's/^/   review: /'
-  if [ -n "$reviewed2" ]; then verdict=0; else verdict=2; fi
+  # That review is the second compaction's own job: the span its compaction
+  # enqueued, claimed no sooner than the spacing after the first one's claim,
+  # and done.
+  span() { grep -o 'span=[^ ]*' | head -1 | cut -d= -f2; }
+  started1=$(records sleep | awk -v since="$first" '$1 > since && $2 == "claimed" && /trigger=compaction/ {print $1; exit}')
+  span2=$(records sleep | awk -v since="$second" '$1 > since && $2 == "enqueued" && /trigger=compaction/' | head -1 | span)
+  claimed2=$(records sleep | awk -v since="$second" -v s="span=$span2" '$1 > since && $2 == "claimed" && index($0, s) {print $1; exit}')
+  done2=$(records sleep | awk -v since="$second" -v s="span=$span2" '$1 > since && $2 == "done" && index($0, s) {print $1; exit}')
+  echo "   first compaction's review claimed at ${started1:-?}; second span ${span2:-?} claimed at ${claimed2:-?}, done at ${done2:-?}"
+  if [ -n "$reviewed2" ] && [ -n "$span2" ] && [ -n "$started1" ] && [ -n "$claimed2" ] && [ -n "$done2" ] \
+    && [ "$claimed2" -ge $((started1 + 240000 - 2000)) ]; then verdict=0; else verdict=2; fi
   "$HA" shutdown --force >/dev/null 2>&1
   break
 done
 check "two turns compacted, the first one's review ran (the precondition)" '[ "$verdict" -ne 1 ]'
-check "the second compaction's turns were reviewed too, after the spacing" '[ "$verdict" -eq 0 ]'
+check "the second compaction's own job reviewed its span, no sooner than the spacing after the first" '[ "$verdict" -eq 0 ]'
 
 echo "################ 4. Deep Dream that fails is tried again, and gives up after so many failures"
 P4="$RX/p4"
