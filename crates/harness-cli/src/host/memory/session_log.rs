@@ -1059,6 +1059,10 @@ pub fn write(root: &Path, draft: &Draft, stamp: &Stamp<'_>) -> Result<Placed, St
             Err(super::markdown_memory::EditError::Unreadable(_)) => {
                 fallback = Some("unreadable_note");
             }
+            // A section the store's lint would refuse goes to a file too.
+            Err(super::markdown_memory::EditError::Refused(_)) => {
+                fallback = Some("refused_note");
+            }
             Err(error) => return Err(error.into()),
         }
     }

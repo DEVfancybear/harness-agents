@@ -21,6 +21,8 @@ mod mcp_cli;
 mod memory_cli;
 #[path = "commands/package_cli.rs"]
 mod package_cli;
+#[path = "commands/project_cli.rs"]
+mod project_cli;
 #[path = "commands/sandbox_cli.rs"]
 mod sandbox_cli;
 
@@ -198,6 +200,9 @@ enum Command {
     /// The memory stores: export what they hold; a project's markdown memory
     /// store: write one (`init`) and check it (`lint`).
     Memory(memory_cli::MemoryCommand),
+    /// Which store a project is kept in: move one to the project's key by
+    /// hand (`rekey`).
+    Project(project_cli::ProjectCommand),
     /// The learning loop: lessons from corrections and wrong assumptions, and
     /// the rules they became.
     Learning(learning_cli::LearningCommand),
@@ -1311,6 +1316,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
         // cheaper than reshaping the dispatch.
         Some(Command::Mcp(command)) => mcp_cli::run(command),
         Some(Command::Memory(command)) => memory_cli::run(command),
+        Some(Command::Project(command)) => project_cli::run(command),
         Some(Command::Learning(command)) => learning_cli::run(command),
         Some(Command::Init { data_dir, json }) => init_store(&data_dir, json).await,
         Some(Command::Package(command)) => package_cli::run(command),

@@ -77,6 +77,7 @@ serde_json.workspace = true
 sqlx.workspace = true
 reqwest.workspace = true
 regex.workspace = true
+similar.workspace = true
 # `web_fetch` decodes a page in the charset it declares; reqwest's `charset`
 # feature already resolves this version.
 encoding_rs = "=0.8.42"

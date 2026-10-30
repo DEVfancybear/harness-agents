@@ -24,6 +24,13 @@ enum MemorySubcommand {
         #[arg(long)]
         conversation: Option<String>,
     },
+    /// Forget a memory entry for good: the entry, every version the log
+    /// kept of it, its use counts and its copies beside the store
+    /// (refinements, the imported legacy files). One event saying it was
+    /// purged, with no content, remains. With --secrets, every entry and
+    /// version that holds a secret value. Lists what it would remove and
+    /// changes nothing without --yes.
+    Purge(PurgeArgs),
     /// Check a markdown memory store (MEMORY.md and memory/) as
     /// markdown-agent-memory's memory-lint does: boot-file caps, provenance tags
     /// on new fact lines, deleted history, edited archives, dead index paths.
@@ -242,6 +249,191 @@ fn migrate(args: MigrateArgs) -> Result<(), HarnessError> {
     Ok(())
 }
 
+/// Which entries `ha memory purge` reads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum PurgeScope {
+    /// The global store's entries kept for every project.
+    Global,
+    /// The global store's entries kept for this project (`--cwd`).
+    Project,
+    /// A conversation's own store (`--conversation`, or every one with
+    /// `--secrets`).
+    Local,
+}
+
+#[derive(Debug, Args)]
+struct PurgeArgs {
+    /// The entry: its immutable memory id or its key.
+    #[arg(required_unless_present = "secrets", conflicts_with = "secrets")]
+    target: Option<String>,
+    /// Every entry and event that holds a secret value (a key, a token, a
+    /// private key), in the global store and every conversation's.
+    #[arg(long)]
+    secrets: bool,
+    /// Only these entries.
+    #[arg(long, value_enum)]
+    scope: Option<PurgeScope>,
+    /// A conversation's own store.
+    #[arg(long)]
+    conversation: Option<String>,
+    /// The project, for `--scope project`; the working directory when left out.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Purge; without it, list what would go and change nothing.
+    #[arg(long)]
+    yes: bool,
+}
+
+/// `ha memory purge`: forget an entry for good, or every one holding a
+/// secret. Lists first; `--yes` purges.
+#[allow(clippy::too_many_lines, reason = "one command: find, list, purge")]
+fn purge(args: &PurgeArgs) -> Result<(), HarnessError> {
+    let failed = |error: String| HarnessError::new(ErrorCode::StorageWriteFailed, error);
+    let data = cli_extras::current_data_dir()?;
+    if args.scope == Some(PurgeScope::Local) && args.conversation.is_none() && !args.secrets {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            "--scope local needs --conversation <id>",
+        ));
+    }
+    let project = match args.scope {
+        Some(PurgeScope::Project) => {
+            let cwd = match &args.cwd {
+                Some(cwd) => cwd.clone(),
+                None => working_directory()?,
+            };
+            Some(crate::interactive::bootstrap::project_key_of(&cwd))
+        }
+        _ => None,
+    };
+    // The stores read, each with how its entries are named in the listing.
+    let mut stores = Vec::new();
+    if args.scope != Some(PurgeScope::Local) {
+        stores.push(("global".to_owned(), harness::global_dir(&data)));
+    }
+    match &args.conversation {
+        Some(task) => stores.push((format!("local {task}"), harness::local_dir(&data, task))),
+        None if args.secrets && args.scope.is_none_or(|scope| scope == PurgeScope::Local) => {
+            let mut tasks = std::fs::read_dir(data.join("sessions"))
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            tasks.sort();
+            for task in tasks {
+                let dir = harness::local_dir(&data, &task);
+                if memory_store::db_path(&dir).is_file() {
+                    stores.push((format!("local {task}"), dir));
+                }
+            }
+        }
+        None => {}
+    }
+    // Which of a store's entries the scope keeps: a global store's entry is
+    // the project's when it says so.
+    let in_scope = |label: &str, doc: &serde_json::Value| {
+        if !label.starts_with("global") {
+            return true;
+        }
+        let tag = harness::project_key(doc.get("project"));
+        match args.scope {
+            Some(PurgeScope::Global) => tag.is_none(),
+            Some(PurgeScope::Project) => tag.is_some() && tag == project,
+            _ => true,
+        }
+    };
+    let mut found = Vec::new();
+    for (label, dir) in &stores {
+        let targets = if args.secrets {
+            memory_store::secret_targets(dir)
+        } else {
+            memory_store::purge_targets(dir, args.target.as_deref().unwrap_or_default())
+                .map(|targets| targets.into_iter().map(|target| (target, "")).collect())
+        }
+        .map_err(|error| HarnessError::new(ErrorCode::StorageOpenFailed, error))?;
+        let targets = targets
+            .into_iter()
+            .filter(|(target, _)| in_scope(label, &target.doc))
+            .collect::<Vec<_>>();
+        if !targets.is_empty() {
+            found.push((label.clone(), dir.clone(), targets));
+        }
+    }
+    if found.is_empty() {
+        if args.secrets {
+            println!("No entry or event of the memory stores holds a secret value.");
+            return Ok(());
+        }
+        return Err(HarnessError::new(
+            ErrorCode::ResourceNotFound,
+            format!(
+                "no memory entry is kept under {:?} in the stores read",
+                args.target.as_deref().unwrap_or_default()
+            ),
+        ));
+    }
+    let verb = if args.yes { "purge" } else { "would purge" };
+    for (label, _, targets) in &found {
+        for (target, shape) in targets {
+            // A key may be made from a title that held the secret.
+            let key = harness_tools::secret_values::redact(&target.key);
+            let what = if target.whole {
+                format!(
+                    "the {} entry and its {} event(s)",
+                    if target.live { "live" } else { "deleted" },
+                    target.logged
+                )
+            } else {
+                format!(
+                    "{} of its {} version(s)",
+                    target.events.len(),
+                    target.logged
+                )
+            };
+            let held = if shape.is_empty() {
+                String::new()
+            } else {
+                format!(": holds a secret value ({shape})")
+            };
+            println!(
+                "{verb} [{label}] {}:{key} ({}): {what}{held}",
+                target.kind, target.memory
+            );
+        }
+    }
+    if !args.yes {
+        println!("Nothing was changed. Run again with --yes to purge.");
+        return Ok(());
+    }
+    let writer = memory_store::Writer::new(
+        "cli",
+        &serde_json::json!({"via": "ha memory purge"}),
+        "purge",
+    );
+    for (label, dir, targets) in &found {
+        let _lock = harness::lock_state(dir).map_err(failed)?;
+        let targets = targets
+            .iter()
+            .map(|(target, _)| target.clone())
+            .collect::<Vec<_>>();
+        let purged = memory_store::purge(dir, &targets, &writer, args.secrets).map_err(failed)?;
+        println!(
+            "[{label}] purged {} memory(ies), {} event(s) removed; one purge event each remains",
+            targets.len(),
+            purged.removed
+        );
+        if !purged.settled {
+            println!(
+                "[{label}] another process reads the store: its log is emptied when that process closes it"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Run one `ha memory` command.
 ///
 /// # Errors
@@ -256,6 +448,7 @@ pub fn run(command: MemoryCommand) -> Result<(), HarnessError> {
             examples,
         } => init(root, hook, examples),
         MemorySubcommand::Migrate(args) => migrate(args),
+        MemorySubcommand::Purge(args) => purge(&args),
         MemorySubcommand::Export { conversation } => {
             let data = cli_extras::current_data_dir()?;
             let (scope, dir) = match &conversation {

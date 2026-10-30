@@ -293,11 +293,13 @@ pub fn resolve(request: LaunchRequest) -> Result<LaunchContext, HarnessError> {
     let digest = ContentHash::from_bytes(key_root.to_string_lossy().as_bytes());
     let key = project_key(digest.as_str());
     let legacy = legacy_key_of(&root);
-    let notices = if legacy == key {
+    let mut notices = if legacy == key {
         Vec::new()
     } else {
         super::adoption::adopt(&paths.data_dir, &key_root, &key, &legacy)
     };
+    // A repository that moved or was renamed finds its store again.
+    notices.extend(super::adoption::follow(&paths.data_dir, &key_root, &key));
     let config = config::load(&paths.config_file)?;
     let provider = provider_state(&request.environment, &paths.data_dir);
     let setup_required = matches!(provider, ProviderState::SetupRequired { .. });

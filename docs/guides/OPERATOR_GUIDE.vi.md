@@ -249,6 +249,8 @@ benchmark chưa đo vẫn được nêu là chưa đo ngay cả khi mọi nền 
 | `ha maintenance release-matrix` | Báo cáo nền tảng, capability và tính trung thực của benchmark | Không bao giờ; nó báo những gì chưa kiểm chứng |
 | `ha bug-report` | Gom log chẩn đoán, log worker, bản ghi store và file harness trong một khoảng thời gian vào một file zip có `SUMMARY.md`, đã che secret ([12.12](#1212-chẩn-đoán-và-báo-lỗi)). Dùng gói này để dò bug | Khoảng thời gian không phải một số theo sau là `s`, `m`, `h` hoặc `d` |
 | `ha diag path`, `ha diag timeline` | Cho biết log chẩn đoán nằm ở đâu; in timeline gộp | Không bao giờ |
+| `ha memory purge` | Quên hẳn một entry memory, hoặc với `--secrets` mọi thứ chứa giá trị secret ([12.18](#1218-xếp-hạng-từ-chỉ-mục-quên-và-repository-bị-chuyển-chỗ-089)) | Không có `--yes`: chỉ liệt kê; `--scope local` mà không có `--conversation` |
+| `ha project rekey` | Chuyển một project store đang giữ dưới key khác sang key của thư mục này ([12.18](#1218-xếp-hạng-từ-chỉ-mục-quên-và-repository-bị-chuyển-chỗ-089)) | Key này đã có store riêng; có gì đó đang giữ store cũ |
 | `ha maintenance support-bundle` | Ghi một bundle có giới hạn, đã che (metadata, số lượng, revision schema, tham chiếu tương quan; với `--config <FILE>` có thêm config đã che) cho host bạn không với tới được; mỗi lần che được đếm trong manifest. Chỉ xuất tên biến môi trường, không xuất giá trị; loại credential, transcript thô, byte artifact và provider request/response. Redaction kiểm cả tên field lẫn giá trị giống secret. | Thư mục `--into` đã có file |
 
 Các lệnh cấp cao nhất khác được mô tả ở đúng chỗ của chúng: `ha`/`ha chat`/`ha exec`
@@ -859,3 +861,11 @@ Bản 0.6.3 hoàn tất phần knowledge và Self-Evolution của 0.6.2.
   - Entry không khớp từ không bao giờ vượt entry có khớp.
   - Khi không có từ nào, hoặc giữa các entry không khớp, entry mới nhất đứng trước; trước đây xếp theo chữ cái.
   - Số lần là kết quả search và số lần được hiện không bao giờ dùng để xếp.
+
+### 12.18. Xếp hạng từ chỉ mục, quên, và repository bị chuyển chỗ (0.8.9)
+
+- **Xếp hạng đọc một chỉ mục.** Digest và memory search lập chỉ mục từ của mỗi store một lần cho mỗi process và chỉ đọc lại các entry đã đổi, chỉ tính điểm những entry chứa từ của truy vấn. Thứ hạng vẫn như trước; một lượt trên store 10.000 entry tốn khoảng 20 ms cho việc này thay vì 400 ms ([Kho memory](../architecture/MEMORY_STORE.vi.md) §15).
+- **`ha memory purge <id hoặc key> [--scope global|project|local] [--conversation ID] [--cwd DIR] --yes`** quên hẳn một entry: entry, mọi phiên bản log đã giữ, số lần dùng, các bản sao trong `refinements.jsonl` và các file legacy đã import. Còn lại một event nói nó đã bị purge, không chứa nội dung, và nội dung không còn trong file nào của store. Không có `--yes` thì lệnh liệt kê những gì sẽ xoá và không đổi gì.
+- **`ha memory purge --secrets [--yes]`** làm như vậy cho mọi entry và phiên bản chứa giá trị secret (key, token, private key), trong store toàn cục và store của mọi hội thoại: entry giờ đã sạch chỉ mất các phiên bản từng chứa secret. Danh sách nêu loại của mỗi secret, không bao giờ nêu giá trị.
+- **Lệnh ghi của host vào markdown store được lint.** Rule và fact của learning loop và phần của session log được lint trước khi ghi; lần ghi nào khiến store sai một check nó đang qua thì bị từ chối và báo lại (`memory/markdown_write_refused`). Quá 20 dòng gạch, index chuyển chúng sang một file mới `memory/archive/index-<năm>.md` ([Kho memory dạng markdown](../architecture/MARKDOWN_MEMORY.vi.md) §8).
+- **Repository bị chuyển chỗ vẫn giữ store của nó.** `project.json` ghi các root commit và remote origin của repository. Repository bị chuyển hay đổi tên tìm lại store của nó ở lần chạy đầu tại chỗ mới, cùng memory của project; một fork hay một bản clone vẫn còn tồn tại không bao giờ lấy store của cái khác. **`ha project rekey <đường dẫn hoặc key cũ> [--cwd DIR]`** chuyển store bằng tay, bị từ chối khi cả hai đều có dữ liệu ([Định danh project](../architecture/PROJECT_IDENTITY.vi.md) §5).

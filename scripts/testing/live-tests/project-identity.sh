@@ -9,6 +9,8 @@
 # the repository's key on the next launch from there, its conversation with it.
 #
 #   bash scripts/testing/live-tests/project-identity.sh
+# Sections 3 and 4 (0.8.9) fail on 0.8.8: a moved repository found its store
+# again by nothing, and there was no `ha project rekey`.
 set -u
 source "$(dirname "$0")/env.sh"
 fresh project-identity
@@ -106,5 +108,85 @@ check "the adoption is in the diagnostics" 'grep -rh "\"store_adopted\"" "$D/dia
 # A second launch changes nothing.
 (cd "$X" && "$HA" sessions list --json >"$RX/adopt-again.json" 2>"$RX/adopt-again.err")
 check "a second launch finds the same store" '[ "$(count "$RX/adopt-again.json")" -ge 1 ] && [ "$(comm -13 <(printf "%s\n" "$before") <(stores | sort))" = "$NEW" ]'
+
+echo "################ 3. a repository moved and renamed keeps its store and its project memory"
+# 0.8.9: project.json records the repository's root commit and origin remote;
+# a launch whose key has no store adopts the store whose identity matches and
+# whose directory is gone. A clone that still exists keeps its own store.
+M=$RX/m
+project "$M"
+git -C "$M" remote add origin https://example.invalid/team/moved-repo.git
+MC=$RX/m-clone
+git clone -q "$M" "$MC" 2>>"$RX/worktree.log"
+git -C "$MC" remote set-url origin https://example.invalid/team/moved-repo.git
+CODE3="OTTER-$("$PY" -c 'import secrets; print(secrets.token_hex(4).upper())')"
+run_exec mroot "$M" "Harness test: call the memory tool exactly once with action write, scope project, title 'Release flag', content: This project's release flag is $CODE3. Do nothing else, then answer DONE."
+MKEY=$(project_key_of_entry "$CODE3")
+if [ -z "$MKEY" ] || [ ! -f "$D/projects/$MKEY/harness.sqlite3" ]; then
+  echo "PRECONDITION FAILED: the model kept no project entry with $CODE3 in a store of its own (see $RX/mroot.json); rerun"
+  exit 2
+fi
+echo "precondition: the entry is kept for project $MKEY"
+before=$(stores | sort)
+run_exec mclone "$MC" "Answer exactly one line: OK-CLONE. Do not call any tool."
+CKEY=$(comm -13 <(printf '%s\n' "$before") <(stores | sort) | head -1)
+if [ -z "$CKEY" ] || [ -z "$(request OK-CLONE)" ]; then
+  echo "PRECONDITION FAILED: the clone's turn left no store of its own (see $RX/mclone.err); rerun"
+  exit 2
+fi
+echo "precondition: the clone keeps its conversation in $CKEY"
+before=$(stores | sort)
+mkdir -p "$RX/moved"
+mv "$M" "$RX/moved/renamed-repo"
+MM=$RX/moved/renamed-repo
+run_exec mmoved "$MM" "Answer exactly one line: OK-MOVED. Do not call any tool."
+RM=$(request "OK-MOVED")
+if [ -z "$RM" ]; then
+  echo "PRECONDITION FAILED: the turn in the moved repository left no request (see $RX/mmoved.err); rerun"
+  exit 2
+fi
+NEWM=$(stores | sort | comm -13 <(printf '%s\n' "$before") - | head -1)
+check "the moved repository's turn carries its project entry" 'printf "%s" "$RM" | grep -q "$CODE3"'
+check "its old key's store is gone and no store was added" '[ ! -e "$D/projects/$MKEY" ] && [ "$(stores | sort)" != "$before" ] && [ "$(stores | wc -l)" -eq "$(printf "%s\n" "$before" | wc -l)" ]'
+check "the store that moved is the one the turn used" '[ -n "$NEWM" ] && grep -q "$MKEY" "$D/projects/$NEWM/project.json"'
+check "project.json records the repository's identity" 'grep -q "moved-repo" "$D/projects/$NEWM/project.json" && grep -q "\"roots\"" "$D/projects/$NEWM/project.json"'
+check "the move is in the diagnostics" 'grep -rh "\"store_followed\"" "$D/diagnostics" | grep -q .'
+check "the clone that still exists keeps its own store" '[ -f "$D/projects/$CKEY/harness.sqlite3" ] && [ "$CKEY" != "$NEWM" ]'
+(cd "$MC" && "$HA" sessions list --json >"$RX/clone-again.json" 2>"$RX/clone-again.err")
+check "and a launch from the clone still opens it" '[ -f "$D/projects/$CKEY/harness.sqlite3" ] && [ "$(stores | wc -l)" -eq "$(printf "%s\n" "$before" | wc -l)" ]'
+
+echo "################ 4. ha project rekey moves a store by hand, never over one that holds data"
+Y=$RX/y
+mkdir -p "$Y"
+before=$(stores | sort)
+# Not a repository: nothing identifies it once it moves.
+run_exec yold "$Y" "Answer exactly one line: OK-YOLD. Do not call any tool."
+YKEY=$(comm -13 <(printf '%s\n' "$before") <(stores | sort) | head -1)
+if [ -z "$YKEY" ] || [ -z "$(request OK-YOLD)" ]; then
+  echo "PRECONDITION FAILED: the turn in $Y left no store of its own (see $RX/yold.err); rerun"
+  exit 2
+fi
+mv "$Y" "$RX/y-moved"
+Z=$RX/y-moved
+(cd "$Z" && "$HA" project rekey "$Y" >"$RX/rekey.out" 2>&1); rekey=$?
+sed 's/^/   /' "$RX/rekey.out"
+ZKEY=$(stores | sort | comm -13 <(printf '%s\n' "$before") - | head -1)
+check "rekey moved the store to the directory's key" '[ "$rekey" -eq 0 ] && [ ! -e "$D/projects/$YKEY" ] && [ -n "$ZKEY" ] && [ "$ZKEY" != "$YKEY" ] && [ -f "$D/projects/$ZKEY/harness.sqlite3" ]'
+(cd "$Z" && "$HA" sessions list --json >"$RX/rekey-list.json" 2>"$RX/rekey-list.err")
+check "its conversation is listed from the new place" '[ "$(count "$RX/rekey-list.json")" -ge 1 ]'
+check "project.json records the key it took" 'grep -q "$YKEY" "$D/projects/$ZKEY/project.json"'
+# A store that holds data is never merged into.
+W=$RX/w
+mkdir -p "$W"
+before=$(stores | sort)
+run_exec wown "$W" "Answer exactly one line: OK-WOWN. Do not call any tool."
+WKEY=$(comm -13 <(printf '%s\n' "$before") <(stores | sort) | head -1)
+if [ -z "$WKEY" ]; then
+  echo "PRECONDITION FAILED: the turn in $W left no store of its own (see $RX/wown.err); rerun"
+  exit 2
+fi
+(cd "$Z" && "$HA" project rekey "$WKEY" >"$RX/rekey-refused.out" 2>&1); refused=$?
+sed 's/^/   /' "$RX/rekey-refused.out"
+check "a rekey into a store that holds data is refused, both kept" '[ "$refused" -ne 0 ] && grep -q "never merged" "$RX/rekey-refused.out" && [ -f "$D/projects/$WKEY/harness.sqlite3" ] && [ -f "$D/projects/$ZKEY/harness.sqlite3" ]'
 
 result

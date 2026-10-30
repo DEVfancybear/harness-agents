@@ -14,6 +14,8 @@
 # 0.8.7).
 #
 #   bash scripts/testing/live-tests/markdown-memory.sh
+# Sections 11 and 12 (0.8.9, no model) fail on 0.8.8: the host wrote the index
+# past its cap, and struck index lines stayed in it.
 set -u
 source "$(dirname "$0")/env.sh"
 fresh markdown-memory
@@ -225,5 +227,81 @@ RFILE=$(head -1 "$RX/rules.tsv" | cut -f2)
 "$HA" learning retire "$RID" --reason "live test" > /dev/null 2>&1
 check "retiring strikes the pointer and the rule" '[ -n "$RFILE" ] && grep -F "\`$RFILE\`" "$L/MEMORY.md" | grep -q "~~" && grep -q "~~\[inferred\] Rule:" "$L/$RFILE"'
 check "and the store still passes the lint" '(cd "$L" && "$HA" memory lint --quiet)'
+
+# rules_for <file> <project> <id> <text>: one rule, seen in two conversations,
+# for `ha learning import`.
+rules_for() { "$PY" - "$@" <<'EOF3'
+import datetime, json, sys
+path, project, rid, text = sys.argv[1:5]
+at = lambda days: (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).isoformat()
+signals = [{"at": at(3), "conversation": "task_a", "against": False, "evidence": "please run the formatter before you commit"},
+           {"at": at(2), "conversation": "task_b", "against": False, "evidence": "again: format before committing"},
+           {"at": at(1), "conversation": "task_b", "against": False, "evidence": "remember to run the formatter before every commit"}]
+rule = {"id": rid, "kind": "correction", "domain": "workflow", "scope": "project", "project": project, "signals": signals, "text": text}
+json.dump({"schema": 1, "kind": "ha-lessons", "lessons": [rule]}, open(path, "w", encoding="utf-8"), ensure_ascii=False)
+EOF3
+}
+chars() { "$PY" -c "import sys; t=open(sys.argv[1],encoding='utf-8').read(); print(len(t.encode('utf-16-le'))//2)" "$1"; }
+
+echo "################ 11. a host write that would add a lint failure is refused (0.8.9)"
+# No model: the index is a few characters under its cap, and the learning loop's
+# pointer line would take it over. On 0.8.8 the write landed and the lint failed.
+F=$RX/full
+project "$F"
+(cd "$F" && "$HA" memory init) > /dev/null 2>&1
+"$PY" - "$F/MEMORY.md" <<'EOF3'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+room = 15000 - len(text.encode("utf-16-le")) // 2 - 20
+line = "- (routing note kept for the live test, not a fact)\n"
+pad = "".join(line for _ in range(room // len(line)))
+pad += "x" * (room - len(pad) - 1) + "\n"
+open(path, "w", encoding="utf-8", newline="\n").write(text + pad)
+EOF3
+(cd "$F" && git add -A && git -c user.name=t -c user.email=t@t commit -qm store)
+echo "precondition: the index holds $(chars "$F/MEMORY.md") of its 15,000 characters"
+rules_for "$RX/full-rules.json" "$(basename "$F")" les_full1 "Run the formatter over every changed file before committing, and commit only what it leaves unchanged"
+(cd "$F" && "$HA" learning import "$RX/full-rules.json") > "$RX/full-import.out" 2>&1
+sed 's/^/   /' "$RX/full-import.out"
+check "the index stays within its cap" '[ "$(chars "$F/MEMORY.md")" -le 15000 ]'
+check "the store still passes the lint" '(cd "$F" && "$HA" memory lint --quiet)'
+check "the refusal is in the diagnostics, naming the check" 'grep -rh "\"markdown_write_refused\"" "$D/diagnostics" | grep -q "rom-caps: MEMORY.md: 15,"'
+# The lesson is held, and says why: the next import or review tries again.
+held_why() { "$PY" -c "
+import json, sys
+for lesson in json.load(open(sys.argv[1], encoding='utf-8')).get('lessons', []):
+    if lesson.get('project', {}).get('name') == sys.argv[2]:
+        print(*[event.get('why', '') for event in lesson.get('events', []) if event.get('what') == 'held'], sep=chr(10))
+" "$D/harness/lessons.json" "$(basename "$F")"; }
+check "the rule is held, its lesson saying the store would fail its lint" 'held_why | grep -q "would fail its lint (rom-caps"'
+
+echo "################ 12. struck index lines past the cap move to the archive"
+# No model: the index holds 21 struck pointers of retired rules; the next host
+# write of the index moves them, whole, to a new archive file.
+S=$RX/struck
+project "$S"
+(cd "$S" && "$HA" memory init) > /dev/null 2>&1
+"$PY" - "$S/MEMORY.md" <<'EOF3'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+lines = "".join(f"- ~~Old rule {n} (learned 2026-01-{n:02d}, les_old{n})~~ retired 2026-02-01\n" for n in range(1, 22))
+text = text.replace("## Current Decisions\n", "## Current Decisions\n\n" + lines, 1)
+open(path, "w", encoding="utf-8", newline="\n").write(text)
+EOF3
+(cd "$S" && git add -A && git -c user.name=t -c user.email=t@t commit -qm store)
+grep "~~" "$S/MEMORY.md" > "$RX/struck-before.txt"
+echo "precondition: the index holds $(wc -l < "$RX/struck-before.txt") struck lines"
+rules_for "$RX/struck-rules.json" "$(basename "$S")" les_struck1 "Keep each commit to one logical change and write its subject in the imperative"
+(cd "$S" && "$HA" learning import "$RX/struck-rules.json") > "$RX/struck-import.out" 2>&1
+sed 's/^/   /' "$RX/struck-import.out"
+ARCH=$(ls "$S"/memory/archive/index-*.md 2>/dev/null | head -1)
+all_archived() { while IFS= read -r line; do grep -qxF -- "$line" "$ARCH" || return 1; done < "$RX/struck-before.txt"; }
+check "the index holds no struck line, and the new rule's pointer" '! grep -q "~~" "$S/MEMORY.md" && grep -q "learned-" "$S/MEMORY.md"'
+check "every struck line is in a new archive file, whole" '[ -n "$ARCH" ] && all_archived'
+check "the lint passes with the move" '[ -n "$ARCH" ] && (cd "$S" && "$HA" memory lint --quiet)'
+(cd "$S" && git add -A && git -c user.name=t -c user.email=t@t commit -qm moved)
+check "and once it is committed" '[ -n "$ARCH" ] && (cd "$S" && "$HA" memory lint --quiet)'
 
 result

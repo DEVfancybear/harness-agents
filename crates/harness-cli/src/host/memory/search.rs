@@ -358,10 +358,12 @@ pub fn search(
         )
     } else {
         // Every variant ranked by BM25, the variants fused, then the best
-        // reordered by recency and use.
+        // reordered by recency and use. One query needs only its best
+        // candidates; variants are fused over their whole rankings.
+        let best_of = (queries.len() == 1).then_some(candidates);
         let rankings = queries
             .iter()
-            .map(|query| bm25(&considered, query))
+            .map(|query| bm25(&considered, query, best_of))
             .collect::<Vec<_>>();
         let ranked = if let [only] = rankings.as_slice() {
             only.clone()
@@ -700,7 +702,10 @@ fn words(text: &str, fold: bool) -> Vec<String> {
 /// A field's words as BM25 matches them: each distinct word once, sorted,
 /// with how often it occurs, and the words of each English stem. A term's
 /// frequency is then a binary search for the words it begins and a lookup of
-/// its stem's words, not a pass over every word of every field.
+/// its stem's words, not a pass over every word of every field. How BM25
+/// read an entry before the index ([`Corpus`]); the tests check the index
+/// against it.
+#[cfg(test)]
 struct Field {
     /// Distinct words in byte order, each with its count: the words a term
     /// begins sit together, from where the term would sort.
@@ -712,6 +717,7 @@ struct Field {
     weight: f64,
 }
 
+#[cfg(test)]
 impl Field {
     fn new(words: Vec<String>, weight: f64, stemmer: &rust_stemmers::Stemmer) -> Self {
         let total = words.len();
@@ -792,8 +798,9 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
 /// one of the query's words: the words it begins, and the words of its stem,
 /// with Snowball's English stemmer as memory-engine's Postgres configuration
 /// has it. Fields weigh by what they say of the entry: its title most, then
-/// its content and where it sits, then its facets.
-fn bm25(considered: &[&Placed<'_>], query: &str) -> Vec<(usize, f64)> {
+/// its content and where it sits, then its facets. With `limit`, only the
+/// best `limit` of them, chosen without sorting the rest.
+fn bm25(considered: &[&Placed<'_>], query: &str, limit: Option<usize>) -> Vec<(usize, f64)> {
     let entries = considered
         .iter()
         .map(|placed| placed.entry)
@@ -802,49 +809,61 @@ fn bm25(considered: &[&Placed<'_>], query: &str) -> Vec<(usize, f64)> {
         .into_iter()
         .map(|term| (term, 1.0))
         .collect::<Vec<_>>();
-    bm25_weighted(&entries, &terms)
+    best(bm25_scores(&entries, &terms), limit.unwrap_or(usize::MAX))
 }
 
-/// One entry's fields as BM25 reads them, its words as written and folded.
+/// The texts of an entry's four fields, as BM25 reads them: its title, its
+/// content, where it sits (its tree and its key), and its facets (`pinned`
+/// left out), each weighing [`FIELD_WEIGHTS`].
+fn field_texts(entry: &Entry) -> [String; 4] {
+    let facets = entry
+        .meta
+        .iter()
+        .filter(|(key, _)| key.as_str() != "pinned")
+        .map(|(key, value)| {
+            format!(
+                "{key} {}",
+                value
+                    .as_str()
+                    .map_or_else(|| value.to_string(), str::to_owned)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    [
+        entry.title.clone().unwrap_or_default(),
+        entry.content.clone().unwrap_or_default(),
+        format!("{} {}", entry.tree.replace('/', " "), entry.id),
+        facets,
+    ]
+}
+
+/// What each of [`field_texts`] weighs.
+const FIELD_WEIGHTS: [f64; 4] = [TITLE_WEIGHT, CONTENT_WEIGHT, PATH_WEIGHT, META_WEIGHT];
+
+/// One entry's fields as BM25 read them before the index, its words as
+/// written and folded: the reference the index is checked against.
+#[cfg(test)]
 struct Fields {
     written: [Field; 4],
     folded: [Field; 4],
 }
 
+#[cfg(test)]
 impl Fields {
     fn new(entry: &Entry, stemmer: &rust_stemmers::Stemmer) -> Self {
-        let facets = entry
-            .meta
-            .iter()
-            .filter(|(key, _)| key.as_str() != "pinned")
-            .map(|(key, value)| {
-                format!(
-                    "{key} {}",
-                    value
-                        .as_str()
-                        .map_or_else(|| value.to_string(), str::to_owned)
-                )
+        let texts = field_texts(entry);
+        let fields = |fold: bool| {
+            std::array::from_fn(|field| {
+                Field::new(words(&texts[field], fold), FIELD_WEIGHTS[field], stemmer)
             })
-            .collect::<Vec<_>>()
-            .join(" ");
-        let place = format!("{} {}", entry.tree.replace('/', " "), entry.id);
-        let texts = [
-            (entry.title.as_deref().unwrap_or_default(), TITLE_WEIGHT),
-            (entry.content.as_deref().unwrap_or_default(), CONTENT_WEIGHT),
-            (place.as_str(), PATH_WEIGHT),
-            (facets.as_str(), META_WEIGHT),
-        ];
-        let fields =
-            |fold: bool| texts.map(|(text, weight)| Field::new(words(text, fold), weight, stemmer));
+        };
         Self {
             written: fields(false),
             folded: fields(true),
         }
     }
 
-    /// How often the entry holds a term, in the form the term is in: a term
-    /// without accents reads the entry without its accents, so `may in` finds
-    /// `máy in`; one with accents reads it as written.
     fn frequency(&self, term: &str, stem: &str, fold: bool) -> f64 {
         let fields = if fold { &self.folded } else { &self.written };
         fields.iter().map(|field| field.frequency(term, stem)).sum()
@@ -859,42 +878,32 @@ impl Fields {
     }
 }
 
-/// [`bm25`] for a query whose terms weigh differently - the turn's digest
-/// weighs a goal's words above an earlier message's - over plain entries.
-/// The indexes of the entries holding a term, best first.
+/// BM25 as it ran before the index: every entry tokenized, stemmed and
+/// scored on every call. The tests check [`bm25_weighted`] against it.
+#[cfg(test)]
 #[allow(clippy::cast_precision_loss, reason = "counts are small")]
-pub fn bm25_weighted(entries: &[&Entry], terms: &[(String, f64)]) -> Vec<(usize, f64)> {
+fn bm25_reference(entries: &[&Entry], terms: &[(String, f64)]) -> Vec<(usize, f64)> {
     if terms.is_empty() || entries.is_empty() {
         return Vec::new();
     }
     let stemmer = rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English);
-    let terms = terms
+    let terms = prepared(terms, &stemmer);
+    let fields = entries
         .iter()
-        .map(|(term, weight)| {
-            let fold = super::knowledge::store::fold(term) == *term;
-            let stem = stemmer.stem(term).into_owned();
-            (term.as_str(), stem, fold, *weight)
-        })
+        .map(|entry| Fields::new(entry, &stemmer))
         .collect::<Vec<_>>();
-    // Each entry's fields are tokenized, stemmed and indexed on its own: the
-    // part that grows with the store, shared across threads for a large one.
-    let fields = parallel_map(entries, |entry| {
-        Fields::new(
-            entry,
-            &rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English),
-        )
-    });
     let lengths = fields.iter().map(Fields::length).collect::<Vec<_>>();
     let average = (lengths.iter().sum::<f64>() / lengths.len() as f64).max(1.0);
     let documents = entries.len() as u64;
-    // Each term's frequency in each entry, once: the document frequencies and
-    // the scores both read it.
-    let frequencies = parallel_map(&fields, |fields| {
-        terms
-            .iter()
-            .map(|(term, stem, fold, _)| fields.frequency(term, stem, *fold))
-            .collect::<Vec<_>>()
-    });
+    let frequencies = fields
+        .iter()
+        .map(|fields| {
+            terms
+                .iter()
+                .map(|term| fields.frequency(&term.text, &term.stem, term.fold))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     let idf = (0..terms.len())
         .map(|term| {
             let holding = frequencies
@@ -909,9 +918,9 @@ pub fn bm25_weighted(entries: &[&Entry], terms: &[(String, f64)]) -> Vec<(usize,
         .enumerate()
         .filter_map(|(index, frequencies)| {
             let mut score = 0.0;
-            for ((tf, (_, _, _, weight)), idf) in frequencies.iter().zip(&terms).zip(&idf) {
+            for ((tf, term), idf) in frequencies.iter().zip(&terms).zip(&idf) {
                 if *tf > 0.0 {
-                    score += weight * idf * tf * (K1 + 1.0)
+                    score += term.weight * idf * tf * (K1 + 1.0)
                         / (tf + K1 * (1.0 - B + B * lengths[index] / average));
                 }
             }
@@ -920,6 +929,402 @@ pub fn bm25_weighted(entries: &[&Entry], terms: &[(String, f64)]) -> Vec<(usize,
         .collect::<Vec<_>>();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     ranked
+}
+
+/// A query term as BM25 matches it: its text, its English stem, whether it
+/// reads the entries without their accents, and what it weighs.
+struct Term {
+    text: String,
+    stem: String,
+    fold: bool,
+    weight: f64,
+}
+
+fn prepared(terms: &[(String, f64)], stemmer: &rust_stemmers::Stemmer) -> Vec<Term> {
+    terms
+        .iter()
+        .map(|(term, weight)| Term {
+            fold: super::knowledge::store::fold(term) == *term,
+            stem: stemmer.stem(term).into_owned(),
+            text: term.clone(),
+            weight: *weight,
+        })
+        .collect()
+}
+
+/// Where an entry was read from, so its words are indexed once and kept
+/// until it changes: its store (the directory and the tree root it was read
+/// under) and its `version_hash`, which every write that changes its title,
+/// content, tree, name or meta changes.
+#[derive(Clone, Debug)]
+pub struct Indexed {
+    pub store: std::sync::Arc<str>,
+    pub hash: String,
+}
+
+/// One entry's words counted per field, written and folded, and its length:
+/// what the index keeps of it.
+struct Counted {
+    /// `(word, field, times as written, times folded)`.
+    words: Vec<(String, u8, u32, u32)>,
+    length: f64,
+}
+
+#[allow(clippy::cast_precision_loss, reason = "counts are small")]
+fn counted(entry: &Entry) -> Counted {
+    let texts = field_texts(entry);
+    let mut counts = BTreeMap::<(String, u8), (u32, u32)>::new();
+    let mut totals = [0_usize; 4];
+    for (field, text) in texts.iter().enumerate() {
+        let written = words(text, false);
+        totals[field] = written.len();
+        #[allow(clippy::cast_possible_truncation, reason = "four fields")]
+        let label = field as u8;
+        for word in written {
+            counts.entry((word, label)).or_default().0 += 1;
+        }
+        for word in words(text, true) {
+            counts.entry((word, label)).or_default().1 += 1;
+        }
+    }
+    Counted {
+        words: counts
+            .into_iter()
+            .map(|((word, field), (written, folded))| (word, field, written, folded))
+            .collect(),
+        length: totals
+            .iter()
+            .zip(FIELD_WEIGHTS)
+            .map(|(total, weight)| *total as f64 * weight)
+            .sum(),
+    }
+}
+
+/// One entry's use of one word in one field.
+#[derive(Clone, Copy)]
+struct Posting {
+    slot: u32,
+    field: u8,
+    written: u32,
+    folded: u32,
+}
+
+/// The words of a store's entries, indexed once: each entry a slot with its
+/// length, each word the slots that hold it (an inverted index), and the
+/// words of each English stem. A term's entries are then the postings of the
+/// words it begins and of its stem's words, not a pass over every entry.
+#[derive(Default)]
+struct Corpus {
+    /// Each entry's slot by `(kind, key)`, with the hash it was indexed at.
+    slots: std::collections::HashMap<(String, String), (String, u32)>,
+    lengths: Vec<f64>,
+    /// Every word, in byte order: the words a term begins sit together.
+    words: BTreeMap<String, u32>,
+    /// Each word's text, by its id.
+    names: Vec<String>,
+    stems: std::collections::HashMap<String, Vec<u32>>,
+    postings: Vec<Vec<Posting>>,
+    /// The most entries one call read from this store since it was indexed:
+    /// slots past twice that are entries changed or gone, and the corpus is
+    /// indexed again.
+    peak: usize,
+    /// When it was last read, in calls: the least recent store goes first.
+    used: u64,
+}
+
+impl Corpus {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a store's slots and words fit u32"
+    )]
+    fn add(&mut self, counted: Counted, stemmer: &rust_stemmers::Stemmer) -> u32 {
+        let slot = self.lengths.len() as u32;
+        self.lengths.push(counted.length);
+        for (word, field, written, folded) in counted.words {
+            let id = if let Some(id) = self.words.get(&word) {
+                *id
+            } else {
+                let id = self.names.len() as u32;
+                self.stems
+                    .entry(stemmer.stem(&word).into_owned())
+                    .or_default()
+                    .push(id);
+                self.names.push(word.clone());
+                self.postings.push(Vec::new());
+                self.words.insert(word, id);
+                id
+            };
+            self.postings[id as usize].push(Posting {
+                slot,
+                field,
+                written,
+                folded,
+            });
+        }
+        slot
+    }
+
+    /// The words a term matches: those it begins (`deploy` finds `deploys`),
+    /// then the words of its stem it does not begin (`deploying` finds
+    /// `deployed`); each word once.
+    fn matching(&self, term: &str, stem: &str) -> Vec<u32> {
+        let mut ids = self
+            .words
+            .range::<str, _>((std::ops::Bound::Included(term), std::ops::Bound::Unbounded))
+            .take_while(|(word, _)| word.starts_with(term))
+            .map(|(_, id)| *id)
+            .collect::<Vec<_>>();
+        if let Some(stemmed) = self.stems.get(stem) {
+            ids.extend(
+                stemmed
+                    .iter()
+                    .filter(|id| !self.names[**id as usize].starts_with(term)),
+            );
+        }
+        ids
+    }
+}
+
+/// The most stores whose index is kept: a long-lived process serves the
+/// global store and the stores of the conversations it runs.
+const INDEXED_STORES: usize = 32;
+/// Slots a store's index may hold beyond twice its peak before it is indexed
+/// again.
+const INDEX_SLACK: usize = 1_024;
+
+/// Every store's index, for the process: the digest and memory search share
+/// it, so a turn re-reads only the entries that changed since the last one.
+fn indexes() -> &'static std::sync::Mutex<std::collections::HashMap<std::sync::Arc<str>, Corpus>> {
+    static INDEXES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::sync::Arc<str>, Corpus>>,
+    > = std::sync::OnceLock::new();
+    INDEXES.get_or_init(Default::default)
+}
+
+/// How many calls have read an index: a store's `used`.
+static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// No entry in this slot.
+const NO_ENTRY: u32 = u32::MAX;
+
+/// [`bm25`] for a query whose terms weigh differently - the turn's digest
+/// weighs a goal's words above an earlier message's - over plain entries.
+/// The indexes of the entries holding a term, best first.
+#[cfg(test)]
+#[must_use]
+pub fn bm25_weighted(entries: &[&Entry], terms: &[(String, f64)]) -> Vec<(usize, f64)> {
+    best(bm25_scores(entries, terms), usize::MAX)
+}
+
+/// The best `limit` of `scores`, best first, ties by index: the order a
+/// full sort gives, without sorting the rest.
+#[must_use]
+pub fn best(mut scores: Vec<(usize, f64)>, limit: usize) -> Vec<(usize, f64)> {
+    let order =
+        |a: &(usize, f64), b: &(usize, f64)| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0));
+    if limit == 0 {
+        return Vec::new();
+    }
+    if scores.len() > limit {
+        scores.select_nth_unstable_by(limit - 1, order);
+        scores.truncate(limit);
+    }
+    scores.sort_by(order);
+    scores
+}
+
+/// Each entry's BM25 score, in the entries' order, for those holding a term
+/// (a score above zero). The statistics are those of `entries`. An entry read
+/// from a store ([`Entry::indexed`]) is looked up in that store's index and
+/// indexed only when it is new or changed; any other is indexed for this call.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    reason = "counts are small; one pass: index, then score"
+)]
+#[must_use]
+pub fn bm25_scores(entries: &[&Entry], terms: &[(String, f64)]) -> Vec<(usize, f64)> {
+    if terms.is_empty() || entries.is_empty() {
+        return Vec::new();
+    }
+    let stemmer = rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English);
+    let terms = prepared(terms, &stemmer);
+    // The stores' indexes are taken out for the call, and put back after: a
+    // call on another thread meanwhile indexes its own, and either is right.
+    let mut corpora: Vec<(Option<std::sync::Arc<str>>, Corpus)> = Vec::new();
+    let mut taken = std::collections::HashMap::<std::sync::Arc<str>, usize>::new();
+    let use_count = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut cache = indexes()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for entry in entries {
+            if let Some(indexed) = &entry.indexed
+                && !taken.contains_key(&indexed.store)
+            {
+                let corpus = cache.remove(&indexed.store).unwrap_or_default();
+                taken.insert(indexed.store.clone(), corpora.len());
+                corpora.push((Some(indexed.store.clone()), corpus));
+            }
+        }
+    }
+    let ephemeral = corpora.len();
+    corpora.push((None, Corpus::default()));
+    // Each entry's (corpus, slot); the ones to index first.
+    let mut places = vec![(0_usize, NO_ENTRY); entries.len()];
+    let mut assigned = corpora
+        .iter()
+        .map(|_| std::collections::HashSet::<u32>::new())
+        .collect::<Vec<_>>();
+    let mut pending = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let found = entry.indexed.as_ref().and_then(|indexed| {
+            let at = taken[&indexed.store];
+            let slot = corpora[at]
+                .1
+                .slots
+                .get(&(entry.kind.clone(), entry.id.clone()))
+                .filter(|(hash, _)| *hash == indexed.hash)
+                .map(|(_, slot)| *slot)?;
+            assigned[at].insert(slot).then_some((at, slot))
+        });
+        match found {
+            Some(place) => places[index] = place,
+            None => pending.push(index),
+        }
+    }
+    // New and changed entries are tokenized, stemmed and counted, on several
+    // threads for many: the part that grows with what changed.
+    let counts = parallel_map(&pending, |index| counted(entries[*index]));
+    for (index, counted) in pending.into_iter().zip(counts) {
+        let entry = entries[index];
+        // A second entry of one key in one call is indexed apart.
+        let at = entry
+            .indexed
+            .as_ref()
+            .map(|indexed| taken[&indexed.store])
+            .filter(|at| {
+                !corpora[*at]
+                    .1
+                    .slots
+                    .get(&(entry.kind.clone(), entry.id.clone()))
+                    .is_some_and(|(_, slot)| assigned[*at].contains(slot))
+            })
+            .unwrap_or(ephemeral);
+        let corpus = &mut corpora[at].1;
+        let slot = corpus.add(counted, &stemmer);
+        if at != ephemeral
+            && let Some(indexed) = &entry.indexed
+        {
+            corpus.slots.insert(
+                (entry.kind.clone(), entry.id.clone()),
+                (indexed.hash.clone(), slot),
+            );
+        }
+        assigned[at].insert(slot);
+        places[index] = (at, slot);
+    }
+    // Which entry each slot of each corpus is in this call.
+    let mut entry_of = corpora
+        .iter()
+        .map(|(_, corpus)| vec![NO_ENTRY; corpus.lengths.len()])
+        .collect::<Vec<_>>();
+    for (index, (at, slot)) in places.iter().enumerate() {
+        entry_of[*at][*slot as usize] = index as u32;
+    }
+    let lengths = places
+        .iter()
+        .map(|(at, slot)| corpora[*at].1.lengths[*slot as usize])
+        .collect::<Vec<_>>();
+    let average = (lengths.iter().sum::<f64>() / lengths.len() as f64).max(1.0);
+    let documents = entries.len() as u64;
+    let mut counts = vec![[0.0_f64; 4]; entries.len()];
+    let mut counting = vec![false; entries.len()];
+    let mut touched = Vec::new();
+    let mut scores = vec![0.0_f64; entries.len()];
+    let mut marked = vec![false; entries.len()];
+    let mut holding = Vec::new();
+    for term in &terms {
+        for (at, (_, corpus)) in corpora.iter().enumerate() {
+            for word in corpus.matching(&term.text, &term.stem) {
+                for posting in &corpus.postings[word as usize] {
+                    let index = entry_of[at][posting.slot as usize];
+                    let times = if term.fold {
+                        posting.folded
+                    } else {
+                        posting.written
+                    };
+                    if index == NO_ENTRY || times == 0 {
+                        continue;
+                    }
+                    let index = index as usize;
+                    if !counting[index] {
+                        counting[index] = true;
+                        touched.push(index);
+                    }
+                    counts[index][usize::from(posting.field)] += f64::from(times);
+                }
+            }
+        }
+        // A field's count times its weight, summed over the fields in their
+        // order: the frequency a pass over the entry's fields gives.
+        let frequencies = touched
+            .iter()
+            .map(|index| {
+                let frequency = counts[*index]
+                    .iter()
+                    .zip(FIELD_WEIGHTS)
+                    .map(|(count, weight)| count * weight)
+                    .sum::<f64>();
+                (*index, frequency)
+            })
+            .filter(|(_, frequency)| *frequency > 0.0)
+            .collect::<Vec<_>>();
+        for index in touched.drain(..) {
+            counts[index] = [0.0; 4];
+            counting[index] = false;
+        }
+        let idf = harness_types::search::bm25_idf(documents, frequencies.len() as u64);
+        for (index, tf) in frequencies {
+            if !marked[index] {
+                marked[index] = true;
+                holding.push(index);
+            }
+            scores[index] += term.weight * idf * tf * (K1 + 1.0)
+                / (tf + K1 * (1.0 - B + B * lengths[index] / average));
+        }
+    }
+    let mut cache = indexes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (at, (store, mut corpus)) in corpora.into_iter().enumerate() {
+        let Some(store) = store else {
+            continue;
+        };
+        corpus.peak = corpus.peak.max(assigned[at].len());
+        corpus.used = use_count;
+        if corpus.lengths.len() <= corpus.peak.saturating_mul(2) + INDEX_SLACK {
+            cache.insert(store, corpus);
+        }
+    }
+    while cache.len() > INDEXED_STORES {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, corpus)| corpus.used)
+            .map(|(store, _)| store.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+    drop(cache);
+    holding.sort_unstable();
+    holding
+        .into_iter()
+        .map(|index| (index, scores[index]))
+        .filter(|(_, score)| *score > 0.0)
+        .collect()
 }
 
 /// Memory search's BM25 over plain documents, each a title and a text: their
@@ -954,6 +1359,7 @@ pub fn rank_documents(documents: &[(&str, &str)], query: &str) -> Vec<(usize, f6
             ended: false,
             source: None,
             usage: memory_store::Usage::default(),
+            indexed: None,
         })
         .collect::<Vec<_>>();
     let doc = Value::Null;
@@ -965,7 +1371,7 @@ pub fn rank_documents(documents: &[(&str, &str)], query: &str) -> Vec<(usize, f6
             doc: &doc,
         })
         .collect::<Vec<_>>();
-    bm25(&placed.iter().collect::<Vec<_>>(), query)
+    bm25(&placed.iter().collect::<Vec<_>>(), query, None)
 }
 
 /// The slots a `readout` search reads by default, and at most: MEMORILLA's
@@ -1210,6 +1616,7 @@ mod tests {
                 ended: false,
                 source: None,
                 usage: memory_store::Usage::default(),
+                indexed: None,
             })
             .collect::<Vec<_>>();
         let refs = entries.iter().collect::<Vec<_>>();
@@ -1260,5 +1667,343 @@ mod tests {
         // "11" is a document's place, not a word any document holds.
         assert!(super::rank_documents(&documents, "11").is_empty());
         assert_eq!(super::rank_documents(&documents, "2026")[0].0, 1);
+    }
+
+    /// An entry of generated prose, indexed as read from `store` at `hash`.
+    fn prose_entry(prose: &mut Prose, index: usize, store: &str, hash: &str) -> Entry {
+        let title_words = 2 + prose.below(6);
+        let content_words = 5 + prose.below(30);
+        let mut meta = serde_json::Map::new();
+        if prose.below(3) == 0 {
+            meta.insert("type".to_owned(), json!(prose.words(1)));
+        }
+        if prose.below(5) == 0 {
+            meta.insert("pinned".to_owned(), json!(true));
+        }
+        Entry {
+            id: format!("k{index}"),
+            name: format!("k{index}"),
+            memory: None,
+            kind: if index.is_multiple_of(7) {
+                "prompt"
+            } else {
+                "memory"
+            }
+            .to_owned(),
+            title: Some(prose.words(title_words)),
+            content: Some(prose.words(content_words)),
+            path: "general".to_owned(),
+            scope: "global".to_owned(),
+            version: 1,
+            reference: serde_json::Map::new(),
+            arguments: serde_json::Map::new(),
+            pinned: false,
+            updated_at: None,
+            project: None,
+            aliases: Vec::new(),
+            tree: format!("/global/area{}/sở_thích", prose.below(4)),
+            meta,
+            temporal: None,
+            ended: false,
+            source: None,
+            usage: memory_store::Usage::default(),
+            indexed: Some(Indexed {
+                store: store.into(),
+                hash: hash.to_owned(),
+            }),
+        }
+    }
+
+    /// The same order and the same scores, to the bit.
+    fn same(index: &[(usize, f64)], reference: &[(usize, f64)], what: &str) {
+        assert_eq!(index.len(), reference.len(), "{what}: how many matched");
+        for (got, want) in index.iter().zip(reference) {
+            assert_eq!(got.0, want.0, "{what}: the order");
+            assert_eq!(got.1.to_bits(), want.1.to_bits(), "{what}: a score");
+        }
+    }
+
+    /// The index ranks as the pass over every entry did, over random stores
+    /// and queries: on its first call, on later calls that read it, after
+    /// entries change, are added and removed, over a subset of a store (a
+    /// filtered search), over two stores at once, and with the same entry
+    /// twice.
+    #[test]
+    fn the_index_ranks_exactly_as_a_pass_over_every_entry() {
+        for seed in 1..=3_u64 {
+            let mut prose = Prose::new(seed);
+            let store = format!("equivalence-{seed}-{}", std::process::id());
+            let mut entries = (0..200)
+                .map(|index| prose_entry(&mut prose, index, &store, "v1"))
+                .collect::<Vec<_>>();
+            let queries = (0..5)
+                .map(|_| {
+                    let count = 1 + prose.below(6);
+                    let text = prose.words(count);
+                    let mut terms = harness::query_terms(&text)
+                        .into_iter()
+                        .map(|term| (term, [1.0, 1.5, 2.0][prose.below(3)]))
+                        .collect::<Vec<_>>();
+                    // Prefixes and folded forms: `dep`, `may`.
+                    terms.push(("dep".to_owned(), 1.0));
+                    terms.push(("may".to_owned(), 0.7));
+                    terms
+                })
+                .collect::<Vec<_>>();
+            let check = |entries: &[Entry], what: &str| {
+                let refs = entries.iter().collect::<Vec<_>>();
+                for terms in &queries {
+                    same(
+                        &bm25_weighted(&refs, terms),
+                        &bm25_reference(&refs, terms),
+                        what,
+                    );
+                }
+            };
+            check(&entries, "first call");
+            check(&entries, "a call that reads the index");
+            // Some entries change (a new hash), some are new, some gone.
+            for index in (0..entries.len()).step_by(17) {
+                let changed = prose_entry(&mut prose, index, &store, "v2");
+                entries[index] = changed;
+            }
+            entries.extend((200..240).map(|index| prose_entry(&mut prose, index, &store, "v1")));
+            entries.retain(|entry| !entry.id.ends_with('3'));
+            check(&entries, "after a change");
+            let subset = entries
+                .iter()
+                .filter(|entry| entry.tree.contains("area1"))
+                .cloned()
+                .collect::<Vec<_>>();
+            check(&subset, "a subset of the store");
+            let other = format!("{store}-local");
+            let mut both = entries.clone();
+            both.extend((0..60).map(|index| prose_entry(&mut prose, index, &other, "v1")));
+            check(&both, "two stores");
+            let mut twice = subset.clone();
+            twice.push(subset[0].clone());
+            check(&twice, "an entry twice");
+            let plain = entries
+                .iter()
+                .cloned()
+                .map(|mut entry| {
+                    entry.indexed = None;
+                    entry
+                })
+                .collect::<Vec<_>>();
+            check(&plain, "entries read from no store");
+            check(&entries, "the store again");
+        }
+    }
+
+    /// The digest and a search over a store read whole rank as before, and
+    /// a write to one entry is seen on the next read.
+    #[test]
+    fn a_store_read_whole_ranks_as_before_and_a_write_is_seen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let dir = directory.path().join("harness");
+        generated_store(&dir, 400, 11);
+        let terms = harness::weighted_terms(
+            Some("fix the deploy of kalo build"),
+            &["parser tokens", "máy in số"],
+        );
+        let ranked = |state: &harness::State| {
+            let entries = state.entries["memory"].iter().collect::<Vec<_>>();
+            (
+                bm25_weighted(&entries, &terms),
+                bm25_reference(&entries, &terms),
+            )
+        };
+        let state = harness::load(&dir, "global");
+        assert!(state.entries["memory"][0].indexed.is_some());
+        let (index, reference) = ranked(&state);
+        same(&index, &reference, "a store's first read");
+        // A write: the entry the words reach least now holds them all.
+        let last = index.last().expect("a match").0;
+        let key = state.entries["memory"][last].id.clone();
+        let mut document = memory_store::load_document(&dir).expect("document");
+        document["entries"]["memory"][&key]["title"] = json!("fix the deploy of kalo build");
+        memory_store::save_document(
+            &dir,
+            &document,
+            &memory_store::Writer::new("model", &json!({"via": "test"}), "update"),
+        )
+        .expect("write");
+        let state = harness::load(&dir, "global");
+        let (index, reference) = ranked(&state);
+        same(&index, &reference, "after a write");
+        assert_eq!(
+            state.entries["memory"][index[0].0].id, key,
+            "the write is seen"
+        );
+    }
+
+    /// A generator of words a store holds: several hundred pseudo-words,
+    /// drawn with a skew so a few are common and most are rare, and English
+    /// words whose stems match.
+    pub(crate) struct Prose {
+        state: u64,
+        vocabulary: Vec<String>,
+    }
+
+    impl Prose {
+        pub(crate) fn new(seed: u64) -> Self {
+            const SYLLABLES: [&str; 24] = [
+                "ka", "lo", "mi", "sen", "tor", "va", "rel", "dun", "pi", "gra", "shu", "ne", "bo",
+                "qua", "zet", "ri", "mon", "fa", "lis", "cu", "dra", "ho", "wen", "ty",
+            ];
+            const ENGLISH: [&str; 24] = [
+                "deploy",
+                "deploys",
+                "deployed",
+                "deploying",
+                "parser",
+                "parsing",
+                "build",
+                "builds",
+                "staging",
+                "stage",
+                "release",
+                "released",
+                "token",
+                "tokens",
+                "review",
+                "reviewed",
+                "máy",
+                "in",
+                "số",
+                "lỗi",
+                "cargo",
+                "test",
+                "tests",
+                "fix",
+            ];
+            let mut vocabulary = ENGLISH.map(str::to_owned).to_vec();
+            for first in SYLLABLES {
+                for second in SYLLABLES {
+                    vocabulary.push(format!("{first}{second}"));
+                }
+            }
+            Self {
+                state: seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1),
+                vocabulary,
+            }
+        }
+
+        pub(crate) fn next(&mut self) -> u64 {
+            self.state = self
+                .state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.state >> 33
+        }
+
+        /// A number below `bound`.
+        pub(crate) fn below(&mut self, bound: usize) -> usize {
+            usize::try_from(self.next()).unwrap_or_default() % bound.max(1)
+        }
+
+        /// `count` words, the first of the vocabulary drawn far more often.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_precision_loss,
+            clippy::cast_sign_loss,
+            reason = "a skewed draw"
+        )]
+        pub(crate) fn words(&mut self, count: usize) -> String {
+            (0..count)
+                .map(|_| {
+                    let unit = self.below(1_000_000) as f64 / 1_000_000.0;
+                    let index = (unit.powi(3) * self.vocabulary.len() as f64) as usize;
+                    self.vocabulary[index.min(self.vocabulary.len() - 1)].clone()
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+
+    /// A store of `count` memory entries of generated prose, written in one
+    /// save.
+    pub(crate) fn generated_store(dir: &Path, count: usize, seed: u64) {
+        let mut prose = Prose::new(seed);
+        let mut records = serde_json::Map::new();
+        for index in 0..count {
+            let title_words = 3 + prose.below(5);
+            let title = prose.words(title_words);
+            let content_words = 15 + prose.below(40);
+            let content = prose.words(content_words);
+            let path = format!("area{}/topic{}", prose.below(7), prose.below(11));
+            let mut entry = json!({"id": format!("e{index}"), "title": title, "content": content, "path": path, "version": 1});
+            if index % 5 == 0 {
+                entry["metadata"] = json!({"type": prose.words(1)});
+            }
+            records.insert(format!("e{index}"), entry);
+        }
+        let state = json!({"schema": 1, "entries": {"memory": records}, "refinements": []});
+        memory_store::save_document(
+            dir,
+            &state,
+            &memory_store::Writer::new("model", &json!({"via": "bench"}), "create"),
+        )
+        .expect("save the generated store");
+    }
+
+    /// What ranking costs a turn on a large store: the digest and a memory
+    /// search, each run three times on one loaded state, over 10,000 and
+    /// 50,000 entries. Run with `cargo test --release -p harness-cli --bin ha
+    /// -- --ignored ranking_cost --nocapture`.
+    #[test]
+    #[ignore = "a timing, not a check"]
+    fn ranking_cost_over_large_stores() {
+        for count in [10_000, 50_000] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let dir = directory.path().join("harness");
+            generated_store(&dir, count, 7);
+            let started = std::time::Instant::now();
+            let state = harness::load(&dir, "global");
+            let load = started.elapsed();
+            let terms = harness::weighted_terms(
+                Some("fix the deploy of kalo build before staging"),
+                &["the parser tokens fail in review", "máy in số bị lỗi"],
+            );
+            let options = harness::DigestOptions {
+                repl: false,
+                refine: false,
+                memory_tool: true,
+            };
+            let mut digests = Vec::new();
+            for _ in 0..3 {
+                let started = std::time::Instant::now();
+                let digest = harness::render_digest(&state, options, &terms);
+                digests.push(started.elapsed());
+                assert!(!digest.shown.is_empty());
+            }
+            let entries = state.entries.get("memory").cloned().unwrap_or_default();
+            let doc = Value::Null;
+            let placed = entries
+                .iter()
+                .map(|entry| Placed {
+                    entry,
+                    dir: Path::new(""),
+                    doc: &doc,
+                })
+                .collect::<Vec<_>>();
+            let mut searches = Vec::new();
+            for _ in 0..3 {
+                let started = std::time::Instant::now();
+                let result = search(
+                    &placed,
+                    &json!({"query": "deploying the parser to staging"}),
+                    &|entry| json!({"id": entry.id}),
+                )
+                .expect("search");
+                searches.push(started.elapsed());
+                assert!(result["total"].as_u64().unwrap_or_default() > 0);
+            }
+            eprintln!(
+                "{count} entries, {} terms: load {load:?}; digest {digests:?}; search {searches:?}",
+                terms.len()
+            );
+        }
     }
 }
