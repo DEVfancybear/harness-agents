@@ -252,9 +252,18 @@ gạch ngang và nằm mãi trong index, được đọc ở mọi lượt. Khi 
 index sẽ để lại hơn 20 dòng gạch (`INDEX_STRUCK_CAP`), chúng được chuyển nguyên
 vẹn sang một file mới của archive, `memory/archive/index-<năm>.md`, rồi
 `index-<năm>-2.md` và tiếp tục như vậy: một file tape vào nguyên vẹn và không
-bao giờ bị sửa. File archive được ghi trước, nên một dòng không bao giờ mất ở
-cả hai nơi, và `memory/markdown_index_archived` ghi lại việc chuyển. Store không
-có tầng tape thì giữ các dòng của nó.
+bao giờ bị sửa.
+
+- Dòng gạch là dòng bị gạch toàn bộ: một mục danh sách có phần chữ mở đầu bằng
+  một đoạn gạch (`- ~~...~~ retired <ngày>`). Một dòng còn hiệu lực chỉ gạch
+  một từ (`- Use pnpm (not ~~npm~~)`) thì ở lại và không được đếm.
+- Lần sửa index và file archive được lint cùng nhau, và archive chỉ được ghi
+  khi cả hai qua, trước index: lần sửa bị từ chối không để lại archive, và một
+  dòng không bao giờ mất ở cả hai nơi.
+- Dòng mà một file của archive đã chứa thì chỉ rời index: một lần chuyển bị
+  ngắt giữa chừng không bao giờ được archive hai lần.
+- `memory/markdown_index_archived` ghi lại việc chuyển. Store không có tầng
+  tape thì giữ các dòng của nó.
 
 **Dòng gạch đã chuyển vào archive được tính là còn giữ.** `disk-history` báo
 lỗi một dòng gạch bị bỏ mà không có dòng thêm khớp. Một dòng gạch mà một file

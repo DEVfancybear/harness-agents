@@ -663,27 +663,28 @@ fn read_text(path: &Path) -> Option<String> {
 }
 
 /// The store's files as the checks read them: as they are on disk, or with
-/// one file as a host write would leave it (`overlay`: its path relative to
-/// the root, and its text), so a write is linted before it lands.
-#[derive(Clone, Copy)]
+/// some files as a host write would leave them (`overlay`: each one's path
+/// relative to the root, and its text), so a write is linted before it lands.
+#[derive(Clone)]
 struct View<'a> {
     root: &'a Path,
-    overlay: Option<(&'a str, &'a str)>,
+    overlay: Vec<(&'a str, &'a str)>,
 }
 
 impl<'a> View<'a> {
     const fn disk(root: &'a Path) -> Self {
         Self {
             root,
-            overlay: None,
+            overlay: Vec::new(),
         }
     }
 
-    /// Whether `full` is the overlaid file.
+    /// The text of the overlaid file at `full`, when it is one.
     fn overlaid(&self, full: &Path) -> Option<&'a str> {
         self.overlay
-            .filter(|(path, _)| self.root.join(path) == full)
-            .map(|(_, text)| text)
+            .iter()
+            .find(|(path, _)| self.root.join(path) == full)
+            .map(|(_, text)| *text)
     }
 
     fn text(&self, relative: &str) -> Option<String> {
@@ -700,13 +701,12 @@ impl<'a> View<'a> {
 
     fn markdown(&self) -> Vec<String> {
         let mut files = walk_markdown(self.root);
-        if let Some((path, _)) = self.overlay
-            && path.ends_with(".md")
-            && !files.iter().any(|file| file == path)
-        {
-            files.push(path.to_owned());
-            files.sort();
+        for (path, _) in &self.overlay {
+            if path.ends_with(".md") && !files.iter().any(|file| file == path) {
+                files.push((*path).to_owned());
+            }
         }
+        files.sort();
         files
     }
 }
@@ -1794,18 +1794,36 @@ pub fn edit(
         .map_err(EditError::Failed)?;
     let mut current = read_current(&path, relative)?;
     let index = index_file(root).ok();
-    let mut archived = BTreeSet::new();
     for _ in 0..EDIT_ATTEMPTS {
         let Some(mut updated) = change(current.as_deref()) else {
             return Ok(false);
         };
+        let mut archive = None;
         if index.as_deref() == Some(relative) {
-            updated = archive_struck(root, &updated, &mut archived)?;
+            (updated, archive) = archive_struck(root, &updated);
         }
-        if current.as_deref() == Some(updated.as_str()) {
+        let unchanged = current.as_deref() == Some(updated.as_str());
+        if unchanged && archive.is_none() {
             return Ok(false);
         }
-        refuse_new_failures(root, relative, current.as_deref(), &updated)?;
+        // The edit and the archive file it fills are linted together, and the
+        // archive is written only once both pass: a refused edit leaves no
+        // archive behind, and a later one finds the lines archived already.
+        let mut edits = vec![(relative, current.as_deref(), updated.as_str())];
+        if let Some((file, text)) = &archive {
+            edits.push((file.as_str(), None, text.as_str()));
+        }
+        refuse_new_failures(root, &edits)?;
+        if let Some((file, text)) = &archive {
+            super::files::write_atomic(&store_path(root, file)?, text)
+                .map_err(EditError::Failed)?;
+            harness_types::diag::info("memory", "markdown_index_archived")
+                .field("file", file.clone())
+                .emit();
+        }
+        if unchanged {
+            return Ok(false);
+        }
         let mut changed = None;
         let written = super::files::write_atomic_checked(&path, &updated, || {
             let now = read_current(&path, relative);
@@ -1831,78 +1849,88 @@ pub fn edit(
 /// is read in every turn.
 pub const INDEX_STRUCK_CAP: usize = 20;
 
-/// `text`, the index as a write leaves it, with its struck lines moved to a
-/// new archive file when it holds more than [`INDEX_STRUCK_CAP`]: the archive
-/// file is written first, so a line is never in neither. `archived` holds the
-/// lines this write moved already (a retry moves the rest). An index in a
-/// store without an archive tier keeps its lines.
-fn archive_struck(
-    root: &Path,
-    text: &str,
-    archived: &mut BTreeSet<String>,
-) -> Result<String, EditError> {
+/// `text`, the index as a write leaves it, with its struck lines taken out
+/// when it holds more than [`INDEX_STRUCK_CAP`], and the new archive file
+/// that holds them (its path and text), for the writer to lint and write
+/// before the index: a line is never in neither. A line a file of the archive
+/// holds already is only taken out. An index in a store without an archive
+/// tier keeps its lines.
+fn archive_struck(root: &Path, text: &str) -> (String, Option<(String, String)>) {
     let lines = text.lines().collect::<Vec<_>>();
     let struck_lines = lines
         .iter()
-        .filter(|line| struck(line.trim()))
+        .filter(|line| struck_through(line))
         .collect::<Vec<_>>();
     if struck_lines.len() <= INDEX_STRUCK_CAP {
-        return Ok(text.to_owned());
+        return (text.to_owned(), None);
     }
-    let Some(tape) = Config::load(root, None)
-        .ok()
-        .and_then(|config| config.tape_dirs)
-        .and_then(|dirs| dirs.into_iter().next())
-    else {
-        return Ok(text.to_owned());
+    let Ok(config) = Config::load(root, None) else {
+        return (text.to_owned(), None);
     };
+    let Some(tape) = config.tape_dirs.as_ref().and_then(|dirs| dirs.first()) else {
+        return (text.to_owned(), None);
+    };
+    // A line a file of the archive holds already is not archived again.
+    let archived = archived_lines(&config, &View::disk(root));
     let moving = struck_lines
         .iter()
         .map(|line| (**line).to_owned())
         .filter(|line| !archived.contains(line.trim()))
         .collect::<Vec<_>>();
-    if !moving.is_empty() {
-        let now = chrono::Utc::now();
-        let year = now.format("%Y");
-        let mut serial = 1;
-        let file = loop {
-            let name = if serial == 1 {
-                format!("{tape}/index-{year}.md")
-            } else {
-                format!("{tape}/index-{year}-{serial}.md")
-            };
-            if !root.join(&name).exists() {
-                break name;
-            }
-            serial += 1;
-        };
-        let mut archive = format!(
-            "# Struck index lines, moved {}\n\nThe index ({}) moved these lines here whole when it held more than {INDEX_STRUCK_CAP} struck through: retired and reworded pointers, kept as history.\n\n",
-            now.format("%Y-%m-%d"),
-            index_file(root).unwrap_or_else(|_| DEFAULT_INDEX.to_owned())
-        );
-        for line in &moving {
-            archive.push_str(line);
-            archive.push('\n');
-        }
-        refuse_new_failures(root, &file, None, &archive)?;
-        super::files::write_atomic(&store_path(root, &file)?, &archive)
-            .map_err(EditError::Failed)?;
-        harness_types::diag::info("memory", "markdown_index_archived")
-            .field("file", file.clone())
-            .field("lines", moving.len().to_string())
-            .emit();
-        archived.extend(moving.iter().map(|line| line.trim().to_owned()));
-    }
     let mut kept = lines
         .into_iter()
-        .filter(|line| !struck(line.trim()))
+        .filter(|line| !struck_through(line))
         .collect::<Vec<_>>()
         .join("\n");
     if text.ends_with('\n') {
         kept.push('\n');
     }
-    Ok(kept)
+    if moving.is_empty() {
+        return (kept, None);
+    }
+    let now = chrono::Utc::now();
+    let year = now.format("%Y");
+    let mut serial = 1;
+    let file = loop {
+        let name = if serial == 1 {
+            format!("{tape}/index-{year}.md")
+        } else {
+            format!("{tape}/index-{year}-{serial}.md")
+        };
+        if !root.join(&name).exists() {
+            break name;
+        }
+        serial += 1;
+    };
+    let mut archive = format!(
+        "# Struck index lines, moved {}\n\nThe index ({}) moved these lines here whole when it held more than {INDEX_STRUCK_CAP} struck through: retired and reworded pointers, kept as history.\n\n",
+        now.format("%Y-%m-%d"),
+        index_file(root).unwrap_or_else(|_| DEFAULT_INDEX.to_owned())
+    );
+    for line in &moving {
+        archive.push_str(line);
+        archive.push('\n');
+    }
+    (kept, Some((file, archive)))
+}
+
+/// Whether an index line is struck through as a whole: a list item (or a
+/// line) whose text opens a struck span, as a retired pointer is written
+/// (`- ~~...~~ retired <date>`). A live line that strikes a word inside it
+/// (`- Use pnpm (not ~~npm~~)`) is not.
+fn struck_through(line: &str) -> bool {
+    let text = line.trim_start();
+    let text = text
+        .strip_prefix(['-', '*', '+'])
+        .or_else(|| {
+            let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            (digits > 0)
+                .then(|| text[digits..].strip_prefix(['.', ')']))
+                .flatten()
+        })
+        .map_or(text, str::trim_start);
+    text.strip_prefix("~~")
+        .is_some_and(|rest| rest.contains("~~"))
 }
 
 /// The lines an edit adds and removes, numbered as `git diff` numbers them.
@@ -1992,23 +2020,29 @@ fn failures(
 /// and only a failure the edit adds refuses it. A store that fails a check
 /// already is not blocked by it forever. A project without a config is not
 /// linted.
-fn refuse_new_failures(
-    root: &Path,
-    relative: &str,
-    before: Option<&str>,
-    after: &str,
-) -> Result<(), EditError> {
+fn refuse_new_failures(root: &Path, edits: &[(&str, Option<&str>, &str)]) -> Result<(), EditError> {
     let Ok(config) = Config::load(root, None) else {
         return Ok(());
     };
-    let diff = edit_diff(relative, before, after);
+    let mut diff = Diff::not_read(&DiffMode::None, DiffState::Read);
+    "edit".clone_into(&mut diff.mode);
+    for (relative, before, after) in edits {
+        diff.entries
+            .extend(edit_diff(relative, *before, after).entries);
+    }
     let was = View {
         root,
-        overlay: before.map(|text| (relative, text)),
+        overlay: edits
+            .iter()
+            .filter_map(|(relative, before, _)| before.map(|text| (*relative, text)))
+            .collect(),
     };
     let will = View {
         root,
-        overlay: Some((relative, after)),
+        overlay: edits
+            .iter()
+            .map(|(relative, _, after)| (*relative, *after))
+            .collect(),
     };
     let was = failures(&config, &was, &diff, false);
     let new = failures(&config, &will, &diff, true)
@@ -2019,13 +2053,18 @@ fn refuse_new_failures(
     if new.is_empty() {
         return Ok(());
     }
+    let files = edits
+        .iter()
+        .map(|(relative, _, _)| *relative)
+        .collect::<Vec<_>>()
+        .join(", ");
     harness_types::diag::warn("memory", "markdown_write_refused")
         .msg("a host write would make the markdown memory store fail its lint; it was not made")
-        .field("file", relative.to_owned())
+        .field("file", files.clone())
         .field("failures", new.join("; "))
         .emit();
     Err(EditError::Refused(format!(
-        "ha did not write {relative}: the markdown memory store would fail its lint ({}); the file is left as it is",
+        "ha did not write {files}: the markdown memory store would fail its lint ({}); the file is left as it is",
         new.join("; ")
     )))
 }
@@ -2921,5 +2960,105 @@ mod tests {
         git_in(root, &["commit", "-qm", "archive"]);
         let report = run(root, DiffMode::WorkingTree);
         assert!(report.passed(), "{}", report.text(false));
+    }
+
+    fn archive_files(root: &Path) -> Vec<String> {
+        let mut files = std::fs::read_dir(root.join("memory/archive"))
+            .expect("archive")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("index-"))
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
+    /// An index edit the lint refuses leaves no archive file behind, and
+    /// lines a file of the archive holds already are not archived again.
+    #[test]
+    fn struck_lines_are_archived_once_and_only_with_an_edit_that_lands() {
+        let dir = store();
+        let root = dir.path();
+        let struck_lines = (0..=INDEX_STRUCK_CAP)
+            .map(|index| format!("- ~~Rule {index}~~ retired 2026-02-01"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let index = std::fs::read_to_string(root.join("MEMORY.md")).expect("index");
+        write(root, "MEMORY.md", &format!("{index}{struck_lines}\n"));
+        // Refused: the edit adds a dead path.
+        edit(root, "MEMORY.md", |current| {
+            current.map(|text| format!("{text}- see `memory/people/nobody.md`\n"))
+        })
+        .expect_err("a dead link");
+        assert!(
+            archive_files(root).is_empty(),
+            "no archive without the edit"
+        );
+        assert!(
+            std::fs::read_to_string(root.join("MEMORY.md"))
+                .expect("index")
+                .contains("~~Rule 0~~")
+        );
+        // The archive holds the lines already (an index write that failed
+        // after it): they leave the index, and no second file is written.
+        let year = chrono::Utc::now().format("%Y").to_string();
+        write(
+            root,
+            &format!("memory/archive/index-{year}.md"),
+            &format!("# Struck index lines\n\n{struck_lines}\n"),
+        );
+        assert!(
+            edit(root, "MEMORY.md", |current| current
+                .map(|text| text.replace("- (none yet)", "- (none)")))
+            .expect("lands")
+        );
+        assert_eq!(archive_files(root), [format!("index-{year}.md")]);
+        let after = std::fs::read_to_string(root.join("MEMORY.md")).expect("index");
+        assert!(!after.contains("~~"), "{after}");
+    }
+
+    /// Only a line struck through as a whole is a struck pointer: a live line
+    /// that strikes a word stays in the index, and does not count.
+    #[test]
+    fn a_live_line_with_a_struck_word_stays_in_the_index() {
+        assert!(struck_through("- ~~Old rule~~ retired 2026-02-01"));
+        assert!(struck_through("  1. ~~Old~~"));
+        assert!(!struck_through(
+            "- Use pnpm (not ~~npm~~) -> `memory/decisions/pnpm.md`"
+        ));
+        assert!(!struck_through("~~ alone"));
+        let dir = store();
+        let root = dir.path();
+        let live = "- Use pnpm (not ~~npm~~) for installs";
+        let lines = |count: usize| {
+            (0..count)
+                .map(|index| format!("- ~~Rule {index}~~ retired 2026-02-01"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let index = std::fs::read_to_string(root.join("MEMORY.md")).expect("index");
+        // At the cap with the live line beside: nothing moves.
+        write(
+            root,
+            "MEMORY.md",
+            &format!("{index}{live}\n{}\n", lines(INDEX_STRUCK_CAP)),
+        );
+        edit(root, "MEMORY.md", |current| {
+            current.map(|text| format!("{text}- (one more)\n"))
+        })
+        .expect("a write");
+        assert!(archive_files(root).is_empty());
+        // Past it: the struck lines move, the live line stays.
+        edit(root, "MEMORY.md", |current| {
+            current.map(|text| format!("{text}- ~~Rule last~~ retired 2026-02-02\n"))
+        })
+        .expect("past the cap");
+        let after = std::fs::read_to_string(root.join("MEMORY.md")).expect("index");
+        assert!(after.contains(live), "{after}");
+        assert!(!after.contains("~~Rule"), "{after}");
+        let archive =
+            std::fs::read_to_string(root.join("memory/archive").join(&archive_files(root)[0]))
+                .expect("archive");
+        assert!(!archive.contains(live));
     }
 }
