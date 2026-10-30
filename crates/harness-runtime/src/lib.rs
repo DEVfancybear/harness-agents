@@ -757,7 +757,9 @@ const USER_MESSAGE_MAX_CHARS: usize = 4_000;
 /// It is kept in a budget of its own, besides [`user_messages_limit`]: cut to
 /// [`USER_MESSAGE_MAX_CHARS`] and the first to go once the others filled the
 /// bound, a spec lost its end at the first compaction and the rest of it a few
-/// compactions later.
+/// compactions later. A summary of a smaller budget keeps at most what it
+/// keeps of the others ([`user_messages_limit`]), so a small window is not
+/// filled by the spec.
 const FIRST_MESSAGE_MAX_CHARS: usize = 16_000;
 
 /// How much of the end of a first message longer than
@@ -805,23 +807,22 @@ impl UserMessages {
     }
 }
 
-/// A first message within [`FIRST_MESSAGE_MAX_CHARS`]: whole when it fits;
-/// else its head and its last [`FIRST_MESSAGE_TAIL_CHARS`], with a line where
-/// the middle was saying how to read it whole.
-fn clip_first_message(message: &str) -> String {
+/// A first message within `longest` characters: whole when it fits; else its
+/// head and its end (a quarter of `longest`, at most
+/// [`FIRST_MESSAGE_TAIL_CHARS`]), with a line where the middle was saying how
+/// to read it whole.
+fn clip_first_message(message: &str, longest: usize) -> String {
     let total = message.chars().count();
-    if total <= FIRST_MESSAGE_MAX_CHARS {
+    if total <= longest {
         return message.to_owned();
     }
-    let head = FIRST_MESSAGE_MAX_CHARS - FIRST_MESSAGE_TAIL_CHARS;
-    let left_out = total - head - FIRST_MESSAGE_TAIL_CHARS;
+    let tail = FIRST_MESSAGE_TAIL_CHARS.min(longest / 4);
+    let head = longest - tail;
+    let left_out = total - head - tail;
     format!(
         "{}\n[... {left_out} characters of this message left out here: history_search finds the message and history_read reads it whole ...]\n{}",
         message.chars().take(head).collect::<String>(),
-        message
-            .chars()
-            .skip(total - FIRST_MESSAGE_TAIL_CHARS)
-            .collect::<String>()
+        message.chars().skip(total - tail).collect::<String>()
     )
 }
 
@@ -852,7 +853,12 @@ fn user_messages(previous: Option<&str>, added: &[String], limit: usize) -> User
         }
         if first_open {
             first_open = false;
-            kept.first = Some(clip_first_message(message));
+            // Its own budget, but never more than the others' bound: a small
+            // summary budget (a small window) keeps less of it too.
+            kept.first = Some(clip_first_message(
+                message,
+                FIRST_MESSAGE_MAX_CHARS.min(limit.max(1)),
+            ));
             continue;
         }
         let message = if message.chars().count() > longest {
@@ -7647,7 +7653,7 @@ the summary"
         assert!(summary.contains("Acceptance code: KESTREL-7731-ZETA"));
         // Longer than its own budget: the head and the end, and where the rest is.
         let huge = format!("HEAD-LINE\n{}\nTAIL-LINE", "z".repeat(30_000));
-        let clipped = super::clip_first_message(&huge);
+        let clipped = super::clip_first_message(&huge, super::FIRST_MESSAGE_MAX_CHARS);
         assert!(clipped.starts_with("HEAD-LINE") && clipped.ends_with("TAIL-LINE"));
         assert!(clipped.contains("history_read"));
         assert!(clipped.chars().count() < super::FIRST_MESSAGE_MAX_CHARS + 200);
