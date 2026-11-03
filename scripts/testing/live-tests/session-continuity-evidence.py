@@ -172,7 +172,9 @@ def settings(home, expected, out):
     # Native config::harness_refinements is on unless explicitly false.
     enabled = state.get('harnessRefinements') is not False
     assert enabled == (expected == 'on'), 'optout was not persisted in actual user settings'
-    assert state.get('defaultThinkingLevel') == 'max', 'optout lost mandated thinking setting'
+    # The mandated `max`, or the highest level a model that has no `max` takes
+    # (ha saves the level clamped to the model: DeepSeek's top is xhigh).
+    assert state.get('defaultThinkingLevel') in ('max', 'xhigh'), 'optout lost mandated thinking setting'
     save(out, dict(path=str(path), harnessRefinements=enabled, defaultThinkingLevel=state['defaultThinkingLevel']))
 
 
