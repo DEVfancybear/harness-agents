@@ -16,12 +16,15 @@
 #   bash scripts/testing/live-tests/children.sh
 #
 # SUBAGENT_FROM is the model the children start on (default:
-# deepseek/deepseek-v4-flash); MODEL is the one /subagent-model moves them to.
+# deepseek/deepseek-v4-flash, deepseek/deepseek-v4-pro when that is MODEL); MODEL
+# is the one /subagent-model moves them to.
 set -u
 source "$(dirname "$0")/env.sh"
 fresh children
 export HA_AUTO_REFINE=off HA_PYTHON=${HA_PYTHON:-$PY}
 FROM=${SUBAGENT_FROM:-deepseek/deepseek-v4-flash}
+# The children must start on a model other than the session's.
+[ "$FROM" = "$MODEL" ] && FROM=deepseek/deepseek-v4-pro
 D="$HA_HOME/data/diagnostics"
 project "$RX/p"
 # Each task's model calls, oldest first: `task model model ...` per line.

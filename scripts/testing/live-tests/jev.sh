@@ -10,7 +10,8 @@
 #   5. a duplicate delegate brief reuses the child already doing it;
 #   6. an AGENTS.md section unrelated to the request is left out, and named;
 #   7. a sensitive subtask stays on the session's model when children otherwise
-#      run on another (SUBAGENT_FROM, deepseek/deepseek-v4-flash by default);
+#      run on another (SUBAGENT_FROM, deepseek/deepseek-v4-flash by default,
+#      deepseek/deepseek-v4-pro when that is MODEL);
 #   8. a long turn's earlier results are ranked for the request before any is
 #      shortened (with `output` switched off, so the results stay long);
 #   9. a long command output leaves out the parts the request does not need,
@@ -30,6 +31,8 @@ source "$(dirname "$0")/env.sh"
 fresh jev
 export HA_AUTO_REFINE=off HA_PYTHON=${HA_PYTHON:-$PY} HA_DIAG=debug
 FROM=${SUBAGENT_FROM:-deepseek/deepseek-v4-flash}
+# The children must run on a model other than the session's.
+[ "$FROM" = "$MODEL" ] && FROM=deepseek/deepseek-v4-pro
 D="$HA_HOME/data/diagnostics"
 P="$RX/p"
 project "$P"

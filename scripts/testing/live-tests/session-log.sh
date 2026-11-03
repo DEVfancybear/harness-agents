@@ -92,8 +92,8 @@ agent "$S" l5
 say l5 "Ghi nhớ: build của project này là cargo build --release, không có Makefile. Trả lời ngắn." | tail -2 | sed 's/^/   /'
 say l5 "Việc tiếp theo là thêm CI chạy cargo test. Chưa làm, chỉ ghi nhận. Trả lời ngắn." | tail -2 | sed 's/^/   /'
 NOTE="$S/memory/$(date +%Y-%m-%d).md"
-for _ in $(seq 1 120); do grep -q "^## Session " "$NOTE" 2>/dev/null && break; sleep 1; done
-check "the day's note has the session's section" 'grep -q "^## Session " "$NOTE"'
+for _ in $(seq 1 120); do grep -q "^## Session [0-9][0-9]:[0-9][0-9]" "$NOTE" 2>/dev/null && break; sleep 1; done
+check "the day's note has the session's section" 'grep -q "^## Session [0-9][0-9]:[0-9][0-9]" "$NOTE"'
 check "with the conversation named" 'grep -q "\*\*Conversation:\*\* task_" "$NOTE"'
 check "and no file in .harness/sessions" '[ -z "$(ls "$S"/.harness/sessions/*.md 2>/dev/null)" ]'
 check "the store passes the lint" '(cd "$S" && "$HA" memory lint --quiet)'
