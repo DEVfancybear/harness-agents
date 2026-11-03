@@ -36,6 +36,10 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_mins(5);
 /// Refresh this long before the token actually expires.
 const REFRESH_MARGIN_MS: i64 = 60_000;
 
+/// How long a refresh waits for another process's refresh of the same file:
+/// past the token request's own 30-second timeout.
+const REFRESH_WAIT: Duration = Duration::from_secs(45);
+
 /// A sign-in that has opened the browser and waits for its code.
 pub struct PendingLogin {
     pub provider: String,
@@ -234,6 +238,18 @@ pub fn current_secret(
     if now_ms() + REFRESH_MARGIN_MS < expires {
         return Ok(access);
     }
+    // Every process that finds the token about to expire would refresh it with
+    // the same refresh token, and the provider revokes the whole sign-in when a
+    // refresh token is used twice. So one refresh runs at a time, and a process
+    // that waited for it reads the token the first one saved.
+    let _held = super::files::hold(&refresh_lock(path), REFRESH_WAIT, "sign-in refresh")?;
+    let refresh = match credentials::load(path, provider) {
+        Ok(Some(Credential::Oauth {
+            access, expires, ..
+        })) if now_ms() + REFRESH_MARGIN_MS < expires => return Ok(access),
+        Ok(Some(Credential::Oauth { refresh, .. })) => refresh,
+        _ => refresh,
+    };
     // The resolver runs inside the async runtime; the refresh runs on its own
     // thread with its own runtime, so it cannot block or re-enter the caller's.
     let refreshed = std::thread::spawn(move || {
@@ -248,6 +264,14 @@ pub fn current_secret(
     .map_err(|error| format!("{error}; log in again with /login"))?;
     credentials::save(path, provider, &refreshed).map_err(|error| error.to_string())?;
     Ok(refreshed.secret().to_owned())
+}
+
+/// The lock a refresh of the sign-ins saved in `path` holds: `auth.json` has
+/// `auth.json.refresh.lock` beside it.
+fn refresh_lock(path: &Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".refresh.lock");
+    path.with_file_name(name)
 }
 
 fn token_request(form: &[(&str, &str)]) -> Result<Credential, String> {
@@ -397,7 +421,44 @@ pub(super) fn decode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{code_from_paste, decode, encode, start};
+    use super::credentials::{self, Credential};
+    use super::{code_from_paste, current_secret, decode, encode, now_ms, refresh_lock, start};
+
+    fn signed_in(access: &str, expires: i64) -> Credential {
+        Credential::Oauth {
+            access: access.to_owned(),
+            refresh: format!("refresh-of-{access}"),
+            expires,
+            account_id: None,
+        }
+    }
+
+    #[test]
+    fn an_expired_token_another_process_refreshed_is_read_not_refreshed_again() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("auth.json");
+        // Another process refreshed the sign-in and saved it; this one still
+        // holds the token it read before, now about to expire.
+        credentials::save(
+            &path,
+            "openai-codex",
+            &signed_in("fresh", now_ms() + 3_600_000),
+        )
+        .expect("saved");
+        let stale = signed_in("stale", now_ms() - 1);
+        // A second refresh would send the rotated refresh token again (and,
+        // here, reach the network): the saved token is used instead.
+        assert_eq!(
+            current_secret(&path, "openai-codex", stale).as_deref(),
+            Ok("fresh")
+        );
+        assert_eq!(
+            refresh_lock(&path)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("auth.json.refresh.lock")
+        );
+    }
 
     #[test]
     fn the_authorize_url_carries_pkce_and_the_state() {
