@@ -1,10 +1,11 @@
 """A pass-through proxy to the ChatGPT Codex backend that can refuse with a
 usage limit, for the live tests of a quota park.
 
-    python quota_proxy.py <dir>
+    python quota_proxy.py <dir> [<upstream>]
 
 It listens on 127.0.0.1 (the port is written to <dir>/port) and forwards every
-request to https://chatgpt.com unchanged. While <dir>/limit exists, a request
+request unchanged to <upstream>, https://chatgpt.com when none is given (the
+`limit` answer is ChatGPT's; `fail` works for any upstream). While <dir>/limit exists, a request
 is answered instead with HTTP 429 and ChatGPT's `usage_limit_reached` body,
 resetting four hours from now. A request whose body holds one of the lines of
 <dir>/fail (a phrase of a system prompt, say) is answered with HTTP 503, as a
@@ -31,6 +32,7 @@ HOP = {"host", "content-length", "connection", "accept-encoding", "transfer-enco
 
 def main() -> None:
     directory = sys.argv[1]
+    upstream_origin = sys.argv[2].rstrip("/") if len(sys.argv) > 2 else UPSTREAM
     os.makedirs(directory, exist_ok=True)
 
     def log(status, body):
@@ -105,7 +107,7 @@ def main() -> None:
                 return
             headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
             request = urllib.request.Request(
-                UPSTREAM + self.path, data=body or None, headers=headers, method=self.command
+                upstream_origin + self.path, data=body or None, headers=headers, method=self.command
             )
             try:
                 upstream = urllib.request.urlopen(request, timeout=600)

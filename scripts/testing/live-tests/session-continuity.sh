@@ -15,7 +15,8 @@ set -o pipefail
 [ ! -e "$LIVE_ROOT/session-continuity" ] || { echo 'Refusing reused evidence directory'; exit 2; }
 export MODEL=${MODEL:-openai-codex/gpt-6-luna}
 export THINKING=${THINKING:-max}
-[ "$MODEL" = openai-codex/gpt-6-luna ] && [ "$THINKING" = max ] || { echo 'Mandated MODEL/THINKING mismatch'; exit 2; }
+# The model is the dedicated config's provider and model (checked below).
+[ "$THINKING" = max ] || { echo 'Mandated THINKING mismatch'; exit 2; }
 HERE=$(cd "$(dirname "$0")" && (pwd -W 2>/dev/null || pwd))
 HA_LIVE_ENV=${HA_LIVE_ENV:-$HERE/env.sh}
 E="$HERE/session-continuity-evidence.py"
@@ -28,13 +29,14 @@ export HA_OFFLINE=1
 # ConPTY supports cursor positioning; a noninteractive shell may advertise dumb.
 export TERM=xterm-256color
 # Do not copy a whole real config (hooks/MCP/routing could contaminate the test).
-"$PY" - "$HA_CONFIG" "$HERE/session-continuity-config/config.toml" <<'PY'
+"$PY" - "$HA_CONFIG" "$HERE/session-continuity-config/config.toml" "$MODEL" <<'PY'
 from pathlib import Path
 import sys, tomllib
-chosen, dedicated = map(Path, sys.argv[1:])
+chosen, dedicated = map(Path, sys.argv[1:3])
+provider, model = sys.argv[3].split('/', 1)
 assert chosen.name == 'config.toml' and chosen.resolve() == dedicated.resolve(), 'use the supplied dedicated config FILE'
 s = chosen.read_text(encoding='utf-8')
-assert tomllib.loads(s) == {'schema_version': 2, 'provider': {'id': 'openai-codex', 'model': 'gpt-6-luna'}}
+assert tomllib.loads(s) == {'schema_version': 2, 'provider': {'id': provider, 'model': model}}, 'MODEL is not the dedicated config'
 PY
 [ "$?" -eq 0 ] || exit 2
 source "$HA_LIVE_ENV"

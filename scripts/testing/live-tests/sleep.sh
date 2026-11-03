@@ -18,18 +18,23 @@
 # The model's calls go through quota_proxy.py, which answers 503 to a request
 # whose body holds a line of its `fail` file (the review gate's or the memory
 # curator's system prompt), so one kind of call fails and the turns run. It
-# needs MODEL on openai-codex. Every check prints PASS or FAIL; the evidence
-# stays in $LIVE_ROOT/sleep.
+# needs MODEL on openai-codex or deepseek. Every check prints PASS or FAIL; the
+# evidence stays in $LIVE_ROOT/sleep.
 #
 #   bash scripts/testing/live-tests/sleep.sh
 set -u
 source "$(dirname "$0")/env.sh"
 fresh sleep
-if [ "${MODEL#openai-codex/}" = "$MODEL" ]; then
-  echo "SKIP  sleep.sh needs MODEL=openai-codex/... (the calls go through quota_proxy.py)"
-  result
-  exit $?
-fi
+# The provider behind the proxy: its protocol, its origin and its path.
+case "${MODEL%%/*}" in
+  openai-codex) UP_PROTOCOL=openai_codex UP_ORIGIN=https://chatgpt.com UP_PATH=/backend-api/codex/responses ;;
+  deepseek) UP_PROTOCOL=openai_chat UP_ORIGIN=https://api.deepseek.com UP_PATH=/chat/completions ;;
+  *)
+    echo "SKIP  sleep.sh needs MODEL=openai-codex/... or deepseek/... (the calls go through quota_proxy.py)"
+    result
+    exit $?
+    ;;
+esac
 unset HA_AUTO_REFINE
 export HA_PYTHON=${HA_PYTHON:-$PY} HA_DIAG=debug
 # A failed pass is due again fifteen seconds later (not within the run that
@@ -41,14 +46,14 @@ CURATOR="You are the memory curator of ha"
 
 X="$RX/proxy"
 mkdir -p "$X"
-"$PY" "$(dirname "$0")/quota_proxy.py" "$X" &
+"$PY" "$(dirname "$0")/quota_proxy.py" "$X" "$UP_ORIGIN" &
 PROXY=$!
 trap 'kill $PROXY 2>/dev/null' EXIT
 for _ in $(seq 1 50); do [ -s "$X/port" ] && break; sleep 0.2; done
 # Every call through the proxy: no --model, which would choose the endpoint.
-export HA_PROVIDER_ID=openai-codex HA_PROVIDER_PROTOCOL=openai_codex \
-  HA_PROVIDER_ENDPOINT="http://127.0.0.1:$(cat "$X/port")/backend-api/codex/responses" \
-  HA_PROVIDER_MODEL="${MODEL#openai-codex/}"
+export HA_PROVIDER_ID="${MODEL%%/*}" HA_PROVIDER_PROTOCOL="$UP_PROTOCOL" \
+  HA_PROVIDER_ENDPOINT="http://127.0.0.1:$(cat "$X/port")$UP_PATH" \
+  HA_PROVIDER_MODEL="${MODEL#*/}"
 now_ms() { date +%s%3N; }
 # The proxy's log from `since`, as `ms status phrase...` (the phrases of
 # `fail` the request held).
