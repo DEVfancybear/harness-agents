@@ -91,6 +91,10 @@ pub fn of_task(store_dir: &Path, task: &str) -> Vec<Said> {
     read_task(store_dir, task).unwrap_or_default()
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one read of the journal: the typed input, the calls, their results, the budget"
+)]
 fn read_task(store_dir: &Path, task: &str) -> Result<Vec<Said>, rusqlite::Error> {
     let path = store_dir.join("harness.sqlite3");
     if !path.is_file() {
