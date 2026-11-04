@@ -50,7 +50,8 @@ kèm trạng thái và độ vững. Review trả về mảng `lessons`:
 Host kiểm tra từng tín hiệu:
 
 - Evidence phải xuất hiện trong các lượt chưa được review (bỏ qua khoảng trắng
-  và hoa thường) và phải là một cụm từ (từ 12 ký tự trở lên): một hai chữ thì ở
+  và hoa thường; dấu ngoặc kép hay nhãn transcript mà model đặt quanh nó không
+  tính là một phần của nó) và phải là một cụm từ (từ 12 ký tự trở lên): một hai chữ thì ở
   đâu cũng có.
 - Nó phải do đúng người nói theo kind của nó: lời sửa hay sở thích thì là lời
   của người dùng; giả định sai hay cách sửa lỗi thì là tool result hoặc lời của

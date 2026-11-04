@@ -876,6 +876,28 @@ fn strip_label(quote: &str) -> &str {
         .map_or(quote, str::trim_start)
 }
 
+/// A quote without the quotation marks a model put around it: `"keep it
+/// short"` and `“keep it short”` are the quote `keep it short`, as a review's
+/// memory edit reads them (`refine::quoted`).
+fn unquote(quote: &str) -> &str {
+    quote
+        .trim()
+        .trim_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\''
+                    | '`'
+                    | '\u{201c}'
+                    | '\u{201d}'
+                    | '\u{2018}'
+                    | '\u{2019}'
+                    | '\u{ab}'
+                    | '\u{bb}'
+            )
+        })
+        .trim()
+}
+
 /// Who is speaking in a block of the transcript.
 #[derive(Clone, Copy, PartialEq)]
 enum Role {
@@ -955,8 +977,8 @@ impl Quotes {
     /// never a quote.
     fn holds(&self, kind: &str, quote: &str) -> bool {
         // A quote the model copied with its label ("[user]: …") is the text
-        // after the label.
-        let quote = strip_label(quote);
+        // after the label, and the quotation marks around it are not its.
+        let quote = unquote(strip_label(unquote(quote)));
         if !self.roled {
             return self.all.contains(quote);
         }
@@ -3502,6 +3524,32 @@ mod tests {
         .expect("record");
         assert_eq!(records[0]["applied"], false, "{records:?}");
         assert_eq!(records[1]["applied"], true, "{records:?}");
+    }
+
+    /// The quotation marks a model puts around a quote are not part of it,
+    /// with or without the label it copied; two quotes stitched together are
+    /// still no quote.
+    #[test]
+    fn quotation_marks_around_a_quote_are_not_part_of_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let conversation = "[User]: please use cargo nextest, not cargo test\n\n[Assistant]: ok\n\n[User]: and keep the answer short";
+        let item = |evidence: &str| json!({"text": "when testing, use nextest", "kind": "correction", "scope": "global", "evidence": evidence});
+        let records = record(
+            dir.path(),
+            &[
+                item("\u{201c}please use cargo nextest, not cargo test\u{201d}"),
+                item("[User]: \"please use cargo nextest, not cargo test\""),
+                item("\u{201c}please use cargo nextest\u{201d} \u{201c}keep the answer short\u{201d}"),
+            ],
+            conversation,
+            "c1",
+            None,
+            &BTreeSet::new(),
+        )
+        .expect("record");
+        assert_eq!(records[0]["applied"], true, "{records:?}");
+        assert_eq!(records[1]["applied"], true, "{records:?}");
+        assert_eq!(records[2]["applied"], false, "{records:?}");
     }
 
     /// One conversation gives a lesson at most part of its case: three

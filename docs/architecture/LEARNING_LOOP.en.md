@@ -50,7 +50,8 @@ its state and standing. The review answers with a `lessons` array:
 The host checks each signal:
 
 - The evidence must occur in the turns not reviewed yet, whitespace and case
-  aside, and be a phrase (12 characters or more): a word or two is found
+  aside, and the quotation marks or transcript label a model put around it
+  are not part of it. It must be a phrase (12 characters or more): a word or two is found
   anywhere.
 - It must be said by whom its kind needs: a correction or a preference in the
   user's words; a wrong assumption or an error's fix in a tool result or the
