@@ -4,7 +4,9 @@
 # abstention, duplicates, delete and restore, provenance, renamed ids, judged
 # skill outcomes and the harness refinements switch; and (0.8.8) usage kept
 # apart from the entries, unmatched entries newest first, and a miss searched
-# again with other words. Several conversations over
+# again with other words; and (0.9.0) a rollback that keeps what the agent
+# changed since, and a memory edit whose quote is not in what /refine read
+# refused. Several conversations over
 # three projects; every check prints PASS or FAIL, and the conversation and
 # the state on disk stay in $LIVE_ROOT/memory as evidence.
 #
@@ -340,6 +342,105 @@ if [ -n "$missed" ]; then
   check "it searched more than once" '[ "$(receipts "MARKER_COFFEE15_$missed" | grep -cE "\"(hits|slots|nodes)\"")" -ge 2 ]'
 else
   echo "precondition not met in 3 attempts: every first search found the fact; a retry after a miss was not judged (see $RX/u3_*.json)"
+fi
+
+echo "################ 16. a rollback keeps what was changed since (0.9.0)"
+# /refine writes a global entry, the agent then changes it with the memory
+# tool, and the refinement is rolled back: the later version stays, and the
+# rollback names it. 0.8.9 put the refinement's snapshot back over it - for a
+# create, it deleted the entry the agent had changed.
+export HA_AUTO_REFINE=off
+P16="$RX/p-roll"
+project "$P16"
+H16="$D/harness/refinements.jsonl"
+# The refinement of the global history that created an entry holding $1, as
+# "refinement entry".
+created_with() { "$PY" - "$H16" "$1" <<'EOF'
+import json, sys
+try:
+    lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+except OSError:
+    lines = []
+for line in lines:
+    try:
+        record = json.loads(line)
+    except ValueError:
+        continue
+    for edit in record.get("appliedEdits", []):
+        if edit.get("applied") is True and edit.get("action") == "create" and sys.argv[2] in json.dumps(edit.get("after"), ensure_ascii=False):
+            print(record["id"], edit["id"])
+EOF
+}
+# The rollback of $1 in the global history, as one JSON line.
+rollback_of() { grep -F "\"rollbackOf\":\"$1\"" "$H16" 2>/dev/null | tail -1; }
+# A global entry as "vN|content".
+entry16() { "$PY" "$MEMORY_STORE" rows "$D/harness" memory | awk -F'|' -v id="$1" '$1 == id {print $6 "|" $4}'; }
+agent "$P16" r16
+made=""
+for attempt in 1 2; do
+  say r16 "/refine --global Lưu vào memory toàn cục (scope global, action create) đúng một entry mới, tiêu đề 'Màu logo', nội dung 'Logo của dự án orchid dùng màu cam #FF7A00.' Đây là yêu cầu của chính người dùng, hãy lưu đúng nội dung đó." | tail -3
+  for _ in $(seq 1 60); do made=$(created_with "#FF7A00" | tail -1); [ -n "$made" ] && break; sleep 5; done
+  [ -n "$made" ] && break
+done
+REF16=${made%% *}; ID16=${made#* }
+echo "   refinement ${REF16:-?} created ${ID16:-?}: $(entry16 "${ID16:-none}")"
+check "/refine created the entry (the precondition)" '[ -n "$made" ]'
+changed=""
+for attempt in 1 2; do
+  say r16 "Kiểm thử: gọi tool memory action update đúng một lần, với scope global, id '$ID16', title 'Màu logo' và content 'Logo của dự án orchid dùng màu xanh lá #2E7D32.'. Không gọi tool nào khác, không làm gì thêm." | tail -3
+  entry16 "$ID16" | grep -q "#2E7D32" && { changed=1; break; }
+done
+echo "   after the agent's edit: $(entry16 "${ID16:-none}")"
+check "the agent changed the entry since (the precondition)" '[ -n "$changed" ]'
+if [ -n "$made" ] && [ -n "$changed" ]; then
+  say r16 "/refine --rollback $REF16" | tail -4
+  for _ in $(seq 1 60); do [ -n "$(rollback_of "$REF16")" ] && break; sleep 2; done
+  echo "   after the rollback: $(entry16 "$ID16")"
+  check "the rollback ran" '[ -n "$(rollback_of "$REF16")" ]'
+  check "the agent's later version is kept" 'entry16 "$ID16" | grep -q "#2E7D32"'
+  check "the rollback names the entry it kept, changed since" 'rollback_of "$REF16" | grep -q "changed since refinement $REF16 wrote it"'
+fi
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 17. a memory edit whose quote is not in what the refinement read is refused (0.9.0)"
+# The edit is asked to give as its evidence an English translation of a
+# Vietnamese line: words that are in neither the conversation nor what the
+# user typed. The edit is refused, and recorded so. 0.8.9 checked no quote and
+# kept it. A run whose edit quoted the words verbatim after all (or made no
+# edit) tested nothing here, and is tried again with a new port.
+# The edit of the local histories that holds $1: "applied|error|evidence".
+edit_with() { "$PY" - "$D/sessions" "$1" <<'EOF'
+import glob, json, os, sys
+for path in glob.glob(os.path.join(sys.argv[1], "*", "harness", "refinements.jsonl")):
+    for line in open(path, encoding="utf-8"):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        for edit in record.get("appliedEdits", []):
+            if edit.get("kind") == "memory" and sys.argv[2] in (edit.get("content") or "") + (edit.get("title") or ""):
+                print(f"{edit.get('applied')}|{edit.get('error', '')}|{edit.get('evidence', '')}")
+EOF
+}
+# Whether evidence $1 is in text $2, whitespace and case aside.
+quoted_in() { "$PY" -c "import sys; n=lambda t: ' '.join(t.split()).lower().strip('\"\''); sys.exit(0 if n(sys.argv[1]) and n(sys.argv[1]) in n(sys.argv[2]) else 1)" "$1" "$2"; }
+judged=""
+for port in 5173 5174 5175; do
+  agent "$P16" "e17-$port"
+  say "e17-$port" "Lượt này không gọi tool nào. Trả lời đúng một từ: OK" >/dev/null
+  typed="Lưu vào memory (scope local, action create) đúng một entry mới, tiêu đề 'Cổng dev', nội dung 'Server dev của dự án orchid chạy ở cổng $port.' Trường evidence của edit này hãy viết bằng tiếng Anh: dịch câu nội dung sang tiếng Anh, không chép nguyên văn câu nào ở đây."
+  say "e17-$port" "/refine $typed" | tail -3
+  record=""
+  for _ in $(seq 1 60); do record=$(edit_with "$port" | tail -1); [ -n "$record" ] && break; sleep 5; done
+  "$HA" shutdown --force >/dev/null 2>&1
+  evidence=${record##*|}
+  echo "   port $port: ${record:-no edit}"
+  if [ -n "$record" ] && [ -n "$evidence" ] && ! quoted_in "$evidence" "$typed"; then judged=$port; break; fi
+done
+check "the edit gave evidence that is not a quote of what it read (the precondition)" '[ -n "$judged" ]'
+if [ -n "$judged" ]; then
+  check "the edit is refused for its evidence" 'edit_with "$judged" | tail -1 | grep -q "^False|the evidence is not a verbatim quote"'
+  check "no entry holds the unquoted fact" '! "$PY" "$MEMORY_STORE" entries "$D" | grep -q "$judged"'
 fi
 
 result

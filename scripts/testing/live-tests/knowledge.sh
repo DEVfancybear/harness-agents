@@ -7,8 +7,10 @@
 # conversation; a review whose apply cannot take the state's lock leaving no
 # page, skill or refinement behind; a failed global part leaving the local one
 # standing; a page's age in the catalog; a conversation's own memory
-# consolidated past forty entries; and (0.8.8) an old embedding configuration
-# that is no longer read. Every check prints PASS or FAIL;
+# consolidated past forty entries; (0.8.8) an old embedding configuration
+# that is no longer read; and (0.9.0) Deep Dream in batches past its budget,
+# merging a pair that shared a batch and rolled back as one pass. Every check
+# prints PASS or FAIL;
 # the conversation and the state stay in $LIVE_ROOT/knowledge as evidence.
 #
 #   bash scripts/testing/live-tests/knowledge.sh
@@ -308,5 +310,94 @@ zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])
 EOF
 check "the report records the reviews and the consolidation" 'grep -q "review.applied\|review.consolidated" "$RX/report/timeline.jsonl"'
 check "it holds the new Deep Dream marks" '[ -f "$RX/report/harness/global/memory_changes" ]'
+
+echo "################ 14. Deep Dream in batches past its budget (0.9.0)"
+# Fourteen global entries, seven facts kept twice, and a batch budget of 300
+# tokens (HA_CONSOLIDATE_BATCH_TOKENS), about five entries: the pass makes one
+# curator call per batch, records each batch as a refinement of the pass,
+# merges a duplicate pair that shared a batch, and one rollback of the pass
+# undoes every batch. 0.8.9 sent all the entries in one call. A home of its
+# own: the store sections 3 and 4 left is not this one's.
+export HA_HOME="$RX/home14"
+mkdir -p "$HA_HOME"
+cp "$HA_CONFIG" "$HA_HOME/"
+if [ -n "${THINKING:-}" ]; then printf '{"defaultThinkingLevel": "%s"}\n' "$THINKING" > "$HA_HOME/settings.json"; fi
+D=$HA_HOME/data
+P14="$RX/p-batch"
+project "$P14"
+lines=()
+for pair in "font|Font chữ của trang tài liệu là Inter" "color|Màu chủ đạo của trang tài liệu là xanh navy" "host|Trang tài liệu được host trên Netlify" "cms|Bài của trang tài liệu soạn bằng Markdown trong thư mục content" "seo|Mỗi trang tài liệu cần thẻ meta description" "rss|Trang tài liệu có RSS feed ở /rss.xml" "img|Ảnh của trang tài liệu là WebP"; do
+  key=${pair%%|*}; fact=${pair#*|}
+  lines+=("${key}_a|${key} (1)|${fact}.|docs|0" "${key}_b|${key} (2)|${fact} - ghi lại lần nữa.|docs|0")
+done
+seed "${lines[@]}"
+echo 20 > "$D/harness/memory_changes"
+before=$(entries | wc -l)
+unset HA_AUTO_REFINE
+export HA_CONSOLIDATE_BATCH_TOKENS=300 HA_DIAG=debug
+agent "$P14" k14
+say k14 "Chào bạn, trả lời đúng một từ: OK" >/dev/null
+# The pass makes a call per batch: wait for it to be marked done.
+for _ in $(seq 1 90); do [ -f "$D/harness/memory_consolidated_changes" ] && break; sleep 10; done
+unset HA_CONSOLIDATE_BATCH_TOKENS
+# The diagnostics of the pass: deep_dream calls and batches.
+cat > "$RX/batches.py" <<'EOF'
+import glob, json, os, sys
+calls, batches = 0, []
+for path in glob.glob(os.path.join(sys.argv[1], "diagnostics", "*.jsonl")):
+    for line in open(path, encoding="utf-8", errors="replace"):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        fields = record.get("fields", {})
+        if record.get("kind") == "refine" and record.get("event") == "call" and fields.get("purpose") == "deep_dream":
+            calls += 1
+        if record.get("kind") == "refine" and record.get("event") == "consolidation_batch" and fields.get("scope") == "global":
+            batches.append(fields)
+what = sys.argv[2]
+if what == "calls":
+    print(calls)
+elif what == "batches":
+    print(len(batches))
+elif what == "show":
+    for batch in batches:
+        print(f"batch {batch.get('batch')}/{batch.get('batches')} {batch.get('refinement')}: {batch.get('entries')} entries, {batch.get('applied')} applied: {' '.join(batch.get('keys', []))}")
+elif what == "shared":
+    # The subjects whose two copies shared a batch.
+    for batch in batches:
+        keys = set(batch.get("keys", []))
+        for key in sorted(keys):
+            if key.endswith("_a") and key[:-2] + "_b" in keys:
+                print(key[len("memory:"):-2])
+EOF
+batches() { "$PY" "$RX/batches.py" "$D" "$1"; }
+after=$(entries | wc -l)
+echo "   entries: $before -> $after; deep_dream calls: $(batches calls)"
+batches show | sed 's/^/   /'
+entries | sed 's/^/   /'
+check "the consolidation ran (the precondition)" '[ -f "$D/harness/memory_consolidated_changes" ]'
+check "it made a curator call per batch, more than one" '[ "$(batches batches)" -ge 2 ] && [ "$(batches calls)" -ge "$(batches batches)" ]'
+pass=$("$PY" -c "
+import json, sys
+for line in open(sys.argv[1], encoding='utf-8'):
+    batch = json.loads(line).get('batch') or {}
+    if batch.get('of'):
+        print(batch['of']); break" "$D/harness/refinements.jsonl" 2>/dev/null)
+check "each batch is a refinement of the pass" '[ -n "$pass" ] && [ "$(grep -c "\"of\":\"$pass\"" "$D/harness/refinements.jsonl")" -eq "$(batches batches)" ]'
+shared=$(batches shared | tr '\n' ' ')
+echo "   pairs that shared a batch: ${shared:-none}"
+merged=""
+for subject in $shared; do
+  [ "$(entries | grep -c "^${subject}_[ab]|")" -eq 1 ] && merged="$merged $subject"
+done
+echo "   of them merged:${merged:- none}"
+check "a duplicate pair that shared a batch was merged" '[ -n "$merged" ]'
+if [ -n "$pass" ]; then
+  say k14 "/refine --rollback $pass" | tail -3
+  for _ in $(seq 1 30); do grep -qF "\"rollbackOf\":\"$pass\"" "$D/harness/refinements.jsonl" && break; sleep 2; done
+  check "one rollback of the pass undoes every batch" '[ "$(entries | wc -l)" -eq "$before" ]'
+fi
+"$HA" shutdown --force >/dev/null 2>&1
 
 result
