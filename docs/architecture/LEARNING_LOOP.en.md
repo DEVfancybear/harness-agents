@@ -272,7 +272,11 @@ lesson's memory entry is still there:
 - a rule the loop wrote that the user deleted retires its lesson.
 
 Deep Dream does not see the loop's own entries (`source: learning`): the
-meditation keeps them.
+meditation keeps them. A review that updates one keeps it the loop's: an
+update keeps an entry's `source` and `origin` and records who edited it in
+`edited_by` (since 0.9.0; before, the edit made the entry the review's, Deep
+Dream could then merge it away, and the lesson retired as "deleted outside
+the learning loop").
 `lessons_meditated` beside it records the last meditation.
 
 ## 9. Tests

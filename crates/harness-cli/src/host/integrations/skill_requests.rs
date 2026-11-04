@@ -430,6 +430,8 @@ impl SkillRequests {
                     let previous = pending.take().unwrap_or_default();
                     *pending = Some(super::refine::RefineOptions {
                         instructions: instructions.or(previous.instructions),
+                        // The model's words: no evidence for a memory edit.
+                        typed: false,
                         global: global || previous.global,
                         rollback: None,
                         curate: false,

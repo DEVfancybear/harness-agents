@@ -10,7 +10,7 @@ background passes that each call a model:
 | Pass | Reads | Writes |
 |---|---|---|
 | A conversation's review (the review gate, then the refinement it approves) | the turns since the last review | the conversation's store, the global memory, lessons, learned skills, knowledge |
-| Deep Dream (consolidation) | the global memory, or a conversation's store past 40 entries | the same scope, merged and pruned |
+| Deep Dream (consolidation) | the global memory, or a conversation's store past 40 entries, in batches past a token budget | the same scope, merged and pruned |
 | The harness evolution | the calls that failed in the last 14 days | rules and tool notes |
 
 A model call fails: the provider is down, a limit is reached, the process
@@ -92,6 +92,15 @@ The triggers are the ones ha had; each writes a job and then runs the due ones.
   conversation's store past 40 entries): marked done only when it applied; one
   consolidation at a time across ha's processes (`consolidation.lock` in the
   global harness directory, an OS lock the process holds while it runs).
+  Since 0.9.0 a memory past 32,000 tokens of entries is consolidated in
+  batches, one curator call each, the related entries of a batch side by
+  side; each batch is applied and recorded (`<id>_b<n>`) as it is planned. A
+  batch that fails is the job's failure: the queue tries the pass again, cut
+  anew, and the batches already applied stay applied. Where the first batch
+  ends moves from pass to pass, so neighbours a boundary parted meet later
+  ([MEMORY_STORE.en.md](MEMORY_STORE.en.md), section 16). Each batch is a
+  `refine.consolidation_batch` record (its scope, refinement, place, entries
+  and edits applied, and the ids of a batch of 64 entries or fewer, `members`).
 - **The evolution** (once a day): marked as run only once it saved; its lock
   and its job's claim keep a second run from starting meanwhile.
 
@@ -116,6 +125,8 @@ itself only after success; it is not in the queue.
 
 `HA_SLEEP_RETRY_SECONDS` sets the first wait after a failure (doubled as
 above), `HA_SLEEP_MAX_ATTEMPTS` the failures a job takes before it gives up,
-and `HA_COMPACTION_REVIEW_SECONDS` the spacing of compaction reviews. They exist
+`HA_COMPACTION_REVIEW_SECONDS` the spacing of compaction reviews, and
+`HA_CONSOLIDATE_BATCH_TOKENS` how many tokens of entries one Deep Dream call
+is given (32,000; a memory past it is consolidated in batches). They exist
 for the live tests (`scripts/testing/live-tests/sleep.sh`); the defaults suit
 everyday use.

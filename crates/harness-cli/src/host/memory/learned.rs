@@ -1681,7 +1681,7 @@ fn land(
                 std::fs::remove_file(&target).map_err(|error| format!("{relative}: {error}"))?;
             }
             append_ledger(&directory, &ledger_entry(intent));
-            Ok(json!({"files": {relative: before}}))
+            Ok(json!({"files": {relative: before}, "written": skill_hash(&directory)}))
         }
         _ => {
             let body = body.expect("shaped body");
@@ -1716,6 +1716,7 @@ fn land(
                 }
                 return Err(error);
             }
+            let written = skill_hash(&directory);
             let (requests, _) = usage(layers, layer);
             if intent.action == "create" {
                 write_atomic(
@@ -1733,13 +1734,53 @@ fn land(
                 });
             }
             append_ledger(&directory, &ledger_entry(intent));
-            Ok(json!({"body": live, "files": previous}))
+            Ok(json!({"body": live, "files": previous, "written": written}))
         }
     }
 }
 
+/// The SHA-256 of a skill's `SKILL.md` as it is on disk, or `None` when it
+/// has none.
+fn skill_hash(directory: &Path) -> Option<String> {
+    let body = std::fs::read(directory.join("SKILL.md")).ok()?;
+    Some(
+        Sha256::digest(&body)
+            .iter()
+            .fold(String::new(), |mut out, byte| {
+                let _ = write!(out, "{byte:02x}");
+                out
+            }),
+    )
+}
+
+/// Why a landed change may not be undone: its skill's `SKILL.md` no longer
+/// has the hash the change wrote, so the agent, the user or a later
+/// refinement changed it since, and that version is kept. A change recorded
+/// before 0.9.0 carries no hash and is undone as it was.
+#[must_use]
+pub fn changed_since(
+    layers: &Layers,
+    action: &str,
+    name: &str,
+    level: &str,
+    undo: &Value,
+) -> Option<String> {
+    let written = undo["written"].as_str()?;
+    if !matches!(action, "create" | "update" | "patch" | "remove_file") || !valid_name(name) {
+        return None;
+    }
+    let root = layers.root(Layer::parse(level)?)?;
+    if skill_hash(&root.join(name)).as_deref() == Some(written) {
+        return None;
+    }
+    Some(format!(
+        "{name}'s SKILL.md changed since the refinement wrote it; that version is kept"
+    ))
+}
+
 /// Undo one landed change, from what [`promote`] recorded. Rollback restores
-/// exactly what was there, so it is not linted again.
+/// exactly what was there, so it is not linted again; a skill whose
+/// `SKILL.md` changed since the change ([`changed_since`]) is left as it is.
 pub fn restore(
     layers: &Layers,
     action: &str,
@@ -1747,6 +1788,9 @@ pub fn restore(
     level: &str,
     undo: &Value,
 ) -> Result<(), String> {
+    if let Some(changed) = changed_since(layers, action, name, level, undo) {
+        return Err(changed);
+    }
     let layer = Layer::parse(level).ok_or_else(|| format!("unknown level {level:?}"))?;
     let root = layers
         .root(layer)

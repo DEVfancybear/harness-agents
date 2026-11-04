@@ -4,7 +4,10 @@
 # abstention, duplicates, delete and restore, provenance, renamed ids, judged
 # skill outcomes and the harness refinements switch; and (0.8.8) usage kept
 # apart from the entries, unmatched entries newest first, and a miss searched
-# again with other words. Several conversations over
+# again with other words; and (0.9.0) a rollback that keeps what the agent
+# changed since. (A memory edit whose quote is not in what the refinement
+# read is refused: the unit tests show it, as gpt-6-luna quoted verbatim
+# however it was asked.) Several conversations over
 # three projects; every check prints PASS or FAIL, and the conversation and
 # the state on disk stay in $LIVE_ROOT/memory as evidence.
 #
@@ -343,5 +346,63 @@ if [ -n "$missed" ]; then
 else
   echo "precondition not met in 3 attempts: every first search found the fact; a retry after a miss was not judged (see $RX/u3_*.json)"
 fi
+
+echo "################ 16. a rollback keeps what was changed since (0.9.0)"
+# /refine writes a global entry, the agent then changes it with the memory
+# tool, and the refinement is rolled back: the later version stays, and the
+# rollback names it. 0.8.9 put the refinement's snapshot back over it - for a
+# create, it deleted the entry the agent had changed.
+export HA_AUTO_REFINE=off
+P16="$RX/p-roll"
+project "$P16"
+H16="$D/harness/refinements.jsonl"
+# The refinement of the global history that created an entry holding $1, as
+# "refinement entry".
+created_with() { "$PY" - "$H16" "$1" <<'EOF'
+import json, sys
+try:
+    lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+except OSError:
+    lines = []
+for line in lines:
+    try:
+        record = json.loads(line)
+    except ValueError:
+        continue
+    for edit in record.get("appliedEdits", []):
+        if edit.get("applied") is True and edit.get("action") == "create" and sys.argv[2] in json.dumps(edit.get("after"), ensure_ascii=False):
+            print(record["id"], edit["id"])
+EOF
+}
+# The rollback of $1 in the global history, as one JSON line.
+rollback_of() { grep -F "\"rollbackOf\":\"$1\"" "$H16" 2>/dev/null | tail -1; }
+# A global entry as "vN|content".
+entry16() { "$PY" "$MEMORY_STORE" rows "$D/harness" memory | tr -d '\r' | awk -F'|' -v id="$1" '$1 == id {print $6 "|" $4}'; }
+agent "$P16" r16
+made=""
+for attempt in 1 2; do
+  say r16 "/refine --global Lưu vào memory toàn cục (scope global, action create) đúng một entry mới, tiêu đề 'Màu logo', nội dung 'Logo của dự án orchid dùng màu cam #FF7A00.' Đây là yêu cầu của chính người dùng, hãy lưu đúng nội dung đó." | tail -3
+  for _ in $(seq 1 60); do made=$(created_with "#FF7A00" | tr -d '\r' | tail -1); [ -n "$made" ] && break; sleep 5; done
+  [ -n "$made" ] && break
+done
+REF16=${made%% *}; ID16=${made#* }
+echo "   refinement ${REF16:-?} created ${ID16:-?}: $(entry16 "${ID16:-none}")"
+check "/refine created the entry (the precondition)" '[ -n "$made" ]'
+changed=""
+for attempt in 1 2; do
+  say r16 "Kiểm thử: gọi tool memory action update đúng một lần, với scope global, id '$ID16', title 'Màu logo' và content 'Logo của dự án orchid dùng màu xanh lá #2E7D32.'. Không gọi tool nào khác, không làm gì thêm." | tail -3
+  entry16 "$ID16" | grep -q "#2E7D32" && { changed=1; break; }
+done
+echo "   after the agent's edit: $(entry16 "${ID16:-none}")"
+check "the agent changed the entry since (the precondition)" '[ -n "$changed" ]'
+if [ -n "$made" ] && [ -n "$changed" ]; then
+  say r16 "/refine --rollback $REF16" | tail -4
+  for _ in $(seq 1 60); do [ -n "$(rollback_of "$REF16")" ] && break; sleep 2; done
+  echo "   after the rollback: $(entry16 "$ID16")"
+  check "the rollback ran" '[ -n "$(rollback_of "$REF16")" ]'
+  check "the agent's later version is kept" 'entry16 "$ID16" | grep -q "#2E7D32"'
+  check "the rollback names the entry it kept, changed since" 'rollback_of "$REF16" | grep -q "changed since refinement $REF16 wrote it"'
+fi
+"$HA" shutdown --force >/dev/null 2>&1
 
 result

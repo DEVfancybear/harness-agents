@@ -974,3 +974,98 @@ cause `expire`; `restore` with its id alone brings it back.
   It is local and fast: no model call.
 - `ha doctor` says when the last pass ran and how many it closed (the
   global store's `expiry` meta).
+
+## 17. What a review writes, and Deep Dream in batches (0.9.0)
+
+0.9.0 closes five gaps an audit found in how refinements write the store
+(`memory/refine.rs`, `memory/learned.rs`). Each is a rule of `apply`, the
+one entry point every refinement - a review, `/refine`, `/learn`, Deep Dream,
+the curator, a rollback - writes through.
+
+**An update keeps who kept the entry.** An update keeps the entry's `source`
+(`agent`, `learning`, `refine`, ...) and its `origin`, and records the
+refinement that changed it in `edited_by`: `{via: "refine", refinement,
+conversation, evidence, confidence}`. A create is the review's (`source:
+refine`, `origin` the same record). Before, every update set `source:
+refine`: a review that reworded a learned rule made it a review entry, Deep
+Dream (which skips `source: learning`) could then merge it away, and the
+learning loop retired its lesson as deleted. A rollback puts the snapshot
+back whole, `source` and `origin` with it, as a new version.
+
+**A rollback undoes only what its refinement wrote.** Each restore carries the
+version the refinement left (`after`, or nothing for an entry it deleted).
+An entry is rolled back only while it is that version - the same `version`,
+title and content; an entry the refinement deleted, only while no entry took
+its id. A learned skill's change records the SHA-256 of the `SKILL.md` it
+wrote (`undo.written`), and is undone only while the file still has it; a
+change recorded before 0.9.0 has no hash and is undone as before. A knowledge
+page was already deleted only while it is as written. What changed since is
+skipped, not failed: the result names it ("Skipped: update local memory
+`deploy`: changed since refinement refine_... wrote it: the later version is
+kept"), and a rollback that skipped everything is "Harness rollback
+unchanged".
+
+**A merge's delete stands or falls with its survivor.** A delete that merges an
+entry into another names it in `merged_into`; the curator's prompt asks for it,
+and the review's may give it. Such deletes are applied after every other edit
+of the refinement, and a delete is skipped when its survivor's edit was not
+applied (refused, or skipped because the entry changed meanwhile), when the
+survivor is not there after the other edits (deleted in the same refinement),
+or refused when it names itself. A delete without `merged_into` (stale,
+temporary, planted) is judged alone, as before. Deep Dream's guard rails use
+the survivor too: a pinned entry merged into an entry the pass updates keeps
+that entry pinned, one merged into an entry kept unpinned is not deleted, a
+constraint is merged only into a constraint, and nothing is merged into an
+entry the pass deletes.
+
+**A review's memory edit quotes what it read.** A memory or prompt-note edit
+of a review, `/refine` or `/learn` is applied only when its `evidence` is
+found in what the refinement read: the conversation (which holds a child's
+`[Child findings, from <child>]` block, quoted for a child's fact), and for
+`/refine` what the user typed after the command - never the review gate's
+instructions, nor those of a refinement the model asked for (`refine.run`),
+which are a model's words. The quote is compared with
+whitespace and case aside, without the quotation marks around it; pieces
+joined by `...` or `…` must each be found, in order; and it is a phrase of 12
+characters or more, as a lesson's is. Otherwise the edit is refused with the
+reason, recorded with the refinement like any refusal. A global edit without
+evidence is still no global edit, and is refused where it stays. The edit's
+`confidence` (`high`, `medium` or `low`) is recorded in the entry's `origin`
+(or `edited_by`); nothing reads it yet.
+
+**Deep Dream's evidence is the entries it was given.** A merge quotes no
+conversation, so its check is on the entries: an edit naming an entry outside
+its batch is refused; a delete in a merge names a survivor of its batch; and
+an update whose content has more than half of its words (the search's terms)
+in none of the batch's entries is refused as adding what no entry says. A
+title may be new.
+
+**Deep Dream in batches.** All the global memory went into one prompt, with no
+cap: about 10,000 entries overflowed the model's context, and the pass failed
+every time. A pass now:
+
+- orders the scope's entries so related ones are side by side - by kind,
+  project and path, then by the rarest word each shares with another entry,
+  which a near-duplicate shares with its twin;
+- cuts the order into batches of at most `HA_CONSOLIDATE_BATCH_TOKENS` tokens
+  of entries (32,000 by default; about four bytes a token, as the context
+  compiler counts), each of two entries or more; a memory within the budget is
+  one batch, as before;
+- moves where the first batch ends, between a quarter and all of the budget,
+  by the pass's moment, so the boundaries of one pass are not those of the
+  next and two entries a boundary parted meet later;
+- calls the curator once per batch, showing it only the batch's entries and
+  where it stands (`batch 2 of 5`, the memory's size, the batch's part of the
+  30-entry target), and applies the batch's edits at once: one pass deletes
+  at most half of each batch;
+- records each batch as a refinement `<id>_b<n>` whose `batch` names the pass
+  (`{of, index, count}`), shown together under `<id>`, which `/refine
+  --rollback <id>` undoes in one go; a pass of one batch is recorded as
+  `<id>`, as before;
+- fails when a batch's call or apply fails: the job's failure, which the queue
+  retries ([SLEEP.en.md](SLEEP.en.md)); the batches before it stay applied,
+  and the error names them.
+
+The same holds for a conversation's store past 40 entries and for the
+curator's memory part (`/refine --curate`), whose batches precede the skills'
+refinement `<id>`.
