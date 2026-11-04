@@ -15,10 +15,12 @@ fresh memory
 export HA_AUTO_REFINE=off
 D=$HA_HOME/data
 for p in p-shop p-blog p-skill; do project "$RX/$p"; done
-# Global entries as "scope|project|kind|id|v|content|origin-via".
+# Global entries that hold now as "scope|project|kind|id|v|content|origin-via":
+# since 0.9.0 a corrected fact closes the old entry instead of rewriting it,
+# and the closed one is history, not what memory claims.
 entries() {
   for kind in memory prompt skill subagent; do
-    "$PY" "$MEMORY_STORE" rows "$D/harness" "$kind" | awk -F'|' -v kind="$kind" 'BEGIN{OFS="|"} {print "global",$5,kind,$1,$6,$4,$7}'
+    "$PY" "$MEMORY_STORE" current "$D/harness" "$kind" | awk -F'|' -v kind="$kind" 'BEGIN{OFS="|"} {print "global",$5,kind,$1,$6,$4,$7}'
   done
 }
 # The global store's event log: each change and the version it left.

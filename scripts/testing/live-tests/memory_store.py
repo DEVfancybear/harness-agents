@@ -9,6 +9,7 @@ its key: the `key` column since schema 3 (0.8.2), the `name` column before it.
 usage:
   memory_store.py entries DATA            scope kind name vN | content (global and every conversation)
   memory_store.py rows DIR [KIND...]      name|path|pinned|content|project|version|via of each entry
+  memory_store.py current DIR [KIND...]   the same, without the entries a correction or expiry closed (0.9.0)
   memory_store.py count DIR [KIND...]     how many entries (memory and prompt by default)
   memory_store.py events DIR              operation|cause|actor type|name|vN|content of each event, oldest first
   memory_store.py document DIR            the whole state as JSON, harness_state.json's shape
@@ -67,10 +68,13 @@ def main(command, target, *kinds):
         for scope, directory in scopes:
             for (kind, name), entry in stored(directory).items():
                 print(scope, kind, name, "v%s" % entry.get("version"), "|", line(entry)[:80])
-    elif command == "rows":
+    elif command in ("rows", "current"):
         wanted = kinds or ("memory", "prompt")
         for (kind, name), entry in stored(target).items():
             if kind not in wanted:
+                continue
+            # What holds now: an entry superseded or expired is history.
+            if command == "current" and (entry.get("superseded_by") or entry.get("expired")):
                 continue
             project = entry.get("project")
             project = project.get("name", "-") if isinstance(project, dict) else "-"

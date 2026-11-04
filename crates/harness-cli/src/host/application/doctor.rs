@@ -417,9 +417,16 @@ fn state(root: &Path, facts: &Facts) -> Subsystem {
 
 /// The background memory passes (`sleep`): how many wait, which failed and
 /// wait to be tried again, and which gave up and are no longer tried by
-/// themselves. Nothing is said of an empty queue.
+/// themselves. Nothing is said of an empty queue. The last expiry pass says
+/// how many unused entries it closed.
 fn sleep(facts: &Facts, subsystem: &mut Subsystem) {
     let queue = &facts.sleep;
+    if let Some((at, closed)) = &queue.expiry {
+        subsystem.pass(format!(
+            "memory expiry: the last pass ({at}) closed {closed} unused entr{} (HA_MEMORY_EXPIRE_DAYS; restore brings one back)",
+            if *closed == 1 { "y" } else { "ies" }
+        ));
+    }
     if queue.waiting > 0 {
         subsystem.pass(format!(
             "{} background memory pass(es) queued (reviews, consolidation, evolution)",
@@ -779,12 +786,19 @@ mod tests {
                 retrying: vec!["review of task-1 (1 failed, timeout)".to_owned()],
                 gave_up: vec!["consolidation (6 failures, rate_limited: limit)".to_owned()],
                 dir: root.path().join("sleep"),
+                expiry: Some(("2026-11-04T10:00:00.000Z".to_owned(), 3)),
             },
             ..Facts::default()
         };
         let text = audited(&facts);
         assert!(
             text.contains("✓ 1 background memory pass(es) queued"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "memory expiry: the last pass (2026-11-04T10:00:00.000Z) closed 3 unused entries"
+            ),
             "{text}"
         );
         assert!(

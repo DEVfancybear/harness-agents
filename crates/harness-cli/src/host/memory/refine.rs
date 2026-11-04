@@ -870,8 +870,11 @@ impl Edit {
     fn invalid(&self, id: &str) -> Option<String> {
         let action = self.text("action").unwrap_or_default();
         let kind = self.text("kind").unwrap_or_default();
-        if !matches!(action, "create" | "update" | "delete") {
+        if !matches!(action, "create" | "update" | "delete" | "supersede") {
             return Some(format!("unsupported action {action}"));
+        }
+        if action == "supersede" && !matches!(kind, "memory" | "prompt") {
+            return Some("supersede is for memory and prompt entries".to_owned());
         }
         if !KINDS.contains(&kind) {
             return Some(format!("unsupported kind {kind}"));
@@ -993,6 +996,17 @@ fn memory_refusal(
             "content is at most {} characters: keep the fact, not its story",
             super::memory::MAX_CONTENT_CHARS
         ));
+    }
+    // A page's words never become a rule every turn follows.
+    let path = edit
+        .text("path")
+        .or_else(|| before["path"].as_str())
+        .unwrap_or_default();
+    if let Some(refusal) = edit
+        .text("origin_kind")
+        .and_then(|from| super::memory_validity::steering_refusal(from, path))
+    {
+        return Some(refusal);
     }
     // A rollback puts back what was there; it duplicates nothing.
     if action != "create" || rollback_of.is_some() {
@@ -1404,6 +1418,9 @@ fn apply(
     let entries_before = memory_entries(&state).len();
     let mut applied_edits = Vec::new();
     let mut modified = std::collections::BTreeSet::new();
+    // The entries a `supersede` creates, with the memory ids the entries it
+    // closes name.
+    let mut revived = Vec::<(String, String, String)>::new();
     for edit in &proposal.edits {
         let action = edit.text("action").unwrap_or_default().to_owned();
         let kind = edit.text("kind").unwrap_or_default().to_owned();
@@ -1441,7 +1458,7 @@ fn apply(
             continue;
         }
         let error = match action.as_str() {
-            "delete" | "update" if before.is_null() => Some("entry not found"),
+            "delete" | "update" | "supersede" if before.is_null() => Some("entry not found"),
             "create" if !before.is_null() => Some("entry already exists"),
             _ => None,
         };
@@ -1465,7 +1482,44 @@ fn apply(
         }
         // What a refinement replaces or removes stays in the store's event
         // log, so the `memory` tool's history and restore reach it too.
-        let by = refine_origin(scopes, id, edit.text("evidence"));
+        let mut by = refine_origin(scopes, id, edit.text("evidence"));
+        if let Some(from) = edit.text("origin_kind") {
+            by["kind"] = json!(from);
+        }
+        // A fact that changed: a new entry, and the old one closed, not
+        // deleted (`memory_validity::supersede_edit`).
+        if action == "supersede" {
+            match super::memory_validity::supersede_edit(
+                dir, &mut state, &kind, &computed, &edit.0, &by,
+            ) {
+                Ok((created, memory)) => {
+                    revived.push((
+                        kind.clone(),
+                        created["after"]["id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        memory,
+                    ));
+                    modified.insert(key);
+                    modified.insert(format!(
+                        "{kind}:{}",
+                        created["after"]["id"].as_str().unwrap_or_default()
+                    ));
+                    record["before"] = before;
+                    record["after"] = state["entries"][&kind][&computed].clone();
+                    record["applied"] = json!(true);
+                    applied_edits.push(record);
+                    applied_edits.push(created);
+                }
+                Err(error) => {
+                    record["applied"] = json!(false);
+                    record["error"] = json!(error);
+                    applied_edits.push(record);
+                }
+            }
+            continue;
+        }
         if action == "delete" {
             if let Some(records) = state["entries"][&kind].as_object_mut() {
                 records.remove(&computed);
@@ -1558,6 +1612,9 @@ fn apply(
             "refine"
         },
     );
+    let writer = revived.iter().fold(writer, |writer, (kind, key, memory)| {
+        writer.reviving(kind, key, memory)
+    });
     let path = save_raw(dir, &state, &writer)?;
     let mut record = json!({
         "id": id,
@@ -2152,7 +2209,14 @@ async fn plan(
     if !value.is_object() {
         return Err("the refiner JSON must be an object".to_owned());
     }
-    Ok(Proposal::from_value(&value))
+    let mut proposal = Proposal::from_value(&value);
+    // Where an edit's words came from is the host's to say, by the turn its
+    // evidence quotes (`memory_provenance::quoted_kind`), never the model's.
+    for edit in &mut proposal.edits {
+        let from = super::memory_provenance::quoted_kind(conversation, edit.text("evidence"));
+        edit.0.insert("origin_kind".to_owned(), json!(from));
+    }
+    Ok(proposal)
 }
 
 /// The automatic review's scope: local by default, with memory that holds

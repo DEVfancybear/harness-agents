@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use super::harness::{self, Entry};
 use super::memory_filters::{Predicate, Temporal, TreeFilter, contains};
 use super::memory_store;
+use super::memory_validity::{self, Window};
 
 /// memory-engine's limits: 10 results by default, 200 at most; 30
 /// candidates per arm, at most 1,000.
@@ -148,7 +149,96 @@ pub fn check(arguments: &Value) -> Result<(), String> {
     if let Some(pattern) = text("grep") {
         grep(pattern)?;
     }
+    for key in TIMES {
+        match arguments.get(key) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(time)) => {
+                memory_store::instant(time)?;
+            }
+            Some(_) => return Err(format!("{key} is a time, such as 2026-10-26T09:30:00Z")),
+        }
+    }
+    if !matches!(
+        arguments.get("include_ended"),
+        None | Some(Value::Null | Value::Bool(_))
+    ) {
+        return Err("include_ended is true or false".to_owned());
+    }
     check_presentation(arguments)
+}
+
+/// The times a search may name beside the temporal filter: `as_of`, the
+/// entries that held then; `since` and `until`, those that held at some time
+/// between.
+const TIMES: [&str; 3] = ["as_of", "since", "until"];
+
+/// The time a search names, as a window: `as_of` a point, `since`/`until`
+/// and the temporal filter's modes a window, all narrowed together. `None`
+/// when it names none.
+///
+/// # Errors
+/// A time or the temporal filter is malformed.
+pub fn named_time(arguments: &Value) -> Result<Option<Window>, String> {
+    let time = |key: &str| {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .map(memory_store::instant)
+            .transpose()
+    };
+    let mut window: Option<Window> = None;
+    let mut narrow = |other: Window| {
+        window = Some(match window.take() {
+            Some(window) => window.and(&other),
+            None => other,
+        });
+    };
+    if let Some(at) = time("as_of")? {
+        narrow(Window {
+            from: Some(at.clone()),
+            to: Some(at),
+        });
+    }
+    let (since, until) = (time("since")?, time("until")?);
+    if since.is_some() || until.is_some() {
+        narrow(Window {
+            from: since,
+            to: until,
+        });
+    }
+    if let Some(temporal) = arguments.get("temporal").filter(|value| !value.is_null()) {
+        let (from, to) = Temporal::parse(temporal)?.window();
+        narrow(Window { from, to });
+    }
+    Ok(window)
+}
+
+/// `ranked` with no entry that ended (its period over, or closed by a
+/// correction or the expiry pass) right above a current one the words
+/// matched as well or better, and none shown as unverified (a web page's, a
+/// child's) above a verified one so matched: what is true now, and what the
+/// user or the agent said, comes first among equals. Otherwise the order
+/// stands.
+#[must_use]
+pub fn settled(entries: &[&Entry], mut ranked: Vec<(usize, f64)>) -> Vec<(usize, f64)> {
+    let standing = |index: usize| {
+        let entry = entries[index];
+        (
+            u8::from(entry.ended || entry.standing.closed()),
+            u8::from(entry.standing.unverified()),
+        )
+    };
+    for at in 1..ranked.len() {
+        let mut place = at;
+        while place > 0
+            && standing(ranked[place].0) < standing(ranked[place - 1].0)
+            && ranked[place].1 >= ranked[place - 1].1
+        {
+            ranked.swap(place, place - 1);
+            place -= 1;
+        }
+    }
+    ranked
 }
 
 /// A search's `order_by`, `format` and `select`.
@@ -401,6 +491,34 @@ pub fn search(
             ),
         )
     };
+    // A search that names a time ranks by how well each entry's validity
+    // matches it, then by the words; one that names none puts what holds
+    // now, and what was not a page's or a child's, first among equals.
+    let ranked = match named_time(arguments)? {
+        Some(window) => {
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut fitted = ranked
+                .into_iter()
+                .map(|(index, score)| {
+                    let fit = memory_validity::fit(considered[index].doc, &window, now);
+                    (index, score, fit)
+                })
+                .collect::<Vec<_>>();
+            fitted.sort_by(|a, b| b.2.total_cmp(&a.2));
+            fitted
+                .into_iter()
+                .map(|(index, score, _)| (index, score))
+                .collect()
+        }
+        None if mode == "fulltext" => settled(
+            &considered
+                .iter()
+                .map(|placed| placed.entry)
+                .collect::<Vec<_>>(),
+            ranked,
+        ),
+        None => ranked,
+    };
     let total = ranked.len();
     let select = arguments
         .get("select")
@@ -427,6 +545,13 @@ pub fn search(
         })
         .collect::<Vec<_>>();
     let mut result = json!({"hits": hits, "total": total, "limit": limit, "mode": mode, "searched": considered.len()});
+    let left_out = closed_left_out(placed, arguments, &queries)?;
+    if left_out > 0 {
+        result["closed"] = json!({
+            "left_out": left_out,
+            "note": format!("{left_out} closed entries (superseded by a correction, or expired unused) also match: as_of a time reads what held then, include_ended: true reads them all"),
+        });
+    }
     if hits_empty(&result) {
         result["note"] = json!(miss_note(&queries));
         missed_branches(&mut result, &considered);
@@ -616,12 +741,14 @@ pub fn filtered<'a>(
         .map(Temporal::parse)
         .transpose()?;
     let pattern = text("grep").map(grep).transpose()?;
+    let held = held(arguments)?;
     Ok(placed
         .iter()
         .filter(|placed| {
             let entry = placed.entry;
             let facets = Value::Object(entry.meta.clone());
-            tree.as_ref().is_none_or(|tree| tree.matches(&entry.tree))
+            held(placed)
+                && tree.as_ref().is_none_or(|tree| tree.matches(&entry.tree))
                 && meta.is_none_or(|meta| contains(&facets, meta))
                 && predicate
                     .as_ref()
@@ -641,6 +768,69 @@ pub fn filtered<'a>(
                 })
         })
         .collect())
+}
+
+/// Which entries a search reads by when they held. An entry a correction or
+/// the expiry pass closed is read only when the search names a time or
+/// `include_ended`; one whose own period ended is read as before, ranked
+/// below a current one ([`settled`]). With `as_of`, only the entries that
+/// held then (and had been written by then); with `since`/`until`, those
+/// that held at some time between.
+///
+/// # Errors
+/// A time is malformed.
+fn held(arguments: &Value) -> Result<impl Fn(&Placed<'_>) -> bool, String> {
+    let as_of = arguments
+        .get("as_of")
+        .and_then(Value::as_str)
+        .map(memory_store::instant)
+        .transpose()?;
+    let between = match (arguments.get("since"), arguments.get("until")) {
+        (None | Some(Value::Null), None | Some(Value::Null)) => None,
+        _ => named_time(&json!({"since": arguments["since"], "until": arguments["until"]}))?,
+    };
+    let closed_too = arguments["include_ended"] == true || named_time(arguments)?.is_some();
+    Ok(move |placed: &Placed<'_>| {
+        (closed_too || !placed.entry.standing.closed())
+            && as_of
+                .as_deref()
+                .is_none_or(|at| memory_validity::valid_at(placed.doc, at))
+            && between
+                .as_ref()
+                .is_none_or(|window| memory_validity::overlaps(placed.doc, window))
+    })
+}
+
+/// How many closed entries a search that names no time left out although its
+/// words match them: it says so, so a question about what held before is
+/// asked again with `as_of`.
+///
+/// # Errors
+/// A filter is malformed.
+fn closed_left_out(
+    placed: &[Placed<'_>],
+    arguments: &Value,
+    queries: &[String],
+) -> Result<usize, String> {
+    if queries.is_empty() || arguments["include_ended"] == true || named_time(arguments)?.is_some()
+    {
+        return Ok(0);
+    }
+    let mut wide = arguments.clone();
+    wide["include_ended"] = json!(true);
+    let closed = filtered(placed, &wide)?
+        .into_iter()
+        .filter(|placed| placed.entry.standing.closed())
+        .collect::<Vec<_>>();
+    if closed.is_empty() {
+        return Ok(0);
+    }
+    Ok(queries
+        .iter()
+        .flat_map(|query| bm25(&closed, query, None))
+        .map(|(index, _)| index)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len())
 }
 
 fn hits_empty(result: &Value) -> bool {
@@ -1360,6 +1550,7 @@ pub fn rank_documents(documents: &[(&str, &str)], query: &str) -> Vec<(usize, f6
             source: None,
             usage: memory_store::Usage::default(),
             indexed: None,
+            standing: super::memory_validity::Standing::default(),
         })
         .collect::<Vec<_>>();
     let doc = Value::Null;
@@ -1557,6 +1748,46 @@ fn inline(value: &Value) -> String {
 mod tests {
     use super::*;
 
+    /// Among entries the words matched alike, what holds now comes before
+    /// what ended, and what the user or the agent said before a fetched
+    /// page's words; a better match keeps its place.
+    #[test]
+    fn among_equals_what_holds_now_and_was_not_a_pages_comes_first() {
+        let state = harness::parse(
+            &json!({"schema": 1, "entries": {"memory": {
+                "ended": {"title": "t", "content": "c", "temporal": {"start": "2026-01-01", "end": "2026-02-01"}},
+                "current": {"title": "t", "content": "c"},
+                "page": {"title": "t", "content": "c", "origin": {"kind": "web"}},
+                "weaker": {"title": "t", "content": "c"},
+            }}}),
+            "global",
+            "/global",
+        );
+        let entries = state.entries["memory"].iter().collect::<Vec<_>>();
+        let at = |id: &str| {
+            entries
+                .iter()
+                .position(|entry| entry.id == id)
+                .expect("entry")
+        };
+        let ranked = settled(
+            &entries,
+            vec![
+                (at("ended"), 1.0),
+                (at("page"), 1.0),
+                (at("current"), 1.0),
+                (at("weaker"), 0.5),
+            ],
+        );
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|(index, _)| entries[*index].id.as_str())
+                .collect::<Vec<_>>(),
+            ["current", "page", "ended", "weaker"]
+        );
+    }
+
     /// The indexed field counts a term as a pass over its words would: the
     /// words it begins and the words of its stem, each occurrence once.
     #[test]
@@ -1617,6 +1848,7 @@ mod tests {
                 source: None,
                 usage: memory_store::Usage::default(),
                 indexed: None,
+                standing: super::memory_validity::Standing::default(),
             })
             .collect::<Vec<_>>();
         let refs = entries.iter().collect::<Vec<_>>();
@@ -1711,6 +1943,7 @@ mod tests {
                 store: store.into(),
                 hash: hash.to_owned(),
             }),
+            standing: super::memory_validity::Standing::default(),
         }
     }
 

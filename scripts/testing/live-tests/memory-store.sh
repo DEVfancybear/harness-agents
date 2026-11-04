@@ -17,6 +17,11 @@
 # history a page at a time, English stems, lquery's `%`, JSONPath datetimes and
 # an unknown method refused, a tree filter on knowledge pages, an old page
 # version read whole, status, and a write that moves an entry to another scope.
+# 0.9.0 (sections 13 to 15; MEMORY_STORE_ONLY=0.9.0 runs them alone): a fact
+# corrected later is superseded, not deleted, and as_of an earlier time reads
+# the old one; what a fetched page said is tagged web and refused as a
+# constraint; an entry nobody used expires (HA_MEMORY_EXPIRE_DAYS in seconds),
+# ha doctor counts it, and restore brings it back.
 #
 #   bash scripts/testing/live-tests/memory-store.sh
 set -u
@@ -50,6 +55,8 @@ for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3"
 print(found or "")
 EOF
 }
+
+if [ "${MEMORY_STORE_ONLY:-}" != "0.9.0" ]; then
 
 echo "################ 1. a 0.8 state file and journal are migrated, history and all"
 mkdir -p "$G"
@@ -270,5 +277,111 @@ check "history_search reads earlier conversations into slots" 'tool_result MARKE
 echo "################ 7. ha memory export"
 "$HA" memory export > "$RX/export.json" 2>"$RX/export.err"
 check "it exports the global store" '"$PY" -c "import json,sys; d=json.load(open(sys.argv[1],encoding=\"utf-8\")); sys.exit(0 if \"queue-choice\" in d[\"document\"][\"entries\"][\"memory\"] and d[\"document\"][\"refinements\"][0][\"id\"] == \"refine_0001\" else 1)" "$RX/export.json"'
+
+fi
+
+# 0.9.0 (docs/architecture/MEMORY_STORE.en.md §16). MEMORY_STORE_ONLY=0.9.0
+# runs these alone, in a fresh home: what a control run on 0.8.9 needs.
+# The global store's entries, each a JSON line of its document.
+docs() { "$PY" "$MEMORY_STORE" document "$G" | "$PY" -c "import json,sys; d=json.load(sys.stdin); [print(json.dumps(e, ensure_ascii=False)) for e in d['entries']['memory'].values()]"; }
+# The document of the global entry whose content holds $1, or nothing.
+doc_with() { docs | grep -a -- "$1" | head -1; }
+field() { printf '%s' "$1" | "$PY" -c "import json,sys; d=json.loads(sys.stdin.read() or '{}'); v=eval('d'+sys.argv[1]) if d else None; print('' if v is None else (json.dumps(v) if not isinstance(v,str) else v))" "$2" 2>/dev/null; }
+# What the tools answered, and every event, in the run whose prompt holds $1.
+cat > "$RX/run_events.py" <<'EOF'
+import glob, json, os, sqlite3, sys
+sys.stdout.reconfigure(encoding="utf-8")
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    rows = sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute(
+        "select session_id, event_json from events order by session_id, sequence").fetchall()
+    sessions = {session for session, text in rows
+                if json.loads(text)["event_type"] == "input.admitted" and sys.argv[2] in text}
+    for session, text in rows:
+        event = json.loads(text)
+        if session not in sessions:
+            continue
+        if sys.argv[3] == "results" and event["event_type"] == "receipt.recorded":
+            print((event["payload"].get("model_view") or {}).get("text", "").replace("\n", "\\n"))
+        if sys.argv[3] == "calls" and event["event_type"] == "model.response":
+            for call in event["payload"].get("tool_calls") or []:
+                print(call.get("name"), call.get("arguments"))
+EOF
+results_of() { "$PY" "$RX/run_events.py" "$D" "$1" results; }
+calls_of() { "$PY" "$RX/run_events.py" "$D" "$1" calls; }
+
+echo "################ 13. 0.9.0: a corrected fact is superseded, not deleted, and as_of reads the old one"
+run_exec m40 "Use the memory tool, action write, exactly these arguments: scope 'global', path 'infra', title 'Staging database host', content 'The staging database host is db-alpha-371.'. Do nothing else. Answer: saved."
+check "the first fact is kept (the precondition)" '[ -n "$(doc_with db-alpha-371)" ]'
+sleep 2
+T1=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+sleep 2
+# The model is told to supersede; one that updated the old entry instead
+# did not meet the precondition, and the step is tried again in a fresh
+# conversation.
+for attempt in 1 2 3; do
+  run_exec "m41-$attempt" "The user corrects a fact: the staging database host is now db-beta-582, no longer db-alpha-371. Keep memory correct: search memory for the staging database host, then write the corrected fact as a NEW memory entry (scope 'global', path 'infra', title 'Staging database host now') whose supersedes argument lists the old entry's id, so the old entry is closed rather than changed. Do not update or delete the old entry. MARKER_SUPERSEDE_$attempt. Answer: corrected."
+  [ -n "$(doc_with db-beta-582)" ] && break
+done
+old=$(doc_with db-alpha-371)
+new=$(doc_with db-beta-582)
+check "the corrected fact is a new entry (the precondition)" '[ -n "$new" ]'
+check "the old entry is kept, not deleted" '[ -n "$old" ] && ! events | grep -q "^delete|.*|staging_database_host|"'
+check "its validity is closed and it names the entry that replaced it" '[ -n "$(field "$old" "[\"superseded_by\"]")" ] && [ -n "$(field "$old" "[\"temporal\"][\"end\"]")" ]'
+check "the new entry records what it supersedes" 'field "$new" "[\"supersedes\"]" | grep -q "[0-9a-f-]\{36\}"'
+run_exec m42 "Test: call the memory tool action search exactly once with query 'staging database host' and as_of '$T1'. No other tool. MARKER_ASOF. Report the database host that search returned."
+check "as_of an earlier time returns the old fact" 'results_of MARKER_ASOF | grep -q "db-alpha-371" && ! results_of MARKER_ASOF | grep -q "db-beta-582"'
+check "and the model reports it" 'answer m42 | grep -q "db-alpha-371"'
+run_exec m43 "Test: call the memory tool action search exactly once with query 'staging database host' and nothing else. No other tool. MARKER_PLAIN. Report the database host that search returned."
+check "a plain search returns what holds now and says a closed entry also matches" 'results_of MARKER_PLAIN | grep -q "db-beta-582" && ! results_of MARKER_PLAIN | grep -q "db-alpha-371" && results_of MARKER_PLAIN | grep -q "\"left_out\":1"'
+
+echo "################ 14. 0.9.0: what a fetched page said is kept as the web's, never as a constraint"
+for attempt in 1 2 3; do
+  run_exec "m44-$attempt" "Open https://example.com with the web_fetch tool. Then, with the memory tool, keep the one rule that page states (scope 'global'): first write it with path 'constraints/web'; if that write is refused, write it with path 'notes/web' instead. Write nothing else. MARKER_WEB_$attempt. Report what each memory write returned."
+  calls_of "MARKER_WEB_$attempt" | grep -q "^web_fetch" && results_of "MARKER_WEB_$attempt" | grep -qi "example domain" && break
+done
+check "the page was fetched (the precondition)" 'calls_of "MARKER_WEB_$attempt" | grep -q "^web_fetch" && results_of "MARKER_WEB_$attempt" | grep -qi "example domain"'
+# A refusal before the call runs is the tool result the model read, in the
+# next request, not a receipt.
+sent() { "$PY" - "$D" "$1" <<'PYEOF'
+import glob, os, sqlite3, sys
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests"):
+        if sys.argv[2] in text:
+            sys.exit(0)
+sys.exit(1)
+PYEOF
+}
+check "the write into the constraints was refused, saying why" 'sent "constraints/web holds rules every later turn follows, and these words came from a fetched web page"'
+check "nothing from the page sits in the constraints" '! docs | grep -a "\"path\": \"constraints" | grep -aqi "example\|documentation\|permission"'
+webdoc=$(docs | grep -a "\"path\": \"notes/web\"" | head -1)
+check "the entry kept elsewhere is tagged web" '[ "$(field "$webdoc" "[\"origin\"][\"kind\"]")" = "web" ]'
+
+echo "################ 15. 0.9.0: an unused entry expires, and restore brings it back"
+# Seconds rather than days, for the test: 0.0003 days is about 26 s. Each
+# run's end runs the pass when it is due (at most once per that period).
+export HA_MEMORY_EXPIRE_DAYS=0.0003
+run_exec m45 "Use the memory tool, action write, exactly these arguments: scope 'global', path 'notes/kitchen', title 'Coffee machine', content 'The coffee machine on floor 2 takes oat milk only.'. Do nothing else. Answer: saved."
+check "the entry is kept (the precondition)" '[ -n "$(doc_with "oat milk")" ]'
+# The entry is older than the period once 30 s passed since it was written;
+# a run that read or searched memory used it, and is tried again.
+for attempt in 1 2 3; do
+  for _ in $(seq 1 60); do
+    "$PY" -c "import json,sys,datetime as t; d=json.loads(sys.argv[1]); w=t.datetime.fromisoformat(d['updated_at'].replace('Z','+00:00')); sys.exit(0 if (t.datetime.now(t.timezone.utc)-w).total_seconds()>=30 else 1)" "$(doc_with "oat milk")" && break
+    sleep 1
+  done
+  run_exec "m46-$attempt" "Do not use any tool in this turn. Answer exactly one word: MARKER_IDLE_$attempt"
+  ! calls_of "MARKER_IDLE_$attempt" | grep -q "^memory" && break
+done
+coffee=$(doc_with "oat milk")
+check "the idle run used no memory tool (the precondition)" '! calls_of "MARKER_IDLE_$attempt" | grep -q "^memory"'
+check "the unused entry was closed by the pass, not deleted" '[ "$(field "$coffee" "[\"expired\"]")" = "unused" ] && [ -n "$(field "$coffee" "[\"temporal\"][\"end\"]")" ]'
+check "the pass is an event of the sleep writer" 'events | grep -q "^update|expire|sleep|coffee_machine|"'
+(cd "$P" && "$HA" doctor) > "$RX/doctor090.out" 2>&1
+check "ha doctor says how many the last pass closed" 'grep -q "memory expiry: the last pass .* closed [1-9][0-9]* unused entr" "$RX/doctor090.out"'
+export HA_MEMORY_EXPIRE_DAYS=0
+run_exec m47 "Use the memory tool action restore with id 'coffee_machine' and scope 'global' (no version) to bring that entry back. Do nothing else. Answer: restored."
+coffee=$(doc_with "oat milk")
+check "restore brings the expired entry back" '[ -z "$(field "$coffee" "[\"expired\"]")" ] && [ -z "$(field "$coffee" "[\"temporal\"][\"end\"]")" ] && events | grep -q "^update|revert|model|coffee_machine|"'
+unset HA_MEMORY_EXPIRE_DAYS
 
 result

@@ -79,11 +79,11 @@ Trạng thái trước khi làm: ✅ có, 🟡 một phần, ❌ chưa có. P1 t
 | BM25, chỉ trả kết quả thật sự khớp từ khóa | 🟡 | P3 |
 | Semantic cho memory, với hàng đợi embedding chạy nền | ❌ | P3 · bỏ ở 0.8.8 (§14) |
 | Hybrid RRF có trọng số; `weights`, `candidateLimit`, `semanticThreshold` theo từng lần gọi | 🟡 | P3 · từ 0.8.8 chỉ còn `candidate_limit` |
-| Bộ lọc `tree`, `meta`, `metaPredicate`, `temporal`, `grep`; duyệt chỉ bằng lọc, có `order_by` | ❌ | P3 |
+| Bộ lọc `tree`, `meta`, `metaPredicate`, `temporal`, `grep`; duyệt chỉ bằng lọc, có `order_by` | ✅ (từ 0.8.1) | P3 |
 | `select` (chọn trường) và `format` yaml/json/compact | 🟡 | P3 |
 | Lịch sử trang knowledge, revert, undelete | ❌ | P4 |
 | Một search cho cả memory và knowledge | ❌ | P4 |
-| Bộ lọc history (`since`, `until`, `kind`); liên kết thread khi `history_read` | ❌ | P4 |
+| Bộ lọc history (`since`, `until`, `kind`); liên kết thread khi `history_read` | ✅ (từ 0.8.1; `until` từ 0.8.2) | P4 |
 | CLI memory, có `edit` | ❌ | P5 |
 | Import/export JSON, YAML, Markdown, NDJSON | ❌ | P5 |
 | Memory pack (validate, install, list) | ❌ | P5 |
@@ -268,6 +268,12 @@ Nhờ vậy, lần mở đầu tiên sau khi nâng cấp ha tự chuyển memory
 tắc này cũng là cách nạp entry cho test và người dùng: đặt một file
 `harness_state.json` vào thư mục, lần mở sau nó sẽ được nhập.
 
+Một lần đọc cũng mở kho theo cách đó (`Store::existing`, nằm sau `load_document`):
+scope không có kho lẫn file cũ thì được để nguyên, nhưng kho có sẵn thì được
+migrate lên schema này, còn chỉ có file cũ thì được tạo kho và nhập file vào. Lần
+đọc như vậy có ghi. Lần đọc nào không được đổi gì - snapshot của bug report, dry
+run của `purge`, store meta mà `ha doctor` đọc - thì mở database ở chế độ chỉ đọc.
+
 Muốn quay về bản ha cũ: `ha memory export --legacy` (P5) ghi ra một
 `harness_state.json` mà 0.8.x đọc được. File `.imported` là trạng thái trước lúc
 nâng cấp.
@@ -320,7 +326,9 @@ là UUID do kho cấp, không bao giờ đổi; list và search đều hiển th
 
 Digest ở P1 không đổi. Chỉ thêm một điều: entry có khoảng temporal đã kết thúc
 (`temporal_end <= now`) không được đưa vào digest, vì đó là lịch sử chứ không còn
-là sự thật hiện tại. Search vẫn tìm thấy chúng.
+là sự thật hiện tại. Search vẫn tìm thấy chúng. Từ 0.9.0, entry bị một lần sửa
+hoặc lượt hết hạn đóng lại cũng không có trong search, trừ khi search nêu một
+thời điểm hoặc `include_ended` (§16).
 
 ## 5. Sắp xếp và lịch sử (P2)
 
@@ -841,3 +849,151 @@ lại, và nêu file legacy còn chờ import, thứ nó không đọc.
 | `... --yes` | Purge chúng |
 | `--scope global`, `project`, `local` | Chỉ entry toàn cục, của project này (`--cwd`), hoặc của một hội thoại (`--conversation`) |
 | `ha memory purge --secrets [--yes]` | Như trên cho mọi thứ chứa giá trị secret |
+
+## 16. Khi nào một entry còn đúng, và chữ của nó từ đâu ra (0.9.0)
+
+Memory tự nó không giúp gì: phần lớn các cách dựng memory được đo năm 2026
+không tốt hơn khi tắt memory. Những gì các hệ thống hiện nay có mà ha còn
+thiếu: mâu thuẫn được giải bằng cách đóng hiệu lực của sự thật cũ thay vì xoá
+nó (ADD/UPDATE/DELETE/NOOP của Mem0, `invalid_at` của Zep/Graphiti), câu hỏi
+theo thời gian, độ tin theo nguồn để chống đầu độc memory (MINJA), và cho hết
+hạn memory không ai dùng (Copilot bỏ memory không được dùng sau 28 ngày).
+
+### 16.1 Các trường
+
+Tất cả nằm trong `memory/validity.rs`, chỗ duy nhất mà một trường mới về sau
+sẽ được thêm vào:
+
+| Trường | Có ở | Nói gì |
+|---|---|---|
+| `origin.kind` | mọi entry do memory tool hoặc một review ghi | chữ của nó từ đâu ra: `user`, `tool`, `web`, `file`, `agent`, `child`, `review`. Host quyết định (§16.4). Entry không có trường này được đọc là `agent`. |
+| `supersedes` | entry đã sửa các entry khác | memory id của các entry nó đã đóng |
+| `superseded_by` | entry bị một entry sau thay thế | memory id của entry đó |
+| `expired` | entry bị lượt hết hạn đóng | lý do: `unused` |
+
+**Hiệu lực** của một entry là giá trị `temporal` của nó: một khoảng
+`[start, end)`, hoặc một thời điểm mà từ đó nó đúng. Không có `temporal` thì
+nó đúng từ lúc được tạo. Đóng một entry là cho khoảng của nó một điểm kết thúc
+là lúc này, tính từ điểm bắt đầu nó đang có (lúc tạo nếu chưa có). Entry đã
+đóng là đã kết thúc (`store::ended`): digest bỏ nó ra, như với một khoảng đã
+hết.
+
+### 16.2 Mâu thuẫn được giải ngay lúc ghi, bằng cách đóng hiệu lực
+
+`write` của tool `memory` nhận `supersedes: [id, ...]` (key, địa chỉ
+`<tree>/<name>` hoặc memory id):
+
+- Khi tạo mới, entry mới ghi `supersedes` (memory id của các entry đó) và đúng
+  từ lúc này, trừ khi `temporal` của nó nói từ khi nào. Mỗi entry được nêu bị
+  đóng: `temporal.end` = lúc này, `superseded_by` = memory id của entry mới,
+  thành phiên bản kế tiếp của nó. Không xoá gì. Memory id của entry mới được
+  cấp trước khi lưu (`Writer::reviving`) để các entry bị đóng có thể nêu nó;
+  việc đóng là thêm một lần lưu trong cùng operation, với cause `supersede`.
+- Khi cập nhật, entry được ghi cũng thay thế chúng như vậy, và `supersedes`
+  của nó dài thêm. Một lần cập nhật có thể chỉ có `supersedes`.
+- Entry được nêu phải còn sống, cùng loại, không phải chính entry đang ghi, và
+  chưa bị thay thế (nếu đã bị thì lỗi nêu entry đã thay nó, để thay thế entry
+  đó). Kiểm tra trùng lặp và kiểm tra lặp lại bằng ngôn ngữ khác không tính
+  các entry mà lần ghi thay thế: lần ghi sửa chúng chứ không lặp lại chúng.
+- Ghi chú `related` khi tạo mới, và cả hai lời từ chối vì trùng, đưa ra cho
+  model các lựa chọn: thay thế entry cũ, cập nhật entry đang có, hoặc không ghi
+  gì (xoá entry mới).
+
+Các edit của review cũng vậy: edit `{"action": "supersede", "kind",
+"id": <cũ>, "title", "content", "path"?, "metadata"?, "evidence"}` ghi một
+entry mới có key theo title, cạnh path và project của entry cũ, rồi đóng entry
+cũ (`validity::supersede_edit`). Refinement ghi nó thành hai edit: edit của
+entry cũ (`before` của nó, và `after` đã đóng) và `create` của entry mới, nên
+rollback sẽ xoá entry mới và đặt lại entry cũ.
+
+`restore` (hoặc `revert`) chỉ với id, trên một entry bị một lần sửa hoặc lượt
+hết hạn đóng, sẽ mở lại nó: `superseded_by` và `expired` bị bỏ, và khoảng hiệu
+lực trở về như trước khi bị đóng.
+
+`history` cho thấy chuỗi đó: mỗi phiên bản mang `supersedes`,
+`superseded_by`, `expired` và `from` của nó.
+
+### 16.3 Câu hỏi theo thời gian
+
+Memory search nhận:
+
+| Tham số | Đọc |
+|---|---|
+| `as_of` | các entry còn hiệu lực lúc đó: hiệu lực của chúng phủ thời điểm ấy, và chúng đã được ghi trước đó. Entry cũ của một sự thật đã được sửa, khi hỏi về một lúc trước lần sửa. |
+| `since`, `until` | các entry còn hiệu lực ở một lúc nào đó giữa hai mốc |
+| `include_ended` | cả các entry đã đóng |
+
+Search nêu một thời điểm (`as_of`, `since`/`until`, hoặc bộ lọc temporal ở
+§6.4) thì đọc cả entry đã đóng, và xếp kết quả theo mức hiệu lực khớp với thời
+điểm đó trước rồi mới đến từ khóa: với một thời điểm, entry có đúng lúc ấy
+không; với một khoảng, phần của khoảng mà entry còn đúng (`validity::fit`).
+Các chế độ của bộ lọc temporal tạo nên khoảng đó: `contains` là một thời điểm,
+`after` và `before` là hai mốc, `overlaps` và `within` là khoảng của chúng.
+
+Search không nêu thời điểm thì bỏ ra các entry đã đóng (bị thay thế hoặc hết
+hạn). Entry mà khoảng của chính nó đã hết vẫn được đọc như trước. Giữa những
+entry khớp từ khóa ngang nhau, entry còn đúng bây giờ đứng trên entry đã kết
+thúc, và entry do người dùng hay agent nói đứng trên entry từ một trang web
+hay một child (`search::settled`); entry khớp hơn giữ nguyên chỗ. Khi từ khóa
+cũng khớp entry đã đóng, kết quả nói có bao nhiêu (`closed.left_out`) và rằng
+`as_of` hoặc `include_ended` sẽ đọc chúng.
+
+Không dùng model để xếp lại: mỗi lần search gọi model thì tốn thời gian và
+token của một request, trong khi hiệu lực và từ khóa đã đủ sắp xếp những gì
+một câu hỏi theo thời gian cần.
+
+### 16.4 Độ tin theo nguồn
+
+`origin.kind` do host quyết định, không bao giờ do model. Memory tool đọc hội
+thoại như journal của project store đang giữ (`memory/provenance.rs`; 4.000
+event mới nhất): những chữ người dùng gõ ở mỗi lượt (lượt do host bắt đầu, như
+báo cáo của một child, là của child), và kết quả của mỗi lần gọi tool theo
+tool đó - của web tool (`web_search`, `web_fetch`) là `web`, của lần đọc file
+(`read_file`, `search_text`, `list_files`, `glob`, `find_files`) là `file`, của
+một child được giao việc là `child`, của chính các tool memory thì không tính,
+của mọi tool khác là `tool`. Mỗi từ của entry, đã bỏ dấu và lấy gốc, có trọng
+số bằng IDF của nó trên các phần đó (từ không có ở phần nào nặng như từ chỉ có
+ở một phần). Entry thuộc loại có các phần giữ nhiều trọng số nhất, khi chúng
+giữ ít nhất một nửa; nếu không thì là `agent`, chữ của chính agent. Hòa thì
+loại đáng tin hơn thắng, theo thứ tự user, file, tool, child, web. Không có
+danh sách từ nào phán xét văn bản.
+
+Một lần cập nhật lấy loại mà chữ của nó có bây giờ; khi hội thoại này không
+cho thấy gì, entry giữ loại cũ, nên chữ của một trang web vẫn là của trang đó
+dù về sau ai viết lại. Một lần move giữ nguyên loại. Edit của review lấy loại
+của lượt mà evidence của nó trích nguyên văn (`provenance::quoted_kind`), nếu
+không thì loại mà các từ của trích dẫn chỉ tới, nếu không nữa thì `review`:
+review tự suy ra.
+
+Hệ quả:
+
+- Digest ghi rõ entry từ một trang web (`, from a web page: unverified`) hay
+  từ một child (`, from a delegated agent: unverified`). Search, read và
+  history cho thấy `from` và `unverified`.
+- Entry như vậy đứng dưới một entry ngang bằng khác (§16.3).
+- Entry có loại `web` - bây giờ, hoặc lúc được lưu - không thể được ghi vào
+  `constraints/*` hay `user/preferences` (và bên dưới): một lần tạo, cập nhật,
+  move hay edit của review đều bị từ chối kèm lý do, trước khi lệnh chạy. Model
+  được bảo giữ nó thành một fact ở chỗ khác, hoặc nhờ người dùng tự nói quy
+  tắc đó.
+
+### 16.5 Hết hạn theo mức dùng
+
+Một lượt chạy đóng các entry không ai dùng: không được đọc và không xuất hiện
+trong kết quả search nào trong `HA_MEMORY_EXPIRE_DAYS` ngày (mặc định 28; 0 là
+tắt; được dùng số ngày lẻ, nên test có thể dùng vài giây) kể từ lần cuối được
+ghi, đọc hoặc tìm thấy. Được hiện trong digest không tính là dùng. Mỗi entry bị
+đóng chứ không bị xoá (`temporal.end`, `expired: "unused"`), thành một event
+của writer `sleep` với cause `expire`; `restore` chỉ với id sẽ đưa nó về.
+
+- Được miễn: `constraints/*`, `user/preferences`, entry `source: learning`, và
+  entry được ghim.
+- Đồng hồ bắt đầu từ lượt chạy đầu tiên trên một kho (`expiry_since` trong meta
+  của kho): trước 0.8.8 không có lần đọc nào được đếm, và một lần nâng cấp
+  không được đóng cả kho vì một sự không-dùng chưa ai đo.
+- Lượt chạy là một job của hàng đợi Sleep (kind `expiry`), chạy ở cuối một
+  lượt trong app và cuối `ha exec`, trên kho toàn cục và kho của hội thoại,
+  nhiều nhất mỗi ngày một lần (hoặc mỗi chu kỳ một lần, nếu chu kỳ ngắn hơn).
+  Nó chạy cục bộ và nhanh: không gọi model.
+- `ha doctor` cho biết lượt gần nhất chạy lúc nào và đã đóng bao nhiêu entry
+  (meta `expiry` của kho toàn cục).

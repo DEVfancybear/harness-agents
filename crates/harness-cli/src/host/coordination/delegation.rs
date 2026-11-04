@@ -3518,6 +3518,10 @@ impl ExternalToolCatalog for DelegateCatalog {
     }
 }
 
+/// The tools a parent reaches its children with: what they return is a
+/// child's report, which the memory reads as unverified (`memory_provenance`).
+pub const TOOLS: [&str; 4] = ["delegate", INTEGRATE_TOOL, COMPARE_TOOL, ROOT_MESSAGE_TOOL];
+
 /// The root agent's tool that brings its coders' work back.
 const INTEGRATE_TOOL: &str = "integrate_children";
 

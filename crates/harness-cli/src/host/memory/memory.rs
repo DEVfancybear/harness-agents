@@ -95,7 +95,7 @@ pub const GUIDANCE: &str = concat!(
     "Search matches words, not meaning: when the wording or language may differ from the entries (the user writes Vietnamese, an entry may be in English), pass up to four variants in queries in the same search - synonyms and a translation; when a search still finds nothing, search again with other words (a broader term, a name or path from the code) before saying memory has nothing. ",
     "When the answer is spread over several entries, search with mode readout: it reads every entry for the request into a few slots, each the entries behind one part of it. ",
     "When the user asks you to remember something, states a lasting preference or corrects how you work, or a decision is reached that later work depends on, write it in the same turn without asking. Use scope global for what holds across conversations and projects (the user's preferences, how they like to work), project for a stable fact about this project (its stack, conventions, where things live; it never reaches another project), and local for this conversation's state. ",
-    "Search before writing and update the matching entry with its id and expected_version instead of adding a near-duplicate (a write that reads as an entry already kept is refused with that entry's id); when a write returns related entries, update or delete one the new fact replaces or contradicts. Delete an entry that turned out wrong. One fact or rule per entry, short and self-contained. Never store secrets, credentials or tokens. ",
+    "Search before writing and update the matching entry with its id and expected_version instead of adding a near-duplicate (a write that reads as an entry already kept is refused with that entry's id); when a fact changed (the user corrects it, a decision is reversed), write the new fact with supersedes: [the old entry's id]: the old one is closed, not deleted - it held until now, and search with as_of an earlier time still finds it - and when a write returns related entries, supersede one the new fact replaces or contradicts. Delete an entry that turned out wrong (never true). One fact or rule per entry, short and self-contained. Never store secrets, credentials or tokens. ",
     "An update by id changes only what it gives: leave content out to retag, move or re-time an entry. An update or a delete keeps the earlier version: history shows an entry's earlier versions (also of a deleted one), and revert brings one back. ",
     "An entry sits in a tree (/global/..., /projects/<this project>/..., /local/...; a relative tree is a path under its scope) and may carry meta (facets such as type, status, source, confidence) and temporal (when it happened, or {start, end} for the period it holds; once that period ends the entry is no longer shown every turn, but search still finds it). Its name is unique in its tree, so <tree>/<name> addresses it; its memory_id never changes. ",
     "An entry is a short note of what was said, not the turns themselves: read shows its origin (the conversation it came from and, for one a review wrote, the quote it rests on), and when the entry is not enough, history_search with scope \"project\" and that quote or the entry's words reads the turns behind it word for word. ",
@@ -388,6 +388,141 @@ impl MemoryHost {
         json!({"conversation": self.conversation, "via": "memory tool"})
     }
 
+    /// [`Self::origin`] of an entry whose words are of `kind`
+    /// (`memory_validity::ORIGIN_KINDS`).
+    fn origin_of(&self, kind: &str) -> Value {
+        let mut origin = self.origin();
+        origin["kind"] = json!(kind);
+        origin
+    }
+
+    /// This conversation as its journal holds it, for where an entry's words
+    /// came from: nothing without a project, whose store holds the journal.
+    fn said(&self) -> Vec<super::memory_provenance::Said> {
+        match (&self.project, self.global.parent()) {
+            (Some(project), Some(data)) if !self.conversation.is_empty() => {
+                super::memory_provenance::of_task(
+                    &super::memory_provenance::store_dir(data, &project.key),
+                    &self.conversation,
+                )
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The kind of origin of an entry saying `title` and `content`, as this
+    /// conversation shows it; for an entry kept before (`before`), its own
+    /// kind when this conversation shows none - a page's words stay a page's
+    /// whoever rewrites them later.
+    fn origin_kind(&self, title: &str, content: &str, before: Option<&Value>) -> &'static str {
+        let found = super::memory_provenance::kind_of(title, content, &self.said());
+        match before.map(super::memory_validity::origin_kind) {
+            Some(kept) if found == super::memory_validity::AGENT => kept,
+            _ => found,
+        }
+    }
+
+    /// Refuse to keep an entry under a path that steers every later turn
+    /// (`constraints/*`, `user/preferences`) when its words came from a web
+    /// page: now, or when it was kept (`before`).
+    fn refuse_steering(
+        &self,
+        path: &str,
+        title: &str,
+        content: &str,
+        before: Option<&Value>,
+    ) -> Result<(), String> {
+        if !super::memory_validity::steering_path(path) {
+            return Ok(());
+        }
+        let kept = before.map(super::memory_validity::origin_kind);
+        let kind = if kept == Some("web") {
+            "web"
+        } else {
+            self.origin_kind(title, content, before)
+        };
+        super::memory_validity::steering_refusal(kind, path).map_or(Ok(()), Err)
+    }
+
+    /// The live entries `supersedes` names (ids, `<tree>/<name>` addresses or
+    /// memory ids), each as its scope, kind and key: of `kind`, not closed
+    /// already, and not `except` (the entry an update writes).
+    fn superseded(
+        &self,
+        arguments: &Value,
+        kind: &str,
+        except: Option<(&str, &str)>,
+    ) -> Result<Vec<(String, String, String)>, String> {
+        let Some(given) = arguments
+            .get(super::memory_validity::SUPERSEDES)
+            .filter(|value| !value.is_null())
+        else {
+            return Ok(Vec::new());
+        };
+        let ids = given
+            .as_array()
+            .filter(|ids| ids.iter().all(Value::is_string))
+            .ok_or(
+                "supersedes is a list of the ids of the entries the new one corrects or replaces",
+            )?;
+        let mut found = Vec::new();
+        for id in ids.iter().filter_map(Value::as_str) {
+            let (scope, of_kind, key) =
+                self.locate(&json!({"action": "read", "id": id, "kind": kind}))?;
+            if except.is_some_and(|(scope_, key_)| scope_ == scope && key_ == key) {
+                return Err("an entry does not supersede itself".to_owned());
+            }
+            let doc = super::refine::load_raw(self.dir(&scope))["entries"][&of_kind][&key].clone();
+            if let Some(by) = doc[super::memory_validity::SUPERSEDED_BY].as_str() {
+                return Err(format!(
+                    "{scope}:{key} was superseded already (by {by}); supersede the entry that replaced it"
+                ));
+            }
+            if !found.contains(&(scope.clone(), of_kind.clone(), key.clone())) {
+                found.push((scope, of_kind, key));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Close each superseded entry: valid until `at`, replaced by the memory
+    /// `by`, in the stores of `states`, which are saved with `writer`; the
+    /// caller holds their locks.
+    fn close_superseded(
+        &self,
+        targets: &[(String, String, String)],
+        by: &str,
+        states: &mut std::collections::BTreeMap<PathBuf, Value>,
+        writer: &Writer,
+    ) -> Result<Vec<String>, String> {
+        let at = super::memory_store::now();
+        let mut closed = Vec::new();
+        for (scope, kind, key) in targets {
+            let dir = self.dir(scope).to_path_buf();
+            let state = states
+                .entry(dir)
+                .or_insert_with_key(|dir| super::refine::load_raw(dir));
+            let doc = &mut state["entries"][kind][key];
+            if !doc.is_object() {
+                return Err(format!("memory entry {scope}:{key} was deleted meanwhile"));
+            }
+            super::memory_validity::supersede(doc, by, &at);
+            closed.push(format!("{scope}:{key}"));
+        }
+        for (dir, state) in states.iter() {
+            super::refine::save_raw(dir, state, writer)?;
+        }
+        Ok(closed)
+    }
+
+    /// Lock the stores of `dirs`, the global one first.
+    fn lock_all(&self, dirs: &[PathBuf]) -> Result<Vec<std::fs::File>, String> {
+        let mut dirs = dirs.to_vec();
+        dirs.sort_by_key(|dir| *dir != self.global);
+        dirs.dedup();
+        dirs.iter().map(|dir| harness::lock_state(dir)).collect()
+    }
+
     /// The model writing through this tool, for `cause`.
     fn writer(&self, cause: &str) -> Writer {
         Writer::new("model", &self.origin(), cause)
@@ -515,7 +650,12 @@ impl MemoryHost {
 
     /// A write's arguments: a create's title and content, or an update's
     /// change; sizes, place, no secret; the version an update read; and a
-    /// create that is not a duplicate of an entry kept.
+    /// create that is not a duplicate of an entry kept; and what it
+    /// supersedes, and where its words came from, fit where it goes.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one write's checks: its fields, its place, its source, its duplicates"
+    )]
     fn check_write(&self, arguments: &Value) -> Result<(), String> {
         // An update by id is a patch: it keeps what it does not give.
         let updating = optional_text(arguments, "id")?.is_some();
@@ -539,9 +679,12 @@ impl MemoryHost {
                 .iter()
                 .all(|key| arguments.get(*key).is_none_or(Value::is_null))
             && arguments.get("temporal").is_none()
+            && arguments
+                .get(super::memory_validity::SUPERSEDES)
+                .is_none_or(Value::is_null)
         {
             return Err(format!(
-                "an update names what changes: {} or temporal",
+                "an update names what changes: {}, temporal or supersedes",
                 PATCHED.join(", ")
             ));
         }
@@ -581,12 +724,40 @@ impl MemoryHost {
             }
         }
         if updating {
-            return needs_version(arguments);
+            needs_version(arguments)?;
+            // What the entry will say and where, for where its words came
+            // from: a page's words do not become a rule every turn follows.
+            let (scope, kind, id) = self.locate(arguments)?;
+            let before = super::refine::load_raw(self.dir(&scope))["entries"][&kind][&id].clone();
+            let given = |key: &str, kept: &str| {
+                optional_text(arguments, key).ok().flatten().map_or_else(
+                    || before[kept].as_str().unwrap_or_default().to_owned(),
+                    str::to_owned,
+                )
+            };
+            let path = self
+                .write_path(arguments)?
+                .unwrap_or_else(|| before["path"].as_str().unwrap_or_default().to_owned());
+            self.refuse_steering(
+                &path,
+                &given("title", "title"),
+                &given("content", "content"),
+                Some(&before),
+            )?;
+            self.superseded(arguments, &kind, Some((&scope, &id)))?;
+            return Ok(());
         }
         let scope = self.new_scope(arguments)?;
         let kind = kinds(arguments)?[0];
         let name = new_name(arguments, title, kind)?;
-        let tree = self.new_tree(scope, self.write_path(arguments)?.as_deref());
+        let path = self.write_path(arguments)?;
+        self.refuse_steering(path.as_deref().unwrap_or("general"), title, content, None)?;
+        let superseded = self
+            .superseded(arguments, kind, None)?
+            .into_iter()
+            .map(|(_, _, key)| key)
+            .collect::<Vec<_>>();
+        let tree = self.new_tree(scope, path.as_deref());
         // A create that may land on a taken name says so; it is not a
         // duplicate of the entry it means to replace.
         let settles = matches!(
@@ -604,8 +775,9 @@ impl MemoryHost {
         if !settles {
             // Refused before the call runs, a duplicate reads as the refusal
             // it is; refused while running, the model was told the outcome
-            // was unknown and might have had side effects.
-            self.refuse_duplicate(scope, kind, title, content, arguments)?;
+            // was unknown and might have had side effects. The entries it
+            // supersedes are what it corrects, not what it repeats.
+            self.refuse_duplicate_except(scope, kind, title, content, arguments, &superseded)?;
         }
         Ok(())
     }
@@ -1104,6 +1276,7 @@ impl MemoryHost {
         if entry["origin"].is_object() {
             read["origin"] = entry["origin"].clone();
         }
+        chain_fields(&mut read, entry);
         if entry["project"].is_object() {
             read["project"] = entry["project"]["name"].clone();
         }
@@ -1149,7 +1322,14 @@ impl MemoryHost {
             return self.move_entry(arguments, &scope, &kind, &id, target);
         }
         let dir = self.dir(&scope);
-        let _lock = harness::lock_state(dir)?;
+        let targets = self.superseded(arguments, &kind, Some((&scope, &id)))?;
+        let mut dirs = vec![dir.to_path_buf()];
+        dirs.extend(
+            targets
+                .iter()
+                .map(|(scope, _, _)| self.dir(scope).to_path_buf()),
+        );
+        let _locks = self.lock_all(&dirs)?;
         let mut state = super::refine::load_raw(dir);
         let before = state["entries"][&kind][&id].clone();
         if !before.is_object() {
@@ -1161,6 +1341,25 @@ impl MemoryHost {
         let tree = super::memory_store::tree_for(root(&scope), &entry);
         let name = free_in_tree(&state, &scope, &kind, &tree, &name, &id, arguments)?;
         entry["name"] = json!(name);
+        let memory = super::memory_store::ids(dir)?
+            .get(&(kind.clone(), id.clone()))
+            .cloned();
+        let closing = self.memory_ids(&targets)?;
+        if !closing.is_empty() {
+            let mut all = entry[super::memory_validity::SUPERSEDES]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            all.extend(closing.iter().map(|memory| json!(memory)));
+            let all = all
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            super::memory_validity::superseding(&mut entry, &all, &super::memory_store::now());
+        }
         if same_entry(&kind, &id, &before, &entry) {
             return Ok(json!({
                 "saved": "unchanged", "reason": "the write changes nothing",
@@ -1172,7 +1371,7 @@ impl MemoryHost {
         if entry["metadata"]["pinned"] == true {
             self.pinned_fits(&scope, &kind, &id, &title, &content)?;
         }
-        entry["origin"] = self.origin();
+        entry["origin"] = self.origin_of(self.origin_kind(&title, &content, Some(&before)));
         entry["source"] = json!("agent");
         entry["updated_at"] = json!(now());
         entry["version"] = json!(current + 1);
@@ -1197,12 +1396,35 @@ impl MemoryHost {
             }
         }
         state["entries"][&kind][&key] = entry;
-        super::refine::save_raw(dir, &state, &self.writer("update"))?;
+        let writer = self.writer("update");
+        super::refine::save_raw(dir, &state, &writer)?;
         let mut saved = self.saved("updated", &scope, &kind, &key, &state);
         if key != id {
             saved["renamed_from"] = json!(id);
         }
+        if let (Some(memory), false) = (memory, targets.is_empty()) {
+            let mut states = std::collections::BTreeMap::from([(dir.to_path_buf(), state)]);
+            saved["superseded"] = json!(self.close_superseded(
+                &targets,
+                &memory,
+                &mut states,
+                &writer.because("supersede"),
+            )?);
+        }
         Ok(saved)
+    }
+
+    /// The memory ids of entries, each as its scope, kind and key.
+    fn memory_ids(&self, entries: &[(String, String, String)]) -> Result<Vec<String>, String> {
+        entries
+            .iter()
+            .map(|(scope, kind, key)| {
+                super::memory_store::ids(self.dir(scope))?
+                    .get(&(kind.clone(), key.clone()))
+                    .cloned()
+                    .ok_or_else(|| format!("memory entry {scope}:{key} has no memory id"))
+            })
+            .collect()
     }
 
     /// Apply what an update gives to `entry` (kept under `key`): its title,
@@ -1297,7 +1519,13 @@ impl MemoryHost {
         if entry["metadata"]["pinned"] == true {
             self.pinned_fits(target, kind, id, &title, &content)?;
         }
-        entry["origin"] = self.origin();
+        self.refuse_steering(
+            entry["path"].as_str().unwrap_or_default(),
+            &title,
+            &content,
+            Some(&before),
+        )?;
+        entry["origin"] = self.origin_of(self.origin_kind(&title, &content, Some(&before)));
         entry["source"] = json!("agent");
         entry["updated_at"] = json!(now());
         entry["version"] = json!(current + 1);
@@ -1395,7 +1623,16 @@ impl MemoryHost {
         let name = new_name(arguments, &title, kind)?;
         let tree = self.new_tree(scope, path.as_deref());
         let dir = self.dir(scope);
-        let _lock = harness::lock_state(dir)?;
+        // Where the words came from, read before any store is locked.
+        let from = self.origin_kind(&title, &content, None);
+        let targets = self.superseded(arguments, kind, None)?;
+        let mut dirs = vec![dir.to_path_buf()];
+        dirs.extend(
+            targets
+                .iter()
+                .map(|(scope, _, _)| self.dir(scope).to_path_buf()),
+        );
+        let _locks = self.lock_all(&dirs)?;
         let mut state = super::refine::load_raw(dir);
         if let Some(key) = named(&state, scope, kind, &tree, &name, None) {
             let existing = state["entries"][kind][&key].clone();
@@ -1438,7 +1675,7 @@ impl MemoryHost {
             if entry["metadata"]["pinned"] == true {
                 self.pinned_fits(scope, kind, &key, &title, &content)?;
             }
-            entry["origin"] = self.origin();
+            entry["origin"] = self.origin_of(from);
             entry["source"] = json!("agent");
             entry["updated_at"] = json!(now());
             entry["version"] = json!(version + 1);
@@ -1452,9 +1689,25 @@ impl MemoryHost {
         if pinned {
             self.pinned_fits(scope, kind, &key, &title, &content)?;
         }
-        self.refuse_duplicate(scope, kind, &title, &content, arguments)?;
+        let replaced = targets
+            .iter()
+            .map(|(_, _, key)| key.clone())
+            .collect::<Vec<_>>();
+        self.refuse_duplicate_except(scope, kind, &title, &content, arguments, &replaced)?;
         let close = self.close_entries(scope, kind, &title, &content);
-        self.refuse_possible_repeat(scope, kind, &content, arguments, &close)?;
+        // An entry it supersedes is the one it corrects, not one it repeats.
+        let mut answered = close.clone();
+        answered.extend(
+            self.compared_entries(scope, kind)
+                .into_iter()
+                .filter(|entry| {
+                    targets
+                        .iter()
+                        .any(|(scope, _, key)| *scope == entry.scope && *key == entry.id)
+                })
+                .map(|entry| (entry, 0.0, 0.0)),
+        );
+        self.refuse_possible_repeat(scope, kind, &content, arguments, &answered)?;
         let stamp = now();
         let mut record = json!({
             "id": key,
@@ -1470,7 +1723,7 @@ impl MemoryHost {
             "arguments": {},
             "metadata": {},
             "source": "agent",
-            "origin": self.origin(),
+            "origin": self.origin_of(from),
             "created_at": stamp,
             "updated_at": stamp,
             "version": 1,
@@ -1481,9 +1734,34 @@ impl MemoryHost {
         {
             record["project"] = project.value();
         }
+        // A correction: the new entry is given its memory id now, so the
+        // entries it closes can name it.
+        let mut writer = self.writer("create");
+        let memory = (!targets.is_empty()).then(|| uuid::Uuid::now_v7().to_string());
+        if let Some(memory) = &memory {
+            super::memory_validity::superseding(
+                &mut record,
+                &self.memory_ids(&targets)?,
+                &super::memory_store::now(),
+            );
+            writer = writer.reviving(kind, &key, memory);
+        }
         state["entries"][kind][&key] = record;
-        super::refine::save_raw(dir, &state, &self.writer("create"))?;
+        super::refine::save_raw(dir, &state, &writer)?;
         let mut saved = self.saved("created", scope, kind, &key, &state);
+        if let Some(memory) = &memory {
+            let mut states = std::collections::BTreeMap::from([(dir.to_path_buf(), state)]);
+            saved["superseded"] = json!(self.close_superseded(
+                &targets,
+                memory,
+                &mut states,
+                &writer.because("supersede"),
+            )?);
+            saved["note"] = json!(
+                "The entries it supersedes are closed, not deleted: they held until now, search reads them with as_of an earlier time or include_ended, and history shows them."
+            );
+            return Ok(saved);
+        }
         let related = close
             .iter()
             .take(3)
@@ -1496,7 +1774,7 @@ impl MemoryHost {
         if !related.is_empty() {
             saved["related"] = json!(related);
             saved["note"] = json!(
-                "These kept entries share much with the new one: if it replaces or contradicts one, update or delete that one."
+                "These kept entries share much with the new one. If the new one corrects, replaces or contradicts one, supersede it: update the new entry with supersedes: [that entry's id] (and its expected_version), which closes the old one - kept in history, valid until now - instead of deleting it. If it says what one of them already says, update that one instead and delete the new entry. If it adds nothing, delete the new entry."
             );
         }
         Ok(saved)
@@ -1663,7 +1941,7 @@ impl MemoryHost {
                 .collect::<Vec<_>>();
             if !only_here.is_empty() {
                 return Err(format!(
-                    "this may say again what {}:{} (v{}, {:?}) keeps - \"{}\" - in other words or another language: it is the only entry that also names '{}'. If it is the same fact, update that entry with its id and expected_version instead of adding another; if it is a different fact, write again with distinct: true",
+                    "this may say again what {}:{} (v{}, {:?}) keeps - \"{}\" - in other words or another language: it is the only entry that also names '{}'. If it is the same fact, update that entry with its id and expected_version instead of adding another; if it is a different fact, write again with distinct: true; if it corrects that one, write again with supersedes: [\"{0}:{1}\"]",
                     entry.scope,
                     entry.id,
                     entry.version,
@@ -1740,12 +2018,14 @@ impl MemoryHost {
             .find(|(_, likeness, _)| *likeness >= DUPLICATE_SIMILARITY)
         {
             return Err(format!(
-                "this reads as the same fact as {}:{} (v{}, {:?}, {:.0}% alike): update that entry with its id and expected_version instead of adding another; pass distinct: true only when it is a different fact",
+                "this reads as the same fact as {}:{} (v{}, {:?}, {:.0}% alike): update that entry with its id and expected_version instead of adding another; pass distinct: true only when it is a different fact; when the fact changed and the old one held until now, write the new one with supersedes: [\"{}:{}\"], which closes that entry instead of rewriting it",
                 same.scope,
                 same.id,
                 same.version,
                 same.title.as_deref().unwrap_or_default(),
-                likeness * 100.0
+                likeness * 100.0,
+                same.scope,
+                same.id,
             ));
         }
         if let Some((same, _, contained)) = close
@@ -1878,9 +2158,14 @@ impl MemoryHost {
                 }
                 let live = &state["entries"][kind][id];
                 let exists = live.is_object() && self.holds(scope, live);
+                // An entry a correction or the expiry pass closed opens again
+                // with its id alone: as it is, its period as it was before.
+                let reopening =
+                    exists && wanted_version.is_none() && super::memory_validity::closed(live);
                 let source = match wanted_version {
                     Some(version) => records.iter().find(|record| record.version == version),
                     None if !exists => records.first().filter(|record| record.deleted),
+                    None if reopening => records.first(),
                     None => None,
                 };
                 let Some(source) = source else {
@@ -1892,8 +2177,16 @@ impl MemoryHost {
                         format!("{scope}:{id} has no such earlier version; history lists them")
                     });
                 };
-                let mut entry = source.doc.clone();
-                let next = if exists {
+                let mut entry = if reopening {
+                    let mut entry = live.clone();
+                    super::memory_validity::reopen(&mut entry, &source.doc);
+                    entry
+                } else {
+                    source.doc.clone()
+                };
+                let next = if reopening {
+                    live["version"].as_i64().unwrap_or(1) + 1
+                } else if exists {
                     expected(arguments, dir, scope, kind, id, live, "restoring")? + 1
                 } else {
                     // The version sequence goes on past every version it had.
@@ -1907,7 +2200,7 @@ impl MemoryHost {
                 let from = source.version;
                 entry["version"] = json!(next);
                 entry["updated_at"] = json!(now());
-                entry["origin"] = json!({"conversation": self.conversation, "via": "memory tool", "restored_from": from});
+                entry["origin"] = json!({"conversation": self.conversation, "via": "memory tool", "restored_from": from, "kind": super::memory_validity::origin_kind(&source.doc)});
                 // A deleted entry comes back under the id it had when it went.
                 let target = if exists {
                     id.to_owned()
@@ -1935,9 +2228,13 @@ impl MemoryHost {
                         .reviving(kind, &target, &source.memory)
                 };
                 super::refine::save_raw(dir, &state, &writer)?;
-                return Ok(json!({
+                let mut restored = json!({
                     "saved": "restored", "scope": scope, "kind": kind, "id": target, "version": next, "from_version": from
-                }));
+                });
+                if reopening {
+                    restored["reopened"] = json!(true);
+                }
+                return Ok(restored);
             }
         }
         Err(format!(
@@ -2108,6 +2405,11 @@ impl MemoryHost {
             if entry.scope != scope {
                 self.refuse_beside_store(scope, &entry.kind)?;
             }
+            if let Some(refusal) =
+                super::memory_validity::steering_refusal(entry.standing.kind, &path)
+            {
+                return Err(format!("{}:{}: {refusal}", entry.scope, entry.id));
+            }
             plans.push((entry, tree, scope, path));
         }
         let listing = plans
@@ -2174,7 +2476,7 @@ impl MemoryHost {
                 }
             }
             moved["updated_at"] = json!(stamp);
-            moved["origin"] = self.origin();
+            moved["origin"] = self.origin_of(super::memory_validity::origin_kind(&doc));
             // An entry keeps its name; another entry with it in the tree it
             // goes to is a conflict, as in memory-engine, and nothing moves.
             moved["name"] = json!(entry.name);
@@ -2508,7 +2810,21 @@ fn version_view(scope: &str, kind: &str, key: &str, doc: &Value) -> Value {
     {
         shown["temporal"] = super::memory_store::temporal_value(&bounds);
     }
+    chain_fields(&mut shown, doc);
     shown
+}
+
+/// The chain of corrections an entry's document records - the entries it
+/// superseded and the one that superseded it - why the expiry pass closed
+/// it, and where its words came from.
+fn chain_fields(shown: &mut Value, doc: &Value) {
+    standing_fields(shown, &super::memory_validity::Standing::of(doc));
+    if let Some(closed) = doc[super::memory_validity::SUPERSEDES]
+        .as_array()
+        .filter(|closed| !closed.is_empty())
+    {
+        shown[super::memory_validity::SUPERSEDES] = json!(closed);
+    }
 }
 
 /// Whether `id` is a store's immutable id (a UUID, as `memory_id` shows it)
@@ -2805,6 +3121,24 @@ fn shown_meta(metadata: Option<&serde_json::Map<String, Value>>) -> Option<Value
     (!meta.is_empty()).then_some(Value::Object(meta))
 }
 
+/// What a result says of an entry's standing: where its words came from
+/// when it was not the agent's own (`from`, and `unverified` for a page's or
+/// a child's), and what closed it.
+fn standing_fields(value: &mut Value, standing: &super::memory_validity::Standing) {
+    if !standing.kind.is_empty() && standing.kind != super::memory_validity::AGENT {
+        value["from"] = json!(standing.kind);
+        if standing.unverified() {
+            value["unverified"] = json!(true);
+        }
+    }
+    if let Some(by) = &standing.superseded_by {
+        value[super::memory_validity::SUPERSEDED_BY] = json!(by);
+    }
+    if let Some(why) = &standing.expired {
+        value[super::memory_validity::EXPIRED] = json!(why);
+    }
+}
+
 /// An entry as a result shows it, its content cut to `limit` characters.
 fn view(entry: &Entry, limit: usize) -> Value {
     let content = entry.content.as_deref().unwrap_or_default();
@@ -2849,6 +3183,7 @@ fn view(entry: &Entry, limit: usize) -> Value {
     if let Some(age) = harness::age_label(entry) {
         value["age"] = json!(age);
     }
+    standing_fields(&mut value, &entry.standing);
     if cut {
         value["truncated"] = json!(true);
     }
@@ -2916,8 +3251,8 @@ fn organizing_properties() -> serde_json::Map<String, Value> {
         "levels":{"type":"integer","minimum":1,"description":"tree: how many levels below tree to show."},
         "max_count":{"type":"integer","minimum":1,"description":"count: stop counting here."},
         "operation_id":{"type":"string","description":"history: the changes one call or refinement made together."},
-        "since":{"type":"string","description":"history: changes at or after this time."},
-        "until":{"type":"string","description":"history: changes before this time."},
+        "since":{"type":"string","description":"history: changes at or after this time. search: entries that held at some time from then on, closed ones included."},
+        "until":{"type":"string","description":"history: changes before this time. search: entries that held at some time before it, closed ones included."},
         "operation":{"type":"string","enum":["insert","update","delete"],"description":"history: only this kind of change."},
         "order":{"type":"string","enum":["asc","desc"],"description":"history: oldest or newest (default) first."},
         "cursor":{"type":"string","description":"history: the next_cursor of the page before."},
@@ -2940,7 +3275,9 @@ fn search_properties() -> serde_json::Map<String, Value> {
         "format":{"type":"string","enum":["json","compact","yaml"],"description":"search, read, history: the result as JSON (default) or YAML text."},
         "sources":{"type":"array","items":{"type":"string","enum":["memory","knowledge"]},"description":"search: what to search, memory (default) and/or the knowledge libraries' pages; with both, one ranking of entries and pages, each hit naming its source."},
         "mode":{"type":"string","enum":["rank","readout"],"description":"search: rank (default) lists the best hits; readout reads every entry for the request into a few slots, each the entries that answer one part of it - for a request whose answer is spread over several entries."},
-        "slots":{"type":"integer","minimum":1,"maximum":16,"description":"search, mode readout: at most this many slots (default 8)."}
+        "slots":{"type":"integer","minimum":1,"maximum":16,"description":"search, mode readout: at most this many slots (default 8)."},
+        "as_of":{"type":"string","description":"search: what memory held at this time (\"2026-10-26\" or an RFC 3339 time): only the entries valid then and written by then, a corrected fact's old entry included. For a question about what was true before a correction."},
+        "include_ended":{"type":"boolean","description":"search: also the entries closed by a correction (superseded) or by expiry, which a search that names no time leaves out; a current entry ranks above a closed one of the same score."}
     });
     properties.as_object().cloned().unwrap_or_default()
 }
@@ -2996,7 +3333,7 @@ impl ExternalToolCatalog for MemoryHost {
         }
         let mut schema = json!({"type":"function","function":{
             "name":"memory",
-            "description":"Your persistent memory across turns and conversations: memory entries (facts, the user's preferences and decisions) and prompt notes (narrow behavioral rules). list and search show entries with id, tree and version; read returns one whole. Search before answering about earlier decisions or preferences you do not see in context. Write without asking when the user asks you to remember something, states a lasting preference or correction, or a decision is reached; search first and update the matching entry (id + expected_version) rather than duplicating. A new entry needs scope (or an absolute tree): global for what holds across conversations and projects, project for a fact about this project, local for this conversation. An update or delete keeps the earlier version: history lists them, revert brings one back. Never store secrets.",
+            "description":"Your persistent memory across turns and conversations: memory entries (facts, the user's preferences and decisions) and prompt notes (narrow behavioral rules). list and search show entries with id, tree and version; read returns one whole. Search before answering about earlier decisions or preferences you do not see in context. Write without asking when the user asks you to remember something, states a lasting preference or correction, or a decision is reached; search first and update the matching entry (id + expected_version) rather than duplicating. A new entry needs scope (or an absolute tree): global for what holds across conversations and projects, project for a fact about this project, local for this conversation. An update or delete keeps the earlier version: history lists them, revert brings one back. When a fact changed, write the new one with supersedes: [the old id]: the old one is closed (valid until now), not deleted, and search with as_of reads what held at an earlier time. Never store secrets.",
             "parameters":{"type":"object","properties":{
                 "action":{"type":"string","enum":["list","search","read","write","delete","history","revert","tree","count","status","move","copy","delete_tree"],"description":"tree: the entries' tree with counts; count: entries a tree or tree pattern matches; status: entries per scope; move/copy: every entry under source to the same place under destination; delete_tree: every entry under a tree (history keeps them). history with an id (or memory_id) shows that entry's versions, a page at a time; without one, the changes under a tree, of one operation_id or memory_id, or since a time."},
                 "query":{"type":"string","description":"search: key words of what you are looking for. Matches words (stems, prefixes, accents folded), not meaning: after a miss, search again with other words - a synonym, the other language, a broader term, a name or path from the code."},
@@ -3015,8 +3352,9 @@ impl ExternalToolCatalog for MemoryHost {
                 "pinned":{"type":"boolean","description":"write: true shows the entry whole in every turn (the user's language, form of address, a hard rule); false unpins; omitted keeps it as it is. Pinned entries share a 4,000-character bound."},
                 "expected_version":{"type":"integer","minimum":1,"description":"The version list, search or read returned; required to update, delete, or revert over an entry that exists."},
                 "version_hash":{"type":"string","description":"Instead of expected_version: the version_hash read returned."},
-                "version":{"type":"integer","minimum":1,"description":"revert: the earlier version history showed; omitted, a deleted entry comes back as it was."},
+                "version":{"type":"integer","minimum":1,"description":"revert: the earlier version history showed; omitted, a deleted entry comes back as it was, and a closed one (superseded or expired) opens again."},
                 "distinct":{"type":"boolean","description":"write: true keeps a new entry that reads like a kept one because it is a different fact."},
+                "supersedes":{"type":"array","items":{"type":"string"},"description":"write: the ids of the entries this one corrects or replaces (a fact that changed). Each is closed, not deleted: valid until now, marked superseded_by this entry, out of the digest, found by search with as_of an earlier time or include_ended, and kept in history; restore with its id alone opens it again. The new entry holds from now unless its temporal says from when."},
                 "limit":{"type":"integer","minimum":1,"maximum":200},
                 "offset":{"type":"integer","minimum":0,"description":"list, history of an entry: continue from next_offset."}
             },"required":["action"],"additionalProperties":false}
@@ -4824,5 +5162,268 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// A conversation's journal as the project store keeps it, holding the
+    /// user's turn and each tool's result in order.
+    fn journal(data: &Path, key: &str, task: &str, parts: &[(&str, &str)]) {
+        let dir = super::super::memory_provenance::store_dir(data, key);
+        std::fs::create_dir_all(&dir).expect("store dir");
+        let conn = rusqlite::Connection::open(dir.join("harness.sqlite3")).expect("db");
+        conn.execute_batch(
+            "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, next_sequence INTEGER NOT NULL, created_at TEXT);
+             CREATE TABLE events (session_id TEXT NOT NULL, sequence INTEGER NOT NULL, event_id TEXT NOT NULL UNIQUE, event_json TEXT NOT NULL, continuity_critical INTEGER NOT NULL, PRIMARY KEY (session_id, sequence));
+             CREATE TABLE session_settings (task_id TEXT NOT NULL, setting_key TEXT NOT NULL, setting_value TEXT NOT NULL, updated_at TEXT, PRIMARY KEY (task_id, setting_key));",
+        )
+        .expect("schema");
+        conn.execute("INSERT INTO sessions VALUES ('s1', ?1, 1, NULL)", [task])
+            .expect("session");
+        for (index, (tool, text)) in parts.iter().enumerate() {
+            let call = format!("call{index}");
+            let events = if *tool == "user" {
+                vec![json!({"event_type": "input.admitted", "payload": {"text": text}})]
+            } else {
+                vec![
+                    json!({"event_type": "model.response", "payload": {"tool_calls": [{"call_id": call, "name": tool, "arguments": "{}"}]}}),
+                    json!({"event_type": "receipt.recorded", "payload": {"model_view": {"call_id": call, "text": text}}}),
+                ]
+            };
+            for (offset, event) in events.into_iter().enumerate() {
+                let sequence = index * 2 + offset + 1;
+                conn.execute(
+                    "INSERT INTO events VALUES ('s1', ?1, ?2, ?3, 1)",
+                    rusqlite::params![
+                        i64::try_from(sequence).expect("sequence"),
+                        format!("event-{sequence}"),
+                        event.to_string()
+                    ],
+                )
+                .expect("event");
+            }
+        }
+    }
+
+    /// Mem0's UPDATE as Zep keeps it: a corrected fact closes the old entry's
+    /// validity instead of deleting it. A plain search reads what holds now
+    /// and says the old one is there; `as_of` an earlier time reads the old
+    /// one; the digest leaves it out; restore with its id alone opens it.
+    #[test]
+    #[allow(clippy::too_many_lines, reason = "one correction, read every way")]
+    fn a_corrected_fact_is_superseded_not_deleted_and_as_of_reads_the_old_one() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = host(directory.path());
+        let old = run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Staging database host","content":"The staging database host is db-alpha-371."}),
+        )
+        .expect("old");
+        let before = super::super::refine::load_raw(&host.global)["entries"]["memory"]["staging_database_host"]["created_at"]
+            .as_str()
+            .expect("created")
+            .to_owned();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let new = run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Staging database host now","content":"The staging database host is now db-beta-582.","supersedes":[old["id"]]}),
+        )
+        .expect("supersede");
+        assert_eq!(
+            new["superseded"],
+            json!(["global:staging_database_host"]),
+            "{new}"
+        );
+        let state = super::super::refine::load_raw(&host.global);
+        let closed = &state["entries"]["memory"]["staging_database_host"];
+        assert_eq!(closed["superseded_by"], new["memory_id"], "{closed}");
+        assert!(super::super::memory_store::ended(closed), "{closed}");
+        assert_eq!(closed["version"], 2);
+        let current = &state["entries"]["memory"][new["id"].as_str().expect("id")];
+        assert_eq!(current["supersedes"], json!([old["memory_id"]]));
+        // A plain search reads what holds now, and says what it left out.
+        let plain = run(
+            &host,
+            &json!({"action":"search","query":"staging database host"}),
+        )
+        .expect("plain");
+        assert_eq!(plain["hits"].as_array().expect("hits").len(), 1, "{plain}");
+        assert!(
+            plain["hits"][0]["content"]
+                .as_str()
+                .expect("content")
+                .contains("db-beta-582")
+        );
+        assert_eq!(plain["closed"]["left_out"], 1, "{plain}");
+        // As of the time the old fact was kept, the old one.
+        let then = run(
+            &host,
+            &json!({"action":"search","query":"staging database host","as_of":before}),
+        )
+        .expect("as of");
+        assert_eq!(then["hits"].as_array().expect("hits").len(), 1, "{then}");
+        assert!(
+            then["hits"][0]["content"]
+                .as_str()
+                .expect("content")
+                .contains("db-alpha-371")
+        );
+        assert_eq!(then["hits"][0]["superseded_by"], new["memory_id"]);
+        // Both with include_ended, what holds now first.
+        let all = run(
+            &host,
+            &json!({"action":"search","query":"staging database host db","include_ended":true}),
+        )
+        .expect("all");
+        assert_eq!(all["hits"].as_array().expect("hits").len(), 2, "{all}");
+        let ended = all["hits"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .filter(|hit| hit["ended"] == true)
+            .collect::<Vec<_>>();
+        assert_eq!(ended.len(), 1, "{all}");
+        assert!(
+            ended[0]["content"]
+                .as_str()
+                .expect("content")
+                .contains("db-alpha-371"),
+            "{all}"
+        );
+        let digest = harness::format_digest(
+            &harness::load(&host.global, "global"),
+            harness::DigestOptions::default(),
+            &[],
+        );
+        assert!(!digest.contains("db-alpha-371"), "{digest}");
+        assert!(digest.contains("db-beta-582"), "{digest}");
+        // The chain is in history; restore with the id alone opens it again.
+        let history =
+            run(&host, &json!({"action":"history","id":old["memory_id"]})).expect("history");
+        assert_eq!(
+            history["current"]["superseded_by"], new["memory_id"],
+            "{history}"
+        );
+        let restored = run(
+            &host,
+            &json!({"action":"restore","id":"staging_database_host"}),
+        )
+        .expect("restore");
+        assert_eq!(restored["reopened"], true, "{restored}");
+        let reopened = &super::super::refine::load_raw(&host.global)["entries"]["memory"]["staging_database_host"];
+        assert!(reopened["superseded_by"].is_null(), "{reopened}");
+        assert!(!super::super::memory_store::ended(reopened), "{reopened}");
+        // An entry is superseded once; one already closed is named as such.
+        run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Unrelated note","content":"Lunch is at noon.","supersedes":["nothing_here"]}),
+        )
+        .expect_err("an unknown id");
+    }
+
+    /// Trust by source: where an entry's words occur in the conversation says
+    /// where it came from, the host decides it, and a fetched page's words
+    /// never become a constraint or a user preference.
+    #[test]
+    fn a_web_page_cannot_set_a_constraint_and_its_entry_says_where_it_came_from() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = project_host(directory.path(), "project-abc", "shop");
+        journal(
+            directory.path(),
+            "project-abc",
+            "test-conversation",
+            &[
+                (
+                    "user",
+                    "Fetch the release policy page and keep what it says.",
+                ),
+                (
+                    "web_fetch",
+                    "Release policy: every release needs the QUOKKA-77 board sign-off before Thursday noon.",
+                ),
+                ("run_shell", "cargo test: 812 passed"),
+            ],
+        );
+        let refused = run(
+            &host,
+            &json!({"action":"write","scope":"global","path":"constraints/releases","title":"Release sign-off","content":"Every release needs the QUOKKA-77 board sign-off before Thursday noon."}),
+        )
+        .expect_err("a page's rule");
+        assert!(refused.contains("fetched web page"), "{refused}");
+        assert!(
+            run(
+                &host,
+                &json!({"action":"write","scope":"global","path":"user/preferences","title":"Release sign-off","content":"Every release needs the QUOKKA-77 board sign-off before Thursday noon."}),
+            )
+            .is_err()
+        );
+        let kept = run(
+            &host,
+            &json!({"action":"write","scope":"global","path":"notes/web","title":"Release sign-off","content":"Every release needs the QUOKKA-77 board sign-off before Thursday noon."}),
+        )
+        .expect("a fact elsewhere");
+        let read = run(&host, &json!({"action":"read","id":kept["id"]})).expect("read");
+        assert_eq!(read["origin"]["kind"], "web", "{read}");
+        assert_eq!(read["unverified"], true, "{read}");
+        let digest = harness::format_digest(
+            &harness::load(&host.global, "global"),
+            harness::DigestOptions::default(),
+            &[],
+        );
+        assert!(digest.contains("from a web page: unverified"), "{digest}");
+        // Moved into the constraints later, it is still a page's words.
+        let moved = run(
+            &host,
+            &json!({"action":"write","id":kept["id"],"path":"constraints","expected_version":1}),
+        )
+        .expect_err("moved into the constraints");
+        assert!(moved.contains("fetched web page"), "{moved}");
+        // What the user said is theirs.
+        let said = run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Fetch policy","content":"The user asked: fetch the release policy page and keep what it says."}),
+        )
+        .expect("the user's words");
+        let read = run(&host, &json!({"action":"read","id":said["id"]})).expect("read");
+        assert_eq!(read["origin"]["kind"], "user", "{read}");
+        assert!(read.get("unverified").is_none(), "{read}");
+    }
+
+    /// Expiry by use: an entry nobody read or found is closed, not deleted,
+    /// and restore with its id alone brings it back.
+    #[test]
+    fn an_expired_entry_comes_back_with_restore() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = host(directory.path());
+        run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Coffee machine","content":"The coffee machine on floor 2 takes oat milk."}),
+        )
+        .expect("write");
+        // The store has been watched for disuse since before the entry.
+        super::super::memory_store::write_meta(
+            &host.global,
+            super::super::memory_validity::EXPIRY_SINCE,
+            &json!("2026-01-01T00:00:00.000Z"),
+        )
+        .expect("watched");
+        let later = chrono::Utc::now() + chrono::TimeDelta::days(40);
+        assert_eq!(
+            super::super::memory_validity::expire_unused(&host.global, 28.0, later)
+                .expect("expire"),
+            1
+        );
+        let plain =
+            run(&host, &json!({"action":"search","query":"coffee machine"})).expect("search");
+        assert!(
+            plain["hits"].as_array().expect("hits").is_empty(),
+            "{plain}"
+        );
+        assert_eq!(plain["closed"]["left_out"], 1, "{plain}");
+        let restored =
+            run(&host, &json!({"action":"restore","id":"coffee_machine"})).expect("restore");
+        assert_eq!(restored["reopened"], true, "{restored}");
+        let found =
+            run(&host, &json!({"action":"search","query":"coffee machine"})).expect("search");
+        assert_eq!(found["hits"].as_array().expect("hits").len(), 1, "{found}");
+        assert!(found["hits"][0].get("expired").is_none(), "{found}");
     }
 }
