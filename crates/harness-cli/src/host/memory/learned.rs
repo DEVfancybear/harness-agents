@@ -1681,7 +1681,11 @@ fn land(
                 std::fs::remove_file(&target).map_err(|error| format!("{relative}: {error}"))?;
             }
             append_ledger(&directory, &ledger_entry(intent));
-            Ok(json!({"files": {relative: before}, "written": skill_hash(&directory)}))
+            Ok(json!({
+                "files": {relative: before},
+                "written": skill_hash(&directory),
+                WRITTEN_FILES: {relative: null},
+            }))
         }
         _ => {
             let body = body.expect("shaped body");
@@ -1717,6 +1721,12 @@ fn land(
                 return Err(error);
             }
             let written = skill_hash(&directory);
+            // Each other file it wrote, as written: an undo rewrites it only
+            // while it still is ([`changed_since`]).
+            let written_files = targets
+                .iter()
+                .map(|(relative, target)| ((*relative).clone(), json!(file_hash(target))))
+                .collect::<Map<_, _>>();
             let (requests, _) = usage(layers, layer);
             if intent.action == "create" {
                 write_atomic(
@@ -1734,15 +1744,30 @@ fn land(
                 });
             }
             append_ledger(&directory, &ledger_entry(intent));
-            Ok(json!({"body": live, "files": previous, "written": written}))
+            Ok(json!({
+                "body": live,
+                "files": previous,
+                "written": written,
+                WRITTEN_FILES: written_files,
+            }))
         }
     }
 }
 
+/// The undo record's field holding the SHA-256 of each file other than
+/// `SKILL.md` a change wrote, by its path in the skill (null for one it
+/// removed).
+const WRITTEN_FILES: &str = "written_files";
+
 /// The SHA-256 of a skill's `SKILL.md` as it is on disk, or `None` when it
 /// has none.
 fn skill_hash(directory: &Path) -> Option<String> {
-    let body = std::fs::read(directory.join("SKILL.md")).ok()?;
+    file_hash(&directory.join("SKILL.md"))
+}
+
+/// The SHA-256 of a file as it is on disk, or `None` when there is none.
+fn file_hash(path: &Path) -> Option<String> {
+    let body = std::fs::read(path).ok()?;
     Some(
         Sha256::digest(&body)
             .iter()
@@ -1753,10 +1778,12 @@ fn skill_hash(directory: &Path) -> Option<String> {
     )
 }
 
-/// Why a landed change may not be undone: its skill's `SKILL.md` no longer
-/// has the hash the change wrote, so the agent, the user or a later
+/// Why a landed change may not be undone: its skill's `SKILL.md`, or another
+/// file the change wrote or removed, is no longer as the change left it
+/// (`written`, [`WRITTEN_FILES`]), so the agent, the user or a later
 /// refinement changed it since, and that version is kept. A change recorded
-/// before 0.9.0 carries no hash and is undone as it was.
+/// before 0.9.0 carries no hash and is undone as it was; one recorded by
+/// 0.9.0 before the files' hashes, by its `SKILL.md` alone.
 #[must_use]
 pub fn changed_since(
     layers: &Layers,
@@ -1769,13 +1796,23 @@ pub fn changed_since(
     if !matches!(action, "create" | "update" | "patch" | "remove_file") || !valid_name(name) {
         return None;
     }
-    let root = layers.root(Layer::parse(level)?)?;
-    if skill_hash(&root.join(name)).as_deref() == Some(written) {
-        return None;
+    let directory = layers.root(Layer::parse(level)?)?.join(name);
+    if skill_hash(&directory).as_deref() != Some(written) {
+        return Some(format!(
+            "{name}'s SKILL.md changed since the refinement wrote it; that version is kept"
+        ));
     }
-    Some(format!(
-        "{name}'s SKILL.md changed since the refinement wrote it; that version is kept"
-    ))
+    for (relative, hash) in undo[WRITTEN_FILES].as_object().into_iter().flatten() {
+        let now = subfile_target(&directory, relative)
+            .ok()
+            .and_then(|target| file_hash(&target));
+        if now.as_deref() != hash.as_str() {
+            return Some(format!(
+                "{name}'s {relative} changed since the refinement wrote it; that version is kept"
+            ));
+        }
+    }
+    None
 }
 
 /// Undo one landed change, from what [`promote`] recorded. Rollback restores
@@ -2149,6 +2186,74 @@ mod tests {
         )
         .expect("revive");
         assert!(is_learned(&root, "ci-test-debugging"));
+    }
+
+    /// An undo rewrites a skill's other files only while each is as the
+    /// change left it: a later edit of `references/flaky.md` is kept, as one
+    /// of `SKILL.md` is. Before, only `SKILL.md`'s hash was checked, and the
+    /// rollback wrote the old reference over the later edit.
+    #[test]
+    fn an_undo_keeps_a_skill_file_changed_since() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let context = PromoteContext::default();
+        let mut created = create(
+            "ci-test-debugging",
+            "Run it alone. See references/flaky.md.",
+        );
+        created
+            .files
+            .insert("references/flaky.md".to_owned(), "Retry once.".to_owned());
+        assert!(promote(&layers, &created, &context).ok);
+        let skill_dir = layers
+            .project
+            .clone()
+            .expect("project")
+            .join("ci-test-debugging");
+        let mut update = create(
+            "ci-test-debugging",
+            "Run it alone, with --locked. See references/flaky.md.",
+        );
+        update.action = "update".to_owned();
+        update
+            .files
+            .insert("references/flaky.md".to_owned(), "Retry twice.".to_owned());
+        let updated = promote(&layers, &update, &context);
+        assert!(updated.ok, "{:?}", updated.findings);
+        assert!(updated.undo[super::WRITTEN_FILES]["references/flaky.md"].is_string());
+        // The agent edits the reference afterwards; SKILL.md is untouched.
+        let reference = skill_dir.join("references/flaky.md");
+        std::fs::write(&reference, "Retry three times, then quarantine.").expect("later edit");
+        let refused = restore(
+            &layers,
+            "update",
+            "ci-test-debugging",
+            "project",
+            &updated.undo,
+        )
+        .expect_err("the later edit is kept");
+        assert!(
+            refused.contains("references/flaky.md changed since"),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&reference).expect("reference"),
+            "Retry three times, then quarantine."
+        );
+        // As the change left it, it is undone.
+        std::fs::write(&reference, "Retry twice.").expect("as written");
+        restore(
+            &layers,
+            "update",
+            "ci-test-debugging",
+            "project",
+            &updated.undo,
+        )
+        .expect("rollback");
+        assert_eq!(
+            std::fs::read_to_string(&reference).expect("reference"),
+            "Retry once."
+        );
     }
 
     #[test]
