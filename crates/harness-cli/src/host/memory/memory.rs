@@ -1869,7 +1869,10 @@ impl MemoryHost {
 
     /// The kept entries of one kind a new entry in `scope` is compared with:
     /// a local entry with this conversation's, any other with every shared
-    /// scope's.
+    /// scope's. Only what holds now: an entry a correction or the expiry pass
+    /// closed, or whose own period ended, is history, and a fact that holds
+    /// again is written anew - it would otherwise be refused as a duplicate
+    /// of an entry an update cannot open (`restore` with its id alone does).
     fn compared_entries(&self, scope: &str, kind: &'static str) -> Vec<Entry> {
         let compared = if scope == "local" {
             vec!["local"]
@@ -1879,7 +1882,9 @@ impl MemoryHost {
                 .filter(|scope| *scope != "local")
                 .collect()
         };
-        self.entries(&compared, &[kind])
+        let mut entries = self.entries(&compared, &[kind]);
+        entries.retain(|entry| !entry.ended && !entry.standing.closed());
+        entries
     }
 
     /// Refuse, once, a new entry that may say a kept one's fact in other words
@@ -5368,6 +5373,39 @@ mod tests {
             &json!({"action":"write","scope":"global","title":"Unrelated note","content":"Lunch is at noon.","supersedes":["nothing_here"]}),
         )
         .expect_err("an unknown id");
+    }
+
+    /// A fact that expired unused (or was superseded) is history, not what
+    /// the memory holds: written again, it is no duplicate of the closed
+    /// entry, which an update could not open. Before, the write was refused
+    /// and pointed at the closed entry.
+    #[test]
+    fn a_closed_fact_can_be_written_again() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = host(directory.path());
+        let content = "Lunch is at noon in the canteen on the third floor.";
+        let kept = run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Lunch","content":content}),
+        )
+        .expect("kept");
+        let again =
+            json!({"action":"write","scope":"global","title":"Lunch again","content":content});
+        let refusal = run(&host, &again).expect_err("a duplicate of a live entry");
+        assert!(refusal.contains("same fact"), "{refusal}");
+        let key = kept["id"].as_str().expect("id").to_owned();
+        let mut state = super::super::refine::load_raw(&host.global);
+        let entry = &mut state["entries"]["memory"][&key];
+        super::super::memory_validity::close(entry, &super::super::memory_store::now());
+        entry["expired"] = json!("unused");
+        super::super::refine::save_raw(
+            &host.global,
+            &state,
+            &super::super::memory_store::Writer::new("sleep", &json!({}), "expire"),
+        )
+        .expect("expired");
+        let written = run(&host, &again).expect("written again");
+        assert_ne!(written["id"], json!(key), "{written}");
     }
 
     /// Trust by source: where an entry's words occur in the conversation says
