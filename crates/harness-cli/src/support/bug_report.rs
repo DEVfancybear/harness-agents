@@ -893,15 +893,18 @@ impl Report {
         }
         let global = crate::interactive::harness::global_dir(&self.data_dir);
         self.memory_store(&global, "harness/global");
+        // Deep Dream's change counts and the meditation's last time.
         for name in [
-            "harness_state.json",
             "memory_changes",
             "memory_consolidated_changes",
             "memory_consolidation_failed",
-            // The learning loop's lessons, with their quotes and history.
-            "lessons.json",
             "lessons_meditated",
         ] {
+            self.copy_file(&global.join(name), &format!("harness/global/{name}"), false);
+        }
+        // A legacy state file not yet imported, and the learning loop's
+        // lessons with their quotes and history.
+        for name in ["harness_state.json", "lessons.json"] {
             self.copy_memory_file(&global.join(name), &format!("harness/global/{name}"), false);
         }
         // The self-evaluations, newest last.

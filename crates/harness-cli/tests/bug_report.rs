@@ -900,7 +900,7 @@ fn what_memory_kept_is_in_the_report_only_with_include_content() {
         global.join("harness_state.json"),
         serde_json::json!({"schema": 1, "entries": {"memory": {"deploy_target": {
             "id": "deploy_target", "kind": "memory", "title": "Deploy", "content": ENTRY, "version": 1
-        }}}})
+        }}}, "refinements": [{"id": "ref_1", "summary": REFINEMENT}]})
         .to_string(),
     )
     .unwrap();
@@ -913,11 +913,8 @@ fn what_memory_kept_is_in_the_report_only_with_include_content() {
         .to_string(),
     )
     .unwrap();
-    std::fs::write(
-        global.join("memory_changes"),
-        format!("{{\"id\":\"ref_1\",\"summary\":\"{REFINEMENT}\"}}\n"),
-    )
-    .unwrap();
+    // A count, not memory: copied as it is.
+    std::fs::write(global.join("memory_changes"), "7").unwrap();
     let report = |extra: &[&str], name: &str| {
         let out = home.join(name);
         let mut args = vec![
@@ -954,6 +951,11 @@ fn what_memory_kept_is_in_the_report_only_with_include_content() {
         without
             .iter()
             .any(|(name, _)| name == "harness/global/harness_state.json.outline.json")
+    );
+    assert!(
+        without
+            .iter()
+            .any(|(name, text)| name == "harness/global/memory_changes" && text == "7")
     );
     let with = report(&["--include-content"], "with.zip");
     for kept in [ENTRY, QUOTE, REFINEMENT] {

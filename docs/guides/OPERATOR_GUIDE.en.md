@@ -536,7 +536,7 @@ ha exec --prompt - --output-format json < prompt.txt
 ha exec "Continue the task" --continue --goal "Task complete" --max-turns 4 --output-format stream-json
 ```
 
-`--prompt -` reads up to 10 MiB from stdin; a positional `-` is literal text. `text` prints the answer, `json` prints a schema 1 envelope with additive fields (a satisfied `--goal` includes `acceptance.command_id`), and `stream-json` prints one NDJSON event per line without ANSI. `--continue` selects the newest session in the project. Exit codes: 0 complete, 2 usage, 3 waiting for a question or approval, 4 failure, 5 ownership conflict, 130 cancel. Legacy `ha chat --headless --json` remains compatible. `--mock` and `--fixture` are local tests; real provider calls may cost money.
+`--prompt -` reads up to 10 MiB from stdin; a positional `-` is literal text. `text` prints the answer, `json` prints a schema 1 envelope with additive fields (a satisfied `--goal` includes `acceptance.command_id`), and `stream-json` prints one NDJSON event per line without ANSI. `--continue` selects the newest session in the project. Exit codes: 0 complete, 2 usage, 3 waiting for a question or approval, 4 failure, 5 ownership conflict, 130 cancel. Legacy `ha chat --headless --json` remains compatible. `--mock` and `--fixture` are local tests; real provider calls may cost money. Since 0.9.0 the JSON (and a stream's `run.terminal`) reports what the run's model calls used, and is written once the run's background memory passes ended (§12.19).
 
 ### 12.5. Limits and checks
 
@@ -696,6 +696,7 @@ A task of hundreds of steps passes through many compactions, and what a compacti
   - from each project store: runs, steps, provider attempts, failed commands, leases, checkpoints and settings;
   - each conversation's harness files: task state, memory history, applied refinements, the review watermark and kernel stderr;
   - the learning loop's `lessons.json` (each lesson's quotes and history) and the self-evaluations' `evaluations.jsonl` (its tail);
+  - since 0.9.0, what memory kept only with `--include-content`: without it, each memory store's `memory_store.json` lists each entry's id, kind, path, version and size and each refinement's id and number of changes, and `lessons.json`, `refinements.jsonl`, the memory history and a legacy `harness_state.json` are each an outline, `<file>.outline.json` (its size and lines, and each record's id, kind and state);
   - `env.json` (version, platform, terminal, `HA_*` variables), the configuration, `settings.json` and `models.json` with every secret withheld;
   - the shared REPL's logs, and the delegated children's directories (names and sizes).
 
@@ -720,7 +721,7 @@ A task of hundreds of steps passes through many compactions, and what a compacti
 
   Options and limits:
   - `--task` and `--session` narrow the report to one conversation. Such a report keeps the diagnostics of the processes that worked on that conversation and of its delegated children, and says how many others it left out.
-  - Without `--include-content`, no request body, checkpoint or long setting is read, only its size.
+  - Without `--include-content`, no request body, checkpoint or long setting is read, only its size, and no memory entry's text, lesson's quote or refinement's text is in the zip, only their ids, kinds, paths, sizes and counts.
   - `private/`, the kernel's pickled state, attachments and artifacts are never read.
   - Known secret values are redacted (the provider keys in the environment and in the credential file), and so are secret patterns. `manifest.json` has the count.
 - **`/bug-report`** writes the same zip for the last 24 hours of the open conversation, into `<data dir>/bug-reports/`.
@@ -871,3 +872,31 @@ A task of hundreds of steps passes through many compactions, and what a compacti
 - **`ha memory purge --secrets [--yes]`** does the same for every entry and version that holds a secret value (a key, a token, a private key), in the global store and every conversation's: an entry clean now loses only the versions that held one. The listing names the kind of each secret, never its value.
 - **The markdown store's host writes are linted.** The learning loop's rules and facts and the session log's section are linted before they land; one that would make the store fail a check it passes is refused and reported (`memory/markdown_write_refused`). Past 20 struck lines, the index moves them to a new `memory/archive/index-<year>.md` ([Markdown memory](../architecture/MARKDOWN_MEMORY.en.md) §8).
 - **A repository that moves keeps its store.** `project.json` records the repository's root commits and origin remote. A repository moved or renamed finds its store again on its first launch at the new place, with its project memory; a fork or a clone that still exists never takes another's store. **`ha project rekey <old path or key> [--cwd DIR]`** moves a store by hand, refused when both hold data ([Project identity](../architecture/PROJECT_IDENTITY.en.md) §5).
+
+### 12.19. Memory on and off, and what a run used (0.9.0)
+
+Memory has to earn its place, so it can be measured: one switch turns it off, whole or one feature at a time, and `ha exec` says what each run cost.
+
+- **`HA_MEMORY=off`** turns off everything that carries memory from one conversation to the next or puts it in a request. What is off is neither read into a request nor written after it: a run with memory off leaves every memory store as it was. The conversation's own task state and the project's AGENTS.md are the task and its instructions, not memory, and stay. `HA_MEMORY=on` turns memory on over the setting.
+- **`HA_MEMORY_OFF=<feature>,...`** turns off the named features alone, for an ablation:
+
+  | feature | what it turns off |
+  |---|---|
+  | `digest` | the memory digest in every turn, the `memory` tool and the kernel's `rlm.harness`, a child's digest and the findings it hands back (`note_finding`); the store is not opened |
+  | `markdown` | a markdown memory store's rules and index in every turn |
+  | `session_log` | writing session logs (at a quiet session, a compaction, `/handoff`, `ha exec`'s exit, a log owed at start), the log a new conversation is told of, and `/recall` |
+  | `lessons` | the learning loop's results in a turn: learned rules and their notes in tool descriptions, the learned skill recalled for a request, the learned skills' note (a child's too), and the count of their use |
+  | `reviews` | every background pass: the review after a turn, of a quiet session and of a compaction, consolidation (Deep Dream), curation, evolution, the self-evaluation, `/refine`, and what a review tells the next turn |
+  | `earlier_state` | what a new conversation is told of earlier ones: the task state an earlier conversation left and the previous conversation's last turns |
+  | `knowledge` | the knowledge library: its catalog in a turn and the `knowledge` tool, a child's too |
+
+  A name that is no feature is ignored, and `/context` and `ha doctor` say so. The lessons a review records are the review's: with `reviews` on and `lessons` off, a review still records them. Learned skills stay in the skill catalog; `lessons` takes away only what puts them in a turn by itself. `history_search` and `history_read` with `project` still read the project's other conversations: they are the journal, not a memory store.
+- **The `memory` key of `settings.json`** says the same: `{"memory": {"enabled": false}}`, or `{"memory": {"off": ["digest", "knowledge"]}}`. The environment wins: `HA_MEMORY` over `enabled`, and `HA_MEMORY_OFF`, even empty, over `off`.
+- **Where it shows.** `/context` has a `Memory:` line (`on`, `off (HA_MEMORY): ...`, or `on except ... (HA_MEMORY_OFF)`), `ha doctor` names what is off (nothing while all of it is on), each run of `ha exec` and the first turn of each app conversation write a `memory.switch` diagnostics record (`off`, `all_off`, `source`), and `ha exec`'s JSON has `memory.off`. With the digest off `memory.entries` is `null`: the store was not read.
+- **What a run used.** `ha exec --output-format json` reports three objects of the same fields - `input_tokens` (every prompt token), `cached_input_tokens` and `cache_write_tokens` (of those, read from and written to the provider's cache), `output_tokens` and `model_calls` (calls that reported their usage):
+  - `usage`: the run's own model calls, its compactions' included;
+  - `children_usage`: its delegated children's;
+  - `upkeep_usage`: the background memory passes the process ran - the self-evaluation, the reviews and their consolidation, the session log at exit.
+
+  The JSON object, and with `stream-json` the `run.terminal` event, is written once those passes ended, so `upkeep_usage` counts them; a plain-text run still prints its answer first. The stream's `usage` events carry `cache_read_tokens` and `cache_write_tokens` beside the prompt and completion tokens.
+- **Measuring it.** The live suite `memory-ab.sh` teaches a project facts, then runs the same tasks from the same snapshot with memory on, off and (with `ABLATE=1`) each feature off alone, and writes a table of success, tokens, calls and time against memory off ([live tests](../../scripts/testing/live-tests/README.md)).
