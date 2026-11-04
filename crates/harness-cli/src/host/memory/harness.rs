@@ -663,12 +663,15 @@ fn ranked<'a>(
 )]
 pub fn render_digest(state: &State, options: DigestOptions, terms: &[(String, f64)]) -> Digest {
     // An entry whose period is over records what was, not what is: search
-    // still finds it, the digest leaves it out.
+    // still finds it, the digest leaves it out. So does one a correction or
+    // the expiry pass closed, whose period may not have ended yet: a
+    // future-dated entry superseded today ends a millisecond after its start.
     let current;
-    let state = if state.entries.values().flatten().any(|entry| entry.ended) {
+    let gone = |entry: &Entry| entry.ended || entry.standing.closed();
+    let state = if state.entries.values().flatten().any(gone) {
         let mut kept = state.clone();
         for entries in kept.entries.values_mut() {
-            entries.retain(|entry| !entry.ended);
+            entries.retain(|entry| !gone(entry));
         }
         current = kept;
         &current
@@ -1555,6 +1558,44 @@ mod tests {
             super::render_digest(&again, DigestOptions::default(), &[]).text,
             digest.text
         );
+    }
+
+    /// A future-dated entry superseded today has a period that has not
+    /// ended (it ends a millisecond after its start), and the digest leaves
+    /// it out all the same: it is closed. So is an expired one.
+    #[test]
+    fn the_digest_leaves_out_a_closed_entry_whose_period_has_not_ended() {
+        let directory = tempfile::tempdir().expect("data");
+        let local = super::local_dir(directory.path(), "task-1");
+        let now = super::super::memory_store::now();
+        let mut planned = json!({"title": "Freeze", "content": "The code freeze starts in December", "temporal": {"start": "2099-12-01T00:00:00.000Z"}});
+        super::super::memory_validity::supersede(
+            &mut planned,
+            "0190f0f0-0000-7000-8000-000000000000",
+            &now,
+        );
+        assert!(!super::super::memory_store::ended(&planned), "{planned}");
+        let mut unused = json!({"title": "Lint", "content": "The linter runs on save", "temporal": {"start": "2099-12-01T00:00:00.000Z"}});
+        super::super::memory_validity::close(&mut unused, &now);
+        unused["expired"] = json!("unused");
+        write(
+            &local,
+            &json!({"entries":{"memory":{
+                "freeze": planned,
+                "lint": unused,
+                "tabs": {"title": "Tabs", "content": "The user prefers tabs"}
+            }}}),
+        );
+        let state = load(&local, "local");
+        let digest = super::render_digest(&state, DigestOptions::default(), &[]);
+        assert!(
+            digest.text.contains("The user prefers tabs"),
+            "{}",
+            digest.text
+        );
+        assert!(!digest.text.contains("code freeze"), "{}", digest.text);
+        assert!(!digest.text.contains("linter"), "{}", digest.text);
+        assert_eq!(digest.shown.len(), 1, "{:?}", digest.shown);
     }
 
     /// The digest over ten thousand entries with times and reads: BM25 plus
