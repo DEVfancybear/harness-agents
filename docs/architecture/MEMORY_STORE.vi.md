@@ -1013,7 +1013,10 @@ bản ghi đó). Trước đây mọi lần cập nhật đều đặt `source: 
 diễn đạt lại một learned rule biến nó thành entry của review, Deep Dream (vốn bỏ
 qua `source: learning`) sau đó có thể gộp mất nó, và learning loop retire lesson
 của nó vì đã bị xoá. Rollback đặt lại nguyên snapshot, kèm `source` và
-`origin`, thành một version mới.
+`origin`, thành một version mới. Memory tool của model cũng làm vậy với entry
+của learning loop: cập nhật, thay thế hay di chuyển một entry `source: learning`
+giữ `source` và `origin` của nó và ghi origin của lần sửa vào `edited_by`; entry
+khác mà tool sửa thì thành của agent, như trước.
 
 **Rollback chỉ hoàn tác những gì refinement của nó đã ghi.** Mỗi lần khôi phục
 mang theo version mà refinement để lại (`after`, hoặc không có gì với entry nó

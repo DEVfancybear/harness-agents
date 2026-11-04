@@ -990,7 +990,11 @@ refine`, `origin` the same record). Before, every update set `source:
 refine`: a review that reworded a learned rule made it a review entry, Deep
 Dream (which skips `source: learning`) could then merge it away, and the
 learning loop retired its lesson as deleted. A rollback puts the snapshot
-back whole, `source` and `origin` with it, as a new version.
+back whole, `source` and `origin` with it, as a new version. The model's
+`memory` tool does the same for the learning loop's entries: an update, a
+replace or a move of a `source: learning` entry keeps its `source` and
+`origin` and records the edit's origin in `edited_by`; any other entry the
+tool edits becomes the agent's, as before.
 
 **A rollback undoes only what its refinement wrote.** Each restore carries the
 version the refinement left (`after`, or nothing for an entry it deleted).

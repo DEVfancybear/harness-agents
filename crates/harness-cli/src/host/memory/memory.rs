@@ -1371,8 +1371,8 @@ impl MemoryHost {
         if entry["metadata"]["pinned"] == true {
             self.pinned_fits(&scope, &kind, &id, &title, &content)?;
         }
-        entry["origin"] = self.origin_of(self.origin_kind(&title, &content, Some(&before)));
-        entry["source"] = json!("agent");
+        let origin = self.origin_of(self.origin_kind(&title, &content, Some(&before)));
+        edited_by_agent(&mut entry, &before, origin);
         entry["updated_at"] = json!(now());
         entry["version"] = json!(current + 1);
         // The key follows the name while the two are the same, so an id made
@@ -1525,8 +1525,8 @@ impl MemoryHost {
             &content,
             Some(&before),
         )?;
-        entry["origin"] = self.origin_of(self.origin_kind(&title, &content, Some(&before)));
-        entry["source"] = json!("agent");
+        let origin = self.origin_of(self.origin_kind(&title, &content, Some(&before)));
+        edited_by_agent(&mut entry, &before, origin);
         entry["updated_at"] = json!(now());
         entry["version"] = json!(current + 1);
         let writer = self.writer("move");
@@ -1675,8 +1675,7 @@ impl MemoryHost {
             if entry["metadata"]["pinned"] == true {
                 self.pinned_fits(scope, kind, &key, &title, &content)?;
             }
-            entry["origin"] = self.origin_of(from);
-            entry["source"] = json!("agent");
+            edited_by_agent(&mut entry, &existing, self.origin_of(from));
             entry["updated_at"] = json!(now());
             entry["version"] = json!(version + 1);
             state["entries"][kind][&key] = entry;
@@ -3005,6 +3004,24 @@ fn history_key(
     Ok(None)
 }
 
+/// What an edit by the model's `memory` tool leaves as the entry's source.
+/// An entry the learning loop keeps stays the loop's, with its origin, and
+/// records the edit in `edited_by`, as a review's edit does: Deep Dream
+/// skips it and its lesson still finds it. Any other entry becomes the
+/// agent's, with the edit's origin.
+fn edited_by_agent(entry: &mut Value, before: &Value, origin: Value) {
+    if before["source"] == "learning" {
+        entry["source"] = json!("learning");
+        if let Some(kept) = before.get("origin").filter(|kept| kept.is_object()) {
+            entry["origin"] = kept.clone();
+        }
+        entry["edited_by"] = origin;
+    } else {
+        entry["origin"] = origin;
+        entry["source"] = json!("agent");
+    }
+}
+
 /// Whether an entry says the same as it did: what a write can change, with
 /// a missing name read as its key and missing facets as none.
 fn same_entry(kind: &str, key: &str, before: &Value, after: &Value) -> bool {
@@ -3857,6 +3874,40 @@ mod tests {
             .expect_err("a new entry needs a title")
             .contains("title")
         );
+    }
+
+    /// The learning loop's entry stays the loop's when the model edits it:
+    /// Deep Dream skips `source: learning` and the loop's lesson finds its
+    /// entry by it. Before, the tool's update made it the agent's.
+    #[test]
+    fn an_update_by_the_tool_keeps_a_learned_entrys_source() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = host(directory.path());
+        run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Deploy day","content":"Deploys happen on Thursdays."}),
+        )
+        .expect("create");
+        let mut state = super::super::refine::load_raw(&host.global);
+        let entry = &mut state["entries"]["memory"]["deploy_day"];
+        entry["source"] = json!("learning");
+        entry["origin"] = json!({"via": "learning", "lesson": "lesson-1"});
+        super::super::refine::save_raw(
+            &host.global,
+            &state,
+            &super::super::memory_store::Writer::new("test", &json!({}), "test"),
+        )
+        .expect("saved");
+        run(
+            &host,
+            &json!({"action":"write","id":"deploy_day","expected_version":1,"content":"Deploys happen on Fridays."}),
+        )
+        .expect("update");
+        let kept = &super::super::refine::load_raw(&host.global)["entries"]["memory"]["deploy_day"];
+        assert_eq!(kept["content"], "Deploys happen on Fridays.");
+        assert_eq!(kept["source"], "learning", "{kept}");
+        assert_eq!(kept["origin"]["lesson"], "lesson-1", "{kept}");
+        assert!(kept["edited_by"].is_object(), "{kept}");
     }
 
     /// After Graphiti: an update or a delete keeps what it replaced, history
