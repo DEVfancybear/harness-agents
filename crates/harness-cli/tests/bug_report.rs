@@ -871,11 +871,99 @@ fn a_bug_report_traces_the_learning_loop_and_the_self_evaluation() {
         .iter()
         .map(|(name, _)| name.as_str())
         .collect::<Vec<_>>();
-    assert!(names.contains(&"harness/global/lessons.json"), "{names:?}");
+    // Without `--include-content`, the lessons' outline, not their text.
+    assert!(
+        names.contains(&"harness/global/lessons.json.outline.json"),
+        "{names:?}"
+    );
+    assert!(!names.contains(&"harness/global/lessons.json"), "{names:?}");
     assert!(
         names.contains(&"harness/global/evaluations.jsonl"),
         "{names:?}"
     );
+}
+
+/// What memory kept - an entry's text, a lesson's quote, a refinement's
+/// text - is in the report only with `--include-content`; without it, the
+/// report has each one's id, kind and size.
+#[test]
+fn what_memory_kept_is_in_the_report_only_with_include_content() {
+    const ENTRY: &str = "entry text kestrel-4471";
+    const QUOTE: &str = "quote text osprey-9032";
+    const REFINEMENT: &str = "refinement text heron-2265";
+    let home = tempfile::tempdir().expect("home");
+    let home = home.path();
+    let global = home.join("data").join("harness");
+    std::fs::create_dir_all(&global).unwrap();
+    // A 0.8 state file not yet imported, copied as it is with its content.
+    std::fs::write(
+        global.join("harness_state.json"),
+        serde_json::json!({"schema": 1, "entries": {"memory": {"deploy_target": {
+            "id": "deploy_target", "kind": "memory", "title": "Deploy", "content": ENTRY, "version": 1
+        }}}, "refinements": [{"id": "ref_1", "summary": REFINEMENT}]})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        global.join("lessons.json"),
+        serde_json::json!({"schema": 1, "lessons": [
+            {"id": "les_q1", "text": "a rule", "kind": "correction", "state": "candidate",
+             "signals": [{"quote": QUOTE}]}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    // A count, not memory: copied as it is.
+    std::fs::write(global.join("memory_changes"), "7").unwrap();
+    let report = |extra: &[&str], name: &str| {
+        let out = home.join(name);
+        let mut args = vec![
+            "bug-report",
+            "--since",
+            "1h",
+            "--out",
+            out.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let run = ha(home, &args);
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        entries(&std::fs::read(&out).unwrap())
+    };
+    let without = report(&[], "without.zip");
+    for (name, text) in &without {
+        for kept in [ENTRY, QUOTE, REFINEMENT] {
+            assert!(!text.contains(kept), "{name} holds {kept:?}");
+        }
+    }
+    let outline = without
+        .iter()
+        .find(|(name, _)| name == "harness/global/lessons.json.outline.json")
+        .map(|(_, text)| text.clone())
+        .expect("the lessons' outline");
+    let outline: serde_json::Value = serde_json::from_str(&outline).expect("JSON");
+    assert_eq!(outline["records"][0]["id"], "les_q1");
+    assert_eq!(outline["records"][0]["kind"], "correction");
+    assert!(
+        without
+            .iter()
+            .any(|(name, _)| name == "harness/global/harness_state.json.outline.json")
+    );
+    assert!(
+        without
+            .iter()
+            .any(|(name, text)| name == "harness/global/memory_changes" && text == "7")
+    );
+    let with = report(&["--include-content"], "with.zip");
+    for kept in [ENTRY, QUOTE, REFINEMENT] {
+        assert!(
+            with.iter().any(|(_, text)| text.contains(kept)),
+            "{kept:?} is in the report with --include-content"
+        );
+    }
 }
 
 /// The session a bug report was traced from: a `ChatGPT` plan's limit parked

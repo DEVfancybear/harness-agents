@@ -4859,7 +4859,15 @@ impl InteractiveController {
                 }
             }
             "/recall" => {
-                if self.phase.has_active_run() {
+                let memory = super::memory_switch::Switch::load(
+                    &self.context.paths.config_file,
+                    &super::paths::LaunchEnvironment::capture(),
+                );
+                if !memory.on(super::memory_switch::Feature::SessionLog) {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: format!("session logs are off ({}): /recall reads none", memory.summary()),
+                    });
+                } else if self.phase.has_active_run() {
                     self.push_history(&mut effects, HistoryItem::Notice {
                         message: "the session logs are recalled when the running turn has finished".to_owned(),
                     });

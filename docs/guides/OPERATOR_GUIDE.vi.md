@@ -535,7 +535,7 @@ ha exec --prompt - --output-format json < prompt.txt
 ha exec "Continue the task" --continue --goal "Task complete" --max-turns 4 --output-format stream-json
 ```
 
-`--prompt -` đọc tối đa 10 MiB từ stdin; `-` ở vị trí prompt là chữ thường. `text` in câu trả lời, `json` in envelope schema 1 với trường mới additive (khi `--goal` satisfied: `acceptance.command_id`), `stream-json` in mỗi event trên một dòng NDJSON, không ANSI. `--continue` chọn session mới nhất của project. Các mã thoát: 0 hoàn tất, 2 usage, 3 chờ câu hỏi hoặc approval, 4 thất bại, 5 xung đột ownership, 130 hủy. `ha chat --headless --json` vẫn tương thích cách gọi cũ. Chỉ dùng `--mock` hoặc `--fixture` cho thử nghiệm cục bộ; gọi provider thật có thể phát sinh chi phí.
+`--prompt -` đọc tối đa 10 MiB từ stdin; `-` ở vị trí prompt là chữ thường. `text` in câu trả lời, `json` in envelope schema 1 với trường mới additive (khi `--goal` satisfied: `acceptance.command_id`), `stream-json` in mỗi event trên một dòng NDJSON, không ANSI. `--continue` chọn session mới nhất của project. Các mã thoát: 0 hoàn tất, 2 usage, 3 chờ câu hỏi hoặc approval, 4 thất bại, 5 xung đột ownership, 130 hủy. `ha chat --headless --json` vẫn tương thích cách gọi cũ. Chỉ dùng `--mock` hoặc `--fixture` cho thử nghiệm cục bộ; gọi provider thật có thể phát sinh chi phí. Từ 0.9.0, JSON (và event `run.terminal` của stream) cho biết các lần gọi model của lần chạy đã dùng bao nhiêu, và được ghi ra khi các lượt memory chạy nền của lần chạy đã xong (§12.20).
 
 ### 12.5. Giới hạn và kiểm tra
 
@@ -695,6 +695,7 @@ Bản 0.6.1 ghi lại những gì đã xảy ra, để tìm bug từ một file 
   - từ store của mỗi project: run, step, lần gọi provider, command lỗi, lease, checkpoint và setting;
   - các file harness của từng hội thoại: trạng thái task, lịch sử memory, refinement đã áp dụng, watermark review và stderr của kernel;
   - `lessons.json` của learning loop (trích dẫn và lịch sử của từng lesson) và `evaluations.jsonl` của self-evaluation (phần cuối);
+  - từ 0.9.0, những gì memory đã giữ chỉ có khi dùng `--include-content`: không có cờ này, `memory_store.json` của mỗi kho memory chỉ liệt kê id, kind, path, version và kích thước của từng entry, id và số thay đổi của từng refinement; còn `lessons.json`, `refinements.jsonl`, lịch sử memory và `harness_state.json` cũ thì mỗi file là một bản phác thảo `<file>.outline.json` (kích thước, số dòng, và id, kind, state của từng bản ghi);
   - `env.json` (phiên bản, nền tảng, terminal, biến `HA_*`), file cấu hình, `settings.json` và `models.json`, mọi secret đều bị bỏ ra;
   - log của REPL dùng chung, và danh sách thư mục của các agent con (tên và dung lượng).
 
@@ -719,7 +720,7 @@ Bản 0.6.1 ghi lại những gì đã xảy ra, để tìm bug từ một file 
 
   Tuỳ chọn và giới hạn:
   - `--task` và `--session` thu hẹp báo cáo về một hội thoại. Khi đó báo cáo giữ log chẩn đoán của các process đã làm việc với hội thoại ấy và của các agent con của nó, và ghi rõ đã bỏ bao nhiêu process khác.
-  - Không có `--include-content` thì không đọc nội dung request, checkpoint hay setting dài, chỉ đọc kích thước.
+  - Không có `--include-content` thì không đọc nội dung request, checkpoint hay setting dài, chỉ đọc kích thước, và zip không chứa nội dung entry memory, trích dẫn của lesson hay nội dung refinement, chỉ có id, kind, path, kích thước và số lượng của chúng.
   - Không bao giờ đọc `private/`, trạng thái pickle của kernel, attachment và artifact.
   - Giá trị secret đã biết bị che (key provider trong môi trường và trong file credential), và các mẫu secret cũng vậy. `manifest.json` ghi số lần che.
 - **`/bug-report`** ghi cùng gói zip đó cho 24 giờ gần nhất của hội thoại đang mở, vào `<data dir>/bug-reports/`.
@@ -882,3 +883,31 @@ Chi tiết ở [Kho memory](../architecture/MEMORY_STORE.vi.md) §16.
 - **Câu hỏi theo thời gian.** Memory search nhận `as_of` (các entry còn hiệu lực lúc đó và đã được ghi trước đó), `since` và `until` (còn hiệu lực ở một lúc nào đó giữa hai mốc) và `include_ended`. Search không nêu thời điểm thì bỏ ra các entry đã bị thay thế hoặc hết hạn và cho biết có bao nhiêu entry như vậy cũng khớp (`closed.left_out`); search nêu thời điểm, kể cả bộ lọc temporal, thì xếp theo mức hiệu lực của entry khớp thời điểm đó trước rồi mới đến từ khóa. Giữa các kết quả khớp ngang nhau, entry còn đúng đứng trên entry đã kết thúc.
 - **Độ tin theo nguồn.** Mỗi entry ghi `origin.kind`: `user`, `tool`, `web`, `file`, `agent`, `child` hoặc `review`. ha quyết định dựa vào chỗ các từ của entry xuất hiện trong journal của hội thoại (các lượt của người dùng, kết quả của web tool, một lần đọc file, kết quả của tool khác), mỗi từ có trọng số theo độ hiếm của nó ở đó; edit của review lấy loại của lượt mà evidence của nó trích. Digest đánh dấu entry từ web và child là `unverified`, và chúng đứng dưới một entry ngang bằng khác. Entry `web` không được ghi vào `constraints/*` hay `user/preferences`: lần ghi bị từ chối kèm lý do.
 - **Memory không dùng sẽ hết hạn.** `HA_MEMORY_EXPIRE_DAYS` (mặc định `28`, `0` là tắt, được dùng số ngày lẻ): entry memory hay prompt không được đọc và không có trong kết quả search nào trong chừng ấy ngày kể từ lần cuối được ghi, đọc hoặc tìm thấy thì bị đóng (`expired: "unused"`), không bị xoá. Constraint, `user/preferences`, rule đã học và entry được ghim thì được miễn, và đồng hồ của một kho bắt đầu từ lượt chạy đầu tiên trên nó. Lượt chạy là một job Sleep, nhiều nhất mỗi ngày một lần, ở cuối một lượt và cuối `ha exec`; `ha doctor` cho biết lượt gần nhất đã đóng bao nhiêu entry. `restore` của `memory` chỉ với id sẽ mở lại một entry đã bị thay thế hoặc hết hạn.
+
+### 12.20. Bật và tắt memory, và một lần chạy đã dùng bao nhiêu (0.9.0)
+
+Memory phải đáng giá chỗ nó chiếm, nên phải đo được: một công tắc tắt nó, toàn bộ hoặc từng tính năng một, và `ha exec` cho biết mỗi lần chạy tốn bao nhiêu.
+
+- **`HA_MEMORY=off`** tắt mọi thứ mang memory từ hội thoại này sang hội thoại sau hoặc đưa nó vào request. Thứ đã tắt thì không được đọc vào request và cũng không được ghi sau đó: một lần chạy tắt memory để mọi kho memory y như cũ. Trạng thái task của chính hội thoại và AGENTS.md của project là task và chỉ dẫn của nó, không phải memory, nên vẫn giữ. `HA_MEMORY=on` bật memory, đè lên setting.
+- **`HA_MEMORY_OFF=<tính năng>,...`** chỉ tắt các tính năng được nêu, để làm ablation:
+
+  | tính năng | tắt những gì |
+  |---|---|
+  | `digest` | memory digest trong mỗi lượt, tool `memory` và `rlm.harness` của kernel, digest của child và các phát hiện nó gửi về (`note_finding`), và việc cho hết hạn các mục không dùng; kho không được mở |
+  | `markdown` | rule và index của kho memory dạng markdown trong mỗi lượt |
+  | `session_log` | việc ghi session log (khi session yên lặng, khi compaction, `/handoff`, lúc `ha exec` thoát, log còn nợ lúc khởi động), log mà hội thoại mới được kể lại, và `/recall` |
+  | `lessons` | kết quả của learning loop trong một lượt: learned rule và ghi chú của chúng trong mô tả tool, learned skill được gợi lại cho một request, ghi chú về các learned skill (của child nữa), và việc đếm số lần dùng chúng |
+  | `reviews` | mọi lượt chạy nền: review sau một lượt, của session yên lặng và của compaction, consolidation (Deep Dream), curation, evolution, self-evaluation, `/refine`, và những gì một review báo cho lượt sau |
+  | `earlier_state` | những gì hội thoại mới được kể về các hội thoại trước: trạng thái task mà một hội thoại trước để lại và các lượt cuối của hội thoại trước |
+  | `knowledge` | thư viện knowledge: catalog của nó trong một lượt và tool `knowledge`, của child nữa |
+
+  Tên không phải tính năng thì bị bỏ qua, và `/context`, `ha doctor` nói rõ điều đó. Lesson mà review ghi là của review: khi `reviews` bật và `lessons` tắt, review vẫn ghi lesson. Learned skill vẫn nằm trong catalog skill; `lessons` chỉ bỏ những gì tự đưa chúng vào một lượt. `history_search` và `history_read` với `project` vẫn đọc các hội thoại khác của project: đó là journal, không phải kho memory.
+- **Khoá `memory` trong `settings.json`** nói điều tương tự: `{"memory": {"enabled": false}}`, hoặc `{"memory": {"off": ["digest", "knowledge"]}}`. Biến môi trường thắng: `HA_MEMORY` đè `enabled`, và `HA_MEMORY_OFF`, kể cả khi rỗng, đè `off`.
+- **Hiện ở đâu.** `/context` có dòng `Memory:` (`on`, `off (HA_MEMORY): ...`, hoặc `on except ... (HA_MEMORY_OFF)`), `ha doctor` nêu những gì đang tắt (không nói gì khi tất cả đều bật), mỗi lần chạy `ha exec` và lượt đầu của mỗi hội thoại trong app ghi một bản ghi chẩn đoán `memory.switch` (`off`, `all_off`, `source`), và JSON của `ha exec` có `memory.off`. Khi digest tắt, `memory.entries` là `null`: kho không được đọc.
+- **Một lần chạy đã dùng bao nhiêu.** `ha exec --output-format json` báo ba object có cùng các trường - `input_tokens` (mọi token của prompt), `cached_input_tokens` và `cache_write_tokens` (trong số đó, phần đọc từ và ghi vào cache của provider), `output_tokens` và `model_calls` (số lần gọi có báo usage):
+  - `usage`: các lần gọi model của chính lần chạy, kể cả compaction;
+  - `children_usage`: của các child được giao việc;
+  - `upkeep_usage`: các lượt memory chạy nền mà process đã chạy - self-evaluation, review và consolidation của nó, session log lúc thoát.
+
+  Object JSON, và với `stream-json` là event `run.terminal`, được ghi ra khi các lượt đó đã xong, nên `upkeep_usage` có tính chúng; lần chạy dạng text vẫn in câu trả lời trước. Các event `usage` của stream có thêm `cache_read_tokens` và `cache_write_tokens` bên cạnh token prompt và completion.
+- **Đo nó.** Bộ live test `memory-ab.sh` dạy một project vài sự thật, rồi chạy cùng các task từ cùng một snapshot với memory bật, tắt và (với `ABLATE=1`) từng tính năng tắt riêng, và ghi một bảng về tỉ lệ thành công, token, số lần gọi và thời gian so với khi tắt memory ([live test](../../scripts/testing/live-tests/README.md)).

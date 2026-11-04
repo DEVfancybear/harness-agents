@@ -25,6 +25,8 @@ pub struct Facts {
     /// The background memory passes waiting, failed or given up
     /// ([`super::sleep::summary`]).
     pub sleep: super::sleep::Summary,
+    /// Which memory features are on (`HA_MEMORY`, [`super::memory_switch`]).
+    pub memory: super::memory_switch::Switch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -411,8 +413,24 @@ fn state(root: &Path, facts: &Facts) -> Subsystem {
     }
     other_stores(facts, &mut subsystem);
     sleep(facts, &mut subsystem);
+    memory_switch(facts, &mut subsystem);
     markdown_memory(root, &mut subsystem);
     subsystem
+}
+
+/// What of memory is off (`HA_MEMORY`, `HA_MEMORY_OFF`, the `memory`
+/// setting), and any name there that is no feature. Nothing is said while
+/// every feature is on.
+fn memory_switch(facts: &Facts, subsystem: &mut Subsystem) {
+    let summary = facts.memory.summary();
+    if summary == "on" {
+        return;
+    }
+    subsystem.short(
+        Level::Warn,
+        format!("memory is {summary}"),
+        "nothing of what is off reaches a turn or is written; unset HA_MEMORY and HA_MEMORY_OFF, or the `memory` key of settings.json, to turn it back on",
+    );
 }
 
 /// The background memory passes (`sleep`): how many wait, which failed and
@@ -812,6 +830,43 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("no longer tried by themselves"), "{text}");
+    }
+
+    /// The doctor names the memory features that are off, and says nothing
+    /// while memory is on.
+    #[test]
+    fn memory_that_is_off_is_named() {
+        let root = tempfile::tempdir().expect("root");
+        let audited = |facts: &Facts| {
+            lines(
+                root.path(),
+                &audit(&std::path::PathBuf::new(), root.path(), root.path(), facts),
+            )
+            .join("\n")
+        };
+        assert!(!audited(&Facts::default()).contains("memory is"));
+        let facts = Facts {
+            memory: crate::interactive::memory_switch::Switch::from_values(Some("off"), None, None),
+            ..Facts::default()
+        };
+        let text = audited(&facts);
+        assert!(
+            text.contains("! memory is off (HA_MEMORY): digest, markdown, session_log"),
+            "{text}"
+        );
+        let facts = Facts {
+            memory: crate::interactive::memory_switch::Switch::from_values(
+                None,
+                Some("knowledge"),
+                None,
+            ),
+            ..Facts::default()
+        };
+        assert!(
+            audited(&facts).contains("! memory is on except knowledge (HA_MEMORY_OFF)"),
+            "{}",
+            audited(&facts)
+        );
     }
 }
 

@@ -237,6 +237,6 @@ zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])
 EOF
 check "the summary has the learning section" 'grep -q "^## Learning, self-evaluation and session logs" "$RX/report/SUMMARY.md"'
 check "with the loop's promotions and its import" 'sed -n "/^## Learning, self-evaluation/,/^## [A-Z]/p" "$RX/report/SUMMARY.md" | grep -q "| promoted |" && sed -n "/^## Learning, self-evaluation/,/^## [A-Z]/p" "$RX/report/SUMMARY.md" | grep -q "| imported |"'
-check "and the lessons file" '[ -f "$RX/report/harness/global/lessons.json" ]'
+check "and the lessons file, outlined without its quotes (0.9.0)" '[ -f "$RX/report/harness/global/lessons.json.outline.json" ]'
 
 result
