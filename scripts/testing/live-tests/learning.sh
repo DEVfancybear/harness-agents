@@ -84,6 +84,44 @@ echo "################ 1. a correction in the moment is recorded as a lesson, wi
 # project. It is the model's call (it may keep a preference of this
 # conversation instead, on 0.8.7 as on 0.8.8), so a miss is retried on a fresh
 # store; an attempt's evidence is kept beside the run.
+# Section 2's runs are part of the attempt: its rule is a review's entry that
+# covers the lesson, or the loop's once the gate holds. Since 0.9.0 a review's
+# memory edit must quote what it read; one resting on words nobody said is
+# refused, as it should be, and the lesson is then no rule yet (one signal
+# from each conversation is weight 2 of the gate's 3). That attempt is retried
+# too; a refused quote that the runs do hold is the product's fault, judged.
+# paraphrased: a review's memory edit was refused for its evidence, and every
+# such evidence is in none of the runs' prompts and answers.
+paraphrased() { "$PY" - "$D" "$RX" <<'EOF'
+import glob, json, os, re, sys
+data, rx = sys.argv[1], sys.argv[2]
+said = [
+    "Giải thích thật chi tiết từng dòng của calc.py.",
+    "Dài quá, mình đọc không nổi. Hàm sub làm gì? 1-2 câu thôi.",
+    "Giải thích hàm add trong calc.py.",
+    "Lại dài quá rồi, như lần trước. Ngắn thôi, 1-2 câu: calc.py có mấy hàm?",
+]
+for name in ("a1", "a2", "b1", "b2"):
+    try:
+        said.append(json.load(open(os.path.join(rx, name + ".json"), encoding="utf-8")).get("response", ""))
+    except Exception:
+        pass
+def norm(text):
+    return re.sub(r"\s+", " ", text).strip().lower()
+held = norm(" ".join(said))
+refused = []
+for path in glob.glob(os.path.join(data, "**", "refinements.jsonl"), recursive=True):
+    for line in open(path, encoding="utf-8"):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        for edit in record.get("appliedEdits") or []:
+            if edit.get("applied") is False and str(edit.get("error", "")).startswith("the evidence is not a verbatim quote"):
+                refused.append(norm(str(edit.get("evidence", ""))))
+print("yes" if refused and all(piece and piece not in held for piece in refused) else "")
+EOF
+}
 ID=""
 for attempt in 1 2 3; do
   if [ "$attempt" -gt 1 ]; then
@@ -95,9 +133,22 @@ for attempt in 1 2 3; do
   A=$(task_of a1)
   run_exec a2 "$P" --resume "$A" "Dài quá, mình đọc không nổi. Hàm sub làm gì? 1-2 câu thôi."
   ID=$(field "x['project'] is None" "x['id']")
-  [ -n "$ID" ] && [ "$(kind "$ID")" = correction ] && break
-  echo "   attempt $attempt: the review kept no correction about every project ($(grep -E 'Created|Changed|Updated' "$RX/a2.err" | tr -s ' ' | tr '\n' ';')); retrying on a fresh store"
-  ID=""
+  if [ -z "$ID" ] || [ "$(kind "$ID")" != correction ]; then
+    echo "   attempt $attempt: the review kept no correction about every project ($(grep -E 'Created|Changed|Updated' "$RX/a2.err" | tr -s ' ' | tr '\n' ';')); retrying on a fresh store"
+    ID=""
+    continue
+  fi
+  # Section 1 judges what the first conversation left.
+  ONE_LEARNED=$(learned_count)
+  run_exec b1 "$P" "Giải thích hàm add trong calc.py."
+  run_exec b2 "$P" --resume "$(task_of b1)" "Lại dài quá rồi, như lần trước. Ngắn thôi, 1-2 câu: calc.py có mấy hàm?"
+  [ "$(state "$ID")" = promoted ] && break
+  if [ "$attempt" -lt 3 ] && [ -n "$(paraphrased)" ]; then
+    echo "   attempt $attempt: the review's rule quoted words the runs do not hold and was refused, so the lesson is no rule yet; retrying on a fresh store"
+    ID=""
+    continue
+  fi
+  break
 done
 if [ -z "$ID" ]; then
   echo "PRECONDITION FAILED: in 3 attempts the review kept no correction about every project (see $RX-attempt-*); rerun"
@@ -108,11 +159,10 @@ check "a lesson about every project was recorded" '[ -n "$ID" ]'
 echo "   lesson: $ID $(field "x['id']=='$ID'" "x['text']")"
 check "it is a correction" '[ "$(kind "$ID")" = correction ]'
 check "its signal quotes the conversation" '"$HA" learning show "$ID" | grep -qi "dài quá\|1-2 câu\|đọc không nổi"'
-check "one conversation writes no rule of the loop" '[ "$(learned_count)" -eq 0 ]'
+check "one conversation writes no rule of the loop" '[ "$ONE_LEARNED" -eq 0 ]'
 
 echo "################ 2. a second conversation makes it a rule, kept once"
-run_exec b1 "$P" "Giải thích hàm add trong calc.py."
-run_exec b2 "$P" --resume "$(task_of b1)" "Lại dài quá rồi, như lần trước. Ngắn thôi, 1-2 câu: calc.py có mấy hàm?"
+# Its runs, b1 and b2, ran in the attempt above.
 check "the review named the open lesson" '[ "$(conversations "$ID")" -ge 2 ]'
 check "the lesson is a rule" '[ "$(state "$ID")" = promoted ]'
 KEY=$(placed "$ID")
@@ -166,7 +216,29 @@ for lesson in data["lessons"]:
 json.dump(data, open(path, "w", encoding="utf-8"), indent=2)
 EOF
 check "two signals from two conversations are not yet a rule" '[ "$(state "$QID")" = candidate ]'
-run_exec q2 "$Q" --resume "$(task_of q1)" "Nhắc lại: build bằng make ci, đừng dùng cargo build. Project có file README không?"
+# The precondition: q2's review recorded its signal. A signal whose quote is
+# not in the turn it reviewed (one stitched from q1's words, say) is refused,
+# as it should be; the turn is then asked again, once.
+quote_refused() { "$PY" - "$D" "$1" <<'EOF'
+import glob, json, os, sys
+for path in glob.glob(os.path.join(sys.argv[1], "**", "refinements.jsonl"), recursive=True):
+    for line in open(path, encoding="utf-8"):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        for edit in record.get("appliedEdits") or []:
+            if edit.get("id") == sys.argv[2] and edit.get("applied") is False and str(edit.get("error", "")).startswith("the evidence is not a verbatim quote"):
+                print("yes")
+                sys.exit()
+EOF
+}
+for attempt in 1 2; do
+  run_exec q2 "$Q" --resume "$(task_of q1)" "Nhắc lại: build bằng make ci, đừng dùng cargo build. Project có file README không?"
+  [ "$(signals "$QID")" -ge 3 ] && break
+  [ -n "$(quote_refused "$QID")" ] || break
+  echo "   attempt $attempt: the review's signal quoted words outside the turn it reviewed and was refused; asking again"
+done
 check "the review named the project's lesson" '[ "$(signals "$QID")" -ge 3 ]'
 check "it was promoted" '[ "$(state "$QID")" = promoted ]'
 DEC=$(cd "$Q" && ls memory/decisions/*-learned-*.md 2>/dev/null | head -1)

@@ -389,8 +389,10 @@ REF16=${made%% *}; ID16=${made#* }
 echo "   refinement ${REF16:-?} created ${ID16:-?}: $(entry16 "${ID16:-none}")"
 check "/refine created the entry (the precondition)" '[ -n "$made" ]'
 changed=""
+# The update names the version it changes: the tool refuses one without it.
+V16=$(entry16 "${ID16:-none}" | cut -d'|' -f1 | tr -d 'v')
 for attempt in 1 2; do
-  say r16 "Kiểm thử: gọi tool memory action update đúng một lần, với scope global, id '$ID16', title 'Màu logo' và content 'Logo của dự án orchid dùng màu xanh lá #2E7D32.'. Không gọi tool nào khác, không làm gì thêm." | tail -3
+  say r16 "Kiểm thử: gọi tool memory action update đúng một lần, với scope global, id '$ID16', expected_version $V16, title 'Màu logo' và content 'Logo của dự án orchid dùng màu xanh lá #2E7D32.'. Không gọi tool nào khác, không làm gì thêm." | tail -3
   entry16 "$ID16" | grep -q "#2E7D32" && { changed=1; break; }
 done
 echo "   after the agent's edit: $(entry16 "${ID16:-none}")"
