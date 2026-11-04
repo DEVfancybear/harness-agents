@@ -371,7 +371,8 @@ elif what == "shared":
             if key.endswith("_a") and key[:-2] + "_b" in keys:
                 print(key[len("memory:"):-2])
 EOF
-batches() { "$PY" "$RX/batches.py" "$D" "$1"; }
+# Python on Windows ends its lines with CR LF: the CR goes.
+batches() { "$PY" "$RX/batches.py" "$D" "$1" | tr -d '\r'; }
 after=$(entries | wc -l)
 echo "   entries: $before -> $after; deep_dream calls: $(batches calls)"
 batches show | sed 's/^/   /'
@@ -383,7 +384,7 @@ import json, sys
 for line in open(sys.argv[1], encoding='utf-8'):
     batch = json.loads(line).get('batch') or {}
     if batch.get('of'):
-        print(batch['of']); break" "$D/harness/refinements.jsonl" 2>/dev/null)
+        print(batch['of']); break" "$D/harness/refinements.jsonl" 2>/dev/null | tr -d '\r')
 check "each batch is a refinement of the pass" '[ -n "$pass14" ] && [ "$(grep -c "\"of\":\"$pass14\"" "$D/harness/refinements.jsonl")" -eq "$(batches batches)" ]'
 shared=$(batches shared | tr '\n' ' ')
 echo "   pairs that shared a batch: ${shared:-none}"

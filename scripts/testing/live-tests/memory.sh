@@ -374,12 +374,12 @@ EOF
 # The rollback of $1 in the global history, as one JSON line.
 rollback_of() { grep -F "\"rollbackOf\":\"$1\"" "$H16" 2>/dev/null | tail -1; }
 # A global entry as "vN|content".
-entry16() { "$PY" "$MEMORY_STORE" rows "$D/harness" memory | awk -F'|' -v id="$1" '$1 == id {print $6 "|" $4}'; }
+entry16() { "$PY" "$MEMORY_STORE" rows "$D/harness" memory | tr -d '\r' | awk -F'|' -v id="$1" '$1 == id {print $6 "|" $4}'; }
 agent "$P16" r16
 made=""
 for attempt in 1 2; do
   say r16 "/refine --global Lưu vào memory toàn cục (scope global, action create) đúng một entry mới, tiêu đề 'Màu logo', nội dung 'Logo của dự án orchid dùng màu cam #FF7A00.' Đây là yêu cầu của chính người dùng, hãy lưu đúng nội dung đó." | tail -3
-  for _ in $(seq 1 60); do made=$(created_with "#FF7A00" | tail -1); [ -n "$made" ] && break; sleep 5; done
+  for _ in $(seq 1 60); do made=$(created_with "#FF7A00" | tr -d '\r' | tail -1); [ -n "$made" ] && break; sleep 5; done
   [ -n "$made" ] && break
 done
 REF16=${made%% *}; ID16=${made#* }
@@ -431,7 +431,7 @@ for port in 5173 5174 5175; do
   typed="Lưu vào memory (scope local, action create) đúng một entry mới, tiêu đề 'Cổng dev', nội dung 'Server dev của dự án orchid chạy ở cổng $port.' Trường evidence của edit này hãy viết bằng tiếng Anh: dịch câu nội dung sang tiếng Anh, không chép nguyên văn câu nào ở đây."
   say "e17-$port" "/refine $typed" | tail -3
   record=""
-  for _ in $(seq 1 60); do record=$(edit_with "$port" | tail -1); [ -n "$record" ] && break; sleep 5; done
+  for _ in $(seq 1 60); do record=$(edit_with "$port" | tr -d '\r' | tail -1); [ -n "$record" ] && break; sleep 5; done
   "$HA" shutdown --force >/dev/null 2>&1
   evidence=${record##*|}
   echo "   port $port: ${record:-no edit}"
@@ -439,7 +439,7 @@ for port in 5173 5174 5175; do
 done
 check "the edit gave evidence that is not a quote of what it read (the precondition)" '[ -n "$judged" ]'
 if [ -n "$judged" ]; then
-  check "the edit is refused for its evidence" 'edit_with "$judged" | tail -1 | grep -q "^False|the evidence is not a verbatim quote"'
+  check "the edit is refused for its evidence" 'edit_with "$judged" | tr -d "\r" | tail -1 | grep -q "^False|the evidence is not a verbatim quote"'
   check "no entry holds the unquoted fact" '! "$PY" "$MEMORY_STORE" entries "$D" | grep -q "$judged"'
 fi
 
