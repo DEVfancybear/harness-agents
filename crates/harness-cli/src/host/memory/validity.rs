@@ -42,6 +42,9 @@ pub const EXPIRE_VARIABLE: &str = "HA_MEMORY_EXPIRE_DAYS";
 /// Unused this long, an entry is closed, unless [`EXPIRE_VARIABLE`] says
 /// otherwise (Copilot drops memory unused for 28 days).
 pub const DEFAULT_EXPIRE_DAYS: f64 = 28.0;
+/// The longest period [`EXPIRE_VARIABLE`] sets, a century: a longer one
+/// would not fit the times the store keeps.
+pub const MAX_EXPIRE_DAYS: f64 = 36_500.0;
 /// The expiry pass runs at most this often (or as often as its period, when
 /// that is shorter, so a test can set seconds).
 const EXPIRY_EVERY_SECONDS: f64 = 86_400.0;
@@ -367,14 +370,20 @@ pub fn fit(doc: &Value, window: &Window, now: i64) -> f64 {
 }
 
 /// After how many days unused memory is closed: [`DEFAULT_EXPIRE_DAYS`], or
-/// [`EXPIRE_VARIABLE`] (fractional days allowed); `None` when it is 0 (off).
+/// [`EXPIRE_VARIABLE`] (fractional days allowed), at most
+/// [`MAX_EXPIRE_DAYS`]; `None` when it is 0 (off).
 #[must_use]
 pub fn expire_days() -> Option<f64> {
-    let days = std::env::var(EXPIRE_VARIABLE)
-        .ok()
+    expire_days_of(std::env::var(EXPIRE_VARIABLE).ok().as_deref())
+}
+
+/// [`expire_days`] of the variable's value.
+fn expire_days_of(value: Option<&str>) -> Option<f64> {
+    let days = value
         .and_then(|value| value.trim().parse::<f64>().ok())
         .filter(|days| days.is_finite() && *days >= 0.0)
-        .unwrap_or(DEFAULT_EXPIRE_DAYS);
+        .unwrap_or(DEFAULT_EXPIRE_DAYS)
+        .min(MAX_EXPIRE_DAYS);
     (days > 0.0).then_some(days)
 }
 
@@ -405,9 +414,16 @@ pub fn expire_unused(
     if !memory_store::db_path(dir).is_file() {
         return Ok(0);
     }
+    // A period past what a time can hold reaches back before any entry:
+    // nothing is that old.
+    let Some(cutoff) =
+        chrono::TimeDelta::try_milliseconds((days.min(MAX_EXPIRE_DAYS) * 86_400_000.0) as i64)
+            .and_then(|span| now.checked_sub_signed(span))
+    else {
+        return Ok(0);
+    };
     let _lock = super::harness::lock_state(dir)?;
     let (mut document, rows) = memory_store::load_with_usage(dir)?;
-    let cutoff = now - chrono::TimeDelta::milliseconds((days * 86_400_000.0) as i64);
     let cutoff = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     // The clock starts with the store's first pass: before 0.8.8 no read
@@ -510,7 +526,20 @@ pub fn expire_due(data_dir: &Path, local: &Path) {
     let mut total = 0_usize;
     let mut failure = None;
     for dir in [global.as_path(), local] {
-        match expire_unused(dir, days, now) {
+        // A pass that panicked fails its job: dropped, the claim would leave
+        // it to run again with no attempt counted, for ever.
+        let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            expire_unused(dir, days, now)
+        }))
+        .unwrap_or_else(|panic| {
+            let reason = panic
+                .downcast_ref::<&str>()
+                .map(|reason| (*reason).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            Err(format!("the expiry pass panicked: {reason}"))
+        });
+        match pass {
             Ok(count) => total += count,
             Err(error) => failure = Some(error),
         }
@@ -553,6 +582,34 @@ mod tests {
         let mut point = json!({"temporal": {"start": "2026-12-01T00:00:00.000Z"}});
         close(&mut point, "2026-11-01T00:00:00.000Z");
         assert_eq!(point["temporal"]["end"], "2026-12-01T00:00:00.001Z");
+    }
+
+    /// An enormous `HA_MEMORY_EXPIRE_DAYS` is capped, and a pass given more
+    /// days than a time holds closes nothing instead of panicking: the panic
+    /// left its Sleep job claimed, neither done nor failed.
+    #[test]
+    fn an_enormous_expiry_period_is_capped_and_never_panics() {
+        assert_eq!(expire_days_of(Some("1e300")), Some(MAX_EXPIRE_DAYS));
+        assert_eq!(expire_days_of(Some("3")), Some(3.0));
+        assert_eq!(expire_days_of(Some("0")), None);
+        assert_eq!(expire_days_of(None), Some(DEFAULT_EXPIRE_DAYS));
+        let directory = tempfile::tempdir().expect("dir");
+        let dir = directory.path().join("harness");
+        let mut state = memory_store::empty_document();
+        state["entries"]["memory"]["old"] = json!({"id": "old", "kind": "memory", "title": "Old", "content": "An old fact",
+            "path": "notes", "version": 1, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"});
+        memory_store::save_document(
+            &dir,
+            &state,
+            &memory_store::Writer::new("model", &json!({}), "create"),
+        )
+        .expect("save");
+        memory_store::write_meta(&dir, EXPIRY_SINCE, &json!("2026-01-01T00:00:00.000Z"))
+            .expect("watched");
+        let now = chrono::Utc::now();
+        assert_eq!(expire_unused(&dir, 1e300, now).expect("no panic"), 0);
+        assert_eq!(expire_unused(&dir, f64::MAX, now).expect("no panic"), 0);
+        assert_eq!(expire_unused(&dir, 1.0, now).expect("expired"), 1);
     }
 
     #[test]
