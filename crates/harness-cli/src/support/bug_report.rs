@@ -39,7 +39,8 @@ pub struct Options {
     pub task: Option<String>,
     /// Only this session (`session_...`).
     pub session: Option<String>,
-    /// Request bodies, checkpoints and every setting's value.
+    /// Request bodies, checkpoints and every setting's value, and what memory
+    /// kept: its entries' text, the lessons' quotes, the refinements.
     pub include_content: bool,
 }
 
@@ -901,7 +902,7 @@ impl Report {
             "lessons.json",
             "lessons_meditated",
         ] {
-            self.copy_file(&global.join(name), &format!("harness/global/{name}"), false);
+            self.copy_memory_file(&global.join(name), &format!("harness/global/{name}"), false);
         }
         // The self-evaluations, newest last.
         self.copy_file(
@@ -936,14 +937,15 @@ impl Report {
         for (_, task) in conversations {
             let local = crate::interactive::harness::local_dir(&self.data_dir, &task);
             self.memory_store(&local, &format!("harness/{task}"));
+            for name in ["task_state.json", "review_watermark"] {
+                self.copy_file(&local.join(name), &format!("harness/{task}/{name}"), true);
+            }
             for name in [
                 "harness_state.json",
-                "task_state.json",
-                "review_watermark",
                 "refinements.jsonl",
                 "memory_history.jsonl",
             ] {
-                self.copy_file(&local.join(name), &format!("harness/{task}/{name}"), true);
+                self.copy_memory_file(&local.join(name), &format!("harness/{task}/{name}"), true);
             }
             let kernel = self.data_dir.join("sessions").join(&task).join("kernel");
             for name in ["kernel-stderr.log", "kernel-state.json"] {
@@ -960,10 +962,17 @@ impl Report {
 
     /// A scope's memory store as `memory_store.json`: its counts and its
     /// entries, read without changing it. A legacy `harness_state.json` not
-    /// yet imported is copied as it is.
+    /// yet imported is copied as it is. Without `--include-content` each
+    /// entry is its id, kind, path, version and size, and each refinement
+    /// its id and how many changes it made: what memory kept is the user's.
     fn memory_store(&mut self, dir: &Path, prefix: &str) {
         match crate::interactive::memory_store::snapshot(dir) {
-            Ok(Some(snapshot)) => {
+            Ok(Some(mut snapshot)) => {
+                if !self.options.include_content
+                    && let Some(document) = snapshot.get_mut("document")
+                {
+                    *document = document_outline(document);
+                }
                 let text = serde_json::to_string_pretty(&snapshot).unwrap_or_default();
                 self.add_text(&format!("{prefix}/memory_store.json"), &text);
             }
@@ -972,6 +981,25 @@ impl Report {
                 .notes
                 .push(format!("memory store {}: {error}", dir.display())),
         }
+    }
+
+    /// A file that holds what memory kept - entries, lessons and their
+    /// quotes, refinements: copied with `--include-content`, else its outline
+    /// at `<path>.outline.json` (its size, and its records' ids, kinds and
+    /// states).
+    fn copy_memory_file(&mut self, source: &Path, path: &str, tail_only: bool) {
+        if self.options.include_content {
+            self.copy_file(source, path, tail_only);
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(source) else {
+            return;
+        };
+        let outline = file_outline(&text);
+        self.add_text(
+            &format!("{path}.outline.json"),
+            &serde_json::to_string_pretty(&outline).unwrap_or_default(),
+        );
     }
 
     fn copy_file(&mut self, source: &Path, path: &str, tail_only: bool) {
@@ -2540,6 +2568,85 @@ fn seconds(ms: u64) -> f64 {
     ms as f64 / 1000.0
 }
 
+/// What one record is, without its text: its id, kind and state, when it
+/// has them as fields of its own.
+fn record_outline(record: &Value) -> Value {
+    let mut outline = serde_json::Map::new();
+    for key in ["id", "kind", "state", "version"] {
+        if let Some(value) = record.get(key).filter(|value| !value.is_object()) {
+            outline.insert(key.to_owned(), value.clone());
+        }
+    }
+    outline.insert(
+        "bytes".to_owned(),
+        json!(serde_json::to_string(record).map_or(0, |text| text.len())),
+    );
+    Value::Object(outline)
+}
+
+/// A memory store's document without what it kept: each entry's id, kind,
+/// path, version and content size, and each refinement's id and the number
+/// of its changes.
+fn document_outline(document: &Value) -> Value {
+    let mut entries = Vec::new();
+    for (kind, records) in document["entries"].as_object().into_iter().flatten() {
+        for entry in records
+            .as_object()
+            .into_iter()
+            .flat_map(serde_json::Map::values)
+        {
+            entries.push(json!({
+                "id": entry["id"],
+                "kind": kind,
+                "path": entry["path"],
+                "version": entry["version"],
+                "content_bytes": entry["content"].as_str().map_or(0, str::len),
+            }));
+        }
+    }
+    let refinements = document["refinements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|refinement| {
+            json!({
+                "id": refinement["id"],
+                "changes": refinement["changes"].as_array().map_or(0, Vec::len),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "withheld": "memory's text; `ha bug-report --include-content` adds it",
+        "entries": entries,
+        "refinements": refinements,
+    })
+}
+
+/// A memory file without its text: its size and lines, and the outline of
+/// each record it holds - a JSON line each, or the items of the first list a
+/// JSON object holds (`lessons.json`'s lessons).
+fn file_outline(text: &str) -> Value {
+    let records = match serde_json::from_str::<Value>(text) {
+        Ok(Value::Array(items)) => items,
+        Ok(Value::Object(fields)) => fields
+            .values()
+            .find_map(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        _ => text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(Value::is_object)
+            .collect(),
+    };
+    json!({
+        "withheld": "memory's text; `ha bug-report --include-content` adds it",
+        "bytes": text.len(),
+        "lines": text.lines().count(),
+        "records": records.iter().map(record_outline).collect::<Vec<_>>(),
+    })
+}
+
 /// Withhold the value of every secret-named key of a settings file.
 fn withhold_secret_values(value: &mut Value) {
     match value {
@@ -2929,5 +3036,33 @@ mod tests {
         assert!(text.contains("model = \"deepseek\""));
         assert!(!text.contains("sk-live-1234"));
         assert!(!text.contains("abc"));
+    }
+
+    /// A memory store's document without its text: ids, kinds, paths,
+    /// versions, sizes and the refinements' change counts.
+    #[test]
+    fn a_memory_document_is_outlined_without_its_text() {
+        let document = serde_json::json!({
+            "schema": 1,
+            "entries": {
+                "memory": {"deploy": {"id": "deploy", "path": "project/deploy", "version": 3,
+                    "title": "Deploy target", "content": "ships to kestrel-4471"}},
+                "prompt": {}
+            },
+            "refinements": [{"id": "ref_1", "trigger": "the user said so", "changes": [{"content": "x"}, {}]}]
+        });
+        let outline = super::document_outline(&document);
+        let text = outline.to_string();
+        assert!(!text.contains("kestrel"), "{text}");
+        assert!(!text.contains("Deploy target"), "{text}");
+        assert!(!text.contains("the user said so"), "{text}");
+        assert_eq!(
+            outline["entries"][0],
+            serde_json::json!({"id": "deploy", "kind": "memory", "path": "project/deploy", "version": 3, "content_bytes": 21})
+        );
+        assert_eq!(
+            outline["refinements"][0],
+            serde_json::json!({"id": "ref_1", "changes": 2})
+        );
     }
 }
