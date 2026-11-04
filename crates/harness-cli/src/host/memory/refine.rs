@@ -4164,7 +4164,7 @@ async fn consolidate_scope(
             );
         // Which entries a small batch held: what shared a batch can be told.
         if keys.len() <= BATCH_KEYS_RECORDED {
-            record = record.field("keys", keys.iter().cloned().collect::<Vec<_>>());
+            record = record.field("members", keys.iter().cloned().collect::<Vec<_>>());
         }
         record.emit();
         done.push(refinement);

@@ -100,7 +100,7 @@ hạn.
   entry bị một ranh giới tách ra sẽ gặp nhau ở lượt sau
   ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md), mục 16). Mỗi lô là một bản ghi
   `refine.consolidation_batch` (phạm vi, refinement, vị trí, số entry và số
-  sửa đổi đã áp dụng).
+  sửa đổi đã áp dụng, và id của các entry khi lô có tối đa 64 entry, `members`).
 - **Tiến hoá** (một lần mỗi ngày): chỉ được đánh dấu đã chạy khi đã lưu xong;
   khoá của nó và việc nhận job ngăn lượt thứ hai bắt đầu trong lúc đó.
 

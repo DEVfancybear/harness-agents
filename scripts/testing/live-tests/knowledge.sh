@@ -362,11 +362,11 @@ elif what == "batches":
     print(len(batches))
 elif what == "show":
     for batch in batches:
-        print(f"batch {batch.get('batch')}/{batch.get('batches')} {batch.get('refinement')}: {batch.get('entries')} entries, {batch.get('applied')} applied: {' '.join(batch.get('keys', []))}")
+        print(f"batch {batch.get('batch')}/{batch.get('batches')} {batch.get('refinement')}: {batch.get('entries')} entries, {batch.get('applied')} applied: {' '.join(batch.get('members', []))}")
 elif what == "shared":
     # The subjects whose two copies shared a batch.
     for batch in batches:
-        keys = set(batch.get("keys", []))
+        keys = set(batch.get("members", []))
         for key in sorted(keys):
             if key.endswith("_a") and key[:-2] + "_b" in keys:
                 print(key[len("memory:"):-2])
@@ -378,13 +378,13 @@ batches show | sed 's/^/   /'
 entries | sed 's/^/   /'
 check "the consolidation ran (the precondition)" '[ -f "$D/harness/memory_consolidated_changes" ]'
 check "it made a curator call per batch, more than one" '[ "$(batches batches)" -ge 2 ] && [ "$(batches calls)" -ge "$(batches batches)" ]'
-pass=$("$PY" -c "
+pass14=$("$PY" -c "
 import json, sys
 for line in open(sys.argv[1], encoding='utf-8'):
     batch = json.loads(line).get('batch') or {}
     if batch.get('of'):
         print(batch['of']); break" "$D/harness/refinements.jsonl" 2>/dev/null)
-check "each batch is a refinement of the pass" '[ -n "$pass" ] && [ "$(grep -c "\"of\":\"$pass\"" "$D/harness/refinements.jsonl")" -eq "$(batches batches)" ]'
+check "each batch is a refinement of the pass" '[ -n "$pass14" ] && [ "$(grep -c "\"of\":\"$pass14\"" "$D/harness/refinements.jsonl")" -eq "$(batches batches)" ]'
 shared=$(batches shared | tr '\n' ' ')
 echo "   pairs that shared a batch: ${shared:-none}"
 merged=""
@@ -393,9 +393,9 @@ for subject in $shared; do
 done
 echo "   of them merged:${merged:- none}"
 check "a duplicate pair that shared a batch was merged" '[ -n "$merged" ]'
-if [ -n "$pass" ]; then
-  say k14 "/refine --rollback $pass" | tail -3
-  for _ in $(seq 1 30); do grep -qF "\"rollbackOf\":\"$pass\"" "$D/harness/refinements.jsonl" && break; sleep 2; done
+if [ -n "$pass14" ]; then
+  say k14 "/refine --rollback $pass14" | tail -3
+  for _ in $(seq 1 30); do grep -qF "\"rollbackOf\":\"$pass14\"" "$D/harness/refinements.jsonl" && break; sleep 2; done
   check "one rollback of the pass undoes every batch" '[ "$(entries | wc -l)" -eq "$before" ]'
 fi
 "$HA" shutdown --force >/dev/null 2>&1

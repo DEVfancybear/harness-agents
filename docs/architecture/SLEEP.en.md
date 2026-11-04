@@ -100,7 +100,7 @@ The triggers are the ones ha had; each writes a job and then runs the due ones.
   ends moves from pass to pass, so neighbours a boundary parted meet later
   ([MEMORY_STORE.en.md](MEMORY_STORE.en.md), section 16). Each batch is a
   `refine.consolidation_batch` record (its scope, refinement, place, entries
-  and edits applied).
+  and edits applied, and the ids of a batch of 64 entries or fewer, `members`).
 - **The evolution** (once a day): marked as run only once it saved; its lock
   and its job's claim keep a second run from starting meanwhile.
 
