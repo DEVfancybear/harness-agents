@@ -492,14 +492,15 @@ pub fn expiry_due(global: &Path, days: f64, now: chrono::DateTime<chrono::Utc>) 
 /// The expiry pass, as a job of the Sleep queue: when it is on and due, it
 /// closes the unused entries of the global store and of the conversation's
 /// store at `local`, and records the run. Another process running it, or a
-/// pass not due, leaves it. Fast and local: no model call.
+/// pass not due, leaves it. Fast and local: no model call. A home with no
+/// global store has nothing to expire, and the pass creates none.
 pub fn expire_due(data_dir: &Path, local: &Path) {
     let Some(days) = expire_days() else {
         return;
     };
     let global = super::harness::global_dir(data_dir);
     let now = chrono::Utc::now();
-    if !expiry_due(&global, days, now) {
+    if !memory_store::db_path(&global).is_file() || !expiry_due(&global, days, now) {
         return;
     }
     let Some(claimed) = super::sleep::claim_upkeep(data_dir, super::sleep::Job::expiry(&global))

@@ -25,6 +25,11 @@ const ATTESTED_SHARE: f64 = 0.5;
 /// one write is likely to rest on.
 const EVENTS_READ: i64 = 4_000;
 
+/// The most text read of them, newest first, and of one part: what a write
+/// is judged against stays a fraction of a second to read.
+const TEXT_READ: usize = 1_000_000;
+const PART_READ: usize = 40_000;
+
 /// The tools whose results are memory reading itself back: never a source.
 const MEMORY_TOOLS: [&str; 5] = [
     "memory",
@@ -185,7 +190,21 @@ fn read_task(store_dir: &Path, task: &str) -> Result<Vec<Said>, rusqlite::Error>
             }
         }
     }
-    Ok(said)
+    // The newest parts first, each cut to its head, within the budget.
+    let mut left = TEXT_READ;
+    let mut kept = Vec::new();
+    for mut part in said.into_iter().rev() {
+        if left == 0 {
+            break;
+        }
+        if let Some((cut, _)) = part.text.char_indices().nth(PART_READ.min(left)) {
+            part.text.truncate(cut);
+        }
+        left = left.saturating_sub(part.text.len());
+        kept.push(part);
+    }
+    kept.reverse();
+    Ok(kept)
 }
 
 /// A review's transcript (`[User]: ...`, `[Tool result (<tool>) #N]: ...`,
