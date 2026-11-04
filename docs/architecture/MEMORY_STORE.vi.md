@@ -841,3 +841,95 @@ lại, và nêu file legacy còn chờ import, thứ nó không đọc.
 | `... --yes` | Purge chúng |
 | `--scope global`, `project`, `local` | Chỉ entry toàn cục, của project này (`--cwd`), hoặc của một hội thoại (`--conversation`) |
 | `ha memory purge --secrets [--yes]` | Như trên cho mọi thứ chứa giá trị secret |
+
+## 16. Những gì một review ghi, và Deep Dream theo từng lô (0.9.0)
+
+0.9.0 đóng năm lỗ hổng mà một lần audit tìm thấy trong cách các refinement ghi
+vào store (`memory/refine.rs`, `memory/learned.rs`). Mỗi điều là một quy tắc của
+`apply`, cửa vào duy nhất mà mọi refinement - review, `/refine`, `/learn`, Deep
+Dream, curator, rollback - đều ghi qua.
+
+**Một lần cập nhật giữ ai đã lưu entry.** Cập nhật giữ `source` của entry
+(`agent`, `learning`, `refine`, ...) và `origin` của nó, và ghi refinement đã
+sửa nó vào `edited_by`: `{via: "refine", refinement, conversation, evidence,
+confidence}`. Một lần tạo mới là của review (`source: refine`, `origin` là cùng
+bản ghi đó). Trước đây mọi lần cập nhật đều đặt `source: refine`: một review
+diễn đạt lại một learned rule biến nó thành entry của review, Deep Dream (vốn bỏ
+qua `source: learning`) sau đó có thể gộp mất nó, và learning loop retire lesson
+của nó vì đã bị xoá. Rollback đặt lại nguyên snapshot, kèm `source` và
+`origin`, thành một version mới.
+
+**Rollback chỉ hoàn tác những gì refinement của nó đã ghi.** Mỗi lần khôi phục
+mang theo version mà refinement để lại (`after`, hoặc không có gì với entry nó
+đã xoá). Một entry chỉ được rollback khi nó vẫn là version đó - cùng `version`,
+tiêu đề và nội dung; entry mà refinement đã xoá thì chỉ khi chưa entry nào lấy
+id của nó. Một thay đổi learned skill ghi SHA-256 của `SKILL.md` mà nó đã viết
+(`undo.written`), và chỉ được hoàn tác khi file vẫn còn hash đó; thay đổi được
+ghi trước 0.9.0 không có hash và được hoàn tác như trước. Trang knowledge vốn
+đã chỉ bị xoá khi còn nguyên như lúc ghi. Thứ đã đổi từ đó được bỏ qua, không
+tính là lỗi: kết quả nêu nó ("Skipped: update local memory `deploy`: changed
+since refinement refine_... wrote it: the later version is kept"), và rollback
+bỏ qua tất cả thì là "Harness rollback unchanged".
+
+**Lệnh xoá của một lần gộp đứng hay đổ cùng entry còn lại.** Lệnh xoá gộp một
+entry vào entry khác thì nêu entry đó trong `merged_into`; prompt của curator
+yêu cầu điều này, và prompt của review cho phép. Các lệnh xoá như vậy được áp
+dụng sau mọi sửa đổi khác của refinement, và một lệnh xoá bị bỏ qua khi sửa
+đổi của entry còn lại không được áp dụng (bị từ chối, hoặc bị bỏ qua vì entry
+đã đổi trong lúc đó), khi entry còn lại không còn sau các sửa đổi khác (bị xoá
+trong cùng refinement), hoặc bị từ chối khi nó tự nêu chính mình. Lệnh xoá
+không có `merged_into` (cũ, tạm thời, bị cài vào) được xét riêng, như trước.
+Các rào chắn của Deep Dream cũng dùng entry còn lại: entry đã ghim gộp vào entry
+mà lượt này cập nhật thì entry đó được ghim, gộp vào entry vẫn không ghim thì
+không bị xoá, constraint chỉ gộp vào constraint, và không gì được gộp vào entry
+mà lượt này xoá.
+
+**Sửa đổi memory của review trích những gì nó đã đọc.** Một sửa đổi memory hay
+prompt note của review, `/refine` hoặc `/learn` chỉ được áp dụng khi `evidence`
+của nó tìm thấy trong những gì refinement đã đọc: hội thoại (có cả khối
+`[Child findings, from <child>]` của một child, được trích cho một sự thật do
+child tìm ra), và với `/refine` là những gì người dùng gõ sau lệnh - không bao
+giờ là instructions của review gate, hay của một refinement mà model yêu cầu
+(`refine.run`), vốn là lời của một model. Câu trích được so
+không tính khoảng trắng và hoa thường, bỏ dấu ngoặc kép bao quanh; các đoạn nối
+bằng `...` hoặc `…` phải tìm thấy từng đoạn, theo thứ tự; và nó phải là một cụm
+dài từ 12 ký tự, như câu trích của lesson. Nếu không, sửa đổi bị từ chối kèm lý
+do, được ghi cùng refinement như mọi lần từ chối khác. Sửa đổi global không có
+evidence vẫn không thành sửa đổi global, và bị từ chối ở nơi nó ở lại.
+`confidence` của sửa đổi (`high`, `medium` hay `low`) được ghi vào `origin` của
+entry (hoặc `edited_by`); chưa có gì đọc nó.
+
+**Bằng chứng của Deep Dream là chính các entry nó được đưa.** Một lần gộp không
+trích hội thoại nào, nên phép kiểm tra nằm trên các entry: sửa đổi nêu một entry
+ngoài lô của nó bị từ chối; lệnh xoá trong một lần gộp nêu một entry còn lại
+thuộc lô của nó; và cập nhật có hơn một nửa số từ trong nội dung (các term của
+tìm kiếm) không nằm trong entry nào của lô bị từ chối vì thêm điều không entry
+nào nói. Tiêu đề có thể mới.
+
+**Deep Dream theo từng lô.** Toàn bộ memory toàn cục từng nằm trong một prompt,
+không giới hạn: khoảng 10.000 entry làm tràn context của model, và lượt chạy
+thất bại mọi lần. Giờ một lượt:
+
+- sắp các entry của phạm vi để các entry liên quan đứng cạnh nhau - theo loại,
+  project và path, rồi theo từ hiếm nhất mà mỗi entry cùng có với một entry
+  khác, từ mà một bản gần trùng có chung với bản kia;
+- cắt thứ tự đó thành các lô tối đa `HA_CONSOLIDATE_BATCH_TOKENS` token entry
+  (mặc định 32.000; khoảng bốn byte một token, như bộ biên dịch context đếm),
+  mỗi lô từ hai entry; memory nằm trong ngân sách là một lô, như trước;
+- dời chỗ lô đầu tiên kết thúc, trong khoảng một phần tư đến toàn bộ ngân sách,
+  theo thời điểm của lượt, nên ranh giới của lượt này không trùng lượt sau và
+  hai entry bị một ranh giới tách ra sẽ gặp nhau sau đó;
+- gọi curator một lần cho mỗi lô, chỉ cho nó thấy các entry của lô và vị trí
+  của lô (`batch 2 of 5`, kích thước memory, phần của lô trong mục tiêu 30
+  entry), và áp dụng ngay các sửa đổi của lô: mỗi lượt xoá tối đa một nửa mỗi
+  lô;
+- ghi mỗi lô thành một refinement `<id>_b<n>` có `batch` nêu lượt
+  (`{of, index, count}`), hiển thị chung dưới `<id>`, mà `/refine --rollback
+  <id>` hoàn tác một lần; lượt chỉ có một lô được ghi là `<id>`, như trước;
+- thất bại khi lời gọi hoặc lần áp dụng của một lô thất bại: đó là thất bại
+  của job, mà hàng đợi thử lại ([SLEEP.vi.md](SLEEP.vi.md)); các lô trước nó vẫn
+  được giữ, và thông báo lỗi nêu tên chúng.
+
+Điều tương tự áp dụng cho store của một hội thoại quá 40 entry và phần memory
+của curator (`/refine --curate`), mà các lô của nó đi trước refinement `<id>`
+của phần skill.

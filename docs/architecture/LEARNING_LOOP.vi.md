@@ -270,7 +270,11 @@ entry memory của lesson đã promote còn không:
 - rule do loop ghi mà người dùng đã xoá thì lesson của nó retire.
 
 Deep Dream không thấy các entry của chính loop (`source: learning`): meditation
-lo các entry đó.
+lo các entry đó. Review cập nhật một entry như vậy thì entry vẫn là của loop:
+một lần cập nhật giữ `source` và `origin` của entry và ghi ai đã sửa vào
+`edited_by` (từ 0.9.0; trước đó sửa đổi biến entry thành của review, Deep
+Dream sau đó có thể gộp mất nó, và lesson bị retire vì "đã bị xoá ngoài
+learning loop").
 `lessons_meditated` nằm cạnh đó ghi lần meditation gần nhất.
 
 ## 9. Kiểm thử

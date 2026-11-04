@@ -10,7 +10,7 @@ bản, qua các lượt chạy nền, mỗi lượt gọi một model:
 | Lượt | Đọc | Ghi |
 |---|---|---|
 | Review một hội thoại (review gate, rồi lần refine nó duyệt) | các lượt từ lần review trước | store của hội thoại, memory toàn cục, bài học, skill tự học, knowledge |
-| Deep Dream (hợp nhất) | memory toàn cục, hoặc store của một hội thoại khi quá 40 entry | chính phạm vi đó, đã gộp và tỉa |
+| Deep Dream (hợp nhất) | memory toàn cục, hoặc store của một hội thoại khi quá 40 entry, theo từng lô khi vượt ngân sách token | chính phạm vi đó, đã gộp và tỉa |
 | Tiến hoá harness | các lần gọi tool hỏng trong 14 ngày qua | luật và ghi chú cho tool |
 
 Một lần gọi model có thể hỏng: provider sập, chạm giới hạn, process chết.
@@ -92,6 +92,15 @@ hạn.
   một hội thoại quá 40 entry): chỉ được đánh dấu xong khi đã áp dụng; mỗi lúc
   một lần hợp nhất trên mọi process của ha (`consolidation.lock` trong thư mục
   harness toàn cục, một khoá của hệ điều hành mà process giữ khi chạy).
+  Từ 0.9.0 memory vượt 32.000 token entry được hợp nhất theo từng lô, mỗi lô
+  một lần gọi curator, các entry liên quan trong một lô đứng cạnh nhau; mỗi lô
+  được áp dụng và ghi lại (`<id>_b<n>`) ngay khi lập xong. Một lô thất bại là
+  thất bại của job: hàng đợi thử lại cả lượt, cắt lô lại từ đầu, và các lô đã
+  áp dụng vẫn được giữ. Chỗ lô đầu tiên kết thúc dời đi giữa các lượt, nên hai
+  entry bị một ranh giới tách ra sẽ gặp nhau ở lượt sau
+  ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md), mục 16). Mỗi lô là một bản ghi
+  `refine.consolidation_batch` (phạm vi, refinement, vị trí, số entry và số
+  sửa đổi đã áp dụng).
 - **Tiến hoá** (một lần mỗi ngày): chỉ được đánh dấu đã chạy khi đã lưu xong;
   khoá của nó và việc nhận job ngăn lượt thứ hai bắt đầu trong lúc đó.
 
@@ -116,6 +125,8 @@ thành công; nó không nằm trong hàng đợi.
 
 `HA_SLEEP_RETRY_SECONDS` đặt thời gian chờ đầu tiên sau một lần hỏng (gấp đôi
 như trên), `HA_SLEEP_MAX_ATTEMPTS` số lần hỏng trước khi job bỏ cuộc, và
-`HA_COMPACTION_REVIEW_SECONDS` khoảng cách giữa các review của compact. Chúng
+`HA_COMPACTION_REVIEW_SECONDS` khoảng cách giữa các review của compact, và
+`HA_CONSOLIDATE_BATCH_TOKENS` số token entry mà một lần gọi Deep Dream được
+đưa (32.000; memory vượt mức này được hợp nhất theo từng lô). Chúng
 dành cho live test (`scripts/testing/live-tests/sleep.sh`); giá trị mặc định
 hợp với dùng hằng ngày.
