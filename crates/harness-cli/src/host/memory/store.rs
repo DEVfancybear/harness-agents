@@ -178,6 +178,17 @@ impl Writer {
     pub fn operation(&self) -> &str {
         &self.operation
     }
+
+    /// The same writer, its saves in the same operation, for another cause:
+    /// a correction's new entry is `create`, the entries it closes
+    /// `supersede`.
+    #[must_use]
+    pub fn because(&self, cause: &str) -> Self {
+        Self {
+            cause: cause.to_owned(),
+            ..self.clone()
+        }
+    }
 }
 
 /// The id of each live memory of a store, by `(kind, key)`.
@@ -685,7 +696,10 @@ pub fn empty_document() -> Value {
 
 /// The whole state of a scope as one document, `harness_state.json`'s shape:
 /// `{"schema", "entries": {kind: {name: entry}}, "refinements"}`. A scope with
-/// no store reads as empty and is not created.
+/// neither a store nor a legacy file reads as empty and no store is created.
+/// A scope with a store has it migrated to this schema first, and one with a
+/// legacy `harness_state.json` or journal gets a store, the files imported
+/// into it ([`Store::existing`]): this read may write.
 ///
 /// # Errors
 /// The store cannot be opened or read.
@@ -946,6 +960,39 @@ pub fn snapshot(dir: &Path) -> Result<Option<Value>, String> {
     })))
 }
 
+/// A value the store keeps about itself under `key` (`store_meta`), read
+/// without changing anything: `None` when the scope has no store, the key
+/// none, or the store cannot be read.
+#[must_use]
+pub fn read_meta(dir: &Path, key: &str) -> Option<Value> {
+    let conn = read_only(dir).ok().flatten()?;
+    conn.query_row("SELECT value FROM store_meta WHERE key = ?", [key], |row| {
+        row.get::<_, String>(0)
+    })
+    .optional()
+    .ok()
+    .flatten()
+    .map(|text| parse(&text))
+}
+
+/// Keep `value` under `key` in the store's own meta (`store_meta`), beside
+/// its entries: never an entry, a version or an event.
+///
+/// # Errors
+/// The store cannot be opened or written.
+pub fn write_meta(dir: &Path, key: &str, value: &Value) -> Result<(), String> {
+    let mut store = Store::open(dir)?;
+    let transaction = store.begin()?;
+    transaction
+        .execute(
+            "INSERT INTO store_meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value.to_string()],
+        )
+        .map_err(sql)?;
+    transaction.commit().map_err(sql)
+}
+
 struct Store {
     conn: Connection,
     root: &'static str,
@@ -971,8 +1018,12 @@ impl Store {
         Ok(store)
     }
 
-    /// The store of `dir` when it has one, or a legacy file to import: reading
-    /// a scope never creates a store.
+    /// The store of `dir` when it has one, or a legacy file to import; `None`
+    /// for a scope with neither, which is left as it is. Otherwise it is
+    /// [`Self::open`]: the store is migrated to this schema, and a legacy
+    /// `harness_state.json` or `memory_history.jsonl` beside it is imported
+    /// and renamed, creating the store when there was only the file. A read
+    /// that must change nothing uses `read_only` instead.
     fn existing(dir: &Path) -> Result<Option<Self>, String> {
         if db_path(dir).exists()
             || dir.join(LEGACY_STATE).exists()

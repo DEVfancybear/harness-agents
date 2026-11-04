@@ -109,12 +109,16 @@ pub mod mcp_oauth;
 pub mod memory;
 #[path = "memory/filters.rs"]
 pub mod memory_filters;
+#[path = "memory/provenance.rs"]
+pub mod memory_provenance;
 #[path = "memory/readout.rs"]
 pub mod memory_readout;
 #[path = "memory/search.rs"]
 pub mod memory_search;
 #[path = "memory/store.rs"]
 pub mod memory_store;
+#[path = "memory/validity.rs"]
+pub mod memory_validity;
 #[path = "prompting/model_prompts.rs"]
 pub mod model_prompts;
 #[path = "models/oauth.rs"]

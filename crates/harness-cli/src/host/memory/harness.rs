@@ -101,6 +101,9 @@ pub struct Entry {
     /// Where its words are indexed for ranking, when it was read from a
     /// store: they are read again only when it changes.
     pub indexed: Option<super::memory_search::Indexed>,
+    /// Where its words came from, and whether a correction or the expiry
+    /// pass closed it (`memory_validity`).
+    pub standing: super::memory_validity::Standing,
 }
 
 /// The merged state of one turn.
@@ -238,6 +241,7 @@ pub fn parse(parsed: &Value, scope: &str, root: &str) -> State {
                 ended: super::memory_store::ended(raw),
                 usage: super::memory_store::Usage::default(),
                 indexed: None,
+                standing: super::memory_validity::Standing::of(raw),
             });
         }
     }
@@ -517,7 +521,13 @@ fn age_suffix(entry: &Entry) -> String {
         Some("learning") => ", learned from corrections",
         _ => "",
     };
-    age_label(entry).map_or_else(|| origin.to_owned(), |age| format!(", {age}{origin}"))
+    // A page's or a child's words are no one's word for it: the entry says so.
+    let origin = match entry.standing.kind {
+        "web" => format!("{origin}, from a web page: unverified"),
+        "child" => format!("{origin}, from a delegated agent: unverified"),
+        _ => origin.to_owned(),
+    };
+    age_label(entry).map_or_else(|| origin.clone(), |age| format!(", {age}{origin}"))
 }
 
 /// The order of two entries' places: path, title and key, compared as the
@@ -617,6 +627,7 @@ fn ranked<'a>(
     }
     matched.sort_by(by_words);
     let matched = super::memory_search::reranked(entries, matched, RERANK_POOL, now);
+    let matched = super::memory_search::settled(entries, matched);
     let mut shown = matched
         .into_iter()
         .take(limit)

@@ -40,6 +40,10 @@ use serde_json::{Value, json};
 
 use super::paths::LaunchEnvironment;
 
+/// The tools this host gives: what they return is a fetched page, which the
+/// memory reads as unverified (`memory_provenance`).
+pub const TOOLS: [&str; 2] = ["web_search", "web_fetch"];
+
 /// `off` (or `0`, `false`, `no`) removes the web tools.
 pub const WEB_VARIABLE: &str = "HA_WEB";
 
@@ -385,13 +389,15 @@ impl ExternalToolCatalog for WebCatalog {
     }
 
     fn resolve(&self, name: &str, arguments: &Value) -> Option<CodingToolAction> {
-        matches!(name, "web_search" | "web_fetch").then(|| CodingToolAction::ExternalTool {
-            plugin_id: "web".to_owned(),
-            tool_name: name.to_owned(),
-            arguments: arguments.clone(),
-            parent_invocation_id: None,
-            timeout_ms: 60_000,
-        })
+        TOOLS
+            .contains(&name)
+            .then(|| CodingToolAction::ExternalTool {
+                plugin_id: "web".to_owned(),
+                tool_name: name.to_owned(),
+                arguments: arguments.clone(),
+                parent_invocation_id: None,
+                timeout_ms: 60_000,
+            })
     }
 }
 

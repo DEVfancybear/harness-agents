@@ -513,6 +513,33 @@ impl Temporal {
                     }
             })
     }
+
+    /// The window of time its modes name together, open where none bounds
+    /// it: what a search that names a time ranks the entries' validity by.
+    /// `contains` is a point; `before` ends it and `after` starts it;
+    /// `overlaps` and `within` are their periods.
+    #[must_use]
+    pub fn window(&self) -> (Option<String>, Option<String>) {
+        let mut from = self.after.clone();
+        let mut to = self.before.clone();
+        let mut narrow = |start: &String, end: &String| {
+            from = Some(
+                from.take()
+                    .map_or_else(|| start.clone(), |from| from.max(start.clone())),
+            );
+            to = Some(
+                to.take()
+                    .map_or_else(|| end.clone(), |to| to.min(end.clone())),
+            );
+        };
+        if let Some(time) = &self.contains {
+            narrow(time, time);
+        }
+        for (start, end) in [&self.overlaps, &self.within].into_iter().flatten() {
+            narrow(start, end);
+        }
+        (from, to)
+    }
 }
 
 // ---------------------------------------------------------------- JSON path
