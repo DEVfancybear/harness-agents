@@ -5069,6 +5069,17 @@ impl InteractiveController {
                         self.reference("/refine --history", lines, &mut effects);
                         return effects;
                     }
+                    // Memory's reviews off leave every store as they were.
+                    let memory = super::memory_switch::Switch::load(
+                        &self.context.paths.config_file,
+                        &super::paths::LaunchEnvironment::capture(),
+                    );
+                    if !memory.on(super::memory_switch::Feature::Reviews) {
+                        self.push_history(&mut effects, HistoryItem::Notice {
+                            message: format!("{name}: {}", super::service::reviews_off_notice(&memory)),
+                        });
+                        return effects;
+                    }
                     self.continuations = 0;
                     self.fresh_run(Instant::now(), Some(text.clone()));
                     self.service.submit(SubmitRequest {
@@ -9698,6 +9709,43 @@ Command: \"npm run build\""
             "{plain}"
         );
         assert!(plain.contains("[info] hello"), "{plain}");
+    }
+
+    /// With memory's reviews off (`HA_MEMORY_OFF=reviews`, or the setting),
+    /// `/refine` and `/learn` change no store: nothing is submitted, and the
+    /// notice says why. The history is still read. Before, both ran.
+    #[test]
+    fn h03b_refine_and_learn_wait_while_memory_reviews_are_off() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let settings =
+            super::super::config::settings_path(&harness.controller.context.paths.config_file);
+        std::fs::create_dir_all(settings.parent().expect("settings dir")).expect("settings dir");
+        std::fs::write(&settings, r#"{"memory": {"off": ["reviews"]}}"#).expect("setting");
+        for command in [
+            "/refine keep the tabs",
+            "/learn",
+            "/refine --rollback refine_1",
+        ] {
+            let shown = effects_to_plain(&submit_text(&mut harness.controller, command)).join("\n");
+            assert!(
+                shown.contains("memory's reviews are off"),
+                "{command}: {shown}"
+            );
+        }
+        assert!(
+            harness
+                .port
+                .submissions
+                .lock()
+                .expect("submissions")
+                .is_empty(),
+            "nothing was submitted"
+        );
+        assert!(!harness.controller.phase.has_active_run());
+        let history =
+            effects_to_plain(&submit_text(&mut harness.controller, "/refine --history")).join("\n");
+        assert!(history.contains("no refinement history"), "{history}");
     }
 
     #[test]

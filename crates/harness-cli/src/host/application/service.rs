@@ -7538,6 +7538,16 @@ pub(super) fn verify_reminder_by_environment() -> bool {
     })
 }
 
+/// What a refinement the user or the model asked for (`/refine`, `/learn`,
+/// the RPC's `refine`, `refine.run`) says when memory's reviews are off: it
+/// is not run, and no store changes.
+pub(crate) fn reviews_off_notice(memory: &super::memory_switch::Switch) -> String {
+    format!(
+        "refine: not run, memory's reviews are off ({})",
+        memory.summary()
+    )
+}
+
 /// prime-agent's `autoRefine.enabled` setting, which `HA_AUTO_REFINE=off` still
 /// overrides, as memory's `reviews` off does (`HA_MEMORY`, `memory_switch`):
 /// every background pass - review, consolidation, curation, evolution - asks
@@ -9160,6 +9170,23 @@ async fn run_turn(
     // `/refine` reads the conversation so far and edits the harness state; it is not
     // a model turn, like compaction above.
     if let Some(options) = request.refine.clone() {
+        // Memory's reviews off leave every store as they were: no refinement,
+        // `/learn`, rollback or curation writes one (`HA_MEMORY`,
+        // `memory_switch`). Reading the history writes nothing.
+        let memory = super::memory_switch::Switch::load(&config_file, &environment);
+        if options.history.is_none() && !memory.on(super::memory_switch::Feature::Reviews) {
+            drop(runtime);
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            send(SessionEvent::Notice {
+                message: reviews_off_notice(&memory),
+            });
+            send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            });
+            return;
+        }
         let scopes = super::refine::HarnessScopes {
             global: super::harness::global_dir(&data_dir),
             local: super::harness::local_dir(&data_dir, task_id.as_str()),
@@ -10837,10 +10864,7 @@ async fn run_turn(
             .filter(|_| {
                 if refinements && !reviews_on {
                     send(SessionEvent::Notice {
-                        message: format!(
-                            "refine: not run, memory's reviews are off ({})",
-                            memory_switch.summary()
-                        ),
+                        message: reviews_off_notice(&memory_switch),
                     });
                 }
                 reviews_on
