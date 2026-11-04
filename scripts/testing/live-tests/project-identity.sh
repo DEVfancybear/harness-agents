@@ -10,7 +10,9 @@
 #
 #   bash scripts/testing/live-tests/project-identity.sh
 # Sections 3 and 4 (0.8.9) fail on 0.8.8: a moved repository found its store
-# again by nothing, and there was no `ha project rekey`.
+# again by nothing, and there was no `ha project rekey`. Section 5 fails on
+# 0.8.9: rekey found no store when the old place, now gone, was typed under
+# a short (8.3) name of the directory above it.
 set -u
 source "$(dirname "$0")/env.sh"
 fresh project-identity
@@ -188,5 +190,31 @@ fi
 (cd "$Z" && "$HA" project rekey "$WKEY" >"$RX/rekey-refused.out" 2>&1); refused=$?
 sed 's/^/   /' "$RX/rekey-refused.out"
 check "a rekey into a store that holds data is refused, both kept" '[ "$refused" -ne 0 ] && grep -q "never merged" "$RX/rekey-refused.out" && [ -f "$D/projects/$WKEY/harness.sqlite3" ] && [ -f "$D/projects/$ZKEY/harness.sqlite3" ]'
+
+
+echo "################ 5. rekey finds a store by its old place under a short (8.3) name"
+# A runner's temp directory is an 8.3 short name (RUNNER~1). The old place is
+# gone, so only the part above it can be resolved: 0.8.9 kept the spelling
+# as given and found no store.
+V=$RX/long-named-old-place
+mkdir -p "$V"
+short=$(powershell -NoProfile -Command "(New-Object -ComObject Scripting.FileSystemObject).GetFolder('$(cygpath -w "$RX")').ShortPath" 2>/dev/null | tr -d '\r')
+if [ -z "$short" ] || [ "$(cygpath -w "$RX" | tr 'A-Z' 'a-z')" = "$(printf '%s' "$short" | tr 'A-Z' 'a-z')" ]; then
+  echo "SKIP  this volume makes no 8.3 short name for $RX"
+else
+  before=$(stores | sort)
+  run_exec vold "$V" "Answer exactly one line: OK-VOLD. Do not call any tool."
+  VKEY=$(comm -13 <(printf '%s\n' "$before") <(stores | sort) | head -1)
+  if [ -z "$VKEY" ] || [ -z "$(request OK-VOLD)" ]; then
+    echo "PRECONDITION FAILED: the turn in $V left no store of its own (see $RX/vold.err); rerun"
+    exit 2
+  fi
+  mv "$V" "$RX/v-moved"
+  old="$short\long-named-old-place"
+  echo "   the old place as typed: $old"
+  (cd "$RX/v-moved" && "$HA" project rekey "$old" >"$RX/rekey-short.out" 2>&1); rekeyed=$?
+  sed 's/^/   /' "$RX/rekey-short.out"
+  check "rekey found the store by the short name and moved it" '[ "$rekeyed" -eq 0 ] && [ ! -e "$D/projects/$VKEY" ] && grep -q "$VKEY" "$D"/projects/*/project.json'
+fi
 
 result

@@ -341,10 +341,32 @@ pub(crate) fn legacy_key_of(root: &Path) -> String {
 }
 
 /// `path` as `resolve` spells a launch directory: canonical, without the
-/// Windows verbatim prefix; as given when it cannot be resolved.
+/// Windows verbatim prefix. A path that does not exist (a directory removed
+/// or not made yet) is its nearest existing ancestor, canonical, with the
+/// rest as given, so an 8.3 short name, a symlink or another case above it
+/// spells it as it was spelled while it existed. As given when no ancestor
+/// resolves (on Unix, an ancestor ending in `..` below a missing part).
 #[must_use]
 pub fn canonical_or_given(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).map_or_else(|_| path.to_path_buf(), |path| displayable(&path))
+    if let Ok(found) = std::fs::canonicalize(path) {
+        return displayable(&found);
+    }
+    let mut rest = Vec::new();
+    let mut ancestor = path;
+    while let Some(parent) = ancestor.parent() {
+        // `..` has no name to keep: the walk stops at it.
+        let Some(name) = ancestor.file_name() else {
+            break;
+        };
+        rest.push(name);
+        if let Ok(found) = std::fs::canonicalize(parent) {
+            let mut spelled = displayable(&found);
+            spelled.extend(rest.iter().rev());
+            return spelled;
+        }
+        ancestor = parent;
+    }
+    path.to_path_buf()
 }
 
 /// Directories a key root must never be: the user's home (and what is above
@@ -733,6 +755,45 @@ mod tests {
         assert_eq!(checkout_root(&missing), canonical(&checkout));
         assert_eq!(checkout_root(&missing), checkout_root(&checkout));
         assert_eq!(project_root(&missing), canonical(&checkout));
+    }
+
+    /// A directory removed or not made yet is spelled from its nearest
+    /// existing ancestor, canonical, as it was while it existed: `ha project
+    /// rekey` names a moved store's old place after the place is gone, and
+    /// a runner's temp directory is an 8.3 short name (`RUNNER~1`).
+    #[test]
+    fn a_missing_directory_is_spelled_from_its_nearest_existing_ancestor() {
+        let temp = tempfile::tempdir().expect("temp");
+        let real = temp.path().join("Real-Place");
+        std::fs::create_dir_all(temp.path().join("other")).expect("other");
+        std::fs::create_dir_all(&real).expect("real");
+        let deeper = Path::new("gone").join("deeper");
+        let expected = canonical(&real).join(&deeper);
+        let roundabout = temp.path().join("other").join("..").join("Real-Place");
+        assert_eq!(
+            super::canonical_or_given(&roundabout.join(&deeper)),
+            expected
+        );
+        if cfg!(windows) {
+            // Another case of the same directory, as a user may type it.
+            let typed = PathBuf::from(real.display().to_string().to_lowercase());
+            assert_eq!(super::canonical_or_given(&typed.join(&deeper)), expected);
+        }
+        // Made later, it is the value it had while missing.
+        std::fs::create_dir_all(real.join(&deeper)).expect("made");
+        assert_eq!(
+            super::canonical_or_given(&roundabout.join(&deeper)),
+            expected
+        );
+        // `..` after the part that does not exist: Windows climbs out of it
+        // by the text, Unix resolves nothing and keeps it as given.
+        let climbing = real.join("never").join("..").join("x");
+        let climbed = if cfg!(windows) {
+            canonical(&real).join("x")
+        } else {
+            climbing.clone()
+        };
+        assert_eq!(super::canonical_or_given(&climbing), climbed);
     }
 
     #[test]
