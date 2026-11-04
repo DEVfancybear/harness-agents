@@ -67,11 +67,11 @@ review after 0.8.1 found and what 0.8.2 changed.
 | BM25 with the positive-match invariant | 🟡 | P3 |
 | Semantic search on memory with a background embedding queue | ❌ | P3 · removed in 0.8.8 (§14) |
 | Weighted RRF hybrid; `weights`, `candidateLimit`, `semanticThreshold` per call | 🟡 | P3 · only `candidate_limit` since 0.8.8 |
-| Filters `tree`, `meta`, `metaPredicate`, `temporal`, `grep`; filter-only browse with `order_by` | ❌ | P3 |
+| Filters `tree`, `meta`, `metaPredicate`, `temporal`, `grep`; filter-only browse with `order_by` | ✅ (since 0.8.1) | P3 |
 | `select` projection and `format` yaml/json/compact | 🟡 | P3 |
 | Knowledge page history, revert and undelete | ❌ | P4 |
 | One search over memory and knowledge | ❌ | P4 |
-| History filters (`since`, `until`, `kind`); thread links on `history_read` | ❌ | P4 |
+| History filters (`since`, `until`, `kind`); thread links on `history_read` | ✅ (since 0.8.1; `until` 0.8.2) | P4 |
 | CLI for memory, including `edit` | ❌ | P5 |
 | Import and export in JSON, YAML, Markdown and NDJSON | ❌ | P5 |
 | Memory packs (validate, install, list) | ❌ | P5 |
@@ -250,6 +250,13 @@ So the first open of an upgraded ha migrates the user's memory. The same rule
 gives tests and users a way to drop entries in: write a `harness_state.json` and
 it is imported on the next open.
 
+A read opens a store the same way (`Store::existing`, behind `load_document`):
+a scope with neither a store nor a legacy file is left as it is, but a store
+is migrated to this schema, and a legacy file alone gets a store with the
+file imported. Such a read writes. A read that must change nothing - the bug
+report's snapshot, `purge`'s dry run, the store meta `ha doctor` reads - opens
+the database read-only instead.
+
 Going back to an older ha: `ha memory export --legacy` (P5) writes a
 `harness_state.json` that 0.8.x reads. The `.imported` file is the state from
 before the upgrade.
@@ -302,7 +309,9 @@ UUID the store gave it, which never changes; list and search show it.
 
 The digest is unchanged in P1. It also leaves out entries whose temporal range
 has ended (`temporal_end <= now`), which are history rather than current fact.
-Search still finds them.
+Search still finds them. Since 0.9.0 an entry a correction or the expiry pass
+closed is left out of a search too, unless it names a time or `include_ended`
+(§16).
 
 ## 5. Organizing and history (P2)
 
@@ -820,3 +829,148 @@ not read.
 | `... --yes` | Purges them |
 | `--scope global`, `project`, `local` | Only the global entries, this project's (`--cwd`), or a conversation's (`--conversation`) |
 | `ha memory purge --secrets [--yes]` | The same for everything that holds a secret value |
+
+## 16. When an entry holds, and where its words came from (0.9.0)
+
+Memory does not help by itself: most memory setups measured in 2026 did no
+better than memory off. What the current systems have and ha lacked: a
+contradiction resolved by closing the old fact's validity rather than
+deleting it (Mem0's ADD/UPDATE/DELETE/NOOP, Zep/Graphiti's `invalid_at`),
+questions about time, trust by source against memory poisoning (MINJA), and
+expiry of memory nobody uses (Copilot drops memory unused for 28 days).
+
+### 16.1 The fields
+
+All in `memory/validity.rs`, the one place a later field joins them:
+
+| Field | On | Says |
+|---|---|---|
+| `origin.kind` | every entry the memory tool or a review writes | where its words came from: `user`, `tool`, `web`, `file`, `agent`, `child`, `review`. The host decides it (§16.4). An entry without one reads as `agent`. |
+| `supersedes` | an entry that corrected others | the memory ids of the entries it closed |
+| `superseded_by` | an entry a later one replaced | that one's memory id |
+| `expired` | an entry the expiry pass closed | why: `unused` |
+
+An entry's **validity** is its `temporal` value: a period `[start, end)`, or a
+point it holds from on. Without one it holds from its creation on. Closing an
+entry gives its period an end, now, from the start it had (its creation when
+it had none). A closed entry is ended (`store::ended`): the digest leaves it
+out, as it did an ended period.
+
+### 16.2 Contradictions are resolved at write, by closing validity
+
+The `memory` tool's `write` takes `supersedes: [id, ...]` (keys, `<tree>/<name>`
+addresses or memory ids):
+
+- On a create, the new entry records `supersedes` (their memory ids) and holds
+  from now unless its `temporal` says from when. Each named entry is closed:
+  `temporal.end` = now, `superseded_by` = the new entry's memory id, as its next
+  version. Nothing is deleted. The new entry's memory id is given before the
+  save (`Writer::reviving`), so the closed entries can name it; the closing is
+  one more save in the same operation, with cause `supersede`.
+- On an update, the entry written supersedes them the same way, and its
+  `supersedes` grows. An update may give `supersedes` alone.
+- A named entry must be live, of the same kind, not the entry written, and not
+  superseded already (that one is named, to supersede the one that replaced
+  it). The duplicate refusal and the cross-language repeat refusal do not count
+  the entries a write supersedes: it corrects them, it does not repeat them.
+- The `related` note on a create, and both duplicate refusals, give the model
+  its choices: supersede the old entry, update the existing one, or write
+  nothing (delete the new entry).
+
+A review's edits get the same: an edit `{"action": "supersede", "kind",
+"id": <old>, "title", "content", "path"?, "metadata"?, "evidence"}` writes a
+new entry keyed by its title, next to the old one's path and project, and
+closes the old one (`validity::supersede_edit`). The refinement records it as
+two edits: the old entry's (its `before`, and its closed `after`) and the new
+entry's `create`, so a rollback deletes the new entry and puts the old one back.
+
+`restore` (or `revert`) with an id alone, on an entry a correction or the
+expiry pass closed, opens it again: `superseded_by` and `expired` go, and its
+period is the one it had before it was closed.
+
+`history` shows the chain: each version carries its `supersedes`,
+`superseded_by`, `expired` and `from`.
+
+### 16.3 Questions about time
+
+Memory search takes:
+
+| Argument | Reads |
+|---|---|
+| `as_of` | the entries valid at that time: their validity covers it, and they had been written by then. A corrected fact's old entry, asked about a time before the correction. |
+| `since`, `until` | the entries valid at some time between |
+| `include_ended` | the closed entries too |
+
+A search that names a time (`as_of`, `since`/`until`, or the temporal filter
+of §6.4) reads closed entries, and ranks the results by how well their
+validity matches the time before the words: for a point, whether the entry
+held then; for a window, the share of it the entry held (`validity::fit`).
+The temporal filter's modes make the window: `contains` a point, `after` and
+`before` its bounds, `overlaps` and `within` their periods.
+
+A search that names no time leaves out the closed entries (superseded or
+expired). An entry whose own period ended is read as before. Among entries
+the words matched alike, one that holds now ranks above one that ended, and
+one the user or the agent said above a page's or a child's
+(`search::settled`); a better match keeps its place. When the words also match
+closed entries, the result says how many (`closed.left_out`) and that `as_of`
+or `include_ended` reads them.
+
+No reranker by the model: a model call per search costs a request's time and
+tokens, and the validity and the words already order what a question about
+time needs.
+
+### 16.4 Trust by source
+
+`origin.kind` is the host's, never the model's. The memory tool reads the
+conversation as the project store's journal holds it (`memory/provenance.rs`;
+the newest 4,000 events): the words the user typed in each turn (a turn the
+host started, such as a child's report, is a child's), and each tool call's
+result, by its tool - a web tool's (`web_search`, `web_fetch`) is `web`, a
+file read's (`read_file`, `search_text`, `list_files`, `glob`, `find_files`)
+`file`, a delegated child's `child`, the memory's own tools none, any other
+tool's `tool`. Each of the entry's words, folded and stemmed, weighs by its
+IDF over those parts (a word in no part weighs as one in a single part). The
+entry is of the kind whose parts hold most of the weight, when they hold at
+least half of it; else it is `agent`, the agent's own words. A tie goes to
+the more trusted kind, in the order user, file, tool, child, web. No word list
+judges the text.
+
+An update takes the kind its words have now; when this conversation shows
+none, the entry keeps its kind, so a page's words stay a page's whoever
+rewrites them later. A move keeps it. A review's edit takes the kind of the
+turn its evidence quotes word for word (`provenance::quoted_kind`), else the
+kind the quote's words point to, else `review`: the review inferred it.
+
+What follows from it:
+
+- The digest frames an entry from a web page (`, from a web page:
+  unverified`) or a delegated child (`, from a delegated agent: unverified`).
+  Search, read and history show `from` and `unverified`.
+- Such an entry ranks below an otherwise equal one (§16.3).
+- An entry whose kind is `web` - now, or when it was kept - cannot be written
+  into `constraints/*` or `user/preferences` (and below): a create, an update,
+  a move or a review's edit is refused with the reason, before the call runs.
+  The model is told to keep it as a fact elsewhere, or to ask the user to
+  state the rule.
+
+### 16.5 Expiry by use
+
+A pass closes the entries nobody used: no read and no search hit for
+`HA_MEMORY_EXPIRE_DAYS` (default 28; 0 turns it off; fractional days allowed,
+so a test can use seconds) since they were last written, read or found. A
+digest showing an entry is not a use. Each is closed, not deleted
+(`temporal.end`, `expired: "unused"`), as one event of the `sleep` writer with
+cause `expire`; `restore` with its id alone brings it back.
+
+- Exempt: `constraints/*`, `user/preferences`, `source: learning` entries, and
+  pinned ones.
+- The clock starts with a store's first pass (`expiry_since` in the store's
+  meta): before 0.8.8 no read was counted, and an upgrade must not close a
+  whole store for a disuse nobody measured.
+- The pass is a job of the Sleep queue (kind `expiry`), run at the end of a
+  turn in the app and of `ha exec`, over the global store and the
+  conversation's, at most daily (or once per period, when that is shorter).
+  It is local and fast: no model call.
+- `ha doctor` says when the last pass ran and how many it closed (the
+  global store's `expiry` meta).
