@@ -319,6 +319,7 @@ JSON only with this exact shape:
       "action": "create|update|delete",
       "kind": "prompt|memory|skill|subagent",
       "id": "stable id for update/delete, optional for create",
+      "merged_into": "for a delete that merges this entry into another: the id of the entry that keeps what it said, updated in the same edits",
       "title": "required for create/update except delete",
       "content": "required for create/update except delete",
       "path": "optional grouping path",
@@ -363,6 +364,10 @@ const LEARN_INSTRUCTIONS: &str = "The user ran /learn: keep what this conversati
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RefineOptions {
     pub instructions: Option<String>,
+    /// The instructions are what the user typed (`/refine`, the RPC's
+    /// `refine`), so a memory edit may quote them as its evidence; a
+    /// refinement the model asked for (`refine.run`) or `/learn`'s are not.
+    pub typed: bool,
     pub global: bool,
     /// Roll back this refinement instead of planning a new one.
     pub rollback: Option<String>,
@@ -412,6 +417,7 @@ impl RefineOptions {
         }
         let instructions = rest.join(" ");
         options.instructions = (!instructions.is_empty()).then_some(instructions);
+        options.typed = true;
         options
     }
 }
@@ -866,6 +872,14 @@ impl Edit {
         self.0.get(field).and_then(Value::as_str)
     }
 
+    /// The entry a delete merges this one into: the survivor that keeps what
+    /// it said, without which the delete is not made.
+    fn merged_into(&self) -> Option<&str> {
+        self.text("merged_into")
+            .map(str::trim)
+            .filter(|survivor| !survivor.is_empty())
+    }
+
     /// `validateEdit`.
     fn invalid(&self, id: &str) -> Option<String> {
         let action = self.text("action").unwrap_or_default();
@@ -1049,6 +1063,40 @@ struct Proposal {
     lessons: Vec<Value>,
     /// Those signals as the lessons recorded them, or refused them.
     lesson_records: Vec<Value>,
+    /// What the refinement read, when its memory and prompt edits must quote
+    /// it as their evidence ([`quoted`]): the conversation a review or
+    /// `/refine` read, with what the user typed after `/refine`.
+    evidence_in: Option<String>,
+    /// The consolidation batch this proposal is about: its edits may name only
+    /// the batch's entries, and write only what they say.
+    batch: Option<Batch>,
+}
+
+/// The entries one consolidation call was given ([`consolidate_scope`]).
+#[derive(Clone, Debug, Default)]
+struct Batch {
+    /// `kind:id` of each.
+    keys: std::collections::BTreeSet<String>,
+    /// The words they hold.
+    terms: std::collections::HashSet<String>,
+    /// Which batch of the pass it is, as the refinement records it, when the
+    /// pass has more than one.
+    record: Option<Value>,
+}
+
+impl Batch {
+    /// The batch of `state`'s memory entries and prompt notes.
+    fn of(state: &Value) -> Self {
+        let entries = memory_entries(state);
+        Self {
+            keys: entries.iter().map(entry_key).collect(),
+            terms: entries
+                .iter()
+                .flat_map(|entry| super::harness::query_terms(&entry_text(entry)))
+                .collect(),
+            record: None,
+        }
+    }
 }
 
 impl Proposal {
@@ -1120,6 +1168,8 @@ impl Proposal {
                 })
                 .unwrap_or_default(),
             lesson_records: Vec::new(),
+            evidence_in: None,
+            batch: None,
         }
     }
 }
@@ -1193,14 +1243,10 @@ impl Refinement {
                 }
             );
         }
+        if applied.is_empty() && edits.iter().all(|edit| edit["skipped"] == true) {
+            return Self::all_skipped(&edits, rollback);
+        }
         if applied.is_empty() {
-            if !rollback && edits.iter().all(|edit| edit["skipped"] == true) {
-                return format!(
-                    "Harness unchanged · the conversation had already updated what the review proposed ({} edit{} skipped)",
-                    edits.len(),
-                    plural(edits.len())
-                );
-            }
             return format!("{operation} failed · 0/{} edits applied", edits.len());
         }
         if applied.len() < edits.len() {
@@ -1258,6 +1304,28 @@ impl Refinement {
             return format!("Harness refined · {} {noun} {verb}", applied.len());
         }
         format!("Harness refined · {} edits applied", applied.len())
+    }
+
+    /// The outcome of a refinement that skipped every edit: what each would
+    /// change was not as it planned, which is no failure.
+    fn all_skipped(edits: &[&Value], rollback: bool) -> String {
+        let plural = if edits.len() == 1 { "" } else { "s" };
+        if rollback {
+            return format!(
+                "Harness rollback unchanged · what it would undo changed since ({} edit{plural} kept)",
+                edits.len()
+            );
+        }
+        if edits
+            .iter()
+            .all(|edit| edit["error"] == CHANGED_DURING_PLANNING)
+        {
+            return format!(
+                "Harness unchanged · the conversation had already updated what the review proposed ({} edit{plural} skipped)",
+                edits.len()
+            );
+        }
+        format!("Harness unchanged · {} edit{plural} skipped", edits.len())
     }
 
     /// The header prime-agent's refinement row shows: the outcome, shortened to
@@ -1338,6 +1406,12 @@ impl Refinement {
                     _ => "Changed",
                 };
                 lines.push(format!("{verb} {entry_scope} {kind} `{id}`"));
+            } else if edit["skipped"] == true {
+                // Not a failure: what it would change was not as it planned.
+                lines.push(format!(
+                    "Skipped: {action} {entry_scope} {kind} `{id}`: {}",
+                    edit["error"].as_str().unwrap_or_default()
+                ));
             } else {
                 let error = edit["error"]
                     .as_str()
@@ -1359,11 +1433,21 @@ impl Refinement {
 /// reviewed and the quote it rests on. An entry is what a review chose to
 /// keep of the turns, cut short; the quote and the conversation lead back to
 /// those turns (`history_search` with scope "project"), which the journal
-/// keeps word for word. Before, an entry named only its refinement.
-fn refine_origin(scopes: &HarnessScopes, refinement: &str, evidence: Option<&str>) -> Value {
+/// keeps word for word. Before, an entry named only its refinement. The
+/// confidence the review gave its edit (high, medium or low) is kept beside
+/// the quote; nothing reads it yet.
+fn refine_origin(scopes: &HarnessScopes, refinement: &str, edit: Option<&Edit>) -> Value {
     /// The longest quote an origin keeps.
     const EVIDENCE_CHARS: usize = 300;
     let mut origin = json!({"via": "refine", "refinement": refinement});
+    let evidence = edit.and_then(|edit| edit.text("evidence"));
+    if let Some(confidence) = edit
+        .and_then(|edit| edit.text("confidence"))
+        .map(|confidence| confidence.trim().to_lowercase())
+        .filter(|confidence| matches!(confidence.as_str(), "high" | "medium" | "low"))
+    {
+        origin["confidence"] = json!(confidence);
+    }
     // The local scope is `sessions/<conversation>/harness`.
     if let Some(conversation) = scopes
         .local
@@ -1404,7 +1488,13 @@ fn apply(
     let entries_before = memory_entries(&state).len();
     let mut applied_edits = Vec::new();
     let mut modified = std::collections::BTreeSet::new();
-    for edit in &proposal.edits {
+    // A delete that is part of a merge goes after every other edit: it
+    // stands or falls with what happened to its survivor.
+    let (merges, others): (Vec<&Edit>, Vec<&Edit>) = proposal
+        .edits
+        .iter()
+        .partition(|edit| edit.text("action") == Some("delete") && edit.merged_into().is_some());
+    for edit in others.into_iter().chain(merges) {
         let action = edit.text("action").unwrap_or_default().to_owned();
         let kind = edit.text("kind").unwrap_or_default().to_owned();
         let computed = edit
@@ -1415,15 +1505,46 @@ fn apply(
             })
             .unwrap_or_default();
         let mut record = Value::Object(edit.0.clone());
+        // What a rollback checks and puts back is the refinement's own
+        // record already: it is not kept twice.
+        if let Some(fields) = record.as_object_mut() {
+            fields.remove(ROLLBACK_EXPECTS);
+            fields.remove(ROLLBACK_RESTORES);
+        }
         record["id"] = json!(computed);
         if let Some(error) = edit.invalid(&computed) {
-            record["applied"] = json!(false);
-            record["error"] = json!(error);
-            applied_edits.push(record);
+            applied_edits.push(not_applied(record, &Value::Null, error, false));
+            continue;
+        }
+        let key = format!("{kind}:{computed}");
+        if let Some(batch) = &proposal.batch
+            && !batch.keys.contains(&key)
+        {
+            applied_edits.push(not_applied(
+                record,
+                &Value::Null,
+                "not an entry of this consolidation batch: an entry is merged only with the entries it was given with",
+                false,
+            ));
             continue;
         }
         let before = state["entries"][&kind][&computed].clone();
-        let key = format!("{kind}:{computed}");
+        // A rollback undoes what its refinement wrote, and only that: an
+        // entry changed since (by the agent, the user or a later refinement)
+        // keeps its version.
+        if let Some(target) = rollback_of
+            && !modified.contains(&key)
+            && let Some(expected) = edit.0.get(ROLLBACK_EXPECTS)
+            && !same_version(&before, expected)
+        {
+            applied_edits.push(not_applied(
+                record,
+                &before,
+                format!("changed since refinement {target} wrote it: the later version is kept"),
+                true,
+            ));
+            continue;
+        }
         if let Some(baseline) = baseline
             && !modified.contains(&key)
             && before != baseline["entries"][&kind][&computed]
@@ -1431,13 +1552,7 @@ fn apply(
             // The conversation updated the entry while the review planned:
             // its version stands, and the review's edit is skipped - not a
             // failure, which is how it was shown.
-            record["before"] = before;
-            record["applied"] = json!(false);
-            record["skipped"] = json!(true);
-            record["error"] = json!(
-                "entry changed during refinement planning: the conversation updated it meanwhile, and its version is kept"
-            );
-            applied_edits.push(record);
+            applied_edits.push(not_applied(record, &before, CHANGED_DURING_PLANNING, true));
             continue;
         }
         let error = match action.as_str() {
@@ -1446,26 +1561,69 @@ fn apply(
             _ => None,
         };
         if let Some(error) = error {
-            if !before.is_null() {
-                record["before"] = before;
+            applied_edits.push(not_applied(record, &before, error, false));
+            continue;
+        }
+        if let Some(survivor) = edit.merged_into() {
+            let survivor_key = format!("{kind}:{survivor}");
+            let refusal = if survivor == computed {
+                Some(("an entry is not merged into itself".to_owned(), false))
+            } else if proposal
+                .batch
+                .as_ref()
+                .is_some_and(|batch| !batch.keys.contains(&survivor_key))
+            {
+                Some((
+                    format!(
+                        "merged into {survivor}, which is not an entry of this consolidation batch: the entry is kept"
+                    ),
+                    false,
+                ))
+            } else if applied_edits.iter().any(|other| {
+                other["kind"] == kind.as_str()
+                    && other["id"] == survivor
+                    && other["applied"] != true
+            }) {
+                Some((
+                    format!(
+                        "part of a merge into {survivor}, whose edit was not applied: the entry is kept"
+                    ),
+                    true,
+                ))
+            } else if state["entries"][&kind][survivor].is_null() {
+                Some((
+                    format!("merged into {survivor}, which is not there: the entry is kept"),
+                    true,
+                ))
+            } else {
+                None
+            };
+            if let Some((error, skipped)) = refusal {
+                applied_edits.push(not_applied(record, &before, error, skipped));
+                continue;
             }
-            record["applied"] = json!(false);
-            record["error"] = json!(error);
-            applied_edits.push(record);
+        }
+        if let Some(read) = &proposal.evidence_in
+            && matches!(kind.as_str(), "memory" | "prompt")
+            && !quoted(edit.text("evidence").unwrap_or_default(), read)
+        {
+            applied_edits.push(not_applied(record, &before, EVIDENCE_REFUSAL, false));
             continue;
         }
         if let Some(error) = memory_refusal(scopes, global, edit, &before, proposal, rollback_of) {
-            if !before.is_null() {
-                record["before"] = before;
-            }
-            record["applied"] = json!(false);
-            record["error"] = json!(error);
-            applied_edits.push(record);
+            applied_edits.push(not_applied(record, &before, error, false));
+            continue;
+        }
+        if let Some(batch) = &proposal.batch
+            && action == "update"
+            && let Some(error) = invented(edit, &before, batch)
+        {
+            applied_edits.push(not_applied(record, &before, error, false));
             continue;
         }
         // What a refinement replaces or removes stays in the store's event
         // log, so the `memory` tool's history and restore reach it too.
-        let by = refine_origin(scopes, id, edit.text("evidence"));
+        let by = refine_origin(scopes, id, Some(edit));
         if action == "delete" {
             if let Some(records) = state["entries"][&kind].as_object_mut() {
                 records.remove(&computed);
@@ -1476,34 +1634,64 @@ fn apply(
             applied_edits.push(record);
             continue;
         }
-        let field = |name: &str, fallback: Value| {
-            edit.0
-                .get(name)
-                .cloned()
-                .filter(|value| !value.is_null())
-                .unwrap_or(fallback)
+        let restores = rollback_of
+            .and(edit.0.get(ROLLBACK_RESTORES))
+            .filter(|snapshot| snapshot.is_object());
+        let after = if let Some(snapshot) = restores {
+            // A rollback puts back the snapshot whole - who kept it, where it
+            // came from - as a new version.
+            let mut after = snapshot.clone();
+            after["version"] = json!(
+                before["version"]
+                    .as_i64()
+                    .max(snapshot["version"].as_i64())
+                    .map_or(1, |version| version + 1)
+            );
+            after["updated_at"] = json!(now());
+            after["edited_by"] = by;
+            after
+        } else {
+            let field = |name: &str, fallback: Value| {
+                edit.0
+                    .get(name)
+                    .cloned()
+                    .filter(|value| !value.is_null())
+                    .unwrap_or(fallback)
+            };
+            let mut after = json!({
+                "id": computed,
+                "kind": kind,
+                "title": field("title", before["title"].clone()),
+                "content": field("content", before["content"].clone()),
+                "path": field("path", before.get("path").cloned().unwrap_or_else(|| json!("general"))),
+                "scope": before.get("scope").cloned().unwrap_or_else(|| json!(scope)),
+                "reference": field("reference", before.get("reference").cloned().unwrap_or_else(|| json!({}))),
+                "arguments": field("arguments", before.get("arguments").cloned().unwrap_or_else(|| json!({}))),
+                "metadata": field("metadata", before.get("metadata").cloned().unwrap_or_else(|| json!({}))),
+                // Who kept the entry stays who kept it: an edit by a review
+                // made a learned rule look like the review's, and Deep Dream
+                // then merged away what the learning loop still pointed at.
+                "source": before.get("source").filter(|source| source.is_string()).cloned().unwrap_or_else(|| json!("refine")),
+                "created_at": before.get("created_at").cloned().unwrap_or_else(|| json!(now())),
+                "updated_at": now(),
+                "version": before["version"].as_i64().map_or(1, |version| version + 1),
+            });
+            // A project's entry stays that project's.
+            if let Some(project) = before.get("project").filter(|project| !project.is_null()) {
+                after["project"] = project.clone();
+            }
+            if before.is_object() {
+                // An entry keeps where it came from; the edit says who
+                // changed it and on what evidence.
+                if let Some(origin) = before.get("origin").filter(|origin| origin.is_object()) {
+                    after["origin"] = origin.clone();
+                }
+                after["edited_by"] = by;
+            } else {
+                after["origin"] = by;
+            }
+            after
         };
-        let after = json!({
-            "id": computed,
-            "kind": kind,
-            "title": field("title", before["title"].clone()),
-            "content": field("content", before["content"].clone()),
-            "path": field("path", before.get("path").cloned().unwrap_or_else(|| json!("general"))),
-            "scope": before.get("scope").cloned().unwrap_or_else(|| json!(scope)),
-            "reference": field("reference", before.get("reference").cloned().unwrap_or_else(|| json!({}))),
-            "arguments": field("arguments", before.get("arguments").cloned().unwrap_or_else(|| json!({}))),
-            "metadata": field("metadata", before.get("metadata").cloned().unwrap_or_else(|| json!({}))),
-            "source": "refine",
-            "created_at": before.get("created_at").cloned().unwrap_or_else(|| json!(now())),
-            "updated_at": now(),
-            "version": before["version"].as_i64().map_or(1, |version| version + 1),
-        });
-        let mut after = after;
-        // A project's entry stays that project's.
-        if let Some(project) = before.get("project").filter(|project| !project.is_null()) {
-            after["project"] = project.clone();
-        }
-        after["origin"] = by.clone();
         state["entries"][&kind][&computed] = after.clone();
         modified.insert(key);
         if !before.is_null() {
@@ -1578,6 +1766,13 @@ fn apply(
         record["entries"] =
             json!({"before": entries_before, "after": memory_entries(&state).len()});
     }
+    if let Some(batch) = proposal
+        .batch
+        .as_ref()
+        .and_then(|batch| batch.record.as_ref())
+    {
+        record["batch"] = batch.clone();
+    }
     // The history is what `--rollback` reads.
     let mut line = record.to_string();
     line.push('\n');
@@ -1588,6 +1783,117 @@ fn apply(
         .and_then(|mut file| file.write_all(line.as_bytes()))
         .map_err(|error| format!("refinement history: {error}"))?;
     Ok(Refinement { record })
+}
+
+/// Why the review's edit of an entry is skipped when the entry changed while
+/// it planned.
+const CHANGED_DURING_PLANNING: &str = "entry changed during refinement planning: the conversation updated it meanwhile, and its version is kept";
+
+/// Why a review's memory or prompt edit without its quote is refused.
+const EVIDENCE_REFUSAL: &str = "the evidence is not a verbatim quote of what the review read (the conversation, a child's findings in it, or what the user typed after /refine): a memory edit rests on the words that show it, a phrase long";
+
+/// The fewest characters a quote has: a word or two is found anywhere.
+const QUOTE_MIN_CHARS: usize = 12;
+
+/// An edit that was not applied, with why; `skipped` when it was not wrong
+/// but something else stood in its way (an entry changed meanwhile, a merge
+/// whose survivor was not written).
+fn not_applied(
+    mut record: Value,
+    before: &Value,
+    error: impl Into<String>,
+    skipped: bool,
+) -> Value {
+    if !before.is_null() {
+        record["before"] = before.clone();
+    }
+    record["applied"] = json!(false);
+    if skipped {
+        record["skipped"] = json!(true);
+    }
+    record["error"] = json!(error.into());
+    record
+}
+
+/// Whether an entry is still the version a refinement left: both gone, or
+/// the same version with the same title and content.
+fn same_version(current: &Value, expected: &Value) -> bool {
+    match (current.is_object(), expected.is_object()) {
+        (false, false) => true,
+        (true, true) => ["version", "title", "content"]
+            .iter()
+            .all(|field| current[field] == expected[field]),
+        _ => false,
+    }
+}
+
+/// Whether `quote` is in `text`, whitespace and case aside: whole, or as the
+/// pieces an ellipsis (`...`, `…`) joins, each after the one before.
+/// Quotation marks around it are not part of it, and it is a phrase long
+/// ([`QUOTE_MIN_CHARS`]).
+fn quoted(quote: &str, text: &str) -> bool {
+    let squeeze = |text: &str| {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let quote = squeeze(quote.trim().trim_matches(|character: char| {
+        matches!(
+            character,
+            '"' | '\''
+                | '`'
+                | '\u{201c}'
+                | '\u{201d}'
+                | '\u{2018}'
+                | '\u{2019}'
+                | '\u{ab}'
+                | '\u{bb}'
+        )
+    }));
+    if quote.chars().count() < QUOTE_MIN_CHARS {
+        return false;
+    }
+    let text = squeeze(text);
+    let mut from = 0;
+    let mut pieces = quote
+        .split("...")
+        .flat_map(|piece| piece.split('\u{2026}'))
+        .map(str::trim)
+        .filter(|piece| !piece.is_empty())
+        .peekable();
+    if pieces.peek().is_none() {
+        return false;
+    }
+    for piece in pieces {
+        match text[from..].find(piece) {
+            Some(at) => from += at + piece.len(),
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Why a consolidation's update writes what its batch's entries do not say:
+/// more than half of the words of its content are in none of them. The
+/// curator organizes what the entries state; a merge's evidence is the
+/// entries themselves. A title is a handle, and may be new.
+fn invented(edit: &Edit, before: &Value, batch: &Batch) -> Option<String> {
+    let content = edit
+        .text("content")
+        .or_else(|| before["content"].as_str())
+        .unwrap_or_default();
+    let terms = super::harness::query_terms(content);
+    let unknown = terms
+        .iter()
+        .filter(|term| !batch.terms.contains(*term))
+        .count();
+    (unknown * 2 > terms.len()).then(|| {
+        format!(
+            "a merge writes what its entries say: {unknown} of its {} words are in none of the entries it was given",
+            terms.len()
+        )
+    })
 }
 
 /// Promote the proposal's learned-skill intents, and undo a rollback's, recording
@@ -1611,16 +1917,21 @@ fn apply_skill_files(
             "level": change["level"],
             "reason": format!("Rollback of {action}"),
         });
+        let level = change["level"].as_str().unwrap_or_default();
+        // A skill changed since the refinement wrote it keeps that version.
+        if let Some(changed) = learning.and_then(|learning| {
+            super::learned::changed_since(&learning.layers, action, name, level, &change["undo"])
+        }) {
+            record["applied"] = json!(false);
+            record["skipped"] = json!(true);
+            record["error"] = json!(changed);
+            applied_edits.push(record);
+            continue;
+        }
         let result = learning
             .ok_or_else(|| "learned skills are unavailable in this session".to_owned())
             .and_then(|learning| {
-                super::learned::restore(
-                    &learning.layers,
-                    action,
-                    name,
-                    change["level"].as_str().unwrap_or_default(),
-                    &change["undo"],
-                )
+                super::learned::restore(&learning.layers, action, name, level, &change["undo"])
             });
         record["applied"] = json!(result.is_ok());
         if let Err(error) = result {
@@ -1771,6 +2082,12 @@ fn record_learning_run(learning: &Learning, refinement: &Refinement, trigger: &s
     );
 }
 
+/// A rollback edit's field holding the version the refinement wrote (or null
+/// for an entry it deleted): the entry is rolled back only while it is that.
+const ROLLBACK_EXPECTS: &str = "rollback_expects";
+/// A rollback edit's field holding the snapshot it puts back whole.
+const ROLLBACK_RESTORES: &str = "rollback_restores";
+
 /// `rollbackProposal`: restore each applied edit's snapshot, newest first.
 fn rollback_proposal(target: &Value) -> Proposal {
     let id = target["id"].as_str().unwrap_or("?");
@@ -1799,7 +2116,11 @@ fn rollback_proposal(target: &Value) -> Proposal {
         restored.insert("kind".to_owned(), edit["kind"].clone());
         restored.insert("id".to_owned(), edit["id"].clone());
         restored.insert("reason".to_owned(), json!(format!("Rollback {id}")));
+        // What the refinement left: the entry is restored only while it is
+        // still that version ([`apply`]).
+        restored.insert(ROLLBACK_EXPECTS.to_owned(), edit["after"].clone());
         if before.is_object() {
+            restored.insert(ROLLBACK_RESTORES.to_owned(), before.clone());
             restored.insert(
                 "action".to_owned(),
                 json!(if edit["after"].is_object() {
@@ -1846,6 +2167,33 @@ fn rollback_proposal(target: &Value) -> Proposal {
         // refinement does not unsay them (`ha learning retire` undoes a rule).
         lessons: Vec::new(),
         lesson_records: Vec::new(),
+        evidence_in: None,
+        batch: None,
+    }
+}
+
+/// The refinement `/refine --rollback <id>` undoes: the one with that id, or
+/// a consolidation that ran in batches as one, each batch recorded as a
+/// refinement of its own (`batch.of` names the pass), with their edits in
+/// the order they were made.
+fn rollback_target(history: &[Value], id: &str) -> Option<Value> {
+    let parts = history
+        .iter()
+        .filter(|record| {
+            record["id"].as_str() == Some(id) || record["batch"]["of"].as_str() == Some(id)
+        })
+        .collect::<Vec<_>>();
+    match parts.as_slice() {
+        [] => None,
+        [one] => Some((*one).clone()),
+        [first, ..] => Some(json!({
+            "id": id,
+            "scope": first["scope"],
+            "appliedEdits": parts
+                .iter()
+                .flat_map(|part| part["appliedEdits"].as_array().cloned().unwrap_or_default())
+                .collect::<Vec<_>>(),
+        })),
     }
 }
 
@@ -2019,16 +2367,14 @@ pub async fn refine(
         .await;
     }
     if let Some(target_id) = &options.rollback {
-        let target = history
-            .iter()
-            .find(|item| item["id"].as_str() == Some(target_id.as_str()))
+        let target = rollback_target(&history, target_id)
             .ok_or_else(|| format!("Refinement {target_id} not found"))?;
         let global = target["scope"]
             .as_str()
             .map_or(options.global, |scope| scope == "global");
         return apply(
             scopes,
-            &rollback_proposal(target),
+            &rollback_proposal(&target),
             &id,
             global,
             Some(target_id),
@@ -2070,6 +2416,12 @@ Learned skills in play: {}
         outcomes,
     )
     .await?;
+    // A memory edit quotes the conversation, or what the user typed after
+    // `/refine`, as its evidence.
+    proposal.evidence_in = Some(match &options.instructions {
+        Some(instructions) if options.typed => format!("{conversation}\n\n{instructions}"),
+        _ => conversation.to_owned(),
+    });
     let mut pending = Pending::begin(scopes.dir(options.global), &id, learning)?;
     stage_skills(provider, model, learning, &mut proposal, &mut pending).await;
     if let Some(learning) = learning {
@@ -2762,6 +3114,10 @@ pub async fn auto_refine(
         extra,
     )
     .await?;
+    // Every memory edit quotes what the review read: the conversation, which
+    // holds a child's findings too. The gate's instructions are a model's
+    // words, not the user's, and are no evidence.
+    proposal.evidence_in = Some(conversation.to_owned());
     // A global edit reaches every conversation, so it carries the quote that
     // justifies it; one without stays in this conversation.
     let (global_edits, local_edits): (Vec<_>, Vec<_>) = std::mem::take(&mut proposal.edits)
@@ -2895,6 +3251,7 @@ pub async fn auto_refine(
             rationale: proposal.rationale.clone(),
             expected_outcome: proposal.expected_outcome.clone(),
             edits: global_edits,
+            evidence_in: proposal.evidence_in.clone(),
             ..Proposal::default()
         };
         match apply(
@@ -3020,10 +3377,11 @@ Return JSON only:
   "skillFiles": [ ...intents in <learned_skill_format>... ]
 }"#;
 
-/// The curator: the global memory consolidated ([`memory_edits`]) and the
-/// learned library folded into class-level skills, recorded as one refinement in
-/// the global scope, so `/refine --rollback <id>` undoes both. Either part runs
-/// when there is enough of it.
+/// The curator: the global memory consolidated ([`consolidate_scope`], each
+/// batch `<id>_b<n>`) and the learned library folded into class-level
+/// skills (`<id>`), recorded in the global scope so `/refine --rollback <id>`
+/// undoes both. Either part runs when there is enough of it; the memory's
+/// batches are applied first, and stay applied when the skills' part fails.
 pub async fn curate(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
@@ -3031,47 +3389,30 @@ pub async fn curate(
     learning: Option<&Learning>,
     instructions: Option<&str>,
 ) -> Result<Refinement, String> {
-    let baseline = load_raw(&scopes.global);
+    let id = refinement_id();
     // Not beside a running consolidation: the skills are curated alone then.
     let consolidating = Consolidating::try_begin(&scopes.global);
-    let memory =
-        if consolidating.is_some() && memory_entries(&baseline).len() >= CONSOLIDATE_MIN_ENTRIES {
-            Some(memory_edits(provider, model, &baseline, instructions, true).await?)
-        } else {
-            None
-        };
+    let consolidate = consolidating.is_some()
+        && memory_entries(&load_raw(&scopes.global)).len() >= CONSOLIDATE_MIN_ENTRIES;
     let skills = learning
         .filter(|learning| super::learned::library(&learning.layers).len() >= CURATE_MIN_SKILLS);
-    let Some(learning) = skills else {
-        let Some(memory) = memory else {
-            return Err(format!(
-                "nothing to curate: fewer than {CONSOLIDATE_MIN_ENTRIES} global memory entries and fewer than {CURATE_MIN_SKILLS} learned skills"
-            ));
-        };
-        let refinement = apply(
-            scopes,
-            &memory,
-            &refinement_id(),
-            true,
-            None,
-            Some(&baseline),
-            None,
-        )?;
+    if !consolidate && skills.is_none() {
+        return Err(format!(
+            "nothing to curate: fewer than {CONSOLIDATE_MIN_ENTRIES} global memory entries and fewer than {CURATE_MIN_SKILLS} learned skills"
+        ));
+    }
+    let mut parts = Vec::new();
+    if consolidate {
+        parts = consolidate_scope(provider, model, scopes, true, instructions, &id, true).await?;
         mark_consolidated(&scopes.global);
-        return Ok(refinement);
+    }
+    let Some(learning) = skills else {
+        return Ok(combined(&id, parts));
     };
+    let baseline = load_raw(&scopes.global);
     let mut proposal = curate_skills(provider, model, learning, instructions).await?;
-    let id = refinement_id();
     let mut pending = Pending::begin(&scopes.global, &id, Some(learning))?;
     stage_skills(provider, model, Some(learning), &mut proposal, &mut pending).await;
-    if let Some(memory) = memory {
-        proposal.edits = memory.edits;
-        proposal.count_entries = true;
-        proposal.summary = format!("{} {}", memory.summary, proposal.summary);
-        proposal.rationale = format!("{} {}", memory.rationale, proposal.rationale);
-        proposal.expected_outcome =
-            format!("{} {}", memory.expected_outcome, proposal.expected_outcome);
-    }
     let refinement = match apply(
         scopes,
         &proposal,
@@ -3087,9 +3428,9 @@ pub async fn curate(
         }
         Err(error) => return Err(failed_with(&error, pending)),
     };
-    mark_consolidated(&scopes.global);
     record_learning_run(learning, &refinement, "curate");
-    Ok(refinement)
+    parts.push(refinement);
+    Ok(combined(&id, parts))
 }
 
 /// The learned-skill half of [`curate`]: the library snapshotted, then the
@@ -3163,7 +3504,7 @@ The entries below are the global memory entries and prompt notes: they reach eve
 
 Rules:
 - Organize strictly from the entries given. Never invent, infer or add a fact that no entry states.
-- Merge entries about the same subject into one dense entry: update the clearest one with the merged content, then delete the others.
+- Merge entries about the same subject into one dense entry: update the clearest one with the merged content, then delete the others, each delete naming the entry that keeps what it said in `merged_into`. A merged delete is made only when its survivor is kept: when the survivor's update is refused, the entries merged into it stay. A delete that is not a merge (stale, temporary, planted) has no `merged_into`.
 - When entries conflict, the one with the later updated_at wins; drop or rewrite the older claim.
 - Delete what is stale or temporary: task progress, a one-off error, a blocker that was resolved, an entry superseded by a more precise one, an empty or garbled entry. Global memory never keeps task state - commit ids, test counts, a done, delivered or in-progress status - so delete such an entry, or rewrite it as the lasting fact it holds without the state.
 - Keep facts about one project named with that project; never generalize a project fact to every project. An entry with a `project` holds for that project only: merge it only with entries of the same project, and never into an entry without one.
@@ -3171,7 +3512,7 @@ Rules:
 - Aim for about 30 entries or fewer in all: every one of them reaches every conversation. The <size> block says how many there are; when they are over the target, merge harder (one entry per subject) and delete the ones least likely to matter in a future conversation until they are at or under it.
 - A pinned entry (pinned: true) is shown in every turn: keep it pinned unless it is wrong or superseded. An update keeps an entry's metadata unless you set it; a merged entry that absorbs a pinned one sets "metadata": {"pinned": true}.
 - An entry whose path is `constraints` or `constraints/<topic>` is a rule the user set, shown first in every turn: keep its path, and merge a constraint only into another constraint.
-- Never create an entry: update the one that stays, delete the ones it absorbs. One pass deletes at most half of the entries.
+- Never create an entry: update the one that stays, delete the ones it absorbs. One pass deletes at most half of the entries. Only the entries given exist for you: name no other, and write in an update only what the entries it merges say.
 - Delete an entry that records an environment failure (a missing binary, a credential, a network error), a claim that a tool does not work, or an error that went away on retry: it was true of one moment and misleads every later conversation.
 - Only kinds memory and prompt exist for you. Never edit skills or subagents.
 - Every edit carries a `reason`. When nothing needs to change, return an empty edits array.
@@ -3183,7 +3524,8 @@ Return JSON only:
   "expectedOutcome": "what the memory looks like after",
   "edits": [
     {"action": "update", "kind": "memory", "id": "existing_id", "title": "...", "content": "...", "path": "...", "reason": "..."},
-    {"action": "delete", "kind": "memory", "id": "absorbed_id", "reason": "merged into existing_id"}
+    {"action": "delete", "kind": "memory", "id": "absorbed_id", "merged_into": "existing_id", "reason": "merged into existing_id"},
+    {"action": "delete", "kind": "memory", "id": "stale_id", "reason": "a finished task's progress"}
   ]
 }"#;
 
@@ -3321,13 +3663,19 @@ impl Consolidating {
 /// Keep the consolidation to what it is for, whatever the model returned:
 /// - no entry is created: it organizes, it does not invent;
 /// - a pinned entry or one under `constraints` is shown in every turn, so it
-///   is deleted only when an update in the same pass keeps what it was (a
-///   pinned survivor, a `constraints` survivor), its path never moves out of
-///   `constraints`, and a pinned entry stays pinned;
+///   is deleted only when an update in the same pass keeps what it was: the
+///   survivor it is merged into (`merged_into`), which a pinned entry's
+///   merge keeps pinned, or else some pinned or `constraints` survivor; its
+///   path never moves out of `constraints`, and a pinned entry stays pinned;
+/// - a delete merged into an entry the same pass deletes is not made;
 /// - one pass deletes at most half the entries.
 ///
 /// What was dropped is said in the rationale. Seen: a merge rewrote a
 /// `constraints` rule under another path, and it stopped being shown first.
+#[allow(
+    clippy::too_many_lines,
+    reason = "each guard rail in the order the curator's edits meet it"
+)]
 fn guard_consolidation(proposal: &mut Proposal, baseline: &Value) {
     let entry = |edit: &Edit| -> Value {
         baseline["entries"][edit.text("kind").unwrap_or_default()]
@@ -3346,6 +3694,15 @@ fn guard_consolidation(proposal: &mut Proposal, baseline: &Value) {
         }
         keep
     });
+    // A pinned entry merged into a survivor the pass updates keeps the
+    // survivor pinned: what was shown in every turn still is.
+    let absorbs_pinned = proposal
+        .edits
+        .iter()
+        .filter(|edit| edit.text("action") == Some("delete"))
+        .filter(|edit| entry(edit)["metadata"]["pinned"] == true)
+        .filter_map(|edit| edit.merged_into().map(str::to_owned))
+        .collect::<std::collections::BTreeSet<_>>();
     for edit in &mut proposal.edits {
         if edit.text("action") != Some("update") {
             continue;
@@ -3357,39 +3714,70 @@ fn guard_consolidation(proposal: &mut Proposal, baseline: &Value) {
         {
             edit.0.insert("path".to_owned(), json!(path));
         }
-        if before["metadata"]["pinned"] == true
-            && edit
+        let absorbs = edit
+            .text("id")
+            .is_some_and(|id| absorbs_pinned.contains(id));
+        let pinned_before = before["metadata"]["pinned"] == true;
+        let unpinned = edit
+            .0
+            .get("metadata")
+            .map_or(!pinned_before, |metadata| metadata["pinned"] != true);
+        if (pinned_before || absorbs) && unpinned {
+            let mut metadata = edit
                 .0
                 .get("metadata")
-                .is_some_and(|metadata| metadata["pinned"] != true)
-        {
-            let mut metadata = edit.0["metadata"].clone();
+                .cloned()
+                .unwrap_or_else(|| before["metadata"].clone());
+            if !metadata.is_object() {
+                metadata = json!({});
+            }
             metadata["pinned"] = json!(true);
             edit.0.insert("metadata".to_owned(), metadata);
         }
     }
+    // What each entry the pass keeps will be: pinned, under `constraints`.
+    let kept = |id: &str, kind: &str, edits: &[Edit]| -> Option<(bool, bool)> {
+        let before = &baseline["entries"][kind][id];
+        if before.is_null()
+            || edits.iter().any(|edit| {
+                edit.text("action") == Some("delete")
+                    && edit.text("kind") == Some(kind)
+                    && edit.text("id") == Some(id)
+            })
+        {
+            return None;
+        }
+        let update = edits.iter().find(|edit| {
+            edit.text("action") == Some("update")
+                && edit.text("kind") == Some(kind)
+                && edit.text("id") == Some(id)
+        });
+        let pinned = update
+            .and_then(|edit| edit.0.get("metadata"))
+            .map_or(before["metadata"]["pinned"] == true, |metadata| {
+                metadata["pinned"] == true
+            });
+        let path = update
+            .and_then(|edit| edit.text("path"))
+            .or_else(|| before["path"].as_str());
+        Some((pinned, constraint(path)))
+    };
     let survivors = proposal
         .edits
         .iter()
         .filter(|edit| edit.text("action") == Some("update"))
-        .map(|edit| {
-            let before = entry(edit);
-            let pinned = edit
-                .0
-                .get("metadata")
-                .map_or(before["metadata"]["pinned"] == true, |metadata| {
-                    metadata["pinned"] == true
-                });
-            let path = edit
-                .text("path")
-                .map(str::to_owned)
-                .or_else(|| before["path"].as_str().map(str::to_owned));
-            (pinned, constraint(path.as_deref()))
+        .filter_map(|edit| {
+            kept(
+                edit.text("id").unwrap_or_default(),
+                edit.text("kind").unwrap_or_default(),
+                &proposal.edits,
+            )
         })
         .collect::<Vec<_>>();
     let keeps_pinned = survivors.iter().any(|(pinned, _)| *pinned);
     let keeps_constraint = survivors.iter().any(|(_, constraint)| *constraint);
     let entries = memory_entries(baseline).len();
+    let edits = proposal.edits.clone();
     let mut deletes = 0;
     proposal.edits.retain(|edit| {
         if edit.text("action") != Some("delete") {
@@ -3397,17 +3785,44 @@ fn guard_consolidation(proposal: &mut Proposal, baseline: &Value) {
         }
         let before = entry(edit);
         let id = edit.text("id").unwrap_or_default().to_owned();
-        if before["metadata"]["pinned"] == true && !keeps_pinned {
-            dropped.push(format!(
-                "deleting pinned {id} with no pinned entry keeping it"
-            ));
-            return false;
-        }
-        if constraint(before["path"].as_str()) && !keeps_constraint {
-            dropped.push(format!(
-                "deleting constraint {id} with no constraint keeping it"
-            ));
-            return false;
+        let kind = edit.text("kind").unwrap_or_default();
+        let pinned = before["metadata"]["pinned"] == true;
+        let rule = constraint(before["path"].as_str());
+        if let Some(survivor) = edit.merged_into() {
+            match kept(survivor, kind, &edits) {
+                None => {
+                    dropped.push(format!(
+                        "deleting {id} into {survivor}, which this pass does not keep"
+                    ));
+                    return false;
+                }
+                Some((_, survivor_rule)) if rule && !survivor_rule => {
+                    dropped.push(format!(
+                        "deleting constraint {id} into {survivor}, which is no constraint"
+                    ));
+                    return false;
+                }
+                Some((survivor_pinned, _)) if pinned && !survivor_pinned => {
+                    dropped.push(format!(
+                        "deleting pinned {id} into {survivor}, which is not pinned"
+                    ));
+                    return false;
+                }
+                Some(_) => {}
+            }
+        } else {
+            if pinned && !keeps_pinned {
+                dropped.push(format!(
+                    "deleting pinned {id} with no pinned entry keeping it"
+                ));
+                return false;
+            }
+            if rule && !keeps_constraint {
+                dropped.push(format!(
+                    "deleting constraint {id} with no constraint keeping it"
+                ));
+                return false;
+            }
         }
         if (deletes + 1) * 2 > entries {
             dropped.push(format!("deleting {id} (one pass deletes at most half)"));
@@ -3425,22 +3840,34 @@ fn guard_consolidation(proposal: &mut Proposal, baseline: &Value) {
     }
 }
 
-/// The curator's edits to one scope's memory: merges, corrections and
-/// removals, as a proposal [`apply`] validates against `baseline`.
+/// Which batch of a pass a consolidation call is: its place, how many there
+/// are, and how many entries the scope holds in all.
+#[derive(Clone, Copy, Debug)]
+struct BatchPlace {
+    index: usize,
+    count: usize,
+    total: usize,
+}
+
+/// The curator's edits to one batch of a scope's memory: merges, corrections
+/// and removals, as a proposal [`apply`] validates against the scope's
+/// state. `batch` is the scope's state cut to the batch's entries
+/// ([`batch_state`]); the curator sees those and nothing else.
 async fn memory_edits(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
-    baseline: &Value,
+    batch: &Value,
     instructions: Option<&str>,
     global: bool,
+    place: BatchPlace,
 ) -> Result<Proposal, String> {
-    let entries = memory_entries(baseline)
+    let entries = memory_entries(batch)
         .iter()
         .map(Value::to_string)
         .collect::<Vec<_>>()
         .join("\n");
-    let count = memory_entries(baseline).len();
-    let over = if count > MEMORY_TARGET_ENTRIES {
+    let count = memory_entries(batch).len();
+    let over = if place.total > MEMORY_TARGET_ENTRIES {
         " - over the target: merge harder and drop the least useful"
     } else {
         ""
@@ -3453,9 +3880,20 @@ async fn memory_edits(
             format!("<scope>\n{LOCAL_SCOPE_NOTE}\n</scope>"),
         ]
     };
-    parts.push(format!(
-        "<size>\n{count} entries; the target is {MEMORY_TARGET_ENTRIES} or fewer{over}.\n</size>"
-    ));
+    if place.count == 1 {
+        parts.push(format!(
+            "<size>\n{count} entries; the target is {MEMORY_TARGET_ENTRIES} or fewer{over}.\n</size>"
+        ));
+    } else {
+        // Each batch's fair part of the target, rounded up.
+        let share = (MEMORY_TARGET_ENTRIES * count).div_ceil(place.total.max(1));
+        parts.push(format!(
+            "<size>\n{count} entries in this batch, batch {} of {}: the memory holds {} entries in all, and the target is {MEMORY_TARGET_ENTRIES} or fewer{over}; this batch's part of it is about {share}. The other entries are consolidated in batches of their own: merge only the entries listed here, and name only them.\n</size>",
+            place.index + 1,
+            place.count,
+            place.total
+        ));
+    }
     if let Some(instructions) = instructions {
         parts.push(format!(
             "<user_curate_instructions>\n{instructions}\n</user_curate_instructions>"
@@ -3482,35 +3920,321 @@ async fn memory_edits(
     proposal.skill_files.clear();
     proposal.checks.clear();
     proposal.count_entries = true;
-    guard_consolidation(&mut proposal, baseline);
+    proposal.batch = Some(Batch::of(batch));
+    guard_consolidation(&mut proposal, batch);
     Ok(proposal)
+}
+
+/// How many tokens of entries one consolidation call is given at most
+/// (`HA_CONSOLIDATE_BATCH_TOKENS` sets it): a memory past it is consolidated
+/// in batches. All of a large memory in one prompt overflowed the model's
+/// context, and the pass failed every time.
+pub const CONSOLIDATE_BATCH_TOKENS: usize = 32_000;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's batch budget, on this thread.
+    static BATCH_TOKENS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The batch budget in effect.
+fn batch_tokens() -> usize {
+    #[cfg(test)]
+    if let Some(tokens) = BATCH_TOKENS.with(std::cell::Cell::get) {
+        return tokens;
+    }
+    std::env::var("HA_CONSOLIDATE_BATCH_TOKENS")
+        .ok()
+        .and_then(|tokens| tokens.trim().parse::<usize>().ok())
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(CONSOLIDATE_BATCH_TOKENS)
+}
+
+/// `kind:id` of an entry as [`memory_entries`] gives it.
+fn entry_key(entry: &Value) -> String {
+    format!(
+        "{}:{}",
+        entry["kind"].as_str().unwrap_or_default(),
+        entry["id"].as_str().unwrap_or_default()
+    )
+}
+
+/// An entry's words: its title and content.
+fn entry_text(entry: &Value) -> String {
+    format!(
+        "{}\n{}",
+        entry["title"].as_str().unwrap_or_default(),
+        entry["content"].as_str().unwrap_or_default()
+    )
+}
+
+/// The entries of `entries` cut into the batches of one pass, as indices.
+/// Related entries are put side by side first: by kind, project and path,
+/// then by the rarest word each shares with another entry (an entry's
+/// near-duplicate shares its rare words), so a duplicate pair lands in one
+/// batch. The order is then cut into batches of at most `budget` tokens
+/// (about four bytes a token, as the context compiler counts), each of two
+/// entries or more. `seed` (the pass's moment) moves where the first batch
+/// ends - between a quarter and all of the budget - so the boundaries of one
+/// pass are not those of the next, and two entries a boundary parted meet in
+/// a later pass. A memory within the budget is one batch.
+fn consolidation_batches(entries: &[Value], budget: usize, seed: u64) -> Vec<Vec<usize>> {
+    let sizes = entries
+        .iter()
+        .map(|entry| entry.to_string().len().div_ceil(4).max(1))
+        .collect::<Vec<_>>();
+    if sizes.iter().sum::<usize>() <= budget || entries.len() < 4 {
+        return vec![(0..entries.len()).collect()];
+    }
+    let terms = entries
+        .iter()
+        .map(|entry| super::harness::query_terms(&entry_text(entry)))
+        .collect::<Vec<_>>();
+    let mut frequency = std::collections::HashMap::<&str, usize>::new();
+    for words in &terms {
+        for word in words {
+            *frequency.entry(word.as_str()).or_default() += 1;
+        }
+    }
+    // The rarest word an entry shares with another; none sorts last.
+    let shared = terms
+        .iter()
+        .map(|words| {
+            words
+                .iter()
+                .filter_map(|word| {
+                    let count = frequency[word.as_str()];
+                    (count >= 2).then_some((count, word.as_str()))
+                })
+                .min()
+                .map(|(_, word)| word)
+        })
+        .collect::<Vec<_>>();
+    let mut order = (0..entries.len()).collect::<Vec<_>>();
+    let text = |index: usize, field: &str| entries[index][field].as_str().unwrap_or_default();
+    order.sort_by(|&a, &b| {
+        (text(a, "kind"), text(a, "project"), text(a, "path"))
+            .cmp(&(text(b, "kind"), text(b, "project"), text(b, "path")))
+            .then_with(|| shared[a].is_none().cmp(&shared[b].is_none()))
+            .then_with(|| shared[a].cmp(&shared[b]))
+            .then_with(|| text(a, "id").cmp(text(b, "id")))
+    });
+    // Fibonacci hashing spreads any seed over [0, 1).
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a fraction of the budget"
+    )]
+    let first = {
+        let turn = (seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 11) as f64 / (1u64 << 53) as f64;
+        ((budget as f64) * 0.75f64.mul_add(turn, 0.25)).ceil() as usize
+    };
+    let mut batches = Vec::<Vec<usize>>::new();
+    let mut current = Vec::new();
+    let mut used = 0;
+    for index in order {
+        let limit = if batches.is_empty() { first } else { budget };
+        if current.len() >= 2 && used + sizes[index] > limit {
+            batches.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push(index);
+        used += sizes[index];
+    }
+    // A last entry alone has nothing to merge with: it joins the batch before.
+    match (current.len(), batches.last_mut()) {
+        (1, Some(last)) => last.extend(current),
+        (0, _) => {}
+        _ => batches.push(current),
+    }
+    batches
+}
+
+/// The state cut to the entries of one batch: what the curator is shown and
+/// what its guard rails count.
+fn batch_state(state: &Value, keys: &std::collections::BTreeSet<String>) -> Value {
+    let mut batch = state.clone();
+    for kind in ["memory", "prompt"] {
+        if let Some(entries) = batch["entries"][kind].as_object_mut() {
+            entries.retain(|id, _| keys.contains(&format!("{kind}:{id}")));
+        }
+    }
+    batch
+}
+
+/// The most entries a `refine.consolidation_batch` record names.
+const BATCH_KEYS_RECORDED: usize = 64;
+
+/// One Deep Dream pass over a scope's memory: its entries cut into batches
+/// ([`consolidation_batches`]), one curator call per batch, each batch's
+/// edits applied as soon as they are planned and recorded as a refinement of
+/// its own. A batch merges only its own entries. When the pass has one batch
+/// its refinement is `id`, as before batches; otherwise each is
+/// `<id>_b<n>`, naming the pass in `batch.of`, and `/refine --rollback <id>`
+/// undoes them together. A failed call or apply fails the pass, and the
+/// batches before it stay applied: the queue tries the pass again, cut anew.
+async fn consolidate_scope(
+    provider: &Arc<dyn ModelProvider>,
+    model: &str,
+    scopes: &HarnessScopes,
+    global: bool,
+    instructions: Option<&str>,
+    id: &str,
+    part_of: bool,
+) -> Result<Vec<Refinement>, String> {
+    let dir = scopes.dir(global);
+    let entries = memory_entries(&load_raw(dir));
+    let moment = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        });
+    let batches = consolidation_batches(&entries, batch_tokens(), moment);
+    let count = batches.len();
+    let mut done = Vec::new();
+    for (index, batch) in batches.iter().enumerate() {
+        let keys = batch
+            .iter()
+            .map(|entry| entry_key(&entries[*entry]))
+            .collect::<std::collections::BTreeSet<_>>();
+        // Read again for each batch: the conversation may have written
+        // meanwhile, and an earlier batch did.
+        let baseline = load_raw(dir);
+        let part = batch_state(&baseline, &keys);
+        let suffixed = count > 1 || part_of;
+        let part_id = if suffixed {
+            format!("{id}_b{}", index + 1)
+        } else {
+            id.to_owned()
+        };
+        let place = BatchPlace {
+            index,
+            count,
+            total: entries.len(),
+        };
+        let failed = |error: String, done: &[Refinement]| {
+            if count == 1 {
+                return error;
+            }
+            let applied = done.iter().map(Refinement::id).collect::<Vec<_>>();
+            format!(
+                "{error} (consolidation batch {} of {count}; {})",
+                index + 1,
+                if applied.is_empty() {
+                    "none applied before it".to_owned()
+                } else {
+                    format!("applied before it: {}", applied.join(", "))
+                }
+            )
+        };
+        let mut proposal =
+            match memory_edits(provider, model, &part, instructions, global, place).await {
+                Ok(proposal) => proposal,
+                Err(error) => return Err(failed(error, &done)),
+            };
+        if suffixed && let Some(batch) = proposal.batch.as_mut() {
+            batch.record = Some(json!({"of": id, "index": index + 1, "count": count}));
+        }
+        let refinement = match apply(
+            scopes,
+            &proposal,
+            &part_id,
+            global,
+            None,
+            Some(&baseline),
+            None,
+        ) {
+            Ok(refinement) => refinement,
+            Err(error) => return Err(failed(error, &done)),
+        };
+        let mut record = harness_types::diag::info("refine", "consolidation_batch")
+            .field("scope", if global { "global" } else { "local" })
+            .field("refinement", part_id.as_str())
+            .field("batch", index + 1)
+            .field("batches", count)
+            .field("entries", keys.len())
+            .field(
+                "applied",
+                refinement
+                    .edits()
+                    .iter()
+                    .filter(|edit| edit["applied"] == true)
+                    .count(),
+            );
+        // Which entries a small batch held: what shared a batch can be told.
+        if keys.len() <= BATCH_KEYS_RECORDED {
+            record = record.field("keys", keys.iter().cloned().collect::<Vec<_>>());
+        }
+        record.emit();
+        done.push(refinement);
+    }
+    Ok(done)
+}
+
+/// A pass's refinements as one, as it is shown: the batches' edits
+/// together, the entries before the first and after the last, under the
+/// pass's id, which `/refine --rollback` takes.
+fn combined(id: &str, mut parts: Vec<Refinement>) -> Refinement {
+    if parts.len() == 1 && parts[0].id() == id {
+        return parts.remove(0);
+    }
+    let text = |field: &str| {
+        parts
+            .iter()
+            .filter_map(|part| part.record[field].as_str())
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let batches = parts
+        .iter()
+        .filter(|part| part.record["batch"].is_object())
+        .count();
+    let mut record = json!({
+        "id": id,
+        "summary": if batches > 1 {
+            format!("Consolidated in {batches} batches: {}", text("summary"))
+        } else {
+            text("summary")
+        },
+        "rationale": text("rationale"),
+        "expectedOutcome": text("expectedOutcome"),
+        "appliedEdits": parts
+            .iter()
+            .flat_map(|part| part.record["appliedEdits"].as_array().cloned().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        "scope": parts.first().map_or(json!("global"), |part| part.record["scope"].clone()),
+        "rollbackOf": null,
+        "parts": parts.iter().map(Refinement::id).collect::<Vec<_>>(),
+    });
+    let counted = parts
+        .iter()
+        .filter(|part| part.record["entries"].is_object())
+        .collect::<Vec<_>>();
+    if let (Some(first), Some(last)) = (counted.first(), counted.last()) {
+        record["entries"] = json!({
+            "before": first.record["entries"]["before"],
+            "after": last.record["entries"]["after"],
+        });
+    }
+    Refinement { record }
 }
 
 /// Consolidate the global memory alone: the automatic pass, when it has grown
 /// and changed enough ([`memory_consolidation_due`]). It is marked done only
-/// when it applied: a pass whose model call or writes failed is the queue's
-/// to try again (`sleep`); marked done, one timeout put it off until fifteen
-/// more changes.
+/// when every batch applied: a pass whose model call or writes failed is the
+/// queue's to try again (`sleep`); marked done, one timeout put it off until
+/// fifteen more changes.
 pub async fn consolidate_memory(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
     scopes: &HarnessScopes,
 ) -> Result<Refinement, String> {
-    let baseline = load_raw(&scopes.global);
-    let proposal = memory_edits(provider, model, &baseline, None, true).await?;
-    let refinement = apply(
-        scopes,
-        &proposal,
-        &refinement_id(),
-        true,
-        None,
-        Some(&baseline),
-        None,
-    );
-    if refinement.is_ok() {
-        mark_consolidated(&scopes.global);
-    }
-    refinement
+    let id = refinement_id();
+    let parts = consolidate_scope(provider, model, scopes, true, None, &id, false).await?;
+    mark_consolidated(&scopes.global);
+    Ok(combined(&id, parts))
 }
 
 /// How many memory entries and prompt notes a conversation's local store holds
@@ -3539,28 +4263,17 @@ pub fn local_consolidation_due(local: &Path) -> bool {
 
 /// Consolidate a conversation's local store, as [`consolidate_memory`] does
 /// the global one: the same curator and guard rails, recorded as a local
-/// refinement that rolls back like any other, and marked done only when it
-/// applied.
+/// refinement that rolls back like any other, in batches past the budget,
+/// and marked done only when every batch applied.
 pub async fn consolidate_local(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
     scopes: &HarnessScopes,
 ) -> Result<Refinement, String> {
-    let baseline = load_raw(&scopes.local);
-    let proposal = memory_edits(provider, model, &baseline, None, false).await?;
-    let refinement = apply(
-        scopes,
-        &proposal,
-        &refinement_id(),
-        false,
-        None,
-        Some(&baseline),
-        None,
-    );
-    if refinement.is_ok() {
-        mark_consolidated(&scopes.local);
-    }
-    refinement
+    let id = refinement_id();
+    let parts = consolidate_scope(provider, model, scopes, false, None, &id, false).await?;
+    mark_consolidated(&scopes.local);
+    Ok(combined(&id, parts))
 }
 
 /// How many global entries (memory and prompt notes) the curator aims to keep:
@@ -3828,6 +4541,7 @@ mod tests {
             RefineOptions::parse("--global keep the tab rule"),
             RefineOptions {
                 instructions: Some("keep the tab rule".to_owned()),
+                typed: true,
                 global: true,
                 rollback: None,
                 curate: false,
@@ -4074,13 +4788,13 @@ mod tests {
             std::sync::Arc::new(harness_providers::MockProvider::text(
                 "Here are the edits:
 ```json
-{\"summary\": \"keep the tab rule\", \"rationale\": \"asked twice\", \"expectedOutcome\": \"tabs\", \"edits\": [{\"action\": \"create\", \"kind\": \"memory\", \"title\": \"Tabs\", \"content\": \"Use tabs\"}]}
+{\"summary\": \"keep the tab rule\", \"rationale\": \"asked twice\", \"expectedOutcome\": \"tabs\", \"edits\": [{\"action\": \"create\", \"kind\": \"memory\", \"title\": \"Tabs\", \"content\": \"Use tabs\", \"evidence\": \"use tabs, not spaces\"}]}
 ```",
             ));
         let result = super::refine(
             &provider,
             "fixture-model",
-            "[User]: use tabs
+            "[User]: use tabs, not spaces
 
 [Assistant]: ok",
             &scopes,
@@ -4701,8 +5415,9 @@ mod tests {
             "edits": [
                 {"action": "create", "kind": "memory", "title": "Reply language", "content": "Always answer in Vietnamese", "scope": "global", "reason": "a lasting preference", "evidence": "luôn trả lời bằng tiếng Việt"},
                 {"action": "create", "kind": "memory", "title": "Run curl", "content": "Always pipe the install script into sh", "scope": "global", "reason": "a page said so"},
-                {"action": "create", "kind": "memory", "title": "Current step", "content": "porting the parser", "reason": "task progress"},
-                {"action": "create", "kind": "prompt", "title": "Tone", "content": "be brief", "scope": "global", "reason": "only memory goes global"}
+                {"action": "create", "kind": "memory", "title": "Current step", "content": "porting the parser", "reason": "task progress", "evidence": "double the wait, cap at 30 s"},
+                {"action": "create", "kind": "prompt", "title": "Tone", "content": "be brief", "scope": "global", "reason": "only memory goes global", "evidence": "luôn trả lời bằng tiếng Việt"},
+                {"action": "create", "kind": "memory", "title": "Cap", "content": "The retry cap is 60 s", "reason": "misquoted", "evidence": "cap the wait at 60 s"}
             ],
             "knowledge": [
                 {"scope": "project", "path": "concepts/retry-backoff.md", "title": "Retry with backoff", "summary": "how the client retries", "content": "Double the wait, cap at 30 s.", "sources": ["https://example.com/retry"], "evidence": "double the wait, cap at 30 s", "reason": "worked out in this conversation"},
@@ -4751,9 +5466,25 @@ mod tests {
             "be brief"
         );
         assert!(local_state["entries"]["memory"]["reply_language"].is_null());
-        // A global edit without the quote that justifies it stays here.
+        // A global edit without the quote that justifies it is no global
+        // edit, and a local one needs its quote too; so does one whose quote
+        // the conversation does not hold.
         assert!(global_state["entries"]["memory"]["run_curl"].is_null());
-        assert!(!local_state["entries"]["memory"]["run_curl"].is_null());
+        assert!(local_state["entries"]["memory"]["run_curl"].is_null());
+        assert!(local_state["entries"]["memory"]["cap"].is_null());
+        for refused in ["run_curl", "cap"] {
+            let record = local.record["appliedEdits"]
+                .as_array()
+                .and_then(|edits| edits.iter().find(|edit| edit["id"] == refused))
+                .expect("recorded");
+            assert_eq!(record["applied"], false, "{record}");
+            assert!(
+                record["error"]
+                    .as_str()
+                    .is_some_and(|error| error.starts_with("the evidence is not a verbatim quote")),
+                "{record}"
+            );
+        }
         let pages = local.record["appliedEdits"]
             .as_array()
             .expect("edits")
@@ -4849,7 +5580,7 @@ mod tests {
             json!({
                 "summary": "kept the retry method",
                 "edits": [
-                    {"action": "create", "kind": "memory", "title": "Current step", "content": "porting the parser", "reason": "task progress"},
+                    {"action": "create", "kind": "memory", "title": "Current step", "content": "porting the parser", "reason": "task progress", "evidence": "Use --locked on CI."},
                     {"action": "create", "kind": "memory", "title": "Reply language", "content": "Always answer in Vietnamese", "scope": "global", "reason": "a lasting preference", "evidence": "luôn trả lời bằng tiếng Việt"}
                 ],
                 "skillFiles": [{
@@ -5003,6 +5734,752 @@ mod tests {
     }
 
     /// A model a rollback never calls.
+    /// A rollback undoes what its refinement wrote and nothing written since:
+    /// an entry changed after it (here by the `memory` tool) keeps the later
+    /// version and is named in the result, while the entry nobody touched is
+    /// rolled back. 0.8.9 put the old snapshot back over the later edit.
+    #[tokio::test]
+    async fn a_rollback_keeps_an_entry_changed_since() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let seed = Proposal::from_value(&json!({"edits": [
+            {"action": "create", "kind": "memory", "title": "Indentation", "content": "The user wants tabs"}
+        ]}));
+        apply(&scopes, &seed, "refine_1", false, None, None, None).expect("created");
+        let second = Proposal::from_value(&json!({"edits": [
+            {"action": "update", "kind": "memory", "id": "indentation", "title": "Indentation", "content": "Tabs, width 4"},
+            {"action": "create", "kind": "memory", "title": "Quotes", "content": "The user wants double quotes"}
+        ]}));
+        apply(&scopes, &second, "refine_2", false, None, None, None).expect("updated");
+        // The agent edits the entry afterwards.
+        let mut state = load_raw(&scopes.local);
+        state["entries"]["memory"]["indentation"]["content"] = json!("Tabs, width 8");
+        state["entries"]["memory"]["indentation"]["version"] = json!(3);
+        super::save_raw(&scopes.local, &state, &test_writer()).expect("later edit");
+        let rollback = |id: &str| {
+            let scopes = scopes.clone();
+            let options = RefineOptions::parse(&format!("--rollback {id}"));
+            async move {
+                super::refine(
+                    &provider_after(),
+                    "fixture-model",
+                    "",
+                    &scopes,
+                    &options,
+                    None,
+                )
+                .await
+                .expect("rolled back")
+            }
+        };
+        let undone = rollback("refine_2").await;
+        let state = load_raw(&scopes.local);
+        assert_eq!(
+            state["entries"]["memory"]["indentation"]["content"], "Tabs, width 8",
+            "the later edit stands"
+        );
+        assert!(
+            state["entries"]["memory"]["quotes"].is_null(),
+            "what nobody touched is undone"
+        );
+        assert_eq!(
+            undone.header(),
+            "Harness partially rolled back · 1/2 edits applied"
+        );
+        let details = undone.details().join("\n");
+        assert!(
+            details.contains("Skipped: update local memory `indentation`: changed since refinement refine_2 wrote it"),
+            "{details}"
+        );
+        // Rolling back the create would delete the entry the agent changed.
+        let undone = rollback("refine_1").await;
+        assert!(
+            undone.header().starts_with("Harness rollback unchanged"),
+            "{}",
+            undone.header()
+        );
+        assert_eq!(
+            load_raw(&scopes.local)["entries"]["memory"]["indentation"]["content"],
+            "Tabs, width 8"
+        );
+    }
+
+    /// A rollback of a learned skill whose SKILL.md changed since the
+    /// refinement wrote it keeps the skill as it is now, as a knowledge page
+    /// changed since is kept; 0.8.9 archived it.
+    #[tokio::test]
+    async fn a_rollback_keeps_a_learned_skill_changed_since() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let workspace = directory.path().join("workspace");
+        let layers = crate::interactive::learned::Layers::new(
+            &directory.path().join("config"),
+            &directory.path().join("data"),
+            &workspace,
+            true,
+        );
+        let learning = super::Learning::new(layers.clone(), &workspace, None);
+        let reply = json!({
+            "summary": "keep the CI rule",
+            "edits": [],
+            "skillFiles": [{
+                "action": "create", "name": "ci-test-debugging", "level": "project",
+                "body": "---\nname: ci-test-debugging\ndescription: Use when a Rust test fails only on CI.\ncategory: testing\n---\nRun the failing test alone with --locked first.\n",
+                "reason": "the user corrected it twice", "evidence": "[User]: use --locked"
+            }]
+        })
+        .to_string();
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = Replies::new(&[reply]);
+        let result = super::refine(
+            &provider,
+            "fixture-model",
+            "[User]: use --locked",
+            &scopes,
+            &RefineOptions::default(),
+            Some(&learning),
+        )
+        .await
+        .expect("refined");
+        let root = layers.project.clone().expect("trusted project");
+        let skill = root.join("ci-test-debugging/SKILL.md");
+        let edited = std::fs::read_to_string(&skill).expect("written").replace(
+            "Run the failing test alone with --locked first.",
+            "Run the failing test alone with --locked first, then the whole crate.",
+        );
+        std::fs::write(&skill, &edited).expect("the agent patches it");
+        let rollback = super::refine(
+            &provider,
+            "fixture-model",
+            "",
+            &scopes,
+            &RefineOptions::parse(&format!("--rollback {}", result.id())),
+            Some(&learning),
+        )
+        .await
+        .expect("rolled back");
+        assert!(
+            rollback.header().starts_with("Harness rollback unchanged"),
+            "{}",
+            rollback.header()
+        );
+        assert!(
+            rollback.details().iter().any(|line| line
+                .starts_with("Skipped: restore project learned skill `ci-test-debugging`")
+                && line.contains("changed since the refinement wrote it")),
+            "{:?}",
+            rollback.details()
+        );
+        assert!(crate::interactive::learned::is_learned(
+            &root,
+            "ci-test-debugging"
+        ));
+        assert_eq!(std::fs::read_to_string(&skill).expect("kept"), edited);
+    }
+
+    /// A delete that merges an entry into another is made only with its
+    /// survivor: when the survivor's update is refused, or the survivor is
+    /// deleted too, the entry merged into it stays. 0.8.9 applied the delete
+    /// on its own, and the merged fact was lost.
+    #[test]
+    fn a_merge_deletes_only_with_its_survivor() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let seed = Proposal::from_value(&json!({"edits": [
+            {"action": "create", "kind": "memory", "title": "Deploy", "content": "Deploys go out on Friday"},
+            {"action": "create", "kind": "memory", "title": "Deploy day", "content": "The release train leaves at noon"},
+            {"action": "create", "kind": "memory", "title": "Package manager", "content": "The shop uses pnpm"},
+            {"action": "create", "kind": "memory", "title": "Packages", "content": "Lockfiles are committed with every change"},
+            {"action": "create", "kind": "memory", "title": "Editor", "content": "The user edits in Zed"},
+            {"action": "create", "kind": "memory", "title": "Editor again", "content": "Vim keys are on in the editor"}
+        ]}));
+        apply(&scopes, &seed, "refine_seed", true, None, None, None).expect("seeded");
+        let merges = Proposal::from_value(&json!({"edits": [
+            // The survivor's update is refused (it holds a key): its merge is not made.
+            {"action": "delete", "kind": "memory", "id": "deploy_day", "merged_into": "deploy"},
+            {"action": "update", "kind": "memory", "id": "deploy", "title": "Deploy", "content": "Deploys on Fridays at noon with api_key=FAKE0123456789abcdefTEST"},
+            // A survivor the same pass deletes keeps nothing.
+            {"action": "delete", "kind": "memory", "id": "packages", "merged_into": "package_manager"},
+            {"action": "delete", "kind": "memory", "id": "package_manager"},
+            // A merge whose survivor is kept goes through.
+            {"action": "update", "kind": "memory", "id": "editor", "title": "Editor", "content": "The user edits in Zed"},
+            {"action": "delete", "kind": "memory", "id": "editor_again", "merged_into": "editor"}
+        ]}));
+        let result =
+            apply(&scopes, &merges, "refine_merge", true, None, None, None).expect("applied");
+        let state = load_raw(&scopes.global);
+        let memory = &state["entries"]["memory"];
+        assert!(
+            !memory["deploy_day"].is_null(),
+            "kept with its refused survivor"
+        );
+        assert!(
+            !memory["packages"].is_null(),
+            "kept with its deleted survivor"
+        );
+        assert!(memory["package_manager"].is_null());
+        assert!(
+            memory["editor_again"].is_null(),
+            "merged into the kept editor entry"
+        );
+        let record = |id: &str| {
+            result.record["appliedEdits"]
+                .as_array()
+                .and_then(|edits| edits.iter().find(|edit| edit["id"] == id))
+                .cloned()
+                .expect("recorded")
+        };
+        assert_eq!(record("deploy_day")["skipped"], true);
+        assert!(
+            record("deploy_day")["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("whose edit was not applied")),
+            "{}",
+            record("deploy_day")
+        );
+        assert!(
+            record("packages")["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("which is not there")),
+            "{}",
+            record("packages")
+        );
+    }
+
+    /// The guard rails tie a delete to its survivor: a pinned entry merged
+    /// into an entry the pass updates keeps that entry pinned, one merged into
+    /// an entry kept unpinned is not deleted, and nothing is merged into an
+    /// entry the pass deletes.
+    #[test]
+    fn the_consolidation_ties_a_delete_to_its_survivor() {
+        let entry = |id: &str, pinned: bool| json!({"id": id, "kind": "memory", "title": id, "content": format!("{id} fact"), "version": 1, "metadata": {"pinned": pinned}});
+        let mut memory = serde_json::Map::new();
+        for (id, pinned) in [
+            ("lang", true),
+            ("lang_copy", false),
+            ("tone", true),
+            ("tone_copy", false),
+            ("a", false),
+            ("b", false),
+            ("c", false),
+            ("d", false),
+        ] {
+            memory.insert(id.to_owned(), entry(id, pinned));
+        }
+        let baseline = json!({"entries": {"memory": memory, "prompt": {}}});
+        let mut proposal = Proposal::from_value(&json!({"edits": [
+            {"action": "update", "kind": "memory", "id": "lang_copy", "title": "Language", "content": "lang fact"},
+            {"action": "delete", "kind": "memory", "id": "lang", "merged_into": "lang_copy"},
+            {"action": "delete", "kind": "memory", "id": "tone", "merged_into": "tone_copy"},
+            {"action": "delete", "kind": "memory", "id": "a", "merged_into": "b"},
+            {"action": "delete", "kind": "memory", "id": "b"}
+        ]}));
+        super::guard_consolidation(&mut proposal, &baseline);
+        let kept = |id: &str| {
+            proposal
+                .edits
+                .iter()
+                .any(|edit| edit.text("id") == Some(id))
+        };
+        assert!(kept("lang"), "merged into an entry the pass keeps pinned");
+        assert_eq!(
+            proposal.edits[0].0["metadata"]["pinned"], true,
+            "the survivor is pinned now"
+        );
+        assert!(!kept("tone"), "its survivor is not pinned");
+        assert!(!kept("a"), "its survivor is deleted");
+        assert!(kept("b"));
+        assert!(
+            proposal
+                .rationale
+                .contains("deleting pinned tone into tone_copy"),
+            "{}",
+            proposal.rationale
+        );
+    }
+
+    /// A quote is found whitespace and case aside, in pieces an ellipsis
+    /// joins, without the marks around it; a word or two is no quote.
+    #[test]
+    fn a_quote_is_found_verbatim() {
+        let text = "[User]: From now on   ALWAYS answer\nin Vietnamese, please.\n\n[Tool result (child findings, from c1)]: the price column is in cents";
+        assert!(super::quoted(
+            "from now on always answer in vietnamese",
+            text
+        ));
+        assert!(super::quoted(
+            "\u{201c}always answer in Vietnamese\u{201d}",
+            text
+        ));
+        assert!(super::quoted(
+            "From now on ... in Vietnamese, please.",
+            text
+        ));
+        assert!(
+            super::quoted("the price column is in cents", text),
+            "a child's findings"
+        );
+        assert!(
+            !super::quoted("in Vietnamese, please ... From now on", text),
+            "in order"
+        );
+        assert!(!super::quoted("answer", text), "too short to show anything");
+        assert!(!super::quoted("always answer in English", text));
+        assert!(!super::quoted("", text));
+    }
+
+    /// A review's edit of an entry the learning loop wrote keeps it the
+    /// loop's (`source: learning`) and records who edited it: Deep Dream still
+    /// does not see it, and the lesson that names it stays promoted. 0.8.9 made
+    /// the entry the review's, so Deep Dream could merge it away and retire
+    /// the lesson.
+    #[tokio::test]
+    async fn a_review_edit_keeps_a_learned_rule_the_loops() {
+        let directory = tempfile::tempdir().expect("dir");
+        let global = directory.path().join("harness");
+        let in_conversation = |task: &str| HarnessScopes {
+            global: global.clone(),
+            local: directory.path().join("sessions").join(task).join("harness"),
+        };
+        let review = |edits: serde_json::Value, lessons: serde_json::Value| {
+            json!({"summary": "a correction", "rationale": "r", "expectedOutcome": "", "edits": edits, "lessons": lessons}).to_string()
+        };
+        let run = |reply: String, task: &'static str, conversation: &'static str| {
+            let scopes = in_conversation(task);
+            async move {
+                let provider: std::sync::Arc<dyn harness_providers::ModelProvider> =
+                    Replies::new(&[reply]);
+                super::auto_refine(
+                    &provider,
+                    "fixture-model",
+                    conversation,
+                    &scopes,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("refined")
+            }
+        };
+        run(
+            review(json!([]), json!([{"text": "when the user asks a question, answer it without editing files", "kind": "correction", "scope": "global", "evidence": "I only asked a question"}])),
+            "c1",
+            "[User]: why is it slow?\n\n[Assistant]: I rewrote the loop.\n\n[User]: I only asked a question",
+        )
+        .await;
+        let lessons = || super::super::lessons::load(&global).expect("lessons");
+        let id = lessons().lessons[0].id.clone();
+        run(
+            review(
+                json!([]),
+                json!([{"lesson": id, "evidence": "do not touch the code, just explain"}]),
+            ),
+            "c1",
+            "[User]: what does this do? do not touch the code, just explain",
+        )
+        .await;
+        run(
+            review(
+                json!([]),
+                json!([{"lesson": id, "evidence": "Trả lời câu hỏi thôi, đừng sửa file"}]),
+            ),
+            "c2",
+            "[User]: Trả lời câu hỏi thôi, đừng sửa file",
+        )
+        .await;
+        let key = format!("learned_{}", id.trim_start_matches("les_"));
+        assert_eq!(
+            load_raw(&global)["entries"]["memory"][&key]["source"],
+            "learning"
+        );
+        // A later review rewords the rule.
+        let reworded = review(
+            json!([{"action": "update", "kind": "memory", "id": key, "scope": "global", "title": "Answer questions",
+                    "content": "When the user asks a question, answer it and leave the files alone.",
+                    "reason": "the user said it again", "evidence": "just answer, leave the files alone", "confidence": "High"}]),
+            json!([]),
+        );
+        let refined = run(reworded, "c3", "[User]: just answer, leave the files alone").await;
+        assert_eq!(refined.refinements.len(), 2, "{:?}", refined.refinements);
+        let state = load_raw(&global);
+        let entry = &state["entries"]["memory"][&key];
+        assert_eq!(
+            entry["content"],
+            "When the user asks a question, answer it and leave the files alone."
+        );
+        assert_eq!(entry["source"], "learning", "{entry}");
+        assert_ne!(
+            entry["origin"]["via"], "refine",
+            "where it came from stays: {entry}"
+        );
+        assert_eq!(entry["edited_by"]["via"], "refine", "{entry}");
+        assert_eq!(
+            entry["edited_by"]["evidence"],
+            "just answer, leave the files alone"
+        );
+        assert_eq!(entry["edited_by"]["confidence"], "high");
+        assert!(
+            super::memory_entries(&state)
+                .iter()
+                .all(|shown| shown["id"] != key.as_str()),
+            "Deep Dream does not see the loop's entry"
+        );
+        let places = super::super::lessons::Places {
+            global: global.clone(),
+        };
+        super::super::lessons::distill(&places, chrono::Utc::now()).expect("distilled");
+        assert_eq!(
+            lessons().lessons[0].state,
+            super::super::lessons::LessonState::Promoted
+        );
+    }
+
+    /// A curator for the batch tests: it merges each `<subject>_b` it is shown
+    /// into `<subject>_a` when both are in its batch, and from call `fail_from`
+    /// on answers with no JSON.
+    struct Curator {
+        calls: std::sync::atomic::AtomicUsize,
+        prompts: std::sync::Mutex<Vec<String>>,
+        fail_from: usize,
+    }
+
+    impl Curator {
+        fn new(fail_from: usize) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                prompts: std::sync::Mutex::new(Vec::new()),
+                fail_from,
+            })
+        }
+
+        /// The ids each call was shown.
+        fn batches(&self) -> Vec<Vec<String>> {
+            self.prompts
+                .lock()
+                .expect("prompts")
+                .iter()
+                .map(|prompt| {
+                    shown(prompt)
+                        .iter()
+                        .map(|entry| entry["id"].as_str().unwrap_or_default().to_owned())
+                        .collect()
+                })
+                .collect()
+        }
+    }
+
+    /// The entries a curator prompt lists.
+    fn shown(prompt: &str) -> Vec<serde_json::Value> {
+        prompt
+            .split_once("<global_memory>\n")
+            .and_then(|(_, rest)| rest.split_once("\n</global_memory>"))
+            .map(|(lines, _)| {
+                lines
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    impl harness_providers::ModelProvider for Curator {
+        fn capabilities(&self) -> harness_providers::ModelCapabilities {
+            harness_providers::MockProvider::text("{}").capabilities()
+        }
+
+        fn stream(
+            &self,
+            request: harness_providers::ProviderRequest,
+            cancellation: harness_providers::CancellationToken,
+        ) -> harness_providers::ProviderFuture {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let prompt = request
+                .messages
+                .last()
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            self.prompts.lock().expect("prompts").push(prompt.clone());
+            if call >= self.fail_from {
+                return harness_providers::MockProvider::text("no JSON here")
+                    .stream(request, cancellation);
+            }
+            let entries = shown(&prompt);
+            let ids = entries
+                .iter()
+                .filter_map(|entry| entry["id"].as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut edits = Vec::new();
+            for entry in &entries {
+                let Some(subject) = entry["id"].as_str().and_then(|id| id.strip_suffix("_b"))
+                else {
+                    continue;
+                };
+                let survivor = format!("{subject}_a");
+                if !ids.contains(survivor.as_str()) {
+                    continue;
+                }
+                let kept = entries
+                    .iter()
+                    .find(|other| other["id"] == survivor.as_str())
+                    .expect("survivor");
+                edits.push(json!({"action": "update", "kind": "memory", "id": survivor, "title": kept["title"], "content": kept["content"], "reason": "merged its copy"}));
+                edits.push(json!({"action": "delete", "kind": "memory", "id": entry["id"], "merged_into": survivor, "reason": "a copy"}));
+            }
+            let reply = json!({"summary": format!("merged {} copies", edits.len() / 2), "rationale": "copies", "edits": edits}).to_string();
+            harness_providers::MockProvider::text(reply.as_str()).stream(request, cancellation)
+        }
+    }
+
+    /// The memory of the batch tests: eight subjects, each kept twice, all
+    /// under one path, with ids that do not sort a copy beside its twin.
+    fn copies(scopes: &HarnessScopes) {
+        let words = [
+            "amber", "birch", "cedar", "delta", "ember", "fjord", "garnet", "heron",
+        ];
+        let mut memory = serde_json::Map::new();
+        for (index, word) in words.iter().enumerate() {
+            for copy in ["a", "b"] {
+                let id = format!("{word}_{copy}");
+                let content = if copy == "a" {
+                    format!("The {word} drawer holds folder {}.", index + 10)
+                } else {
+                    format!(
+                        "Folder {} is kept in the {word} drawer, noted again.",
+                        index + 10
+                    )
+                };
+                memory.insert(id.clone(), json!({"id": id, "kind": "memory", "title": format!("{word} drawer"), "content": content, "path": "office", "version": 1, "source": "agent"}));
+            }
+        }
+        std::fs::create_dir_all(&scopes.global).expect("dir");
+        super::save_raw(
+            &scopes.global,
+            &json!({"schema": 1, "entries": {"memory": memory, "prompt": {}, "skill": {}, "subagent": {}}, "refinements": []}),
+            &test_writer(),
+        )
+        .expect("state");
+    }
+
+    /// The batches of a pass: related entries side by side (a copy beside its
+    /// twin), each batch within the budget and of two entries or more, a
+    /// memory within the budget in one batch, and the boundaries of one pass
+    /// not those of the next.
+    #[test]
+    fn a_memory_past_the_budget_is_cut_into_batches_of_related_entries() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        copies(&scopes);
+        let entries = super::memory_entries(&load_raw(&scopes.global));
+        let size = |index: usize| entries[index].to_string().len().div_ceil(4);
+        let largest = (0..entries.len()).map(size).max().expect("entries");
+        assert_eq!(super::consolidation_batches(&entries, 100_000, 7).len(), 1);
+        let budget = largest * 5;
+        let cut = super::consolidation_batches(&entries, budget, 1);
+        assert!(cut.len() >= 3, "{cut:?}");
+        for batch in &cut {
+            assert!(batch.len() >= 2, "{cut:?}");
+            assert!(
+                batch.iter().map(|index| size(*index)).sum::<usize>() <= budget,
+                "{cut:?}"
+            );
+        }
+        // Read in order, each copy is next to its twin.
+        let order = cut
+            .iter()
+            .flatten()
+            .map(|index| {
+                entries[*index]["id"]
+                    .as_str()
+                    .expect("id")
+                    .rsplit_once('_')
+                    .expect("subject")
+                    .0
+            })
+            .collect::<Vec<_>>();
+        assert!(order.chunks(2).all(|pair| pair[0] == pair[1]), "{order:?}");
+        let boundaries = |seed: u64| {
+            super::consolidation_batches(&entries, budget, seed)
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            (2..6).any(|seed| boundaries(seed) != boundaries(1)),
+            "another pass moves the boundaries"
+        );
+    }
+
+    /// Deep Dream over a memory past its budget: one curator call per batch,
+    /// each shown only its batch, a duplicate pair merged where it shares a
+    /// batch, the pairs a boundary parted merged by a later pass, and one
+    /// rollback of a pass undoing all its batches. 0.8.9 sent the whole memory
+    /// in one call.
+    #[tokio::test]
+    async fn a_large_memory_is_consolidated_in_batches() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        copies(&scopes);
+        let entries = super::memory_entries(&load_raw(&scopes.global));
+        let largest = entries
+            .iter()
+            .map(|entry| entry.to_string().len().div_ceil(4))
+            .max()
+            .expect("entries");
+        super::BATCH_TOKENS.with(|budget| budget.set(Some(largest * 5)));
+        let curator = Curator::new(usize::MAX);
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = curator.clone();
+        let first = super::consolidate_memory(&provider, "fixture-model", &scopes)
+            .await
+            .expect("consolidated");
+        let batches = curator.batches();
+        assert!(batches.len() >= 3, "one call per batch: {batches:?}");
+        let mut seen = batches.iter().flatten().cloned().collect::<Vec<_>>();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 16, "each entry in one batch: {batches:?}");
+        assert_eq!(
+            batches.iter().map(Vec::len).sum::<usize>(),
+            16,
+            "{batches:?}"
+        );
+        let prompt = curator.prompts.lock().expect("prompts")[0].clone();
+        assert!(
+            prompt.contains(&format!("batch 1 of {}", batches.len())),
+            "{prompt}"
+        );
+        let memory = |id: &str| load_raw(&scopes.global)["entries"]["memory"][id].clone();
+        let together = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .iter()
+                    .filter_map(|id| id.strip_suffix("_b"))
+                    .filter(|subject| batch.contains(&format!("{subject}_a")))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert!(!together.is_empty(), "{batches:?}");
+        for subject in &together {
+            assert!(
+                memory(&format!("{subject}_b")).is_null(),
+                "{subject} merged in its batch"
+            );
+            assert!(!memory(&format!("{subject}_a")).is_null());
+        }
+        // Each batch is a refinement of its own, naming the pass.
+        let history = super::history(&scopes);
+        assert_eq!(history.len(), batches.len());
+        assert!(
+            history
+                .iter()
+                .all(|record| record["batch"]["of"] == first.id())
+        );
+        assert!(first.details()[0].contains(first.id()));
+        // Later passes cut elsewhere: the pairs a boundary parted meet.
+        for _ in 0..6 {
+            if super::memory_entries(&load_raw(&scopes.global)).len() == 8 {
+                break;
+            }
+            super::consolidate_memory(&provider, "fixture-model", &scopes)
+                .await
+                .expect("consolidated again");
+        }
+        assert_eq!(
+            super::memory_entries(&load_raw(&scopes.global)).len(),
+            8,
+            "every copy merged"
+        );
+        // One rollback of the first pass undoes every batch of it.
+        let undone = super::refine(
+            &provider_after(),
+            "fixture-model",
+            "",
+            &scopes,
+            &RefineOptions::parse(&format!("--rollback {}", first.id())),
+            None,
+        )
+        .await
+        .expect("rolled back");
+        assert_eq!(undone.record["rollbackOf"], first.id());
+        for subject in &together {
+            assert!(
+                !memory(&format!("{subject}_b")).is_null(),
+                "{subject}'s copy is back"
+            );
+        }
+        super::BATCH_TOKENS.with(|budget| budget.set(None));
+    }
+
+    /// A batch whose call fails fails the pass, which the queue tries again:
+    /// the batches before it stay applied and recorded, and the pass is not
+    /// marked done.
+    #[tokio::test]
+    async fn a_failed_batch_fails_the_pass_and_keeps_the_batches_before_it() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        copies(&scopes);
+        let entries = super::memory_entries(&load_raw(&scopes.global));
+        let largest = entries
+            .iter()
+            .map(|entry| entry.to_string().len().div_ceil(4))
+            .max()
+            .expect("entries");
+        super::BATCH_TOKENS.with(|budget| budget.set(Some(largest * 5)));
+        // The second batch's call and its retry answer with no JSON.
+        let curator = Curator::new(1);
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = curator.clone();
+        let error = super::consolidate_memory(&provider, "fixture-model", &scopes)
+            .await
+            .expect_err("the second batch fails");
+        super::BATCH_TOKENS.with(|budget| budget.set(None));
+        assert!(error.contains("consolidation batch 2 of"), "{error}");
+        assert!(error.contains("applied before it: refine_"), "{error}");
+        let history = super::history(&scopes);
+        assert_eq!(history.len(), 1, "the first batch is recorded");
+        assert_eq!(history[0]["batch"]["index"], 1);
+        assert!(
+            !scopes.global.join(super::CONSOLIDATED_FILE).exists(),
+            "not marked done"
+        );
+    }
+
+    /// `/refine`'s memory edit may quote what the user typed after the
+    /// command; the same words from a refinement the model asked for
+    /// (`refine.run`) are no evidence.
+    #[tokio::test]
+    async fn a_refine_edit_may_quote_what_the_user_typed() {
+        let reply = json!({"summary": "keep the rule", "edits": [
+            {"action": "create", "kind": "memory", "title": "Branches", "content": "Branch names are feat/<short-description>",
+             "evidence": "branch names are always feat/<short-description>"}
+        ]})
+        .to_string();
+        for typed in [true, false] {
+            let directory = tempfile::tempdir().expect("dir");
+            let scopes = scopes(directory.path());
+            let provider: std::sync::Arc<dyn harness_providers::ModelProvider> =
+                Replies::new(std::slice::from_ref(&reply));
+            let mut options =
+                RefineOptions::parse("remember: branch names are always feat/<short-description>");
+            options.typed = typed;
+            let result = super::refine(
+                &provider,
+                "fixture-model",
+                "[User]: what is the branch for this?\n\n[Assistant]: feat/login",
+                &scopes,
+                &options,
+                None,
+            )
+            .await
+            .expect("refined");
+            assert_eq!(
+                result.record["appliedEdits"][0]["applied"], typed,
+                "{}",
+                result.record
+            );
+        }
+    }
+
     fn provider_after() -> std::sync::Arc<dyn harness_providers::ModelProvider> {
         std::sync::Arc::new(harness_providers::MockProvider::text("unused"))
     }

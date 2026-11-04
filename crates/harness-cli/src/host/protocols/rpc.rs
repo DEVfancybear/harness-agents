@@ -736,6 +736,7 @@ impl Rpc {
                         compact_guidance: None,
                         refine: Some(super::refine::RefineOptions {
                             instructions: text("instructions"),
+                            typed: true,
                             global: payload
                                 .get("global")
                                 .and_then(Value::as_bool)
