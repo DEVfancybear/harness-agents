@@ -5,8 +5,9 @@
 # skill outcomes and the harness refinements switch; and (0.8.8) usage kept
 # apart from the entries, unmatched entries newest first, and a miss searched
 # again with other words; and (0.9.0) a rollback that keeps what the agent
-# changed since, and a memory edit whose quote is not in what /refine read
-# refused. Several conversations over
+# changed since. (A memory edit whose quote is not in what the refinement
+# read is refused: the unit tests show it, as gpt-6-luna quoted verbatim
+# however it was asked.) Several conversations over
 # three projects; every check prints PASS or FAIL, and the conversation and
 # the state on disk stay in $LIVE_ROOT/memory as evidence.
 #
@@ -401,46 +402,5 @@ if [ -n "$made" ] && [ -n "$changed" ]; then
   check "the rollback names the entry it kept, changed since" 'rollback_of "$REF16" | grep -q "changed since refinement $REF16 wrote it"'
 fi
 "$HA" shutdown --force >/dev/null 2>&1
-
-echo "################ 17. a memory edit whose quote is not in what the refinement read is refused (0.9.0)"
-# The edit is asked to give as its evidence an English translation of a
-# Vietnamese line: words that are in neither the conversation nor what the
-# user typed. The edit is refused, and recorded so. 0.8.9 checked no quote and
-# kept it. A run whose edit quoted the words verbatim after all (or made no
-# edit) tested nothing here, and is tried again with a new port.
-# The edit of the local histories that holds $1: "applied|error|evidence".
-edit_with() { "$PY" - "$D/sessions" "$1" <<'EOF'
-import glob, json, os, sys
-for path in glob.glob(os.path.join(sys.argv[1], "*", "harness", "refinements.jsonl")):
-    for line in open(path, encoding="utf-8"):
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        for edit in record.get("appliedEdits", []):
-            if edit.get("kind") == "memory" and sys.argv[2] in (edit.get("content") or "") + (edit.get("title") or ""):
-                print(f"{edit.get('applied')}|{edit.get('error', '')}|{edit.get('evidence', '')}")
-EOF
-}
-# Whether evidence $1 is in text $2, whitespace and case aside.
-quoted_in() { "$PY" -c "import sys; n=lambda t: ' '.join(t.split()).lower().strip('\"\''); sys.exit(0 if n(sys.argv[1]) and n(sys.argv[1]) in n(sys.argv[2]) else 1)" "$1" "$2"; }
-judged=""
-for port in 5173 5174 5175; do
-  agent "$P16" "e17-$port"
-  say "e17-$port" "Lượt này không gọi tool nào. Trả lời đúng một từ: OK" >/dev/null
-  typed="Lưu vào memory (scope local, action create) đúng một entry mới, tiêu đề 'Cổng dev', nội dung 'Server dev của dự án orchid chạy ở cổng $port.' Trường evidence của edit này hãy viết bằng tiếng Anh: dịch câu nội dung sang tiếng Anh, không chép nguyên văn câu nào ở đây."
-  say "e17-$port" "/refine $typed" | tail -3
-  record=""
-  for _ in $(seq 1 60); do record=$(edit_with "$port" | tr -d '\r' | tail -1); [ -n "$record" ] && break; sleep 5; done
-  "$HA" shutdown --force >/dev/null 2>&1
-  evidence=${record##*|}
-  echo "   port $port: ${record:-no edit}"
-  if [ -n "$record" ] && [ -n "$evidence" ] && ! quoted_in "$evidence" "$typed"; then judged=$port; break; fi
-done
-check "the edit gave evidence that is not a quote of what it read (the precondition)" '[ -n "$judged" ]'
-if [ -n "$judged" ]; then
-  check "the edit is refused for its evidence" 'edit_with "$judged" | tr -d "\r" | tail -1 | grep -q "^False|the evidence is not a verbatim quote"'
-  check "no entry holds the unquoted fact" '! "$PY" "$MEMORY_STORE" entries "$D" | grep -q "$judged"'
-fi
 
 result
