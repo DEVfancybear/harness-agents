@@ -163,13 +163,23 @@ impl TurnObserver for HeadlessObserver {
             TurnProgress::Usage {
                 prompt_tokens,
                 completion_tokens,
-                ..
+                cache_read_tokens,
+                cache_write_tokens,
             } => {
                 self.tokens.fetch_add(
                     prompt_tokens.saturating_add(*completion_tokens),
                     Ordering::SeqCst,
                 );
-                self.stream_event("usage", &serde_json::json!({"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}));
+                // Of `prompt_tokens`, those read from and written to the cache.
+                self.stream_event(
+                    "usage",
+                    &serde_json::json!({
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "cache_read_tokens": cache_read_tokens,
+                        "cache_write_tokens": cache_write_tokens,
+                    }),
+                );
             }
             TurnProgress::ToolStarted { name, summary, .. } => self.stream_event(
                 "tool.started",
@@ -516,6 +526,18 @@ pub async fn run_with(
         .map_err(|error| HarnessError::new(error.code(), error.to_string()))?,
         None => Arc::new(MockProvider::text("mock profile: no model was called")),
     };
+    // What the run's own calls use, its children's and the background memory
+    // passes' apart: the JSON's `usage`, `children_usage` and `upkeep_usage`.
+    let run_usage = Arc::new(super::usage_tally::UsageTally::default());
+    let children_usage = Arc::new(super::usage_tally::UsageTally::default());
+    let upkeep_usage = Arc::new(super::usage_tally::UsageTally::default());
+    let children_provider =
+        super::usage_tally::Tallied::wrap(Arc::clone(&provider), &children_usage);
+    let upkeep_provider = super::usage_tally::Tallied::wrap(Arc::clone(&provider), &upkeep_usage);
+    let provider = super::usage_tally::Tallied::wrap(provider, &run_usage);
+    // Which memory features this run has (`HA_MEMORY`, `HA_MEMORY_OFF`).
+    let memory_switch = super::memory_switch::Switch::load(&context.paths.config_file, environment);
+    memory_switch.record(Some(task_id.as_str()));
     let mut runtime = RuntimeService::new(
         Arc::clone(&store),
         Arc::clone(&provider),
@@ -601,6 +623,13 @@ pub async fn run_with(
     }
     let knowledge_host =
         super::knowledge::KnowledgeHost::new(&context.project.root, &context.paths.data_dir);
+    // prime-agent's `harnessRefinements`, then memory's switch feature by
+    // feature: what is off is neither put in this run nor written after it.
+    let refinements = super::config::harness_refinements(&context.paths.config_file);
+    let digest_on = refinements && memory_switch.on(super::memory_switch::Feature::Digest);
+    let lessons_on = refinements && memory_switch.on(super::memory_switch::Feature::Lessons);
+    let reviews_on = refinements && memory_switch.on(super::memory_switch::Feature::Reviews);
+    let knowledge_on = memory_switch.on(super::memory_switch::Feature::Knowledge);
     // prime-agent 9eec445a: `ha exec` delegates as the app does, and the run
     // waits for its children. Nobody can answer an approval here, so a gated
     // action a child asks for is refused, as the root's is.
@@ -635,12 +664,12 @@ pub async fn run_with(
         Some((agents, config))
     });
     let delegate_host = agents.as_ref().map(|(agents, config)| {
-        let refinements = super::config::harness_refinements(&context.paths.config_file);
         super::delegation::DelegateHost::new(
             agents,
             super::delegation::ChildLaunch {
                 model: super::delegation::ChildModel {
-                    provider: Arc::clone(&provider),
+                    // Counted apart: the JSON's `children_usage`.
+                    provider: Arc::clone(&children_provider),
                     reference: format!("{}/{}", config.provider_id, config.model),
                     price: config.model_price,
                     thinking: None,
@@ -669,16 +698,16 @@ pub async fn run_with(
                     .as_ref()
                     .map(|host| (host.tools(), host.dispatcher())),
                 checks: resolved_config.verify.checks.clone(),
-                knowledge: Some(knowledge_host.readonly()),
+                knowledge: knowledge_on.then(|| knowledge_host.readonly()),
                 memory: Some(
                     super::memory::MemoryHost::new(&context.paths.data_dir, task_id.as_str())
                         .with_project(&context.project.root)
-                        .with_refinements(refinements)
+                        .with_refinements(digest_on)
                         .readonly(),
                 ),
                 context: Vec::new(),
                 // `ha exec`'s children get the root's memory too, ranked for their brief.
-                digest: refinements.then(|| super::harness::DigestSource {
+                digest: digest_on.then(|| super::harness::DigestSource {
                     data_dir: context.paths.data_dir.clone(),
                     conversation: task_id.as_str().to_owned(),
                     project: Some(
@@ -688,12 +717,12 @@ pub async fn run_with(
                     ),
                 }),
                 follows: None,
-                learned: refinements.then(|| context.paths.data_dir.clone()),
+                learned: lessons_on.then(|| context.paths.data_dir.clone()),
                 conversation_dir: Some(super::harness::local_dir(
                     &context.paths.data_dir,
                     task_id.as_str(),
                 )),
-                keep_findings: refinements,
+                keep_findings: digest_on,
             },
             cancellation.clone(),
         )
@@ -708,10 +737,9 @@ pub async fn run_with(
         None,
         None,
     );
-    let refinements = super::config::harness_refinements(&context.paths.config_file);
     let memory_host = super::memory::MemoryHost::new(&context.paths.data_dir, task_id.as_str())
         .with_project(&context.project.root)
-        .with_refinements(refinements);
+        .with_refinements(digest_on);
     if let Some((agents, _)) = &agents {
         tools = tools.with_elsewhere(Arc::clone(agents) as Arc<dyn harness_tools::PathElsewhere>);
     }
@@ -732,7 +760,7 @@ pub async fn run_with(
         super::service::verify_reminder_enabled(&context.paths.config_file, environment),
     );
     // What the harness learned from failed calls, as in the app.
-    let driver = if refinements {
+    let driver = if lessons_on {
         driver.with_learned_rules(Arc::new(super::evolution::rules(&context.paths.data_dir)))
     } else {
         driver
@@ -749,15 +777,18 @@ pub async fn run_with(
         };
     // The self-evaluation as in the app; `ha exec` has no `/self-eval`, so
     // only `auto` attaches it. The mock profile calls no model to judge with.
+    // It is a review: memory's `reviews` off turns it off, and its calls are
+    // the upkeep's.
     let driver = match &provider_config {
         Some(config)
-            if super::self_eval::mode(&context.paths.config_file, environment)
-                == super::self_eval::Mode::Auto =>
+            if reviews_on
+                && super::self_eval::mode(&context.paths.config_file, environment)
+                    == super::self_eval::Mode::Auto =>
         {
             driver.with_turn_evaluation(
                 Arc::new(super::self_eval::Evaluator::new(
                     super::self_eval::Judge::new(
-                        Arc::clone(&provider),
+                        Arc::clone(&upkeep_provider),
                         config.model.clone(),
                         super::harness::global_dir(&context.paths.data_dir),
                         task_id.as_str().to_owned(),
@@ -781,14 +812,17 @@ pub async fn run_with(
         None,
         None,
     );
+    // Memory's `knowledge` off leaves the library's tool out, as its catalog.
+    let external_tools = if knowledge_on {
+        Some(super::knowledge::with_tools(
+            external_tools,
+            &knowledge_host,
+        ))
+    } else {
+        external_tools
+    };
     let external_tools = super::jev::with_tools(
-        Some(super::memory::with_tools(
-            Some(super::knowledge::with_tools(
-                external_tools,
-                &knowledge_host,
-            )),
-            &memory_host,
-        )),
+        Some(super::memory::with_tools(external_tools, &memory_host)),
         jev_host.as_ref(),
     );
     let driver = match &external_tools {
@@ -823,7 +857,7 @@ pub async fn run_with(
     if let Some(external) = &external_tools {
         tool_schemas.extend(super::service::in_cache_order(external.schemas()));
     }
-    if refinements {
+    if lessons_on {
         super::evolution::annotate(&context.paths.data_dir, &mut tool_schemas);
     }
     // Long extension tools are listed and reached on demand, as in the app.
@@ -943,21 +977,24 @@ pub async fn run_with(
     .with_tool_schemas(tool_schemas)
     .with_system_policy(system_prompt);
     // Memory is prime-agent's continual harness state, as in the app: this run reads
-    // the digest of what the model has kept, ranked for this prompt.
-    let harness_state = super::harness::merge(
-        super::harness::for_project(
-            super::harness::load(
-                &super::harness::global_dir(&context.paths.data_dir),
-                "global",
+    // the digest of what the model has kept, ranked for this prompt. With the
+    // digest off the store is not opened, and the report counts no entries.
+    let harness_state = digest_on.then(|| {
+        super::harness::merge(
+            super::harness::for_project(
+                super::harness::load(
+                    &super::harness::global_dir(&context.paths.data_dir),
+                    "global",
+                ),
+                Some(super::bootstrap::project_key_of(&context.project.root).as_str()),
             ),
-            Some(super::bootstrap::project_key_of(&context.project.root).as_str()),
-        ),
-        super::harness::load(
-            &super::harness::local_dir(&context.paths.data_dir, task_id.as_str()),
-            "local",
-        ),
-    );
-    let harness_entries = harness_state.total();
+            super::harness::load(
+                &super::harness::local_dir(&context.paths.data_dir, task_id.as_str()),
+                "local",
+            ),
+        )
+    });
+    let harness_entries = harness_state.as_ref().map(super::harness::State::total);
     // The date and the Git facts ride the input, as in the app, so the system
     // prompt is the same from one run to the next and stays cached.
     let mut project_blocks = vec![harness_session::ContextBlock::mandatory(
@@ -969,10 +1006,11 @@ pub async fn run_with(
         super::jev::tool_suggestions(jev_decisions.as_deref(), &request.prompt, &deferred_tools)
             .await,
     );
-    // With harness refinements off, no saved entry reaches the model.
-    if refinements {
+    // With harness refinements or the digest off, no saved entry reaches the
+    // model.
+    if let Some(harness_state) = &harness_state {
         let digest = super::harness::render_digest(
-            &harness_state,
+            harness_state,
             super::harness::DigestOptions {
                 memory_tool: true,
                 ..super::harness::DigestOptions::default()
@@ -988,14 +1026,21 @@ pub async fn run_with(
         );
         project_blocks.push(super::harness::digest_block(&digest.text));
     }
-    if let Some(block) = super::knowledge::context_block(&knowledge_host, &[(&request.prompt, 1.0)])
+    if knowledge_on
+        && let Some(block) =
+            super::knowledge::context_block(&knowledge_host, &[(&request.prompt, 1.0)])
     {
         project_blocks.push(block);
     }
     // A project's markdown memory store reaches this run as it reaches the
-    // app's turns: its rules and its index (`docs/architecture/MARKDOWN_MEMORY.en.md`).
+    // app's turns: its rules and its index (`docs/architecture/MARKDOWN_MEMORY.en.md`),
+    // unless memory's `markdown` is off.
     let (markdown_memory, markdown_notices) =
-        super::markdown_memory::context_blocks(&context.project.root);
+        if memory_switch.on(super::memory_switch::Feature::Markdown) {
+            super::markdown_memory::context_blocks(&context.project.root)
+        } else {
+            (Vec::new(), Vec::new())
+        };
     for notice in markdown_notices {
         eprintln!("{notice}");
     }
@@ -1234,9 +1279,11 @@ pub async fn run_with(
         notices.push(notice.clone());
     }
     acceptance_trace("turn_finished");
+    // `off` names the memory features this run had off (`HA_MEMORY`).
     let memory_report = serde_json::json!({
         "kind": "harness",
         "entries": harness_entries,
+        "off": memory_switch.off_names(),
     });
     let extensions_report = match &active_extensions {
         Some(active) => serde_json::json!({
@@ -1323,6 +1370,11 @@ pub async fn run_with(
         "resumed_from": resumed_from
             .as_ref()
             .map(|(source, _)| source.as_str().to_owned()),
+        // What the run's own model calls used, its compactions' included, and
+        // its children's apart; the memory passes' (`upkeep_usage`) is added
+        // once they ran, before the JSON is written.
+        "usage": run_usage.json(),
+        "children_usage": children_usage.json(),
     });
     if request.options.output_format.is_some() {
         output["acceptance"] = serde_json::json!({
@@ -1338,7 +1390,7 @@ pub async fn run_with(
     // next run in the conversation reviews those turns. A run that answered
     // nothing (a mock, a cancel) queues and runs no review.
     let reviewing = provider_config.is_some()
-        && refinements
+        && reviews_on
         && super::service::auto_refine_enabled(&context.paths.config_file, environment)
         && !cancellation.is_cancelled()
         && outcome.stop != harness_tools::TurnStop::Canceled;
@@ -1396,11 +1448,9 @@ pub async fn run_with(
     }
     acceptance_trace("writer_closed");
 
-    if format == OutputFormat::Json {
-        out.stdout(&output.to_string());
-    } else if format == OutputFormat::StreamJson {
-        observer.stream_event("run.terminal", &output);
-    } else {
+    // The JSON object, and a stream's terminal event, are written last, once
+    // the memory passes below ran, so their `upkeep_usage` counts them.
+    if format == OutputFormat::Text {
         for message in notices {
             out.stdout(&format!("[info] {message}"));
         }
@@ -1445,9 +1495,9 @@ pub async fn run_with(
             .unwrap_or_default();
         let reviews = super::service::Reviews {
             sender: tokio::sync::mpsc::unbounded_channel().0,
-            helper_provider: Arc::clone(&provider),
+            helper_provider: Arc::clone(&upkeep_provider),
             helper_model: model.clone(),
-            provider: Arc::clone(&provider),
+            provider: Arc::clone(&upkeep_provider),
             model,
             data_dir: context.paths.data_dir.clone(),
             store_dir: context.project_store_dir(),
@@ -1480,7 +1530,7 @@ pub async fn run_with(
             {
                 events.push(
                     super::service::consolidate_local_event(
-                        &provider,
+                        &upkeep_provider,
                         &model,
                         &scopes,
                         outcome.task_id.as_str(),
@@ -1523,7 +1573,7 @@ pub async fn run_with(
                 Ok(store) => {
                     let result = super::session_log::write_from_journal(
                         &store,
-                        Arc::clone(&provider),
+                        Arc::clone(&upkeep_provider),
                         root,
                         &outcome.session_id,
                         &outcome.task_id,
@@ -1555,6 +1605,14 @@ pub async fn run_with(
                 out.stderr("the session log was cut off; the next start of ha in this project writes it");
             }
         }
+    }
+    // What the background memory passes of this process used: the
+    // self-evaluation, the reviews and consolidation, the session log.
+    output["upkeep_usage"] = upkeep_usage.json();
+    if format == OutputFormat::Json {
+        out.stdout(&output.to_string());
+    } else if format == OutputFormat::StreamJson {
+        observer.stream_event("run.terminal", &output);
     }
     // prime-agent's print-mode autonomous contract applies to every output.
     if let Some(line) = autonomous.exit_stderr(std::time::Instant::now()) {

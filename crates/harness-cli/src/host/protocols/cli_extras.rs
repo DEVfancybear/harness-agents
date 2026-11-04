@@ -255,6 +255,7 @@ pub fn doctor(cwd: Option<&Path>, json: bool) -> Result<ExitCode, HarnessError> 
         mcp_servers: config.mcp_servers.len(),
         other_stores: super::adoption::other_stores_of(&paths.data_dir, &root),
         sleep: super::sleep::summary(&paths.data_dir),
+        memory: super::memory_switch::Switch::load(&paths.config_file, &environment),
     };
     let global_config_dir = paths
         .config_file

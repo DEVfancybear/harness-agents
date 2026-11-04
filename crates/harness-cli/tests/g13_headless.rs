@@ -89,6 +89,69 @@ fn g13_stdin_prompt_requires_the_explicit_dash() {
     assert_eq!(json(&output)["acceptance"]["state"], "not_evaluated");
 }
 
+/// The JSON reports what the run's model calls used - its own, its
+/// children's and the memory passes' apart - and which memory features it
+/// had off (`HA_MEMORY`, `HA_MEMORY_OFF`).
+#[test]
+fn g13_json_reports_usage_and_the_memory_features_that_were_off() {
+    let root = tempfile::tempdir().expect("temporary project");
+    let exec = |pairs: &[(&str, &str)]| {
+        let mut command = command(root.path());
+        command.env_remove("HA_MEMORY").env_remove("HA_MEMORY_OFF");
+        for (name, value) in pairs {
+            command.env(name, value);
+        }
+        let output = command
+            .args(["exec", "hello", "--mock", "--output-format", "json"])
+            .output()
+            .expect("ha exec runs");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        json(&output)
+    };
+    let on = exec(&[]);
+    for field in ["usage", "children_usage", "upkeep_usage"] {
+        for count in [
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_write_tokens",
+            "output_tokens",
+            "model_calls",
+        ] {
+            assert!(on[field][count].is_u64(), "{field}.{count}: {on}");
+        }
+    }
+    assert_eq!(on["memory"]["off"], serde_json::json!([]), "{on}");
+    let off = exec(&[("HA_MEMORY", "off")]);
+    assert_eq!(
+        off["memory"]["off"],
+        serde_json::json!([
+            "digest",
+            "markdown",
+            "session_log",
+            "lessons",
+            "reviews",
+            "earlier_state",
+            "knowledge"
+        ]),
+        "{off}"
+    );
+    assert!(
+        off["memory"]["entries"].is_null(),
+        "the store is not read: {off}"
+    );
+    let some = exec(&[("HA_MEMORY_OFF", "knowledge,digest")]);
+    assert_eq!(
+        some["memory"]["off"],
+        serde_json::json!(["digest", "knowledge"]),
+        "{some}"
+    );
+}
+
 #[test]
 fn g13_headless_never_emits_ansi() {
     let root = tempfile::tempdir().expect("temporary project");

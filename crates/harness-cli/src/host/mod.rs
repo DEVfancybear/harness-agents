@@ -115,6 +115,8 @@ pub mod memory_readout;
 pub mod memory_search;
 #[path = "memory/store.rs"]
 pub mod memory_store;
+#[path = "memory/switch.rs"]
+pub mod memory_switch;
 #[path = "prompting/model_prompts.rs"]
 pub mod model_prompts;
 #[path = "models/oauth.rs"]
@@ -196,6 +198,8 @@ pub mod tree_view;
 pub mod tui;
 #[path = "configuration/update_check.rs"]
 pub mod update_check;
+#[path = "models/usage_tally.rs"]
+pub mod usage_tally;
 #[path = "application/verify.rs"]
 pub mod verify;
 #[path = "presentation/view.rs"]

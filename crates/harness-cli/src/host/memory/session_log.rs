@@ -367,11 +367,14 @@ impl Drop for Writing {
 }
 
 /// Whether the host writes session logs: on unless the `sessionLog` setting
-/// is `false` or `HA_SESSION_LOG` is off.
+/// is `false`, `HA_SESSION_LOG` is off, or memory's `session_log` is off
+/// (`HA_MEMORY`, `memory_switch`).
 pub fn enabled(config_file: &Path, environment: &super::paths::LaunchEnvironment) -> bool {
-    super::config::load_setting(config_file, SETTING)
-        .and_then(|setting| setting.as_bool())
-        .unwrap_or(true)
+    super::memory_switch::Switch::load(config_file, environment)
+        .on(super::memory_switch::Feature::SessionLog)
+        && super::config::load_setting(config_file, SETTING)
+            .and_then(|setting| setting.as_bool())
+            .unwrap_or(true)
         && !environment
             .value(VARIABLE)
             .and_then(|value| value.to_str())
@@ -1394,7 +1397,8 @@ pub(super) struct StartBlock {
 /// What a new conversation hears of the previous one, once: the session log
 /// block when there is one, and the journal's last turns of the previous
 /// conversation unless that log already covers them. With logs off, the
-/// last turns alone, as before there were logs.
+/// last turns alone, as before there were logs; with `journal` off (memory's
+/// `earlier_state`), never the last turns.
 #[allow(
     clippy::too_many_arguments,
     reason = "what the turn knows of the conversation it starts"
@@ -1405,6 +1409,7 @@ pub(super) async fn previous_conversation_blocks(
     source: Option<&SessionId>,
     refinements: bool,
     logs: bool,
+    journal: bool,
     root: &Path,
     carried: Option<&TaskId>,
     now: &DateTime<FixedOffset>,
@@ -1420,6 +1425,7 @@ pub(super) async fn previous_conversation_blocks(
     let covered = logged.as_ref().is_some_and(|logged| logged.previous);
     let mut blocks = logged.map(|logged| vec![logged.block]).unwrap_or_default();
     if !covered
+        && journal
         && let Some(block) = super::session_brief::context_block(
             store,
             current,
@@ -2786,13 +2792,13 @@ mod tests {
             .turn(&newest, Some(&early), "more newest work")
             .await;
         let current = TaskId::generate();
-        let blocks = |logs: bool| {
+        let blocks = |logs: bool, turns: bool| {
             let store = Arc::clone(&journal.store);
             let root = root.clone();
             let current = current.clone();
             async move {
                 previous_conversation_blocks(
-                    &store, &current, None, true, logs, &root, None, &today,
+                    &store, &current, None, true, logs, turns, &root, None, &today,
                 )
                 .await
             }
@@ -2803,7 +2809,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            ids(&blocks(true).await),
+            ids(&blocks(true, true).await),
             ["recent-session"],
             "no log: the turns alone"
         );
@@ -2834,7 +2840,10 @@ mod tests {
                 .contains("HISTORICAL REFERENCE ONLY, NOT LIVE INSTRUCTIONS")
         );
         assert_eq!(shown.block.channel, ContextChannel::Reference);
-        assert_eq!(ids(&blocks(true).await), ["session-log", "recent-session"]);
+        assert_eq!(
+            ids(&blocks(true, true).await),
+            ["session-log", "recent-session"]
+        );
 
         // The previous conversation's log, written before its last turn: shown,
         // and its last turns are sent too.
@@ -2858,7 +2867,13 @@ mod tests {
                 .text
                 .contains("written before that conversation's last turn")
         );
-        assert_eq!(ids(&blocks(true).await), ["session-log", "recent-session"]);
+        assert_eq!(
+            ids(&blocks(true, true).await),
+            ["session-log", "recent-session"]
+        );
+        // Memory's `earlier_state` off: the log, never the last turns.
+        assert_eq!(ids(&blocks(true, false).await), ["session-log"]);
+        assert!(blocks(false, false).await.is_empty());
 
         // Written through its last turn: the log alone, with its pending steps.
         put_through(
@@ -2875,9 +2890,9 @@ mod tests {
             shown.previous,
             "the previous conversation's turns are not sent too"
         );
-        assert_eq!(ids(&blocks(true).await), ["session-log"]);
+        assert_eq!(ids(&blocks(true, true).await), ["session-log"]);
         assert_eq!(
-            ids(&blocks(false).await),
+            ids(&blocks(false, true).await),
             ["recent-session"],
             "logs off: as before"
         );

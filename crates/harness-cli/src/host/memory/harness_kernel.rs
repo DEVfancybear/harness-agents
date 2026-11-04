@@ -52,6 +52,17 @@ pub fn answer(dirs: &Dirs, request: &Value) -> Result<Value, String> {
     {
         return Err(super::config::REFINEMENTS_DISABLED.to_owned());
     }
+    // Memory's digest off takes the memory away from the kernel as from the
+    // `memory` tool (`HA_MEMORY`, read from the host process and the settings).
+    if let Some(settings) = &dirs.settings
+        && let switch = super::memory_switch::Switch::of_process(settings)
+        && !switch.on(super::memory_switch::Feature::Digest)
+    {
+        return Err(format!(
+            "memory is off for this session ({}): rlm.harness neither reads nor writes it",
+            switch.summary()
+        ));
+    }
     let global = request["global"].as_bool().unwrap_or(false);
     let dir = match request.get("state_dir").and_then(Value::as_str) {
         Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),

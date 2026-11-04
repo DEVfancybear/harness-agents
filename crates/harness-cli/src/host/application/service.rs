@@ -5437,6 +5437,11 @@ impl SessionPort for AgentSessionService {
 
     fn context_summary(&self) -> Vec<String> {
         let mut lines = self.usage_lines();
+        // What of memory reaches the turns (`HA_MEMORY`, `memory_switch`).
+        lines.push(format!(
+            "Memory:   {}",
+            super::memory_switch::Switch::load(&self.config_file, &self.environment).summary()
+        ));
         lines.push(String::new());
         lines.extend(self.context_summary.lock().map_or_else(
             |_| vec!["context details are unavailable".to_owned()],
@@ -5643,6 +5648,7 @@ impl SessionPort for AgentSessionService {
             mcp_servers: config.mcp_servers.len(),
             other_stores: super::adoption::other_stores_of(&self.data_dir, &self.workspace_root),
             sleep: super::sleep::summary(&self.data_dir),
+            memory: super::memory_switch::Switch::load(&self.config_file, &self.environment),
         };
         let subsystems = super::doctor::audit(
             &self.global_config_dir,
@@ -7533,11 +7539,15 @@ pub(super) fn verify_reminder_by_environment() -> bool {
 }
 
 /// prime-agent's `autoRefine.enabled` setting, which `HA_AUTO_REFINE=off` still
-/// overrides.
+/// overrides, as memory's `reviews` off does (`HA_MEMORY`, `memory_switch`):
+/// every background pass - review, consolidation, curation, evolution - asks
+/// this.
 pub(super) fn auto_refine_enabled(config_file: &Path, environment: &LaunchEnvironment) -> bool {
-    super::config::load_setting(config_file, "autoRefine")
-        .and_then(|setting| setting.get("enabled").and_then(serde_json::Value::as_bool))
-        .unwrap_or(true)
+    super::memory_switch::Switch::load(config_file, environment)
+        .on(super::memory_switch::Feature::Reviews)
+        && super::config::load_setting(config_file, "autoRefine")
+            .and_then(|setting| setting.get("enabled").and_then(serde_json::Value::as_bool))
+            .unwrap_or(true)
         && !environment
             .value("HA_AUTO_REFINE")
             .and_then(|value| value.to_str())
@@ -9346,8 +9356,20 @@ async fn run_turn(
     let hashline_rule =
         super::config::HashlineRule::load(&config_file, environment.value("HA_HASHLINE"));
     // prime-agent's `harnessRefinements`: off, no saved harness entry reaches
-    // this turn and nothing is refined after it.
+    // this turn and nothing is refined after it. Memory's switch turns each
+    // feature off on its own (`HA_MEMORY`, `HA_MEMORY_OFF`): what is off is
+    // neither put in this turn nor written after it.
     let refinements = super::config::harness_refinements(&config_file);
+    let memory_switch = super::memory_switch::Switch::load(&config_file, &environment);
+    memory_switch.record_once(task_id.as_str());
+    let digest_on = refinements && memory_switch.on(super::memory_switch::Feature::Digest);
+    let lessons_on = refinements && memory_switch.on(super::memory_switch::Feature::Lessons);
+    let reviews_on = refinements && memory_switch.on(super::memory_switch::Feature::Reviews);
+    let earlier_on = memory_switch.on(super::memory_switch::Feature::EarlierState);
+    let knowledge_on = memory_switch.on(super::memory_switch::Feature::Knowledge);
+    // Read again for this turn: the switch may have changed since the session
+    // began.
+    let auto_refine = auto_refine && reviews_on;
     let hashline = hashline_rule.applies(&format!("{}/{}", config.provider_id, config.model));
     agents.set_configured_depth(config.agents_max_depth);
     harness_orchestrator::workspace::set_commit_identity(
@@ -9429,27 +9451,37 @@ async fn run_turn(
                 .as_ref()
                 .map(|host| (host.tools(), host.dispatcher())),
             checks: config.verify.checks.clone(),
-            knowledge: Some(
-                super::knowledge::KnowledgeHost::new(&workspace_root, &data_dir).readonly(),
-            ),
+            knowledge: knowledge_on.then(|| {
+                super::knowledge::KnowledgeHost::new(&workspace_root, &data_dir).readonly()
+            }),
             memory: Some(
                 super::memory::MemoryHost::new(&data_dir, task_id.as_str())
                     .with_project(&workspace_root)
-                    .with_refinements(refinements)
+                    .with_refinements(digest_on)
                     .readonly(),
             ),
-            context: child_context(
-                &data_dir,
-                &super::learned::Layers::new(
-                    &global_config_dir,
+            context: {
+                let mut blocks = child_context(
                     &data_dir,
-                    &workspace_root,
-                    config.project_trusted,
-                ),
-                &super::instructions::load(&global_config_dir, &workspace_root, &caller_dir).blocks,
-            ),
-            // With harness refinements off, no saved entry reaches a child either.
-            digest: refinements.then(|| super::harness::DigestSource {
+                    &super::learned::Layers::new(
+                        &global_config_dir,
+                        &data_dir,
+                        &workspace_root,
+                        config.project_trusted,
+                    ),
+                    &super::instructions::load(&global_config_dir, &workspace_root, &caller_dir)
+                        .blocks,
+                );
+                // The learned skills are the learning loop's: memory's
+                // `lessons` off leaves them out of a child too.
+                if !lessons_on {
+                    blocks.retain(|block| block.id != "learned-skills");
+                }
+                blocks
+            },
+            // With harness refinements or the digest off, no saved entry
+            // reaches a child either.
+            digest: digest_on.then(|| super::harness::DigestSource {
                 data_dir: data_dir.clone(),
                 conversation: task_id.as_str().to_owned(),
                 project: Some(
@@ -9459,9 +9491,9 @@ async fn run_turn(
                 ),
             }),
             follows: None,
-            learned: refinements.then(|| data_dir.clone()),
+            learned: lessons_on.then(|| data_dir.clone()),
             conversation_dir: Some(super::harness::local_dir(&data_dir, task_id.as_str())),
-            keep_findings: refinements,
+            keep_findings: digest_on,
         },
         cancellation.clone(),
     ));
@@ -9572,7 +9604,7 @@ async fn run_turn(
                     goal_host.clone(),
                 )
                 .with_usage(Arc::clone(&cost_tracker))
-                .with_refinements(refinements),
+                .with_refinements(reviews_on),
             );
             let mut chain: Vec<Arc<dyn super::repl::HostRequests>> = vec![
                 skills,
@@ -9640,10 +9672,10 @@ async fn run_turn(
         repl_host.as_ref(),
     );
     // The model keeps its memory with a native tool, with or without the REPL,
-    // while harness refinements are on.
+    // while harness refinements and the digest are on.
     let memory_host = super::memory::MemoryHost::new(&data_dir, task_id.as_str())
         .with_project(&workspace_root)
-        .with_refinements(refinements);
+        .with_refinements(digest_on);
     // The jev plugin, when `/jev on` turned it on.
     let jev_host = super::jev::JevHost::from_settings(&environment, &data_dir, &config_file);
     tools = tools.with_external(super::jev::with_dispatcher(
@@ -9671,7 +9703,12 @@ async fn run_turn(
     // Last in the end-of-turn chain, after the verify reminder and jev: a
     // model call of the helper's judges a turn that did enough, and the turn
     // is kept for `/self-eval` (`docs/architecture/SELF_EVALUATION.en.md`).
-    let self_evaluation = super::self_eval::mode(&config_file, &environment);
+    // A judge of the turn is a review: memory's `reviews` off turns it off.
+    let self_evaluation = if reviews_on {
+        super::self_eval::mode(&config_file, &environment)
+    } else {
+        super::self_eval::Mode::Off
+    };
     let driver = if self_evaluation == super::self_eval::Mode::Off {
         driver
     } else {
@@ -9700,15 +9737,18 @@ async fn run_turn(
         feature_host.as_ref(),
         repl_host.as_ref(),
     );
+    // Memory's `knowledge` off leaves the library's tool out, as its catalog.
+    let external_tools = if knowledge_on {
+        Some(super::knowledge::with_tools(
+            external_tools,
+            &knowledge_host,
+        ))
+    } else {
+        external_tools
+    };
     let external_tools = super::jev::with_tools(
         Some(super::task_state::with_tools(
-            Some(super::memory::with_tools(
-                Some(super::knowledge::with_tools(
-                    external_tools,
-                    &knowledge_host,
-                )),
-                &memory_host,
-            )),
+            Some(super::memory::with_tools(external_tools, &memory_host)),
             &task_state_host,
         )),
         jev_host.as_ref(),
@@ -9725,11 +9765,11 @@ async fn run_turn(
             _ => None,
         },
         &workspace_root,
-        refinements,
+        digest_on,
     )));
     // What the harness learned from calls that failed: rules applied before a
     // call runs, and notes in the tools' descriptions.
-    let driver = if refinements {
+    let driver = if lessons_on {
         driver.with_learned_rules(Arc::new(super::evolution::rules(&data_dir)))
     } else {
         driver
@@ -9738,7 +9778,7 @@ async fn run_turn(
     if let Some(tools) = &external_tools {
         tool_schemas.extend(in_cache_order(tools.schemas()));
     }
-    if refinements {
+    if lessons_on {
         super::evolution::annotate(&data_dir, &mut tool_schemas);
     }
     // The design notes' tiered disclosure: the tools of MCP servers and
@@ -9872,9 +9912,14 @@ async fn run_turn(
         });
     }
     // A project that keeps a markdown memory store has its rules and its index
-    // in every turn, as the store's boot path reads them.
+    // in every turn, as the store's boot path reads them - unless memory's
+    // `markdown` is off.
     let (markdown_memory, markdown_notices) =
-        super::markdown_memory::context_blocks(&workspace_root);
+        if memory_switch.on(super::memory_switch::Feature::Markdown) {
+            super::markdown_memory::context_blocks(&workspace_root)
+        } else {
+            (Vec::new(), Vec::new())
+        };
     for notice in markdown_notices {
         send(SessionEvent::Notice { message: notice });
     }
@@ -9950,7 +9995,9 @@ async fn run_turn(
     if let Some(catalog) = &skill_catalog {
         built_prompt.text =
             super::prompt::append_skill_metadata(built_prompt.text, catalog.entries());
-        if let Some(note) = super::learned::prompt_note(&super::learned::library(&learning.layers))
+        if lessons_on
+            && let Some(note) =
+                super::learned::prompt_note(&super::learned::library(&learning.layers))
         {
             built_prompt.text.push_str("\n\n");
             built_prompt.text.push_str(&note);
@@ -10045,6 +10092,7 @@ async fn run_turn(
             None => 0,
         };
         if turns < super::task_state::EARLIER_STATE_TURNS
+            && earlier_on
             && let Some((task, title, state)) = earlier_task_state(
                 &store,
                 &data_dir,
@@ -10068,6 +10116,7 @@ async fn run_turn(
                 source.as_ref(),
                 refinements,
                 session_log_on,
+                earlier_on,
                 &workspace_root,
                 carried.as_ref(),
                 &chrono::Local::now().fixed_offset(),
@@ -10085,18 +10134,6 @@ async fn run_turn(
     {
         project_blocks.extend(blocks);
     }
-    // Memory is prime-agent's continual harness state: the model keeps it through
-    // `rlm.harness`, and every turn carries a digest of it ranked for this task.
-    let harness_state = super::harness::merge(
-        super::harness::for_project(
-            super::harness::load(&super::harness::global_dir(&data_dir), "global"),
-            memory_host.project_key(),
-        ),
-        super::harness::load(
-            &super::harness::local_dir(&data_dir, task_id.as_str()),
-            "local",
-        ),
-    );
     let goal_objective = match &goal {
         GoalRecord::Active(objective) => Some(objective.as_str()),
         _ => None,
@@ -10123,8 +10160,21 @@ async fn run_turn(
         }
         texts
     };
-    // With harness refinements off, no saved entry reaches the model.
-    if refinements {
+    // Memory is prime-agent's continual harness state: the model keeps it through
+    // `rlm.harness`, and every turn carries a digest of it ranked for this task.
+    // With harness refinements or the digest off, no saved entry reaches the
+    // model, and the store is not opened.
+    if digest_on {
+        let harness_state = super::harness::merge(
+            super::harness::for_project(
+                super::harness::load(&super::harness::global_dir(&data_dir), "global"),
+                memory_host.project_key(),
+            ),
+            super::harness::load(
+                &super::harness::local_dir(&data_dir, task_id.as_str()),
+                "local",
+            ),
+        );
         let digest = super::harness::render_digest(
             &harness_state,
             super::harness::DigestOptions {
@@ -10151,7 +10201,7 @@ async fn run_turn(
     }
     // The one learned skill that fits this request, with what it took for
     // granted when it failed (LIFE-HARNESS's procedural skill layer).
-    if refinements {
+    if lessons_on {
         let query = goal_objective
             .into_iter()
             .chain(digest_context.first().map(String::as_str))
@@ -10188,11 +10238,13 @@ async fn run_turn(
                 .map(|(text, weight)| (text.as_str(), weight)),
         )
         .collect::<Vec<_>>();
-    if let Some(block) = super::knowledge::context_block(&knowledge_host, &knowledge_queries) {
+    if knowledge_on
+        && let Some(block) = super::knowledge::context_block(&knowledge_host, &knowledge_queries)
+    {
         project_blocks.push(block);
     }
     // What a review beside the conversation changed since the last turn.
-    if refinements
+    if reviews_on
         && let Some(text) = super::refine::take_review_notes(&super::harness::local_dir(
             &data_dir,
             task_id.as_str(),
@@ -10601,7 +10653,13 @@ async fn run_turn(
                 }
             });
         }
-        let requests = super::learned::count_request(&learning.layers);
+        // The learned skills' bookkeeping is the learning loop's: with memory's
+        // `lessons` off, no request or use is counted.
+        let requests = if lessons_on {
+            super::learned::count_request(&learning.layers)
+        } else {
+            0
+        };
         // Every so many requests the curator folds the learned library into
         // class-level skills, beside the conversation like the review.
         if auto_refine
@@ -10726,12 +10784,14 @@ async fn run_turn(
                 let _ = sender.send(event);
             });
         }
-        refine_cadence.note_in_play(super::learned::record_turn(
-            &learning.layers,
-            &learning.context.workspace,
-            &turn.executions,
-        ));
-        if super::learned::lifecycle_enabled(&environment) {
+        if lessons_on {
+            refine_cadence.note_in_play(super::learned::record_turn(
+                &learning.layers,
+                &learning.context.workspace,
+                &turn.executions,
+            ));
+        }
+        if lessons_on && super::learned::lifecycle_enabled(&environment) {
             for (layer, name) in super::learned::run_lifecycle(&learning.layers) {
                 send(SessionEvent::Notice {
                     message: format!(
@@ -10764,7 +10824,17 @@ async fn run_turn(
             .lock()
             .ok()
             .and_then(|mut pending| pending.take())
-            .filter(|_| refinements);
+            .filter(|_| {
+                if refinements && !reviews_on {
+                    send(SessionEvent::Notice {
+                        message: format!(
+                            "refine: not run, memory's reviews are off ({})",
+                            memory_switch.summary()
+                        ),
+                    });
+                }
+                reviews_on
+            });
         let tool_calls = outcome.as_ref().map_or(0, |turn| turn.tool_calls);
         let interval = auto_refine_interval(&config_file);
         let review = if auto_refine && refinements {
