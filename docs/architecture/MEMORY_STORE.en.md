@@ -853,8 +853,9 @@ All in `memory/validity.rs`, the one place a later field joins them:
 An entry's **validity** is its `temporal` value: a period `[start, end)`, or a
 point it holds from on. Without one it holds from its creation on. Closing an
 entry gives its period an end, now, from the start it had (its creation when
-it had none). A closed entry is ended (`store::ended`): the digest leaves it
-out, as it did an ended period.
+it had none). The digest leaves out a closed entry, as it does an ended
+period, even while its period has not ended: a future-dated entry superseded
+today ends a millisecond after its start.
 
 ### 16.2 Contradictions are resolved at write, by closing validity
 
@@ -873,6 +874,8 @@ addresses or memory ids):
   superseded already (that one is named, to supersede the one that replaced
   it). The duplicate refusal and the cross-language repeat refusal do not count
   the entries a write supersedes: it corrects them, it does not repeat them.
+  Nor do they count a closed entry, or one whose period ended: they compare
+  with what holds now, and a fact that holds again is written anew.
 - The `related` note on a create, and both duplicate refusals, give the model
   its choices: supersede the old entry, update the existing one, or write
   nothing (delete the new entry).
@@ -883,6 +886,9 @@ new entry keyed by its title, next to the old one's path and project, and
 closes the old one (`validity::supersede_edit`). The refinement records it as
 two edits: the old entry's (its `before`, and its closed `after`) and the new
 entry's `create`, so a rollback deletes the new entry and puts the old one back.
+It undoes both or neither: when one of them changed since, both are kept, so
+the old fact and its correction are never live at once, and the result names
+the one that changed.
 
 `restore` (or `revert`) with an id alone, on an entry a correction or the
 expiry pass closed, opens it again: `superseded_by` and `expired` go, and its
@@ -941,6 +947,13 @@ none, the entry keeps its kind, so a page's words stay a page's whoever
 rewrites them later. A move keeps it. A review's edit takes the kind of the
 turn its evidence quotes word for word (`provenance::quoted_kind`), else the
 kind the quote's words point to, else `review`: the review inferred it.
+The review's transcript is split into turns at blank lines, and keeps a blank
+line inside a turn or a tool result as a line of one space
+(`harness_runtime::transcript_body`): a fetched page that carries `[User]: ...`
+after a blank line stays the page's. A Deep Dream edit takes the kind of the
+entries it rewrites: an update the least trusted of its own entry's and of
+the entries merged into it, so a page's words merged into a constraint are
+refused. Any `origin_kind` a model writes into an edit is dropped.
 
 What follows from it:
 
@@ -957,8 +970,9 @@ What follows from it:
 ### 16.5 Expiry by use
 
 A pass closes the entries nobody used: no read and no search hit for
-`HA_MEMORY_EXPIRE_DAYS` (default 28; 0 turns it off; fractional days allowed,
-so a test can use seconds) since they were last written, read or found. A
+`HA_MEMORY_EXPIRE_DAYS` (default 28; 0 turns it off; at most 36,500, a
+century; fractional days allowed, so a test can use seconds) since they were
+last written, read or found. A
 digest showing an entry is not a use. Each is closed, not deleted
 (`temporal.end`, `expired: "unused"`), as one event of the `sleep` writer with
 cause `expire`; `restore` with its id alone brings it back.
@@ -971,13 +985,14 @@ cause `expire`; `restore` with its id alone brings it back.
 - The pass is a job of the Sleep queue (kind `expiry`), run at the end of a
   turn in the app and of `ha exec`, over the global store and the
   conversation's, at most daily (or once per period, when that is shorter).
-  It is local and fast: no model call.
+  It is local and fast: no model call. A pass that fails, or panics, fails
+  its job, which the queue retries.
 - `ha doctor` says when the last pass ran and how many it closed (the
   global store's `expiry` meta).
 
 ## 17. What a review writes, and Deep Dream in batches (0.9.0)
 
-0.9.0 closes five gaps an audit found in how refinements write the store
+0.9.0 closes the gaps two audits found in how refinements write the store
 (`memory/refine.rs`, `memory/learned.rs`). Each is a rule of `apply`, the
 one entry point every refinement - a review, `/refine`, `/learn`, Deep Dream,
 the curator, a rollback - writes through.
@@ -1001,7 +1016,8 @@ version the refinement left (`after`, or nothing for an entry it deleted).
 An entry is rolled back only while it is that version - the same `version`,
 title and content; an entry the refinement deleted, only while no entry took
 its id. A learned skill's change records the SHA-256 of the `SKILL.md` it
-wrote (`undo.written`), and is undone only while the file still has it; a
+wrote (`undo.written`) and of each other file it wrote or removed
+(`undo.written_files`), and is undone only while every one is still so; a
 change recorded before 0.9.0 has no hash and is undone as before. A knowledge
 page was already deleted only while it is as written. What changed since is
 skipped, not failed: the result names it ("Skipped: update local memory
@@ -1022,6 +1038,15 @@ that entry pinned, one merged into an entry kept unpinned is not deleted, a
 constraint is merged only into a constraint, and nothing is merged into an
 entry the pass deletes.
 
+**A closed entry is kept as it was.** A review, `/refine`, `/learn` and Deep
+Dream are not shown the entries a correction or the expiry pass closed, and
+those entries count toward no consolidation (`CONSOLIDATE_MIN_ENTRIES`,
+`LOCAL_CONSOLIDATE_ENTRIES`). An update, delete or supersede of one, or a
+merge into one, is refused with the reason, recorded like any refusal: an
+edit would reopen it, or delete what `as_of` and history read. A rollback
+still puts back what its refinement closed. An update of a live entry keeps
+its `temporal`, `supersedes`, `superseded_by` and `expired`.
+
 **A review's memory edit quotes what it read.** A memory or prompt-note edit
 of a review, `/refine` or `/learn` is applied only when its `evidence` is
 found in what the refinement read: the conversation (which holds a child's
@@ -1030,8 +1055,9 @@ found in what the refinement read: the conversation (which holds a child's
 instructions, nor those of a refinement the model asked for (`refine.run`),
 which are a model's words. The quote is compared with
 whitespace and case aside, without the quotation marks around it; pieces
-joined by `...` or `…` must each be found, in order; and it is a phrase of 12
-characters or more, as a lesson's is. Otherwise the edit is refused with the
+joined by `...` or `…` must each be found, in order; and its pieces together
+are a phrase of 12 characters or more, as a lesson's is, each of 4 or more:
+letters scattered between ellipses are found in any text. Otherwise the edit is refused with the
 reason, recorded with the refinement like any refusal. A global edit without
 evidence is still no global edit, and is refused where it stays. The edit's
 `confidence` (`high`, `medium` or `low`) is recorded in the entry's `origin`
@@ -1042,7 +1068,8 @@ conversation, so its check is on the entries: an edit naming an entry outside
 its batch is refused; a delete in a merge names a survivor of its batch; and
 an update whose content has more than half of its words (the search's terms)
 in none of the batch's entries is refused as adding what no entry says. A
-title may be new.
+title may be new. The pass creates no entry and supersedes none: a `create`
+or a `supersede` the curator proposes is dropped, and the rationale says so.
 
 **Deep Dream in batches.** All the global memory went into one prompt, with no
 cap: about 10,000 entries overflowed the model's context, and the pass failed

@@ -874,9 +874,10 @@ sẽ được thêm vào:
 **Hiệu lực** của một entry là giá trị `temporal` của nó: một khoảng
 `[start, end)`, hoặc một thời điểm mà từ đó nó đúng. Không có `temporal` thì
 nó đúng từ lúc được tạo. Đóng một entry là cho khoảng của nó một điểm kết thúc
-là lúc này, tính từ điểm bắt đầu nó đang có (lúc tạo nếu chưa có). Entry đã
-đóng là đã kết thúc (`store::ended`): digest bỏ nó ra, như với một khoảng đã
-hết.
+là lúc này, tính từ điểm bắt đầu nó đang có (lúc tạo nếu chưa có). Digest bỏ
+ra entry đã đóng, như với một khoảng đã hết, kể cả khi khoảng của nó chưa hết:
+một entry có ngày trong tương lai bị thay thế hôm nay sẽ kết thúc một mili giây
+sau điểm bắt đầu của nó.
 
 ### 16.2 Mâu thuẫn được giải ngay lúc ghi, bằng cách đóng hiệu lực
 
@@ -895,6 +896,9 @@ hết.
   chưa bị thay thế (nếu đã bị thì lỗi nêu entry đã thay nó, để thay thế entry
   đó). Kiểm tra trùng lặp và kiểm tra lặp lại bằng ngôn ngữ khác không tính
   các entry mà lần ghi thay thế: lần ghi sửa chúng chứ không lặp lại chúng.
+  Chúng cũng không tính entry đã đóng, hay entry mà khoảng của nó đã hết:
+  chúng so với những gì đang đúng, và một sự thật đúng trở lại thì được ghi
+  mới.
 - Ghi chú `related` khi tạo mới, và cả hai lời từ chối vì trùng, đưa ra cho
   model các lựa chọn: thay thế entry cũ, cập nhật entry đang có, hoặc không ghi
   gì (xoá entry mới).
@@ -904,7 +908,9 @@ Các edit của review cũng vậy: edit `{"action": "supersede", "kind",
 entry mới có key theo title, cạnh path và project của entry cũ, rồi đóng entry
 cũ (`validity::supersede_edit`). Refinement ghi nó thành hai edit: edit của
 entry cũ (`before` của nó, và `after` đã đóng) và `create` của entry mới, nên
-rollback sẽ xoá entry mới và đặt lại entry cũ.
+rollback sẽ xoá entry mới và đặt lại entry cũ. Nó hoàn tác cả hai hoặc không
+cái nào: khi một trong hai đã đổi từ đó, cả hai được giữ, nên sự thật cũ và
+bản sửa của nó không bao giờ cùng còn sống, và kết quả nêu entry đã đổi.
 
 `restore` (hoặc `revert`) chỉ với id, trên một entry bị một lần sửa hoặc lượt
 hết hạn đóng, sẽ mở lại nó: `superseded_by` và `expired` bị bỏ, và khoảng hiệu
@@ -963,7 +969,13 @@ cho thấy gì, entry giữ loại cũ, nên chữ của một trang web vẫn l
 dù về sau ai viết lại. Một lần move giữ nguyên loại. Edit của review lấy loại
 của lượt mà evidence của nó trích nguyên văn (`provenance::quoted_kind`), nếu
 không thì loại mà các từ của trích dẫn chỉ tới, nếu không nữa thì `review`:
-review tự suy ra.
+review tự suy ra. Transcript của review được cắt thành từng lượt ở các dòng
+trống, và giữ một dòng trống bên trong một lượt hay một kết quả tool thành một
+dòng chỉ có một dấu cách (`harness_runtime::transcript_body`): một trang web
+mang `[User]: ...` sau một dòng trống vẫn là của trang đó. Edit của Deep Dream
+lấy loại của các entry nó viết lại: một lần cập nhật lấy loại kém tin nhất
+giữa entry của nó và các entry gộp vào nó, nên chữ của một trang web gộp vào
+một constraint bị từ chối. `origin_kind` mà model tự ghi vào một edit bị bỏ.
 
 Hệ quả:
 
@@ -981,7 +993,8 @@ Hệ quả:
 
 Một lượt chạy đóng các entry không ai dùng: không được đọc và không xuất hiện
 trong kết quả search nào trong `HA_MEMORY_EXPIRE_DAYS` ngày (mặc định 28; 0 là
-tắt; được dùng số ngày lẻ, nên test có thể dùng vài giây) kể từ lần cuối được
+tắt; tối đa 36.500, một thế kỷ; được dùng số ngày lẻ, nên test có thể dùng vài
+giây) kể từ lần cuối được
 ghi, đọc hoặc tìm thấy. Được hiện trong digest không tính là dùng. Mỗi entry bị
 đóng chứ không bị xoá (`temporal.end`, `expired: "unused"`), thành một event
 của writer `sleep` với cause `expire`; `restore` chỉ với id sẽ đưa nó về.
@@ -994,13 +1007,14 @@ của writer `sleep` với cause `expire`; `restore` chỉ với id sẽ đưa n
 - Lượt chạy là một job của hàng đợi Sleep (kind `expiry`), chạy ở cuối một
   lượt trong app và cuối `ha exec`, trên kho toàn cục và kho của hội thoại,
   nhiều nhất mỗi ngày một lần (hoặc mỗi chu kỳ một lần, nếu chu kỳ ngắn hơn).
-  Nó chạy cục bộ và nhanh: không gọi model.
+  Nó chạy cục bộ và nhanh: không gọi model. Lượt chạy lỗi, hay panic, thì job
+  của nó thất bại, và hàng đợi thử lại.
 - `ha doctor` cho biết lượt gần nhất chạy lúc nào và đã đóng bao nhiêu entry
   (meta `expiry` của kho toàn cục).
 
 ## 17. Những gì một review ghi, và Deep Dream theo từng lô (0.9.0)
 
-0.9.0 đóng năm lỗ hổng mà một lần audit tìm thấy trong cách các refinement ghi
+0.9.0 đóng các lỗ hổng mà hai lần audit tìm thấy trong cách các refinement ghi
 vào store (`memory/refine.rs`, `memory/learned.rs`). Mỗi điều là một quy tắc của
 `apply`, cửa vào duy nhất mà mọi refinement - review, `/refine`, `/learn`, Deep
 Dream, curator, rollback - đều ghi qua.
@@ -1023,7 +1037,8 @@ mang theo version mà refinement để lại (`after`, hoặc không có gì v�
 đã xoá). Một entry chỉ được rollback khi nó vẫn là version đó - cùng `version`,
 tiêu đề và nội dung; entry mà refinement đã xoá thì chỉ khi chưa entry nào lấy
 id của nó. Một thay đổi learned skill ghi SHA-256 của `SKILL.md` mà nó đã viết
-(`undo.written`), và chỉ được hoàn tác khi file vẫn còn hash đó; thay đổi được
+(`undo.written`) và của từng file khác nó đã viết hay xoá
+(`undo.written_files`), và chỉ được hoàn tác khi mọi file vẫn như vậy; thay đổi được
 ghi trước 0.9.0 không có hash và được hoàn tác như trước. Trang knowledge vốn
 đã chỉ bị xoá khi còn nguyên như lúc ghi. Thứ đã đổi từ đó được bỏ qua, không
 tính là lỗi: kết quả nêu nó ("Skipped: update local memory `deploy`: changed
@@ -1043,6 +1058,15 @@ mà lượt này cập nhật thì entry đó được ghim, gộp vào entry v�
 không bị xoá, constraint chỉ gộp vào constraint, và không gì được gộp vào entry
 mà lượt này xoá.
 
+**Entry đã đóng được giữ nguyên.** Review, `/refine`, `/learn` và Deep Dream
+không được thấy các entry mà một lần sửa hay lượt hết hạn đã đóng, và các entry
+đó không được tính cho việc gộp (`CONSOLIDATE_MIN_ENTRIES`,
+`LOCAL_CONSOLIDATE_ENTRIES`). Một lần cập nhật, xoá hay supersede một entry như
+vậy, hoặc gộp vào nó, bị từ chối kèm lý do, được ghi như mọi lần từ chối khác:
+một edit sẽ mở lại nó, hoặc xoá thứ mà `as_of` và history đọc. Rollback vẫn đặt
+lại những gì refinement của nó đã đóng. Cập nhật một entry còn sống thì giữ
+`temporal`, `supersedes`, `superseded_by` và `expired` của nó.
+
 **Sửa đổi memory của review trích những gì nó đã đọc.** Một sửa đổi memory hay
 prompt note của review, `/refine` hoặc `/learn` chỉ được áp dụng khi `evidence`
 của nó tìm thấy trong những gì refinement đã đọc: hội thoại (có cả khối
@@ -1051,8 +1075,9 @@ child tìm ra), và với `/refine` là những gì người dùng gõ sau lện
 giờ là instructions của review gate, hay của một refinement mà model yêu cầu
 (`refine.run`), vốn là lời của một model. Câu trích được so
 không tính khoảng trắng và hoa thường, bỏ dấu ngoặc kép bao quanh; các đoạn nối
-bằng `...` hoặc `…` phải tìm thấy từng đoạn, theo thứ tự; và nó phải là một cụm
-dài từ 12 ký tự, như câu trích của lesson. Nếu không, sửa đổi bị từ chối kèm lý
+bằng `...` hoặc `…` phải tìm thấy từng đoạn, theo thứ tự; và các đoạn gộp lại
+phải là một cụm dài từ 12 ký tự, như câu trích của lesson, mỗi đoạn từ 4 ký tự:
+vài chữ cái rải giữa các dấu ba chấm thì văn bản nào cũng có. Nếu không, sửa đổi bị từ chối kèm lý
 do, được ghi cùng refinement như mọi lần từ chối khác. Sửa đổi global không có
 evidence vẫn không thành sửa đổi global, và bị từ chối ở nơi nó ở lại.
 `confidence` của sửa đổi (`high`, `medium` hay `low`) được ghi vào `origin` của
@@ -1063,7 +1088,9 @@ trích hội thoại nào, nên phép kiểm tra nằm trên các entry: sửa �
 ngoài lô của nó bị từ chối; lệnh xoá trong một lần gộp nêu một entry còn lại
 thuộc lô của nó; và cập nhật có hơn một nửa số từ trong nội dung (các term của
 tìm kiếm) không nằm trong entry nào của lô bị từ chối vì thêm điều không entry
-nào nói. Tiêu đề có thể mới.
+nào nói. Tiêu đề có thể mới. Lượt gộp không tạo entry nào và không supersede
+entry nào: `create` hay `supersede` mà curator đề xuất bị bỏ, và rationale nói
+vậy.
 
 **Deep Dream theo từng lô.** Toàn bộ memory toàn cục từng nằm trong một prompt,
 không giới hạn: khoảng 10.000 entry làm tràn context của model, và lượt chạy
