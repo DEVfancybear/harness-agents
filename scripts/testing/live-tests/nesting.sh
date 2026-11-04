@@ -3,7 +3,8 @@
 #   1. children nest past two levels: with no limit set, a grandchild starts a
 #      child of its own (depth 3), which 0.7.3 refused with "RLM recursion depth
 #      limit reached"; `[agents] max_depth` in the config sets a limit again;
-#   2. web_search asks DeepSeek Search with the DeepSeek key before Serper;
+#   2. web_search asks DeepSeek Search with the DeepSeek key before Serper
+#      (SEARCH=serper checks Serper instead, while the key has no balance);
 #   3. a DeepSeek key the API refuses hands the search to the next API, and the
 #      answer says so, naming /login deepseek;
 #   4. the Python websearch skill does the same in the REPL;
@@ -79,12 +80,23 @@ check "the child under max_depth = 1 was started with that limit" 'records child
 cp "$RX/home/$(basename "$HA_CONFIG")" "$RX/config-with-limit.toml"
 cp "$HA_CONFIG" "$HA_HOME/"
 
-echo "################ 2. web_search asks DeepSeek Search first"
+# SEARCH=serper runs sections 2 and 4 on Serper (HA_WEB_SEARCH=serper), for a
+# while the DeepSeek key has no balance; the default checks DeepSeek Search.
+# Section 3 checks a refused DeepSeek key either way.
+if [ "${SEARCH:-deepseek}" = serper ]; then
+  FIRST="Google via Serper"; export HA_WEB_SEARCH=serper
+  echo "   SEARCH=serper: sections 2 and 4 check Serper, not DeepSeek Search"
+else
+  FIRST="DeepSeek Search"
+fi
+echo "################ 2. web_search asks $FIRST first"
 agent "$RX/p" n2
 say n2 "Kiểm thử harness: gọi tool web_search đúng một lần với query 'DeepSeek API search guide', rồi in nguyên văn dòng đầu tiên của kết quả tool (dòng bắt đầu bằng Results for query) và URL của kết quả 1. Không gọi tool nào khác." | tail -4 | sed 's/^/   /'
-check "the results came from DeepSeek Search" 'last | grep -q "(DeepSeek Search)"'
+records web | sed 's/^/   /'
+check "the results came from $FIRST" 'last | grep -qF "($FIRST)"'
 check "no search API failed" '! (records web | grep -q "^search_failed")'
 "$HA" shutdown --force >/dev/null 2>&1
+unset HA_WEB_SEARCH
 
 echo "################ 3. a refused DeepSeek key hands the search to the next API"
 # A key DeepSeek refuses (401), set for this agent only: the search moves on.
@@ -99,11 +111,13 @@ check "the refused key is skipped by the next search" 'last | grep -q "DeepSeek 
 check "the skipped key made no second request" '[ "$(records web | grep -c "^search_failed .*api=deepseek")" -eq 1 ]'
 "$HA" shutdown --force >/dev/null 2>&1
 
-echo "################ 4. the Python websearch skill asks DeepSeek Search"
+echo "################ 4. the Python websearch skill asks $FIRST"
+[ "$FIRST" = "Google via Serper" ] && export HA_WEB_SEARCH=serper
 agent "$RX/p" n4
 say n4 "Kiểm thử harness: trong tool python_repl chạy đúng đoạn này: print((await websearch('DeepSeek search API')).splitlines()[0]) rồi in nguyên văn dòng nó in ra. Không gọi tool nào khác ngoài python_repl." | tail -3 | sed 's/^/   /'
-check "the skill's results came from DeepSeek Search" 'last | grep -q "(DeepSeek Search)"'
+check "the skill's results came from $FIRST" 'last | grep -qF "($FIRST)"'
 "$HA" shutdown --force >/dev/null 2>&1
+unset HA_WEB_SEARCH
 
 echo "################ 5. a coder's commits are by Harness Agents"
 agent "$RX/p" n5
