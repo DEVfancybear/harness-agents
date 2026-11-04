@@ -1343,6 +1343,15 @@ pub async fn run_with(
         && !cancellation.is_cancelled()
         && outcome.stop != harness_tools::TurnStop::Canceled;
     let local = super::harness::local_dir(&context.paths.data_dir, outcome.task_id.as_str());
+    // Memory nobody used is closed, at most daily: a job of the Sleep queue,
+    // local and fast, done before the run exits (`memory_validity`).
+    if refinements {
+        let (data_dir, local) = (context.paths.data_dir.clone(), local.clone());
+        let _ = tokio::task::spawn_blocking(move || {
+            super::memory_validity::expire_due(&data_dir, &local);
+        })
+        .await;
+    }
     if reviewing {
         // On a blocking thread: the queue's lock may wait for another
         // process's change.

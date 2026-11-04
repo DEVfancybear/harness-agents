@@ -79,6 +79,8 @@ pub enum Kind {
     Consolidation,
     /// The harness evolution from the calls that failed.
     Evolution,
+    /// Closing the memory nobody used (`memory_validity::expire_due`).
+    Expiry,
 }
 
 impl Kind {
@@ -88,6 +90,7 @@ impl Kind {
             Self::Review => "review",
             Self::Consolidation => "consolidation",
             Self::Evolution => "evolution",
+            Self::Expiry => "expiry",
         }
     }
 
@@ -97,7 +100,7 @@ impl Kind {
     const fn first_backoff_seconds(self) -> i64 {
         match self {
             Self::Review => 300,
-            Self::Consolidation | Self::Evolution => 3_600,
+            Self::Consolidation | Self::Evolution | Self::Expiry => 3_600,
         }
     }
 }
@@ -222,6 +225,15 @@ impl Job {
     #[must_use]
     pub fn evolution() -> Self {
         Self::new(Kind::Evolution, "evolution".to_owned(), "due")
+    }
+
+    /// The expiry pass over the memory, keyed by the global store `scope`.
+    #[must_use]
+    pub fn expiry(scope: &Path) -> Self {
+        Self {
+            scope: Some(scope.display().to_string()),
+            ..Self::new(Kind::Expiry, format!("expiry:{}", scope.display()), "due")
+        }
     }
 
     /// Whether `pid`'s claim stands at `now`, judging the lease alone.
@@ -875,6 +887,9 @@ pub struct Summary {
     pub gave_up: Vec<String>,
     /// The queue's directory.
     pub dir: PathBuf,
+    /// The last expiry pass: when it ran and how many unused entries it
+    /// closed (`memory_validity::expire_due`).
+    pub expiry: Option<(String, u64)>,
 }
 
 /// The queue under `data_dir`, for `ha doctor`.
@@ -882,6 +897,7 @@ pub struct Summary {
 pub fn summary(data_dir: &Path) -> Summary {
     let mut summary = Summary {
         dir: dir(data_dir),
+        expiry: super::memory_validity::last_expiry(&super::harness::global_dir(data_dir)),
         ..Summary::default()
     };
     for job in jobs(data_dir) {

@@ -10569,6 +10569,15 @@ async fn run_turn(
     // What the turn did with learned skills counts toward whether they survive, and
     // the lifecycle archives the ones that did not earn their place.
     if let Ok(turn) = &outcome {
+        // Memory nobody used is closed, at most daily: a job of the Sleep
+        // queue, local and fast, beside the conversation (`memory_validity`).
+        if refinements {
+            let data_dir = data_dir.clone();
+            let local = super::harness::local_dir(&data_dir, goal_task.as_str());
+            drop(tokio::task::spawn_blocking(move || {
+                super::memory_validity::expire_due(&data_dir, &local);
+            }));
+        }
         // Once a day the harness evolves by itself from the calls that
         // failed: rules into shadow, shadows promoted or retired, notes.
         // Its job in the queue keeps a failed run: tried again after a
