@@ -16,7 +16,13 @@
 #   3. `/refine` asked to keep a fetched page's rule as a constraint queues it
 #      (0.9.0 refused it); accepting it makes it a constraint of the person's;
 #   4. with HA_MEMORY_REVIEW=all a review's ordinary update waits and is not in
-#      the store, and an accept after the entry changed is refused as stale.
+#      the store, and an accept after the entry changed is refused as stale;
+#   5. an entry kept for app/billing/** with a citation, updated (or
+#      superseded) by a review and accepted, is still kept for those files -
+#      and, updated, still cites its code - and is in no request of a turn
+#      that touches no billing file, yet loads with one that reads one. The
+#      checks of 5 fail on the first wave-2 build, whose review dropped
+#      `paths` and `citations`.
 #
 # Each check prints PASS or FAIL; the conversations, the exec runs and the
 # diagnostics stay in $LIVE_ROOT/memory-queue as evidence. The model's steps
@@ -324,5 +330,97 @@ sed 's/^/   /' "$RX/q4-accept.txt"
 check "an accept after the entry changed is refused as stale" '[ -n "$item4" ] && [ "$stale4" -ne 0 ] && grep -q "refused $item4 as stale" "$RX/q4-accept.txt"'
 check "the entry keeps the later version, and the stale change left the queue" '[ -n "$item4" ] && [ -n "$(global_has 17417)" ] && [ -z "$(global_has 19417)" ] && ! queue_json | grep -q "\"$item4\""'
 unset HA_MEMORY_REVIEW
+
+echo "################ 5. a review's accepted update keeps the entry's files and its citation"
+P5=$RX/p5
+project "$P5"
+mkdir -p "$P5/app/billing"
+printf '# Billing amounts.\n\nROUNDING_MODE = HALF_EVEN\n\n\ndef rounded(cents):\n    return cents\n' > "$P5/app/billing/rounding.py"
+(cd "$P5" && git add -A && git -c user.name=t -c user.email=t@t commit -qm billing)
+export HA_MEMORY_REVIEW=all
+# requested <task> <text>: whether any request of the conversation, a delta included, holds <text>.
+requested() {
+  "$PY" - "$D" "$1" "$2" <<'EOF'
+import glob, os, sqlite3, sys
+found = False
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    for (text,) in c.execute("select request_json from frozen_requests where task_id = ? order by rowid", (sys.argv[2],)):
+        if sys.argv[3] in text:
+            found = True
+sys.exit(0 if found else 1)
+EOF
+}
+# calls5 <marker>: the tool calls of the conversation whose input holds <marker>, as `name arguments` lines.
+calls5() {
+  "$PY" - "$D" "$1" <<'EOF'
+import glob, json, os, sqlite3, sys
+sys.stdout.reconfigure(encoding="utf-8")
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    rows = sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute(
+        "select session_id, event_json from events order by session_id, sequence").fetchall()
+    sessions = {session for session, text in rows
+                if json.loads(text)["event_type"] == "input.admitted" and sys.argv[2] in text}
+    for session, text in rows:
+        event = json.loads(text)
+        if session in sessions and event["event_type"] == "model.response":
+            for call in event["payload"].get("tool_calls") or []:
+                print(call.get("name"), call.get("arguments"))
+EOF
+}
+# The entry as the memory tool wrote it: kept for app/billing/**, citing the line it rests on.
+E5=""; T5=""
+for attempt in 1 2; do
+  run_exec "q5a-$attempt" "$P5" "Dùng tool memory action write với đúng các tham số: scope 'project', path 'billing', title 'Billing rounding', content 'Billing amounts in this project round half-even (rm-5521).', paths ['app/billing/**'], citations [{\"path\": \"app/billing/rounding.py\", \"quote\": \"ROUNDING_MODE = HALF_EVEN\"}]. Không làm gì khác, trả lời ĐÃ-LƯU."
+  E5=$(global_has rm-5521 "e.get('paths')==['app/billing/**'] and any(c.get('path')=='app/billing/rounding.py' for c in e.get('citations') or [])" | head -1)
+  T5=$(task_of "q5a-$attempt")
+  [ -n "$E5" ] && break
+done
+echo "   the entry: ${E5:-none}"
+check "precondition: the entry is kept for app/billing/** and cites app/billing/rounding.py" '[ -n "$E5" ]'
+# The user changes the fact; the review (HA_MEMORY_REVIEW=all) proposes the
+# entry's update, which waits. One that proposed none, or another entry's,
+# is tried again.
+held5=""; item5=""
+for attempt in 1 2 3; do
+  run_exec "q5b-$attempt" "$P5" --resume "$T5" "Quy tắc làm tròn của billing đã đổi: từ hôm nay số tiền billing của project làm tròn half-up (rm-5522), không còn half-even nữa. Đừng tự cập nhật memory và đừng gọi tool memory: review sau lượt này sẽ lo việc đó. Trả lời đúng một dòng: ĐÃ-BIẾT."
+  item5=$(queued rm-5522 "i['edit'].get('id')=='$E5' and i['edit'].get('action') in ('update','supersede')" | head -1)
+  echo "   attempt $attempt: the change of $E5 that waits: ${item5:-none}"
+  if [ -n "$E5" ] && [ -n "$item5" ]; then held5=$attempt; break; fi
+done
+check "precondition: the review proposed an update of that entry, and it waits (attempt ${held5:-none})" '[ -n "$held5" ]'
+action5=$(queue_json | "$PY" -c "import json,sys; print(next((i['edit'].get('action','') for i in json.load(sys.stdin).get('items',[]) if i['id']==sys.argv[1]), ''))" "$item5" 2>/dev/null)
+"$HA" memory queue accept "$item5" > "$RX/q5-accept.txt" 2>&1; accepted5=$?
+sed 's/^/   /' "$RX/q5-accept.txt"
+check "precondition: the accept applied the review's ${action5:-change}" '[ -n "$item5" ] && [ "$accepted5" -eq 0 ] && [ -n "$(global_has rm-5522)" ]'
+check "the entry the accept wrote is still kept for app/billing/** (${action5:-none})" '[ -n "$item5" ] && [ -n "$(global_has rm-5522 "e.get(\"paths\")==[\"app/billing/**\"]")" ]'
+if [ "$action5" = supersede ]; then
+  # A correction cites none of the old entry's code (MEMORY_STORE §16).
+  check "superseded, the correction cites none of the old entry's code" '[ -n "$(global_has rm-5522 "not e.get(\"citations\")")" ]'
+else
+  check "updated, it still cites app/billing/rounding.py" '[ -n "$item5" ] && [ -n "$(global_has rm-5522 "any(c.get(\"path\")==\"app/billing/rounding.py\" for c in e.get(\"citations\") or [])")" ]'
+fi
+unset HA_MEMORY_REVIEW
+# A turn that touches no billing file: the entry is in none of its requests.
+held5c=""
+for attempt in 1 2; do
+  since5=$(now_ms)
+  run_exec "q5c-$attempt" "$P5" "Đọc file README.md bằng read_file rồi trả lời đúng một từ: XONG. Không đọc, liệt kê hay tìm file nào khác, không gọi tool memory. MARKER_Q5_PLAIN_$attempt"
+  T5C=$(task_of "q5c-$attempt")
+  calls5 "MARKER_Q5_PLAIN_$attempt" | sed 's/^/   call: /'
+  if [ -n "$T5C" ] && calls5 "MARKER_Q5_PLAIN_$attempt" | grep -q '^read_file.*README.md' && ! calls5 "MARKER_Q5_PLAIN_$attempt" | grep -q 'billing'; then held5c=$attempt; break; fi
+done
+check "precondition: that turn read README.md and touched no billing file (attempt ${held5c:-none})" '[ -n "$held5c" ]'
+check "the updated entry is in no request of a turn that touches no billing file" '[ -n "$held5c" ] && requested "$T5C" "MARKER_Q5_PLAIN_$held5c" && ! requested "$T5C" rm-5522 && ! records memory scoped_loaded "$since5" | grep -q .'
+# And one that reads a billing file loads it, with that result.
+held5d=""
+for attempt in 1 2; do
+  since5d=$(now_ms)
+  run_exec "q5d-$attempt" "$P5" "Đọc file app/billing/rounding.py bằng read_file rồi trả lời đúng một từ: XONG. Không gọi tool memory. MARKER_Q5_BILLING_$attempt"
+  T5D=$(task_of "q5d-$attempt")
+  if [ -n "$T5D" ] && calls5 "MARKER_Q5_BILLING_$attempt" | grep -q '^read_file.*app/billing/rounding.py'; then held5d=$attempt; break; fi
+done
+check "precondition: that turn read app/billing/rounding.py (attempt ${held5d:-none})" '[ -n "$held5d" ]'
+check "a turn that reads a billing file loads the updated entry with that result" '[ -n "$held5d" ] && records memory scoped_loaded "$since5d" | grep -q "path=app/billing/rounding.py" && requested "$T5D" rm-5522'
 
 result
