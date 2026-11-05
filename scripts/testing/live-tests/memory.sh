@@ -72,7 +72,14 @@ check "it says it does not know" "last | grep -qi 'không có\|không biết\|ch
 check "it names no database" "! last | grep -qiE '(dùng|uses|using|sử dụng) (postgres|mysql|sqlite|mongo|redis)'"
 
 echo "################ 6. duplicates: the same fact written again is refused by the tool"
-say s5 "Kiểm thử: gọi tool memory action write ngay (không search trước, không truyền id), scope project, tiêu đề 'Trình quản lý gói', nội dung 'Dự án này dùng pnpm làm trình quản lý gói.'. In nguyên văn thông báo tool trả về, rồi làm theo hướng dẫn của nó." | tail -5
+# The precondition: the write is a create (no id). A model that passed the
+# entry's id made it an update, which the duplicate refusal does not judge:
+# asked again once.
+for attempt in 1 2; do
+  say s5 "Kiểm thử: gọi tool memory action write ngay (không search trước, không truyền id), scope project, tiêu đề 'Trình quản lý gói', nội dung 'Dự án này dùng pnpm làm trình quản lý gói.'. In nguyên văn thông báo tool trả về, rồi làm theo hướng dẫn của nó." | tail -5
+  last | grep -q '"saved":"updated"' || break
+  echo "   attempt $attempt: the write passed the entry's id and updated it; asking again without one"
+done
 show
 check "the tool refused it as the same fact" "last | grep -qi 'same fact\|alike\|distinct'"
 check "one p-shop entry holds pnpm" "[ \$(entries | grep -a '^global|p-shop|' | grep -ci 'pnpm') -eq 1 ]"
