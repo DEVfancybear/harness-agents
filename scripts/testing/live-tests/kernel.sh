@@ -53,7 +53,9 @@ say r1 "/factory on" | tail -2
 check "/factory on saved factory.enabled" "grep -q '\"enabled\": true' '$HA_HOME/settings.json'"
 say r1 "Dùng ipython. Đọc rlm.factory.help() để biết cú pháp dag. Tạo một factory bằng rlm.harness.create_factory với dag 2 node: node 'viet' (agent con ghi file a.txt nội dung A vào thư mục dự án) và node 'kiem' phụ thuộc 'viet' (agent con ghi file b.txt nội dung B). Chạy bằng await rlm.factory.run(<id>), rồi lặp await rlm.factory.status(run_id) mỗi 15 giây cho tới khi run kết thúc (tối đa 6 phút). Báo trạng thái cuối và nội dung a.txt, b.txt." | tail -12
 check "factory stored as a factory entry" "state | grep -q ' factory '"
-check "both factory states ran (a.txt and b.txt exist)" "[ -f '$RX/p/a.txt' ] && [ -f '$RX/p/b.txt' ]"
+# Where in the project a child put its file is the child's choice: that each
+# state ran is what is judged.
+check "both factory states ran (a.txt and b.txt exist)" "find '$RX/p' -name a.txt | grep -q . && find '$RX/p' -name b.txt | grep -q ."
 
 echo "################ 5. prime's newer rlm: collect's answer_text, rename, bash(), mcp, list_subagents"
 say r1 "Dùng ipython: h = await rlm.spawn('Trả lời đúng một từ: PONG', name='ping'); r = await rlm.collect([h], timeout_ms=180000); print('ANSWER_TEXT=' + str(r[0].answer_text)). Sau đó await rlm.rename('ping2', session_id=h) và in [s.session_name for s in await rlm.list_subagents()]. Rồi print('BASH=' + (await bash('echo from' + '-bash')).output.strip()) và print('MCP=' + str(await mcp.list_connections())). Báo nguyên văn output." | tail -10
