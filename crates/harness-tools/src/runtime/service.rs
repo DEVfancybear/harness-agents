@@ -263,6 +263,13 @@ pub trait PathElsewhere: Send + Sync {
 /// session had not loaded yet.
 pub trait ToolResultContext: Send + Sync {
     fn context_for(&self, action: &CodingToolAction) -> Vec<String>;
+
+    /// Text for what the call's result touched: the files it read, edited,
+    /// wrote or listed, which an action's path alone does not name (memory
+    /// kept for those files).
+    fn context_for_result(&self, _output: &ToolOutput) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// The one P3 authority permitted to move a coding proposal across a side
@@ -282,7 +289,7 @@ pub struct ToolExecutionService {
     /// "refuse": a strict request is never served against capabilities nobody
     /// measured.
     capabilities: Option<Arc<crate::CapabilityMatrix>>,
-    result_context: Option<Arc<dyn ToolResultContext>>,
+    result_context: Vec<Arc<dyn ToolResultContext>>,
     /// Hashline anchors in `read_file` and `search_text` results; the schemas
     /// the model is shown say the same (`coding_tool_schemas_for`).
     hashline: bool,
@@ -316,7 +323,7 @@ impl ToolExecutionService {
             spool: crate::capture::ProcessSpoolConfig::default(),
             hooks: Vec::new(),
             capabilities: None,
-            result_context: None,
+            result_context: Vec::new(),
             hashline: false,
             elsewhere: None,
             guard: None,
@@ -372,18 +379,28 @@ impl ToolExecutionService {
         }
     }
 
-    /// Add host context to the results of calls that ran.
+    /// Add host context to the results of calls that ran; each one given is
+    /// asked, in the order given.
     #[must_use]
     pub fn with_result_context(mut self, context: Arc<dyn ToolResultContext>) -> Self {
-        self.result_context = Some(context);
+        self.result_context.push(context);
         self
     }
 
-    pub(crate) fn result_context(&self, action: &CodingToolAction) -> Vec<String> {
+    /// What every context adds to the result of `action`, which gave `output`.
+    pub(crate) fn result_context(
+        &self,
+        action: &CodingToolAction,
+        output: &ToolOutput,
+    ) -> Vec<String> {
         self.result_context
-            .as_ref()
-            .map(|context| context.context_for(action))
-            .unwrap_or_default()
+            .iter()
+            .flat_map(|context| {
+                let mut added = context.context_for(action);
+                added.extend(context.context_for_result(output));
+                added
+            })
+            .collect()
     }
 
     /// Supply the capability matrix measured on this host (M12).

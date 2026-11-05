@@ -3656,7 +3656,7 @@ async fn run_post_tool_hooks(
         let mut answer = crate::HookResponse::default();
         answer
             .host_context
-            .extend(tools.result_context(&prepared.final_action));
+            .extend(tools.result_context(&prepared.final_action, &view.output));
         return answer;
     }
     let mut payload = crate::service::tool_hook_payload(prepared, "post_tool_use");
@@ -3671,7 +3671,7 @@ async fn run_post_tool_hooks(
     }
     answer
         .host_context
-        .extend(tools.result_context(&prepared.final_action));
+        .extend(tools.result_context(&prepared.final_action, &view.output));
     answer
 }
 
