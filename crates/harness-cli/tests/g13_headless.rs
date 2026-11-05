@@ -136,7 +136,9 @@ fn g13_json_reports_usage_and_the_memory_features_that_were_off() {
             "lessons",
             "reviews",
             "earlier_state",
-            "knowledge"
+            "knowledge",
+            "citations",
+            "scoped"
         ]),
         "{off}"
     );
