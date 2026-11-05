@@ -10,9 +10,16 @@
 #    reviews run after every run (autoRefine.turnInterval 1) and finish
 #    before it exits; the precondition is that the stores (`ha memory
 #    export`, the markdown store, .harness, the lessons) hold each fact by its
-#    token, the teaching restated up to twice when they do not.
-# 2. Evaluation: five tasks whose success depends on a taught fact, judged
-#    from a file the agent wrote, and two that do not (their cost only), each
+#    token, the teaching restated up to twice when they do not. Two more are
+#    set up for the features of wave 2: the agent keeps the HTTP client's
+#    retry limit with a citation of the line that sets it (app/net.py), which
+#    the test then changes, so the kept fact is stale; and the markdown store
+#    has a file kept for app/billing/** (a `paths:` frontmatter, not in the
+#    index) naming a constant every billing module defines.
+# 2. Evaluation: seven tasks whose success depends on a taught fact, judged
+#    from a file the agent wrote - `retries` on noticing the kept fact went
+#    stale (the citation), `ledger` on the billing file's rule (memory scoped
+#    to paths) - and two that do not (their cost only), each
 #    in a fresh `ha exec` conversation once per mode and repeat: memory ON,
 #    memory OFF (HA_MEMORY=off), and with ABLATE=1 each feature of
 #    HA_MEMORY_OFF off alone. Every run starts from a copy of the same
@@ -33,17 +40,17 @@
 # judged. All but the precondition fail on 0.8.9, which has no switch and no
 # usage in its JSON.
 #
-#   REPEATS=2 (default) TASKS="deploy ci vendor owner region median explain"
+#   REPEATS=2 (default) TASKS="deploy ci vendor owner region median explain retries ledger"
 #   ABLATE=1 [ABLATE_FEATURES="digest markdown ..."]
 #   bash scripts/testing/live-tests/memory-ab.sh
-# The default run is 7 tasks x 2 modes x 2 repeats = 28 evaluation runs and
-# 2-4 teaching runs.
+# The default run is 9 tasks x 2 modes x 2 repeats = 36 evaluation runs and
+# 3-5 teaching runs.
 set -u
 source "$(dirname "$0")/env.sh"
 fresh memory-ab
 AB="$(cd "$(dirname "$0")" && (pwd -W 2>/dev/null || pwd))/memory_ab.py"
 REPEATS=${REPEATS:-2}
-TASKS=${TASKS:-deploy ci vendor owner region median explain}
+TASKS=${TASKS:-deploy ci vendor owner region median explain retries ledger}
 # One process per run: the data a run starts from is copied in place, and a
 # background worker would hold it open.
 export HA_DAEMON=off HA_PYTHON=${HA_PYTHON:-$PY}
@@ -53,8 +60,8 @@ started=$(date +%s)
 runs=0
 
 tok() { "$PY" -c "import secrets; print(secrets.token_hex(3))"; }
-T1="stg-$(tok)" T2="ci-$(tok)" T3="textkit-$(tok)" T4="team-$(tok)" T5="r-$(tok)"
-printf 'deploy %s\nci %s\nvendor %s\nowner %s\nregion %s\n' "$T1" "$T2" "$T3" "$T4" "$T5" > "$RX/tokens.txt"
+T1="stg-$(tok)" T2="ci-$(tok)" T3="textkit-$(tok)" T4="team-$(tok)" T5="r-$(tok)" T6="ldg-$(tok)"
+printf 'deploy %s\nci %s\nvendor %s\nowner %s\nregion %s\nledger %s\n' "$T1" "$T2" "$T3" "$T4" "$T5" "$T6" > "$RX/tokens.txt"
 
 # The fixture: a small Python project with its tests, a vendored module, a
 # config holding the region the tests want, and a markdown memory store.
@@ -81,6 +88,9 @@ files = {
         "        self.assertEqual(os.environ.get('LEDGER_REGION'), default_code())\n"
     ),
     "config/regions.ini": f"[eu-west]\ncode = {other1}\n\n[ap-south]\ncode = {region}\ndefault = true\n\n[us-east]\ncode = {other2}\n",
+    "app/net.py": "MAX_RETRIES = 3\n\n\ndef attempts():\n    \"\"\"How many times a failed request is sent again.\"\"\"\n    return MAX_RETRIES\n",
+    "app/billing/__init__.py": "",
+    "app/billing/invoice.py": "def total_cents(lines):\n    \"\"\"The sum of the (name, cents) lines of an invoice.\"\"\"\n    return sum(cents for _, cents in lines)\n",
     "run_tests.py": (
         "import argparse\nimport sys\nimport unittest\n\n"
         "parser = argparse.ArgumentParser()\nparser.add_argument('--suite', required=True)\n"
@@ -95,6 +105,10 @@ for path, text in files.items():
     open(full, "w", encoding="utf-8", newline="\n").write(text)
 EOF
 (cd "$P" && "$HA" memory init > "$RX/init.out" 2>&1)
+# A memory file kept for app/billing/**: the index does not route to it, so
+# only memory scoped to paths brings it to a turn.
+mkdir -p "$P/memory/projects"
+printf -- '---\npaths: ["app/billing/**"]\n---\n# Billing\n\n- Every module under app/billing/ defines LEDGER = "%s" at module level: the ledger it posts to. [stated]\n' "$T6" > "$P/memory/projects/billing.md"
 (cd "$P" && git add -A && git -c user.name=t -c user.email=t@t commit -qm fixture)
 # A review after every run while teaching.
 "$PY" - "$HA_HOME/settings.json" <<'EOF'
@@ -169,6 +183,16 @@ for attempt in 1 2; do
   done
   exec_run "teach-again$attempt" "Make sure each of these is kept in memory for future sessions:$restated" --resume "$(field "$RX/teach2.json" session_id)"
 done
+# The retry limit, kept with a citation of the line that sets it; the test
+# then changes that line, so the kept fact is stale.
+for attempt in 1 2 3; do
+  exec_run "teach-cite$attempt" "Use the memory tool action write with exactly these arguments: scope 'global', path 'project/net', title 'HTTP retry limit', content 'The HTTP client in app/net.py retries a failed request at most 3 times.', citations [{\"path\": \"app/net.py\", \"quote\": \"MAX_RETRIES = 3\"}]. Do nothing else. Reply: saved."
+  (cd "$P" && "$HA" memory export 2>/dev/null) | grep -q '"quote": *"MAX_RETRIES = 3"' && break
+done
+(cd "$P" && "$HA" memory export 2>/dev/null) > "$RX/cited.json"
+check "precondition: the retry limit is kept with its citation" 'grep -q "\"quote\": *\"MAX_RETRIES = 3\"" "$RX/cited.json"'
+sed -i 's/^MAX_RETRIES = 3$/MAX_RETRIES = 7/' "$P/app/net.py"
+(cd "$P" && git add -A && git -c user.name=t -c user.email=t@t commit -qm "retry more")
 missing=$(missing_tokens | tr '\n' ' ')
 reviews=$(reviews_of "$TASK" | sort | uniq -c | tr '\n' ',' )
 echo "   the teaching conversation's reviews: ${reviews:-none}"
@@ -205,10 +229,12 @@ prompt_of() {
     region) echo "Write into notes/test-command.txt the exact command line that makes every test of this repo pass - one line, nothing else." ;;
     median) echo "Add a function median(xs) to app/calc.py that returns the median of a non-empty list of numbers." ;;
     explain) echo "In one sentence: what does total() in app/calc.py do?" ;;
+    retries) echo "Write into notes/retries.txt how many times our HTTP client retries a failed request - the number alone." ;;
+    ledger) echo "Add a module app/billing/refunds.py with a function refund_cents(amount_cents, percent) that returns the refunded amount in integer cents, rounded down." ;;
   esac
 }
 kind_of() { case "$1" in median|explain) echo cost ;; *) echo fact ;; esac; }
-token_of() { case "$1" in deploy) echo "$T1" ;; ci) echo "$T2" ;; vendor) echo "$T3" ;; owner) echo "$T4" ;; region) echo "$T5" ;; esac; }
+token_of() { case "$1" in deploy) echo "$T1" ;; ci) echo "$T2" ;; vendor) echo "$T3" ;; owner) echo "$T4" ;; region) echo "$T5" ;; retries) echo "MAX_RETRIES = 3" ;; ledger) echo "$T6" ;; esac; }
 # judge <task> <run json>: whether the run did the task (from what it wrote).
 judge() {
   case "$1" in
@@ -221,12 +247,14 @@ judge() {
     region) grep -q -- "$T5" "$P/notes/test-command.txt" 2>/dev/null && grep -q LEDGER_REGION "$P/notes/test-command.txt" ;;
     median) (cd "$P" && "$PY" -c "from app.calc import median; assert median([3, 1, 2]) == 2 and median([1, 2, 3, 4]) == 2.5") 2>/dev/null ;;
     explain) [ -n "$(field "$2" response)" ] ;;
+    retries) [ "$(tr -d ' \r\n' < "$P/notes/retries.txt" 2>/dev/null)" = 7 ] ;;
+    ledger) (cd "$P" && "$PY" -c "from app.billing.refunds import LEDGER, refund_cents; assert LEDGER == '$T6' and refund_cents(1000, 15) == 150") 2>/dev/null ;;
   esac
 }
 
 MODES="on off"
 if [ "${ABLATE:-}" = 1 ]; then
-  for feature in ${ABLATE_FEATURES:-digest markdown session_log lessons reviews earlier_state knowledge}; do
+  for feature in ${ABLATE_FEATURES:-digest markdown session_log lessons reviews earlier_state knowledge citations scoped}; do
     MODES="$MODES ablate:$feature"
   done
 fi

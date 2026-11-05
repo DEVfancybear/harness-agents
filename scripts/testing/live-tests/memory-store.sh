@@ -22,6 +22,14 @@
 # the old one; what a fetched page said is tagged web and refused as a
 # constraint; an entry nobody used expires (HA_MEMORY_EXPIRE_DAYS in seconds),
 # ha doctor counts it, and restore brings it back.
+# Wave 2, part cite (sections 16 to 18; MEMORY_STORE_ONLY=cite runs them
+# alone): a fact saved with a citation of the code it rests on, shown holding
+# by a later search and digest, still holding when lines are inserted above
+# it, and broken - in search, in the digest, counted by ha doctor, with no new
+# version - once the test changes the cited line; an entry kept for
+# src/billing/** in no request until the run reads a billing file, then in
+# one, once; a markdown memory file with paths: frontmatter loaded the same
+# way, its globs checked by ha memory lint.
 #
 #   bash scripts/testing/live-tests/memory-store.sh
 set -u
@@ -56,7 +64,7 @@ print(found or "")
 EOF
 }
 
-if [ "${MEMORY_STORE_ONLY:-}" != "0.9.0" ]; then
+if [ -z "${MEMORY_STORE_ONLY:-}" ]; then
 
 echo "################ 1. a 0.8 state file and journal are migrated, history and all"
 mkdir -p "$G"
@@ -281,7 +289,8 @@ check "it exports the global store" '"$PY" -c "import json,sys; d=json.load(open
 fi
 
 # 0.9.0 (docs/architecture/MEMORY_STORE.en.md §16). MEMORY_STORE_ONLY=0.9.0
-# runs these alone, in a fresh home: what a control run on 0.8.9 needs.
+# runs these alone, in a fresh home: what a control run on 0.8.9 needs; and
+# MEMORY_STORE_ONLY=cite the sections of wave 2's part cite (16 to 18).
 # The global store's entries, each a JSON line of its document.
 docs() { "$PY" "$MEMORY_STORE" document "$G" | "$PY" -c "import json,sys; d=json.load(sys.stdin); [print(json.dumps(e, ensure_ascii=False)) for e in d['entries']['memory'].values()]"; }
 # The document of the global entry whose content holds $1, or nothing.
@@ -308,6 +317,8 @@ for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3"
 EOF
 results_of() { "$PY" "$RX/run_events.py" "$D" "$1" results; }
 calls_of() { "$PY" "$RX/run_events.py" "$D" "$1" calls; }
+
+if [ "${MEMORY_STORE_ONLY:-0.9.0}" = 0.9.0 ]; then
 
 echo "################ 13. 0.9.0: a corrected fact is superseded, not deleted, and as_of reads the old one"
 run_exec m40 "Use the memory tool, action write, exactly these arguments: scope 'global', path 'infra', title 'Staging database host', content 'The staging database host is db-alpha-371.'. Do nothing else. Answer: saved."
@@ -383,5 +394,124 @@ run_exec m47 "Use the memory tool action restore with id 'coffee_machine' and sc
 coffee=$(doc_with "oat milk")
 check "restore brings the expired entry back" '[ -z "$(field "$coffee" "[\"expired\"]")" ] && [ -z "$(field "$coffee" "[\"temporal\"][\"end\"]")" ] && events | grep -q "^update|revert|model|coffee_machine|"'
 unset HA_MEMORY_EXPIRE_DAYS
+
+fi
+
+if [ "${MEMORY_STORE_ONLY:-cite}" = cite ]; then
+
+# Wave 2, part cite (docs/architecture/MEMORY_STORE.en.md §18).
+# MEMORY_STORE_ONLY=cite runs these alone, in a fresh home: what a control
+# run on 0.9.0 needs.
+# The requests of the run whose input holds $1, each as the number of times
+# it holds $2 (a request stored as a delta of the one before is put back
+# together first), one line per model call, in order.
+cat > "$RX/request_counts.py" <<'EOF'
+import glob, json, os, sqlite3, sys
+sys.stdout.reconfigure(encoding="utf-8")
+marker, token = sys.argv[2], sys.argv[3]
+def strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from strings(item)
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    rows = sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute(
+        "select request_id, session_id, request_json from frozen_requests order by rowid").fetchall()
+    full, sessions = {}, {}
+    for request, session, text in rows:
+        doc = json.loads(text)
+        if doc.get("delta_of") in full:
+            base = full[doc["delta_of"]]
+            doc["messages"] = base["messages"][:doc["delta_prefix"]] + doc["messages"]
+        full[request] = doc
+        sessions.setdefault(session, []).append(doc)
+    for session, docs in sessions.items():
+        first = docs[0]
+        if not any(marker in text for text in strings(first.get("messages", []))):
+            continue
+        for doc in docs:
+            print(sum(text.count(token) for text in strings(doc.get("messages", []))))
+EOF
+counts() { "$PY" "$RX/request_counts.py" "$D" "$1" "$2"; }
+# The scoped_loaded diagnostics records, as JSON lines.
+scoped_records() { cat "$D"/diagnostics/*.jsonl 2>/dev/null | grep -a '"scoped_loaded"'; }
+# The last check of each entry's citations, kept in the store's meta.
+checks() { "$PY" -c "import sqlite3,sys; r=sqlite3.connect('file:'+sys.argv[1]+'/memory.sqlite3?mode=ro',uri=True).execute(\"select value from store_meta where key='citations'\").fetchone(); print(r[0] if r else '')" "$G" 2>/dev/null; }
+
+mkdir -p "$P/src/billing"
+printf '# Tax rules for invoices.\n\nDEFAULT_RATE = 0.06\nAUSTIN_RATE = 0.0825\n\n\ndef rate(region):\n    """The sales tax rate of a region."""\n    return AUSTIN_RATE if region == "austin" else DEFAULT_RATE\n' > "$P/src/billing/tax.py"
+printf 'def refund(amount_cents, percent):\n    return amount_cents * percent // 100\n' > "$P/src/billing/refunds.py"
+(cd "$P" && git add -A && git -c user.name=t -c user.email=t@t commit -qm billing)
+
+echo "################ 16. cite: a fact saved with a citation; the citation holds, moves, and breaks when the code changes"
+for attempt in 1 2 3; do
+  run_exec "m50-$attempt" "Read src/billing/tax.py. Then keep this fact with the memory tool, action write: scope 'project', path 'billing', title 'Austin tax rate', content 'The Austin sales tax rate is 0.0825.', and citations naming that file and the line that sets the Austin rate, quoted word for word from the file. Do nothing else. MARKER_CITE_WRITE_$attempt. Answer: saved."
+  cited=$(doc_with "Austin sales tax rate")
+  field "$cited" "[\"citations\"][0][\"quote\"]" | grep -q "0.0825" && break
+done
+cited=$(doc_with "Austin sales tax rate")
+check "the fact is kept with a citation of the line that sets the rate (the precondition)" '[ "$(field "$cited" "[\"citations\"][0][\"path\"]")" = "src/billing/tax.py" ] && field "$cited" "[\"citations\"][0][\"quote\"]" | grep -q "AUSTIN_RATE = 0.0825"'
+check "the host kept the line it found the quote at" '[ "$(field "$cited" "[\"citations\"][0][\"lines\"]")" = "[4, 4]" ]'
+run_exec m51 "Test: call the memory tool action search exactly once with query 'Austin tax rate' and nothing else. No other tool. MARKER_CITE_HOLDS. Report what the search said of the hit's citations."
+check "a later conversation's search shows the citation holding" 'results_of MARKER_CITE_HOLDS | grep -q "\"citations_state\":\"holds\""'
+check "and its digest names the cited code" 'request MARKER_CITE_HOLDS | grep -q "\[cites src/billing/tax.py:4\]"'
+# Two lines inserted above the cited one, by the test: the code moved.
+printf '# Tax rules for invoices.\n# Rates are fractions of the net amount.\n# Reviewed by finance.\n\nDEFAULT_RATE = 0.06\nAUSTIN_RATE = 0.0825\n\n\ndef rate(region):\n    """The sales tax rate of a region."""\n    return AUSTIN_RATE if region == "austin" else DEFAULT_RATE\n' > "$P/src/billing/tax.py"
+run_exec m52 "Test: call the memory tool action search exactly once with query 'Austin tax rate' and nothing else. No other tool. MARKER_CITE_MOVED. Report what the search said of the hit's citations."
+check "a citation moved by lines inserted above still holds, at its new line" 'results_of MARKER_CITE_MOVED | grep -q "\"citations_state\":\"holds\"" && results_of MARKER_CITE_MOVED | grep -q "\"state\":\"moved\"" && results_of MARKER_CITE_MOVED | grep -q "\"lines\":\[6,6\]"'
+check "and the digest follows it" 'request MARKER_CITE_MOVED | grep -q "\[cites src/billing/tax.py:6\]"'
+# The cited line changed, by the test, not the model.
+sed -i 's/^AUSTIN_RATE = 0.0825$/AUSTIN_RATE = 0.0900/' "$P/src/billing/tax.py"
+run_exec m53 "Test: call the memory tool action search exactly once with query 'Austin tax rate' and nothing else. No other tool. MARKER_CITE_BROKEN. Report what the search said of the hit's citations."
+check "once the cited code changed, search reports the citation broken" 'results_of MARKER_CITE_BROKEN | grep -q "\"citations_state\":\"broken\"" && results_of MARKER_CITE_BROKEN | grep -q "no longer holds the quoted code"'
+check "and the next conversation's digest marks the entry as no longer holding" 'request MARKER_CITE_BROKEN | grep -q "\[its cited code changed since: src/billing/tax.py no longer holds the quoted code; check the code before relying on it"'
+cited=$(doc_with "Austin sales tax rate")
+check "the checks made no version of the entry; their last result is in the store's meta" '[ "$(field "$cited" "[\"version\"]")" = 1 ] && checks | grep -q "\"state\":\"broken\""'
+(cd "$P" && "$HA" doctor) > "$RX/doctor-cite.out" 2>&1
+check "ha doctor counts the entry whose citation is broken" 'grep -q "memory citations: 1 of 1 entries cite code that changed since they were kept" "$RX/doctor-cite.out"'
+
+echo "################ 17. cite: an entry kept for src/billing/** enters a conversation once it reads a matching file, once"
+for attempt in 1 2 3; do
+  run_exec "m55-$attempt" "Use the memory tool action write with exactly these arguments: scope 'project', path 'billing', title 'Refund ledger rule', content 'Refunds in the billing module post to the ledger before the customer is notified (zk-5521).', paths ['src/billing/**']. Do nothing else. MARKER_SCOPED_WRITE_$attempt. Answer: saved."
+  scoped=$(doc_with zk-5521)
+  [ "$(field "$scoped" "[\"paths\"]")" = '["src/billing/**"]' ] && break
+done
+check "the entry is kept for src/billing/** (the precondition)" '[ "$(field "$scoped" "[\"paths\"]")" = "[\"src/billing/**\"]" ]'
+for attempt in 1 2 3; do
+  run_exec "m56-$attempt" "Do these steps in order, one tool call each: 1. read the file README.md; 2. read the file src/billing/refunds.py; 3. read the file src/billing/tax.py. Then answer with one word: DONE. MARKER_SCOPED_$attempt"
+  calls_of "MARKER_SCOPED_$attempt" | grep -q '^read_file.*src/billing/refunds.py' && calls_of "MARKER_SCOPED_$attempt" | grep -q '^read_file.*README.md' && break
+done
+mapfile -t seen < <(counts "MARKER_SCOPED_$attempt" zk-5521)
+echo "   the run's requests hold the entry: ${seen[*]}"
+check "the run read README.md, then the billing files (the precondition)" 'calls_of "MARKER_SCOPED_$attempt" | grep -q "^read_file.*README.md" && calls_of "MARKER_SCOPED_$attempt" | grep -q "^read_file.*src/billing/refunds.py"'
+check "no request holds the entry before a matching file is read" '[ "${#seen[@]}" -ge 2 ] && [ "${seen[0]}" = 0 ]'
+check "the request after the read holds it, and every later one once" '[ "${seen[-1]}" = 1 ] && ! printf "%s\n" "${seen[@]}" | grep -qvx "[01]"'
+check "the load is recorded with the path that loaded it" 'scoped_records | grep -a "\"path\":\"src/billing/refunds.py\"" | grep -aq "\"compactions\":0"'
+
+echo "################ 18. cite: a markdown memory file with paths: frontmatter loads the same way"
+P2=$RX/p2
+project "$P2"
+(cd "$P2" && "$HA" memory init > "$RX/init-p2.out" 2>&1)
+mkdir -p "$P2/src/billing" "$P2/memory/projects"
+printf 'def refund(amount_cents, percent):\n    return amount_cents * percent // 100\n' > "$P2/src/billing/refunds.py"
+printf -- '---\npaths: ["src/billing/**"]\n---\n# Billing\n\n- Refund amounts are integer cents, never floats (qv-9034). [stated]\n' > "$P2/memory/projects/billing.md"
+(cd "$P2" && git add -A && git -c user.name=t -c user.email=t@t commit -qm store)
+(cd "$P2" && "$HA" memory lint --no-diff) > "$RX/lint-p2.out" 2>&1
+check "ha memory lint checks the file's globs" 'grep -q "^PASS scoped-paths  1 file(s) kept for some paths, 1 glob(s) checked" "$RX/lint-p2.out" && grep -q "^RESULT PASS" "$RX/lint-p2.out"'
+for attempt in 1 2 3; do
+  printf '\n## %s (ha exec m57-%s in p2)\n\n' "$(date +%H:%M:%S)" "$attempt" >> "$LOG"
+  (cd "$P2" && "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto --output-format json "Do these steps in order, one tool call each: 1. read the file README.md; 2. read the file src/billing/refunds.py. Then answer with one word: DONE. Read no other file. MARKER_MDSCOPED_$attempt" > "$RX/m57-$attempt.json" 2> "$RX/m57-$attempt.err")
+  calls_of "MARKER_MDSCOPED_$attempt" | grep -q '^read_file.*src/billing/refunds.py' && ! calls_of "MARKER_MDSCOPED_$attempt" | grep -q 'memory/projects' && break
+done
+mapfile -t seen < <(counts "MARKER_MDSCOPED_$attempt" qv-9034)
+echo "   the run's requests hold the file: ${seen[*]}"
+check "the run read the billing file and not the memory file (the precondition)" 'calls_of "MARKER_MDSCOPED_$attempt" | grep -q "^read_file.*src/billing/refunds.py" && ! calls_of "MARKER_MDSCOPED_$attempt" | grep -q "memory/projects"'
+check "the memory file is in no request before the billing file is read, then in one, once" '[ "${#seen[@]}" -ge 2 ] && [ "${seen[0]}" = 0 ] && [ "${seen[-1]}" = 1 ] && ! printf "%s\n" "${seen[@]}" | grep -qvx "[01]"'
+
+fi
 
 result
