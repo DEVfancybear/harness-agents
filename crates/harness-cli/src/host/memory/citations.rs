@@ -265,9 +265,11 @@ pub fn matcher(paths: &[String]) -> Option<globset::GlobSet> {
     builder.build().ok()
 }
 
-/// The globs one gitignore-style pattern stands for.
+/// The globs one gitignore-style pattern stands for; a leading `/` anchors it
+/// at the root.
 fn expanded(pattern: &str) -> Vec<String> {
     let pattern = relative_text(pattern);
+    let anchored = pattern.starts_with('/');
     let pattern = pattern.trim_start_matches('/');
     let pattern = if pattern.ends_with('/') {
         format!("{pattern}**")
@@ -278,7 +280,7 @@ fn expanded(pattern: &str) -> Vec<String> {
     if !pattern.ends_with("**") {
         globs.push(format!("{pattern}/**"));
     }
-    if !pattern.contains('/') {
+    if !anchored && !pattern.contains('/') {
         globs.extend(globs.clone().into_iter().map(|glob| format!("**/{glob}")));
     }
     globs
@@ -320,7 +322,8 @@ pub fn glob_error(pattern: &str) -> Option<String> {
     if pattern.chars().count() > MAX_GLOB_CHARS {
         return Some(format!("is longer than {MAX_GLOB_CHARS} characters"));
     }
-    let leaves = Path::new(pattern).is_absolute()
+    // A leading `/` anchors the glob at the root: it is no absolute path.
+    let leaves = Path::new(pattern.trim_start_matches('/')).is_absolute()
         || pattern.contains(':')
         || pattern.split('/').any(|label| label == "..");
     if leaves {
@@ -1091,5 +1094,26 @@ mod tests {
                 .contains("not inside")
         );
         assert!(verify_paths(&json!("src/**")).is_err());
+    }
+
+    /// A leading `/` anchors a glob at the workspace root, as in gitignore:
+    /// it is no absolute path, and a name under it is not matched at any
+    /// depth.
+    #[test]
+    fn a_leading_slash_anchors_a_glob_at_the_root() {
+        assert_eq!(
+            verify_paths(&json!(["/Makefile", "/docs/"])).expect("anchored"),
+            ["/Makefile", "/docs/"]
+        );
+        let cited = Cited::of(&json!({"paths": ["/Makefile", "/docs/"]}));
+        assert!(cited.applies_to("Makefile"));
+        assert!(!cited.applies_to("vendor/lib/Makefile"));
+        assert!(cited.applies_to("docs/api/index.md"));
+        assert!(!cited.applies_to("src/docs/index.md"));
+        assert!(
+            verify_paths(&json!(["C:/work/src/**"]))
+                .expect_err("a drive")
+                .contains("not inside")
+        );
     }
 }
