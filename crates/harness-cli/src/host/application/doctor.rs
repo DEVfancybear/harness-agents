@@ -29,6 +29,9 @@ pub struct Facts {
     pub memory: super::memory_switch::Switch,
     /// The memory changes waiting for the person ([`super::memory_queue`]).
     pub memory_queue: super::memory_queue::Counts,
+    /// The project's entries that cite code, and those kept for some files
+    /// ([`super::memory_citations::count`]).
+    pub citations: super::memory_citations::Count,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -417,8 +420,42 @@ fn state(root: &Path, facts: &Facts) -> Subsystem {
     sleep(facts, &mut subsystem);
     memory_switch(facts, &mut subsystem);
     memory_queue(facts, &mut subsystem);
+    memory_citations(facts, &mut subsystem);
     markdown_memory(root, &mut subsystem);
     subsystem
+}
+
+/// The memory entries that cite code, and how many of them rest on code that
+/// changed since they were kept; the entries kept for some files. Nothing is
+/// said of a project with neither.
+fn memory_citations(facts: &Facts, subsystem: &mut Subsystem) {
+    let count = &facts.citations;
+    if count.scoped > 0 {
+        subsystem.pass(format!(
+            "memory kept for some files only: {} entr{} (loaded when a conversation touches a matching file)",
+            count.scoped,
+            if count.scoped == 1 { "y" } else { "ies" }
+        ));
+    }
+    if count.citing == 0 {
+        return;
+    }
+    if count.broken == 0 {
+        subsystem.pass(format!(
+            "memory citations: {} entr{} cite code, and it holds",
+            count.citing,
+            if count.citing == 1 { "y" } else { "ies" }
+        ));
+    } else {
+        subsystem.short(
+            Level::Warn,
+            format!(
+                "memory citations: {} of {} entries cite code that changed since they were kept",
+                count.broken, count.citing
+            ),
+            "a memory search shows each citation's state: check the code, then update the entry with new citations or supersede it",
+        );
+    }
 }
 
 /// What of memory is off (`HA_MEMORY`, `HA_MEMORY_OFF`, the `memory`

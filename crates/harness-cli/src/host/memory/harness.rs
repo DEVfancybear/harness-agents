@@ -104,6 +104,8 @@ pub struct Entry {
     /// Where its words came from, and whether a correction or the expiry
     /// pass closed it (`memory_validity`).
     pub standing: super::memory_validity::Standing,
+    /// The code it cites and the files it is kept for (`memory_citations`).
+    pub cited: super::memory_citations::Cited,
 }
 
 /// The merged state of one turn.
@@ -114,6 +116,9 @@ pub struct State {
     /// Why a scope's store could not be read: its entries are missing from
     /// this state, which says so rather than reading as an empty memory.
     pub unreadable: Option<String>,
+    /// Checks the citations of the entries a digest shows, in the
+    /// conversation's workspace; none while `citations` is off.
+    pub checker: Option<super::memory_citations::Checker>,
 }
 
 impl State {
@@ -137,6 +142,8 @@ pub fn load(dir: &Path, scope: &str) -> State {
     match super::memory_store::load_with_usage(dir) {
         Ok((document, rows)) => {
             let mut state = parse(&document, scope, root);
+            // The last check of each entry's citations, kept apart from it.
+            let checks = super::memory_citations::recorded(dir);
             // One store, read under one root: what its entries are indexed by.
             let store: std::sync::Arc<str> = format!(
                 "{}
@@ -148,6 +155,7 @@ pub fn load(dir: &Path, scope: &str) -> State {
                 for entry in entries {
                     if let Some(row) = rows.get(&(entry.kind.clone(), entry.id.clone())) {
                         entry.memory = Some(row.memory.clone());
+                        entry.cited.last = checks.get(&row.memory).cloned();
                         entry.usage = row.usage.clone();
                         entry.indexed = Some(super::memory_search::Indexed {
                             store: store.clone(),
@@ -242,6 +250,7 @@ pub fn parse(parsed: &Value, scope: &str, root: &str) -> State {
                 usage: super::memory_store::Usage::default(),
                 indexed: None,
                 standing: super::memory_validity::Standing::of(raw),
+                cited: super::memory_citations::Cited::of(raw),
             });
         }
     }
@@ -306,6 +315,7 @@ pub fn merge(global: State, local: State) -> State {
     merged.refinements = global.refinements;
     merged.refinements.extend(local.refinements);
     merged.unreadable = global.unreadable.or(local.unreadable);
+    merged.checker = global.checker.or(local.checker);
     merged
 }
 
@@ -514,7 +524,7 @@ pub fn age_of(written: &str) -> Option<String> {
 /// `, updated 3d ago` for a line that has room for it, or nothing.
 /// The entry's age and who wrote it, after its version: the reader weighs a
 /// rule the review inferred differently from one the agent was told to keep.
-fn age_suffix(entry: &Entry) -> String {
+pub(crate) fn age_suffix(entry: &Entry) -> String {
     let origin = match entry.source.as_deref() {
         Some("agent") => ", kept by the agent",
         Some("refine") => ", kept by the review",
@@ -585,6 +595,8 @@ pub struct Shown {
     /// Its key as the digest named it, `local:` prefix and all.
     pub id: String,
     pub memory: Option<String>,
+    /// The check of its citations the digest made, kept as their last.
+    pub checked: Option<super::memory_citations::Checked>,
 }
 
 /// A rendered digest and the entries it showed.
@@ -666,8 +678,16 @@ pub fn render_digest(state: &State, options: DigestOptions, terms: &[(String, f6
     // still finds it, the digest leaves it out. So does one a correction or
     // the expiry pass closed, whose period may not have ended yet: a
     // future-dated entry superseded today ends a millisecond after its start.
+    // An entry kept for some files only enters a conversation when it
+    // touches one of them (`memory_scoped`), not in every turn.
     let current;
-    let gone = |entry: &Entry| entry.ended || entry.standing.closed();
+    let scoped = state
+        .entries
+        .values()
+        .flatten()
+        .filter(|entry| entry.cited.scoped() && !entry.ended && !entry.standing.closed())
+        .count();
+    let gone = |entry: &Entry| entry.ended || entry.standing.closed() || entry.cited.scoped();
     let state = if state.entries.values().flatten().any(gone) {
         let mut kept = state.clone();
         for entries in kept.entries.values_mut() {
@@ -806,14 +826,25 @@ pub fn render_digest(state: &State, options: DigestOptions, terms: &[(String, f6
                     )
                 );
             }
+            // Code the entry rests on is checked as it is shown: one whose
+            // code changed since says so, and is not read as fact.
+            let checked = state
+                .checker
+                .as_ref()
+                .and_then(|checker| checker.check(&entry.cited));
+            let note = checked
+                .as_ref()
+                .and_then(super::memory_citations::Checked::note)
+                .map_or_else(String::new, |note| format!(" {note}"));
             shown_entries.push(Shown {
                 scope: entry.scope.clone(),
                 kind: entry.kind.clone(),
                 id: entry.id.clone(),
                 memory: entry.memory.clone(),
+                checked,
             });
             lines.push(format!(
-                "- [{}:{}] {} ({}, v{}{}){extra}: {}",
+                "- [{}:{}] {} ({}, v{}{}){extra}: {}{note}",
                 entry.scope,
                 entry.id,
                 title,
@@ -826,6 +857,12 @@ pub fn render_digest(state: &State, options: DigestOptions, terms: &[(String, f6
         if entries.len() > shown {
             lines.push(format!("- +{} more {kind} entries", entries.len() - shown));
         }
+        lines.push(String::new());
+    }
+    if scoped > 0 {
+        lines.push(format!(
+            "memory kept for some files only: {scoped} (each enters the conversation once it reads, edits or lists a matching file; memory search finds them)"
+        ));
         lines.push(String::new());
     }
     if let Some(error) = &state.unreadable {
@@ -948,6 +985,15 @@ pub fn record_shown(global: &Path, local: &Path, shown: &[Shown]) {
                 .field("error", error)
                 .emit();
         }
+        // What the digest's check of each entry's citations found, as their
+        // last check: in the store's meta, never in the entry.
+        super::memory_citations::record(
+            dir,
+            &entries
+                .iter()
+                .filter_map(|entry| Some((entry.memory.clone()?, entry.checked.clone()?)))
+                .collect::<Vec<_>>(),
+        );
     }
 }
 
@@ -974,8 +1020,16 @@ fn pinned_lines(state: &State, lines: &mut Vec<String>) -> Vec<Shown> {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
+        let checked = state
+            .checker
+            .as_ref()
+            .and_then(|checker| checker.check(&entry.cited));
+        let note = checked
+            .as_ref()
+            .and_then(super::memory_citations::Checked::note)
+            .map_or_else(String::new, |note| format!(" {note}"));
         let line = format!(
-            "- [{}:{}] {} ({}, {}, v{}{}): {content}",
+            "- [{}:{}] {} ({}, {}, v{}{}): {content}{note}",
             entry.scope,
             entry.id,
             entry.title.as_deref().unwrap_or_default(),
@@ -996,6 +1050,7 @@ fn pinned_lines(state: &State, lines: &mut Vec<String>) -> Vec<Shown> {
             kind: entry.kind.clone(),
             id: entry.id.clone(),
             memory: entry.memory.clone(),
+            checked,
         });
     }
     if left_out > 0 {

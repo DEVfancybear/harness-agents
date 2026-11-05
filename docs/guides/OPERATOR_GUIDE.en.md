@@ -913,7 +913,23 @@ Memory has to earn its place, so it can be measured: one switch turns it off, wh
   The JSON object, and with `stream-json` the `run.terminal` event, is written once those passes ended, so `upkeep_usage` counts them; a plain-text run still prints its answer first. The stream's `usage` events carry `cache_read_tokens` and `cache_write_tokens` beside the prompt and completion tokens.
 - **Measuring it.** The live suite `memory-ab.sh` teaches a project facts, then runs the same tasks from the same snapshot with memory on, off and (with `ABLATE=1`) each feature off alone, and writes a table of success, tokens, calls and time against memory off ([live tests](../../scripts/testing/live-tests/README.md)).
 
-### 12.22. Memory changes that wait for you, and what a child proposes
+### 12.21. Memory that cites code, and memory kept for some files (0.9.2)
+
+[Memory store](../architecture/MEMORY_STORE.en.md) §18 has the details.
+
+- **Citations.** `memory` `write` takes `citations: [{path, quote, lines?}]` (at most 5): a file of the workspace, relative to its root, and a short span of its code the fact rests on, copied word for word (whitespace aside, at least 8 characters), with the lines where it is if you like. ha checks each one before the write and refuses one that does not hold, saying why; it keeps the lines it found the quote at. An update's `citations` replaces them, `[]` clears them. ha attaches none by itself: a write whose words came from a file read and that gives none is told how to add one (`cite`).
+- **Checked on every read.** The digest, `search` and `read` check each citation against the file as it is now: `holds`, `moved` (lines inserted above: its lines follow the code), `broken` (the file or the quoted code is gone) or `unchecked` (a file over 1 MiB, another project's citation, the read budget of 4 MiB spent). A hit and a read carry `citations`, `citations_state` and, when broken, `citations_note`. The digest marks an entry whose citations hold `[cites <path>:<line>]` and one whose citations are broken `[its cited code changed since: ...; check the code before relying on it, then update or supersede the entry]`. A check makes no version of the entry: its last result is kept in the store's meta. `ha doctor` counts the entries that cite code and how many of them are broken.
+- **Memory kept for some files.** `memory` `write` takes `paths: [glob, ...]` (at most 16): workspace-relative, gitignore-style globs (`src/billing/**`, `*.sql`, `docs/api`). Such an entry is not in every turn's digest; it comes with the result of the first file tool call of the conversation that reads, edits, writes or lists a matching file, or whose search matches one, as a section after that result's text, once per conversation, and again after a compaction. Search still finds it, and a query that names a path (`src/billing/invoice.rs`, `invoice.rs`) puts the entries kept for it first. `ha doctor` counts them. A markdown store's file with `paths:` in its frontmatter loads the same way, and `ha memory lint` checks its globs ([Markdown memory](../architecture/MARKDOWN_MEMORY.en.md) §9).
+- **Switches.** `HA_MEMORY_OFF` (and the `memory` setting's `off`) take two more features, for an ablation; `/context` and `ha doctor` name them when they are off:
+
+  | feature | what it turns off |
+  |---|---|
+  | `citations` | checking and showing citations (digest, search, read, the meta record); a write that gives `citations` is refused and the tool does not offer it |
+  | `scoped` | memory kept for some files: loading it with a result, the `memory` tool listing, searching or reading it, writing `paths` (refused, not offered), and a markdown store's files with `paths:` |
+
+  `memory-ab.sh` measures them with the tasks `retries` (a cited fact gone stale) and `ledger` (a billing rule kept for `app/billing/**`).
+
+### 12.22. Memory changes that wait for you, and what a child proposes (0.9.2)
 
 [Memory store](../architecture/MEMORY_STORE.en.md) §19 has the details.
 

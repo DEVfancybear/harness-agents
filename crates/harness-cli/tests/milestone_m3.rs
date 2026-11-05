@@ -1516,6 +1516,78 @@ async fn multi_file_reads_deliver_host_context_to_the_next_provider_request() {
     close(store).await;
 }
 
+/// What a context adds for a call's result (memory kept for the file it
+/// read) reaches the next provider request with that result, and not the
+/// one before the call.
+#[tokio::test]
+async fn context_for_a_result_reaches_the_next_provider_request() {
+    struct Scoped;
+    impl harness_tools::ToolResultContext for Scoped {
+        fn context_for(&self, _action: &harness_tools::CodingToolAction) -> Vec<String> {
+            Vec::new()
+        }
+        fn context_for_result(&self, output: &harness_tools::ToolOutput) -> Vec<String> {
+            match output {
+                harness_tools::ToolOutput::ReadFile { path, .. } => {
+                    vec![format!("SCOPED-MEMORY-7731 kept for {path}")]
+                }
+                _ => Vec::new(),
+            }
+        }
+    }
+    let bench = bench();
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptStep::Events(vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta("first", "read_file", r#"{"path":"src/parser.rs"}"#),
+            ProviderStreamEvent::completed("tool_calls"),
+        ]),
+        ScriptStep::Events(vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("done"),
+            ProviderStreamEvent::completed("stop"),
+        ]),
+    ]));
+    let (runtime, _) = runtime_for(&store, provider.clone(), None, None).await;
+    let driver = TurnDriver::new(
+        runtime,
+        ToolExecutionService::new(Arc::clone(&store)).with_result_context(Arc::new(Scoped)),
+    );
+    driver
+        .run_turn(
+            request(
+                &bench.workspace,
+                SessionId::generate(),
+                TaskId::generate(),
+                "read the parser",
+            ),
+            options(&bench.workspace),
+            Arc::new(RecordingObserver::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn");
+    let seen = provider.seen();
+    let held = |index: usize| {
+        seen[index]
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .map(|message| {
+                message
+                    .content
+                    .matches("SCOPED-MEMORY-7731 kept for src/parser.rs")
+                    .count()
+            })
+            .sum::<usize>()
+    };
+    assert_eq!(held(0), 0, "not before the call");
+    assert_eq!(held(1), 1, "with the result, once");
+    drop(driver);
+    close(store).await;
+}
+
 #[tokio::test]
 async fn m3_03_valid_polling_is_not_a_loop() {
     let bench = bench();

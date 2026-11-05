@@ -608,10 +608,21 @@ pub async fn run_with(
             .chain([context.paths.data_dir.clone()])
             .collect(),
     );
+    // Memory kept for some files enters the run when a tool's result
+    // touches one of them, as in the app.
+    let scoped_memory = Arc::new(super::memory_scoped::ScopedMemory::new(
+        &context.paths.data_dir,
+        task_id.as_str(),
+        &context.project.root,
+        Some(super::bootstrap::project_key_of(&context.project.root)),
+        &memory_switch,
+        super::config::harness_refinements(&context.paths.config_file),
+    ));
     let mut tools = ToolExecutionService::new(Arc::clone(&store))
         .with_hashline(hashline)
         .with_policy(tool_policy)
-        .with_hooks(resolved_config.hooks.clone());
+        .with_hooks(resolved_config.hooks.clone())
+        .with_result_context(scoped_memory);
     // The jev plugin's harness decisions, when it is on and has a key.
     let jev_decisions = super::jev::JevDecisions::from_settings(
         environment,
@@ -703,6 +714,7 @@ pub async fn run_with(
                     super::memory::MemoryHost::new(&context.paths.data_dir, task_id.as_str())
                         .with_project(&context.project.root)
                         .with_refinements(digest_on)
+                        .with_switch(&memory_switch)
                         .readonly(),
                 ),
                 context: Vec::new(),
@@ -739,7 +751,8 @@ pub async fn run_with(
     );
     let memory_host = super::memory::MemoryHost::new(&context.paths.data_dir, task_id.as_str())
         .with_project(&context.project.root)
-        .with_refinements(digest_on);
+        .with_refinements(digest_on)
+        .with_switch(&memory_switch);
     if let Some((agents, _)) = &agents {
         tools = tools.with_elsewhere(Arc::clone(agents) as Arc<dyn harness_tools::PathElsewhere>);
     }
@@ -980,7 +993,7 @@ pub async fn run_with(
     // the digest of what the model has kept, ranked for this prompt. With the
     // digest off the store is not opened, and the report counts no entries.
     let harness_state = digest_on.then(|| {
-        super::harness::merge(
+        let mut state = super::harness::merge(
             super::harness::for_project(
                 super::harness::load(
                     &super::harness::global_dir(&context.paths.data_dir),
@@ -992,7 +1005,10 @@ pub async fn run_with(
                 &super::harness::local_dir(&context.paths.data_dir, task_id.as_str()),
                 "local",
             ),
-        )
+        );
+        // The code the shown entries cite is checked as they are shown.
+        super::memory_citations::for_digest(&mut state, &context.project.root, &memory_switch);
+        state
     });
     let harness_entries = harness_state.as_ref().map(super::harness::State::total);
     // The date and the Git facts ride the input, as in the app, so the system

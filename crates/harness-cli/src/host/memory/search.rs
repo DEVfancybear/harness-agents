@@ -519,6 +519,7 @@ pub fn search(
         ),
         None => ranked,
     };
+    let ranked = named_first(&considered, &queries, ranked);
     let total = ranked.len();
     let select = arguments
         .get("select")
@@ -850,6 +851,53 @@ fn number(arguments: &Value, key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// The paths a search's queries name: words with a `/` in them, or a file's
+/// name with its extension (`invoice.rs`), quotes and brackets aside.
+fn named_paths(queries: &[String]) -> Vec<String> {
+    let mut named = Vec::new();
+    for word in queries.iter().flat_map(|query| query.split_whitespace()) {
+        let word = word.trim_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | ',' | ';' | ':'
+            )
+        });
+        let path_like = word.contains('/')
+            || word.contains('\\')
+            || word.rsplit_once('.').is_some_and(|(stem, extension)| {
+                !stem.is_empty()
+                    && !extension.is_empty()
+                    && extension
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric())
+                    && stem.chars().last().is_some_and(char::is_alphanumeric)
+            });
+        if path_like && !named.iter().any(|seen| seen == word) {
+            named.push(word.to_owned());
+        }
+    }
+    named
+}
+
+/// `ranked` with the entries kept for, or citing, a path the queries name
+/// first, each group in its order: a search that names a file finds what
+/// was kept for it.
+fn named_first(
+    considered: &[&Placed<'_>],
+    queries: &[String],
+    ranked: Vec<(usize, f64)>,
+) -> Vec<(usize, f64)> {
+    let named = named_paths(queries);
+    if named.is_empty() {
+        return ranked;
+    }
+    let (first, rest): (Vec<_>, Vec<_>) = ranked.into_iter().partition(|(index, _)| {
+        let cited = &considered[*index].entry.cited;
+        named.iter().any(|path| cited.names(path))
+    });
+    first.into_iter().chain(rest).collect()
+}
+
 /// A search's query and its variants, without repeats.
 fn queries(arguments: &Value) -> Vec<String> {
     let mut queries: Vec<String> = Vec::new();
@@ -1020,10 +1068,27 @@ fn field_texts(entry: &Entry) -> [String; 4] {
         })
         .collect::<Vec<_>>()
         .join(" ");
+    // The files it is kept for and cites are words of its place: a search
+    // for `billing` finds an entry kept for `src/billing/**`.
+    let files = entry
+        .cited
+        .paths
+        .iter()
+        .map(String::as_str)
+        .chain(
+            entry
+                .cited
+                .citations
+                .iter()
+                .map(|citation| citation.path.as_str()),
+        )
+        .map(|path| path.replace(['/', '*', '.'], " "))
+        .collect::<Vec<_>>()
+        .join(" ");
     [
         entry.title.clone().unwrap_or_default(),
         entry.content.clone().unwrap_or_default(),
-        format!("{} {}", entry.tree.replace('/', " "), entry.id),
+        format!("{} {} {files}", entry.tree.replace('/', " "), entry.id),
         facets,
     ]
 }
@@ -1551,6 +1616,7 @@ pub fn rank_documents(documents: &[(&str, &str)], query: &str) -> Vec<(usize, f6
             usage: memory_store::Usage::default(),
             indexed: None,
             standing: super::memory_validity::Standing::default(),
+            cited: super::memory_citations::Cited::default(),
         })
         .collect::<Vec<_>>();
     let doc = Value::Null;
@@ -1849,6 +1915,7 @@ mod tests {
                 usage: memory_store::Usage::default(),
                 indexed: None,
                 standing: super::memory_validity::Standing::default(),
+                cited: super::super::memory_citations::Cited::default(),
             })
             .collect::<Vec<_>>();
         let refs = entries.iter().collect::<Vec<_>>();
@@ -1944,6 +2011,7 @@ mod tests {
                 hash: hash.to_owned(),
             }),
             standing: super::memory_validity::Standing::default(),
+            cited: super::super::memory_citations::Cited::default(),
         }
     }
 

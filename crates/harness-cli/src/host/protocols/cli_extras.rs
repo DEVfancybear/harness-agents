@@ -257,6 +257,7 @@ pub fn doctor(cwd: Option<&Path>, json: bool) -> Result<ExitCode, HarnessError> 
         sleep: super::sleep::summary(&paths.data_dir),
         memory: super::memory_switch::Switch::load(&paths.config_file, &environment),
         memory_queue: super::memory_queue::counts(&paths.data_dir),
+        citations: super::memory_citations::count(&paths.data_dir, &root),
     };
     let global_config_dir = paths
         .config_file

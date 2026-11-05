@@ -690,8 +690,12 @@ fn overview(scopes: &HarnessScopes) -> String {
                 .as_deref()
                 .map_or_else(String::new, |key| format!(", project {key}"));
             lines.push(format!(
-                "- [{}:{}] {title} ({}, v{}{age}{project}){extra}: {content}",
-                entry.scope, entry.id, entry.path, entry.version
+                "- [{}:{}] {title} ({}, v{}{age}{project}){extra}: {content}{}",
+                entry.scope,
+                entry.id,
+                entry.path,
+                entry.version,
+                super::memory_citations::review_note(&entry.cited)
             ));
         }
         if entries.len() > 40 {

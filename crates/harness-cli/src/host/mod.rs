@@ -107,6 +107,8 @@ pub mod mcp_config;
 pub mod mcp_oauth;
 #[path = "memory/memory.rs"]
 pub mod memory;
+#[path = "memory/citations.rs"]
+pub mod memory_citations;
 #[path = "memory/filters.rs"]
 pub mod memory_filters;
 #[path = "memory/provenance.rs"]
@@ -115,6 +117,8 @@ pub mod memory_provenance;
 pub mod memory_queue;
 #[path = "memory/readout.rs"]
 pub mod memory_readout;
+#[path = "memory/scoped.rs"]
+pub mod memory_scoped;
 #[path = "memory/search.rs"]
 pub mod memory_search;
 #[path = "memory/store.rs"]

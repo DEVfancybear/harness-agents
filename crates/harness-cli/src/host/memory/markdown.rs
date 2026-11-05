@@ -1382,6 +1382,119 @@ fn check_index_links(config: &Config, view: &View<'_>) -> Check {
     )
 }
 
+/// The memory files of a store kept for some workspace files: each of
+/// `files` (`.md` paths relative to the root) under `memory/` - the archive
+/// and the examples aside - whose frontmatter has `paths:`, with its globs as
+/// written.
+fn scoped_memory_files(view: &View<'_>, files: Vec<String>) -> Vec<(String, Vec<String>)> {
+    files
+        .into_iter()
+        .filter(|path| {
+            path.starts_with("memory/")
+                && !path.starts_with("memory/archive/")
+                && !path.starts_with(&format!("{TEMPLATES_DIR}/"))
+        })
+        .filter_map(|path| {
+            let paths = frontmatter_paths(&view.text(&path)?)?;
+            Some((path, paths))
+        })
+        .collect()
+}
+
+/// The `paths:` of a file's leading frontmatter: an inline list
+/// (`paths: ["src/billing/**", "*.sql"]`), one glob (`paths: src/**`), or a
+/// block list of `- glob` lines below it. `None` without one.
+#[must_use]
+pub fn frontmatter_paths(text: &str) -> Option<Vec<String>> {
+    let lines = split_lines(text);
+    if lines.first() != Some(&"---") {
+        return None;
+    }
+    let end = lines.iter().skip(1).position(|line| *line == "---")? + 1;
+    let body = &lines[1..end];
+    let start = body
+        .iter()
+        .position(|line| line.trim_end().strip_prefix("paths:").is_some())?;
+    let unquote = |item: &str| {
+        item.trim()
+            .trim_matches(|character| character == '"' || character == '\'')
+            .trim()
+            .to_owned()
+    };
+    let inline = body[start]["paths:".len()..].trim();
+    let paths = if inline.is_empty() {
+        body[start + 1..]
+            .iter()
+            .map_while(|line| {
+                line.trim_start()
+                    .strip_prefix("- ")
+                    .or_else(|| (line.trim() == "-").then_some(""))
+            })
+            .map(unquote)
+            .filter(|item| !item.is_empty())
+            .collect()
+    } else if let Some(list) = inline.strip_prefix('[') {
+        list.trim_end_matches(']')
+            .split(',')
+            .map(unquote)
+            .filter(|item| !item.is_empty())
+            .collect()
+    } else {
+        vec![unquote(inline)]
+    };
+    Some(paths)
+}
+
+/// The store's memory files kept for some workspace files, with their
+/// globs: what a conversation loads when it touches a matching file
+/// (`memory_scoped`). None without a store.
+#[must_use]
+pub fn scoped_files(root: &Path) -> Vec<(String, Vec<String>)> {
+    if !root.join(CONFIG_FILE).is_file() {
+        return Vec::new();
+    }
+    // Only `memory/` is walked: a turn reads this, and the project's tree
+    // may be large.
+    let files = walk_markdown(&root.join("memory"))
+        .into_iter()
+        .map(|path| format!("memory/{path}"))
+        .collect();
+    scoped_memory_files(&View::disk(root), files)
+}
+
+/// `scoped-paths`: every glob a memory file's `paths:` frontmatter gives
+/// parses and stays inside the workspace. Only a store with such a file
+/// gets the check.
+fn check_scoped_paths(view: &View<'_>) -> Option<Check> {
+    const NAME: &str = "scoped-paths";
+    let files = scoped_memory_files(view, view.markdown());
+    if files.is_empty() {
+        return None;
+    }
+    let mut failures = Vec::new();
+    let mut globs = 0;
+    for (path, patterns) in &files {
+        if patterns.is_empty() {
+            failures.push(Detail::file(path.clone(), "paths: names no glob"));
+        }
+        for pattern in patterns {
+            globs += 1;
+            if let Some(error) = super::memory_citations::glob_error(pattern) {
+                failures.push(Detail::file(path.clone(), format!("paths: {error}")));
+            }
+        }
+    }
+    Some(Check::graded(
+        NAME,
+        format!(
+            "{} file(s) kept for some paths, {globs} glob(s) checked",
+            files.len()
+        ),
+        failures,
+        Vec::new(),
+    ))
+}
+
 /// How one lint run reads the store.
 #[derive(Clone, Debug, Default)]
 pub struct LintOptions {
@@ -1401,7 +1514,7 @@ pub fn lint(options: &LintOptions) -> Result<Report, String> {
     let config = Config::load(&root, options.config.as_deref())?;
     let diff = read_diff(&root, &options.mode);
     let view = View::disk(&root);
-    let checks = vec![
+    let mut checks = vec![
         check_rom_caps(&config, &view),
         check_ram_caps(&config, &view, &diff),
         check_disk_provenance(&config, &view, &diff),
@@ -1409,6 +1522,10 @@ pub fn lint(options: &LintOptions) -> Result<Report, String> {
         check_tape_frozen(&config, &diff),
         check_index_links(&config, &view),
     ];
+    // ha's own check, beside the package's six: only a store that keeps a
+    // file for some workspace files (`paths:`) has it, so a store the
+    // package checks gets the package's report.
+    checks.extend(check_scoped_paths(&view));
     let result = if checks.iter().any(|check| check.status == Status::Fail) {
         Status::Fail
     } else {
@@ -2282,6 +2399,54 @@ mod tests {
         let report = run(dir.path(), DiffMode::WorkingTree);
         assert!(report.passed(), "{}", report.text(false));
         assert_eq!(check(&report, "index-links").summary, "5 links checked");
+        // The package's six checks, and no seventh without a scoped file.
+        assert_eq!(report.checks.len(), 6);
+    }
+
+    /// A memory file kept for some workspace files names its globs in its
+    /// frontmatter, as a list on one line, one glob, or a block list; the
+    /// lint checks each one parses, and only a store with such a file gets
+    /// that check.
+    #[test]
+    fn a_memory_files_paths_are_read_and_linted() {
+        assert_eq!(
+            frontmatter_paths("---\npaths: [\"src/billing/**\", '*.sql']\n---\n# x\n"),
+            Some(vec!["src/billing/**".to_owned(), "*.sql".to_owned()])
+        );
+        assert_eq!(
+            frontmatter_paths("---\ntitle: x\npaths:\n  - src/billing/**\n  - \"docs/api\"\n---\n"),
+            Some(vec!["src/billing/**".to_owned(), "docs/api".to_owned()])
+        );
+        assert_eq!(
+            frontmatter_paths("---\r\npaths: src/**\r\n---\r\n"),
+            Some(vec!["src/**".to_owned()])
+        );
+        assert_eq!(frontmatter_paths("# no frontmatter\npaths: src/**\n"), None);
+        let dir = store();
+        write(
+            dir.path(),
+            "memory/projects/billing.md",
+            "---\npaths: [\"src/billing/**\"]\n---\n# Billing\n\n- Refunds go through the ledger. [stated]\n",
+        );
+        let report = run(dir.path(), DiffMode::None);
+        assert_eq!(check(&report, "scoped-paths").status, Status::Pass);
+        assert_eq!(
+            scoped_files(dir.path()),
+            [(
+                "memory/projects/billing.md".to_owned(),
+                vec!["src/billing/**".to_owned()]
+            )]
+        );
+        write(
+            dir.path(),
+            "memory/projects/tax.md",
+            "---\npaths: [\"src/[tax\", \"../outside/**\"]\n---\n# Tax\n",
+        );
+        let report = run(dir.path(), DiffMode::None);
+        let scoped = check(&report, "scoped-paths");
+        assert_eq!(scoped.status, Status::Fail, "{}", report.text(false));
+        assert_eq!(scoped.details.len(), 2);
+        assert!(!report.passed());
     }
 
     #[test]
