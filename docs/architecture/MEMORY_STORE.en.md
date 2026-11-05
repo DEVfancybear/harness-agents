@@ -1100,3 +1100,126 @@ every time. A pass now:
 The same holds for a conversation's store past 40 entries and for the
 curator's memory part (`/refine --curate`), whose batches precede the skills'
 refinement `<id>`.
+
+## 19. The person's review queue, and what a child proposes
+
+Until 0.9.0 nothing waited for a person: a review, `/refine`, `/learn` and
+Deep Dream applied what passed the checks at once, and refused the rest -
+a fetched page's words made a rule among them, which the person could not
+take even when it was right. The queue (`memory/review_queue.rs`) holds the
+changes the person should have a say in, beside the store they would change.
+
+### 19.1 What waits
+
+A memory or prompt change a refinement planned is checked as it would be
+applied - the evidence quote, the secrets and steering text, the size, the
+duplicates, a closed entry - and then, instead of being applied, waits when:
+
+| `HA_MEMORY_REVIEW` | What waits |
+|---|---|
+| `policy` (the default) | a change that writes, changes or removes a rule every later turn follows - an entry in `constraints/*` or `user/preferences`, now or before the change - from a fetched page's words (0.9.0 refused it), or from evidence that is not the user's own words (it quotes a file, a tool, a child's finding, or nothing: the review inferred it). Deep Dream's merges rest on the entries, not on a quote: only a page's words in them wait. And a delegated child's proposal its parent's review did not keep (§19.4). |
+| `all` | every memory and prompt change of a review, `/refine`, `/learn` and Deep Dream, and every child's proposal the review did not keep |
+| `off` | nothing: what 0.9.0 did (a page's words into a rule refused, a child's proposal the review did not keep dropped) |
+
+`HA_MEMORY_REVIEW` wins over the `review` field of the `memory` key of
+`settings.json` (`{"memory": {"review": "all"}}`), as the memory switch reads
+its own. The default is `policy`: the person is asked about what steers every
+later turn and rests on words they did not say, and about nothing else. The
+`reviews` feature off (`HA_MEMORY_OFF=reviews`, `HA_MEMORY=off`) runs no
+review, so nothing is queued either. memory-ab needs no feature of its own for
+the queue: `HA_MEMORY_REVIEW=off` is the queue off, and what waits is not in a
+request, as with memory off.
+
+A merge's delete whose survivor's change waits, waits on it (`after`): it is
+accepted only after the survivor's change, and leaves the queue when that is
+rejected. A rollback and an accept never wait.
+
+### 19.2 The queue
+
+One file per scope, `memory_queue.json` in the scope's folder (the global
+store's `harness/`, a conversation's `sessions/<task>/harness/`), written
+whole under `memory_queue.lock`. An item holds:
+
+| Field | Holds |
+|---|---|
+| `id` | `mq-` and eight hex digits |
+| `at_ms` | when it was queued |
+| `scope`, `conversation` | the store it would change, the conversation whose review proposed it |
+| `edit` | the edit as `apply` takes it (`action` create, update, supersede or delete, `kind`, `id`, `title`, `content`, `path`, `evidence`, `reason`, and `origin_kind`, the host's) |
+| `expected` | the entry as it was when proposed (`version`, `title`, `content`), or `null` for one that was not there |
+| `by` | who proposed it: `{via: review, refine, learn, deep_dream or child, refinement, child, role}` |
+| `why` | why it waits |
+| `fingerprint` | what makes two proposals the same change |
+| `after` | the item it waits on |
+
+An item waits 30 days (`KEEP_DAYS`), then expires unread. The same change
+proposed again while it waits is not queued twice. The refinement records a
+change that waits as `queued` (the item's id) and `waits` (why), neither
+applied nor failed; its outcome says how many wait (`Harness unchanged · 1
+change waits for your review`), and the `review` diagnostics record counts
+them (`queued`).
+
+### 19.3 Accept and reject
+
+`ha memory queue` and `/memory queue` (§12.22 of the operator guide) list the
+items of every queue under the data directory, show one with its evidence and
+a diff against the entry as it is now, and accept or reject them.
+
+- **Accept** applies the change through `apply`, the write path a review's
+  edit takes, with its checks: a duplicate, a secret or a closed entry is
+  still refused, and the item keeps waiting. The entry must be as it was when
+  the change was proposed - the same `version`, title and content, or still
+  absent for a new entry - else the change is refused as stale (`stale: the
+  entry changed since the change was proposed (version 1 then, 2 now)`) and
+  leaves the queue. An accepted change is the person's: its `origin.kind` (or,
+  for an update, the entry's) is `user`, and `origin.accepted` (or
+  `edited_by.accepted`) records the item, the kind its words had (`from`), who
+  proposed it and when. The page's-words refusal is not made: the person made
+  it a rule. It is recorded as a refinement, which `/refine --rollback` undoes.
+- **Reject** takes the item out and remembers the change for 90 days: its
+  kind, whether it writes or deletes, the entry it changes, its fingerprint and
+  its words. The same change proposed again - the same entry, and 60 % of its
+  words the same, or a delete of the same entry - is refused as rejected
+  (`the person rejected the same change in the memory queue`), not queued. The
+  next reviews, `/refine` and `/learn` are told the ten newest rejections
+  (`<rejected_by_user>`) and asked not to propose them again unless the
+  conversation shows the user wants them now.
+
+### 19.4 What a child proposes
+
+0.8.9's `note_finding` let a child keep a fact with the words of its own tool
+result that show it; the parent's review could turn it into memory. A
+proposal builds on it rather than beside it: `note_finding` takes an optional
+`propose` - `{title, path?, scope?: global (the default) or local, content?
+(the fact, when left out)}` - so a proposal has the finding's checks (its
+evidence must be in one of the child's tool results, at most 8 a run) and its
+way to the review. A sibling tool would have needed the same checks and the
+same file twice.
+
+- The finding is kept with its proposal in `child_findings.jsonl`, and the
+  review reads it in the `[Child findings, from <child>]` block, marked
+  `[proposed as a global memory entry in <path>, title "...": ...]`.
+- When an edit of the review rests on the finding - its evidence quotes the
+  finding's line as the review read it - and that edit is applied, the
+  proposal is closed as `kept`: the entry is the review's. When that edit
+  waits for the person, the proposal is closed as `queued` with its item.
+- Otherwise, once the review succeeded (or found nothing to refine), the
+  proposal waits in the queue of its scope as the child's - `by.via` child,
+  `origin_kind` child - checked as a review's edit is (a duplicate or a
+  rejected change is refused: `refused`). With `HA_MEMORY_REVIEW=off` it is
+  dropped (`dropped`).
+- A proposal is never applied by the child's authority. The child's system
+  text and the tool's description say so. How each ended is recorded on the
+  finding (`proposal.closed`, `note`, `queued`) and in the diagnostics
+  (`memory_queue child_proposal`).
+
+### 19.5 Where it shows
+
+- After a review that queued changes, the session says so once, with where to
+  review them (`memory: 1 proposed change waits for your review (2 in all):
+  /memory queue ...`); the diagnostics record `memory_queue queued`. `ha exec`
+  prints it with the review's other lines.
+- `ha doctor` and `/doctor` warn while changes wait, and how many a child
+  proposed; `/context` has a `Memory queue:` line while changes wait or the
+  mode is not the default; the bug report's Memory section counts them and
+  copies the queues (their outline without `--include-content`).

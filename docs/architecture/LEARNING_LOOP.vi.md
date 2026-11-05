@@ -85,7 +85,11 @@ quy tắc đó lần thứ hai:
   ngay dưới dạng entry đó (placement `covered`). Tín hiệu về sau chỉ cộng thêm
   bằng chứng, không ghi gì mới.
 - Nếu rốt cuộc entry không được ghi (phần local hoặc global lỗi, hoặc memory từ
-  chối edit), lesson quay lại thành candidate.
+  chối edit), lesson quay lại thành candidate. Lesson có edit đang chờ người
+  dùng trong hàng đợi memory cũng vậy (một rule từ lời không phải của người
+  dùng, hoặc mọi thay đổi khi `HA_MEMORY_REVIEW=all`:
+  [MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §19): nó chưa được ghi cho tới khi
+  được chấp nhận, và tín hiệu sau lại được đếm.
 - Trước khi ngưỡng ghi một rule, nó hỏi memory xem đã có entry nào nói điều đó
   chưa, bằng đúng thước đo memory tool dùng để từ chối trùng (giống 60 %, hoặc
   85 % nằm sẵn trong một entry). Nếu có, lesson được promote dưới dạng entry đó

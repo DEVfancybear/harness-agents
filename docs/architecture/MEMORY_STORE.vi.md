@@ -1119,3 +1119,127 @@ thất bại mọi lần. Giờ một lượt:
 Điều tương tự áp dụng cho store của một hội thoại quá 40 entry và phần memory
 của curator (`/refine --curate`), mà các lô của nó đi trước refinement `<id>`
 của phần skill.
+
+## 19. Hàng đợi để người dùng duyệt, và những gì một child đề xuất
+
+Cho đến 0.9.0 không có gì chờ người dùng: một review, `/refine`, `/learn` và
+Deep Dream áp dụng ngay những gì qua được các kiểm tra, và từ chối phần còn
+lại - trong đó có chữ của một trang web bị biến thành rule, mà người dùng không
+thể nhận lấy kể cả khi nó đúng. Hàng đợi (`memory/review_queue.rs`) giữ những
+thay đổi mà người dùng nên có tiếng nói, đặt cạnh store mà chúng sẽ thay đổi.
+
+### 19.1 Những gì phải chờ
+
+Một thay đổi memory hoặc prompt mà một refinement lập ra được kiểm tra như khi
+nó được áp dụng - câu trích làm bằng chứng, secret và chữ lái agent, kích
+thước, bản trùng, entry đã đóng - rồi, thay vì được áp dụng, phải chờ khi:
+
+| `HA_MEMORY_REVIEW` | Những gì phải chờ |
+|---|---|
+| `policy` (mặc định) | một thay đổi ghi, sửa hoặc xoá một rule mà mọi lượt sau đều theo - một entry trong `constraints/*` hoặc `user/preferences`, hiện tại hoặc trước thay đổi - từ chữ của một trang web (0.9.0 từ chối nó), hoặc từ bằng chứng không phải lời của chính người dùng (nó trích một file, một tool, một phát hiện của child, hoặc không trích gì: review tự suy ra). Các lần gộp của Deep Dream dựa trên các entry, không dựa trên câu trích: chỉ chữ của trang web trong đó mới phải chờ. Và một đề xuất của child mà review của agent cha không giữ (§19.4). |
+| `all` | mọi thay đổi memory và prompt của review, `/refine`, `/learn` và Deep Dream, và mọi đề xuất của child mà review không giữ |
+| `off` | không gì cả: như 0.9.0 (chữ của trang web vào rule bị từ chối, đề xuất của child mà review không giữ bị bỏ) |
+
+`HA_MEMORY_REVIEW` thắng trường `review` của khoá `memory` trong
+`settings.json` (`{"memory": {"review": "all"}}`), như công tắc memory đọc các
+trường của nó. Mặc định là `policy`: người dùng được hỏi về những gì lái mọi
+lượt sau mà lại dựa trên lời họ không nói, và không gì khác. Tính năng
+`reviews` tắt (`HA_MEMORY_OFF=reviews`, `HA_MEMORY=off`) thì không review nào
+chạy, nên cũng không gì vào hàng đợi. memory-ab không cần tính năng riêng cho
+hàng đợi: `HA_MEMORY_REVIEW=off` là hàng đợi tắt, và những gì đang chờ thì
+không có trong request, như khi memory tắt.
+
+Một lệnh xoá của lần gộp mà thay đổi của entry còn lại (survivor) đang chờ thì
+chờ theo nó (`after`): nó chỉ được chấp nhận sau thay đổi của survivor, và rời
+hàng đợi khi thay đổi kia bị từ chối. Một rollback và một lần chấp nhận không
+bao giờ phải chờ.
+
+### 19.2 Hàng đợi
+
+Mỗi scope một file, `memory_queue.json` trong thư mục của scope (`harness/`
+của store global, `sessions/<task>/harness/` của một hội thoại), ghi nguyên
+file dưới `memory_queue.lock`. Một mục giữ:
+
+| Trường | Giữ |
+|---|---|
+| `id` | `mq-` và tám chữ số hex |
+| `at_ms` | lúc nó vào hàng đợi |
+| `scope`, `conversation` | store nó sẽ thay đổi, hội thoại mà review của nó đã đề xuất |
+| `edit` | edit như `apply` nhận (`action` create, update, supersede hoặc delete, `kind`, `id`, `title`, `content`, `path`, `evidence`, `reason`, và `origin_kind` của host) |
+| `expected` | entry như lúc được đề xuất (`version`, `title`, `content`), hoặc `null` cho một entry chưa có |
+| `by` | ai đề xuất: `{via: review, refine, learn, deep_dream hoặc child, refinement, child, role}` |
+| `why` | vì sao nó phải chờ |
+| `fingerprint` | thứ làm hai đề xuất là cùng một thay đổi |
+| `after` | mục mà nó chờ theo |
+
+Một mục chờ 30 ngày (`KEEP_DAYS`), rồi hết hạn dù chưa ai đọc. Cùng một thay
+đổi được đề xuất lại trong khi nó đang chờ thì không vào hàng đợi hai lần.
+Refinement ghi một thay đổi đang chờ là `queued` (id của mục) và `waits` (vì
+sao), không phải đã áp dụng cũng không phải thất bại; kết quả của nó nói bao
+nhiêu thay đổi đang chờ (`Harness unchanged · 1 change waits for your
+review`), và bản ghi chẩn đoán `review` đếm chúng (`queued`).
+
+### 19.3 Chấp nhận và từ chối
+
+`ha memory queue` và `/memory queue` (§12.22 của hướng dẫn vận hành) liệt kê
+các mục của mọi hàng đợi trong thư mục dữ liệu, hiện một mục cùng bằng chứng
+và một diff so với entry như hiện tại, và chấp nhận hoặc từ chối chúng.
+
+- **Chấp nhận** áp dụng thay đổi qua `apply`, đường ghi mà edit của một review
+  đi qua, với các kiểm tra của nó: bản trùng, secret hay entry đã đóng vẫn bị
+  từ chối, và mục tiếp tục chờ. Entry phải còn như lúc thay đổi được đề xuất -
+  cùng `version`, title và content, hoặc vẫn chưa có với một entry mới - nếu
+  không thay đổi bị từ chối vì đã cũ (`stale: the entry changed since the
+  change was proposed (version 1 then, 2 now)`) và rời hàng đợi. Một thay đổi
+  đã chấp nhận là của người dùng: `origin.kind` của nó (hoặc, với một update,
+  của entry) là `user`, và `origin.accepted` (hoặc `edited_by.accepted`) ghi
+  mục đó, loại nguồn mà chữ của nó có (`from`), ai đề xuất và khi nào. Lời từ
+  chối vì chữ của trang web không được đưa ra: người dùng đã biến nó thành
+  rule. Nó được ghi như một refinement, mà `/refine --rollback` hoàn tác được.
+- **Từ chối** lấy mục ra và nhớ thay đổi đó trong 90 ngày: loại của nó, nó ghi
+  hay xoá, entry nó thay đổi, fingerprint và các từ của nó. Cùng thay đổi đó
+  được đề xuất lại - cùng entry, và 60 % số từ giống nhau, hoặc một lệnh xoá
+  cùng entry - bị từ chối vì đã bị từ chối (`the person rejected the same
+  change in the memory queue`), không vào hàng đợi. Các review, `/refine` và
+  `/learn` kế tiếp được cho biết mười lần từ chối mới nhất
+  (`<rejected_by_user>`) và được yêu cầu không đề xuất lại chúng trừ khi hội
+  thoại cho thấy người dùng giờ muốn chúng.
+
+### 19.4 Những gì một child đề xuất
+
+`note_finding` của 0.8.9 cho một child giữ một sự thật cùng chữ của chính kết
+quả tool của nó cho thấy sự thật đó; review của agent cha có thể biến nó thành
+memory. Một đề xuất được xây trên nó thay vì đặt cạnh nó: `note_finding` nhận
+thêm `propose` tuỳ chọn - `{title, path?, scope?: global (mặc định) hoặc
+local, content? (khi bỏ trống thì là sự thật)}` - nên một đề xuất có các kiểm
+tra của finding (bằng chứng phải có trong một kết quả tool của child, tối đa 8
+lần một lượt chạy) và đường đi tới review của nó. Một tool anh em sẽ cần các
+kiểm tra đó và file đó hai lần.
+
+- Finding được giữ cùng đề xuất của nó trong `child_findings.jsonl`, và review
+  đọc nó trong khối `[Child findings, from <child>]`, được đánh dấu
+  `[proposed as a global memory entry in <path>, title "...": ...]`.
+- Khi một edit của review dựa trên finding đó - bằng chứng của nó trích dòng
+  của finding như review đã đọc - và edit đó được áp dụng, đề xuất được đóng là
+  `kept`: entry là của review. Khi edit đó phải chờ người dùng, đề xuất được
+  đóng là `queued` cùng mục của nó.
+- Nếu không, khi review đã thành công (hoặc thấy không có gì để refine), đề
+  xuất chờ trong hàng đợi của scope của nó như của child - `by.via` child,
+  `origin_kind` child - được kiểm tra như edit của một review (bản trùng hoặc
+  thay đổi đã bị từ chối thì bị từ chối: `refused`). Với `HA_MEMORY_REVIEW=off`
+  nó bị bỏ (`dropped`).
+- Một đề xuất không bao giờ được áp dụng bằng quyền của child. System text của
+  child và mô tả của tool nói như vậy. Mỗi đề xuất kết thúc ra sao được ghi
+  trên finding (`proposal.closed`, `note`, `queued`) và trong chẩn đoán
+  (`memory_queue child_proposal`).
+
+### 19.5 Nơi nó hiện ra
+
+- Sau một review đưa thay đổi vào hàng đợi, session nói điều đó một lần, kèm
+  nơi để duyệt (`memory: 1 proposed change waits for your review (2 in all):
+  /memory queue ...`); chẩn đoán ghi `memory_queue queued`. `ha exec` in nó
+  cùng các dòng khác của review.
+- `ha doctor` và `/doctor` cảnh báo khi có thay đổi đang chờ, và bao nhiêu
+  trong đó do child đề xuất; `/context` có dòng `Memory queue:` khi có thay đổi
+  đang chờ hoặc chế độ không phải mặc định; mục Memory của bug report đếm
+  chúng và chép các hàng đợi (chỉ dàn ý khi không có `--include-content`).

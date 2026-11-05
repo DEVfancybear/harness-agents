@@ -85,7 +85,11 @@ write that rule a second time:
   promoted at once as that entry (placement `covered`). Later signals add to its
   evidence and write nothing.
 - If the entry is not written after all - the local or global part failed, or
-  the memory refused the edit - the lesson becomes a candidate again.
+  the memory refused the edit - the lesson becomes a candidate again. So does
+  one whose edit waits for the person in the memory queue (a rule from words
+  that are not the user's, or every change with `HA_MEMORY_REVIEW=all`:
+  [MEMORY_STORE.en.md](MEMORY_STORE.en.md) §19): it is not written until it is
+  accepted, and the next signal counts again.
 - Before the gate writes a rule, it asks the memory whether an entry already
   says it, by the measures the memory tool refuses a duplicate with (60 %
   alike, or 85 % of it held in an entry). If one does, the lesson is promoted as
