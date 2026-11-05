@@ -1046,7 +1046,8 @@ those entries count toward no consolidation (`CONSOLIDATE_MIN_ENTRIES`,
 merge into one, is refused with the reason, recorded like any refusal: an
 edit would reopen it, or delete what `as_of` and history read. A rollback
 still puts back what its refinement closed. An update of a live entry keeps
-its `temporal`, `supersedes`, `superseded_by` and `expired`.
+its `temporal`, `supersedes`, `superseded_by`, `expired`, `citations` and
+`paths` (§18).
 
 **A review's memory edit quotes what it read.** A memory or prompt-note edit
 of a review, `/refine` or `/learn` is applied only when its `evidence` is

@@ -1066,7 +1066,8 @@ không được thấy các entry mà một lần sửa hay lượt hết hạn 
 vậy, hoặc gộp vào nó, bị từ chối kèm lý do, được ghi như mọi lần từ chối khác:
 một edit sẽ mở lại nó, hoặc xoá thứ mà `as_of` và history đọc. Rollback vẫn đặt
 lại những gì refinement của nó đã đóng. Cập nhật một entry còn sống thì giữ
-`temporal`, `supersedes`, `superseded_by` và `expired` của nó.
+`temporal`, `supersedes`, `superseded_by`, `expired`, `citations` và `paths`
+của nó (§18).
 
 **Sửa đổi memory của review trích những gì nó đã đọc.** Một sửa đổi memory hay
 prompt note của review, `/refine` hoặc `/learn` chỉ được áp dụng khi `evidence`
