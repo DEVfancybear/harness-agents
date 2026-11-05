@@ -235,7 +235,7 @@ prompt_of() {
     median) echo "Add a function median(xs) to app/calc.py that returns the median of a non-empty list of numbers." ;;
     explain) echo "In one sentence: what does total() in app/calc.py do?" ;;
     retries) echo "Write into notes/retries.txt how many times our HTTP client retries a failed request - the number alone." ;;
-    ledger) echo "Add a module app/billing/refunds.py with a function refund_cents(amount_cents, percent) that returns the refunded amount in integer cents, rounded down." ;;
+    ledger) echo "Add a module app/billing/refunds.py with a function refund_cents(amount_cents, percent) that returns the refunded amount in integer cents, rounded down, and the module-level constant LEDGER our billing modules define. If you do not know its value, set LEDGER = 'UNKNOWN'." ;;
   esac
 }
 kind_of() { case "$1" in median|explain) echo cost ;; *) echo fact ;; esac; }
