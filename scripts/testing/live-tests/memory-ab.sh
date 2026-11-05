@@ -14,8 +14,8 @@
 #    set up for the features of wave 2: the agent keeps the HTTP client's
 #    retry limit with a citation of the line that sets it (app/net.py), which
 #    the test then changes, so the kept fact is stale; and it keeps, as an
-#    entry kept for app/billing/** (`paths`), the constant every billing
-#    module defines. A file of the repository would not do: a run with memory
+#    entry kept for app/billing/** (`paths`), the name of the ledger the
+#    billing modules post to. A file of the repository would not do: a run with memory
 #    off reads the markdown store's files as it reads any file.
 # 2. Evaluation: seven tasks whose success depends on a taught fact, judged
 #    from a file the agent wrote - `retries` on noticing the kept fact went
@@ -190,7 +190,7 @@ done
 check "precondition: the retry limit is kept with its citation" 'grep -q "\"quote\": *\"MAX_RETRIES = 3\"" "$RX/cited.json"'
 # The billing modules' rule, kept only for app/billing/**.
 for attempt in 1 2 3; do
-  exec_run "teach-scoped$attempt" "Use the memory tool action write with exactly these arguments: scope 'global', path 'project/billing', title 'Billing module ledger', content 'Every module under app/billing/ defines LEDGER = \"$T6\" at module level: the ledger it posts to.', paths [\"app/billing/**\"]. Do nothing else. Reply: saved."
+  exec_run "teach-scoped$attempt" "Use the memory tool action write with exactly these arguments: scope 'global', path 'project/billing', title 'Billing module ledger', content 'The billing modules under app/billing/ post to the ledger named $T6.', paths [\"app/billing/**\"]. Do nothing else. Reply: saved."
   (cd "$P" && "$HA" memory export 2>/dev/null) | grep -q '"app/billing/\*\*"' && break
 done
 (cd "$P" && "$HA" memory export 2>/dev/null) > "$RX/scoped.json"
@@ -235,7 +235,7 @@ prompt_of() {
     median) echo "Add a function median(xs) to app/calc.py that returns the median of a non-empty list of numbers." ;;
     explain) echo "In one sentence: what does total() in app/calc.py do?" ;;
     retries) echo "Write into notes/retries.txt how many times our HTTP client retries a failed request - the number alone." ;;
-    ledger) echo "Add a module app/billing/refunds.py with a function refund_cents(amount_cents, percent) that returns the refunded amount in integer cents, rounded down, and the module-level constant LEDGER our billing modules define. If you do not know its value, set LEDGER = 'UNKNOWN'." ;;
+    ledger) echo "Add a module app/billing/refunds.py with a function refund_cents(amount_cents, percent) that returns the refunded amount in integer cents, rounded down, and a module-level constant LEDGER holding the name of the ledger our billing modules post to. If you do not know that name, set LEDGER = 'UNKNOWN'." ;;
   esac
 }
 kind_of() { case "$1" in median|explain) echo cost ;; *) echo fact ;; esac; }

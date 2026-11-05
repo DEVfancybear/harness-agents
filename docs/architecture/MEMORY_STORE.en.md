@@ -1273,6 +1273,6 @@ one with `..` or a drive is refused, and so is one that does not parse
 task for each: `retries` (the agent kept the HTTP client's retry limit with a
 citation, the test then changed the line: the task succeeds when the run
 notices the kept fact went stale) and `ledger` (an entry kept for `app/billing/**`
-holds the constant a new billing module must define; a file of the
+names the ledger the billing modules post to, which a new module records; a file of the
 repository would not do, since a run with memory off reads the markdown
 store's files as any file).
