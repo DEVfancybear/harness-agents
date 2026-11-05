@@ -605,9 +605,8 @@ pub fn waiting_notice(queued: usize, waiting: usize) -> String {
     )
 }
 
-/// Take the item `id` out of the queue in `dir`.
+/// Take the item `id` out of the queue in `dir`, whose lock the caller holds.
 fn remove(dir: &Path, id: &str) -> Result<Option<Item>, String> {
-    let _lock = hold(dir)?;
     let mut queue = load(dir);
     let Some(index) = queue.items.iter().position(|item| item.id == id) else {
         return Ok(None);
@@ -687,14 +686,29 @@ pub enum Accepted {
 /// Accept the item `id`: applied through the write path a review uses, with
 /// its checks, as the person's (`origin.kind` `user`). One whose entry
 /// changed since it was proposed is refused as stale and leaves the queue.
+/// Its queue is held from the look until it leaves: a reject meanwhile is
+/// not overridden, and nothing is applied that would stay waiting.
 ///
 /// # Errors
 /// No item `id` waits, it waits on another item, or the queue cannot be
-/// written.
+/// had or written.
 pub fn accept(data: &Path, id: &str) -> Result<Accepted, String> {
     let items = all(data);
-    let Some(located) = items.iter().find(|located| located.item.id == id) else {
+    let Some(found) = items.iter().find(|located| located.item.id == id) else {
         return Err(format!("{id} is not waiting in the memory queue"));
+    };
+    let _lock = hold(&found.dir)?;
+    // As the queue holds it now: rejected or accepted since, it is gone.
+    let Some(item) = load(&found.dir)
+        .items
+        .into_iter()
+        .find(|item| item.id == id)
+    else {
+        return Err(format!("{id} is not waiting in the memory queue"));
+    };
+    let located = &Located {
+        dir: found.dir.clone(),
+        item,
     };
     if let Some(after) = &located.item.after
         && items.iter().any(|other| &other.item.id == after)
@@ -1138,6 +1152,42 @@ mod tests {
             offer(dir.path(), item(child)).expect("offer"),
             Offered::Rejected(_)
         ));
+    }
+
+    /// An accept holds the queue while it applies the change: one that cannot
+    /// have it applies nothing, so a reject made meanwhile is never
+    /// overridden and an item applied never stays waiting.
+    #[test]
+    fn an_accept_applies_nothing_without_the_queue() {
+        let data = tempfile::tempdir().expect("data");
+        let global = super::super::harness::global_dir(data.path());
+        let mut change = edit(
+            "create",
+            "",
+            "Editor",
+            "The user edits in Helix with tabs of four",
+        );
+        change["path"] = json!("notes");
+        if let Some(fields) = change.as_object_mut() {
+            fields.remove("id");
+        }
+        let Offered::Queued(id) = offer(&global, item(change)).expect("offer") else {
+            panic!("queued");
+        };
+        let held = hold(&global).expect("held");
+        assert!(accept(data.path(), &id).is_err(), "the queue is held");
+        assert!(
+            super::super::refine::load_raw(&global)["entries"]["memory"]
+                .as_object()
+                .is_none_or(serde_json::Map::is_empty),
+            "nothing applied"
+        );
+        drop(held);
+        assert!(matches!(
+            accept(data.path(), &id).expect("accepted"),
+            Accepted::Applied(_)
+        ));
+        assert!(waiting(&global).is_empty());
     }
 
     #[test]

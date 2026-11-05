@@ -1357,6 +1357,9 @@ a diff against the entry as it is now, and accept or reject them.
   `edited_by.accepted`) records the item, the kind its words had (`from`), who
   proposed it and when. The page's-words refusal is not made: the person made
   it a rule. It is recorded as a refinement, which `/refine --rollback` undoes.
+  The accept holds the item's queue (`memory_queue.lock`) from reading the
+  item until it leaves: a reject meanwhile is not overridden, and a queue it
+  cannot have applies nothing.
 - **Reject** takes the item out and remembers the change for 90 days: its
   kind, whether it writes or deletes, the entry it changes, its fingerprint,
   its words and its quote. The same change proposed again - the same entry (or

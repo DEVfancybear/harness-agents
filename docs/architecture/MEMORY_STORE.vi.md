@@ -1374,6 +1374,9 @@ và một diff so với entry như hiện tại, và chấp nhận hoặc từ c
   mục đó, loại nguồn mà chữ của nó có (`from`), ai đề xuất và khi nào. Lời từ
   chối vì chữ của trang web không được đưa ra: người dùng đã biến nó thành
   rule. Nó được ghi như một refinement, mà `/refine --rollback` hoàn tác được.
+  Lần chấp nhận giữ hàng đợi của mục (`memory_queue.lock`) từ lúc đọc mục cho
+  tới khi mục rời đi: một lần từ chối trong lúc đó không bị ghi đè, và khi
+  không lấy được hàng đợi thì không gì được áp dụng.
 - **Từ chối** lấy mục ra và nhớ thay đổi đó trong 90 ngày: loại của nó, nó ghi
   hay xoá, entry nó thay đổi, fingerprint, các từ và câu trích của nó. Cùng
   thay đổi đó được đề xuất lại - cùng entry (hoặc lại là một entry mới) với 60 %
