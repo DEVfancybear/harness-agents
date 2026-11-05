@@ -265,6 +265,15 @@ pub fn supersede_edit(
     if let Some(project) = before.get("project").filter(|project| !project.is_null()) {
         after["project"] = project.clone();
     }
+    // The correction holds where the old fact did: kept for the same files,
+    // else it would join every turn. The code the old fact cited is not
+    // what the new one rests on, and a review cannot cite: none is kept.
+    if let Some(paths) = before
+        .get(super::memory_citations::PATHS)
+        .filter(|paths| paths.is_array())
+    {
+        after[super::memory_citations::PATHS] = paths.clone();
+    }
     let memory = uuid::Uuid::now_v7().to_string();
     superseding(&mut after, std::slice::from_ref(&closed), &at);
     state["entries"][kind][&key] = after.clone();
@@ -653,6 +662,8 @@ mod tests {
         let mut state = memory_store::empty_document();
         state["entries"]["memory"]["deploy_day"] = json!({"id": "deploy_day", "kind": "memory", "title": "Deploy day",
             "content": "Deploys go out on Thursdays.", "path": "ops", "version": 1,
+            "paths": ["ops/deploy/**"],
+            "citations": [{"path": "ops/deploy/day.toml", "quote": "day = \"thursday\"", "lines": [1, 1]}],
             "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z"});
         memory_store::save_document(
             &dir,
@@ -678,6 +689,10 @@ mod tests {
         assert_eq!(created["action"], "create");
         assert_eq!(created["after"]["supersedes"], json!([old]));
         assert_eq!(created["after"]["path"], "ops");
+        // The correction is kept for the files the old fact was; the code
+        // the old fact cited is not the new one's.
+        assert_eq!(created["after"]["paths"], json!(["ops/deploy/**"]));
+        assert!(created["after"].get("citations").is_none());
         assert_eq!(
             state["entries"]["memory"]["deploy_day"][SUPERSEDED_BY],
             memory

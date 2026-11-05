@@ -882,8 +882,9 @@ addresses or memory ids):
 
 A review's edits get the same: an edit `{"action": "supersede", "kind",
 "id": <old>, "title", "content", "path"?, "metadata"?, "evidence"}` writes a
-new entry keyed by its title, next to the old one's path and project, and
-closes the old one (`validity::supersede_edit`). The refinement records it as
+new entry keyed by its title, next to the old one's path and project, kept for
+the same files (`paths`, §18.4) but citing none of its code, and closes the
+old one (`validity::supersede_edit`). The refinement records it as
 two edits: the old entry's (its `before`, and its closed `after`) and the new
 entry's `create`, so a rollback deletes the new entry and puts the old one back.
 It undoes both or neither: when one of them changed since, both are kept, so

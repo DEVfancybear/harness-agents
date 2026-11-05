@@ -905,7 +905,8 @@ sau điểm bắt đầu của nó.
 
 Các edit của review cũng vậy: edit `{"action": "supersede", "kind",
 "id": <cũ>, "title", "content", "path"?, "metadata"?, "evidence"}` ghi một
-entry mới có key theo title, cạnh path và project của entry cũ, rồi đóng entry
+entry mới có key theo title, cạnh path và project của entry cũ, dành cho cùng
+các file (`paths`, §18.4) nhưng không trích dẫn code nào của nó, rồi đóng entry
 cũ (`validity::supersede_edit`). Refinement ghi nó thành hai edit: edit của
 entry cũ (`before` của nó, và `after` đã đóng) và `create` của entry mới, nên
 rollback sẽ xoá entry mới và đặt lại entry cũ. Nó hoàn tác cả hai hoặc không
