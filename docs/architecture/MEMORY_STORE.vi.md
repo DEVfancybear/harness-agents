@@ -1169,7 +1169,10 @@ that quote at lines 6-6, not within 1-2: give those lines, or leave lines out`.
 
 `citations` của một lần cập nhật thay toàn bộ trích dẫn của entry; `[]` hoặc
 `null` xoá chúng. Lần tạo mới thay entry đang giữ tên đó (`on_conflict:
-replace`) chỉ giữ các trích dẫn nó đưa. Trích dẫn có thể nằm trên entry thuộc
+replace`) chỉ giữ các trích dẫn nó đưa. Lần cập nhật của một review,
+`/refine`, `/learn` hay Deep Dream, và một mục của hàng đợi được chấp nhận
+(§19.3), không đưa được `citations` hay `paths`: entry giữ nguyên chúng.
+Trích dẫn có thể nằm trên entry thuộc
 scope nào cũng được; đọc trong workspace của project khác thì nó không được
 kiểm tra (§18.3), không bao giờ bị gọi là hỏng: đó là những file khác.
 

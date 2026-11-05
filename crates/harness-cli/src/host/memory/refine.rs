@@ -1951,12 +1951,16 @@ fn apply(
                 after["project"] = project.clone();
             }
             // When it holds and what it corrected stay too: an update that
-            // dropped them reopened a closed entry, back in the digest.
+            // dropped them reopened a closed entry, back in the digest. So do
+            // the code it cites and the files it is kept for: dropped, an
+            // entry kept for some files was back in every turn.
             for field in [
                 "temporal",
                 super::memory_validity::SUPERSEDES,
                 super::memory_validity::SUPERSEDED_BY,
                 super::memory_validity::EXPIRED,
+                super::memory_citations::CITATIONS,
+                super::memory_citations::PATHS,
             ] {
                 if let Some(value) = before.get(field).filter(|value| !value.is_null()) {
                     after[field] = value.clone();
@@ -8616,5 +8620,50 @@ Run `node scripts/build.js`.
         );
         assert_eq!(dropped[0].closed, "dropped");
         assert_eq!(memory_queue::all(data).len(), 1);
+    }
+
+    /// A review's update - an accepted one too - keeps the code the entry
+    /// cites and the files it is kept for: it rewrote the words, not where
+    /// the entry applies. Dropped, a scoped entry was back in every turn's
+    /// digest, and its citations were no longer checked.
+    #[test]
+    fn an_update_keeps_the_entrys_citations_and_paths() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let citations = json!([{"path": "src/billing/tax.rs", "quote": "pub fn rate() -> f64",
+            "lines": [3, 3], "project": "p"}]);
+        std::fs::create_dir_all(&scopes.global).expect("dir");
+        super::save_raw(
+            &scopes.global,
+            &json!({"schema": 1, "entries": {"memory": {"rounding": {"id": "rounding", "kind": "memory",
+                "title": "Billing rounding", "content": "Invoice totals round half-even.",
+                "path": "project/billing", "version": 1, "citations": citations,
+                "paths": ["src/billing/**"]}}, "prompt": {}, "skill": {}, "subagent": {}},
+                "refinements": []}),
+            &test_writer(),
+        )
+        .expect("state");
+        let update = json!([{"action": "update", "kind": "memory", "id": "rounding",
+            "title": "Billing rounding", "content": "Invoice totals round half-even to the cent.",
+            "evidence": "to the cent"}]);
+        let result = apply(
+            &scopes,
+            &reviewed(&update, "user"),
+            "refine_1",
+            true,
+            None,
+            None,
+            None,
+        )
+        .expect("applied");
+        assert_eq!(
+            result.record["appliedEdits"][0]["applied"], true,
+            "{}",
+            result.record
+        );
+        let entry = &load_raw(&scopes.global)["entries"]["memory"]["rounding"];
+        assert_eq!(entry["version"], 2, "{entry}");
+        assert_eq!(entry["paths"], json!(["src/billing/**"]), "{entry}");
+        assert_eq!(entry["citations"], citations, "{entry}");
     }
 }

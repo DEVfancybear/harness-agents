@@ -1152,7 +1152,9 @@ give those lines, or leave lines out`.
 
 An update's `citations` replaces the entry's whole; `[]` or `null` clears
 them. A create that replaces the entry its name holds (`on_conflict:
-replace`) keeps only the citations it gives. A citation may sit on an entry
+replace`) keeps only the citations it gives. An update by a review,
+`/refine`, `/learn` or Deep Dream, and an accepted queue item (§19.3), cannot
+give `citations` or `paths`: the entry keeps its own. A citation may sit on an entry
 of any scope; read in another project's workspace it is not checked (§18.3),
 never called broken: those are other files.
 
