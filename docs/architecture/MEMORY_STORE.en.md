@@ -1177,9 +1177,11 @@ a diff against the entry as it is now, and accept or reject them.
   proposed it and when. The page's-words refusal is not made: the person made
   it a rule. It is recorded as a refinement, which `/refine --rollback` undoes.
 - **Reject** takes the item out and remembers the change for 90 days: its
-  kind, whether it writes or deletes, the entry it changes, its fingerprint and
-  its words. The same change proposed again - the same entry, and 60 % of its
-  words the same, or a delete of the same entry - is refused as rejected
+  kind, whether it writes or deletes, the entry it changes, its fingerprint,
+  its words and its quote. The same change proposed again - the same entry (or
+  a new one again) with 60 % of its words the same or resting on the same quote
+  (a child's proposal and the review's edit that kept it are worded apart), or a
+  delete of the same entry - is refused as rejected
   (`the person rejected the same change in the memory queue`), not queued. The
   next reviews, `/refine` and `/learn` are told the ten newest rejections
   (`<rejected_by_user>`) and asked not to propose them again unless the

@@ -1197,9 +1197,11 @@ và một diff so với entry như hiện tại, và chấp nhận hoặc từ c
   chối vì chữ của trang web không được đưa ra: người dùng đã biến nó thành
   rule. Nó được ghi như một refinement, mà `/refine --rollback` hoàn tác được.
 - **Từ chối** lấy mục ra và nhớ thay đổi đó trong 90 ngày: loại của nó, nó ghi
-  hay xoá, entry nó thay đổi, fingerprint và các từ của nó. Cùng thay đổi đó
-  được đề xuất lại - cùng entry, và 60 % số từ giống nhau, hoặc một lệnh xoá
-  cùng entry - bị từ chối vì đã bị từ chối (`the person rejected the same
+  hay xoá, entry nó thay đổi, fingerprint, các từ và câu trích của nó. Cùng
+  thay đổi đó được đề xuất lại - cùng entry (hoặc lại là một entry mới) với 60 %
+  số từ giống nhau hoặc dựa trên cùng câu trích (đề xuất của child và edit của
+  review đã giữ nó được diễn đạt khác nhau), hoặc một lệnh xoá cùng entry - bị
+  từ chối vì đã bị từ chối (`the person rejected the same
   change in the memory queue`), không vào hàng đợi. Các review, `/refine` và
   `/learn` kế tiếp được cho biết mười lần từ chối mới nhất
   (`<rejected_by_user>`) và được yêu cầu không đề xuất lại chúng trừ khi hội

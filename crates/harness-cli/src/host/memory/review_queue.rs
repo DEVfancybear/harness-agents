@@ -233,20 +233,36 @@ pub struct Rejection {
     pub target: Option<String>,
     /// The words of its title and content, folded.
     pub terms: Vec<String>,
+    /// The quote it rested on, its blanks one space and lowercase.
+    #[serde(default)]
+    pub evidence: String,
     pub title: String,
     pub content: String,
     pub at_ms: u64,
 }
 
 /// What makes two proposals the same change: the kind, whether it writes or
-/// deletes, the entry it changes, and its words.
+/// deletes, the entry it changes, and its words or the quote it rests on.
 #[derive(Clone, Debug)]
 struct Shape {
     kind: String,
-    class: &'static str,
+    class: String,
     target: Option<String>,
     terms: Vec<String>,
+    evidence: String,
     fingerprint: String,
+}
+
+/// The shortest quote two proposals share to rest on the same words: a
+/// phrase, as a review's evidence is.
+const SAME_EVIDENCE_CHARS: usize = 12;
+
+/// Text on one line, lowercase: how two changes' words are compared.
+fn squeezed(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 impl Shape {
@@ -262,56 +278,68 @@ impl Shape {
             .then(|| text("id"))
             .filter(|id| !id.is_empty());
         let terms = super::harness::query_terms(&format!("{}\n{}", text("title"), text("content")));
-        let squeeze = |text: String| {
-            text.split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_lowercase()
-        };
+        let evidence = squeezed(text("evidence").trim_matches(|character: char| {
+            matches!(character, '"' | '\'' | '`' | '\u{201c}' | '\u{201d}')
+        }));
         let digest = Sha256::digest(
             format!(
                 "{}|{class}|{}|{}|{}|{}",
                 text("kind"),
                 target.as_deref().unwrap_or_default(),
-                squeeze(text("path")),
-                squeeze(text("title")),
-                squeeze(text("content"))
+                squeezed(&text("path")),
+                squeezed(&text("title")),
+                squeezed(&text("content"))
             )
             .as_bytes(),
         );
         Self {
             kind: text("kind"),
-            class,
+            class: class.to_owned(),
             target,
             terms,
+            evidence,
             fingerprint: hex(&digest[..8]),
         }
     }
 
-    /// Whether `self` and a change of `kind`, `class`, `target` and `terms`
-    /// (or `fingerprint`) are the same change: a delete of the same entry, or
-    /// a write of the same entry (or a new one) whose words are mostly the
-    /// same.
-    fn same(
-        &self,
-        kind: &str,
-        class: &str,
-        target: Option<&str>,
-        terms: &[String],
-        fingerprint: &str,
-    ) -> bool {
-        if self.kind != kind || self.class != class || self.target.as_deref() != target {
+    fn of_rejection(rejection: &Rejection) -> Self {
+        Self {
+            kind: rejection.kind.clone(),
+            class: rejection.class.clone(),
+            target: rejection.target.clone(),
+            terms: rejection.terms.clone(),
+            evidence: rejection.evidence.clone(),
+            fingerprint: rejection.fingerprint.clone(),
+        }
+    }
+
+    /// Whether `self` and `other` are the same change: of the same kind,
+    /// both writes or both deletes, of the same entry (or both new), and a
+    /// delete, the same fingerprint, a quote of the same words (one holding
+    /// the other, a phrase long), or mostly the same words. A child's
+    /// proposal and the review's edit that kept it are worded apart, and
+    /// rest on the same quote.
+    fn same(&self, other: &Self) -> bool {
+        if self.kind != other.kind || self.class != other.class || self.target != other.target {
             return false;
         }
-        if self.fingerprint == fingerprint || class == "delete" {
+        if self.fingerprint == other.fingerprint || self.class == "delete" {
+            return true;
+        }
+        let (short, long) = if self.evidence.len() <= other.evidence.len() {
+            (&self.evidence, &other.evidence)
+        } else {
+            (&other.evidence, &self.evidence)
+        };
+        if short.chars().count() >= SAME_EVIDENCE_CHARS && long.contains(short.as_str()) {
             return true;
         }
         let shared = self
             .terms
             .iter()
-            .filter(|term| terms.contains(term))
+            .filter(|term| other.terms.contains(term))
             .count();
-        let all = self.terms.len() + terms.len() - shared;
+        let all = self.terms.len() + other.terms.len() - shared;
         #[allow(clippy::cast_precision_loss, reason = "a few hundred words at most")]
         let share = if all == 0 {
             1.0
@@ -322,24 +350,11 @@ impl Shape {
     }
 
     fn same_as_item(&self, item: &Item) -> bool {
-        let other = Self::of(&item.edit);
-        self.same(
-            &other.kind,
-            other.class,
-            other.target.as_deref(),
-            &other.terms,
-            &other.fingerprint,
-        )
+        self.same(&Self::of(&item.edit))
     }
 
     fn same_as_rejection(&self, rejection: &Rejection) -> bool {
-        self.same(
-            &rejection.kind,
-            &rejection.class,
-            rejection.target.as_deref(),
-            &rejection.terms,
-            &rejection.fingerprint,
-        )
+        self.same(&Self::of_rejection(rejection))
     }
 }
 
@@ -619,9 +634,10 @@ pub fn reject(dir: &Path, id: &str) -> Result<(Item, Vec<String>), String> {
     queue.rejected.push(Rejection {
         fingerprint: shape.fingerprint,
         kind: shape.kind,
-        class: shape.class.to_owned(),
+        class: shape.class,
         target: shape.target,
         terms: shape.terms,
+        evidence: shape.evidence,
         title: clip(item.text("title"), 120),
         content: clip(item.text("content"), REJECTED_CONTENT_CHARS),
         at_ms: now_ms(),
@@ -1092,6 +1108,36 @@ mod tests {
         let (_, dropped) = reject(dir.path(), &survivor.id).expect("reject");
         assert_eq!(dropped, vec![merged.id]);
         assert!(waiting(dir.path()).is_empty());
+    }
+
+    /// A child's proposal worded in its language and the review's edit that
+    /// kept it in another rest on the same quote: rejecting one keeps the
+    /// other out too.
+    #[test]
+    fn a_change_resting_on_a_rejected_quote_is_the_same_change() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut review = edit(
+            "create",
+            "deploy-window",
+            "Deploy window",
+            "The project deploys in the quartz-lynx-608 window (ops/deploy.ini)",
+        );
+        review["evidence"] = json!("deploy_window = quartz-lynx-608");
+        let Offered::Queued(id) = offer(dir.path(), item(review)).expect("offer") else {
+            panic!("queued");
+        };
+        reject(dir.path(), &id).expect("reject");
+        let mut child = edit(
+            "create",
+            "khung-gio-deploy",
+            "Khung giờ deploy",
+            "Khung giờ deploy của project là quartz-lynx-608",
+        );
+        child["evidence"] = json!("\"deploy_window = quartz-lynx-608\"");
+        assert!(matches!(
+            offer(dir.path(), item(child)).expect("offer"),
+            Offered::Rejected(_)
+        ));
     }
 
     #[test]
