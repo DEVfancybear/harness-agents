@@ -911,3 +911,19 @@ Memory phải đáng giá chỗ nó chiếm, nên phải đo được: một cô
 
   Object JSON, và với `stream-json` là event `run.terminal`, được ghi ra khi các lượt đó đã xong, nên `upkeep_usage` có tính chúng; lần chạy dạng text vẫn in câu trả lời trước. Các event `usage` của stream có thêm `cache_read_tokens` và `cache_write_tokens` bên cạnh token prompt và completion.
 - **Đo nó.** Bộ live test `memory-ab.sh` dạy một project vài sự thật, rồi chạy cùng các task từ cùng một snapshot với memory bật, tắt và (với `ABLATE=1`) từng tính năng tắt riêng, và ghi một bảng về tỉ lệ thành công, token, số lần gọi và thời gian so với khi tắt memory ([live test](../../scripts/testing/live-tests/README.md)).
+
+### 12.21. Memory trích dẫn code, và memory chỉ dành cho một số file
+
+Chi tiết ở [Kho memory](../architecture/MEMORY_STORE.vi.md) §18.
+
+- **Trích dẫn.** `write` của `memory` nhận `citations: [{path, quote, lines?}]` (tối đa 5): một file của workspace, tính từ gốc của nó, và một đoạn ngắn code mà sự thật dựa vào, chép đúng từng chữ (không kể khoảng trắng, ít nhất 8 ký tự), kèm các dòng nơi nó nằm nếu muốn. ha kiểm tra từng trích dẫn trước lần ghi và từ chối trích dẫn không đúng, kèm lý do; nó giữ các dòng nơi tìm thấy quote. `citations` của một lần cập nhật thay toàn bộ, `[]` xoá chúng. ha không tự gắn trích dẫn: lần ghi có chữ đến từ một lần đọc file mà không đưa trích dẫn nào được chỉ cách thêm (`cite`).
+- **Kiểm tra ở mọi lần đọc.** Digest, `search` và `read` kiểm tra từng trích dẫn với file như hiện tại: `holds`, `moved` (có dòng chèn phía trên: các dòng của nó đi theo code), `broken` (file hoặc đoạn code được trích không còn) hoặc `unchecked` (file lớn hơn 1 MiB, trích dẫn của project khác, ngân sách đọc 4 MiB đã hết). Kết quả search và read mang `citations`, `citations_state` và, khi hỏng, `citations_note`. Digest đánh dấu entry có trích dẫn còn đúng bằng `[cites <path>:<line>]` và entry có trích dẫn hỏng bằng `[its cited code changed since: ...; check the code before relying on it, then update or supersede the entry]`. Lần kiểm tra không tạo phiên bản mới của entry: kết quả gần nhất được giữ trong meta của kho. `ha doctor` đếm các entry trích dẫn code và bao nhiêu trong số đó đang hỏng.
+- **Memory chỉ dành cho một số file.** `write` của `memory` nhận `paths: [glob, ...]` (tối đa 16): glob kiểu gitignore, tính từ gốc workspace (`src/billing/**`, `*.sql`, `docs/api`). Entry như vậy không nằm trong digest của mọi lượt; nó đi kèm kết quả của lần gọi file tool đầu tiên trong hội thoại đọc, sửa, ghi hoặc liệt kê một file khớp, hoặc có kết quả search khớp một file như vậy, thành một phần sau nội dung kết quả, mỗi hội thoại một lần, và lần nữa sau một lần compact. Search vẫn tìm thấy nó, và truy vấn có nêu một đường dẫn (`src/billing/invoice.rs`, `invoice.rs`) đưa các entry dành cho đường dẫn đó lên trước. `ha doctor` đếm chúng. Một file của kho markdown có `paths:` trong frontmatter được nạp cùng cách, và `ha memory lint` kiểm tra các glob của nó ([Kho memory dạng markdown](../architecture/MARKDOWN_MEMORY.vi.md) §9).
+- **Công tắc.** `HA_MEMORY_OFF` (và `off` của setting `memory`) nhận thêm hai tính năng, cho ablation; `/context` và `ha doctor` nêu tên chúng khi chúng bị tắt:
+
+  | tính năng | tắt những gì |
+  |---|---|
+  | `citations` | việc kiểm tra và hiển thị trích dẫn (digest, search, read, bản ghi meta); lần ghi có `citations` bị từ chối và tool không đưa ra tham số đó |
+  | `scoped` | memory dành cho một số file: việc nạp nó cùng kết quả, tool `memory` liệt kê, search hay read nó, việc ghi `paths` (bị từ chối, không được đưa ra), và các file của kho markdown có `paths:` |
+
+  `memory-ab.sh` đo chúng bằng các tác vụ `retries` (một sự thật có trích dẫn đã cũ) và `ledger` (một rule billing dành cho `app/billing/**`).

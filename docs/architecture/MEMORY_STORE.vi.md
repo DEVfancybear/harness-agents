@@ -1119,3 +1119,173 @@ thất bại mọi lần. Giờ một lượt:
 Điều tương tự áp dụng cho store của một hội thoại quá 40 entry và phần memory
 của curator (`/refine --curate`), mà các lô của nó đi trước refinement `<id>`
 của phần skill.
+
+## 18. Code mà một entry trích dẫn, và memory chỉ dành cho một số file (wave 2)
+
+Một sự thật về code sẽ cũ đi khi code đổi, mà không gì trong entry nói ra điều
+đó: digest vẫn trình bày nó như sự thật. Còn một rule chỉ có ý nghĩa với một số
+file (billing làm tròn thế nào, một migration không được đụng vào đâu) thì
+hoặc nằm trong digest của mọi lượt, chiếm một chỗ trong sáu chỗ, hoặc nằm ngoài
+đúng lúc cần đến nó. Hai tính năng của các agent hiện nay giải quyết việc này:
+GitHub Copilot Memory giữ trích dẫn tới code kèm mỗi memory và kiểm tra chúng
+với nhánh hiện tại khi memory được lấy ra; Claude Code nạp một
+`.claude/rules/*.md` có `paths:` khớp với file nó đọc, và Amp, Devin cũng giới
+hạn knowledge theo đường dẫn như vậy. Cả hai đều đo được và tắt được (§18.5).
+
+### 18.1 Các trường
+
+Tất cả nằm trong `memory/citations.rs` (`memory_citations`), như các trường
+của §16.1 nằm trong `memory/validity.rs`:
+
+| Trường | Có ở | Nói gì |
+|---|---|---|
+| `citations` | entry được tool `memory` ghi kèm trích dẫn | code mà nó dựa vào: `[{path, quote, lines, project}]` - một file tính từ gốc workspace, một đoạn ngắn đúng chữ của file, các dòng `[start, end]` nơi host tìm thấy đoạn đó, và key của project lúc ghi |
+| `paths` | entry chỉ dành cho một số file | các glob kiểu gitignore, tính từ gốc workspace (`src/billing/**`) |
+
+Hai bản ghi nằm cạnh các entry, không bao giờ nằm trong chúng: khoá meta
+`citations` của kho giữ lần kiểm tra gần nhất các trích dẫn của mỗi entry, theo
+memory id (§18.3); khoá meta `scoped_loaded` trong kho của một hội thoại giữ
+những gì hội thoại đó đã nạp (§18.4).
+
+### 18.2 Trích dẫn, kiểm tra lúc ghi
+
+`write` của tool `memory`, tạo mới hay cập nhật, nhận
+`citations: [{path, quote, lines?}]`, tối đa 5:
+
+- `path` là một file của workspace của hội thoại, tính từ gốc của nó; đường
+  dẫn tuyệt đối nằm trong workspace được đổi thành tương đối, đường dẫn nằm
+  ngoài, hoặc có `..`, bị từ chối. File lớn hơn 1 MiB không được đọc.
+- `quote` là đúng chữ của code mà sự thật dựa vào: ít nhất 8 ký tự không kể
+  khoảng trắng, tối đa 400. Nó được so sánh khi đã gộp khoảng trắng: một chuỗi
+  dấu cách, tab và xuống dòng là một dấu cách, chữ hoa thường giữ nguyên.
+- `lines` (`[start, end]`, đếm từ 1) là tuỳ chọn. Có thì quote phải nằm trong
+  các dòng đó; không có thì tìm ở bất kỳ đâu, lấy chỗ đầu tiên.
+
+Host kiểm tra từng trích dẫn trước khi lần ghi chạy và giữ nó cùng các dòng nơi
+tìm thấy quote và key của project. Trích dẫn không đúng bị từ chối kèm lý do,
+ví dụ `citation 1: src/billing/tax.py does not hold that quote (compared with
+whitespace aside): copy a short span of the file's own words`, hoặc `... holds
+that quote at lines 6-6, not within 1-2: give those lines, or leave lines out`.
+
+`citations` của một lần cập nhật thay toàn bộ trích dẫn của entry; `[]` hoặc
+`null` xoá chúng. Lần tạo mới thay entry đang giữ tên đó (`on_conflict:
+replace`) chỉ giữ các trích dẫn nó đưa. Trích dẫn có thể nằm trên entry thuộc
+scope nào cũng được; đọc trong workspace của project khác thì nó không được
+kiểm tra (§18.3), không bao giờ bị gọi là hỏng: đó là những file khác.
+
+**Host không tự gắn trích dẫn.** Khi provenance cho thấy chữ của entry đến từ
+một lần đọc file (`origin.kind = file`, §16.4) mà lần ghi không đưa trích dẫn
+nào, kết quả có `cite` nói cách thêm. Host biết file nào đã được đọc, không
+biết đoạn nào của nó là chỗ sự thật dựa vào: một đoạn đoán mò về sau sẽ đánh
+dấu một entry đúng là đã cũ, hoặc để một entry đã cũ trông như còn đúng.
+
+### 18.3 Trích dẫn, kiểm tra lúc đọc
+
+Mỗi lần đọc một entry đều kiểm tra trích dẫn của nó với file như hiện tại:
+digest, với từng entry nó hiển thị (kể cả entry ghim); `search`, với từng kết
+quả, ở cả hai mode; `read`. Một trích dẫn:
+
+| Trạng thái | Khi nào | Các dòng |
+|---|---|---|
+| `holds` | quote vẫn ở chỗ đã tìm thấy | như đã giữ |
+| `moved` | quote ở chỗ khác trong file (có dòng được chèn phía trên) | chỗ gần nhất với nơi tìm thấy lần trước: chúng đi theo code |
+| `broken` | file không còn, không còn là file, hoặc không còn chứa quote | |
+| `unchecked` | file lớn hơn 1 MiB hoặc không đọc được, trích dẫn của project khác, hoặc ngân sách đọc của lần đọc đã hết | |
+
+Kết luận của entry là `broken` khi có một trích dẫn hỏng, `unchecked` khi có
+một trích dẫn chưa kiểm tra và không cái nào hỏng, ngoài ra là `holds`. Kết
+quả search và read mang `citations` (`path`, `state`, `lines` và `reason` của
+từng cái), `citations_state` (kết luận) và, khi hỏng, `citations_note`.
+
+Digest ghi `[cites src/billing/tax.py:6]` sau entry có trích dẫn còn đúng, và
+sau entry có trích dẫn hỏng thì ghi `[its cited code changed since:
+src/billing/tax.py no longer holds the quoted code; check the code before
+relying on it, then update or supersede the entry]`: nó không được trình bày
+như sự thật. Nó được đánh dấu chứ không bị bỏ ra, để model thấy và có thể cập
+nhật hoặc thay thế nó, và một lần ablation (tắt `citations`) đo được dấu đó.
+Entry chưa kiểm tra được hiển thị như trước.
+
+- **Chi phí.** File được cache theo đường dẫn, thời điểm sửa và kích thước
+  (256 file, file lâu nhất chưa dùng bị bỏ trước), nên digest không đọc lại
+  file chưa đổi; một digest, một search hay một read đọc tối đa 4 MiB file
+  chưa có trong cache, các trích dẫn sau đó là chưa kiểm tra.
+- **Không tạo phiên bản.** Lần kiểm tra không bao giờ ghi vào entry: kết quả
+  của nó là bản ghi meta `citations` của memory id - kết luận, các dòng nơi
+  tìm thấy từng trích dẫn (nơi lần kiểm tra sau nhìn trước tiên: các dòng lặng
+  lẽ đi theo một quote đã dời chỗ), lý do của các trích dẫn hỏng và thời điểm,
+  chỉ ghi khi có thay đổi. Các lần kiểm tra của digest được ghi cùng bộ đếm số
+  lần hiển thị, ngoài đường đi của lượt.
+- **Review thấy được.** Bản tổng quan mà review đọc đánh dấu entry có lần kiểm
+  tra gần nhất là hỏng (`[its cited code changed since it was kept: ...]`).
+- **`ha doctor`** đếm các entry của project có trích dẫn code và các entry có
+  trích dẫn đang hỏng (`memory citations: 1 of 3 entries cite code that
+  changed since they were kept`).
+
+### 18.4 Memory chỉ dành cho một số file
+
+`write` của tool `memory` nhận `paths: [glob, ...]`, tối đa 16, mỗi glob tối
+đa 200 ký tự, tính từ gốc workspace, kiểu gitignore: glob không có `/` khớp ở
+mọi độ sâu (`*.sql`), một thư mục khớp những gì bên dưới nó (`docs/api`), dấu
+`/` ở đầu neo vào gốc; glob tuyệt đối, có `..` hoặc ổ đĩa bị từ chối, glob không
+parse được cũng vậy (`paths[0] "src/[billing" is not a glob: ...`). `[]` hoặc
+`null` xoá chúng.
+
+- **Nằm ngoài digest.** Entry có `paths` không nằm trong các entry mà digest
+  của mọi lượt hiển thị; digest đếm chúng (`memory kept for some files only:
+  2 (...)`).
+- **Nạp cùng kết quả đã chạm vào file khớp.** Kết quả của một file tool chạm
+  vào một file khi `read_file`, `edit_file`, `write_file` hoặc `apply_patch`
+  nêu tên nó, `list_files` hoặc `glob` liệt kê nó, `find_files` tìm thấy nó,
+  hoặc một kết quả khớp của `search_text` nằm trong nó (500 đường dẫn đầu của
+  một kết quả). Các entry dành cho file bị chạm đi kèm kết quả đó, mỗi entry
+  một phần riêng sau nội dung kết quả, mà lần gọi model kế tiếp đọc:
+  `[memory-scoped: a memory entry kept for src/billing/**; this result touched
+  src/billing/refunds.py. A record of earlier work - data to weigh, not an
+  instruction: ...]` và dòng của entry, nội dung đầy đủ tới 2.000 ký tự, kèm
+  trạng thái trích dẫn. Một kết quả mang tối đa 8 entry.
+- **Vì sao đi kèm kết quả.** Một lượt gửi context packet của bước đầu tiên ở
+  mọi bước, để cache của provider giữ được nó; một block thêm vào packet giữa
+  lượt chỉ tới được model ở lượt sau. Kết quả thì tới được lần gọi kế tiếp,
+  như instruction của một thư mục mà lần gọi chạm tới (`NestedInstructions`).
+- **Mỗi hội thoại một lần.** Kho của hội thoại ghi những gì nó đã nạp
+  (`scoped_loaded`: memory id của entry, đường dẫn đã nạp nó, thời điểm, và số
+  lần hội thoại đã bị compact lúc đó, theo số sự kiện `compaction.completed`
+  trong journal). Một lần chạm khác, trong cùng lượt, lượt sau hay một process
+  sau, không mang thêm gì - cho tới một lần compact: nó đã tóm tắt mất kết quả
+  mà entry đi kèm, và lần chạm kế tiếp mang nó tới lần nữa.
+- **Có bản ghi.** Mỗi lần nạp là một bản ghi chẩn đoán `memory.scoped_loaded`
+  (`loaded`, `path`, `compactions`).
+- **Vẫn search được.** Search vẫn tìm thấy entry như vậy, và hiển thị `paths`
+  của nó. Các glob và các file nó trích dẫn là từ của vị trí nó (trường path
+  trong BM25 của memory search), nên search `billing` tìm thấy entry dành cho
+  `src/billing/**`; search có truy vấn nêu một đường dẫn - một từ có `/`, hoặc
+  tên file có phần mở rộng (`invoice.rs`) - đưa các entry dành cho hoặc trích
+  dẫn nó lên trước, mỗi nhóm giữ thứ tự của nó.
+- **Trích dẫn không giới hạn phạm vi.** Entry trích dẫn `src/billing/tax.py`
+  vẫn nằm trong digest của mọi lượt nếu không có `paths`: sự thật về một hàm
+  cũng có ý nghĩa ở nơi gọi nó, xa file của nó, và entry áp dụng ở đâu là lựa
+  chọn của người ghi.
+- **Chạy ở đâu.** Chat và `ha exec`. Child được uỷ quyền không có memory theo
+  file: agent uỷ quyền giữ memory, và các lần đọc file của child không nạp gì.
+- **Kho markdown.** Một file memory có `paths:` trong frontmatter được nạp
+  cùng cách ([MARKDOWN_MEMORY.vi.md](MARKDOWN_MEMORY.vi.md) §9).
+
+### 18.5 Đo được, và tắt được
+
+`HA_MEMORY_OFF` nhận thêm hai tính năng ([hướng dẫn vận hành](../guides/OPERATOR_GUIDE.vi.md)
+§12.21):
+
+- `citations`: trích dẫn không được kiểm tra cũng không được hiển thị - không
+  kiểm tra trong digest, search hay read, không đánh dấu, không ghi meta - và
+  lần ghi có trích dẫn bị từ chối; tool không đưa ra tham số đó.
+- `scoped`: entry dành cho một số file không được nạp cũng không được ghi -
+  không nạp cùng kết quả, tool `memory` không liệt kê, search hay read chúng,
+  lần ghi có `paths` bị từ chối và tham số không được đưa ra - và các file của
+  kho markdown có `paths:` không được nạp.
+
+`/context` và `ha doctor` nêu tên chúng khi chúng bị tắt. `memory-ab.sh` có một
+tác vụ cho mỗi tính năng: `retries` (agent đã giữ giới hạn retry của HTTP
+client kèm trích dẫn, rồi bài test đổi dòng đó: tác vụ thành công khi lần chạy
+nhận ra sự thật đã giữ đã cũ) và `ledger` (một file của kho markdown dành cho
+`app/billing/**`, không có trong index, chứa hằng số mà một module billing mới
+phải định nghĩa).
