@@ -5649,6 +5649,7 @@ impl SessionPort for AgentSessionService {
             other_stores: super::adoption::other_stores_of(&self.data_dir, &self.workspace_root),
             sleep: super::sleep::summary(&self.data_dir),
             memory: super::memory_switch::Switch::load(&self.config_file, &self.environment),
+            citations: super::memory_citations::count(&self.data_dir, &self.workspace_root),
         };
         let subsystems = super::doctor::audit(
             &self.global_config_dir,
@@ -9485,6 +9486,7 @@ async fn run_turn(
                 super::memory::MemoryHost::new(&data_dir, task_id.as_str())
                     .with_project(&workspace_root)
                     .with_refinements(digest_on)
+                    .with_switch(&memory_switch)
                     .readonly(),
             ),
             context: {
@@ -9674,6 +9676,16 @@ async fn run_turn(
     // ha's configuration and state decide what the agent may do; no command
     // changes them (`docs/architecture/GUARDS.en.md`).
     harness_tools::protect_host_dirs(vec![global_config_dir.clone(), data_dir.clone()]);
+    // Memory kept for some files comes with the result of the first tool
+    // call that touches one of them, once per conversation.
+    let scoped_memory = Arc::new(super::memory_scoped::ScopedMemory::new(
+        &data_dir,
+        task_id.as_str(),
+        &workspace_root,
+        Some(super::bootstrap::project_key_of(&workspace_root)),
+        &memory_switch,
+        refinements,
+    ));
     let mut tools = ToolExecutionService::new(Arc::clone(&store))
         .with_hashline(hashline)
         .with_policy(tool_policy)
@@ -9684,7 +9696,8 @@ async fn run_turn(
             &caller_dir,
             task_id.as_str(),
             nested_instructions,
-        )));
+        )))
+        .with_result_context(scoped_memory);
     if let Some(decisions) = &jev_decisions {
         tools = tools.with_guard(Arc::clone(decisions) as Arc<dyn harness_tools::ToolGuard>);
     }
@@ -9702,7 +9715,8 @@ async fn run_turn(
     // while harness refinements and the digest are on.
     let memory_host = super::memory::MemoryHost::new(&data_dir, task_id.as_str())
         .with_project(&workspace_root)
-        .with_refinements(digest_on);
+        .with_refinements(digest_on)
+        .with_switch(&memory_switch);
     // The jev plugin, when `/jev on` turned it on.
     let jev_host = super::jev::JevHost::from_settings(&environment, &data_dir, &config_file);
     tools = tools.with_external(super::jev::with_dispatcher(
@@ -10192,7 +10206,7 @@ async fn run_turn(
     // With harness refinements or the digest off, no saved entry reaches the
     // model, and the store is not opened.
     if digest_on {
-        let harness_state = super::harness::merge(
+        let mut harness_state = super::harness::merge(
             super::harness::for_project(
                 super::harness::load(&super::harness::global_dir(&data_dir), "global"),
                 memory_host.project_key(),
@@ -10202,6 +10216,8 @@ async fn run_turn(
                 "local",
             ),
         );
+        // The code the shown entries cite is checked as they are shown.
+        super::memory_citations::for_digest(&mut harness_state, &workspace_root, &memory_switch);
         let digest = super::harness::render_digest(
             &harness_state,
             super::harness::DigestOptions {

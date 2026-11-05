@@ -51,11 +51,17 @@ pub enum Feature {
     EarlierState,
     /// The knowledge library: its catalog in a turn and the `knowledge` tool.
     Knowledge,
+    /// The code an entry cites: checked at write and whenever it is read,
+    /// and shown with its state (`memory_citations`).
+    Citations,
+    /// Memory kept for some files only (`paths`): loaded when a conversation
+    /// touches a matching file, and written (`memory_scoped`).
+    Scoped,
 }
 
 impl Feature {
     /// Every feature, in the order they are listed.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Digest,
         Self::Markdown,
         Self::SessionLog,
@@ -63,6 +69,8 @@ impl Feature {
         Self::Reviews,
         Self::EarlierState,
         Self::Knowledge,
+        Self::Citations,
+        Self::Scoped,
     ];
 
     /// The name `HA_MEMORY_OFF` and the setting take.
@@ -76,6 +84,8 @@ impl Feature {
             Self::Reviews => "reviews",
             Self::EarlierState => "earlier_state",
             Self::Knowledge => "knowledge",
+            Self::Citations => "citations",
+            Self::Scoped => "scoped",
         }
     }
 
@@ -312,6 +322,15 @@ mod tests {
         assert!(!switch.on(Feature::Digest));
         assert!(!switch.on(Feature::SessionLog));
         assert!(!switch.on(Feature::Knowledge));
+        // Citations and memory kept for some files are measured the same way.
+        let switch = Switch::from_values(None, Some("citations,scoped"), None);
+        assert!(!switch.on(Feature::Citations) && !switch.on(Feature::Scoped));
+        assert!(switch.on(Feature::Digest));
+        assert_eq!(
+            switch.summary(),
+            "on except citations, scoped (HA_MEMORY_OFF)"
+        );
+        let switch = Switch::from_values(None, Some("digest, session-log;knowledge"), None);
         assert!(switch.on(Feature::Markdown));
         assert!(switch.on(Feature::Reviews));
         assert_eq!(switch.off_names(), ["digest", "session_log", "knowledge"]);
