@@ -1239,7 +1239,9 @@ one with `..` or a drive is refused, and so is one that does not parse
   journal's `compaction.completed` events count). Another touch, in the same
   turn, a later one or a later process, brings nothing more - until a
   compaction: it summarized away the result the entry came with, and the
-  next touch brings it again.
+  next touch brings it again. With harness refinements or the `digest` off
+  the store is not opened: none of its entries loads, and what a markdown
+  store's file loaded is recorded in the running process only.
 - **Recorded.** Each load is a `memory.scoped_loaded` diagnostics record
   (`loaded`, `path`, `compactions`).
 - **Searched.** Search still finds such an entry, and shows its `paths`. Its

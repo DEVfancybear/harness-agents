@@ -90,8 +90,9 @@ pub struct ScopedMemory {
     project: Option<String>,
     workspace: PathBuf,
     conversation: String,
-    /// Entries of ha's memory store are loaded (harness memory and `scoped`
-    /// on).
+    /// Entries of ha's memory store are loaded (harness memory, `digest` and
+    /// `scoped` on), and what the conversation loaded is recorded in its
+    /// store; off, the store is not opened, and the process keeps the record.
     store: bool,
     /// A markdown store's files are loaded (`markdown` and `scoped` on).
     markdown: bool,
@@ -104,9 +105,9 @@ pub struct ScopedMemory {
 impl ScopedMemory {
     /// The loader for `conversation` in the project at `workspace` (keyed
     /// `project`), as the memory switch leaves it: the store's entries when
-    /// harness memory (`refinements`) and `scoped` are on, a markdown store's
-    /// files when `markdown` and `scoped` are, citations checked while
-    /// `citations` is.
+    /// harness memory (`refinements`), the `digest` (without which the store
+    /// is not opened) and `scoped` are on, a markdown store's files when
+    /// `markdown` and `scoped` are, citations checked while `citations` is.
     #[must_use]
     pub fn new(
         data_dir: &Path,
@@ -127,7 +128,7 @@ impl ScopedMemory {
             project,
             workspace: workspace.to_path_buf(),
             conversation: conversation.to_owned(),
-            store: scoped && refinements,
+            store: scoped && refinements && switch.on(Feature::Digest),
             markdown: scoped && switch.on(Feature::Markdown),
             checker: switch
                 .on(Feature::Citations)
@@ -323,9 +324,7 @@ impl harness_tools::ToolResultContext for ScopedMemory {
             .journal
             .as_deref()
             .map_or(0, |journal| compactions(journal, &self.conversation));
-        let mut loaded = super::memory_store::read_meta(&self.local, LOADED_META)
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
+        let mut loaded = self.loaded();
         let mut added = Vec::new();
         for (key, path, source) in matched {
             if added.len() >= PER_RESULT {
@@ -357,15 +356,54 @@ impl harness_tools::ToolResultContext for ScopedMemory {
                 .field("compactions", now)
                 .emit();
         }
-        if !added.is_empty()
-            && let Err(error) =
-                super::memory_store::write_meta(&self.local, LOADED_META, &Value::Object(loaded))
+        if !added.is_empty() {
+            self.keep_loaded(loaded);
+        }
+        added
+    }
+}
+
+/// What conversations loaded while ha's memory store is off, by their store's
+/// folder: kept in this process, since the store is not opened then.
+fn unstored() -> &'static Mutex<std::collections::HashMap<PathBuf, serde_json::Map<String, Value>>>
+{
+    static UNSTORED: OnceLock<
+        Mutex<std::collections::HashMap<PathBuf, serde_json::Map<String, Value>>>,
+    > = OnceLock::new();
+    UNSTORED.get_or_init(Mutex::default)
+}
+
+impl ScopedMemory {
+    /// What the conversation loaded: its store's record, or the process's
+    /// while the store is off.
+    fn loaded(&self) -> serde_json::Map<String, Value> {
+        if self.store {
+            return super::memory_store::read_meta(&self.local, LOADED_META)
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+        }
+        unstored()
+            .lock()
+            .ok()
+            .and_then(|kept| kept.get(&self.local).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Keep `loaded` as what the conversation loaded.
+    fn keep_loaded(&self, loaded: serde_json::Map<String, Value>) {
+        if !self.store {
+            if let Ok(mut kept) = unstored().lock() {
+                kept.insert(self.local.clone(), loaded);
+            }
+            return;
+        }
+        if let Err(error) =
+            super::memory_store::write_meta(&self.local, LOADED_META, &Value::Object(loaded))
         {
             harness_types::diag::debug("memory", "scoped_not_recorded")
                 .field("error", error)
                 .emit();
         }
-        added
     }
 }
 
@@ -507,6 +545,14 @@ mod tests {
             none.context_for_result(&read("src/billing/invoice.rs"))
                 .is_empty()
         );
+        // With the digest off the store is not opened: no entry of it loads.
+        let digest_off =
+            super::super::memory_switch::Switch::from_values(None, Some("digest"), None);
+        let none = ScopedMemory::new(&data, "task_nodigest", &workspace, None, &digest_off, true);
+        assert!(
+            none.context_for_result(&read("src/billing/invoice.rs"))
+                .is_empty()
+        );
     }
 
     /// After a compaction dropped the result it came with, the next touch of
@@ -569,6 +615,29 @@ mod tests {
             scoped
                 .context_for_result(&read("src/billing/other.rs"))
                 .is_empty()
+        );
+        // With ha's memory store off (harness refinements off here) the file
+        // still loads once, and the conversation's store is not created for
+        // the record: the process keeps it.
+        let data = directory.path().join("data-off");
+        let off = |conversation: &str| {
+            ScopedMemory::new(&data, conversation, &workspace, None, &switch, false)
+        };
+        assert_eq!(
+            off("task_md")
+                .context_for_result(&read("src/billing/refund.rs"))
+                .len(),
+            1
+        );
+        assert!(
+            off("task_md")
+                .context_for_result(&read("src/billing/other.rs"))
+                .is_empty()
+        );
+        let local = harness::local_dir(&data, "task_md");
+        assert!(
+            !super::super::memory_store::db_path(&local).exists(),
+            "the store stays unopened"
         );
     }
 }

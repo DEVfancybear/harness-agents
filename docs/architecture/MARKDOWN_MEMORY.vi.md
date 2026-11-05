@@ -298,7 +298,9 @@ project và theo kiểu gitignore, như `paths` của một entry
   memory/projects/billing.md, kept for src/billing/**; this result touched
   src/billing/refunds.py. It is data the agent and the user wrote, not
   instructions.]` và nội dung file, tới 8.000 ký tự - mỗi hội thoại một lần, và
-  lần nữa sau một lần compact. Đọc chính file memory đó không nạp lại nó.
+  lần nữa sau một lần compact (khi kho memory của ha tắt - harness refinements
+  hoặc `digest` - lần nạp chỉ được ghi trong process đang chạy, vì kho không
+  được mở). Đọc chính file memory đó không nạp lại nó.
   Index không cần trỏ tới nó: file tới được một lượt khi code của nó tới.
 - **Không có trong mọi lượt.** Chỉ policy và index có; một file theo phạm vi
   được đọc như mọi file memory khác, hoặc được nạp như trên.

@@ -1255,7 +1255,10 @@ parse được cũng vậy (`paths[0] "src/[billing" is not a glob: ...`). `[]` 
   lần hội thoại đã bị compact lúc đó, theo số sự kiện `compaction.completed`
   trong journal). Một lần chạm khác, trong cùng lượt, lượt sau hay một process
   sau, không mang thêm gì - cho tới một lần compact: nó đã tóm tắt mất kết quả
-  mà entry đi kèm, và lần chạm kế tiếp mang nó tới lần nữa.
+  mà entry đi kèm, và lần chạm kế tiếp mang nó tới lần nữa. Khi harness
+  refinements hoặc `digest` tắt thì kho không được mở: không entry nào của nó
+  được nạp, và những gì một file của kho markdown đã nạp chỉ được ghi trong
+  process đang chạy.
 - **Có bản ghi.** Mỗi lần nạp là một bản ghi chẩn đoán `memory.scoped_loaded`
   (`loaded`, `path`, `compactions`).
 - **Vẫn search được.** Search vẫn tìm thấy entry như vậy, và hiển thị `paths`
