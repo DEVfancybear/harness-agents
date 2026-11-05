@@ -474,9 +474,20 @@ fn memory_switch(facts: &Facts, subsystem: &mut Subsystem) {
 }
 
 /// The memory changes a review left to the person: how many wait, and how
-/// many a delegated child proposed. Nothing is said of an empty queue.
+/// many a delegated child proposed, and a queue that cannot be read. Nothing
+/// is said of an empty queue.
 fn memory_queue(facts: &Facts, subsystem: &mut Subsystem) {
     let queue = facts.memory_queue;
+    if queue.unreadable > 0 {
+        subsystem.short(
+            Level::Fail,
+            format!(
+                "{} memory queue file(s) cannot be read: what waited there is not listed, and a change that would wait there is not applied",
+                queue.unreadable
+            ),
+            "`ha memory queue` names the file and why; fix the JSON, or move it aside",
+        );
+    }
     if queue.waiting == 0 {
         return;
     }
@@ -925,6 +936,29 @@ mod tests {
             audited(&facts).contains("! memory is on except knowledge (HA_MEMORY_OFF)"),
             "{}",
             audited(&facts)
+        );
+    }
+
+    /// A memory queue that cannot be read is named: what waited in it is
+    /// not listed, and no change waits until it is fixed.
+    #[test]
+    fn an_unreadable_memory_queue_is_named() {
+        let root = tempfile::tempdir().expect("root");
+        let facts = Facts {
+            memory_queue: crate::interactive::memory_queue::Counts {
+                unreadable: 1,
+                ..Default::default()
+            },
+            ..Facts::default()
+        };
+        let text = lines(
+            root.path(),
+            &audit(&std::path::PathBuf::new(), root.path(), root.path(), &facts),
+        )
+        .join("\n");
+        assert!(
+            text.contains("1 memory queue file(s) cannot be read"),
+            "{text}"
         );
     }
 }

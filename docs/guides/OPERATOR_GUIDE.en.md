@@ -940,7 +940,8 @@ Memory has to earn its place, so it can be measured: one switch turns it off, wh
   - `show <id>` adds its evidence and a diff against the entry as it is now;
   - `accept <id>` applies it through the review's own write path, with its checks, as yours (`origin.kind` `user`); a change whose entry changed since it was proposed is refused as stale and leaves the queue; `/refine --rollback <refinement>` undoes an accept;
   - `reject <id>` keeps it out: the same change is not queued again, and the next reviews are told what you rejected.
-  - The command exits 1 when an id is not waiting or an accept was refused.
+  - The command exits 1 when an id is not waiting or an accept was refused, and `list` exits 1 while a queue file cannot be read.
 - **An item waits 30 days**, then expires.
+- **A queue file that cannot be read** (`memory_queue.json` that is not valid JSON) is said to be unreadable, not empty, and is never written over: `ha memory queue` names it, `ha doctor` fails on it, and a change that would wait there is not applied either (the refinement says why). Fix the JSON or move the file aside.
 - **Where it shows.** After the review that queued changes the app says once how many wait (`memory: 1 proposed change waits for your review ...`); `ha exec` prints it with the review's lines. `ha doctor` warns while changes wait, `/context` has a `Memory queue:` line, and the bug report counts them.
 - **A child proposes, never writes.** `note_finding` takes an optional `propose` (`title`, `path`, `scope` global or local, `content`): the parent's review keeps the proposal as its own edit when it lasts, else it waits in the queue as the child's (`origin.kind` `child`). The child's instructions and the tool say so.

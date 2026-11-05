@@ -939,7 +939,8 @@ Chi tiết ở [Kho memory](../architecture/MEMORY_STORE.vi.md) §18.
   - `show <id>` thêm bằng chứng của nó và một diff so với entry như hiện tại;
   - `accept <id>` áp dụng nó qua chính đường ghi của review, với các kiểm tra của nó, như của bạn (`origin.kind` `user`); một thay đổi mà entry của nó đã đổi từ lúc được đề xuất bị từ chối vì đã cũ và rời hàng đợi; `/refine --rollback <refinement>` hoàn tác một lần chấp nhận;
   - `reject <id>` giữ nó ở ngoài: cùng thay đổi đó không vào hàng đợi lần nữa, và các review kế tiếp được cho biết bạn đã từ chối gì.
-  - Lệnh thoát với mã 1 khi một id không có trong hàng đợi hoặc một lần chấp nhận bị từ chối.
+  - Lệnh thoát với mã 1 khi một id không có trong hàng đợi hoặc một lần chấp nhận bị từ chối, và `list` thoát với mã 1 khi có một file hàng đợi không đọc được.
 - **Một mục chờ 30 ngày**, rồi hết hạn.
+- **Một file hàng đợi không đọc được** (`memory_queue.json` không phải JSON hợp lệ) được báo là không đọc được, không phải rỗng, và không bao giờ bị ghi đè: `ha memory queue` nêu tên nó, `ha doctor` báo lỗi, và một thay đổi lẽ ra phải chờ ở đó cũng không được áp dụng (refinement nói lý do). Sửa JSON hoặc chuyển file đi chỗ khác.
 - **Nơi nó hiện ra.** Sau review đã đưa thay đổi vào hàng đợi, app nói một lần có bao nhiêu thay đổi đang chờ (`memory: 1 proposed change waits for your review ...`); `ha exec` in nó cùng các dòng của review. `ha doctor` cảnh báo khi có thay đổi đang chờ, `/context` có dòng `Memory queue:`, và bug report đếm chúng.
 - **Một child đề xuất, không bao giờ ghi.** `note_finding` nhận thêm `propose` tuỳ chọn (`title`, `path`, `scope` global hoặc local, `content`): review của agent cha giữ đề xuất như edit của chính nó khi nó có giá trị lâu dài, nếu không nó chờ trong hàng đợi như của child (`origin.kind` `child`). Hướng dẫn của child và mô tả tool nói như vậy.

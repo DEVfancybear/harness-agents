@@ -5451,9 +5451,20 @@ impl SessionPort for AgentSessionService {
         // What of memory waits for the person (`memory_queue`).
         let review = super::memory_queue::ReviewMode::load(&self.config_file, &self.environment);
         let waiting = super::memory_queue::counts(&self.data_dir);
-        if waiting.waiting > 0 || review != super::memory_queue::ReviewMode::default() {
+        if waiting.waiting > 0
+            || waiting.unreadable > 0
+            || review != super::memory_queue::ReviewMode::default()
+        {
+            let unreadable = if waiting.unreadable > 0 {
+                format!(
+                    "; {} queue file(s) cannot be read (/memory queue names them)",
+                    waiting.unreadable
+                )
+            } else {
+                String::new()
+            };
             lines.push(format!(
-                "Memory queue: {} change(s) wait for your review ({} from delegated children; /memory queue), HA_MEMORY_REVIEW={}",
+                "Memory queue: {} change(s) wait for your review ({} from delegated children; /memory queue), HA_MEMORY_REVIEW={}{unreadable}",
                 waiting.waiting,
                 waiting.from_children,
                 review.name()

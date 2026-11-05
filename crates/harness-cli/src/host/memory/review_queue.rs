@@ -400,13 +400,29 @@ fn clip(text: &str, limit: usize) -> String {
 }
 
 /// The queue in `dir`, without the items past [`KEEP_DAYS`] and the
-/// rejections past [`REJECTED_DAYS`]. A file that cannot be read is an
-/// empty queue.
-fn load(dir: &Path) -> Queue {
-    let mut queue = std::fs::read_to_string(dir.join(FILE))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Queue>(&text).ok())
-        .unwrap_or_default();
+/// rejections past [`REJECTED_DAYS`]. No file is an empty queue; one that
+/// cannot be read or parsed is unreadable, not empty, as an unreadable
+/// memory store is: the error says so, and nothing writes over it, since a
+/// save of the empty queue would drop every change waiting and every
+/// rejection.
+///
+/// # Errors
+/// The file is there and cannot be read or parsed.
+fn load(dir: &Path) -> Result<Queue, String> {
+    let path = dir.join(FILE);
+    let unreadable = |error: String| {
+        format!(
+            "the memory queue {} cannot be read ({error}): it is not written over, and no change waits in it until the file is fixed or moved aside",
+            path.display()
+        )
+    };
+    let mut queue = match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            serde_json::from_str::<Queue>(&text).map_err(|error| unreadable(error.to_string()))?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Queue::default(),
+        Err(error) => return Err(unreadable(error.to_string())),
+    };
     let now = now_ms();
     queue
         .items
@@ -414,7 +430,7 @@ fn load(dir: &Path) -> Queue {
     queue
         .rejected
         .retain(|rejection| now.saturating_sub(rejection.at_ms) < REJECTED_DAYS * DAY_MS);
-    queue
+    Ok(queue)
 }
 
 fn save(dir: &Path, queue: &mut Queue) -> Result<(), String> {
@@ -446,10 +462,11 @@ pub enum Offered {
 /// waits already or the person rejected it.
 ///
 /// # Errors
-/// The queue's lock or file cannot be had.
+/// The queue's lock or file cannot be had, or the file is unreadable: the
+/// change does not wait then, and the caller does not apply it either.
 pub fn offer(dir: &Path, item: Item) -> Result<Offered, String> {
     let _lock = hold(dir)?;
-    let mut queue = load(dir);
+    let mut queue = load(dir)?;
     let shape = Shape::of(&item.edit);
     if let Some(rejection) = queue
         .rejected
@@ -472,16 +489,28 @@ pub fn offer(dir: &Path, item: Item) -> Result<Offered, String> {
     Ok(Offered::Queued(id))
 }
 
-/// The items waiting in `dir`, oldest first.
+/// The items waiting in `dir`, oldest first; none in an unreadable queue
+/// ([`unreadable`] names it).
 #[must_use]
 pub fn waiting(dir: &Path) -> Vec<Item> {
-    load(dir).items
+    load(dir).map(|queue| queue.items).unwrap_or_default()
 }
 
-/// The changes the person rejected in `dir`, newest last.
+/// The changes the person rejected in `dir`, newest last; none known of an
+/// unreadable queue, which takes no change either.
 #[must_use]
 pub fn rejections(dir: &Path) -> Vec<Rejection> {
-    load(dir).rejected
+    load(dir).map(|queue| queue.rejected).unwrap_or_default()
+}
+
+/// The queues under the data directory `data` whose file cannot be read,
+/// each with why: their changes are not listed, and none is written over.
+#[must_use]
+pub fn unreadable(data: &Path) -> Vec<(PathBuf, String)> {
+    queue_dirs(data)
+        .into_iter()
+        .filter_map(|dir| load(&dir).err().map(|error| (dir, error)))
+        .collect()
 }
 
 /// What a review is told of the changes the person rejected lately in the
@@ -568,12 +597,13 @@ pub fn all(data: &Path) -> Vec<Located> {
     found
 }
 
-/// How many items wait under the data directory, and how many of them a
-/// child proposed.
+/// How many items wait under the data directory, how many of them a child
+/// proposed, and how many queues cannot be read.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Counts {
     pub waiting: usize,
     pub from_children: usize,
+    pub unreadable: usize,
 }
 
 /// [`Counts`] under the data directory `data`.
@@ -586,6 +616,7 @@ pub fn counts(data: &Path) -> Counts {
             .iter()
             .filter(|located| located.item.by["via"] == "child")
             .count(),
+        unreadable: unreadable(data).len(),
     }
 }
 
@@ -607,7 +638,7 @@ pub fn waiting_notice(queued: usize, waiting: usize) -> String {
 
 /// Take the item `id` out of the queue in `dir`, whose lock the caller holds.
 fn remove(dir: &Path, id: &str) -> Result<Option<Item>, String> {
-    let mut queue = load(dir);
+    let mut queue = load(dir)?;
     let Some(index) = queue.items.iter().position(|item| item.id == id) else {
         return Ok(None);
     };
@@ -624,7 +655,7 @@ fn remove(dir: &Path, id: &str) -> Result<Option<Item>, String> {
 /// The item is not in that queue, or the queue cannot be written.
 pub fn reject(dir: &Path, id: &str) -> Result<(Item, Vec<String>), String> {
     let _lock = hold(dir)?;
-    let mut queue = load(dir);
+    let mut queue = load(dir)?;
     let Some(index) = queue.items.iter().position(|item| item.id == id) else {
         return Err(format!("{id} is not waiting in the memory queue"));
     };
@@ -699,7 +730,7 @@ pub fn accept(data: &Path, id: &str) -> Result<Accepted, String> {
     };
     let _lock = hold(&found.dir)?;
     // As the queue holds it now: rejected or accepted since, it is gone.
-    let Some(item) = load(&found.dir)
+    let Some(item) = load(&found.dir)?
         .items
         .into_iter()
         .find(|item| item.id == id)
@@ -866,7 +897,7 @@ pub fn command(data: &Path, words: &[&str]) -> Answer {
     let (action, ids) = words
         .split_first()
         .map_or(("list", &[][..]), |(action, ids)| (*action, ids));
-    match action {
+    let mut answer = match action {
         "list" | "ls" => list(data),
         "show" => show(data, ids),
         "accept" => decide(data, ids, true),
@@ -878,12 +909,32 @@ pub fn command(data: &Path, words: &[&str]) -> Answer {
             json: json!({"error": format!("unknown action {other}")}),
             ok: false,
         },
+    };
+    // A queue that cannot be read is named, never shown as empty: what
+    // waited in it is not listed, and a list then is no clean answer.
+    let unreadable = unreadable(data);
+    if !unreadable.is_empty() {
+        for (_, error) in &unreadable {
+            answer.lines.push(format!("unreadable: {error}"));
+        }
+        answer.json["unreadable"] = json!(
+            unreadable
+                .iter()
+                .map(|(dir, error)| json!({"dir": dir.display().to_string(), "error": error}))
+                .collect::<Vec<_>>()
+        );
+        if matches!(action, "list" | "ls") {
+            answer.ok = false;
+        }
     }
+    answer
 }
 
 fn list(data: &Path) -> Answer {
     let items = all(data);
-    let mut lines = if items.is_empty() {
+    let mut lines = if items.is_empty() && !unreadable(data).is_empty() {
+        vec!["No memory queue that can be read holds a change; one that cannot be read is named below.".to_owned()]
+    } else if items.is_empty() {
         vec![
             "The memory queue is empty: no proposed memory change waits for your review."
                 .to_owned(),
@@ -1188,6 +1239,50 @@ mod tests {
             Accepted::Applied(_)
         ));
         assert!(waiting(&global).is_empty());
+    }
+
+    /// A queue file that cannot be parsed is said to be unreadable, not
+    /// empty, and is never written over: a change offered to it does not
+    /// wait (nor is it applied: the caller drops it), the commands name it,
+    /// and the counts say so.
+    #[test]
+    fn an_unreadable_queue_is_said_so_and_never_written_over() {
+        let data = tempfile::tempdir().expect("data");
+        let global = super::super::harness::global_dir(data.path());
+        std::fs::create_dir_all(&global).expect("dir");
+        let broken = "{\"items\": [{\"id\": \"mq-1\", truncated";
+        std::fs::write(global.join(FILE), broken).expect("broken");
+        let offered = offer(
+            &global,
+            item(edit("create", "", "Editor", "The user edits in Helix")),
+        )
+        .expect_err("unreadable");
+        assert!(offered.contains("cannot be read"), "{offered}");
+        assert_eq!(
+            std::fs::read_to_string(global.join(FILE)).expect("file"),
+            broken,
+            "not written over"
+        );
+        assert!(reject(&global, "mq-1").is_err());
+        assert_eq!(counts(data.path()).unreadable, 1);
+        let listed = command(data.path(), &[]);
+        assert!(!listed.ok);
+        assert!(
+            listed
+                .lines
+                .iter()
+                .any(|line| line.contains("cannot be read") && line.contains(FILE)),
+            "{:?}",
+            listed.lines
+        );
+        assert_eq!(
+            listed.json["unreadable"][0]["dir"],
+            global.display().to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(global.join(FILE)).expect("file"),
+            broken
+        );
     }
 
     #[test]

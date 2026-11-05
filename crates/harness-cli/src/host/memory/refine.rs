@@ -2273,12 +2273,22 @@ fn queue_edit(
             ),
             false,
         ),
-        Err(error) => not_applied(
-            record,
-            before,
-            format!("the memory queue could not keep it: {error}"),
-            false,
-        ),
+        // Not applied either: a change the person should decide never goes
+        // past them because their queue cannot take it.
+        Err(error) => {
+            harness_types::diag::warn("memory_queue", "not_queued")
+                .field("refinement", refinement)
+                .field("kind", record["kind"].as_str().unwrap_or_default())
+                .field("id", record["id"].as_str().unwrap_or_default())
+                .msg(error.clone())
+                .emit();
+            not_applied(
+                record,
+                before,
+                format!("the memory queue could not keep it, so it is not applied: {error}"),
+                false,
+            )
+        }
     }
 }
 
@@ -8620,6 +8630,47 @@ Run `node scripts/build.js`.
         );
         assert_eq!(dropped[0].closed, "dropped");
         assert_eq!(memory_queue::all(data).len(), 1);
+    }
+
+    /// A change that would wait while its queue cannot be read neither waits
+    /// nor is applied: nothing goes past the person. The refinement says why,
+    /// and the queue's file is left as it was.
+    #[test]
+    fn a_change_for_an_unreadable_queue_is_neither_queued_nor_applied() {
+        use super::super::memory_queue::ReviewMode;
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = data_scopes(directory.path(), ReviewMode::All);
+        std::fs::create_dir_all(&scopes.global).expect("dir");
+        let queue = scopes.global.join(super::super::memory_queue::FILE);
+        std::fs::write(&queue, "not json").expect("broken");
+        let fact = json!([{"action": "create", "kind": "memory", "title": "Editor",
+            "content": "The user edits in Helix with tabs of four", "path": "notes",
+            "evidence": "edits in Helix with tabs of four"}]);
+        let result = apply(
+            &scopes,
+            &reviewed(&fact, "user"),
+            "refine_1",
+            true,
+            None,
+            None,
+            None,
+        )
+        .expect("refined");
+        let edit = &result.record["appliedEdits"][0];
+        assert_eq!(edit["applied"], false, "{edit}");
+        assert!(edit["queued"].is_null(), "{edit}");
+        assert!(
+            edit["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("cannot be read")),
+            "{edit}"
+        );
+        assert!(
+            load_raw(&scopes.global)["entries"]["memory"]
+                .as_object()
+                .is_none_or(serde_json::Map::is_empty)
+        );
+        assert_eq!(std::fs::read_to_string(&queue).expect("file"), "not json");
     }
 
     /// A review's update - an accepted one too - keeps the code the entry

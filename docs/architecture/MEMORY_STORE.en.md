@@ -1341,6 +1341,18 @@ applied nor failed; its outcome says how many wait (`Harness unchanged · 1
 change waits for your review`), and the `review` diagnostics record counts
 them (`queued`).
 
+**A queue that cannot be read is unreadable, not empty**, as a memory store
+is since 0.8.7: a `memory_queue.json` that cannot be read or parsed is never written
+over, since a save of the empty queue would drop every change waiting there
+and every rejection. Its changes are not listed; `ha memory queue` and
+`/memory queue` name the file and why (`unreadable: the memory queue ...
+cannot be read (...)`, `unreadable` in `--json`, and `list` exits 1), and
+`ha doctor` fails on it. A change that would wait in it is not applied
+either - nothing goes past the person because their queue cannot take it:
+the refinement records it as not applied (`the memory queue could not keep
+it, so it is not applied: ...`) and the diagnostics as `memory_queue
+not_queued`. A reject or an accept in it is refused.
+
 ### 19.3 Accept and reject
 
 `ha memory queue` and `/memory queue` (§12.22 of the operator guide) list the

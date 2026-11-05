@@ -1358,6 +1358,18 @@ sao), không phải đã áp dụng cũng không phải thất bại; kết qu�
 nhiêu thay đổi đang chờ (`Harness unchanged · 1 change waits for your
 review`), và bản ghi chẩn đoán `review` đếm chúng (`queued`).
 
+**Hàng đợi không đọc được là không đọc được, không phải rỗng**, như một kho
+memory từ 0.8.7: một `memory_queue.json` không đọc hoặc không parse được thì
+không bao giờ bị ghi đè, vì lưu hàng đợi rỗng sẽ bỏ mọi thay đổi đang chờ ở đó
+và mọi lần từ chối. Các thay đổi của nó không được liệt kê; `ha memory queue`
+và `/memory queue` nêu tên file và lý do (`unreadable: the memory queue ...
+cannot be read (...)`, `unreadable` trong `--json`, và `list` thoát với mã 1),
+và `ha doctor` báo lỗi. Một thay đổi lẽ ra phải chờ trong đó cũng không được áp
+dụng - không gì vượt qua người dùng chỉ vì hàng đợi của họ không nhận được:
+refinement ghi nó là không được áp dụng (`the memory queue could not keep it,
+so it is not applied: ...`) và chẩn đoán ghi `memory_queue not_queued`. Lần từ
+chối hay chấp nhận trong hàng đợi đó bị từ chối.
+
 ### 19.3 Chấp nhận và từ chối
 
 `ha memory queue` và `/memory queue` (§12.22 của hướng dẫn vận hành) liệt kê
