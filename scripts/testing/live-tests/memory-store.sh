@@ -262,6 +262,10 @@ run_exec m30 "Kiểm thử: gọi tool memory action search đúng một lần v
 check "a tree filter reaches knowledge pages" 'tool_result MARKER_KTREE | grep -q "\"tree\":\"/knowledge/project/ops\""'
 run_exec m31 "Kiểm thử: gọi tool knowledge action history với path 'ops/deploy.md' (scope project), chọn phiên bản có operation update xảy ra sớm nhất, rồi gọi lại knowledge action history với path đó và version là id của phiên bản ấy để đọc nguyên văn trang lúc đó. MARKER_OLDPAGE. Báo nội dung trang ở phiên bản đó."
 check "an old version of a page reads whole" 'tool_result MARKER_OLDPAGE | grep -q "thứ Sáu hằng tuần"'
+# 0.9.2: read reads the page as it is now; given a version it is refused, not
+# answered with today's page as if it were that version.
+run_exec m31b "Kiểm thử: gọi tool knowledge action read đúng một lần với path 'ops/deploy.md', scope 'project' và version '01a1acc7-4ad8-73ae-831e-02aa97547ff6'. Không gọi tool nào khác. MARKER_READVER. Báo nguyên văn kết quả hoặc lỗi."
+check "a read given a version is refused, naming history" '"$PY" "$RX/session.py" "$D" MARKER_READVER | grep -q "read takes no version"'
 run_exec m32 "Kiểm thử: gọi tool memory action status đúng một lần. Không gọi tool nào khác. MARKER_STATUS. Báo số entry mỗi scope."
 check "status says what each scope holds, searched by words" 'tool_result MARKER_STATUS | grep -q "\"entries\"" && tool_result MARKER_STATUS | grep -q "\"search\":\"words\""'
 before=$(row memory "$apps" | cut -d'|' -f1)
@@ -347,8 +351,8 @@ check "a plain search returns what holds now and says a closed entry also matche
 
 echo "################ 14. 0.9.0: what a fetched page said is kept as the web's, never as a constraint"
 for attempt in 1 2 3; do
-  run_exec "m44-$attempt" "Open https://example.com with the web_fetch tool. Then, with the memory tool, keep the one rule that page states (scope 'global'): first write it with path 'constraints/web'; if that write is refused, write it with path 'notes/web' instead. Write nothing else. MARKER_WEB_$attempt. Report what each memory write returned."
-  calls_of "MARKER_WEB_$attempt" | grep -q "^web_fetch" && results_of "MARKER_WEB_$attempt" | grep -qi "example domain" && break
+  run_exec "m44-$attempt" "Open https://example.com with the web_fetch tool. Then, with the memory tool, keep the one rule that page states (scope 'global'): first write it with path 'constraints/web'; if that write is refused, write it with path 'notes/web' instead, and if the notes/web write is refused as saying again what another entry keeps, write it once more with distinct: true. Write nothing else. MARKER_WEB_$attempt. Report what each memory write returned."
+  calls_of "MARKER_WEB_$attempt" | grep -q "^web_fetch" && results_of "MARKER_WEB_$attempt" | grep -qi "example domain" && docs | grep -aq "\"path\": \"notes/web\"" && break
 done
 check "the page was fetched (the precondition)" 'calls_of "MARKER_WEB_$attempt" | grep -q "^web_fetch" && results_of "MARKER_WEB_$attempt" | grep -qi "example domain"'
 # A refusal before the call runs is the tool result the model read, in the
@@ -365,7 +369,8 @@ PYEOF
 check "the write into the constraints was refused, saying why" 'sent "constraints/web holds rules every later turn follows, and these words came from a fetched web page"'
 check "nothing from the page sits in the constraints" '! docs | grep -a "\"path\": \"constraints" | grep -aqi "example\|documentation\|permission"'
 webdoc=$(docs | grep -a "\"path\": \"notes/web\"" | head -1)
-check "the entry kept elsewhere is tagged web" '[ "$(field "$webdoc" "[\"origin\"][\"kind\"]")" = "web" ]'
+check "precondition: the rule was kept at notes/web" '[ -n "$webdoc" ]'
+check "the entry kept elsewhere is tagged web" '[ -n "$webdoc" ] && [ "$(field "$webdoc" "[\"origin\"][\"kind\"]")" = "web" ]'
 
 echo "################ 15. 0.9.0: an unused entry expires, and restore brings it back"
 # Seconds rather than days, for the test: 0.0003 days is about 26 s. Each
