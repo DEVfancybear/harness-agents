@@ -13,13 +13,14 @@
 #    token, the teaching restated up to twice when they do not. Two more are
 #    set up for the features of wave 2: the agent keeps the HTTP client's
 #    retry limit with a citation of the line that sets it (app/net.py), which
-#    the test then changes, so the kept fact is stale; and the markdown store
-#    has a file kept for app/billing/** (a `paths:` frontmatter, not in the
-#    index) naming a constant every billing module defines.
+#    the test then changes, so the kept fact is stale; and it keeps, as an
+#    entry kept for app/billing/** (`paths`), the constant every billing
+#    module defines. A file of the repository would not do: a run with memory
+#    off reads the markdown store's files as it reads any file.
 # 2. Evaluation: seven tasks whose success depends on a taught fact, judged
 #    from a file the agent wrote - `retries` on noticing the kept fact went
-#    stale (the citation), `ledger` on the billing file's rule (memory scoped
-#    to paths) - and two that do not (their cost only), each
+#    stale (the citation), `ledger` on the billing modules' rule (memory
+#    scoped to paths) - and two that do not (their cost only), each
 #    in a fresh `ha exec` conversation once per mode and repeat: memory ON,
 #    memory OFF (HA_MEMORY=off), and with ABLATE=1 each feature of
 #    HA_MEMORY_OFF off alone. Every run starts from a copy of the same
@@ -44,7 +45,7 @@
 #   ABLATE=1 [ABLATE_FEATURES="digest markdown ..."]
 #   bash scripts/testing/live-tests/memory-ab.sh
 # The default run is 9 tasks x 2 modes x 2 repeats = 36 evaluation runs and
-# 3-5 teaching runs.
+# 4-6 teaching runs.
 set -u
 source "$(dirname "$0")/env.sh"
 fresh memory-ab
@@ -105,10 +106,6 @@ for path, text in files.items():
     open(full, "w", encoding="utf-8", newline="\n").write(text)
 EOF
 (cd "$P" && "$HA" memory init > "$RX/init.out" 2>&1)
-# A memory file kept for app/billing/**: the index does not route to it, so
-# only memory scoped to paths brings it to a turn.
-mkdir -p "$P/memory/projects"
-printf -- '---\npaths: ["app/billing/**"]\n---\n# Billing\n\n- Every module under app/billing/ defines LEDGER = "%s" at module level: the ledger it posts to. [stated]\n' "$T6" > "$P/memory/projects/billing.md"
 (cd "$P" && git add -A && git -c user.name=t -c user.email=t@t commit -qm fixture)
 # A review after every run while teaching.
 "$PY" - "$HA_HOME/settings.json" <<'EOF'
@@ -191,6 +188,14 @@ for attempt in 1 2 3; do
 done
 (cd "$P" && "$HA" memory export 2>/dev/null) > "$RX/cited.json"
 check "precondition: the retry limit is kept with its citation" 'grep -q "\"quote\": *\"MAX_RETRIES = 3\"" "$RX/cited.json"'
+# The billing modules' rule, kept only for app/billing/**.
+for attempt in 1 2 3; do
+  exec_run "teach-scoped$attempt" "Use the memory tool action write with exactly these arguments: scope 'global', path 'project/billing', title 'Billing module ledger', content 'Every module under app/billing/ defines LEDGER = \"$T6\" at module level: the ledger it posts to.', paths [\"app/billing/**\"]. Do nothing else. Reply: saved."
+  (cd "$P" && "$HA" memory export 2>/dev/null) | grep -q '"app/billing/\*\*"' && break
+done
+(cd "$P" && "$HA" memory export 2>/dev/null) > "$RX/scoped.json"
+check "precondition: the billing rule is kept for app/billing/** only" 'grep -q "\"app/billing/\*\*\"" "$RX/scoped.json" && grep -q -- "$T6" "$RX/scoped.json"'
+check "precondition: no memory file of the project holds the billing rule" '! grep -rq -- "$T6" "$P/MEMORY.md" "$P/memory"'
 sed -i 's/^MAX_RETRIES = 3$/MAX_RETRIES = 7/' "$P/app/net.py"
 (cd "$P" && git add -A && git -c user.name=t -c user.email=t@t commit -qm "retry more")
 missing=$(missing_tokens | tr '\n' ' ')

@@ -1286,6 +1286,7 @@ parse được cũng vậy (`paths[0] "src/[billing" is not a glob: ...`). `[]` 
 `/context` và `ha doctor` nêu tên chúng khi chúng bị tắt. `memory-ab.sh` có một
 tác vụ cho mỗi tính năng: `retries` (agent đã giữ giới hạn retry của HTTP
 client kèm trích dẫn, rồi bài test đổi dòng đó: tác vụ thành công khi lần chạy
-nhận ra sự thật đã giữ đã cũ) và `ledger` (một file của kho markdown dành cho
-`app/billing/**`, không có trong index, chứa hằng số mà một module billing mới
-phải định nghĩa).
+nhận ra sự thật đã giữ đã cũ) và `ledger` (một entry dành cho `app/billing/**`
+chứa hằng số mà một module billing mới phải định nghĩa; một file trong
+repository thì không được, vì lần chạy tắt memory vẫn đọc các file của kho
+markdown như mọi file khác).

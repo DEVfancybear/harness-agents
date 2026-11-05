@@ -1272,6 +1272,7 @@ one with `..` or a drive is refused, and so is one that does not parse
 `/context` and `ha doctor` name them when they are off. `memory-ab.sh` has a
 task for each: `retries` (the agent kept the HTTP client's retry limit with a
 citation, the test then changed the line: the task succeeds when the run
-notices the kept fact went stale) and `ledger` (a markdown store file kept for
-`app/billing/**`, not in the index, holds the constant a new billing module
-must define).
+notices the kept fact went stale) and `ledger` (an entry kept for `app/billing/**`
+holds the constant a new billing module must define; a file of the
+repository would not do, since a run with memory off reads the markdown
+store's files as any file).
