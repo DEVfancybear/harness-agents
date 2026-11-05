@@ -485,7 +485,7 @@ for attempt in 1 2 3; do
   run_exec "m56-$attempt" "Do these steps in order, one tool call each: 1. read the file README.md; 2. read the file src/billing/refunds.py; 3. read the file src/billing/tax.py. Then answer with one word: DONE. MARKER_SCOPED_$attempt"
   calls_of "MARKER_SCOPED_$attempt" | grep -q '^read_file.*src/billing/refunds.py' && calls_of "MARKER_SCOPED_$attempt" | grep -q '^read_file.*README.md' && break
 done
-mapfile -t seen < <(counts "MARKER_SCOPED_$attempt" zk-5521)
+mapfile -t seen < <(counts "MARKER_SCOPED_$attempt" zk-5521 | tr -d "\r")
 echo "   the run's requests hold the entry: ${seen[*]}"
 check "the run read README.md, then the billing files (the precondition)" 'calls_of "MARKER_SCOPED_$attempt" | grep -q "^read_file.*README.md" && calls_of "MARKER_SCOPED_$attempt" | grep -q "^read_file.*src/billing/refunds.py"'
 check "no request holds the entry before a matching file is read" '[ "${#seen[@]}" -ge 2 ] && [ "${seen[0]}" = 0 ]'
@@ -507,7 +507,7 @@ for attempt in 1 2 3; do
   (cd "$P2" && "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto --output-format json "Do these steps in order, one tool call each: 1. read the file README.md; 2. read the file src/billing/refunds.py. Then answer with one word: DONE. Read no other file. MARKER_MDSCOPED_$attempt" > "$RX/m57-$attempt.json" 2> "$RX/m57-$attempt.err")
   calls_of "MARKER_MDSCOPED_$attempt" | grep -q '^read_file.*src/billing/refunds.py' && ! calls_of "MARKER_MDSCOPED_$attempt" | grep -q 'memory/projects' && break
 done
-mapfile -t seen < <(counts "MARKER_MDSCOPED_$attempt" qv-9034)
+mapfile -t seen < <(counts "MARKER_MDSCOPED_$attempt" qv-9034 | tr -d "\r")
 echo "   the run's requests hold the file: ${seen[*]}"
 check "the run read the billing file and not the memory file (the precondition)" 'calls_of "MARKER_MDSCOPED_$attempt" | grep -q "^read_file.*src/billing/refunds.py" && ! calls_of "MARKER_MDSCOPED_$attempt" | grep -q "memory/projects"'
 check "the memory file is in no request before the billing file is read, then in one, once" '[ "${#seen[@]}" -ge 2 ] && [ "${seen[0]}" = 0 ] && [ "${seen[-1]}" = 1 ] && ! printf "%s\n" "${seen[@]}" | grep -qvx "[01]"'
