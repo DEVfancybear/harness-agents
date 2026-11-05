@@ -1513,10 +1513,12 @@ pub async fn run_with(
             store_dir: context.project_store_dir(),
             learning,
             knowledge: knowledge_host.clone(),
+            review: super::memory_queue::ReviewMode::load(&context.paths.config_file, environment),
         };
         let scopes = super::refine::HarnessScopes {
             global: super::harness::global_dir(&context.paths.data_dir),
             local,
+            review: reviews.review,
         };
         let model = reviews.model.clone();
         // Boxed: the review's future is large, and the run's own is already.

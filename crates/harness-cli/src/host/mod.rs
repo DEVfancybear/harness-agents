@@ -111,6 +111,8 @@ pub mod memory;
 pub mod memory_filters;
 #[path = "memory/provenance.rs"]
 pub mod memory_provenance;
+#[path = "memory/review_queue.rs"]
+pub mod memory_queue;
 #[path = "memory/readout.rs"]
 pub mod memory_readout;
 #[path = "memory/search.rs"]

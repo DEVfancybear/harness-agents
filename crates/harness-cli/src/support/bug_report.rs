@@ -902,9 +902,14 @@ impl Report {
         ] {
             self.copy_file(&global.join(name), &format!("harness/global/{name}"), false);
         }
-        // A legacy state file not yet imported, and the learning loop's
-        // lessons with their quotes and history.
-        for name in ["harness_state.json", "lessons.json"] {
+        // A legacy state file not yet imported, the learning loop's lessons
+        // with their quotes and history, and the memory changes waiting for
+        // the person.
+        for name in [
+            "harness_state.json",
+            "lessons.json",
+            crate::interactive::memory_queue::FILE,
+        ] {
             self.copy_memory_file(&global.join(name), &format!("harness/global/{name}"), false);
         }
         // The self-evaluations, newest last.
@@ -947,6 +952,7 @@ impl Report {
                 "harness_state.json",
                 "refinements.jsonl",
                 "memory_history.jsonl",
+                crate::interactive::memory_queue::FILE,
             ] {
                 self.copy_memory_file(&local.join(name), &format!("harness/{task}/{name}"), true);
             }
@@ -1752,6 +1758,7 @@ impl Report {
         const READERS: [&str; 4] = ["memory", "knowledge", "history_search", "history_read"];
         let mut calls = self.recorded("refine", "call");
         calls.extend(self.recorded("refine", "call_failed"));
+        let queue = self.memory_queue_line();
         let mut reads = [0_usize; READERS.len()];
         for event in ["ok", "failed"] {
             for record in self.recorded("tool", event) {
@@ -1763,7 +1770,7 @@ impl Report {
                 }
             }
         }
-        if calls.is_empty() && reads.iter().all(|count| *count == 0) {
+        if calls.is_empty() && reads.iter().all(|count| *count == 0) && queue.is_none() {
             return;
         }
         let _ = writeln!(
@@ -1771,6 +1778,7 @@ impl Report {
             "## Memory
 "
         );
+        out.push_str(queue.as_deref().unwrap_or_default());
         if !calls.is_empty() {
             #[derive(Default)]
             struct Purpose {
@@ -1849,6 +1857,23 @@ impl Report {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+    }
+
+    /// The memory changes waiting for the person now, and how many the
+    /// window's reviews queued, as a paragraph; `None` when neither is any.
+    fn memory_queue_line(&self) -> Option<String> {
+        let queue = crate::interactive::memory_queue::counts(&self.data_dir);
+        let queued = self
+            .recorded("memory_queue", "queued")
+            .iter()
+            .map(|record| record["fields"]["queued"].as_u64().unwrap_or_default())
+            .sum::<u64>();
+        (queue.waiting > 0 || queued > 0).then(|| {
+            format!(
+                "Memory queue: {} change(s) wait for the person's review now ({} from delegated children); the window's reviews queued {queued}.\n\n",
+                queue.waiting, queue.from_children
+            )
+        })
     }
 
     /// The background memory passes (`sleep`): the jobs on disk now - waiting,

@@ -27,6 +27,8 @@ pub struct Facts {
     pub sleep: super::sleep::Summary,
     /// Which memory features are on (`HA_MEMORY`, [`super::memory_switch`]).
     pub memory: super::memory_switch::Switch,
+    /// The memory changes waiting for the person ([`super::memory_queue`]).
+    pub memory_queue: super::memory_queue::Counts,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -414,6 +416,7 @@ fn state(root: &Path, facts: &Facts) -> Subsystem {
     other_stores(facts, &mut subsystem);
     sleep(facts, &mut subsystem);
     memory_switch(facts, &mut subsystem);
+    memory_queue(facts, &mut subsystem);
     markdown_memory(root, &mut subsystem);
     subsystem
 }
@@ -430,6 +433,25 @@ fn memory_switch(facts: &Facts, subsystem: &mut Subsystem) {
         Level::Warn,
         format!("memory is {summary}"),
         "nothing of what is off reaches a turn or is written; unset HA_MEMORY and HA_MEMORY_OFF, or the `memory` key of settings.json, to turn it back on",
+    );
+}
+
+/// The memory changes a review left to the person: how many wait, and how
+/// many a delegated child proposed. Nothing is said of an empty queue.
+fn memory_queue(facts: &Facts, subsystem: &mut Subsystem) {
+    let queue = facts.memory_queue;
+    if queue.waiting == 0 {
+        return;
+    }
+    subsystem.short(
+        Level::Warn,
+        format!(
+            "{} proposed memory change(s) wait for your review ({} from delegated children); each expires after {} days",
+            queue.waiting,
+            queue.from_children,
+            super::memory_queue::KEEP_DAYS
+        ),
+        "`ha memory queue` lists them, `ha memory queue show <id>` shows one with its evidence, `accept <id>` or `reject <id>` decides (or /memory queue in the app)",
     );
 }
 

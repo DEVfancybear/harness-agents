@@ -397,8 +397,63 @@ const FINDINGS_KEPT: usize = 200;
 /// How many findings one review is given, the oldest not given yet.
 const FINDINGS_PER_REVIEW: usize = 12;
 
+/// The longest title a proposal may have: a memory entry's.
+const PROPOSAL_TITLE_CHARS: usize = 120;
+
+/// The longest tree a proposal may name.
+const PROPOSAL_PATH_CHARS: usize = 120;
+
+/// The proposal `note_finding`'s `propose` makes of `fact`, when it makes
+/// one.
+fn proposal_of(propose: Option<&Value>, fact: &str) -> Result<Option<ChildProposal>, String> {
+    let Some(propose) = propose.filter(|propose| !propose.is_null()) else {
+        return Ok(None);
+    };
+    let Some(fields) = propose.as_object() else {
+        return Err("`propose` is an object: {title, path?, scope?, content?}".to_owned());
+    };
+    let text = |key: &str| one_line(fields.get(key).and_then(Value::as_str).unwrap_or_default());
+    let title = text("title");
+    if title.is_empty() {
+        return Err("`propose` needs a `title`".to_owned());
+    }
+    if title.chars().count() > PROPOSAL_TITLE_CHARS {
+        return Err(format!(
+            "`propose.title` is longer than {PROPOSAL_TITLE_CHARS} characters: say it shorter"
+        ));
+    }
+    let path = text("path").trim_matches('/').to_owned();
+    if path.chars().count() > PROPOSAL_PATH_CHARS {
+        return Err(format!(
+            "`propose.path` is longer than {PROPOSAL_PATH_CHARS} characters"
+        ));
+    }
+    let scope = match text("scope").as_str() {
+        "" | "global" => "global",
+        "local" => "local",
+        other => return Err(format!("`propose.scope` is global or local, not {other:?}")),
+    };
+    let content = Some(text("content"))
+        .filter(|content| !content.is_empty())
+        .unwrap_or_else(|| fact.to_owned());
+    if content.chars().count() > FINDING_FACT_CHARS {
+        return Err(format!(
+            "`propose.content` is longer than {FINDING_FACT_CHARS} characters: say it shorter"
+        ));
+    }
+    Ok(Some(ChildProposal {
+        scope: scope.to_owned(),
+        path,
+        title,
+        content,
+        closed: None,
+        note: None,
+        queued: None,
+    }))
+}
+
 /// What a child's system text says of `note_finding`.
-const FINDINGS_LINE: &str = " When a tool result shows a lasting fact about the project worth knowing after this task - where something is configured, what a check needs, how a part works - record it with note_finding, quoting the tool result's words that show it: you cannot write memory, and your parent's review keeps what you note. Note only what a tool result showed, never a guess or this task's progress.";
+const FINDINGS_LINE: &str = " When a tool result shows a lasting fact about the project worth knowing after this task - where something is configured, what a check needs, how a part works - record it with note_finding, quoting the tool result's words that show it: you cannot write memory, and your parent's review keeps what you note. To propose the fact as a memory entry, give note_finding `propose` (a title, and a path and a scope when they matter): your parent's review keeps it as its own edit, or else it waits for the person, who accepts or rejects it in the memory queue; it is never written by your authority. Note only what a tool result showed, never a guess or this task's progress.";
 
 /// A fact a child found, with the words of its tool result that show it.
 #[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
@@ -414,12 +469,104 @@ pub struct ChildFinding {
     pub role: String,
     pub fact: String,
     pub evidence: String,
+    /// The memory entry the child proposes from the fact: its parent's
+    /// review keeps it, or it waits for the person in the memory queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<ChildProposal>,
+}
+
+/// A memory entry a child proposes (`note_finding`'s `propose`). It is never
+/// written by the child's authority: its parent's review keeps it as its own
+/// edit, or it waits for the person (`memory_queue`), as the child's.
+#[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+pub struct ChildProposal {
+    /// `global` (every later conversation) or `local` (the root
+    /// conversation's own store).
+    pub scope: String,
+    /// The tree it goes in; empty for the store's default.
+    #[serde(default)]
+    pub path: String,
+    pub title: String,
+    /// The entry's text: the fact, unless the child worded it otherwise.
+    pub content: String,
+    /// How it ended once a review read it: `kept`, `queued`, `refused`,
+    /// `dropped` ([`crate::interactive::refine::ProposalOutcome`]); `None`
+    /// while no review settled it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<String>,
+    /// What happened to it, in words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The memory queue item it waits as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued: Option<String>,
 }
 
 /// Text on one line, its runs of blanks one space: how a finding is kept
 /// and how its evidence is found in a tool result.
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A finding as its review reads it: the fact and the words that show it.
+/// An edit whose evidence quotes this rests on the finding.
+#[must_use]
+pub fn finding_line(finding: &ChildFinding) -> String {
+    format!(
+        "{} (evidence: \"{}\")",
+        one_line(&finding.fact),
+        one_line(&finding.evidence)
+    )
+}
+
+/// The findings up to `through` whose proposal no review settled yet: the
+/// ones the review that carried them settles once it succeeded.
+#[must_use]
+pub fn proposals_through(local: &Path, through: u64) -> Vec<ChildFinding> {
+    pending_findings(local)
+        .into_iter()
+        .filter(|finding| finding.seq <= through)
+        .filter(|finding| {
+            finding
+                .proposal
+                .as_ref()
+                .is_some_and(|proposal| proposal.closed.is_none())
+        })
+        .collect()
+}
+
+/// Record how each proposal ended (`(seq, closed, note, queued)`), under the
+/// findings' lock.
+pub fn settle_proposals(local: &Path, settled: &[(u64, String, String, Option<String>)]) {
+    if settled.is_empty() {
+        return;
+    }
+    let Ok(_lock) = super::files::hold(
+        &local.join(FINDINGS_LOCK_FILE),
+        FINDINGS_LOCK_WAIT,
+        "child findings",
+    ) else {
+        return;
+    };
+    let mut findings = kept_findings(local);
+    for finding in &mut findings {
+        if let Some((_, closed, note, queued)) =
+            settled.iter().find(|(seq, ..)| *seq == finding.seq)
+            && let Some(proposal) = finding.proposal.as_mut()
+        {
+            proposal.closed = Some(closed.clone());
+            proposal.note = Some(note.clone());
+            proposal.queued.clone_from(queued);
+        }
+    }
+    let mut text = String::new();
+    for kept in &findings {
+        if let Ok(line) = serde_json::to_string(kept) {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
+    let _ = super::files::write_atomic(&local.join(CHILD_FINDINGS_FILE), &text);
 }
 
 /// The findings kept in the folder `local`, oldest first.
@@ -541,12 +688,22 @@ pub fn findings_for_review(local: &Path) -> Option<String> {
                 "[Tool result (child findings, from {child})]: [Child findings, from {child}] Facts this delegated child found in tool results only it saw, each with the words of the tool result that show it: what the project showed, not the user's words."
             );
             for finding in list {
-                let _ = write!(
-                    block,
-                    "\n- {} (evidence: \"{}\")",
-                    one_line(&finding.fact),
-                    one_line(&finding.evidence)
-                );
+                let _ = write!(block, "\n- {}", finding_line(finding));
+                // A proposal is the child's: the review keeps it as its own
+                // edit, quoting the finding, or it waits for the person.
+                if let Some(proposal) = &finding.proposal {
+                    let _ = write!(
+                        block,
+                        " [proposed as a {} memory entry{}, title \"{}\": keep it with a memory edit whose evidence quotes this finding when it lasts; one you do not keep waits for the person's review]",
+                        proposal.scope,
+                        if proposal.path.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" in {}", proposal.path)
+                        },
+                        one_line(&proposal.title)
+                    );
+                }
             }
             block
         })
@@ -4637,12 +4794,24 @@ impl ChildTools {
             "type": "function",
             "function": {
                 "name": "note_finding",
-                "description": "Keep a lasting fact about the project that a tool result showed you, for your parent's memory: you cannot write memory, and your parent's review reads what you note with its conversation. `evidence` quotes the tool result's own words that show the fact, as the tool returned them; a quote no tool result of yours holds is refused. Not for guesses, this task's progress or what your answer already says.",
+                "description": "Keep a lasting fact about the project that a tool result showed you, for your parent's memory: you cannot write memory, and your parent's review reads what you note with its conversation. `evidence` quotes the tool result's own words that show the fact, as the tool returned them; a quote no tool result of yours holds is refused. With `propose`, the fact is proposed as a memory entry: your parent's review keeps it as its own edit, or else it waits for the person, who accepts or rejects it in the memory queue (`ha memory queue`); it is never written by your authority. Not for guesses, this task's progress or what your answer already says.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "fact": {"type": "string", "minLength": 1, "maxLength": FINDING_FACT_CHARS, "description": "The fact itself, anchored to where it holds (\"in this project the deploy port is set in ops/deploy.toml\")."},
-                        "evidence": {"type": "string", "minLength": FINDING_EVIDENCE_MIN_CHARS, "maxLength": FINDING_EVIDENCE_CHARS, "description": "The words of a tool result you received that show it."}
+                        "evidence": {"type": "string", "minLength": FINDING_EVIDENCE_MIN_CHARS, "maxLength": FINDING_EVIDENCE_CHARS, "description": "The words of a tool result you received that show it."},
+                        "propose": {
+                            "type": "object",
+                            "description": "Propose the fact as a memory entry. Your parent's review keeps it when it lasts; one it does not keep waits for the person's accept or reject. Nothing is written by your authority.",
+                            "properties": {
+                                "title": {"type": "string", "minLength": 1, "maxLength": PROPOSAL_TITLE_CHARS, "description": "A short title, unique enough to find the entry again."},
+                                "path": {"type": "string", "maxLength": PROPOSAL_PATH_CHARS, "description": "The tree it goes in, such as \"project/deploy\"; left out, the store's default."},
+                                "scope": {"type": "string", "enum": ["global", "local"], "description": "global: every later conversation (the default); local: this conversation only."},
+                                "content": {"type": "string", "maxLength": FINDING_FACT_CHARS, "description": "The entry's text; left out, the fact."}
+                            },
+                            "required": ["title"],
+                            "additionalProperties": false
+                        }
                     },
                     "required": ["fact", "evidence"],
                     "additionalProperties": false
@@ -4671,6 +4840,7 @@ impl ChildTools {
         };
         let fact = field("fact", FINDING_FACT_CHARS)?;
         let evidence = field("evidence", FINDING_EVIDENCE_CHARS)?;
+        let proposal = proposal_of(arguments.get("propose"), &fact)?;
         if evidence.chars().count() < FINDING_EVIDENCE_MIN_CHARS {
             return Err(format!(
                 "`evidence` quotes at least {FINDING_EVIDENCE_MIN_CHARS} characters of the tool result"
@@ -4719,11 +4889,16 @@ impl ChildTools {
                 role,
                 fact,
                 evidence,
+                proposal: proposal.clone(),
             },
         )?;
         self.noted.fetch_add(1, Ordering::SeqCst);
         Ok(json!({
-            "text": "kept: your parent's review reads it with the conversation and keeps what lasts",
+            "text": if proposal.is_some() {
+                "kept, with its proposal: your parent's review keeps it as its own edit when it lasts, or else it waits for the person's review in the memory queue; nothing is written by your authority"
+            } else {
+                "kept: your parent's review reads it with the conversation and keeps what lasts"
+            },
         }))
     }
 }
@@ -6327,6 +6502,72 @@ pub(super) mod tests {
         );
     }
 
+    /// A child's proposal rides on its finding: `propose` makes one (its
+    /// content the fact when left out, global unless said), the review reads
+    /// it marked as a proposal, and once settled it is no longer handed to
+    /// the next review's settling.
+    #[test]
+    fn a_proposal_rides_on_its_finding_until_a_review_settles_it() {
+        let fact = "the deploy port is set in ops/deploy.toml";
+        let proposal = super::proposal_of(
+            Some(&serde_json::json!({"title": "Deploy port", "path": "/project/deploy/"})),
+            fact,
+        )
+        .expect("a proposal")
+        .expect("made");
+        assert_eq!(proposal.scope, "global");
+        assert_eq!(proposal.path, "project/deploy");
+        assert_eq!(proposal.content, fact);
+        assert!(super::proposal_of(None, fact).expect("none").is_none());
+        assert!(super::proposal_of(Some(&serde_json::json!({"path": "x"})), fact).is_err());
+        assert!(
+            super::proposal_of(
+                Some(&serde_json::json!({"title": "t", "scope": "team"})),
+                fact
+            )
+            .is_err()
+        );
+        let temp = tempfile::tempdir().expect("temp dir");
+        let local = temp.path().join("harness");
+        super::keep_finding(
+            &local,
+            super::ChildFinding {
+                seq: 0,
+                at_ms: 1,
+                child: "explorer-1".to_owned(),
+                role: "explorer".to_owned(),
+                fact: fact.to_owned(),
+                evidence: "port = 8443".to_owned(),
+                proposal: Some(proposal),
+            },
+        )
+        .expect("kept");
+        let block = super::findings_for_review(&local).expect("given");
+        assert!(
+            block.contains(
+                "[proposed as a global memory entry in project/deploy, title \"Deploy port\""
+            ),
+            "{block}"
+        );
+        let through = super::findings_pending_through(&local).expect("waiting");
+        let waiting = super::proposals_through(&local, through);
+        assert_eq!(waiting.len(), 1);
+        super::settle_proposals(
+            &local,
+            &[(
+                waiting[0].seq,
+                "queued".to_owned(),
+                "waits".to_owned(),
+                Some("mq-1".to_owned()),
+            )],
+        );
+        assert!(super::proposals_through(&local, through).is_empty());
+        let kept = super::kept_findings(&local);
+        let settled = kept[0].proposal.as_ref().expect("proposal");
+        assert_eq!(settled.closed.as_deref(), Some("queued"));
+        assert_eq!(settled.queued.as_deref(), Some("mq-1"));
+    }
+
     /// The findings cursor cannot skip one: each finding is numbered under the
     /// lock after the last kept and after the cursor, a review is given the
     /// oldest waiting ones, and only a review that succeeded moves the cursor.
@@ -6341,6 +6582,7 @@ pub(super) mod tests {
             role: "explorer".to_owned(),
             fact: fact.to_owned(),
             evidence: format!("{fact} as the tool said"),
+            proposal: None,
         };
         super::keep_finding(&local, finding("fact one")).expect("kept");
         let through = super::findings_pending_through(&local).expect("waiting");

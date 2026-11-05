@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 71] = [
+pub const SLASH_COMMANDS: [SlashCommand; 72] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -182,6 +182,14 @@ pub const SLASH_COMMANDS: [SlashCommand; 71] = [
             "/checks",
             "[list|accept <name>|reject <name>]",
             "Review the checks learning proposed; accepted ones join [verify]",
+        )
+    },
+    SlashCommand {
+        options: &["queue"],
+        ..command(
+            "/memory",
+            "queue [show <id>|accept <id>...|reject <id>...]",
+            "Review the memory changes that wait for you; accepted ones join memory",
         )
     },
     command(

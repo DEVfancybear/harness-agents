@@ -396,6 +396,20 @@ impl RefineOptions {
         }
     }
 
+    /// Who a refinement of these options is, for the memory queue: `/learn`
+    /// or `/refine`.
+    fn proposer(&self) -> &'static str {
+        if self
+            .instructions
+            .as_deref()
+            .is_some_and(|instructions| instructions.starts_with(LEARN_INSTRUCTIONS))
+        {
+            "learn"
+        } else {
+            "refine"
+        }
+    }
+
     /// `/refine [--global] [--rollback <id>] [--curate] [instructions]`.
     #[must_use]
     pub fn parse(arguments: &str) -> Self {
@@ -512,11 +526,13 @@ impl Learning {
     }
 }
 
-/// Where the two scopes live.
+/// Where the two scopes live, and which of the changes proposed to them wait
+/// for the person (`HA_MEMORY_REVIEW`, [`super::memory_queue`]).
 #[derive(Clone, Debug)]
 pub struct HarnessScopes {
     pub global: PathBuf,
     pub local: PathBuf,
+    pub review: super::memory_queue::ReviewMode,
 }
 
 impl HarnessScopes {
@@ -968,7 +984,9 @@ impl Edit {
 /// `memory` tool and the kernel make. A review, `/refine`, `/learn` and the
 /// memory consolidation write through here; without them a review saved a
 /// fact the tool would have refused as a duplicate, under another title, and
-/// the digest's few places filled with copies again.
+/// the digest's few places filled with copies again. With `by_source` false
+/// the refusal of a page's words made a rule is not made: the change waits
+/// for the person instead ([`wait_reason`]), or the person accepted it.
 fn memory_refusal(
     scopes: &HarnessScopes,
     global: bool,
@@ -976,6 +994,7 @@ fn memory_refusal(
     before: &Value,
     proposal: &Proposal,
     rollback_of: Option<&str>,
+    by_source: bool,
 ) -> Option<String> {
     let action = edit.text("action").unwrap_or_default();
     let kind: &'static str = match edit.text("kind").unwrap_or_default() {
@@ -1028,16 +1047,18 @@ fn memory_refusal(
         .text("path")
         .or_else(|| before["path"].as_str())
         .unwrap_or_default();
-    if let Some(refusal) = edit
-        .text(ORIGIN_KIND)
-        .and_then(|from| super::memory_validity::steering_refusal(from, path))
+    if by_source
+        && let Some(refusal) = edit
+            .text(ORIGIN_KIND)
+            .and_then(|from| super::memory_validity::steering_refusal(from, path))
     {
         return Some(refusal);
     }
     // Nor do they when the entry kept them: a page's entry stays a page's
     // whoever rewrites it, and is not moved into a rule (§16.4). A rollback
     // puts back what was there.
-    if rollback_of.is_none()
+    if by_source
+        && rollback_of.is_none()
         && before.is_object()
         && let Some(refusal) = super::memory_validity::steering_refusal(
             super::memory_validity::origin_kind(before),
@@ -1108,6 +1129,18 @@ struct Proposal {
     /// The consolidation batch this proposal is about: its edits may name only
     /// the batch's entries, and write only what they say.
     batch: Option<Batch>,
+    /// Who planned it, when its memory changes may wait for the person
+    /// ([`wait_reason`]): `review`, `refine`, `learn`, `deep_dream` or
+    /// `child`. `None` for a rollback and an accept, which never wait.
+    proposer: Option<&'static str>,
+    /// The queue item the person accepted, which this proposal applies.
+    accepting: Option<String>,
+    /// Every edit waits for the person: nothing is saved or recorded, the
+    /// queue holds them (a child's proposal its parent's review did not keep).
+    queue_only: bool,
+    /// Who proposed the changes that wait, when it is not the refinement
+    /// itself (a child).
+    queue_by: Option<Value>,
 }
 
 /// The entries one consolidation call was given ([`consolidate_scope`]).
@@ -1155,8 +1188,12 @@ impl Proposal {
                         // Where an edit's words came from is the host's to
                         // say on every path ([`plan`], [`memory_edits`]):
                         // a kind the model wrote would skip the web guard.
+                        // So is whether it waits for the person: a model's
+                        // `queued` would read as a change that waits.
                         .map(|mut edit| {
-                            edit.0.remove(ORIGIN_KIND);
+                            for field in [ORIGIN_KIND, QUEUE_EXPECTS, "queued", "waits", "stale"] {
+                                edit.0.remove(field);
+                            }
                             edit
                         })
                         .collect()
@@ -1215,6 +1252,10 @@ impl Proposal {
             lesson_records: Vec::new(),
             evidence_in: None,
             batch: None,
+            proposer: None,
+            accepting: None,
+            queue_only: false,
+            queue_by: None,
         }
     }
 }
@@ -1263,10 +1304,41 @@ impl Refinement {
             .unwrap_or_default()
     }
 
-    /// prime-agent's `refinementHeader`: what the refinement did, in one line.
+    /// How many of its changes wait for the person in the memory queue.
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.edits()
+            .iter()
+            .filter(|edit| edit["queued"].is_string())
+            .count()
+    }
+
+    /// prime-agent's `refinementHeader`: what the refinement did, in one line,
+    /// and how many of its changes wait for the person.
     #[must_use]
     pub fn outcome(&self) -> String {
-        let edits = self.edits();
+        let queued = self.queued();
+        if queued == 0 {
+            return self.applied_outcome();
+        }
+        let waits = format!(
+            "{queued} change{} wait{} for your review (/memory queue)",
+            if queued == 1 { "" } else { "s" },
+            if queued == 1 { "s" } else { "" }
+        );
+        if self.edits().len() == queued {
+            return format!("Harness unchanged · {waits}");
+        }
+        format!("{} · {waits}", self.applied_outcome())
+    }
+
+    /// The outcome of the edits that do not wait for the person.
+    fn applied_outcome(&self) -> String {
+        let edits = self
+            .edits()
+            .into_iter()
+            .filter(|edit| !edit["queued"].is_string())
+            .collect::<Vec<_>>();
         let applied = edits
             .iter()
             .filter(|edit| edit["applied"] == true)
@@ -1451,6 +1523,11 @@ impl Refinement {
                     _ => "Changed",
                 };
                 lines.push(format!("{verb} {entry_scope} {kind} `{id}`"));
+            } else if let Some(queued) = edit["queued"].as_str() {
+                lines.push(format!(
+                    "Waits for your review as {queued}: {action} {entry_scope} {kind} `{id}`: {}",
+                    edit["waits"].as_str().unwrap_or_default()
+                ));
             } else if edit["skipped"] == true {
                 // Not a failure: what it would change was not as it planned.
                 lines.push(format!(
@@ -1578,6 +1655,7 @@ fn apply(
             fields.remove(ROLLBACK_EXPECTS);
             fields.remove(ROLLBACK_RESTORES);
             fields.remove(ROLLBACK_PAIR);
+            fields.remove(QUEUE_EXPECTS);
         }
         record["id"] = json!(computed);
         if let Some(error) = edit.invalid(&computed) {
@@ -1629,6 +1707,17 @@ fn apply(
             ));
             continue;
         }
+        // An accepted change applies to the entry as it was proposed
+        // against: one written, changed or deleted since is refused as stale.
+        if proposal.accepting.is_some()
+            && let Some(expected) = edit.0.get(QUEUE_EXPECTS)
+            && !same_version(&before, expected)
+        {
+            let mut refused = not_applied(record, &before, stale_refusal(expected, &before), false);
+            refused["stale"] = json!(true);
+            applied_edits.push(refused);
+            continue;
+        }
         if let Some(baseline) = baseline
             && !modified.contains(&key)
             && before != baseline["entries"][&kind][&computed]
@@ -1655,6 +1744,9 @@ fn apply(
             applied_edits.push(not_applied(record, &before, CLOSED_REFUSAL, false));
             continue;
         }
+        // A merge's delete whose survivor's change waits for the person
+        // waits with it, and leaves the queue with it when that is rejected.
+        let mut after_item = None;
         if let Some(survivor) = edit.merged_into() {
             let survivor_key = format!("{kind}:{survivor}");
             let refusal = if survivor == computed {
@@ -1670,6 +1762,13 @@ fn apply(
                     ),
                     false,
                 ))
+            } else if let Some(waits) = applied_edits.iter().find(|other| {
+                other["kind"] == kind.as_str()
+                    && other["id"] == survivor
+                    && other["queued"].is_string()
+            }) {
+                after_item = waits["queued"].as_str().map(str::to_owned);
+                None
             } else if applied_edits.iter().any(|other| {
                 other["kind"] == kind.as_str()
                     && other["id"] == survivor
@@ -1708,7 +1807,29 @@ fn apply(
             applied_edits.push(not_applied(record, &before, EVIDENCE_REFUSAL, false));
             continue;
         }
-        if let Some(error) = memory_refusal(scopes, global, edit, &before, proposal, rollback_of) {
+        let waits = after_item.as_ref().map_or_else(
+            || {
+                proposal.proposer.and_then(|by| {
+                    wait_reason(scopes.review, by, proposal.queue_only, edit, &before)
+                })
+            },
+            |survivor| {
+                Some(format!(
+                    "it deletes an entry merged into what {survivor} writes, which waits for the person"
+                ))
+            },
+        );
+        // A change that waits is checked as one applied now, but for its
+        // source: the person decides that.
+        if let Some(error) = memory_refusal(
+            scopes,
+            global,
+            edit,
+            &before,
+            proposal,
+            rollback_of,
+            waits.is_none() && proposal.accepting.is_none(),
+        ) {
             applied_edits.push(not_applied(record, &before, error, false));
             continue;
         }
@@ -1719,11 +1840,21 @@ fn apply(
             applied_edits.push(not_applied(record, &before, error, false));
             continue;
         }
+        if let Some(why) = waits {
+            applied_edits.push(queue_edit(
+                scopes, proposal, id, scope, record, &before, &why, after_item,
+            ));
+            continue;
+        }
         // What a refinement replaces or removes stays in the store's event
         // log, so the `memory` tool's history and restore reach it too.
         let mut by = refine_origin(scopes, id, Some(edit));
         if let Some(from) = edit.text(ORIGIN_KIND) {
             by["kind"] = json!(from);
+        }
+        // An accepted change is the person's: they read it and took it.
+        if let Some(accepted) = proposal.accepting.as_ref().and(proposal.queue_by.as_ref()) {
+            by["accepted"] = accepted.clone();
         }
         // A fact that changed: a new entry, and the old one closed, not
         // deleted (`memory_validity::supersede_edit`).
@@ -1832,6 +1963,10 @@ fn apply(
                 // changed it and on what evidence.
                 if let Some(origin) = before.get("origin").filter(|origin| origin.is_object()) {
                     after["origin"] = origin.clone();
+                    // The person took its words as theirs.
+                    if proposal.accepting.is_some() {
+                        after["origin"]["kind"] = json!("user");
+                    }
                 }
                 after["edited_by"] = by;
             } else {
@@ -1860,6 +1995,17 @@ fn apply(
             &proposal.checks,
             &learning.project_checks,
         ));
+    }
+    // A child's proposals that wait were only checked: nothing is written.
+    if proposal.queue_only {
+        return Ok(Refinement {
+            record: json!({
+                "id": id,
+                "summary": proposal.summary,
+                "appliedEdits": applied_edits,
+                "scope": scope,
+            }),
+        });
     }
     let changes = applied_edits
         .iter()
@@ -1971,6 +2117,395 @@ fn not_applied(
     }
     record["error"] = json!(error.into());
     record
+}
+
+/// The field of an accepted edit holding the entry as it was proposed
+/// against ([`super::memory_queue::Item::expected`]).
+const QUEUE_EXPECTS: &str = "queue_expects";
+
+/// Why a review's change waits for the person.
+const ALL_WAITS: &str =
+    "HA_MEMORY_REVIEW=all: every memory change a review proposes waits for the person";
+
+/// Why a page's words made a rule wait for the person.
+const WEB_RULE_WAITS: &str = "a fetched web page's words would become a rule every later turn follows (constraints, user/preferences): only the person makes them one";
+
+/// Why a child's proposal waits for the person.
+const CHILD_WAITS: &str = "a delegated child proposed it from what its tool results showed, and its parent's review did not keep it: a child never writes memory by its own authority";
+
+/// Why a memory or prompt change a refinement planned waits for the person
+/// instead of being applied, when it does ([`super::memory_queue`]):
+///
+/// - with `HA_MEMORY_REVIEW=all`, every one;
+/// - by default, one that writes, changes or removes a rule every later turn
+///   follows - an entry in `constraints/*` or `user/preferences`, now or
+///   before - from a fetched page's words (which 0.9.0 refused), or from
+///   evidence that is not the user's own words (a file's, a tool's, a
+///   child's, or the review's inference). Deep Dream's merges rest on the
+///   entries, not on a quote, and wait only for a page's words;
+/// - with `off`, none.
+///
+/// A child's proposal its parent's review did not keep always waits.
+fn wait_reason(
+    mode: super::memory_queue::ReviewMode,
+    proposer: &str,
+    queue_only: bool,
+    edit: &Edit,
+    before: &Value,
+) -> Option<String> {
+    use super::memory_queue::ReviewMode;
+    if !matches!(edit.text("kind"), Some("memory" | "prompt")) {
+        return None;
+    }
+    if queue_only {
+        return Some(CHILD_WAITS.to_owned());
+    }
+    match mode {
+        ReviewMode::Off => None,
+        ReviewMode::All => Some(ALL_WAITS.to_owned()),
+        ReviewMode::Policy => {
+            let path = edit
+                .text("path")
+                .or_else(|| before["path"].as_str())
+                .unwrap_or_default();
+            let was = before["path"].as_str().unwrap_or_default();
+            let rule = super::memory_validity::steering_path(path)
+                || (before.is_object() && super::memory_validity::steering_path(was));
+            if !rule {
+                return None;
+            }
+            let from = edit.text(ORIGIN_KIND).unwrap_or("review");
+            let kept = if before.is_object() {
+                super::memory_validity::origin_kind(before)
+            } else {
+                "user"
+            };
+            if from == "web" || kept == "web" {
+                return Some(WEB_RULE_WAITS.to_owned());
+            }
+            (proposer != "deep_dream" && from != "user").then(|| {
+                format!(
+                    "it writes or removes a rule every later turn follows (constraints, user/preferences), and its evidence is not the user's own words (it quotes {})",
+                    match from {
+                        "file" => "a file",
+                        "tool" => "a tool's output",
+                        "child" => "a delegated child's finding",
+                        "agent" => "the agent",
+                        _ => "nothing the user said: the review inferred it",
+                    }
+                )
+            })
+        }
+    }
+}
+
+/// The conversation a local store belongs to, when it is one.
+fn conversation_name(local: &Path) -> Option<String> {
+    local
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .filter(|name| name.starts_with("task_"))
+        .map(str::to_owned)
+}
+
+/// Put a change that waits in its scope's queue, and record it as waiting:
+/// not applied, not failed. One the person rejected before is refused.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the change, its entry and its place in the refinement"
+)]
+fn queue_edit(
+    scopes: &HarnessScopes,
+    proposal: &Proposal,
+    refinement: &str,
+    scope: &str,
+    mut record: Value,
+    before: &Value,
+    why: &str,
+    after: Option<String>,
+) -> Value {
+    let expected = if before.is_object() {
+        json!({"version": before["version"], "title": before["title"], "content": before["content"]})
+    } else {
+        Value::Null
+    };
+    let by = proposal.queue_by.clone().unwrap_or_else(
+        || json!({"via": proposal.proposer.unwrap_or("review"), "refinement": refinement}),
+    );
+    let mut item = super::memory_queue::Item::new(
+        scope,
+        conversation_name(&scopes.local),
+        record.clone(),
+        expected,
+        by,
+        why.to_owned(),
+    );
+    item.after = after;
+    match super::memory_queue::offer(scopes.dir(scope == "global"), item) {
+        Ok(
+            super::memory_queue::Offered::Queued(queued)
+            | super::memory_queue::Offered::Waiting(queued),
+        ) => {
+            if before.is_object() {
+                record["before"] = before.clone();
+            }
+            record["applied"] = json!(false);
+            record["queued"] = json!(queued);
+            record["waits"] = json!(why);
+            record
+        }
+        Ok(super::memory_queue::Offered::Rejected(at)) => not_applied(
+            record,
+            before,
+            format!(
+                "the person rejected the same change in the memory queue ({}): it is not proposed again",
+                chrono::DateTime::from_timestamp_millis(i64::try_from(at).unwrap_or_default())
+                    .map_or_else(String::new, |time| time.format("%Y-%m-%d").to_string())
+            ),
+            false,
+        ),
+        Err(error) => not_applied(
+            record,
+            before,
+            format!("the memory queue could not keep it: {error}"),
+            false,
+        ),
+    }
+}
+
+/// Why an accepted change is refused as stale: its entry is not as it was
+/// proposed against.
+fn stale_refusal(expected: &Value, current: &Value) -> String {
+    match (expected.is_object(), current.is_object()) {
+        (false, true) => format!(
+            "stale: an entry with this id was written since the change was proposed (now version {}): it is not applied",
+            current["version"]
+        ),
+        (true, false) => {
+            "stale: the entry was deleted since the change was proposed: it is not applied"
+                .to_owned()
+        }
+        _ => format!(
+            "stale: the entry changed since the change was proposed (version {} then, {} now): it is not applied",
+            expected["version"], current["version"]
+        ),
+    }
+}
+
+/// Apply a change the person accepted from the memory queue, through the
+/// write path and the checks a review's edit has (`apply`), as the person's:
+/// its `origin.kind` is `user`, and the origin records the item, where its
+/// words came from and who proposed it. The page's-words refusal is not made:
+/// the person made it a rule. The entry must be as it was when the change was
+/// proposed, else the change is refused as stale. A rollback undoes it.
+///
+/// # Errors
+/// The item holds no edit, or the store cannot be written.
+pub fn accept_queued(
+    scopes: &HarnessScopes,
+    item: &super::memory_queue::Item,
+) -> Result<Refinement, String> {
+    let mut fields = item
+        .edit
+        .as_object()
+        .cloned()
+        .ok_or("the queued change holds no edit")?;
+    let from = fields
+        .get(ORIGIN_KIND)
+        .and_then(Value::as_str)
+        .unwrap_or("review")
+        .to_owned();
+    fields.insert(ORIGIN_KIND.to_owned(), json!("user"));
+    fields.insert(QUEUE_EXPECTS.to_owned(), item.expected.clone());
+    let proposal = Proposal {
+        summary: format!("Accepted from the memory queue: {}", item.id),
+        rationale: item.why.clone(),
+        expected_outcome: "The change the person accepted is in memory.".to_owned(),
+        edits: vec![Edit(fields)],
+        accepting: Some(item.id.clone()),
+        queue_by: Some(json!({
+            "item": item.id,
+            "from": from,
+            "by": item.by,
+            "queued_at_ms": item.at_ms,
+        })),
+        ..Proposal::default()
+    };
+    apply(
+        scopes,
+        &proposal,
+        &refinement_id(),
+        item.scope == "global",
+        None,
+        None,
+        None,
+    )
+}
+
+/// How a child's proposal ended after its parent's review.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalOutcome {
+    /// The finding's place ([`super::delegation::ChildFinding::seq`]).
+    pub seq: u64,
+    /// `kept` (the review applied it as its own), `queued` (it waits for the
+    /// person, as the child's or as the review's own edit), `refused` (a
+    /// check refused it: a duplicate, a secret, one the person rejected) or
+    /// `dropped` (`HA_MEMORY_REVIEW=off`: nothing waits).
+    pub closed: &'static str,
+    /// What happened, in words.
+    pub note: String,
+    /// The queue item it waits as.
+    pub queued: Option<String>,
+    /// Whether this settling put it in the queue.
+    pub newly_queued: bool,
+}
+
+/// Settle the proposals of `findings` once their parent's review
+/// (`refinements`, none when the gate found nothing to refine) ran. A
+/// proposal is kept when an edit of the review rests on its finding - its
+/// evidence quotes the finding's line as the review read it - and that edit
+/// was applied (or waits for the person). One the review did not keep waits
+/// in the person's queue as the child's (`origin.kind` `child`), checked as
+/// the review's edits are; with `HA_MEMORY_REVIEW=off` it is dropped.
+#[must_use]
+pub fn settle_child_proposals(
+    scopes: &HarnessScopes,
+    refinements: &[Refinement],
+    findings: &[super::delegation::ChildFinding],
+) -> Vec<ProposalOutcome> {
+    let edits = refinements
+        .iter()
+        .flat_map(|refinement| {
+            refinement.record["appliedEdits"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(move |edit| (refinement, edit))
+        })
+        .filter(|(_, edit)| matches!(edit["kind"].as_str(), Some("memory" | "prompt")))
+        .filter(|(_, edit)| edit["applied"] == true || edit["queued"].is_string())
+        .collect::<Vec<_>>();
+    let mut outcomes = Vec::new();
+    for finding in findings {
+        let Some(proposed) = &finding.proposal else {
+            continue;
+        };
+        let line = super::delegation::finding_line(finding);
+        let kept = edits
+            .iter()
+            .find(|(_, edit)| quoted(edit["evidence"].as_str().unwrap_or_default(), &line));
+        let outcome = match kept {
+            Some((refinement, edit)) => match edit["queued"].as_str() {
+                Some(queued) => ProposalOutcome {
+                    seq: finding.seq,
+                    closed: "queued",
+                    note: format!(
+                        "the review's own edit for it, {} `{}`, waits for the person as {queued}",
+                        edit["action"].as_str().unwrap_or("?"),
+                        edit["id"].as_str().unwrap_or("?")
+                    ),
+                    queued: Some(queued.to_owned()),
+                    newly_queued: false,
+                },
+                None => ProposalOutcome {
+                    seq: finding.seq,
+                    closed: "kept",
+                    note: format!(
+                        "kept by the review (refinement {}) as {} {} `{}`",
+                        refinement.id(),
+                        refinement.record["scope"].as_str().unwrap_or("local"),
+                        edit["kind"].as_str().unwrap_or("memory"),
+                        edit["id"].as_str().unwrap_or("?")
+                    ),
+                    queued: None,
+                    newly_queued: false,
+                },
+            },
+            None if scopes.review == super::memory_queue::ReviewMode::Off => ProposalOutcome {
+                seq: finding.seq,
+                closed: "dropped",
+                note: "the review did not keep it, and HA_MEMORY_REVIEW=off queues nothing"
+                    .to_owned(),
+                queued: None,
+                newly_queued: false,
+            },
+            None => queue_child_proposal(scopes, finding, proposed),
+        };
+        outcomes.push(outcome);
+    }
+    outcomes
+}
+
+/// A child's proposal the review did not keep, offered to the person's
+/// queue through `apply`'s checks.
+fn queue_child_proposal(
+    scopes: &HarnessScopes,
+    finding: &super::delegation::ChildFinding,
+    proposed: &super::delegation::ChildProposal,
+) -> ProposalOutcome {
+    let global = proposed.scope == "global";
+    let mut fields = Map::new();
+    fields.insert("action".to_owned(), json!("create"));
+    fields.insert("kind".to_owned(), json!("memory"));
+    fields.insert("title".to_owned(), json!(proposed.title));
+    fields.insert("content".to_owned(), json!(proposed.content));
+    if !proposed.path.is_empty() {
+        fields.insert("path".to_owned(), json!(proposed.path));
+    }
+    fields.insert("evidence".to_owned(), json!(finding.evidence));
+    fields.insert(
+        "reason".to_owned(),
+        json!(format!(
+            "delegated child {} ({}) found it: {}",
+            finding.child, finding.role, finding.fact
+        )),
+    );
+    fields.insert(ORIGIN_KIND.to_owned(), json!("child"));
+    let proposal = Proposal {
+        summary: format!("A proposal of delegated child {}", finding.child),
+        edits: vec![Edit(fields)],
+        proposer: Some("child"),
+        queue_only: true,
+        queue_by: Some(json!({
+            "via": "child",
+            "child": finding.child,
+            "role": finding.role,
+            "finding": finding.seq,
+        })),
+        ..Proposal::default()
+    };
+    let refused = |note: String| ProposalOutcome {
+        seq: finding.seq,
+        closed: "refused",
+        note,
+        queued: None,
+        newly_queued: false,
+    };
+    match apply(
+        scopes,
+        &proposal,
+        &refinement_id(),
+        global,
+        None,
+        None,
+        None,
+    ) {
+        Ok(refinement) => {
+            let edit = &refinement.record["appliedEdits"][0];
+            match edit["queued"].as_str() {
+                Some(queued) => ProposalOutcome {
+                    seq: finding.seq,
+                    closed: "queued",
+                    note: format!("waits for the person as {queued}"),
+                    queued: Some(queued.to_owned()),
+                    newly_queued: true,
+                },
+                None => refused(edit["error"].as_str().unwrap_or("not queued").to_owned()),
+            }
+        }
+        Err(error) => refused(error),
+    }
 }
 
 /// Whether an entry is still the version a refinement left: both gone, or
@@ -2344,6 +2879,10 @@ fn rollback_proposal(target: &Value) -> Proposal {
         lesson_records: Vec::new(),
         evidence_in: None,
         batch: None,
+        proposer: None,
+        accepting: None,
+        queue_only: false,
+        queue_by: None,
     }
 }
 
@@ -2593,6 +3132,7 @@ Learned skills in play: {}
     .await?;
     // A memory edit quotes the conversation, or what the user typed after
     // `/refine`, as its evidence.
+    proposal.proposer = Some(options.proposer());
     proposal.evidence_in = Some(match &options.instructions {
         Some(instructions) if options.typed => format!("{conversation}\n\n{instructions}"),
         _ => conversation.to_owned(),
@@ -2661,6 +3201,10 @@ async fn plan(
         parts.extend(learning.prompt_parts());
     }
     parts.extend(extra);
+    // What the person rejected in the memory queue is not proposed again.
+    if let Some(rejected) = super::memory_queue::rejected_part(&[&scopes.global, &scopes.local]) {
+        parts.push(rejected);
+    }
     if let Some(instructions) = &options.instructions {
         parts.push(format!(
             "<user_refine_instructions>\n{instructions}\n</user_refine_instructions>"
@@ -2682,8 +3226,15 @@ async fn plan(
     let mut proposal = Proposal::from_value(&value);
     // Where an edit's words came from is the host's to say, by the turn its
     // evidence quotes (`memory_provenance::quoted_kind`), never the model's.
+    // What the user typed after `/refine` is the user's turn.
+    let read = match &options.instructions {
+        Some(instructions) if options.typed => {
+            format!("{conversation}\n\n[User]: {instructions}")
+        }
+        _ => conversation.to_owned(),
+    };
     for edit in &mut proposal.edits {
-        let from = super::memory_provenance::quoted_kind(conversation, edit.text("evidence"));
+        let from = super::memory_provenance::quoted_kind(&read, edit.text("evidence"));
         edit.0.insert(ORIGIN_KIND.to_owned(), json!(from));
     }
     Ok(proposal)
@@ -3300,6 +3851,7 @@ pub async fn auto_refine(
     // holds a child's findings too. The gate's instructions are a model's
     // words, not the user's, and are no evidence.
     proposal.evidence_in = Some(conversation.to_owned());
+    proposal.proposer = Some("review");
     // A global edit reaches every conversation, so it carries the quote that
     // justifies it; one without stays in this conversation.
     let (global_edits, local_edits): (Vec<_>, Vec<_>) = std::mem::take(&mut proposal.edits)
@@ -3434,6 +3986,7 @@ pub async fn auto_refine(
             expected_outcome: proposal.expected_outcome.clone(),
             edits: global_edits,
             evidence_in: proposal.evidence_in.clone(),
+            proposer: Some("review"),
             ..Proposal::default()
         };
         match apply(
@@ -4378,6 +4931,7 @@ async fn consolidate_scope(
         if suffixed && let Some(batch) = proposal.batch.as_mut() {
             batch.record = Some(json!({"of": id, "index": index + 1, "count": count}));
         }
+        proposal.proposer = Some("deep_dream");
         let refinement = match apply(
             scopes,
             &proposal,
@@ -4696,6 +5250,7 @@ mod tests {
         HarnessScopes {
             global: root.join("global"),
             local: root.join("local"),
+            review: super::super::memory_queue::ReviewMode::default(),
         }
     }
 
@@ -4708,6 +5263,7 @@ mod tests {
         let in_conversation = |task: &str| HarnessScopes {
             global: directory.path().join("harness"),
             local: directory.path().join("sessions").join(task).join("harness"),
+            review: super::super::memory_queue::ReviewMode::default(),
         };
         let review = |lessons: serde_json::Value| {
             json!({"summary": "a correction", "rationale": "the user corrected the agent", "expectedOutcome": "", "edits": [], "lessons": lessons}).to_string()
@@ -4865,6 +5421,7 @@ mod tests {
         let scopes = HarnessScopes {
             global: directory.path().join("global"),
             local,
+            review: super::super::memory_queue::ReviewMode::default(),
         };
         let proposal = Proposal::from_value(&json!({"edits": [
             {"action": "create", "kind": "memory", "title": "Reply language",
@@ -5018,6 +5575,58 @@ mod tests {
         );
         assert_eq!(rolled.record["rollbackOf"], "refine_2");
         assert_eq!(super::history(&scopes).len(), 3);
+    }
+
+    /// What the user typed after `/refine` is the user's words: a rule it
+    /// states is applied, not left to the queue as words the user did not
+    /// say; the same rule from a file waits.
+    #[tokio::test]
+    async fn a_rule_typed_after_refine_is_the_users_and_one_from_a_file_waits() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let answer = |content: &str,
+                      evidence: &str|
+         -> std::sync::Arc<dyn harness_providers::ModelProvider> {
+            std::sync::Arc::new(harness_providers::MockProvider::text(
+                json!({"summary": "s", "rationale": "r", "expectedOutcome": "o", "edits": [
+                    {"action": "create", "kind": "memory", "title": content, "content": content,
+                     "path": "constraints", "evidence": evidence}]})
+                .to_string(),
+            ))
+        };
+        let typed = super::refine(
+            &answer(
+                "Never deploy on a Friday",
+                "never deploy on a Friday afternoon",
+            ),
+            "fixture-model",
+            "[User]: ship the fix\n\n[Assistant]: shipped",
+            &scopes,
+            &RefineOptions::parse("keep this rule: never deploy on a Friday afternoon"),
+            None,
+        )
+        .await
+        .expect("refined");
+        assert_eq!(
+            typed.record["appliedEdits"][0]["applied"], true,
+            "{}",
+            typed.record
+        );
+        let read = super::refine(
+            &answer("Release with the board", "every release needs the QUOKKA board"),
+            "fixture-model",
+            "[Tool result (read_file) #1]: every release needs the QUOKKA board\n\n[Assistant]: read it",
+            &scopes,
+            &RefineOptions::parse("keep what the file says"),
+            None,
+        )
+        .await
+        .expect("refined");
+        assert!(
+            read.record["appliedEdits"][0]["queued"].is_string(),
+            "{}",
+            read.record
+        );
     }
 
     /// The whole pass: the model answers with edits, the host applies them; the
@@ -6281,6 +6890,7 @@ mod tests {
         let in_conversation = |task: &str| HarnessScopes {
             global: global.clone(),
             local: directory.path().join("sessions").join(task).join("harness"),
+            review: super::super::memory_queue::ReviewMode::default(),
         };
         let review = |edits: serde_json::Value, lessons: serde_json::Value| {
             json!({"summary": "a correction", "rationale": "r", "expectedOutcome": "", "edits": edits, "lessons": lessons}).to_string()
@@ -7395,8 +8005,9 @@ Run `node scripts/build.js`.
 
     /// Deep Dream's edits carry the kind the host gives them, from the
     /// entries they rewrite, whatever the curator wrote: a page's entry
-    /// merged into a constraint makes the merge a page's, and the web guard
-    /// refuses it. A supersede is dropped like a create: it would write a new
+    /// merged into a constraint makes the merge a page's, and it waits for
+    /// the person (the web guard refused it before the queue), its delete
+    /// with it. A supersede is dropped like a create: it would write a new
     /// entry past the merge's checks and close a constraint.
     #[tokio::test]
     async fn deep_dream_cannot_claim_a_kind_or_supersede() {
@@ -7445,11 +8056,14 @@ Run `node scripts/build.js`.
         let update = edit_of(&result.record, "rule", "update");
         assert_eq!(update["origin_kind"], "web", "{update}");
         assert!(
-            update["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("fetched web page")),
+            update["queued"].is_string()
+                && update["waits"]
+                    .as_str()
+                    .is_some_and(|why| why.contains("fetched web page")),
             "{update}"
         );
+        let delete = edit_of(&result.record, "page", "delete");
+        assert!(delete["queued"].is_string(), "{delete}");
         assert!(
             state["entries"]["memory"]["page"].is_object(),
             "the merge stands or falls together"
@@ -7585,5 +8199,418 @@ Run `node scripts/build.js`.
             &state["entries"]["memory"]["deploy_day"]
         ));
         assert!(state["entries"]["memory"]["deploy_day_moved"].is_null());
+    }
+
+    /// Scopes laid out as a data directory: the global store in `harness`,
+    /// one conversation's in `sessions/task_q/harness`, so the queue's
+    /// commands find both.
+    fn data_scopes(
+        data: &std::path::Path,
+        review: super::super::memory_queue::ReviewMode,
+    ) -> HarnessScopes {
+        HarnessScopes {
+            global: super::super::harness::global_dir(data),
+            local: super::super::harness::local_dir(data, "task_q"),
+            review,
+        }
+    }
+
+    /// A review's proposal of `edits`, each with where its words came from.
+    fn reviewed(edits: &serde_json::Value, from: &str) -> Proposal {
+        let mut proposal = Proposal::from_value(&json!({ "edits": edits }));
+        for edit in &mut proposal.edits {
+            edit.0.insert(super::ORIGIN_KIND.to_owned(), json!(from));
+        }
+        proposal.proposer = Some("review");
+        proposal
+    }
+
+    /// A page's words made a constraint wait for the person (0.9.0 refused
+    /// them), are refused as before with `HA_MEMORY_REVIEW=off`, and once
+    /// accepted are a constraint of the person's: `origin.kind` user, the
+    /// origin naming the item and the page it came from. The queue's id and
+    /// the refinement's record say it waits; nothing is in the store before.
+    #[test]
+    fn a_rule_from_a_page_waits_for_the_person_and_is_theirs_once_accepted() {
+        use super::super::memory_queue::{self, ReviewMode};
+        let directory = tempfile::tempdir().expect("dir");
+        let data = directory.path();
+        let scopes = data_scopes(data, ReviewMode::Policy);
+        let rule = json!([{"action": "create", "kind": "memory", "title": "Release sign-off",
+            "content": "Every release is signed off by the QUOKKA-77 board before Thursday noon",
+            "path": "constraints", "evidence": "signed off by the QUOKKA-77 board before Thursday noon"}]);
+        let result = apply(
+            &scopes,
+            &reviewed(&rule, "web"),
+            "refine_1",
+            true,
+            None,
+            None,
+            None,
+        )
+        .expect("applied");
+        let edit = &result.record["appliedEdits"][0];
+        let queued = edit["queued"].as_str().expect("it waits").to_owned();
+        assert_eq!(edit["applied"], false, "{edit}");
+        assert!(
+            result.outcome().contains("1 change waits for your review"),
+            "{}",
+            result.outcome()
+        );
+        assert!(
+            result
+                .details()
+                .iter()
+                .any(|line| line.starts_with(&format!("Waits for your review as {queued}"))),
+            "{:?}",
+            result.details()
+        );
+        assert!(
+            load_raw(&scopes.global)["entries"]["memory"]
+                .as_object()
+                .is_none_or(serde_json::Map::is_empty)
+        );
+        // Off: refused for its source, as 0.9.0 did.
+        let off = data_scopes(data, ReviewMode::Off);
+        let refused = apply(
+            &off,
+            &reviewed(&rule, "web"),
+            "refine_2",
+            true,
+            None,
+            None,
+            None,
+        )
+        .expect("applied");
+        assert!(
+            refused.record["appliedEdits"][0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("fetched web page")),
+            "{}",
+            refused.record
+        );
+        assert_eq!(memory_queue::waiting(&scopes.global).len(), 1);
+        let shown = memory_queue::command(data, &["show", &queued]);
+        assert!(shown.ok, "{:?}", shown.lines);
+        assert!(
+            shown
+                .lines
+                .iter()
+                .any(|line| line.contains("+ Every release")),
+            "{:?}",
+            shown.lines
+        );
+        let accepted = memory_queue::command(data, &["accept", &queued]);
+        assert!(accepted.ok, "{:?}", accepted.lines);
+        let entry = &load_raw(&scopes.global)["entries"]["memory"]["release_sign_off"];
+        assert_eq!(entry["path"], "constraints", "{entry}");
+        assert_eq!(entry["origin"]["kind"], "user", "{entry}");
+        assert_eq!(entry["origin"]["accepted"]["from"], "web", "{entry}");
+        assert_eq!(
+            entry["origin"]["accepted"]["item"],
+            queued.as_str(),
+            "{entry}"
+        );
+        assert!(memory_queue::waiting(&scopes.global).is_empty());
+    }
+
+    /// By default a rule whose evidence is not the user's own words waits;
+    /// one the user said is applied, and so is a fact outside the rules.
+    #[test]
+    fn a_rule_not_in_the_users_words_waits_and_the_users_is_applied() {
+        use super::super::memory_queue::ReviewMode;
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = data_scopes(directory.path(), ReviewMode::Policy);
+        let edit = |title: &str, content: &str, path: &str| {
+            json!([{"action": "create", "kind": "memory", "title": title, "content": content,
+                "path": path, "evidence": content}])
+        };
+        let from_file = apply(
+            &scopes,
+            &reviewed(
+                &edit(
+                    "Indentation",
+                    "Indent the YAML files with four spaces",
+                    "user/preferences",
+                ),
+                "file",
+            ),
+            "refine_1",
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("applied");
+        let waits = &from_file.record["appliedEdits"][0];
+        assert!(waits["queued"].is_string(), "{waits}");
+        assert!(
+            waits["waits"]
+                .as_str()
+                .is_some_and(|why| why.contains("not the user's own words")),
+            "{waits}"
+        );
+        let said = apply(
+            &scopes,
+            &reviewed(
+                &edit(
+                    "Tabs",
+                    "The user indents Rust with tabs of four",
+                    "user/preferences",
+                ),
+                "user",
+            ),
+            "refine_2",
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("applied");
+        assert_eq!(
+            said.record["appliedEdits"][0]["applied"], true,
+            "{}",
+            said.record
+        );
+        let fact = apply(
+            &scopes,
+            &reviewed(
+                &edit("Build tool", "The project builds with ninja", "project"),
+                "file",
+            ),
+            "refine_3",
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("applied");
+        assert_eq!(
+            fact.record["appliedEdits"][0]["applied"], true,
+            "{}",
+            fact.record
+        );
+    }
+
+    /// `HA_MEMORY_REVIEW=all`: a review's ordinary edit waits and is not in
+    /// the store until accepted; an accept of a change whose entry changed
+    /// since is refused as stale and leaves the queue; a rejected change is
+    /// not queued again, and the next review is told of it.
+    #[test]
+    fn with_all_every_change_waits_a_stale_one_is_refused_and_a_rejected_one_stays_out() {
+        use super::super::memory_queue::{self, ReviewMode};
+        let directory = tempfile::tempdir().expect("dir");
+        let data = directory.path();
+        let scopes = data_scopes(data, ReviewMode::All);
+        let fact = json!([{"action": "create", "kind": "memory", "title": "Release channel",
+            "content": "The project ships on the amber channel", "path": "project",
+            "evidence": "ships on the amber channel"}]);
+        let result = apply(
+            &scopes,
+            &reviewed(&fact, "user"),
+            "refine_1",
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("applied");
+        let first = result.record["appliedEdits"][0]["queued"]
+            .as_str()
+            .expect("waits")
+            .to_owned();
+        assert!(load_raw(&scopes.local)["entries"]["memory"]["release_channel"].is_null());
+        // An entry the conversation keeps, and a review's update of it.
+        let seed = Proposal::from_value(&json!({"edits": [{"action": "create", "kind": "memory",
+            "title": "Port", "content": "The service listens on port 8080"}]}));
+        apply(&scopes, &seed, "refine_seed", false, None, None, None).expect("seeded");
+        let update = json!([{"action": "update", "kind": "memory", "id": "port", "title": "Port",
+            "content": "The service listens on port 9090 since the move",
+            "evidence": "listens on port 9090 since the move"}]);
+        let result = apply(
+            &scopes,
+            &reviewed(&update, "user"),
+            "refine_2",
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("applied");
+        let second = result.record["appliedEdits"][0]["queued"]
+            .as_str()
+            .expect("waits")
+            .to_owned();
+        // The entry changes meanwhile.
+        let meanwhile =
+            Proposal::from_value(&json!({"edits": [{"action": "update", "kind": "memory",
+            "id": "port", "title": "Port", "content": "The service listens on port 7070"}]}));
+        apply(&scopes, &meanwhile, "refine_3", false, None, None, None).expect("changed");
+        let stale = memory_queue::command(data, &["accept", &second]);
+        assert!(!stale.ok, "{:?}", stale.lines);
+        assert!(
+            stale.lines[0].contains("stale") && stale.lines[0].contains("version 1 then, 2 now"),
+            "{:?}",
+            stale.lines
+        );
+        assert_eq!(
+            load_raw(&scopes.local)["entries"]["memory"]["port"]["content"],
+            "The service listens on port 7070"
+        );
+        let accepted = memory_queue::command(data, &["accept", &first]);
+        assert!(accepted.ok, "{:?}", accepted.lines);
+        assert_eq!(
+            load_raw(&scopes.local)["entries"]["memory"]["release_channel"]["content"],
+            "The project ships on the amber channel"
+        );
+        assert!(memory_queue::all(data).is_empty());
+        // A rejected change stays out.
+        let proposal = || {
+            reviewed(
+                &json!([{"action": "create", "kind": "memory", "title": "Deploy day",
+                    "content": "Deploys go out on Tuesdays after the standup", "path": "project",
+                    "evidence": "Deploys go out on Tuesdays"}]),
+                "user",
+            )
+        };
+        let result =
+            apply(&scopes, &proposal(), "refine_4", false, None, None, None).expect("applied");
+        let third = result.record["appliedEdits"][0]["queued"]
+            .as_str()
+            .expect("waits")
+            .to_owned();
+        let rejected = memory_queue::command(data, &["reject", &third]);
+        assert!(rejected.ok, "{:?}", rejected.lines);
+        let again =
+            apply(&scopes, &proposal(), "refine_5", false, None, None, None).expect("applied");
+        let edit = &again.record["appliedEdits"][0];
+        assert!(edit["queued"].is_null(), "{edit}");
+        assert!(
+            edit["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("rejected the same change")),
+            "{edit}"
+        );
+        let told = memory_queue::rejected_part(&[&scopes.global, &scopes.local]).expect("told");
+        assert!(told.contains("Deploys go out on Tuesdays"), "{told}");
+    }
+
+    /// Deep Dream's merge with `all`: the survivor's update waits, and the
+    /// delete merged into it waits on it: accepted only after it, and
+    /// rejected with it.
+    #[test]
+    fn a_merge_that_waits_keeps_its_delete_behind_its_survivor() {
+        use super::super::memory_queue::{self, ReviewMode};
+        let directory = tempfile::tempdir().expect("dir");
+        let data = directory.path();
+        let scopes = data_scopes(data, ReviewMode::All);
+        let seed = Proposal::from_value(&json!({"edits": [
+            {"action": "create", "kind": "memory", "title": "Port", "content": "The service listens on port 8080"},
+            {"action": "create", "kind": "memory", "title": "Port again", "content": "Port 8080 is where the service listens"}
+        ]}));
+        apply(&scopes, &seed, "refine_seed", true, None, None, None).expect("seeded");
+        let mut merge = Proposal::from_value(&json!({"edits": [
+            {"action": "update", "kind": "memory", "id": "port", "title": "Port", "content": "The service listens on port 8080"},
+            {"action": "delete", "kind": "memory", "id": "port_again", "merged_into": "port"}
+        ]}));
+        merge.proposer = Some("deep_dream");
+        let result = apply(&scopes, &merge, "refine_1", true, None, None, None).expect("applied");
+        let survivor = edit_of(&result.record, "port", "update")["queued"]
+            .as_str()
+            .expect("waits")
+            .to_owned();
+        let gone = edit_of(&result.record, "port_again", "delete")["queued"]
+            .as_str()
+            .expect("waits too")
+            .to_owned();
+        let early = memory_queue::command(data, &["accept", &gone]);
+        assert!(!early.ok);
+        assert!(early.lines[0].contains("first"), "{:?}", early.lines);
+        let rejected = memory_queue::command(data, &["reject", &survivor]);
+        assert!(rejected.ok, "{:?}", rejected.lines);
+        assert!(
+            memory_queue::all(data).is_empty(),
+            "the delete left with it"
+        );
+        assert!(load_raw(&scopes.global)["entries"]["memory"]["port_again"].is_object());
+    }
+
+    /// A child's proposal is kept when an edit of its parent's review quotes
+    /// its finding; one the review did not keep waits for the person as the
+    /// child's, and with `HA_MEMORY_REVIEW=off` it is dropped.
+    #[test]
+    fn a_childs_proposal_is_kept_by_the_review_or_waits_for_the_person() {
+        use super::super::memory_queue::{self, ReviewMode};
+        let directory = tempfile::tempdir().expect("dir");
+        let data = directory.path();
+        let scopes = data_scopes(data, ReviewMode::Policy);
+        let finding = |seq: u64, fact: &str, evidence: &str, title: &str| {
+            super::super::delegation::ChildFinding {
+                seq,
+                at_ms: 1,
+                child: "explorer-1".to_owned(),
+                role: "explorer".to_owned(),
+                fact: fact.to_owned(),
+                evidence: evidence.to_owned(),
+                proposal: Some(super::super::delegation::ChildProposal {
+                    scope: "global".to_owned(),
+                    path: "project".to_owned(),
+                    title: title.to_owned(),
+                    content: fact.to_owned(),
+                    closed: None,
+                    note: None,
+                    queued: None,
+                }),
+            }
+        };
+        let findings = vec![
+            finding(
+                1,
+                "The release channel is set in config/deploy.ini",
+                "release_channel = amber-falcon-38",
+                "Release channel",
+            ),
+            finding(
+                2,
+                "The project's tests run with nextest",
+                "cargo nextest run --workspace",
+                "Test runner",
+            ),
+        ];
+        // The review kept the first, quoting its finding.
+        let review = Proposal {
+            proposer: Some("review"),
+            evidence_in: Some(super::super::delegation::finding_line(&findings[0])),
+            ..reviewed(
+                &json!([{"action": "create", "kind": "memory", "title": "Release channel",
+                    "content": "The release channel is amber-falcon-38 (config/deploy.ini)",
+                    "path": "project", "evidence": "release_channel = amber-falcon-38"}]),
+                "child",
+            )
+        };
+        let kept = apply(&scopes, &review, "refine_1", true, None, None, None).expect("applied");
+        let outcomes = super::settle_child_proposals(&scopes, &[kept], &findings);
+        assert_eq!(outcomes[0].closed, "kept", "{outcomes:?}");
+        assert_eq!(outcomes[1].closed, "queued", "{outcomes:?}");
+        assert!(outcomes[1].newly_queued);
+        let waiting = memory_queue::all(data);
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].item.by["via"], "child");
+        assert_eq!(waiting[0].item.edit["origin_kind"], "child");
+        assert_eq!(waiting[0].item.scope, "global");
+        // Off: nothing waits.
+        let off = data_scopes(data, ReviewMode::Off);
+        let dropped = super::settle_child_proposals(
+            &off,
+            &[],
+            &[finding(
+                3,
+                "The docs build with mdbook",
+                "mdbook build docs",
+                "Docs",
+            )],
+        );
+        assert_eq!(dropped[0].closed, "dropped");
+        assert_eq!(memory_queue::all(data).len(), 1);
     }
 }

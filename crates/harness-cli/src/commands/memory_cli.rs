@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 use harness_types::{ErrorCode, HarnessError};
 
-use crate::interactive::{cli_extras, harness, markdown_memory, memory_store};
+use crate::interactive::{cli_extras, harness, markdown_memory, memory_queue, memory_store};
 
 #[derive(Debug, Args)]
 pub struct MemoryCommand {
@@ -50,11 +50,53 @@ enum MemorySubcommand {
         #[arg(long)]
         examples: bool,
     },
+    /// The memory changes that wait for your review: what a review, /refine
+    /// or Deep Dream proposed that you have a say in (a page's words made a
+    /// rule, a rule not in the user's own words, a delegated child's
+    /// proposal; every change with `HA_MEMORY_REVIEW=all`). `list` (the
+    /// default), `show <id>...` (with its evidence and a diff against the
+    /// entry as it is), `accept <id>...` (applied through the review's write
+    /// path; refused as stale when the entry changed since), `reject
+    /// <id>...` (kept out, and not proposed again).
+    Queue(QueueArgs),
     /// Turn a flat memory file into the markdown store: the file is archived
     /// whole in memory/archive/, and an agent run (`ha exec`) splits it into
     /// people, projects, decisions and daily notes, tags every fact and
     /// rebuilds MEMORY.md as an index; then the store is linted.
     Migrate(MigrateArgs),
+}
+
+#[derive(Debug, Args)]
+struct QueueArgs {
+    /// `list`, `show`, `accept` or `reject`.
+    #[arg(default_value = "list")]
+    action: String,
+    /// The items, by id (`mq-...`).
+    ids: Vec<String>,
+    /// Print the answer as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+/// `ha memory queue`: the memory changes that wait for the person, over
+/// every queue of the data directory. Exits 1 when an item named was not
+/// found, or an accept or reject was refused.
+fn queue(args: &QueueArgs) -> Result<(), HarnessError> {
+    let data = cli_extras::current_data_dir()?;
+    let mut words = vec![args.action.as_str()];
+    words.extend(args.ids.iter().map(String::as_str));
+    let answer = memory_queue::command(&data, &words);
+    if args.json {
+        println!("{}", answer.json);
+    } else {
+        for line in &answer.lines {
+            println!("{line}");
+        }
+    }
+    if !answer.ok {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Args)]
@@ -481,6 +523,7 @@ pub fn run(command: MemoryCommand) -> Result<(), HarnessError> {
         } => init(root, hook, examples),
         MemorySubcommand::Migrate(args) => migrate(args),
         MemorySubcommand::Purge(args) => purge(&args),
+        MemorySubcommand::Queue(args) => queue(&args),
         MemorySubcommand::Export { conversation } => {
             let data = cli_extras::current_data_dir()?;
             let (scope, dir) = match &conversation {

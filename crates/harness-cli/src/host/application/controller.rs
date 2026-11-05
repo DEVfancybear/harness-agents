@@ -4825,6 +4825,10 @@ impl InteractiveController {
                 Ok(lines) => self.reference("/features", lines, &mut effects),
                 Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
             },
+            "/memory" => match self.service.memory(raw_argument.unwrap_or_default()) {
+                Ok(lines) => self.reference("/memory", lines, &mut effects),
+                Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+            },
             "/knowledge" => match self.service.knowledge(raw_argument.unwrap_or_default()) {
                 Ok(lines) => self.reference("/knowledge", lines, &mut effects),
                 Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),

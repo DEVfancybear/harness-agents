@@ -202,6 +202,7 @@ pub fn help_card_lines() -> Vec<String> {
                 "/learn",
                 "/refinements",
                 "/checks",
+                "/memory",
                 "/strategy",
                 "/context",
                 "/copy",

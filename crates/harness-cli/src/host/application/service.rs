@@ -600,6 +600,11 @@ pub trait SessionPort: Send {
     fn knowledge(&mut self, _argument: &str) -> Result<Vec<String>, String> {
         Err("this backend has no knowledge store".to_owned())
     }
+    /// `/memory queue [show|accept|reject] <id>...`: the memory changes that
+    /// wait for the person's review.
+    fn memory(&mut self, _argument: &str) -> Result<Vec<String>, String> {
+        Err("this backend has no memory store".to_owned())
+    }
     /// What leaving now would leave the next session to trip over.
     fn clean_state(&self) -> Vec<String> {
         Vec::new()
@@ -5423,6 +5428,7 @@ impl SessionPort for AgentSessionService {
             &super::refine::HarnessScopes {
                 global: super::harness::global_dir(&self.data_dir),
                 local: super::harness::local_dir(&self.data_dir, self.task_id.as_str()),
+                review: super::memory_queue::ReviewMode::default(),
             },
             limit,
         )
@@ -5442,6 +5448,17 @@ impl SessionPort for AgentSessionService {
             "Memory:   {}",
             super::memory_switch::Switch::load(&self.config_file, &self.environment).summary()
         ));
+        // What of memory waits for the person (`memory_queue`).
+        let review = super::memory_queue::ReviewMode::load(&self.config_file, &self.environment);
+        let waiting = super::memory_queue::counts(&self.data_dir);
+        if waiting.waiting > 0 || review != super::memory_queue::ReviewMode::default() {
+            lines.push(format!(
+                "Memory queue: {} change(s) wait for your review ({} from delegated children; /memory queue), HA_MEMORY_REVIEW={}",
+                waiting.waiting,
+                waiting.from_children,
+                review.name()
+            ));
+        }
         lines.push(String::new());
         lines.extend(self.context_summary.lock().map_or_else(
             |_| vec!["context details are unavailable".to_owned()],
@@ -5649,6 +5666,7 @@ impl SessionPort for AgentSessionService {
             other_stores: super::adoption::other_stores_of(&self.data_dir, &self.workspace_root),
             sleep: super::sleep::summary(&self.data_dir),
             memory: super::memory_switch::Switch::load(&self.config_file, &self.environment),
+            memory_queue: super::memory_queue::counts(&self.data_dir),
         };
         let subsystems = super::doctor::audit(
             &self.global_config_dir,
@@ -5673,6 +5691,17 @@ impl SessionPort for AgentSessionService {
 
     fn knowledge(&mut self, argument: &str) -> Result<Vec<String>, String> {
         super::knowledge::KnowledgeHost::new(&self.workspace_root, &self.data_dir).command(argument)
+    }
+
+    fn memory(&mut self, argument: &str) -> Result<Vec<String>, String> {
+        let words = argument.split_whitespace().collect::<Vec<_>>();
+        match words.split_first() {
+            Some((&"queue", rest)) => Ok(super::memory_queue::command(&self.data_dir, rest).lines),
+            None => Ok(super::memory_queue::command(&self.data_dir, &[]).lines),
+            Some((other, _)) => Err(format!(
+                "/memory {other}: unknown; /memory queue [show <id>|accept <id>...|reject <id>...]"
+            )),
+        }
     }
 
     fn run_gates(&mut self, job: super::autonomous::GateJob) -> Result<(), String> {
@@ -7391,9 +7420,64 @@ struct AutoRefine {
     reviewed: Option<String>,
     /// The library the review adds the knowledge the agent left unsaved to.
     knowledge: super::knowledge::KnowledgeHost,
+    /// The findings the review is given whose proposals it settles.
+    proposals: Vec<super::delegation::ChildFinding>,
+    /// The data directory, whose memory queues the notice counts.
+    data_dir: PathBuf,
 }
 
 impl AutoRefine {
+    /// Settle the children's proposals once the review ran (`refinements`,
+    /// none when it found nothing to refine), and say once what of the
+    /// review waits for the person. Returns how many changes it queued.
+    fn settle(&self, refinements: &[super::refine::Refinement]) -> usize {
+        let outcomes =
+            super::refine::settle_child_proposals(&self.scopes, refinements, &self.proposals);
+        for outcome in &outcomes {
+            harness_types::diag::info("memory_queue", "child_proposal")
+                .task(&self.task)
+                .field("finding", outcome.seq)
+                .field("closed", outcome.closed)
+                .field("queued", outcome.queued.clone())
+                .msg(outcome.note.clone())
+                .emit();
+        }
+        super::delegation::settle_proposals(
+            &self.scopes.local,
+            &outcomes
+                .iter()
+                .map(|outcome| {
+                    (
+                        outcome.seq,
+                        outcome.closed.to_owned(),
+                        outcome.note.clone(),
+                        outcome.queued.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let queued = refinements
+            .iter()
+            .map(super::refine::Refinement::queued)
+            .sum::<usize>()
+            + outcomes
+                .iter()
+                .filter(|outcome| outcome.newly_queued)
+                .count();
+        if queued > 0 {
+            let waiting = super::memory_queue::counts(&self.data_dir).waiting;
+            harness_types::diag::info("memory_queue", "queued")
+                .task(&self.task)
+                .field("queued", queued)
+                .field("waiting", waiting)
+                .emit();
+            let _ = self.sender.send(SessionEvent::Notice {
+                message: super::memory_queue::waiting_notice(queued, waiting),
+            });
+        }
+        queued
+    }
+
     /// Run the review and the refinement it approves. An error is the job's
     /// to keep: the review gate or the refinement failed, and the queue tries
     /// the same turns again later (`sleep`).
@@ -7432,6 +7516,7 @@ impl AutoRefine {
                 send(SessionEvent::Notice {
                     message: format!("auto-refine: nothing to refine ({})", review.rationale),
                 });
+                self.settle(&[]);
                 return Ok(());
             }
             Err(error) => {
@@ -7493,6 +7578,7 @@ impl AutoRefine {
                         message: format!("learning loop: {line}"),
                     });
                 }
+                self.settle(&refinements);
                 Ok(())
             }
             Err(error) => {
@@ -7599,6 +7685,9 @@ pub(super) struct Reviews {
     pub(super) store_dir: PathBuf,
     pub(super) learning: super::refine::Learning,
     pub(super) knowledge: super::knowledge::KnowledgeHost,
+    /// Which memory changes the reviews leave to the person
+    /// (`HA_MEMORY_REVIEW`, [`super::memory_queue`]).
+    pub(super) review: super::memory_queue::ReviewMode,
 }
 
 impl Reviews {
@@ -7679,6 +7768,11 @@ impl Reviews {
         // The children's findings the transcript carries are marked given only
         // once the review succeeded: a failed one's retry is given them again.
         let findings = super::delegation::findings_pending_through(&local);
+        // Their proposals are settled by the review: kept, or left to the
+        // person.
+        let proposals = findings
+            .map(|through| super::delegation::proposals_through(&local, through))
+            .unwrap_or_default();
         let conversation = refine_transcript(&store, &session, &local).await;
         let _ = store.close().await;
         if conversation.is_empty() {
@@ -7700,6 +7794,7 @@ impl Reviews {
             scopes: super::refine::HarnessScopes {
                 global: super::harness::global_dir(&self.data_dir),
                 local: local.clone(),
+                review: self.review,
             },
             learning,
             turns: job.turns.max(1),
@@ -7709,6 +7804,8 @@ impl Reviews {
                 job.before.clone()
             },
             knowledge: self.knowledge.clone(),
+            proposals,
+            data_dir: self.data_dir.clone(),
         }
         .run()
         .await
@@ -8052,6 +8149,7 @@ mod review_record_tests {
         let scopes = crate::interactive::refine::HarnessScopes {
             global: directory.path().join("global"),
             local: directory.path().join("local"),
+            review: crate::interactive::memory_queue::ReviewMode::default(),
         };
         let provider: std::sync::Arc<dyn harness_providers::ModelProvider> =
             std::sync::Arc::new(harness_providers::MockProvider::text(
@@ -8082,6 +8180,8 @@ mod review_record_tests {
                             &workspace,
                             &directory.path().join("data"),
                         ),
+                        proposals: Vec::new(),
+                        data_dir: directory.path().join("data"),
                     }
                     .run(),
                 )
@@ -8168,6 +8268,7 @@ mod review_record_tests {
                 None,
             ),
             knowledge: crate::interactive::knowledge::KnowledgeHost::new(&workspace, &data),
+            review: crate::interactive::memory_queue::ReviewMode::default(),
         };
         let job = crate::interactive::sleep::Job::review(
             &store_dir,
@@ -8295,7 +8396,8 @@ fn review_record(
             .task(conversation)
             .msg(refinement.summary())
             .field("refinement", refinement.id())
-            .field("edits", refinement.details().len()),
+            .field("edits", refinement.details().len())
+            .field("queued", refinement.queued()),
         Err(error) => harness_types::diag::warn("review", event)
             .task(conversation)
             .msg(error.to_owned())
@@ -9190,6 +9292,7 @@ async fn run_turn(
         let scopes = super::refine::HarnessScopes {
             global: super::harness::global_dir(&data_dir),
             local: super::harness::local_dir(&data_dir, task_id.as_str()),
+            review: super::memory_queue::ReviewMode::load(&config_file, &environment),
         };
         let conversation = match source.as_ref() {
             Some(source_session) => refine_transcript(&store, source_session, &scopes.local).await,
@@ -9388,6 +9491,8 @@ async fn run_turn(
     // neither put in this turn nor written after it.
     let refinements = super::config::harness_refinements(&config_file);
     let memory_switch = super::memory_switch::Switch::load(&config_file, &environment);
+    // Which memory changes the reviews leave to the person (`HA_MEMORY_REVIEW`).
+    let review_mode = super::memory_queue::ReviewMode::load(&config_file, &environment);
     memory_switch.record_once(task_id.as_str());
     let digest_on = refinements && memory_switch.on(super::memory_switch::Feature::Digest);
     let lessons_on = refinements && memory_switch.on(super::memory_switch::Feature::Lessons);
@@ -10419,6 +10524,7 @@ async fn run_turn(
         store_dir: store_dir.clone(),
         learning: learning.clone(),
         knowledge: knowledge_host.clone(),
+        review: review_mode,
     };
     if auto_refine && refinements {
         // The count alone: the runtime holds the store, and a watcher holding
@@ -10712,6 +10818,7 @@ async fn run_turn(
             let scopes = super::refine::HarnessScopes {
                 global: super::harness::global_dir(&data_dir),
                 local: super::harness::local_dir(&data_dir, goal_task.as_str()),
+                review: review_mode,
             };
             let learning = learning.clone();
             let conversation = goal_task.as_str().to_owned();
@@ -10761,6 +10868,7 @@ async fn run_turn(
             let scopes = super::refine::HarnessScopes {
                 global,
                 local: super::harness::local_dir(&data_dir, goal_task.as_str()),
+                review: review_mode,
             };
             let conversation = goal_task.as_str().to_owned();
             send(SessionEvent::Notice {
@@ -10807,6 +10915,7 @@ async fn run_turn(
             let scopes = super::refine::HarnessScopes {
                 global: super::harness::global_dir(&data_dir),
                 local,
+                review: review_mode,
             };
             let conversation = goal_task.as_str().to_owned();
             send(SessionEvent::Notice {
@@ -10880,6 +10989,7 @@ async fn run_turn(
             let scopes = super::refine::HarnessScopes {
                 global: super::harness::global_dir(&data_dir),
                 local: super::harness::local_dir(&data_dir, goal_task.as_str()),
+                review: review_mode,
             };
             let mut learning = learning.clone();
             learning.in_play = refine_cadence.take_in_play();
