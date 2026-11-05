@@ -798,6 +798,15 @@ fn check_history(action: &str, arguments: &Value) -> Result<(), String> {
         text(arguments, "path")?;
         text(arguments, "version")?;
     }
+    // Another action would read or change the page as it is now, while the
+    // caller asked for it as it was.
+    if !matches!(action, "history" | "revert")
+        && !matches!(arguments.get("version"), None | Some(Value::Null))
+    {
+        return Err(format!(
+            "{action} takes no version: history with path and version reads the page as it was then, and revert brings it back"
+        ));
+    }
     for key in ["since", "until"] {
         if let Some(time) = arguments.get(key) {
             let time = time
@@ -1629,6 +1638,21 @@ mod tests {
                 .expect("sources")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_version_outside_history_and_revert_is_refused_not_ignored() {
+        let root = tempfile::tempdir().expect("root");
+        let host = host(root.path());
+        host.execute(&page("project", "deploy.md", "Deploy on Thursday."))
+            .expect("write");
+        let error = host
+            .execute(&json!({"action":"read","path":"deploy.md","version":"01a1acc7-4ad8-73ae-831e-02aa97547ff6"}))
+            .expect_err("a read of the page as it is now is not the version asked for");
+        assert!(error.contains("history with path and version"), "{error}");
+        // Null is what a model sends for an argument it leaves out.
+        host.execute(&json!({"action":"read","path":"deploy.md","version":null}))
+            .expect("read");
     }
 
     #[test]
