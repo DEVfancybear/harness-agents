@@ -142,7 +142,9 @@ for attempt in 1 2 3; do
   ONE_LEARNED=$(learned_count)
   run_exec b1 "$P" "Giải thích hàm add trong calc.py."
   run_exec b2 "$P" --resume "$(task_of b1)" "Lại dài quá rồi, như lần trước. Ngắn thôi, 1-2 câu: calc.py có mấy hàm?"
-  [ "$(state "$ID")" = promoted ] && break
+  # A rule covered by the first review's own entry is promoted with one
+  # conversation: the second review must name the lesson too.
+  [ "$(state "$ID")" = promoted ] && [ "$(conversations "$ID")" -ge 2 ] && break
   if [ "$attempt" -lt 3 ] && [ -n "$(paraphrased)" ]; then
     echo "   attempt $attempt: the review's rule quoted words the runs do not hold and was refused, so the lesson is no rule yet; retrying on a fresh store"
     ID=""
@@ -200,8 +202,17 @@ echo "################ 6. a project's lesson becomes a decision of its markdown 
 Q=$RX/q
 project "$Q"
 (cd "$Q" && "$HA" memory init >/dev/null && git add -A && git -c user.name=t -c user.email=t@t commit -qm store)
-run_exec q1 "$Q" "Không, project này không build bằng cargo build: lệnh build của project này là make ci. Mình đã phải nói điều này rồi. Giờ liệt kê các file ở gốc project."
-QID=$(field "x['project'] is not None" "x['id']")
+# The precondition: the review scoped the correction to this project. One
+# that kept it as a lesson about every project is the model's choice of
+# scope, not the loop's fault: asked again once, in a fresh conversation.
+Q1=q1
+for attempt in 1 2; do
+  run_exec "$Q1" "$Q" "Không, project này không build bằng cargo build: lệnh build của project này là make ci. Mình đã phải nói điều này rồi. Giờ liệt kê các file ở gốc project."
+  QID=$(field "x['project'] is not None" "x['id']")
+  [ -n "$QID" ] && break
+  echo "   attempt $attempt: the review kept no lesson about this project ($(grep -E 'Created|Changed' "$RX/$Q1.err" | tr -s ' ' | tr '\n' ';')); asking again in a fresh conversation"
+  Q1=q1b
+done
 pname() { field "x['id']=='$1'" "x['project']['name']"; }
 check "a lesson about this project was recorded" '[ -n "$QID" ] && [ "$(pname "$QID")" = q ]'
 # One earlier conversation's signal, as the review would have recorded it.
@@ -234,7 +245,7 @@ for path in glob.glob(os.path.join(sys.argv[1], "**", "refinements.jsonl"), recu
 EOF
 }
 for attempt in 1 2; do
-  run_exec q2 "$Q" --resume "$(task_of q1)" "Nhắc lại: build bằng make ci, đừng dùng cargo build. Project có file README không?"
+  run_exec q2 "$Q" --resume "$(task_of "$Q1")" "Nhắc lại: build bằng make ci, đừng dùng cargo build. Project có file README không?"
   [ "$(signals "$QID")" -ge 3 ] && break
   [ -n "$(quote_refused "$QID")" ] || break
   echo "   attempt $attempt: the review's signal quoted words outside the turn it reviewed and was refused; asking again"
