@@ -205,16 +205,18 @@ if [ "$closed1" = queued ]; then
   check "accept puts it in the store, as the person's" '[ "$accepted" -eq 0 ] && [ -n "$(store_has teal-osprey-417 "e.get(\"origin\",{}).get(\"kind\")==\"user\" or (e.get(\"edited_by\") or {}).get(\"accepted\")")" ]'
   check "the queue no longer holds it" '[ -z "$(queued teal-osprey-417)" ]'
 else
-  check "the review kept it as its own entry" '[ -n "$(store_has teal-osprey-417 "(e.get(\"origin\") or {}).get(\"via\")==\"refine\" or (e.get(\"edited_by\") or {}).get(\"via\")==\"refine\"")" ]'
-  check "nothing of it waits" '[ -z "$(queued teal-osprey-417)" ]'
+  # Judged only on a proposal the review kept: 0.9.0's review keeps the
+  # finding too, with no proposal to close.
+  check "the review kept it as its own entry, the proposal closed as kept" '[ "$closed1" = kept ] && [ -n "$(store_has teal-osprey-417 "(e.get(\"origin\") or {}).get(\"via\")==\"refine\" or (e.get(\"edited_by\") or {}).get(\"via\")==\"refine\"")" ]'
+  check "nothing of it waits" '[ "$closed1" = kept ] && [ -z "$(queued teal-osprey-417)" ]'
 fi
-if [ -n "$(global_has teal-osprey-417)" ]; then
+if [ -n "$held1" ] && [ -n "$(global_has teal-osprey-417)" ]; then
   run_exec q1-next "$P1" "Không dùng tool nào, không đọc file. Trả lời đúng một dòng: kênh phát hành (release_channel) của project này là gì, theo những gì bạn đã có sẵn; nếu không có thì trả lời KHÔNG-BIẾT."
   T1N=$(task_of q1-next)
   check "the next conversation's request carries it" '[ -n "$T1N" ] && carried "$T1N" teal-osprey-417'
 else
-  echo "   the entry is not global (the review kept it in the conversation's store): the next conversation is not told of it"
-  check "the entry is in the store" '[ -n "$(store_has teal-osprey-417)" ]'
+  echo "   no proposal settled, or the entry is not global (kept in the conversation's store): the next conversation is not told of it"
+  check "the proposal's entry is in the store" '[ -n "$held1" ] && [ -n "$(store_has teal-osprey-417)" ]'
 fi
 
 echo "################ 2. in the app with HA_MEMORY_REVIEW=all: said once, listed, rejected, not queued again"
@@ -319,8 +321,8 @@ run_exec q4c "$P4" "Dùng tool memory action write với id '$E4' (scope global)
 check "precondition: the entry changed since the update was proposed" '[ -n "$(global_has 17417)" ]'
 "$HA" memory queue accept "$item4" > "$RX/q4-accept.txt" 2>&1; stale4=$?
 sed 's/^/   /' "$RX/q4-accept.txt"
-check "an accept after the entry changed is refused as stale" '[ "$stale4" -ne 0 ] && grep -q "refused $item4 as stale" "$RX/q4-accept.txt"'
-check "the entry keeps the later version, and the stale change left the queue" '[ -n "$(global_has 17417)" ] && [ -z "$(global_has 19417)" ] && ! queue_json | grep -q "\"$item4\""'
+check "an accept after the entry changed is refused as stale" '[ -n "$item4" ] && [ "$stale4" -ne 0 ] && grep -q "refused $item4 as stale" "$RX/q4-accept.txt"'
+check "the entry keeps the later version, and the stale change left the queue" '[ -n "$item4" ] && [ -n "$(global_has 17417)" ] && [ -z "$(global_has 19417)" ] && ! queue_json | grep -q "\"$item4\""'
 unset HA_MEMORY_REVIEW
 
 result
