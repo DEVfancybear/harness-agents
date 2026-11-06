@@ -84,23 +84,19 @@ pub fn render(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
             block.lines.push(trimmed.to_owned());
             continue;
         }
+        // A run of blank lines is one: a model that leaves two or three between
+        // paragraphs drew an answer with holes in it.
+        if trimmed.trim().is_empty() {
+            if index >= 2 && source[index - 2].trim().is_empty() {
+                continue;
+            }
+            lines.push(Line::default());
+            continue;
+        }
         match classify(trimmed) {
             Block::Heading(level) => {
                 let text = trimmed.trim_start().trim_start_matches('#').trim_start();
-                let style = match level {
-                    1 => theme
-                        .md_heading
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                    2 | 3 => theme.md_heading.add_modifier(Modifier::BOLD),
-                    4 => theme
-                        .md_heading
-                        .add_modifier(Modifier::BOLD | Modifier::ITALIC),
-                    _ => theme.md_heading.add_modifier(Modifier::ITALIC),
-                };
-                lines.extend(wrap_spans(
-                    vec![Span::styled(text.to_owned(), style)],
-                    width,
-                ));
+                lines.extend(heading(text, level, width, theme));
             }
             Block::Bullet => {
                 let indent = trimmed.len() - trimmed.trim_start().len();
@@ -138,6 +134,35 @@ pub fn render(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     lines
 }
 
+/// A heading's rows: H1 bold and underlined, H2-H3 bold, H4 bold italic,
+/// deeper italic. Its own `code` and **emphasis** are read as in prose - 0.9.2
+/// drew "## `calc.py`" all in the heading's colour - prose taking the
+/// heading's colour and code keeping its own, with the heading's weight.
+fn heading(text: &str, level: usize, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let style = match level {
+        1 => theme
+            .md_heading
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        2 | 3 => theme.md_heading.add_modifier(Modifier::BOLD),
+        4 => theme
+            .md_heading
+            .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        _ => theme.md_heading.add_modifier(Modifier::ITALIC),
+    };
+    let spans = inline_spans(text, theme)
+        .into_iter()
+        .map(|span| {
+            let own = if span.style == theme.assistant {
+                style
+            } else {
+                span.style.add_modifier(style.add_modifier)
+            };
+            span.style(own)
+        })
+        .collect();
+    wrap_spans(spans, width)
+}
+
 /// A fenced block: the language its label names, and its lines.
 struct Fence {
     language: Option<Language>,
@@ -159,13 +184,45 @@ fn code_block(block: &Fence, width: u16, theme: &Theme) -> Vec<Line<'static>> {
         ),
     };
     let mut lines = Vec::new();
+    if !theme.color {
+        for line in runs {
+            let mut spans = vec![Span::raw("  ".to_owned())];
+            spans.extend(
+                line.into_iter()
+                    .map(|(kind, text)| Span::styled(text, highlight::style(kind, plain, theme))),
+            );
+            lines.extend(wrap_spans(spans, width));
+        }
+        return lines;
+    }
+    // In colour the block sits on the panel's background, as a card: one cell
+    // of margin, one of padding, the code, and padding to the block's widest
+    // row (at most the room there is), so its right edge is straight.
+    let panel = theme.panel;
+    let room = width.saturating_sub(3).max(1);
+    let mut rows: Vec<Line<'static>> = Vec::new();
     for line in runs {
-        let mut spans = vec![Span::raw("  ".to_owned())];
-        spans.extend(
-            line.into_iter()
-                .map(|(kind, text)| Span::styled(text, highlight::style(kind, plain, theme))),
-        );
-        lines.extend(wrap_spans(spans, width));
+        let spans = line
+            .into_iter()
+            .map(|(kind, text)| {
+                Span::styled(text, highlight::style(kind, plain, theme).patch(panel))
+            })
+            .collect::<Vec<_>>();
+        rows.extend(wrap_spans(spans, room));
+    }
+    let widest = rows.iter().map(Line::width).max().unwrap_or(0);
+    let inner = (widest + 1).min(usize::from(width.saturating_sub(2)).max(1));
+    for row in rows {
+        let pad = inner.saturating_sub(row.width());
+        let mut spans = vec![
+            Span::raw(" ".to_owned()),
+            Span::styled(" ".to_owned(), panel),
+        ];
+        spans.extend(row.spans);
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), panel));
+        }
+        lines.push(Line::from(spans));
     }
     lines
 }
@@ -424,6 +481,8 @@ pub fn plain_text(lines: &[Line<'_>]) -> String {
 mod tests {
     use super::{Block, classify, plain_text, render};
     use crate::interactive::tui::theme::Theme;
+    use ratatui::style::Modifier;
+    use ratatui::text::Line;
 
     /// The one invariant that matters: rendering never loses a character.
     #[test]
@@ -465,7 +524,7 @@ fn main() {} // hi
             80,
             &theme,
         );
-        assert_eq!(plain_text(&rendered), "  fn main() {} // hi");
+        assert_eq!(plain_text(&rendered).trim_end(), "  fn main() {} // hi");
         let style_of = |text: &str| {
             rendered[0]
                 .spans
@@ -473,9 +532,18 @@ fn main() {} // hi
                 .find(|span| span.content.contains(text))
                 .map(|span| span.style)
         };
-        assert_eq!(style_of("fn"), Some(theme.syntax.keyword));
-        assert_eq!(style_of("main"), Some(theme.syntax.function));
-        assert_eq!(style_of("// hi"), Some(theme.syntax.comment));
+        assert_eq!(
+            style_of("fn"),
+            Some(theme.syntax.keyword.patch(theme.panel))
+        );
+        assert_eq!(
+            style_of("main"),
+            Some(theme.syntax.function.patch(theme.panel))
+        );
+        assert_eq!(
+            style_of("// hi"),
+            Some(theme.syntax.comment.patch(theme.panel))
+        );
 
         for fence in [
             "```
@@ -490,8 +558,9 @@ fn main() {}
                 rendered[0]
                     .spans
                     .iter()
-                    .skip(1)
-                    .all(|span| span.style == theme.md_code_block),
+                    .skip(2)
+                    .all(|span| span.style == theme.md_code_block.patch(theme.panel)
+                        || span.content.trim().is_empty()),
                 "no language, no guessing: {fence}"
             );
         }
@@ -509,16 +578,92 @@ def f():",
             &theme,
         );
         assert_eq!(
-            plain_text(&rendered),
+            plain_text(&rendered)
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join(
+                    "
+"
+                ),
             "text
   def f():"
         );
         assert!(
-            rendered[1]
-                .spans
-                .iter()
-                .any(|span| span.content == "def" && span.style == theme.syntax.keyword)
+            rendered[1].spans.iter().any(|span| span.content == "def"
+                && span.style == theme.syntax.keyword.patch(theme.panel))
         );
+    }
+
+    /// A code block in colour is a card: every row on the panel's
+    /// background to the same right edge, the block's widest row and a cell.
+    #[test]
+    fn a_code_block_is_a_card_with_a_straight_right_edge() {
+        let theme = Theme::prime(crate::interactive::tui::theme::Depth::TrueColor);
+        let rendered = render(
+            "```python
+def subtract(a, b):
+    return a - b
+```",
+            60,
+            &theme,
+        );
+        assert_eq!(rendered.len(), 2);
+        let widths = rendered.iter().map(Line::width).collect::<Vec<_>>();
+        assert_eq!(widths, [2 + 19 + 1, 2 + 19 + 1], "{rendered:?}");
+        for row in &rendered {
+            assert_eq!(row.spans[0].style.bg, None, "the margin is not the card");
+            assert!(
+                row.spans[1..]
+                    .iter()
+                    .all(|span| span.style.bg == theme.panel.bg)
+            );
+        }
+        // A row too wide for the room still wraps inside the card.
+        let long = render(
+            &format!(
+                "```
+{}
+```",
+                "x".repeat(100)
+            ),
+            40,
+            &theme,
+        );
+        assert!(long.iter().all(|row| row.width() <= 40), "{long:?}");
+    }
+
+    /// 0.9.2 drew "## `calc.py`" all in the heading's colour, code and all,
+    /// and three blank rows where the model left three blank lines.
+    #[test]
+    fn a_heading_reads_its_code_and_blank_runs_are_one() {
+        let theme = Theme::prime(crate::interactive::tui::theme::Depth::TrueColor);
+        let rendered = render(
+            "## The `calc.py` file
+
+
+
+- one
+
+end",
+            60,
+            &theme,
+        );
+        assert_eq!(
+            plain_text(&rendered),
+            "The `calc.py` file
+
+- one
+
+end"
+        );
+        let code = rendered[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("calc.py"))
+            .expect("the code span");
+        assert_eq!(code.style.fg, theme.md_code.fg);
+        assert!(code.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

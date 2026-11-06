@@ -263,7 +263,9 @@ fn user_box(text: &str, width: u16, theme: &Theme, detail: Detail) -> Vec<Line<'
             ],
             _ => vec![Span::styled(line.to_owned(), theme.user)],
         };
-        body.extend(wrap_spans(spans, inner));
+        // Between words, as an answer is: 0.9.2 broke a typed request by
+        // cells, "a small p" on one row and "ython" on the next.
+        body.extend(super::markdown::wrap_spans(spans, inner));
     }
     if command.is_some() && detail == Detail::Collapsed && body.len() > FOLDED_COMMAND_ROWS + 1 {
         let more = body.len() - FOLDED_COMMAND_ROWS;
@@ -1501,6 +1503,36 @@ mod tests {
     /// with several hundred words of guidance filled the screen as one user
     /// block. Collapsed, it is the command, two rows and a count; ctrl+o's
     /// detail mode shows all of it. A plain prompt is never folded.
+    #[test]
+    fn a_user_message_wraps_between_words() {
+        let text = "Read calc.py and then reply with a short markdown answer with a heading and two bullet points and a small python code block that adds a subtract function. Do not edit files.";
+        for width in [60_u16, 80, 109, 113, 140] {
+            let rows = render(
+                &HistoryItem::User {
+                    text: text.to_owned(),
+                },
+                width,
+                &Theme::plain(),
+                Detail::default(),
+            );
+            let words = plain_text(&rows)
+                .lines()
+                .map(|row| row.trim_start_matches([' ', '▎']).trim_end().to_owned())
+                .filter(|row| !row.is_empty())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                words.join(" "),
+                text,
+                "width {width}: {:#?}",
+                plain_text(&rows)
+            );
+            assert!(
+                rows.iter().all(|row| row.width() <= usize::from(width)),
+                "width {width}"
+            );
+        }
+    }
+
     #[test]
     fn a_command_with_long_guidance_folds_until_ctrl_o() {
         let theme = Theme::plain();

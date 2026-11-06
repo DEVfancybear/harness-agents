@@ -240,7 +240,10 @@ fn phase_chip(state: &UiState, theme: &Theme) -> Option<Span<'static>> {
     // as more border text.
     match state.phase {
         AppPhase::Running | AppPhase::Canceling => Some(Span::styled(
-            format!(" {} đang chạy ", Theme::spinner(state.tick)),
+            format!(
+                " {} đang chạy ",
+                Theme::spinner(super::super::pacing::spinner_frame())
+            ),
             theme.info.patch(theme.chip),
         )),
         AppPhase::WaitingApproval => Some(Span::styled(

@@ -270,7 +270,9 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Readouts) {
                 "Writing"
             };
             push(Span::styled(
-                format!("{} ", Theme::spinner(state.tick)),
+                // The terminal's own clock: the worker's tick comes ten times a
+                // second, and a spinner on it stepped visibly.
+                format!("{} ", Theme::spinner(super::super::pacing::spinner_frame())),
                 if state.phase == AppPhase::Canceling {
                     theme.warning
                 } else {
@@ -282,7 +284,9 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Readouts) {
                 // carries its own "esc to cancel".
                 push(Span::styled(line.clone(), theme.warning));
             } else {
-                push(Span::styled(activity.to_owned(), theme.muted));
+                for span in shimmer(activity, theme, super::super::pacing::clock_ms()) {
+                    push(span);
+                }
                 if let Some(started) = state.run_started_at {
                     push(Span::styled(
                         format!(" · ◷ {}", view::clock_label(started.elapsed())),
@@ -347,7 +351,17 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Readouts) {
                 push(Span::styled(format!(" · ✧ thinking {level}"), theme.dim));
             }
             if let Some(tier) = &state.service_tier {
-                push(Span::styled(format!(" · {tier}"), theme.dim));
+                // Fast mode costs more: it is named in amber, apart from the
+                // dim readouts, so it is not left on by mistake.
+                push(Span::styled(" · ".to_owned(), theme.dim));
+                push(Span::styled(
+                    format!("» {tier}"),
+                    if tier == "fast" {
+                        theme.warning.add_modifier(ratatui::style::Modifier::BOLD)
+                    } else {
+                        theme.muted
+                    },
+                ));
             }
             if let Some(goal) = &state.goal {
                 push(Span::styled(format!(" · {goal}"), theme.accent));
@@ -360,6 +374,60 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Readouts) {
         push(Span::styled(format!(" · {reason}"), theme.error));
     }
     (spans, telemetry(theme))
+}
+
+/// The working line's activity with a band of light sweeping across it, so the
+/// line shows the agent is alive between tokens. Only in true colour: the band
+/// is a blend of the muted text and the title's lavender, which the 256-colour
+/// cube cannot draw smoothly, and the plain theme has no colour at all.
+fn shimmer(text: &str, theme: &Theme, clock_ms: u64) -> Vec<Span<'static>> {
+    use ratatui::style::Color;
+    /// One sweep across the word and the pause after it.
+    const PERIOD_MS: u64 = 1_800;
+    /// The band's half width, in characters.
+    const BAND: f64 = 3.0;
+    let (Some(Color::Rgb(r0, g0, b0)), Some(Color::Rgb(r1, g1, b1))) =
+        (theme.muted.fg, theme.title.fg)
+    else {
+        return vec![Span::styled(text.to_owned(), theme.muted)];
+    };
+    let characters = text.chars().collect::<Vec<_>>();
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a word's length and a clock inside one period"
+    )]
+    let (length, phase) = (
+        characters.len() as f64,
+        (clock_ms % PERIOD_MS) as f64 / PERIOD_MS as f64,
+    );
+    // The band enters before the first character and leaves after the last.
+    let centre = phase.mul_add(4.0f64.mul_add(BAND, length), -2.0 * BAND);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (index, character) in characters.into_iter().enumerate() {
+        #[allow(clippy::cast_precision_loss, reason = "a word's length")]
+        let distance = (index as f64 - centre).abs();
+        let glow = (1.0 - distance / BAND).clamp(0.0, 1.0);
+        // A smooth edge rather than a linear ramp.
+        let glow = glow * glow * 2.0f64.mul_add(-glow, 3.0);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a blend of two bytes stays a byte"
+        )]
+        let mix = |from: u8, to: u8| {
+            (f64::from(to) - f64::from(from))
+                .mul_add(glow, f64::from(from))
+                .round() as u8
+        };
+        let style = theme
+            .muted
+            .fg(Color::Rgb(mix(r0, r1), mix(g0, g1), mix(b0, b1)));
+        match spans.last_mut() {
+            Some(last) if last.style == style => last.content.to_mut().push(character),
+            _ => spans.push(Span::styled(character.to_string(), style)),
+        }
+    }
+    spans
 }
 
 /// herdr's context gauge: `ctx ━━━━━─── 42% of 200k`, the bar in green, yellow
@@ -582,6 +650,49 @@ mod tests {
         assert!(text.contains("tools 3/16"), "{text}");
         assert!(text.contains("00:00"), "{text}");
         assert!(text.contains("esc to interrupt"), "{text}");
+    }
+
+    /// The activity keeps its words while a band of light crosses it: at the
+    /// band's middle a character is lighter than the muted ends, and the
+    /// 256-colour and plain themes draw it in one style.
+    #[test]
+    fn the_working_word_shimmers_in_true_colour_only() {
+        use super::shimmer;
+        let theme = Theme::prime(crate::interactive::tui::theme::Depth::TrueColor);
+        let middle = shimmer("Thinking", &theme, 900);
+        assert_eq!(
+            middle
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "Thinking"
+        );
+        assert!(middle.len() > 2, "the band is a blend: {middle:?}");
+        assert!(middle.iter().any(|span| span.style.fg != theme.muted.fg));
+        for theme in [
+            Theme::prime(crate::interactive::tui::theme::Depth::Ansi256),
+            Theme::plain(),
+        ] {
+            let flat = shimmer("Thinking", &theme, 900);
+            assert_eq!(flat.len(), 1);
+            assert_eq!(flat[0].style, theme.muted);
+        }
+    }
+
+    /// `/fast` is named in amber on the idle line.
+    #[test]
+    fn fast_mode_stands_out_on_the_idle_line() {
+        let theme = Theme::prime(crate::interactive::tui::theme::Depth::TrueColor);
+        let mut state = state(AppPhase::Ready);
+        state.service_tier = Some("fast".to_owned());
+        let line = row(&state, &theme, 200);
+        let fast = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("fast"))
+            .expect("the tier is shown");
+        assert_eq!(fast.content, "» fast");
+        assert_eq!(fast.style.fg, theme.warning.fg);
     }
 
     #[test]
