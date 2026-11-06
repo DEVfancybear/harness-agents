@@ -21,6 +21,7 @@ pub mod icons;
 pub mod layout;
 pub mod markdown;
 mod markdown_table;
+pub mod pacing;
 pub mod pane;
 #[cfg(test)]
 mod preview;
@@ -191,6 +192,13 @@ pub trait TuiRenderer {
     fn tick_viewport(&mut self) -> bool {
         false
     }
+    /// How long the loop waits for a key before it looks for the session's
+    /// events: shorter while a run streams ([`pacing::FAST_POLL`]).
+    fn poll_interval(&self) -> Duration {
+        POLL_INTERVAL
+    }
+    /// The first `chars` characters of the live answer went to the scrollback.
+    fn committed_stream(&mut self, _chars: usize) {}
     /// Alt+`number`: the sidebar's row of that number. Whether the frame
     /// changed, and the agent the terminal should switch to.
     fn agent_key(&mut self, _number: u8, _state: &UiState) -> (bool, Option<String>) {
@@ -516,6 +524,14 @@ pub struct RuntimeRenderer<T: TerminalBackend> {
     roster: Option<roster::Scope>,
     /// An input read while looking for more mouse reports, returned first.
     held: Option<Key>,
+    /// The answer still streaming, revealed at a steady pace.
+    reveal: pacing::Reveal,
+    /// Whether the last frame drawn had a run active or text left to reveal:
+    /// the loop then looks for work every [`pacing::FAST_POLL`].
+    active: bool,
+    behind: bool,
+    /// When the last frame was drawn, for the working line's animation.
+    drawn_at: Instant,
 }
 
 impl<T: TerminalBackend> RuntimeRenderer<T> {
@@ -582,6 +598,10 @@ impl<T: TerminalBackend> RuntimeRenderer<T> {
             sidebar: prefs.sidebar,
             roster,
             held: None,
+            reveal: pacing::Reveal::default(),
+            active: false,
+            behind: false,
+            drawn_at: Instant::now(),
         };
         if prefs.enabled {
             renderer.set_fullscreen(true)?;
@@ -635,10 +655,27 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
 
     fn draw_state(&mut self, state: &UiState) -> io::Result<()> {
         super::terminal::injected_fault()?;
+        self.active = state.phase.has_active_run();
+        let revealed = self.reveal.frame(state);
+        self.behind = revealed.is_some();
+        self.drawn_at = Instant::now();
+        let state = revealed.as_ref().unwrap_or(state);
         match &mut self.screen {
             Screen::Inline(inline) => inline.draw_state(state),
             Screen::Fullscreen(screen) => screen.draw(state),
         }
+    }
+
+    fn poll_interval(&self) -> Duration {
+        if self.active || self.behind {
+            pacing::FAST_POLL
+        } else {
+            POLL_INTERVAL
+        }
+    }
+
+    fn committed_stream(&mut self, chars: usize) {
+        self.reveal.committed(chars);
     }
 
     fn insert_history(&mut self, item: &HistoryItem) -> io::Result<()> {
@@ -798,10 +835,13 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
     }
 
     fn tick_viewport(&mut self) -> bool {
-        match &mut self.screen {
+        let screen = match &mut self.screen {
             Screen::Fullscreen(screen) => screen.tick(),
             Screen::Inline(_) => false,
-        }
+        };
+        // The answer still being revealed, and the working line's spinner and
+        // shimmer, ask for frames of their own while a run is active.
+        screen || self.behind || (self.active && self.drawn_at.elapsed() >= pacing::ANIMATION_EVERY)
     }
 
     fn agent_key(&mut self, number: u8, state: &UiState) -> (bool, Option<String>) {
@@ -1132,7 +1172,7 @@ fn run_loop_inner(
         // that repaints it must reach the screen with them (no flash).
         let mut effects = Vec::new();
         if let Some(key) = renderer
-            .poll_key(POLL_INTERVAL)
+            .poll_key(renderer.poll_interval())
             .map_err(|error| terminal_error(&error))?
         {
             timing.input = Some(Instant::now());
@@ -1227,6 +1267,7 @@ fn run_loop_inner(
             Ok(Step::Continue) if redraw => {
                 let state = controller.ui_state();
                 built = begun.elapsed();
+                timing.live = Some(state.live_text.len());
                 renderer
                     .draw_state(&state)
                     .map_err(|error| terminal_error(&error))
@@ -1281,6 +1322,8 @@ struct Timing {
     frame: Duration,
     /// What the frame applied, by kind and count: `History×3 Redraw`.
     effects: String,
+    /// Bytes of answer text in the live block when the frame was drawn.
+    live: Option<usize>,
 }
 
 /// The effects of a frame by kind, for [`FrameLog`].
@@ -1319,7 +1362,8 @@ fn effect_kinds(effects: &[Effect]) -> String {
 /// microseconds the key's round trip, taking the events, building the
 /// state, the whole frame, the input's latency to the painted frame (`-`
 /// when no input caused it) and applying the effects, then the effects by
-/// kind: `1520 0 40 180 2410 2650 90 History×2,Redraw`.
+/// kind, and the bytes of answer text the live block held:
+/// `1520 0 40 180 2410 2650 90 History×2,Redraw live=812`.
 struct FrameLog {
     file: std::io::BufWriter<std::fs::File>,
     started: Instant,
@@ -1346,7 +1390,7 @@ impl FrameLog {
             .map_or_else(|| "-".to_owned(), |at| at.elapsed().as_micros().to_string());
         let _ = writeln!(
             self.file,
-            "{} {} {} {} {} {latency} {} {}",
+            "{} {} {} {} {} {latency} {} {} live={}",
             self.started.elapsed().as_millis(),
             timing.key.as_micros(),
             timing.pump.as_micros(),
@@ -1358,6 +1402,9 @@ impl FrameLog {
             } else {
                 &timing.effects
             },
+            timing
+                .live
+                .map_or_else(|| "-".to_owned(), |bytes| bytes.to_string()),
         );
         let _ = self.file.flush();
     }
@@ -1475,6 +1522,7 @@ fn apply(renderer: &mut impl TuiRenderer, effects: Vec<Effect>) -> Result<Step, 
             // Streamed text is committed to the scrollback as it is flushed: the
             // live block already showed it, and the history renderer styles it.
             Effect::Stream(text) => {
+                renderer.committed_stream(text.chars().count());
                 pending.push(HistoryItem::Assistant { text });
                 continue;
             }

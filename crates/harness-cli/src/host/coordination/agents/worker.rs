@@ -41,12 +41,15 @@ use super::registry::{self, Descriptor};
 use super::{CreateSession, SessionHost};
 
 /// How long an agent's loop waits for a command before it drains its events.
-const POLL: Duration = Duration::from_millis(20);
+/// A streamed token waits at most this long to leave for the terminal (0.9.2
+/// waited 20 ms and shipped a frame at most every 33 ms, and the answer reached
+/// the screen in steps a reader could see).
+const POLL: Duration = Duration::from_millis(8);
 /// The spinner and clocks, as the TUI ticks them.
 const TICK: Duration = Duration::from_millis(100);
-/// The shortest gap between two frames that only redraw (about 30 a second):
+/// The shortest gap between two frames that only redraw (about 60 a second):
 /// a streaming answer redraws on every poll, and each frame ships the view.
-const FRAME_EVERY: Duration = Duration::from_millis(33);
+const FRAME_EVERY: Duration = Duration::from_millis(16);
 /// The longest a tick-only frame stands in for the whole view, in case
 /// something changed it without an effect.
 const FULL_EVERY: Duration = Duration::from_secs(1);
