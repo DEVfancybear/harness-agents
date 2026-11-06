@@ -337,7 +337,8 @@ impl Catalog {
             .and_then(|text| parse(&text))
             .map(|models| bundled.admit(models))
             .filter(|models| !models.is_empty());
-        let mut catalog = cached.map_or(bundled, |models| Self { models });
+        let mut catalog = cached.map_or_else(|| bundled.clone(), |models| Self { models });
+        catalog.keep_snapshot_models(&bundled);
         for provider in LIVE_LISTS {
             let Some(ids) = std::fs::read_to_string(live_path(data_dir, provider.0))
                 .ok()
@@ -350,6 +351,26 @@ impl Catalog {
         // A broken models.json is reported where the session starts.
         let _ = catalog.apply_custom();
         catalog
+    }
+
+    /// The snapshot's models the download left out, after the download's own.
+    /// Seen in 0.9.2: the upstream catalog listed `gpt-6.1-sol` but not
+    /// `gpt-6.1-terra`, which the `ChatGPT` backend serves, so once the download
+    /// was cached `/model` no longer offered the model the snapshot had. The
+    /// download still wins for every model both of them have.
+    fn keep_snapshot_models(&mut self, snapshot: &Self) {
+        let missing = snapshot
+            .models
+            .iter()
+            .filter(|model| {
+                !self
+                    .models
+                    .iter()
+                    .any(|known| known.provider == model.provider && known.id == model.id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        self.models.extend(missing);
     }
 
     /// Models a provider lists that the catalog does not have yet (a release
@@ -775,6 +796,45 @@ mod tests {
         assert!(catalog.find_or_listed("anthropic/claude-new-9").is_none());
         assert!(catalog.find_or_listed("opencode-go/zz").is_none());
         assert!(catalog.find_or_listed("deepseek-v4.1-flash").is_none());
+    }
+
+    /// Seen in 0.9.2: the downloaded catalog had `gpt-6.1-sol` but no
+    /// `gpt-6.1-terra`, and once it was cached the snapshot's terra was gone.
+    #[test]
+    fn a_download_that_lacks_a_snapshot_model_keeps_it() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let mut file: serde_json::Value = serde_json::from_str(super::BUNDLED).expect("snapshot");
+        let sol = file["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .find(|model| model["provider"] == "openai-codex" && model["id"] == "gpt-6.1-sol")
+            .cloned()
+            .expect("the snapshot has openai-codex/gpt-6.1-sol");
+        let mut downloaded = sol;
+        downloaded["name"] = "GPT-6.1 Sol (downloaded)".into();
+        file["models"] = serde_json::json!([downloaded]);
+        let path = super::cache_path(data.path());
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("cache dir");
+        std::fs::write(&path, file.to_string()).expect("cache written");
+
+        let catalog = Catalog::load_files(data.path());
+        assert_eq!(
+            catalog
+                .find("openai-codex/gpt-6.1-sol")
+                .map(|model| model.name.as_str()),
+            Some("GPT-6.1 Sol (downloaded)"),
+            "the download wins for a model both have"
+        );
+        assert!(catalog.find("openai-codex/gpt-6.1-terra").is_some());
+        assert!(catalog.find("openai/gpt-6.1-terra").is_some());
+        assert_eq!(
+            catalog
+                .for_provider("openai-codex")
+                .filter(|model| model.id == "gpt-6.1-sol")
+                .count(),
+            1
+        );
     }
 
     #[test]

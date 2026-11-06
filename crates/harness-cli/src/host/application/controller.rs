@@ -4540,8 +4540,9 @@ impl InteractiveController {
                     self.apply_tier(next, true, &mut effects);
                 } else {
                     self.push_history(&mut effects, HistoryItem::Notice {
-                        // prime-agent's wording for a model without the priority tier.
-                        message: "Fast mode requires GPT-5.4, GPT-5.5, or GPT-5.6 with ChatGPT or OpenAI API key authentication".to_owned(),
+                        // prime-agent's wording for a model without the priority tier, with
+                        // the GPT-6 models ha also offers it for.
+                        message: "Fast mode requires GPT-5.4, GPT-5.5, GPT-5.6 or GPT-6 with ChatGPT or OpenAI API key authentication".to_owned(),
                     });
                 }
                 effects.push(Effect::Redraw);
