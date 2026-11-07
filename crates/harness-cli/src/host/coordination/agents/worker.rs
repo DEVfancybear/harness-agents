@@ -245,6 +245,34 @@ pub struct Worker {
     runtime: tokio::runtime::Handle,
 }
 
+/// How long a starting worker waits for the project's lock while no worker
+/// serves the project. A worker that stops removes its descriptor before its
+/// process ends and the OS releases the lock, so the worker started right
+/// after a `shutdown` can find the lock still held for a moment (a live run
+/// lost its chat that way: the new worker left, and the old one ended 0.25 s
+/// later).
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// Take the project's lock: at once, or once a worker that is stopping lets it
+/// go. `false` when another worker serves the project (its descriptor names a
+/// live process) or the lock stayed held for [`LOCK_WAIT`].
+fn take_project_lock(lock: &std::fs::File, registry: &std::path::Path, key: &str) -> bool {
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        if lock.try_lock().is_ok() {
+            return true;
+        }
+        let served =
+            registry::read(&registry::descriptor_path(registry, key)).is_some_and(|other| {
+                other.pid != std::process::id() && registry::process_is_alive(other.pid)
+            });
+        if served || Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Run the worker until it has nothing left to do.
 ///
 /// # Errors
@@ -260,7 +288,7 @@ pub fn run(args: &WorkerArgs) -> Result<(), String> {
         .write(true)
         .open(registry::lock_path(&args.registry, &key))
         .map_err(|error| error.to_string())?;
-    if lock.try_lock().is_err() {
+    if !take_project_lock(&lock, &args.registry, &key) {
         // Not a failure the supervisor should retry: the project is served.
         log("another worker serves this project");
         return Ok(());
@@ -2275,6 +2303,30 @@ mod tests {
         );
         assert_eq!(exit_cause(Some(7)), "an unexpected exit");
         assert_eq!(exit_cause(None), "killed by a signal");
+    }
+
+    #[test]
+    fn a_starting_worker_waits_for_the_lock_a_stopping_worker_lets_go() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let path = super::registry::lock_path(temp.path(), "k");
+        let open = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .expect("lock file")
+        };
+        // The stopping worker: its descriptor is gone, its lock held a moment.
+        let old = open();
+        old.try_lock().expect("the old worker holds the lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(old);
+        });
+        let new = open();
+        assert!(super::take_project_lock(&new, temp.path(), "k"));
+        release.join().expect("release");
     }
 
     struct TestWorker(Arc<Worker>);
