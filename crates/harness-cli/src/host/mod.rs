@@ -7,6 +7,8 @@
 
 #[path = "protocols/acp.rs"]
 pub mod acp;
+#[path = "coordination/action_bank.rs"]
+pub mod action_bank;
 #[path = "configuration/adoption.rs"]
 pub mod adoption;
 #[path = "coordination/agents/mod.rs"]

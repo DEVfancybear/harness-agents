@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 72] = [
+pub const SLASH_COMMANDS: [SlashCommand; 73] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -164,7 +164,12 @@ pub const SLASH_COMMANDS: [SlashCommand; 72] = [
     command(
         "/jev",
         "[on|off|status] | <decision> on|off",
-        "Show or set the jev plugin (off by default) and its nine harness decisions (/jev status lists them)",
+        "Show or set the jev plugin (off by default) and its ten harness decisions (/jev status lists them)",
+    ),
+    command(
+        "/bank",
+        "[on|off|status]",
+        "Show or set the action bank (off by default): calls the model fully decided run without a model step",
     ),
     SlashCommand {
         options: &[

@@ -5020,7 +5020,7 @@ impl InteractiveController {
                 }
                 effects.push(Effect::Redraw);
             }
-            name @ ("/refinements" | "/factory" | "/jev") => {
+            name @ ("/refinements" | "/factory" | "/jev" | "/bank") => {
                 let enable = match argument {
                     None | Some("status") => Ok(None),
                     Some("on") => Ok(Some(true)),
@@ -5032,6 +5032,8 @@ impl InteractiveController {
                         self.service.factory(enable)
                     } else if name == "/jev" {
                         self.service.jev_plugin(enable)
+                    } else if name == "/bank" {
+                        self.service.action_bank(enable)
                     } else {
                         self.service.refinements(enable)
                     }
