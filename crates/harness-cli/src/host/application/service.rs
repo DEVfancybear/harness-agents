@@ -5679,6 +5679,8 @@ impl SessionPort for AgentSessionService {
             memory: super::memory_switch::Switch::load(&self.config_file, &self.environment),
             memory_queue: super::memory_queue::counts(&self.data_dir),
             citations: super::memory_citations::count(&self.data_dir, &self.workspace_root),
+            knowledge: super::knowledge::KnowledgeHost::new(&self.workspace_root, &self.data_dir)
+                .health(),
         };
         let subsystems = super::doctor::audit(
             &self.global_config_dir,
@@ -7862,6 +7864,82 @@ async fn claim_upkeep_async(
         .flatten()
 }
 
+/// Run the wiki pass over each knowledge library that is due one
+/// (`knowledge::wiki::due`), in the background: a job of the Sleep queue,
+/// claimed for the library so one pass runs per library at a time; a failed
+/// one waits its backoff. A library no longer due forgets a job that gave up.
+pub(super) async fn tend_wiki(
+    knowledge: &super::knowledge::KnowledgeHost,
+    data_dir: &Path,
+    provider: &Arc<dyn ModelProvider>,
+    model: &str,
+    sender: &UnboundedSender<SessionEvent>,
+) {
+    let host = knowledge.clone();
+    let data = data_dir.to_path_buf();
+    let due = tokio::task::spawn_blocking(move || {
+        let sources = host.sources();
+        host.libraries()
+            .into_iter()
+            .filter_map(|library| {
+                let trigger = super::knowledge::wiki::due(&library.store, &library.root, &sources);
+                if trigger.is_none() {
+                    super::sleep::forget_given_up(
+                        &data,
+                        &super::sleep::Job::wiki(&library.root, "due").key,
+                    );
+                }
+                trigger.map(|trigger| (library, trigger))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    for (library, trigger) in due {
+        let Some(claimed) =
+            claim_upkeep_async(data_dir, super::sleep::Job::wiki(&library.root, trigger)).await
+        else {
+            continue;
+        };
+        let provider = Arc::clone(provider);
+        let model = model.to_owned();
+        let sender = sender.clone();
+        let sources = knowledge.sources();
+        let _ = sender.send(SessionEvent::Notice {
+            message: format!(
+                "knowledge: tending the {} library as a wiki in the background",
+                library.scope
+            ),
+        });
+        tokio::spawn(async move {
+            let result = super::knowledge::wiki::run(
+                &provider,
+                &model,
+                &library.store,
+                &library.root,
+                library.scope,
+                &sources,
+            )
+            .await;
+            let message = match result {
+                Ok(outcome) => {
+                    let _ = tokio::task::spawn_blocking(move || claimed.done()).await;
+                    outcome.describe(library.scope)
+                }
+                Err(error) => {
+                    let message = format!(
+                        "knowledge: the wiki pass over the {} library failed: {error}; it is tried again later",
+                        library.scope
+                    );
+                    let _ = tokio::task::spawn_blocking(move || claimed.failed(&error)).await;
+                    message
+                }
+            };
+            let _ = sender.send(SessionEvent::Notice { message });
+        });
+    }
+}
+
 /// An upkeep pass that gave up is forgotten once it is no longer due: it
 /// succeeded another way (`/refine --curate`, a manual Deep Dream), and the
 /// doctor stops warning of it.
@@ -9047,6 +9125,9 @@ async fn run_turn(
         }
     };
 
+    // A memory search with `sources` naming history searches this project's
+    // conversations, as `history_search` does.
+    let history_project = project_id.clone();
     let observation = match observe_workspace(project_id, &workspace_root) {
         Ok(observation) => observation,
         Err(error) => {
@@ -9832,7 +9913,13 @@ async fn run_turn(
     let memory_host = super::memory::MemoryHost::new(&data_dir, task_id.as_str())
         .with_project(&workspace_root)
         .with_refinements(digest_on)
-        .with_switch(&memory_switch);
+        .with_switch(&memory_switch)
+        .with_history(super::memory_search::history_searcher(
+            tokio::runtime::Handle::current(),
+            Arc::downgrade(&store),
+            history_project,
+            task_id.clone(),
+        ));
     // The jev plugin, when `/jev on` turned it on.
     let jev_host = super::jev::JevHost::from_settings(&environment, &data_dir, &config_file);
     tools = tools.with_external(super::jev::with_dispatcher(
@@ -10956,6 +11043,20 @@ async fn run_turn(
                 drop(consolidating);
                 let _ = sender.send(event);
             });
+        }
+        // The knowledge libraries are tended as a wiki beside the
+        // conversation once they changed and have work for it: a review wrote
+        // a page, or a day passed (`knowledge::wiki`). A job of the Sleep
+        // queue, one per library.
+        if auto_refine && refinements && knowledge_on && !cancellation.is_cancelled() {
+            tend_wiki(
+                &knowledge_host,
+                &data_dir,
+                &provider,
+                &config.model,
+                &sender,
+            )
+            .await;
         }
         if lessons_on {
             refine_cadence.note_in_play(super::learned::record_turn(

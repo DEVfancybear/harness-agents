@@ -43,7 +43,8 @@ const META_WEIGHT: f64 = 0.5;
 /// The most other wordings one search takes, as knowledge search does.
 const MAX_VARIANTS: usize = 4;
 
-/// What a search reads: `memory` (the default), `knowledge`, or both.
+/// What a search reads: `memory` (the default), `knowledge`, `history` (the
+/// project's conversations as the journal keeps them), or several.
 ///
 /// # Errors
 /// `sources` is not a non-empty list of those.
@@ -51,13 +52,14 @@ pub fn sources(arguments: &Value) -> Result<Vec<&'static str>, String> {
     let Some(given) = arguments.get("sources").filter(|value| !value.is_null()) else {
         return Ok(vec!["memory"]);
     };
-    let refusal = || "sources is a list of memory and knowledge".to_owned();
+    let refusal = || "sources is a list of memory, knowledge and history".to_owned();
     let names = given.as_array().ok_or_else(refusal)?;
     let mut sources = Vec::new();
     for name in names {
         let source = match name.as_str() {
             Some("memory") => "memory",
             Some("knowledge") => "knowledge",
+            Some("history") => "history",
             _ => return Err(refusal()),
         };
         if !sources.contains(&source) {
@@ -109,9 +111,13 @@ pub fn check(arguments: &Value) -> Result<(), String> {
             if !searches {
                 return Err("a readout reads for a query: give query or queries".to_owned());
             }
-            if sources(arguments)?.contains(&"knowledge") {
+            if sources(arguments)?
+                .iter()
+                .any(|source| matches!(*source, "knowledge" | "history"))
+            {
                 return Err(
-                    "a readout reads memory entries; search knowledge with mode rank".to_owned(),
+                    "a readout reads memory entries; search knowledge and history with mode rank"
+                        .to_owned(),
                 );
             }
         }
@@ -935,6 +941,84 @@ fn words(text: &str, fold: bool) -> Vec<String> {
     } else {
         harness::tokens(text)
     }
+}
+
+/// A search of the project's conversations as the journal keeps them, for a
+/// memory search with `sources` naming `history`: the hits of `query` (at
+/// most `limit`) as values, and how many sessions the index had not caught
+/// up yet. It is the `history_search` tool's search with scope `project`.
+pub type HistorySearch =
+    std::sync::Arc<dyn Fn(&str, usize) -> Result<(Vec<Value>, u64), String> + Send + Sync>;
+
+/// How long a history search waits for the journal's index to catch up, as
+/// the `history_search` tool does; what is left is caught up behind it.
+const HISTORY_CATCH_UP: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The characters of a history hit's text a memory search shows.
+const HISTORY_PREVIEW_CHARS: usize = 400;
+
+/// [`HistorySearch`] over the project store `store` (the turn's writer, held
+/// weakly: the index is brought up to date before the search) for the conversations of
+/// `project`, `task` the one asking. Called from a blocking thread: the
+/// search runs on the runtime `handle` from a thread of its own.
+#[must_use]
+pub fn history_searcher(
+    handle: tokio::runtime::Handle,
+    store: std::sync::Weak<harness_store_sqlite::SqliteStore>,
+    project: harness_types::ProjectId,
+    task: harness_types::TaskId,
+) -> HistorySearch {
+    std::sync::Arc::new(move |query: &str, limit: usize| {
+        // The store is the turn's: a search after it closed finds nothing.
+        let store = store.upgrade().ok_or("the project store is closed")?;
+        let (project, task, query) = (project.clone(), task.clone(), query.to_owned());
+        let search = async move {
+            let caught = store
+                .catch_up_history(
+                    None,
+                    harness_store_sqlite::CatchUpPace::Until(
+                        std::time::Instant::now() + HISTORY_CATCH_UP,
+                    ),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if caught.behind > 0 {
+                store.catch_up_history_in_background(None);
+            }
+            let scope = harness_store_sqlite::HistoryScope::new(project, task).across_project();
+            let hits = store
+                .history_search_filtered(
+                    &scope,
+                    &query,
+                    limit,
+                    &harness_store_sqlite::HistoryFilter::default(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok((hits.iter().map(history_hit).collect(), caught.behind))
+        };
+        let handle = handle.clone();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || handle.block_on(search))
+                .join()
+                .unwrap_or_else(|_| Err("the history search stopped".to_owned()))
+        })
+    })
+}
+
+/// One history hit as a memory search shows it: the source `history_read`
+/// reads, its kind, the conversation and when its session began, and the
+/// head of its text.
+fn history_hit(hit: &harness_store_sqlite::HistoryHit) -> Value {
+    json!({
+        "source_id": hit.source_id,
+        "kind": hit.kind,
+        "conversation": hit.task_id,
+        "started": hit.started,
+        "matched_terms": format!("{}/{}", hit.matched_terms, hit.query_terms),
+        "preview": hit.preview.chars().take(HISTORY_PREVIEW_CHARS).collect::<String>(),
+    })
 }
 
 /// A field's words as BM25 matches them: each distinct word once, sorted,

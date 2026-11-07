@@ -132,7 +132,7 @@ for _ in $(seq 1 18); do find "$D/sessions" -name review_watermark -newer "$RX/r
 sleep 5
 check "the review ran" 'find "$D/sessions" -name review_watermark -newer "$RX/review5.marker" | grep -q .'
 echo "   pages about backoff: $(grep -rli backoff "$K" | sed "s#$K/##" | tr '\n' ' ')"
-check "no second page on the backoff subject without an origin" '[ "$(grep -rli backoff "$K" | grep -v log.md | wc -l)" -eq 1 ] || grep -rl backoff "$K" | grep -v "retry-backoff\|log.md\|index.md" | xargs grep -l "\"origin\":\"review\"" | grep -q .'
+check "no second page on the backoff subject without an origin" '[ "$(grep -rli backoff "$K" | grep -v log.md | wc -l)" -eq 1 ] || grep -rl backoff "$K" | grep -v "retry-backoff\|log.md\|index.md\|topics.md" | xargs grep -l "\"origin\":\"review\"" | grep -q .'
 check "a page the review wrote is marked so in the log" '! grep -q "\"origin\":\"review\"" -r "$K" || grep -q " by review" "$K/log.md"'
 
 echo "################ 6. the next turn is told what the review changed"

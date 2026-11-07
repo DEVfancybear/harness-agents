@@ -29,7 +29,9 @@
 # version - once the test changes the cited line; an entry kept for
 # src/billing/** in no request until the run reads a billing file, then in
 # one, once; a markdown memory file with paths: frontmatter loaded the same
-# way, its globs checked by ha memory lint.
+# way, its globs checked by ha memory lint. MEMORY_STORE_ONLY=core runs
+# sections 1 to 12 and the export alone: the store and one search over memory
+# and knowledge.
 #
 #   bash scripts/testing/live-tests/memory-store.sh
 set -u
@@ -64,7 +66,7 @@ print(found or "")
 EOF
 }
 
-if [ -z "${MEMORY_STORE_ONLY:-}" ]; then
+if [ -z "${MEMORY_STORE_ONLY:-}" ] || [ "$MEMORY_STORE_ONLY" = core ]; then
 
 echo "################ 1. a 0.8 state file and journal are migrated, history and all"
 mkdir -p "$G"

@@ -12,6 +12,7 @@ bản, qua các lượt chạy nền, mỗi lượt gọi một model:
 | Review một hội thoại (review gate, rồi lần refine nó duyệt) | các lượt từ lần review trước | store của hội thoại, memory toàn cục, bài học, skill tự học, knowledge |
 | Deep Dream (hợp nhất) | memory toàn cục, hoặc store của một hội thoại khi quá 40 entry, theo từng lô khi vượt ngân sách token | chính phạm vi đó, đã gộp và tỉa |
 | Tiến hoá harness | các lần gọi tool hỏng trong 14 ngày qua | luật và ghi chú cho tool |
+| Lượt wiki | toàn bộ một thư viện knowledge, và các nguồn mà trang của nó nêu | chính thư viện đó: liên kết được trỏ lại hoặc lấp, trang trùng được gộp, một trang mục lục, khẳng định được sửa ([KNOWLEDGE_WIKI.vi.md](KNOWLEDGE_WIKI.vi.md)) |
 
 Một lần gọi model có thể hỏng: provider sập, chạm giới hạn, process chết.
 Trước 0.8.9, một lần hỏng làm mất việc của lượt đó: bộ đếm lượt của review bị
@@ -25,8 +26,9 @@ ngày, và Deep Dream hỏng bị thử lại mỗi giờ mãi mãi. Từ 0.8.9 
 
 - Một job là một file JSON trong `<data-dir>/sleep/`, ghi trọn vẹn hoặc không
   ghi gì (file tạm rồi đổi tên). Nó ghi loại (`review`, `consolidation`,
-  `evolution`), cái gì yêu cầu nó (`turn`, `compaction`, `idle`,
-  `session_end`, `exec`, `due`), và với review thì store của project, hội
+  `evolution`, `expiry`, `wiki`), cái gì yêu cầu nó (`turn`, `compaction`,
+  `idle`, `session_end`, `exec`, `due`, và với lượt wiki là `review` khi một
+  review đã viết một trang), và với review thì store của project, hội
   thoại, session mới nhất cần đọc và số lượt nó bao.
 - **Cái kích hoạt nó chỉ được đặt lại khi job đã ghi xong.** Bộ đếm lượt và
   lần gọi tool của app, `review_cadence.json` của `ha exec` và phần đuôi chưa
@@ -103,6 +105,12 @@ hạn.
   sửa đổi đã áp dụng, và id của các entry khi lô có tối đa 64 entry, `members`).
 - **Tiến hoá** (một lần mỗi ngày): chỉ được đánh dấu đã chạy khi đã lưu xong;
   khoá của nó và việc nhận job ngăn lượt thứ hai bắt đầu trong lúc đó.
+- **Lượt wiki** (cuối một lượt, khi review đang chạy và knowledge đang bật):
+  mỗi thư viện knowledge một job (`wiki:<thư mục thư viện>`) khi thư viện đã
+  đổi kể từ lượt trước, có việc cho một lượt, và một review đã viết một trang
+  kể từ đó hoặc đã qua một ngày. Thư viện không còn đến hạn thì quên job đã bỏ
+  cuộc của nó. Thời gian chờ đầu tiên sau một lần hỏng là một giờ, như Deep
+  Dream.
 
 Lượt meditation của vòng học vốn đã tự giữ chỗ một giờ và chỉ đánh dấu sau khi
 thành công; nó không nằm trong hàng đợi.
@@ -127,6 +135,8 @@ thành công; nó không nằm trong hàng đợi.
 như trên), `HA_SLEEP_MAX_ATTEMPTS` số lần hỏng trước khi job bỏ cuộc, và
 `HA_COMPACTION_REVIEW_SECONDS` khoảng cách giữa các review của compact, và
 `HA_CONSOLIDATE_BATCH_TOKENS` số token entry mà một lần gọi Deep Dream được
-đưa (32.000; memory vượt mức này được hợp nhất theo từng lô). Chúng
+đưa (32.000; memory vượt mức này được hợp nhất theo từng lô), và
+`HA_WIKI_DUE_NOW=1` khiến lượt wiki đến hạn mà không chờ một ngày
+(`scripts/testing/live-tests/wiki.sh`). Chúng
 dành cho live test (`scripts/testing/live-tests/sleep.sh`); giá trị mặc định
 hợp với dùng hằng ngày.

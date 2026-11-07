@@ -16,6 +16,10 @@ use unicode_normalization::UnicodeNormalization;
 mod links;
 #[path = "manage.rs"]
 mod manage;
+#[path = "wiki_store.rs"]
+mod wiki_store;
+
+pub(crate) use wiki_store::{WIKI, WikiPage};
 
 const STATE: &str = ".ha-state.json";
 const PENDING: &str = ".ha-pending.json";
@@ -91,6 +95,12 @@ pub(crate) struct PageSummary {
     /// the file's modification time for a page written by hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// The pages this page links to that do not exist: a link written
+    /// before its target, or left by a page removed outside the store. They
+    /// are not edges of the graph; `/knowledge status`, `ha doctor` and a
+    /// read name them, and the wiki pass repoints or fills them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dangling: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +117,9 @@ pub(crate) struct PageRead {
     pub total_lines: usize,
     pub backlinks: Vec<String>,
     pub sources: Vec<String>,
+    /// The page's links to pages that do not exist.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dangling: Vec<String>,
     pub truncated: bool,
 }
 
@@ -141,7 +154,15 @@ pub(crate) struct Stats {
     /// the whole store down with it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
+    /// How many links point at pages that do not exist, and the first
+    /// [`DANGLING_SHOWN`] of them as `page -> target`.
+    pub dangling: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dangling_first: Vec<String>,
 }
+
+/// How many dangling links status and `ha doctor` name; the rest are counted.
+pub(crate) const DANGLING_SHOWN: usize = 5;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct Graph {
@@ -356,6 +377,7 @@ impl Store {
                 next_column,
                 total_lines: all.len(),
                 backlinks: backlinks(&pages, &page.summary.path),
+                dangling: page.summary.dangling.clone(),
                 truncated,
             })
         })
@@ -868,38 +890,37 @@ impl Store {
                 return Ok(None);
             }
             let pages = scan(root)?;
-            let words = |text: &str| {
-                crate::interactive::harness::query_terms(&fold(text))
-                    .into_iter()
-                    .collect::<BTreeSet<_>>()
-            };
-            let new = words(&format!("{title} {summary}"));
+            let new = subject_words(&format!("{title} {summary}"));
             if new.len() < 2 {
                 return Ok(None);
             }
-            let kept = pages
-                .iter()
-                .map(|page| words(&format!("{} {}", page.summary.title, page.summary.summary)))
-                .collect::<Vec<_>>();
-            #[allow(clippy::cast_precision_loss, reason = "a page count")]
-            let total = pages.len() as f64;
-            let weight = |word: &String| {
-                #[allow(clippy::cast_precision_loss, reason = "a page count")]
-                let frequency = kept.iter().filter(|words| words.contains(word)).count() as f64;
-                ((total + 1.0) / (frequency + 1.0)).ln() + 1.0
-            };
-            let whole = new.iter().map(weight).sum::<f64>();
+            let subjects = Subjects::of(&pages);
             let best = pages
                 .iter()
-                .zip(&kept)
-                .map(|(page, words)| {
-                    let shared = new.intersection(words).map(weight).sum::<f64>();
-                    (page, shared / whole)
-                })
+                .zip(&subjects.words)
+                .map(|(page, words)| (page, subjects.share(&new, words)))
                 .max_by(|a, b| a.1.total_cmp(&b.1));
             Ok(best
                 .filter(|(_, share)| *share >= SAME_SUBJECT_SHARE)
                 .map(|(page, share)| (page.summary.clone(), share)))
+        })
+    }
+
+    /// The pairs of pages that are one subject, as [`Self::same_subject`]
+    /// judges a new page against the library: most of one page's title and
+    /// summary words, weighted by rarity, are the other's. The most alike
+    /// first, at most `limit`; the page at `skip` (the wiki's index) is left
+    /// out.
+    pub(crate) fn same_subject_pairs(
+        &self,
+        skip: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, f64)>, String> {
+        self.with_lock(|root| {
+            if !enabled_at(root)? {
+                return Ok(Vec::new());
+            }
+            Ok(subject_pairs(&scan(root)?, skip, limit))
         })
     }
 
@@ -1225,21 +1246,28 @@ fn scan_reporting(root: &Path) -> Result<(Vec<Page>, Vec<String>), String> {
     Ok((pages, skipped))
 }
 
+/// Keep the page's links to admitted pages as its edges, and set the ones to
+/// pages that do not exist apart as dangling: they were dropped unseen.
 fn resolve_page_links(page: &mut Page, admitted: &BTreeMap<String, String>) {
     let own = normalized(&page.summary.path);
-    page.summary.related = page
-        .summary
-        .related
-        .iter()
-        .filter_map(|target| {
-            let target = normalized(target);
-            (target != own)
-                .then(|| admitted.get(&target).cloned())
-                .flatten()
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let mut related = BTreeSet::new();
+    let mut dangling = BTreeSet::new();
+    for target in &page.summary.related {
+        let key = normalized(target);
+        if key == own {
+            continue;
+        }
+        match admitted.get(&key) {
+            Some(path) => {
+                related.insert(path.clone());
+            }
+            None => {
+                dangling.insert(target.clone());
+            }
+        }
+    }
+    page.summary.related = related.into_iter().collect();
+    page.summary.dangling = dangling.into_iter().collect();
 }
 
 fn parse_metadata(path: &str, text: &str) -> Result<Metadata, String> {
@@ -1304,6 +1332,7 @@ fn parse_page(path: &str, text: String) -> Result<Page, String> {
             sources: metadata.sources,
             related: metadata.related,
             updated_at: metadata.updated_at,
+            dangling: Vec::new(),
         },
         text,
     })
@@ -1344,6 +1373,17 @@ fn render_page(path: &str, metadata: &Metadata, content: &str) -> Result<String,
         return Err("knowledge page exceeds 256 KiB".to_owned());
     }
     Ok(text)
+}
+
+/// The pages `markdown`, a page at `source`, links to (resolved paths).
+pub(crate) fn link_targets(source: &str, markdown: &str) -> Vec<String> {
+    links::targets(source, markdown)
+}
+
+/// `- [title](path)`, a link from the library's root, as the index lists a
+/// page.
+pub(crate) fn index_line(title: &str, path: &str) -> String {
+    format!("- [{}]({})", markdown_label(title), encode_path(path))
 }
 
 fn markdown_label(value: &str) -> String {
@@ -1395,7 +1435,86 @@ fn find_page<'a>(pages: &'a [Page], path: &str) -> Result<&'a Page, String> {
 
 /// How much of a proposed page's title and summary an existing page must
 /// hold to be the same subject.
-const SAME_SUBJECT_SHARE: f64 = 0.7;
+pub(crate) const SAME_SUBJECT_SHARE: f64 = 0.7;
+
+/// A page's subject as the same-subject checks read it: the words of its
+/// title and summary, folded, each once.
+fn subject_words(text: &str) -> BTreeSet<String> {
+    crate::interactive::harness::query_terms(&fold(text))
+        .into_iter()
+        .collect()
+}
+
+/// The library's subjects, each page's words, with each word weighed by how
+/// rare it is among them (a smoothed IDF).
+struct Subjects {
+    words: Vec<BTreeSet<String>>,
+}
+
+impl Subjects {
+    fn of(pages: &[Page]) -> Self {
+        Self {
+            words: pages
+                .iter()
+                .map(|page| {
+                    subject_words(&format!("{} {}", page.summary.title, page.summary.summary))
+                })
+                .collect(),
+        }
+    }
+
+    fn weight(&self, word: &String) -> f64 {
+        #[allow(clippy::cast_precision_loss, reason = "a page count")]
+        let total = self.words.len() as f64;
+        #[allow(clippy::cast_precision_loss, reason = "a page count")]
+        let frequency = self
+            .words
+            .iter()
+            .filter(|words| words.contains(word))
+            .count() as f64;
+        ((total + 1.0) / (frequency + 1.0)).ln() + 1.0
+    }
+
+    /// How much of `new`'s word weight `kept` holds.
+    fn share(&self, new: &BTreeSet<String>, kept: &BTreeSet<String>) -> f64 {
+        let whole = new.iter().map(|word| self.weight(word)).sum::<f64>();
+        if whole <= 0.0 {
+            return 0.0;
+        }
+        new.intersection(kept)
+            .map(|word| self.weight(word))
+            .sum::<f64>()
+            / whole
+    }
+}
+
+/// [`Store::same_subject_pairs`] over scanned pages.
+fn subject_pairs(pages: &[Page], skip: &str, limit: usize) -> Vec<(String, String, f64)> {
+    let subjects = Subjects::of(pages);
+    let mut pairs = Vec::new();
+    for (left, left_words) in pages.iter().zip(&subjects.words) {
+        for (right, right_words) in pages.iter().zip(&subjects.words) {
+            if left.summary.path >= right.summary.path
+                || [&left.summary.path, &right.summary.path]
+                    .iter()
+                    .any(|path| normalized(path) == normalized(skip))
+                || left_words.len() < 2
+                || right_words.len() < 2
+            {
+                continue;
+            }
+            let share = subjects
+                .share(left_words, right_words)
+                .max(subjects.share(right_words, left_words));
+            if share >= SAME_SUBJECT_SHARE {
+                pairs.push((left.summary.path.clone(), right.summary.path.clone(), share));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    pairs.truncate(limit);
+    pairs
+}
 
 /// `pages` ranked by each of `queries` by its weight (reciprocal rank
 /// fusion), then the rest by path.
@@ -1437,11 +1556,22 @@ fn backlinks(pages: &[Page], path: &str) -> Vec<String> {
 }
 
 fn counts(pages: &[Page], enabled: bool, skipped: Vec<String>) -> Stats {
+    let dangling = pages
+        .iter()
+        .flat_map(|page| {
+            page.summary
+                .dangling
+                .iter()
+                .map(move |target| format!("{} -> {target}", page.summary.path))
+        })
+        .collect::<Vec<_>>();
     Stats {
         pages: pages.len(),
         links: pages.iter().map(|p| p.summary.related.len()).sum(),
         enabled,
         skipped,
+        dangling: dangling.len(),
+        dangling_first: dangling.into_iter().take(DANGLING_SHOWN).collect(),
     }
 }
 
@@ -2404,6 +2534,39 @@ mod tests {
         assert_eq!(store.graph().unwrap().edges.len(), 1);
         fs::remove_file(store.root.join("notes/ref.md")).unwrap();
         store.delete(&target.path, &target.hash).unwrap();
+    }
+
+    /// A link to a page that does not exist was dropped unseen; it is kept
+    /// as the page's dangling link, named by a read and counted by status,
+    /// and resolves once the page is written.
+    #[test]
+    fn a_link_to_a_missing_page_is_kept_as_dangling() {
+        let (_dir, store) = store();
+        store.write(input("target.md", "target")).unwrap();
+        store
+            .write(input(
+                "notes/ref.md",
+                "[Target](../target.md), [Gone](../missing.md) and [Later](later.md)",
+            ))
+            .unwrap();
+        let read = store.read("notes/ref.md", 1, 200).unwrap();
+        assert_eq!(read.dangling, ["missing.md", "notes/later.md"]);
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.dangling, 2);
+        assert_eq!(
+            stats.dangling_first,
+            [
+                "notes/ref.md -> missing.md",
+                "notes/ref.md -> notes/later.md"
+            ]
+        );
+        assert_eq!(store.graph().unwrap().edges.len(), 1, "not an edge");
+        store.write(input("notes/later.md", "now here")).unwrap();
+        assert_eq!(store.stats().unwrap().dangling, 1);
+        assert_eq!(
+            store.document("notes/later.md").unwrap().backlinks,
+            ["notes/ref.md"]
+        );
     }
 
     #[test]

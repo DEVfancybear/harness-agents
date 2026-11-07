@@ -81,6 +81,10 @@ pub enum Kind {
     Evolution,
     /// Closing the memory nobody used (`memory_validity::expire_due`).
     Expiry,
+    /// The wiki pass over a knowledge library (`knowledge::wiki`): dangling
+    /// links repointed or filled, pages on one subject merged, the index,
+    /// claims checked against their sources.
+    Wiki,
 }
 
 impl Kind {
@@ -91,6 +95,7 @@ impl Kind {
             Self::Consolidation => "consolidation",
             Self::Evolution => "evolution",
             Self::Expiry => "expiry",
+            Self::Wiki => "wiki",
         }
     }
 
@@ -100,7 +105,7 @@ impl Kind {
     const fn first_backoff_seconds(self) -> i64 {
         match self {
             Self::Review => 300,
-            Self::Consolidation | Self::Evolution | Self::Expiry => 3_600,
+            Self::Consolidation | Self::Evolution | Self::Expiry | Self::Wiki => 3_600,
         }
     }
 }
@@ -233,6 +238,16 @@ impl Job {
         Self {
             scope: Some(scope.display().to_string()),
             ..Self::new(Kind::Expiry, format!("expiry:{}", scope.display()), "due")
+        }
+    }
+
+    /// The wiki pass over the knowledge library at `root`, one per library;
+    /// `trigger` is what made it due (`review`, `due`).
+    #[must_use]
+    pub fn wiki(root: &Path, trigger: &str) -> Self {
+        Self {
+            scope: Some(root.display().to_string()),
+            ..Self::new(Kind::Wiki, format!("wiki:{}", root.display()), trigger)
         }
     }
 
@@ -1272,6 +1287,46 @@ mod tests {
         job.gave_up = true;
         super::save(data, &job).expect("gave up");
         super::forget_given_up(data, "evolution");
+        assert!(jobs(data).is_empty());
+    }
+
+    /// The wiki pass is a job of its library: asked for again it is one job,
+    /// one library's pass runs at a time while another library's can, a
+    /// failure waits an hour and doubles, and after its attempts it gives up
+    /// and takes no new job until forgotten.
+    #[test]
+    fn a_wiki_pass_is_one_job_per_library_with_backoff_and_give_up() {
+        let directory = tempfile::tempdir().expect("dir");
+        let data = directory.path();
+        let project = std::path::Path::new("p/.harness/knowledge");
+        let global = std::path::Path::new("data/knowledge");
+        let running = super::claim_upkeep(data, Job::wiki(project, "review")).expect("claimed");
+        assert_eq!(running.job.kind, Kind::Wiki);
+        assert_eq!(running.job.trigger, "review");
+        assert!(super::claim_upkeep(data, Job::wiki(project, "due")).is_none());
+        let other = super::claim_upkeep(data, Job::wiki(global, "due")).expect("another library");
+        other.done();
+        running.failed("the refinement model call failed: rate_limited: limit");
+        let kept = jobs(data);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].attempts, 1);
+        assert_eq!(backoff(Kind::Wiki, 1).num_seconds(), 3_600);
+        assert!(
+            super::claim_upkeep(data, Job::wiki(project, "due")).is_none(),
+            "it waits out its backoff"
+        );
+        for _ in 1..super::MAX_ATTEMPTS {
+            for mut job in jobs(data) {
+                job.next_at = 0;
+                super::save(data, &job).expect("due");
+            }
+            super::claim_upkeep(data, Job::wiki(project, "due"))
+                .expect("retried")
+                .failed("the refinement model call timed out");
+        }
+        assert!(jobs(data)[0].gave_up);
+        assert!(super::claim_upkeep(data, Job::wiki(project, "due")).is_none());
+        super::forget_given_up(data, &Job::wiki(project, "due").key);
         assert!(jobs(data).is_empty());
     }
 
