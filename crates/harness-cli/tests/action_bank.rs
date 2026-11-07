@@ -325,6 +325,41 @@ async fn a_ready_banked_call_runs_without_a_model_call() {
     assert!(kept.content.starts_with("action bank "), "{}", kept.content);
 }
 
+/// A bank authored alone in its response has an empty root: its first node
+/// runs at once, where the model's own call would have, and saves no model
+/// step; the node after it does.
+#[tokio::test]
+async fn a_bank_authored_alone_saves_no_step_with_its_first_call() {
+    let bench = bench();
+    let run = run(
+        &bench,
+        vec![
+            calls(&[(
+                "b1",
+                "action_bank",
+                bank(&[
+                    node("version", "root", "ok", &["--version"]),
+                    node("status", "version", "ok", &["status", "--short"]),
+                ]),
+            )]),
+            answer("done"),
+        ],
+        Some(ActionBank::default()),
+        ApprovalMode::Auto,
+        TurnLimits::default(),
+    )
+    .await;
+    assert_eq!(run.seen.len(), 2);
+    assert_eq!(
+        run.outcome.bank.immediate, 1,
+        "the first node is the response's call"
+    );
+    assert_eq!(
+        run.outcome.bank.dispatched, 1,
+        "the second saves a model step"
+    );
+}
+
 /// A later turn and a resume rebuild the conversation from the store: the
 /// banked calls are there as calls with their results, and the bank call
 /// with its answer, so no receipt is orphaned and the transcript is valid.

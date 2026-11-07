@@ -65,7 +65,7 @@ Một lệnh bị từ chối, bị chặn, hỏng, bị huỷ hoặc không rõ
 và không guard nào đúng trên nó: model đọc nó. Các lệnh của root được đọc như một
 kết quả: không rõ nếu có một lệnh không rõ, thất bại nếu có một lệnh thất bại, mã
 thoát cuối cùng, mọi đoạn chữ. Bank được viết một mình trong response có root
-rỗng, tức là `ok`.
+rỗng, tức là `ok`: node đầu tiên chạy ngay, đúng chỗ lệnh của chính response lẽ ra chạy, và được đếm là `immediate`, không phải một bước đã tiết kiệm.
 
 ## 3. Lệnh được bỏ qua hiện ra với model thế nào
 
@@ -111,7 +111,7 @@ Mỗi lần bỏ qua ghi `bank/dispatched` với: `graph` (hash các node đã v
 `tool` và `args_hash` (đúng tham số đã chạy), `tool_receipt` (id receipt bền) và
 `tool_receipt_hash`, `status`, `replaced_step` (bước model mà nó thay) và
 `model_steps` (số lần gọi model của lượt đến lúc đó, không tăng). Các bản ghi
-khác: `bank/authored` (graph, node, cạnh, ước lượng chi phí viết),
+khác: `bank/authored` (graph, node, cạnh, `author_estimate`: ước lượng chi phí viết tính bằng token; diagnostics giấu mọi trường có tên giống token),
 `bank/refused` (lý do), `bank/abstained` (ứng viên, có hỏi selector không và
 input token của nó), `bank/discarded` (các node và lý do: `guard_false`,
 `not_chosen`, `replaced`, `deferred`, `turn_end`) và `bank/turn` (bảng đếm của
@@ -127,7 +127,7 @@ lượng**: số byte tham số của lệnh bank chia 4. Chi phí trọn task l
 provider của lần chạy, vốn đã gồm bước viết bank và mọi lần quay về model.
 
 - `ha exec --json` có object `bank`: `enabled`, `authored`, `refused`,
-  `nodes`, `dispatched`, `model_steps_saved`, `abstained`, `discarded`,
+  `nodes`, `dispatched`, `model_steps_saved`, `immediate`, `abstained`, `discarded`,
   `selector_calls`, `selector_input_tokens`, `author_tokens_estimate`.
 - `/context` có dòng `Bank:` khi bank bật hoặc đã làm gì đó.
 

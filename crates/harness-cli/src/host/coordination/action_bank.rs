@@ -109,6 +109,7 @@ pub fn report(on: bool, tally: &harness_tools::BankTally) -> serde_json::Value {
         "nodes": tally.nodes,
         "dispatched": tally.dispatched,
         "model_steps_saved": tally.dispatched,
+        "immediate": tally.immediate,
         "abstained": tally.abstained,
         "discarded": tally.discarded,
         "selector_calls": tally.selector_calls,
@@ -152,10 +153,11 @@ pub fn total(task: &str) -> harness_tools::BankTally {
 pub fn line(tally: &harness_tools::BankTally) -> Option<String> {
     (!tally.is_empty()).then(|| {
         format!(
-            "action bank: {} bank(s) of {} node(s), {} run without a model step, {} back to the model, {} dropped; authoring ~{} tokens (estimate){}",
+            "action bank: {} bank(s) of {} node(s), {} run without a model step ({} more in place of a call of its own), {} back to the model, {} dropped; authoring ~{} tokens (estimate){}",
             tally.authored,
             tally.nodes,
             tally.dispatched,
+            tally.immediate,
             tally.abstained,
             tally.discarded,
             tally.author_tokens_estimate,

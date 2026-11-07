@@ -572,6 +572,9 @@ pub struct BankTally {
     pub nodes: u32,
     /// Nodes run without a model call: model steps saved.
     pub dispatched: u32,
+    /// Nodes run right after a bank authored alone in its response: where
+    /// the model's own call would have run, so no model step is saved.
+    pub immediate: u32,
     /// Boundaries where the selector abstained or could not answer.
     pub abstained: u32,
     /// Nodes dropped unrun: guard false, not chosen, replaced, turn end.
@@ -590,6 +593,7 @@ impl BankTally {
         self.refused += other.refused;
         self.nodes += other.nodes;
         self.dispatched += other.dispatched;
+        self.immediate += other.immediate;
         self.abstained += other.abstained;
         self.discarded += other.discarded;
         self.selector_calls += other.selector_calls;

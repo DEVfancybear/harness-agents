@@ -91,10 +91,15 @@ held=0
 for attempt in 1 2 3; do
   since=$(now_ms)
   HA_ACTION_BANK=on run "$P1" "task1-$attempt" "$TASK1" --approval full-auto
-  if [ "$(count bank authored "$since")" -ge 1 ]; then held=1; T1="$RX/task1-$attempt.json"; S1=$since; break; fi
+  # A bank that can save a step: authored with other calls, or a chain.
+  saving=$(records bank authored "$since" | "$PY" -c "
+import json, sys
+fields = [json.loads(l)['fields'] for l in sys.stdin if l.strip()]
+print(any(f.get('root_calls', 0) >= 1 or f.get('nodes', 0) >= 2 for f in fields))")
+  if [ "$saving" = True ]; then held=1; T1="$RX/task1-$attempt.json"; S1=$since; break; fi
   (cd "$P1" && git reset -q --hard && git clean -qfd)
 done
-check "precondition: the model authored a bank (attempts: $attempt)" '[ "$held" = 1 ]'
+check "precondition: the model authored a bank that can save a step, beside its own calls or as a chain (attempts: $attempt)" '[ "$held" = 1 ]'
 if [ "$held" = 1 ]; then
   dispatched=$(jget "$T1" bank.dispatched)
   steps=$(jget "$T1" steps)
@@ -120,6 +125,7 @@ P2="$RX/p2"
 fixture "$P2"
 printf 'def total(items):\n    return sum(amount for _, amount in items) + 1\n' > "$P2/app/calc.py"
 (cd "$P2" && git add -A && git -c user.name=t -c user.email=t@t commit -qm calc)
+BASE2=$(cd "$P2" && git rev-list --count HEAD)
 TASK2="Write tests/test_calc.py with one unittest test: total([('a', 2), ('b', 3)]) from app.calc equals 5. Do not change app/calc.py. In the same response, queue with action_bank: node 'test' after root when ok runs the tests with run_shell: $TESTS ; node 'commit' after 'test' when ok runs run_shell: git add -A && git -c user.name=t -c user.email=t@t commit -m tests . Then report whether the tests passed."
 held=0
 for attempt in 1 2 3; do
@@ -135,7 +141,7 @@ check "precondition: a chain of two banked nodes was authored (attempts: $attemp
 if [ "$held" = 1 ]; then
   check "the failing test run ran from the bank (a certificate with status failed)" '[ "$(records bank dispatched "$S2" | grep -cE "\"status\": *\"failed\"")" -ge 1 ]'
   check "the commit after it was dropped: its guard did not hold" '[ "$(records bank discarded "$S2" | grep -c "guard_false")" -ge 1 ]'
-  check "nothing was committed" '[ "$(cd "$P2" && git rev-list --count HEAD)" = 2 ]'
+  check "nothing was committed" '[ "$(cd "$P2" && git rev-list --count HEAD)" = "$BASE2" ]'
   check "the model was called after the failure and answered" '[ "$(jget "$T2" stop)" = final ] && [ "$(jget "$T2" steps)" -ge 2 ]'
 fi
 

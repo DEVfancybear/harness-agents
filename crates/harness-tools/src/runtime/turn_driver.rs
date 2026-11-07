@@ -1183,7 +1183,21 @@ struct Bypass {
     predecessor_receipt: String,
     /// The model step this call stands in for.
     replaced_step: u32,
+    /// Whether running it saves a model step. A node that follows the root
+    /// of a bank authored alone in its response runs where the model's own
+    /// call would have: it is the call that response made, and saves none.
+    saves_step: bool,
     call: NormalizedToolCall,
+}
+
+/// The call whose result a boundary settled, for the bank: its predecessor
+/// name, a line describing it, its result, and whether it is the root of a
+/// response that made no other call.
+struct Settled {
+    predecessor: String,
+    described: String,
+    receipt: crate::bank::Receipt,
+    empty_root: bool,
 }
 
 /// One call's public result as the bank's guards read it.
@@ -1362,7 +1376,7 @@ impl TurnDriver {
         bypassing: Option<&Bypass>,
         receipts: &[(String, crate::bank::Receipt)],
         steps: u32,
-    ) -> Option<(String, String, crate::bank::Receipt)> {
+    ) -> Option<Settled> {
         if let Some(bypass) = bypassing {
             let receipt = receipts.first().map_or_else(
                 || crate::bank::Receipt::unclear(""),
@@ -1371,8 +1385,15 @@ impl TurnDriver {
             // The certificate of one bypass: the graph and node, the result it
             // followed, the exact arguments run, the receipt they produced, and
             // the model step that was not made (the step count did not move).
-            state.tally.dispatched += 1;
+            // A node run where the authoring response's own call would have
+            // been saves no step, and says so.
+            if bypass.saves_step {
+                state.tally.dispatched += 1;
+            } else {
+                state.tally.immediate += 1;
+            }
             harness_types::diag::info("bank", "dispatched")
+                .field("saved", bypass.saves_step)
                 .call(&bypass.call.call_id)
                 .field("graph", bypass.graph.clone())
                 .field("node", bypass.node.id.clone())
@@ -1392,11 +1413,12 @@ impl TurnDriver {
                 .field("replaced_step", bypass.replaced_step)
                 .field("model_steps", steps)
                 .emit();
-            return Some((
-                bypass.node.id.clone(),
-                format!("{} {}", bypass.node.tool, bypass.node.arguments),
+            return Some(Settled {
+                predecessor: bypass.node.id.clone(),
+                described: format!("{} {}", bypass.node.tool, bypass.node.arguments),
                 receipt,
-            ));
+                empty_root: false,
+            });
         }
         let bank = authored?;
         let graph = bank.hash.clone();
@@ -1421,20 +1443,22 @@ impl TurnDriver {
             .field("graph", graph)
             .field("nodes", nodes)
             .field("edges", edges)
-            .field("author_tokens_estimate", author_tokens)
+            .field("author_estimate", author_tokens)
             .field("replaced", replaced.len())
+            .field("root_calls", receipts.len())
             .field("step", steps)
             .emit();
-        Some((
-            crate::bank::ROOT.to_owned(),
-            "the calls of the response that authored the bank".to_owned(),
-            crate::bank::Receipt::combined(
+        Some(Settled {
+            predecessor: crate::bank::ROOT.to_owned(),
+            described: "the calls of the response that authored the bank".to_owned(),
+            receipt: crate::bank::Receipt::combined(
                 receipts
                     .iter()
                     .map(|(_, receipt)| receipt.clone())
                     .collect(),
             ),
-        ))
+            empty_root: receipts.is_empty(),
+        })
     }
 
     /// The banked call to run now in place of a model step, if exactly one
@@ -1445,7 +1469,7 @@ impl TurnDriver {
     async fn bank_next(
         &self,
         state: &mut crate::bank::BankState,
-        settled: Option<(String, String, crate::bank::Receipt)>,
+        settled: Option<Settled>,
         clean: bool,
         request_text: &str,
         room: bool,
@@ -1455,7 +1479,12 @@ impl TurnDriver {
         observer: &Arc<dyn TurnObserver>,
         cancellation: &CancellationToken,
     ) -> Option<Bypass> {
-        let (predecessor, described, receipt) = settled?;
+        let Settled {
+            predecessor,
+            described,
+            receipt,
+            empty_root,
+        } = settled?;
         let eligible = state.eligible(&predecessor, &receipt);
         if eligible.is_empty() {
             return None;
@@ -1514,7 +1543,7 @@ impl TurnDriver {
                     )
                     .field("selector", selector.is_some())
                     .field("asked", selection.asked)
-                    .field("input_tokens", selection.input_tokens)
+                    .field("selector_input", selection.input_tokens)
                     .emit();
                 state.abstained(&eligible);
                 return None;
@@ -1537,6 +1566,7 @@ impl TurnDriver {
             predecessor,
             predecessor_receipt: receipt.hash(),
             replaced_step: steps + 1,
+            saves_step: !empty_root,
             node: chosen,
             call,
         })
@@ -3298,11 +3328,12 @@ impl TurnDriver {
                     .field("refused", tally.refused)
                     .field("nodes", tally.nodes)
                     .field("dispatched", tally.dispatched)
+                    .field("immediate", tally.immediate)
                     .field("abstained", tally.abstained)
                     .field("discarded", tally.discarded)
                     .field("selector_calls", tally.selector_calls)
-                    .field("selector_input_tokens", tally.selector_input_tokens)
-                    .field("author_tokens_estimate", tally.author_tokens_estimate)
+                    .field("selector_input", tally.selector_input_tokens)
+                    .field("author_estimate", tally.author_tokens_estimate)
                     .field("model_steps", steps)
                     .emit();
             }

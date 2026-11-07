@@ -2158,18 +2158,19 @@ impl Report {
         };
         let _ = writeln!(
             out,
-            "- {} turn(s): {} bank(s) authored ({} node(s), ~{} authoring tokens, an estimate), {} refused; {} call(s) run without a model step over {} model step(s); {} abstention(s), {} node(s) dropped; selector {} call(s), {} input token(s)",
+            "- {} turn(s): {} bank(s) authored ({} node(s), ~{} authoring tokens, an estimate), {} refused; {} call(s) run without a model step over {} model step(s), {} more run right after a bank authored alone (no step saved); {} abstention(s), {} node(s) dropped; selector {} call(s), {} input token(s)",
             turns.len(),
             sum("authored"),
             sum("nodes"),
-            sum("author_tokens_estimate"),
+            sum("author_estimate"),
             sum("refused"),
             sum("dispatched"),
             sum("model_steps"),
+            sum("immediate"),
             sum("abstained"),
             sum("discarded"),
             sum("selector_calls"),
-            sum("selector_input_tokens"),
+            sum("selector_input"),
         );
         for record in refused.iter().rev().take(5) {
             let _ = writeln!(

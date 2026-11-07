@@ -66,7 +66,7 @@ A call that was refused, denied, malformed, cancelled or of unknown outcome is
 *unclear*, and no guard holds on it: the model reads it. The root's calls are
 read as one result: unclear if any is, failed if any failed, the last exit
 code, all their texts. A bank authored alone in its response has an empty root,
-which is `ok`.
+which is `ok`: its first node then runs at once, where the response's own call would have run, and is counted as `immediate`, not as a saved step.
 
 ## 3. How a bypassed call appears to the model
 
@@ -113,7 +113,7 @@ the guard read), `tool` and `args_hash` (the exact arguments run),
 `tool_receipt` (the durable receipt ids) and `tool_receipt_hash`, `status`,
 `replaced_step` (the model step it stands in for) and `model_steps` (the
 turn's model calls so far, which did not move). Other records: `bank/authored`
-(graph, nodes, edges, authoring estimate), `bank/refused` (reason),
+(graph, nodes, edges, `author_estimate`: the authoring estimate in tokens; the diagnostics withhold any field named like a token), `bank/refused` (reason),
 `bank/abstained` (candidates, whether a selector was asked and its input
 tokens), `bank/discarded` (nodes and reason: `guard_false`, `not_chosen`,
 `replaced`, `deferred`, `turn_end`) and `bank/turn` (the turn's tally).
@@ -129,7 +129,7 @@ the bank call's argument bytes / 4. The complete cost of a task is the run's
 provider usage, which already includes the authoring step and every fallback.
 
 - `ha exec --json` has a `bank` object: `enabled`, `authored`, `refused`,
-  `nodes`, `dispatched`, `model_steps_saved`, `abstained`, `discarded`,
+  `nodes`, `dispatched`, `model_steps_saved`, `immediate`, `abstained`, `discarded`,
   `selector_calls`, `selector_input_tokens`, `author_tokens_estimate`.
 - `/context` has a `Bank:` line while the bank is on or did anything.
 
