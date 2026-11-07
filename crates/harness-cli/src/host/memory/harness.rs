@@ -535,9 +535,21 @@ pub(crate) fn age_suffix(entry: &Entry) -> String {
     let origin = match entry.standing.kind {
         "web" => format!("{origin}, from a web page: unverified"),
         "child" => format!("{origin}, from a delegated agent: unverified"),
+        _ if unverified(entry) => format!("{origin}, unverified: check it before relying on it"),
         _ => origin.to_owned(),
     };
     age_label(entry).map_or_else(|| origin.clone(), |age| format!(", {age}{origin}"))
+}
+
+/// Whether an entry is a theory nobody checked yet (`MEMORY_STORE.en.md`
+/// §20.2): its meta says `verified: unverified`, or it says nothing of it and
+/// the review that wrote it was unsure (`confidence: low`).
+#[must_use]
+pub fn unverified(entry: &Entry) -> bool {
+    match entry.meta.get("verified").and_then(Value::as_str) {
+        Some(verified) => verified == "unverified",
+        None => entry.standing.low_confidence,
+    }
 }
 
 /// The order of two entries' places: path, title and key, compared as the
@@ -1261,6 +1273,44 @@ mod tests {
         assert!(digest.contains(&long), "the whole entry: {digest}");
         assert!(digest.contains("memory: 13 (1 pinned above)"), "{digest}");
         assert_eq!(digest.matches("[global:language]").count(), 1, "{digest}");
+    }
+
+    /// An entry nobody checked says so in the digest, so the agent checks it
+    /// before relying on it: one marked unverified, and one a review wrote
+    /// unsure of it that says nothing of how it is known; a confirmed one
+    /// does not.
+    #[test]
+    fn an_unverified_entry_is_marked_in_the_digest() {
+        let directory = tempfile::tempdir().expect("state");
+        write(
+            directory.path(),
+            &json!({"entries":{"memory":{
+                "theory": {"title": "Cache theory", "content": "the slowness comes from the cache", "metadata": {"verified": "unverified"}},
+                "guess": {"title": "Port guess", "content": "the service listens on 8080", "origin": {"via": "refine", "confidence": "low"}},
+                "checked": {"title": "Billing tests", "content": "cargo test billing passes", "metadata": {"verified": "confirmed", "verified_by": "test passed"}, "origin": {"confidence": "low"}}
+            }}}),
+        );
+        let digest = format_digest(
+            &load(directory.path(), "global"),
+            DigestOptions::default(),
+            &[],
+        );
+        let line = |id: &str| {
+            digest
+                .lines()
+                .find(|line| line.contains(&format!("[global:{id}]")))
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert!(
+            line("theory").contains("unverified: check it before relying on it"),
+            "{digest}"
+        );
+        assert!(
+            line("guess").contains("unverified: check it before relying on it"),
+            "{digest}"
+        );
+        assert!(!line("checked").contains("unverified"), "{digest}");
     }
 
     #[test]

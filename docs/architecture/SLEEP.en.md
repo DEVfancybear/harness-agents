@@ -101,6 +101,14 @@ The triggers are the ones ha had; each writes a job and then runs the due ones.
   ([MEMORY_STORE.en.md](MEMORY_STORE.en.md), section 16). Each batch is a
   `refine.consolidation_batch` record (its scope, refinement, place, entries
   and edits applied, and the ids of a batch of 64 entries or fewer, `members`).
+  After 0.9.3 a pass also reads the turns behind each entry from the journal
+  and may correct an entry with a quote of them, moves a long entry's detail
+  to a knowledge page with a pointer left behind, runs the batches likeliest
+  to have drifted first, and follows the user's `dream.md`: the global
+  harness directory's for the global memory, `<project>/.harness/dream.md`
+  for a conversation's store, at most 4,000 characters, joined by what
+  `/refine --curate` was given ([MEMORY_STORE.en.md](MEMORY_STORE.en.md),
+  section 20).
 - **The evolution** (once a day): marked as run only once it saved; its lock
   and its job's claim keep a second run from starting meanwhile.
 

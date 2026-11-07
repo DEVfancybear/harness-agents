@@ -88,7 +88,13 @@ hạn.
 - **`ha exec` thoát**: một job khi các lần chạy của hội thoại đã làm đủ; rồi các
   job review đến hạn của hội thoại chạy trước khi process thoát. Một lần chạy
   không tự đến hạn review vẫn chạy job mà một lần chạy trước chưa làm xong.
-- **Deep Dream** (memory toàn cục quá 12 entry và 15 thay đổi, hoặc store của
+- **Deep Dream** (sau 0.9.3: còn đọc các lượt đứng sau mỗi entry từ journal và
+  có thể sửa entry bằng câu trích nguyên văn, chuyển chi tiết của entry dài
+  sang một trang knowledge và để lại con trỏ, chạy trước các batch dễ trôi
+  nhất, và theo `dream.md` của người dùng: của thư mục harness global cho
+  memory global, `<project>/.harness/dream.md` cho store của một hội thoại,
+  tối đa 4.000 ký tự, nối với điều `/refine --curate` được đưa;
+  [MEMORY_STORE.vi.md](MEMORY_STORE.vi.md), mục 20.) Điều kiện: memory toàn cục quá 12 entry và 15 thay đổi, hoặc store của
   một hội thoại quá 40 entry): chỉ được đánh dấu xong khi đã áp dụng; mỗi lúc
   một lần hợp nhất trên mọi process của ha (`consolidation.lock` trong thư mục
   harness toàn cục, một khoá của hệ điều hành mà process giữ khi chạy).

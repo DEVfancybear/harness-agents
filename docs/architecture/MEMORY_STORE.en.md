@@ -1422,3 +1422,161 @@ same file twice.
   proposed; `/context` has a `Memory queue:` line while changes wait or the
   mode is not the default; the bug report's Memory section counts them and
   copies the queues (their outline without `--include-content`).
+
+## 20. Deep Dream against the transcripts, verification, demotes (after 0.9.3)
+
+After Anthropic's "The components of agent memory" (2026-11-06): a note an
+agent writes from what one moment seemed to show can be wrong from the start,
+or drift, and a later session reads and trusts it. Dreaming tests the notes
+against the original transcripts, keeps the injected layer small by moving
+detail down and leaving links behind, follows a goal the user sets, and
+spends its effort on what is likely to change. The code is
+`memory/dream.rs`, called from `memory/refine.rs`.
+
+### 20.1 The turns behind an entry
+
+For each entry of a Deep Dream batch whose `origin` (or `edited_by`) names a
+conversation, the pass reads that conversation from its project store's
+journal, read-only, as the memory tool's provenance does
+(`memory_provenance::of_task`: what the user typed in each turn, and each tool
+call's result with the kind of its tool; the agent's own words are not
+read). The store is the entry's project's, then the project the pass runs in,
+then the others (at most 64 looked through). Of those turns it keeps the ones
+that hold the review's quote, then the rest by the weight of the entry's
+words each holds (each word by its IDF over the conversation's turns), each
+cut to 1,500 characters around what matched, at most four per entry.
+
+The budget is `dream::EVIDENCE_TOKENS` (6,000 tokens of excerpts per batch,
+about four bytes a token) and `ENTRY_EVIDENCE_TOKENS` (1,200 per entry). The
+entries likely to drift (§20.5) get theirs first. The curator reads them in a
+`<transcript_evidence>` block, each labelled by who said it (`[the user
+typed]`, `[a tool result, file]`), framed as records, never instructions; a
+`</` inside an excerpt cannot close the block. The entries with no turns are
+named, and the curator corrects none of them. A `dream evidence` debug record
+counts the entries, the excerpts and the entries without.
+
+### 20.2 `correct`, and how an entry is known
+
+A curator edit `{"action": "correct", "kind", "id", "title", "content",
+"evidence", "changed"}` changes what an entry claims. The host checks it
+before the apply:
+
+- `evidence` must be a span of that entry's excerpt, word for word
+  (`refine::quoted`: whitespace and case aside, a phrase of 12 characters or
+  more). Otherwise the edit is refused (`a correction's evidence must be a span
+  of its entry's transcript excerpt ...`), recorded like any refusal. An
+  entry without an excerpt cannot be corrected.
+- The correction's words may be the excerpt's: the merge check (more than
+  half of the content's words in none of the batch's entries) also counts the
+  excerpt's words for it. It may only say what the transcript shows.
+- `changed: false` (the fact was never so) makes it an update: the old
+  version stays in the store's history, as every update's does. `changed:
+  true` (it held, then changed) makes it a supersede (§16.2): a new entry,
+  the old one closed for `as_of`, the new one kept as the old one was
+  (pinned, its meta) but for how it was known. ha's model is that a wrong
+  note was never true, so `as_of` must not read it as a past fact, while a
+  changed fact was true then. The curator says which; both need the quote.
+- What it rests on is recorded: the entry's `edited_by` (or the new entry's
+  `origin`) carries `correction: true`, the conversation of the excerpt, the
+  quote and its kind (`user`, `tool`, ...), which is also the edit's
+  `origin_kind`. The refinement's row says `Corrected global memory <id>`, and
+  `/refine --rollback` undoes it.
+- A correction of a rule every turn follows (`constraints/*`,
+  `user/preferences`) waits for the person unless it quotes the user's own
+  words, as a review's edit does (§19.1).
+
+An entry's meta says how it is known: `verified` is `confirmed` (checked;
+`verified_by` says how, at most 160 characters: `test passed: cargo test
+billing`, `user confirmed`) or `unverified` (a theory nobody tested). The
+review's prompt asks for it on a fact or rule, and for a trap to be kept as a
+warning that names what sets it off, without telling the model what to
+record: the article measured that fixed rules of what to record hurt strong
+models. The host:
+
+- writes `unverified` when the review gave its edit `confidence: low` and no
+  `verified`;
+- keeps an entry's `verified` through an update that says nothing of it,
+  except a correction, whose claim the old check never covered;
+- adds an edit's metadata to the entry's when it holds only `verified`,
+  `verified_by` or `scope` (a pinned entry stays pinned);
+- drops any other value of `verified`, and the `verified_by` of an entry not
+  confirmed;
+- keeps a Deep Dream `verified: confirmed` only when its `evidence` is in the
+  entry's excerpt; otherwise it is dropped and the record says so
+  (`verified_dropped`).
+
+The digest marks an entry `unverified: check it before relying on it` when its
+meta says `unverified`, or says nothing and the review that wrote it last was
+unsure (`confidence: low` in `edited_by`, else `origin`). A web page's or a
+child's entry keeps its own mark (§16.4).
+
+### 20.3 `demote`: detail down, a pointer left behind
+
+While the knowledge library is on (`HA_MEMORY_OFF` without `knowledge`), the
+curator is offered `{"action": "demote", "kind", "id", "content", "page":
+{"path", "title", "summary"}}` for an entry of 600 characters or more
+(`DEMOTE_MIN_CHARS`), or any entry while the memory is over its 30-entry
+target, as an alternative to deleting or cutting it. The host:
+
+- refuses it for a pinned entry or a constraint (read whole in every turn),
+  for a statement over 100 characters (`DEMOTE_SUMMARY_CHARS`), for a path
+  over 48 characters or one a page holds already, and while changes wait for
+  the person (`HA_MEMORY_REVIEW=all`): a demote is made whole or not at all;
+- writes the page through the knowledge store's own write (`Store::
+  write_update`, origin `dream`): the global library for the global memory,
+  the project's for a conversation's store. Its content is the entry's whole
+  content, or the curator's page, which must hold it word for word; the page
+  as written is read back and checked to hold it, and removed if not. Its
+  sources are `memory <kind>:<id>` and the conversations the entry came from;
+- rewrites the entry to the statement and a pointer, `<statement> (details:
+  global knowledge concepts/x.md)`, which fits the 180 characters the digest
+  shows of an entry. The statement passes the merge check: it is the entry's
+  point in its own words.
+
+The refinement records the entry's update and the page's create; a rollback
+puts the entry back and deletes the page while it is as written. When the
+save that keeps the pointer fails, the page is removed.
+
+### 20.4 `dream.md`: memory in service of a goal
+
+The automatic passes read the user's instructions for what the memory is
+for: `dream.md` in the global harness directory for the global memory, and
+`<project>/.harness/dream.md` (the main checkout's) for a conversation's
+store. They reach the curator as `<user_curate_instructions>`, framed as the
+user's own file (as the project's AGENTS.md is), guiding what to keep, merge,
+correct and demote within the curator's rules. At most 4,000 characters
+(`DREAM_INSTRUCTIONS_CHARS`) are read: past it the file is cut on a character
+boundary, the prompt says so, and a `dream instructions_cut` warning is
+recorded; each read is a `dream instructions` record. What the user types
+after `/refine --curate` joins the global file and wins where they differ.
+
+### 20.5 What is likely to drift goes first
+
+The batches of a pass run in the order of how likely their entries are to
+have drifted (`dream::drift_scores`), and a batch shows its entries in that
+order: a citation of code that no longer holds (its last check, §18.3), then
+a state (a `status` in the meta, or a period of validity), then how long
+since the entry was written or read against how often it was read or found,
+so a rarely used old entry comes before an often used one. Only the fields
+ha keeps decide; no word list does. A pass that fails part way has checked
+those first.
+
+### 20.6 Patterns across sessions
+
+The learning loop's daily meditation ([LEARNING_LOOP.en.md](LEARNING_LOOP.en.md)
+§5) also reads the project's newest session logs, while session logs are on:
+at most 6, 4,000 characters each and 16,000 in all. It may report `signals`
+found in them: a correction or a wrong assumption one log shows again, or
+several show. Each signal's quote must be in the log it names, word for word;
+it is that log's conversation's signal, tagged with the log (`log` on the
+signal), and a lesson that already has a signal from that conversation gets
+none from its log. There is no new writer: the gate (3 signals across 2
+conversations) promotes as for any signal. Each signal is a `learning
+log_signal` record, or a `log_signal_refused` one with why.
+
+### 20.7 Switched off
+
+All of it is Deep Dream's or the meditation's, under `reviews`
+(`HA_MEMORY_OFF=reviews` runs none of it). With `knowledge` off no demote is
+offered or made; with `session_log` off the meditation reads no log; with
+`digest` off no digest shows the mark.

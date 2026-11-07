@@ -1508,13 +1508,17 @@ pub async fn run_with(
             .config_file
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
-        let learning = super::service::refine_learning(
+        let mut learning = super::service::refine_learning(
             config_dir,
             &context.paths.data_dir,
             &context.project.root,
             environment,
             resolved_config.project_trusted,
         );
+        learning.dream.knowledge = knowledge_on;
+        learning.dream.session_logs =
+            super::session_log::enabled(&context.paths.config_file, environment);
+        let dream = learning.dream.clone();
         let model = provider_config
             .as_ref()
             .map(|config| config.model.clone())
@@ -1563,6 +1567,7 @@ pub async fn run_with(
                         &scopes,
                         outcome.task_id.as_str(),
                         claimed,
+                        &dream,
                     )
                     .await,
                 );
