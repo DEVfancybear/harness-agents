@@ -27,7 +27,7 @@ pub(super) fn targets(source: &str, markdown: &str) -> Vec<String> {
     }
     parsed_links(&visible, &references)
         .into_iter()
-        .filter_map(|(href, _)| resolve(source, &href))
+        .filter_map(|link| resolve(source, &link.href))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -92,9 +92,9 @@ pub(super) fn rewrite(
         }
         offset += line.len();
     }
-    for (href, span) in parsed_links(&visible, &references) {
-        if let Some((start, end)) = span {
-            record(0, href, start, end);
+    for link in parsed_links(&visible, &references) {
+        if let Some((start, end)) = link.destination {
+            record(0, link.href, start, end);
         }
     }
     let mut result = markdown.to_owned();
@@ -104,12 +104,59 @@ pub(super) fn rewrite(
     result
 }
 
+/// Replace each inline link to one of `gone` (page paths, as `targets` gives
+/// them) with its label, so the prose stays and the link goes: the wiki
+/// pass's removal of a link to a page that does not exist. A reference link
+/// is left as it is.
+pub(super) fn unlink(source: &str, markdown: &str, gone: &BTreeSet<String>) -> String {
+    let visible = visible_markdown(markdown);
+    let mut references = BTreeMap::new();
+    for line in visible.split_inclusive('\n') {
+        let trimmed = line.trim_start_matches(' ');
+        if line.len() - trimmed.len() <= 3
+            && let Some((end, label)) = label_at(trimmed, 0)
+            && let Some(rest) = trimmed[end..].strip_prefix(':')
+            && let Some((destination, _, _, _)) = destination(rest.trim_start(), false)
+        {
+            references
+                .entry(reference_key(label))
+                .or_insert(destination);
+        }
+    }
+    let gone = gone
+        .iter()
+        .map(|path| super::normalized(path))
+        .collect::<BTreeSet<_>>();
+    let mut result = markdown.to_owned();
+    let mut spans = parsed_links(&visible, &references)
+        .into_iter()
+        .filter(|link| {
+            link.destination.is_some()
+                && resolve(source, &link.href)
+                    .is_some_and(|target| gone.contains(&super::normalized(&target)))
+        })
+        .filter_map(|link| link.whole.map(|whole| (whole, link.label)))
+        .collect::<Vec<_>>();
+    spans.sort_by_key(|((start, _), _)| std::cmp::Reverse(*start));
+    for ((start, end), (label_start, label_end)) in spans {
+        let label = markdown[label_start..label_end].to_owned();
+        result.replace_range(start..end, &label);
+    }
+    result
+}
+
+/// One link `parsed_links` found: where its destination is (an inline link's),
+/// the whole link (`[label](destination)`) and its label, as byte ranges.
+struct ParsedLink {
+    href: String,
+    destination: Option<(usize, usize)>,
+    whole: Option<(usize, usize)>,
+    label: (usize, usize),
+}
+
 /// Match brackets once so malformed or deeply nested input cannot make
 /// rescanning every opener quadratic. Inner links close outer `CommonMark` links.
-fn parsed_links(
-    markdown: &str,
-    references: &BTreeMap<String, String>,
-) -> Vec<(String, Option<(usize, usize)>)> {
+fn parsed_links(markdown: &str, references: &BTreeMap<String, String>) -> Vec<ParsedLink> {
     let bytes = markdown.as_bytes();
     let mut stack = Vec::new();
     let mut labels = BTreeMap::new();
@@ -158,6 +205,10 @@ fn parsed_links(
             (key.and_then(|key| references.get(&key).cloned()), None)
         };
         let Some(href) = href else { continue };
+        let whole = (bytes.get(end) == Some(&b'('))
+            .then_some(())
+            .and(consumed_end)
+            .map(|finish| (open, finish));
         if let Some(consumed_end) = consumed_end {
             let suffix = links
                 .range(end..consumed_end)
@@ -177,7 +228,15 @@ fn parsed_links(
                 links.remove(&key);
             }
         } else if links.range(open + 1..end).next().is_none() {
-            links.insert(open, (href, span));
+            links.insert(
+                open,
+                ParsedLink {
+                    href,
+                    destination: span,
+                    whole,
+                    label: (open + 1, end - 1),
+                },
+            );
         }
     }
     links.into_values().collect()
@@ -458,6 +517,21 @@ mod regression_tests {
     fn reference_images_and_link_titles_do_not_create_extra_page_links() {
         let markdown = "![Image][ref]\n\n[Target](target.md \"[ref]\")\n\n[ref]: image.md";
         assert_eq!(targets("source.md", markdown), ["target.md"]);
+    }
+
+    #[test]
+    fn unlink_keeps_the_label_and_leaves_other_links_alone() {
+        let markdown =
+            "See [the old page](../gone.md#part) and [Kept](kept.md).\n`[Code](../gone.md)`\n";
+        let gone = BTreeSet::from(["gone.md".to_owned()]);
+        assert_eq!(
+            unlink("notes/a.md", markdown, &gone),
+            "See the old page and [Kept](kept.md).\n`[Code](../gone.md)`\n"
+        );
+        assert_eq!(
+            targets("notes/a.md", &unlink("notes/a.md", markdown, &gone)),
+            ["notes/kept.md"]
+        );
     }
 
     #[test]

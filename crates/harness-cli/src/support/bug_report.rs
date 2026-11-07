@@ -1096,6 +1096,7 @@ impl Report {
         self.summary_activity(&mut out);
         self.summary_memory(&mut out);
         self.summary_sleep(&mut out);
+        self.summary_wiki(&mut out);
         self.summary_learning(&mut out);
         self.summary_jev(&mut out);
         self.summary_strategy(&mut out);
@@ -1948,6 +1949,71 @@ impl Report {
             );
         }
         if !failures.is_empty() {
+            let _ = writeln!(out);
+        }
+    }
+
+    /// What the wiki pass did to the knowledge libraries in the window, from
+    /// its records: the passes, each kind of edit applied and refused, and
+    /// the last refusals with why.
+    fn summary_wiki(&self, out: &mut String) {
+        let passes = self.recorded("wiki", "pass");
+        let applied = self.recorded("wiki", "applied");
+        let refused = self.recorded("wiki", "refused");
+        if passes.is_empty() && applied.is_empty() && refused.is_empty() {
+            return;
+        }
+        let _ = writeln!(out, "## Knowledge wiki\n");
+        let _ = writeln!(
+            out,
+            "{} pass(es), {} edit(s) applied, {} refused in the window.\n",
+            passes.len(),
+            applied.len(),
+            refused.len()
+        );
+        let mut kinds: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for record in &applied {
+            kinds
+                .entry(record["fields"]["edit"].as_str().unwrap_or("?").to_owned())
+                .or_default()
+                .0 += 1;
+        }
+        for record in &refused {
+            kinds
+                .entry(record["fields"]["edit"].as_str().unwrap_or("?").to_owned())
+                .or_default()
+                .1 += 1;
+        }
+        let _ = writeln!(out, "| edit | applied | refused |");
+        let _ = writeln!(out, "|---|---|---|");
+        for (kind, (done, refused)) in &kinds {
+            let _ = writeln!(out, "| {kind} | {done} | {refused} |");
+        }
+        let _ = writeln!(out);
+        if let Some(last) = passes.last() {
+            let fields = &last["fields"];
+            let _ = writeln!(
+                out,
+                "Last pass ({} library): dangling links {} -> {}, size ratio {}.\n",
+                fields["scope"].as_str().unwrap_or("?"),
+                fields["dangling_before"].as_u64().unwrap_or_default(),
+                fields["dangling_after"].as_u64().unwrap_or_default(),
+                fields["ratio"]
+                    .as_f64()
+                    .map_or_else(|| "n/a".to_owned(), |ratio| format!("{ratio:.2}"))
+            );
+        }
+        for record in refused.iter().rev().take(5).rev() {
+            let _ = writeln!(
+                out,
+                "- {} refused `{}` of {}: {}",
+                record["ts"].as_str().unwrap_or("?"),
+                record["fields"]["edit"].as_str().unwrap_or("?"),
+                record["fields"]["page"].as_str().unwrap_or("?"),
+                self.clip_cell(record["msg"].as_str().unwrap_or_default())
+            );
+        }
+        if !refused.is_empty() {
             let _ = writeln!(out);
         }
     }

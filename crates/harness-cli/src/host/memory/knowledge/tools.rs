@@ -41,6 +41,30 @@ pub struct KnowledgeHost {
     read_only: bool,
     /// Who writes through this host when it is not the agent: the review.
     origin: Option<String>,
+    /// Where the pages' sources are read: the workspace's files and its
+    /// project's conversations (the wiki pass and the size check).
+    workspace: PathBuf,
+    data_dir: PathBuf,
+}
+
+/// One of the host's libraries, for the wiki pass.
+pub(crate) struct Library {
+    pub scope: &'static str,
+    pub root: PathBuf,
+    pub store: Store,
+}
+
+/// What `ha doctor` says of a library: its pages, its links to pages that do
+/// not exist (the first few named), and its size against its readable
+/// sources.
+#[derive(Clone, Debug, Default)]
+pub struct Health {
+    pub scope: &'static str,
+    pub enabled: bool,
+    pub pages: usize,
+    pub dangling: usize,
+    pub dangling_first: Vec<String>,
+    pub size: Option<super::wiki::Size>,
 }
 
 impl KnowledgeHost {
@@ -53,7 +77,51 @@ impl KnowledgeHost {
             global: data_dir.join("knowledge"),
             read_only: false,
             origin: None,
+            workspace: workspace.to_path_buf(),
+            data_dir: data_dir.to_path_buf(),
         }
+    }
+
+    /// The project's library and the global one, each with its store.
+    pub(crate) fn libraries(&self) -> Vec<Library> {
+        [Scope::Project, Scope::Global]
+            .into_iter()
+            .map(|scope| Library {
+                scope: scope.label(),
+                root: self.root(scope).to_path_buf(),
+                store: self.store(scope),
+            })
+            .collect()
+    }
+
+    /// Where the pages' sources are read.
+    #[must_use]
+    pub fn sources(&self) -> super::wiki::Sources {
+        super::wiki::Sources::new(&self.workspace, &self.data_dir)
+    }
+
+    /// Each library's state for `ha doctor`. A library that cannot be read
+    /// is left out: the knowledge commands say why.
+    #[must_use]
+    pub fn health(&self) -> Vec<Health> {
+        let sources = self.sources();
+        self.libraries()
+            .into_iter()
+            .filter_map(|library| {
+                let stats = library.store.stats().ok()?;
+                Some(Health {
+                    scope: library.scope,
+                    enabled: stats.enabled,
+                    pages: stats.pages,
+                    dangling: stats.dangling,
+                    dangling_first: stats.dangling_first,
+                    size: stats
+                        .enabled
+                        .then(|| super::wiki::size(&library.store, &sources))
+                        .flatten(),
+                })
+            })
+            .collect()
     }
 
     #[must_use]
@@ -696,11 +764,22 @@ impl KnowledgeHost {
             }
             "status" => {
                 let scopes = if global { vec![Scope::Global] } else { vec![Scope::Project, Scope::Global] };
+                let sources = self.sources();
                 let mut lines = scopes.iter().map(|scope| {
-                    let stats = self.store(*scope).stats()?;
-                    Ok(format!("{} knowledge: {}, {} page(s), {} link(s){}", scope.label(),
+                    let store = self.store(*scope);
+                    let stats = store.stats()?;
+                    // The library against what it summarizes, as the wiki
+                    // pass keeps it (`wiki::MAX_SIZE_RATIO`).
+                    let size = if stats.enabled && stats.pages > 0 {
+                        super::wiki::size(&store, &sources)
+                            .map(|size| format!("; {}", size.describe()))
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    Ok(format!("{} knowledge: {}, {} page(s), {} link(s){}{}{size}", scope.label(),
                         if stats.enabled { "on" } else { "off" }, stats.pages, stats.links,
-                        skipped_note(&stats.skipped)))
+                        dangling_note(&stats), skipped_note(&stats.skipped)))
                 }).collect::<Result<Vec<_>, String>>()?;
                 lines.extend(scopes.iter().filter_map(|scope| super::retired_embedding_note_in(self.root(*scope))));
                 Ok(lines)
@@ -725,6 +804,29 @@ impl KnowledgeHost {
             _ => Err("usage: /knowledge [status|list|search QUERY|read PATH|graph|refresh|on|off] [--global]; browser: ha knowledge serve --cwd DIR".to_owned()),
         }
     }
+}
+
+/// `, N dangling link(s)` and the first ones, for a library that is on.
+fn dangling_note(stats: &super::store::Stats) -> String {
+    if !stats.enabled {
+        return String::new();
+    }
+    let mut note = format!(", {} dangling link(s)", stats.dangling);
+    if !stats.dangling_first.is_empty() {
+        let _ = std::fmt::Write::write_fmt(
+            &mut note,
+            format_args!(
+                " ({}{})",
+                stats.dangling_first.join("; "),
+                if stats.dangling > stats.dangling_first.len() {
+                    "; ..."
+                } else {
+                    ""
+                }
+            ),
+        );
+    }
+    note
 }
 
 /// `; N file(s) skipped: path: why; ...` for files the scan left out.
@@ -1169,6 +1271,8 @@ mod tests {
             global: root.join("global"),
             read_only: false,
             origin: None,
+            workspace: root.join("workspace"),
+            data_dir: root.join("data"),
         }
     }
 

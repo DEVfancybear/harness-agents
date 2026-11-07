@@ -663,6 +663,29 @@ fn a_bug_report_sets_memory_upkeep_beside_its_reads() {
             "gate_slow",
             serde_json::json!({"tool": "web_search", "prepare_ms": 2, "guard_ms": 0, "hooks_ms": 0, "approval_ms": 90_000, "intent_ms": 4}),
         ),
+        // The wiki pass: an edit applied, one refused, the pass.
+        record(
+            98_000,
+            "wiki",
+            "applied",
+            serde_json::json!({"scope": "project", "edit": "repoint", "page": "ops/deploy.md"}),
+        ),
+        record(
+            98_100,
+            "wiki",
+            "refused",
+            serde_json::json!({"scope": "project", "edit": "merge", "page": "a.md"}),
+        )
+        .replace(
+            "\"msg\":\"\"",
+            "\"msg\":\"a.md and b.md are not a same-subject pair\"",
+        ),
+        record(
+            98_200,
+            "wiki",
+            "pass",
+            serde_json::json!({"scope": "project", "applied": 1, "refused": 1, "dangling_before": 2, "dangling_after": 0, "ratio": 0.42}),
+        ),
     ];
     let diagnostics = home.join("data").join("diagnostics");
     std::fs::create_dir_all(&diagnostics).unwrap();
@@ -715,6 +738,22 @@ fn a_bug_report_sets_memory_upkeep_beside_its_reads() {
         sleep.contains("gave_up `consolidation` - (attempt 6, rate_limited)"),
         "{sleep}"
     );
+    let wiki = summary
+        .split("## Knowledge wiki")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .unwrap_or_else(|| panic!("a Knowledge wiki section: {summary}"));
+    assert!(
+        wiki.contains("1 pass(es), 1 edit(s) applied, 1 refused"),
+        "{wiki}"
+    );
+    assert!(wiki.contains("| repoint | 1 | 0 |"), "{wiki}");
+    assert!(wiki.contains("| merge | 0 | 1 |"), "{wiki}");
+    assert!(
+        wiki.contains("dangling links 2 -> 0, size ratio 0.42"),
+        "{wiki}"
+    );
+    assert!(wiki.contains("not a same-subject pair"), "{wiki}");
     assert!(
         memory.contains(
             "Read by the agent: `memory` 1, `knowledge` 0, `history_search` 1, `history_read` 0."

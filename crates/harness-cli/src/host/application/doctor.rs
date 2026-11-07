@@ -32,6 +32,9 @@ pub struct Facts {
     /// The project's entries that cite code, and those kept for some files
     /// ([`super::memory_citations::count`]).
     pub citations: super::memory_citations::Count,
+    /// The knowledge libraries: dangling links and size against their
+    /// sources ([`super::knowledge::KnowledgeHost::health`]).
+    pub knowledge: Vec<super::knowledge::Health>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -421,8 +424,43 @@ fn state(root: &Path, facts: &Facts) -> Subsystem {
     memory_switch(facts, &mut subsystem);
     memory_queue(facts, &mut subsystem);
     memory_citations(facts, &mut subsystem);
+    knowledge(facts, &mut subsystem);
     markdown_memory(root, &mut subsystem);
     subsystem
+}
+
+/// Each knowledge library that has pages: its links to pages that do not
+/// exist, the first ones named, and its size against the sources it
+/// summarizes. Nothing is said of an empty or disabled library.
+fn knowledge(facts: &Facts, subsystem: &mut Subsystem) {
+    for library in facts
+        .knowledge
+        .iter()
+        .filter(|library| library.enabled && library.pages > 0)
+    {
+        let size = library
+            .size
+            .map(|size| format!("; {}", size.describe()))
+            .unwrap_or_default();
+        if library.dangling == 0 {
+            subsystem.pass(format!(
+                "{} knowledge: {} page(s), no dangling link{size}",
+                library.scope, library.pages
+            ));
+        } else {
+            subsystem.short(
+                Level::Warn,
+                format!(
+                    "{} knowledge: {} dangling link(s) to pages that do not exist ({}{}){size}",
+                    library.scope,
+                    library.dangling,
+                    library.dangling_first.join("; "),
+                    if library.dangling > library.dangling_first.len() { "; ..." } else { "" }
+                ),
+                "write the missing page or fix the link; the wiki pass repoints or fills them in the background",
+            );
+        }
+    }
 }
 
 /// The memory entries that cite code, and how many of them rest on code that
