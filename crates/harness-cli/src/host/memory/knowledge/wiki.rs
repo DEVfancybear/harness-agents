@@ -501,17 +501,24 @@ pub(crate) fn due(store: &Store, root: &Path, sources: &Sources) -> Option<&'sta
         .as_deref()
         .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
         .map(|at| at.with_timezone(&chrono::Utc));
+    // A library the pass has not seen starts its day's wait now: one kept
+    // before the pass existed is not sent to the model at the first turn
+    // after an upgrade.
+    let Some(last) = last.or_else(|| forced().then(chrono::Utc::now)) else {
+        state.last_at = Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        save_state(root, &state);
+        return None;
+    };
     let reviewed = pages.iter().any(|page| {
         page.origin.as_deref() == Some("review")
-            && last.is_none_or(|last| {
-                page.summary
-                    .updated_at
-                    .as_deref()
-                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
-                    .is_some_and(|at| at.with_timezone(&chrono::Utc) > last)
-            })
+            && page
+                .summary
+                .updated_at
+                .as_deref()
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                .is_some_and(|at| at.with_timezone(&chrono::Utc) > last)
     });
-    let waited = last.is_none_or(|last| chrono::Utc::now() - last >= SPACING);
+    let waited = chrono::Utc::now() - last >= SPACING;
     if !(forced() || reviewed || waited) {
         return None;
     }
@@ -1862,6 +1869,15 @@ mod tests {
         assert_eq!(due(&store, &root, &sources), None, "an empty library");
         page(&store, "a.md", "Alpha", "First", "Alpha.", &[]);
         page(&store, "b.md", "Beta", "Second", "Beta.", &[]);
+        assert_eq!(
+            due(&store, &root, &sources),
+            None,
+            "a library first seen starts its day's wait"
+        );
+        assert!(load_state(&root).last_at.is_some());
+        let mut state = load_state(&root);
+        state.last_at = Some((chrono::Utc::now() - chrono::TimeDelta::hours(25)).to_rfc3339());
+        save_state(&root, &state);
         assert_eq!(due(&store, &root, &sources), None, "nothing to do");
         assert!(
             load_state(&root).fingerprint.is_some(),

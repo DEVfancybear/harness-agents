@@ -41,8 +41,10 @@ bỏ cuộc như các job khác.
 có từ hai trang trở lên, đã thay đổi kể từ lượt trước (một dấu vân tay của
 đường dẫn và hash các trang, lưu trong `.ha-wiki.json`), có việc cho một lượt
 chạy, và hoặc một review đã viết một trang kể từ lượt trước (trigger `review`)
-hoặc đã qua một ngày (trigger `due`). `HA_WIKI_DUE_NOW=1` bỏ thời gian chờ, cho
-kiểm thử. Thư viện đã thay đổi nhưng không có việc thì không được kiểm tra lại
+hoặc đã qua một ngày (trigger `due`). Thư viện mà lượt chạy chưa thấy bao giờ
+bắt đầu thời gian chờ một ngày ngay lần kiểm tra đầu, nên một thư viện có từ
+trước khi có lượt wiki không bị gửi cho model ngay lượt đầu sau khi nâng cấp.
+`HA_WIKI_DUE_NOW=1` bỏ thời gian chờ, cho kiểm thử. Thư viện đã thay đổi nhưng không có việc thì không được kiểm tra lại
 cho tới khi nó đổi tiếp. Lượt chạy chỉ diễn ra khi review tự động chạy
 (`autoRefine`, `/refinements`, tính năng `reviews`) và knowledge đang bật
 (`/knowledge off`, `HA_MEMORY_OFF` `knowledge`).

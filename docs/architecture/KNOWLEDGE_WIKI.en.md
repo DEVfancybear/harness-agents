@@ -40,8 +40,11 @@ at a time across processes; it fails, backs off and gives up like the others.
 has two pages or more, changed since the last pass (a fingerprint of its pages'
 paths and hashes, kept in `.ha-wiki.json`), has work for a pass, and either a
 review wrote a page since the last pass (trigger `review`) or a day passed
-(trigger `due`). `HA_WIKI_DUE_NOW=1` drops the wait, for tests. A library that
-changed but has no work is not checked again until it changes. The pass runs
+(trigger `due`). A library the pass has not seen yet starts its day's wait
+when it is first checked, so a library kept before the pass existed is not
+sent to the model at the first turn after an upgrade. `HA_WIKI_DUE_NOW=1`
+drops the wait, for tests. A library that changed but has no work is not
+checked again until it changes. The pass runs
 only while the automatic review runs (`autoRefine`, `/refinements`, the
 `reviews` feature) and knowledge is on (`/knowledge off`, `HA_MEMORY_OFF`
 `knowledge`).
