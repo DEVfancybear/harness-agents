@@ -355,10 +355,17 @@ pub(crate) fn size(store: &Store, sources: &Sources) -> Option<Size> {
 struct Work {
     dangling: Vec<(String, String)>,
     merges: Vec<(String, String, f64)>,
-    /// The index is asked for: `Some(None)` to write, `Some(Some(hash))` to
-    /// refresh the one there.
-    index: Option<Option<String>>,
+    index: Option<IndexNeed>,
     checks: Vec<(String, String)>,
+}
+
+/// What the library's index needs.
+#[derive(Debug, PartialEq, Eq)]
+enum IndexNeed {
+    /// There is none: write it.
+    Write,
+    /// The pass's index, at this hash, leaves pages out: refresh it.
+    Refresh(String),
 }
 
 impl Work {
@@ -375,7 +382,7 @@ fn is_index(path: &str) -> bool {
 }
 
 /// Whether the library needs its index written or refreshed.
-fn index_need(pages: &[WikiPage]) -> Option<Option<String>> {
+fn index_need(pages: &[WikiPage]) -> Option<IndexNeed> {
     let others = pages
         .iter()
         .filter(|page| !is_index(&page.summary.path))
@@ -403,12 +410,12 @@ fn index_need(pages: &[WikiPage]) -> Option<Option<String>> {
         return None;
     }
     match ours {
-        None => Some(None),
+        None => Some(IndexNeed::Write),
         Some(ours) => {
             let all = others
                 .iter()
                 .all(|page| ours.summary.related.contains(&page.summary.path));
-            (!all).then(|| Some(ours.summary.hash.clone()))
+            (!all).then(|| IndexNeed::Refresh(ours.summary.hash.clone()))
         }
     }
 }
@@ -640,6 +647,10 @@ fn clipped(text: &str, limit: usize) -> String {
 }
 
 /// The curator's prompt: the catalog, then what each kind of work needs.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one prompt: the catalog, then a section for each kind of work"
+)]
 fn prompt(
     store: &Store,
     scope: &str,
@@ -722,13 +733,13 @@ fn prompt(
         let _ = writeln!(
             text,
             "\n<index>\nThe library has more than {INDEX_MIN_PAGES} pages and no page that links most of them. {} the index at {INDEX_PATH}: every page in the catalog, grouped by topic.\n</index>",
-            if existing.is_some() {
+            if matches!(existing, IndexNeed::Refresh(_)) {
                 "Refresh"
             } else {
                 "Write"
             }
         );
-        if existing.is_some() {
+        if matches!(existing, IndexNeed::Refresh(_)) {
             show(INDEX_PATH, &mut text, &mut budget);
         }
     }
@@ -918,7 +929,7 @@ fn apply(
     let mut rest = Vec::new();
     for edit in ordered {
         match edit["edit"].as_str() {
-            Some("repoint") | Some("unlink") => {
+            Some("repoint" | "unlink") => {
                 let page = edit["page"].as_str().unwrap_or_default().to_owned();
                 let entry = relinks.entry(page).or_default();
                 if edit["edit"] == "repoint" {
@@ -1273,13 +1284,11 @@ fn merge(
     let keep_path = pages
         .iter()
         .find(|page| page.summary.path.eq_ignore_ascii_case(keep))
-        .map(|page| page.summary.path.clone())
-        .unwrap_or_else(|| keep.to_owned());
+        .map_or_else(|| keep.to_owned(), |page| page.summary.path.clone());
     let absorb_path = pages
         .iter()
         .find(|page| page.summary.path.eq_ignore_ascii_case(absorb))
-        .map(|page| page.summary.path.clone())
-        .unwrap_or_else(|| absorb.to_owned());
+        .map_or_else(|| absorb.to_owned(), |page| page.summary.path.clone());
     guard_size(
         store,
         sources,
@@ -1367,7 +1376,10 @@ fn index(store: &Store, known: &Known, work: &Work, edit: &Value) -> Result<Vec<
             body.push('\n');
         }
     }
-    let hash = existing.as_ref().and_then(|_| known.hash(INDEX_PATH));
+    let hash = match existing {
+        IndexNeed::Write => None,
+        IndexNeed::Refresh(_) => known.hash(INDEX_PATH),
+    };
     let written = store.write_update(&WritePageUpdate {
         path: INDEX_PATH.to_owned(),
         title: Some(title.to_owned()),
@@ -1384,6 +1396,7 @@ fn index(store: &Store, known: &Known, work: &Work, edit: &Value) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn library() -> (tempfile::TempDir, Store, PathBuf) {
         let directory = tempfile::tempdir().expect("dir");
@@ -1688,7 +1701,7 @@ mod tests {
             );
         }
         let pages = store.wiki_pages().unwrap();
-        assert_eq!(index_need(&pages), Some(None));
+        assert_eq!(index_need(&pages), Some(IndexNeed::Write));
         let prose = pass(
             &store,
             &Sources::default(),
@@ -1701,12 +1714,12 @@ mod tests {
         );
         let mut content = String::from("## Ops\n\n");
         for index in (0..=INDEX_MIN_PAGES).step_by(2) {
-            content.push_str(&format!("- [Page {index}](ops/p{index}.md)\n"));
+            let _ = writeln!(content, "- [Page {index}](ops/p{index}.md)");
         }
         content.push_str("\n## Concepts\n\n");
         // One left out, and one that names a page that is not there.
         for index in (3..=INDEX_MIN_PAGES).step_by(2) {
-            content.push_str(&format!("- [Page {index}](concepts/p{index}.md)\n"));
+            let _ = writeln!(content, "- [Page {index}](concepts/p{index}.md)");
         }
         content.push_str("- [Gone](concepts/gone.md)\n");
         let made = pass(
@@ -1727,7 +1740,7 @@ mod tests {
         page(&store, "ops/new.md", "New", "A new page", "Text.", &[]);
         assert!(matches!(
             index_need(&store.wiki_pages().unwrap()),
-            Some(Some(_))
+            Some(IndexNeed::Refresh(_))
         ));
         // A small library is not given one.
         let (_small, small, _) = library();
