@@ -1217,7 +1217,7 @@ fn bank_receipt(name: &str, slot: &Slot) -> crate::bank::Receipt {
 }
 
 /// What the model is told when its bank is kept.
-fn bank_accepted(bank: &crate::bank::Bank) -> String {
+fn bank_accepted(bank: &crate::bank::Bank, alone: bool) -> String {
     let nodes = bank
         .nodes
         .iter()
@@ -1233,8 +1233,13 @@ fn bank_accepted(bank: &crate::bank::Bank) -> String {
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "action bank {} kept: {nodes}. When a call settles, the one node that follows it and whose guard holds on its result runs without asking you; otherwise you are asked as usual. You will see every call the harness ran, with its result. A new action_bank replaces the nodes not run yet.",
-        bank.hash
+        "action bank {} kept: {nodes}. When a call settles, the one node that follows it and whose guard holds on its result runs without asking you; otherwise you are asked as usual. You will see every call the harness ran, with its result. A new action_bank replaces the nodes not run yet.{}",
+        bank.hash,
+        if alone {
+            " This bank came alone in its response, so its first node only runs where your own call would have: next time make action_bank one more call of the response whose calls it follows."
+        } else {
+            ""
+        }
     )
 }
 
@@ -2596,7 +2601,7 @@ impl TurnDriver {
                     } else {
                         match crate::bank::parse_bank(&call.arguments, &request.tool_schemas) {
                             Ok(bank) => {
-                                let answer = bank_accepted(&bank);
+                                let answer = bank_accepted(&bank, result.tool_calls.len() == 1);
                                 self.record_bank_answer(&result.run_id, &call.call_id, &answer)
                                     .await;
                                 authored = Some(bank);
