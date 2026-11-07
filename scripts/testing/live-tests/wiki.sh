@@ -205,7 +205,7 @@ CODE="BLUEHERON-$(( RANDOM % 900 + 100 ))"
 start h1
 say h1 "For this conversation only: the codename of the Q3 storage migration is $CODE. Do not save it to memory, knowledge or any file; just acknowledge in one word." | tail -2
 "$HA" shutdown --force >/dev/null 2>&1
-check "precondition: the codename is in no memory store or page" '! grep -rlaq "$CODE" "$D/harness" "$K" 2>/dev/null && ! find "$D/sessions" -name "*.sqlite3" -exec grep -laq "$CODE" {} + 2>/dev/null'
+check "precondition: the codename is in no memory store or page" '! grep -rlaq "$CODE" "$D/harness" "$K" 2>/dev/null && ! grep -rlaq --include="*.sqlite3*" "$CODE" "$D/sessions" 2>/dev/null'
 start h2
 say h2 "In an earlier conversation of this project I told you the codename of the Q3 storage migration. Find it with the memory tool: one search with action search, sources [\"memory\", \"knowledge\", \"history\"] and query \"codename Q3 storage migration\". Then answer with the codename only." | tail -3
 check "the memory search named history among its sources" 'journal_has "sources:\[memory, ?knowledge, ?history\]"'
