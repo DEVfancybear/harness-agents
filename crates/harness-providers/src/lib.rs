@@ -206,6 +206,13 @@ pub struct ProviderMessage {
     /// durable.
     #[serde(skip)]
     pub reasoning: Option<Reasoning>,
+    /// An assistant message the harness wrote for a call it ran without a
+    /// model step (an action bank node, `docs/architecture/ACTION_BANK.en.md`).
+    /// The model authored the call earlier; no model response holds it, so it
+    /// has no reasoning, and a protocol that needs reasoning on the last
+    /// assistant message (Anthropic with thinking) folds the call into a note.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub harness_issued: bool,
 }
 
 /// One assistant message's private reasoning.
@@ -343,6 +350,7 @@ impl ProviderMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning: None,
+            harness_issued: false,
         }
     }
 
@@ -356,6 +364,7 @@ impl ProviderMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning: None,
+            harness_issued: false,
         }
     }
 
@@ -372,6 +381,7 @@ impl ProviderMessage {
             tool_calls,
             tool_call_id: None,
             reasoning: None,
+            harness_issued: false,
         }
     }
 
@@ -385,6 +395,7 @@ impl ProviderMessage {
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
             reasoning: None,
+            harness_issued: false,
         }
     }
 
@@ -393,6 +404,14 @@ impl ProviderMessage {
     #[must_use]
     pub fn with_attachments(mut self, images: Vec<ImageAttachment>) -> Self {
         self.attachments = images;
+        self
+    }
+
+    /// Mark an assistant message as written by the harness for a call it ran
+    /// without a model step (see [`Self::harness_issued`]).
+    #[must_use]
+    pub const fn issued_by_harness(mut self) -> Self {
+        self.harness_issued = true;
         self
     }
 
@@ -3099,6 +3118,53 @@ mod chat_message_tests {
                 .is_some_and(|text| text.contains("requested tool calls"))),
             "no call is ever written out as text"
         );
+    }
+
+    /// A call the harness ran from an action bank goes to Chat Completions as
+    /// the model's own call and its result: valid for the API and the
+    /// transcript check, with and without reasoning content.
+    #[test]
+    fn a_harness_issued_call_is_sent_as_a_call_with_its_result() {
+        let messages = vec![
+            ProviderMessage::new(MessageRole::User, "write and test"),
+            ProviderMessage::assistant_with_calls(
+                "",
+                vec![ProviderToolCall::new(
+                    "call_a",
+                    "write_file",
+                    r#"{"path":"a"}"#,
+                )],
+            ),
+            ProviderMessage::tool_result("call_a", "wrote a"),
+            ProviderMessage::assistant_with_calls(
+                "",
+                vec![ProviderToolCall::new(
+                    "bank_n1",
+                    "run_process",
+                    r#"{"command":"t"}"#,
+                )],
+            )
+            .issued_by_harness(),
+            ProviderMessage::tool_result("bank_n1", "ok"),
+        ];
+        super::validate_transcript(&messages).expect("valid transcript");
+        for wire in [
+            wire_messages(&messages),
+            super::wire_messages_with_reasoning(&messages),
+        ] {
+            assert_eq!(wire.len(), 5, "{wire:#?}");
+            assert_eq!(wire[3]["role"], "assistant");
+            assert_eq!(wire[3]["tool_calls"][0]["id"], "bank_n1");
+            assert_eq!(
+                wire[4],
+                json!({"role": "tool", "tool_call_id": "bank_n1", "content": "ok"})
+            );
+        }
+        // The mark is kept in a frozen request, and an unmarked message
+        // serializes as before.
+        let frozen = serde_json::to_value(&messages).expect("serializes");
+        assert_eq!(frozen[3]["harness_issued"], true);
+        assert!(frozen[1].get("harness_issued").is_none());
     }
 
     /// An empty assistant answer with no calls is left out, as prime-agent does.

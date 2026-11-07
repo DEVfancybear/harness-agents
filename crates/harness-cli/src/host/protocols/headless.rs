@@ -645,6 +645,10 @@ pub async fn run_with(
     // waits for its children. Nobody can answer an approval here, so a gated
     // action a child asks for is refused, as the root's is.
     let (child_events, mut child_inbox) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+    // The action bank (`HA_ACTION_BANK`, `actionBank`), off by default; the
+    // run's children run with it too.
+    let bank_on = super::action_bank::enabled(&context.paths.config_file, environment);
+    let action_bank = bank_on.then(|| super::action_bank::bank(jev_decisions.as_ref()));
     let agents = provider_config.as_ref().and_then(|config| {
         let agents = super::delegation::SessionAgents::new(
             super::store_lease::SharedStore::for_dir(context.project_store_dir()),
@@ -665,6 +669,7 @@ pub async fn run_with(
                 .clone()
                 .map(|decisions| decisions as Arc<dyn harness_tools::ToolGuard>),
         );
+        agents.set_action_bank(action_bank.clone());
         agents.set_turn_judges(jev_decisions.clone().map(|decisions| {
             super::delegation::TurnJudges {
                 visibility: Arc::clone(&decisions) as Arc<dyn harness_tools::ResultVisibility>,
@@ -778,6 +783,10 @@ pub async fn run_with(
     let driver = TurnDriver::new(Arc::clone(&runtime), tools).with_verify_reminder(
         super::service::verify_reminder_enabled(&context.paths.config_file, environment),
     );
+    let driver = match action_bank {
+        Some(bank) => driver.with_action_bank(bank),
+        None => driver,
+    };
     // What the harness learned from failed calls, as in the app.
     let driver = if lessons_on {
         driver.with_learned_rules(Arc::new(super::evolution::rules(&context.paths.data_dir)))
@@ -1397,6 +1406,9 @@ pub async fn run_with(
         // once they ran, before the JSON is written.
         "usage": run_usage.json(),
         "children_usage": children_usage.json(),
+        // What the action bank did: banks authored, nodes, calls run without a
+        // model step. `usage` above already holds the authoring and fallbacks.
+        "bank": super::action_bank::report(bank_on, &outcome.bank),
     });
     if request.options.output_format.is_some() {
         output["acceptance"] = serde_json::json!({

@@ -1100,6 +1100,7 @@ impl Report {
         self.summary_learning(&mut out);
         self.summary_jev(&mut out);
         self.summary_strategy(&mut out);
+        self.summary_bank(&mut out);
         self.summary_children(&mut out);
         self.summary_timeline(&mut out);
         out
@@ -2199,6 +2200,69 @@ impl Report {
                     record["fields"]["to"].as_str().unwrap_or_default()
                 );
             }
+        }
+        out.push('\n');
+    }
+
+    /// What the action bank did (`docs/architecture/ACTION_BANK.en.md`):
+    /// banks authored and refused, calls run without a model step with their
+    /// certificates, abstentions and dropped nodes, and the turns' totals.
+    fn summary_bank(&self, out: &mut String) {
+        let turns = self.recorded("bank", "turn");
+        let dispatched = self.recorded("bank", "dispatched");
+        let refused = self.recorded("bank", "refused");
+        let authored = self.recorded("bank", "authored");
+        if turns.is_empty() && dispatched.is_empty() && refused.is_empty() && authored.is_empty() {
+            return;
+        }
+        let _ = writeln!(out, "## Action bank\n");
+        let sum = |name: &str| {
+            turns
+                .iter()
+                .filter_map(|record| record["fields"][name].as_u64())
+                .sum::<u64>()
+        };
+        let _ = writeln!(
+            out,
+            "- {} turn(s): {} bank(s) authored ({} node(s), ~{} authoring tokens, an estimate), {} refused; {} call(s) run without a model step over {} model step(s), {} more run right after a bank authored alone (no step saved); {} abstention(s), {} node(s) dropped; selector {} call(s), {} input token(s)",
+            turns.len(),
+            sum("authored"),
+            sum("nodes"),
+            sum("author_estimate"),
+            sum("refused"),
+            sum("dispatched"),
+            sum("model_steps"),
+            sum("immediate"),
+            sum("abstained"),
+            sum("discarded"),
+            sum("selector_calls"),
+            sum("selector_input"),
+        );
+        for record in refused.iter().rev().take(5) {
+            let _ = writeln!(
+                out,
+                "- refused at {}: {}",
+                ms_text(record["ms"].as_i64().unwrap_or_default()),
+                record["fields"]["reason"].as_str().unwrap_or_default()
+            );
+        }
+        for record in dispatched.iter().rev().take(10) {
+            let fields = &record["fields"];
+            let _ = writeln!(
+                out,
+                "- bypass at {}: graph {} node {} after {} ({}), {} args {}, receipt {} ({}), {}, in place of step {}",
+                ms_text(record["ms"].as_i64().unwrap_or_default()),
+                fields["graph"].as_str().unwrap_or_default(),
+                fields["node"].as_str().unwrap_or_default(),
+                fields["predecessor"].as_str().unwrap_or_default(),
+                fields["predecessor_receipt"].as_str().unwrap_or_default(),
+                fields["tool"].as_str().unwrap_or_default(),
+                fields["args_hash"].as_str().unwrap_or_default(),
+                fields["tool_receipt"].as_str().unwrap_or_default(),
+                fields["tool_receipt_hash"].as_str().unwrap_or_default(),
+                fields["status"].as_str().unwrap_or_default(),
+                fields["replaced_step"]
+            );
         }
         out.push('\n');
     }

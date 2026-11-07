@@ -802,6 +802,67 @@ mod tests {
         assert_eq!(body["tools"][0]["name"], "list_files");
     }
 
+    /// A call the harness ran from an action bank goes to Responses as a
+    /// `function_call` and its output with no reasoning item of its own, as
+    /// a replayed earlier turn's calls do; the model's own reasoning item stays
+    /// with the call it came with.
+    #[test]
+    fn a_harness_issued_call_is_sent_as_a_function_call_without_reasoning() {
+        let reasoning_item =
+            json!({"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc"});
+        let request = ProviderRequest::new(
+            RequestId::generate(),
+            "gpt-5",
+            vec![
+                ProviderMessage::new(MessageRole::User, "write and test"),
+                ProviderMessage::assistant_with_calls(
+                    "",
+                    vec![ProviderToolCall::new(
+                        "call_1",
+                        "write_file",
+                        "{\"path\":\"a\"}",
+                    )],
+                )
+                .with_reasoning(Some(Reasoning {
+                    text: "plan".to_owned(),
+                    signature: Some(reasoning_item.to_string()),
+                })),
+                ProviderMessage::tool_result("call_1", "wrote a"),
+                ProviderMessage::assistant_with_calls(
+                    "",
+                    vec![ProviderToolCall::new(
+                        "bank_n1",
+                        "run_process",
+                        "{\"command\":\"t\"}",
+                    )],
+                )
+                .issued_by_harness(),
+                ProviderMessage::tool_result("bank_n1", "ok"),
+            ],
+        );
+        crate::validate_transcript(&request.messages).expect("valid transcript");
+        let body = adapter(ResponsesFlavor::Api).request_body(&request);
+        let input = body["input"].as_array().expect("input");
+        let types = input
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or("message").to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            [
+                "message",
+                "reasoning",
+                "function_call",
+                "function_call_output",
+                "function_call",
+                "function_call_output"
+            ],
+            "{body:#}"
+        );
+        assert_eq!(input[4]["call_id"], "bank_n1");
+        assert_eq!(input[5]["call_id"], "bank_n1");
+    }
+
     #[test]
     fn a_stream_becomes_text_calls_reasoning_and_a_reason() {
         let stream = [

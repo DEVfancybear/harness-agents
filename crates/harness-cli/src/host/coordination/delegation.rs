@@ -1335,6 +1335,8 @@ struct AgentsShared {
     /// out, what is shortened first as the turn grows, and whether its answer
     /// claims an unchecked change works.
     results: Mutex<Option<TurnJudges>>,
+    /// The action bank children run with: the parent's, when it is on.
+    bank: Mutex<Option<harness_tools::ActionBank>>,
     running_workers: Mutex<u32>,
     worker_freed: tokio::sync::Notify,
     children: Mutex<Vec<ChildRecord>>,
@@ -1424,6 +1426,7 @@ impl AgentsShared {
             judge: Mutex::new(None),
             guard: Mutex::new(None),
             results: Mutex::new(None),
+            bank: Mutex::new(None),
             running_workers: Mutex::new(0),
             worker_freed: tokio::sync::Notify::new(),
             children: Mutex::new(Vec::new()),
@@ -2355,6 +2358,14 @@ impl SessionAgents {
     pub fn set_turn_judges(&self, judges: Option<TurnJudges>) {
         if let Ok(mut current) = self.shared.results.lock() {
             *current = judges;
+        }
+    }
+
+    /// The action bank children started from here on run with: the
+    /// parent's (`None` while it is off), so a child inherits the setting.
+    pub fn set_action_bank(&self, bank: Option<harness_tools::ActionBank>) {
+        if let Ok(mut current) = self.shared.bank.lock() {
+            *current = bank;
         }
     }
 
@@ -5830,6 +5841,12 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     .with_visibility(judges.visibility)
                     .with_admission(judges.admission)
                     .with_completion_check(judges.completion),
+                None => driver,
+            };
+            // The parent's action bank, when it is on.
+            let bank = self.shared.bank.lock().ok().and_then(|bank| bank.clone());
+            let driver = match bank {
+                Some(bank) => driver.with_action_bank(bank),
                 None => driver,
             };
             // A child's question is shown to the user, named after the child, and

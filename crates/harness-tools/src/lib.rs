@@ -6,6 +6,8 @@
 //! are proposals; they become a side effect only after canonicalization,
 //! policy, final-action approval, a durable intent, and a durable receipt.
 
+#[path = "runtime/bank.rs"]
+mod bank;
 #[path = "processes/capture.rs"]
 mod capture;
 #[path = "security/command_guard.rs"]
@@ -57,6 +59,11 @@ mod walk;
 #[path = "filesystem/workspace.rs"]
 mod workspace;
 
+pub use bank::{
+    ACTION_BANK_TOOL, ActionBank, Bank, BankCandidate, BankChoice, BankNode, BankSelector,
+    BankTally, Guard, MAX_BANK_NODES, Receipt as BankReceipt, Selection as BankSelection,
+    action_bank_schema, parse_bank,
+};
 pub use capture::{
     CAPTURE_HEADER_VERSION, CaptureHeader, DEFAULT_CAPTURE_QUOTA_BYTES, DEFAULT_HEAD_PREVIEW_BYTES,
     DEFAULT_TAIL_PREVIEW_BYTES, ProcessSpoolConfig, STREAM_TAIL_BYTES, SpoolLimits, StreamTail,

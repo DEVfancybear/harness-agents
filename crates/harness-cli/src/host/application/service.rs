@@ -791,6 +791,10 @@ pub trait SessionPort: Send {
     fn jev_decision(&mut self, _decision: &str, _enable: bool) -> Result<String, String> {
         Err("this backend has no plugins".to_owned())
     }
+    /// `/bank on|off|status`: the action bank, off by default (`actionBank`).
+    fn action_bank(&mut self, _enable: Option<bool>) -> Result<String, String> {
+        Err("this backend runs no turn loop".to_owned())
+    }
     /// prime-agent's global `harnessRefinements` switch: report or set it.
     fn refinements(&mut self, _enable: Option<bool>) -> Result<String, String> {
         Err("this backend keeps no harness".to_owned())
@@ -5443,6 +5447,15 @@ impl SessionPort for AgentSessionService {
 
     fn context_summary(&self) -> Vec<String> {
         let mut lines = self.usage_lines();
+        // The action bank, when it is on or did anything in this conversation.
+        let bank = super::action_bank::total(self.task_id.as_str());
+        if super::action_bank::enabled(&self.config_file, &self.environment) || !bank.is_empty() {
+            lines.push(format!(
+                "Bank:     {}",
+                super::action_bank::line(&bank)
+                    .unwrap_or_else(|| "on; no bank authored in this conversation yet".to_owned())
+            ));
+        }
         // What of memory reaches the turns (`HA_MEMORY`, `memory_switch`).
         lines.push(format!(
             "Memory:   {}",
@@ -6833,6 +6846,10 @@ impl SessionPort for AgentSessionService {
             &self.environment,
             &self.data_dir,
         ))
+    }
+
+    fn action_bank(&mut self, enable: Option<bool>) -> Result<String, String> {
+        super::action_bank::set(&self.config_file, &self.environment, enable)
     }
 
     fn jev_decision(&mut self, decision: &str, enable: bool) -> Result<String, String> {
@@ -9642,6 +9659,10 @@ async fn run_turn(
                 completion: decisions as Arc<dyn harness_tools::CompletionCheck>,
             }),
     );
+    // The action bank (`/bank`), off by default; children run with it too.
+    let action_bank = super::action_bank::enabled(&config_file, &environment)
+        .then(|| super::action_bank::bank(jev_decisions.as_ref()));
+    agents.set_action_bank(action_bank.clone());
     let delegate_host = Some(super::delegation::DelegateHost::new(
         &agents,
         super::delegation::ChildLaunch {
@@ -9943,6 +9964,10 @@ async fn run_turn(
     ));
     let driver = TurnDriver::new(Arc::clone(&runtime), tools)
         .with_verify_reminder(verify_reminder_enabled(&config_file, &environment));
+    let driver = match action_bank {
+        Some(bank) => driver.with_action_bank(bank),
+        None => driver,
+    };
     let driver =
         match &jev_decisions {
             Some(decisions) => driver
@@ -11341,6 +11366,7 @@ async fn run_turn(
             {
                 send(SessionEvent::OutputCapped);
             }
+            super::action_bank::record(outcome.task_id.as_str(), &outcome.bank);
             match outcome.stop {
                 TurnStop::Final => RunOutcome::Done,
                 TurnStop::Canceled => RunOutcome::Canceled,
