@@ -301,6 +301,8 @@ pub struct TurnOutcome {
     /// Why the last model response ended (`stop`, `length`, ...), as the
     /// provider said.
     pub final_finish_reason: Option<String>,
+    /// What the action bank did in this turn; all zero while it is off.
+    pub bank: crate::bank::BankTally,
 }
 
 /// What one goal evaluation run reported, in words the CLI can print.
@@ -1166,6 +1168,62 @@ pub const FLUSH_PREFIX: &str =
 /// its agent on track by rewriting a todo list at the end of the context.
 pub const RECAP_EVERY_STEPS: u32 = 40;
 
+/// How long the bank's selector may take before the model is asked instead.
+const BANK_SELECTOR_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How much of the request and of the settled result the selector is shown.
+const BANK_SELECTOR_CHARS: usize = 4_000;
+
+/// A banked call about to run in place of a model step, and what its
+/// certificate binds.
+struct Bypass {
+    node: crate::bank::BankNode,
+    graph: String,
+    predecessor: String,
+    predecessor_receipt: String,
+    /// The model step this call stands in for.
+    replaced_step: u32,
+    call: NormalizedToolCall,
+}
+
+/// One call's public result as the bank's guards read it.
+fn bank_receipt(name: &str, slot: &Slot) -> crate::bank::Receipt {
+    use crate::bank::Receipt;
+    let part = |done: &Result<ToolExecutionView, HarnessError>| match done {
+        Ok(view) => Receipt::of_view(view, &render_tool_output(name, &view.output)),
+        Err(error) => Receipt::unclear(&error.to_string()),
+    };
+    match slot {
+        Slot::Failed(message, _) => Receipt::unclear(message),
+        Slot::Answered(text) => Receipt::answered(text),
+        Slot::Done(done) => part(done),
+        Slot::Many(parts) => Receipt::combined(parts.iter().map(part).collect()),
+        Slot::Ready(_) | Slot::Taken => Receipt::unclear(""),
+    }
+}
+
+/// What the model is told when its bank is kept.
+fn bank_accepted(bank: &crate::bank::Bank) -> String {
+    let nodes = bank
+        .nodes
+        .iter()
+        .map(|node| {
+            format!(
+                "{} after {} when {}: {}",
+                node.id,
+                node.after,
+                node.guard.text(),
+                node.tool
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "action bank {} kept: {nodes}. When a call settles, the one node that follows it and whose guard holds on its result runs without asking you; otherwise you are asked as usual. You will see every call the harness ran, with its result. A new action_bank replaces the nodes not run yet.",
+        bank.hash
+    )
+}
+
 /// Bounded model -> tool -> model loop.
 #[derive(Clone)]
 pub struct TurnDriver {
@@ -1207,6 +1265,9 @@ pub struct TurnDriver {
     /// The tools listed in the roster but not sent, reached through
     /// `tool_schema` and `use_tool`.
     deferred: Arc<Vec<Value>>,
+    /// The action bank, when it is on: the `action_bank` tool is offered and
+    /// its ready calls run without a model step.
+    bank: Option<crate::bank::ActionBank>,
 }
 
 /// A workspace path as a key: one separator, no leading `./`.
@@ -1249,6 +1310,236 @@ impl TurnDriver {
         let _ = RunInbox::new(Arc::clone(self.runtime.store()))
             .record_host_message(&run, text, now_unix_ms())
             .await;
+    }
+
+    /// Keep what the harness answered an `action_bank` call with, so a later
+    /// turn's replay shows the answer and not "this call did not run".
+    async fn record_bank_answer(
+        &self,
+        run_id: &harness_types::AgentRunId,
+        call_id: &str,
+        text: &str,
+    ) {
+        let Ok(Some(run)) = self.runtime.run_record(run_id).await else {
+            return;
+        };
+        let _ = RunInbox::new(Arc::clone(self.runtime.store()))
+            .record_answered_call(&run, call_id, text, now_unix_ms())
+            .await;
+    }
+
+    /// Keep a banked call with the turn: no provider attempt holds it, and
+    /// later turns and a resume rebuild the conversation from the record.
+    async fn record_bank_call(
+        &self,
+        run_id: &harness_types::AgentRunId,
+        call: &NormalizedToolCall,
+        node: &str,
+    ) {
+        let Ok(Some(run)) = self.runtime.run_record(run_id).await else {
+            return;
+        };
+        let _ = RunInbox::new(Arc::clone(self.runtime.store()))
+            .record_issued_call(
+                &run,
+                &ProviderToolCall::new(
+                    call.call_id.clone(),
+                    call.name.clone(),
+                    call.arguments.clone(),
+                ),
+                node,
+                now_unix_ms(),
+            )
+            .await;
+    }
+
+    /// The predecessor whose result this boundary settled, with a line that
+    /// names it and its result: the banked call that just ran, certified
+    /// here, or the root of a bank this response authored, put in place here.
+    fn bank_settled(
+        state: &mut crate::bank::BankState,
+        authored: Option<crate::bank::Bank>,
+        bypassing: Option<&Bypass>,
+        receipts: &[(String, crate::bank::Receipt)],
+        steps: u32,
+    ) -> Option<(String, String, crate::bank::Receipt)> {
+        if let Some(bypass) = bypassing {
+            let receipt = receipts.first().map_or_else(
+                || crate::bank::Receipt::unclear(""),
+                |(_, receipt)| receipt.clone(),
+            );
+            // The certificate of one bypass: the graph and node, the result it
+            // followed, the exact arguments run, the receipt they produced, and
+            // the model step that was not made (the step count did not move).
+            state.tally.dispatched += 1;
+            harness_types::diag::info("bank", "dispatched")
+                .call(&bypass.call.call_id)
+                .field("graph", bypass.graph.clone())
+                .field("node", bypass.node.id.clone())
+                .field("predecessor", bypass.predecessor.clone())
+                .field("predecessor_receipt", bypass.predecessor_receipt.clone())
+                .field("tool", bypass.node.tool.clone())
+                .field(
+                    "args_hash",
+                    crate::bank::canonical_hash(&bypass.call.arguments),
+                )
+                .field("tool_receipt", receipt.receipt_ids.join(","))
+                .field("tool_receipt_hash", receipt.hash())
+                .field(
+                    "status",
+                    format!("{:?}", receipt.status).to_ascii_lowercase(),
+                )
+                .field("replaced_step", bypass.replaced_step)
+                .field("model_steps", steps)
+                .emit();
+            return Some((
+                bypass.node.id.clone(),
+                format!("{} {}", bypass.node.tool, bypass.node.arguments),
+                receipt,
+            ));
+        }
+        let bank = authored?;
+        let graph = bank.hash.clone();
+        let edges = bank
+            .nodes
+            .iter()
+            .map(|node| {
+                format!(
+                    "{}<-{} [{}] {}",
+                    node.id,
+                    node.after,
+                    node.guard.text(),
+                    node.tool
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let nodes = bank.nodes.len();
+        let author_tokens = bank.author_tokens;
+        let replaced = state.install(bank);
+        harness_types::diag::info("bank", "authored")
+            .field("graph", graph)
+            .field("nodes", nodes)
+            .field("edges", edges)
+            .field("author_tokens_estimate", author_tokens)
+            .field("replaced", replaced.len())
+            .field("step", steps)
+            .emit();
+        Some((
+            crate::bank::ROOT.to_owned(),
+            "the calls of the response that authored the bank".to_owned(),
+            crate::bank::Receipt::combined(
+                receipts
+                    .iter()
+                    .map(|(_, receipt)| receipt.clone())
+                    .collect(),
+            ),
+        ))
+    }
+
+    /// The banked call to run now in place of a model step, if exactly one
+    /// node is ready - or the selector picked one of several. Nothing ready,
+    /// an abstention, no room under the tool bound, or a boundary the model
+    /// must read (`clean` false) leaves the model to go on.
+    #[allow(clippy::too_many_arguments)]
+    async fn bank_next(
+        &self,
+        state: &mut crate::bank::BankState,
+        settled: Option<(String, String, crate::bank::Receipt)>,
+        clean: bool,
+        request_text: &str,
+        room: bool,
+        run_id: &harness_types::AgentRunId,
+        steps: u32,
+        tool_calls: u32,
+        observer: &Arc<dyn TurnObserver>,
+        cancellation: &CancellationToken,
+    ) -> Option<Bypass> {
+        let (predecessor, described, receipt) = settled?;
+        let eligible = state.eligible(&predecessor, &receipt);
+        if eligible.is_empty() {
+            return None;
+        }
+        if !clean || !room || cancellation.is_cancelled() {
+            state.deferred(&eligible);
+            return None;
+        }
+        let chosen = if let [only] = eligible.as_slice() {
+            only.clone()
+        } else {
+            let selector = self.bank.as_ref().and_then(|bank| bank.selector.clone());
+            let selection = match &selector {
+                Some(selector) => {
+                    let choice = crate::bank::BankChoice {
+                        request: request_text.chars().take(BANK_SELECTOR_CHARS).collect(),
+                        predecessor: described,
+                        result: receipt.text.chars().take(BANK_SELECTOR_CHARS).collect(),
+                        candidates: eligible
+                            .iter()
+                            .map(|node| crate::bank::BankCandidate {
+                                id: node.id.clone(),
+                                tool: node.tool.clone(),
+                                arguments: node.arguments.clone(),
+                                guard: node.guard.text(),
+                            })
+                            .collect(),
+                    };
+                    tokio::select! {
+                        answer = tokio::time::timeout(BANK_SELECTOR_TIMEOUT, selector.select(choice)) => answer.unwrap_or_default(),
+                        () = cancellation.cancelled() => crate::bank::Selection::default(),
+                    }
+                }
+                None => crate::bank::Selection::default(),
+            };
+            if selection.asked {
+                state.tally.selector_calls += 1;
+                state.tally.selector_input_tokens += selection.input_tokens;
+            }
+            let picked = selection
+                .node
+                .as_deref()
+                .and_then(|id| eligible.iter().find(|node| node.id == id));
+            if let Some(node) = picked {
+                node.clone()
+            } else {
+                harness_types::diag::info("bank", "abstained")
+                    .field("graph", state.hash().unwrap_or_default().to_owned())
+                    .field(
+                        "candidates",
+                        eligible
+                            .iter()
+                            .map(|node| node.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                    .field("selector", selector.is_some())
+                    .field("asked", selection.asked)
+                    .field("input_tokens", selection.input_tokens)
+                    .emit();
+                state.abstained(&eligible);
+                return None;
+            }
+        };
+        state.dispatched(&chosen.id, &eligible);
+        let graph = state.hash().unwrap_or_default().to_owned();
+        let call = NormalizedToolCall {
+            call_id: format!("bank_{graph}_{}_{tool_calls}", chosen.id),
+            name: chosen.tool.clone(),
+            arguments: chosen.arguments.clone(),
+        };
+        self.record_bank_call(run_id, &call, &chosen.id).await;
+        observer.observe(TurnProgress::Notice(format!(
+            "action bank: running node {} ({}) without a model step",
+            chosen.id, chosen.tool
+        )));
+        Some(Bypass {
+            graph,
+            predecessor,
+            predecessor_receipt: receipt.hash(),
+            replaced_step: steps + 1,
+            node: chosen,
+            call,
+        })
     }
 
     async fn claim_inbox(
@@ -1329,7 +1620,18 @@ impl TurnDriver {
             evaluation: None,
             evaluate_automatically: false,
             deferred: Arc::default(),
+            bank: None,
         }
+    }
+
+    /// Turn the action bank on (`docs/architecture/ACTION_BANK.en.md`): the
+    /// model may queue fully decided calls, and a ready one runs without a
+    /// model step. `bank.selector` chooses when several are ready; without
+    /// one the model is asked.
+    #[must_use]
+    pub fn with_action_bank(mut self, bank: crate::bank::ActionBank) -> Self {
+        self.bank = Some(bank);
+        self
     }
 
     /// Recite the task and ask for it to be saved as the context fills.
@@ -1636,6 +1938,15 @@ impl TurnDriver {
         // Every call id already announced in that transcript.
         let mut announced_call_ids: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
+        // The action bank of this turn, and the banked call about to run in
+        // place of the next model step.
+        let mut bank_state = crate::bank::BankState::default();
+        let mut bypass: Option<Bypass> = None;
+        if self.bank.is_some()
+            && parameters_schema(&request.tool_schemas, crate::bank::ACTION_BANK_TOOL).is_none()
+        {
+            request.tool_schemas.push(crate::bank::action_bank_schema());
+        }
 
         let first_step = match source_session_id {
             Some(source) => {
@@ -1670,6 +1981,8 @@ impl TurnDriver {
 
         // The loop yields why it stopped, so no bound can silently fall through.
         let stop = 'turn: loop {
+            // Set when this pass runs a banked call instead of a model response.
+            let bypassing = bypass.take();
             for notice in std::mem::take(&mut result.notices) {
                 observer.observe(TurnProgress::Notice(notice));
             }
@@ -2152,24 +2465,28 @@ impl TurnDriver {
                     id
                 })
                 .collect();
-            appended.push(
-                ProviderMessage::assistant_with_calls(
-                    assistant_text,
-                    result
-                        .tool_calls
-                        .iter()
-                        .zip(transcript_ids.iter())
-                        .map(|(call, transcript_id)| {
-                            ProviderToolCall::new(
-                                transcript_id.clone(),
-                                call.name.clone(),
-                                call.arguments.clone(),
-                            )
-                        })
-                        .collect(),
-                )
-                .with_reasoning(result.reasoning.clone()),
-            );
+            let assistant = ProviderMessage::assistant_with_calls(
+                assistant_text,
+                result
+                    .tool_calls
+                    .iter()
+                    .zip(transcript_ids.iter())
+                    .map(|(call, transcript_id)| {
+                        ProviderToolCall::new(
+                            transcript_id.clone(),
+                            call.name.clone(),
+                            call.arguments.clone(),
+                        )
+                    })
+                    .collect(),
+            )
+            .with_reasoning(result.reasoning.clone());
+            // A banked call is the harness's message, not a model response.
+            appended.push(if bypassing.is_some() {
+                assistant.issued_by_harness()
+            } else {
+                assistant
+            });
             // prime-agent's `executeToolCalls`, by segment: the calls between two
             // calls that must run alone run side by side, and a call that must run
             // alone runs after everything before it and before everything after
@@ -2188,6 +2505,9 @@ impl TurnDriver {
             // Each call's arguments as the model wrote them, unwrapped.
             let mut written: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
+            // The bank this response authored, and its calls' transcript ids.
+            let mut authored: Option<crate::bank::Bank> = None;
+            let mut bank_call_ids: HashSet<String> = HashSet::new();
             for (mut call, transcript_id) in
                 result.tool_calls.clone().into_iter().zip(transcript_ids)
             {
@@ -2233,6 +2553,40 @@ impl TurnDriver {
                 if name == TOOL_SCHEMA_TOOL && !self.deferred.is_empty() {
                     let answer = tool_schema_answer(&self.deferred, &call.arguments);
                     slots.push((name.clone(), transcript_id, Slot::Answered(answer)));
+                    continue;
+                }
+                // An action bank is the host's to keep, answered here; what it
+                // holds runs later, through this same pipeline.
+                if name == crate::bank::ACTION_BANK_TOOL && self.bank.is_some() {
+                    bank_call_ids.insert(transcript_id.clone());
+                    let slot = if authored.is_some() {
+                        let reason = "one action_bank per response; this one was not kept";
+                        bank_state.tally.refused += 1;
+                        Slot::Failed(format!("action_bank refused: {reason}"), reason.to_owned())
+                    } else {
+                        match crate::bank::parse_bank(&call.arguments, &request.tool_schemas) {
+                            Ok(bank) => {
+                                let answer = bank_accepted(&bank);
+                                self.record_bank_answer(&result.run_id, &call.call_id, &answer)
+                                    .await;
+                                authored = Some(bank);
+                                Slot::Answered(answer)
+                            }
+                            Err(reason) => {
+                                bank_state.tally.refused += 1;
+                                harness_types::diag::info("bank", "refused")
+                                    .call(&transcript_id)
+                                    .field("reason", reason.clone())
+                                    .field("step", steps)
+                                    .emit();
+                                Slot::Failed(
+                                    format!("action_bank refused, nothing was kept: {reason}"),
+                                    reason,
+                                )
+                            }
+                        }
+                    };
+                    slots.push((name.clone(), transcript_id, slot));
                     continue;
                 }
                 // The call as the model wrote it, unwrapped from `use_tool`: what
@@ -2571,6 +2925,10 @@ impl TurnDriver {
             )
             .await?;
 
+            // Each call's public result, for the bank's guards; the bank's own
+            // call is not part of the root it follows.
+            let mut receipts: Vec<(String, crate::bank::Receipt)> = Vec::new();
+            let mut intervened = false;
             // Results in call order.
             for (index, (name, transcript_id, slot)) in slots.into_iter().enumerate() {
                 let shown = announced.contains(&index);
@@ -2581,6 +2939,10 @@ impl TurnDriver {
                     &transcript_id,
                     &slot,
                 );
+                intervened |= intervention.is_some();
+                if self.bank.is_some() && !bank_call_ids.contains(&transcript_id) {
+                    receipts.push((transcript_id.clone(), bank_receipt(&name, &slot)));
+                }
                 let results_before = appended.len();
                 match slot {
                     Slot::Failed(message, detail) => {
@@ -2732,6 +3094,19 @@ impl TurnDriver {
                     result.content.push_str(&intervention.note);
                 }
             }
+            // A call the harness ran from the bank says so on its first line:
+            // the model always knows which calls it did not make in that step.
+            if let Some(bypassing) = &bypassing
+                && let Some(message) = appended
+                    .iter_mut()
+                    .find(|message| message.role == MessageRole::Tool)
+            {
+                message.content = format!(
+                    "{}\n{}",
+                    harness_runtime::bank_result_note(&bypassing.node.id),
+                    message.content
+                );
+            }
 
             // pa-agent's steering poll after the tool batch: what the user sent
             // while the tools ran reaches this next call, not the one after it.
@@ -2743,7 +3118,8 @@ impl TurnDriver {
                 (Vec::new(), None)
             };
             // What the user said may be what a failed call waited for.
-            if !early_steering.is_empty() || !late_steering.is_empty() {
+            let steered = !early_steering.is_empty() || !late_steering.is_empty();
+            if steered {
                 regulator.steer();
             }
             appended.extend(early_steering);
@@ -2760,6 +3136,47 @@ impl TurnDriver {
                     "canceled at a step boundary: {reason}"
                 )));
                 break TurnStop::Canceled;
+            }
+
+            // The action bank (`docs/architecture/ACTION_BANK.en.md`): the call
+            // that just settled may make one banked call ready, which then runs
+            // through this same loop with no model call. Steering, a loop
+            // warning or a regulation note is for the model to read, so then
+            // the model is called as usual.
+            if self.bank.is_some() {
+                let settled = Self::bank_settled(
+                    &mut bank_state,
+                    authored.take(),
+                    bypassing.as_ref(),
+                    &receipts,
+                    steps,
+                );
+                let clean = !steered && loop_warning.is_none() && !intervened;
+                if let Some(next) = self
+                    .bank_next(
+                        &mut bank_state,
+                        settled,
+                        clean,
+                        &request.text,
+                        tool_calls < options.limits.max_tool_calls,
+                        &result.run_id,
+                        steps,
+                        tool_calls,
+                        &observer,
+                        &cancellation,
+                    )
+                    .await
+                {
+                    if started.elapsed() >= options.limits.deadline {
+                        break TurnStop::Deadline;
+                    }
+                    transcript.extend(appended);
+                    result.tool_calls = vec![next.call.clone()];
+                    result.response.clear();
+                    result.reasoning = None;
+                    bypass = Some(next);
+                    continue 'turn;
+                }
             }
 
             steps += 1;
@@ -2869,6 +3286,27 @@ impl TurnDriver {
                 .await
                 .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
         };
+        // The bank lives for one turn; what it still holds is dropped, and the
+        // turn's bank accounting is one record.
+        if self.bank.is_some() {
+            bank_state.finish();
+            let tally = bank_state.tally;
+            if !tally.is_empty() {
+                harness_types::diag::info("bank", "turn")
+                    .run(result.run_id.as_str())
+                    .field("authored", tally.authored)
+                    .field("refused", tally.refused)
+                    .field("nodes", tally.nodes)
+                    .field("dispatched", tally.dispatched)
+                    .field("abstained", tally.abstained)
+                    .field("discarded", tally.discarded)
+                    .field("selector_calls", tally.selector_calls)
+                    .field("selector_input_tokens", tally.selector_input_tokens)
+                    .field("author_tokens_estimate", tally.author_tokens_estimate)
+                    .field("model_steps", steps)
+                    .emit();
+            }
+        }
         // One record for the turn: a bug report counts what was shortened.
         if trimmed_total > 0 {
             harness_types::diag::info("compaction", "tool_results_trimmed")
@@ -3001,6 +3439,7 @@ impl TurnDriver {
             goal: goal_report,
             pending_question,
             final_finish_reason: result.finish_reason.clone(),
+            bank: bank_state.tally,
         })
     }
 
@@ -4294,7 +4733,7 @@ fn goal_evidence(result: &RunResult, executions: &[ToolExecutionView]) -> GoalEv
 /// half was wrong instead of being told the tool was denied.
 /// The parameters schema the model was shown for `name`, in the
 /// OpenAI-style function shape the schemas use (or the bare one).
-fn parameters_schema<'a>(schemas: &'a [Value], name: &str) -> Option<&'a Value> {
+pub(crate) fn parameters_schema<'a>(schemas: &'a [Value], name: &str) -> Option<&'a Value> {
     schemas.iter().find_map(|schema| {
         let function = schema.get("function").unwrap_or(schema);
         (function.get("name").and_then(Value::as_str) == Some(name))
