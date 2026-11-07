@@ -140,4 +140,31 @@ là selector.
 
 ## 8. Kết quả đo
 
-Xem mục 8 của bản tiếng Anh.
+`scripts/testing/live-tests/bank.sh` trên `openai-codex/gpt-6-luna`, thinking
+`max` (2026-11-08):
+
+- **Cơ chế, khi prompt yêu cầu dùng bank.** Model viết một module và file test
+  của nó, và trong cùng response đưa lần chạy test vào bank; lần chạy test sau
+  đó chạy mà không gọi model (một chứng nhận, 6 lần gọi model thay vì 7), test
+  qua, và một hội thoại được resume trả lời từ kết quả của lần chạy trong bank.
+  Một test trong bank thất bại thì lệnh commit trong bank sau nó không chạy
+  (`guard_false`) và không có gì được commit. Với `--approval auto-edit`, một
+  lệnh `git add` trong bank vẫn qua cổng duyệt, bị từ chối, và model được gọi.
+  Backend Responses của ChatGPT nhận mọi request body có lệnh do harness phát.
+- **Phiên bản đầu, đã đo.** Khi chưa yêu cầu gọi bank cùng response, model này
+  ghi file trong một response và gọi bank một mình ở response sau: node đầu của
+  bank chạy đúng chỗ lệnh của chính model lẽ ra chạy, và không tiết kiệm gì.
+  Trường hợp đó giờ được đếm là `immediate`, không phải bước đã tiết kiệm, và
+  mô tả tool mở đầu bằng "trong cùng response".
+- **A/B, prompt trung tính** (ba task code nhỏ, bank tắt và bật, hai lần lặp,
+  cùng prompt cho cả hai bên): thành công 6/6 khi tắt và 6/6 khi bật; số lần
+  gọi model trung bình 9,00 và 8,83 (-1,9%), input token 96.020 và 98.289
+  (+2,4%, schema của tool bank trong mọi request), output token 1.294 và 1.363
+  (+5,3%). Model **không viết bank nào** trong mọi lần chạy, nên không bước nào
+  được tiết kiệm: chênh lệch là nhiễu giữa các lần chạy cộng chi phí schema.
+
+Vậy, như bài báo thấy với Terminal-Bench và GAIA2, bank chỉ có lợi khi model
+thật sự đưa các lệnh tiếp theo vào bank. Với model này, điều đó xảy ra khi được
+yêu cầu; chỉ được cấp tool thì nó tốn thêm một chút input mà không tiết kiệm gì.
+Hãy để tắt trừ khi task hoặc chỉ dẫn của bạn làm bank được dùng thường xuyên, và
+đo bằng `bank.sh` (`AB=1`, `REPEATS`).

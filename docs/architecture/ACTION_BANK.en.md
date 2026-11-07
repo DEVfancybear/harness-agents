@@ -142,5 +142,32 @@ setting. The jev `bank` decision (`/jev bank on|off`, threshold
 
 ## 8. Measured result
 
-See section 8 of the live suite report (`scripts/testing/live-tests/bank.sh`,
-`$RX/bank-ab.md`).
+`scripts/testing/live-tests/bank.sh` on `openai-codex/gpt-6-luna`, thinking
+`max` (2026-11-08):
+
+- **Mechanics, with the prompt asking for a bank.** The model wrote a module
+  and its test file and, in the same response, banked the test run; the test
+  run then ran with no model call (one certificate, 6 model calls where 7
+  would have been made), the tests passed, and a resumed conversation
+  answered from the banked run's result. A banked test that failed left the
+  banked commit after it unrun (`guard_false`) and nothing was committed. In
+  `--approval auto-edit` a banked `git add` met the approval gate, was
+  refused, and the model was called. Every response body was accepted by the
+  ChatGPT Responses backend with the harness-issued calls in it.
+- **First version, measured.** Without the instruction to co-issue the bank,
+  this model wrote its files in one response and the bank alone in the next:
+  the bank's first node then ran where the model's own call would have, and
+  saved nothing. That is now counted as `immediate`, not as a saved step, and
+  the tool's description leads with "in the same response".
+- **A/B, neutral prompts** (three small coding tasks, bank off and on, two
+  repeats, the same prompt in both arms): success 6/6 off and 6/6 on; mean
+  model calls 9.00 off and 8.83 on (-1.9%), input tokens 96,020 and 98,289
+  (+2.4%, the bank tool's schema in every request), output tokens 1,294 and
+  1,363 (+5.3%). The model authored **no bank** in any run, so no step was
+  saved: the difference is run-to-run noise plus the schema's cost.
+
+So, as the paper found for Terminal-Bench and GAIA2, the bank pays only where
+the model actually banks its next calls. With this model that happens when it
+is asked to; offered the tool alone, it costs a little input and saves
+nothing. Leave it off unless your tasks or instructions make banks common, and
+measure with `bank.sh` (`AB=1`, `REPEATS`).
