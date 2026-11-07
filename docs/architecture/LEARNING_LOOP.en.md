@@ -195,6 +195,14 @@ newest quotes. It answers with:
   changes (the last 30 meditations), and the report shows the newest.
 
 - `generalize` and `evolve`: see §6.
+- `signals`: while session logs are on, the meditation also reads the
+  project's newest session logs (at most 6, 4,000 characters each, 16,000 in
+  all) and reports a correction or a wrong assumption one log shows again, or
+  several show, as a signal: its quote must be in the log it names, word for
+  word; it is the log's conversation's signal, tagged with the log; a lesson
+  that has a signal from that conversation already gets none from its log
+  ([MEMORY_STORE.en.md](MEMORY_STORE.en.md) §20.6). Each is a `learning
+  log_signal` record, or `log_signal_refused` with why.
 
 The gate runs again after it, since merged signals may pass. The conversation is
 told each change: `learning loop: meditation: merged lesson …`.

@@ -8529,8 +8529,9 @@ pub(super) async fn consolidate_local_event(
     scopes: &super::refine::HarnessScopes,
     conversation: &str,
     claimed: super::sleep::Claimed,
+    dream: &super::refine::Dream,
 ) -> SessionEvent {
-    match super::refine::consolidate_local(provider, model, scopes).await {
+    match super::refine::consolidate_local(provider, model, scopes, dream).await {
         Ok(refinement) => {
             claimed.done();
             review_record("consolidated", conversation, Ok(&refinement)).emit();
@@ -9426,6 +9427,8 @@ async fn run_turn(
         );
         learning.in_play = refine_cadence.take_in_play();
         learning.project_checks.clone_from(&config.verify.checks);
+        learning.dream.knowledge = memory.on(super::memory_switch::Feature::Knowledge);
+        learning.dream.session_logs = super::session_log::enabled(&config_file, &environment);
         let result = super::refine::refine(
             &helper_provider,
             &helper_model,
@@ -9782,6 +9785,10 @@ async fn run_turn(
         skill_catalog.as_ref(),
     );
     learning.project_checks.clone_from(&config.verify.checks);
+    // Deep Dream moves detail down to knowledge, and the meditation reads the
+    // session logs, only while those are on (`HA_MEMORY_OFF`).
+    learning.dream.knowledge = knowledge_on;
+    learning.dream.session_logs = session_log_on;
     // The task's state - objective, checklist, decisions, constraints - kept by
     // the host for this conversation and never summarized away.
     let task_state_host = super::task_state::TaskStateHost::new(&data_dir, task_id.as_str());
@@ -11018,13 +11025,16 @@ async fn run_turn(
                 local: super::harness::local_dir(&data_dir, goal_task.as_str()),
                 review: review_mode,
             };
+            let dream = learning.dream.clone();
             let conversation = goal_task.as_str().to_owned();
             send(SessionEvent::Notice {
                 message: "memory: consolidating the global memory in the background".to_owned(),
             });
             tokio::spawn(async move {
-                let event = match super::refine::consolidate_memory(&provider, &model, &scopes)
-                    .await
+                let event = match super::refine::consolidate_memory(
+                    &provider, &model, &scopes, &dream,
+                )
+                .await
                 {
                     Ok(refinement) => {
                         claimed.done();
@@ -11066,14 +11076,21 @@ async fn run_turn(
                 review: review_mode,
             };
             let conversation = goal_task.as_str().to_owned();
+            let dream = learning.dream.clone();
             send(SessionEvent::Notice {
                 message: "memory: consolidating this conversation's memory in the background"
                     .to_owned(),
             });
             tokio::spawn(async move {
-                let event =
-                    consolidate_local_event(&provider, &model, &scopes, &conversation, claimed)
-                        .await;
+                let event = consolidate_local_event(
+                    &provider,
+                    &model,
+                    &scopes,
+                    &conversation,
+                    claimed,
+                    &dream,
+                )
+                .await;
                 drop(consolidating);
                 let _ = sender.send(event);
             });

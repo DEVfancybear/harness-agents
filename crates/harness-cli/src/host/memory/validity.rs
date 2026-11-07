@@ -63,16 +63,25 @@ pub struct Standing {
     pub superseded_by: Option<String>,
     /// Why the expiry pass closed it.
     pub expired: Option<String>,
+    /// The review that wrote it last was unsure of it (`confidence: low`,
+    /// in its `edited_by`, else its `origin`): with no `verified` in its
+    /// meta, it reads as unverified (`MEMORY_STORE.en.md` §20.2).
+    pub low_confidence: bool,
 }
 
 impl Standing {
     /// The standing an entry's document records.
     #[must_use]
     pub fn of(doc: &Value) -> Self {
+        let confidence = doc["edited_by"]["confidence"]
+            .as_str()
+            .or_else(|| doc["origin"]["confidence"].as_str());
         Self {
             kind: origin_kind(doc),
             superseded_by: doc[SUPERSEDED_BY].as_str().map(str::to_owned),
             expired: doc[EXPIRED].as_str().map(str::to_owned),
+            low_confidence: confidence
+                .is_some_and(|confidence| confidence.eq_ignore_ascii_case("low")),
         }
     }
 

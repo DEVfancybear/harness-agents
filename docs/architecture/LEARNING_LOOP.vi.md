@@ -191,6 +191,14 @@ và các trích dẫn mới nhất. Nó trả về:
   meditation gần nhất), và report hiện bản mới nhất.
 
 - `generalize` và `evolve`: xem §6.
+- `signals`: khi session log đang bật, meditation cũng đọc các session log mới
+  nhất của project (tối đa 6, mỗi log 4.000 ký tự, tổng 16.000) và báo một lời
+  sửa hay một giả định sai mà một log lại cho thấy, hoặc nhiều log cùng cho
+  thấy, như một signal: câu trích phải nằm nguyên văn trong log nó nêu; đó là
+  signal của cuộc hội thoại của log, gắn tên log; lesson đã có signal từ cuộc
+  hội thoại đó không nhận thêm từ log của nó
+  ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §20.6). Mỗi signal là một bản ghi
+  `learning log_signal`, hoặc `log_signal_refused` kèm lý do.
 
 Ngưỡng chạy lại sau đó, vì tín hiệu đã gộp có thể đủ điều kiện. Hội thoại được
 báo từng thay đổi: `learning loop: meditation: merged lesson …`.

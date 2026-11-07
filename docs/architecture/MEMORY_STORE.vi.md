@@ -1452,3 +1452,157 @@ kiểm tra đó và file đó hai lần.
   trong đó do child đề xuất; `/context` có dòng `Memory queue:` khi có thay đổi
   đang chờ hoặc chế độ không phải mặc định; mục Memory của bug report đếm
   chúng và chép các hàng đợi (chỉ dàn ý khi không có `--include-content`).
+
+## 20. Deep Dream đối chiếu với bản ghi hội thoại, cách một entry được biết, demote (sau 0.9.3)
+
+Theo bài "The components of agent memory" của Anthropic (2026-11-06): một ghi
+chú agent viết từ điều một khoảnh khắc có vẻ cho thấy có thể sai ngay từ đầu,
+hoặc trôi dần, và một phiên sau đọc rồi tin nó. Dreaming đối chiếu ghi chú với
+bản ghi gốc, giữ lớp được nạp vào mỗi lượt nhỏ bằng cách chuyển chi tiết xuống
+và để lại liên kết, theo một mục tiêu người dùng đặt, và dồn công sức vào điều
+dễ thay đổi. Mã nằm ở `memory/dream.rs`, được `memory/refine.rs` gọi.
+
+### 20.1 Các lượt đứng sau một entry
+
+Với mỗi entry của một batch Deep Dream có `origin` (hoặc `edited_by`) nêu một
+cuộc hội thoại, pass đọc cuộc hội thoại đó từ journal của project store của
+nó, chỉ đọc, như phần provenance của tool memory (`memory_provenance::of_task`:
+điều người dùng gõ ở mỗi lượt và kết quả của mỗi lời gọi tool kèm loại tool;
+lời của chính agent không được đọc). Store là của project của entry, rồi của
+project pass đang chạy, rồi các store khác (xem tối đa 64). Trong các lượt đó,
+pass giữ những lượt chứa câu trích của review, rồi các lượt khác theo trọng số
+các từ của entry mà lượt chứa (mỗi từ theo IDF của nó trên các lượt của cuộc
+hội thoại), mỗi lượt cắt còn 1.500 ký tự quanh chỗ khớp, tối đa bốn lượt một
+entry.
+
+Ngân sách là `dream::EVIDENCE_TOKENS` (6.000 token trích đoạn mỗi batch,
+khoảng bốn byte một token) và `ENTRY_EVIDENCE_TOKENS` (1.200 mỗi entry). Các
+entry dễ trôi (§20.5) được trước. Curator đọc chúng trong khối
+`<transcript_evidence>`, mỗi phần ghi rõ ai nói (`[the user typed]`, `[a tool
+result, file]`), đóng khung là bản ghi, không bao giờ là chỉ dẫn; một `</` trong
+trích đoạn không đóng được khối. Các entry không có lượt nào được nêu tên, và
+curator không sửa entry nào trong số đó. Bản ghi debug `dream evidence` đếm số
+entry, số trích đoạn và số entry không có.
+
+### 20.2 `correct`, và cách một entry được biết
+
+Một edit của curator `{"action": "correct", "kind", "id", "title", "content",
+"evidence", "changed"}` đổi điều entry khẳng định. Host kiểm tra trước khi
+apply:
+
+- `evidence` phải là một đoạn nguyên văn của trích đoạn của entry đó
+  (`refine::quoted`: bỏ qua khoảng trắng và hoa thường, dài một cụm từ 12 ký tự
+  trở lên). Nếu không, edit bị từ chối (`a correction's evidence must be a span
+  of its entry's transcript excerpt ...`), được ghi như mọi lần từ chối. Entry
+  không có trích đoạn thì không sửa được.
+- Lời của bản sửa được phép là lời của trích đoạn: kiểm tra merge (quá nửa số
+  từ của nội dung không có trong entry nào của batch) cũng tính các từ của
+  trích đoạn cho nó. Nó chỉ được nói điều bản ghi cho thấy.
+- `changed: false` (sự thật chưa bao giờ như vậy) biến nó thành update: phiên
+  bản cũ vẫn nằm trong lịch sử của store, như mọi update. `changed: true` (từng
+  đúng, rồi đổi) biến nó thành supersede (§16.2): một entry mới, entry cũ bị
+  đóng cho `as_of`, entry mới giữ như entry cũ (pinned, meta) trừ cách nó được
+  biết. Mô hình của ha là một ghi chú sai chưa bao giờ đúng, nên `as_of` không
+  được đọc nó như một sự thật quá khứ, còn một sự thật đã đổi thì từng đúng.
+  Curator nói là trường hợp nào; cả hai đều cần câu trích.
+- Điều nó dựa vào được ghi lại: `edited_by` của entry (hoặc `origin` của entry
+  mới) mang `correction: true`, cuộc hội thoại của trích đoạn, câu trích và loại
+  của nó (`user`, `tool`, ...), cũng là `origin_kind` của edit. Dòng của
+  refinement ghi `Corrected global memory <id>`, và `/refine --rollback` hoàn
+  tác được.
+- Bản sửa một quy tắc mọi lượt đều theo (`constraints/*`, `user/preferences`)
+  chờ người dùng duyệt trừ khi nó trích lời của chính người dùng, như edit của
+  review (§19.1).
+
+Meta của entry nói nó được biết thế nào: `verified` là `confirmed` (đã kiểm
+tra; `verified_by` nói cách nào, tối đa 160 ký tự: `test passed: cargo test
+billing`, `user confirmed`) hoặc `unverified` (một giả thuyết chưa ai kiểm).
+Prompt của review hỏi điều này cho một sự thật hay quy tắc, và hỏi giữ một cái
+bẫy như một lời cảnh báo nêu cái gì kích hoạt nó, mà không bảo model phải ghi
+gì: bài viết đo được rằng quy tắc cố định về điều cần ghi làm hại model mạnh.
+Host:
+
+- ghi `unverified` khi review cho edit `confidence: low` và không có `verified`;
+- giữ `verified` của entry qua một update không nói gì về nó, trừ bản sửa,
+  vì lần kiểm cũ không phủ khẳng định mới;
+- gộp metadata của edit vào metadata của entry khi nó chỉ có `verified`,
+  `verified_by` hoặc `scope` (entry pinned vẫn pinned);
+- bỏ mọi giá trị khác của `verified`, và `verified_by` của entry không
+  confirmed;
+- chỉ giữ `verified: confirmed` của Deep Dream khi `evidence` của nó nằm trong
+  trích đoạn của entry; nếu không thì bỏ và bản ghi nói vậy
+  (`verified_dropped`).
+
+Digest đánh dấu một entry `unverified: check it before relying on it` khi meta
+của nó ghi `unverified`, hoặc không ghi gì và review viết nó lần cuối không
+chắc (`confidence: low` trong `edited_by`, nếu không thì trong `origin`). Entry
+từ trang web hay từ agent con giữ dấu riêng của nó (§16.4).
+
+### 20.3 `demote`: chi tiết xuống dưới, để lại con trỏ
+
+Khi thư viện knowledge đang bật (`HA_MEMORY_OFF` không có `knowledge`),
+curator được đề nghị `{"action": "demote", "kind", "id", "content", "page":
+{"path", "title", "summary"}}` cho một entry dài từ 600 ký tự
+(`DEMOTE_MIN_CHARS`), hoặc bất kỳ entry nào khi memory vượt mục tiêu 30 entry,
+thay cho việc xoá hay cắt nó. Host:
+
+- từ chối với entry pinned hay một constraint (được đọc nguyên mỗi lượt), với
+  câu tóm quá 100 ký tự (`DEMOTE_SUMMARY_CHARS`), với path quá 48 ký tự hoặc đã
+  có trang, và khi các thay đổi chờ người dùng duyệt (`HA_MEMORY_REVIEW=all`):
+  một demote làm trọn vẹn hoặc không làm;
+- ghi trang qua chính hàm ghi của knowledge store (`Store::write_update`,
+  origin `dream`): thư viện global cho memory global, thư viện của project cho
+  store của một cuộc hội thoại. Nội dung là toàn bộ nội dung của entry, hoặc
+  trang curator viết, phải chứa nó nguyên văn; trang sau khi ghi được đọc lại
+  và kiểm có chứa nó, không thì bị xoá. Nguồn của trang là `memory <kind>:<id>`
+  và các cuộc hội thoại entry đến từ;
+- viết lại entry thành câu tóm và một con trỏ, `<câu tóm> (details: global
+  knowledge concepts/x.md)`, vừa trong 180 ký tự digest hiển thị của một entry.
+  Câu tóm qua kiểm tra merge: nó là ý chính của entry bằng lời của entry.
+
+Refinement ghi update của entry và việc tạo trang; rollback đặt lại entry và
+xoá trang khi trang còn như lúc ghi. Khi lần lưu giữ con trỏ thất bại, trang bị
+xoá.
+
+### 20.4 `dream.md`: memory phục vụ một mục tiêu
+
+Các pass tự động đọc chỉ dẫn của người dùng về việc memory dùng để làm gì:
+`dream.md` trong thư mục harness global cho memory global, và
+`<project>/.harness/dream.md` (của checkout chính) cho store của một cuộc hội
+thoại. Chúng đến curator dưới dạng `<user_curate_instructions>`, đóng khung là
+file của chính người dùng (như AGENTS.md của project), hướng dẫn điều nên giữ,
+gộp, sửa và demote trong khuôn các quy tắc của curator. Đọc tối đa 4.000 ký tự
+(`DREAM_INSTRUCTIONS_CHARS`): quá mức đó file bị cắt tại ranh giới ký tự, prompt
+nói vậy, và có cảnh báo `dream instructions_cut`; mỗi lần đọc là một bản ghi
+`dream instructions`. Điều người dùng gõ sau `/refine --curate` được nối với
+file global và thắng khi hai bên khác nhau.
+
+### 20.5 Điều dễ trôi đi trước
+
+Các batch của một pass chạy theo thứ tự entry của chúng dễ trôi đến đâu
+(`dream::drift_scores`), và một batch hiển thị entry theo thứ tự đó: một trích
+dẫn code không còn đúng (lần kiểm cuối, §18.3), rồi một trạng thái (`status`
+trong meta, hoặc một khoảng hiệu lực), rồi bao lâu kể từ khi entry được ghi hay
+đọc so với số lần nó được đọc hay tìm thấy, nên một entry cũ ít dùng đi trước
+một entry hay dùng. Chỉ các trường ha giữ quyết định; không có danh sách từ
+nào. Một pass hỏng giữa chừng đã kiểm những entry đó trước.
+
+### 20.6 Mẫu lặp lại qua các phiên
+
+Lần meditation hằng ngày của vòng học ([LEARNING_LOOP.vi.md](LEARNING_LOOP.vi.md)
+§5) cũng đọc các session log mới nhất của project, khi session log đang bật:
+tối đa 6, mỗi log 4.000 ký tự và tổng 16.000. Nó có thể báo `signals` tìm thấy
+trong đó: một lời sửa hay một giả định sai mà một log lại cho thấy, hoặc nhiều
+log cùng cho thấy. Câu trích của mỗi signal phải nằm nguyên văn trong log nó
+nêu; nó là signal của cuộc hội thoại của log đó, gắn tên log (`log` trên
+signal), và một lesson đã có signal từ cuộc hội thoại đó không nhận thêm từ log
+của nó. Không có bộ ghi mới: cổng (3 signal qua 2 cuộc hội thoại) thăng hạng như
+với mọi signal. Mỗi signal là một bản ghi `learning log_signal`, hoặc
+`log_signal_refused` kèm lý do.
+
+### 20.7 Tắt
+
+Tất cả thuộc Deep Dream hoặc meditation, nằm dưới `reviews`
+(`HA_MEMORY_OFF=reviews` không chạy gì trong số này). Với `knowledge` tắt thì
+không đề nghị và không làm demote; với `session_log` tắt thì meditation không
+đọc log; với `digest` tắt thì không digest nào hiển thị dấu.
