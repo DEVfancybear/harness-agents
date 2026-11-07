@@ -3208,19 +3208,30 @@ async fn turn_steps(
 ) -> Result<Option<TurnBody>, RuntimeError> {
     // Every read is awaited before any borrowing iterator exists, so the
     // future stays Send.
-    let steering = store
-        .applied_steering(session_id)
-        .await?
+    let applied = store.applied_steering(session_id).await?;
+    // Steering, and the calls the harness ran itself (action bank nodes), in
+    // the order they were recorded: both go back between the steps they came
+    // between.
+    let steering = applied
         .iter()
         .filter_map(|command| {
+            let at = command
+                .applied_at_unix_ms
+                .unwrap_or(command.created_at_unix_ms);
+            if let Some((call, node)) = inbox::RunInbox::issued_call(command) {
+                return Some((at, Replayed::Issued(call, node)));
+            }
             Some((
-                command
-                    .applied_at_unix_ms
-                    .unwrap_or(command.created_at_unix_ms),
-                inbox::RunInbox::steering_message(command)?,
+                at,
+                Replayed::Steer(inbox::RunInbox::steering_message(command)?),
             ))
         })
         .collect::<Vec<_>>();
+    // What the harness answered calls that ran no tool with, by call id.
+    let host_answers = applied
+        .iter()
+        .filter_map(inbox::RunInbox::answered_call)
+        .collect::<std::collections::HashMap<_, _>>();
     let used_tools = attempts_in(attempts, &["completed"])
         .into_iter()
         .filter_map(dispatched)
@@ -3253,8 +3264,8 @@ async fn turn_steps(
         // A steering message was delivered before the request that read it was
         // frozen, and request ids carry the time they were made.
         let asked_at = id_unix_ms(request_id).unwrap_or(u64::MAX);
-        while let Some((_, text)) = steering.next_if(|(at, _)| *at <= asked_at) {
-            steps.push(ProviderMessage::new(MessageRole::User, text));
+        while let Some((_, replayed)) = steering.next_if(|(at, _)| *at <= asked_at) {
+            replayed.push_to(&mut steps, &results, &started, &mut seen, result_chars);
         }
         let calls = response
             .tool_calls
@@ -3283,20 +3294,79 @@ async fn turn_steps(
             let text = results
                 .iter()
                 .rfind(|result| result.call_id.as_deref() == Some(call.call_id.as_str()))
-                .map_or_else(
-                    || unanswered_call(&call.name, started.contains(&call.call_id)).to_owned(),
-                    |result| clip_result(&result.text, result_chars),
-                );
+                .map(|result| clip_result(&result.text, result_chars))
+                .or_else(|| host_answers.get(&call.call_id).cloned())
+                .unwrap_or_else(|| {
+                    unanswered_call(&call.name, started.contains(&call.call_id)).to_owned()
+                });
             steps.push(ProviderMessage::tool_result(call.call_id, text));
         }
     }
-    // Delivered to a step that never answered: still something the user said.
-    steps.extend(steering.map(|(_, text)| ProviderMessage::new(MessageRole::User, text)));
+    // Delivered to a step that never answered: still something the user said,
+    // or a call the harness ran after the last step.
+    for (_, replayed) in steering {
+        replayed.push_to(&mut steps, &results, &started, &mut seen, result_chars);
+    }
     Ok(Some(if interrupted {
         TurnBody::Steps(steps)
     } else {
         TurnBody::Worked(steps)
     }))
+}
+
+/// What goes back between two steps of a replayed turn besides the steps.
+enum Replayed {
+    /// What the user (or the host) said while the turn ran.
+    Steer(String),
+    /// A call the harness ran from an action bank, and its node.
+    Issued(harness_providers::ProviderToolCall, String),
+}
+
+impl Replayed {
+    /// Push this onto a replayed turn: a steering message as the user's, an
+    /// issued call as the harness-written call it was and its recorded result,
+    /// under the line that says the harness ran it.
+    fn push_to(
+        self,
+        steps: &mut Vec<ProviderMessage>,
+        results: &[harness_store_sqlite::RecoveredToolResult],
+        started: &std::collections::BTreeSet<String>,
+        seen: &mut std::collections::BTreeSet<String>,
+        result_chars: usize,
+    ) {
+        match self {
+            Self::Steer(text) => steps.push(ProviderMessage::new(MessageRole::User, text)),
+            Self::Issued(call, node) => {
+                if !seen.insert(call.call_id.clone()) {
+                    return;
+                }
+                let text = results
+                    .iter()
+                    .rfind(|result| result.call_id.as_deref() == Some(call.call_id.as_str()))
+                    .map_or_else(
+                        || unanswered_call(&call.name, started.contains(&call.call_id)).to_owned(),
+                        |result| clip_result(&result.text, result_chars),
+                    );
+                let call_id = call.call_id.clone();
+                steps.push(
+                    ProviderMessage::assistant_with_calls(String::new(), vec![call])
+                        .issued_by_harness(),
+                );
+                steps.push(ProviderMessage::tool_result(
+                    call_id,
+                    format!("{}\n{text}", bank_result_note(&node)),
+                ));
+            }
+        }
+    }
+}
+
+/// The line over the result of a call the harness ran from an action bank
+/// (`docs/architecture/ACTION_BANK.en.md`): the model always sees which calls
+/// it did not make in that step.
+#[must_use]
+pub fn bank_result_note(node: &str) -> String {
+    format!("[action bank node {node}: run by the harness without a model step]")
 }
 
 /// An attempt's response, when it may be replayed: a transport EOF can be

@@ -134,6 +134,95 @@ impl RunInbox {
         text: impl Into<String>,
         now_unix_ms: u64,
     ) -> Result<(), RuntimeError> {
+        self.record_applied(
+            run,
+            json!({"text": text.into(), "verbatim": true, "host": true}),
+            now_unix_ms,
+        )
+        .await
+    }
+
+    /// Keep a call the harness ran itself - an action bank node, authored by
+    /// the model in an earlier step and run without a model step - with the
+    /// turn. No provider attempt holds it, so without this record the
+    /// conversation replay (`turn_steps`) would show its receipt's result
+    /// with no call before it. The record carries no `text`, so it is never
+    /// read as steering.
+    pub async fn record_issued_call(
+        &self,
+        run: &RunRecord,
+        call: &harness_providers::ProviderToolCall,
+        node: &str,
+        now_unix_ms: u64,
+    ) -> Result<(), RuntimeError> {
+        self.record_applied(
+            run,
+            json!({"host": true, "issued": {
+                "call_id": call.call_id,
+                "name": call.name,
+                "arguments": call.arguments,
+                "node": node,
+            }}),
+            now_unix_ms,
+        )
+        .await
+    }
+
+    /// Keep what the harness answered a call with that ran no tool (an
+    /// `action_bank` call): the replay gives it that answer, not "did not run".
+    pub async fn record_answered_call(
+        &self,
+        run: &RunRecord,
+        call_id: &str,
+        text: &str,
+        now_unix_ms: u64,
+    ) -> Result<(), RuntimeError> {
+        self.record_applied(
+            run,
+            json!({"host": true, "answered": {"call_id": call_id, "text": text}}),
+            now_unix_ms,
+        )
+        .await
+    }
+
+    /// The call a [`Self::record_issued_call`] record keeps, and its node.
+    #[must_use]
+    pub fn issued_call(
+        command: &RunCommandRecord,
+    ) -> Option<(harness_providers::ProviderToolCall, String)> {
+        let issued = command.payload.get("issued")?;
+        let field = |name: &str| {
+            issued
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        };
+        Some((
+            harness_providers::ProviderToolCall::new(
+                field("call_id")?,
+                field("name")?,
+                field("arguments")?,
+            ),
+            field("node").unwrap_or_default(),
+        ))
+    }
+
+    /// The call id and answer a [`Self::record_answered_call`] record keeps.
+    #[must_use]
+    pub fn answered_call(command: &RunCommandRecord) -> Option<(String, String)> {
+        let answered = command.payload.get("answered")?;
+        Some((
+            answered.get("call_id")?.as_str()?.to_owned(),
+            answered.get("text")?.as_str()?.to_owned(),
+        ))
+    }
+
+    async fn record_applied(
+        &self,
+        run: &RunRecord,
+        payload: serde_json::Value,
+        now_unix_ms: u64,
+    ) -> Result<(), RuntimeError> {
         let record = RunCommandRecord {
             command_id: RuntimeCommandId::generate(),
             run_id: run.run_id.clone(),
@@ -141,7 +230,7 @@ impl RunInbox {
             task_id: run.task_id.clone(),
             kind: RunCommandKind::Steer,
             state: RunCommandState::Applied,
-            payload: json!({"text": text.into(), "verbatim": true, "host": true}),
+            payload,
             detail: None,
             created_at_unix_ms: now_unix_ms,
             claimed_at_unix_ms: Some(now_unix_ms),
