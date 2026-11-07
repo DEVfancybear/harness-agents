@@ -55,6 +55,9 @@ status() { (cd "$P" && "$HA" knowledge status --cwd "$P" 2>&1); }
 read_page() { (cd "$P" && "$HA" knowledge read "$1" --cwd "$P" 2>&1); }
 # The diagnostics records of one kind and event.
 records() { cat "$D"/diagnostics/*.jsonl 2>/dev/null | grep "\"kind\":\"$1\"" | grep "\"event\":\"$2\""; }
+# Start an agent in the project, once more if it did not come up (a loaded
+# machine starts it late).
+start() { agent "$P" "$1" 2>/dev/null || { sleep 15; agent "$P" "$1"; }; }
 # The request a turn sent, found by a phrase of its prompt.
 request() { "$PY" - "$D" "$1" <<'EOF'
 import glob, os, sqlite3, sys
@@ -140,7 +143,7 @@ check "status shows the size against the readable sources" 'printf "%s" "$S" | g
 check "ha doctor warns of the dangling link" '(cd "$P" && "$HA" doctor 2>&1) | grep -q "project knowledge: 1 dangling link(s)"'
 
 echo "################ 2. the wiki pass tends the library"
-agent "$P" w1
+start w1
 touch "$RX/pass.marker"
 say w1 "Reply with exactly one word: OK" | tail -2
 for _ in $(seq 1 "${WIKI_WAIT:-60}"); do records wiki pass | grep -q . && break; sleep 10; done
@@ -176,7 +179,7 @@ check "every edit is recorded as the wiki's in the log" 'grep -q " by wiki" "$K/
 check "the bug report has the Knowledge wiki section" '(cd "$P" && "$HA" bug-report --since 1h --out "$RX/report.zip" >/dev/null 2>&1) && "$PY" -c "
 import sys, zipfile
 z = zipfile.ZipFile(sys.argv[1])
-text = \"\".join(z.read(n).decode(\"utf-8\", \"replace\") for n in z.namelist() if n.endswith(\"summary.md\"))
+text = \"\".join(z.read(n).decode(\"utf-8\", \"replace\") for n in z.namelist() if n.lower().endswith(\"summary.md\"))
 sys.exit(0 if \"## Knowledge wiki\" in text else 1)
 " "$RX/report.zip"'
 fi
@@ -199,11 +202,11 @@ echo "################ 4. a memory search with history finds what an earlier con
 # No background pass in this part: nothing but the journal holds the codename.
 export HA_AUTO_REFINE=off
 CODE="BLUEHERON-$(( RANDOM % 900 + 100 ))"
-agent "$P" h1
+start h1
 say h1 "For this conversation only: the codename of the Q3 storage migration is $CODE. Do not save it to memory, knowledge or any file; just acknowledge in one word." | tail -2
 "$HA" shutdown --force >/dev/null 2>&1
 check "precondition: the codename is in no memory store or page" '! grep -rlaq "$CODE" "$D/harness" "$K" 2>/dev/null && ! find "$D/sessions" -name "*.sqlite3" -exec grep -laq "$CODE" {} + 2>/dev/null'
-agent "$P" h2
+start h2
 say h2 "In an earlier conversation of this project I told you the codename of the Q3 storage migration. Find it with the memory tool: one search with action search, sources [\"memory\", \"knowledge\", \"history\"] and query \"codename Q3 storage migration\". Then answer with the codename only." | tail -3
 check "the memory search named history among its sources" 'journal_has "sources:\[memory, ?knowledge, ?history\]"'
 check "a hit of that search is the earlier conversation's turn" 'journal_has "$CODE[^{]*source:history|source:history[^}]*$CODE"'

@@ -938,16 +938,33 @@ fn apply(
         match edit["edit"].as_str() {
             Some("repoint" | "unlink") => {
                 let page = edit["page"].as_str().unwrap_or_default().to_owned();
-                let entry = relinks.entry(page).or_default();
+                let dangling = pages
+                    .iter()
+                    .find(|known| known.summary.path.eq_ignore_ascii_case(&page))
+                    .map(|known| known.summary.dangling.clone())
+                    .unwrap_or_default();
+                let missing = |path: &str| {
+                    dangling
+                        .iter()
+                        .any(|target| target.eq_ignore_ascii_case(path))
+                };
+                let exists = |path: &str| {
+                    pages
+                        .iter()
+                        .any(|known| known.summary.path.eq_ignore_ascii_case(path))
+                };
+                let entry = relinks.entry(page.clone()).or_default();
                 if edit["edit"] == "repoint" {
                     entry.0.insert(
-                        edit["from"].as_str().unwrap_or_default().to_owned(),
-                        edit["to"].as_str().unwrap_or_default().to_owned(),
+                        named(&page, edit["from"].as_str().unwrap_or_default(), missing),
+                        named(&page, edit["to"].as_str().unwrap_or_default(), exists),
                     );
                 } else {
-                    entry
-                        .1
-                        .insert(edit["target"].as_str().unwrap_or_default().to_owned());
+                    entry.1.insert(named(
+                        &page,
+                        edit["target"].as_str().unwrap_or_default(),
+                        missing,
+                    ));
                 }
                 entry.2.push(edit.clone());
             }
@@ -990,6 +1007,21 @@ fn apply(
             known.wrote(store, &changed);
         }
     }
+}
+
+/// The page path an edit of `page` means by `path`: the path itself when it
+/// is one `known` accepts (a page of the library, a missing target), else
+/// the path read as a link of `page` - relative to its folder, as the page's
+/// own text writes it (`../concepts/x.md`).
+fn named(page: &str, path: &str, known: impl Fn(&str) -> bool) -> String {
+    if known(path) {
+        return path.to_owned();
+    }
+    super::store::link_targets(page, &format!("[link](<{path}>)"))
+        .into_iter()
+        .next()
+        .filter(|resolved| known(resolved))
+        .unwrap_or_else(|| path.to_owned())
 }
 
 fn record(scope: &str, edit: &Value, result: Result<(), String>, outcome: &mut Outcome) {
@@ -1510,8 +1542,8 @@ mod tests {
             &store,
             &Sources::default(),
             &json!([
-                {"edit": "repoint", "page": "ops/deploy.md", "from": "concepts/backoff.md", "to": "concepts/retry.md"},
-                {"edit": "unlink", "page": "ops/deploy.md", "target": "ops/runbook.md"}
+                {"edit": "repoint", "page": "ops/deploy.md", "from": "../concepts/backoff.md", "to": "../concepts/retry.md"},
+                {"edit": "unlink", "page": "ops/deploy.md", "target": "runbook.md"}
             ]),
         );
         assert_eq!(outcome.applied.len(), 2, "{outcome:?}");
