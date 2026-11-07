@@ -530,12 +530,25 @@ Revert một trang đã xóa sẽ tạo lại trang đó, theo cùng luật back
 Thời gian giữ giống memory: 30 ngày, luôn giữ 10 phiên bản mới nhất của mỗi
 trang.
 
-### Một search cho cả hai
+### Một search cho memory, knowledge và history
 
-`search` của memory nhận `sources: ["memory", "knowledge"]`; mặc định chỉ tìm
-memory. Kết quả knowledge lấy từ engine knowledge (BM25) rồi gộp bằng RRF thành một danh sách. Mỗi kết quả ghi rõ `source`, và với
-trang knowledge thì có `path` cùng khoảng dòng. CLI làm tương tự với
-`--knowledge`.
+`search` của memory nhận `sources: ["memory", "knowledge", "history"]`, bất kỳ
+nguồn nào trong đó; mặc định chỉ tìm memory. Kết quả knowledge lấy từ engine
+knowledge (BM25); kết quả history là các lượt của những cuộc hội thoại trong dự
+án này như journal lưu, tìm bằng chính phép tìm của `history_search` với scope
+`project` (chỉ mục được cập nhật trước, tối đa ba giây, phần còn lại chạy nền;
+mỗi biến thể truy vấn được tìm riêng rồi gộp lại). Kết quả của từng nguồn được
+gộp bằng RRF thành một danh sách theo thứ hạng, vì điểm của các nguồn không so
+được với nhau. Mỗi kết quả ghi rõ `source`, với trang knowledge thì có `path`
+cùng khoảng dòng, với một lượt thì có `source_id`, `kind`, `conversation`,
+`started` và phần đầu văn bản (`history_read` đọc trọn `source_id` đó). CLI làm
+tương tự với `--knowledge`. Một lượt không có giá trị tree, meta hay temporal:
+các bộ lọc đó loại mọi lượt, còn `grep` đọc phần đầu của lượt. History cần
+store của dự án trong lượt: một lần tìm khi không có store (yêu cầu từ kernel,
+store đã đóng) sẽ ghi rằng history không được tìm. Mặc định vẫn chỉ là memory;
+bài viết mà phần này theo ("The components of agent memory") thấy wiki cùng với
+search tốt hơn từng thứ riêng lẻ, chứ không phải mọi lần tìm đều nên đọc
+journal.
 
 Bộ lọc áp lên trang theo cách ME đọc một record không có meta và không có
 temporal:

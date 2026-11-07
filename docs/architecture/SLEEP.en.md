@@ -12,6 +12,7 @@ background passes that each call a model:
 | A conversation's review (the review gate, then the refinement it approves) | the turns since the last review | the conversation's store, the global memory, lessons, learned skills, knowledge |
 | Deep Dream (consolidation) | the global memory, or a conversation's store past 40 entries, in batches past a token budget | the same scope, merged and pruned |
 | The harness evolution | the calls that failed in the last 14 days | rules and tool notes |
+| The wiki pass | a knowledge library whole, and the sources its pages name | the same library: links repointed or filled, duplicates merged, an index, claims fixed ([KNOWLEDGE_WIKI.en.md](KNOWLEDGE_WIKI.en.md)) |
 
 A model call fails: the provider is down, a limit is reached, the process
 dies. Before 0.8.9 a failure lost the pass's work: the review's turn count was
@@ -25,8 +26,9 @@ a failed Deep Dream was tried every hour forever. Since 0.8.9 every pass is a
 
 - A job is one JSON file under `<data-dir>/sleep/`, written whole or not at all
   (a temporary file renamed into place). It names its kind (`review`,
-  `consolidation`, `evolution`), what asked for it (`turn`, `compaction`,
-  `idle`, `session_end`, `exec`, `due`), and for a review the project store,
+  `consolidation`, `evolution`, `expiry`, `wiki`), what asked for it (`turn`,
+  `compaction`, `idle`, `session_end`, `exec`, `due`, and for the wiki pass
+  `review` when a review wrote a page), and for a review the project store,
   the conversation, the newest session to read and the turns it covers.
 - **What triggered it is reset only once the job is written.** The app's count
   of turns and tool calls, `ha exec`'s `review_cadence.json` and a session's
@@ -103,6 +105,11 @@ The triggers are the ones ha had; each writes a job and then runs the due ones.
   and edits applied, and the ids of a batch of 64 entries or fewer, `members`).
 - **The evolution** (once a day): marked as run only once it saved; its lock
   and its job's claim keep a second run from starting meanwhile.
+- **The wiki pass** (a turn's end, while reviews run and knowledge is on): a
+  job per knowledge library (`wiki:<library directory>`) when the library
+  changed since its last pass, has work for one, and a review wrote a page
+  since or a day passed. A library that is no longer due forgets its job that
+  gave up. Its first wait after a failure is an hour, as for Deep Dream.
 
 The learning loop's meditation already claimed itself for an hour and marked
 itself only after success; it is not in the queue.
@@ -127,6 +134,8 @@ itself only after success; it is not in the queue.
 above), `HA_SLEEP_MAX_ATTEMPTS` the failures a job takes before it gives up,
 `HA_COMPACTION_REVIEW_SECONDS` the spacing of compaction reviews, and
 `HA_CONSOLIDATE_BATCH_TOKENS` how many tokens of entries one Deep Dream call
-is given (32,000; a memory past it is consolidated in batches). They exist
+is given (32,000; a memory past it is consolidated in batches), and
+`HA_WIKI_DUE_NOW=1` makes the wiki pass due without its day's wait
+(`scripts/testing/live-tests/wiki.sh`). They exist
 for the live tests (`scripts/testing/live-tests/sleep.sh`); the defaults suit
 everyday use.

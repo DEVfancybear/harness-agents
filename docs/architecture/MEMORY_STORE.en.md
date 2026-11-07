@@ -509,12 +509,25 @@ Reverting a deleted page recreates it, subject to the same backlink rule a write
 has. Retention is the same as memory: 30 days, with the 10 newest versions of
 each page always kept.
 
-### One search over both
+### One search over memory, knowledge and history
 
-`memory` search accepts `sources: ["memory", "knowledge"]`; the default is memory
-only. Knowledge hits come from the knowledge engine (BM25) and are fused by
-RRF into one list. Each hit says `source`, plus
-`path` and the line range for a page. The CLI does the same with `--knowledge`.
+`memory` search accepts `sources: ["memory", "knowledge", "history"]`, any of
+them; the default is memory only. Knowledge hits come from the knowledge
+engine (BM25); history hits are the turns of this project's conversations as
+the journal keeps them, found by `history_search`'s own search with scope
+`project` (the index caught up first, at most three seconds, the rest behind
+it; each query variant searched and the variants fused). Each source's hits
+are fused by RRF into one list, by rank, since their scores are not
+comparable. Each hit says `source`, plus `path` and the line range for a page,
+and `source_id`, `kind`, `conversation`, `started` and the head of the text
+for a turn (`history_read` reads its `source_id` whole). The CLI does the same
+with `--knowledge`. A turn has no tree, meta or temporal value: those filters
+leave every turn out, and `grep` reads a turn's head. History needs the
+turn's project store: a search where there is none (a kernel's request, a
+store already closed) says history was not searched. The default stays
+memory alone; the article this follows ("The components of agent memory")
+found a wiki and search together beat either, not that every search should
+read the journal.
 
 The filters reach the pages as ME's would read a record with no meta and no
 temporal value: a `meta`, `meta_predicate` or `temporal` filter leaves every
