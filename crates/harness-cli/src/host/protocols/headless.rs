@@ -752,7 +752,13 @@ pub async fn run_with(
     let memory_host = super::memory::MemoryHost::new(&context.paths.data_dir, task_id.as_str())
         .with_project(&context.project.root)
         .with_refinements(digest_on)
-        .with_switch(&memory_switch);
+        .with_switch(&memory_switch)
+        .with_history(super::memory_search::history_searcher(
+            tokio::runtime::Handle::current(),
+            Arc::downgrade(&store),
+            project_id.clone(),
+            task_id.clone(),
+        ));
     if let Some((agents, _)) = &agents {
         tools = tools.with_elsewhere(Arc::clone(agents) as Arc<dyn harness_tools::PathElsewhere>);
     }

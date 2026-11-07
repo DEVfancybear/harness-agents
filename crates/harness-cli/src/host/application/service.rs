@@ -9125,6 +9125,9 @@ async fn run_turn(
         }
     };
 
+    // A memory search with `sources` naming history searches this project's
+    // conversations, as `history_search` does.
+    let history_project = project_id.clone();
     let observation = match observe_workspace(project_id, &workspace_root) {
         Ok(observation) => observation,
         Err(error) => {
@@ -9910,7 +9913,13 @@ async fn run_turn(
     let memory_host = super::memory::MemoryHost::new(&data_dir, task_id.as_str())
         .with_project(&workspace_root)
         .with_refinements(digest_on)
-        .with_switch(&memory_switch);
+        .with_switch(&memory_switch)
+        .with_history(super::memory_search::history_searcher(
+            tokio::runtime::Handle::current(),
+            Arc::downgrade(&store),
+            history_project,
+            task_id.clone(),
+        ));
     // The jev plugin, when `/jev on` turned it on.
     let jev_host = super::jev::JevHost::from_settings(&environment, &data_dir, &config_file);
     tools = tools.with_external(super::jev::with_dispatcher(

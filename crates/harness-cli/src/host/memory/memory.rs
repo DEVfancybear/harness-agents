@@ -89,16 +89,16 @@ const MAX_VARIANTS: usize = 4;
 const MAX_LIST_PAGE: usize = 100;
 
 pub const GUIDANCE: &str = concat!(
-    "Memory is what you keep across turns and conversations: durable facts, the user's preferences and decisions (memory entries) and narrow behavioral rules (prompt notes). Manage it with the `memory` tool. ",
+    "Memory is for what a later conversation will need and cannot read off its environment: files, git, test output and the screen show their current state each time, so a copy of them only goes stale. A rule or decision worked out here is lost unless kept, and keeping it is a prediction that a later conversation will rely on it: you judge what is worth keeping. Entries hold facts, preferences, decisions and rules; prompt notes hold narrow behavioral rules. Manage it with the `memory` tool. ",
     "The harness digest each turn shows only the few entries that rank highest for the request, cut short; the rest are found with memory search. ",
     "Before answering about an earlier decision, preference, person, plan or past piece of work you do not see in context, search memory first; when it has nothing, say so instead of guessing. ",
     "Search matches words, not meaning: when the wording or language may differ from the entries (the user writes Vietnamese, an entry may be in English), pass up to four variants in queries in the same search - synonyms and a translation; when a search still finds nothing, search again with other words (a broader term, a name or path from the code) before saying memory has nothing. ",
     "When the answer is spread over several entries, search with mode readout: it reads every entry for the request into a few slots, each the entries behind one part of it. ",
-    "When the user asks you to remember something, states a lasting preference or corrects how you work, or a decision is reached that later work depends on, write it in the same turn without asking. Use scope global for what holds across conversations and projects (the user's preferences, how they like to work), project for a stable fact about this project (its stack, conventions, where things live; it never reaches another project), and local for this conversation's state. ",
+    "Write in the same turn, without asking, when the user asks you to remember something or something is clearly worth keeping - for example a lasting preference, a correction of how you work, a decision later work depends on, a rule you checked, or a trap you hit (as a warning: what happens, how to avoid it). With a rule, say how you know it holds: meta verified \"confirmed\" and verified_by (a test passed, the user confirmed), or \"unverified\". Use scope global for what holds across conversations and projects (the user's preferences, how they like to work), project for a stable fact about this project (its stack, conventions, where things live; it never reaches another project), and local for this conversation's state. ",
     "Search before writing and update the matching entry with its id and expected_version instead of adding a near-duplicate (a write that reads as an entry already kept is refused with that entry's id); when a fact changed (the user corrects it, a decision is reversed), write the new fact with supersedes: [the old entry's id]: the old one is closed, not deleted - it held until now, and search with as_of an earlier time still finds it - and when a write returns related entries, supersede one the new fact replaces or contradicts. Delete an entry that turned out wrong (never true). One fact or rule per entry, short and self-contained. Never store secrets, credentials or tokens. ",
     "An update by id changes only what it gives: leave content out to retag, move or re-time an entry. An update or a delete keeps the earlier version: history shows an entry's earlier versions (also of a deleted one), and revert brings one back. ",
     "An entry sits in a tree (/global/..., /projects/<this project>/..., /local/...; a relative tree is a path under its scope) and may carry meta (facets such as type, status, source, confidence) and temporal (when it happened, or {start, end} for the period it holds; once that period ends the entry is no longer shown every turn, but search still finds it). Its name is unique in its tree, so <tree>/<name> addresses it; its memory_id never changes. ",
-    "An entry is a short note of what was said, not the turns themselves: read shows its origin (the conversation it came from and, for one a review wrote, the quote it rests on), and when the entry is not enough, history_search with scope \"project\" and that quote or the entry's words reads the turns behind it word for word. ",
+    "An entry is a short note of what was said, not the turns themselves: read shows its origin (the conversation it came from and, for one a review wrote, the quote it rests on), and when the entry is not enough, history_search with scope \"project\" and that quote or the entry's words reads the turns behind it word for word. A search with sources [\"memory\", \"knowledge\", \"history\"] ranks entries, pages and earlier conversations' turns in one list. ",
     "Pin (pinned: true) only an entry every turn should obey whatever the request, such as the user's language, how to address them or a hard rule they set; pinned entries are shown whole in every turn's digest within a 4,000-character bound, so keep them few and short and unpin what stops applying. ",
     "Global memory holds what stays true: never task state such as commit ids, test counts or a done/in-progress status (keep those local, or as knowledge). An entry that records a state goes stale: check its age and the current state before relying on it, and update or delete it when it changed. ",
     "When a fact about this project rests on code, cite it (citations: [{path, quote}], a short span copied from the file): later reads check it and say when that code changed. A rule or fact that matters only for some files takes paths: [glob] (src/billing/**): it stays out of every turn and enters when the conversation touches a matching file. ",
@@ -134,6 +134,9 @@ pub struct MemoryHost {
     off: bool,
     /// Whether citations are checked and entries kept for some files written.
     features: super::memory_citations::Features,
+    /// The project's conversations, for a search with `sources` naming
+    /// `history`; none outside a turn that holds the project store.
+    history: Option<super::memory_search::HistorySearch>,
 }
 
 /// The project a global entry holds for: ha's project key, and its folder's
@@ -225,6 +228,7 @@ impl MemoryHost {
             workspace: None,
             off: false,
             features: super::memory_citations::Features::default(),
+            history: None,
         }
     }
 
@@ -241,6 +245,7 @@ impl MemoryHost {
             workspace: None,
             off: false,
             features: super::memory_citations::Features::default(),
+            history: None,
         }
     }
 
@@ -354,6 +359,14 @@ impl MemoryHost {
     #[must_use]
     pub fn with_refinements(mut self, enabled: bool) -> Self {
         self.off = !enabled;
+        self
+    }
+
+    /// The same host, searching the project's conversations when a search's
+    /// `sources` names `history`.
+    #[must_use]
+    pub fn with_history(mut self, history: super::memory_search::HistorySearch) -> Self {
+        self.history = Some(history);
         self
     }
 
@@ -1092,54 +1105,83 @@ impl MemoryHost {
             }
             _ => None,
         };
-        let knowledge = match &host {
-            _ if queries.is_empty() => {
-                Err("knowledge is searched by words: give a query".to_owned())
-            }
-            Some(host) => host
-                .search_hits(&queries, limit)
-                .and_then(|pages| filter_pages(host, pages, arguments)),
-            None => Err("this conversation has no project, so no knowledge to search".to_owned()),
-        };
-        match knowledge {
-            Ok((pages, note)) => {
-                if let Some(note) = note {
-                    result["knowledge"] = json!(note);
+        // Each source's hits in its own order, fused into one ranking by
+        // RRF: the scores of two sources are not comparable, their ranks are.
+        let mut lists = vec![(
+            "memory",
+            result["hits"].as_array().cloned().unwrap_or_default(),
+        )];
+        if sources.contains(&"knowledge") {
+            let knowledge = match &host {
+                _ if queries.is_empty() => {
+                    Err("knowledge is searched by words: give a query".to_owned())
                 }
-                let memory = result["hits"].as_array().cloned().unwrap_or_default();
-                let keyed = |prefix: &str, count: usize| {
-                    (0..count)
-                        .map(|index| (format!("{prefix}{index:08}"), 0.0))
-                        .collect::<Vec<_>>()
-                };
-                let (from_memory, from_knowledge) =
-                    (keyed("m", memory.len()), keyed("k", pages.len()));
-                let fused = harness_types::search::weighted_rrf(&[
-                    (&from_memory, 1.0),
-                    (&from_knowledge, 1.0),
-                ]);
-                let hits = fused
-                    .into_iter()
-                    .take(limit)
-                    .filter_map(|(key, score)| {
-                        let index = key[1..].parse::<usize>().ok()?;
-                        let (mut hit, source) = if key.starts_with('m') {
-                            (memory.get(index)?.clone(), "memory")
-                        } else {
-                            (pages.get(index)?.clone(), "knowledge")
-                        };
-                        hit["source"] = json!(source);
-                        hit["fused"] = json!((score * 1e6).round() / 1e6);
-                        Some(hit)
-                    })
-                    .collect::<Vec<_>>();
-                result["total"] = json!(result["total"].as_u64().unwrap_or(0) + pages.len() as u64);
-                result["hits"] = json!(hits);
-            }
-            Err(error) => {
-                result["knowledge"] = json!(format!("knowledge was not searched: {error}"));
+                Some(host) => host
+                    .search_hits(&queries, limit)
+                    .and_then(|pages| filter_pages(host, pages, arguments)),
+                None => {
+                    Err("this conversation has no project, so no knowledge to search".to_owned())
+                }
+            };
+            match knowledge {
+                Ok((pages, note)) => {
+                    if let Some(note) = note {
+                        result["knowledge"] = json!(note);
+                    }
+                    lists.push(("knowledge", pages));
+                }
+                Err(error) => {
+                    result["knowledge"] = json!(format!("knowledge was not searched: {error}"));
+                }
             }
         }
+        if sources.contains(&"history") {
+            match self.search_history(&queries, limit, arguments) {
+                Ok((hits, note)) => {
+                    if let Some(note) = note {
+                        result["history"] = json!(note);
+                    }
+                    lists.push(("history", hits));
+                }
+                Err(error) => {
+                    result["history"] = json!(format!("history was not searched: {error}"));
+                }
+            }
+        }
+        let keyed = lists
+            .iter()
+            .enumerate()
+            .map(|(list, (_, hits))| {
+                (0..hits.len())
+                    .map(|index| (format!("{list}:{index:08}"), 0.0))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let fused = harness_types::search::weighted_rrf(
+            &keyed
+                .iter()
+                .map(|keys| (keys.as_slice(), 1.0))
+                .collect::<Vec<_>>(),
+        );
+        let hits = fused
+            .into_iter()
+            .take(limit)
+            .filter_map(|(key, score)| {
+                let (list, index) = key.split_once(':')?;
+                let (source, hits) = lists.get(list.parse::<usize>().ok()?)?;
+                let mut hit = hits.get(index.parse::<usize>().ok()?)?.clone();
+                hit["source"] = json!(source);
+                hit["fused"] = json!((score * 1e6).round() / 1e6);
+                Some(hit)
+            })
+            .collect::<Vec<_>>();
+        let added = lists
+            .iter()
+            .skip(1)
+            .map(|(_, hits)| hits.len() as u64)
+            .sum::<u64>();
+        result["total"] = json!(result["total"].as_u64().unwrap_or(0) + added);
+        result["hits"] = json!(hits);
         result["sources"] = json!(sources);
         Ok(if yaml {
             json!({"text": super::memory_search::yaml(&result)})
@@ -2947,6 +2989,96 @@ fn filter_pages(
     Ok((kept, note))
 }
 
+impl MemoryHost {
+    /// The project's conversations for `queries`, each variant searched as
+    /// `history_search` with scope project does and the rankings fused,
+    /// filtered as `arguments` say: a tree, meta or temporal filter leaves
+    /// every turn out (a turn has none of them), and grep reads a hit's text.
+    /// With a note when the journal's index had sessions left to catch up.
+    fn search_history(
+        &self,
+        queries: &[String],
+        limit: usize,
+        arguments: &Value,
+    ) -> Result<(Vec<Value>, Option<String>), String> {
+        let search = self
+            .history
+            .as_ref()
+            .ok_or("this conversation holds no project journal to search")?;
+        if queries.is_empty() {
+            return Err("history is searched by words: give a query".to_owned());
+        }
+        let given = |key: &str| arguments.get(key).is_some_and(|value| !value.is_null());
+        if ["tree", "meta", "meta_predicate", "temporal"]
+            .iter()
+            .any(|key| given(key))
+        {
+            return Ok((
+                Vec::new(),
+                Some("a conversation's turns have no tree, meta or temporal value, so those filters left every turn out".to_owned()),
+            ));
+        }
+        let pattern = optional_text(arguments, "grep")?
+            .map(super::memory_search::grep)
+            .transpose()?;
+        let mut found = std::collections::BTreeMap::<String, Value>::new();
+        let mut rankings = Vec::new();
+        let mut behind = 0;
+        let mut failure = None;
+        for query in queries.iter().take(1 + MAX_VARIANTS) {
+            let (hits, unindexed) = match search(query, limit) {
+                Ok(searched) => searched,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            };
+            behind = behind.max(unindexed);
+            let mut ranking = Vec::new();
+            for hit in hits {
+                if pattern.as_ref().is_some_and(|pattern| {
+                    !pattern.is_match(hit["preview"].as_str().unwrap_or_default())
+                }) {
+                    continue;
+                }
+                let key = hit["source_id"].as_str().unwrap_or_default().to_owned();
+                ranking.push((key.clone(), 0.0));
+                found.entry(key).or_insert(hit);
+            }
+            rankings.push(ranking);
+        }
+        if rankings.is_empty() {
+            return Err(failure.unwrap_or_else(|| "no query could be searched".to_owned()));
+        }
+        let select = super::memory_search::selected(arguments);
+        let hits = harness_types::search::weighted_rrf(
+            &rankings
+                .iter()
+                .map(|ranking| (ranking.as_slice(), 1.0))
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .take(limit)
+        .filter_map(|(key, _)| found.get(&key).cloned())
+        .map(|mut hit| {
+            hit["id"] = hit["source_id"].clone();
+            match &select {
+                Some(fields) => {
+                    let mut whole = hit.clone();
+                    whole["content"] = hit["preview"].clone();
+                    super::memory_search::select_fields(&whole, fields)
+                }
+                None => hit,
+            }
+        })
+        .collect::<Vec<_>>();
+        let note = (behind > 0).then(|| {
+            format!("{behind} session(s) of the journal were not indexed yet and were not searched; they are being caught up")
+        });
+        Ok((hits, note))
+    }
+}
+
 /// Where a knowledge page sits for a tree filter: `/knowledge/<scope>` and
 /// its folders.
 fn knowledge_tree(scope: &str, path: &str) -> String {
@@ -3462,7 +3594,7 @@ fn search_properties() -> serde_json::Map<String, Value> {
         "order_by":{"type":"string","enum":["asc","desc"],"description":"search by filters alone: oldest or newest (default) first."},
         "select":{"type":"array","items":{"type":"string"},"description":"search, read, history: only these fields of each hit or version: id, memory_id, name, scope, kind, title, tree, path, meta, meta.<key>, temporal, version, version_hash, content, content:N, content:M:N, content_length, score, created_at, updated_at, pinned."},
         "format":{"type":"string","enum":["json","compact","yaml"],"description":"search, read, history: the result as JSON (default) or YAML text."},
-        "sources":{"type":"array","items":{"type":"string","enum":["memory","knowledge"]},"description":"search: what to search, memory (default) and/or the knowledge libraries' pages; with both, one ranking of entries and pages, each hit naming its source."},
+        "sources":{"type":"array","items":{"type":"string","enum":["memory","knowledge","history"]},"description":"search: what to search, memory (default), the knowledge libraries' pages and/or history, the turns of this project's conversations as the journal keeps them (history_read reads a hit's source_id whole); with several, one ranking of entries, pages and turns, each hit naming its source."},
         "mode":{"type":"string","enum":["rank","readout"],"description":"search: rank (default) lists the best hits; readout reads every entry for the request into a few slots, each the entries that answer one part of it - for a request whose answer is spread over several entries."},
         "slots":{"type":"integer","minimum":1,"maximum":16,"description":"search, mode readout: at most this many slots (default 8)."},
         "as_of":{"type":"string","description":"search: what memory held at this time (\"2026-10-26\" or an RFC 3339 time): only the entries valid then and written by then, a corrected fact's old entry included. For a question about what was true before a correction."},
@@ -3749,11 +3881,45 @@ mod tests {
             workspace: None,
             off: false,
             features: super::super::memory_citations::Features::default(),
+            history: None,
         }
     }
 
     fn run(host: &MemoryHost, arguments: &Value) -> Result<Value, String> {
         host.execute(arguments)
+    }
+
+    /// The guidance says what memory is for and leaves the judgment to the
+    /// model: the occasions to write are examples, not the only triggers, and
+    /// a kept rule says how it is known to hold.
+    #[test]
+    fn the_guidance_says_what_memory_is_for_not_a_fixed_rule() {
+        for said in [
+            "cannot read off its environment",
+            "it is a prediction",
+            "you judge what is worth keeping",
+            "for example",
+            "a trap you hit",
+            "warning",
+            r#"verified "confirmed""#,
+            "verified_by",
+            r#""unverified""#,
+        ] {
+            assert!(GUIDANCE.contains(said), "missing {said:?}");
+        }
+        // The operational rules stay.
+        for kept in [
+            "Search before writing",
+            "supersedes",
+            "citations",
+            "Pin (pinned: true)",
+        ] {
+            assert!(GUIDANCE.contains(kept), "missing {kept:?}");
+        }
+        let knowledge = super::super::knowledge::GUIDANCE;
+        assert!(knowledge.contains("cannot find again by itself"));
+        assert!(knowledge.contains("you judge what is worth a page"));
+        assert!(!knowledge.contains("you must organize"));
     }
 
     #[test]
@@ -5166,6 +5332,112 @@ mod tests {
 
     /// `sources` with knowledge: one ranking of entries and pages, each hit
     /// naming where it came from.
+    /// `sources` naming history fuses the project's conversations (the
+    /// `history_search` hits, every variant searched) with memory in one
+    /// ranking; the memory filters a turn has no value for leave the turns
+    /// out; without a journal it says history was not searched; the default
+    /// stays memory alone.
+    #[test]
+    fn a_search_reads_history_with_memory_as_one_ranking() {
+        let directory = tempfile::tempdir().expect("dir");
+        let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&asked);
+        let journal: super::super::memory_search::HistorySearch = Arc::new(
+            move |query: &str, _limit: usize| {
+                seen.lock().expect("asked").push(query.to_owned());
+                Ok((
+                    vec![
+                        json!({"source_id": format!("src-{query}"), "kind": "user_input", "conversation": "task_earlier", "preview": format!("we chose {query} for the queue")}),
+                    ],
+                    1,
+                ))
+            },
+        );
+        let plain = host(directory.path());
+        run(
+            &plain,
+            &json!({"action":"write","scope":"global","title":"Queue","content":"The order queue runs on Redis Streams."}),
+        )
+        .expect("entry");
+        let missing = run(
+            &plain,
+            &json!({"action":"search","query":"redis queue","sources":["memory","history"]}),
+        )
+        .expect("search");
+        assert!(
+            missing["history"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("history was not searched"),
+            "{missing}"
+        );
+        let host = plain.with_history(journal);
+        let both = run(
+            &host,
+            &json!({"action":"search","query":"redis queue","queries":["kafka"],"sources":["memory","history"]}),
+        )
+        .expect("search");
+        let hits = both["hits"].as_array().expect("hits");
+        let sources = hits
+            .iter()
+            .map(|hit| hit["source"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert!(sources.contains(&"memory"), "{both}");
+        assert_eq!(
+            sources
+                .iter()
+                .filter(|source| **source == "history")
+                .count(),
+            2,
+            "{both}"
+        );
+        assert_eq!(*asked.lock().expect("asked"), ["redis queue", "kafka"]);
+        assert!(
+            hits.iter()
+                .any(|hit| hit["source_id"] == "src-kafka" && hit["id"] == "src-kafka")
+        );
+        assert!(
+            both["history"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not indexed yet")
+        );
+        let grepped = run(
+            &host,
+            &json!({"action":"search","query":"redis queue","sources":["history"],"grep":"chose kafka"}),
+        )
+        .expect("grep");
+        assert_eq!(
+            grepped["hits"].as_array().expect("hits").len(),
+            0,
+            "{grepped}"
+        );
+        let treed = run(
+            &host,
+            &json!({"action":"search","query":"redis queue","sources":["memory","history"],"tree":"/global"}),
+        )
+        .expect("tree");
+        assert!(
+            treed["hits"]
+                .as_array()
+                .expect("hits")
+                .iter()
+                .all(|hit| hit["source"] == "memory"),
+            "{treed}"
+        );
+        // The default is memory alone: the journal is not asked.
+        let before = asked.lock().expect("asked").len();
+        run(&host, &json!({"action":"search","query":"redis queue"})).expect("default");
+        assert_eq!(asked.lock().expect("asked").len(), before);
+        assert!(
+            run(
+                &host,
+                &json!({"action":"search","query":"redis","sources":["history"],"mode":"readout"})
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     #[allow(
         clippy::too_many_lines,
