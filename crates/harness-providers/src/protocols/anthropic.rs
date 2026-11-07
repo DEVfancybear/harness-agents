@@ -70,10 +70,57 @@ impl AnthropicMessagesAdapter {
     #[allow(clippy::too_many_lines)] // the Messages API body, field by field
     fn request_body(request: &ProviderRequest, thinking: Option<&crate::Thinking>) -> Value {
         let mut system = Vec::new();
-        let mut messages = Vec::new();
+        let mut messages: Vec<Value> = Vec::new();
+        // The calls of harness-issued messages folded into notes, by id: with
+        // thinking on, the API refuses a last assistant message that does not
+        // start with a signed thinking block, and no model response - so no
+        // signature - holds a call the harness ran from an action bank. The
+        // call and its result then go back as one note in the user message
+        // that holds the results before it, and the last assistant message
+        // stays the model's own.
+        let mut folded: BTreeMap<String, (String, String)> = BTreeMap::new();
         for message in request.messages.iter() {
             match message.role {
                 super::MessageRole::System => system.push(message.content.clone()),
+                super::MessageRole::Assistant if thinking.is_some() && message.harness_issued => {
+                    for call in &message.tool_calls {
+                        folded.insert(
+                            call.call_id.clone(),
+                            (call.name.clone(), call.arguments.clone()),
+                        );
+                    }
+                }
+                super::MessageRole::Tool
+                    if message
+                        .tool_call_id
+                        .as_deref()
+                        .is_some_and(|id| folded.contains_key(id)) =>
+                {
+                    let (name, arguments) = message
+                        .tool_call_id
+                        .as_deref()
+                        .and_then(|id| folded.get(id))
+                        .cloned()
+                        .unwrap_or_default();
+                    let block = json!({
+                        "type": "text",
+                        "text": format!(
+                            "{HARNESS_ISSUED_NOTE} {name} {arguments}\n{}",
+                            message.content
+                        ),
+                    });
+                    match messages.last_mut() {
+                        Some(last) if last["role"] == "user" => {
+                            if let Some(text) = last["content"].as_str().map(str::to_owned) {
+                                last["content"] = json!([{"type": "text", "text": text}]);
+                            }
+                            if let Some(blocks) = last["content"].as_array_mut() {
+                                blocks.push(block);
+                            }
+                        }
+                        _ => messages.push(json!({"role": "user", "content": [block]})),
+                    }
+                }
                 super::MessageRole::Tool => {
                     let block = json!({
                         "type": "tool_result",
@@ -198,6 +245,11 @@ impl AnthropicMessagesAdapter {
         body
     }
 }
+
+/// How a folded harness-issued call introduces itself: the call it was,
+/// written by the model in an earlier step and run by the harness.
+pub const HARNESS_ISSUED_NOTE: &str =
+    "[call from your action bank, run by the harness without a model step]";
 
 const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
@@ -727,6 +779,85 @@ mod tests {
             marks <= 4,
             "the API takes at most four breakpoints: {marks}"
         );
+    }
+
+    /// A step with a call the harness ran from an action bank: the model's
+    /// call, its result, then the harness-issued call and its result.
+    fn bank_transcript() -> crate::ProviderRequest {
+        crate::ProviderRequest::new(
+            harness_types::RequestId::generate(),
+            "claude-opus-5-5",
+            vec![
+                ProviderMessage::new(crate::MessageRole::User, "write and test"),
+                ProviderMessage::assistant_with_calls(
+                    "",
+                    vec![crate::ProviderToolCall::new(
+                        "call-a",
+                        "write_file",
+                        r#"{"path":"a.rs"}"#,
+                    )],
+                )
+                .with_reasoning(Some(crate::Reasoning {
+                    text: "plan".to_owned(),
+                    signature: Some("sig-1".to_owned()),
+                })),
+                ProviderMessage::tool_result("call-a", "wrote a.rs"),
+                ProviderMessage::assistant_with_calls(
+                    "",
+                    vec![crate::ProviderToolCall::new(
+                        "bank-n1",
+                        "run_process",
+                        r#"{"command":"cargo test"}"#,
+                    )],
+                )
+                .issued_by_harness(),
+                ProviderMessage::tool_result("bank-n1", "test result: ok"),
+            ],
+        )
+    }
+
+    /// With thinking on, the last assistant message must be the model's own,
+    /// with its signed thinking block first: the harness-issued call and its
+    /// result go back as a note after the results before it.
+    #[test]
+    fn a_harness_issued_call_is_folded_into_a_note_when_thinking_is_on() {
+        let thinking = crate::Thinking {
+            level: crate::ThinkingLevel::High,
+            format: crate::ThinkingFormat::Anthropic,
+            model: None,
+        };
+        let body = AnthropicMessagesAdapter::request_body(&bank_transcript(), Some(&thinking));
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 3, "{body:#}");
+        let last_assistant = messages
+            .iter()
+            .rfind(|message| message["role"] == "assistant")
+            .expect("assistant");
+        assert_eq!(last_assistant["content"][0]["type"], "thinking", "{body:#}");
+        let results = messages[2]["content"].as_array().expect("blocks");
+        assert_eq!(results[0]["type"], "tool_result", "{body:#}");
+        assert_eq!(results[0]["tool_use_id"], "call-a");
+        assert_eq!(results[1]["type"], "text", "{body:#}");
+        let note = results[1]["text"].as_str().unwrap_or_default();
+        assert!(note.starts_with(super::HARNESS_ISSUED_NOTE), "{note}");
+        assert!(note.contains("cargo test") && note.contains("test result: ok"));
+        assert!(
+            !body.to_string().contains("bank-n1"),
+            "no orphan id: {body:#}"
+        );
+    }
+
+    /// Without thinking the harness-issued call goes back as a call, as if
+    /// the model had made it.
+    #[test]
+    fn a_harness_issued_call_stays_a_call_without_thinking() {
+        let body = AnthropicMessagesAdapter::request_body(&bank_transcript(), None);
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 5, "{body:#}");
+        assert_eq!(messages[3]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[3]["content"][0]["id"], "bank-n1");
+        assert_eq!(messages[4]["content"][0]["tool_use_id"], "bank-n1");
+        crate::validate_transcript(&bank_transcript().messages).expect("valid transcript");
     }
 
     fn adapter(endpoint: String) -> AnthropicMessagesAdapter {
