@@ -68,8 +68,8 @@ EOF
 }
 
 echo "################ 1. the user states a fact"
-(cd "$P" && "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto --output-format json \
-  "For this test only: our staging database listens on port 6543, not on 5432. Do not save anything to memory or knowledge and call no tool; just answer with the one word OK." \
+SAID="Our staging database listens on port 6543, not on 5432. Do not save anything to memory or knowledge and call no tool; just answer with the one word OK."
+(cd "$P" && "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto --output-format json "$SAID" \
   >"$RX/d1.json" 2>"$RX/d1.err")
 TASK=$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1],encoding='utf-8'))['task_id'])" "$RX/d1.json" | tr -d '\r')
 echo "   conversation: $TASK"
@@ -108,7 +108,7 @@ for number, fact in enumerate(["The office printer is on the third floor.", "Lun
                                "The coffee machine takes tokens."], start=1):
     memory[f"scratch_{number}"] = entry(f"scratch_{number}", f"Note {number}", fact, "scratch")
 steps = [f"Step {n}: run release check {n} and write its result to the release log." for n in range(1, 13)]
-steps[8] = f"Step 9: sign the release zip with the key named {token} and write its result to the release log."
+steps[8] = f"Step 9: post the release notes to the chat channel named {token} and write its result to the release log."
 memory["release"] = entry("release", "Release procedure", " ".join(steps), "ops")
 memory["theory"] = entry("theory", "Cache theory", "The slow page loads may come from the image cache.", "perf",
     metadata={"pinned": True, "verified": "unverified"})
@@ -152,15 +152,15 @@ check "dream.md was honoured: the scratch notes are gone" '! "$PY" "$MEMORY_STOR
 page=$(entry release "e['content']" | sed -n 's/.*(details: global knowledge \(.*\.md\)).*/\1/p')
 echo "   release: $(entry release "e['content']")"
 check "the procedure was demoted: a short entry with a pointer" '[ -n "$page" ] && [ "$(entry release "len(e[\"content\"])")" -le 180 ] && ! entry release "e[\"content\"]" | grep -q "$TOKEN"'
-check "the page holds the procedure word for word" '[ -n "$page" ] && grep -q "Step 9: sign the release zip with the key named $TOKEN" "$D/knowledge/$page"'
+check "the page holds the procedure word for word" '[ -n "$page" ] && grep -q "Step 9: post the release notes to the chat channel named $TOKEN" "$D/knowledge/$page"'
 check "the pinned theory is still pinned and unverified" '[ "$(entry theory "e.get(\"metadata\", {}).get(\"pinned\")")" = True ] && [ "$(entry theory "e[\"metadata\"].get(\"verified\")")" = unverified ]'
 "$HA" shutdown --force >/dev/null 2>&1
 
 echo "################ 4. the next turn: the short entry, and the detail read from the page"
 export HA_AUTO_REFINE=off
 agent "$P" d3
-say d3 "In our release procedure, which key signs the release zip in step 9? Look it up and answer with the key's name only." | tail -3
-R=$(request "which key signs the release zip in step 9")
+say d3 "In our release procedure, which chat channel gets the release notes in step 9? Look it up and answer with the channel's name only." | tail -3
+R=$(request "which chat channel gets the release notes in step 9")
 check "the request carries the short entry with its pointer" 'printf "%s" "$R" | grep -q "(details: global knowledge"'
 check "the request does not carry the detail" '! printf "%s" "$R" | grep -q "$TOKEN"'
 check "the agent answers from the page" 'last | grep -q "$TOKEN"'
