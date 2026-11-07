@@ -109,7 +109,7 @@ The triggers are the ones ha had; each writes a job and then runs the due ones.
   job per knowledge library (`wiki:<library directory>`) when the library
   changed since its last pass, has work for one, and a review wrote a page
   since or a day passed. A library that is no longer due forgets its job that
-  gave up. Its first wait after a failure is an hour, as for Deep Dream.
+  gave up; one still due forgets it a day after it gave up, and the pass is tried afresh. Its first wait after a failure is an hour, as for Deep Dream.
 
 The learning loop's meditation already claimed itself for an hour and marked
 itself only after success; it is not in the queue.

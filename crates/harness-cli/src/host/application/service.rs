@@ -7882,13 +7882,22 @@ pub(super) async fn tend_wiki(
         host.libraries()
             .into_iter()
             .filter_map(|library| {
-                let trigger = super::knowledge::wiki::due(&library.store, &library.root, &sources);
-                if trigger.is_none() {
-                    super::sleep::forget_given_up(
-                        &data,
-                        &super::sleep::Job::wiki(&library.root, "due").key,
-                    );
-                }
+                let trigger = super::knowledge::wiki::due(
+                    &library.store,
+                    &library.root,
+                    &sources.for_scope(library.scope),
+                );
+                // No longer due, its job that gave up is forgotten; still
+                // due, it is forgotten after a cool-off and tried afresh.
+                super::sleep::forget_given_up_after(
+                    &data,
+                    &super::sleep::Job::wiki(&library.root, "due").key,
+                    if trigger.is_none() {
+                        std::time::Duration::ZERO
+                    } else {
+                        super::knowledge::wiki::GIVE_UP_COOL_OFF
+                    },
+                );
                 trigger.map(|trigger| (library, trigger))
             })
             .collect::<Vec<_>>()
@@ -7904,7 +7913,7 @@ pub(super) async fn tend_wiki(
         let provider = Arc::clone(provider);
         let model = model.to_owned();
         let sender = sender.clone();
-        let sources = knowledge.sources();
+        let sources = knowledge.sources().for_scope(library.scope);
         let _ = sender.send(SessionEvent::Notice {
             message: format!(
                 "knowledge: tending the {} library as a wiki in the background",

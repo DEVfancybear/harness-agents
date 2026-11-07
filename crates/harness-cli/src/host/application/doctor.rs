@@ -433,6 +433,13 @@ fn state(root: &Path, facts: &Facts) -> Subsystem {
 /// exist, the first ones named, and its size against the sources it
 /// summarizes. Nothing is said of an empty or disabled library.
 fn knowledge(facts: &Facts, subsystem: &mut Subsystem) {
+    use super::memory_switch::Feature;
+    // The wiki pass runs only while knowledge and the background passes do.
+    let fix = if facts.memory.on(Feature::Knowledge) && facts.memory.on(Feature::Reviews) {
+        "write the missing page or fix the link; the wiki pass repoints or fills them in the background"
+    } else {
+        "write the missing page or fix the link; the wiki pass is off while memory's knowledge or reviews are (HA_MEMORY, HA_MEMORY_OFF)"
+    };
     for library in facts
         .knowledge
         .iter()
@@ -455,9 +462,13 @@ fn knowledge(facts: &Facts, subsystem: &mut Subsystem) {
                     library.scope,
                     library.dangling,
                     library.dangling_first.join("; "),
-                    if library.dangling > library.dangling_first.len() { "; ..." } else { "" }
+                    if library.dangling > library.dangling_first.len() {
+                        "; ..."
+                    } else {
+                        ""
+                    }
                 ),
-                "write the missing page or fix the link; the wiki pass repoints or fills them in the background",
+                fix,
             );
         }
     }
@@ -782,6 +793,44 @@ pub fn json(subsystems: &[Subsystem]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{Facts, Level, audit, broken_links, lines};
+
+    /// A library's dangling links are named, and the fix says the wiki pass
+    /// tends them only while it runs: not with memory's knowledge off.
+    #[test]
+    fn dangling_links_name_the_wiki_pass_only_while_it_runs() {
+        let library = super::super::knowledge::Health {
+            scope: "project",
+            enabled: true,
+            pages: 3,
+            dangling: 1,
+            dangling_first: vec!["a.md -> gone.md".to_owned()],
+            size: None,
+        };
+        let fix = |memory: super::super::memory_switch::Switch| {
+            let facts = Facts {
+                knowledge: vec![library.clone()],
+                memory,
+                ..Facts::default()
+            };
+            let mut subsystem = super::Subsystem {
+                name: "State",
+                findings: Vec::new(),
+            };
+            super::knowledge(&facts, &mut subsystem);
+            assert!(subsystem.findings[0].text.contains("a.md -> gone.md"));
+            subsystem.findings[0].fix.clone().unwrap_or_default()
+        };
+        assert!(
+            fix(super::super::memory_switch::Switch::default()).contains("repoints or fills them")
+        );
+        let off = fix(super::super::memory_switch::Switch::from_values(
+            None,
+            Some("knowledge"),
+            None,
+        ));
+        assert!(off.contains("is off"), "{off}");
+        assert!(!off.contains("repoints"), "{off}");
+    }
 
     #[test]
     fn a_bare_directory_fails_where_the_course_says_it_must_not() {

@@ -792,9 +792,25 @@ impl Claimed {
 /// due, so it succeeded another way, `/refine --curate` say), and the
 /// doctor's warning goes with it.
 pub fn forget_given_up(data_dir: &Path, key: &str) {
+    forget_given_up_after(data_dir, key, Duration::ZERO);
+}
+
+/// [`forget_given_up`] once the job gave up at least `age` ago (when its file
+/// was last written): a pass still due after its cool-off is owed afresh,
+/// as the wiki pass of a library that keeps its work. A job that gave up was
+/// otherwise never tried again while its pass stayed due.
+pub fn forget_given_up_after(data_dir: &Path, key: &str, age: Duration) {
     let given_up = jobs(data_dir)
         .into_iter()
         .filter(|job| job.key == key && job.gave_up)
+        .filter(|job| {
+            age.is_zero()
+                || std::fs::metadata(job_path(data_dir, &job.id))
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|elapsed| elapsed >= age)
+        })
         .collect::<Vec<_>>();
     if given_up.is_empty() {
         return;
@@ -1288,6 +1304,31 @@ mod tests {
         super::save(data, &job).expect("gave up");
         super::forget_given_up(data, "evolution");
         assert!(jobs(data).is_empty());
+    }
+
+    /// A pass still due forgets its job that gave up only after a cool-off,
+    /// counted from when the job gave up: the wiki pass of a library that
+    /// keeps its work was otherwise never tried again.
+    #[test]
+    fn a_job_that_gave_up_is_forgotten_after_its_cool_off() {
+        let directory = tempfile::tempdir().expect("dir");
+        let data = directory.path();
+        let mut job = Job::wiki(std::path::Path::new("lib"), "due");
+        job.id = "wiki-1".to_owned();
+        job.gave_up = true;
+        super::save(data, &job).expect("gave up");
+        let day = std::time::Duration::from_hours(24);
+        super::forget_given_up_after(data, &job.key, day);
+        assert_eq!(jobs(data).len(), 1, "it just gave up");
+        let file = std::fs::File::options()
+            .write(true)
+            .open(super::job_path(data, &job.id))
+            .expect("job file");
+        file.set_modified(std::time::SystemTime::now() - 2 * day)
+            .expect("backdate");
+        drop(file);
+        super::forget_given_up_after(data, &job.key, day);
+        assert!(jobs(data).is_empty(), "a day later it is forgotten");
     }
 
     /// The wiki pass is a job of its library: asked for again it is one job,

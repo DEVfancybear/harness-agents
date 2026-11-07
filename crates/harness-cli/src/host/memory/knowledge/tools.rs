@@ -117,7 +117,9 @@ impl KnowledgeHost {
                     dangling_first: stats.dangling_first,
                     size: stats
                         .enabled
-                        .then(|| super::wiki::size(&library.store, &sources))
+                        .then(|| {
+                            super::wiki::size(&library.store, &sources.for_scope(library.scope))
+                        })
                         .flatten(),
                 })
             })
@@ -771,7 +773,7 @@ impl KnowledgeHost {
                     // The library against what it summarizes, as the wiki
                     // pass keeps it (`wiki::MAX_SIZE_RATIO`).
                     let size = if stats.enabled && stats.pages > 0 {
-                        super::wiki::size(&store, &sources)
+                        super::wiki::size(&store, &sources.for_scope(scope.label()))
                             .map(|size| format!("; {}", size.describe()))
                             .unwrap_or_default()
                     } else {

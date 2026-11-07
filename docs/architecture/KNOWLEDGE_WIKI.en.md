@@ -57,9 +57,9 @@ only while the automatic review runs (`autoRefine`, `/refinements`, the
 | Dangling links | the store, with the existing pages whose words come closest to each missing page's name (a store search on its file name) |
 | Two pages on one subject | the store's same-subject check, pairwise: most of one page's title and summary words, weighted by rarity, are the other's (`SAME_SUBJECT_SHARE`, 0.7), at most six pairs |
 | An index | more than `INDEX_MIN_PAGES` (12) pages and no page that links to 60% of the others |
-| Claims to check | pages whose source is a workspace file (a path in the workspace, `:line` allowed) or a conversation of the project (a conversation id in the source), not checked since the page or the source last changed; at most four, the newest first, each source cut at 12,000 characters |
+| Claims to check | pages whose source is a workspace file (a path in the workspace, `:line` allowed) or a conversation of the project (a conversation id in the source), not checked since the page or the source last changed; at most four, the newest first, each source cut at 12,000 characters. A protected path (`.env`, `.git`, `.harness`, a key, a name with `secret`, `credential` or `password` in it, as the file tools refuse them) and a file Git ignores are never sources: their text would go to the model. The global library, shared by every project, reads no path relative to this workspace: only an absolute path into it, or a conversation |
 
-Everything it reads is data, not instructions: the curator's prompt says so,
+The catalog (at most 30,000 characters, then how many pages it left out) and the dangling links (at most 8,000) count against the same budget. A check is marked done only when its page and its source were in the prompt; one the budget left out waits for a later pass. Everything it reads is data, not instructions: the curator's prompt says so,
 and the host checks each edit it proposes before applying it.
 
 **What it may do** - one JSON list of at most twelve edits, each applied
@@ -73,8 +73,8 @@ wiki's (`cause` and `actor` `wiki`, the log's line `by wiki`):
 | `unlink` a dangling link, its label kept | the link is a dangling link of the page |
 | `create` the missing page | its path is a missing page a link points to; it names the pages it is written from, and those hold at least 80% of its word weight (`CREATE_SUPPORT`); its sources are theirs and it relates to them |
 | `merge` two pages | the pair is one the same-subject check found; the merged text keeps at least 80% of each page's word weight (`MERGE_KEEP`); the host joins their sources and related pages, points every page that linked to the absorbed one at the kept one, and deletes the absorbed one (its history keeps it, so `revert` brings it back) |
-| `index` | asked for; headings and `- [Title](path)` lines only; a link to a page that is not there is left out, pages it left out are listed at its end, and an index that leaves out more than a fifth of the pages is refused; written at `topics.md` (a page of the user's own there is never touched) |
-| `fix` a claim | the source is one of the page's sources and readable; the quote is in it word for word (whitespace and case aside, at least 8 characters); the text the fix replaces occurs once in the page; at least 80% of the word weight the fix brings in is the quote's (`FIX_SUPPORT`) |
+| `index` | asked for; nothing that looks like a secret; headings of at most 120 characters and `- [Title](path)` lines only; a link to a page that is not there is left out, pages it left out are listed at its end, and an index that leaves out more than a fifth of the pages is refused; written at `topics.md` (a page of the user's own there is never touched) |
+| `fix` a claim | the source is one of the page's sources and readable; the quote is in it word for word (whitespace and case aside, at least 8 characters); it has a replacement; the text it replaces occurs once in the page and is at most a quarter of the page's prose and 2,000 characters (a fix corrects a claim, it does not rewrite the page); at least 80% of the word weight the fix brings in is the quote's (`FIX_SUPPORT`) |
 
 Word weights are token statistics: `harness::query_terms` over folded text, a
 word weighed by how few pages hold it (a smoothed IDF). No word list judges
