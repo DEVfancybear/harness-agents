@@ -2,7 +2,7 @@
 # The jev plugin with a real model and TypeSafe's real Jev (a TypeSafe key in
 # HA_CREDENTIALS_DIR's credential file, `typesafe`, or TYPESAFE_API_KEY):
 #   1. off by default: /jev status says so and no turn has the jev tool;
-#   2. /jev on: the status lists the nine harness decisions;
+#   2. /jev on: the status lists the ten harness decisions;
 #   3. the agent's workflow (jev-fraud): the jev tool judges a batch of emails,
 #      decides the confident ones and hands the rest back for review;
 #   4. the command guard judges a plain command and lets it run (its refusal
@@ -121,7 +121,7 @@ check "a turn has no jev tool while the plugin is off" 'last | grep -q "KHONG-JE
 echo "################ 2. /jev on"
 "$HA" send j1 "/jev on" --wait >/dev/null 2>&1
 sleep 3
-check "/jev on reports the plugin on with its nine decisions" 'records jev | grep -q "^status decisions=9 enabled=True"'
+check "/jev on reports the plugin on with its ten decisions" 'records jev | grep -q "^status decisions=10 enabled=True"'
 check "/jev on saved jev.enabled" 'grep -q "\"enabled\": *true" "$HA_HOME/settings.json"'
 "$HA" shutdown --force >/dev/null 2>&1
 

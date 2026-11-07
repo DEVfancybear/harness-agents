@@ -120,7 +120,7 @@ Ba nguyên tắc chung cho cả chín điểm:
 
 Quyết định 3, 6 và 7 cũng áp cho lượt của child, giống như lượt gốc.
 
-Khi plugin bật, cả chín quyết định đều bật, trừ những cái bạn tắt riêng.
+Khi plugin bật, cả mười quyết định đều bật, trừ những cái bạn tắt riêng.
 
 Mỗi quyết định có ngưỡng riêng `jev.thresholds.<quyết định>`. TypeSafe khuyên đặt ngưỡng theo
 cái giá của một câu trả lời sai.
