@@ -24,6 +24,7 @@ app riêng được phát hành.
 | Lessons from corrections and wrong assumptions, `ha learning` / Bài học từ lời sửa và giả định sai, `ha learning` | [Learning loop (EN)](architecture/LEARNING_LOOP.en.md) · [Vòng học (VI)](architecture/LEARNING_LOOP.vi.md) |
 | Background memory passes as a durable queue: reviews, Deep Dream, evolution / Các lượt memory chạy nền thành hàng đợi bền: review, Deep Dream, tiến hoá | [Sleep (EN)](architecture/SLEEP.en.md) · [Sleep (VI)](architecture/SLEEP.vi.md) |
 | Scoring a finished turn on five quality axes, `/self-eval` / Chấm một lượt đã xong trên năm trục chất lượng, `/self-eval` | [Self-evaluation (EN)](architecture/SELF_EVALUATION.en.md) · [Tự đánh giá (VI)](architecture/SELF_EVALUATION.vi.md) |
+| Calls the model already decided, run without a model step, `/bank` / Các lệnh model đã quyết định xong, chạy không cần một bước model, `/bank` | [Action bank (EN)](architecture/ACTION_BANK.en.md) · [Action bank (VI)](architecture/ACTION_BANK.vi.md) |
 | What a command or file write may never do / Những gì một lệnh hay lần ghi file không được làm | [Guards (EN)](architecture/GUARDS.en.md) · [Guard (VI)](architecture/GUARDS.vi.md) |
 | Skills, extensions and MCP / Skill, extension và MCP | [Plugin architecture (EN)](architecture/PLUGIN_ARCHITECTURE.en.md) · [Kiến trúc plugin (VI)](architecture/PLUGIN_ARCHITECTURE.vi.md) |
 | Isolation limits and measured support / Giới hạn cô lập và hỗ trợ đã đo | [Strict execution support](support/STRICT_EXECUTION_SUPPORT.vi.md) |
