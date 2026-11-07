@@ -608,7 +608,10 @@ pub fn write_page(
     key: &str,
 ) -> Result<Value, String> {
     let path = page["path"].as_str().map(str::trim).unwrap_or_default();
-    if path.is_empty() || !path.ends_with(".md") {
+    let markdown = Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
+    if path.is_empty() || !markdown {
         return Err("a demote names its page: `page.path`, a Markdown path such as concepts/release-steps.md".to_owned());
     }
     if path.chars().count() > DEMOTE_PATH_CHARS {

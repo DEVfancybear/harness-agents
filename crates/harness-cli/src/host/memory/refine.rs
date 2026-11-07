@@ -2834,10 +2834,10 @@ fn settle_verified(metadata: &mut Value, edit: &Edit, before: &Value) {
         *metadata = json!({});
     }
     let valid = |value: &Value| matches!(value.as_str(), Some("confirmed" | "unverified"));
-    if metadata.get("verified").is_some_and(|value| !valid(value)) {
-        if let Some(fields) = metadata.as_object_mut() {
-            fields.remove("verified");
-        }
+    if metadata.get("verified").is_some_and(|value| !valid(value))
+        && let Some(fields) = metadata.as_object_mut()
+    {
+        fields.remove("verified");
     }
     let says = given.is_some_and(|given| given.contains_key("verified"));
     if !says && !edit.0.contains_key(CORRECTS) && valid(&before["metadata"]["verified"]) {
@@ -2845,11 +2845,12 @@ fn settle_verified(metadata: &mut Value, edit: &Edit, before: &Value) {
         if before["metadata"]["verified_by"].is_string() {
             metadata["verified_by"] = before["metadata"]["verified_by"].clone();
         }
-    } else if !says && edit.0.contains_key(CORRECTS) {
-        if let Some(fields) = metadata.as_object_mut() {
-            fields.remove("verified");
-            fields.remove("verified_by");
-        }
+    } else if !says
+        && edit.0.contains_key(CORRECTS)
+        && let Some(fields) = metadata.as_object_mut()
+    {
+        fields.remove("verified");
+        fields.remove("verified_by");
     }
     let low = edit
         .text("confidence")
@@ -5093,6 +5094,10 @@ const CORRECTION_EVIDENCE_REFUSAL: &str = "a correction's evidence must be a spa
 ///   entry's excerpt; otherwise it is dropped, and the record says so.
 ///
 /// A refusal is marked on the edit ([`DREAM_REFUSAL`]); [`apply`] records it.
+#[allow(
+    clippy::too_many_lines,
+    reason = "each check in the order the curator's edits meet it"
+)]
 fn dream_edits(proposal: &mut Proposal, baseline: &Value) {
     /// The longest quote a correction's record keeps.
     const EVIDENCE_CHARS: usize = 300;
@@ -5215,27 +5220,24 @@ fn dream_edits(proposal: &mut Proposal, baseline: &Value) {
         let Some(metadata) = edit.0.get_mut("metadata").and_then(Value::as_object_mut) else {
             continue;
         };
-        match shown {
-            Some(conversation) => {
-                if metadata
-                    .get("verified_by")
-                    .and_then(Value::as_str)
-                    .is_none_or(|by| by.trim().is_empty())
-                {
-                    metadata.insert(
-                        "verified_by".to_owned(),
-                        json!(format!("transcript {conversation}")),
-                    );
-                }
-            }
-            None => {
-                metadata.remove("verified");
-                metadata.remove("verified_by");
-                edit.0.insert(
-                    VERIFIED_DROPPED.to_owned(),
-                    json!("verified: confirmed needs a span of the entry's transcript excerpt that shows the check as its evidence; none was given, so how it is known is unchanged"),
+        if let Some(conversation) = shown {
+            if metadata
+                .get("verified_by")
+                .and_then(Value::as_str)
+                .is_none_or(|by| by.trim().is_empty())
+            {
+                metadata.insert(
+                    "verified_by".to_owned(),
+                    json!(format!("transcript {conversation}")),
                 );
             }
+        } else {
+            metadata.remove("verified");
+            metadata.remove("verified_by");
+            edit.0.insert(
+                VERIFIED_DROPPED.to_owned(),
+                json!("verified: confirmed needs a span of the entry's transcript excerpt that shows the check as its evidence; none was given, so how it is known is unchanged"),
+            );
         }
     }
 }
@@ -5461,6 +5463,7 @@ const BATCH_KEYS_RECORDED: usize = 64;
 /// entry; and the knowledge library, while it is on.
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the pass, its scope and what it reaches"
 )]
 async fn consolidate_scope(
@@ -6765,6 +6768,7 @@ mod tests {
     /// kept pinned, a skill edit refused as not the curator's to make - all
     /// recorded as one refinement a rollback undoes.
     #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "one pass, checked step by step")]
     async fn the_global_memory_is_consolidated_validated_and_reversible() {
         let directory = tempfile::tempdir().expect("dir");
         let scopes = scopes(directory.path());
@@ -9396,7 +9400,7 @@ Run `node scripts/build.js`.
     }
 
     /// A global memory past the consolidation's floor, with `extra` entries.
-    fn dream_memory(scopes: &HarnessScopes, extra: serde_json::Value) {
+    fn dream_memory(scopes: &HarnessScopes, extra: &serde_json::Value) {
         let mut memory = serde_json::Map::new();
         for number in 0..super::CONSOLIDATE_MIN_ENTRIES {
             memory.insert(
@@ -9432,6 +9436,7 @@ Run `node scripts/build.js`.
     /// shown, or corrects an entry with no turns, is refused; a check is
     /// confirmed only by the turns that show it.
     #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "one pass, checked step by step")]
     async fn deep_dream_corrects_a_note_against_its_transcript() {
         let directory = tempfile::tempdir().expect("dir");
         let scopes = dream_scopes(directory.path());
@@ -9449,7 +9454,7 @@ Run `node scripts/build.js`.
         );
         dream_memory(
             &scopes,
-            json!({
+            &json!({
                 "db_port": {"id": "db_port", "kind": "memory", "title": "Staging database port", "content": "The staging database runs on port 5432.", "version": 1,
                     "origin": {"via": "refine", "refinement": "refine_0", "conversation": "task_a", "evidence": "Our staging database runs on port", "kind": "user"}},
                 "billing": {"id": "billing", "kind": "memory", "title": "Billing tests", "content": "The billing tests pass with cargo test billing.", "version": 1,
@@ -9574,7 +9579,7 @@ Run `node scripts/build.js`.
         );
         dream_memory(
             &scopes,
-            json!({"db_port": {"id": "db_port", "kind": "memory", "title": "Staging database port", "content": "The staging database runs on port 5432.", "version": 1,
+            &json!({"db_port": {"id": "db_port", "kind": "memory", "title": "Staging database port", "content": "The staging database runs on port 5432.", "version": 1,
                 "origin": {"via": "refine", "conversation": "task_a", "evidence": "staging database runs on port"}}}),
         );
         let reply = json!({"summary": "s", "rationale": "r", "expectedOutcome": "", "edits": [
@@ -9623,7 +9628,7 @@ Run `node scripts/build.js`.
         );
         dream_memory(
             &scopes,
-            json!({"db_port": {"id": "db_port", "kind": "memory", "title": "Staging database port", "content": "The staging database runs on port 5432.", "version": 1,
+            &json!({"db_port": {"id": "db_port", "kind": "memory", "title": "Staging database port", "content": "The staging database runs on port 5432.", "version": 1,
                 "metadata": {"pinned": true},
                 "origin": {"via": "refine", "conversation": "task_a", "evidence": "the staging database"}}}),
         );
@@ -9676,6 +9681,7 @@ Run `node scripts/build.js`.
     /// rollback deletes the page and puts the entry back. With knowledge
     /// off, or for a pinned entry, nothing moves.
     #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "one pass, checked step by step")]
     async fn deep_dream_demotes_a_long_entry_to_a_page_with_a_pointer() {
         let directory = tempfile::tempdir().expect("dir");
         let scopes = dream_scopes(directory.path());
@@ -9686,7 +9692,7 @@ Run `node scripts/build.js`.
         assert!(steps.chars().count() >= super::dream::DEMOTE_MIN_CHARS);
         dream_memory(
             &scopes,
-            json!({
+            &json!({
                 "release": {"id": "release", "kind": "memory", "title": "Release procedure", "content": steps, "version": 1},
                 "rule": {"id": "rule", "kind": "memory", "title": "Release rule", "content": steps, "version": 1, "metadata": {"pinned": true}},
             }),
@@ -9700,7 +9706,7 @@ Run `node scripts/build.js`.
         .to_string();
         // Knowledge off: no demote is offered, and none is made.
         let off: std::sync::Arc<dyn harness_providers::ModelProvider> =
-            Replies::new(&[reply.clone()]);
+            Replies::new(std::slice::from_ref(&reply));
         let refused = super::consolidate_memory(&off, "m", &scopes, &super::Dream::default())
             .await
             .expect("consolidated");
@@ -9799,7 +9805,7 @@ Run `node scripts/build.js`.
     async fn the_automatic_passes_follow_the_users_dream_md() {
         let directory = tempfile::tempdir().expect("dir");
         let scopes = dream_scopes(directory.path());
-        dream_memory(&scopes, json!({}));
+        dream_memory(&scopes, &json!({}));
         std::fs::write(
             scopes.global.join(super::dream::DREAM_FILE),
             "Keep every contract term word for word.",
@@ -9807,7 +9813,7 @@ Run `node scripts/build.js`.
         .expect("dream.md");
         let empty = json!({"summary": "s", "rationale": "r", "expectedOutcome": "", "edits": []})
             .to_string();
-        let replies = Replies::new(&[empty.clone()]);
+        let replies = Replies::new(std::slice::from_ref(&empty));
         let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = replies.clone();
         super::consolidate_memory(&provider, "m", &scopes, &super::Dream::default())
             .await
