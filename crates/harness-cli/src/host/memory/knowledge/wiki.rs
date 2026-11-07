@@ -88,7 +88,7 @@ const DANGLING_CHARS: usize = 8_000;
 
 /// How long a wiki job that gave up waits before it is forgotten and the
 /// library, still due, is tried afresh.
-pub const GIVE_UP_COOL_OFF: std::time::Duration = std::time::Duration::from_secs(86_400);
+pub const GIVE_UP_COOL_OFF: std::time::Duration = std::time::Duration::from_hours(24);
 
 /// The most characters a fix replaces, and the most of a page's prose: a fix
 /// corrects a claim, it does not rewrite the page.
@@ -335,7 +335,7 @@ fn ignored(root: &Path, file: &Path) -> bool {
             folders.push(folder.clone());
         }
     }
-    let mut matched = false;
+    let mut is_ignored = false;
     for (index, folder) in folders.iter().enumerate() {
         let mut builder = ignore::gitignore::GitignoreBuilder::new(folder);
         let mut any = false;
@@ -354,12 +354,12 @@ fn ignored(root: &Path, file: &Path) -> bool {
             continue;
         };
         match matcher.matched_path_or_any_parents(file, false) {
-            ignore::Match::Ignore(_) => matched = true,
-            ignore::Match::Whitelist(_) => matched = false,
+            ignore::Match::Ignore(_) => is_ignored = true,
+            ignore::Match::Whitelist(_) => is_ignored = false,
             ignore::Match::None => {}
         }
     }
-    matched
+    is_ignored
 }
 
 /// Sources read once per pass.

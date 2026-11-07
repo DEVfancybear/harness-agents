@@ -1317,7 +1317,7 @@ mod tests {
         job.id = "wiki-1".to_owned();
         job.gave_up = true;
         super::save(data, &job).expect("gave up");
-        let day = std::time::Duration::from_secs(86_400);
+        let day = std::time::Duration::from_hours(24);
         super::forget_given_up_after(data, &job.key, day);
         assert_eq!(jobs(data).len(), 1, "it just gave up");
         let file = std::fs::File::options()
