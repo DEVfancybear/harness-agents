@@ -65,13 +65,13 @@ Workspace có mười một crate.
 
 | Crate | Sở hữu | Không sở hữu |
 |---|---|---|
-| `harness-types` | ID dùng chung, error code, event/receipt contracts, store port, scope và workspace types, schema và quy ước serialization | Business orchestration, provider calls, policy mutation SQL |
+| `harness-types` | ID dùng chung, error code, event/receipt contracts, store port, scope và workspace types, schema và quy ước serialization; diagnostics sink mà mọi crate dùng để báo cáo (`diag.rs`), tìm kiếm theo từ và BM25 dùng chung cho các tool tìm kiếm (`search.rs`) và memory readout MEMORILLA (`readout.rs`) | Business orchestration, provider calls, policy mutation SQL |
 | `harness-kernel` | Validate plugin graph trong process, service requirements, scoped registration, service lease và shutdown theo thứ tự | Sandbox native code, input admission, provider state |
 | `harness-store-sqlite` | Quy tắc mở SQLite và single-writer lock/fence, migrations, transactions, durable records (run, step, budget, question, tool intent/approval, delegation, tombstone), backend leases, journal index rebuild được và notes, artifacts | Model context policy, terminal rendering, tool/process tùy ý |
 | `harness-session` | Atomic input admission, instruction ledger, projections, snapshots, recovery views xác định được và context builder (context block có kiểu, có channel) | Model classification, process execution, UI state |
 | `harness-providers` | Provider request/response types, mock provider, adapter OpenAI Chat, OpenAI Responses (API và backend ChatGPT Codex) và Anthropic Messages, giải mã SSE, thinking level, parse rate-limit, trường prompt-cache trong request | Session mutation, tool approval, ghi workspace |
 | `harness-runtime` | Run state machine, budgets, frozen requests, provider attempts, human input, đánh giá goal, compaction, fork/rollback/resume hội thoại, run inbox, import/export session file | Terminal UI trực tiếp, filesystem/process effects tùy ý |
-| `harness-tools` | Coding-tool descriptors, canonicalization, path policy và approval mode, durable intents/receipts, adapter filesystem/Git/process, turn driver model-tool-model có giới hạn, hooks, destructive-git guard và strict-execution capability probes | Model selection, terminal widgets, cross-session extraction |
+| `harness-tools` | Coding-tool descriptors, canonicalization, path policy và approval mode, durable intents/receipts, adapter filesystem/Git/process, turn driver model-tool-model có giới hạn, hooks, destructive-git guard, guard cho lệnh và che giá trị bí mật (`security/command_guard.rs`, `secret_values.rs`, xem [guard](GUARDS.vi.md)), theo dõi trajectory và luật học được (`runtime/regulation.rs`, `runtime/rules.rs`, xem [chiến lược và runtime](STRATEGY_AND_RUNTIME.vi.md)), lời nhắc kiểm tra (verify reminder) và gate `TurnEvaluation` trong turn driver (`runtime/turn_driver.rs`, xem [tự đánh giá](SELF_EVALUATION.vi.md)), công bố tool theo tầng qua `tool_schema`/`use_tool`, và strict-execution capability probes | Model selection, terminal widgets, cross-session extraction |
 | `harness-orchestrator` | Delegation contracts và grants, durable task DAG, worker scheduling có giới hạn, worktree cô lập do host sở hữu, integration gắn với revision | Chi tiết provider protocol, triển khai tool policy, raw SQL authority |
 | `harness-extensions` | Extension handshake và trust, capability negotiation, transport NDJSON stdio, bridge tool/provider ngoài, MCP client (stdio và Streamable HTTP), tool catalogue, skill composition có version | Trust chỉ dựa trên tên, bypass host policy, database ownership trực tiếp |
 | `harness-maintenance` | Backup/restore verification, compatibility checks, migration copies, retention pins/tombstones, garbage collection và support bundle | Turn execution thông thường hoặc presentation tương tác |
@@ -89,7 +89,7 @@ harness-types                       (không phụ thuộc sibling nào)
         └── harness-session
               └── harness-runtime   (thêm providers)
                     ├── harness-tools          (thêm providers, session, store)
-                    └── harness-orchestrator   (thêm kernel)
+                    └── harness-orchestrator   (thêm kernel, providers, session, store)
 harness-extensions  -> kernel, providers, session, tools
 harness-maintenance -> session, store
 harness-cli         -> mọi crate ở trên
@@ -106,14 +106,14 @@ Mười một crate vẫn nằm ngang hàng trong `crates/`, giữ public module
 | `application/` | Startup, controller, session service, lifecycle và verification |
 | `configuration/` | Configuration, permissions, paths và resources |
 | `coordination/` | Agents, delegation, goals và scheduling |
-| `integrations/` | Extensions, MCP, packages, Python REPL, skills và web |
-| `memory/` | Continual harness, knowledge, task state và learned skills |
+| `integrations/` | Extensions, MCP, packages, Python REPL, skills, web, plugin `jev` (`jev.rs`) và công bố tool theo tầng (`tool_tiers.rs`) |
+| `memory/` | Memory store (`store.rs`) và tool `memory`, markdown memory, session log, lesson và learned skill, hàng đợi các lượt chạy nền của Sleep, review và Deep Dream, tự đánh giá, chiến lược và evolution, citation, memory theo file, hàng đợi duyệt, readout, công tắc memory, knowledge và task state |
 | `models/` | Catalog, credentials, routing và service tiers |
 | `presentation/` | TUI, terminal input, views, attachments và rendering |
 | `prompting/` | Instructions và prompt assets đóng gói |
 | `protocols/` | CLI routing, headless mode, RPC và ACP |
 
-Khai báo `#[path]` giữ namespace logic `crate::interactive::*` và test selector. Thư viện nhóm source theo trách nhiệm dưới `src/lib.rs` mà không thêm Rust namespace. Root manifest, `.agents/skills`, `e2e/`, `npm/`, `schemas/` và `tests/fixtures` giữ đường dẫn. Script được nhóm trong `scripts/{common,install,release,testing,verify}`. Bố cục này không tách API cho app.
+Khai báo `#[path]` giữ namespace logic `crate::interactive::*` và test selector. Thư viện nhóm source theo trách nhiệm dưới `src/lib.rs` mà không thêm Rust namespace. Root manifest, `.agents/skills`, `e2e/`, `npm/`, `schemas/` và `tests/fixtures` giữ đường dẫn. Script được nhóm trong `scripts/{common,install,release,testing,verify}`. Thư mục `vendor/` ở gốc chứa một dependency đã vá (`libsqlite3-sys`, để có SQLite đóng gói mới hơn) mà `[patch.crates-io]` trong `Cargo.toml` gốc trỏ tới; nó nằm ngoài workspace. Bố cục này không tách API cho app.
 
 ## 5. Luồng request chính
 
@@ -162,7 +162,7 @@ model / CLI proposal
   -> session projection và user-facing view
 ```
 
-Mọi coding-tool action đi qua cùng một ranh giới `harness-tools`. Tool lõi gồm đọc/liệt kê/tìm/glob/find file, `edit_file`, `write_file`, `apply_patch`, `run_process`, `run_shell`, `read_process_output`, Git status/diff/log, history search/read và `task_update`. Tool đến từ nơi khác vào cùng gate dưới dạng external-tool action: tool của extension và MCP, `web_search`/`web_fetch` (từ chối đích loopback, private và link-local; `HA_WEB=off` gỡ chúng), tool Python `ipython` (duyệt như `run_shell`) và tool `delegate` ở mục 7.
+Mọi coding-tool action đi qua cùng một ranh giới `harness-tools`. Tool lõi gồm đọc/liệt kê/tìm/glob/find file, `edit_file`, `write_file`, `apply_patch`, `run_process`, `run_shell`, `read_process_output`, Git status/diff/log, history search/read và `task_update`. Tool đến từ nơi khác vào cùng gate dưới dạng external-tool action: tool của extension và MCP, `web_search`/`web_fetch` (từ chối đích loopback, private và link-local; `HA_WEB=off` gỡ chúng), Python REPL `python_repl` (`ipython` và `python` là alias của nó; duyệt như `run_shell`) và tool `delegate` ở mục 7.
 
 Presentation trả về model hoặc UI có thể bị truncate hoặc định hình lại, nhưng không phải execution record có authority. Receipt ghi action đã admit, outcome, output references và các hash liên quan trong phạm vi host biết được. Approval mode gồm `ask`, `auto-edit` và `full-auto`; mọi mode đều giữ path validation, deny rules, workspace revalidation và receipt. Hook có thể chặn một call hoặc hỏi người dùng, nhưng `allow` từ hook không bỏ qua được approval, và hook `pre_tool_use` bị lỗi thì chặn call.
 
@@ -215,8 +215,17 @@ Các tính năng này nằm trong `harness-cli` như tính năng tầng ứng d�
 - **Verification thay vì tự báo cáo.** Các check `[verify]` trong config project do harness tự chạy (khi model gọi `goal_complete`, khi một feature xin chuyển sang passing, làm gate của `/autonomous`, và khi `/verify`); check lỗi được gửi lại cho agent cùng output và gợi ý sửa. Sau khi các check qua, một verifier độc lập (child với context mới, tool chỉ đọc) đánh giá goal trước khi nó hoàn tất. Feature list `.harness/features.json` ghi state và evidence của từng feature; model có thể thêm, bắt đầu hoặc block feature nhưng chỉ một lần chạy pass các command do harness thực thi mới chuyển nó sang `passing`.
 - **Session lifecycle.** Prompt đầu tiên của phiên mang một brief do harness tự thu thập (commit gần nhất, thay đổi chưa commit, handoff trong `.harness/progress.md`). `/handoff` bảo agent ghi file đó và `/handoff --reset` mở hội thoại mới bắt đầu từ nó. `/doctor` và `ha doctor` chấm điểm repository theo instructions, tools, environment, state và feedback, chỉ bằng check cấu trúc.
 - **Learned state.** `/refine` để model đề xuất sửa memory, prompt note, skill và subagent spec, còn host validate và áp dụng (phía host, không có keyword classifier); nó cũng có thể đề xuất check, chỉ gia nhập `[[verify.checks]]` sau khi người dùng chấp nhận (`/checks accept`). Learned skill là thư mục `SKILL.md` thường ở tầng global hoặc tầng project đã trust, chỉ do một hàm promotion ghi, kèm ledger, đếm lượt dùng và archive.
-- **Task state, memory và knowledge.** Native tool `task_state` giữ objective, checklist, quyết định và constraint ngoài bản tóm tắt compaction. `memory` giữ entry memory/prompt có version ở scope local, project và global; delegated agent chỉ được recall read-only. `knowledge` quản lý trang Markdown project/global với provenance, update có kiểm hash, search và graph liên kết trang. Delegated agent chỉ được list/search/read/graph. Memory và knowledge được tìm theo từ (không còn embedding từ 0.8.8); memory còn xếp các kết quả khớp tốt nhất theo độ mới và mức dùng.
-- **Bật và tắt memory.** Một module (`host/memory/switch.rs`) quyết định một lượt có những tính năng memory nào: `HA_MEMORY=off`, `HA_MEMORY_OFF=<tính năng>,...` hoặc setting `memory` tắt digest và tool memory, các block của kho markdown, session log, kết quả của learning loop, mọi lượt chạy nền, những gì hội thoại mới được kể về hội thoại trước, hoặc knowledge. Mọi gate trong lượt của app và của `ha exec` hỏi nó, bên cạnh `harnessRefinements`; thứ đã tắt thì không được đọc vào request và cũng không được ghi. `ha exec` đếm riêng các lần gọi model của chính nó, của child và của các lượt memory qua lớp bọc provider (`host/models/usage_tally.rs`) và báo chúng là `usage`, `children_usage` và `upkeep_usage`; `memory-ab.sh` dùng chúng để đo memory bật so với tắt ([Hướng dẫn vận hành](../guides/OPERATOR_GUIDE.vi.md) §12.20).
+- **Task state, memory và knowledge.** Native tool `task_state` giữ objective, checklist, quyết định và constraint ngoài bản tóm tắt compaction. `memory` giữ entry memory/prompt có version. Từ 0.8.1 mỗi scope, scope global và scope của từng hội thoại, là một file SQLite `memory.sqlite3` (`host/memory/store.rs`) với các cây `/global`, `/projects/<key>` và `/local`. Một bản sửa thay thế (supersede) entry cũ, entry được tin theo nơi lời của nó đến từ, entry không dùng tới thì hết hạn, và entry có thể trích dẫn code và chỉ được giữ cho một số file (`paths`); thay đổi mà người dùng cần được góp ý thì chờ trong hàng đợi duyệt ([memory store](MEMORY_STORE.vi.md)). Delegated agent chỉ được recall read-only: child không ghi được memory và đề xuất entry qua `propose` của `note_finding`. `knowledge` quản lý trang Markdown project/global với provenance, update có kiểm hash, search và graph liên kết trang. Delegated agent chỉ được list/search/read/graph. Memory và knowledge được tìm theo từ (không còn embedding từ 0.8.8); memory còn xếp các kết quả khớp tốt nhất theo độ mới và mức dùng.
+- **Bật và tắt memory.** Một module (`host/memory/switch.rs`) quyết định một lượt có những tính năng memory nào: `HA_MEMORY=off`, `HA_MEMORY_OFF=<tính năng>,...` hoặc setting `memory` tắt digest và tool memory, các block của kho markdown, session log, kết quả của learning loop, mọi lượt chạy nền, những gì hội thoại mới được kể về hội thoại trước, knowledge, code mà entry trích dẫn (`citations`) hoặc memory chỉ giữ cho một số file (`scoped`). Mọi gate trong lượt của app và của `ha exec` hỏi nó, bên cạnh `harnessRefinements`; thứ đã tắt thì không được đọc vào request và cũng không được ghi. `ha exec` đếm riêng các lần gọi model của chính nó, của child và của các lượt memory qua lớp bọc provider (`host/models/usage_tally.rs`) và báo chúng là `usage`, `children_usage` và `upkeep_usage`; `memory-ab.sh` dùng chúng để đo memory bật so với tắt ([Hướng dẫn vận hành](../guides/OPERATOR_GUIDE.vi.md) §12.20). `HA_MEMORY_REVIEW` (mặc định `policy`, hoặc `all`, `off`) quyết định những thay đổi memory được đề xuất nào phải chờ người dùng trong hàng đợi duyệt.
+- **Markdown memory.** Project có thể giữ memory dưới dạng file markdown ở gốc: ha ghi một store rỗng, đưa luật và chỉ mục của nó vào mọi turn và lint nó. Store này chạy bên cạnh memory store, không thay thế nó ([markdown memory](MARKDOWN_MEMORY.vi.md)).
+- **Learning loop.** Review tự động gom những gì người dùng đã sửa và những gì agent đã giả định sai qua các hội thoại; bài học lặp lại thì trở thành luật lâu dài (`host/memory/lessons.rs`, `ha learning`; [learning loop](LEARNING_LOOP.vi.md)).
+- **Session log.** Mỗi hội thoại một log được chọn lọc, do host ghi bằng một lần gọi model từ journal: những gì đã quyết, đã học, đã sửa, đã đổi và còn phải làm. Hội thoại mới được kể về log mới nhất, và `/recall` đọc chúng (`host/memory/session_log.rs`; [session continuity](SESSION_CONTINUITY.vi.md)).
+- **Sleep và Deep Dream.** Mọi lượt memory chạy nền (review của một hội thoại, consolidation theo lô của Deep Dream, evolution của harness, lượt hết hạn) trước hết là một job trên đĩa dưới `<data>/sleep/`, được thử lại sau một thời gian chờ và bỏ cuộc sau một số lần hỏng (`host/memory/sleep.rs`; [Sleep](SLEEP.vi.md)).
+- **Tự đánh giá.** Turn đã làm đủ việc được chấm trên năm trục chất lượng bằng một lần gọi model của host, sau lời nhắc kiểm tra; `/self-eval` yêu cầu nó bằng tay, và mỗi lần đánh giá là một dòng trong `evaluations.jsonl` ([tự đánh giá](SELF_EVALUATION.vi.md)).
+- **Guard.** Guard cho lệnh và che giá trị bí mật chạy trong tool dispatch ở mọi approval mode, là Rust đã biên dịch chứ không phải hook script ([guard](GUARDS.vi.md)).
+- **Đổi chiến lược và các lớp runtime.** Các turn của một goal là những lần đánh giá chiến lược của nó; tới plateau, một child strategist nêu tên các chiến lược khác. Theo dõi trajectory, luật học được, ghi chú tool và learned skill được recall định hình runtime quanh model ([chiến lược và runtime](STRATEGY_AND_RUNTIME.vi.md)).
+- **Định danh project.** Project được định danh theo Git repository, nên thư mục con hay linked worktree mở project của main checkout; store giữ dưới key cũ được chuyển về đúng chỗ, và `ha project rekey` chuyển bằng tay ([định danh project](PROJECT_IDENTITY.vi.md)).
+- **Service tier.** `/tier` hiển thị và đặt `service_tier` của request (`default`, `flex`, `priority`, `auto`), còn `/fast` bật tắt `priority` trên các model OpenAI và ChatGPT nhận nó; tier mà model không nhận được gửi là `default` (`host/models/service_tier.rs`).
 - **Goal, schedule và autonomy.** Goal bền vững (chỉ `goal_complete` mới kết thúc), `/autonomous` tiếp tục trong giới hạn budget và gate là shell command, hàng đợi steering và follow-up, heartbeat và schedule lưu dưới data directory. Schedule và heartbeat chạy khi có worker giữ agent sống.
 - **Cây hội thoại.** Các turn tạo thành nhánh; `/tree` điều hướng chúng kèm tóm tắt nhánh tùy chọn, `/fork` bắt đầu hội thoại mới trước một tin nhắn của người dùng và `/clone` bắt đầu hội thoại mới với toàn bộ lịch sử.
 - **Python REPL.** Tool `python_repl` (`ipython` và `python` vẫn là alias tương thích) là kernel Python bền vững (runtime `rlm` vendored trong `crates/harness-cli/python`), chỉ được cung cấp khi tìm thấy Python 3.11+; `HA_REPL=off` gỡ nó. Host request của kernel do controller trả lời, và kernel mồ côi do `ha` crash để lại được dọn qua journal.
@@ -238,6 +247,11 @@ Các tính năng này nằm trong `harness-cli` như tính năng tầng ứng d�
 | Backup, migration và deletion markers | `harness-maintenance` cộng metadata của store | Manifest hashes, compatibility refusal, retention pins/tombstones |
 | Agent nền | Journal và descriptor file của worker, cộng store của project | Một worker và một store writer mỗi project; journal chỉ nói agent nào cần đưa trở lại, hội thoại vẫn nằm trong store |
 | State harness của project | File trong workspace (`.harness/`) và data directory | Do host ghi hoặc sau khi người dùng chấp nhận; không bao giờ là nguồn sự thật thứ hai của run |
+| Entry memory | `memory.sqlite3` cùng `memory.lock` của nó trong mỗi thư mục scope: scope global (`<data>/harness/`) và scope của từng hội thoại (`<data>/sessions/<task>/harness/`), do `host/memory/store.rs` sở hữu | Mỗi lần lưu là một transaction và mỗi entry thay đổi là một event trong log chỉ ghi thêm; lock giữ một lượt đọc-sửa-ghi của scope |
+| Lượt memory chạy nền | Mỗi lượt một job JSON dưới `<data>/sleep/` (`host/memory/sleep.rs`) | Job được ghi trọn vẹn trước khi thứ kích hoạt nó được đặt lại; lượt hỏng được thử lại sau một thời gian chờ |
+| Thay đổi memory chờ người dùng | `memory_queue.json` (và `memory_queue.lock`) trong thư mục của scope mà chúng sẽ đổi (`host/memory/review_queue.rs`) | Chỉ được áp dụng khi người dùng chấp nhận, qua đường ghi của chính review; bị từ chối là cũ nếu entry đã đổi từ lúc đó |
+| Luật và ghi chú tool đã tiến hoá | `<data>/harness-evolution.json`, dưới `harness-evolution.lock` (`host/memory/evolution.rs`) | Luật bắt đầu ở chế độ chạy bóng và được bật hay bỏ dựa trên các lần gọi đã ghi; xoá file là quên hết |
+| Kết quả tự đánh giá | `<data>/harness/evaluations.jsonl` (`host/memory/self_eval.rs`) | Mỗi lần đánh giá ghi thêm một dòng; được chuyển sang `evaluations.jsonl.old` khi quá 5 MB |
 | UI projections | `harness-cli` views trên services | Presentation không thành writer thứ hai |
 
 Chuỗi identity lõi là project → task → session → run, với typed IDs và workspace observations gắn ở boundary cần chúng. Session mới không phải quyền duplicate task, và label hiển thị cho model không phải authority grant.
@@ -290,14 +304,16 @@ Các giới hạn phải được giữ nhất quán trong code và docs:
 
 ## 13. Bản đồ kiểm chứng
 
-Khi sửa implementation, dùng các kiểm tra thông thường của repository cùng tests của crate sở hữu:
+Khi sửa implementation, chạy gate trong `AGENTS.md` của repository cùng tests của crate sở hữu, rồi kiểm tra tài liệu:
 
 ```powershell
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --all-targets --locked
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --no-fail-fast
 pwsh -NoProfile -File scripts/verify/Verify-Docs.ps1
 ```
+
+Riêng gate thì chưa đủ. Thay đổi mà người dùng thấy được, hoặc chạm vào agent loop, tool, delegation, compaction, memory, diagnostics, worker hay TUI, chỉ xong khi đã qua kiểm thử live: bản release `ha` chạy với model thật bằng các suite trong [live tests](../../scripts/testing/live-tests/README.md) bao phủ nó.
 
 Các test đánh dấu `#[ignore]` (ca acceptance dùng pseudo-terminal) bị `cargo test` bỏ qua; chạy chúng bằng `scripts/testing/Invoke-HaPtyAcceptance.ps1`. Dùng Git revision và test output hiện tại; không coi plan cũ là release claim mới.
 
@@ -305,5 +321,16 @@ Các test đánh dấu `#[ignore]` (ca acceptance dùng pseudo-terminal) bị `c
 
 - [Operator guide](../guides/OPERATOR_GUIDE.vi.md)
 - [Plugin architecture](PLUGIN_ARCHITECTURE.vi.md)
+- [Guard cho lệnh và bí mật](GUARDS.vi.md)
+- [Learning loop](LEARNING_LOOP.vi.md)
+- [Markdown memory store](MARKDOWN_MEMORY.vi.md)
+- [Memory readout](MEMORY_READOUT.vi.md)
+- [Memory store](MEMORY_STORE.vi.md)
+- [Định danh project](PROJECT_IDENTITY.vi.md)
+- [Tự đánh giá](SELF_EVALUATION.vi.md)
+- [Session continuity](SESSION_CONTINUITY.vi.md)
+- [Sleep](SLEEP.vi.md)
+- [Đổi chiến lược và runtime harness](STRATEGY_AND_RUNTIME.vi.md)
+- [Live tests](../../scripts/testing/live-tests/README.md)
 - [Giao diện terminal](../guides/TUI.md)
 - [Build and release](../guides/BUILD_AND_RELEASE.md)

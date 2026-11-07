@@ -88,7 +88,7 @@ write that rule a second time:
   the memory refused the edit - the lesson becomes a candidate again. So does
   one whose edit waits for the person in the memory queue (a rule from words
   that are not the user's, or every change with `HA_MEMORY_REVIEW=all`:
-  [MEMORY_STORE.en.md](MEMORY_STORE.en.md) §19): it is not written until it is
+  [MEMORY_STORE.en.md](MEMORY_STORE.en.md) §15): it is not written until it is
   accepted, and the next signal counts again.
 - Before the gate writes a rule, it asks the memory whether an entry already
   says it, by the measures the memory tool refuses a duplicate with (60 %
@@ -149,6 +149,12 @@ A lesson's standing at a given time:
   passes `ha memory lint`.
 - **One project without a store:** a global memory entry like the first, marked
   as that project's, so only its turns show it.
+
+The gate writes a rule's memory entry itself, as the `learning` writer: it never
+waits in the person's memory queue ([MEMORY_STORE.en.md](MEMORY_STORE.en.md)
+§15). Its `origin` names the loop and the lesson but no `kind`, so it reads as
+`agent` (§12.1). Like every `source: learning` entry, it is exempt from expiry
+(§12.5).
 
 ## 5. Facts, what a rule did, and the meditation
 
@@ -283,6 +289,14 @@ update keeps an entry's `source` and `origin` and records who edited it in
 Dream could then merge it away, and the lesson retired as "deleted outside
 the learning loop").
 `lessons_meditated` beside it records the last meditation.
+
+**Off.** `HA_MEMORY_OFF=reviews` (or `HA_MEMORY=off`) runs no review, so no
+signal is recorded, no meditation runs, and the gate runs only on
+`ha learning distill`. A promoted rule reaches a turn through the digest
+(`digest` off drops it) or the store's index (`markdown`). `lessons` off does
+not touch the loop's rules: it drops the rules learned from failed calls, their
+notes in tool descriptions, and the learned skills' recall and note; a review
+still records lessons.
 
 ## 9. Tests
 

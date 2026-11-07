@@ -65,13 +65,13 @@ The workspace has eleven crates.
 
 | Crate | Owns | Does not own |
 |---|---|---|
-| `harness-types` | Shared IDs, error codes, event/receipt contracts, the store port, scope and workspace types, schemas and serialization conventions | Business orchestration, provider calls, SQL mutation policy |
+| `harness-types` | Shared IDs, error codes, event/receipt contracts, the store port, scope and workspace types, schemas and serialization conventions; the diagnostics sink every crate reports through (`diag.rs`), the word and BM25 search the search tools share (`search.rs`) and the MEMORILLA memory readout (`readout.rs`) | Business orchestration, provider calls, SQL mutation policy |
 | `harness-kernel` | In-process plugin graph validation, service requirements, scoped registration, service leases and ordered shutdown | Native-code sandboxing, user input admission, provider state |
 | `harness-store-sqlite` | SQLite opening rules and the single-writer lock/fence, migrations, transactions, durable records (runs, steps, budgets, questions, tool intents/approvals, delegation, tombstones), backend leases, the rebuildable journal index and notes, artifacts | Model context policy, terminal rendering, arbitrary tool execution |
 | `harness-session` | Atomic input admission, instruction ledger, projections, snapshots, deterministic recovery views, and the context builder (typed context blocks with channels) | Model classification, process execution, UI state |
 | `harness-providers` | Provider request/response types, the mock provider, OpenAI Chat, OpenAI Responses (API and the ChatGPT Codex backend) and Anthropic Messages adapters, SSE decoding, thinking levels, rate-limit parsing, prompt-cache request fields | Session mutation, tool approval, workspace writes |
 | `harness-runtime` | Run state machine, budgets, frozen requests, provider attempts, human input, goal evaluation, compaction, fork/rollback/resume of a conversation, the run inbox, session-file import/export | Direct terminal UI, arbitrary filesystem/process effects |
-| `harness-tools` | Coding-tool descriptors, canonicalization, path policy and approval modes, durable intents/receipts, filesystem/Git/process adapters, the bounded model-tool-model turn driver, hooks, the destructive-git guard, and strict-execution capability probes | Model selection, terminal widgets, cross-session extraction |
+| `harness-tools` | Coding-tool descriptors, canonicalization, path policy and approval modes, durable intents/receipts, filesystem/Git/process adapters, the bounded model-tool-model turn driver, hooks, the destructive-git guard, command guards and secret-value redaction (`security/command_guard.rs`, `secret_values.rs`, see [guards](GUARDS.en.md)), trajectory regulation and learned rules (`runtime/regulation.rs`, `runtime/rules.rs`, see [strategy and runtime](STRATEGY_AND_RUNTIME.en.md)), the verify reminder and the `TurnEvaluation` gate in the turn driver (`runtime/turn_driver.rs`, see [self-evaluation](SELF_EVALUATION.en.md)), tiered tool disclosure through `tool_schema`/`use_tool`, and strict-execution capability probes | Model selection, terminal widgets, cross-session extraction |
 | `harness-orchestrator` | Delegation contracts and grants, the durable task DAG, bounded worker scheduling, host-owned isolated worktrees, revision-bound integration | Provider protocol details, tool policy implementation, raw SQL authority |
 | `harness-extensions` | Extension handshake and trust, capability negotiation, the NDJSON stdio transport, external tool/provider bridges, the MCP client (stdio and Streamable HTTP), the tool catalogue, versioned skill composition | Trust by name alone, host policy bypass, direct database ownership |
 | `harness-maintenance` | Backup/restore verification, compatibility checks, migration copies, retention pins/tombstones, garbage collection and support bundles | Normal turn execution or interactive presentation |
@@ -89,7 +89,7 @@ harness-types                       (depends on no sibling)
         └── harness-session
               └── harness-runtime   (also providers)
                     ├── harness-tools          (also providers, session, store)
-                    └── harness-orchestrator   (also kernel)
+                    └── harness-orchestrator   (also kernel, providers, session, store)
 harness-extensions  -> kernel, providers, session, tools
 harness-maintenance -> session, store
 harness-cli         -> every crate above
@@ -106,14 +106,14 @@ The eleven crates remain flat peers under `crates/`, with their public module pa
 | `application/` | Startup, controller, session service, lifecycle and verification |
 | `configuration/` | Configuration, permissions, paths and resources |
 | `coordination/` | Agents, delegation, goals and scheduling |
-| `integrations/` | Extensions, MCP, packages, Python REPL, skills and web |
-| `memory/` | Continual harness, knowledge, task state and learned skills |
+| `integrations/` | Extensions, MCP, packages, Python REPL, skills, web, the `jev` plugin (`jev.rs`) and tiered tool disclosure (`tool_tiers.rs`) |
+| `memory/` | The memory store (`store.rs`) and the `memory` tool, markdown memory, session logs, lessons and learned skills, Sleep's queue of background passes, reviews and Deep Dream, self-evaluation, strategy and evolution, citations, scoped memory, the review queue, the readout, the memory switch, knowledge and task state |
 | `models/` | Catalog, credentials, routing and service tiers |
 | `presentation/` | TUI, terminal input, views, attachments and rendering |
 | `prompting/` | Instructions and bundled prompt assets |
 | `protocols/` | CLI routing, headless mode, RPC and ACP |
 
-Explicit `#[path]` declarations preserve the logical `crate::interactive::*` namespace and test selectors. Libraries group source by responsibility under `src/lib.rs` without adding Rust namespaces. Root manifests, `.agents/skills`, `e2e/`, `npm/`, `schemas/` and `tests/fixtures` retain their paths. Scripts are grouped in `scripts/{common,install,release,testing,verify}`. This layout does not extract an app API.
+Explicit `#[path]` declarations preserve the logical `crate::interactive::*` namespace and test selectors. Libraries group source by responsibility under `src/lib.rs` without adding Rust namespaces. Root manifests, `.agents/skills`, `e2e/`, `npm/`, `schemas/` and `tests/fixtures` retain their paths. Scripts are grouped in `scripts/{common,install,release,testing,verify}`. The root `vendor/` holds a patched dependency (`libsqlite3-sys`, for a newer bundled SQLite) that `[patch.crates-io]` in the root `Cargo.toml` points at; it is excluded from the workspace. This layout does not extract an app API.
 
 ## 5. The main request path
 
@@ -162,7 +162,7 @@ model / CLI proposal
   -> session projection and user-facing view
 ```
 
-All coding-tool actions pass through the same `harness-tools` boundary. The core tools are file read/list/search/glob/find, `edit_file`, `write_file`, `apply_patch`, `run_process`, `run_shell`, `read_process_output`, Git status/diff/log, history search/read, and `task_update`. Tools that come from elsewhere reach the same gate as an external-tool action: extension and MCP tools, `web_search`/`web_fetch` (loopback, private and link-local targets refused; `HA_WEB=off` removes them), the Python `ipython` tool (approved like `run_shell`), and the `delegate` tool of section 7.
+All coding-tool actions pass through the same `harness-tools` boundary. The core tools are file read/list/search/glob/find, `edit_file`, `write_file`, `apply_patch`, `run_process`, `run_shell`, `read_process_output`, Git status/diff/log, history search/read, and `task_update`. Tools that come from elsewhere reach the same gate as an external-tool action: extension and MCP tools, `web_search`/`web_fetch` (loopback, private and link-local targets refused; `HA_WEB=off` removes them), the Python REPL `python_repl` (`ipython` and `python` are its aliases; approved like `run_shell`), and the `delegate` tool of section 7.
 
 The presentation returned to the model or UI may be truncated or otherwise shaped, but it is not the authoritative execution record. The receipt records what the host knows about the admitted action, its outcome, output references and relevant hashes. Approval modes are `ask`, `auto-edit` and `full-auto`; all of them keep path validation, deny rules, workspace revalidation and receipts. A hook can block a call or ask the user, but an `allow` from a hook cannot skip an approval, and a `pre_tool_use` hook that fails blocks the call.
 
@@ -215,8 +215,17 @@ These live in `harness-cli` as application-layer features over the services abov
 - **Verification, not self-report.** `[verify]` checks in the project config are run by the harness (when the model calls `goal_complete`, when a feature asks to become passing, as gates of `/autonomous`, and on `/verify`); a failure goes back to the agent with its output and a fix hint. After the checks pass, an independent verifier child (fresh context, read-only tools) judges a goal before it completes. The feature list `.harness/features.json` records each feature's state and evidence; the model can add, start or block a feature but only a passing run of the harness's own commands moves it to `passing`.
 - **Session lifecycle.** The first prompt of a session carries a brief the harness gathers (recent commits, uncommitted changes, the handoff in `.harness/progress.md`). `/handoff` has the agent write that file and `/handoff --reset` starts a fresh conversation from it. `/doctor` and `ha doctor` score a repository on instructions, tools, environment, state and feedback with structural checks only.
 - **Learned state.** `/refine` has a model propose edits to memories, prompt notes, skills and subagent specs, and the host validates and applies them (host-side, no keyword classifier); it can also propose checks, which join `[[verify.checks]]` only after the user accepts them (`/checks accept`). Learned skills are plain `SKILL.md` folders in a global or a trusted-project layer, written only by one promotion function, with a ledger, use counting and archiving.
-- **Task state, memory and knowledge.** The native `task_state` tool keeps the objective, checklist, decisions and constraints outside compaction summaries. `memory` keeps versioned memory/prompt entries in local, project and global scopes; delegated agents receive read-only recall. `knowledge` manages project/global Markdown pages with provenance, hash-checked updates, search and page-link graphs. Delegated agents can only list/search/read/graph. Memory and knowledge are searched by their words (no embeddings since 0.8.8); memory ranks the best matches by recency and use too.
-- **Memory on and off.** One module (`host/memory/switch.rs`) decides which memory features a turn has: `HA_MEMORY=off`, `HA_MEMORY_OFF=<feature>,...` or the `memory` setting turns off the digest and the memory tool, the markdown store's blocks, session logs, the learning loop's results, every background pass, what a new conversation hears of earlier ones, or knowledge. Every gate of the app's turn and of `ha exec` asks it, beside `harnessRefinements`; what is off is neither read into a request nor written. `ha exec` counts its own, its children's and its memory passes' model calls apart through provider wrappers (`host/models/usage_tally.rs`) and reports them as `usage`, `children_usage` and `upkeep_usage`; `memory-ab.sh` measures memory on against off with them ([Operator guide](../guides/OPERATOR_GUIDE.en.md) §12.20).
+- **Task state, memory and knowledge.** The native `task_state` tool keeps the objective, checklist, decisions and constraints outside compaction summaries. `memory` keeps versioned memory/prompt entries. Since 0.8.1 each scope, the global one and each conversation's, is one SQLite `memory.sqlite3` (`host/memory/store.rs`) with the trees `/global`, `/projects/<key>` and `/local`. A correction supersedes an entry, an entry is trusted by where its words came from, an unused one expires, and an entry can cite code and be kept for some files only (`paths`); a change the person should have a say in waits in the review queue ([memory store](MEMORY_STORE.en.md)). Delegated agents receive read-only recall: a child cannot write memory and proposes an entry through `note_finding`'s `propose`. `knowledge` manages project/global Markdown pages with provenance, hash-checked updates, search and page-link graphs. Delegated agents can only list/search/read/graph. Memory and knowledge are searched by their words (no embeddings since 0.8.8); memory ranks the best matches by recency and use too.
+- **Memory on and off.** One module (`host/memory/switch.rs`) decides which memory features a turn has: `HA_MEMORY=off`, `HA_MEMORY_OFF=<feature>,...` or the `memory` setting turns off the digest and the memory tool, the markdown store's blocks, session logs, the learning loop's results, every background pass, what a new conversation hears of earlier ones, knowledge, the code an entry cites (`citations`) or memory kept for some files (`scoped`). Every gate of the app's turn and of `ha exec` asks it, beside `harnessRefinements`; what is off is neither read into a request nor written. `ha exec` counts its own, its children's and its memory passes' model calls apart through provider wrappers (`host/models/usage_tally.rs`) and reports them as `usage`, `children_usage` and `upkeep_usage`; `memory-ab.sh` measures memory on against off with them ([Operator guide](../guides/OPERATOR_GUIDE.en.md) §12.20). `HA_MEMORY_REVIEW` (`policy` by default, `all` or `off`) says which proposed memory changes wait for the person in the review queue.
+- **Markdown memory.** A project can keep its memory as markdown files at its root: ha writes an empty store, puts its rules and its index in every turn and lints it. It runs beside the memory store and does not replace it ([markdown memory](MARKDOWN_MEMORY.en.md)).
+- **The learning loop.** The automatic review gathers what the user corrected and what the agent assumed wrongly across conversations; a lesson that recurs becomes a standing rule (`host/memory/lessons.rs`, `ha learning`; [learning loop](LEARNING_LOOP.en.md)).
+- **Session logs.** One curated log per conversation, written by the host with one model call from the journal: what was decided, learned, fixed, changed and left to do. A new conversation is told of the newest, and `/recall` reads them (`host/memory/session_log.rs`; [session continuity](SESSION_CONTINUITY.en.md)).
+- **Sleep and Deep Dream.** Every background memory pass (a conversation's review, Deep Dream's consolidation in batches, the harness evolution, the expiry) is first a job on disk under `<data>/sleep/`, tried again after a backoff and given up after so many failures (`host/memory/sleep.rs`; [Sleep](SLEEP.en.md)).
+- **Self-evaluation.** A turn that did enough is scored on five quality axes by a model call of the host's, after the verify reminder; `/self-eval` asks for it by hand, and each evaluation is one line of `evaluations.jsonl` ([self-evaluation](SELF_EVALUATION.en.md)).
+- **Guards.** Command guards and secret-value redaction run in the tool dispatch in every approval mode, as compiled Rust rather than hook scripts ([guards](GUARDS.en.md)).
+- **Strategy revision and runtime layers.** A goal's turns are evaluations of its strategy; at a plateau a strategist child names other strategies. Trajectory regulation, learned rules, tool notes and the recalled learned skill shape the runtime around the model ([strategy and runtime](STRATEGY_AND_RUNTIME.en.md)).
+- **Project identity.** A project is keyed by its Git repository, so a subdirectory or a linked worktree opens the main checkout's project; a store kept under an older key is moved into place, and `ha project rekey` moves one by hand ([project identity](PROJECT_IDENTITY.en.md)).
+- **Service tiers.** `/tier` shows and sets the request's `service_tier` (`default`, `flex`, `priority`, `auto`) and `/fast` toggles `priority` on the OpenAI and ChatGPT models that take it; a tier the model does not take is sent as `default` (`host/models/service_tier.rs`).
 - **Goals, schedules and autonomy.** Persistent goals (only `goal_complete` finishes one), `/autonomous` continuation within budgets and shell-command gates, steering and follow-up queues, heartbeats and schedules kept under the data directory. Schedules and heartbeats run while a worker keeps the agent alive.
 - **Conversation tree.** Turns form branches; `/tree` navigates them with optional branch summaries, and `/fork` starts a new conversation before one of the user's messages and `/clone` starts one with the whole history.
 - **Python REPL.** The `python_repl` tool (`ipython` and `python` remain compatibility aliases) is a persistent Python kernel (vendored `rlm` runtime under `crates/harness-cli/python`) offered only when Python 3.11+ is found; `HA_REPL=off` removes it. Its host requests are answered by the controller, and orphan kernels from a crashed `ha` are reaped through a journal.
@@ -238,6 +247,11 @@ These live in `harness-cli` as application-layer features over the services abov
 | Backups, migrations and deletion markers | `harness-maintenance` plus store metadata | Manifest hashes, compatibility refusal, retention pins/tombstones |
 | Background agents | The worker's journal and descriptor files, plus the project store | One worker and one store writer per project; the journal only says which agents to bring back, the conversation stays in the store |
 | Project harness state | Files in the workspace (`.harness/`) and the data directory | Written by the host or after user acceptance; never a second source of run truth |
+| Memory entries | `memory.sqlite3` and its `memory.lock` in each scope directory: the global one (`<data>/harness/`) and each conversation's (`<data>/sessions/<task>/harness/`), owned by `host/memory/store.rs` | A save is one transaction and each changed entry an event in an append-only log; the lock holds a read-modify-write of the scope |
+| Background memory passes | One JSON job per pass under `<data>/sleep/` (`host/memory/sleep.rs`) | A job is written whole before what triggered it is reset; a failed pass is tried again after a backoff |
+| Memory changes waiting for the person | `memory_queue.json` (and `memory_queue.lock`) in the folder of the scope they would change (`host/memory/review_queue.rs`) | Applied only when the person accepts, through the review's own write path; refused as stale when the entry changed since |
+| Evolved rules and tool notes | `<data>/harness-evolution.json`, under `harness-evolution.lock` (`host/memory/evolution.rs`) | Rules start in shadow and are promoted or retired on recorded calls; deleting the file forgets them |
+| Self-evaluations | `<data>/harness/evaluations.jsonl` (`host/memory/self_eval.rs`) | One appended line per evaluation; moved to `evaluations.jsonl.old` past 5 MB |
 | UI projections | `harness-cli` views over services | Presentation cannot become a second writer |
 
 The core identity chain is project → task → session → run, with typed IDs and workspace observations attached at the boundaries that need them. A new session is not permission to duplicate a task, and a model-visible label is not an authority grant.
@@ -290,14 +304,16 @@ Current limits to preserve in code and docs:
 
 ## 13. Verification map
 
-For implementation changes, use the repository's normal checks and the owning crate's tests:
+For implementation changes, run the gate in the repository's `AGENTS.md` and the owning crate's tests, then check the documentation:
 
 ```powershell
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --all-targets --locked
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --no-fail-fast
 pwsh -NoProfile -File scripts/verify/Verify-Docs.ps1
 ```
+
+The gate is not enough by itself. A change a user can see, or one that touches the agent loop, tools, delegation, compaction, memory, diagnostics, the worker or the TUI, is done only when it has passed live: the release `ha` driven against a real model by the suites in [live tests](../../scripts/testing/live-tests/README.md) that cover it.
 
 Tests marked `#[ignore]` (the pseudo-terminal acceptance cases) are skipped by `cargo test`; run them with `scripts/testing/Invoke-HaPtyAcceptance.ps1`. Use the current Git revision and test output; do not treat an old plan as a fresh release claim.
 
@@ -305,5 +321,16 @@ Tests marked `#[ignore]` (the pseudo-terminal acceptance cases) are skipped by `
 
 - [Operator guide](../guides/OPERATOR_GUIDE.en.md)
 - [Plugin architecture](PLUGIN_ARCHITECTURE.en.md)
+- [Command and secret guards](GUARDS.en.md)
+- [The learning loop](LEARNING_LOOP.en.md)
+- [Markdown memory store](MARKDOWN_MEMORY.en.md)
+- [Memory readout](MEMORY_READOUT.en.md)
+- [Memory store](MEMORY_STORE.en.md)
+- [Project identity](PROJECT_IDENTITY.en.md)
+- [Self-evaluation](SELF_EVALUATION.en.md)
+- [Session continuity](SESSION_CONTINUITY.en.md)
+- [Sleep](SLEEP.en.md)
+- [Strategy revision and the runtime harness](STRATEGY_AND_RUNTIME.en.md)
+- [Live tests](../../scripts/testing/live-tests/README.md)
 - [Terminal interface](../guides/TUI.md)
 - [Build and release](../guides/BUILD_AND_RELEASE.md)

@@ -2,7 +2,7 @@
 
 [English](PLUGIN_ARCHITECTURE.en.md) | Tiếng Việt
 
-**Trạng thái:** contract kernel/extension hiện tại, ngày 07/10/2026. `harness-kernel` và `harness-extensions` là crate đã có trong workspace; tài liệu này mô tả boundary thật, không phải SDK được đề xuất.
+**Trạng thái:** contract kernel/extension hiện tại của ha 0.9.3, ngày 08/11/2026. `harness-kernel` và `harness-extensions` là crate đã có trong workspace; tài liệu này mô tả boundary thật, không phải SDK được đề xuất.
 
 ## 1. Ownership
 
@@ -79,6 +79,8 @@ Configuration được resolve trước composition. CLI có thể mount local e
 
 ## 7. Composition của CLI host
 
-Native host của CLI như memory, knowledge, task state và web dùng seam catalog/dispatcher `ExternalTools`; chúng không tự động là subprocess extension hay MCP server. Mọi tool phơi ra vẫn đi qua policy và approval của host.
+Native host của CLI như memory, knowledge, task state và web dùng seam catalog/dispatcher `ExternalTools`; chúng không tự động là subprocess extension hay MCP server. Mọi tool phơi ra vẫn đi qua policy và approval của host. Plugin host có sẵn `jev` (`crates/harness-cli/src/host/integrations/jev.rs`) là một trong số đó: nó đưa model Jev của TypeSafe cho agent dùng vào các phán đoán hẹp lặp lại, mặc định tắt và được bật bằng `/jev on` (settings.json `jev.enabled`); xem [hướng dẫn Jev](../guides/JEV.vi.md).
+
+Tool của MCP server và extension có thể được hoãn lại (công bố theo tầng, `crates/harness-cli/src/host/integrations/tool_tiers.rs`). Khi đó danh sách tool của model gồm tool lõi, tool riêng của host và thêm hai tool `tool_schema` và `use_tool`, còn system prompt liệt kê mỗi tool bị hoãn trên một dòng. Model đọc tham số của những tool nó cần bằng `tool_schema` rồi gọi chúng qua `use_tool`; tham số được kiểm theo schema của tool, và lời gọi bị hoãn vẫn đi qua cùng policy và approval. `tools.tiered` trong settings.json, hoặc `HA_TOOL_TIERS`, nhận `auto` (hoãn khi schema dài, mặc định), `on` hoặc `off`. Danh sách tool không đổi theo những gì model xem, nên prefix prompt đã cache vẫn giữ nguyên.
 
 Skill root gồm skill đóng gói, skill user, `~/.agents/skills`, `HA_SKILL_PATHS` và root project chỉ sau khi trust project. Mức trust của nguồn không cấp authority. Prompt contribution bị giới hạn 256 file, mỗi file 256 KiB. Xem [operator guide](../guides/OPERATOR_GUIDE.vi.md) cho MCP login, skill, package, template và hook; xem [build và release](../guides/BUILD_AND_RELEASE.md) cho các kiểm tra.

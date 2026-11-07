@@ -2,7 +2,7 @@
 
 English | [Tiếng Việt](PLUGIN_ARCHITECTURE.vi.md)
 
-**Status:** current kernel/extension contract, 7 October 2026. `harness-kernel` and `harness-extensions` are implemented workspace crates; this document describes their boundaries, not a proposed SDK.
+**Status:** current kernel/extension contract for ha 0.9.3, 8 November 2026. `harness-kernel` and `harness-extensions` are implemented workspace crates; this document describes their boundaries, not a proposed SDK.
 
 ## 1. Ownership
 
@@ -79,6 +79,8 @@ Configuration resolves before composition. The CLI can mount local extension pro
 
 ## 7. CLI host composition
 
-Native CLI hosts such as memory, knowledge, task state and web use the `ExternalTools` catalog/dispatcher seam; they are not automatically subprocess extensions or MCP servers. Every exposed tool still enters the same host policy and approval path.
+Native CLI hosts such as memory, knowledge, task state and web use the `ExternalTools` catalog/dispatcher seam; they are not automatically subprocess extensions or MCP servers. Every exposed tool still enters the same host policy and approval path. The built-in `jev` host plugin (`crates/harness-cli/src/host/integrations/jev.rs`) is one of them: it gives the agent TypeSafe's Jev model for repeated narrow judgments, is off by default and is turned on with `/jev on` (settings.json `jev.enabled`); see the [Jev guide](../guides/JEV.en.md).
+
+The tools of MCP servers and extensions can be deferred (tiered disclosure, `crates/harness-cli/src/host/integrations/tool_tiers.rs`). The model's tool list then holds the core tools, the host's own and two more, `tool_schema` and `use_tool`, and the system prompt lists each deferred tool on one line. The model reads the arguments of the ones it needs with `tool_schema` and calls them through `use_tool`; the arguments are checked against the tool's schema and the deferred call is still gated by the same policy and approval. `tools.tiered` in settings.json, or `HA_TOOL_TIERS`, is `auto` (deferred when their schemas are long, the default), `on` or `off`. The tool list does not change with what the model looks at, so the cached prompt prefix stays whole.
 
 Skill roots include bundled and user skills, `~/.agents/skills`, `HA_SKILL_PATHS`, and project roots only after project trust. A source's trust level does not grant authority. Prompt contributions are bounded to 256 files of 256 KiB each. For MCP login, skills, packages, templates and hooks, see the [operator guide](../guides/OPERATOR_GUIDE.en.md); for checks, see [build and release](../guides/BUILD_AND_RELEASE.md).

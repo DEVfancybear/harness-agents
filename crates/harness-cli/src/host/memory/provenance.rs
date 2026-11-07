@@ -1,5 +1,5 @@
 //! Where a memory's words came from: trust by source, against memory
-//! poisoning (MINJA, `docs/architecture/MEMORY_STORE.en.md` §16).
+//! poisoning (MINJA, `docs/architecture/MEMORY_STORE.en.md` §12).
 //!
 //! The host decides an entry's `origin.kind`, never the model. For the
 //! `memory` tool it reads the conversation as its journal holds it - the

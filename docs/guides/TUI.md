@@ -18,7 +18,10 @@ under it as warnings. While the card is still on screen, `/model` and `/effort`
 it has scrolled away, the status line is the current source.
 
 **Turns.** Each turn sits on a colored rail: the operator's message on a blue
-rail over a shaded background, the assistant's answer on a mauve rail. A command
+rail over a shaded background, the assistant's answer on a mauve rail. A typed
+request wraps between words. In an answer, a code block sits on a panel with a
+straight right edge (its widest row and one cell), a heading's `code` is drawn
+as code, and a run of blank lines shows as one. A command
 typed with long guidance (`/compact` and several hundred words of what to keep)
 shows the command, its first two rows and `… N more lines (ctrl+o)`; the
 details and expanded modes show all of it. The palette
@@ -57,7 +60,9 @@ level, the permission mode, the chat's name and the goal. `agents` lists the
 session's own agent (`main`) and every agent the run delegated to, each by its
 own name (`coder-c0cc21d5`: several children share a role) and in herdr's two
 lines: the glyph and the name, then the state in its colour - a spinner and
-`working`, `◉ blocked` when an approval or a question waits for you, `✓ done`,
+`working`, `◌ queued` for a child waiting for a place under `[agents]
+max_workers` (it has made no call yet), `◉ blocked` when an approval or a
+question waits for you, `✓ done`,
 `✗ failed`, `■ stopped`, `○ idle` - with the tools it called, and under that the
 model and thinking level it runs on (`◆ deepseek-v4.1-flash high`). A child's
 state is the one the agents view shows (the session's child registry), working
@@ -82,9 +87,15 @@ in front is on the selected background. The last row points to the agents view
 (Left on an empty prompt). `terminal.sidebar: false` in `settings.json` turns
 the sidebar off; a narrower console never shows it.
 
-**Status line.** Two ends. The left says what the app is doing: spinner, clock,
-`esc to interrupt`, counters, the model and thinking level, and anything that
-needs a decision (an approval's countdown, a selector's keys). The right carries
+**Status line.** Two ends. The left says what the app is doing: spinner, the
+working word (`Thinking`, `Writing`, `Executing`), clock, `esc to interrupt`,
+counters, the model and thinking level, and anything that needs a decision (an
+approval's countdown, a selector's keys). In true colour a band of light sweeps
+across the working word; the 256-colour cube and `NO_COLOR` draw it flat. The
+spinner steps every 80 ms on the terminal's own clock, not on a background
+agent's tick. Idle, the line names the model, the thinking level and the
+service tier as `» <tier>` in muted text; `» fast` is amber and bold, since fast
+mode costs more. The right carries
 telemetry only worth a glance: cost, `↯ cache NN%` (the share of the session's
 prompt served from the provider's cache), herdr's context gauge `ctx ━━━━──── NN%`
 (green, then yellow from 60% and red from 85%) with the provider's tightest usage
@@ -100,8 +111,9 @@ top right for three seconds. A repeat coalesces (`(x3)`), and at most three stac
 **Agents view and `/tree`.** A background agent keeps running when you leave its
 terminal. Left on an empty prompt, or a bare `/resume`, opens the agents view: every
 running agent and saved conversation, grouped Running, Idle and Inactive. Enter or
-Right opens a row, Space writes a reply, Ctrl+R renames, Ctrl+X stops or deletes
-(press twice), Ctrl+N starts a session, and Esc leaves. An agent with subagents shows
+Right opens a row, Space writes a reply, Ctrl+R renames, Ctrl+X or Delete stops
+or deletes (press twice), Ctrl+N starts a session, and Esc leaves. An agent with
+subagents shows
 `N subagents (M running)`; Alt+Right expands the forest and Ctrl+O shows the
 program each was spawned with. `ha attach` brings a running agent back. `/tree`
 (also a double Esc on an empty idle prompt) shows the conversation's branches:
@@ -199,17 +211,34 @@ showed at its top. Ctrl+F and the first row (Home) wait for every entry. The
 pointer moving with no button held is read and dropped, so it never holds up a
 key or splits a burst of wheel notches into a frame each.
 
-To see where a frame's time goes, set `HA_FRAME_LOG=<file>` for the terminal (one
-line per frame: when it ended in ms, then in microseconds the key's round trip to
-a background agent, taking its events, building the state, the whole frame, and
-the input's latency to the painted frame) and `HA_WORKER_LOG=<file>` for a
+While a run is active the loop looks for work about every 8 ms, and the spinner
+and the working word get a frame about every 33 ms when nothing else asks for
+one. A background agent's worker sends its terminal a frame at most every 16 ms.
+The answer still streaming is revealed at a pace that follows how far behind it
+is: a burst flows out over a fraction of a second instead of landing at once,
+and a backlog of 4000 characters or more is shown whole. An idle app draws
+nothing.
+
+To see where a frame's time goes, set `HA_FRAME_LOG=<file>` for the terminal. It
+writes one line per frame: when the frame ended (ms since the app started); then,
+in microseconds, the key's round trip to a background agent, taking its events,
+building the state, the whole frame, the input's latency to the painted frame
+(`-` when no input caused it) and applying the effects; then the effects by kind
+(`-` for none) and `live=<bytes>`, the answer text the live block held (`-` when
+there is none):
+
+```text
+1520 0 40 180 2410 2650 90 History×2,Redraw live=812
+```
+
+Set `HA_WORKER_LOG=<file>` for a
 background agent (each step of its loop that took 5 ms or more, a session event
 by its kind: `events:RunTerminal 10466`). A key typed in an attached terminal
 waits for the step the agent is in.
 
 - `/fullscreen` toggles it and saves `terminal.fullscreen` in `settings.json`;
-  `terminal.fullscreenMouse` turns mouse tracking off, and `terminal.sidebar:
-  false` hides the sidebar.
+  `terminal.fullscreenMouse: false` turns mouse tracking off (it is on by
+  default), and `terminal.sidebar: false` hides the sidebar.
 - `HA_FULLSCREEN=1` forces it on and any other value forces it off, overriding
   the setting.
 
@@ -280,6 +309,13 @@ The script builds the test binary, runs it in a new console with a hard time bou
 (`-TimeoutSeconds`, default 600) and writes the transcript under
 `target/pty-acceptance/`. A run that leaves worker processes behind can make the
 next one flaky; stop stray `ha` processes first.
+
+A change to the interface is checked live too: the release `ha` driven against a
+real model through `pty_probe`. The suites `tui.sh` (the fullscreen screen, the
+wheel, the agents view, the reference panels), `sidebar.sh` (herdr's sidebar
+and a delegate's pane) and `ui-stream.sh` (frame pacing while an answer streams,
+`/fast` and `/tier`) cover it; see the
+[live tests](../../scripts/testing/live-tests/README.md) for how to run them.
 
 If the installed interface looks old, check `Get-Command ha -All`: building
 `target/debug/ha.exe` does not replace the installed copy in `.cargo/bin`. Run

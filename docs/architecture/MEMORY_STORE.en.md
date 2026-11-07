@@ -2,28 +2,24 @@
 
 English | [Tiếng Việt](MEMORY_STORE.vi.md)
 
-**Status:** design, 26 October 2026. This is the plan for giving ha's memory the
-features of [timescale/memory-engine](https://github.com/timescale/memory-engine)
-(read at commit `9c9bdc1`, 23 October 2026). The work ships in seven phases. Each
-section says which phase delivers it. Until a phase ships, the code is the
-authority, not this document.
+This is a reference for how ha's memory store works: the SQLite stores, the
+`memory` tool's writes, searches and filters, history, ranking, forgetting,
+validity and trust, what reviews write, citations and scoped memory, the review
+queue and the memory switch. Where this document and the code differ, the code
+is the authority.
 
-0.8.1 ships P1 to P4. P5 (CLI, formats, packs), P6 (importers) and P7 (MCP
-server, integrations, console) are on hold until the maintainer resumes them.
-P1 adds only the one CLI command its tests need: `ha memory export`.
-
-0.8.2 closes what a second review against ME found missing in P1 to P4 (§13):
-a name unique per tree and kept through updates, patch updates, the immutable
-`memory_id` as an address, paged history with every field, English stemming,
-lquery's `%` as PostgreSQL has it, PostgreSQL 17's JSONPath methods, filters
-on knowledge pages, old page versions read whole, and `status`.
+The design follows [timescale/memory-engine](https://github.com/timescale/memory-engine)
+(read at commit `9c9bdc1`, 23 October 2026). The later parts of that plan - CLI
+formats and packs, importers, and integrations with an MCP server - were not
+built (§8).
 
 ## 1. Goal and decisions
 
 memory-engine (ME) is a team memory server: Postgres with `ltree`, `pgvector` and
-BM25. Agents reach it over MCP. ha keeps memory in `harness_state.json` files,
-keeps knowledge as Markdown pages and keeps a history index in SQLite. The goal is
-that every ME capability a single user can use also exists in ha, running locally.
+BM25. Agents reach it over MCP. ha keeps memory in one SQLite store per scope
+(§3), knowledge as Markdown pages, and a history index in SQLite. The goal is
+that every ME capability a single user can use also exists in ha, running
+locally; §8 lists what was not built.
 
 The maintainer decided:
 
@@ -31,8 +27,8 @@ The maintainer decided:
 |---|---|
 | Sharing | **Out of scope for now.** ha stays local and single-user: no spaces, principals, groups, grants, API keys, login, invites or remote backend. To be revisited later. |
 | Memory storage | **One SQLite store per scope** with ME's record model: tree, name, meta, temporal, version and an event log. It replaces `harness_state.json`. |
-| Meaning | **No embeddings (0.8.8).** Search and the digest rank by words, then by how recently and how much an entry was used (§14). Nothing waits on a network call, and nothing leaves the machine. |
-| Knowledge | **Stays Markdown files** that people can edit by hand. It gains page history and revert, and shares one search with memory. |
+| Meaning | **No embeddings (0.8.8).** Search and the digest rank by words, then by how recently and how much an entry was used (§10). Nothing waits on a network call, and nothing leaves the machine. |
+| Knowledge | **Stays Markdown files** that people can edit by hand. It has page history and revert, and shares one search with memory. |
 | Filters | **Full parity:** tree exact/lquery/ltxtquery, `meta` containment, a JSONPath `metaPredicate`, five temporal modes and `grep`. |
 
 What ha keeps, because ME has no equivalent:
@@ -44,50 +40,39 @@ What ha keeps, because ME has no equivalent:
 - the knowledge link graph.
 
 ME deliberately has no extraction layer. In ha that layer stays, writing through
-the new store.
+the store.
 
 ## 2. Feature map
 
-Status before this work: ✅ present, 🟡 partial, ❌ missing. P1 to P7 are the
-phases in §12. Since 0.8.2 every row up to P4 is present; §13 lists what the
-review after 0.8.1 found and what 0.8.2 changed.
-
-| ME feature | Today | Phase |
-|---|---|---|
-| `content`, version and CAS | ✅ | P1 (kept) |
-| Hierarchical `tree`, address by `tree/name`, immutable id | 🟡 | P1 |
-| Free `meta` object, reserved `$prev`/`$next`/`$thread`, `display_name` | ❌ | P1 |
-| `temporal` point or range | ❌ | P1 (stored) · P3 (queried) |
-| `on_conflict` error / replace / ignore | 🟡 | P1 |
-| Append-only event log: snapshot, actor, cause, `operation_id` | 🟡 | P1 |
-| History by memory, path, subtree, operation or time feed, with cursor | 🟡 | P2 |
-| Revert and undelete as a new forward version | ✅ memory · ❌ knowledge | P1 · P4 |
-| Time-based retention (30 days) | ❌ | P1 |
-| `tree` (counts per node), `count`, `mv`, `copy`, `delete_tree`, get/delete by path | ❌ | P2 |
-| BM25 with the positive-match invariant | 🟡 | P3 |
-| Semantic search on memory with a background embedding queue | ❌ | P3 · removed in 0.8.8 (§14) |
-| Weighted RRF hybrid; `weights`, `candidateLimit`, `semanticThreshold` per call | 🟡 | P3 · only `candidate_limit` since 0.8.8 |
-| Filters `tree`, `meta`, `metaPredicate`, `temporal`, `grep`; filter-only browse with `order_by` | ✅ (since 0.8.1) | P3 |
-| `select` projection and `format` yaml/json/compact | 🟡 | P3 |
-| Knowledge page history, revert and undelete | ❌ | P4 |
-| One search over memory and knowledge | ❌ | P4 |
-| History filters (`since`, `until`, `kind`); thread links on `history_read` | ✅ (since 0.8.1; `until` 0.8.2) | P4 |
-| CLI for memory, including `edit` | ❌ | P5 |
-| Import and export in JSON, YAML, Markdown and NDJSON | ❌ | P5 |
-| Memory packs (validate, install, list) | ❌ | P5 |
-| Import docs (`--git-aware`, `--prune`) | 🟡 | P6 |
-| Import git history | ❌ | P6 |
-| Import Claude Code, Codex and OpenCode sessions | ❌ | P6 |
-| MCP server offering memory tools to other harnesses | ❌ | P7 |
-| Install harness integrations, with capture hooks | ❌ | P7 |
-| Web UI for memory | 🟡 knowledge only | P7 |
-| `doctor` / `status` for memory | 🟡 | P7 |
+| memory-engine | ha |
+|---|---|
+| `content`, version and CAS | `expected_version` or `version_hash` on an update (§4) |
+| Hierarchical `tree`, address by `tree/name`, immutable id | `tree`, a `name` unique per tree, `memory_id` (§3.2, §4) |
+| Free `meta` object with reserved keys | `meta`, the entry's `metadata` (§3.2) |
+| `temporal` point or range | `temporal`, stored and filtered (§3.2, §6.3), and an entry's validity (§12) |
+| `on_conflict` | `error`, `replace`, `ignore` (§4) |
+| Append-only event log, 30-day retention | `memory_event` with actor, cause and `operation_id`; the 10 newest versions always kept (§3.5) |
+| History by memory, tree, operation or time, with a cursor | `history` (§5) |
+| Revert and undelete | `revert` for memory (§4) and for knowledge pages (§7) |
+| `tree`, `count`, `mv`, `copy`, `delete_tree`, get and delete by path | `memory` tool actions (§5) |
+| BM25 with the positive-match invariant | BM25 with English stemming (§6.1), indexed once per process (§11) |
+| Semantic and hybrid search | None: removed in 0.8.8; ranking by words, recency and use (§10) |
+| Filters `tree`, `meta`, `metaPredicate`, `temporal`, `grep` | All of them (§6.3) |
+| `select` and `format` | On `search`, `read` and `history` (§6.4) |
+| `memory.embeddingStatus` | `status` (§5) |
+| One search over memory and knowledge | `sources: ["memory", "knowledge"]` (§7) |
+| The `me memory` CLI | `ha memory`: export, purge, queue, lint, init, migrate (§8) |
+| Import and export formats, packs, importers, MCP server, harness integrations, web UI | Not built (§8) |
 
 Out of scope: spaces, principals, groups, grants, API keys, service accounts,
 invites, login, the CI import workflow, a remote backend, and the Granola and Slab
 importers (one is macOS only, the other a niche service).
 
-## 3. Storage (P1)
+Not taken from ME: its batch create (only its importers use it), its stopword
+list (ha does not judge text by word lists), and `strict` JSONPath mode (ME
+runs lax).
+
+## 3. Storage
 
 ### 3.1 Files
 
@@ -106,9 +91,8 @@ There is one database per scope directory, not one for all of ha:
   only the global part of a review.
 - Tests and tools that point at a bare directory keep working.
 
-The read-modify-write lock becomes `memory.lock` beside the database (today
-`harness_state.json.lock`). The database runs in WAL mode with a 5 s busy
-timeout. `PRAGMA user_version` carries the schema version; migrations are
+The read-modify-write lock is `memory.lock` beside the database. The database
+runs in WAL mode with a 5 s busy timeout. `PRAGMA user_version` carries the schema version; migrations are
 ordered Rust functions, applied when the database is opened.
 
 ha talks to it through `rusqlite` 0.39. That version links the same
@@ -121,7 +105,7 @@ need a runtime bridge.
 ```sql
 CREATE TABLE memory (
   id              TEXT PRIMARY KEY,      -- UUIDv7, immutable
-  kind            TEXT NOT NULL,         -- prompt|memory|skill|subagent|factory|record
+  kind            TEXT NOT NULL,         -- prompt|memory|skill|subagent|factory
   key             TEXT NOT NULL,         -- ha's entry id (slug), unique per kind
   name            TEXT,                  -- ME's name, unique in its tree (schema 3)
   tree            TEXT NOT NULL,         -- '/global/user/preferences'
@@ -150,7 +134,7 @@ CREATE TABLE memory_event (
   operation    TEXT NOT NULL,      -- insert|update|delete
   operation_id TEXT NOT NULL,      -- one per write transaction
   cause        TEXT,               -- create|update|delete|move|copy|revert|import|migrate|review|dream|curate|rollback|...
-  actor        TEXT NOT NULL,      -- JSON: {"type": model|refine|kernel|migration|cli|mcp|import, ...origin}
+  actor        TEXT NOT NULL,      -- JSON: {"type": model|refine|kernel|migration|learning|sleep|cli, ...origin}
   version      INTEGER NOT NULL,
   doc          TEXT NOT NULL       -- snapshot of the resulting state (the removed state for a delete)
 );
@@ -162,9 +146,9 @@ CREATE INDEX memory_event_at ON memory_event(at DESC);
 
 CREATE TABLE refinement (seq INTEGER PRIMARY KEY, event TEXT NOT NULL);  -- the `refinements` array
 CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);     -- `schema` and other top-level fields
--- P3 (schema 2): memory_vector, memory_embedding_queue (dropped by schema 4)
--- 0.8.2 (schema 3): the V1 `name` column renamed `key`, and `name` added (§13)
--- 0.8.8 (schema 4): memory_usage added, the two embedding tables dropped (§14)
+-- schema 2 (0.8.1): memory_vector, memory_embedding_queue (dropped by schema 4)
+-- 0.8.2 (schema 3): the V1 `name` column renamed `key`, and `name` added
+-- 0.8.8 (schema 4): memory_usage added, the two embedding tables dropped (§10)
 CREATE TABLE memory_usage (
   memory_id     TEXT PRIMARY KEY,   -- removed with its memory
   reads         INTEGER NOT NULL DEFAULT 0,  last_read_at  TEXT,
@@ -190,7 +174,7 @@ How ha's entries map onto ME's record:
   - an empty path becomes `general`.
 
   The original `path` is kept in `doc`. A tree under `/projects/<key>` is the
-  "project" scope of today. A record without a project is global.
+  "project" scope. A record without a project is global.
 - **meta.** The entry's existing `metadata` object, so `pinned` is `meta.pinned`.
   Reserved keys, as in ME: `$prev`, `$next`, `$thread`, `display_name`, `pinned`.
   `meta` is replaced whole on update, as in ME.
@@ -201,7 +185,7 @@ How ha's entries map onto ME's record:
 
 ### 3.3 The document view (compatibility layer)
 
-Three functions are how the code reads and writes the state today:
+Three functions read and write the whole state:
 
 - `harness::load`, used by the digest;
 - `refine::load_raw` and `refine::save_raw`, used by the `memory` tool, the review,
@@ -217,20 +201,20 @@ They keep their JSON document shape:
   - inserts, updates and deletes the rows that changed;
   - writes one event per changed row, all sharing one `operation_id`;
   - replaces `refinement` when it changed;
-  - bumps the memory-change counter (`memory_changes`) as today.
-- `Writer { actor, cause }` is new and required. Every call site states who
-  writes:
+  - bumps the memory-change counter (`memory_changes`).
+- `Writer { actor, cause }` is required. Every call site states who writes:
   - `model`: the `memory` tool;
   - `refine`: every refinement (`/refine`, the automatic review, Deep Dream,
     the curator), with the refinement's id, which `refinements.jsonl` explains,
     and cause `refine`, or `rollback` for a rollback;
   - `kernel`: `rlm.harness`;
   - `migration`: a legacy import;
-  - `cli` and `mcp` once those land.
+  - `learning`: the learning loop, placing a lesson's rule;
+  - `sleep`: the expiry pass (§12.5);
+  - `cli`: `ha memory purge` (§11).
 
-New features (filters, history, tree operations, search) query the rows directly.
-The document view only serves existing callers, so their behaviour does not
-change in P1.
+Filters, history, tree operations and search query the rows directly. The
+document view serves the callers that read or write the whole state.
 
 ### 3.4 Migration and legacy files
 
@@ -257,27 +241,28 @@ file imported. Such a read writes. A read that must change nothing - the bug
 report's snapshot, `purge`'s dry run, the store meta `ha doctor` reads - opens
 the database read-only instead.
 
-Going back to an older ha: `ha memory export --legacy` (P5) writes a
-`harness_state.json` that 0.8.x reads. The `.imported` file is the state from
-before the upgrade.
+There is no downgrade command. `ha memory export` prints a store's state as
+JSON in `harness_state.json`'s shape, and the `.imported` file is the state
+from before the upgrade.
 
 ### 3.5 Event log retention
 
 Events older than 30 days are dropped, as in ME. The exception: the 10 newest
-versions of each memory are always kept, which is what `history` shows today. A
+versions of each memory are always kept, as many as a `history` page shows by
+default. A
 memory that has not changed for a month can still be reverted.
 
 Pruning runs at most once an hour, inside a write. History and revert reach
 exactly as far as the log does.
 
-## 4. Writes and identity (P1)
+## 4. Writes and identity
 
-The `memory` tool's `write` gains:
+The `memory` tool's `write` takes, besides a title and content:
 
 - `name`, an explicit slug, unique in its tree;
 - `tree`, either absolute (`/global/...`, `/projects/<this project>/...`,
-  `/local/...`, which also chooses the scope) or relative to `scope` (today's
-  `path`, still accepted);
+  `/local/...`, which also chooses the scope) or relative to `scope` (`path`,
+  also accepted);
 - `meta`, an object;
 - `temporal`, `{start, end?}`;
 - `on_conflict`, `error` | `replace` | `ignore`, keyed on `(kind, tree, name)`.
@@ -298,7 +283,7 @@ result carries the entry's `name`, `tree`, `version_hash` and `memory_id`.
 An entry is addressed by its key, by `<tree>/<name>`, or by its `memory_id`, the
 UUID the store gave it, which never changes; list and search show it.
 
-`restore` becomes `revert`, and `restore` stays as an alias:
+`revert`, with `restore` as an alias:
 
 - it re-applies a snapshot from the event log as a new forward version, with
   cause `revert`;
@@ -307,15 +292,16 @@ UUID the store gave it, which never changes; list and search show it.
 - reverting into a key, or a `(tree, name)`, that another entry now holds is a
   conflict.
 
-The digest is unchanged in P1. It also leaves out entries whose temporal range
+The digest leaves out entries whose temporal range
 has ended (`temporal_end <= now`), which are history rather than current fact.
 Search still finds them. Since 0.9.0 an entry a correction or the expiry pass
 closed is left out of a search too, unless it names a time or `include_ended`
-(§16).
+(§12).
 
-## 5. Organizing and history (P2)
+## 5. Organizing and history
 
-New `memory` tool actions. Children get only the read-only ones.
+The `memory` tool's actions for organizing and history. Children get only the
+read-only ones.
 
 | Action | ME equivalent | Notes |
 |---|---|---|
@@ -332,14 +318,14 @@ New `memory` tool actions. Children get only the read-only ones.
 A refinement records the `operation_id` of its write, so `/refine --rollback` and
 `history operation_id=…` agree on what one review changed.
 
-## 6. Search (P3)
+## 6. Search
 
 ### 6.1 Lexical
 
 BM25 runs in `memory/search.rs` over the entries a search considers, after the
 filters. A global and a conversation's store rank as one corpus, with one set of
-statistics. The stores are small, so this beats keeping an FTS5 index in step;
-an index can come later if they grow.
+statistics. There is no FTS5 index: since 0.8.9 each store's words are indexed
+once per process (§11).
 
 Words are ha's own tokens:
 
@@ -368,70 +354,15 @@ and can browse a branch with `tree` and no query. A question asked in English
 of a store kept in Vietnamese was retried with English synonyms only until the
 branches were shown. The model picks the words; ha keeps no synonym table.
 
-### 6.2 Semantic (removed in 0.8.8)
+### 6.2 Meaning (removed in 0.8.8)
 
-What follows is how 0.8.1 to 0.8.7 searched by meaning. 0.8.8 removed it: the
-tables are dropped (§14), and `semantic`, `semantic_threshold`, `weights` and
-`has_embedding` are gone from the tool.
+0.8.1 to 0.8.7 also searched by meaning, fusing embeddings with BM25 by weighted
+RRF. 0.8.8 removed it (§10): a search's modes are `fulltext` and `filter`, and
+`semantic`, `semantic_threshold`, `weights` and `has_embedding` are gone from
+the tool. `limit` (10, at most 200) and `candidate_limit` (30, at least
+`limit`, at most 1000) remain.
 
-Memory uses the embedding endpoint configured for the global knowledge library
-(`/knowledge semantic --global`). Nothing is embedded until the user configures
-it.
-
-| Table | Contents |
-|---|---|
-| `memory_vector` | `memory_id`, `content_version`, `namespace` (endpoint and model), vector |
-| `memory_embedding_queue` | One row per `(memory_id, content_version)` |
-
-An entry needs a vector when it has none for its current content version in the
-current namespace. The queue table records only failed attempts. Embedding runs
-in a background thread after each write through the `memory` tool, and for up
-to 20 s before a semantic search.
-
-The write-back is guarded by `content_version`, so a stale vector never lands.
-Failures retry three times, and a 429 defers the row without spending an attempt.
-
-Scoring is exact cosine over every vector: ha's stores are small enough that ME's
-HNSW recall caveats do not arise. The result is cosine similarity in `[-1, 1]`.
-`semantic_threshold` is in `[0, 1]`; a value outside it is refused, not clamped.
-
-### 6.3 Hybrid (removed in 0.8.8)
-
-Until 0.8.7, weighted Reciprocal Rank Fusion, as in ME:
-
-```text
-score = w_fulltext / (60 + rank_fulltext) + w_semantic / (60 + rank_semantic)
-```
-
-| Parameter | Default and limits |
-|---|---|
-| `weights` | 1 / 1, each in [0, 1] |
-| `candidate_limit` per arm | 30, at least `limit`, at most 1000 |
-| `limit` | 10, at most 200 |
-
-A missing arm adds 0, and ties break by id. A weight of 0 turns its arm off:
-`weights {semantic: 0}` ranks by words alone, with BM25 scores, and says when
-no word matched.
-
-Query variants (`queries`) are fused inside each arm first, by plain RRF as today.
-
-`harness_types::search::hybrid_fuse` is replaced by this fusion, so knowledge and
-history search also reward cross-arm agreement. Today they average normalized
-ranks, and a one-arm top hit beats an item that both arms found.
-
-Each score keeps its mode's meaning, as in ME:
-
-| Mode | Score |
-|---|---|
-| fulltext | BM25 > 0 |
-| semantic | cosine |
-| hybrid | RRF |
-| filter-only | -1 |
-
-Since 0.8.8 a search's modes are `fulltext` (BM25, its order also weighing
-recency and use, §14) and `filter`.
-
-### 6.4 Filters
+### 6.3 Filters
 
 They compose with any mode and with each other, all ANDed. They are evaluated in
 Rust over the candidate rows; SQL narrows candidates first with a tree prefix and
@@ -467,7 +398,7 @@ It is a hand-written parser and evaluator in `memory/filters.rs`.
 With no search text, filters browse: newest first, or by `order_by` `asc`/`desc`.
 Every response carries `total`, counted with `max_count` semantics up to 10 000.
 
-### 6.5 Presentation
+### 6.4 Presentation
 
 | Parameter | Behaviour |
 |---|---|
@@ -475,13 +406,9 @@ Every response carries `total`, counted with `max_count` semantics up to 10 000.
 | `format` | `json` (the tool default, compact), `compact`, or `yaml`; on `search`, `read` and `history`. |
 
 `format: yaml` comes from a small emitter in `memory/search.rs`, which quotes any
-string YAML could read as something else. Reading YAML (packs, import) needs a
-parser: a pinned serde YAML crate is chosen when P5 resumes.
+string YAML could read as something else.
 
-Until 0.8.7 `semantic` named what was meant, searched by meaning; 0.8.8
-removed it with the embeddings.
-
-## 7. Knowledge and history (P4)
+## 7. Knowledge and history
 
 ### Knowledge page history
 
@@ -498,7 +425,7 @@ not undo the write. A page's first recorded change also keeps the text it
 replaced (cause `baseline`), so a page written before the history began can
 still be reverted to.
 
-The `knowledge` tool gains:
+The `knowledge` tool has:
 
 - `history` (a page, a folder or a time feed, with `since`, `until`,
   `operation` and a per-scope `cursor`); with `version`, that version whole, to
@@ -514,7 +441,7 @@ each page always kept.
 `memory` search accepts `sources: ["memory", "knowledge"]`; the default is memory
 only. Knowledge hits come from the knowledge engine (BM25) and are fused by
 RRF into one list. Each hit says `source`, plus
-`path` and the line range for a page. The CLI does the same with `--knowledge`.
+`path` and the line range for a page.
 
 The filters reach the pages as ME's would read a record with no meta and no
 temporal value: a `meta`, `meta_predicate` or `temporal` filter leaves every
@@ -523,7 +450,7 @@ page out; a `tree` filter reads a page at `/knowledge/<scope>/<its folders>`;
 
 ### History tools
 
-- **`history_search`** gains:
+- **`history_search`** takes:
   - `since` and `until`: a source id is the journal event's `event_<UUIDv7>`,
     whose head is its time, so a window of time is a range of ids and needs no
     new column;
@@ -534,172 +461,44 @@ page out; a `tree` filter reads a page at `/knowledge/<scope>/<its folders>`;
   same session, by `sequence`, so a reader can walk the thread without searching
   again.
 
-## 8. CLI, formats and packs (P5)
+## 8. The `ha memory` command
 
-### `ha memory`
+`ha memory` works on the stores and on a project's markdown memory store
+(`crates/harness-cli/src/commands/memory_cli.rs`):
 
-`ha memory <action>`, mirroring `me memory`:
-
-- `create`, `get`, `search`, `update`, `delete`, `deltree`;
-- `history`, `revert`, `edit`;
-- `count`, `tree`, `copy`, `move`;
-- `import`, `export`.
-
-It also has `ha memory pack validate|install|list`.
-
-| Option | Meaning |
+| Command | Does |
 |---|---|
-| `--cwd DIR` | The project, as in `ha knowledge` |
-| `--global` | Global entries only |
-| `--conversation ID` | A conversation's local store |
-| `--json`, `--yaml` | Output format |
-| `--select` | Fields to show |
+| `ha memory export [--conversation ID]` | Prints a store's whole state as JSON, its entries and refinements, in `harness_state.json`'s shape: the global store, or a conversation's |
+| `ha memory purge <id or key> [--yes]`, `ha memory purge --secrets [--yes]` | Forgets an entry, or every entry and version that holds a secret value, with every copy beside the store; it lists first and changes nothing without `--yes`; `--scope`, `--conversation`, `--cwd` (§11) |
+| `ha memory queue [list\|show\|accept\|reject] [id...] [--json]` | The changes that wait for the person's review (§15.3) |
+| `ha memory lint` | Checks a markdown memory store; exits 1 when a check fails ([MARKDOWN_MEMORY.en.md](MARKDOWN_MEMORY.en.md)) |
+| `ha memory init [--hook] [--examples]` | Writes an empty markdown memory store |
+| `ha memory migrate` | Turns a flat memory file into the markdown store through an `ha exec` run, then lints the store |
 
-Every write the CLI makes is recorded with actor `cli`.
+A model reads and writes the stores through the `memory` tool; the CLI has no
+`create`, `get`, `search`, `update` or `delete`.
 
-`edit` opens `$VISUAL` / `$EDITOR` (Notepad on Windows when neither is set) on a
-Markdown file: YAML front matter for tree, name, meta and temporal, then the
-content. Saving writes the file back with `expected_version`.
+**Not built.** The rest of the plan modelled on ME:
 
-### Formats
+- `ha memory` actions mirroring `me memory` (`create`, `get`, `search`, `edit`, ...), and import and export in JSON, YAML, Markdown and NDJSON;
+- memory packs (`validate`, `install`, `list`);
+- importers for docs, git history, and Claude Code, Codex and OpenCode sessions, and the `record` kind they would write;
+- an MCP server offering the memory tools to other harnesses, harness integrations with capture hooks, and a web console for memory (`ha memory serve`).
 
-The same as ME's `formats.md`:
-
-- a JSON array or a single object;
-- NDJSON (`.ndjson`, `.jsonl`; import only);
-- a YAML array or a single object;
-- Markdown, one memory per file, with YAML front matter.
-
-Format comes from the extension or is sniffed. `temporal` accepts all three input
-shapes. A record without a tree goes to `/global/imported`.
-
-Import uses `on_conflict: ignore`, so a re-import is a no-op. Export takes the
-§6.4 filters and writes to a file or a directory (Markdown, one file per memory),
-up to 200 records per call, or more with `--all` on the CLI. `--legacy` writes a
-0.8-compatible `harness_state.json`.
-
-### Packs
-
-The same format as ME:
-
-- a YAML array of records, with the comment header `# Pack:`, `# Version:`,
-  `# Description:`, `# ID prefix:`;
-- deterministic UUIDv7 ids;
-- `meta.pack {name, version}`;
-- a tree under `/global/pack/<name>/...`.
-
-`install` deletes the records of an older version of the pack and then inserts the
-new ones. `validate` runs offline.
-
-## 9. Importers (P6)
-
-| Command | Writes | Shape |
-|---|---|---|
-| `ha memory import docs [dir]` | Knowledge pages in the project library, under `docs/<relative path>`, `origin: import:docs`, `sources: [repo path]` | ME's options: `--git-aware`, `--include`, `--exclude`, `--temporal-key`, `--prune` (deletes only pages this importer wrote), `--dry-run`. Front matter is document data. Over-size pages are truncated and flagged. |
-| `ha memory import git [repo]` | `record` rows at `/projects/<key>/git_history/<sha>` | Subject, body and up to 50 changed files with counts; temporal = commit date; `$prev` along first parents; ME's metadata keys; incremental from the newest imported commit; `--branch`, `--since`, `--until`, `--max-count`, `--full`, `--no-merges`, `--no-file-list`. |
-| `ha memory import claude\|codex\|opencode` | `record` rows at `/projects/<key>/agent_sessions/<session>/msg_<id>` | ME's flags (`--project`, `--since`, `--until`, `--full-transcript`, `--include-temp-cwd`, `--include-trivial`, `--include-sidechains`, `--dry-run`); `$prev` and `$thread`; ME's `source_*` metadata; `on_conflict: replace` stamped with `importer_version`. |
-
-`record` is a new kind. It is searchable and filterable, and it is **never in the
-digest**: thousands of commits must not crowd out the user's preferences.
-
-Docs go into knowledge rather than into memory, because a document is what a
-knowledge page already is. The shared search of §7 reaches them either way.
-
-## 10. Integration (P7)
-
-- **`ha mcp serve memory`.** A stdio MCP server (rmcp, already a dependency with
-  `server`) that exposes ME's tool set as `ha_memory_*`:
-  - `context`, `create`, `update`, `delete`, `delete_by_path`, `delete_tree`;
-  - `search`, `get`, `get_by_path`, `count`, `tree`, `copy`, `mv`;
-  - `import`, `export`, `history`, `revert`;
-  - knowledge search.
-
-  It works on the project of its working directory. `--read-only` exposes only the
-  read tools.
-- **`ha integrate install|uninstall claude|codex|opencode`.**
-  - Registers that MCP server with the harness.
-  - With `--capture`, also adds the harness's stop/session-end hook that runs the
-    matching `ha memory import <harness>` for that one session. The hook runs
-    asynchronously and always exits with success.
-  - ha records every file it writes in `<data>/integrations.json`.
-  - Uninstall removes only recorded files that have not been changed since.
-  - Codex hooks still need the user's approval in Codex.
-- **`ha memory serve`.** The knowledge console, extended with memory: tree
-  browsing, search with filters, an entry's history with revert, and
-  previous/next along `$prev`.
-- **`ha doctor`.** Gains a memory section: the stores and their schema versions,
-  entry and event counts, legacy files still waiting, and installed
-  integrations.
-
-## 11. Compatibility rules
+## 9. Compatibility
 
 - The `memory` tool, the kernel's `rlm.harness`, `/refine`, `/learn`, Deep Dream
-  and the digest behave as they do today unless this document says otherwise.
-  Their unit tests keep passing through the document view.
-- Children stay read-only. Every new action is classified as read or write.
+  and the digest read and write through the document view (§3.3), so they keep
+  the JSON shape they had before the stores.
+- Children stay read-only: every `memory` action is classified as read or write,
+  and children get the read ones.
 - The bug report includes a JSON export of both stores instead of the raw files,
   with event counts.
-- Nothing ever leaves the machine. Embeddings call only the endpoint the user
-  configured.
+- Nothing leaves the machine.
 
-## 12. Phases
+## 10. Ranking by words, recency and use
 
-Each phase passes the gate (`fmt`, `clippy`, `test`) and the live suites it
-touches before the next one starts (see `AGENTS.md`). A new live suite,
-`memory-store.sh`, collects the parity checks. Each check must fail on 0.8.0 and
-pass on the new build, and that control run is reported. The version and release
-stay with the maintainer.
-
-| Phase | Delivers | Live suites |
-|---|---|---|
-| **P1 Core** | §3, §4: SQLite stores, document view, migration, event log with actor/cause/operation, retention, `name`/`tree`/`meta`/`temporal`/`on_conflict`, revert on the log, digest temporal rule | memory, kernel, knowledge, compaction, session-continuity, children, memory-store |
-| **P2 Organize** | §5: get/delete by path, tree, count, move, copy, delete_tree, history feed | memory, children, memory-store |
-| **P3 Search** | §6: FTS5 BM25, memory vectors and queue (removed in 0.8.8), weighted RRF (also for knowledge and history), every filter, JSONPath, select/format, YAML crate | memory, knowledge, memory-store |
-| **P4 Knowledge and history** | §7: page history and revert, unified search, history filters and thread links | knowledge, session-continuity, memory-store |
-| **P5 CLI** | §8: `ha memory`, four formats, `--legacy`, packs | memory-store |
-| **P6 Importers** | §9: docs, git, Claude, Codex and OpenCode sessions, `record` kind | memory-store |
-| **P7 Integration** | §10: MCP server, harness integrations and capture, web console, doctor | memory-store, plus a run with a real MCP client |
-
-Before P1 the live tests read and seed `harness_state.json` directly
-(`kernel.sh`, `knowledge.sh`, `memory.sh`, `session-continuity-evidence.py`).
-P1 moves their seeding to the legacy-import rule of §3.4, and their reads to
-`ha memory export --json` (a minimal export lands in P1 for this) or to read-only
-`sqlite3` queries.
-
-## 13. The review after 0.8.1 (0.8.2)
-
-After 0.8.1 the maintainer asked for a second, independent review of P1 to P4
-against ME's source, with P5 to P7 left out. What it found, and what 0.8.2 does:
-
-| Found | 0.8.2 |
-|---|---|
-| An update renamed an entry that had a name of its own: the name followed the title on every update, so `<tree>/<name>` broke | A name follows the title only while it says the title; a given name stays (§3.2) |
-| Names were unique per store, so two trees could not share one, and a copy renamed its entries | Names are unique per tree (schema 3: `key` and `name`); a copy keeps names, a clash is a conflict (§5) |
-| `content` was required on every update | An update is a patch; one that changes nothing keeps its version (§4) |
-| The `memory_id` a feed showed could not address anything | `memory_id` reads, writes, pages history, reverts and deletes; list and search show it (§4) |
-| History of an entry showed ten versions, title and content only | Every field of each version, a page at a time (§5) |
-| An entry could not move to another scope alone | An absolute tree in another scope moves it, under its id (§4) |
-| `replace` kept the old meta and period when the write left them out | `replace` takes the entry whole, as ME (§4) |
-| A new title kept the old vector | The title is embedded with the content, and bumps `content_version` |
-| No English stemming | Snowball English, as PostgreSQL's `english` configuration (§6.1) |
-| Pure keyword search was not possible once embeddings were on | A weight of 0 turns an arm off (§6.3) |
-| `%` matched words by position; trees took only `/` | `%` as PostgreSQL's `compare_subnode`; `.` joins labels; relative trees (§6.4) |
-| An unknown JSONPath method matched nothing, silently; no `.datetime()`, `.**{n}`, `\u` | Unknown methods are refused; PostgreSQL 17's conversion methods, levels and escapes (§6.4) |
-| Combined search ignored the filters on knowledge pages | The filters reach the pages (§7) |
-| No way to read an old page version, no `until` or cursor | `history` with `version`, `until`, `operation`, `cursor` (§7) |
-| No embedding status, no `has_embedding` | `status`, and `has_embedding` in `select` (§5, §6.5) |
-| `select` and `format` only on search; `meta.<key>` flat | Also on read and history; `meta.<key>` under `meta` (§6.5) |
-
-Not taken: ME's batch create (only its importers use it; P5), ME's stopword
-list (ha does not judge text by word lists), and `strict` JSONPath mode (ME runs
-lax).
-
-The rows about vectors and `has_embedding` describe 0.8.2; 0.8.8 removed both
-(§14).
-
-## 14. Words, recency and use (0.8.8)
-
-0.8.8 removes semantic search everywhere: memory search, the digest's
+0.8.8 removed semantic search everywhere: memory search, the digest's
 by-meaning arm, the readout's meaning recall, knowledge search, history search,
 the embedding cache and `/knowledge semantic`. It was off unless the user
 configured an endpoint, and when on it could stall a turn on the provider and
@@ -742,7 +541,7 @@ library's `.ha-embedding.json` and `.ha-embedding.sqlite`, and
 and `/knowledge status` say when a `.ha-embedding.json` is still there, and the
 diagnostics record `knowledge.embedding_config_ignored` once.
 
-## 15. An index for ranking, and forgetting (0.8.9)
+## 11. An index for ranking, and forgetting
 
 **The words are indexed once.** Until 0.8.8 the digest and memory search
 tokenized, stemmed and folded every entry on every call, then sorted every
@@ -830,7 +629,9 @@ not read.
 | `--scope global`, `project`, `local` | Only the global entries, this project's (`--cwd`), or a conversation's (`--conversation`) |
 | `ha memory purge --secrets [--yes]` | The same for everything that holds a secret value |
 
-## 16. When an entry holds, and where its words came from (0.9.0)
+## 12. Validity and trust
+
+Since 0.9.0 an entry says when it holds and where its words came from.
 
 Memory does not help by itself: most memory setups measured in 2026 did no
 better than memory off. What the current systems have and ha lacked: a
@@ -839,13 +640,13 @@ deleting it (Mem0's ADD/UPDATE/DELETE/NOOP, Zep/Graphiti's `invalid_at`),
 questions about time, trust by source against memory poisoning (MINJA), and
 expiry of memory nobody uses (Copilot drops memory unused for 28 days).
 
-### 16.1 The fields
+### 12.1 The fields
 
 All in `memory/validity.rs`, the one place a later field joins them:
 
 | Field | On | Says |
 |---|---|---|
-| `origin.kind` | every entry the memory tool or a review writes | where its words came from: `user`, `tool`, `web`, `file`, `agent`, `child`, `review`. The host decides it (§16.4). An entry without one reads as `agent`. |
+| `origin.kind` | every entry the memory tool or a review writes | where its words came from: `user`, `tool`, `web`, `file`, `agent`, `child`, `review`. The host decides it (§12.4). An entry without one reads as `agent`. |
 | `supersedes` | an entry that corrected others | the memory ids of the entries it closed |
 | `superseded_by` | an entry a later one replaced | that one's memory id |
 | `expired` | an entry the expiry pass closed | why: `unused` |
@@ -857,7 +658,7 @@ it had none). The digest leaves out a closed entry, as it does an ended
 period, even while its period has not ended: a future-dated entry superseded
 today ends a millisecond after its start.
 
-### 16.2 Contradictions are resolved at write, by closing validity
+### 12.2 Contradictions are resolved at write, by closing validity
 
 The `memory` tool's `write` takes `supersedes: [id, ...]` (keys, `<tree>/<name>`
 addresses or memory ids):
@@ -883,7 +684,7 @@ addresses or memory ids):
 A review's edits get the same: an edit `{"action": "supersede", "kind",
 "id": <old>, "title", "content", "path"?, "metadata"?, "evidence"}` writes a
 new entry keyed by its title, next to the old one's path and project, kept for
-the same files (`paths`, §18.4) but citing none of its code, and closes the
+the same files (`paths`, §14.4) but citing none of its code, and closes the
 old one (`validity::supersede_edit`). The refinement records it as
 two edits: the old entry's (its `before`, and its closed `after`) and the new
 entry's `create`, so a rollback deletes the new entry and puts the old one back.
@@ -898,7 +699,7 @@ period is the one it had before it was closed.
 `history` shows the chain: each version carries its `supersedes`,
 `superseded_by`, `expired` and `from`.
 
-### 16.3 Questions about time
+### 12.3 Questions about time
 
 Memory search takes:
 
@@ -909,7 +710,7 @@ Memory search takes:
 | `include_ended` | the closed entries too |
 
 A search that names a time (`as_of`, `since`/`until`, or the temporal filter
-of §6.4) reads closed entries, and ranks the results by how well their
+of §6.3) reads closed entries, and ranks the results by how well their
 validity matches the time before the words: for a point, whether the entry
 held then; for a window, the share of it the entry held (`validity::fit`).
 The temporal filter's modes make the window: `contains` a point, `after` and
@@ -927,7 +728,7 @@ No reranker by the model: a model call per search costs a request's time and
 tokens, and the validity and the words already order what a question about
 time needs.
 
-### 16.4 Trust by source
+### 12.4 Trust by source
 
 `origin.kind` is the host's, never the model's. The memory tool reads the
 conversation as the project store's journal holds it (`memory/provenance.rs`;
@@ -961,14 +762,14 @@ What follows from it:
 - The digest frames an entry from a web page (`, from a web page:
   unverified`) or a delegated child (`, from a delegated agent: unverified`).
   Search, read and history show `from` and `unverified`.
-- Such an entry ranks below an otherwise equal one (§16.3).
+- Such an entry ranks below an otherwise equal one (§12.3).
 - An entry whose kind is `web` - now, or when it was kept - cannot be written
   into `constraints/*` or `user/preferences` (and below): a create, an update,
   a move or a review's edit is refused with the reason, before the call runs.
   The model is told to keep it as a fact elsewhere, or to ask the user to
   state the rule.
 
-### 16.5 Expiry by use
+### 12.5 Expiry by use
 
 A pass closes the entries nobody used: no read and no search hit for
 `HA_MEMORY_EXPIRE_DAYS` (default 28; 0 turns it off; at most 36,500, a
@@ -991,9 +792,9 @@ cause `expire`; `restore` with its id alone brings it back.
 - `ha doctor` says when the last pass ran and how many it closed (the
   global store's `expiry` meta).
 
-## 17. What a review writes, and Deep Dream in batches (0.9.0)
+## 13. What a review writes, and Deep Dream in batches
 
-0.9.0 closes the gaps two audits found in how refinements write the store
+0.9.0 closed the gaps two audits found in how refinements write the store
 (`memory/refine.rs`, `memory/learned.rs`). Each is a rule of `apply`, the
 one entry point every refinement - a review, `/refine`, `/learn`, Deep Dream,
 the curator, a rollback - writes through.
@@ -1047,7 +848,7 @@ merge into one, is refused with the reason, recorded like any refusal: an
 edit would reopen it, or delete what `as_of` and history read. A rollback
 still puts back what its refinement closed. An update of a live entry keeps
 its `temporal`, `supersedes`, `superseded_by`, `expired`, `citations` and
-`paths` (§18).
+`paths` (§14).
 
 **A review's memory edit quotes what it read.** A memory or prompt-note edit
 of a review, `/refine` or `/learn` is applied only when its `evidence` is
@@ -1103,7 +904,10 @@ The same holds for a conversation's store past 40 entries and for the
 curator's memory part (`/refine --curate`), whose batches precede the skills'
 refinement `<id>`.
 
-## 18. Code an entry cites, and memory kept for some files (0.9.2)
+## 14. Citations and scoped memory
+
+Since 0.9.2 an entry can cite the code it rests on, and can be kept for some
+files only.
 
 A fact about code goes stale when the code changes, and nothing in an entry
 said so: the digest kept presenting it as fact. And a rule that matters only
@@ -1114,11 +918,11 @@ Memory keeps citations to code with each memory and checks them against the
 current branch when the memory is retrieved; Claude Code loads a
 `.claude/rules/*.md` whose `paths:` match a file it reads, and Amp and Devin
 scope knowledge to paths the same way. Both are measurable and switchable
-(§18.5).
+(§14.5).
 
-### 18.1 The fields
+### 14.1 The fields
 
-All in `memory/citations.rs` (`memory_citations`), as §16.1's are in
+All in `memory/citations.rs` (`memory_citations`), as §12.1's are in
 `memory/validity.rs`:
 
 | Field | On | Says |
@@ -1128,10 +932,10 @@ All in `memory/citations.rs` (`memory_citations`), as §16.1's are in
 
 Two records sit beside the entries, never in them: the store meta key
 `citations` holds the last check of each entry's citations, by memory id
-(§18.3); a conversation's store meta key `scoped_loaded` holds what the
-conversation loaded (§18.4).
+(§14.3); a conversation's store meta key `scoped_loaded` holds what the
+conversation loaded (§14.4).
 
-### 18.2 Citations, checked at write
+### 14.2 Citations, checked at write
 
 The `memory` tool's `write`, a create or an update, takes
 `citations: [{path, quote, lines?}]`, at most 5:
@@ -1155,18 +959,18 @@ give those lines, or leave lines out`.
 An update's `citations` replaces the entry's whole; `[]` or `null` clears
 them. A create that replaces the entry its name holds (`on_conflict:
 replace`) keeps only the citations it gives. An update by a review,
-`/refine`, `/learn` or Deep Dream, and an accepted queue item (§19.3), cannot
+`/refine`, `/learn` or Deep Dream, and an accepted queue item (§15.3), cannot
 give `citations` or `paths`: the entry keeps its own. A citation may sit on an entry
-of any scope; read in another project's workspace it is not checked (§18.3),
+of any scope; read in another project's workspace it is not checked (§14.3),
 never called broken: those are other files.
 
 **The host does not attach a citation itself.** When provenance says the
-entry's words came from a file read (`origin.kind = file`, §16.4) and the
+entry's words came from a file read (`origin.kind = file`, §12.4) and the
 write gives none, the result's `cite` says how to add one. The host knows
 which file was read, not which span of it the fact rests on: a guessed span
 would later mark a sound entry as stale, or keep a stale one looking sound.
 
-### 18.3 Citations, checked on read
+### 14.3 Citations, checked on read
 
 Each read of an entry checks its citations against the files as they are:
 the digest, for each entry it shows (pinned ones included); `search`, for each
@@ -1208,7 +1012,7 @@ the mark. An unchecked entry is shown as before.
   citations are broken now (`memory citations: 1 of 3 entries cite code that
   changed since they were kept`).
 
-### 18.4 Memory kept for some files
+### 14.4 Memory kept for some files
 
 The `memory` tool's `write` takes `paths: [glob, ...]`, at most 16, each at
 most 200 characters, relative to the workspace root and gitignore-style: a
@@ -1262,9 +1066,9 @@ one with `..` or a drive is refused, and so is one that does not parse
 - **The markdown store.** A memory file whose frontmatter has `paths:` is
   loaded the same way ([MARKDOWN_MEMORY.en.md](MARKDOWN_MEMORY.en.md) §9).
 
-### 18.5 Measured, and switched off
+### 14.5 Measured, and switched off
 
-`HA_MEMORY_OFF` takes two more features ([operator guide](../guides/OPERATOR_GUIDE.en.md)
+`HA_MEMORY_OFF` (§16) takes two more features ([operator guide](../guides/OPERATOR_GUIDE.en.md)
 §12.21):
 
 - `citations`: citations are neither checked nor shown - no check in the
@@ -1283,15 +1087,15 @@ names the ledger the billing modules post to, which a new module records; a file
 repository would not do, since a run with memory off reads the markdown
 store's files as any file).
 
-## 19. The person's review queue, and what a child proposes (0.9.2)
+## 15. The review queue and child proposals
 
 Until 0.9.0 nothing waited for a person: a review, `/refine`, `/learn` and
 Deep Dream applied what passed the checks at once, and refused the rest -
 a fetched page's words made a rule among them, which the person could not
-take even when it was right. The queue (`memory/review_queue.rs`) holds the
+take even when it was right. The queue (`memory/review_queue.rs`, since 0.9.2) holds the
 changes the person should have a say in, beside the store they would change.
 
-### 19.1 What waits
+### 15.1 What waits
 
 A memory or prompt change a refinement planned is checked as it would be
 applied - the evidence quote, the secrets and steering text, the size, the
@@ -1299,7 +1103,7 @@ duplicates, a closed entry - and then, instead of being applied, waits when:
 
 | `HA_MEMORY_REVIEW` | What waits |
 |---|---|
-| `policy` (the default) | a change that writes, changes or removes a rule every later turn follows - an entry in `constraints/*` or `user/preferences`, now or before the change - from a fetched page's words (0.9.0 refused it), or from evidence that is not the user's own words (it quotes a file, a tool, a child's finding, or nothing: the review inferred it). Deep Dream's merges rest on the entries, not on a quote: only a page's words in them wait. And a delegated child's proposal its parent's review did not keep (§19.4). |
+| `policy` (the default) | a change that writes, changes or removes a rule every later turn follows - an entry in `constraints/*` or `user/preferences`, now or before the change - from a fetched page's words (0.9.0 refused it), or from evidence that is not the user's own words (it quotes a file, a tool, a child's finding, or nothing: the review inferred it). Deep Dream's merges rest on the entries, not on a quote: only a page's words in them wait. And a delegated child's proposal its parent's review did not keep (§15.4). |
 | `all` | every memory and prompt change of a review, `/refine`, `/learn` and Deep Dream, and every child's proposal the review did not keep |
 | `off` | nothing: what 0.9.0 did (a page's words into a rule refused, a child's proposal the review did not keep dropped) |
 
@@ -1316,7 +1120,7 @@ A merge's delete whose survivor's change waits, waits on it (`after`): it is
 accepted only after the survivor's change, and leaves the queue when that is
 rejected. A rollback and an accept never wait.
 
-### 19.2 The queue
+### 15.2 The queue
 
 One file per scope, `memory_queue.json` in the scope's folder (the global
 store's `harness/`, a conversation's `sessions/<task>/harness/`), written
@@ -1353,7 +1157,7 @@ the refinement records it as not applied (`the memory queue could not keep
 it, so it is not applied: ...`) and the diagnostics as `memory_queue
 not_queued`. A reject or an accept in it is refused.
 
-### 19.3 Accept and reject
+### 15.3 Accept and reject
 
 `ha memory queue` and `/memory queue` (§12.22 of the operator guide) list the
 items of every queue under the data directory, show one with its evidence and
@@ -1384,7 +1188,7 @@ a diff against the entry as it is now, and accept or reject them.
   (`<rejected_by_user>`) and asked not to propose them again unless the
   conversation shows the user wants them now.
 
-### 19.4 What a child proposes
+### 15.4 What a child proposes
 
 0.8.9's `note_finding` let a child keep a fact with the words of its own tool
 result that show it; the parent's review could turn it into memory. A
@@ -1412,7 +1216,7 @@ same file twice.
   finding (`proposal.closed`, `note`, `queued`) and in the diagnostics
   (`memory_queue child_proposal`).
 
-### 19.5 Where it shows
+### 15.5 Where it shows
 
 - After a review that queued changes, the session says so once, with where to
   review them (`memory: 1 proposed change waits for your review (2 in all):
@@ -1422,3 +1226,56 @@ same file twice.
   proposed; `/context` has a `Memory queue:` line while changes wait or the
   mode is not the default; the bug report's Memory section counts them and
   copies the queues (their outline without `--include-content`).
+
+## 16. Memory on and off
+
+Since 0.9.0 one switch turns memory off, whole or one feature at a time, so a
+run with memory on can be measured against one with memory off
+(`memory/switch.rs`). A feature that is off is neither read into a request nor
+written after it: a run with memory off leaves every memory store as it was.
+The conversation's own task state and the project's AGENTS.md are the task and
+its instructions, not memory, and stay.
+
+- **`HA_MEMORY=off`** (or `0`, `false`, `no`) turns every feature off.
+  `HA_MEMORY=on` (or `1`, `true`, `yes`) turns memory on over the setting.
+- **`HA_MEMORY_OFF=<feature>,...`** turns off the named features alone, for an
+  ablation. Names are separated by commas, semicolons or spaces; case does not
+  matter, and `-` reads as `_`.
+
+| Feature | What it turns off |
+|---|---|
+| `digest` | the memory digest in every turn, the `memory` tool and the kernel's `rlm.harness`, a child's digest and the findings it hands back (`note_finding`), and the expiry of unused entries (§12.5); the store is not opened |
+| `markdown` | a markdown memory store's rules and index in every turn |
+| `session_log` | writing session logs, the log a new conversation is told of, and `/recall` |
+| `lessons` | the learning loop's results in a turn: learned rules and their notes in tool descriptions, the learned skill recalled for a request, the learned skills' note, and the count of their use |
+| `reviews` | every background pass: the automatic review (after a turn, of a quiet session, after a compaction), consolidation (Deep Dream), curation, evolution, the self-evaluation, `/refine`, `/learn`, and what a review tells the next turn; nothing is queued either (§15.1) |
+| `earlier_state` | what a new conversation is told of earlier ones: the task state an earlier conversation left, and the previous conversation's last turns |
+| `knowledge` | the knowledge library: its catalog in a turn and the `knowledge` tool |
+| `citations` | checking, showing and writing citations (§14.5) |
+| `scoped` | memory kept for some files: loading, listing, searching, reading and writing it, and a markdown store's files with `paths:` (§14.5) |
+
+A name that is no feature is ignored, and said: `/context` and `ha doctor` name
+it with the list of features. A value of `HA_MEMORY` that is neither on nor off
+is ignored the same way.
+
+- **The `memory` key of `settings.json`** says the same: `{"memory":
+  {"enabled": false}}` or `{"memory": {"off": ["digest", "knowledge"]}}`. The
+  environment wins: `HA_MEMORY` over `enabled`, and `HA_MEMORY_OFF`, even
+  empty, over `off`. The same key's `review` field sets which changes wait for
+  the person (`policy`, `all`, `off`), and `HA_MEMORY_REVIEW` wins over it
+  (§15.1).
+- **Where it shows.**
+  - `/context` has a `Memory:` line: `on`, `off (HA_MEMORY): ...`, or `on
+    except ... (HA_MEMORY_OFF)`, with `settings.json memory` in the brackets
+    when the setting turned the features off. A `Memory queue:` line follows
+    while changes wait or the review mode is not the default (§15.5).
+  - `ha doctor` warns with what is off, and says nothing while all of it is on.
+  - Each run of `ha exec`, and the first turn of each app conversation, write a
+    `memory.switch` diagnostics record (`off`, `all_off`, `source`, and
+    `unknown` for names that are no feature); the app writes it again when the
+    switch changes. `ha exec`'s JSON has `memory.off`.
+- **Measured.** The live suite `scripts/testing/live-tests/memory-ab.sh` teaches
+  a project facts, then runs the same tasks from the same snapshot with memory
+  on, off and (with `ABLATE=1`) each feature off alone, and writes a table of
+  success, tokens, calls and time against memory off
+  ([live tests](../../scripts/testing/live-tests/README.md)).

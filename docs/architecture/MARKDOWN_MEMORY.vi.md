@@ -30,9 +30,9 @@ viết dòng đó, `diff` là việc thay thế.
 
 | | Tool `memory` của ha | Kho markdown |
 |---|---|---|
-| Nằm ở | `<data>/harness/memory.sqlite3`, theo hội thoại và global | Các file trong project, trong Git |
+| Nằm ở | `memory.sqlite3`: của một hội thoại ở `<data>/sessions/<task>/harness/`, bản global ở `<data>/harness/` | Các file trong project, trong Git |
 | Giữ | Sở thích và quyết định của người dùng xuyên project, và ghi chú riêng của một hội thoại (scope local); không bao giờ là trạng thái việc, thứ thuộc về `task_state` | Người, quyết định, trạng thái và bài học của project này |
-| Ai ghi | Tool `memory`, lượt review, Deep Dream | Tool file của agent và người dùng bằng editor; cả host: decision và fact của learning loop, và phần của session log trong daily note |
+| Ai ghi | Tool `memory`, lượt review, `/refine`, `/learn`, Deep Dream, và các mục trong hàng chờ review mà người dùng chấp nhận | Tool file của agent và người dùng bằng editor; cả host: decision và fact của learning loop, và phần của session log trong daily note |
 | Đọc | Digest ở mọi lượt, tìm bằng `memory` | `MEMORY.md` ở mọi lượt; các file khi index chỉ tới |
 
 ## 3. Lệnh
@@ -157,6 +157,9 @@ Config không đọc được thì vẫn gửi luật, và lượt được báo
 Project không có `memory-lint.json` thì không nhận block nào. Chat và
 `ha exec` mang các block này; child được giao việc thì không, vì agent giao việc
 là bên giữ memory.
+
+Tắt: `HA_MEMORY_OFF=markdown` (hoặc `HA_MEMORY=off`, hoặc key `memory` của
+`settings.json`) bỏ cả hai block, trong chat lẫn `ha exec`.
 
 ## 5. Host ghi gì, và ghi thế nào
 
@@ -289,7 +292,7 @@ paths: ["src/billing/**", "*.sql"]
 `paths:` là một danh sách trên cùng dòng, một glob (`paths: src/billing/**`),
 hoặc một danh sách khối gồm các dòng `- glob` bên dưới. Các glob tính từ gốc
 project và theo kiểu gitignore, như `paths` của một entry
-([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §18.4).
+([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §14.4).
 
 - **Nạp khi một file khớp bị chạm tới.** File đi kèm kết quả của lần gọi file
   tool đầu tiên trong hội thoại đọc, sửa, ghi hoặc liệt kê một file khớp (hoặc

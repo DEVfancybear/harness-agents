@@ -1,5 +1,5 @@
 //! Memory kept for some files only, loaded when a conversation touches one
-//! of them (`docs/architecture/MEMORY_STORE.en.md` §18), as Claude Code loads
+//! of them (`docs/architecture/MEMORY_STORE.en.md` §14), as Claude Code loads
 //! a `.claude/rules/*.md` whose `paths:` match a file it reads.
 //!
 //! An entry with `paths` (`memory_citations::PATHS`) is out of the digest

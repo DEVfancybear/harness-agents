@@ -1,7 +1,6 @@
 # Đổi chiến lược và runtime harness
 
-Phần ha lấy từ hai bài báo: nó hoạt động thế nào, và phần nào không lấy. Kế
-hoạch và các quyết định của chủ dự án nằm trong [plan](STRATEGY_AND_RUNTIME_PLAN.vi.md).
+Phần ha lấy từ hai bài báo: nó hoạt động thế nào, và phần nào không lấy.
 
 - **[A] arXiv 2608.19072**, *What Is Missing from AI Post-Training AI*: agent
   thực thi tốt nhưng khoá cứng vào chiến lược ban đầu. Chỉ 2,1% số lần thử
@@ -17,10 +16,10 @@ hoạch và các quyết định của chủ dự án nằm trong [plan](STRATEG
 
 | Lớp | Ở đâu | Làm gì |
 |---|---|---|
-| Theo dõi trajectory | `harness-tools/src/runtime/regulation.rs`, gọi sau mỗi lần gọi tool trong `turn_driver.rs` | Một tool hỏng cùng một lỗi 3 lần, dù tham số khác nhau, thì có ghi chú ngay dưới lần gọi đó. 5 lần thì ghi chú bảo dừng. Lệnh trả exit code khác 0 cũng tính là hỏng. Hai lần sửa file xen kẽ, cái sau hoàn tác cái trước (A, B, A, B), cũng được chỉ ra. Khi turn sắp hết step hoặc lượt gọi tool thì được báo một lần. |
-| Kiểm lệnh trước khi chạy | cùng chỗ, trước khi chạy lệnh | Lệnh y hệt lệnh ngay trước nó vừa hỏng thì không chạy, nếu giữa hai lần không có lệnh nào khác chạy và người dùng không nói gì. Chỉ áp dụng cho tool file, và chỉ cho lỗi do chính lệnh: approval, workspace cũ hay provider bận không bao giờ là lý do để chặn. Luật học được (`rules.rs`) đổi tên tham số mà tool không nhận, hoặc từ chối một hình dạng tham số chưa từng chạy được. |
-| Contract của tool | `evolution.rs`, hàm `annotate` | Ghi chú học từ các lần hỏng được thêm vào mô tả tool. |
-| Skill | `memory/skill_recall.rs` | Request (cùng goal) được chấm BM25 với từng learned skill. Chỉ skill top-1 được đưa vào turn, và chỉ khi điểm nổi bật hẳn so với phần còn lại. Kèm theo là các giả định đã sai trong những lần skill đó thất bại trước. |
+| Theo dõi trajectory | `crates/harness-tools/src/runtime/regulation.rs`, gọi sau mỗi lần gọi tool trong `crates/harness-tools/src/runtime/turn_driver.rs` | Một tool hỏng cùng một lỗi 3 lần, dù tham số khác nhau, thì có ghi chú ngay dưới lần gọi đó. 5 lần thì ghi chú bảo dừng. Lệnh trả exit code khác 0 cũng tính là hỏng. Hai lần sửa file xen kẽ, cái sau hoàn tác cái trước (A, B, A, B), cũng được chỉ ra. Khi turn sắp hết step hoặc lượt gọi tool thì được báo một lần. |
+| Kiểm lệnh trước khi chạy | cùng chỗ, trước khi chạy lệnh | Lệnh y hệt lệnh ngay trước nó vừa hỏng thì không chạy, nếu giữa hai lần không có lệnh nào khác chạy và người dùng không nói gì. Chỉ áp dụng cho tool file, và chỉ cho lỗi do chính lệnh: approval, workspace cũ hay provider bận không bao giờ là lý do để chặn. Luật học được (`crates/harness-tools/src/runtime/rules.rs`) đổi tên tham số mà tool không nhận, hoặc từ chối một hình dạng tham số chưa từng chạy được. |
+| Contract của tool | `crates/harness-cli/src/host/memory/evolution.rs`, hàm `annotate` | Ghi chú học từ các lần hỏng được thêm vào mô tả tool. |
+| Skill | `crates/harness-cli/src/host/memory/skill_recall.rs` | Request (cùng goal) được chấm BM25 với từng learned skill. Chỉ skill top-1 được đưa vào turn, và chỉ khi điểm nổi bật hẳn so với phần còn lại. Kèm theo là các giả định đã sai trong những lần skill đó thất bại trước. |
 
 Mỗi lần gọi tool xong để lại một record `call settled` gồm hash và hình dạng
 tham số (tên và kiểu, không bao giờ có giá trị) cùng loại lỗi: mã lỗi, và câu
@@ -30,7 +29,7 @@ regulation* đếm tất cả những thứ này.
 
 ### Tiến hoá tự động
 
-`memory/evolution.rs` chạy tối đa một lần mỗi ngày, sau một turn. Nó giữ khoá
+`crates/harness-cli/src/host/memory/evolution.rs` chạy tối đa một lần mỗi ngày, sau một turn. Nó giữ khoá
 để mỗi lúc chỉ một process chạy, và chỉ đánh dấu lần chạy khi đã lưu xong:
 lượt hỏng được job của nó trong hàng đợi các lượt chạy nền
 ([Sleep](SLEEP.vi.md)) thử lại sau một thời gian chờ, và bỏ cuộc sau 6 lần
@@ -57,6 +56,10 @@ là quên hết.
 
 ## Đổi chiến lược ([A])
 
+Code: `crates/harness-cli/src/host/memory/strategy.rs` (lần đánh giá, plateau,
+quyết định) và `crates/harness-cli/src/host/coordination/goal.rs` (nơi goal
+được đánh giá).
+
 - **`task_state`** ghi tên chiến lược (cùng các phương án đã cân nhắc), nhật ký
   theo kiểu của bài báo (plan, observation, lesson, eval, eval analysis) và các
   quyết định.
@@ -65,6 +68,11 @@ là quên hết.
   lại bao nhiêu ở bước đó, rồi đến lỗi in ra bao nhiêu dòng. Nhờ vậy test giảm
   từ 40 lỗi xuống 2 được tính là có tiến triển. Task mà model chưa từng dùng
   `task_state` vẫn được đánh giá.
+- **Turn của một goal kết thúc khi chưa tới đích** mà chưa có lần đánh giá nào
+  cũng vậy: host đánh giá nó sau turn (`evaluate_turn` trong `goal.rs`), dù
+  model có yêu cầu hay không. Turn không đổi gì trong workspace là một lần đánh
+  giá không đổi; turn có đổi thì chạy check của project, hoặc đọc checklist khi
+  không có check.
 - **Sau mỗi lần đánh giá là tới lúc quyết định.** Lời từ chối và task state ở
   mọi turn đều nói điều đó. Đây chỉ là lời khuyên, không chặn (theo quyết định
   của chủ dự án): model tự cân nhắc bằng chứng rồi ghi `decide` continue hoặc
@@ -72,8 +80,10 @@ là quên hết.
 - **Plateau.** Ba lần đánh giá dưới cùng một chiến lược mà không tiến thêm là
   plateau. Khi đó một child explorer với context mới (strategist) được hỏi một
   lần cho mỗi plateau, để nêu tên 2–3 chiến lược *khác*. Lời từ chối và task
-  state mang các phương án đó. Nếu quyết định tiếp tục, phải qua thêm đủ một
-  plateau đánh giá nữa thì strategist mới được hỏi lại.
+  state mang các phương án đó. Nếu quyết định tiếp tục được đưa ra tại một
+  plateau, phải qua thêm đủ một plateau đánh giá nữa thì strategist mới được
+  hỏi lại. Quyết định `continue` sau một lần đánh giá bình thường không giữ
+  strategist lại.
 - **`compare_children`** chạy check của project ngay trong worktree của từng
   coder, để chọn được bản tốt hơn khi hai chiến lược được thử song song, trước
   khi integrate.
@@ -81,6 +91,15 @@ là quên hết.
   bắt người dùng phải chọn.
 - **Review đọc bản ghi chiến lược** cùng cuộc trò chuyện, để chiến lược đã
   giậm chân trở thành bài học cho task sau.
+
+## Tắt
+
+- `HA_MEMORY_OFF=reviews` (hoặc `HA_MEMORY=off`, hoặc tắt `harnessRefinements`)
+  dừng evolution: nó không chạy, và không có luật hay ghi chú nào được thêm.
+- `HA_MEMORY_OFF=lessons` (hoặc `HA_MEMORY=off`) gỡ luật học được, ghi chú tool
+  và learned skill được recall khỏi turn gốc, child được delegate và `ha exec`.
+  Những gì đã học vẫn còn trong `harness-evolution.json`.
+- Công tắc memory là `crates/harness-cli/src/host/memory/switch.rs`.
 
 ## Phần không lấy
 
@@ -92,3 +111,7 @@ là quên hết.
   chừng, check của feature và các ghi chú lỗi lặp lại của regulator chưa được
   tính là lần đánh giá chiến lược. `switch` chưa tự fork một nhánh mới, và
   verifier chưa trỏ được vào worktree của coder.
+- **Đã đề xuất mà chưa làm:** `block_repeat`, `require_read_before` và
+  `normalize_path` trong bộ từ vựng luật (hiện chỉ có `RenameArgument` và
+  `RefuseShape`), tín hiệu cho một chuỗi kết quả rỗng, lệnh `/harness evolve`,
+  và `workspace_rev` trong record của lần gọi.

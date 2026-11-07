@@ -29,9 +29,9 @@ Git is the store's history: `log` is when a fact held, `blame` who wrote a line,
 
 | | ha's `memory` tool | The markdown store |
 |---|---|---|
-| Where | `<data>/harness/memory.sqlite3`, per conversation and global | Files in the project, in Git |
+| Where | `memory.sqlite3`: a conversation's in `<data>/sessions/<task>/harness/`, the global one in `<data>/harness/` | Files in the project, in Git |
 | Holds | The user's preferences and decisions across projects, and a conversation's own notes (local scope); never task state, which is `task_state`'s | This project's people, decisions, state and lessons |
-| Written by | The `memory` tool, the review, Deep Dream | The agent's file tools and people with an editor; the host too: the learning loop's decisions and facts, and the session log's section of the day's note |
+| Written by | The `memory` tool, the review, `/refine`, `/learn`, Deep Dream, and review-queue items the person accepts | The agent's file tools and people with an editor; the host too: the learning loop's decisions and facts, and the session log's section of the day's note |
 | Read | The digest in every turn, `memory` search | `MEMORY.md` in every turn; the files when the index routes there |
 
 ## 3. Commands
@@ -159,6 +159,9 @@ A config that cannot be read still sends the rules, and the turn is told why the
 index is missing. A project without `memory-lint.json` gets neither block. The
 chat and `ha exec` carry them; a delegated child does not, since the agent that
 delegates keeps the memory.
+
+Off: `HA_MEMORY_OFF=markdown` (or `HA_MEMORY=off`, or the `memory` key of
+`settings.json`) drops both blocks, in the chat and in `ha exec`.
 
 ## 5. What the host writes, and how
 
@@ -294,7 +297,7 @@ paths: ["src/billing/**", "*.sql"]
 `paths:` is a list on its line, one glob (`paths: src/billing/**`), or a block
 list of `- glob` lines below it. The globs are relative to the project root
 and gitignore-style, as an entry's `paths` are
-([MEMORY_STORE.en.md](MEMORY_STORE.en.md) §18.4).
+([MEMORY_STORE.en.md](MEMORY_STORE.en.md) §14.4).
 
 - **Loaded when a matching file is touched.** The file comes with the result
   of the first file tool call of a conversation that reads, edits, writes or

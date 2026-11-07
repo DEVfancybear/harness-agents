@@ -49,13 +49,19 @@ Close every running `ha` before installing: Windows does not let a running execu
 
 ### 4. Check before you ship
 
+The gate, as [`AGENTS.md`](../../AGENTS.md) gives it. Unset the live-test variables first (`HA`, `HA_HOME`, `HA_CREDENTIALS_DIR`, `HA_PYTHON`, `PROBE`, `PROBE_WT`, `MODEL`, `THINKING`, `LIVE_ROOT`, `PYTHONPATH`):
+
 ```powershell
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
 # Prepare and manually verify the candidate in section 5 before this unskipped suite:
-cargo test --workspace --all-targets --locked
+cargo test --locked --workspace --no-fail-fast
 python -m unittest discover -s crates/harness-cli/python/tests -v
 ```
+
+`m9_04_release_candidate_has_checksums_and_is_not_published` needs a candidate under `target/release-candidate` (section 5).
+
+The gate is not enough on its own: a change a user can see, or one that touches the agent loop, tools, children, compaction, memory, diagnostics, the worker or the TUI, is done only when it has passed live, the release `ha` driven against a real model. The suites and how to run them are in [`scripts/testing/live-tests`](../../scripts/testing/live-tests/README.md); a release runs them with `MODEL=openai-codex/gpt-6-luna THINKING=max` unless the maintainer names another model.
 
 The Python regressions include mock desktop tests and do not send GUI input. `cargo test` skips the `#[ignore]`d terminal (PTY) cases because they need a real console. Run that opt-in suite from a local console with `pwsh -NoProfile -File scripts/testing/Invoke-HaPtyAcceptance.ps1` (see [TUI.md](TUI.md)); `-Filter <name>` runs a subset. Live provider and desktop probes also remain opt-in.
 
@@ -63,7 +69,7 @@ The Python regressions include mock desktop tests and do not send GUI input. `ca
 
 ### 5. Build a release candidate
 
-For a new `X.Y.Z`, bump `[workspace.package].version` in `Cargo.toml` and all 11 workspace packages in `Cargo.lock`. Leave `npm/harness-agents/package.json` at its source placeholder `0.1.0`: the packer derives the published version from the bundle. Review and commit source/docs/version changes, then require a clean worktree **before** building. The script records `HEAD`, not uncommitted changes, and does not enforce cleanliness itself. Do not use `-SkipBuild` for a new release.
+For a new `X.Y.Z`, bump `[workspace.package].version` in `Cargo.toml` and all 11 workspace packages in `Cargo.lock`. Leave `npm/harness-agents/package.json` at its source placeholder `0.1.0`: the packer derives the published version from the bundle. Bump the version only when the maintainer says to release. Review the source/docs/version changes and commit them as `chore(release): ha X.Y.Z`, then require a clean worktree **before** building. The script records `HEAD` as `build_commit` in `ha.release.json`, not uncommitted changes, and does not enforce cleanliness itself. Do not use `-SkipBuild` for a new release.
 
 ```powershell
 pwsh -NoProfile -File scripts/release/New-HaRelease.ps1                  # release build + bundle
@@ -93,12 +99,24 @@ Options: `-Profile Debug` for a quick local candidate, `-OutputDirectory <dir>`,
 
 ### 6. Publish
 
-`New-HaRelease.ps1` never publishes; the GitHub release is created by hand, and npm publication follows its published-release event (section 7):
+`New-HaRelease.ps1` never publishes; the GitHub release is created by hand, and npm publication follows its published-release event (section 7). The whole flow, as [`AGENTS.md`](../../AGENTS.md) "Versions and releases" gives it:
 
-1. Complete the version/clean-commit preparation and candidate build/manual checks in section 5, then the unskipped suite in section 4 and candidate acceptance. Do not publish a stale binary.
-2. Tag that exact commit and push: `git tag -a ha-vX.Y.Z -m "ha X.Y.Z"` and `git push origin ha-vX.Y.Z`.
-3. Publish the GitHub release with the intended ZIP, bundle `checksums.txt` and notes: `gh release create ha-vX.Y.Z <zip> <checksums.txt> --title "ha X.Y.Z" --notes-file <release-notes.md>`.
-4. Let the OIDC npm workflow download and package that ZIP; it does not rebuild Rust. Tag creation alone does not publish npm. Keep tag, bundle and npm versions aligned for a normal release; do not manually publish unrelated bytes under the same version.
+1. Bump `[workspace.package] version` and the workspace crates in `Cargo.lock`, and commit `chore(release): ha X.Y.Z` (section 5).
+2. From that clean tree, build the candidate with `pwsh -NoProfile -File scripts/release/New-HaRelease.ps1` and check it by hand (section 5). Run the gate in section 4 and candidate acceptance.
+3. Run the live suites on the candidate's own `ha.exe` (`HA` set to the full Windows path of `target\release-candidate\ha-X.Y.Z-windows-x64\ha.exe`, `MODEL=openai-codex/gpt-6-luna THINKING=max`; see [`scripts/testing/live-tests`](../../scripts/testing/live-tests/README.md)). Every check passes on the exact binary that is released. A fix to the code means a new commit, a new candidate and the gate again; do not publish a stale binary.
+4. Push the release commit: `git push origin master`.
+5. Tag that exact commit and push the tag: `git tag -a ha-vX.Y.Z -m "ha X.Y.Z"` and `git push origin ha-vX.Y.Z`.
+6. Create the GitHub release with the candidate's ZIP and the bundle's `checksums.txt`: `gh release create ha-vX.Y.Z <zip> <checksums.txt> --title "ha X.Y.Z" --notes-file <release-notes.md>`.
+7. Publishing the release starts the OIDC npm workflow, which downloads and packages that ZIP; it does not rebuild Rust. Tag creation alone does not publish npm. Keep tag, bundle and npm versions aligned for a normal release; do not manually publish unrelated bytes under the same version.
+8. Download the release and check it. `checksums.txt` has CRLF lines, so strip the carriage returns before `sha256sum -c`:
+
+```bash
+gh release download ha-vX.Y.Z --dir release-check
+cd release-check
+sha256sum ha-X.Y.Z-windows-x64.zip      # the SHA-256 New-HaRelease.ps1 printed
+unzip -q ha-X.Y.Z-windows-x64.zip -d bundle
+(cd bundle && tr -d '\r' < ../checksums.txt | sha256sum -c -)
+```
 
 `-PublishDryRun` prints the tag, the archive's SHA-256 and the `git tag`, `git push` and `gh release create` commands it would suggest, and whether `gh` or `GH_TOKEN` is available. Publishing the release triggers [`npm-publish.yml`](../../.github/workflows/npm-publish.yml).
 
@@ -172,13 +190,19 @@ ha --version
 
 ### 4. Kiểm tra trước khi phát hành
 
+Gate theo [`AGENTS.md`](../../AGENTS.md). Trước tiên unset các biến của live test (`HA`, `HA_HOME`, `HA_CREDENTIALS_DIR`, `HA_PYTHON`, `PROBE`, `PROBE_WT`, `MODEL`, `THINKING`, `LIVE_ROOT`, `PYTHONPATH`):
+
 ```powershell
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
 # Chuẩn bị và kiểm thủ công candidate ở mục 5 trước suite không skip này:
-cargo test --workspace --all-targets --locked
+cargo test --locked --workspace --no-fail-fast
 python -m unittest discover -s crates/harness-cli/python/tests -v
 ```
+
+`m9_04_release_candidate_has_checksums_and_is_not_published` cần một candidate trong `target/release-candidate` (mục 5).
+
+Chỉ gate thì chưa đủ: thay đổi mà người dùng thấy được, hoặc chạm vào agent loop, tool, child, compaction, memory, diagnostics, worker hay TUI, chỉ xong khi đã qua live, tức là `ha` bản release chạy với model thật. Các suite và cách chạy nằm ở [`scripts/testing/live-tests`](../../scripts/testing/live-tests/README.md); một release chạy chúng với `MODEL=openai-codex/gpt-6-luna THINKING=max`, trừ khi maintainer chỉ định model khác.
 
 Regression Python có test desktop mock, không gửi GUI input. `cargo test` bỏ qua các ca terminal (PTY) đánh dấu `#[ignore]` vì chúng cần console thật. Chạy bộ opt-in này từ console cục bộ bằng `pwsh -NoProfile -File scripts/testing/Invoke-HaPtyAcceptance.ps1` (xem [TUI.md](TUI.md)); `-Filter <tên>` chạy một phần. Probe provider live và desktop cũng vẫn cần opt-in.
 
@@ -186,7 +210,7 @@ Regression Python có test desktop mock, không gửi GUI input. `cargo test` b�
 
 ### 5. Build bản release candidate
 
-Với bản `X.Y.Z` mới, nâng `[workspace.package].version` trong `Cargo.toml` và version của cả 11 package workspace trong `Cargo.lock`. Giữ `npm/harness-agents/package.json` ở placeholder nguồn `0.1.0`: packer lấy version phát hành từ bundle. Review và commit thay đổi source/docs/version, rồi yêu cầu worktree sạch **trước khi** build. Script ghi `HEAD`, không ghi thay đổi chưa commit và không tự kiểm worktree sạch. Không dùng `-SkipBuild` cho release mới.
+Với bản `X.Y.Z` mới, nâng `[workspace.package].version` trong `Cargo.toml` và version của cả 11 package workspace trong `Cargo.lock`. Giữ `npm/harness-agents/package.json` ở placeholder nguồn `0.1.0`: packer lấy version phát hành từ bundle. Chỉ nâng version khi maintainer bảo phát hành. Review thay đổi source/docs/version và commit thành `chore(release): ha X.Y.Z`, rồi yêu cầu worktree sạch **trước khi** build. Script ghi `HEAD` vào `build_commit` của `ha.release.json`, không ghi thay đổi chưa commit và không tự kiểm worktree sạch. Không dùng `-SkipBuild` cho release mới.
 
 ```powershell
 pwsh -NoProfile -File scripts/release/New-HaRelease.ps1                  # build release + đóng gói
@@ -216,12 +240,24 @@ Tùy chọn: `-Profile Debug` cho bản thử nhanh, `-OutputDirectory <dir>`, `
 
 ### 6. Phát hành
 
-`New-HaRelease.ps1` không tự phát hành; GitHub release được tạo bằng tay, rồi sự kiện publish release kích hoạt npm (mục 7):
+`New-HaRelease.ps1` không tự phát hành; GitHub release được tạo bằng tay, rồi sự kiện publish release kích hoạt npm (mục 7). Toàn bộ quy trình, theo mục "Versions and releases" của [`AGENTS.md`](../../AGENTS.md):
 
-1. Hoàn tất chuẩn bị version/commit sạch, build và kiểm thủ công candidate ở mục 5, rồi suite không skip ở mục 4 và nghiệm thu candidate. Không publish binary cũ.
-2. Tạo tag tại đúng commit đó và push: `git tag -a ha-vX.Y.Z -m "ha X.Y.Z"` và `git push origin ha-vX.Y.Z`.
-3. Publish GitHub release kèm đúng ZIP, `checksums.txt` của bundle và ghi chú: `gh release create ha-vX.Y.Z <zip> <checksums.txt> --title "ha X.Y.Z" --notes-file <release-notes.md>`.
-4. Để workflow npm OIDC tải và đóng gói ZIP đó; nó không build lại Rust. Chỉ tạo tag chưa publish npm. Release thông thường phải giữ tag, bundle và npm version khớp nhau; không publish thủ công binary không liên quan dưới cùng version.
+1. Nâng `[workspace.package] version` và các crate workspace trong `Cargo.lock`, rồi commit `chore(release): ha X.Y.Z` (mục 5).
+2. Từ worktree sạch đó, build candidate bằng `pwsh -NoProfile -File scripts/release/New-HaRelease.ps1` và kiểm thủ công (mục 5). Chạy gate ở mục 4 và nghiệm thu candidate.
+3. Chạy các live suite trên chính `ha.exe` của candidate (`HA` là đường dẫn Windows đầy đủ tới `target\release-candidate\ha-X.Y.Z-windows-x64\ha.exe`, `MODEL=openai-codex/gpt-6-luna THINKING=max`; xem [`scripts/testing/live-tests`](../../scripts/testing/live-tests/README.md)). Mọi check phải qua trên đúng binary được phát hành. Sửa code nghĩa là commit mới, candidate mới và chạy lại gate; không publish binary cũ.
+4. Push commit release: `git push origin master`.
+5. Tạo tag tại đúng commit đó và push tag: `git tag -a ha-vX.Y.Z -m "ha X.Y.Z"` và `git push origin ha-vX.Y.Z`.
+6. Tạo GitHub release kèm ZIP của candidate và `checksums.txt` của bundle: `gh release create ha-vX.Y.Z <zip> <checksums.txt> --title "ha X.Y.Z" --notes-file <release-notes.md>`.
+7. Publish release sẽ chạy workflow npm OIDC, workflow tải và đóng gói ZIP đó; nó không build lại Rust. Chỉ tạo tag chưa publish npm. Release thông thường phải giữ tag, bundle và npm version khớp nhau; không publish thủ công binary không liên quan dưới cùng version.
+8. Tải release về và kiểm tra. `checksums.txt` có dòng CRLF, nên bỏ ký tự carriage return trước `sha256sum -c`:
+
+```bash
+gh release download ha-vX.Y.Z --dir release-check
+cd release-check
+sha256sum ha-X.Y.Z-windows-x64.zip      # SHA-256 mà New-HaRelease.ps1 đã in
+unzip -q ha-X.Y.Z-windows-x64.zip -d bundle
+(cd bundle && tr -d '\r' < ../checksums.txt | sha256sum -c -)
+```
 
 `-PublishDryRun` in ra tag, SHA-256 của file zip, các lệnh `git tag`, `git push`, `gh release create` mà nó gợi ý, và cho biết `gh` hoặc `GH_TOKEN` có sẵn không. Việc publish release sẽ kích hoạt [`npm-publish.yml`](../../.github/workflows/npm-publish.yml).
 

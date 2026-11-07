@@ -2,41 +2,27 @@
 
 [English](MEMORY_STORE.en.md) | Tiếng Việt
 
-**Trạng thái:** thiết kế, ngày 26/10/2026. Đây là kế hoạch đưa các tính năng của
-[timescale/memory-engine](https://github.com/timescale/memory-engine) (đọc ở
-commit `9c9bdc1`, ngày 23/10/2026) vào memory của ha. Việc chia làm bảy phase, và
-mỗi mục ghi rõ phase nào làm. Khi một phase chưa ship thì code là chuẩn, không
-phải tài liệu này.
+Tài liệu này mô tả cách kho memory của ha hoạt động: các kho SQLite, việc ghi,
+tìm kiếm và lọc của tool `memory`, lịch sử, xếp hạng, quên, hiệu lực và độ tin,
+những gì review ghi, trích dẫn và memory theo file, hàng đợi duyệt và công tắc
+memory. Chỗ nào tài liệu và code khác nhau thì code là chuẩn.
 
-Bản 0.8.1 gồm P1 tới P4. P5 (CLI, định dạng, pack), P6 (importer) và P7 (MCP
-server, tích hợp, console) tạm hoãn tới khi maintainer làm tiếp. P1 chỉ thêm đúng
-một lệnh CLI mà test của nó cần: `ha memory export`.
-
-Bản 0.8.2 bổ sung những gì lần rà soát thứ hai so với ME còn thiếu ở P1 tới P4
-(§13):
-
-- name duy nhất theo tree và được giữ qua các lần cập nhật;
-- cập nhật kiểu patch;
-- `memory_id` không đổi dùng làm địa chỉ;
-- history phân trang, đủ mọi trường;
-- stemming tiếng Anh;
-- `%` của lquery theo đúng PostgreSQL;
-- các method JSONPath của PostgreSQL 17;
-- bộ lọc áp lên trang knowledge;
-- đọc nguyên văn phiên bản trang cũ;
-- action `status`.
+Thiết kế dựa theo [timescale/memory-engine](https://github.com/timescale/memory-engine)
+(đọc ở commit `9c9bdc1`, ngày 23/10/2026). Các phần sau của kế hoạch đó - định
+dạng và pack cho CLI, importer, và tích hợp qua MCP server - không được làm
+(§8).
 
 ## 1. Mục tiêu và quyết định
 
 memory-engine (ME) là server memory dùng chung cho nhóm, chạy trên Postgres với
-`ltree`, `pgvector` và BM25; agent dùng nó qua MCP. ha hiện giữ:
+`ltree`, `pgvector` và BM25; agent dùng nó qua MCP. ha giữ:
 
-- memory trong các file `harness_state.json`;
+- memory trong mỗi scope một kho SQLite (§3);
 - knowledge dưới dạng trang Markdown;
 - một history index trong SQLite.
 
 Mục tiêu: mọi khả năng của ME mà một người dùng đơn lẻ dùng được thì ha cũng có,
-chạy cục bộ.
+chạy cục bộ; §8 liệt kê những gì không được làm.
 
 Maintainer đã quyết:
 
@@ -44,8 +30,8 @@ Maintainer đã quyết:
 |---|---|
 | Chia sẻ | **Chưa làm.** ha chỉ chạy cục bộ, một người dùng: không có space, principal, group, grant, API key, login, invite hay backend từ xa. Tính lại sau. |
 | Lưu memory | **Mỗi scope một kho SQLite**, theo mô hình record của ME: tree, name, meta, temporal, version, event log. Thay cho `harness_state.json`. |
-| Theo nghĩa | **Không dùng embedding (0.8.8).** Search và digest xếp theo từ, rồi theo entry được dùng gần đây và nhiều đến đâu (§14). Không gì phải chờ một lần gọi mạng, và không gì rời khỏi máy. |
-| Knowledge | **Vẫn là file Markdown**, người dùng sửa tay được. Có thêm lịch sử trang và revert, và dùng chung một search với memory. |
+| Theo nghĩa | **Không dùng embedding (0.8.8).** Search và digest xếp theo từ, rồi theo entry được dùng gần đây và nhiều đến đâu (§10). Không gì phải chờ một lần gọi mạng, và không gì rời khỏi máy. |
+| Knowledge | **Vẫn là file Markdown**, người dùng sửa tay được. Có lịch sử trang và revert, và dùng chung một search với memory. |
 | Bộ lọc | **Đủ như ME:** tree theo đường dẫn chính xác, lquery và ltxtquery; `meta` kiểu "chứa"; `metaPredicate` (JSONPath); temporal 5 kiểu; `grep`. |
 
 Những thứ ha giữ lại vì ME không có:
@@ -56,44 +42,29 @@ Những thứ ha giữ lại vì ME không có:
 - nhiều cách diễn đạt câu hỏi (`queries`);
 - đồ thị liên kết knowledge.
 
-ME cố ý không có lớp tự trích xuất; ở ha lớp đó vẫn còn và ghi qua kho mới.
+ME cố ý không có lớp tự trích xuất; ở ha lớp đó vẫn còn và ghi qua kho.
 
 ## 2. Bản đồ tính năng
 
-Trạng thái trước khi làm: ✅ có, 🟡 một phần, ❌ chưa có. P1 tới P7 là các phase
-ở §12. Từ 0.8.2 mọi dòng tới P4 đều đã có; §13 liệt kê những gì lần rà soát sau
-0.8.1 tìm ra và 0.8.2 đã đổi gì.
-
-| Tính năng ME | Hiện tại | Phase |
-|---|---|---|
-| `content`, version, CAS | ✅ | P1 (giữ) |
-| `tree` phân cấp, gọi theo `tree/name`, id không đổi | 🟡 | P1 |
-| Object `meta` tự do; khóa dành riêng `$prev`/`$next`/`$thread`, `display_name` | ❌ | P1 |
-| `temporal` (một thời điểm hoặc một khoảng) | ❌ | P1 (lưu) · P3 (truy vấn) |
-| `on_conflict` error / replace / ignore | 🟡 | P1 |
-| Event log chỉ ghi thêm: snapshot, actor, cause, `operation_id` | 🟡 | P1 |
-| Lịch sử theo memory, path, cây con, operation hoặc feed theo thời gian, có cursor | 🟡 | P2 |
-| Revert và undelete thành một phiên bản mới | ✅ memory · ❌ knowledge | P1 · P4 |
-| Giữ log theo thời gian (30 ngày) | ❌ | P1 |
-| `tree` (số lượng mỗi nút), `count`, `mv`, `copy`, `delete_tree`, get/delete theo path | ❌ | P2 |
-| BM25, chỉ trả kết quả thật sự khớp từ khóa | 🟡 | P3 |
-| Semantic cho memory, với hàng đợi embedding chạy nền | ❌ | P3 · bỏ ở 0.8.8 (§14) |
-| Hybrid RRF có trọng số; `weights`, `candidateLimit`, `semanticThreshold` theo từng lần gọi | 🟡 | P3 · từ 0.8.8 chỉ còn `candidate_limit` |
-| Bộ lọc `tree`, `meta`, `metaPredicate`, `temporal`, `grep`; duyệt chỉ bằng lọc, có `order_by` | ✅ (từ 0.8.1) | P3 |
-| `select` (chọn trường) và `format` yaml/json/compact | 🟡 | P3 |
-| Lịch sử trang knowledge, revert, undelete | ❌ | P4 |
-| Một search cho cả memory và knowledge | ❌ | P4 |
-| Bộ lọc history (`since`, `until`, `kind`); liên kết thread khi `history_read` | ✅ (từ 0.8.1; `until` từ 0.8.2) | P4 |
-| CLI memory, có `edit` | ❌ | P5 |
-| Import/export JSON, YAML, Markdown, NDJSON | ❌ | P5 |
-| Memory pack (validate, install, list) | ❌ | P5 |
-| Import tài liệu (`--git-aware`, `--prune`) | 🟡 | P6 |
-| Import lịch sử git | ❌ | P6 |
-| Import phiên Claude Code, Codex, OpenCode | ❌ | P6 |
-| MCP server cung cấp tool memory cho harness khác | ❌ | P7 |
-| Cài tích hợp vào harness khác, có hook capture | ❌ | P7 |
-| Web UI cho memory | 🟡 chỉ knowledge | P7 |
-| `doctor` / `status` cho memory | 🟡 | P7 |
+| memory-engine | ha |
+|---|---|
+| `content`, version, CAS | `expected_version` hoặc `version_hash` khi cập nhật (§4) |
+| `tree` phân cấp, địa chỉ `tree/name`, id không đổi | `tree`, `name` duy nhất theo tree, `memory_id` (§3.2, §4) |
+| Object `meta` tự do, có khóa dành riêng | `meta`, chính là `metadata` của entry (§3.2) |
+| `temporal` (một thời điểm hoặc một khoảng) | `temporal`, được lưu và lọc (§3.2, §6.3), và là hiệu lực của entry (§12) |
+| `on_conflict` | `error`, `replace`, `ignore` (§4) |
+| Event log chỉ ghi thêm, giữ 30 ngày | `memory_event` có actor, cause và `operation_id`; luôn giữ 10 phiên bản mới nhất (§3.5) |
+| Lịch sử theo memory, tree, operation hoặc thời gian, có cursor | `history` (§5) |
+| Revert và undelete | `revert` cho memory (§4) và cho trang knowledge (§7) |
+| `tree`, `count`, `mv`, `copy`, `delete_tree`, get và delete theo path | Các action của tool `memory` (§5) |
+| BM25, chỉ trả kết quả thật sự khớp từ khóa | BM25 có stemming tiếng Anh (§6.1), lập chỉ mục một lần cho mỗi process (§11) |
+| Search theo nghĩa và hybrid | Không có: bỏ ở 0.8.8; xếp theo từ, độ mới và mức dùng (§10) |
+| Bộ lọc `tree`, `meta`, `metaPredicate`, `temporal`, `grep` | Đủ cả (§6.3) |
+| `select` và `format` | Trên `search`, `read` và `history` (§6.4) |
+| `memory.embeddingStatus` | `status` (§5) |
+| Một search cho cả memory và knowledge | `sources: ["memory", "knowledge"]` (§7) |
+| CLI `me memory` | `ha memory`: export, purge, queue, lint, init, migrate (§8) |
+| Định dạng import/export, pack, importer, MCP server, tích hợp harness, web UI | Không làm (§8) |
 
 Ngoài phạm vi:
 
@@ -101,7 +72,13 @@ Ngoài phạm vi:
 - workflow import qua CI, backend từ xa;
 - importer Granola (chỉ có trên macOS) và Slab (dịch vụ ít dùng).
 
-## 3. Lưu trữ (P1)
+Không lấy từ ME:
+
+- batch create của ME, vì chỉ importer của nó dùng;
+- danh sách stopword của ME, vì ha không đánh giá văn bản theo danh sách từ;
+- chế độ JSONPath `strict`, vì ME chạy lax.
+
+## 3. Lưu trữ
 
 ### 3.1 File
 
@@ -120,8 +97,8 @@ Mỗi thư mục scope một database, không phải một database chung cho c�
   hỏng phần global của review.
 - Test và tool trỏ vào một thư mục bất kỳ vẫn chạy được.
 
-Khóa cho mỗi lần đọc-sửa-ghi đổi tên thành `memory.lock`, nằm cạnh database (hiện
-là `harness_state.json.lock`). Database chạy WAL, busy timeout 5 s.
+Khóa cho mỗi lần đọc-sửa-ghi là `memory.lock`, nằm cạnh database. Database chạy
+WAL, busy timeout 5 s.
 `PRAGMA user_version` ghi phiên bản schema; migration là các hàm Rust có thứ tự,
 chạy khi mở database.
 
@@ -134,7 +111,7 @@ Code memory vốn đồng bộ, nên không cần cầu nối sang runtime async
 ```sql
 CREATE TABLE memory (
   id              TEXT PRIMARY KEY,      -- UUIDv7, không đổi
-  kind            TEXT NOT NULL,         -- prompt|memory|skill|subagent|factory|record
+  kind            TEXT NOT NULL,         -- prompt|memory|skill|subagent|factory
   key             TEXT NOT NULL,         -- id entry của ha (slug), duy nhất theo kind
   name            TEXT,                  -- name của ME, duy nhất trong tree (schema 3)
   tree            TEXT NOT NULL,         -- '/global/user/preferences'
@@ -163,7 +140,7 @@ CREATE TABLE memory_event (
   operation    TEXT NOT NULL,      -- insert|update|delete
   operation_id TEXT NOT NULL,      -- một giá trị cho mỗi transaction ghi
   cause        TEXT,               -- create|update|delete|move|copy|revert|import|migrate|review|dream|curate|rollback|...
-  actor        TEXT NOT NULL,      -- JSON: {"type": model|refine|kernel|migration|cli|mcp|import, ...origin}
+  actor        TEXT NOT NULL,      -- JSON: {"type": model|refine|kernel|migration|learning|sleep|cli, ...origin}
   version      INTEGER NOT NULL,
   doc          TEXT NOT NULL       -- snapshot trạng thái sau thay đổi (với delete: trạng thái bị xóa)
 );
@@ -175,9 +152,9 @@ CREATE INDEX memory_event_at ON memory_event(at DESC);
 
 CREATE TABLE refinement (seq INTEGER PRIMARY KEY, event TEXT NOT NULL);  -- mảng `refinements`
 CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);     -- `schema` và các trường cấp gốc khác
--- P3 (schema 2): memory_vector, memory_embedding_queue (schema 4 xóa đi)
--- 0.8.2 (schema 3): cột `name` của V1 đổi tên thành `key`, và thêm cột `name` (§13)
--- 0.8.8 (schema 4): thêm memory_usage, xóa hai bảng embedding (§14)
+-- schema 2 (0.8.1): memory_vector, memory_embedding_queue (schema 4 xóa đi)
+-- 0.8.2 (schema 3): cột `name` của V1 đổi tên thành `key`, và thêm cột `name`
+-- 0.8.8 (schema 4): thêm memory_usage, xóa hai bảng embedding (§10)
 CREATE TABLE memory_usage (
   memory_id     TEXT PRIMARY KEY,   -- xóa cùng memory của nó
   reads         INTEGER NOT NULL DEFAULT 0,  last_read_at  TEXT,
@@ -207,7 +184,7 @@ Entry của ha ánh xạ sang record của ME như sau:
   - path rỗng thành `general`.
 
   `path` gốc được giữ trong `doc`. Tree nằm dưới `/projects/<key>` chính là scope
-  "project" hiện nay; record không gắn project là global.
+  "project"; record không gắn project là global.
 - **meta.** Chính là object `metadata` mà entry đang có, nên `pinned` là
   `meta.pinned`. Khóa dành riêng giống ME: `$prev`, `$next`, `$thread`,
   `display_name`, `pinned`. Cập nhật thì `meta` bị thay cả object, giống ME.
@@ -218,7 +195,7 @@ Entry của ha ánh xạ sang record của ME như sau:
 
 ### 3.3 Lớp tương thích dạng document
 
-Hiện code đọc và ghi state qua ba chỗ:
+Code đọc và ghi toàn bộ state qua ba chỗ:
 
 - `harness::load`, dùng cho digest;
 - `refine::load_raw` và `refine::save_raw`, dùng cho tool `memory`, review, Deep
@@ -234,20 +211,21 @@ Ba chỗ này giữ nguyên dạng document JSON:
   - chèn, sửa, xóa đúng những dòng thay đổi;
   - ghi mỗi dòng thay đổi một event, tất cả chung một `operation_id`;
   - thay bảng `refinement` nếu nó đổi;
-  - tăng bộ đếm thay đổi memory (`memory_changes`) như hiện nay.
-- `Writer { actor, cause }` là tham số mới và bắt buộc: mỗi chỗ gọi phải nói ai
-  đang ghi:
+  - tăng bộ đếm thay đổi memory (`memory_changes`).
+- `Writer { actor, cause }` là tham số bắt buộc: mỗi chỗ gọi phải nói ai đang
+  ghi:
   - `model`: tool `memory`;
   - `refine`: mọi lượt refine (`/refine`, review tự động, Deep Dream, curator),
     kèm id của refinement (giải thích trong `refinements.jsonl`), cause là
     `refine`, hoặc `rollback` khi rollback;
   - `kernel`: `rlm.harness`;
   - `migration`: nhập file cũ;
-  - `cli` và `mcp` khi các phần đó có.
+  - `learning`: learning loop, khi đặt rule của một lesson;
+  - `sleep`: lượt hết hạn (§12.5);
+  - `cli`: `ha memory purge` (§11).
 
-Tính năng mới (bộ lọc, lịch sử, thao tác trên cây, search) truy vấn thẳng các
-dòng. Lớp document chỉ phục vụ các chỗ gọi cũ, nên ở P1 hành vi của chúng không
-đổi.
+Bộ lọc, lịch sử, thao tác trên cây và search truy vấn thẳng các dòng. Lớp
+document phục vụ các chỗ gọi đọc hoặc ghi toàn bộ state.
 
 ### 3.4 Chuyển dữ liệu và file cũ
 
@@ -274,27 +252,27 @@ migrate lên schema này, còn chỉ có file cũ thì được tạo kho và nh
 đọc như vậy có ghi. Lần đọc nào không được đổi gì - snapshot của bug report, dry
 run của `purge`, store meta mà `ha doctor` đọc - thì mở database ở chế độ chỉ đọc.
 
-Muốn quay về bản ha cũ: `ha memory export --legacy` (P5) ghi ra một
-`harness_state.json` mà 0.8.x đọc được. File `.imported` là trạng thái trước lúc
-nâng cấp.
+Không có lệnh nào để quay về bản ha cũ. `ha memory export` in state của một kho
+ra JSON theo dạng của `harness_state.json`, còn file `.imported` là trạng thái
+trước lúc nâng cấp.
 
 ### 3.5 Thời gian giữ event log
 
 Event cũ hơn 30 ngày bị xóa, giống ME. Ngoại lệ: 10 phiên bản mới nhất của mỗi
-memory luôn được giữ, đúng số `history` đang hiển thị. Nhờ vậy, một memory không
+memory luôn được giữ, đúng số một trang `history` hiển thị theo mặc định. Nhờ vậy, một memory không
 đổi suốt một tháng vẫn revert được.
 
 Việc dọn chạy tối đa mỗi giờ một lần, trong một lần ghi. History và revert chỉ
 với tới được những gì log còn giữ.
 
-## 4. Ghi và định danh (P1)
+## 4. Ghi và định danh
 
-Action `write` của tool `memory` có thêm:
+Action `write` của tool `memory` nhận, ngoài title và content:
 
 - `name`: đặt slug cụ thể, duy nhất trong tree;
 - `tree`: đường dẫn tuyệt đối (`/global/...`, `/projects/<project này>/...`,
-  `/local/...`, đồng thời chọn luôn scope) hoặc tương đối theo `scope` (chính là
-  `path` hiện nay, vẫn được chấp nhận);
+  `/local/...`, đồng thời chọn luôn scope) hoặc tương đối theo `scope` (`path`
+  cũng được chấp nhận);
 - `meta`: một object;
 - `temporal`: `{start, end?}`;
 - `on_conflict`: `error` | `replace` | `ignore`, theo khóa `(kind, tree, name)`.
@@ -317,22 +295,23 @@ Cập nhật vẫn dùng `expected_version`, và nhận thêm `version_hash` nh�
 Có ba cách gọi tới một entry: key, `<tree>/<name>`, hoặc `memory_id`. `memory_id`
 là UUID do kho cấp, không bao giờ đổi; list và search đều hiển thị nó.
 
-`restore` đổi thành `revert`, và `restore` vẫn dùng được như một tên gọi khác:
+`revert`, với `restore` là một tên gọi khác:
 
 - nó áp lại một snapshot từ event log thành phiên bản mới, với cause `revert`;
 - revert một memory đã xóa sẽ tạo lại nó với id cũ, version đánh số tiếp;
 - revert vào một key, hoặc một `(tree, name)`, mà entry khác đang giữ là xung
   đột.
 
-Digest ở P1 không đổi. Chỉ thêm một điều: entry có khoảng temporal đã kết thúc
+Entry có khoảng temporal đã kết thúc
 (`temporal_end <= now`) không được đưa vào digest, vì đó là lịch sử chứ không còn
 là sự thật hiện tại. Search vẫn tìm thấy chúng. Từ 0.9.0, entry bị một lần sửa
 hoặc lượt hết hạn đóng lại cũng không có trong search, trừ khi search nêu một
-thời điểm hoặc `include_ended` (§16).
+thời điểm hoặc `include_ended` (§12).
 
-## 5. Sắp xếp và lịch sử (P2)
+## 5. Sắp xếp và lịch sử
 
-Các action mới của tool `memory`. Agent con chỉ có các action chỉ đọc.
+Các action sắp xếp và lịch sử của tool `memory`. Agent con chỉ có các action chỉ
+đọc.
 
 | Action | Tương đương ME | Ghi chú |
 |---|---|---|
@@ -349,14 +328,14 @@ Các action mới của tool `memory`. Agent con chỉ có các action chỉ đ�
 Mỗi refinement ghi lại `operation_id` của lần ghi, để `/refine --rollback` và
 `history operation_id=…` khớp nhau về những gì một lượt review đã đổi.
 
-## 6. Tìm kiếm (P3)
+## 6. Tìm kiếm
 
 ### 6.1 Theo từ khóa
 
 BM25 chạy trong `memory/search.rs` trên các entry mà search xét, sau khi lọc. Kho
 global và kho của cuộc trò chuyện được xếp hạng như một kho chung, với cùng một
-bộ thống kê. Vì kho nhỏ, cách này đơn giản hơn giữ một index FTS5 đồng bộ; khi
-kho lớn lên thì có thể thêm index sau.
+bộ thống kê. Không có index FTS5: từ 0.8.9, từ của mỗi kho được lập chỉ mục một
+lần cho mỗi process (§11).
 
 Từ được tách theo cách của ha:
 
@@ -387,70 +366,13 @@ tiếng Việt chỉ được tìm lại bằng từ đồng nghĩa tiếng Anh,
 
 ### 6.2 Theo nghĩa (bỏ ở 0.8.8)
 
-Phần dưới là cách 0.8.1 đến 0.8.7 tìm theo nghĩa. 0.8.8 đã bỏ: các bảng bị xóa
-(§14), và `semantic`, `semantic_threshold`, `weights`, `has_embedding` không còn
-trong tool.
+0.8.1 tới 0.8.7 còn tìm theo nghĩa, gộp embedding với BM25 bằng RRF có trọng
+số. 0.8.8 đã bỏ (§10): search chỉ còn hai mode `fulltext` và `filter`, và
+`semantic`, `semantic_threshold`, `weights`, `has_embedding` không còn trong
+tool. `limit` (10, tối đa 200) và `candidate_limit` (30, ít nhất bằng `limit`,
+tối đa 1000) vẫn còn.
 
-Memory dùng endpoint embedding đã cấu hình cho thư viện knowledge global
-(`/knowledge semantic --global`). Chưa cấu hình thì không embed gì.
-
-| Bảng | Nội dung |
-|---|---|
-| `memory_vector` | `memory_id`, `content_version`, `namespace` (endpoint + model), vector |
-| `memory_embedding_queue` | Một dòng cho mỗi `(memory_id, content_version)` |
-
-Một entry cần vector khi chưa có vector cho phiên bản nội dung hiện tại trong
-namespace hiện tại. Bảng hàng đợi chỉ ghi các lần thử thất bại. Việc embed chạy
-trong một thread nền sau mỗi lần ghi qua tool `memory`, và tối đa 20 s ngay trước
-một lần search theo nghĩa.
-
-Lúc ghi kết quả có kiểm `content_version`, nên vector cũ không bao giờ ghi đè.
-Lỗi thì thử lại 3 lần; gặp 429 thì hoãn dòng đó mà không tính một lần thử.
-
-Điểm là cosine tính đủ trên mọi vector: kho của ha đủ nhỏ để không gặp các giới
-hạn độ phủ của HNSW như ME. Kết quả là độ tương đồng cosine trong `[-1, 1]`.
-`semantic_threshold` nằm trong `[0, 1]`; giá trị ngoài khoảng bị từ chối chứ
-không bị kẹp lại.
-
-### 6.3 Hybrid (bỏ ở 0.8.8)
-
-Đến 0.8.7, Reciprocal Rank Fusion có trọng số, giống ME:
-
-```text
-score = w_fulltext / (60 + rank_fulltext) + w_semantic / (60 + rank_semantic)
-```
-
-| Tham số | Mặc định và giới hạn |
-|---|---|
-| `weights` | 1 / 1, mỗi giá trị trong [0, 1] |
-| `candidate_limit` mỗi nhánh | 30, ít nhất bằng `limit`, tối đa 1000 |
-| `limit` | 10, tối đa 200 |
-
-Nhánh nào không có kết quả thì góp 0; điểm bằng nhau thì xếp theo id. Trọng số
-0 tắt nhánh đó: `weights {semantic: 0}` chỉ xếp theo từ, với điểm BM25, và báo
-khi không từ nào khớp.
-
-Các cách diễn đạt (`queries`) được gộp trong từng nhánh trước, bằng RRF thường
-như hiện nay.
-
-`harness_types::search::hybrid_fuse` được thay bằng cách gộp này, nên search
-knowledge và history cũng được thưởng khi hai nhánh cùng thấy một kết quả. Hiện
-nay chúng lấy trung bình thứ hạng đã chuẩn hóa, nên kết quả đứng đầu của chỉ một
-nhánh lại thắng kết quả mà cả hai nhánh cùng tìm thấy.
-
-Điểm của mỗi chế độ giữ đúng nghĩa của nó, giống ME:
-
-| Chế độ | Điểm |
-|---|---|
-| fulltext | BM25 > 0 |
-| semantic | cosine |
-| hybrid | RRF |
-| chỉ lọc | -1 |
-
-Từ 0.8.8 search chỉ còn hai mode: `fulltext` (BM25, thứ tự có tính cả độ mới và
-mức dùng, §14) và `filter`.
-
-### 6.4 Bộ lọc
+### 6.3 Bộ lọc
 
 Dùng được với mọi chế độ và kết hợp với nhau theo AND. Chúng chạy bằng Rust trên
 các dòng ứng viên; trước đó SQL đã thu hẹp ứng viên bằng tiền tố tree và index
@@ -489,7 +411,7 @@ Không có văn bản search thì bộ lọc dùng để duyệt: mới nhất t
 `order_by` `asc`/`desc`. Mọi kết quả đều có `total`, đếm theo kiểu `max_count`
 tới 10 000.
 
-### 6.5 Trình bày
+### 6.4 Trình bày
 
 | Tham số | Cách dùng |
 |---|---|
@@ -497,12 +419,9 @@ tới 10 000.
 | `format` | `json` (mặc định của tool, dạng gọn), `compact`, hoặc `yaml`; dùng được với `search`, `read` và `history`. |
 
 `format: yaml` dùng một bộ xuất nhỏ trong `memory/search.rs`, đặt ngoặc kép cho
-mọi chuỗi mà YAML có thể đọc thành thứ khác. Đọc YAML (pack, import) cần một
-parser: crate YAML cho serde sẽ được chọn và ghim khi làm tiếp P5.
+mọi chuỗi mà YAML có thể đọc thành thứ khác.
 
-Đến 0.8.7 `semantic` là điều muốn tìm theo nghĩa; 0.8.8 bỏ nó cùng embedding.
-
-## 7. Knowledge và history (P4)
+## 7. Knowledge và history
 
 ### Lịch sử trang knowledge
 
@@ -519,7 +438,7 @@ giữ nguyên. Lần thay đổi đầu tiên được ghi lại của một tra
 nó thay thế (cause `baseline`), nên trang viết trước khi có lịch sử vẫn revert về
 được.
 
-Tool `knowledge` có thêm:
+Tool `knowledge` có:
 
 - `history`: một trang, một thư mục, hoặc feed theo thời gian. Lọc được bằng
   `since`, `until`, `operation`, và phân trang bằng `cursor` riêng cho từng
@@ -534,8 +453,7 @@ trang.
 
 `search` của memory nhận `sources: ["memory", "knowledge"]`; mặc định chỉ tìm
 memory. Kết quả knowledge lấy từ engine knowledge (BM25) rồi gộp bằng RRF thành một danh sách. Mỗi kết quả ghi rõ `source`, và với
-trang knowledge thì có `path` cùng khoảng dòng. CLI làm tương tự với
-`--knowledge`.
+trang knowledge thì có `path` cùng khoảng dòng.
 
 Bộ lọc áp lên trang theo cách ME đọc một record không có meta và không có
 temporal:
@@ -549,7 +467,7 @@ Kết quả ghi rõ việc này.
 
 ### Tool history
 
-- **`history_search`** có thêm:
+- **`history_search`** nhận:
   - `since` và `until`: ID của nguồn là `event_<UUIDv7>` của event trong journal,
     phần đầu chính là thời điểm, nên một khoảng thời gian là một khoảng ID và
     không cần thêm cột;
@@ -558,168 +476,43 @@ Kết quả ghi rõ việc này.
 - **`history_read`** trả thêm `previous_source_id` và `next_source_id` trong cùng
   phiên, theo `sequence`, để đọc nối tiếp mà không phải tìm lại.
 
-## 8. CLI, định dạng và pack (P5)
+## 8. Lệnh `ha memory`
 
-### `ha memory`
+`ha memory` làm việc trên các kho memory và trên kho memory markdown của một
+project (`crates/harness-cli/src/commands/memory_cli.rs`):
 
-`ha memory <action>`, giống `me memory`:
-
-- `create`, `get`, `search`, `update`, `delete`, `deltree`;
-- `history`, `revert`, `edit`;
-- `count`, `tree`, `copy`, `move`;
-- `import`, `export`.
-
-Ngoài ra có `ha memory pack validate|install|list`.
-
-| Tùy chọn | Ý nghĩa |
+| Lệnh | Làm gì |
 |---|---|
-| `--cwd DIR` | Project, như `ha knowledge` |
-| `--global` | Chỉ entry global |
-| `--conversation ID` | Kho local của một cuộc trò chuyện |
-| `--json`, `--yaml` | Định dạng đầu ra |
-| `--select` | Các trường cần hiện |
+| `ha memory export [--conversation ID]` | In toàn bộ state của một kho ra JSON, gồm entry và refinement, theo dạng của `harness_state.json`: kho global, hoặc kho của một cuộc trò chuyện |
+| `ha memory purge <id hoặc key> [--yes]`, `ha memory purge --secrets [--yes]` | Quên một entry, hoặc mọi entry và phiên bản chứa giá trị secret, cùng mọi bản sao cạnh kho; lệnh liệt kê trước và không đổi gì khi thiếu `--yes`; `--scope`, `--conversation`, `--cwd` (§11) |
+| `ha memory queue [list\|show\|accept\|reject] [id...] [--json]` | Các thay đổi đang chờ người dùng duyệt (§15.3) |
+| `ha memory lint` | Kiểm tra một kho memory markdown; thoát với mã 1 khi một check fail ([MARKDOWN_MEMORY.vi.md](MARKDOWN_MEMORY.vi.md)) |
+| `ha memory init [--hook] [--examples]` | Ghi một kho memory markdown rỗng |
+| `ha memory migrate` | Chuyển một file memory phẳng thành kho markdown qua một lần chạy `ha exec`, rồi lint kho |
 
-Mọi lần ghi từ CLI được ghi nhận với actor `cli`.
+Model đọc và ghi các kho qua tool `memory`; CLI không có `create`, `get`,
+`search`, `update` hay `delete`.
 
-`edit` mở `$VISUAL` / `$EDITOR` (trên Windows là Notepad nếu chưa đặt) với một file
-Markdown: front matter YAML cho tree, name, meta, temporal, rồi tới nội dung. Lưu
-file thì ghi lại kèm `expected_version`.
+**Không làm.** Phần còn lại của kế hoạch theo ME:
 
-### Định dạng
+- các action của `ha memory` giống `me memory` (`create`, `get`, `search`, `edit`, ...), và import/export dạng JSON, YAML, Markdown, NDJSON;
+- memory pack (`validate`, `install`, `list`);
+- importer cho tài liệu, lịch sử git, và phiên Claude Code, Codex, OpenCode, cùng kind `record` mà chúng sẽ ghi;
+- MCP server cung cấp tool memory cho harness khác, tích hợp harness có hook capture, và web console cho memory (`ha memory serve`).
 
-Giống `formats.md` của ME:
-
-- mảng JSON hoặc một object;
-- NDJSON (`.ndjson`, `.jsonl`; chỉ để import);
-- mảng YAML hoặc một object;
-- Markdown, mỗi file một memory, có front matter YAML.
-
-Định dạng lấy theo đuôi file hoặc tự nhận diện. `temporal` nhận cả ba dạng đầu
-vào. Record không có tree vào `/global/imported`.
-
-Import dùng `on_conflict: ignore`, nên import lại không đổi gì. Export dùng bộ lọc
-§6.4 và ghi ra file hoặc thư mục (Markdown thì mỗi memory một file). Mỗi lần gọi
-tối đa 200 record; trên CLI dùng `--all` để lấy nhiều hơn. `--legacy` ghi ra
-`harness_state.json` mà bản 0.8 đọc được.
-
-### Pack
-
-Định dạng giống ME:
-
-- mảng YAML các record, có header dạng comment `# Pack:`, `# Version:`,
-  `# Description:`, `# ID prefix:`;
-- id UUIDv7 cố định;
-- `meta.pack {name, version}`;
-- tree dưới `/global/pack/<tên>/...`.
-
-`install` xóa record của phiên bản pack cũ rồi chèn bản mới. `validate` chạy
-offline.
-
-## 9. Importer (P6)
-
-| Lệnh | Ghi vào | Nội dung |
-|---|---|---|
-| `ha memory import docs [dir]` | Trang knowledge trong thư viện project, dưới `docs/<đường dẫn tương đối>`, `origin: import:docs`, `sources: [đường dẫn trong repo]` | Các tùy chọn của ME: `--git-aware`, `--include`, `--exclude`, `--temporal-key`, `--prune` (chỉ xóa trang do importer này ghi), `--dry-run`. Front matter là dữ liệu của tài liệu. Trang quá cỡ bị cắt và đánh dấu. |
-| `ha memory import git [repo]` | Dòng `record` tại `/projects/<key>/git_history/<sha>` | Tiêu đề, thân commit và tối đa 50 file thay đổi kèm số dòng; temporal = ngày commit; `$prev` theo cha thứ nhất; khóa metadata như ME; import tăng dần từ commit mới nhất đã có; `--branch`, `--since`, `--until`, `--max-count`, `--full`, `--no-merges`, `--no-file-list`. |
-| `ha memory import claude\|codex\|opencode` | Dòng `record` tại `/projects/<key>/agent_sessions/<phiên>/msg_<id>` | Các cờ như ME (`--project`, `--since`, `--until`, `--full-transcript`, `--include-temp-cwd`, `--include-trivial`, `--include-sidechains`, `--dry-run`); `$prev` và `$thread`; metadata `source_*` của ME; `on_conflict: replace` kèm `importer_version`. |
-
-`record` là kind mới: tìm và lọc được, nhưng **không bao giờ vào digest**, để hàng
-nghìn commit không đẩy mất sở thích của người dùng.
-
-Tài liệu được nhập vào knowledge thay vì memory, vì trang knowledge vốn đã là tài
-liệu. Search chung ở §7 tìm tới được chúng dù nằm ở đâu.
-
-## 10. Tích hợp (P7)
-
-- **`ha mcp serve memory`.** MCP server qua stdio (rmcp, đã là dependency và có
-  `server`), cung cấp bộ tool của ME dưới tên `ha_memory_*`:
-  - `context`, `create`, `update`, `delete`, `delete_by_path`, `delete_tree`;
-  - `search`, `get`, `get_by_path`, `count`, `tree`, `copy`, `mv`;
-  - `import`, `export`, `history`, `revert`;
-  - search knowledge.
-
-  Server làm việc trên project của thư mục nó chạy. `--read-only` chỉ cung cấp các
-  tool đọc.
-- **`ha integrate install|uninstall claude|codex|opencode`.**
-  - Đăng ký MCP server trên với harness đó.
-  - Thêm `--capture` thì cài thêm hook stop/session-end của harness, chạy lệnh
-    `ha memory import <harness>` tương ứng cho đúng phiên đó. Hook chạy bất đồng bộ
-    và luôn thoát thành công.
-  - ha ghi lại mọi file nó tạo vào `<data>/integrations.json`.
-  - Gỡ cài chỉ xóa những file đã ghi lại mà chưa bị sửa.
-  - Hook của Codex vẫn phải được người dùng duyệt trong Codex.
-- **`ha memory serve`.** Web console knowledge, mở rộng thêm memory: duyệt cây,
-  search có bộ lọc, lịch sử một entry kèm revert, và nút trước/sau theo `$prev`.
-- **`ha doctor`.** Thêm phần memory: các kho và phiên bản schema, số entry và
-  event, file cũ còn chờ nhập, các tích hợp đã cài.
-
-## 11. Quy tắc tương thích
+## 9. Tương thích
 
 - Tool `memory`, `rlm.harness` của kernel, `/refine`, `/learn`, Deep Dream và
-  digest chạy như hiện nay, trừ chỗ tài liệu này nói khác. Unit test của chúng vẫn
-  pass qua lớp document.
-- Agent con vẫn chỉ được đọc. Mỗi action mới đều được xếp vào loại đọc hoặc ghi.
+  digest đọc và ghi qua lớp document (§3.3), nên vẫn giữ dạng JSON như trước
+  khi có kho SQLite.
+- Agent con vẫn chỉ được đọc: mỗi action của `memory` đều được xếp vào loại đọc
+  hoặc ghi, và agent con chỉ có các action đọc.
 - Bug report chứa bản export JSON của cả hai kho thay cho file thô, kèm số event.
-- Không có gì rời khỏi máy. Embedding chỉ gọi endpoint người dùng đã cấu hình.
+- Không có gì rời khỏi máy.
 
-## 12. Các phase
+## 10. Xếp hạng theo từ khóa, độ mới và mức dùng
 
-Mỗi phase phải qua gate (`fmt`, `clippy`, `test`) và các suite live liên quan
-trước khi sang phase sau (xem `AGENTS.md`). Một suite live mới, `memory-store.sh`,
-gom các check về tương đương. Mỗi check phải fail trên 0.8.0 và pass trên bản mới,
-và lần chạy đối chứng đó được báo cáo. Bump version và release do maintainer quyết.
-
-| Phase | Nội dung | Suite live |
-|---|---|---|
-| **P1 Lõi** | §3, §4: kho SQLite, lớp document, chuyển dữ liệu, event log có actor/cause/operation, thời gian giữ log, `name`/`tree`/`meta`/`temporal`/`on_conflict`, revert dựa trên log, luật temporal cho digest | memory, kernel, knowledge, compaction, session-continuity, children, memory-store |
-| **P2 Sắp xếp** | §5: get/delete theo path, tree, count, move, copy, delete_tree, feed lịch sử | memory, children, memory-store |
-| **P3 Tìm kiếm** | §6: FTS5 BM25, vector và hàng đợi cho memory (bỏ ở 0.8.8), RRF có trọng số (cả knowledge và history), mọi bộ lọc, JSONPath, select/format, crate YAML | memory, knowledge, memory-store |
-| **P4 Knowledge và history** | §7: lịch sử trang và revert, search chung, bộ lọc history và liên kết thread | knowledge, session-continuity, memory-store |
-| **P5 CLI** | §8: `ha memory`, bốn định dạng, `--legacy`, pack | memory-store |
-| **P6 Importer** | §9: docs, git, phiên Claude, Codex, OpenCode, kind `record` | memory-store |
-| **P7 Tích hợp** | §10: MCP server, tích hợp harness và capture, web console, doctor | memory-store, cộng một lần chạy với MCP client thật |
-
-Trước P1, các test live đọc và nạp thẳng `harness_state.json` (`kernel.sh`,
-`knowledge.sh`, `memory.sh`, `session-continuity-evidence.py`). P1 chuyển việc nạp
-sang quy tắc nhập file cũ ở §3.4, còn việc đọc chuyển sang
-`ha memory export --json` (P1 làm sẵn một bản export tối thiểu cho việc này) hoặc
-truy vấn `sqlite3` chỉ đọc.
-
-## 13. Lần rà soát sau 0.8.1 (0.8.2)
-
-Sau 0.8.1, maintainer yêu cầu rà soát lại lần nữa, độc lập, phần P1 tới P4 so
-với mã nguồn của ME (không tính P5 tới P7). Những gì tìm ra và 0.8.2 đã làm:
-
-| Tìm thấy | 0.8.2 |
-|---|---|
-| Cập nhật làm đổi tên entry đã có name riêng: name đi theo title ở mọi lần cập nhật, nên `<tree>/<name>` hỏng | Name chỉ đi theo title khi nó đang nói title; name được đặt thì giữ (§3.2) |
-| Name duy nhất theo kho, nên hai tree không dùng chung được, và copy đổi tên entry | Name duy nhất theo tree (schema 3: `key` và `name`); copy giữ name, trùng thì báo xung đột (§5) |
-| Cập nhật nào cũng bắt buộc `content` | Cập nhật là patch; cập nhật không đổi gì thì giữ version (§4) |
-| `memory_id` mà feed hiển thị không dùng làm địa chỉ được | `memory_id` dùng được để đọc, ghi, phân trang history, revert, xóa; list và search hiển thị nó (§4) |
-| History của entry chỉ hiện 10 phiên bản, chỉ có title và content | Đủ mọi trường của mỗi phiên bản, theo từng trang (§5) |
-| Không chuyển riêng một entry sang scope khác được | `tree` tuyệt đối ở scope khác thì chuyển entry, giữ id (§4) |
-| `replace` giữ meta và khoảng thời gian cũ khi lệnh ghi bỏ trống | `replace` thay toàn bộ entry, như ME (§4) |
-| Đổi title vẫn giữ vector cũ | Title được embed cùng content, đổi title thì tăng `content_version` |
-| Không có stemming tiếng Anh | Snowball tiếng Anh, như cấu hình `english` của PostgreSQL (§6.1) |
-| Đã bật embedding thì không tìm thuần theo từ khóa được | Trọng số 0 tắt một nhánh (§6.3) |
-| `%` khớp từ theo vị trí; tree chỉ nhận `/` | `%` theo `compare_subnode` của PostgreSQL; `.` nối nhãn; tree tương đối (§6.4) |
-| Method JSONPath lạ âm thầm không khớp gì; không có `.datetime()`, `.**{n}`, `\u` | Method lạ bị từ chối; có các method chuyển kiểu, mức độ sâu và escape của PostgreSQL 17 (§6.4) |
-| Search chung bỏ qua bộ lọc với trang knowledge | Bộ lọc áp lên cả trang (§7) |
-| Không đọc được phiên bản trang cũ, không có `until` hay cursor | `history` với `version`, `until`, `operation`, `cursor` (§7) |
-| Không có trạng thái embedding, không có `has_embedding` | `status`, và `has_embedding` trong `select` (§5, §6.5) |
-| `select` và `format` chỉ có ở search; `meta.<khóa>` nằm phẳng | Có cả ở read và history; `meta.<khóa>` nằm trong `meta` (§6.5) |
-
-Không làm:
-
-- batch create của ME, vì chỉ importer của nó dùng (để P5);
-- danh sách stopword của ME, vì ha không đánh giá văn bản theo danh sách từ;
-- chế độ JSONPath `strict`, vì ME chạy lax.
-
-Các dòng về vector và `has_embedding` mô tả 0.8.2; 0.8.8 đã bỏ cả hai (§14).
-
-## 14. Từ khóa, độ mới và mức dùng (0.8.8)
-
-0.8.8 bỏ semantic search ở mọi nơi: search memory, nhánh theo nghĩa của digest,
+0.8.8 đã bỏ semantic search ở mọi nơi: search memory, nhánh theo nghĩa của digest,
 phần recall theo nghĩa của readout, search knowledge, search history, cache
 embedding và `/knowledge semantic`. Nó vốn tắt nếu người dùng chưa cấu hình
 endpoint, và khi bật thì có thể làm một lượt đứng chờ provider, hoặc loại vĩnh
@@ -764,7 +557,7 @@ không bao giờ được đọc. `memory status` và `/knowledge status` báo k
 `.ha-embedding.json`, và diagnostics ghi `knowledge.embedding_config_ignored`
 một lần.
 
-## 15. Chỉ mục để xếp hạng, và quên (0.8.9)
+## 11. Chỉ mục để xếp hạng, và quên
 
 **Từ được lập chỉ mục một lần.** Tới 0.8.8, digest và memory search tách từ,
 lấy gốc từ và bỏ dấu cho mọi entry ở mỗi lần gọi, rồi sắp xếp mọi kết quả khớp:
@@ -850,7 +643,9 @@ lại, và nêu file legacy còn chờ import, thứ nó không đọc.
 | `--scope global`, `project`, `local` | Chỉ entry toàn cục, của project này (`--cwd`), hoặc của một hội thoại (`--conversation`) |
 | `ha memory purge --secrets [--yes]` | Như trên cho mọi thứ chứa giá trị secret |
 
-## 16. Khi nào một entry còn đúng, và chữ của nó từ đâu ra (0.9.0)
+## 12. Hiệu lực và độ tin
+
+Từ 0.9.0, một entry cho biết khi nào nó còn đúng và chữ của nó từ đâu ra.
 
 Memory tự nó không giúp gì: phần lớn các cách dựng memory được đo năm 2026
 không tốt hơn khi tắt memory. Những gì các hệ thống hiện nay có mà ha còn
@@ -859,14 +654,14 @@ nó (ADD/UPDATE/DELETE/NOOP của Mem0, `invalid_at` của Zep/Graphiti), câu h
 theo thời gian, độ tin theo nguồn để chống đầu độc memory (MINJA), và cho hết
 hạn memory không ai dùng (Copilot bỏ memory không được dùng sau 28 ngày).
 
-### 16.1 Các trường
+### 12.1 Các trường
 
 Tất cả nằm trong `memory/validity.rs`, chỗ duy nhất mà một trường mới về sau
 sẽ được thêm vào:
 
 | Trường | Có ở | Nói gì |
 |---|---|---|
-| `origin.kind` | mọi entry do memory tool hoặc một review ghi | chữ của nó từ đâu ra: `user`, `tool`, `web`, `file`, `agent`, `child`, `review`. Host quyết định (§16.4). Entry không có trường này được đọc là `agent`. |
+| `origin.kind` | mọi entry do memory tool hoặc một review ghi | chữ của nó từ đâu ra: `user`, `tool`, `web`, `file`, `agent`, `child`, `review`. Host quyết định (§12.4). Entry không có trường này được đọc là `agent`. |
 | `supersedes` | entry đã sửa các entry khác | memory id của các entry nó đã đóng |
 | `superseded_by` | entry bị một entry sau thay thế | memory id của entry đó |
 | `expired` | entry bị lượt hết hạn đóng | lý do: `unused` |
@@ -879,7 +674,7 @@ ra entry đã đóng, như với một khoảng đã hết, kể cả khi khoả
 một entry có ngày trong tương lai bị thay thế hôm nay sẽ kết thúc một mili giây
 sau điểm bắt đầu của nó.
 
-### 16.2 Mâu thuẫn được giải ngay lúc ghi, bằng cách đóng hiệu lực
+### 12.2 Mâu thuẫn được giải ngay lúc ghi, bằng cách đóng hiệu lực
 
 `write` của tool `memory` nhận `supersedes: [id, ...]` (key, địa chỉ
 `<tree>/<name>` hoặc memory id):
@@ -906,7 +701,7 @@ sau điểm bắt đầu của nó.
 Các edit của review cũng vậy: edit `{"action": "supersede", "kind",
 "id": <cũ>, "title", "content", "path"?, "metadata"?, "evidence"}` ghi một
 entry mới có key theo title, cạnh path và project của entry cũ, dành cho cùng
-các file (`paths`, §18.4) nhưng không trích dẫn code nào của nó, rồi đóng entry
+các file (`paths`, §14.4) nhưng không trích dẫn code nào của nó, rồi đóng entry
 cũ (`validity::supersede_edit`). Refinement ghi nó thành hai edit: edit của
 entry cũ (`before` của nó, và `after` đã đóng) và `create` của entry mới, nên
 rollback sẽ xoá entry mới và đặt lại entry cũ. Nó hoàn tác cả hai hoặc không
@@ -920,7 +715,7 @@ lực trở về như trước khi bị đóng.
 `history` cho thấy chuỗi đó: mỗi phiên bản mang `supersedes`,
 `superseded_by`, `expired` và `from` của nó.
 
-### 16.3 Câu hỏi theo thời gian
+### 12.3 Câu hỏi theo thời gian
 
 Memory search nhận:
 
@@ -931,7 +726,7 @@ Memory search nhận:
 | `include_ended` | cả các entry đã đóng |
 
 Search nêu một thời điểm (`as_of`, `since`/`until`, hoặc bộ lọc temporal ở
-§6.4) thì đọc cả entry đã đóng, và xếp kết quả theo mức hiệu lực khớp với thời
+§6.3) thì đọc cả entry đã đóng, và xếp kết quả theo mức hiệu lực khớp với thời
 điểm đó trước rồi mới đến từ khóa: với một thời điểm, entry có đúng lúc ấy
 không; với một khoảng, phần của khoảng mà entry còn đúng (`validity::fit`).
 Các chế độ của bộ lọc temporal tạo nên khoảng đó: `contains` là một thời điểm,
@@ -949,7 +744,7 @@ Không dùng model để xếp lại: mỗi lần search gọi model thì tốn 
 token của một request, trong khi hiệu lực và từ khóa đã đủ sắp xếp những gì
 một câu hỏi theo thời gian cần.
 
-### 16.4 Độ tin theo nguồn
+### 12.4 Độ tin theo nguồn
 
 `origin.kind` do host quyết định, không bao giờ do model. Memory tool đọc hội
 thoại như journal của project store đang giữ (`memory/provenance.rs`; 4.000
@@ -983,14 +778,14 @@ Hệ quả:
 - Digest ghi rõ entry từ một trang web (`, from a web page: unverified`) hay
   từ một child (`, from a delegated agent: unverified`). Search, read và
   history cho thấy `from` và `unverified`.
-- Entry như vậy đứng dưới một entry ngang bằng khác (§16.3).
+- Entry như vậy đứng dưới một entry ngang bằng khác (§12.3).
 - Entry có loại `web` - bây giờ, hoặc lúc được lưu - không thể được ghi vào
   `constraints/*` hay `user/preferences` (và bên dưới): một lần tạo, cập nhật,
   move hay edit của review đều bị từ chối kèm lý do, trước khi lệnh chạy. Model
   được bảo giữ nó thành một fact ở chỗ khác, hoặc nhờ người dùng tự nói quy
   tắc đó.
 
-### 16.5 Hết hạn theo mức dùng
+### 12.5 Hết hạn theo mức dùng
 
 Một lượt chạy đóng các entry không ai dùng: không được đọc và không xuất hiện
 trong kết quả search nào trong `HA_MEMORY_EXPIRE_DAYS` ngày (mặc định 28; 0 là
@@ -1013,9 +808,9 @@ của writer `sleep` với cause `expire`; `restore` chỉ với id sẽ đưa n
 - `ha doctor` cho biết lượt gần nhất chạy lúc nào và đã đóng bao nhiêu entry
   (meta `expiry` của kho toàn cục).
 
-## 17. Những gì một review ghi, và Deep Dream theo từng lô (0.9.0)
+## 13. Những gì một review ghi, và Deep Dream theo từng lô
 
-0.9.0 đóng các lỗ hổng mà hai lần audit tìm thấy trong cách các refinement ghi
+0.9.0 đã đóng các lỗ hổng mà hai lần audit tìm thấy trong cách các refinement ghi
 vào store (`memory/refine.rs`, `memory/learned.rs`). Mỗi điều là một quy tắc của
 `apply`, cửa vào duy nhất mà mọi refinement - review, `/refine`, `/learn`, Deep
 Dream, curator, rollback - đều ghi qua.
@@ -1067,7 +862,7 @@ vậy, hoặc gộp vào nó, bị từ chối kèm lý do, được ghi như m�
 một edit sẽ mở lại nó, hoặc xoá thứ mà `as_of` và history đọc. Rollback vẫn đặt
 lại những gì refinement của nó đã đóng. Cập nhật một entry còn sống thì giữ
 `temporal`, `supersedes`, `superseded_by`, `expired`, `citations` và `paths`
-của nó (§18).
+của nó (§14).
 
 **Sửa đổi memory của review trích những gì nó đã đọc.** Một sửa đổi memory hay
 prompt note của review, `/refine` hoặc `/learn` chỉ được áp dụng khi `evidence`
@@ -1122,7 +917,10 @@ thất bại mọi lần. Giờ một lượt:
 của curator (`/refine --curate`), mà các lô của nó đi trước refinement `<id>`
 của phần skill.
 
-## 18. Code mà một entry trích dẫn, và memory chỉ dành cho một số file (0.9.2)
+## 14. Trích dẫn và memory theo file
+
+Từ 0.9.2, một entry có thể trích dẫn code mà nó dựa vào, và có thể chỉ dành cho
+một số file.
 
 Một sự thật về code sẽ cũ đi khi code đổi, mà không gì trong entry nói ra điều
 đó: digest vẫn trình bày nó như sự thật. Còn một rule chỉ có ý nghĩa với một số
@@ -1132,12 +930,12 @@ hoặc nằm trong digest của mọi lượt, chiếm một chỗ trong sáu ch
 GitHub Copilot Memory giữ trích dẫn tới code kèm mỗi memory và kiểm tra chúng
 với nhánh hiện tại khi memory được lấy ra; Claude Code nạp một
 `.claude/rules/*.md` có `paths:` khớp với file nó đọc, và Amp, Devin cũng giới
-hạn knowledge theo đường dẫn như vậy. Cả hai đều đo được và tắt được (§18.5).
+hạn knowledge theo đường dẫn như vậy. Cả hai đều đo được và tắt được (§14.5).
 
-### 18.1 Các trường
+### 14.1 Các trường
 
 Tất cả nằm trong `memory/citations.rs` (`memory_citations`), như các trường
-của §16.1 nằm trong `memory/validity.rs`:
+của §12.1 nằm trong `memory/validity.rs`:
 
 | Trường | Có ở | Nói gì |
 |---|---|---|
@@ -1146,10 +944,10 @@ của §16.1 nằm trong `memory/validity.rs`:
 
 Hai bản ghi nằm cạnh các entry, không bao giờ nằm trong chúng: khoá meta
 `citations` của kho giữ lần kiểm tra gần nhất các trích dẫn của mỗi entry, theo
-memory id (§18.3); khoá meta `scoped_loaded` trong kho của một hội thoại giữ
-những gì hội thoại đó đã nạp (§18.4).
+memory id (§14.3); khoá meta `scoped_loaded` trong kho của một hội thoại giữ
+những gì hội thoại đó đã nạp (§14.4).
 
-### 18.2 Trích dẫn, kiểm tra lúc ghi
+### 14.2 Trích dẫn, kiểm tra lúc ghi
 
 `write` của tool `memory`, tạo mới hay cập nhật, nhận
 `citations: [{path, quote, lines?}]`, tối đa 5:
@@ -1173,18 +971,18 @@ that quote at lines 6-6, not within 1-2: give those lines, or leave lines out`.
 `null` xoá chúng. Lần tạo mới thay entry đang giữ tên đó (`on_conflict:
 replace`) chỉ giữ các trích dẫn nó đưa. Lần cập nhật của một review,
 `/refine`, `/learn` hay Deep Dream, và một mục của hàng đợi được chấp nhận
-(§19.3), không đưa được `citations` hay `paths`: entry giữ nguyên chúng.
+(§15.3), không đưa được `citations` hay `paths`: entry giữ nguyên chúng.
 Trích dẫn có thể nằm trên entry thuộc
 scope nào cũng được; đọc trong workspace của project khác thì nó không được
-kiểm tra (§18.3), không bao giờ bị gọi là hỏng: đó là những file khác.
+kiểm tra (§14.3), không bao giờ bị gọi là hỏng: đó là những file khác.
 
 **Host không tự gắn trích dẫn.** Khi provenance cho thấy chữ của entry đến từ
-một lần đọc file (`origin.kind = file`, §16.4) mà lần ghi không đưa trích dẫn
+một lần đọc file (`origin.kind = file`, §12.4) mà lần ghi không đưa trích dẫn
 nào, kết quả có `cite` nói cách thêm. Host biết file nào đã được đọc, không
 biết đoạn nào của nó là chỗ sự thật dựa vào: một đoạn đoán mò về sau sẽ đánh
 dấu một entry đúng là đã cũ, hoặc để một entry đã cũ trông như còn đúng.
 
-### 18.3 Trích dẫn, kiểm tra lúc đọc
+### 14.3 Trích dẫn, kiểm tra lúc đọc
 
 Mỗi lần đọc một entry đều kiểm tra trích dẫn của nó với file như hiện tại:
 digest, với từng entry nó hiển thị (kể cả entry ghim); `search`, với từng kết
@@ -1226,7 +1024,7 @@ Entry chưa kiểm tra được hiển thị như trước.
   trích dẫn đang hỏng (`memory citations: 1 of 3 entries cite code that
   changed since they were kept`).
 
-### 18.4 Memory chỉ dành cho một số file
+### 14.4 Memory chỉ dành cho một số file
 
 `write` của tool `memory` nhận `paths: [glob, ...]`, tối đa 16, mỗi glob tối
 đa 200 ký tự, tính từ gốc workspace, kiểu gitignore: glob không có `/` khớp ở
@@ -1278,9 +1076,9 @@ parse được cũng vậy (`paths[0] "src/[billing" is not a glob: ...`). `[]` 
 - **Kho markdown.** Một file memory có `paths:` trong frontmatter được nạp
   cùng cách ([MARKDOWN_MEMORY.vi.md](MARKDOWN_MEMORY.vi.md) §9).
 
-### 18.5 Đo được, và tắt được
+### 14.5 Đo được, và tắt được
 
-`HA_MEMORY_OFF` nhận thêm hai tính năng ([hướng dẫn vận hành](../guides/OPERATOR_GUIDE.vi.md)
+`HA_MEMORY_OFF` (§16) nhận thêm hai tính năng ([hướng dẫn vận hành](../guides/OPERATOR_GUIDE.vi.md)
 §12.21):
 
 - `citations`: trích dẫn không được kiểm tra cũng không được hiển thị - không
@@ -1299,15 +1097,15 @@ nêu tên ledger mà các module billing ghi vào, thứ một module mới ph�
 repository thì không được, vì lần chạy tắt memory vẫn đọc các file của kho
 markdown như mọi file khác).
 
-## 19. Hàng đợi để người dùng duyệt, và những gì một child đề xuất (0.9.2)
+## 15. Hàng đợi duyệt và đề xuất của child
 
 Cho đến 0.9.0 không có gì chờ người dùng: một review, `/refine`, `/learn` và
 Deep Dream áp dụng ngay những gì qua được các kiểm tra, và từ chối phần còn
 lại - trong đó có chữ của một trang web bị biến thành rule, mà người dùng không
-thể nhận lấy kể cả khi nó đúng. Hàng đợi (`memory/review_queue.rs`) giữ những
+thể nhận lấy kể cả khi nó đúng. Hàng đợi (`memory/review_queue.rs`, từ 0.9.2) giữ những
 thay đổi mà người dùng nên có tiếng nói, đặt cạnh store mà chúng sẽ thay đổi.
 
-### 19.1 Những gì phải chờ
+### 15.1 Những gì phải chờ
 
 Một thay đổi memory hoặc prompt mà một refinement lập ra được kiểm tra như khi
 nó được áp dụng - câu trích làm bằng chứng, secret và chữ lái agent, kích
@@ -1315,7 +1113,7 @@ thước, bản trùng, entry đã đóng - rồi, thay vì được áp dụng,
 
 | `HA_MEMORY_REVIEW` | Những gì phải chờ |
 |---|---|
-| `policy` (mặc định) | một thay đổi ghi, sửa hoặc xoá một rule mà mọi lượt sau đều theo - một entry trong `constraints/*` hoặc `user/preferences`, hiện tại hoặc trước thay đổi - từ chữ của một trang web (0.9.0 từ chối nó), hoặc từ bằng chứng không phải lời của chính người dùng (nó trích một file, một tool, một phát hiện của child, hoặc không trích gì: review tự suy ra). Các lần gộp của Deep Dream dựa trên các entry, không dựa trên câu trích: chỉ chữ của trang web trong đó mới phải chờ. Và một đề xuất của child mà review của agent cha không giữ (§19.4). |
+| `policy` (mặc định) | một thay đổi ghi, sửa hoặc xoá một rule mà mọi lượt sau đều theo - một entry trong `constraints/*` hoặc `user/preferences`, hiện tại hoặc trước thay đổi - từ chữ của một trang web (0.9.0 từ chối nó), hoặc từ bằng chứng không phải lời của chính người dùng (nó trích một file, một tool, một phát hiện của child, hoặc không trích gì: review tự suy ra). Các lần gộp của Deep Dream dựa trên các entry, không dựa trên câu trích: chỉ chữ của trang web trong đó mới phải chờ. Và một đề xuất của child mà review của agent cha không giữ (§15.4). |
 | `all` | mọi thay đổi memory và prompt của review, `/refine`, `/learn` và Deep Dream, và mọi đề xuất của child mà review không giữ |
 | `off` | không gì cả: như 0.9.0 (chữ của trang web vào rule bị từ chối, đề xuất của child mà review không giữ bị bỏ) |
 
@@ -1333,7 +1131,7 @@ chờ theo nó (`after`): nó chỉ được chấp nhận sau thay đổi của
 hàng đợi khi thay đổi kia bị từ chối. Một rollback và một lần chấp nhận không
 bao giờ phải chờ.
 
-### 19.2 Hàng đợi
+### 15.2 Hàng đợi
 
 Mỗi scope một file, `memory_queue.json` trong thư mục của scope (`harness/`
 của store global, `sessions/<task>/harness/` của một hội thoại), ghi nguyên
@@ -1370,7 +1168,7 @@ refinement ghi nó là không được áp dụng (`the memory queue could not k
 so it is not applied: ...`) và chẩn đoán ghi `memory_queue not_queued`. Lần từ
 chối hay chấp nhận trong hàng đợi đó bị từ chối.
 
-### 19.3 Chấp nhận và từ chối
+### 15.3 Chấp nhận và từ chối
 
 `ha memory queue` và `/memory queue` (§12.22 của hướng dẫn vận hành) liệt kê
 các mục của mọi hàng đợi trong thư mục dữ liệu, hiện một mục cùng bằng chứng
@@ -1401,7 +1199,7 @@ và một diff so với entry như hiện tại, và chấp nhận hoặc từ c
   (`<rejected_by_user>`) và được yêu cầu không đề xuất lại chúng trừ khi hội
   thoại cho thấy người dùng giờ muốn chúng.
 
-### 19.4 Những gì một child đề xuất
+### 15.4 Những gì một child đề xuất
 
 `note_finding` của 0.8.9 cho một child giữ một sự thật cùng chữ của chính kết
 quả tool của nó cho thấy sự thật đó; review của agent cha có thể biến nó thành
@@ -1429,7 +1227,7 @@ kiểm tra đó và file đó hai lần.
   trên finding (`proposal.closed`, `note`, `queued`) và trong chẩn đoán
   (`memory_queue child_proposal`).
 
-### 19.5 Nơi nó hiện ra
+### 15.5 Nơi nó hiện ra
 
 - Sau một review đưa thay đổi vào hàng đợi, session nói điều đó một lần, kèm
   nơi để duyệt (`memory: 1 proposed change waits for your review (2 in all):
@@ -1439,3 +1237,57 @@ kiểm tra đó và file đó hai lần.
   trong đó do child đề xuất; `/context` có dòng `Memory queue:` khi có thay đổi
   đang chờ hoặc chế độ không phải mặc định; mục Memory của bug report đếm
   chúng và chép các hàng đợi (chỉ dàn ý khi không có `--include-content`).
+
+## 16. Bật và tắt memory
+
+Từ 0.9.0, một công tắc tắt memory, toàn bộ hoặc từng tính năng, để đo được một
+lần chạy có memory so với một lần chạy không có (`memory/switch.rs`). Tính năng
+đã tắt thì không được đọc vào request và cũng không được ghi sau đó: một lần
+chạy tắt memory để mọi kho memory nguyên như cũ. Task state của chính cuộc trò
+chuyện và AGENTS.md của project là task và chỉ dẫn của nó, không phải memory,
+nên vẫn còn.
+
+- **`HA_MEMORY=off`** (hoặc `0`, `false`, `no`) tắt mọi tính năng.
+  `HA_MEMORY=on` (hoặc `1`, `true`, `yes`) bật memory, bất kể setting.
+- **`HA_MEMORY_OFF=<tính năng>,...`** chỉ tắt các tính năng được nêu, để làm
+  ablation. Các tên cách nhau bằng dấu phẩy, chấm phẩy hoặc dấu cách; không
+  phân biệt hoa thường, và `-` được đọc như `_`.
+
+| Tính năng | Tắt những gì |
+|---|---|
+| `digest` | digest memory ở mỗi lượt, tool `memory` và `rlm.harness` của kernel, digest của agent con và các phát hiện nó gửi về (`note_finding`), và việc cho hết hạn entry không dùng (§12.5); kho không được mở |
+| `markdown` | rule và index của kho memory markdown ở mỗi lượt |
+| `session_log` | việc ghi session log, log mà một cuộc trò chuyện mới được cho biết, và `/recall` |
+| `lessons` | kết quả của learning loop trong một lượt: learned rule và ghi chú của chúng trong mô tả tool, learned skill được gợi lại cho một yêu cầu, ghi chú về learned skill, và việc đếm số lần dùng chúng |
+| `reviews` | mọi lượt chạy nền: review tự động (sau một lượt, khi session lặng, sau compaction), gộp (Deep Dream), curation, evolution, tự đánh giá, `/refine`, `/learn`, và những gì một review báo cho lượt sau; cũng không gì vào hàng đợi (§15.1) |
+| `earlier_state` | những gì một cuộc trò chuyện mới được cho biết về các cuộc trước: task state mà một cuộc trước để lại, và các lượt cuối của cuộc trò chuyện trước |
+| `knowledge` | thư viện knowledge: catalog của nó trong một lượt và tool `knowledge` |
+| `citations` | việc kiểm tra, hiển thị và ghi trích dẫn (§14.5) |
+| `scoped` | memory dành cho một số file: nạp, liệt kê, search, đọc và ghi nó, và các file có `paths:` của kho markdown (§14.5) |
+
+Tên không phải tính năng thì bị bỏ qua và được báo ra: `/context` và `ha doctor`
+nêu nó cùng danh sách tính năng. Giá trị `HA_MEMORY` không phải bật cũng không
+phải tắt thì bị bỏ qua như vậy.
+
+- **Khóa `memory` của `settings.json`** nói cùng điều đó: `{"memory":
+  {"enabled": false}}` hoặc `{"memory": {"off": ["digest", "knowledge"]}}`.
+  Biến môi trường thắng: `HA_MEMORY` thắng `enabled`, và `HA_MEMORY_OFF`, kể
+  cả khi rỗng, thắng `off`. Trường `review` của cùng khóa đặt những thay đổi
+  nào phải chờ người dùng (`policy`, `all`, `off`), và `HA_MEMORY_REVIEW`
+  thắng nó (§15.1).
+- **Nơi nó hiện ra.**
+  - `/context` có dòng `Memory:`: `on`, `off (HA_MEMORY): ...`, hoặc `on
+    except ... (HA_MEMORY_OFF)`, với `settings.json memory` trong ngoặc khi
+    chính setting tắt các tính năng. Tiếp theo là dòng `Memory queue:` khi có
+    thay đổi đang chờ hoặc chế độ duyệt không phải mặc định (§15.5).
+  - `ha doctor` cảnh báo kèm những gì đang tắt, và không nói gì khi mọi tính
+    năng đều bật.
+  - Mỗi lần chạy `ha exec`, và lượt đầu của mỗi cuộc trò chuyện trong app, ghi
+    một bản ghi chẩn đoán `memory.switch` (`off`, `all_off`, `source`, và
+    `unknown` cho các tên không phải tính năng); app ghi lại khi công tắc đổi.
+    JSON của `ha exec` có `memory.off`.
+- **Đo.** Suite live `scripts/testing/live-tests/memory-ab.sh` dạy một project
+  vài sự thật, rồi chạy cùng các tác vụ từ cùng một snapshot với memory bật,
+  tắt và (với `ABLATE=1`) từng tính năng tắt riêng, và ghi bảng tỉ lệ thành
+  công, token, số lần gọi và thời gian so với khi tắt memory
+  ([live test](../../scripts/testing/live-tests/README.md)).

@@ -5,13 +5,14 @@ conversation (the journal), the conversation's own store, the global memory,
 and the harness's evolved rules. The "Sleep" paper (arXiv 2606.03979) gives the
 rule they follow: a faster tier is consolidated into the next one **before** it
 is reset or overwritten, or what it held is lost. ha does this in text, through
-background passes that each call a model:
+background passes, all but the expiry calling a model:
 
 | Pass | Reads | Writes |
 |---|---|---|
-| A conversation's review (the review gate, then the refinement it approves) | the turns since the last review | the conversation's store, the global memory, lessons, learned skills, knowledge |
+| A conversation's review (the review gate, then the refinement it approves) | the turns since the last review | the conversation's store, the global memory, lessons, learned skills, knowledge, the memory queue (`memory_queue.json`, what waits for the person); then it closes each child proposal it read as kept or queued ([MEMORY_STORE.en.md](MEMORY_STORE.en.md) §15.1, §15.4) |
 | Deep Dream (consolidation) | the global memory, or a conversation's store past 40 entries, in batches past a token budget | the same scope, merged and pruned |
 | The harness evolution | the calls that failed in the last 14 days | rules and tool notes |
+| The expiry (0.9.0), at most daily, no model call | when each entry of the global store and the conversation's was last written, read or found (`HA_MEMORY_EXPIRE_DAYS`, 28 by default) | the same stores: an unused entry closed, not deleted |
 
 A model call fails: the provider is down, a limit is reached, the process
 dies. Before 0.8.9 a failure lost the pass's work: the review's turn count was
@@ -25,7 +26,7 @@ a failed Deep Dream was tried every hour forever. Since 0.8.9 every pass is a
 
 - A job is one JSON file under `<data-dir>/sleep/`, written whole or not at all
   (a temporary file renamed into place). It names its kind (`review`,
-  `consolidation`, `evolution`), what asked for it (`turn`, `compaction`,
+  `consolidation`, `evolution`, `expiry`), what asked for it (`turn`, `compaction`,
   `idle`, `session_end`, `exec`, `due`), and for a review the project store,
   the conversation, the newest session to read and the turns it covers.
 - **What triggered it is reset only once the job is written.** The app's count
@@ -56,7 +57,7 @@ a failed Deep Dream was tried every hour forever. Since 0.8.9 every pass is a
 - **Done removes the job; a failure keeps it.** A failed pass counts the
   attempt, records the error and its class (the provider's stable error code,
   `timeout`, `truncated` or `other`), and waits: 5 minutes for a review, an
-  hour for a consolidation or an evolution, doubled after each next failure, at
+  hour for a consolidation, an evolution or an expiry, doubled after each next failure, at
   most a day. New turns of a conversation bring its failed review forward; an
   upkeep pass asked for again at a turn's end keeps its wait.
 - **After 6 failures in a row a job gives up.** It stays on disk, is no longer
@@ -98,14 +99,23 @@ The triggers are the ones ha had; each writes a job and then runs the due ones.
   batch that fails is the job's failure: the queue tries the pass again, cut
   anew, and the batches already applied stay applied. Where the first batch
   ends moves from pass to pass, so neighbours a boundary parted meet later
-  ([MEMORY_STORE.en.md](MEMORY_STORE.en.md), section 16). Each batch is a
+  ([MEMORY_STORE.en.md](MEMORY_STORE.en.md), section 13). Each batch is a
   `refine.consolidation_batch` record (its scope, refinement, place, entries
   and edits applied, and the ids of a batch of 64 entries or fewer, `members`).
 - **The evolution** (once a day): marked as run only once it saved; its lock
   and its job's claim keep a second run from starting meanwhile.
+- **The expiry** (a turn's end in the app, `ha exec`'s exit): a job keyed
+  `expiry:<global store>`, trigger `due`, when the last pass is a day old (or
+  older than `HA_MEMORY_EXPIRE_DAYS`, when that is shorter). It closes the
+  unused entries of the global store and the conversation's
+  ([MEMORY_STORE.en.md](MEMORY_STORE.en.md) §12.5).
 
 The learning loop's meditation already claimed itself for an hour and marked
 itself only after success; it is not in the queue.
+
+**Off.** `HA_MEMORY_OFF=reviews` (or `HA_MEMORY=off`) runs none of the model
+passes: no review, Deep Dream or evolution, and `/refine` and `/learn` say they
+did not run. The expiry follows `digest`: with it off the store is not touched.
 
 ## What shows it
 

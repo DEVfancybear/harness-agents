@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The person's review queue for memory, and what a child proposes (wave 2,
-# docs/architecture/MEMORY_STORE.en.md §19), with a real model. Every check
+# docs/architecture/MEMORY_STORE.en.md §15), with a real model. Every check
 # fails on 0.9.0, which queued nothing, had no `ha memory queue` or `/memory`,
 # and whose note_finding took no `propose`.
 #
@@ -400,7 +400,7 @@ sed 's/^/   /' "$RX/q5-accept.txt"
 check "precondition: the accept applied the review's ${action5:-change}" '[ -n "$held5" ] && [ "$accepted5" -eq 0 ] && [ -n "$(global_has rm-5522)" ]'
 check "the entry the accept wrote is still kept for app/billing/** (${action5:-none})" '[ -n "$held5" ] && [ -n "$(global_has rm-5522 "e.get(\"paths\")==[\"app/billing/**\"]")" ]'
 if [ "$action5" = supersede ]; then
-  # A correction cites none of the old entry's code (MEMORY_STORE §16).
+  # A correction cites none of the old entry's code (MEMORY_STORE §12).
   check "superseded, the correction cites none of the old entry's code" '[ -n "$(global_has rm-5522 "not e.get(\"citations\")")" ]'
 else
   check "updated, it still cites app/billing/rounding.py" '[ -n "$held5" ] && [ -n "$(global_has rm-5522 "any(c.get(\"path\")==\"app/billing/rounding.py\" for c in e.get(\"citations\") or [])")" ]'
