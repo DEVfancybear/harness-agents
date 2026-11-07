@@ -57,9 +57,9 @@ cho tới khi nó đổi tiếp. Lượt chạy chỉ diễn ra khi review tự 
 | Liên kết treo | store, kèm các trang có sẵn có từ ngữ gần nhất với tên của trang còn thiếu (một lượt tìm trong store theo tên tệp) |
 | Hai trang cùng một chủ đề | phép kiểm tra cùng chủ đề của store, theo từng cặp: phần lớn từ ngữ của tiêu đề và tóm tắt một trang, có trọng số theo độ hiếm, nằm trong trang kia (`SAME_SUBJECT_SHARE`, 0,7), tối đa sáu cặp |
 | Một trang mục lục | hơn `INDEX_MIN_PAGES` (12) trang và không có trang nào liên kết tới 60% các trang còn lại |
-| Khẳng định cần đối chiếu | các trang có nguồn là một tệp trong workspace (một đường dẫn trong workspace, cho phép `:dòng`) hoặc một cuộc hội thoại của dự án (một conversation id trong nguồn), chưa được đối chiếu kể từ khi trang hoặc nguồn đổi lần cuối; tối đa bốn, mới nhất trước, mỗi nguồn cắt ở 12.000 ký tự |
+| Khẳng định cần đối chiếu | các trang có nguồn là một tệp trong workspace (một đường dẫn trong workspace, cho phép `:dòng`) hoặc một cuộc hội thoại của dự án (một conversation id trong nguồn), chưa được đối chiếu kể từ khi trang hoặc nguồn đổi lần cuối; tối đa bốn, mới nhất trước, mỗi nguồn cắt ở 12.000 ký tự. Một đường dẫn được bảo vệ (`.env`, `.git`, `.harness`, một khóa, một tên có `secret`, `credential` hay `password`, như các tool tệp từ chối) và một tệp Git bỏ qua không bao giờ là nguồn: văn bản của chúng sẽ bị gửi cho model. Thư viện global, dùng chung cho mọi dự án, không đọc đường dẫn tương đối theo workspace này: chỉ một đường dẫn tuyệt đối vào nó, hoặc một cuộc hội thoại |
 
-Mọi thứ nó đọc là dữ liệu, không phải chỉ dẫn: prompt của người biên tập nói
+Catalog (tối đa 30.000 ký tự, rồi số trang bị bỏ ra) và các liên kết treo (tối đa 8.000) tính vào cùng ngân sách. Một lần đối chiếu chỉ được đánh dấu xong khi trang và nguồn của nó có trong prompt; lần mà ngân sách bỏ ra chờ lượt sau. Mọi thứ nó đọc là dữ liệu, không phải chỉ dẫn: prompt của người biên tập nói
 rõ điều đó, và host kiểm tra từng chỉnh sửa được đề xuất trước khi áp dụng.
 
 **Nó được làm gì** - một danh sách JSON tối đa mười hai chỉnh sửa, mỗi chỉnh sửa
@@ -73,8 +73,8 @@ rõ điều đó, và host kiểm tra từng chỉnh sửa được đề xuất
 | `unlink` một liên kết treo, giữ nhãn của nó | liên kết là liên kết treo của trang |
 | `create` trang còn thiếu | đường dẫn là một trang còn thiếu mà một liên kết trỏ tới; nó nêu các trang mà nó được viết từ đó, và các trang này chứa ít nhất 80% trọng số từ ngữ của nó (`CREATE_SUPPORT`); nguồn của nó là nguồn của các trang đó và nó liên quan tới chúng |
 | `merge` hai trang | cặp là cặp mà phép kiểm tra cùng chủ đề tìm thấy; văn bản gộp giữ ít nhất 80% trọng số từ ngữ của mỗi trang (`MERGE_KEEP`); host nối nguồn và các trang liên quan của cả hai, trỏ mọi trang từng liên kết tới trang bị gộp về trang được giữ, và xóa trang bị gộp (lịch sử vẫn giữ nó, nên `revert` đưa nó trở lại) |
-| `index` | được yêu cầu; chỉ gồm tiêu đề mục và các dòng `- [Tiêu đề](đường-dẫn)`; liên kết tới trang không có thì bị bỏ, các trang bị sót được liệt kê ở cuối, và mục lục sót hơn một phần năm số trang thì bị từ chối; được viết ở `topics.md` (một trang của chính người dùng ở đó không bao giờ bị đụng tới) |
-| `fix` một khẳng định | nguồn là một nguồn của trang và đọc được; câu trích có trong nguồn từng chữ (bỏ qua khoảng trắng và chữ hoa, ít nhất 8 ký tự); đoạn văn bị thay xuất hiện đúng một lần trong trang; ít nhất 80% trọng số từ ngữ mà bản sửa đưa vào thuộc về câu trích (`FIX_SUPPORT`) |
+| `index` | được yêu cầu; không có gì trông như bí mật; chỉ gồm tiêu đề mục dài tối đa 120 ký tự và các dòng `- [Tiêu đề](đường-dẫn)`; liên kết tới trang không có thì bị bỏ, các trang bị sót được liệt kê ở cuối, và mục lục sót hơn một phần năm số trang thì bị từ chối; được viết ở `topics.md` (một trang của chính người dùng ở đó không bao giờ bị đụng tới) |
+| `fix` một khẳng định | nguồn là một nguồn của trang và đọc được; câu trích có trong nguồn từng chữ (bỏ qua khoảng trắng và chữ hoa, ít nhất 8 ký tự); có văn bản thay thế; đoạn văn bị thay xuất hiện đúng một lần trong trang và dài tối đa một phần tư phần văn của trang và 2.000 ký tự (bản sửa sửa một khẳng định, không viết lại trang); ít nhất 80% trọng số từ ngữ mà bản sửa đưa vào thuộc về câu trích (`FIX_SUPPORT`) |
 
 Trọng số từ ngữ là thống kê token: `harness::query_terms` trên văn bản đã bỏ
 dấu, mỗi từ có trọng số theo việc ít trang chứa nó (một IDF đã làm trơn). Không

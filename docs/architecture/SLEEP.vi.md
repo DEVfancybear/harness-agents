@@ -109,7 +109,7 @@ hạn.
   mỗi thư viện knowledge một job (`wiki:<thư mục thư viện>`) khi thư viện đã
   đổi kể từ lượt trước, có việc cho một lượt, và một review đã viết một trang
   kể từ đó hoặc đã qua một ngày. Thư viện không còn đến hạn thì quên job đã bỏ
-  cuộc của nó. Thời gian chờ đầu tiên sau một lần hỏng là một giờ, như Deep
+  cuộc của nó; thư viện vẫn đến hạn thì quên job đó một ngày sau khi nó bỏ cuộc, và lượt chạy được thử lại từ đầu. Thời gian chờ đầu tiên sau một lần hỏng là một giờ, như Deep
   Dream.
 
 Lượt meditation của vòng học vốn đã tự giữ chỗ một giờ và chỉ đánh dấu sau khi

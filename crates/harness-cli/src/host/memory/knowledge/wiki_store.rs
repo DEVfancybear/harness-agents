@@ -24,6 +24,15 @@ pub(crate) struct WikiPage {
 }
 
 impl Store {
+    /// Run `action` holding the library's lock: what the wiki pass keeps
+    /// beside the pages is written under it too.
+    pub(crate) fn locked<T>(
+        &self,
+        action: impl FnOnce(&Path) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.with_lock(action)
+    }
+
     /// Every page with its text, for the wiki pass to read.
     pub(crate) fn wiki_pages(&self) -> Result<Vec<WikiPage>, String> {
         self.with_lock(|root| {
