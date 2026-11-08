@@ -931,4 +931,58 @@ mod tests {
             content.chars().count()
         );
     }
+
+    /// The meditation reads the project's newest curated logs, in the shape
+    /// the host writes them (and `dream.sh` seeds them), named by their path
+    /// in the project, newest first; none while session logs are off.
+    #[test]
+    fn the_meditation_reads_the_newest_session_logs() {
+        let directory = tempfile::tempdir().expect("dir");
+        let sessions = directory
+            .path()
+            .join(super::super::super::session_log::SESSIONS_DIR);
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        for (name, conversation, written) in [
+            (
+                "2026-11-05-10_00-older.md",
+                "task_older",
+                "2026-11-05T10:00:00+00:00",
+            ),
+            (
+                "2026-11-06-15_30-newer.md",
+                "task_newer",
+                "2026-11-06T15:30:00+00:00",
+            ),
+        ] {
+            std::fs::write(
+                sessions.join(name),
+                format!(
+                    "# Session Log: {} - A topic\n\n## Quick Reference (for AI scanning)\n**Conversation:** {conversation}\n**Through:** session_x\n**Written:** {written}\n**Outcome:** Done.\n\n## Key Learnings\n- The user corrected the agent: run `just test`.\n\n---\n\n## Quick Resume Context\nDone.\n",
+                    &name[..10]
+                ),
+            )
+            .expect("log");
+        }
+        let on = Dream {
+            workspace: Some(directory.path().to_path_buf()),
+            session_logs: true,
+            ..Dream::default()
+        };
+        let logs = recent_logs(&on);
+        assert_eq!(
+            logs.iter()
+                .map(|log| (log.name.as_str(), log.conversation.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (".harness/sessions/2026-11-06-15_30-newer.md", "task_newer"),
+                (".harness/sessions/2026-11-05-10_00-older.md", "task_older"),
+            ]
+        );
+        assert!(logs[0].text.contains("run `just test`"));
+        let off = Dream {
+            session_logs: false,
+            ..on
+        };
+        assert!(recent_logs(&off).is_empty());
+    }
 }
