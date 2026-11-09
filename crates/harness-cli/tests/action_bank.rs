@@ -598,6 +598,7 @@ async fn several_ready_nodes_go_to_the_selector_or_to_the_model() {
         two_ready(),
         Some(ActionBank {
             selector: Some(abstains.clone()),
+            timeout: None,
         }),
         ApprovalMode::Auto,
         TurnLimits::default(),
@@ -614,6 +615,7 @@ async fn several_ready_nodes_go_to_the_selector_or_to_the_model() {
         two_ready(),
         Some(ActionBank {
             selector: Some(picks.clone()),
+            timeout: None,
         }),
         ApprovalMode::Auto,
         TurnLimits::default(),
@@ -657,6 +659,160 @@ async fn an_invalid_bank_is_refused_and_nothing_runs() {
         .expect("answered");
     assert!(refusal.content.contains("refused"), "{}", refusal.content);
     assert!(refusal.content.contains("schema"), "{}", refusal.content);
+    // A later turn's replay gives the refusal, not "this call did not run".
+    let history = harness_runtime::conversation_history(&run.store, &run.session)
+        .await
+        .expect("history")
+        .messages;
+    let replayed = history
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some("b1"))
+        .expect("replayed");
+    assert!(
+        replayed.content.contains("action_bank refused"),
+        "{}",
+        replayed.content
+    );
+}
+
+/// A selector that runs out of time abstains, and its call is still counted.
+struct Slow;
+
+impl BankSelector for Slow {
+    fn select<'a>(
+        &'a self,
+        _choice: BankChoice,
+    ) -> Pin<Box<dyn Future<Output = BankSelection> + Send + 'a>> {
+        Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            BankSelection {
+                node: Some("a".to_owned()),
+                input_tokens: 1,
+                asked: true,
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_selector_that_times_out_abstains_and_is_counted() {
+    let bench = bench();
+    let run = run(
+        &bench,
+        two_ready(),
+        Some(ActionBank {
+            selector: Some(Arc::new(Slow)),
+            timeout: Some(std::time::Duration::from_millis(50)),
+        }),
+        ApprovalMode::Auto,
+        TurnLimits::default(),
+    )
+    .await;
+    assert_eq!(run.outcome.bank.dispatched, 0);
+    assert_eq!(run.outcome.bank.abstained, 1);
+    assert_eq!(
+        run.outcome.bank.selector_calls, 1,
+        "the timed-out call counts"
+    );
+    assert_eq!(run.seen.len(), 2);
+}
+
+/// A steer the user sent while a banked call was being chosen reaches the
+/// model before the call: the banked call is dropped, never run, and not
+/// kept with the turn as a call the harness issued.
+struct SteersWhileChoosing {
+    store: Arc<SqliteStore>,
+    input: InputId,
+}
+
+impl BankSelector for SteersWhileChoosing {
+    fn select<'a>(
+        &'a self,
+        _choice: BankChoice,
+    ) -> Pin<Box<dyn Future<Output = BankSelection> + Send + 'a>> {
+        Box::pin(async move {
+            let run = self
+                .store
+                .run_by_input(&self.input)
+                .await
+                .expect("run read")
+                .expect("the run exists");
+            harness_runtime::RunInbox::new(Arc::clone(&self.store))
+                .steer(
+                    &run,
+                    "stop, do not run the next command",
+                    harness_runtime::now_unix_ms(),
+                )
+                .await
+                .expect("steer queued");
+            BankSelection {
+                node: Some("a".to_owned()),
+                input_tokens: 0,
+                asked: true,
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_steer_sent_while_a_banked_call_is_chosen_drops_the_call() {
+    let bench = bench();
+    let store = open_store(&bench).await;
+    let provider = Scripted::new(two_ready());
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let input = InputId::generate();
+    let driver = TurnDriver::new(
+        Arc::clone(&runtime),
+        ToolExecutionService::new(Arc::clone(&store)),
+    )
+    .with_inbox(harness_runtime::RunInbox::new(Arc::clone(&store)))
+    .with_action_bank(ActionBank {
+        selector: Some(Arc::new(SteersWhileChoosing {
+            store: Arc::clone(&store),
+            input: input.clone(),
+        })),
+        timeout: None,
+    });
+    let session = SessionId::generate();
+    let outcome = driver
+        .run_turn(
+            RunRequest::new(
+                session.clone(),
+                TaskId::generate(),
+                input,
+                "write a module and test it".to_owned(),
+                observe_workspace(bench.project_id.clone(), &bench.workspace).expect("observation"),
+            )
+            .with_tool_schemas(coding_tool_schemas()),
+            options(&bench, ApprovalMode::Auto, TurnLimits::default()),
+            Arc::new(Silent),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn runs");
+    let seen = provider.seen();
+    assert_eq!(seen.len(), 2, "the model reads the steer");
+    assert_eq!(outcome.bank.dispatched, 0, "the chosen call never ran");
+    assert_eq!(outcome.tool_calls, 2, "only the write and the bank");
+    let last = &seen[1].messages;
+    assert!(issued(last).is_empty(), "{last:#?}");
+    assert!(last.iter().any(|message| {
+        message
+            .content
+            .contains("stop, do not run the next command")
+    }));
+    let history = harness_runtime::conversation_history(&store, &session)
+        .await
+        .expect("history")
+        .messages;
+    assert!(
+        issued(&history).is_empty(),
+        "a call that never ran is not replayed as issued: {history:#?}"
+    );
 }
 
 /// The approvals of a banked call are asked as the model's own are, and a
@@ -783,4 +939,117 @@ async fn with_the_bank_off_there_is_no_bank_tool() {
     );
     assert_eq!(run.outcome.bank, harness_tools::BankTally::default());
     assert!(issued(last_messages(&run)).is_empty());
+}
+
+/// One more turn of `session`'s conversation, from the store opened again as
+/// a later turn opens it: its outcome, what the model was sent, and the store.
+async fn continue_turn(
+    bench: &Bench,
+    store: Arc<SqliteStore>,
+    session: &SessionId,
+    task: &TaskId,
+    responses: Vec<Vec<ProviderStreamEvent>>,
+) -> (TurnOutcome, Vec<ProviderRequest>, Arc<SqliteStore>) {
+    Arc::try_unwrap(store)
+        .expect("store released")
+        .close()
+        .await
+        .expect("store closes");
+    let store = open_store(bench).await;
+    let provider = Scripted::new(responses);
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let outcome = TurnDriver::new(
+        Arc::clone(&runtime),
+        ToolExecutionService::new(Arc::clone(&store)),
+    )
+    .with_action_bank(ActionBank::default())
+    .run_turn_continuing(
+        session,
+        request(
+            bench,
+            SessionId::generate(),
+            task.clone(),
+            "fix it and test again",
+        ),
+        options(bench, ApprovalMode::Auto, TurnLimits::default()),
+        Arc::new(Silent),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("the turn runs");
+    drop(runtime);
+    (outcome, provider.seen(), store)
+}
+
+/// The same bank authored in two turns (fix, then test again) gives each
+/// banked call an id of its own: the replay of the first turn and the
+/// second turn's call never announce one id twice, and a third turn runs on
+/// a valid transcript.
+#[tokio::test]
+async fn the_same_bank_in_two_turns_keeps_every_call_id_unique() {
+    let bench = bench();
+    let banked = || bank(&[node("version", "root", "ok", &["--version"])]);
+    let first = run(
+        &bench,
+        vec![
+            calls(&[
+                ("w1", "write_file", write("src/main.rs")),
+                ("b1", "action_bank", banked()),
+            ]),
+            answer("done"),
+        ],
+        Some(ActionBank::default()),
+        ApprovalMode::Auto,
+        TurnLimits::default(),
+    )
+    .await;
+    assert_eq!(first.outcome.bank.dispatched, 1);
+    let Run {
+        store,
+        session,
+        task,
+        ..
+    } = first;
+    let (second, sent, store) = continue_turn(
+        &bench,
+        store,
+        &session,
+        &task,
+        vec![
+            calls(&[
+                ("w2", "write_file", write("src/lib.rs")),
+                ("b2", "action_bank", banked()),
+            ]),
+            answer("fixed and tested"),
+        ],
+    )
+    .await;
+    assert_eq!(second.stop, TurnStop::Final);
+    assert_eq!(second.bank.dispatched, 1);
+    let last = &sent.last().expect("a model call").messages;
+    harness_providers::validate_transcript(last).expect("the second turn's transcript is valid");
+    let ids = issued(last)
+        .iter()
+        .map(|message| message.tool_calls[0].call_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 2, "the replayed call and the new one: {last:#?}");
+    assert_ne!(ids[0], ids[1]);
+    assert!(ids.iter().all(|id| id.len() <= 64));
+    let (third, sent, store) = continue_turn(
+        &bench,
+        store,
+        &second.session_id,
+        &task,
+        vec![answer("both runs passed")],
+    )
+    .await;
+    assert_eq!(third.stop, TurnStop::Final);
+    harness_providers::validate_transcript(&sent[0].messages)
+        .expect("the third turn's transcript is valid");
+    assert_eq!(issued(&sent[0].messages).len(), 2);
+    drop(store);
 }

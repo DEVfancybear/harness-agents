@@ -2032,6 +2032,9 @@ pub enum ToolOutput {
         operation: String,
         output: String,
         truncated: bool,
+        /// How git exited; `None` when it never ran or the exit is unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
     },
     TaskUpdate {
         note: String,
