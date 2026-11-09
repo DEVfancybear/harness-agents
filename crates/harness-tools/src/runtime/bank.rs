@@ -605,6 +605,7 @@ impl std::fmt::Debug for ActionBank {
         formatter
             .debug_struct("ActionBank")
             .field("selector", &self.selector.is_some())
+            .field("timeout", &self.timeout)
             .finish()
     }
 }
