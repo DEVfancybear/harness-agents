@@ -363,6 +363,14 @@ pub struct InteractiveController {
     login_scope: super::credentials::Scope,
     /// Reasoning received since the last committed row.
     pending_thinking: String,
+    /// An answer (or its reasoning) is being written: text has streamed since
+    /// the last row that ended it, part of it maybe already in the scrollback.
+    answer_open: bool,
+    /// Rows that arrived on their own while an answer was being written - a
+    /// background review's result, a notice - held until the answer ends. Put
+    /// in at once, they cut the answer in two between two of its tokens
+    /// ("... thất" / the review / " bại ..."), each half its own block.
+    held_rows: Vec<HistoryItem>,
     /// The thinking level the next turn uses, for the status line.
     thinking_label: Option<String>,
     tier_label: Option<String>,
@@ -481,6 +489,8 @@ impl InteractiveController {
             login_scope: super::credentials::Scope::Main,
             signing_in: None,
             pending_thinking: String::new(),
+            answer_open: false,
+            held_rows: Vec::new(),
             thinking_label: None,
             tier_label: None,
             autonomous: super::autonomous::Autonomous::default(),
@@ -2528,6 +2538,7 @@ impl InteractiveController {
                     .pending_newlines
                     .saturating_add(text.bytes().filter(|byte| *byte == b'\n').count());
                 self.pending_text.push_str(&text);
+                self.answer_open = true;
             }
             SessionEvent::StreamRestarted => {
                 // The provider stream failed part-way and the runtime is asking
@@ -2562,6 +2573,7 @@ impl InteractiveController {
                     self.flush_text(effects);
                 }
                 self.pending_thinking.push_str(&text);
+                self.answer_open = true;
                 effects.push(Effect::Redraw);
             }
             SessionEvent::UsageUpdated { label, tokens } => {
@@ -2955,7 +2967,10 @@ impl InteractiveController {
                 // Child progress can arrive between two tokens of the parent's
                 // answer. Keep the TUI's live text together so markdown spans
                 // across those tokens render as one assistant message.
-                if self.plain || !message.starts_with("[child ") {
+                // Any other notice that lands inside the answer waits for its end
+                // too (below).
+                let inside_answer = !self.plain && self.answer_open;
+                if !inside_answer && (self.plain || !message.starts_with("[child ")) {
                     self.flush_stream(effects);
                 }
                 self.note_child_activity(&message);
@@ -2980,6 +2995,8 @@ impl InteractiveController {
                         .trim()
                         .to_owned();
                     self.pending_allowance = Some(reason);
+                } else if inside_answer {
+                    self.held_rows.push(HistoryItem::Notice { message });
                 } else {
                     self.push_history(effects, HistoryItem::Notice { message });
                 }
@@ -3114,8 +3131,9 @@ impl InteractiveController {
                 summary,
                 details,
             } => {
-                self.flush_stream(effects);
-                self.push_history(
+                // A background review finishes on its own clock, often while
+                // the turn is still answering.
+                self.push_between(
                     effects,
                     HistoryItem::Refinement {
                         header,
@@ -4133,6 +4151,8 @@ impl InteractiveController {
         self.turn_tokens_start = self.service.session_tokens();
         self.pending_text.clear();
         self.pending_newlines = 0;
+        // Rows held for an answer that is gone still come out, at the run's start.
+        self.answer_open = false;
         self.last_answer.clear();
         self.run_report = None;
         self.active_deliveries.clear();
@@ -6166,9 +6186,27 @@ impl InteractiveController {
         }
     }
 
+    /// End the answer being written: commit what is left of it, then the rows
+    /// that waited for it to end.
     fn flush_stream(&mut self, effects: &mut Vec<Effect>) {
         self.flush_thinking(effects);
         self.flush_text(effects);
+        self.answer_open = false;
+        for row in std::mem::take(&mut self.held_rows) {
+            self.push_history(effects, row);
+        }
+    }
+
+    /// A row that arrives on its own, not as a step of the answer: after the
+    /// answer when one is being written, else now. The plain transcript is a
+    /// log and keeps the order things happened in.
+    fn push_between(&mut self, effects: &mut Vec<Effect>, item: HistoryItem) {
+        if !self.plain && self.answer_open {
+            self.held_rows.push(item);
+            return;
+        }
+        self.flush_stream(effects);
+        self.push_history(effects, item);
     }
 
     /// Commit the answer text gathered so far.
@@ -11287,6 +11325,155 @@ Command: \"npm run build\""
                 "Xác nhận thêm: trang success **crash render** với `note` dạng object (log server có `Objects are not valid as a React child`)."
             ],
             "child progress must not create separate assistant fragments"
+        );
+    }
+
+    /// The order of what one stream of events puts in the scrollback: the
+    /// answer's text, and the header or message of every other row.
+    fn rows_of(effects: &[Effect]) -> Vec<String> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Stream(text) => Some(format!("answer: {text}")),
+                Effect::History(HistoryItem::Refinement { header, .. }) => {
+                    Some(format!("review: {header}"))
+                }
+                Effect::History(HistoryItem::Notice { message }) => {
+                    Some(format!("notice: {message}"))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn review_result() -> SessionEvent {
+        SessionEvent::Refined {
+            header: "Harness unchanged · no edits applied".to_owned(),
+            summary: "Không đề xuất thay đổi continual harness.".to_owned(),
+            details: Vec::new(),
+        }
+    }
+
+    /// Seen in a session: a background review finished between two tokens of
+    /// the answer, and the answer came out as two blocks with the review between
+    /// them - "... test màn hình cũ thất", the review, " bại vì ..." - the second
+    /// half indented by the space its first token began with.
+    #[test]
+    fn a_review_that_ends_inside_the_answer_waits_for_the_answer_to_end() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "fix the tests");
+        let mut effects = Vec::new();
+        for event in [
+            SessionEvent::TextDelta {
+                text: "Màn hình mới phân tích mã sạch, nhưng test màn hình cũ thất".to_owned(),
+            },
+            review_result(),
+            SessionEvent::TextDelta {
+                text: " bại vì vẫn kiểm tra dòng chữ của bản mẫu.".to_owned(),
+            },
+            SessionEvent::Notice {
+                message: "memory: 1 proposed change waits for your review".to_owned(),
+            },
+        ] {
+            harness.events.send(event).expect("event");
+            effects.extend(harness.controller.pump_events());
+        }
+        assert!(
+            rows_of(&effects).is_empty(),
+            "nothing is committed while the answer is being written: {effects:#?}"
+        );
+        assert_eq!(
+            harness.controller.ui_state().live_text,
+            "Màn hình mới phân tích mã sạch, nhưng test màn hình cũ thất bại vì vẫn kiểm tra dòng chữ của bản mẫu."
+        );
+
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("terminal");
+        effects.extend(harness.controller.pump_events());
+        assert_eq!(
+            rows_of(&effects),
+            [
+                "answer: Màn hình mới phân tích mã sạch, nhưng test màn hình cũ thất bại vì vẫn kiểm tra dòng chữ của bản mẫu.",
+                "review: Harness unchanged · no edits applied",
+                "notice: memory: 1 proposed change waits for your review",
+            ]
+        );
+    }
+
+    /// The answer ends at the next step of the turn, not only at its end: a
+    /// tool call puts the held review right after the text before it.
+    #[test]
+    fn a_held_review_comes_out_when_the_answer_gives_way_to_a_tool() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "fix the tests");
+        let mut effects = Vec::new();
+        for event in [
+            SessionEvent::TextDelta {
+                text: "I will update the test.".to_owned(),
+            },
+            review_result(),
+            SessionEvent::TurnActivity {
+                label: "Editing".to_owned(),
+            },
+            SessionEvent::TextDelta {
+                text: "Done.".to_owned(),
+            },
+        ] {
+            harness.events.send(event).expect("event");
+            effects.extend(harness.controller.pump_events());
+        }
+        assert_eq!(
+            rows_of(&effects),
+            [
+                "answer: I will update the test.",
+                "review: Harness unchanged · no edits applied",
+            ]
+        );
+        assert_eq!(harness.controller.ui_state().live_text, "Done.");
+    }
+
+    /// With no answer being written, a review's result shows at once; and the
+    /// plain transcript, a log, keeps the order things happened in.
+    #[test]
+    fn a_review_outside_an_answer_or_in_plain_mode_shows_at_once() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "fix the tests");
+        harness.events.send(review_result()).expect("review");
+        assert_eq!(
+            rows_of(&harness.controller.pump_events()),
+            ["review: Harness unchanged · no edits applied"]
+        );
+
+        let mut plain = bench_with(true, RecordingPort::default(), true);
+        let _ = plain.controller.boot_lines();
+        let _ = submit_text(&mut plain.controller, "fix the tests");
+        let mut effects = Vec::new();
+        for event in [
+            SessionEvent::TextDelta {
+                text: "thất".to_owned(),
+            },
+            review_result(),
+            SessionEvent::TextDelta {
+                text: " bại".to_owned(),
+            },
+        ] {
+            plain.events.send(event).expect("event");
+            effects.extend(plain.controller.pump_events());
+        }
+        assert_eq!(
+            rows_of(&effects),
+            [
+                "answer: thất",
+                "review: Harness unchanged · no edits applied",
+                "answer:  bại"
+            ]
         );
     }
 
