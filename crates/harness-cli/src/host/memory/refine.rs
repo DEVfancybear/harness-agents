@@ -1282,6 +1282,14 @@ impl Refinement {
         self.edits().is_empty()
     }
 
+    /// How many edits the refinement made, and how many of them applied.
+    #[must_use]
+    pub fn edit_counts(&self) -> (usize, usize) {
+        let edits = self.edits();
+        let applied = edits.iter().filter(|edit| edit["applied"] == true).count();
+        (edits.len(), applied)
+    }
+
     /// The edits that count: an intent refused and then handed to the repair
     /// pass is reported apart, not as a failure.
     fn edits(&self) -> Vec<&Value> {
@@ -2462,7 +2470,8 @@ fn queue_child_proposal(
     finding: &super::delegation::ChildFinding,
     proposed: &super::delegation::ChildProposal,
 ) -> ProposalOutcome {
-    let global = proposed.scope == "global";
+    // A project's fact goes where the review keeps one: the global store.
+    let global = proposed.scope != "local";
     let mut fields = Map::new();
     fields.insert("action".to_owned(), json!("create"));
     fields.insert("kind".to_owned(), json!("memory"));

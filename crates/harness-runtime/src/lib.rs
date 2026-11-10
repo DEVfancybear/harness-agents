@@ -6548,11 +6548,20 @@ impl RuntimeService {
         // replayed, the kept summary no longer matched what was replayed and
         // was written again from what was left, and they were gone without a
         // word. A checkpoint stands for everything before it instead.
-        if history.near_replay_bound()
-            && !request.auto_compaction_attempted.load(Ordering::SeqCst)
-            && Box::pin(self.compact(source_session_id)).await.is_ok()
+        if history.near_replay_bound() && !request.auto_compaction_attempted.load(Ordering::SeqCst)
         {
-            history = self.conversation_history(source_session_id).await?;
+            let compacted = Box::pin(self.compact(source_session_id)).await.is_ok();
+            // The checkpoint's events are the source session's, and writing
+            // them took the task back for that session from the turn it was
+            // handed to: the new turn's admission then failed with
+            // `task_lease_conflict`, and a goal stopped for seven hours. A
+            // compaction that failed wrote its start already. The task goes
+            // back to the turn that continues it either way; only this
+            // store's own lease is released.
+            self.store.release_task_lease(&request.task_id).await?;
+            if compacted {
+                history = self.conversation_history(source_session_id).await?;
+            }
         }
         // The previous request packet is no longer the carrier of the conversation.
         // It held the question and never the answer, and because each packet also

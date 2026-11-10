@@ -12,8 +12,12 @@
 #      the user's own message still runs while parked (it waited forever),
 #      after the held one;
 #   4. a child told its usage limit resets in hours asks once, not three
-#      times a minute apart.
-# Sections 3 and 4 need MODEL on openai-codex: the agents reach ChatGPT through
+#      times a minute apart;
+#   5. (bug report 2026-11-10) the quiet session log that comes due while the
+#      session is parked is left to the next one - it failed with the park's
+#      error and told the user "the session log was not written:
+#      rate_limited". Its checks run in section 3 (HA_IDLE_REVIEW_SECONDS=20).
+# Sections 3 to 5 need MODEL on openai-codex: the agents reach ChatGPT through
 # quota_proxy.py, which answers with a usage limit while a flag file exists.
 # Every check prints PASS or FAIL; the conversation and the diagnostics stay in
 # $LIVE_ROOT/queue as evidence.
@@ -25,7 +29,7 @@ fresh queue
 export HA_AUTO_REFINE=off HA_PYTHON=${HA_PYTHON:-$PY} HA_DIAG=debug
 D="$HA_HOME/data/diagnostics"
 project "$RX/p"
-# Diagnostic records of one kind with their time, as `ms event key=value ...`.
+# Diagnostic records of one kind with their time, as `ms event key=value ... msg`.
 records() {
   "$PY" - "$D" "$1" <<'EOF'
 import glob, json, os, sys
@@ -39,7 +43,8 @@ for path in glob.glob(os.path.join(directory, "*.jsonl")):
             continue
         if record.get("kind") == kind:
             fields = " ".join(f"{k}={v}" for k, v in sorted(record.get("fields", {}).items()))
-            rows.append((record.get("ms", 0), f"{record.get('ms', 0)} {record.get('event')} {fields}"))
+            message = str(record.get("msg", "")).replace("\n", " ")
+            rows.append((record.get("ms", 0), f"{record.get('ms', 0)} {record.get('event')} {fields} {message}".rstrip()))
 for _, row in sorted(rows):
     print(row)
 EOF
@@ -118,6 +123,9 @@ trap 'kill $PROXY 2>/dev/null' EXIT
 for _ in $(seq 1 50); do [ -s "$X/port" ] && break; sleep 0.2; done
 # The session's provider, through the proxy: no --model, which would choose
 # the endpoint itself.
+# A quiet session log 20 s after a turn (section 5's checks): it comes due
+# while section 3's park holds.
+export HA_IDLE_REVIEW_SECONDS=20
 export HA_PROVIDER_ID=openai-codex HA_PROVIDER_PROTOCOL=openai_codex \
   HA_PROVIDER_ENDPOINT="http://127.0.0.1:$(cat "$X/port")/backend-api/codex/responses" \
   HA_PROVIDER_MODEL="${MODEL#openai-codex/}"
@@ -168,6 +176,13 @@ requests "$parked" | sed 's/^/   proxy after the park: /'
 check "the usage limit parked the session (the precondition)" '[ -n "$parked" ]'
 check "no turn started while the session was parked" '[ -n "$parked" ] && ! (records turn | awk -v since="$parked" "\$1 > since && \$2 == \"start\"" | grep -q .)'
 check "no call reached the provider while parked" '[ -n "$parked" ] && [ "$(requests "$parked" | wc -l)" -eq 0 ]'
+quiet=$(records session_log | awk -v since="$parked" '$1 > since && /trigger=quiet/')
+echo "$quiet" | sed 's/^/   session log while parked: /'
+# Met the park: failed with it (0.9.3) or left to the next write for it -
+# a write superseded by a later turn, or of too few turns, met nothing.
+check "a quiet session log came due while parked and met the park (the precondition)" '[ -n "$parked" ] && echo "$quiet" | grep -qE "reason=rate_limited|^[0-9]+ failed"'
+check "the quiet log met the park and was left to the next one, not failed" '[ -n "$quiet" ] && ! echo "$quiet" | grep -qE "^[0-9]+ failed"'
+check "the user was not told the session log was not written" '[ -n "$parked" ] && ! (records notice | awk -v since="$parked" "\$1 > since" | grep -q "session log was not written")'
 rm -f "$X/limit"
 before=$(now_ms)
 # Bounded: a parked, idle agent queued the user's message "after the active
@@ -185,6 +200,8 @@ done
 check "the user's message ran while parked" 'echo "$user_ok" | grep -q "USER-OK"'
 check "the queued message ran once the park was over" '[ -n "$ran" ]'
 "$HA" shutdown --force >/dev/null 2>&1
+# Section 4 counts each conversation's calls: no session log of its own.
+unset HA_IDLE_REVIEW_SECONDS
 
 echo "################ 4. a child told its limit resets in hours asks once"
 proxied "$RX/p" q4

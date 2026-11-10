@@ -351,9 +351,12 @@ impl SessionEvent {
             Self::ChildSettled { name, notice } => diag::info("child", "settled")
                 .msg(notice.clone())
                 .field("child", name.clone()),
+            // The row the person is shown; the review's own record
+            // (`review.applied`) is written where it ran, and each review
+            // read as two in a report.
             Self::Refined {
                 header, summary, ..
-            } => diag::info("review", "applied")
+            } => diag::info("review", "shown")
                 .msg(summary.clone())
                 .field("header", header.clone()),
             _ => return None,

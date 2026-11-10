@@ -1011,6 +1011,20 @@ static SECRET_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
     ]
 });
 
+/// Whether `found` is a part of a decimal number: the digits after its point
+/// (`score=20.319646402472134`, which a report redacted as a card number ten
+/// times), or before it.
+fn in_a_decimal(text: &str, found: &regex::Match<'_>) -> bool {
+    let before = text[..found.start()]
+        .chars()
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>();
+    let after = text[found.end()..].chars().take(2).collect::<Vec<_>>();
+    matches!(before.as_slice(), ['.', digit, ..] if digit.is_ascii_digit())
+        || matches!(after.as_slice(), ['.', digit, ..] if digit.is_ascii_digit())
+}
+
 fn luhn(candidate: &str) -> bool {
     let digits = candidate
         .chars()
@@ -1046,7 +1060,7 @@ pub fn redact(text: &str) -> String {
         .flat_map(|rule| {
             rule.pattern
                 .find_iter(text)
-                .filter(|found| !rule.luhn || luhn(found.as_str()))
+                .filter(|found| !rule.luhn || (luhn(found.as_str()) && !in_a_decimal(text, found)))
                 .map(move |found| (found.start(), found.end(), rule))
         })
         .collect::<Vec<_>>();
@@ -2736,5 +2750,22 @@ mod tests {
         assert!(text.contains("[REDACTED:pii:email]"), "{text}");
         assert!(text.contains("[REDACTED:pii:credit_card]"), "{text}");
         assert!(text.contains("1234567890123"), "{text}");
+    }
+
+    /// Seen in a bug report: a skill's recall score `20.319646402472134`
+    /// passed the card check on its fraction and read
+    /// `score=20.[REDACTED:pii:credit_card]` ten times. The digits of a
+    /// decimal number are not a card; a card beside a sentence's full stop
+    /// still is.
+    #[test]
+    fn the_digits_of_a_decimal_number_are_not_a_card() {
+        assert!(
+            super::luhn("319646402472134"),
+            "the fraction passes the check"
+        );
+        let text = redact("failures=0 score=20.319646402472134 skill=e2e");
+        assert!(text.contains("20.319646402472134"), "{text}");
+        let text = redact("paid with 4111 1111 1111 1111.");
+        assert!(text.contains("[REDACTED:pii:credit_card]"), "{text}");
     }
 }

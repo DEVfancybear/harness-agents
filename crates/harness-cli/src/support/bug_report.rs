@@ -29,6 +29,9 @@ const REPORT_BYTES: usize = 64 * 1024 * 1024;
 const SUMMARY_TIMELINE: usize = 400;
 /// Conversations whose harness files are read, newest first.
 const MAX_CONVERSATIONS: usize = 24;
+/// How far apart a worker's log line and its diagnostic record of the same
+/// line may be timed.
+const WORKER_LOG_TWIN_MS: i64 = 1_000;
 
 /// What to report on.
 #[derive(Clone, Debug)]
@@ -1029,6 +1032,23 @@ impl Report {
     fn sorted_points(&self) -> Vec<Point> {
         let mut points = self.points.clone();
         points.sort_by_key(|point| point.ms);
+        // A worker writes each line to its log file and as a diagnostic
+        // record: the timeline showed every one twice, once by its pid and
+        // once by its log's name. The two take their times one after the
+        // other, which may be a millisecond or so apart.
+        let mut logged: BTreeMap<String, (i64, String)> = BTreeMap::new();
+        points.retain(|point| {
+            if point.what != "worker.log" {
+                return true;
+            }
+            let twin = logged.get(&point.text).is_some_and(|(ms, source)| {
+                *source != point.source && point.ms - ms <= WORKER_LOG_TWIN_MS
+            });
+            if !twin {
+                logged.insert(point.text.clone(), (point.ms, point.source.clone()));
+            }
+            !twin
+        });
         points
     }
 
@@ -1355,13 +1375,38 @@ impl Report {
                 ));
             }
         }
-        // The runtime waits at most 30 s between attempts.
+        // The runtime waits at most 30 s between attempts. A failed attempt
+        // was retried when a later attempt of the same request was made: seen
+        // in a report, three usage limits of one conversation, each parked
+        // until its reset and hit again hours after the park lifted, and a
+        // child that failed at its first refusal, read as four retries.
+        let attempts = self
+            .recorded("provider", "call")
+            .into_iter()
+            .chain(self.recorded("provider", "attempt_failed"))
+            .filter_map(|record| {
+                Some((
+                    record["request"].as_str()?,
+                    record["fields"]["attempt"].as_u64()?,
+                ))
+            })
+            .collect::<Vec<_>>();
         let mut retried: BTreeMap<String, (usize, u64, i64)> = BTreeMap::new();
         for record in self.recorded("provider", "attempt_failed") {
             let fields = &record["fields"];
             let reset = fields["retry_after_ms"].as_u64().unwrap_or_default();
             let last = fields["attempt"].as_u64() >= fields["max_attempts"].as_u64();
             if fields["code"] != "rate_limited" || reset <= 30_000 || last {
+                continue;
+            }
+            // A record without its request (an older build) cannot show
+            // whether the call was made again; it is counted as before.
+            if let (Some(request), Some(attempt)) =
+                (record["request"].as_str(), fields["attempt"].as_u64())
+                && !attempts
+                    .iter()
+                    .any(|(other, later)| *other == request && *later > attempt)
+            {
                 continue;
             }
             let entry = retried
@@ -2511,7 +2556,6 @@ impl Report {
     }
 
     fn into_zip(mut self) -> Vec<u8> {
-        let summary = self.summary();
         // Each point's texts are redacted, never the line: its `ms` was taken
         // for a card number and the line was no longer JSON.
         let points = self.sorted_points();
@@ -2522,6 +2566,9 @@ impl Report {
             lines.push(value.to_string());
         }
         let timeline = lines.join("\n");
+        // After the timeline's redactions, which the summary counts: written
+        // first, it said "secrets redacted: 0" beside a manifest's 10.
+        let summary = self.summary();
         let summary = self.redact(&summary);
         let manifest = json!({
             "schema_version": 1,

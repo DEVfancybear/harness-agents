@@ -22,7 +22,13 @@
 #      and, updated, still cites its code - and is in no request of a turn
 #      that touches no billing file, yet loads with one that reads one. The
 #      checks of 5 fail on the first wave-2 build, whose review dropped
-#      `paths` and `citations`.
+#      `paths` and `citations`;
+#   6. (after 0.9.3) a child's proposal with `scope: project`, the memory
+#      tool's own scope, is taken, its evidence quoting two lines of a file
+#      as the file has them (no `read_file` line numbers) is found, and a
+#      quote no tool result holds is refused as a plain failure, never "side
+#      effect may be uncertain". Each fails on 0.9.3 (a bug report's four
+#      refused proposals and four refused quotes).
 #
 # Each check prints PASS or FAIL; the conversations, the exec runs and the
 # diagnostics stay in $LIVE_ROOT/memory-queue as evidence. The model's steps
@@ -427,5 +433,39 @@ for attempt in 1 2; do
 done
 check "precondition: that turn read app/billing/rounding.py (attempt ${held5d:-none})" '[ -n "$held5d" ]'
 check "a turn that reads a billing file loads the updated entry with that result" '[ -n "$held5d" ] && records memory scoped_loaded "$since5d" | grep -q "path=app/billing/rounding.py" && requested "$T5D" rm-5522'
+
+echo "################ 6. a project proposal, a quote of two lines, and a refusal that is plain"
+P6=$RX/p6
+project "$P6"
+mkdir -p "$P6/config"
+printf '[owners]\nteam = "amber-kite-913"\npager = "slate-wren-274"\n' > "$P6/config/owners.toml"
+(cd "$P6" && git add -A && git -c user.name=t -c user.email=t@t commit -qm owners)
+# The findings of the child holding a text, as `scope evidence` lines.
+findings6() {
+  cat "$D"/sessions/*/harness/child_findings.jsonl 2>/dev/null | "$PY" -c "
+import json, sys
+sys.stdout.reconfigure(encoding='utf-8')
+for line in sys.stdin:
+    try:
+        f = json.loads(line)
+    except ValueError:
+        continue
+    if sys.argv[1] in f.get('fact', '') + f.get('evidence', ''):
+        print((f.get('proposal') or {}).get('scope', '-'), json.dumps(f.get('evidence', ''), ensure_ascii=False))" "$1"
+}
+held6=""
+for attempt in 1 2 3; do
+  since6=$(now_ms)
+  run_exec "q6-$attempt" "$P6" "Dùng tool delegate (wait mặc định, đợi kết quả) giao cho đúng một agent role explorer, brief đúng nguyên văn: 'Đọc file config/owners.toml bằng read_file (lần $attempt). Rồi gọi note_finding đúng hai lần, theo thứ tự. Lần 1 (một trích dẫn không có trong kết quả nào, để xem tool từ chối ra sao): fact là \"owners.toml names no escalation contact\", evidence là \"escalation = nobody-here-000\". Lần 2: fact nêu team và pager của project theo owners.toml; evidence là ĐÚNG HAI DÒNG team và pager, chép như trong file, KHÔNG kèm số dòng mà read_file đặt đầu mỗi dòng, hai dòng cách nhau bằng một xuống dòng; propose là {\"title\": \"Project owners\", \"path\": \"project/owners\", \"scope\": \"project\"}. Trả lời agent cha đúng một dòng: kết quả mỗi lần gọi (KEPT hoặc lỗi tool trả về), không nêu team hay pager.' Bản thân bạn không đọc file đó và không gọi tool memory. Đợi explorer xong rồi trả lời đúng một dòng."
+  calls6=$(records call settled "$since6" | grep -c 'tool=note_finding')
+  echo "   attempt $attempt: note_finding calls: $calls6; findings: $(findings6 amber-kite-913 | tr '\n' ' ')"
+  if [ "$calls6" -ge 2 ]; then held6=$attempt; break; fi
+done
+check "precondition: the child called note_finding twice (attempt ${held6:-none})" '[ -n "$held6" ]'
+records tool failed "$since6" | grep 'tool=note_finding' | sed 's/^/   refused: /'
+check "the quote no tool result holds is refused" '[ -n "$held6" ] && records tool failed "$since6" | grep "tool=note_finding" | grep -q "no tool result of yours holds this evidence"'
+check "the refusal is a plain failure, not an unknown outcome" '[ -n "$held6" ] && ! records tool failed "$since6" | grep "tool=note_finding" | grep -q "side effect may be uncertain" && ! records call settled "$since6" | grep "tool=note_finding" | grep -q "error_code=outcome_unknown"'
+check "a proposal with scope project is taken, not refused by the schema" '[ -n "$held6" ] && ! records call settled "$since6" | grep "tool=note_finding" | grep -q "error_code=invalid_call" && findings6 amber-kite-913 | grep -q "^project "'
+check "the quote of two lines without line numbers is found and kept" '[ -n "$held6" ] && findings6 amber-kite-913 | grep "amber-kite-913.*slate-wren-274" | grep -qvE "[0-9]+(#[0-9a-z]+)?: (team|pager)"'
 
 result
