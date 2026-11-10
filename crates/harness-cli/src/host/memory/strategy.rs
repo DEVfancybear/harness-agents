@@ -54,6 +54,48 @@ pub struct Alternative {
     pub name: String,
     #[serde(default)]
     pub why: String,
+    /// The children that would carry it out, when the strategist named a
+    /// team for it ([`TeamRole`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub team: Vec<TeamRole>,
+}
+
+/// One member of the team a strategist proposes for an alternative, after
+/// Evolving Agent Teams (arXiv 2610.36848): its supervisor invents the roles
+/// a stalled task needs - a debugger kept off the main code, an integrator of
+/// what earlier attempts found - instead of picking from a fixed set, and
+/// says what each must leave alone and where it writes what it finds.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TeamRole {
+    /// The role's name, as the strategist invented it.
+    pub title: String,
+    /// The kind of child that fills it: explorer, coder or verifier.
+    #[serde(default)]
+    pub kind: String,
+    /// What it does, what it must not touch, where it leaves its findings.
+    #[serde(default)]
+    pub mandate: String,
+}
+
+impl Alternative {
+    /// The alternative as the model reads it: its name and reason, then its
+    /// team, one member a line.
+    fn render(&self, indent: &str, text: &mut String) {
+        let _ = write!(text, "\n{indent}- {}: {}", self.name, self.why);
+        for role in &self.team {
+            let _ = write!(
+                text,
+                "\n{indent}  team: {} ({}): {}",
+                role.title,
+                if role.kind.is_empty() {
+                    "explorer"
+                } else {
+                    &role.kind
+                },
+                role.mandate
+            );
+        }
+    }
 }
 
 /// The paper's journal entry kinds.
@@ -182,6 +224,10 @@ pub struct StrategyState {
     /// Alternatives the strategist named at the last plateau, until a decision.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proposals: Vec<Alternative>,
+    /// Why the strategy stalled, as the strategist read it at the last
+    /// plateau: what the agent kept doing, not only what it should try.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub diagnosis: String,
     /// The evaluation after which the proposals were made.
     #[serde(default)]
     pub proposed_after: usize,
@@ -344,6 +390,7 @@ impl StrategyState {
             self.current = Some(to);
         }
         self.proposals.clear();
+        self.diagnosis.clear();
         self.decisions.push(decision.clone());
         let excess = self.decisions.len().saturating_sub(MAX_DECISIONS);
         self.decisions.drain(..excess);
@@ -367,7 +414,15 @@ impl StrategyState {
     }
 
     /// The strategist's alternatives, kept until the next decision.
+    #[cfg(test)]
     pub fn propose(&mut self, proposals: Vec<Alternative>) {
+        self.propose_with(proposals, String::new());
+    }
+
+    /// [`Self::propose`], with the strategist's reading of why the strategy
+    /// stalled.
+    pub fn propose_with(&mut self, proposals: Vec<Alternative>, diagnosis: String) {
+        self.diagnosis = diagnosis;
         self.proposals = proposals;
         self.proposed_after = self.evaluated;
     }
@@ -441,9 +496,23 @@ impl StrategyState {
                 );
             }
             if !self.proposals.is_empty() {
+                if !self.diagnosis.is_empty() {
+                    let _ = write!(
+                        text,
+                        "\nWhy it stalled, as a strategist that read the task afresh sees it: {}",
+                        self.diagnosis
+                    );
+                }
                 text.push_str("\nAlternatives named by a strategist that read the task afresh:");
                 for proposal in &self.proposals {
-                    let _ = write!(text, "\n- {}: {}", proposal.name, proposal.why);
+                    proposal.render("", text);
+                }
+                if self
+                    .proposals
+                    .iter()
+                    .any(|proposal| !proposal.team.is_empty())
+                {
+                    text.push_str("\nA team is a suggestion: start each member with delegate, its title as the title and its mandate in the brief.");
                 }
             }
         }
@@ -528,9 +597,17 @@ pub fn view(state: &StrategyState) -> Vec<String> {
     }
     if !state.proposals.is_empty() {
         lines.push(String::new());
+        if !state.diagnosis.is_empty() {
+            lines.push(format!(
+                "Why it stalled (the strategist): {}",
+                state.diagnosis
+            ));
+        }
         lines.push("Alternatives the strategist named, not yet decided on:".to_owned());
         for proposal in &state.proposals {
-            lines.push(format!("  - {}: {}", proposal.name, proposal.why));
+            let mut text = String::new();
+            proposal.render("  ", &mut text);
+            lines.extend(text.lines().skip(1).map(str::to_owned));
         }
     }
     if !state.journal.is_empty() {
@@ -613,6 +690,7 @@ mod tests {
         state.propose(vec![Alternative {
             name: "Use a parser".to_owned(),
             why: "the input nests".to_owned(),
+            ..Alternative::default()
         }]);
         let decision = state
             .decide(
@@ -722,6 +800,7 @@ mod tests {
         state.propose(vec![Alternative {
             name: "use a parser".to_owned(),
             why: "brackets nest".to_owned(),
+            ..Alternative::default()
         }]);
         let mut text = String::new();
         state.render(&mut text);

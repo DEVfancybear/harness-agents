@@ -2,7 +2,7 @@
 
 English | [Tiếng Việt](TEAMWORK.vi.md)
 
-What ha took from four papers read on 2026-11-10, how it works, and what is
+What ha took from five papers read on 2026-11-10, how it works, and what is
 not taken.
 
 - **[S] arXiv 2611.08615**, *s3: Simple Scaling of Swarms*: agents that all
@@ -19,6 +19,12 @@ not taken.
   failing ones restricted. Reuse raised success 4.4 points and cut tokens 24%
   on its selected set; it warns that an outdated strategy costs more than
   none.
+- **[V] arXiv 2610.36848**, *Evolving Agent Teams*: coding agents stall at a
+  local optimum, and so does a fixed team of roles (0.31 of the expert
+  baseline against 0.74 for the same model with a team that is remade). A
+  supervisor reads why the team stalled and redesigns it - roles it invents,
+  how they work together, where they write what they learn - over files that
+  outlast every team.
 - **[T] arXiv 2610.27307**, *TURTLE*: a proposer evolves benchmark tasks until
   a solver completes them about half the time. Not taken yet (below).
 
@@ -85,6 +91,31 @@ What was missing:
 A check that passed or failed after a skill was used counts in the trial too.
 The diagnostics' `skill recalled` record carries `cases` and `unproven`.
 
+## A team remade at a plateau ([V])
+
+Code: `strategist_brief`, `diagnosis_of`, `team_of` in
+`crates/harness-cli/src/host/coordination/goal.rs`; `TeamRole` and
+`Alternative::team` in `memory/strategy.rs`; `title_of` and `titled` in
+`coordination/delegation.rs`; `child_block` in `memory/task_state.rs`.
+
+ha already had [V]'s trigger and its record: a goal's evaluations, the plateau
+after three without progress, the strategist that reads the task afresh, the
+task state's journal and decisions ([strategy and
+runtime](STRATEGY_AND_RUNTIME.en.md)). What it adds:
+
+| [V] | ha | Why |
+|---|---|---|
+| The supervisor reflects on the team's behaviour: drifting to the easy path, an insight lost, stuck debugging, micro-optimizing | The strategist first says why the strategy stalled, from what the agent kept doing (`diagnosis`, kept in the task state until the next decision) | An alternative named without the cause is a guess; the patterns are examples to the model, not a list the host matches |
+| It designs the next team: roles it invents, each with a mandate | An alternative may carry a `team` of one to three members: a title the strategist invents, the kind of child that fills it (explorer, coder, verifier) and its mandate - what it does, what it leaves alone, what it hands back | A debugger kept off the main code cannot block the agent optimizing it |
+| Roles are not picked from a fixed set | `delegate` takes a `title`. The child is named `<title>-<n>`, is told its name, and its teammates read it. The three roles still say what a child may do | The role is a permission; the title is the part |
+| Coordination: a pipeline, in parallel on separate branches, or both | The mandate says it; coders already work in worktrees of their own, and children started together are teammates | Nothing new to build |
+| The learnings document every later team reads | A child's task-state block ends with the journal's lessons and evaluation analyses, newest last, within the block's 1,500 tokens | Three of [V]'s teams repeated a failure whose cause a fourth had written in its own report |
+| The evolution history | The task state's strategy decisions and evaluations, as before | Already there |
+
+The team is advice, as every strategist proposal is: the refusal and the task
+state show it, and the agent decides. Nothing is started for it. The
+diagnostics' `strategy proposed` record carries `diagnosed` and `team_roles`.
+
 ## Not taken
 
 - **[S]'s training** (team reward, group-relative advantage): ha does not
@@ -104,6 +135,11 @@ The diagnostics' `skill recalled` record carries `cases` and `unproven`.
 - **Recall in `ha exec` and for children:** a child is sent the whole learned
   library instead, and `ha exec` none ([strategy and
   runtime](STRATEGY_AND_RUNTIME.en.md) has the recall itself).
+- **[V]'s supervisor as a process of its own, on a timer:** ha's strategist
+  is asked at a plateau of a goal, once, and does not watch a running team.
+- **[V]'s per-team artifact folders and a synthesis document the host
+  keeps:** the journal and the knowledge library are where findings go; the
+  root is told to record what a child found as a lesson.
 - **[T], all of it, for now:** a self-tuning benchmark is a command of its
   own (`ha exec` as the solver, a project's checks as the grader, tasks kept
   near a 50% completion rate). It is proposed, not built.
@@ -117,6 +153,11 @@ The diagnostics' `skill recalled` record carries `cases` and `unproven`.
   `learned.rs`; `a_skill_that_keeps_failing_is_not_recalled_until_it_is_rewritten`
   and `the_block_says_a_skill_is_unproven_and_carries_the_case_it_worked_in` in
   `skill_recall.rs`.
+- Unit, for [V]: `a_strategist_answer_carries_its_diagnosis_and_a_team_of_invented_roles`
+  in `goal.rs`; `a_title_names_the_child` and
+  `a_titled_child_is_told_its_name_and_a_second_takes_the_next_number` in
+  `delegation.rs`; `a_child_is_shown_the_lessons_of_the_task_and_not_its_plans`
+  in `task_state.rs`.
 - Live: `scripts/testing/live-tests/team.sh` (two explorers at once learn of
   each other and exchange what they found by name; a verifier is on nobody's
   team) and section 4b of `strategy.sh` (unproven, the case, held back).

@@ -2,7 +2,7 @@
 
 [English](TEAMWORK.en.md) | Tiếng Việt
 
-Phần ha lấy từ bốn bài báo đọc ngày 2026-11-10: nó hoạt động thế nào, và phần
+Phần ha lấy từ năm bài báo đọc ngày 2026-11-10: nó hoạt động thế nào, và phần
 nào không lấy.
 
 - **[S] arXiv 2611.08615**, *s3: Simple Scaling of Swarms*: các agent làm việc
@@ -20,6 +20,12 @@ nào không lấy.
   chưa kiểm chứng, cái hay hỏng bị hạn chế. Dùng lại làm tỉ lệ thành công tăng
   4,4 điểm và giảm 24% token trên tập bài báo chọn; bài báo cũng cảnh báo một
   chiến lược lỗi thời tốn hơn là không có.
+- **[V] arXiv 2610.36848**, *Evolving Agent Teams*: coding agent giậm chân ở
+  một cực trị địa phương, và một đội vai trò cố định cũng vậy (0,31 so với
+  baseline của chuyên gia, trong khi cùng model với đội được dựng lại đạt
+  0,74). Một supervisor đọc vì sao đội giậm chân rồi thiết kế lại nó - vai trò
+  do nó tự đặt, cách các vai phối hợp, nơi ghi điều học được - trên các file
+  tồn tại qua mọi đội.
 - **[T] arXiv 2610.27307**, *TURTLE*: một proposer tiến hoá các task benchmark
   tới khi solver làm được khoảng một nửa số lần. Chưa lấy (xem dưới).
 
@@ -87,6 +93,31 @@ dùng, kết quả do review phán, các giả định đã sai. Phần còn thi
 Check qua hay hỏng sau khi skill được dùng cũng tính vào lần thử. Record chẩn
 đoán `skill recalled` có thêm `cases` và `unproven`.
 
+## Đội được dựng lại ở plateau ([V])
+
+Code: `strategist_brief`, `diagnosis_of`, `team_of` trong
+`crates/harness-cli/src/host/coordination/goal.rs`; `TeamRole` và
+`Alternative::team` trong `memory/strategy.rs`; `title_of` và `titled` trong
+`coordination/delegation.rs`; `child_block` trong `memory/task_state.rs`.
+
+ha đã có sẵn tín hiệu kích hoạt và hồ sơ của [V]: các lần đánh giá của goal,
+plateau sau ba lần không tiến, strategist đọc task từ đầu, journal và các
+quyết định trong task state ([đổi chiến lược và
+runtime](STRATEGY_AND_RUNTIME.vi.md)). Phần thêm vào:
+
+| [V] | ha | Vì sao |
+|---|---|---|
+| Supervisor nhìn lại hành vi của đội: trượt sang đường dễ, mất một phát hiện, kẹt ở debug, tối ưu vụn vặt | Strategist trước hết nói vì sao chiến lược giậm chân, từ việc agent cứ lặp lại (`diagnosis`, giữ trong task state tới quyết định kế) | Phương án nêu ra mà không có nguyên nhân là đoán; các mẫu hành vi là ví dụ cho model, không phải danh sách host đem so khớp |
+| Nó thiết kế đội kế tiếp: vai trò tự đặt, mỗi vai có nhiệm vụ | Một phương án có thể kèm `team` từ một đến ba thành viên: tên vai do strategist đặt, loại child đảm nhận (explorer, coder, verifier) và nhiệm vụ - làm gì, không đụng vào gì, giao lại gì | Người debug bị giữ ngoài code chính thì không chặn được agent đang tối ưu nó |
+| Vai trò không chọn từ một bộ cố định | `delegate` nhận `title`. Child được đặt tên `<title>-<n>`, được cho biết tên mình, và đồng đội đọc được tên đó. Ba role vẫn quy định child được làm gì | Role là quyền; title là phần việc |
+| Phối hợp: nối tiếp, song song trên nhánh riêng, hoặc cả hai | Nhiệm vụ nói điều đó; coder vốn làm trong worktree riêng, và các child tạo cùng lúc là đồng đội | Không cần dựng gì mới |
+| Tài liệu bài học mà mọi đội sau đều đọc | Khối task-state của child kết thúc bằng các bài học và phân tích đánh giá trong journal, mới nhất ở cuối, trong 1.500 token của khối | Ba đội của [V] lặp lại một thất bại mà nguyên nhân đã được đội thứ tư ghi trong báo cáo riêng của nó |
+| Lịch sử tiến hoá | Các quyết định chiến lược và lần đánh giá trong task state, như trước | Đã có |
+
+Đội chỉ là lời khuyên, như mọi đề xuất của strategist: lời từ chối và task
+state hiển thị nó, còn agent quyết định. Không có gì tự khởi động. Record chẩn
+đoán `strategy proposed` có thêm `diagnosed` và `team_roles`.
+
 ## Phần không lấy
 
 - **Phần huấn luyện của [S]** (phần thưởng đội, advantage theo nhóm): ha không
@@ -107,6 +138,11 @@ Check qua hay hỏng sau khi skill được dùng cũng tính vào lần thử. 
 - **Recall trong `ha exec` và cho child:** child được gửi cả thư viện đã học,
   còn `ha exec` thì không có gì ([đổi chiến lược và
   runtime](STRATEGY_AND_RUNTIME.vi.md) mô tả chính phần recall).
+- **Supervisor của [V] như một tiến trình riêng chạy theo giờ:** strategist
+  của ha được hỏi một lần ở plateau của goal, và không theo dõi đội đang chạy.
+- **Thư mục artifact theo từng đội và tài liệu tổng hợp do host giữ của [V]:**
+  phát hiện đi vào journal và thư viện knowledge; gốc được bảo ghi điều một
+  child tìm ra thành bài học.
 - **[T], toàn bộ, lúc này:** benchmark tự chỉnh là một lệnh riêng (`ha exec`
   làm solver, check của project làm người chấm, task được giữ quanh mức hoàn
   thành 50%). Mới đề xuất, chưa làm.
@@ -121,6 +157,11 @@ Check qua hay hỏng sau khi skill được dùng cũng tính vào lần thử. 
   `a_skill_that_keeps_failing_is_not_recalled_until_it_is_rewritten` và
   `the_block_says_a_skill_is_unproven_and_carries_the_case_it_worked_in` trong
   `skill_recall.rs`.
+- Unit, cho [V]: `a_strategist_answer_carries_its_diagnosis_and_a_team_of_invented_roles`
+  trong `goal.rs`; `a_title_names_the_child` và
+  `a_titled_child_is_told_its_name_and_a_second_takes_the_next_number` trong
+  `delegation.rs`; `a_child_is_shown_the_lessons_of_the_task_and_not_its_plans`
+  trong `task_state.rs`.
 - Live: `scripts/testing/live-tests/team.sh` (hai explorer chạy cùng lúc biết
   về nhau và trao đổi thứ tìm được theo tên; verifier không thuộc đội nào) và
   mục 4b của `strategy.sh` (chưa kiểm chứng, ca đã chạy, bị giữ lại).

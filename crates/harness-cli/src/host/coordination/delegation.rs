@@ -539,6 +539,26 @@ pub struct ChildProposal {
 
 /// Text on one line, its runs of blanks one space: how a finding is kept
 /// and how its evidence is found in a tool result.
+/// The longest title a child is named after.
+const MAX_TITLE_CHARS: usize = 40;
+
+/// The `title` of a `delegate` call as a name: its letters and digits in
+/// lower case, the rest as single hyphens. `None` when it has none, so a
+/// title of punctuation alone names the child after its role as before.
+fn title_of(arguments: &Value) -> Option<String> {
+    let title = arguments.get("title").and_then(Value::as_str)?;
+    let mut name = String::new();
+    for character in title.chars().take(MAX_TITLE_CHARS) {
+        if character.is_alphanumeric() {
+            name.extend(character.to_lowercase());
+        } else if !name.is_empty() && !name.ends_with('-') {
+            name.push('-');
+        }
+    }
+    let name = name.trim_end_matches('-').to_owned();
+    (!name.is_empty()).then_some(name)
+}
+
 /// One teammate, as a child reads it.
 fn team_line(name: &str, role: AgentRole, objective: &str) -> String {
     let brief = one_line(objective);
@@ -2109,6 +2129,25 @@ impl AgentsShared {
             }
             let _ = self.deliver_to_child(&teammate, notice.clone()).await;
         }
+    }
+
+    /// A name for a child with the invented `title`: the title and a number
+    /// no child of this session carries yet.
+    fn titled(&self, title: &str) -> String {
+        let taken = self.children.lock().map_or_else(
+            |_| std::collections::BTreeSet::new(),
+            |children| {
+                children
+                    .iter()
+                    .filter(|child| !child.deleted)
+                    .map(|child| child.name.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+            },
+        );
+        (1..=taken.len() + 1)
+            .map(|number| format!("{title}-{number}"))
+            .find(|name| !taken.contains(name))
+            .unwrap_or_else(|| title.to_owned())
     }
 
     /// Why no sibling is named `name`, with the names there are.
@@ -3858,6 +3897,7 @@ impl ExternalToolCatalog for DelegateCatalog {
                         "type": "object",
                         "properties": {
                             "role": {"type": "string", "enum": ["explorer", "coder", "verifier"]},
+                            "title": {"type": "string", "maxLength": MAX_TITLE_CHARS, "description": "A name for the part this child plays in the task, which you invent for what the task needs now - \"focused-debugger\", \"knowledge-integrator\", \"challenger\". The child is named after it, and its teammates read it. Left out, the child is named after its role."},
                             "brief": {"type": "string", "minLength": 1, "maxLength": MAX_BRIEF_CHARS},
                             "wait": {"type": "boolean", "description": "Wait for the child's answer (default true)."}
                         },
@@ -4145,11 +4185,11 @@ impl DelegateTool {
         };
         if object
             .keys()
-            .any(|key| !matches!(key.as_str(), "role" | "brief" | "wait"))
+            .any(|key| !matches!(key.as_str(), "role" | "title" | "brief" | "wait"))
         {
             return Err(HarnessError::new(
                 ErrorCode::InvalidPayload,
-                "delegate accepts only role, brief and wait",
+                "delegate accepts only role, title, brief and wait",
             ));
         }
         Ok((role, brief.to_owned(), wait))
@@ -4175,7 +4215,11 @@ impl DelegateTool {
             .and_then(|model| self.launch.for_role(role, Some(model)).ok())
             .map_or_else(|| self.launch.for_role(role, None), Ok)
             .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error))?;
-        let (task_id, name) = self.agents.start(role, brief, None, &launch, None).await?;
+        // Evolving Agent Teams (arXiv 2610.36848): the part a child plays is
+        // invented for what the task needs now, not picked from a fixed set.
+        // The role still says what it may do; the title names it.
+        let name = title_of(arguments).map(|title| self.agents.shared.titled(&title));
+        let (task_id, name) = self.agents.start(role, brief, name, &launch, None).await?;
         let payload = if wait {
             match self
                 .agents
@@ -6151,6 +6195,11 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     request.brief.objective
                 )
             });
+            // Its own name, which its teammates and its parent call it by and
+            // which carries the title its parent invented for it.
+            if !woken && let Some(name) = self.shared.update(&task_id, |child| child.name.clone()) {
+                let _ = write!(prompt, "\n\nYou are {name}.");
+            }
             if let Some(team) = team.filter(|_| !woken) {
                 prompt.push_str("\n\n");
                 prompt.push_str(&team);
@@ -9573,6 +9622,49 @@ mod real_worker_tests {
                     .contains("no sibling named \"nobody\"; your parent's other children are one"),
             "{seen}"
         );
+    }
+
+    /// Evolving Agent Teams (arXiv 2610.36848): a child is named after the
+    /// part its parent invented for it.
+    #[test]
+    fn a_title_names_the_child() {
+        let title = |text: &str| super::title_of(&json!({"title": text}));
+        assert_eq!(
+            title("Focused Debugger").as_deref(),
+            Some("focused-debugger")
+        );
+        assert_eq!(
+            title("  knowledge_integrator!! ").as_deref(),
+            Some("knowledge-integrator")
+        );
+        assert_eq!(title("người-tổng-hợp").as_deref(), Some("người-tổng-hợp"));
+        assert_eq!(title("--"), None);
+        assert_eq!(super::title_of(&json!({})), None);
+    }
+
+    #[tokio::test]
+    async fn a_titled_child_is_told_its_name_and_a_second_takes_the_next_number() {
+        let bench = bench();
+        let provider = Scripted::new(vec![Reply::Text("ok"), Reply::Text("ok")]);
+        let host = host(&bench, Arc::clone(&provider) as Arc<dyn ModelProvider>);
+        let tool = host.delegate_tool();
+        let first = tool
+            .run(&json!({"role": "explorer", "title": "Focused Debugger", "brief": "find the nesting bug"}))
+            .await
+            .expect("first");
+        let second = tool
+            .run(&json!({"role": "explorer", "title": "Focused Debugger", "brief": "find the quoting bug"}))
+            .await
+            .expect("second");
+        let names = [first, second]
+            .iter()
+            .map(|output| format!("{output:?}"))
+            .collect::<Vec<_>>();
+        assert!(names[0].contains("focused-debugger-1"), "{names:?}");
+        assert!(names[1].contains("focused-debugger-2"), "{names:?}");
+        let seen = provider.requests_text();
+        assert!(seen.contains("\n\nYou are focused-debugger-1."), "{seen}");
+        assert!(seen.contains("\n\nYou are focused-debugger-2."), "{seen}");
     }
 
     #[test]

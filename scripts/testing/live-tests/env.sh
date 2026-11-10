@@ -16,6 +16,14 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && (pwd -W 2>/dev/null || pw
 export HA=${HA:-$REPO/target/release/ha.exe}
 export PROBE=${PROBE:-$REPO/target/debug/examples/pty_probe.exe}
 export PY=${PY:-python}
+# The briefs have an agent run `python` (a wait, a one-line script). Where the
+# PATH's python is not one that runs - Windows' Store alias answers 9009 "Python
+# was not found" - PY's directory goes first, so the agents' `python` is PY.
+if ! python -c "" >/dev/null 2>&1; then
+  py_dir=$(dirname "$(command -v "$PY" 2>/dev/null || echo "$PY")")
+  PATH="$(cygpath -u "$py_dir" 2>/dev/null || echo "$py_dir"):$PATH"
+  export PATH
+fi
 # Reads a home's memory stores read-only (see the script's usage).
 export MEMORY_STORE="$REPO/scripts/testing/live-tests/memory_store.py"
 export MODEL=${MODEL:-opencode-go/deepseek-v4.1-flash}

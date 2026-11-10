@@ -97,6 +97,8 @@ echo "   evaluations before passing: $evaluated"
 check "three evaluations or more under the first strategy (the precondition)" '[ "$evaluated" -ge 3 ]'
 check "the third was a plateau" 'records strategy evaluated "$since" | grep -q "\"plateau\": true"'
 check "a strategist named other strategies" 'records strategy proposed "$since" | grep -q proposed'
+# Evolving Agent Teams (arXiv 2610.36848): the strategist says why it stalled.
+check "and said why the strategy stalled" 'records strategy proposed "$since" | grep -q "\"diagnosed\": true"'
 check "the agent recorded a switch" 'records strategy decided "$since" | grep -q "\"kind\": \"switch\""'
 check "the switched strategy passed the check" 'grep -q XONG-42 "$P2/result.txt" 2>/dev/null'
 

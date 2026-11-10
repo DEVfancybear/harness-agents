@@ -13,7 +13,10 @@
 #      must agree on in their briefs;
 #   2. each, asked to, tells the other what it found by its name, and the
 #      message is in the other's conversation;
-#   3. a verifier started beside them is on nobody's team.
+#   3. a verifier started beside them is on nobody's team;
+#   4. (Evolving Agent Teams, arXiv 2610.36848) a child delegated with a
+#      `title` is named after that part and told its name, and is shown the
+#      lessons its parent's task recorded.
 # Every check prints PASS or FAIL; the conversation and the store stay in
 # $LIVE_ROOT/team as evidence.
 #
@@ -124,6 +127,8 @@ for attempt in 1 2 3; do
 done
 T="$RX/team-${ran:-1}.jsonl"
 check "precondition: the root started exactly two explorers with the briefs (attempt ${ran:-none})" '[ -n "$ran" ]'
+# The wait is what keeps both in their runs together: it must have run.
+check "precondition: each explorer's wait ran (python exit 0)" '[ -n "$ran" ] && judge "$T" "all(\"process python exit=Some(0)\" in e[\"text\"] for e in explorers)"'
 check "the briefs name no sibling (the precondition)" '[ -n "$ran" ] && judge "$T" "pair() and all(e[\"name\"] not in brief(o) for e in explorers for o in explorers)"'
 check "each explorer was told of the other, in its task or as it joined" '[ -n "$ran" ] && judge "$T" "pair() and knows(*pair()) and knows(*pair()[::-1])"'
 check "none was told of the other twice" '[ -n "$ran" ] && judge "$T" "pair() and not (listed(*pair()) and joined(*pair())) and not (listed(*pair()[::-1]) and joined(*pair()[::-1]))"'
@@ -149,8 +154,31 @@ done
 sleep 10
 "$HA" shutdown --force >/dev/null 2>&1
 children | grep "VERIF-" > "$RX/kids-v.jsonl"
+check "precondition: the explorer's and the verifier's wait ran (python exit 0)" 'judge "$RX/kids-v.jsonl" "all(\"process python exit=Some(0)\" in k[\"text\"] for k in kids)"'
 check "precondition: one explorer and one verifier ran with the briefs" 'judge "$RX/kids-v.jsonl" "len(explorers) == 1 and len(verifiers) == 1"'
 check "the verifier was told of no teammate and given no team protocol" 'judge "$RX/kids-v.jsonl" "len(verifiers) == 1 and \"Teammates: your parent\" not in verifiers[0][\"text\"] and \"[teammate-joined:\" not in verifiers[0][\"text\"] and \"working alone is fine\" not in verifiers[0][\"text\"]"'
 check "the explorer beside it was not told of the verifier" 'judge "$RX/kids-v.jsonl" "len(explorers) == 1 and \"Teammates: your parent\" not in explorers[0][\"text\"] and \"[teammate-joined:\" not in explorers[0][\"text\"]"'
+
+echo "################ 4. a part invented for the task, and what the task learned (arXiv 2610.36848)"
+# The lesson is in the parent's journal only; the brief names neither it nor
+# the child's name. 0.9.4 named every child after its role and sent a child
+# the task's constraints and decisions, never what the task had learned.
+held=""
+for attempt in 1 2 3; do
+  agent "$RX/p" "te$attempt"
+  say "te$attempt" "Ghi vào task_state bằng add_journal đúng một mục kind lesson, nguyên văn: 'Mã vùng bắc đã kiểm chứng xong, không cần đọc lại north/notes.txt (GANNET-7718).' Không làm gì khác, trả lời ĐÃ-GHI." | tail -1 | sed 's/^/   /'
+  say "te$attempt" "Dùng tool delegate (wait mặc định, đợi kết quả) đúng một lần: role explorer, title đúng là 'Knowledge Integrator', brief đúng nguyên văn (không thêm bớt, không nhắc bài học hay tên nào): 'Việc TITLE-$attempt. Trả lời đúng hai dòng. Dòng 1: tên của bạn, như nhiệm vụ này cho bạn biết. Dòng 2: mã trong ngoặc đơn ở cuối bài học mà task của cha bạn đã ghi; nếu bạn không được cho thấy bài học nào thì ghi KHÔNG-THẤY.' Rồi trả lời nguyên văn hai dòng nó trả về." > "$RX/te-$attempt.txt"
+  tail -3 "$RX/te-$attempt.txt" | sed 's/^/   /'
+  "$HA" shutdown --force >/dev/null 2>&1
+  children | grep "TITLE-$attempt\." > "$RX/kids-t.jsonl"
+  recorded=$(cat "$HA_HOME"/data/sessions/*/harness/task_state.json 2>/dev/null | grep -c "GANNET-7718")
+  echo "   attempt $attempt: lesson recorded=$recorded, children with the brief: $(grep -c . "$RX/kids-t.jsonl")"
+  if [ "$recorded" -ge 1 ] && judge "$RX/kids-t.jsonl" 'len(kids) == 1 and "GANNET" not in brief(kids[0]) and "integrator" not in brief(kids[0]).lower()'; then held=$attempt; break; fi
+done
+check "precondition: the lesson is in the task state, one child ran, its brief names neither (attempt ${held:-none})" '[ -n "$held" ]'
+check "the child is named after the part its parent invented, and told its name" '[ -n "$held" ] && judge "$RX/kids-t.jsonl" "\"You are knowledge-integrator-1.\" in kids[0][\"text\"]"'
+check "the child was shown what the task learned" '[ -n "$held" ] && judge "$RX/kids-t.jsonl" "\"Learned so far on this task\" in kids[0][\"text\"] and \"GANNET-7718\" in kids[0][\"text\"].split(\"Learned so far on this task\", 1)[1]"'
+check "the child answered with its name and the lesson's code" '[ -n "$held" ] && grep -q "knowledge-integrator-1" "$RX/te-$held.txt" && grep -q "GANNET-7718" "$RX/te-$held.txt"'
+check "the root is told a title names the part a child plays" 'root_text | grep -q "names the part it plays, which you invent for what the task needs now"'
 
 result

@@ -372,7 +372,18 @@ pub const CHILD_STATE_TOKENS: u64 = 1_500;
 #[must_use]
 pub fn child_block(path: &Path) -> Option<ContextBlock> {
     let state = load(path);
-    if state.constraints.is_empty() && state.decisions.is_empty() {
+    // What the task learned: the journal's lessons and evaluation analyses.
+    // Evolving Agent Teams (arXiv 2610.36848) found the insight of one team
+    // lost to the next whenever it stayed in a report and not in what every
+    // later agent reads; three of its teams failed on a cause the fourth
+    // before them had named.
+    let learned = state
+        .strategy
+        .journal
+        .iter()
+        .filter(|entry| matches!(entry.kind, JournalKind::Lesson | JournalKind::EvalAnalysis))
+        .collect::<Vec<_>>();
+    if state.constraints.is_empty() && state.decisions.is_empty() && learned.is_empty() {
         return None;
     }
     let room = usize::try_from(CHILD_STATE_TOKENS).unwrap_or(usize::MAX) * 4 - 512;
@@ -404,6 +415,13 @@ pub fn child_block(path: &Path) -> Option<ContextBlock> {
         .take_while(|line| fits(line))
         .collect::<Vec<_>>();
     decisions.reverse();
+    let mut lessons = learned
+        .iter()
+        .rev()
+        .map(|entry| format!("- {}", entry.text))
+        .take_while(|line| fits(line))
+        .collect::<Vec<_>>();
+    lessons.reverse();
     let hidden =
         state.constraints.len() + state.decisions.len() - constraints.len() - decisions.len();
     let mut text = String::from(
@@ -418,6 +436,12 @@ pub fn child_block(path: &Path) -> Option<ContextBlock> {
     if !decisions.is_empty() {
         text.push_str("\nDecisions:");
         for line in &decisions {
+            let _ = write!(text, "\n{line}");
+        }
+    }
+    if !lessons.is_empty() {
+        text.push_str("\nLearned so far on this task (your parent's journal, newest last; build on it, and do not try again what it says failed without a reason it did not have):");
+        for line in &lessons {
             let _ = write!(text, "\n{line}");
         }
     }
@@ -981,6 +1005,7 @@ fn strategy_of(value: &Value, key: &str) -> Result<Strategy, HarnessError> {
                             .and_then(Value::as_str)
                             .map(|why| bounded(why, MAX_TEXT_CHARS))
                             .unwrap_or_default(),
+                        ..Alternative::default()
                     })
                 })
                 .collect()
@@ -1042,7 +1067,7 @@ pub fn note_workspace(path: &Path, fingerprint: &str) {
 
 /// Keep the alternatives a strategist named, for the next decision. None
 /// named is not kept: the next evaluation asks again.
-pub fn record_proposals(path: &Path, proposals: Vec<Alternative>) {
+pub fn record_proposals(path: &Path, proposals: Vec<Alternative>, diagnosis: String) {
     if proposals.is_empty() {
         return;
     }
@@ -1050,7 +1075,7 @@ pub fn record_proposals(path: &Path, proposals: Vec<Alternative>) {
         return;
     };
     let mut state = load(path);
-    state.strategy.propose(proposals);
+    state.strategy.propose_with(proposals, diagnosis);
     let _ = save(path, &state);
 }
 
@@ -1385,6 +1410,35 @@ mod tests {
         assert!(
             turn().flush_note().is_some(),
             "after a summary it asks again"
+        );
+    }
+
+    /// Evolving Agent Teams (arXiv 2610.36848): what the task learned reaches
+    /// the next child, so one child's finding is not lost to those after it.
+    /// A plan or an observation is the parent's own working note and does not.
+    #[test]
+    fn a_child_is_shown_the_lessons_of_the_task_and_not_its_plans() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let host = host(root.path());
+        assert!(child_block(host.path()).is_none(), "nothing to show yet");
+        host.execute(&json!({"action": "update", "objective": "parse configs",
+            "add_journal": [
+                {"kind": "plan", "text": "extend the regex for nesting"},
+                {"kind": "lesson", "text": "the regex cannot count brackets: SWIFT-3381"},
+                {"kind": "observation", "text": "two tests fail"},
+                {"kind": "eval_analysis", "text": "nested input fails at depth three: TERN-6602"}]}))
+            .expect("journal");
+        let block = format!(
+            "{:?}",
+            child_block(host.path()).expect("lessons alone are shown")
+        );
+        assert!(block.contains("Learned so far on this task"), "{block}");
+        let swift = block.find("SWIFT-3381").expect("the lesson");
+        let tern = block.find("TERN-6602").expect("the evaluation analysis");
+        assert!(swift < tern, "oldest first: {block}");
+        assert!(
+            !block.contains("extend the regex for nesting") && !block.contains("two tests fail"),
+            "{block}"
         );
     }
 
