@@ -922,6 +922,7 @@ mod tests {
     #[test]
     fn a_quote_of_a_files_lines_or_a_payloads_path_is_found() {
         let excerpt = Excerpt {
+            conversation: "task_1".to_owned(),
             quote: None,
             parts: vec![
                 said("file", "[…] 12: port = 6543\n13#a3: host = \"db.internal\""),
