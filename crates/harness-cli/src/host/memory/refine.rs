@@ -1243,6 +1243,9 @@ impl Proposal {
                                 CORRECTS,
                                 DREAM_REFUSAL,
                                 VERIFIED_DROPPED,
+                                // The project an entry is kept for: the host
+                                // tags it after reading the proposal.
+                                "project",
                             ] {
                                 edit.0.remove(field);
                             }
@@ -3725,19 +3728,26 @@ impl Edit {
 
     /// An automatic review's memory edit meant for every conversation.
     fn wants_global(&self) -> bool {
-        let scope = self.text("scope").or_else(|| {
-            self.0
-                .get("metadata")
-                .and_then(|metadata| metadata.get("scope"))
-                .and_then(Value::as_str)
-        });
-        self.text("kind") == Some("memory") && matches!(scope, Some("global" | "project"))
+        self.text("kind") == Some("memory") && matches!(self.scope(), Some("global" | "project"))
     }
 
     /// A memory edit kept for this conversation's project: the global store's,
     /// tagged with the project.
     fn for_project(&self) -> bool {
-        self.text("kind") == Some("memory") && self.text("scope") == Some("project")
+        self.text("kind") == Some("memory") && self.scope() == Some("project")
+    }
+
+    /// The scope an edit asks for, at its top or in its `metadata`, where the
+    /// review's prompt puts it. Read in one place: an edit whose
+    /// `metadata.scope` was `project` went to the global store untagged, and
+    /// reached every project.
+    fn scope(&self) -> Option<&str> {
+        self.text("scope").or_else(|| {
+            self.0
+                .get("metadata")
+                .and_then(|metadata| metadata.get("scope"))
+                .and_then(Value::as_str)
+        })
     }
 }
 
@@ -9540,6 +9550,28 @@ Run `node scripts/build.js`.
         assert!(edit("global").wants_global());
         assert!(!edit("global").for_project());
         assert!(!edit("local").wants_global());
+        let in_metadata = super::Edit(
+            json!({"action": "create", "kind": "memory", "title": "t", "content": "c", "metadata": {"scope": "project"}})
+                .as_object()
+                .expect("object")
+                .clone(),
+        );
+        assert!(in_metadata.wants_global());
+        assert!(
+            in_metadata.for_project(),
+            "a metadata scope is tagged, not left for every project"
+        );
+    }
+
+    /// The project an entry is kept for is the host's to say: a model's
+    /// `project` on an edit is dropped when the proposal is read.
+    #[test]
+    fn a_model_cannot_name_an_entrys_project() {
+        let proposal = super::Proposal::from_value(&json!({"edits": [
+            {"action": "create", "kind": "memory", "title": "t", "content": "c",
+             "project": {"key": "elsewhere", "name": "other"}}
+        ]}));
+        assert!(proposal.edits[0].0.get("project").is_none());
     }
 
     /// A change that would wait while its queue cannot be read neither waits

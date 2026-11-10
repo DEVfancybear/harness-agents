@@ -520,7 +520,7 @@ fn one_line(text: &str) -> String {
 
 /// `text` without the `12: ` or `12#a3: ` prefix `read_file` puts on a line,
 /// on each line that carries one.
-fn without_read_gutters(text: &str) -> String {
+pub(crate) fn without_read_gutters(text: &str) -> String {
     text.split('\n')
         .map(|line| {
             let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
@@ -550,7 +550,7 @@ fn without_read_gutters(text: &str) -> String {
 /// `text` with a JSON string's escapes read back: a tool without its own
 /// words is shown to the model as its JSON payload, where a Windows path
 /// reads `C:\\Users` and a quote `\"`.
-fn json_unescaped(text: &str) -> String {
+pub(crate) fn json_unescaped(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars();
     while let Some(c) = chars.next() {

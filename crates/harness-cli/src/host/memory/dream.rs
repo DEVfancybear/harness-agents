@@ -78,6 +78,33 @@ pub fn spans(quote: &str, text: &str) -> bool {
     quote.chars().count() >= SPAN_MIN_CHARS && flat(text).contains(&quote)
 }
 
+/// Whether a part of `kind` holds `quote` as one span ([`spans`]), read as the
+/// curator reads it: a file's lines without `read_file`'s `12: ` numbers, a
+/// tool's payload without its JSON escapes (`C:\\Users`, `\"`). A quote of a
+/// file's lines, or of a Windows path, was refused though the part held it,
+/// as `note_finding`'s evidence was before its own check read it so.
+fn part_spans(kind: &str, quote: &str, text: &str) -> bool {
+    use super::super::delegation::{json_unescaped, without_read_gutters};
+    if spans(quote, text) {
+        return true;
+    }
+    if kind == "user" {
+        return false;
+    }
+    let mut texts = vec![json_unescaped(text)];
+    // Only a file's lines carry the numbers: elsewhere a line that starts
+    // with `7:` is the text's own. A cut part starts with the cut's mark.
+    if kind == "file" {
+        let bare = text.strip_prefix("[…] ").unwrap_or(text);
+        texts.push(without_read_gutters(bare));
+        texts.push(without_read_gutters(&json_unescaped(bare)));
+    }
+    let bare_quote = without_read_gutters(quote);
+    texts
+        .iter()
+        .any(|text| spans(quote, text) || spans(&bare_quote, text))
+}
+
 impl Excerpt {
     /// The kind of the part that holds `quote` as one span ([`spans`]), the
     /// most trusted first: what a correction quoting it rests on. `None` when
@@ -88,7 +115,7 @@ impl Excerpt {
         let holding = self
             .parts
             .iter()
-            .filter(|(_, text)| spans(quote, text))
+            .filter(|(kind, text)| part_spans(kind, quote, text))
             .map(|(kind, _)| *kind)
             .collect::<BTreeSet<_>>();
         ORDER.into_iter().find(|kind| holding.contains(kind))
@@ -887,6 +914,34 @@ mod tests {
         );
         assert_eq!(excerpt.source_of("listens on port 5432"), None, "not said");
         assert_eq!(excerpt.source_of("6543"), None, "a word or two is no quote");
+    }
+
+    /// A file's lines are quoted without `read_file`'s numbers, a payload's
+    /// Windows path without its JSON escapes; a user's words are read as
+    /// they were typed.
+    #[test]
+    fn a_quote_of_a_files_lines_or_a_payloads_path_is_found() {
+        let excerpt = Excerpt {
+            quote: None,
+            parts: vec![
+                said("file", "[…] 12: port = 6543\n13#a3: host = \"db.internal\""),
+                said("tool", r#"{"path":"C:\\Users\\dev\\app.toml","ok":true}"#),
+                said("user", "12: the user typed this line"),
+            ],
+        };
+        assert_eq!(
+            excerpt.source_of("port = 6543 host = \"db.internal\""),
+            Some("file")
+        );
+        assert_eq!(
+            excerpt.source_of("12: port = 6543\n13#a3: host"),
+            Some("file"),
+            "a quote with the numbers is found too"
+        );
+        assert_eq!(excerpt.source_of(r"C:\Users\dev\app.toml"), Some("tool"));
+        assert_eq!(excerpt.source_of("the user typed this line"), Some("user"));
+        assert_eq!(excerpt.source_of("12: the user typed"), Some("user"));
+        assert_eq!(excerpt.source_of("port = 6543 host = \"db.example\""), None);
     }
 
     #[test]
