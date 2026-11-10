@@ -335,6 +335,11 @@ pub struct InteractiveController {
     escape_armed_at: Option<Instant>,
     /// The shared picker is prime-agent's tree (or fork) selector.
     turn_picker: Option<super::events::TurnsPurpose>,
+    /// A command sent with `ha send` whose answer comes later - `/tree` and
+    /// `/fork` list their turns, `/btw` hears its answer - and the delivery
+    /// it answers: it is answered in words, not with a selector or a panel
+    /// left open for whoever attaches next.
+    sent_awaiting: Option<(u64, SentAwaits)>,
     /// The shared picker is `/plugins`: the service id of each row.
     plugin_picker: Option<Vec<String>>,
     /// The `/resume` row Delete was pressed on once, with its label: a
@@ -475,6 +480,7 @@ impl InteractiveController {
             exit_armed_at: None,
             escape_armed_at: None,
             turn_picker: None,
+            sent_awaiting: None,
             plugin_picker: None,
             resume_delete: None,
             tree_view: None,
@@ -702,12 +708,13 @@ impl InteractiveController {
         self.chat_title.clone()
     }
 
-    /// Choose the thinking level, as `/effort` does.
+    /// The level the session starts at (`--thinking`), not kept as the
+    /// default for new sessions.
     ///
     /// # Errors
     /// The model does not have that level.
-    pub fn set_thinking(&mut self, level: &str) -> Result<String, String> {
-        self.service.set_thinking(level)
+    pub fn start_thinking(&mut self, level: &str) -> Result<String, String> {
+        self.service.start_thinking(level)
     }
 
     /// Let the agent's code start separate top-level sessions
@@ -770,7 +777,14 @@ impl InteractiveController {
                 .editor
                 .overlay()
                 .map(|panel| (panel.title.clone(), panel.lines.len()));
+            let picker_before = self.editor.picker().is_some();
             let produced = self.command(&text);
+            // A selector the command opened is answered in words and closed.
+            // Seen while testing the app: `ha send "/plugins"` opened the
+            // service selector in the agent, where nobody saw it; the next
+            // terminal that attached typed into it, and its Enter connected
+            // the first service listed (Linear) and started a browser sign-in.
+            let selector = (!picker_before).then(|| self.take_selector()).flatten();
             if !was_running && self.phase.has_active_run() {
                 self.active_deliveries.push((receipt, text));
             } else {
@@ -778,6 +792,15 @@ impl InteractiveController {
                     Effect::History(HistoryItem::Error { message }) => Some(message.clone()),
                     _ => None,
                 });
+                // `/tree`, `/fork` and `/btw` answer later: the delivery waits
+                // for that answer, which `ha send --wait` prints.
+                if error.is_none()
+                    && let Some(awaits) = SentAwaits::of(&text)
+                {
+                    self.sent_awaiting = Some((receipt, awaits));
+                    effects.extend(produced);
+                    return (receipt, "delivered");
+                }
                 // What the command showed is its answer: `ha send --wait
                 // "/goal"` printed nothing, and the panel it opened stayed open
                 // for whoever attached next.
@@ -788,7 +811,13 @@ impl InteractiveController {
                     != panel_before)
                     .then(|| self.editor.take_overlay())
                     .flatten();
-                let answer = command_answer(&produced, panel.as_ref());
+                let mut answer = command_answer(&produced, panel.as_ref());
+                if let Some(lines) = selector {
+                    if !answer.is_empty() {
+                        answer.push('\n');
+                    }
+                    answer.push_str(&lines.join("\n"));
+                }
                 self.record_delivery_answer(receipt, error.map_or(Ok(answer), Err));
             }
             effects.extend(produced);
@@ -807,10 +836,57 @@ impl InteractiveController {
         (receipt, outcome)
     }
 
-    /// A terminal attached: a reference panel left open by an earlier one,
-    /// or by a command sent with `ha send`, is not what it came to see.
+    /// A terminal attached: a reference panel or a selector left open by an
+    /// earlier one, or by a command sent with `ha send`, is not what it came
+    /// to see - and a selector would take its first keys.
     pub fn close_panels(&mut self) {
         let _ = self.editor.take_overlay();
+        self.editor.close_picker();
+        self.turn_picker = None;
+        self.plugin_picker = None;
+        self.file_picker_active = false;
+        self.file_picker_query.clear();
+        self.tree_view = None;
+    }
+
+    /// The open selector's rows, as a command sent with `ha send` answers
+    /// with them, and the selector closed: nobody sees it in the agent.
+    fn take_selector(&mut self) -> Option<Vec<String>> {
+        let items = self.editor.picker()?.items().to_vec();
+        let sessions = self.session_picker_open();
+        let mut lines = match self.plugin_picker.take() {
+            Some(ids) => {
+                let mut lines = items
+                    .iter()
+                    .zip(&ids)
+                    .map(|(row, id)| format!("{row}  [{id}]"))
+                    .collect::<Vec<_>>();
+                lines.push(String::new());
+                lines.push("connect one with /plugins connect <id>".to_owned());
+                lines
+            }
+            None => items,
+        };
+        if sessions {
+            lines.push(String::new());
+            lines.push("resume one with /resume <id or name>".to_owned());
+        }
+        self.editor.close_picker();
+        self.turn_picker = None;
+        self.file_picker_active = false;
+        self.file_picker_query.clear();
+        Some(lines)
+    }
+
+    /// The delivery a sent command's later answer is for, when it is `what`.
+    fn sent_awaiting(&mut self, what: SentAwaits) -> Option<u64> {
+        match self.sent_awaiting {
+            Some((receipt, awaits)) if awaits == what => {
+                self.sent_awaiting = None;
+                Some(receipt)
+            }
+            _ => None,
+        }
     }
 
     pub fn take_delivery_answer(&mut self, receipt: u64) -> Result<Option<String>, String> {
@@ -819,6 +895,9 @@ impl InteractiveController {
         }
         if self.active_deliveries.iter().any(|(id, _)| *id == receipt)
             || self.queue.contains_receipt(receipt)
+            || self
+                .sent_awaiting
+                .is_some_and(|(awaiting, _)| awaiting == receipt)
         {
             return Ok(None);
         }
@@ -1678,8 +1757,9 @@ impl InteractiveController {
         if let Some(note) = note.as_mut() {
             note("heartbeats", begun.elapsed());
         }
+        // `--thinking` is this session's level, not the default for new ones.
         if let Some(level) = self.initial_thinking.take()
-            && let Err(message) = self.service.set_thinking(&level)
+            && let Err(message) = self.service.start_thinking(&level)
         {
             self.push_history(&mut effects, HistoryItem::Notice { message });
         }
@@ -2091,6 +2171,24 @@ impl InteractiveController {
             Err(message) => self.push_history(effects, HistoryItem::Error { message }),
         }
         effects.push(Effect::Redraw);
+    }
+
+    /// The turns `/tree` or `/fork` listed for a command sent with `ha
+    /// send`: the numbered list the plain renderer shows, as its answer.
+    fn answer_sent_turns(
+        &mut self,
+        receipt: u64,
+        purpose: super::events::TurnsPurpose,
+        turns: Vec<(String, String)>,
+        effects: &mut Vec<Effect>,
+    ) {
+        let plain = std::mem::replace(&mut self.plain, true);
+        let mut shown = Vec::new();
+        self.show_turns(purpose, turns, &mut shown);
+        self.plain = plain;
+        let panel = self.editor.take_overlay();
+        self.record_delivery_answer(receipt, Ok(command_answer(&shown, panel.as_ref())));
+        effects.extend(shown);
     }
 
     fn show_turns(
@@ -3124,7 +3222,10 @@ impl InteractiveController {
                 self.phase = AppPhase::WaitingMcpInput;
             }
             SessionEvent::TurnsListed { purpose, turns } => {
-                self.show_turns(purpose, turns, effects);
+                match self.sent_awaiting(SentAwaits::Turns) {
+                    Some(receipt) => self.answer_sent_turns(receipt, purpose, turns, effects),
+                    None => self.show_turns(purpose, turns, effects),
+                }
             }
             SessionEvent::Refined {
                 header,
@@ -3211,6 +3312,17 @@ impl InteractiveController {
             }
             SessionEvent::SideAnswer { question, answer } => {
                 self.side_pending = false;
+                // Asked with `ha send`: the answer is the delivery's, printed by
+                // `--wait`, not a panel for whoever attaches next.
+                if let Some(receipt) = self.sent_awaiting(SentAwaits::Side) {
+                    self.record_delivery_answer(
+                        receipt,
+                        answer
+                            .map(|answer| format!("Q: {question}\n\n{answer}"))
+                            .map_err(|message| format!("side question failed: {message}")),
+                    );
+                    return;
+                }
                 match answer {
                     Ok(answer) => {
                         let mut lines = vec![format!("Q: {question}"), String::new()];
@@ -3517,7 +3629,18 @@ impl InteractiveController {
                 // `/tree <number>` and `/tree label <number>` count the turns
                 // on the path to the leaf, as the numbered list showed them.
                 self.turn_points = tree_path(&turns, leaf.as_deref());
-                self.open_tree(&turns, leaf.as_deref(), effects);
+                match self.sent_awaiting(SentAwaits::Turns) {
+                    Some(receipt) => {
+                        let path = self.turn_points.clone();
+                        self.answer_sent_turns(
+                            receipt,
+                            super::events::TurnsPurpose::Tree,
+                            path,
+                            effects,
+                        );
+                    }
+                    None => self.open_tree(&turns, leaf.as_deref(), effects),
+                }
             }
         }
     }
@@ -6917,6 +7040,28 @@ fn table_safe_cut(text: &str, cut: usize) -> usize {
 
 /// The text a command run for `ha send` produced: its notices and messages,
 /// then the panel it opened.
+/// What a command sent with `ha send` answers later than it runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SentAwaits {
+    /// `/tree` or `/fork` with no number: the list of turns.
+    Turns,
+    /// `/btw <question>`: the side answer.
+    Side,
+}
+
+impl SentAwaits {
+    fn of(text: &str) -> Option<Self> {
+        let mut words = text.split_whitespace();
+        let name = words.next()?;
+        let rest = words.next();
+        match super::commands::builtin(name).map(|command| command.name)? {
+            "/tree" | "/fork" if rest.is_none() => Some(Self::Turns),
+            "/btw" if rest.is_some() => Some(Self::Side),
+            _ => None,
+        }
+    }
+}
+
 fn command_answer(produced: &[Effect], panel: Option<&super::input::Overlay>) -> String {
     let mut lines = produced
         .iter()
@@ -7914,6 +8059,76 @@ mod tests {
             .open_overlay("/goal", vec!["Status: complete".to_owned()]);
         h.controller.close_panels();
         assert!(h.controller.editor.overlay().is_none());
+    }
+
+    /// Seen while testing the app: `ha send "/tree"` opened the tree
+    /// selector in the agent, where nobody saw it and `--wait` printed
+    /// nothing; `ha send "/plugins"` left the service selector open, and the
+    /// next terminal's Enter connected the first service. A sent command
+    /// answers in words - `/tree` and `/fork` with the numbered list once it
+    /// arrives, `/btw` with its answer - and leaves no selector open.
+    #[test]
+    fn a_sent_selector_command_answers_in_words_and_leaves_no_selector() {
+        use crate::interactive::events::TurnsPurpose;
+        let mut h = tui_bench(true);
+        let mut effects = Vec::new();
+        let (tree, _) = h
+            .controller
+            .deliver_tracked("/tree".into(), true, false, &mut effects);
+        assert_eq!(
+            h.controller.take_delivery_answer(tree),
+            Ok(None),
+            "it waits"
+        );
+        turns_listed(&mut h, TurnsPurpose::Tree);
+        let answer = h
+            .controller
+            .take_delivery_answer(tree)
+            .expect("answered")
+            .expect("the list");
+        assert!(answer.contains("1. first ask"), "{answer}");
+        assert!(answer.contains("/tree <number>"), "{answer}");
+        assert!(h.controller.editor.picker().is_none(), "no selector left");
+        assert!(h.controller.tree_view.is_none());
+        assert!(h.controller.editor.overlay().is_none(), "no panel left");
+
+        let (side, _) =
+            h.controller
+                .deliver_tracked("/btw which file?".into(), true, false, &mut effects);
+        assert_eq!(h.controller.take_delivery_answer(side), Ok(None));
+        h.events
+            .send(SessionEvent::SideAnswer {
+                question: "which file?".to_owned(),
+                answer: Ok("src/parser.rs".to_owned()),
+            })
+            .expect("answer");
+        let _ = h.controller.pump_events();
+        let answer = h
+            .controller
+            .take_delivery_answer(side)
+            .expect("answered")
+            .expect("the side answer");
+        assert!(answer.contains("src/parser.rs"), "{answer}");
+        assert!(h.controller.editor.overlay().is_none(), "no panel left");
+
+        // A selector a sent command opens is its answer, and closed.
+        h.controller
+            .editor
+            .open_picker(vec!["Linear · not connected".to_owned()]);
+        h.controller.plugin_picker = Some(vec!["linear".to_owned()]);
+        let rows = h.controller.take_selector().expect("rows");
+        assert_eq!(rows[0], "Linear · not connected  [linear]");
+        assert!(rows.iter().any(|row| row.contains("/plugins connect <id>")));
+        assert!(!rows.iter().any(|row| row.contains("/resume")), "{rows:?}");
+        assert!(h.controller.editor.picker().is_none());
+        assert!(h.controller.plugin_picker.is_none());
+
+        // A selector an earlier terminal left open is closed for the next.
+        h.controller.editor.open_picker(vec!["Linear".to_owned()]);
+        h.controller.plugin_picker = Some(vec!["linear".to_owned()]);
+        h.controller.close_panels();
+        assert!(h.controller.editor.picker().is_none());
+        assert!(h.controller.plugin_picker.is_none());
     }
 
     #[test]

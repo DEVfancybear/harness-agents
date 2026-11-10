@@ -274,7 +274,7 @@ fn auth_path() -> Result<PathBuf, HarnessError> {
         environment: &environment,
         explicit_data_dir: None,
     })?;
-    Ok(crate::interactive::credentials::resolve_path(
+    Ok(crate::interactive::credentials::resolve_file(
         &environment,
         &paths.data_dir,
     ))
