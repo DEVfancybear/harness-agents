@@ -17,7 +17,8 @@
 #
 # SUBAGENT_FROM is the model the children start on (default:
 # deepseek/deepseek-v4-flash, deepseek/deepseek-v4-pro when that is MODEL); MODEL
-# is the one /subagent-model moves them to.
+# is the one /subagent-model moves them to. SUBAGENT_FROM_THINKING (low ..
+# max) starts them at that level, as for a model with few tokens left.
 set -u
 source "$(dirname "$0")/env.sh"
 fresh children
@@ -58,6 +59,11 @@ for line in sys.stdin:
 echo "################ 1. a running child follows /subagent-model"
 agent "$RX/p" c1
 "$HA" send c1 "/subagent-model $FROM" --wait 2>&1 | sed 's/^/   /'
+# SUBAGENT_FROM_THINKING: the level the children start at, for a model with
+# few tokens left (they move to the session's level with the model).
+if [ -n "${SUBAGENT_FROM_THINKING:-}" ]; then
+  "$HA" send c1 "/subagent-effort $SUBAGENT_FROM_THINKING" --wait 2>&1 | sed 's/^/   /'
+fi
 # The child works in many model calls, so it is still running when the
 # default changes. Sent without waiting: the change is made mid-turn.
 "$HA" send c1 "Dùng tool delegate giao cho đúng một agent role explorer nhiệm vụ sau, giữ nguyên văn: 'Gọi tool run_process đúng 6 lần liên tiếp, mỗi lần một lượt riêng, với executable là python và args là -c và import time; time.sleep(6). Không gọi song song. Xong cả 6 lần thì trả lời đúng một dòng EXPLORER-XONG.' Đợi explorer xong rồi trả lời đúng một dòng: MOC-XONG" >/dev/null 2>&1
@@ -68,6 +74,9 @@ for _ in $(seq 1 60); do
   sleep 5
 done
 echo "   the child's task: ${started:-none yet}"
+if [ -n "${SUBAGENT_FROM_THINKING:-}" ]; then
+  "$HA" send c1 "/subagent-effort inherit" --wait 2>&1 | sed 's/^/   /'
+fi
 moved=$("$HA" send c1 "/subagent-model $MODEL" --wait 2>&1)
 echo "$moved" | sed 's/^/   /'
 for _ in $(seq 1 60); do
