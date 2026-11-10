@@ -4271,6 +4271,24 @@ pub async fn auto_refine(
     // words, not the user's, and are no evidence.
     proposal.evidence_in = Some(conversation.to_owned());
     proposal.proposer = Some("review");
+    // A new entry that keeps a child's `scope: project` proposal is the
+    // project's, whatever scope the review wrote on it: seen live, the review
+    // kept a child's fact about its project as `scope: global` (and it
+    // reached every project), and as a local entry (and the project's next
+    // conversation never saw it).
+    let project_findings = learning.map_or(&[][..], |learning| &learning.project_findings[..]);
+    if project.is_some() {
+        for edit in &mut proposal.edits {
+            let keeps_project_finding = edit.text("kind") == Some("memory")
+                && edit.text("action") == Some("create")
+                && edit.text("evidence").is_some_and(|evidence| {
+                    project_findings.iter().any(|line| quoted(evidence, line))
+                });
+            if keeps_project_finding {
+                edit.0.insert("scope".to_owned(), json!("project"));
+            }
+        }
+    }
     // A global edit reaches every conversation, so it carries the quote that
     // justifies it; one without stays in this conversation.
     let (mut global_edits, local_edits): (Vec<_>, Vec<_>) = std::mem::take(&mut proposal.edits)
@@ -4284,17 +4302,9 @@ pub async fn auto_refine(
     // A memory edit for this project (`scope: project`, as a child proposes
     // one) is the global store's, kept for the project; with no project it
     // is an ordinary global entry, which names the project in its words.
-    // So is one that keeps a child's `scope: project` proposal, whatever
-    // scope the review wrote on it: seen live, the review kept a child's fact
-    // about its project as `scope: global`, and it reached every project.
-    let project_findings = learning.map_or(&[][..], |learning| &learning.project_findings[..]);
     if let Some(project) = &project {
         for edit in &mut global_edits {
-            let keeps_project_finding = edit.text("kind") == Some("memory")
-                && edit.text("evidence").is_some_and(|evidence| {
-                    project_findings.iter().any(|line| quoted(evidence, line))
-                });
-            if edit.for_project() || keeps_project_finding {
+            if edit.for_project() {
                 edit.0.insert(
                     "project".to_owned(),
                     json!({"key": project.key, "name": project.name}),
@@ -9491,11 +9501,14 @@ Run `node scripts/build.js`.
         let layers = crate::interactive::learned::Layers::new(&config, &data, &workspace, true);
         let mut learning = super::Learning::new(layers, &workspace, None);
         let line = "config/owners.toml names team amber-kite-913 (evidence: \"team = \\\"amber-kite-913\\\"\")";
-        learning.project_findings = vec![line.to_owned()];
+        let pager = "config/owners.toml names pager slate-wren-274 (evidence: \"pager = \\\"slate-wren-274\\\"\")";
+        learning.project_findings = vec![line.to_owned(), pager.to_owned()];
         let reply = json!({"summary": "kept the child's finding", "rationale": "r", "expectedOutcome": "", "edits": [
             {"action": "create", "kind": "memory", "title": "Project owners", "content": "config/owners.toml names team amber-kite-913.",
              "scope": "global", "metadata": {"scope": "global"}, "reason": "a child read it",
              "evidence": "config/owners.toml names team amber-kite-913"},
+            {"action": "create", "kind": "memory", "title": "Project pager", "content": "config/owners.toml names pager slate-wren-274.",
+             "reason": "a child read it", "evidence": "config/owners.toml names pager slate-wren-274"},
             {"action": "create", "kind": "memory", "title": "Reply language", "content": "Always answer in Vietnamese.",
              "scope": "global", "reason": "a lasting preference", "evidence": "luôn trả lời bằng tiếng Việt"}
         ]})
@@ -9505,7 +9518,7 @@ Run `node scripts/build.js`.
         let refined = super::auto_refine(
             &provider,
             "fixture-model",
-            &format!("[User]: luôn trả lời bằng tiếng Việt\n\n[Child finding]: {line}\n\n[Assistant]: vâng"),
+            &format!("[User]: luôn trả lời bằng tiếng Việt\n\n[Child finding]: {line}\n\n[Child finding]: {pager}\n\n[Assistant]: vâng"),
             &scopes,
             None,
             Some(&learning),
@@ -9517,6 +9530,14 @@ Run `node scripts/build.js`.
         let state = load_raw(&scopes.global);
         let project = &state["entries"]["memory"]["project_owners"]["project"];
         assert_eq!(project["name"], "p6", "{state:#}");
+        assert_eq!(
+            state["entries"]["memory"]["project_pager"]["project"]["name"], "p6",
+            "a local edit of a project finding is the project's too: {state:#}"
+        );
+        assert!(
+            load_raw(&scopes.local)["entries"]["memory"]["project_pager"].is_null(),
+            "and not this conversation's alone"
+        );
         assert!(
             state["entries"]["memory"]["reply_language"]["project"].is_null(),
             "{state:#}"
