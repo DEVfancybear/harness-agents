@@ -1758,6 +1758,8 @@ pub struct LiveTurn {
     selection: Mutex<LiveSelection>,
     /// The session model a turn left for the backup model, until it answers again.
     left_primary: Arc<Mutex<Option<String>>>,
+    /// The usage-limit park of the session, which its children read.
+    session_park: Arc<super::routing::SessionPark>,
     /// prime-agent's `compaction.enabled: false`: turns do not compact on their own.
     auto_compaction_off: std::sync::atomic::AtomicBool,
     /// prime-agent's `retry.enabled: false`: a failed model call is not retried.
@@ -1877,6 +1879,9 @@ struct ServiceChildModels {
     config_file: PathBuf,
     /// `[agents] default_model`, read after the setting.
     configured: Option<String>,
+    /// The session's usage-limit park: a child's model makes no call on a
+    /// provider the session is parked on.
+    park: Arc<super::routing::SessionPark>,
 }
 
 impl super::delegation::ChildModels for ServiceChildModels {
@@ -1960,6 +1965,7 @@ impl super::delegation::ChildModels for ServiceChildModels {
             credentials::Scope::Subagent,
         )
         .map_err(|error| error.to_string())?;
+        let provider = super::routing::ParkAware::wrap(provider, &entry.reference(), &self.park);
         Ok(super::delegation::ChildModel {
             provider,
             reference: entry.reference(),
@@ -2057,6 +2063,7 @@ impl LiveProvider {
                 .then_some(super::routing::UsageWait::PRIME),
             max_attempts,
             Arc::clone(&self.live.left_primary),
+            Arc::clone(&self.live.session_park),
         )
     }
 
@@ -7287,46 +7294,69 @@ impl AgentSessionService {
         // Counted while the inbox is still the running turn's, so a turn that ends
         // meanwhile waits for this message before it looks for unread ones.
         active.in_flight.fetch_add(1, Ordering::SeqCst);
-        handle.spawn(async move {
-            let result = async {
-                let deadline = Instant::now() + Duration::from_secs(2);
-                let run = loop {
-                    match active.store.latest_run(&active.session_id).await {
-                        Ok(Some(run)) => break run,
-                        Ok(None) if Instant::now() < deadline => {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
-                        Ok(None) => {
-                            return Err("the active run did not open its inbox within two seconds"
-                                .to_owned());
-                        }
-                        Err(error) => return Err(error.to_string()),
-                    }
-                };
-                if verbatim {
-                    active
-                        .inbox
-                        .deliver(&run, text, harness_runtime::now_unix_ms())
-                        .await
-                        .map_err(|error| error.to_string())?;
-                } else {
-                    active
-                        .inbox
-                        .steer(&run, text, harness_runtime::now_unix_ms())
-                        .await
-                        .map_err(|error| error.to_string())?;
-                }
-                Ok::<(), String>(())
-            }
-            .await;
-            active.in_flight.fetch_sub(1, Ordering::SeqCst);
-            if let Err(error) = result {
-                let _ = sender.send(SessionEvent::Notice {
-                    message: format!("steering note was not queued: {error}"),
-                });
-            }
-        });
+        handle.spawn(deliver_into_run(
+            active,
+            text,
+            verbatim,
+            sender,
+            Duration::from_secs(2),
+        ));
         Ok(())
+    }
+}
+
+/// Put `text` in the running turn's inbox once its run is open, within
+/// `wait`; one that does not open by then gets it with the next turn.
+async fn deliver_into_run(
+    active: ActiveTurnInbox,
+    text: String,
+    verbatim: bool,
+    sender: UnboundedSender<SessionEvent>,
+    wait: Duration,
+) {
+    let result = async {
+        let deadline = Instant::now() + wait;
+        let run = loop {
+            match active.store.latest_run(&active.session_id).await {
+                Ok(Some(run)) => break run,
+                Ok(None) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                // The turn is still getting ready - a checkpoint of a long
+                // conversation took 146 s in a report - and the message waits
+                // for the next turn, as one that came as a turn ended does.
+                // Dropped, a background command's completion was never read.
+                Ok(None) => {
+                    let _ = sender.send(SessionEvent::UnreadMessage {
+                        text: text.clone(),
+                        verbatim,
+                    });
+                    return Ok(());
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        if verbatim {
+            active
+                .inbox
+                .deliver(&run, text, harness_runtime::now_unix_ms())
+                .await
+                .map_err(|error| error.to_string())?;
+        } else {
+            active
+                .inbox
+                .steer(&run, text, harness_runtime::now_unix_ms())
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    active.in_flight.fetch_sub(1, Ordering::SeqCst);
+    if let Err(error) = result {
+        let _ = sender.send(SessionEvent::Notice {
+            message: format!("steering note was not queued: {error}"),
+        });
     }
 }
 
@@ -7392,6 +7422,14 @@ fn spawn_session_log(
             }
             Err(error) => Err(format!("the project store cannot be read: {error}")),
         };
+        // A quiet write found the model's usage limit: ten minutes after a
+        // session was parked, it failed with the park's own error and told the
+        // person so, twice in one report. The session's next turn, after the
+        // park lifts, writes the log again from the whole journal.
+        if quiet_write_hit_the_limit(trigger, &result) {
+            super::session_log::record_skip(&task, trigger, "rate_limited");
+            return;
+        }
         super::session_log::record(&task, trigger, &root, &result);
         match result {
             Ok(super::session_log::Outcome::Written { placed, .. }) => {
@@ -7430,6 +7468,19 @@ fn spawn_session_log(
     }
 }
 
+/// Whether a quiet session-log write failed on the model's usage limit,
+/// which it leaves to the session's next quiet write.
+fn quiet_write_hit_the_limit(
+    trigger: &str,
+    result: &Result<super::session_log::Outcome, String>,
+) -> bool {
+    trigger == "quiet"
+        && result.as_ref().is_err_and(|error| {
+            error.starts_with(ErrorCode::RateLimited.as_str())
+                || error.contains(&format!("{}:", ErrorCode::RateLimited.as_str()))
+        })
+}
+
 /// One automatic refine review, and the refinement it approves, run off the turn.
 struct AutoRefine {
     sender: UnboundedSender<SessionEvent>,
@@ -7462,8 +7513,12 @@ impl AutoRefine {
     /// none when it found nothing to refine), and say once what of the
     /// review waits for the person. Returns how many changes it queued.
     fn settle(&self, refinements: &[super::refine::Refinement]) -> usize {
-        let outcomes =
-            super::refine::settle_child_proposals(&self.scopes, refinements, &self.proposals);
+        let outcomes = super::refine::settle_child_proposals(
+            &self.scopes,
+            refinements,
+            &self.proposals,
+            Some(&self.learning),
+        );
         for outcome in &outcomes {
             harness_types::diag::info("memory_queue", "child_proposal")
                 .task(&self.task)
@@ -8508,12 +8563,21 @@ fn review_record(
     outcome: Result<&super::refine::Refinement, &str>,
 ) -> harness_types::diag::Builder {
     match outcome {
-        Ok(refinement) => harness_types::diag::info("review", event)
-            .task(conversation)
-            .msg(refinement.summary())
-            .field("refinement", refinement.id())
-            .field("edits", refinement.details().len())
-            .field("queued", refinement.queued()),
+        // The edits themselves, and the outcome in words: `edits` once
+        // counted the lines the row shows, so a review that changed nothing
+        // read `edits=1`, and one whose summary said "no edits proposed"
+        // while an edit applied could not be told from the record.
+        Ok(refinement) => {
+            let (edits, applied) = refinement.edit_counts();
+            harness_types::diag::info("review", event)
+                .task(conversation)
+                .msg(refinement.summary())
+                .field("refinement", refinement.id())
+                .field("outcome", refinement.outcome())
+                .field("edits", edits)
+                .field("applied", applied)
+                .field("queued", refinement.queued())
+        }
         Err(error) => harness_types::diag::warn("review", event)
             .task(conversation)
             .msg(error.to_owned())
@@ -9604,6 +9668,11 @@ async fn run_turn(
         credentials::Scope::Subagent,
     )
     .unwrap_or_else(|_| Arc::clone(&provider));
+    let child_provider = super::routing::ParkAware::wrap(
+        child_provider,
+        &format!("{}/{}", config.provider_id, config.model),
+        &live.session_park,
+    );
     // The depth children of this turn may spawn to, read for this conversation.
     let hashline_rule =
         super::config::HashlineRule::load(&config_file, environment.value("HA_HASHLINE"));
@@ -9683,6 +9752,7 @@ async fn run_turn(
                 session: task_id.as_ref().to_owned(),
                 config_file: config_file.clone(),
                 configured: config.agents_default_model.clone(),
+                park: Arc::clone(&live.session_park),
             })),
             runtime_config: RuntimeConfig {
                 context_window_tokens: config.context_window_tokens,
@@ -13118,6 +13188,83 @@ mod tests {
         assert_eq!(log_root(&store, &task, main.clone()).await, main, "gone");
     }
 
+    /// Seen in a bug report: ten minutes after each usage-limit park, the
+    /// quiet session log failed with the park's error and told the person
+    /// "the session log was not written: `rate_limited` ...". A quiet write
+    /// leaves it to the next one; any other failure, and a limit met by a
+    /// compaction's or a handoff's write, is still said.
+    #[test]
+    fn a_quiet_session_log_leaves_a_usage_limit_to_the_next_write() {
+        let parked: Result<super::super::session_log::Outcome, String> = Err(
+            "rate_limited: provider reported recovery in 15079s, beyond the wait bound of 900s. Session parked until 2026-11-09T18:16:46Z".to_owned(),
+        );
+        assert!(super::quiet_write_hit_the_limit("quiet", &parked));
+        assert!(!super::quiet_write_hit_the_limit("compaction", &parked));
+        let wrapped: Result<super::super::session_log::Outcome, String> =
+            Err("the summary call failed: rate_limited: usage limit".to_owned());
+        assert!(super::quiet_write_hit_the_limit("quiet", &wrapped));
+        let other: Result<super::super::session_log::Outcome, String> =
+            Err("the project store cannot be read: locked".to_owned());
+        assert!(!super::quiet_write_hit_the_limit("quiet", &other));
+    }
+
+    /// Seen in a bug report: a background command finished while the turn was
+    /// still getting ready (a checkpoint of the conversation took 146 s), and
+    /// its completion was dropped: "steering note was not queued: the active
+    /// run did not open its inbox within two seconds". It waits for the next
+    /// turn, as a message that came as a turn ended does.
+    #[tokio::test]
+    async fn q03b_a_message_for_a_turn_not_open_yet_waits_for_the_next() {
+        use super::ActiveTurnInbox;
+        use harness_runtime::RunInbox;
+        use harness_types::SessionId;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+        let temp = tempfile::tempdir().expect("temp");
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                temp.path().join("data"),
+                harness_types::HostId::generate(),
+            ))
+            .await
+            .expect("store opens"),
+        );
+        // A turn still getting ready: its session has no run yet.
+        let active = ActiveTurnInbox {
+            inbox: RunInbox::new(Arc::clone(&store)),
+            store: Arc::clone(&store),
+            session_id: SessionId::generate(),
+            in_flight: Arc::new(AtomicUsize::new(1)),
+        };
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        super::deliver_into_run(
+            active.clone(),
+            "[bash-done pid=7] cargo test exited 0".to_owned(),
+            true,
+            sender,
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(active.in_flight.load(Ordering::SeqCst), 0);
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::UnreadMessage { text, verbatim: true }]
+                    if text.contains("bash-done")
+            ),
+            "{events:?}"
+        );
+        drop(active);
+        if let Ok(store) = Arc::try_unwrap(store) {
+            store.close().await.expect("closes");
+        }
+    }
+
     /// A message that lands in a turn's inbox after its last step - or is still
     /// on its way there when the turn ends - goes to the next turn instead of
     /// being dropped with the run. (Measured in the full PTY run: a child's
@@ -15224,6 +15371,7 @@ mod tests {
             session: "child-effort-regression".to_owned(),
             config_file,
             configured: None,
+            park: Arc::default(),
         };
         (temp, models)
     }

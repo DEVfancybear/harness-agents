@@ -334,6 +334,8 @@ pub struct Router {
     /// provider again, fail on the same limit, and end the turn with that bare
     /// error instead of the one saying when the session resumes.
     parked: Mutex<Option<ProviderError>>,
+    /// Session-wide: the park its children read.
+    session_park: Arc<SessionPark>,
     /// Whether the session model has answered this turn, said once.
     answered: AtomicBool,
     told: Mutex<Vec<String>>,
@@ -354,6 +356,7 @@ impl Router {
         wait: Option<UsageWait>,
         max_attempts: u32,
         left_primary: Arc<Mutex<Option<String>>>,
+        session_park: Arc<SessionPark>,
     ) -> Self {
         Self {
             sender,
@@ -368,6 +371,7 @@ impl Router {
             on_backup: AtomicBool::new(false),
             gave_up: AtomicBool::new(false),
             parked: Mutex::new(None),
+            session_park,
             answered: AtomicBool::new(false),
             told: Mutex::new(Vec::new()),
         }
@@ -606,6 +610,7 @@ impl Router {
     /// a primary a previous turn left for the backup is announced as back.
     fn primary_answered(&self) {
         self.failures.store(0, Ordering::SeqCst);
+        self.session_park.lift();
         if !self.answered.swap(true, Ordering::SeqCst) {
             let _ = self.sender.send(SessionEvent::PrimaryAnswered);
         }
@@ -681,7 +686,107 @@ impl Router {
         if let Ok(mut kept) = self.parked.lock() {
             *kept = Some(parked.clone());
         }
+        self.session_park.hold(
+            provider_of(&self.primary),
+            until,
+            ProviderError::new(
+                ErrorCode::RateLimited,
+                format!(
+                    "the session is parked until {at} on this provider's usage limit, so this call was not made: {said}"
+                ),
+            )
+            .with_retry_after(Some(reset)),
+        );
         parked
+    }
+}
+
+/// The provider of a `provider/id` reference.
+fn provider_of(reference: &str) -> &str {
+    reference.split('/').next().unwrap_or(reference)
+}
+
+/// A usage-limit park of the session, which the session's children read: a
+/// child of a parked session called the same account a second after the park
+/// and failed on the same limit (bug report 2026-11-10). It holds until the
+/// reset, or until the session model answers again.
+#[derive(Debug, Default)]
+pub struct SessionPark(Mutex<Option<(String, chrono::DateTime<chrono::Utc>, ProviderError)>>);
+
+impl SessionPark {
+    fn hold(&self, provider: &str, until: chrono::DateTime<chrono::Utc>, error: ProviderError) {
+        if let Ok(mut held) = self.0.lock() {
+            *held = Some((provider.to_owned(), until, error));
+        }
+    }
+
+    /// The session model answered: the park is over.
+    fn lift(&self) {
+        if let Ok(mut held) = self.0.lock() {
+            *held = None;
+        }
+    }
+
+    /// The park's error for a call to `reference`, while the session is
+    /// parked on that model's provider.
+    #[must_use]
+    pub fn holds(&self, reference: &str) -> Option<ProviderError> {
+        let mut held = self.0.lock().ok()?;
+        match held.as_ref() {
+            Some((_, until, _)) if *until <= chrono::Utc::now() => {
+                *held = None;
+                None
+            }
+            Some((provider, _, error)) if provider == provider_of(reference) => Some(error.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// A child's model, which makes no call while its session is parked on the
+/// same provider's usage limit: it fails at once with the park's words.
+pub struct ParkAware {
+    inner: Arc<dyn ModelProvider>,
+    reference: String,
+    park: Arc<SessionPark>,
+}
+
+impl ParkAware {
+    #[must_use]
+    pub fn wrap(
+        inner: Arc<dyn ModelProvider>,
+        reference: &str,
+        park: &Arc<SessionPark>,
+    ) -> Arc<dyn ModelProvider> {
+        Arc::new(Self {
+            inner,
+            reference: reference.to_owned(),
+            park: Arc::clone(park),
+        })
+    }
+}
+
+impl ModelProvider for ParkAware {
+    fn capabilities(&self) -> harness_providers::ModelCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn stream(&self, request: ProviderRequest, cancellation: CancellationToken) -> ProviderFuture {
+        match self.park.holds(&self.reference) {
+            Some(error) => Box::pin(async move { Err(error) }),
+            None => self.inner.stream(request, cancellation),
+        }
+    }
+
+    fn stream_events(
+        &self,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> ProviderEventStream {
+        match self.park.holds(&self.reference) {
+            Some(error) => failed(error),
+            None => self.inner.stream_events(request, cancellation),
+        }
     }
 }
 
@@ -1047,6 +1152,24 @@ mod tests {
         wait: Option<UsageWait>,
         left: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     ) -> (std::sync::Arc<super::Router>, Events) {
+        parked_router(
+            primary_takes_images,
+            backup,
+            image,
+            wait,
+            left,
+            std::sync::Arc::default(),
+        )
+    }
+
+    fn parked_router(
+        primary_takes_images: bool,
+        backup: Option<super::Handoff>,
+        image: Option<super::Handoff>,
+        wait: Option<UsageWait>,
+        left: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        park: std::sync::Arc<super::SessionPark>,
+    ) -> (std::sync::Arc<super::Router>, Events) {
         let (sender, events) = tokio::sync::mpsc::unbounded_channel();
         (
             std::sync::Arc::new(super::Router::new(
@@ -1058,6 +1181,7 @@ mod tests {
                 wait,
                 3,
                 left,
+                park,
             )),
             events,
         )
@@ -1366,6 +1490,71 @@ mod tests {
             primary.calls(),
             1,
             "the parked turn asked the provider once"
+        );
+    }
+
+    /// Seen in a bug report: a child of a parked session called the same
+    /// `ChatGPT` account a second after the park and failed on the same limit.
+    /// A child's model of that provider makes no call while the session is
+    /// parked; one of another provider does; an answer lifts the park.
+    #[tokio::test]
+    async fn q13b_a_parked_sessions_child_makes_no_call_on_that_provider() {
+        let primary = std::sync::Arc::new(Failing {
+            errors: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            forever: Some(harness_providers::ProviderError::new(
+                harness_types::ErrorCode::RateLimited,
+                "You have hit your usage limit (plus plan). Try again in ~204 min.",
+            )),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let park = std::sync::Arc::<super::SessionPark>::default();
+        let (turn, _events) = parked_router(
+            true,
+            None,
+            None,
+            Some(quick(30)),
+            std::sync::Arc::default(),
+            std::sync::Arc::clone(&park),
+        );
+        let token = harness_providers::CancellationToken::new;
+        let _ = call(&turn, primary.clone(), request(false), token()).await;
+        assert!(park.holds("main/child-model").is_some(), "parked on main");
+        assert!(
+            park.holds("other/model").is_none(),
+            "another provider is not"
+        );
+        let child = std::sync::Arc::new(harness_providers::MockProvider::text("child answer"));
+        let guarded = super::ParkAware::wrap(child.clone(), "main/child-model", &park);
+        let error = super::collect(guarded.stream_events(request(false), token()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), harness_types::ErrorCode::RateLimited);
+        assert!(
+            error.to_string().contains("the session is parked until"),
+            "{error}"
+        );
+        assert!(
+            error.retry_after().is_some(),
+            "the runtime does not retry it"
+        );
+        assert_eq!(child.call_count(), 0, "the child's call was not made");
+        let other = super::ParkAware::wrap(
+            std::sync::Arc::new(harness_providers::MockProvider::text("other answer")),
+            "other/model",
+            &park,
+        );
+        assert!(
+            super::collect(other.stream_events(request(false), token()))
+                .await
+                .is_ok()
+        );
+        // The session model answers again: the park is over for its children.
+        turn.primary_answered();
+        assert!(park.holds("main/child-model").is_none());
+        assert!(
+            super::collect(guarded.stream_events(request(false), token()))
+                .await
+                .is_ok()
         );
     }
 

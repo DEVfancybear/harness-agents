@@ -882,6 +882,181 @@ async fn p2_c06_new_session_continuation_reuses_task_checkpoint_and_scope() {
     close_writer(store).await;
 }
 
+/// Seen in a bug report: a goal turn of a long conversation started near the
+/// replay bound, so the conversation was checkpointed first. The checkpoint's
+/// event was written as the turn before, which took back the task the app had
+/// just handed to the new turn; 146 s later the new turn's admission failed
+/// with `task_lease_conflict`, and the goal stopped for seven hours. The new
+/// turn is admitted after the checkpoint.
+#[tokio::test]
+async fn p2_c06b_a_continuation_checkpointed_first_still_owns_its_task() {
+    struct Summary;
+    impl harness_runtime::SummaryProvider for Summary {
+        fn summarize(
+            &self,
+            _recovery: &harness_session::RecoveryView,
+        ) -> Result<String, harness_runtime::RuntimeError> {
+            Ok("the work so far".to_owned())
+        }
+        fn summarize_conversation(
+            &self,
+            _prompt: &str,
+            _budget_tokens: u64,
+        ) -> Result<String, harness_runtime::RuntimeError> {
+            Ok("the user asked for the original task; it was answered at length".to_owned())
+        }
+    }
+    let temp = TempDir::new().unwrap();
+    let task_id = TaskId::generate();
+    let old_session = SessionId::generate();
+    // One store across both turns, as when a delegated child keeps it open:
+    // the same host at the same generation.
+    let store = writer(&temp).await;
+    // Each answer replays 32 000 characters at most, here of four bytes
+    // each: past half the replay bound (8 MiB) after some 33 turns, and the
+    // next turn checkpoints the conversation before it starts.
+    let long = "\u{1f642}".repeat(32_000);
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        Arc::new(MockProvider::text(&long)),
+        RuntimeConfig::default(),
+    )
+    .with_summarizer(Arc::new(Summary));
+    runtime
+        .run(request(
+            old_session.clone(),
+            task_id.clone(),
+            "original task",
+        ))
+        .await
+        .unwrap();
+    let mut previous = old_session;
+    let mut checkpointed = None;
+    for turn in 0..200 {
+        // The app hands the task to each new turn (service::run_turn).
+        store.release_task_lease(&task_id).await.unwrap();
+        let next = SessionId::generate();
+        let result = runtime
+            .continue_task(
+                &previous,
+                request(next.clone(), task_id.clone(), &format!("continue {turn}")),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("turn {turn} owns its task: {error}"));
+        assert_eq!(result.session_id, next);
+        if store
+            .latest_context_checkpoint(&previous)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            checkpointed = Some(turn);
+            break;
+        }
+        previous = next;
+    }
+    assert!(
+        checkpointed.is_some(),
+        "the conversation was checkpointed before a turn"
+    );
+    drop(runtime);
+    close_writer(store).await;
+}
+
+/// The same with a checkpoint that fails: its start is written as the turn
+/// before as well, and the new turn still owns its task.
+#[tokio::test]
+async fn p2_c06c_a_continuation_whose_checkpoint_failed_still_owns_its_task() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // A model summary of the conversation until `down`: then a conversation
+    // past the summary budget cannot be checkpointed, after the start is
+    // recorded.
+    struct Summary(Arc<AtomicBool>);
+    impl harness_runtime::SummaryProvider for Summary {
+        fn summarize(
+            &self,
+            _recovery: &harness_session::RecoveryView,
+        ) -> Result<String, harness_runtime::RuntimeError> {
+            Ok("the work so far".to_owned())
+        }
+        fn summarize_conversation(
+            &self,
+            _prompt: &str,
+            _budget_tokens: u64,
+        ) -> Result<String, harness_runtime::RuntimeError> {
+            if self.0.load(Ordering::SeqCst) {
+                Err(harness_runtime::RuntimeError::new(
+                    ErrorCode::ServiceUnavailable,
+                    "the summarizer is down",
+                ))
+            } else {
+                Ok("the user asked for the original task; it was answered at length".to_owned())
+            }
+        }
+    }
+    let down = Arc::new(AtomicBool::new(false));
+    let temp = TempDir::new().unwrap();
+    let task_id = TaskId::generate();
+    let first = SessionId::generate();
+    let store = writer(&temp).await;
+    let long = "\u{1f642}".repeat(32_000);
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        Arc::new(MockProvider::text(&long)),
+        RuntimeConfig::default(),
+    )
+    .with_summarizer(Arc::new(Summary(Arc::clone(&down))));
+    runtime
+        .run(request(first.clone(), task_id.clone(), "original task"))
+        .await
+        .unwrap();
+    let mut previous = first;
+    let mut failed = None;
+    for turn in 0..200 {
+        // The turn that checkpoints the conversation first meets a summarizer
+        // that is down: its checkpoint fails.
+        let near = runtime
+            .conversation_history(&previous)
+            .await
+            .unwrap()
+            .near_replay_bound();
+        down.store(near, Ordering::SeqCst);
+        store.release_task_lease(&task_id).await.unwrap();
+        let next = SessionId::generate();
+        let result = runtime
+            .continue_task(
+                &previous,
+                request(next.clone(), task_id.clone(), &format!("continue {turn}")),
+            )
+            .await;
+        if near {
+            // The turn may fail on the window it then has, never on its task.
+            if let Err(error) = &result {
+                assert_ne!(
+                    error.code(),
+                    ErrorCode::TaskLeaseConflict,
+                    "turn {turn}: {error}"
+                );
+            }
+            assert!(
+                store
+                    .latest_context_checkpoint(&previous)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the checkpoint failed"
+            );
+            failed = Some(turn);
+            break;
+        }
+        result.unwrap_or_else(|error| panic!("turn {turn}: {error}"));
+        previous = next;
+    }
+    assert!(failed.is_some(), "a turn tried a checkpoint first");
+    drop(runtime);
+    close_writer(store).await;
+}
+
 #[tokio::test]
 async fn p2_c14_offline_replay_dispatches_nothing_and_matches_frozen_packet() {
     let temp = TempDir::new().unwrap();

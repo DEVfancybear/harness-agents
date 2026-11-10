@@ -1,5 +1,5 @@
 //! The person's review queue for memory changes
-//! (`docs/architecture/MEMORY_STORE.en.md` §19).
+//! (`docs/architecture/MEMORY_STORE.en.md` §15).
 //!
 //! A review, `/refine`, `/learn` and Deep Dream apply what they propose at
 //! once, except the changes the person should have a say in: a fetched

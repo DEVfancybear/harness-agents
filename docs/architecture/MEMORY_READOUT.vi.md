@@ -3,7 +3,7 @@
 [English](MEMORY_READOUT.en.md) | Tiếng Việt
 
 **Trạng thái:** có từ 0.8.3; từ 0.8.8 chỉ đọc theo từ (embedding đã bị bỏ, xem
-[Kho memory §14](MEMORY_STORE.vi.md)). Tài liệu này mô tả cách chuyển thể MEMORILLA
+[Kho memory §10](MEMORY_STORE.vi.md)). Tài liệu này mô tả cách chuyển thể MEMORILLA
 (Fallahpour, Idehpour, Kothapalli và cộng sự, "Latent semantic memory for LLMs",
 arXiv 2610.21375, Stanford) cho ha. Code là chuẩn.
 
@@ -74,6 +74,11 @@ số.
   - Kết quả ghi `encoder: words`; khi không nhớ lại được gì, nó ghi câu hỏi đã
     đọc và khuyên tìm lại bằng từ khác.
   - Các entry nó hiện được đếm là hit (`memory_usage`).
+  - Bộ lọc giống hệt bộ lọc của `search`, nên entry đã bị một lần sửa thay thế
+    hoặc bị lượt expiry đóng lại sẽ bị bỏ ra, trừ khi lời gọi có `as_of`,
+    `since`/`until` hoặc `include_ended` ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §12.3, §12.5).
+  - Entry có trích dẫn code mang theo các trích dẫn đó và trạng thái của chúng
+    (`citations_state`), được kiểm tra ngay lúc đọc ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §14.3).
   - Chế độ này chỉ đọc memory; knowledge tìm bằng `mode: rank`.
 - **`history_search` với `mode: readout`.** Đây là thiết lập học liên tục của
   bài báo: các lượt cũ của cuộc trò chuyện là tài liệu, gồm tin nhắn của người

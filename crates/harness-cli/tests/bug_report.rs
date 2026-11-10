@@ -110,7 +110,10 @@ fn a_bug_report_holds_the_problems_and_no_secret() {
     std::fs::write(
         Path::new(diagnostics.trim()).join("20260101-tui-7.jsonl"),
         format!(
-            "{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n",
+            // The worker's log line, which it also records as a diagnostic,
+            // timed a few milliseconds apart.
+            serde_json::json!({"v":1,"ms":chrono::DateTime::parse_from_rfc3339(&stamp).unwrap().timestamp_millis() - 3,"ts":stamp,"pid":1,"role":"worker","level":"info","kind":"worker","event":"log","msg":"worker 1 serving C:\\p on 127.0.0.1:1"}),
             serde_json::json!({"v":1,"ms":card_like,"ts":stamp,"pid":7,"role":"tui","level":"warn","kind":"provider","event":"stream_restarted","task":"task_01a13d6f-385f-7390-a32a-c2a3326523b3"}),
             serde_json::json!({"v":1,"ms":now.timestamp_millis(),"ts":stamp,"pid":7,"role":"tui","level":"info","kind":"process","event":"start"}),
             serde_json::json!({"v":1,"ms":now.timestamp_millis(),"ts":stamp,"pid":7,"role":"tui","level":"error","kind":"store","event":"open_failed","msg":format!("refused with {SECRET}"),"task":"task_01a13d6f-385f-7390-a32a-c2a3326523b3"}),
@@ -200,6 +203,16 @@ fn a_bug_report_holds_the_problems_and_no_secret() {
     }
     assert!(
         timeline.contains(&format!("\"ms\":{card_like}")),
+        "{timeline}"
+    );
+    // The worker's line is in its log file and in its diagnostics: once in
+    // the timeline.
+    assert_eq!(
+        timeline
+            .lines()
+            .filter(|line| line.contains("worker 1 serving"))
+            .count(),
+        1,
         "{timeline}"
     );
     for (name, text) in entries.iter().filter(|(name, _)| {
@@ -1033,6 +1046,11 @@ fn a_bug_report_traces_a_park_and_what_waited() {
     let record = |ms: i64, level: &str, kind: &str, event: &str, task: &str, fields| {
         serde_json::json!({"v":1,"ms":ms,"ts":ts(ms),"pid":9,"role":"worker","level":level,"kind":kind,"event":event,"msg":"","task":task,"fields":fields}).to_string()
     };
+    let with_request = |line: String, request: &str| {
+        let mut value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        value["request"] = serde_json::json!(request);
+        value.to_string()
+    };
     let call = |ms: i64, task: &str, model: &str| {
         record(
             ms,
@@ -1062,13 +1080,42 @@ fn a_bug_report_traces_a_park_and_what_waited() {
         ),
         call(at(0) + 1_000, child, "gpt-6-luna"),
         call(at(0) + 2_000, child, "gpt-6.1-sol"),
-        record(
-            at(1),
-            "warn",
-            "provider",
-            "attempt_failed",
-            child,
-            serde_json::json!({"code":"rate_limited","attempt":1,"max_attempts":3,"retry_after_ms":1_935_000}),
+        // The child's request was made again 2 s later: a retry of a limit
+        // that lasts 32 min.
+        with_request(
+            record(
+                at(1),
+                "warn",
+                "provider",
+                "attempt_failed",
+                child,
+                serde_json::json!({"code":"rate_limited","attempt":1,"max_attempts":3,"retry_after_ms":1_935_000}),
+            ),
+            "request_child",
+        ),
+        with_request(
+            record(
+                at(1) + 2_000,
+                "warn",
+                "provider",
+                "attempt_failed",
+                child,
+                serde_json::json!({"code":"rate_limited","attempt":2,"max_attempts":3,"retry_after_ms":1_933_000}),
+            ),
+            "request_child",
+        ),
+        // The parent's was parked at its first refusal and never made again:
+        // no retry, though its attempt was not the last allowed.
+        with_request(
+            record(
+                at(1),
+                "warn",
+                "provider",
+                "attempt_failed",
+                parent,
+                serde_json::json!({"code":"rate_limited","attempt":1,"max_attempts":3,"retry_after_ms":1_935_000}),
+            ),
+            "request_parent",
         ),
         record(
             at(1),
@@ -1185,6 +1232,13 @@ fn a_bug_report_traces_a_park_and_what_waited() {
             && found.contains("resets in up to 32 min"),
         "{found}"
     );
+    // Only the child retried; the parked parent made no second attempt.
+    let retries = found
+        .lines()
+        .filter(|line| line.contains("retried a rate limit"))
+        .collect::<Vec<_>>();
+    assert_eq!(retries.len(), 1, "{found}");
+    assert!(retries[0].contains(&child[child.len() - 8..]), "{found}");
     assert!(found.contains("not when it failed") || !found.contains("From the stores"));
     let parks = section("Quota parks");
     let row = parks

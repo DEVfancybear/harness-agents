@@ -1,5 +1,5 @@
 //! The code an entry cites, checked when it is read, and the files an entry
-//! is kept for (`docs/architecture/MEMORY_STORE.en.md` §18).
+//! is kept for (`docs/architecture/MEMORY_STORE.en.md` §14).
 //!
 //! The fields this adds to an entry's document are all named here:
 //!

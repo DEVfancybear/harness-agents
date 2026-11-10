@@ -46,6 +46,7 @@ quyết định vào `memory/decisions/` thay vì một mục riêng, như `/pre
 | Session brief | 3 lượt cuối của hội thoại trước, trích đoạn có giới hạn | Host, từ journal, không gọi model | Lượt đầu của hội thoại mới, khi hội thoại trước không có session log |
 | Chỉ dẫn của project (`AGENTS.md`, không có thì `CLAUDE.md`) | Điều mọi phiên cần: quy ước, lệnh, cấu trúc, mẫu làm, cảnh báo | Người dùng, hoặc agent khi `/preserve` | Mọi lượt |
 | Kho markdown (project có `memory-lint.json`) | Fact và quyết định lâu dài có tag nguồn gốc; ghi chú hằng ngày | Agent, theo policy của kho; host thêm session log vào ghi chú hằng ngày | Mọi lượt (policy và index) |
+| Memory digest (`memory.sqlite3`, global và của hội thoại) | Sở thích và quyết định của người dùng xuyên project, và ghi chú riêng của một hội thoại: luật và entry được ghim đi trước, rồi các entry xếp hạng theo yêu cầu bằng từ, độ mới và mức dùng | Tool `memory`, lượt review, `/refine`, `/learn`, Deep Dream, learning loop | Mọi lượt (`harness_state`, trong khoảng 3K token); entry chỉ giữ cho một số file thì đến cùng kết quả tool file đầu tiên chạm tới file khớp ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §14.4) |
 
 ## Session log
 
@@ -129,7 +130,8 @@ nó: log ghi trong lúc một coder đang làm không đổi checkout mà coder 
 `integrate_children` vẫn áp dụng được việc của coder. Log trong ghi chú hằng ngày của kho markdown vẫn
 được theo dõi: nó thuộc về kho.
 
-**Tắt.** `"sessionLog": false` trong `settings.json`, hoặc `HA_SESSION_LOG=off`.
+**Tắt.** `"sessionLog": false` trong `settings.json`, hoặc `HA_SESSION_LOG=off`; công
+tắc memory cũng tắt được: `HA_MEMORY_OFF=session_log` hoặc `HA_MEMORY=off`.
 
 **Chẩn đoán.** Mỗi quyết định là một bản ghi chẩn đoán loại `session_log`, mà báo cáo
 lỗi đọc:
@@ -162,6 +164,9 @@ Prompt đầu tiên của hội thoại mới nghe về hội thoại trước �
   Khi log mới hơn `.harness/progress.md`, khối nói điều đó trong một dòng.
 
 Fork, import, `/resume`, nén ngữ cảnh và `/refinements off` không thêm khối này.
+`HA_MEMORY_OFF=earlier_state` (hoặc `HA_MEMORY=off`) bỏ task state của hội thoại trước
+(xem dưới) và các lượt cuối của hội thoại trước; khối của session log vẫn còn, trừ khi
+`session_log` cũng tắt.
 
 **Chỉ hội thoại đã rời.** Một hội thoại còn mở không phải là "hội thoại trước": một pane
 khác của cùng ha, một agent nền, hay một hội thoại mà một tiến trình ha khác còn sống đang
@@ -201,6 +206,8 @@ Mọi khối trong ngữ cảnh của một lượt đều có chỗ trong một
 | --- | --- | --- | --- |
 | `task-state` (của hội thoại này) | có | 4.000 (mục đã xong thành một con số, các quyết định mới nhất) | - |
 | `recalled-skill` | có | 1.500 | - |
+| `markdown-memory:policy` (project có kho markdown) | có | không có (khoảng 1.100 từ) | - |
+| `markdown-memory:MEMORY.md` (index của kho) | có | không có; cắt ở `maxChars` của index, mặc định 15.000 ký tự | - |
 | `harness_state` (digest của memory) | không | 3.000 | 70 |
 | `session-start` (commit, chưa commit, kiểm tra baseline) | không | 800 | 55 |
 | `earlier-task-state` | không | 1.500 | 50 |
@@ -208,6 +215,11 @@ Mọi khối trong ngữ cảnh của một lượt đều có chỗ trong một
 | `session-log` | không | 1.500 | 42 |
 | `knowledge-catalog` | không | 1.500 | 40 |
 | `recent-session` (session brief) | không | 1.500 | 30 |
+
+Memory chỉ giữ cho một số file (`paths`, 0.9.2) không nằm trong packet: một lượt gửi
+packet của bước đầu ở mọi bước, nên entry như vậy đến cùng kết quả tool file đầu tiên
+chạm tới file khớp, mỗi hội thoại một lần cho tới lần compaction kế tiếp
+([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §14.4).
 
 ## Lệnh
 

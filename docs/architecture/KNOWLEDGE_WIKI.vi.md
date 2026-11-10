@@ -110,4 +110,4 @@ readable sources (ratio R, kept under 1.00)`.
 - Nó không tải URL để đối chiếu một trang: chỉ tệp trong workspace và các cuộc
   hội thoại của dự án là nguồn nó đọc được.
 - Nó không biên tập các memory entry: Deep Dream làm việc đó
-  ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md), mục 17).
+  ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md), mục 13).

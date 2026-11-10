@@ -5,13 +5,14 @@ hội thoại (journal), store riêng của hội thoại, memory toàn cục, v
 harness tự tiến hoá. Bài "Sleep" (arXiv 2606.03979) nêu quy tắc chúng tuân
 theo: một tầng nhanh phải được hợp nhất vào tầng kế tiếp **trước khi** nó bị
 đặt lại hay ghi đè, nếu không những gì nó giữ sẽ mất. ha làm việc này bằng văn
-bản, qua các lượt chạy nền, mỗi lượt gọi một model:
+bản, qua các lượt chạy nền, mọi lượt trừ expiry đều gọi một model:
 
 | Lượt | Đọc | Ghi |
 |---|---|---|
-| Review một hội thoại (review gate, rồi lần refine nó duyệt) | các lượt từ lần review trước | store của hội thoại, memory toàn cục, bài học, skill tự học, knowledge |
+| Review một hội thoại (review gate, rồi lần refine nó duyệt) | các lượt từ lần review trước | store của hội thoại, memory toàn cục, bài học, skill tự học, knowledge, hàng chờ memory (`memory_queue.json`, những gì chờ người dùng duyệt); sau đó nó đóng từng đề xuất của child đã đọc, là `kept` hoặc `queued` ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §15.1, §15.4) |
 | Deep Dream (hợp nhất) | memory toàn cục, hoặc store của một hội thoại khi quá 40 entry, theo từng lô khi vượt ngân sách token | chính phạm vi đó, đã gộp và tỉa |
 | Tiến hoá harness | các lần gọi tool hỏng trong 14 ngày qua | luật và ghi chú cho tool |
+| Expiry (0.9.0), tối đa mỗi ngày một lần, không gọi model | lần cuối mỗi entry của store toàn cục và store của hội thoại được ghi, đọc hoặc tìm thấy (`HA_MEMORY_EXPIRE_DAYS`, mặc định 28) | chính các store đó: entry không dùng bị đóng lại, không bị xoá |
 | Lượt wiki | toàn bộ một thư viện knowledge, và các nguồn mà trang của nó nêu | chính thư viện đó: liên kết được trỏ lại hoặc lấp, trang trùng được gộp, một trang mục lục, khẳng định được sửa ([KNOWLEDGE_WIKI.vi.md](KNOWLEDGE_WIKI.vi.md)) |
 
 Một lần gọi model có thể hỏng: provider sập, chạm giới hạn, process chết.
@@ -56,10 +57,10 @@ ngày, và Deep Dream hỏng bị thử lại mỗi giờ mãi mãi. Từ 0.8.9 
   tại.
 - **Xong thì job bị xoá; hỏng thì job ở lại.** Lượt hỏng đếm thêm một lần thử,
   ghi lỗi và loại lỗi (mã lỗi ổn định của provider, `timeout`, `truncated`
-  hoặc `other`), rồi chờ: 5 phút với review, một giờ với hợp nhất hay tiến
-  hoá, gấp đôi sau mỗi lần hỏng tiếp theo, tối đa một ngày. Lượt mới của một
-  hội thoại kéo review hỏng của nó lên sớm; một lượt bảo trì được yêu cầu lại ở
-  cuối lượt thì vẫn giữ thời gian chờ của nó.
+  hoặc `other`), rồi chờ: 5 phút với review, một giờ với hợp nhất, tiến
+  hoá, expiry hay lượt wiki, gấp đôi sau mỗi lần hỏng tiếp theo, tối đa một
+  ngày. Lượt mới của một hội thoại kéo review hỏng của nó lên sớm; một lượt
+  bảo trì được yêu cầu lại ở cuối lượt thì vẫn giữ thời gian chờ của nó.
 - **Sau 6 lần hỏng liên tiếp job bỏ cuộc.** Nó vẫn nằm trên đĩa, không tự được
   thử lại nữa, và `ha doctor` cùng bug report nói ra điều đó. Lượt mới của một
   hội thoại là một job review mới; một lần hợp nhất hay tiến hoá đã bỏ cuộc thì
@@ -90,13 +91,7 @@ hạn.
 - **`ha exec` thoát**: một job khi các lần chạy của hội thoại đã làm đủ; rồi các
   job review đến hạn của hội thoại chạy trước khi process thoát. Một lần chạy
   không tự đến hạn review vẫn chạy job mà một lần chạy trước chưa làm xong.
-- **Deep Dream** (sau 0.9.3: còn đọc các lượt đứng sau mỗi entry từ journal và
-  có thể sửa entry bằng câu trích nguyên văn, chuyển chi tiết của entry dài
-  sang một trang knowledge và để lại con trỏ, chạy trước các batch dễ trôi
-  nhất, và theo `dream.md` của người dùng: của thư mục harness global cho
-  memory global, `<project>/.harness/dream.md` cho store của một hội thoại,
-  tối đa 4.000 ký tự, nối với điều `/refine --curate` được đưa;
-  [MEMORY_STORE.vi.md](MEMORY_STORE.vi.md), mục 20.) Điều kiện: memory toàn cục quá 12 entry và 15 thay đổi, hoặc store của
+- **Deep Dream** (memory toàn cục quá 12 entry và 15 thay đổi, hoặc store của
   một hội thoại quá 40 entry): chỉ được đánh dấu xong khi đã áp dụng; mỗi lúc
   một lần hợp nhất trên mọi process của ha (`consolidation.lock` trong thư mục
   harness toàn cục, một khoá của hệ điều hành mà process giữ khi chạy).
@@ -106,20 +101,37 @@ hạn.
   thất bại của job: hàng đợi thử lại cả lượt, cắt lô lại từ đầu, và các lô đã
   áp dụng vẫn được giữ. Chỗ lô đầu tiên kết thúc dời đi giữa các lượt, nên hai
   entry bị một ranh giới tách ra sẽ gặp nhau ở lượt sau
-  ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md), mục 16). Mỗi lô là một bản ghi
+  ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md), mục 13). Mỗi lô là một bản ghi
   `refine.consolidation_batch` (phạm vi, refinement, vị trí, số entry và số
   sửa đổi đã áp dụng, và id của các entry khi lô có tối đa 64 entry, `members`).
+  Sau 0.9.3 một lần chạy còn đọc các lượt đứng sau mỗi entry từ journal và có
+  thể sửa entry bằng câu trích nguyên văn, chuyển chi tiết của entry dài sang
+  một trang knowledge và để lại con trỏ, chạy trước các lô dễ trôi nhất, và
+  theo `dream.md` của người dùng: của thư mục harness toàn cục cho memory toàn
+  cục, `<project>/.harness/dream.md` cho store của một hội thoại, tối đa 4.000
+  ký tự, nối với điều `/refine --curate` được đưa
+  ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md), mục 17).
 - **Tiến hoá** (một lần mỗi ngày): chỉ được đánh dấu đã chạy khi đã lưu xong;
   khoá của nó và việc nhận job ngăn lượt thứ hai bắt đầu trong lúc đó.
+- **Expiry** (cuối một lượt trong app, khi `ha exec` thoát): một job có key
+  `expiry:<store toàn cục>`, điểm kích hoạt `due`, khi lần chạy trước đã quá
+  một ngày (hoặc quá `HA_MEMORY_EXPIRE_DAYS`, nếu ngắn hơn). Nó đóng các entry
+  không dùng của store toàn cục và store của hội thoại
+  ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §12.5).
 - **Lượt wiki** (cuối một lượt, khi review đang chạy và knowledge đang bật):
   mỗi thư viện knowledge một job (`wiki:<thư mục thư viện>`) khi thư viện đã
   đổi kể từ lượt trước, có việc cho một lượt, và một review đã viết một trang
   kể từ đó hoặc đã qua một ngày. Thư viện không còn đến hạn thì quên job đã bỏ
-  cuộc của nó; thư viện vẫn đến hạn thì quên job đó một ngày sau khi nó bỏ cuộc, và lượt chạy được thử lại từ đầu. Thời gian chờ đầu tiên sau một lần hỏng là một giờ, như Deep
-  Dream.
+  cuộc của nó; thư viện vẫn đến hạn thì quên job đó một ngày sau khi nó bỏ
+  cuộc, và lượt chạy được thử lại từ đầu. Thời gian chờ đầu tiên sau một lần
+  hỏng là một giờ, như Deep Dream.
 
 Lượt meditation của vòng học vốn đã tự giữ chỗ một giờ và chỉ đánh dấu sau khi
 thành công; nó không nằm trong hàng đợi.
+
+**Tắt.** `HA_MEMORY_OFF=reviews` (hoặc `HA_MEMORY=off`) không chạy lượt nào
+gọi model: không review, Deep Dream, tiến hoá hay lượt wiki, và `/refine`,
+`/learn` báo là không chạy. Expiry đi theo `digest`: tắt nó thì store không bị đụng tới.
 
 ## Những gì cho thấy nó
 

@@ -153,6 +153,8 @@ kept under another key to the key of the current directory (or `--cwd`), with
 the same move and retag. The old store is named by its key (`project-` and 16
 hex digits) or by the directory the project was at: the key that directory
 had, the key it had before 0.8.8, or the store whose manifest or registered
-directories name it (separators and, on Windows, case do not matter). It is
-refused when the current key has a store of its own, or something holds the
-old one.
+directories name it (separators and, on Windows, case do not matter). A
+directory that no longer exists is spelled from its nearest existing ancestor,
+so an old path typed under a Windows 8.3 short name (`RUNNER~1`) or through a
+symlink names the same store. It is refused when the current key has a store
+of its own, or something holds the old one.

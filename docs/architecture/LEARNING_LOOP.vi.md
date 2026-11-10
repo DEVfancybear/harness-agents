@@ -88,7 +88,7 @@ quy tắc đó lần thứ hai:
   chối edit), lesson quay lại thành candidate. Lesson có edit đang chờ người
   dùng trong hàng đợi memory cũng vậy (một rule từ lời không phải của người
   dùng, hoặc mọi thay đổi khi `HA_MEMORY_REVIEW=all`:
-  [MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §19): nó chưa được ghi cho tới khi
+  [MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §15): nó chưa được ghi cho tới khi
   được chấp nhận, và tín hiệu sau lại được đếm.
 - Trước khi ngưỡng ghi một rule, nó hỏi memory xem đã có entry nào nói điều đó
   chưa, bằng đúng thước đo memory tool dùng để từ chối trùng (giống 60 %, hoặc
@@ -148,6 +148,12 @@ của nó đã ghi lại.
 - **Một project không có kho:** entry memory global như trường hợp đầu, đánh dấu
   thuộc project đó, nên chỉ các lượt của project đó thấy.
 
+Ngưỡng tự ghi entry memory của rule, với tư cách bộ ghi `learning`: rule không
+bao giờ nằm chờ trong hàng chờ memory của người dùng
+([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §15). `origin` của nó ghi loop và
+lesson nhưng không có `kind`, nên được đọc là `agent` (§12.1). Như mọi entry
+`source: learning`, nó không bị expiry (§12.5).
+
 ## 5. Fact, rule đã làm được gì, và meditation
 
 **Fact.** Một deviation về một project (một file, một lệnh hay một check không
@@ -197,7 +203,7 @@ và các trích dẫn mới nhất. Nó trả về:
   thấy, như một signal: câu trích phải nằm nguyên văn trong log nó nêu; đó là
   signal của cuộc hội thoại của log, gắn tên log; lesson đã có signal từ cuộc
   hội thoại đó không nhận thêm từ log của nó
-  ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §20.6). Mỗi signal là một bản ghi
+  ([MEMORY_STORE.vi.md](MEMORY_STORE.vi.md) §17.6). Mỗi signal là một bản ghi
   `learning log_signal`, hoặc `log_signal_refused` kèm lý do.
 
 Ngưỡng chạy lại sau đó, vì tín hiệu đã gộp có thể đủ điều kiện. Hội thoại được
@@ -289,6 +295,13 @@ một lần cập nhật giữ `source` và `origin` của entry và ghi ai đã
 Dream sau đó có thể gộp mất nó, và lesson bị retire vì "đã bị xoá ngoài
 learning loop").
 `lessons_meditated` nằm cạnh đó ghi lần meditation gần nhất.
+
+**Tắt.** `HA_MEMORY_OFF=reviews` (hoặc `HA_MEMORY=off`) không chạy review nào,
+nên không tín hiệu nào được ghi, không meditation nào chạy, và ngưỡng chỉ chạy
+khi gọi `ha learning distill`. Rule đã promote tới lượt qua digest (tắt `digest` là
+mất) hoặc qua index của kho (`markdown`). Tắt `lessons` không đụng tới rule
+của loop: nó bỏ các rule học từ lời gọi thất bại, ghi chú của chúng trong mô
+tả tool, và việc gợi lại cùng ghi chú của learned skill; review vẫn ghi lesson.
 
 ## 9. Kiểm thử
 

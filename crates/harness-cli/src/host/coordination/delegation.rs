@@ -428,10 +428,19 @@ fn proposal_of(propose: Option<&Value>, fact: &str) -> Result<Option<ChildPropos
             "`propose.path` is longer than {PROPOSAL_PATH_CHARS} characters"
         ));
     }
+    // `project` is the memory tool's own scope, which a child reads its
+    // entries in: refused, four proposals of one session were lost. The
+    // review keeps a project's fact in the global store, worded with the
+    // project's name, so it is proposed there.
     let scope = match text("scope").as_str() {
         "" | "global" => "global",
+        "project" => "project",
         "local" => "local",
-        other => return Err(format!("`propose.scope` is global or local, not {other:?}")),
+        other => {
+            return Err(format!(
+                "`propose.scope` is global, project or local, not {other:?}"
+            ));
+        }
     };
     let content = Some(text("content"))
         .filter(|content| !content.is_empty())
@@ -480,8 +489,9 @@ pub struct ChildFinding {
 /// edit, or it waits for the person (`memory_queue`), as the child's.
 #[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
 pub struct ChildProposal {
-    /// `global` (every later conversation) or `local` (the root
-    /// conversation's own store).
+    /// `global` (every later conversation), `project` (a fact about the
+    /// project, kept in the global store as the review keeps one) or `local`
+    /// (the root conversation's own store).
     pub scope: String,
     /// The tree it goes in; empty for the store's default.
     #[serde(default)]
@@ -506,6 +516,85 @@ pub struct ChildProposal {
 /// and how its evidence is found in a tool result.
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `text` without the `12: ` or `12#a3: ` prefix `read_file` puts on a line,
+/// on each line that carries one.
+fn without_read_gutters(text: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            if digits == 0 {
+                return line;
+            }
+            let mut rest = &line[digits..];
+            if let Some(anchor) = rest.strip_prefix('#') {
+                let hash = anchor.len()
+                    - anchor
+                        .trim_start_matches(|c: char| c.is_ascii_alphanumeric())
+                        .len();
+                if hash == 0 {
+                    return line;
+                }
+                rest = &anchor[hash..];
+            }
+            match rest.strip_prefix(':') {
+                Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
+                None => line,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `text` with a JSON string's escapes read back: a tool without its own
+/// words is shown to the model as its JSON payload, where a Windows path
+/// reads `C:\\Users` and a quote `\"`.
+fn json_unescaped(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n' | 'r' | 't') => out.push(' '),
+            Some(escaped @ ('"' | '\\' | '/')) => out.push(escaped),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Whether a tool result holds `evidence`, read as the model reads it: a
+/// file's lines without `read_file`'s numbers, a payload's text without its
+/// JSON escapes. Seen in a report: a child quoted two lines of a file it had
+/// read and was refused, four times in one session, since the result holds
+/// `12: ` before each.
+fn holds_evidence(result: &str, evidence: &str) -> bool {
+    // A quote is still a quote without the numbers: one they leave shorter
+    // than a quote's least (`123456789:` leaves nothing) shows nothing.
+    let quotes = [
+        one_line(evidence),
+        one_line(&without_read_gutters(evidence)),
+    ]
+    .into_iter()
+    .filter(|quote| quote.chars().count() >= FINDING_EVIDENCE_MIN_CHARS)
+    .collect::<Vec<_>>();
+    let mut texts = vec![one_line(result), one_line(&json_unescaped(result))];
+    // Only a file's lines carry the numbers: elsewhere a line that starts
+    // with `7:` is the text's own.
+    if result.starts_with("read_file ") {
+        texts.push(one_line(&without_read_gutters(result)));
+    }
+    texts
+        .iter()
+        .any(|text| quotes.iter().any(|quote| text.contains(quote.as_str())))
 }
 
 /// A finding as its review reads it: the fact and the words that show it.
@@ -694,14 +783,15 @@ pub fn findings_for_review(local: &Path) -> Option<String> {
                 if let Some(proposal) = &finding.proposal {
                     let _ = write!(
                         block,
-                        " [proposed as a {} memory entry{}, title \"{}\": keep it with a memory edit whose evidence quotes this finding when it lasts; one you do not keep waits for the person's review]",
+                        " [proposed as a {} memory entry{}, title \"{}\": keep it with a memory edit (\"scope\": \"{}\") whose evidence quotes this finding when it lasts; one you do not keep waits for the person's review]",
                         proposal.scope,
                         if proposal.path.is_empty() {
                             String::new()
                         } else {
                             format!(" in {}", proposal.path)
                         },
-                        one_line(&proposal.title)
+                        one_line(&proposal.title),
+                        proposal.scope
                     );
                 }
             }
@@ -4488,7 +4578,7 @@ fn stopped_short(stop: TurnStop) -> Option<String> {
 fn coder_unavailable_error(reason: impl std::fmt::Display) -> HarnessError {
     HarnessError::new(
         ErrorCode::RoleUnavailable,
-        format!("coder cannot obtain an M8-03 worktree: {reason}"),
+        format!("coder cannot obtain an isolated worktree: {reason}"),
     )
 }
 
@@ -4603,8 +4693,44 @@ async fn inspect_coder_input(
         .map_err(coder_unavailable_error)?
     {
         InputInspection::Clean(snapshot) => Ok(snapshot),
-        InputInspection::Dirty(reasons) => Err(coder_unavailable_error(dirty_reasons(&reasons))),
+        InputInspection::Dirty(reasons) => {
+            let mut said = dirty_reasons(&reasons);
+            if reasons
+                .iter()
+                .any(|reason| matches!(reason, DirtyReason::NotARepository))
+            {
+                said.push_str(&repositories_below(workspace_root));
+            }
+            Err(coder_unavailable_error(said))
+        }
     }
+}
+
+/// What a coder refused for a workspace that is no repository says of the
+/// repositories right under it. Seen in a report: the session ran in
+/// `Downloads`, the project was `Downloads/NexaClip`, and the refusal named
+/// neither, so the model tried no other way.
+fn repositories_below(root: &std::path::Path) -> String {
+    let mut found = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().join(".git").exists())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    if found.is_empty() {
+        return String::new();
+    }
+    found.sort();
+    let shown = found
+        .iter()
+        .take(5)
+        .map(|name| format!("{name}/"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "; the Git repositories under it are {shown}: a coder works on the repository the session was started in, so for one of these start ha in that folder, or do the edit yourself or with an explorer's findings here"
+    )
 }
 
 async fn persist_worktree(
@@ -4817,7 +4943,7 @@ impl ChildTools {
                             "properties": {
                                 "title": {"type": "string", "minLength": 1, "maxLength": PROPOSAL_TITLE_CHARS, "description": "A short title, unique enough to find the entry again."},
                                 "path": {"type": "string", "maxLength": PROPOSAL_PATH_CHARS, "description": "The tree it goes in, such as \"project/deploy\"; left out, the store's default."},
-                                "scope": {"type": "string", "enum": ["global", "local"], "description": "global: every later conversation (the default); local: this conversation only."},
+                                "scope": {"type": "string", "enum": ["global", "project", "local"], "description": "global: every later conversation (the default); project: a fact about this project, kept for later conversations - name the project in the fact; local: this conversation only."},
                                 "content": {"type": "string", "maxLength": FINDING_FACT_CHARS, "description": "The entry's text; left out, the fact."}
                             },
                             "required": ["title"],
@@ -4832,8 +4958,31 @@ impl ChildTools {
     }
 
     /// Keep a finding for the root's review once its evidence is found in a
-    /// tool result of this run.
-    async fn note_finding(&self, arguments: &Value) -> Result<Value, String> {
+    /// tool result of this run. A refusal comes before anything is written;
+    /// only a failed write may have kept part of it.
+    async fn note_finding(&self, arguments: &Value) -> Result<Value, Refusal> {
+        let (path, finding) = self
+            .checked_finding(arguments)
+            .await
+            .map_err(Refusal::Refused)?;
+        let proposal = finding.proposal.clone();
+        keep_finding(path, finding).map_err(Refusal::Failed)?;
+        self.noted.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({
+            "text": if proposal.is_some() {
+                "kept, with its proposal: your parent's review keeps it as its own edit when it lasts, or else it waits for the person's review in the memory queue; nothing is written by your authority"
+            } else {
+                "kept: your parent's review reads it with the conversation and keeps what lasts"
+            },
+        }))
+    }
+
+    /// The finding `arguments` note, with the file it goes in, once every
+    /// check passed. Nothing is written.
+    async fn checked_finding(
+        &self,
+        arguments: &Value,
+    ) -> Result<(&std::path::Path, ChildFinding), String> {
         let Some(path) = &self.findings else {
             return Err("findings are not kept for this child".to_owned());
         };
@@ -4887,12 +5036,12 @@ impl ChildTools {
         drop(lease);
         if !results
             .iter()
-            .any(|result| one_line(&result.text).contains(&evidence))
+            .any(|result| holds_evidence(&result.text, &evidence))
         {
             return Err("no tool result of yours holds this evidence: quote the words a tool returned, as it returned them".to_owned());
         }
-        keep_finding(
-            path,
+        Ok((
+            path.as_path(),
             ChildFinding {
                 seq: 0,
                 at_ms: harness_runtime::now_unix_ms(),
@@ -4900,18 +5049,38 @@ impl ChildTools {
                 role,
                 fact,
                 evidence,
-                proposal: proposal.clone(),
+                proposal,
             },
-        )?;
-        self.noted.fetch_add(1, Ordering::SeqCst);
-        Ok(json!({
-            "text": if proposal.is_some() {
-                "kept, with its proposal: your parent's review keeps it as its own edit when it lasts, or else it waits for the person's review in the memory queue; nothing is written by your authority"
-            } else {
-                "kept: your parent's review reads it with the conversation and keeps what lasts"
-            },
-        }))
+        ))
     }
+}
+
+/// What a `note_finding` call settles as. A refusal wrote nothing: it is the
+/// call's known outcome, which the model may correct and call again.
+fn finding_output(result: Result<Value, Refusal>) -> Result<ToolOutput, HarnessError> {
+    match result {
+        Ok(payload) => Ok(ToolOutput::ExternalTool {
+            plugin_id: "agent".to_owned(),
+            tool_name: "note_finding".to_owned(),
+            payload,
+            inflight: 1,
+        }),
+        Err(Refusal::Refused(reason)) => Ok(ToolOutput::Denied {
+            code: ErrorCode::InvalidPayload.as_str().to_owned(),
+            reason,
+        }),
+        Err(Refusal::Failed(error)) => Err(HarnessError::new(ErrorCode::InvalidPayload, error)),
+    }
+}
+
+/// Why `note_finding` kept nothing.
+enum Refusal {
+    /// A check refused it before anything was written: a plain failure the
+    /// model corrects. As an unknown outcome ("side effect may be uncertain;
+    /// do not rerun automatically") it read as if the finding might be kept.
+    Refused(String),
+    /// The write failed, and may have kept part of it.
+    Failed(String),
 }
 
 impl ExternalToolCatalog for ChildTools {
@@ -5114,7 +5283,9 @@ impl ExternalToolDispatcher for ChildTools {
             let result = match tool_name {
                 "agent_message" => self.shared.send_from_child(&self.task_id, arguments).await,
                 "progress_note" => self.shared.progress_note(&self.task_id, arguments),
-                "note_finding" => self.note_finding(arguments).await,
+                "note_finding" => {
+                    return finding_output(self.note_finding(arguments).await);
+                }
                 _ => Err(format!("unknown agent tool {tool_name:?}")),
             };
             let payload =
@@ -5648,7 +5819,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                         return WorkerOutcome::Failed {
                             error: OrchestratorError::new(
                                 ErrorCode::RoleUnavailable,
-                                "coder worker was dispatched without its M8-03 worktree",
+                                "coder worker was dispatched without its isolated worktree",
                             ),
                         };
                     };
@@ -5670,7 +5841,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                         child_policy(&launch.parent_policy),
                         harness_tools::coding_tool_schemas_for(hashline),
                         format!(
-                            "You are a delegated coder. Work only in the assigned isolated M8-03 worktree and follow the brief. Tool calls use the host approval and policy service. Leave your changes in that worktree (committed or not) and report what changed, with paths; do not merge, push or copy them into the user's checkout and do not claim they are there - your parent brings them in with integrate_children, which merges every coder's branch, runs the project checks on the result and applies it only if the user's checkout has not changed.{spawn_line}{findings_line}"
+                            "You are a delegated coder. Work only in the isolated worktree assigned to you and follow the brief. Tool calls use the host approval and policy service. Leave your changes in that worktree (committed or not) and report what changed, with paths; do not merge, push or copy them into the user's checkout and do not claim they are there - your parent brings them in with integrate_children, which merges every coder's branch, runs the project checks on the result and applies it only if the user's checkout has not changed.{spawn_line}{findings_line}"
                         ),
                     )
                 }
@@ -6519,6 +6690,97 @@ pub(super) mod tests {
         );
     }
 
+    /// Seen in a report: children quoted lines of files they had read and
+    /// were refused, since the result holds `read_file`'s `12: ` numbers
+    /// before each line; and a payload shown as JSON holds `C:\\Users`.
+    /// Evidence is found as the model reads it; words no result holds are
+    /// still refused.
+    #[test]
+    fn evidence_is_found_without_line_numbers_or_json_escapes() {
+        let read = "read_file lib/main.dart [hash abc]:\n12: void main() {\n13#a3:   runApp(const App());\n14: }\n";
+        assert!(super::holds_evidence(
+            read,
+            "void main() {\n  runApp(const App());"
+        ));
+        assert!(super::holds_evidence(read, "12: void main() {"));
+        assert!(super::holds_evidence(read, "runApp(const App());"));
+        assert!(!super::holds_evidence(read, "runApp(const Other());"));
+        let payload = r#"web_fetch: {"path":"C:\\Users\\dev\\app.json","note":"says \"ready\""}"#;
+        assert!(super::holds_evidence(payload, r"C:\Users\dev\app.json"));
+        assert!(super::holds_evidence(payload, r#"says "ready""#));
+        assert!(super::holds_evidence(payload, r"C:\\Users\\dev"));
+        assert!(!super::holds_evidence(payload, r"C:\Users\other"));
+        // A line that only starts with digits keeps them.
+        assert_eq!(
+            super::without_read_gutters("2026 was a year"),
+            "2026 was a year"
+        );
+        // The raw words are found too, whatever a gutter would strip.
+        assert!(super::holds_evidence(
+            "meet at\n7:30 am sharp",
+            "meet at 7:30 am"
+        ));
+        // Only a file's lines lose numbers: elsewhere `7:` is the text's.
+        assert!(!super::holds_evidence(
+            "meet at\n7:30 am sharp",
+            "meet at 30 am"
+        ));
+        // A quote that is only numbers shows nothing once they are gone.
+        assert!(!super::holds_evidence(read, "123456789:"));
+        assert!(!super::holds_evidence(read, "20261110: }"));
+    }
+
+    /// Seen in a report: a coder was refused for a session in `Downloads`
+    /// ("workspace root is not a Git repository") while the project was the
+    /// repository `Downloads/NexaClip`. The refusal names it.
+    #[test]
+    fn a_coder_refused_outside_a_repository_names_the_ones_below() {
+        let root = tempfile::tempdir().expect("root");
+        assert_eq!(super::repositories_below(root.path()), "");
+        std::fs::create_dir_all(root.path().join("NexaClip").join(".git")).expect("repo");
+        std::fs::create_dir_all(root.path().join("photos")).expect("folder");
+        let said = super::repositories_below(root.path());
+        assert!(said.contains("NexaClip/"), "{said}");
+        assert!(!said.contains("photos"), "{said}");
+        assert!(said.contains("start ha in that folder"), "{said}");
+    }
+
+    /// Seen in a report: `note_finding`'s refusal of evidence no result held
+    /// came back as "side effect may be uncertain; do not rerun
+    /// automatically", though nothing was written. A check's refusal is a
+    /// plain failure; only a failed write stays an error.
+    #[tokio::test]
+    async fn a_refused_finding_is_a_plain_failure_not_an_unknown_outcome() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (sender, _events) = tokio::sync::mpsc::unbounded_channel();
+        let tools = ChildTools {
+            shared: shared(sender),
+            task_id: TaskId::generate(),
+            findings: Some(temp.path().join("harness")),
+            noted: std::sync::atomic::AtomicUsize::new(0),
+            web: None,
+            knowledge: None,
+            memory: None,
+            spawn: None,
+        };
+        for arguments in [
+            serde_json::json!({"fact": "the port is 8443", "evidence": "short"}),
+            serde_json::json!({"fact": "the port is 8443", "evidence": "port = 8443",
+                "propose": {"title": "Port", "scope": "team"}}),
+        ] {
+            let refused = tools.note_finding(&arguments).await;
+            assert!(matches!(refused, Err(super::Refusal::Refused(_))));
+            let output = super::finding_output(refused).expect("a known outcome");
+            let harness_tools::ToolOutput::Denied { code, reason } = output else {
+                panic!("{output:?}");
+            };
+            assert_eq!(code, "invalid_payload");
+            assert!(!reason.contains("uncertain"), "{reason}");
+        }
+        let failed = super::finding_output(Err(super::Refusal::Failed("disk full".to_owned())));
+        assert!(failed.is_err());
+    }
+
     /// A child's proposal rides on its finding: `propose` makes one (its
     /// content the fact when left out, global unless said), the review reads
     /// it marked as a proposal, and once settled it is no longer handed to
@@ -6543,6 +6805,20 @@ pub(super) mod tests {
                 fact
             )
             .is_err()
+        );
+        // Seen in a report: four proposals of a session's children said
+        // `scope: project`, the memory tool's own scope, and were refused.
+        let project = super::proposal_of(
+            Some(&serde_json::json!({"title": "t", "scope": "project"})),
+            fact,
+        )
+        .expect("project is a scope")
+        .expect("made");
+        assert_eq!(project.scope, "project");
+        assert_eq!(
+            ChildTools::finding_schema()["function"]["parameters"]["properties"]["propose"]["properties"]
+                ["scope"]["enum"],
+            serde_json::json!(["global", "project", "local"])
         );
         let temp = tempfile::tempdir().expect("temp dir");
         let local = temp.path().join("harness");

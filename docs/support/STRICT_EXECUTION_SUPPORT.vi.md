@@ -69,7 +69,7 @@ strict_profile_full=refused
 
 ## 3. Linux (GitHub Actions `ubuntu-latest`)
 
-Probe M12 chạy trên runner Ubuntu của [run 36423142320](https://github.com/DEVfancybear/harness-agents/actions/runs/36423142320). Năm capability của vòng đời tiến trình, môi trường, deadline và output đạt `enforced`; các giới hạn filesystem, mạng, credential socket và tài nguyên vẫn `unsupported`. `full` tiếp tục bị từ chối.
+Linux được đo một lần: probe M12 chạy trên runner Ubuntu của [run 36423142320](https://github.com/DEVfancybear/harness-agents/actions/runs/36423142320). CI không còn chạy nó trên Linux: ma trận M-gates trong [`ci.yml`](../../.github/workflows/ci.yml) chỉ có `windows-latest`. Năm capability của vòng đời tiến trình, môi trường, deadline và output đạt `enforced`; các giới hạn filesystem, mạng, credential socket và tài nguyên vẫn `unsupported`. `full` tiếp tục bị từ chối.
 
 ```text
 <!-- support-matrix:begin -->
@@ -93,8 +93,8 @@ strict_profile_full=refused
 ```
 
 `posix_process_session` tạo process group riêng. Khi tiến trình cha thoát trước các tiến trình con, runner kết thúc
-nhóm còn sống và chờ nó biến mất. Probe `P-CONT` đo cả nhánh hủy và nhánh cha thoát tự nhiên. Test A36 đối chiếu từng
-verdict ở trên với lần probe mới trên chính runner đang chạy.
+nhóm còn sống và chờ nó biến mất. Probe `P-CONT` đo cả nhánh hủy và nhánh cha thoát tự nhiên. Khi chạy trên Linux, test
+A36 đối chiếu từng verdict ở trên với lần probe mới trên chính máy đang chạy.
 
 ## 4. Residual risk (nói ra, không giấu)
 
@@ -106,7 +106,7 @@ verdict ở trên với lần probe mới trên chính runner đang chạy.
 - Một descendant thừa hưởng handle stdio *inheritable* của cha (hành vi Windows). Đó là lý do runner **giết cây
   trước khi drain output**; probe `P-CONT` ghi lại điều này.
 - `tree_cleanup = reaped_on_exit` **không** chứng minh job rỗng khi direct child thoát trước descendant. Không rò rỉ orphan (đã đo), nhưng nhãn thì mạnh hơn bằng chứng.
-- Windows và Linux đã được đo trong CI; chưa có E2E trong browser/CI hoặc connector/thông báo ra ngoài.
+- CI đo Windows ở mỗi lần chạy; Linux chỉ được đo một lần, trong run 36423142320, và CI không còn chạy nó. Chưa có E2E trong browser/CI hoặc connector/thông báo ra ngoài.
 
 ## 5. Lease, artifact và thay đổi capability
 

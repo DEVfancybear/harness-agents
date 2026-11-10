@@ -47,6 +47,7 @@ of its own, as `/preserve` does.
 | Session brief | The previous conversation's last 3 turns, bounded excerpts | The host, from the journal, no model call | A new conversation's first turn, when the previous conversation has no session log |
 | Project instructions (`AGENTS.md`, else `CLAUDE.md`) | What every session needs: conventions, commands, structure, patterns, warnings | The user, or the agent on `/preserve` | Every turn |
 | Markdown store (`memory-lint.json` projects) | Durable facts and decisions with provenance tags; daily notes | The agent, by the store's policy; the host adds session logs to daily notes | Every turn (policy and index) |
+| Memory digest (`memory.sqlite3`, global and the conversation's) | The user's preferences and decisions across projects, and a conversation's own notes: rules and pinned entries first, then the entries ranked for the request by words, recency and use | The `memory` tool, the review, `/refine`, `/learn`, Deep Dream, the learning loop | Every turn (`harness_state`, within about 3K tokens); an entry kept for some files comes instead with the first file tool result that touches a matching one ([MEMORY_STORE.en.md](MEMORY_STORE.en.md) §14.4) |
 
 ## The session log
 
@@ -135,7 +136,8 @@ too: a log written while a coder works leaves the checkout as the coder found it
 `integrate_children` still applies the coder's work. A log inside the markdown store's daily note
 stays tracked: it is the store's.
 
-**Off.** `"sessionLog": false` in `settings.json`, or `HA_SESSION_LOG=off`.
+**Off.** `"sessionLog": false` in `settings.json`, or `HA_SESSION_LOG=off`; memory's
+switch too: `HA_MEMORY_OFF=session_log` or `HA_MEMORY=off`.
 
 **Diagnostics.** Every decision is a diagnostics record of kind `session_log`, which the
 bug report reads:
@@ -171,6 +173,9 @@ The first prompt of a new conversation hears of the previous one once:
   line.
 
 Forks, imports, `/resume`, compaction and `/refinements off` add no such block.
+`HA_MEMORY_OFF=earlier_state` (or `HA_MEMORY=off`) leaves out the earlier task state
+(below) and the previous conversation's last turns; the session log's block stays
+unless `session_log` is off too.
 
 **Only a conversation that was left.** A conversation still open is not "the previous
 one": another pane of the same ha, a background agent, or a conversation another live ha
@@ -211,6 +216,8 @@ Every block a turn's context carries has a place in one budget
 | --- | --- | --- | --- |
 | `task-state` (this conversation's) | yes | 4,000 (done items as a count, the newest decisions) | - |
 | `recalled-skill` | yes | 1,500 | - |
+| `markdown-memory:policy` (a project with a markdown store) | yes | none (about 1,100 words) | - |
+| `markdown-memory:MEMORY.md` (its index) | yes | none; cut at the index's `maxChars`, 15,000 characters by default | - |
 | `harness_state` (the memory digest) | no | 3,000 | 70 |
 | `session-start` (commits, uncommitted, the baseline check) | no | 800 | 55 |
 | `earlier-task-state` | no | 1,500 | 50 |
@@ -218,6 +225,11 @@ Every block a turn's context carries has a place in one budget
 | `session-log` | no | 1,500 | 42 |
 | `knowledge-catalog` | no | 1,500 | 40 |
 | `recent-session` (the session brief) | no | 1,500 | 30 |
+
+Memory kept for some files (`paths`, 0.9.2) is not in the packet: a turn sends its first
+step's packet at every step, so such an entry comes with the first file tool result that
+touches a matching file, once per conversation until a compaction
+([MEMORY_STORE.en.md](MEMORY_STORE.en.md) §14.4).
 
 ## Commands
 

@@ -1,5 +1,5 @@
 //! When an entry holds and where its words came from (0.9.0,
-//! `docs/architecture/MEMORY_STORE.en.md` §16).
+//! `docs/architecture/MEMORY_STORE.en.md` §12).
 //!
 //! The fields 0.9.0 adds to an entry's document are all named here:
 //!

@@ -127,7 +127,12 @@ judges automatically, and `ha learning report` reads the results.
 - `HA_SELF_EVAL=auto|manual|off` overrides the setting.
 - Delegated children are never evaluated: their parent judges their result.
 - `ha exec` is evaluated as the chat is when the mode is `auto`. The mock
-  profile is not.
+  profile is not. Its judge's model calls count in `ha exec`'s
+  `upkeep_usage`, not in `usage`.
+- A judge of a turn is a review. Since 0.9.0, memory's `reviews` off
+  (`HA_MEMORY_OFF=reviews`, or `HA_MEMORY=off`) or harness refinements off
+  (`harnessRefinements`) turns self-evaluation off in the app and in `ha exec`,
+  whatever the mode; with no turn kept, `/self-eval` has none to judge.
 
 ## 6. What is kept
 
@@ -178,3 +183,7 @@ refused one reports `self_eval invalid`. Both reach the bug report.
 - `tests/milestone_m4.rs`, a real turn driver with a scripted provider:
   - `self_evaluation_sends_a_qualifying_turn_back_once`;
   - `self_evaluation_waits_behind_the_verify_reminder`.
+- Live, with a real model: `scripts/testing/live-tests/self-eval.sh` (a turn
+  that did enough is judged once and kept, a turn the verify reminder sent
+  back is not judged too, a one-line change is not judged, `HA_SELF_EVAL=off`
+  judges nothing, `/self-eval` and `ha learning report`).

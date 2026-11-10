@@ -12,8 +12,15 @@
 #      the user's own message still runs while parked (it waited forever),
 #      after the held one;
 #   4. a child told its usage limit resets in hours asks once, not three
-#      times a minute apart.
-# Sections 3 and 4 need MODEL on openai-codex: the agents reach ChatGPT through
+#      times a minute apart;
+#   5. (bug report 2026-11-10) the quiet session log that comes due while the
+#      session is parked is left to the next one - it failed with the park's
+#      error and told the user "the session log was not written:
+#      rate_limited". Its checks run in section 3 (HA_IDLE_REVIEW_SECONDS=20);
+#   6. (bug report 2026-11-10) a child of a session the limit parked makes no
+#      call on that provider - it called it a second after the park and met
+#      the same limit.
+# Sections 3 to 6 need MODEL on openai-codex: the agents reach ChatGPT through
 # quota_proxy.py, which answers with a usage limit while a flag file exists.
 # Every check prints PASS or FAIL; the conversation and the diagnostics stay in
 # $LIVE_ROOT/queue as evidence.
@@ -25,7 +32,7 @@ fresh queue
 export HA_AUTO_REFINE=off HA_PYTHON=${HA_PYTHON:-$PY} HA_DIAG=debug
 D="$HA_HOME/data/diagnostics"
 project "$RX/p"
-# Diagnostic records of one kind with their time, as `ms event key=value ...`.
+# Diagnostic records of one kind with their time, as `ms event key=value ... msg`.
 records() {
   "$PY" - "$D" "$1" <<'EOF'
 import glob, json, os, sys
@@ -39,7 +46,8 @@ for path in glob.glob(os.path.join(directory, "*.jsonl")):
             continue
         if record.get("kind") == kind:
             fields = " ".join(f"{k}={v}" for k, v in sorted(record.get("fields", {}).items()))
-            rows.append((record.get("ms", 0), f"{record.get('ms', 0)} {record.get('event')} {fields}"))
+            message = str(record.get("msg", "")).replace("\n", " ")
+            rows.append((record.get("ms", 0), f"{record.get('ms', 0)} {record.get('event')} {fields} {message}".rstrip()))
 for _, row in sorted(rows):
     print(row)
 EOF
@@ -118,6 +126,9 @@ trap 'kill $PROXY 2>/dev/null' EXIT
 for _ in $(seq 1 50); do [ -s "$X/port" ] && break; sleep 0.2; done
 # The session's provider, through the proxy: no --model, which would choose
 # the endpoint itself.
+# A quiet session log 20 s after a turn (section 5's checks): it comes due
+# while section 3's park holds.
+export HA_IDLE_REVIEW_SECONDS=20
 export HA_PROVIDER_ID=openai-codex HA_PROVIDER_PROTOCOL=openai_codex \
   HA_PROVIDER_ENDPOINT="http://127.0.0.1:$(cat "$X/port")/backend-api/codex/responses" \
   HA_PROVIDER_MODEL="${MODEL#openai-codex/}"
@@ -168,6 +179,13 @@ requests "$parked" | sed 's/^/   proxy after the park: /'
 check "the usage limit parked the session (the precondition)" '[ -n "$parked" ]'
 check "no turn started while the session was parked" '[ -n "$parked" ] && ! (records turn | awk -v since="$parked" "\$1 > since && \$2 == \"start\"" | grep -q .)'
 check "no call reached the provider while parked" '[ -n "$parked" ] && [ "$(requests "$parked" | wc -l)" -eq 0 ]'
+quiet=$(records session_log | awk -v since="$parked" '$1 > since && /trigger=quiet/')
+echo "$quiet" | sed 's/^/   session log while parked: /'
+# Met the park: failed with it (0.9.3) or left to the next write for it -
+# a write superseded by a later turn, or of too few turns, met nothing.
+check "a quiet session log came due while parked and met the park (the precondition)" '[ -n "$parked" ] && echo "$quiet" | grep -qE "reason=rate_limited|^[0-9]+ failed"'
+check "the quiet log met the park and was left to the next one, not failed" '[ -n "$quiet" ] && ! echo "$quiet" | grep -qE "^[0-9]+ failed"'
+check "the user was not told the session log was not written" '[ -n "$parked" ] && ! (records notice | awk -v since="$parked" "\$1 > since" | grep -q "session log was not written")'
 rm -f "$X/limit"
 before=$(now_ms)
 # Bounded: a parked, idle agent queued the user's message "after the active
@@ -185,6 +203,8 @@ done
 check "the user's message ran while parked" 'echo "$user_ok" | grep -q "USER-OK"'
 check "the queued message ran once the park was over" '[ -n "$ran" ]'
 "$HA" shutdown --force >/dev/null 2>&1
+# Section 4 counts each conversation's calls: no session log of its own.
+unset HA_IDLE_REVIEW_SECONDS
 
 echo "################ 4. a child told its limit resets in hours asks once"
 proxied "$RX/p" q4
@@ -210,6 +230,37 @@ most=$(requests "$limited" | awk '$2 == 429 {n[$3]++} END {m=0; for (k in n) if 
 check "the child started before the limit (the precondition)" 'records child | awk -v since="$asked" "\$1 > since && \$1 < $limited && \$2 == \"started\"" | grep -q .'
 check "the child met the limit and stopped (the precondition)" 'records child | awk -v since="$limited" "\$1 > since && \$2 == \"failed\"" | grep -q .'
 check "no conversation asked again after a limit that resets in hours" '[ "$most" -eq 1 ]'
+rm -f "$X/limit"
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 6. a parked session's child makes no call on that provider"
+proxied "$RX/p" q6
+asked6=$(now_ms)
+"$HA" send q6 "Kiểm thử harness, làm đúng thứ tự: (1) dùng tool delegate với wait=false giao cho một agent role explorer nhiệm vụ: gọi run_shell đúng một lần với command Start-Sleep -Seconds 50 và timeout_ms 120000, rồi trả lời đúng CHILD-DONE. (2) Sau khi giao, tự gọi run_shell với command Start-Sleep -Seconds 15 và timeout_ms 60000. (3) Trả lời đúng một dòng: PARENT-DONE." >/dev/null 2>&1
+for _ in $(seq 1 60); do
+  records child | awk -v since="$asked6" '$1 > since && $2 == "started"' | grep -q . && break
+  sleep 3
+done
+# Both are in their sleeps: the parent's next call meets the limit first.
+sleep 5
+limited6=$(now_ms)
+touch "$X/limit"
+parked6=""
+for _ in $(seq 1 40); do
+  parked6=$(records provider | awk -v since="$limited6" '$1 > since && $2 == "quota_parked" {print $1; exit}')
+  [ -n "$parked6" ] && break
+  sleep 3
+done
+ended6=""
+for _ in $(seq 1 60); do
+  ended6=$(records child | awk -v since="$limited6" '$1 > since && ($2 == "failed" || $2 == "settled") {print $1; exit}')
+  [ -n "$ended6" ] && break
+  sleep 3
+done
+records child | awk -v since="$asked6" '$1 > since' | sed 's/^/   /'
+requests "${parked6:-$limited6}" | sed 's/^/   proxy after the park: /'
+check "the session was parked while its child still ran (the precondition)" '[ -n "$parked6" ] && [ -n "$ended6" ] && [ "$parked6" -lt "$ended6" ]'
+check "the child's call after the park reached no provider" '[ -n "$parked6" ] && [ -n "$ended6" ] && [ "$(requests "$parked6" | awk -v end="$ended6" "\$1 <= end" | wc -l)" -eq 0 ]'
 rm -f "$X/limit"
 "$HA" shutdown --force >/dev/null 2>&1
 

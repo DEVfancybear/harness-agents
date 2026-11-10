@@ -3,7 +3,7 @@
 English | [Tiếng Việt](MEMORY_READOUT.vi.md)
 
 **Status:** shipped in 0.8.3; since 0.8.8 it reads words only (embeddings were
-removed, see [Memory store §14](MEMORY_STORE.en.md)). This adapts MEMORILLA (Fallahpour, Idehpour,
+removed, see [Memory store §10](MEMORY_STORE.en.md)). This adapts MEMORILLA (Fallahpour, Idehpour,
 Kothapalli et al., "Latent semantic memory for LLMs", arXiv 2610.21375,
 Stanford) to ha. The code is the authority.
 
@@ -77,6 +77,11 @@ tokens:
   - The result says `encoder: words`; one that recalls nothing says which
     query it read and to search again with other words.
   - The entries it shows are counted as hits (`memory_usage`).
+  - The filters are the ones `search` applies, so an entry a correction
+    superseded or the expiry pass closed is left out unless the call gives
+    `as_of`, `since`/`until` or `include_ended` ([MEMORY_STORE.en.md](MEMORY_STORE.en.md) §12.3, §12.5).
+  - An entry that cites code carries its citations and their state
+    (`citations_state`), checked as it is read ([MEMORY_STORE.en.md](MEMORY_STORE.en.md) §14.3).
   - It reads memory only; knowledge is searched with `mode: rank`.
 - **`history_search` with `mode: readout`.** The paper's continual setting: the
   conversation's past turns, user and assistant messages and tool results, are

@@ -294,7 +294,7 @@ check "it exports the global store" '"$PY" -c "import json,sys; d=json.load(open
 
 fi
 
-# 0.9.0 (docs/architecture/MEMORY_STORE.en.md §16). MEMORY_STORE_ONLY=0.9.0
+# 0.9.0 (docs/architecture/MEMORY_STORE.en.md §12). MEMORY_STORE_ONLY=0.9.0
 # runs these alone, in a fresh home: what a control run on 0.8.9 needs; and
 # MEMORY_STORE_ONLY=cite the sections of wave 2's part cite (16 to 18).
 # The global store's entries, each a JSON line of its document.
@@ -406,7 +406,7 @@ fi
 
 if [ "${MEMORY_STORE_ONLY:-cite}" = cite ]; then
 
-# Wave 2, part cite (docs/architecture/MEMORY_STORE.en.md §18).
+# Wave 2, part cite (docs/architecture/MEMORY_STORE.en.md §14).
 # MEMORY_STORE_ONLY=cite runs these alone, in a fresh home: what a control
 # run on 0.9.0 needs.
 # The requests of the run whose input holds $1, each as the number of times

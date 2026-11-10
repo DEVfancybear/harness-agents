@@ -129,6 +129,13 @@ exec` tự chấm, và `ha learning report` đọc kết quả.
 - Agent con được ủy quyền không bao giờ bị chấm: agent cha phán đoán kết quả
   của chúng.
 - `ha exec` được chấm như chat khi chế độ là `auto`. Mock profile thì không.
+  Các lần gọi model của bộ chấm được tính vào `upkeep_usage` của `ha exec`,
+  không vào `usage`.
+- Chấm một lượt là một review. Từ 0.9.0, tắt `reviews` của memory
+  (`HA_MEMORY_OFF=reviews`, hoặc `HA_MEMORY=off`) hoặc tắt harness refinements
+  (`harnessRefinements`) sẽ tắt tự đánh giá trong app và trong `ha exec`, bất
+  kể chế độ nào; khi không có lượt nào được giữ, `/self-eval` không có gì để
+  chấm.
 
 ## 6. Những gì được lưu
 
@@ -178,3 +185,7 @@ bị từ chối báo `self_eval invalid`. Cả hai đều có mặt trong bug r
 - `tests/milestone_m4.rs`, turn driver thật với provider theo kịch bản:
   - `self_evaluation_sends_a_qualifying_turn_back_once`;
   - `self_evaluation_waits_behind_the_verify_reminder`.
+- Live, với model thật: `scripts/testing/live-tests/self-eval.sh` (lượt đã làm
+  đủ việc được chấm một lần và được lưu, lượt bị verify reminder gửi lại thì
+  không bị chấm thêm, thay đổi một dòng không bị chấm, `HA_SELF_EVAL=off` không
+  chấm gì, `/self-eval` và `ha learning report`).

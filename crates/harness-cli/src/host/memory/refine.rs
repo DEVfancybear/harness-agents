@@ -1330,6 +1330,14 @@ impl Refinement {
         self.edits().is_empty()
     }
 
+    /// How many edits the refinement made, and how many of them applied.
+    #[must_use]
+    pub fn edit_counts(&self) -> (usize, usize) {
+        let edits = self.edits();
+        let applied = edits.iter().filter(|edit| edit["applied"] == true).count();
+        (edits.len(), applied)
+    }
+
     /// The edits that count: an intent refused and then handed to the repair
     /// pass is reported apart, not as a failure.
     fn edits(&self) -> Vec<&Value> {
@@ -2090,8 +2098,18 @@ fn apply(
                 "updated_at": now(),
                 "version": before["version"].as_i64().map_or(1, |version| version + 1),
             });
-            // A project's entry stays that project's.
-            if let Some(project) = before.get("project").filter(|project| !project.is_null()) {
+            // A project's entry stays that project's, and a new one proposed
+            // for this project (`scope: project`) is kept for it: untagged, a
+            // child's fact about one project reached every project.
+            if let Some(project) = before
+                .get("project")
+                .filter(|project| !project.is_null())
+                .or_else(|| {
+                    edit.0
+                        .get("project")
+                        .filter(|project| project["key"].is_string() && before.is_null())
+                })
+            {
                 after["project"] = project.clone();
             }
             // When it holds and what it corrected stay too: an update that
@@ -2557,7 +2575,10 @@ pub fn settle_child_proposals(
     scopes: &HarnessScopes,
     refinements: &[Refinement],
     findings: &[super::delegation::ChildFinding],
+    learning: Option<&Learning>,
 ) -> Vec<ProposalOutcome> {
+    // The project a `scope: project` proposal is kept for.
+    let project = lesson_project(learning);
     let edits = refinements
         .iter()
         .flat_map(|refinement| {
@@ -2614,7 +2635,7 @@ pub fn settle_child_proposals(
                 queued: None,
                 newly_queued: false,
             },
-            None => queue_child_proposal(scopes, finding, proposed),
+            None => queue_child_proposal(scopes, finding, proposed, project.as_ref()),
         };
         outcomes.push(outcome);
     }
@@ -2627,9 +2648,37 @@ fn queue_child_proposal(
     scopes: &HarnessScopes,
     finding: &super::delegation::ChildFinding,
     proposed: &super::delegation::ChildProposal,
+    project: Option<&super::lessons::ProjectRef>,
 ) -> ProposalOutcome {
-    let global = proposed.scope == "global";
+    let refused = |note: String| ProposalOutcome {
+        seq: finding.seq,
+        closed: "refused",
+        note,
+        queued: None,
+        newly_queued: false,
+    };
+    // A project's fact is kept in the global store for its project, as the
+    // memory tool's `scope: project` keeps one; a project that keeps a
+    // markdown store keeps it there instead.
+    let tag = if proposed.scope == "project" {
+        let Some(project) = project else {
+            return refused("this conversation has no project, so no project entries".to_owned());
+        };
+        if Path::new(&project.root)
+            .join(super::markdown_memory::CONFIG_FILE)
+            .is_file()
+        {
+            return refused(MARKDOWN_STORE_REFUSAL.to_owned());
+        }
+        Some(json!({"key": project.key, "name": project.name}))
+    } else {
+        None
+    };
+    let global = proposed.scope != "local";
     let mut fields = Map::new();
+    if let Some(tag) = tag {
+        fields.insert("project".to_owned(), tag);
+    }
     fields.insert("action".to_owned(), json!("create"));
     fields.insert("kind".to_owned(), json!("memory"));
     fields.insert("title".to_owned(), json!(proposed.title));
@@ -2658,13 +2707,6 @@ fn queue_child_proposal(
             "finding": finding.seq,
         })),
         ..Proposal::default()
-    };
-    let refused = |note: String| ProposalOutcome {
-        seq: finding.seq,
-        closed: "refused",
-        note,
-        queued: None,
-        newly_queued: false,
     };
     match apply(
         scopes,
@@ -3614,14 +3656,19 @@ impl Edit {
 
     /// An automatic review's memory edit meant for every conversation.
     fn wants_global(&self) -> bool {
-        self.text("kind") == Some("memory")
-            && (self.text("scope") == Some("global")
-                || self
-                    .0
-                    .get("metadata")
-                    .and_then(|metadata| metadata.get("scope"))
-                    .and_then(Value::as_str)
-                    == Some("global"))
+        let scope = self.text("scope").or_else(|| {
+            self.0
+                .get("metadata")
+                .and_then(|metadata| metadata.get("scope"))
+                .and_then(Value::as_str)
+        });
+        self.text("kind") == Some("memory") && matches!(scope, Some("global" | "project"))
+    }
+
+    /// A memory edit kept for this conversation's project: the global store's,
+    /// tagged with the project.
+    fn for_project(&self) -> bool {
+        self.text("kind") == Some("memory") && self.text("scope") == Some("project")
     }
 }
 
@@ -4131,7 +4178,7 @@ pub async fn auto_refine(
     proposal.proposer = Some("review");
     // A global edit reaches every conversation, so it carries the quote that
     // justifies it; one without stays in this conversation.
-    let (global_edits, local_edits): (Vec<_>, Vec<_>) = std::mem::take(&mut proposal.edits)
+    let (mut global_edits, local_edits): (Vec<_>, Vec<_>) = std::mem::take(&mut proposal.edits)
         .into_iter()
         .partition(|edit| {
             edit.wants_global()
@@ -4139,6 +4186,19 @@ pub async fn auto_refine(
                     .text("evidence")
                     .is_some_and(|evidence| !evidence.trim().is_empty())
         });
+    // A memory edit for this project (`scope: project`, as a child proposes
+    // one) is the global store's, kept for the project; with no project it
+    // is an ordinary global entry, which names the project in its words.
+    if let Some(project) = &project {
+        for edit in &mut global_edits {
+            if edit.for_project() {
+                edit.0.insert(
+                    "project".to_owned(),
+                    json!({"key": project.key, "name": project.name}),
+                );
+            }
+        }
+    }
     // A project that keeps a markdown store keeps its facts in it: a memory
     // edit about that project, global or local, would be the same fact in a
     // second place. The prompt says so; this holds when the model does not.
@@ -9248,7 +9308,7 @@ Run `node scripts/build.js`.
             )
         };
         let kept = apply(&scopes, &review, "refine_1", true, None, None, None).expect("applied");
-        let outcomes = super::settle_child_proposals(&scopes, &[kept], &findings);
+        let outcomes = super::settle_child_proposals(&scopes, &[kept], &findings, None);
         assert_eq!(outcomes[0].closed, "kept", "{outcomes:?}");
         assert_eq!(outcomes[1].closed, "queued", "{outcomes:?}");
         assert!(outcomes[1].newly_queued);
@@ -9268,9 +9328,100 @@ Run `node scripts/build.js`.
                 "mdbook build docs",
                 "Docs",
             )],
+            None,
         );
         assert_eq!(dropped[0].closed, "dropped");
         assert_eq!(memory_queue::all(data).len(), 1);
+    }
+
+    /// Seen in a report: a child's fact about one project (`scope:
+    /// project`) was kept in the global store untagged, so it reached every
+    /// project. It waits tagged with its project, and accepted it is that
+    /// project's entry; a conversation with no project, or a project that
+    /// keeps a markdown store, refuses it.
+    #[test]
+    fn a_childs_project_proposal_is_kept_for_its_project() {
+        use super::super::memory_queue::{self, ReviewMode};
+        let directory = tempfile::tempdir().expect("dir");
+        let data = directory.path().join("data");
+        let root = directory.path().join("NexaClip");
+        std::fs::create_dir_all(&root).expect("root");
+        let scopes = data_scopes(&data, ReviewMode::Policy);
+        let project = super::super::lessons::ProjectRef {
+            key: "project-0b55fb557325e05a".to_owned(),
+            name: "NexaClip".to_owned(),
+            root: root.display().to_string(),
+        };
+        let finding = super::super::delegation::ChildFinding {
+            seq: 1,
+            at_ms: 1,
+            child: "verifier-1".to_owned(),
+            role: "verifier".to_owned(),
+            fact: "In NexaClip the history store keeps 200 entries".to_owned(),
+            evidence: "const maxEntries = 200;".to_owned(),
+            proposal: Some(super::super::delegation::ChildProposal {
+                scope: "project".to_owned(),
+                path: "project/history".to_owned(),
+                title: "History size".to_owned(),
+                content: "In NexaClip the history store keeps 200 entries".to_owned(),
+                closed: None,
+                note: None,
+                queued: None,
+            }),
+        };
+        let proposed = finding.proposal.clone().expect("proposal");
+        let none = super::queue_child_proposal(&scopes, &finding, &proposed, None);
+        assert_eq!(none.closed, "refused", "{none:?}");
+        let outcome = super::queue_child_proposal(&scopes, &finding, &proposed, Some(&project));
+        assert_eq!(outcome.closed, "queued", "{outcome:?}");
+        let waiting = memory_queue::all(&data);
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].item.scope, "global");
+        assert_eq!(
+            waiting[0].item.edit["project"]["key"],
+            "project-0b55fb557325e05a"
+        );
+        super::accept_queued(&scopes, &waiting[0].item).expect("accepted");
+        let state = load_raw(&scopes.global);
+        let entry = state["entries"]["memory"]
+            .as_object()
+            .expect("entries")
+            .values()
+            .find(|entry| entry["title"] == "History size")
+            .expect("the accepted entry");
+        assert_eq!(
+            entry["project"]["key"], "project-0b55fb557325e05a",
+            "{entry}"
+        );
+        assert_eq!(entry["project"]["name"], "NexaClip", "{entry}");
+        // A project that keeps a markdown store keeps the fact there.
+        std::fs::write(
+            root.join(super::super::markdown_memory::CONFIG_FILE),
+            "version = 1\n",
+        )
+        .expect("store");
+        let beside = super::queue_child_proposal(&scopes, &finding, &proposed, Some(&project));
+        assert_eq!(beside.closed, "refused", "{beside:?}");
+        assert!(beside.note.contains("markdown"), "{}", beside.note);
+    }
+
+    /// The review keeps a child's project proposal as its own edit with
+    /// `"scope": "project"`: a global edit, tagged before it is applied.
+    #[test]
+    fn a_project_edit_is_a_global_one_for_the_project() {
+        let edit = |scope: &str| {
+            super::Edit(
+                json!({"action": "create", "kind": "memory", "title": "t", "content": "c", "scope": scope})
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            )
+        };
+        assert!(edit("project").wants_global());
+        assert!(edit("project").for_project());
+        assert!(edit("global").wants_global());
+        assert!(!edit("global").for_project());
+        assert!(!edit("local").wants_global());
     }
 
     /// A change that would wait while its queue cannot be read neither waits

@@ -147,5 +147,7 @@ bằng cách chuyển và gán lại như trên. Store cũ được gọi bằng
 (`project-` và 16 chữ số hex) hoặc bằng thư mục project từng ở: key thư mục đó
 có, key nó có trước 0.8.8, hoặc store mà manifest hay các thư mục đã đăng ký
 nêu tên thư mục đó (dấu phân cách và, trên Windows, chữ hoa thường không quan
-trọng). Lệnh bị từ chối khi key hiện tại đã có store riêng, hoặc có gì đó đang
-giữ store cũ.
+trọng). Thư mục không còn tồn tại được viết lại từ thư mục cha gần nhất còn
+tồn tại, nên một đường dẫn cũ gõ theo tên ngắn 8.3 của Windows (`RUNNER~1`) hay
+qua symlink vẫn chỉ đúng store đó. Lệnh bị từ chối khi key hiện tại đã có store
+riêng, hoặc có gì đó đang giữ store cũ.

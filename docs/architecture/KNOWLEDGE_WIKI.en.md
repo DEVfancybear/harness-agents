@@ -110,4 +110,4 @@ page(s) over S of their readable sources (ratio R, kept under 1.00)`.
 - It does not fetch a URL to check a page: only workspace files and the
   project's conversations are sources it can read.
 - It is not a curator of memory entries: Deep Dream is
-  ([MEMORY_STORE.en.md](MEMORY_STORE.en.md), section 17).
+  ([MEMORY_STORE.en.md](MEMORY_STORE.en.md), section 13).

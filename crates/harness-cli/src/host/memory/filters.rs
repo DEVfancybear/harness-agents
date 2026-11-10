@@ -1,5 +1,5 @@
 //! memory-engine's search filters, on memory entries
-//! (`docs/architecture/MEMORY_STORE.en.md` §6.4).
+//! (`docs/architecture/MEMORY_STORE.en.md` §6.3).
 //!
 //! memory-engine filters in Postgres: `ltree` lquery and ltxtquery for the
 //! tree, `@>` for meta, a SQL/JSON path predicate (`@@`) for `metaPredicate`,
