@@ -357,6 +357,23 @@ for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3"
 sys.exit(0 if found else 1)
 EOF
 }
+# loaded <task> <text>: as `requested`, outside the harness state's list of
+# recent refinements. That list quotes each refinement's summary and outcome
+# in the review's own words, which may name what an entry says; whether a
+# scoped entry was loaded is judged by the rest of the request.
+loaded() {
+  "$PY" - "$D" "$1" "$2" <<'EOF'
+import glob, os, re, sqlite3, sys
+found = False
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    for (text,) in c.execute("select request_json from frozen_requests where task_id = ? order by rowid", (sys.argv[2],)):
+        text = re.sub(r"- \[refine_[^\]]*\][^\n]*", "", text.replace("\\n", "\n"))
+        if sys.argv[3] in text:
+            found = True
+sys.exit(0 if found else 1)
+EOF
+}
 # calls5 <marker>: the tool calls of the conversation whose input holds <marker>, as `name arguments` lines.
 calls5() {
   "$PY" - "$D" "$1" <<'EOF'
@@ -422,7 +439,7 @@ for attempt in 1 2; do
   if [ -n "$T5C" ] && calls5 "MARKER_Q5_PLAIN_$attempt" | grep -q '^read_file.*README.md' && ! calls5 "MARKER_Q5_PLAIN_$attempt" | grep -q 'billing'; then held5c=$attempt; break; fi
 done
 check "precondition: that turn read README.md and touched no billing file (attempt ${held5c:-none})" '[ -n "$held5c" ]'
-check "the updated entry is in no request of a turn that touches no billing file" '[ -n "$held5c" ] && requested "$T5C" "MARKER_Q5_PLAIN_$held5c" && ! requested "$T5C" rm-5522 && ! records memory scoped_loaded "$since5" | grep -q .'
+check "the updated entry is in no request of a turn that touches no billing file" '[ -n "$held5c" ] && requested "$T5C" "MARKER_Q5_PLAIN_$held5c" && ! loaded "$T5C" rm-5522 && ! records memory scoped_loaded "$since5" | grep -q .'
 # And one that reads a billing file loads it, with that result.
 held5d=""
 for attempt in 1 2; do
