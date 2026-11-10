@@ -199,6 +199,13 @@ Hai biến điều chỉnh:
 - `HA_CACHE_LIFETIME`: thời gian lưu cache (tính bằng giây) cho một provider.
 - `HA_FRESH_START_MIN_TOKENS`: hội thoại nhỏ hơn mức này luôn được dùng tiếp.
 
+## Jev lái desktop
+
+`computer_use.pilot(task, ...)` của skill `computer-use` giao desktop Windows cho Jev làm một việc hẹp, như System
+One Computer Use: mỗi bước là một lần gọi Jev với ảnh chụp màn hình làm image asset (`assets` trong `jev.decide`,
+gửi kèm image header của TypeSafe) và ba câu hỏi - `choice` hành động, `box` chỗ bấm, `choice` chữ cần gõ, chỉ lấy
+từ task. Chỉ cần key TypeSafe, không cần `/jev on`. Xem [COMPUTER_USE.md](COMPUTER_USE.md).
+
 ## Cấu hình
 
 `settings.json`, nằm cạnh config của người dùng:

@@ -30,6 +30,23 @@ result = await computer_use.run([
 
 The result includes the raw screenshot path, raw/preview dimensions, preview-to-screen scale and completed action count. Coordinates are read in the last screenshot the model was shown (`space="preview"`, the default), the way computer-use models act in the image they see; the skill maps them to primary-display pixels, and refuses a batch if the screen changed size since that screenshot. `space="screen"` takes raw pixels. `zoom([x, y, width, height])` shows a region at full resolution for small text without changing the full screenshot coordinate frame used by later preview-space actions. Actions include `drag` (held in steps), horizontal `scroll`, and `type` in any language: ASCII the layout types safely goes as keystrokes, everything else as Unicode input (`SendInput` with `KEYEVENTF_UNICODE`; PyAutoGUI alone drops such characters silently). Secondary displays and locked/headless desktops are not supported. No clipboard changes. The newest 100 captures are kept.
 
+## Jev as the pilot
+
+`computer_use.pilot(task, texts=[...], websites=[...], max_steps=30, dry_run=False)` ports System One Computer Use
+(brainstormity/System-One-Computer-Use, MIT) onto this skill's input: TypeSafe's Jev sees each screenshot and picks
+the next action, where, and which offered text to type; the step runs as a bounded batch and the next screenshot is
+taken once the screen has reacted and settled. Jev may type only quoted text, `texts` and 1-3 word phrases of the
+task, and open only `websites` and URLs in the task. It stops below 50% confidence (25% for scroll, wait, opening a
+website), after 5 unchanged screens or `max_steps`, and zooms in to re-ask an unsure click. Reports, with one
+annotated screenshot per step, stay in `.harness/artifacts/computer-use/pilot/` (the newest 20). It needs the `jev`
+skill and a TypeSafe key (`/login typesafe`); screenshots are sent to TypeSafe. `run(..., settle=True)` waits the
+same way and returns `screen_changed`.
+
+Left out: the dashboard, closing browser tabs, clipboard link copy/paste, the site and app name tables, and Android
+over adb (no device to test it live yet).
+
+The live check is `scripts/testing/live-tests/computer-pilot.sh` (a TypeSafe key, the model, and a free desktop).
+
 ## Safety and limits
 
 Layout modifiers come from Windows, not a US punctuation table; unsafe mappings reject the whole batch before input. Start with Caps Lock off and user-held modifiers released. Raw PNG captures stay lossless and are bounded to 36MP. Noisy 4K captures may exceed the arbitrary-file `attach_image` source limit of 20MB; computer-use feeds its own capture through the shared preview encoder. Previews keep the 1200-pixel edge and 350,000-base64-character budgets.

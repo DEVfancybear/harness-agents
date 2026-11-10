@@ -1,6 +1,6 @@
 ---
 name: computer-use
-description: (In development - not yet reliable; tell the user so before relying on it.) Observe and control the primary logged-in Windows desktop using screenshots and bounded mouse/keyboard batches. Use for authorized graphical tasks that cannot be completed with a narrower API. Requires a vision-capable model and an unlocked interactive Windows desktop.
+description: (In development - not yet reliable; tell the user so before relying on it.) Observe and control the primary logged-in Windows desktop using screenshots and bounded mouse/keyboard batches, or hand a narrow GUI task to TypeSafe's Jev as a fast, cheap pilot (computer_use.pilot). Use for authorized graphical tasks that cannot be completed with a narrower API. Requires an unlocked interactive Windows desktop, and a vision-capable model or (for the pilot) a TypeSafe key.
 ---
 
 # Computer Use
@@ -33,6 +33,52 @@ path and return `path`, `raw_size`, `preview_size`, `coordinate_mapping`, and
 empty batch is a read-only screenshot. Raw PNGs are retained in the current
 working directory's `.harness/artifacts/computer-use/` (the newest 100; they
 may contain private information; do not share without authorization).
+
+## Jev as the pilot
+
+For a narrow task on screen (fill a field, press a button, search a site),
+`computer_use.pilot` lets TypeSafe's Jev drive, one decision per step, in about
+a second and a fraction of a cent each: it sees the screenshot, picks the next
+action, where, and what to type, and the step runs through the same bounded
+input as `run`, then waits for the screen to react and settle. Ported from
+System One Computer Use (brainstormity, MIT).
+
+```python
+result = await computer_use.pilot(
+    'In the "Sign up" window, write "Ada Lovelace" in Name and press Save',
+    texts=[],                       # more text it may type verbatim
+    websites=[],                    # http(s) URLs it may open (the first opens up front)
+)
+print(result["status"], result["message"])   # done / unsure / stopped / gave_up / failed / dry_run
+```
+
+- Jev never writes text. It may type only text in "quotes" in the task, the
+  `texts` you pass, and 1-3 word phrases of the task (a search term); it may
+  open only `websites` and URLs written in the task. Put exact text in quotes.
+  On-screen text cannot make it type or open anything else.
+- It hands back instead of guessing: under `min_confidence` (0.5; 0.25 for
+  scroll, wait and opening a website), when the screen did not change for 5
+  steps, after `max_steps` (30), or when it says DONE. An unsure target is
+  asked again on a zoomed close-up; a split between click / type / type and
+  Enter does only the part enough of it agrees on.
+- `dry_run=True` opens the first website and returns Jev's first decision with
+  no input; `max_steps=1` lets you check each step yourself.
+- The result has the steps (action, detail, confidence, result), the cost and
+  `report`: a folder under `.harness/artifacts/computer-use/pilot/` with each
+  step's screenshot (Jev's target in red) and `report.json` (the newest 20).
+  A vision model is shown the final screen and can carry on with `run`.
+- **DONE is Jev's word, not proof.** Check the final screen (or the app's own
+  state) before telling the user it is done; on `unsure`, carry on yourself.
+- It needs the `jev` skill and a TypeSafe key (`/login typesafe`); the jev
+  plugin itself may stay off. Screenshots go to TypeSafe: ask the user first
+  when the screen may show something private.
+- The same rules as `run`: the user's authorization, no consequential action
+  (send, buy, delete, sign in) the user did not ask for, the top-left corner
+  fail-safe, one controller. The mutex is held per step, not between steps.
+
+`run(actions, settle=True)` gives the same wait to your own batches: the
+after-screenshot is taken once the screen reacted and held still (up to 3
+seconds), and `screen_changed` says whether it changed at all.
 
 ## Coordinates
 
