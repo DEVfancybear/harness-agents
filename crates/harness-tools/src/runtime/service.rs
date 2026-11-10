@@ -3005,6 +3005,7 @@ fn git_output(operation: &str, output: ProcessResult) -> ToolOutput {
                 "this workspace is not a Git repository, so git {operation} has nothing to show; the file tools work without one, and `git init` starts one when the user wants it"
             ),
             truncated: false,
+            exit_code: output.exit_code,
         };
     }
     let combined = if output.stderr.is_empty() {
@@ -3018,6 +3019,7 @@ fn git_output(operation: &str, output: ProcessResult) -> ToolOutput {
         operation: operation.to_owned(),
         output: redact_text(&combined),
         truncated: output.stdout_truncated || output.stderr_truncated,
+        exit_code: output.exit_code,
     }
 }
 

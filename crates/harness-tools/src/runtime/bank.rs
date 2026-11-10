@@ -66,7 +66,7 @@ pub fn action_bank_schema() -> Value {
         "type": "function",
         "function": {
             "name": ACTION_BANK_TOOL,
-            "description": format!("Queue tool calls you have already fully decided, so the harness runs them after the calls you make now without calling you again. Call it IN THE SAME RESPONSE as the calls it follows, as one more parallel tool call: for example write_file, write_file and action_bank with node `test` (after `root`, when `ok`) running the tests, then node `commit` (after `test`, when `ok`). `root` is the other calls of that response; a node can also follow another node. A bank called alone in a response saves nothing for its first node, which only runs where your own call would have. Use it only when the next commands are already determined and their arguments are complete and literal; never bank a call whose arguments depend on output you have not seen yet. After each call settles, the one node that follows it and whose `when` guard holds on its result runs; if none holds, or the result is unclear, you are asked as usual and see every call the harness ran with its result. Guards: `ok`, `failed`, `exit_code: N`, `output_contains: \"text\"`, `output_lacks: \"text\"`, `changed` (a write changed its file). Keep banks small (at most {MAX_BANK_NODES} nodes); a new action_bank replaces the nodes not run yet, and each node runs at most once. Approvals and checks apply to banked calls as to your own."),
+            "description": format!("Queue tool calls you have already fully decided, so the harness runs them after the calls you make now without calling you again. Call it IN THE SAME RESPONSE as the calls it follows, as one more parallel tool call: for example write_file, write_file and action_bank with node `test` (after `root`, when `ok`) running the tests, then node `commit` (after `test`, when `ok`). `root` is the other calls of that response; a node can also follow another node. A bank called alone in a response saves nothing for its first node, which only runs where your own call would have. Use it only when the next commands are already determined and their arguments are complete and literal; never bank a call whose arguments depend on output you have not seen yet. After each call settles, the one node that follows it and whose `when` guard holds on its result runs; if none holds, or the result is unclear, you are asked as usual and see every call the harness ran with its result. Guards: `ok` (every call succeeded), `failed` (one ran and failed), `exit_code: N` (every process exited N), `output_contains: \"text\"`, `output_lacks: \"text\"`, `changed` (a write changed its file). Keep banks small (at most {MAX_BANK_NODES} nodes); a new action_bank replaces the nodes not run yet, and each node runs at most once. Approvals and checks apply to banked calls as to your own."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -166,7 +166,14 @@ impl Guard {
             (_, Status::Unclear) => false,
             (Self::Ok, status) => status == Status::Ok,
             (Self::Failed, status) => status == Status::Failed,
-            (Self::ExitCode(code), _) => receipt.exit_code == Some(*code),
+            // Every process the call (or the root) ran exited with the code;
+            // `exit_code: 0` also needs no part to have failed, so a build
+            // that broke beside a status that passed does not read as 0.
+            (Self::ExitCode(code), status) => {
+                !receipt.exit_codes.is_empty()
+                    && receipt.exit_codes.iter().all(|exit| *exit == Some(*code))
+                    && (*code != 0 || status == Status::Ok)
+            }
             (Self::OutputContains(text), _) => receipt.text.contains(text.as_str()),
             (Self::OutputLacks(text), _) => !receipt.text.contains(text.as_str()),
             (Self::Changed, status) => status == Status::Ok && receipt.changed,
@@ -372,6 +379,10 @@ pub enum Status {
     /// It ran and succeeded.
     #[default]
     Ok,
+    /// It ran, but its result does not say whether it succeeded (a plugin
+    /// or MCP tool's payload): `ok` and `failed` do not hold on it, its text
+    /// can still be tested.
+    Ran,
     /// It ran and failed: a non-zero exit, a timeout.
     Failed,
     /// Not clear: refused, denied, malformed, interrupted or of unknown
@@ -379,13 +390,27 @@ pub enum Status {
     Unclear,
 }
 
+impl Status {
+    /// The status of two results read as one: unclear before failed before
+    /// ran before ok.
+    const fn with(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unclear, _) | (_, Self::Unclear) => Self::Unclear,
+            (Self::Failed, _) | (_, Self::Failed) => Self::Failed,
+            (Self::Ran, _) | (_, Self::Ran) => Self::Ran,
+            _ => Self::Ok,
+        }
+    }
+}
+
 /// The public result of a call (or of the root's calls together), as guards
 /// read it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Receipt {
     pub status: Status,
-    /// The last process exit code among the calls, when one ran.
-    pub exit_code: Option<i32>,
+    /// How each process (or git command) of the calls exited, in order;
+    /// `None` for one with no exit code (killed at its time-out).
+    pub exit_codes: Vec<Option<i32>>,
     /// What the model is shown of the result.
     pub text: String,
     /// Whether a write, edit or patch changed its file.
@@ -398,7 +423,12 @@ impl Receipt {
     /// The receipt of a finished call that reached the gate.
     #[must_use]
     pub fn of_view(view: &ToolExecutionView, text: &str) -> Self {
-        let (status, exit_code, changed) = match &view.output {
+        let exited = |code: Option<i32>| match code {
+            Some(0) => Status::Ok,
+            Some(_) => Status::Failed,
+            None => Status::Ran,
+        };
+        let (status, exit_codes, changed) = match &view.output {
             ToolOutput::Process {
                 exit_code,
                 timed_out,
@@ -412,8 +442,9 @@ impl Receipt {
                 } else {
                     Status::Ok
                 };
-                (status, *exit_code, false)
+                (status, vec![*exit_code], false)
             }
+            ToolOutput::Git { exit_code, .. } => (exited(*exit_code), vec![*exit_code], false),
             ToolOutput::WriteFile {
                 before_hash,
                 after_hash,
@@ -428,15 +459,27 @@ impl Receipt {
                 before_hash,
                 after_hash,
                 ..
-            } => (Status::Ok, None, before_hash != after_hash),
+            } => (Status::Ok, Vec::new(), before_hash != after_hash),
+            // These tools answer a failure with an error, never with a result.
+            ToolOutput::ReadFile { .. }
+            | ToolOutput::ListFiles { .. }
+            | ToolOutput::SearchText { .. }
+            | ToolOutput::Glob { .. }
+            | ToolOutput::FindFiles { .. }
+            | ToolOutput::ProcessOutput { .. }
+            | ToolOutput::HistorySearch { .. }
+            | ToolOutput::HistoryRead { .. }
+            | ToolOutput::TaskUpdate { .. }
+            | ToolOutput::SkillActivated { .. } => (Status::Ok, Vec::new(), false),
+            // A plugin or MCP tool's payload may hold its own error.
+            ToolOutput::ExternalTool { .. } => (Status::Ran, Vec::new(), false),
             ToolOutput::Denied { .. } | ToolOutput::OutcomeUnknown { .. } => {
-                (Status::Unclear, None, false)
+                (Status::Unclear, Vec::new(), false)
             }
-            _ => (Status::Ok, None, false),
         };
         Self {
             status,
-            exit_code,
+            exit_codes,
             text: text.to_owned(),
             changed,
             receipt_ids: view
@@ -469,20 +512,14 @@ impl Receipt {
     }
 
     /// Several receipts read as one, as the root's calls are: unclear if any
-    /// is, failed if any failed, the last exit code, every text.
+    /// is, failed if any failed, every exit code, every text.
     #[must_use]
     pub fn combined(parts: Vec<Self>) -> Self {
         let mut combined = Self::default();
         let mut texts = Vec::new();
         for part in parts {
-            combined.status = match (combined.status, part.status) {
-                (Status::Unclear, _) | (_, Status::Unclear) => Status::Unclear,
-                (Status::Failed, _) | (_, Status::Failed) => Status::Failed,
-                _ => Status::Ok,
-            };
-            if part.exit_code.is_some() {
-                combined.exit_code = part.exit_code;
-            }
+            combined.status = combined.status.with(part.status);
+            combined.exit_codes.extend(part.exit_codes);
             combined.changed |= part.changed;
             combined.receipt_ids.extend(part.receipt_ids);
             texts.push(part.text);
@@ -497,7 +534,7 @@ impl Receipt {
         short_hash(&format!(
             "{:?}|{:?}|{}|{}|{}",
             self.status,
-            self.exit_code,
+            self.exit_codes,
             self.changed,
             self.receipt_ids.join(","),
             self.text
@@ -544,10 +581,23 @@ pub trait BankSelector: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Selection> + Send + 'a>>;
 }
 
+/// How long the bank's selector may take before the model is asked instead.
+pub const SELECTOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The action bank of one driver: whether it is on, and its selector.
 #[derive(Clone, Default)]
 pub struct ActionBank {
     pub selector: Option<std::sync::Arc<dyn BankSelector>>,
+    /// How long the selector may take; `None` for [`SELECTOR_TIMEOUT`].
+    pub timeout: Option<std::time::Duration>,
+}
+
+impl ActionBank {
+    /// How long the selector may take before the model is asked instead.
+    #[must_use]
+    pub fn selector_timeout(&self) -> std::time::Duration {
+        self.timeout.unwrap_or(SELECTOR_TIMEOUT)
+    }
 }
 
 impl std::fmt::Debug for ActionBank {
@@ -555,6 +605,7 @@ impl std::fmt::Debug for ActionBank {
         formatter
             .debug_struct("ActionBank")
             .field("selector", &self.selector.is_some())
+            .field("timeout", &self.timeout)
             .finish()
     }
 }
@@ -706,6 +757,12 @@ impl BankState {
             .map(|node| node.id.clone())
             .collect::<Vec<_>>();
         self.discard(&ids, Discard::NotChosen);
+    }
+
+    /// A node chosen to run is dropped before it ran: the user said something
+    /// the model must read first.
+    pub fn withdrawn(&mut self, id: &str) {
+        self.discard(&[id.to_owned()], Discard::Deferred);
     }
 
     /// The model must read this boundary: the ready nodes are dropped.
@@ -863,7 +920,7 @@ mod tests {
                 Some(_) => Status::Failed,
                 None => Status::Unclear,
             },
-            exit_code: code,
+            exit_codes: vec![code],
             text: stdout.to_owned(),
             ..Receipt::default()
         }
@@ -911,7 +968,7 @@ mod tests {
     fn the_root_is_read_as_one_result() {
         let both = Receipt::combined(vec![Receipt::answered("wrote a"), process(Some(0), "ok")]);
         assert_eq!(both.status, Status::Ok);
-        assert_eq!(both.exit_code, Some(0));
+        assert_eq!(both.exit_codes, [Some(0)]);
         let one_failed = Receipt::combined(vec![process(Some(1), "x"), process(Some(0), "y")]);
         assert_eq!(one_failed.status, Status::Failed);
         let unclear = Receipt::combined(vec![process(Some(0), "y"), Receipt::unclear("denied")]);
@@ -919,6 +976,82 @@ mod tests {
         assert!(
             Receipt::combined(Vec::new()).status == Status::Ok,
             "no root calls: ok"
+        );
+    }
+
+    /// A root of two processes, a build that broke and a status that passed,
+    /// is not `exit_code: 0`: the guard holds only when every process exited
+    /// with the code, and 0 also needs no part to have failed.
+    #[test]
+    fn an_exit_code_holds_only_when_every_process_exited_with_it() {
+        let broken = Receipt::combined(vec![process(Some(101), "error"), process(Some(0), "")]);
+        assert!(!Guard::ExitCode(0).holds(&broken));
+        assert!(!Guard::ExitCode(101).holds(&broken));
+        let both = Receipt::combined(vec![process(Some(0), ""), process(Some(0), "")]);
+        assert!(Guard::ExitCode(0).holds(&both));
+        let failed_write = Receipt::combined(vec![
+            process(Some(0), ""),
+            Receipt {
+                status: Status::Failed,
+                ..Receipt::default()
+            },
+        ]);
+        assert!(!Guard::ExitCode(0).holds(&failed_write));
+        let killed = Receipt {
+            status: Status::Failed,
+            exit_codes: vec![None],
+            ..Receipt::default()
+        };
+        assert!(!Guard::ExitCode(0).holds(&killed));
+        assert!(!Guard::ExitCode(1).holds(&Receipt::answered("no process")));
+    }
+
+    fn view(output: ToolOutput) -> ToolExecutionView {
+        ToolExecutionView {
+            schema_version: 1,
+            execution_id: None,
+            receipt: None,
+            output,
+            observer_failure: None,
+        }
+    }
+
+    /// A failed git command fails `ok`; a plugin's payload, which may hold
+    /// its own error, meets neither `ok` nor `failed`, while its text can
+    /// still be tested.
+    #[test]
+    fn git_exits_are_read_and_a_plugin_result_is_neither_ok_nor_failed() {
+        let git = |code| {
+            Receipt::of_view(
+                &view(ToolOutput::Git {
+                    operation: "log".to_owned(),
+                    output: "fatal: bad revision".to_owned(),
+                    truncated: false,
+                    exit_code: code,
+                }),
+                "git log:\nfatal: bad revision",
+            )
+        };
+        assert!(!Guard::Ok.holds(&git(Some(128))));
+        assert!(Guard::Failed.holds(&git(Some(128))));
+        assert!(Guard::Ok.holds(&git(Some(0))));
+        let plugin = Receipt::of_view(
+            &view(ToolOutput::ExternalTool {
+                plugin_id: "mcp".to_owned(),
+                tool_name: "deploy".to_owned(),
+                payload: json!({"isError": true, "text": "boom"}),
+                inflight: 0,
+            }),
+            "boom",
+        );
+        assert_eq!(plugin.status, Status::Ran);
+        assert!(!Guard::Ok.holds(&plugin));
+        assert!(!Guard::Failed.holds(&plugin));
+        assert!(Guard::OutputContains("boom".to_owned()).holds(&plugin));
+        let root = Receipt::combined(vec![Receipt::answered("wrote"), plugin]);
+        assert!(
+            !Guard::Ok.holds(&root),
+            "a root with a plugin call is not ok"
         );
     }
 

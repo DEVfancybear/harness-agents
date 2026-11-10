@@ -93,6 +93,7 @@ pub fn bank(decisions: Option<&Arc<super::jev::JevDecisions>>) -> harness_tools:
         selector: decisions
             .filter(|decisions| decisions.decides("bank"))
             .map(|decisions| Arc::clone(decisions) as Arc<dyn harness_tools::BankSelector>),
+        timeout: None,
     }
 }
 

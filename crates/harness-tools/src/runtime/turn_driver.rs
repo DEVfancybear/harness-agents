@@ -1168,9 +1168,6 @@ pub const FLUSH_PREFIX: &str =
 /// its agent on track by rewriting a todo list at the end of the context.
 pub const RECAP_EVERY_STEPS: u32 = 40;
 
-/// How long the bank's selector may take before the model is asked instead.
-const BANK_SELECTOR_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// How much of the request and of the settled result the selector is shown.
 const BANK_SELECTOR_CHARS: usize = 4_000;
 
@@ -1198,6 +1195,26 @@ struct Settled {
     described: String,
     receipt: crate::bank::Receipt,
     empty_root: bool,
+}
+
+/// How many characters of a generated id's random tail a banked call id
+/// keeps: with `bank_`, a 12-character graph hash and a node id of at most
+/// 24, the id stays under the 64 characters Anthropic takes.
+const BANK_CALL_SUFFIX_CHARS: usize = 12;
+
+/// A banked call's id: its graph and node, and a random tail. The graph
+/// hash and node repeat whenever a turn authors the same bank again (fix,
+/// then test), so without the tail a later turn's call took an id the
+/// replayed earlier turn already announced, and the transcript was refused.
+fn bank_call_id(graph: &str, node: &str) -> String {
+    let generated = harness_types::ToolExecutionId::generate();
+    let tail = generated
+        .as_str()
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .collect::<String>();
+    let tail = &tail[tail.len().saturating_sub(BANK_CALL_SUFFIX_CHARS)..];
+    format!("bank_{graph}_{node}_{tail}")
 }
 
 /// One call's public result as the bank's guards read it.
@@ -1478,9 +1495,7 @@ impl TurnDriver {
         clean: bool,
         request_text: &str,
         room: bool,
-        run_id: &harness_types::AgentRunId,
         steps: u32,
-        tool_calls: u32,
         observer: &Arc<dyn TurnObserver>,
         cancellation: &CancellationToken,
     ) -> Option<Bypass> {
@@ -1518,8 +1533,9 @@ impl TurnDriver {
                             })
                             .collect(),
                     };
+                    // A selector that ran out of time was still asked, and may be billed.
                     tokio::select! {
-                        answer = tokio::time::timeout(BANK_SELECTOR_TIMEOUT, selector.select(choice)) => answer.unwrap_or_default(),
+                        answer = tokio::time::timeout(self.bank.as_ref().map_or(crate::bank::SELECTOR_TIMEOUT, crate::bank::ActionBank::selector_timeout), selector.select(choice)) => answer.unwrap_or(crate::bank::Selection { asked: true, ..crate::bank::Selection::default() }),
                         () = cancellation.cancelled() => crate::bank::Selection::default(),
                     }
                 }
@@ -1557,11 +1573,10 @@ impl TurnDriver {
         state.dispatched(&chosen.id, &eligible);
         let graph = state.hash().unwrap_or_default().to_owned();
         let call = NormalizedToolCall {
-            call_id: format!("bank_{graph}_{}_{tool_calls}", chosen.id),
+            call_id: bank_call_id(&graph, &chosen.id),
             name: chosen.tool.clone(),
             arguments: chosen.arguments.clone(),
         };
-        self.record_bank_call(run_id, &call, &chosen.id).await;
         observer.observe(TurnProgress::Notice(format!(
             "action bank: running node {} ({}) without a model step",
             chosen.id, chosen.tool
@@ -2013,6 +2028,18 @@ impl TurnDriver {
         };
         let mut result =
             first_step.map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+        // The earlier turns this one is sent with announced their calls
+        // already: a call of this turn that takes one of their ids is renamed
+        // for the wire as a repeat inside the turn is.
+        for message in request
+            .conversation
+            .iter()
+            .chain(request.recovered_messages.iter())
+        {
+            for call in &message.tool_calls {
+                announced_call_ids.insert(call.call_id.clone());
+            }
+        }
 
         // The loop yields why it stopped, so no bound can silently fall through.
         let stop = 'turn: loop {
@@ -2440,6 +2467,32 @@ impl TurnDriver {
                 )));
                 break TurnStop::Canceled;
             }
+            // What the user sent while a banked call was being chosen ("stop,
+            // don't commit") comes before it: the banked call is dropped and
+            // the model reads the message instead.
+            if let Some(dropped) = &bypassing
+                && !early_steering.is_empty()
+            {
+                bank_state.withdrawn(&dropped.node.id);
+                regulator.steer();
+                steps += 1;
+                if started.elapsed() >= options.limits.deadline {
+                    break TurnStop::Deadline;
+                }
+                observer.observe(TurnProgress::StepStarted { step: steps });
+                transcript.extend(early_steering);
+                result = self
+                    .runtime
+                    .continue_run(
+                        &request,
+                        &transcript,
+                        cancellation.clone(),
+                        Some(sink_with(&observer, prefetcher.clone())),
+                    )
+                    .await
+                    .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+                continue 'turn;
+            }
             // Loop detection: the same tool call repeated inside the window is a
             // loop, not progress. Different arguments or a changed batch are not.
             push_batch(&mut loop_signatures, &result.tool_calls);
@@ -2474,6 +2527,13 @@ impl TurnDriver {
             }
             if loop_warning.is_some() {
                 loop_warned = true;
+            }
+            // A banked call that passed every check above is about to reach the
+            // gate: only now is it kept with the turn, so a call that never ran
+            // is not replayed as one the harness issued.
+            if let Some(bypassing) = &bypassing {
+                self.record_bank_call(&result.run_id, &bypassing.call, &bypassing.node.id)
+                    .await;
             }
 
             // The assistant turn keeps its own words and its typed calls, and
@@ -2621,6 +2681,12 @@ impl TurnDriver {
                             }
                         }
                     };
+                    // What the model was told, refusal or not, is what a later
+                    // turn's replay shows for this call.
+                    if let Slot::Failed(text, _) = &slot {
+                        self.record_bank_answer(&result.run_id, &call.call_id, text)
+                            .await;
+                    }
                     slots.push((name.clone(), transcript_id, slot));
                     continue;
                 }
@@ -3194,9 +3260,7 @@ impl TurnDriver {
                         clean,
                         &request.text,
                         tool_calls < options.limits.max_tool_calls,
-                        &result.run_id,
                         steps,
-                        tool_calls,
                         &observer,
                         &cancellation,
                     )

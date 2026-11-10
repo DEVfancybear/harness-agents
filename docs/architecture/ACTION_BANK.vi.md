@@ -54,9 +54,9 @@ Guard đọc kết quả công khai của lệnh nó đi sau:
 
 | Guard | Đúng khi |
 |---|---|
-| `ok` | lệnh đã chạy và thành công: tiến trình thoát 0, tool file trả về |
+| `ok` | lệnh đã chạy và thành công: tiến trình hoặc lệnh git thoát 0, tool file trả về. Kết quả của một plugin hay MCP, vốn có thể chứa lỗi riêng, không phải `ok` cũng không phải `failed`; vẫn kiểm được phần chữ của nó |
 | `failed` | lệnh đã chạy và thất bại: mã thoát khác 0 hoặc hết giờ |
-| `exit_code: N` | tiến trình thoát với N |
+| `exit_code: N` | mọi tiến trình của lệnh (hoặc của root) đều thoát với N; `exit_code: 0` còn cần không lệnh nào thất bại |
 | `output_contains: "text"` | phần kết quả model được xem có chứa đoạn chữ |
 | `output_lacks: "text"` | không chứa |
 | `changed` | một lần ghi, sửa hay patch đã đổi file (hash trước và sau khác nhau) |

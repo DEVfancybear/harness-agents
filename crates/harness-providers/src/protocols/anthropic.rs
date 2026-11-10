@@ -102,23 +102,28 @@ impl AnthropicMessagesAdapter {
                         .and_then(|id| folded.get(id))
                         .cloned()
                         .unwrap_or_default();
-                    let block = json!({
-                        "type": "text",
-                        "text": format!(
+                    // The note, then any image the result carried, as a user
+                    // message's blocks: a folded result keeps what it showed.
+                    let blocks = match content_with_images(
+                        &format!(
                             "{HARNESS_ISSUED_NOTE} {name} {arguments}\n{}",
                             message.content
                         ),
-                    });
+                        &message.attachments,
+                    ) {
+                        Value::Array(blocks) => blocks,
+                        text => vec![json!({"type": "text", "text": text})],
+                    };
                     match messages.last_mut() {
                         Some(last) if last["role"] == "user" => {
                             if let Some(text) = last["content"].as_str().map(str::to_owned) {
                                 last["content"] = json!([{"type": "text", "text": text}]);
                             }
-                            if let Some(blocks) = last["content"].as_array_mut() {
-                                blocks.push(block);
+                            if let Some(existing) = last["content"].as_array_mut() {
+                                existing.extend(blocks);
                             }
                         }
-                        _ => messages.push(json!({"role": "user", "content": [block]})),
+                        _ => messages.push(json!({"role": "user", "content": blocks})),
                     }
                 }
                 super::MessageRole::Tool => {
@@ -845,6 +850,29 @@ mod tests {
             !body.to_string().contains("bank-n1"),
             "no orphan id: {body:#}"
         );
+    }
+
+    /// A folded result keeps the image it carried, after its note.
+    #[test]
+    fn a_folded_result_keeps_its_image() {
+        let mut request = bank_transcript();
+        let messages = Arc::make_mut(&mut request.messages);
+        let last = messages.last_mut().expect("result");
+        last.attachments = vec![crate::ImageAttachment::inline(
+            "image/png",
+            "iVBORw0KGgo=",
+            "shot.png",
+        )];
+        let thinking = crate::Thinking {
+            level: crate::ThinkingLevel::High,
+            format: crate::ThinkingFormat::Anthropic,
+            model: None,
+        };
+        let body = AnthropicMessagesAdapter::request_body(&request, Some(&thinking));
+        let blocks = body["messages"][2]["content"].as_array().expect("blocks");
+        assert_eq!(blocks[1]["type"], "text", "{body:#}");
+        assert_eq!(blocks[2]["type"], "image", "{body:#}");
+        assert_eq!(blocks[2]["source"]["data"], "iVBORw0KGgo=");
     }
 
     /// Without thinking the harness-issued call goes back as a call, as if

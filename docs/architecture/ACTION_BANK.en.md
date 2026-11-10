@@ -55,9 +55,9 @@ A guard reads the public result of the call it follows:
 
 | Guard | Holds when |
 |---|---|
-| `ok` | the call ran and succeeded: a process exited 0, a file tool returned |
+| `ok` | the call ran and succeeded: a process or git command exited 0, a file tool returned. A plugin or MCP result, which may hold its own error, is neither `ok` nor `failed`; its text can still be tested |
 | `failed` | the call ran and failed: a non-zero exit or a time-out |
-| `exit_code: N` | a process exited with N |
+| `exit_code: N` | every process the call (or the root) ran exited with N; `exit_code: 0` also needs no call to have failed |
 | `output_contains: "text"` | what the model is shown of the result contains the text |
 | `output_lacks: "text"` | it does not |
 | `changed` | a write, edit or patch changed its file (the hashes before and after differ) |
