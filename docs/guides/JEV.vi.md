@@ -204,7 +204,7 @@ Hai biến điều chỉnh:
 `computer_use.pilot(task, ...)` của skill `computer-use` giao desktop Windows cho Jev làm một việc hẹp, như System
 One Computer Use: mỗi bước là một lần gọi Jev với ảnh chụp màn hình làm image asset (`assets` trong `jev.decide`,
 gửi kèm image header của TypeSafe) và ba câu hỏi - `choice` hành động, `box` chỗ bấm, `choice` chữ cần gõ, chỉ lấy
-từ task. Chỉ cần key TypeSafe, không cần `/jev on`. Xem [COMPUTER_USE.md](COMPUTER_USE.md).
+từ task. Cần `/jev on` (bật cùng skill jev) và key TypeSafe. Xem [COMPUTER_USE.md](COMPUTER_USE.md).
 
 ## Cấu hình
 

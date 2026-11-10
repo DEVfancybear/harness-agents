@@ -169,7 +169,7 @@ size below which a conversation is always carried on.
 The `computer-use` skill's `computer_use.pilot(task, ...)` gives Jev the Windows desktop for a narrow task, the way
 System One Computer Use does: each step one Jev call with the screenshot as an image asset (`assets` in
 `jev.decide`, sent with TypeSafe's image header) and three questions - a `choice` of action, a `box` of where to
-click, a `choice` of the text to type, offered only from the task. It needs the TypeSafe key, not `/jev on`. See
+click, a `choice` of the text to type, offered only from the task. It needs `/jev on` (which brings the jev skill) and the TypeSafe key. See
 [COMPUTER_USE.md](COMPUTER_USE.md).
 
 ## Settings

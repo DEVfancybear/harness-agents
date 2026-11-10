@@ -69,8 +69,8 @@ print(result["status"], result["message"])   # done / unsure / stopped / gave_up
   A vision model is shown the final screen and can carry on with `run`.
 - **DONE is Jev's word, not proof.** Check the final screen (or the app's own
   state) before telling the user it is done; on `unsure`, carry on yourself.
-- It needs the `jev` skill and a TypeSafe key (`/login typesafe`); the jev
-  plugin itself may stay off. Screenshots go to TypeSafe: ask the user first
+- It needs the jev plugin on (`/jev on`, which brings the `jev` skill) and a
+  TypeSafe key (`/login typesafe`). Screenshots go to TypeSafe: ask the user first
   when the screen may show something private.
 - The same rules as `run`: the user's authorization, no consequential action
   (send, buy, delete, sign in) the user did not ask for, the top-left corner

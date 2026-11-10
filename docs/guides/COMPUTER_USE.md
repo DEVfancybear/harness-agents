@@ -38,8 +38,9 @@ the next action, where, and which offered text to type; the step runs as a bound
 taken once the screen has reacted and settled. Jev may type only quoted text, `texts` and 1-3 word phrases of the
 task, and open only `websites` and URLs in the task. It stops below 50% confidence (25% for scroll, wait, opening a
 website), after 5 unchanged screens or `max_steps`, and zooms in to re-ask an unsure click. Reports, with one
-annotated screenshot per step, stay in `.harness/artifacts/computer-use/pilot/` (the newest 20). It needs the `jev`
-skill and a TypeSafe key (`/login typesafe`); screenshots are sent to TypeSafe. `run(..., settle=True)` waits the
+annotated screenshot per step, stay in `.harness/artifacts/computer-use/pilot/` (the newest 20). It needs the jev
+plugin on (`/jev on`, which brings the `jev` skill) and a TypeSafe key (`/login typesafe`); screenshots
+are sent to TypeSafe. `run(..., settle=True)` waits the
 same way and returns `screen_changed`.
 
 Left out: the dashboard, closing browser tabs, clipboard link copy/paste, the site and app name tables, and Android

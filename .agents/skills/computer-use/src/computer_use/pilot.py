@@ -133,7 +133,10 @@ def _jev():
     try:
         module = importlib.import_module("jev.jev")
     except ImportError as error:
-        raise RuntimeError("computer_use.pilot needs the jev skill and httpx in the kernel") from error
+        raise RuntimeError(
+            "computer_use.pilot needs the jev plugin, which brings the jev skill: ask the user to run "
+            "/jev on (and /login typesafe for the key); it takes effect in a new kernel"
+        ) from error
     if not module._api_key():
         raise module.JevError("computer_use.pilot needs a TypeSafe key: the user can run /login typesafe or set TYPESAFE_API_KEY.")
     return module

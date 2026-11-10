@@ -308,6 +308,21 @@ class PilotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/login typesafe", str(caught.exception))
         self.assertEqual(self.desktop.events, [])
 
+    async def test_without_the_jev_plugin_it_says_to_turn_it_on(self):
+        # The jev skill reaches the kernel only with /jev on (seen live: "no module jev").
+        real = importlib.import_module
+
+        def without_jev(name, *args, **kwargs):
+            if name == "jev.jev":
+                raise ModuleNotFoundError("No module named 'jev'")
+            return real(name, *args, **kwargs)
+
+        with patch.object(pilot_module.importlib, "import_module", side_effect=without_jev):
+            with self.assertRaises(RuntimeError) as caught:
+                await computer_use.pilot("Click the save button")
+        self.assertIn("/jev on", str(caught.exception))
+        self.assertEqual(self.desktop.events, [])
+
     async def test_old_runs_are_pruned(self):
         folder = Path(self.temp.name) / ".harness/artifacts/computer-use/pilot"
         for index in range(pilot_module.KEEP_RUNS + 5):
