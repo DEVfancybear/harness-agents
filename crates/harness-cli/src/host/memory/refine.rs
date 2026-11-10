@@ -1678,6 +1678,13 @@ fn apply(
     // The knowledge pages the demotes wrote: removed again when the save
     // that keeps their pointers fails.
     let mut pages = Vec::<Value>::new();
+    // A rollback's pages of demotes whose entries it put back: deleted once
+    // the entries are saved.
+    let mut undemoted = Vec::<Value>::new();
+    // The pages the demotes wrote, noted on disk as each lands, so a process
+    // that dies before the save leaves none behind (the next refinement in
+    // the scope deletes them).
+    let mut noted: Option<Pending> = None;
     // A delete that is part of a merge goes after every other edit: it
     // stands or falls with what happened to its survivor.
     let (merges, others): (Vec<&Edit>, Vec<&Edit>) = proposal
@@ -1720,6 +1727,7 @@ fn apply(
             fields.remove(ROLLBACK_EXPECTS);
             fields.remove(ROLLBACK_RESTORES);
             fields.remove(ROLLBACK_PAIR);
+            fields.remove(ROLLBACK_PAGE);
             fields.remove(QUEUE_EXPECTS);
         }
         record["id"] = json!(computed);
@@ -2025,10 +2033,23 @@ fn apply(
                 .batch
                 .as_ref()
                 .and_then(|batch| batch.library.as_ref());
-            let page = library.map_or_else(
-                || Err(KNOWLEDGE_OFF_REFUSAL.to_owned()),
-                |library| dream::write_page(library, &edit.0["page"], &before, &key),
-            );
+            let page = match library {
+                None => Err(KNOWLEDGE_OFF_REFUSAL.to_owned()),
+                Some(library) => match noted
+                    .take()
+                    .map_or_else(|| Pending::pages_only(dir, id), Ok)
+                {
+                    Ok(mut pending) => {
+                        let page = dream::write_page(library, &edit.0["page"], &before, &key);
+                        if let Ok(page) = &page {
+                            pending.note(page);
+                        }
+                        noted = Some(pending);
+                        page
+                    }
+                    Err(error) => Err(error),
+                },
+            };
             match page {
                 Ok(page) => {
                     let mut moved = edit.clone();
@@ -2149,6 +2170,9 @@ fn apply(
         };
         state["entries"][&kind][&computed] = after.clone();
         modified.insert(key);
+        if let Some(page) = rollback_of.and(edit.0.get(ROLLBACK_PAGE)) {
+            undemoted.push(page.clone());
+        }
         if !before.is_null() {
             record["before"] = before;
         }
@@ -2227,12 +2251,19 @@ fn apply(
         Err(error) => {
             // No entry points at a page the failed save would have pointed
             // at: the pages go too.
-            for page in &pages {
-                let _ = delete_page(page);
+            if let Some(pending) = noted.take() {
+                let _ = pending.undo();
             }
             return Err(error);
         }
     };
+    // Saved: the entries point at their pages, which stay.
+    if let Some(pending) = noted.take() {
+        pending.complete();
+    }
+    // The entries are back without their pointers: their pages go, while
+    // they are as the demote wrote them.
+    applied_edits.extend(undemoted.iter().map(delete_page));
     let mut record = json!({
         "id": id,
         "summary": proposal.summary,
@@ -2858,7 +2889,10 @@ const VERIFIED_BY_CHARS: usize = 160;
 /// or none; `verified_by`, a short note of how it was checked. An edit whose
 /// metadata holds only those keys keeps the entry's other metadata (a pinned
 /// entry stays pinned). An edit that says nothing of it keeps the entry's -
-/// except a correction, whose claim the old check never covered. An edit the
+/// except a correction, whose claim the old check never covered, and a
+/// `confirmed` of an entry whose content the edit rewrites (but for a
+/// demote, whose detail moved unchanged): the check was of the old words,
+/// so the new ones are not said to be checked. An edit the
 /// review gave `confidence: low` with no `verified` is `unverified`: a guess
 /// is not written as a checked fact.
 fn settle_verified(metadata: &mut Value, edit: &Edit, before: &Value) {
@@ -2882,13 +2916,20 @@ fn settle_verified(metadata: &mut Value, edit: &Edit, before: &Value) {
         fields.remove("verified");
     }
     let says = given.is_some_and(|given| given.contains_key("verified"));
-    if !says && !edit.0.contains_key(CORRECTS) && valid(&before["metadata"]["verified"]) {
+    let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let rewritten = edit.text("action") != Some("demote")
+        && edit.text("content").is_some_and(|content| {
+            flat(content) != flat(before["content"].as_str().unwrap_or_default())
+        });
+    let unchecked = edit.0.contains_key(CORRECTS)
+        || (rewritten && before["metadata"]["verified"] == "confirmed");
+    if !says && !unchecked && valid(&before["metadata"]["verified"]) {
         metadata["verified"] = before["metadata"]["verified"].clone();
         if before["metadata"]["verified_by"].is_string() {
             metadata["verified_by"] = before["metadata"]["verified_by"].clone();
         }
     } else if !says
-        && edit.0.contains_key(CORRECTS)
+        && unchecked
         && let Some(fields) = metadata.as_object_mut()
     {
         fields.remove("verified");
@@ -3106,6 +3147,21 @@ const ROLLBACK_RESTORES: &str = "rollback_restores";
 /// A rollback edit's field naming the supersede it is half of (the closed
 /// entry's `kind:id`): the two halves are undone together or not at all.
 const ROLLBACK_PAIR: &str = "rollback_pair";
+/// A rollback edit's field holding the knowledge page a demote of its entry
+/// wrote: deleted once the entry is put back and saved, and kept when the
+/// entry changed since and stays, as its pointer still leads there.
+const ROLLBACK_PAGE: &str = "rollback_page";
+
+/// The paths of the pages a refinement's demotes wrote.
+fn demoted_pages(target: &Value) -> std::collections::BTreeSet<&str> {
+    target["appliedEdits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|edit| edit["applied"] == true && edit["action"] == "demote")
+        .filter_map(|edit| edit["page"].as_str())
+        .collect()
+}
 
 /// `rollbackProposal`: restore each applied edit's snapshot, newest first.
 fn rollback_proposal(target: &Value) -> Proposal {
@@ -3113,6 +3169,9 @@ fn rollback_proposal(target: &Value) -> Proposal {
     let mut edits = Vec::new();
     let mut skill_changes = Vec::new();
     let mut knowledge = Vec::new();
+    // The pages demotes wrote, by path: each goes with its entry's restore.
+    let demoted = demoted_pages(target);
+    let mut pages = std::collections::BTreeMap::<String, Value>::new();
     for edit in target["appliedEdits"]
         .as_array()
         .into_iter()
@@ -3127,7 +3186,12 @@ fn rollback_proposal(target: &Value) -> Proposal {
             continue;
         }
         if edit["kind"] == KNOWLEDGE_KIND {
-            knowledge.push(edit.clone());
+            match edit["id"].as_str().filter(|path| demoted.contains(path)) {
+                Some(path) if edit["action"] == "create" => {
+                    pages.insert(path.to_owned(), edit.clone());
+                }
+                _ => knowledge.push(edit.clone()),
+            }
             continue;
         }
         let before = &edit["before"];
@@ -3147,6 +3211,11 @@ fn rollback_proposal(target: &Value) -> Proposal {
         };
         if let (Some(kind), Some(closed)) = (edit["kind"].as_str(), closed) {
             restored.insert(ROLLBACK_PAIR.to_owned(), json!(format!("{kind}:{closed}")));
+        }
+        if edit["action"] == "demote"
+            && let Some(page) = edit["page"].as_str().and_then(|path| pages.remove(path))
+        {
+            restored.insert(ROLLBACK_PAGE.to_owned(), page);
         }
         if before.is_object() {
             restored.insert(ROLLBACK_RESTORES.to_owned(), before.clone());
@@ -3762,6 +3831,17 @@ impl Pending {
     fn begin(dir: &Path, id: &str, learning: Option<&Learning>) -> Result<Self, String> {
         let layers = learning.map(|learning| learning.layers.clone());
         recover_pending(dir, layers.as_ref());
+        Self::open(dir, id, layers)
+    }
+
+    /// Record a refinement that writes knowledge pages only (Deep Dream's
+    /// demotes), leaving what a refinement that died left behind to the next
+    /// one that has the learned skills to undo it with.
+    fn pages_only(dir: &Path, id: &str) -> Result<Self, String> {
+        Self::open(dir, id, None)
+    }
+
+    fn open(dir: &Path, id: &str, layers: Option<super::learned::Layers>) -> Result<Self, String> {
         let pending_dir = dir.join(PENDING_DIR);
         std::fs::create_dir_all(&pending_dir)
             .map_err(|error| format!("pending refinement: {error}"))?;
@@ -5139,6 +5219,11 @@ const NO_EXCERPT_REFUSAL: &str = "a correction rests on the turns behind its ent
 /// Why a correction whose evidence its excerpt does not hold is refused.
 const CORRECTION_EVIDENCE_REFUSAL: &str = "a correction's evidence must be a span of its entry's transcript excerpt, word for word (whitespace and case aside, a phrase long): a correction states only what the transcript shows";
 
+/// Why a global entry kept for one project is not demoted: the global
+/// library is every project's catalog and search, and the detail is that
+/// project's.
+const PROJECT_DEMOTE_REFUSAL: &str = "the entry is kept for one project: its detail is not moved into the global library, which every project reads";
+
 /// Deep Dream's own checks of the curator's corrections, demotes and
 /// verifications, against what its batch was given, before [`apply`]:
 ///
@@ -5148,8 +5233,11 @@ const CORRECTION_EVIDENCE_REFUSAL: &str = "a correction's evidence must be a spa
 ///   changed fact), marked with what it rests on ([`CORRECTS`]) and with the
 ///   words' kind of the part it quotes; any other is refused;
 /// - a `demote` needs the knowledge library, an entry neither pinned nor a
-///   constraint, a long entry (or a memory over its target) and a statement
-///   short enough to keep with the pointer;
+///   constraint, nor kept for one project when the library is the global
+///   one, a long entry (or a memory over its target) and a statement short
+///   enough to keep with the pointer;
+/// - an edit whose `evidence` holds a secret is refused, as the quote would
+///   be kept;
 /// - `verified: confirmed` is kept only where its `evidence` is in the
 ///   entry's excerpt; otherwise it is dropped, and the record says so.
 ///
@@ -5174,6 +5262,19 @@ fn dream_edits(proposal: &mut Proposal, baseline: &Value) {
         let key = format!("{kind}:{id}");
         let before = &baseline["entries"][&kind][&id];
         let mut refusal = None;
+        // A quote is kept in the entry's record and the refinement's: one
+        // that holds a secret is not kept, whatever the edit.
+        let secrets = super::learned::secret_hits(edit.text("evidence").unwrap_or_default());
+        if !secrets.is_empty() {
+            edit.0.insert(
+                DREAM_REFUSAL.to_owned(),
+                json!(format!(
+                    "the evidence looks like {}: a quote that holds a secret is never kept",
+                    secrets.join(", ")
+                )),
+            );
+            continue;
+        }
         match edit.text("action") {
             Some("correct") => {
                 let evidence = edit.text("evidence").unwrap_or_default().to_owned();
@@ -5220,8 +5321,16 @@ fn dream_edits(proposal: &mut Proposal, baseline: &Value) {
                     .unwrap_or_default()
                     .chars()
                     .count();
+                let one_project = super::harness::project_key(before.get("project")).is_some();
                 refusal = if batch.library.is_none() {
                     Some(KNOWLEDGE_OFF_REFUSAL.to_owned())
+                } else if one_project
+                    && batch
+                        .library
+                        .as_ref()
+                        .is_some_and(|library| library.level == "global")
+                {
+                    Some(PROJECT_DEMOTE_REFUSAL.to_owned())
                 } else if before["metadata"]["pinned"] == true
                     || constraint(before["path"].as_str())
                 {
@@ -5632,6 +5741,15 @@ async fn consolidate_scope(
             Ok(refinement) => refinement,
             Err(error) => return Err(failed(error, &done)),
         };
+        // The entries the curator was shown the turns of were checked: they
+        // wait behind the others in the next pass's order.
+        if let Some(batch) = proposal.batch.as_ref() {
+            dream::mark_checked(
+                dir,
+                batch.excerpts.keys().map(String::as_str),
+                chrono::Utc::now().timestamp(),
+            );
+        }
         let mut record = harness_types::diag::info("refine", "consolidation_batch")
             .field("scope", if global { "global" } else { "local" })
             .field("refinement", part_id.as_str())
@@ -10105,5 +10223,281 @@ Run `node scripts/build.js`.
         };
         assert!(score("state") > score("old"), "{scores:?}");
         assert!(score("old") > score("fresh"), "{scores:?}");
+    }
+
+    /// The long text a demote is offered for.
+    fn long_steps(what: &str) -> String {
+        (1..=12)
+            .map(|step| format!("Step {step}: run the {what} check number {step} and record its result in the {what} log."))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A global pass keeps one project's detail out of the global library,
+    /// which every project reads; an edit whose quote holds a secret is
+    /// refused, and the curator never sees the secret, as its excerpt is
+    /// redacted; a demote that landed leaves no pending record behind, and
+    /// the entries shown their turns are marked checked.
+    #[tokio::test]
+    async fn deep_dream_keeps_a_projects_detail_and_secrets_out() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = dream_scopes(directory.path());
+        journal(
+            directory.path(),
+            "proj",
+            "task_a",
+            &[(
+                "user",
+                "The staging host is db.internal; deploy with api_key=FAKE0123456789abcdefTEST for now.",
+            )],
+        );
+        dream_memory(
+            &scopes,
+            &json!({
+                "billing": {"id": "billing", "kind": "memory", "title": "Billing steps", "content": long_steps("billing"), "version": 1,
+                    "project": {"key": "proj_b", "name": "b"}},
+                "release": {"id": "release", "kind": "memory", "title": "Release steps", "content": long_steps("release"), "version": 1},
+                "host": {"id": "host", "kind": "memory", "title": "Staging host", "content": "The staging host is db.example.", "version": 1,
+                    "origin": {"via": "refine", "conversation": "task_a", "evidence": "The staging host is db.internal", "kind": "user"}},
+            }),
+        );
+        let reply = json!({"summary": "s", "rationale": "r", "expectedOutcome": "", "edits": [
+            {"action": "demote", "kind": "memory", "id": "billing", "content": "Billing: run the billing check and record its result in the billing log.", "page": {"path": "concepts/billing.md"}, "reason": "long"},
+            {"action": "demote", "kind": "memory", "id": "release", "content": "Release: run the release check and record its result in the release log.", "page": {"path": "concepts/release.md"}, "reason": "long"},
+            {"action": "correct", "kind": "memory", "id": "host", "title": "Staging host", "content": "The staging host is db.internal.",
+             "evidence": "deploy with api_key=FAKE0123456789abcdefTEST for now", "changed": false, "reason": "the user said"}
+        ]})
+        .to_string();
+        let replies = Replies::new(&[reply]);
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = replies.clone();
+        let dream = super::Dream {
+            knowledge: true,
+            ..super::Dream::default()
+        };
+        let result = super::consolidate_memory(&provider, "m", &scopes, &dream)
+            .await
+            .expect("consolidated");
+        let prompt = replies.prompt(0);
+        assert!(
+            prompt.contains("The staging host is db.internal"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("FAKE0123456789abcdefTEST"),
+            "redacted: {prompt}"
+        );
+        let edits = result.record["appliedEdits"].as_array().expect("edits");
+        let outcome = |id: &str| {
+            edits
+                .iter()
+                .find(|edit| edit["id"] == id)
+                .map(|edit| {
+                    (
+                        edit["applied"].clone(),
+                        edit["error"].as_str().unwrap_or_default().to_owned(),
+                    )
+                })
+                .expect("edit")
+        };
+        assert_eq!(
+            outcome("billing"),
+            (json!(false), super::PROJECT_DEMOTE_REFUSAL.to_owned())
+        );
+        let (applied, error) = outcome("host");
+        assert!(
+            applied == false && error.contains("holds a secret"),
+            "{error}"
+        );
+        assert_eq!(outcome("release").0, json!(true));
+        let store = super::super::knowledge::store::Store::new(directory.path().join("knowledge"));
+        assert!(store.document("concepts/billing.md").is_err());
+        assert!(store.document("concepts/release.md").is_ok());
+        let state = load_raw(&scopes.global);
+        assert_eq!(
+            state["entries"]["memory"]["billing"]["content"],
+            long_steps("billing").as_str()
+        );
+        assert!(!state.to_string().contains("FAKE0123456789abcdefTEST"));
+        let pending = std::fs::read_dir(scopes.global.join(super::PENDING_DIR))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .count();
+        assert_eq!(
+            pending, 0,
+            "the demote's pending record is closed once saved"
+        );
+        // What the curator was shown the turns of was checked.
+        let checked = std::fs::read_to_string(scopes.global.join(super::dream::CHECKED_FILE))
+            .expect("checked");
+        assert!(checked.contains("memory:host"), "{checked}");
+    }
+
+    /// A rollback deletes a demote's page only with its entry put back: an
+    /// entry changed since keeps its pointer, and its page stays.
+    #[tokio::test]
+    async fn a_rollback_keeps_the_page_of_an_entry_changed_since() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = dream_scopes(directory.path());
+        dream_memory(
+            &scopes,
+            &json!({"release": {"id": "release", "kind": "memory", "title": "Release steps", "content": long_steps("release"), "version": 1}}),
+        );
+        let reply = json!({"summary": "s", "rationale": "r", "expectedOutcome": "", "edits": [
+            {"action": "demote", "kind": "memory", "id": "release", "content": "Release: run the release check and record its result in the release log.", "page": {"path": "concepts/release.md"}, "reason": "long"}
+        ]})
+        .to_string();
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = Replies::new(&[reply]);
+        let dream = super::Dream {
+            knowledge: true,
+            ..super::Dream::default()
+        };
+        let result = super::consolidate_memory(&provider, "m", &scopes, &dream)
+            .await
+            .expect("consolidated");
+        // The user edits the entry, keeping the pointer.
+        let mut state = load_raw(&scopes.global);
+        state["entries"]["memory"]["release"]["content"] = json!(
+            "Release has twelve checks; run them in order. (details: global knowledge concepts/release.md)"
+        );
+        state["entries"]["memory"]["release"]["version"] = json!(3);
+        super::save_raw(&scopes.global, &state, &test_writer()).expect("edited");
+        let none: std::sync::Arc<dyn harness_providers::ModelProvider> = Replies::new(&[]);
+        let rolled = super::refine(
+            &none,
+            "m",
+            "",
+            &scopes,
+            &RefineOptions::parse(&format!("--rollback {}", result.id())),
+            None,
+        )
+        .await
+        .expect("rolled back");
+        let store = super::super::knowledge::store::Store::new(directory.path().join("knowledge"));
+        assert!(
+            store.document("concepts/release.md").is_ok(),
+            "the page its pointer leads to stays: {}",
+            rolled.record
+        );
+        assert!(
+            load_raw(&scopes.global)["entries"]["memory"]["release"]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("run them in order"))
+        );
+    }
+
+    /// A demote's page is noted as the refinement's pending write: a process
+    /// that died before the save leaves no page behind.
+    #[test]
+    fn a_demoted_page_left_by_a_dead_pass_is_removed() {
+        let directory = tempfile::tempdir().expect("dir");
+        let dir = directory.path().join("harness");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let library = super::dream::Library {
+            root: directory.path().join("knowledge"),
+            level: "global",
+            in_checkout: false,
+        };
+        let mut pending = super::Pending::pages_only(&dir, "refine_dead").expect("pending");
+        let page = super::dream::write_page(
+            &library,
+            &json!({"path": "concepts/release.md"}),
+            &json!({"title": "Release", "content": long_steps("release")}),
+            "memory:release",
+        )
+        .expect("page");
+        pending.note(&page);
+        // The process dies: its lock goes, its record stays.
+        drop(pending.lock.take());
+        std::mem::forget(pending);
+        let store = super::super::knowledge::store::Store::new(library.root.clone());
+        assert!(store.document("concepts/release.md").is_ok());
+        let next = super::Pending::begin(&dir, "refine_next", None).expect("next");
+        next.complete();
+        assert!(
+            store.document("concepts/release.md").is_err(),
+            "the dead pass's page is gone"
+        );
+    }
+
+    /// `verified: confirmed` was a check of the words it was given: an edit
+    /// that rewrites them and says nothing of it leaves the entry unchecked;
+    /// one that keeps them keeps the check, and an unverified entry stays so.
+    #[test]
+    fn a_rewrite_is_not_said_to_be_checked() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let seed = Proposal::from_value(&json!({"edits": [
+            {"action": "create", "kind": "memory", "id": "port", "title": "Port", "content": "The API listens on 8080.",
+             "metadata": {"verified": "confirmed", "verified_by": "test passed: curl"}},
+            {"action": "create", "kind": "memory", "id": "name", "title": "Name", "content": "The API is called atlas.",
+             "metadata": {"verified": "confirmed", "verified_by": "user confirmed"}},
+            {"action": "create", "kind": "memory", "id": "guess", "title": "Guess", "content": "The cache may be slow.",
+             "metadata": {"verified": "unverified"}}
+        ]}));
+        apply(&scopes, &seed, "refine_1", false, None, None, None).expect("seeded");
+        let edits = Proposal::from_value(&json!({"edits": [
+            {"action": "update", "kind": "memory", "id": "port", "title": "Port", "content": "The API listens on 9090."},
+            {"action": "update", "kind": "memory", "id": "name", "title": "API name", "content": "The API is called   atlas."},
+            {"action": "update", "kind": "memory", "id": "guess", "title": "Guess", "content": "The image cache may be slow."}
+        ]}));
+        apply(&scopes, &edits, "refine_2", false, None, None, None).expect("updated");
+        let state = load_raw(&scopes.local);
+        let meta = |id: &str| state["entries"]["memory"][id]["metadata"].clone();
+        assert!(meta("port").get("verified").is_none(), "{}", meta("port"));
+        assert!(meta("port").get("verified_by").is_none());
+        assert_eq!(meta("name")["verified"], "confirmed");
+        assert_eq!(meta("name")["verified_by"], "user confirmed");
+        assert_eq!(meta("guess")["verified"], "unverified");
+    }
+
+    /// An entry a pass checked against its turns lately waits behind the
+    /// others, so the excerpts' budget reaches each in turn, and comes back
+    /// as the check ages; a check older than the store keeps is forgotten.
+    #[test]
+    #[allow(clippy::float_cmp, reason = "the same inputs give the same score")]
+    fn checked_entries_wait_their_turn() {
+        let directory = tempfile::tempdir().expect("dir");
+        let dir = directory.path().join("harness");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let old = (chrono::Utc::now() - chrono::Duration::days(200)).to_rfc3339();
+        super::save_raw(
+            &dir,
+            &json!({"schema": 1, "entries": {"memory": {
+                "a": {"id": "a", "kind": "memory", "title": "A", "content": "one fact", "version": 1, "updated_at": old},
+                "b": {"id": "b", "kind": "memory", "title": "B", "content": "another fact", "version": 1, "updated_at": old}
+            }, "prompt": {}, "skill": {}, "subagent": {}}, "refinements": []}),
+            &test_writer(),
+        )
+        .expect("state");
+        let entries = super::memory_entries(&load_raw(&dir));
+        let now = chrono::Utc::now().timestamp();
+        let score = |at: i64, id: &str| {
+            let scores = super::dream::drift_scores(&dir, "global", &entries, at);
+            entries
+                .iter()
+                .position(|entry| entry["id"] == id)
+                .map(|index| scores[index])
+                .expect("entry")
+        };
+        assert_eq!(score(now, "a"), score(now, "b"));
+        super::dream::mark_checked(&dir, ["memory:a"], now);
+        assert!(score(now + 3_600, "a") < score(now + 3_600, "b"));
+        assert!(
+            score(now + 30 * 86_400, "a") > score(now + 3_600, "a"),
+            "it comes back"
+        );
+        super::dream::mark_checked(&dir, ["memory:b"], now + 100 * 86_400);
+        let kept = std::fs::read_to_string(dir.join(super::dream::CHECKED_FILE)).expect("file");
+        assert!(
+            !kept.contains("memory:a") && kept.contains("memory:b"),
+            "{kept}"
+        );
     }
 }

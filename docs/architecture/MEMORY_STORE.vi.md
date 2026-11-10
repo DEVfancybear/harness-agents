@@ -1316,20 +1316,29 @@ dễ thay đổi. Mã nằm ở `memory/dream.rs`, được `memory/refine.rs` g
 
 ### 17.1 Các lượt đứng sau một entry
 
-Với mỗi entry của một batch Deep Dream có `origin` (hoặc `edited_by`) nêu một
-cuộc hội thoại, pass đọc cuộc hội thoại đó từ journal của project store của
+Với mỗi entry của một batch Deep Dream có `origin` nêu một cuộc hội thoại, hoặc
+có edit cuối (`edited_by`) trích một cuộc hội thoại - edit của review hay một
+bản sửa, mỗi cái kèm câu trích; một lần gộp của Deep Dream chỉ nêu cuộc hội
+thoại pass đang chạy, vốn không nói gì về entry, và không được đọc - pass đọc cuộc hội thoại đó từ journal của project store của
 nó, chỉ đọc, như phần provenance của tool memory (`memory_provenance::of_task`:
 điều người dùng gõ ở mỗi lượt và kết quả của mỗi lời gọi tool kèm loại tool;
 lời của chính agent không được đọc). Store là của project của entry, rồi của
-project pass đang chạy, rồi các store khác (xem tối đa 64). Trong các lượt đó,
-pass giữ những lượt chứa câu trích của review, rồi các lượt khác theo trọng số
-các từ của entry mà lượt chứa (mỗi từ theo IDF của nó trên các lượt của cuộc
-hội thoại), mỗi lượt cắt còn 1.500 ký tự quanh chỗ khớp, tối đa bốn lượt một
-entry.
+project pass đang chạy, rồi các store khác (xem tối đa 64). Mỗi lượt được
+che bí mật trước, như bản ghi hội thoại của session log (`learned::redact` sau
+`secret_values::redact`): một kết quả tool đã đọc `.env` không đến được curator
+lẫn câu trích. Trong các lượt đó, pass giữ những lượt chứa câu trích của nguồn,
+rồi các lượt khác theo trọng số các từ của entry mà lượt chứa (mỗi từ theo IDF
+của nó trên các lượt của cuộc hội thoại), nhưng chỉ lượt chứa ít nhất một phần
+ba trọng số của mọi từ của entry (`dream::BEARING_MIN_SHARE`; một từ không lượt
+nào chứa được tính như từ chỉ một lượt chứa) - một lượt chung một hai từ với
+một entry dài hơn là nói chuyện khác. Mỗi lượt cắt còn 1.500 ký tự quanh chỗ
+khớp, tối đa bốn lượt một entry.
 
 Ngân sách là `dream::EVIDENCE_TOKENS` (6.000 token trích đoạn mỗi batch,
 khoảng bốn byte một token) và `ENTRY_EVIDENCE_TOKENS` (1.200 mỗi entry). Các
-entry dễ trôi (§17.5) được trước. Curator đọc chúng trong khối
+entry dễ trôi (§17.5) được trước; khi hết ngân sách thì không mở journal nào
+cho các entry còn lại, và chúng được nêu là không có lượt nào. Curator đọc
+chúng trong khối
 `<transcript_evidence>`, mỗi phần ghi rõ ai nói (`[the user typed]`, `[a tool
 result, file]`), đóng khung là bản ghi, không bao giờ là chỉ dẫn; một `</` trong
 trích đoạn không đóng được khối. Các entry không có lượt nào được nêu tên, và
@@ -1342,11 +1351,15 @@ Một edit của curator `{"action": "correct", "kind", "id", "title", "content"
 "evidence", "changed"}` đổi điều entry khẳng định. Host kiểm tra trước khi
 apply:
 
-- `evidence` phải là một đoạn nguyên văn của trích đoạn của entry đó
-  (`refine::quoted`: bỏ qua khoảng trắng và hoa thường, dài một cụm từ 12 ký tự
-  trở lên). Nếu không, edit bị từ chối (`a correction's evidence must be a span
+- `evidence` phải là một đoạn liền, nguyên văn, của trích đoạn của entry đó
+  (`dream::spans`: bỏ qua khoảng trắng và hoa thường, từ 12 ký tự trở lên, và
+  không ghép các mảnh bằng dấu lược như câu trích của review được phép: "runs on
+  port … 5432" không được tìm thấy trong "runs on port 6543, not 5432"). Nếu
+  không, edit bị từ chối (`a correction's evidence must be a span
   of its entry's transcript excerpt ...`), được ghi như mọi lần từ chối. Entry
-  không có trích đoạn thì không sửa được.
+  không có trích đoạn thì không sửa được. Edit có `evidence` chứa bí mật
+  (`learned::secret_hits`) bị từ chối dù là action nào, vì câu trích sẽ được
+  giữ trong bản ghi của entry và của refinement.
 - Lời của bản sửa được phép là lời của trích đoạn: kiểm tra merge (quá nửa số
   từ của nội dung không có trong entry nào của batch) cũng tính các từ của
   trích đoạn cho nó. Nó chỉ được nói điều bản ghi cho thấy.
@@ -1376,13 +1389,15 @@ Host:
 
 - ghi `unverified` khi review cho edit `confidence: low` và không có `verified`;
 - giữ `verified` của entry qua một update không nói gì về nó, trừ bản sửa,
-  vì lần kiểm cũ không phủ khẳng định mới;
+  vì lần kiểm cũ không phủ khẳng định mới, và trừ `confirmed` của entry mà
+  update viết lại nội dung (bỏ qua khoảng trắng; demote, chuyển chi tiết đi
+  nguyên vẹn, vẫn giữ): lần kiểm là của lời cũ;
 - gộp metadata của edit vào metadata của entry khi nó chỉ có `verified`,
   `verified_by` hoặc `scope` (entry pinned vẫn pinned);
 - bỏ mọi giá trị khác của `verified`, và `verified_by` của entry không
   confirmed;
-- chỉ giữ `verified: confirmed` của Deep Dream khi `evidence` của nó nằm trong
-  trích đoạn của entry; nếu không thì bỏ và bản ghi nói vậy
+- chỉ giữ `verified: confirmed` của Deep Dream khi `evidence` của nó là một
+  đoạn liền của trích đoạn của entry; nếu không thì bỏ và bản ghi nói vậy
   (`verified_dropped`).
 
 Digest đánh dấu một entry `unverified: check it before relying on it` khi meta
@@ -1399,22 +1414,31 @@ curator được đề nghị `{"action": "demote", "kind", "id", "content", "pa
 thay cho việc xoá hay cắt nó. Host:
 
 - từ chối với entry pinned hay một constraint (được đọc nguyên mỗi lượt), với
-  câu tóm quá 100 ký tự (`DEMOTE_SUMMARY_CHARS`), với path quá 48 ký tự hoặc đã
+  entry global dành cho một project (có `project`) trong pass global, vì thư
+  viện global sẽ cho mọi project thấy chi tiết của nó, với câu tóm quá 100 ký
+  tự (`DEMOTE_SUMMARY_CHARS`), với path quá 48 ký tự hoặc đã
   có trang, và khi các thay đổi chờ người dùng duyệt (`HA_MEMORY_REVIEW=all`):
   một demote làm trọn vẹn hoặc không làm;
 - ghi trang qua chính hàm ghi của knowledge store (`Store::write_update`,
   origin `dream`): thư viện global cho memory global, thư viện của project cho
-  store của một cuộc hội thoại. Nội dung là toàn bộ nội dung của entry, hoặc
-  trang curator viết, phải chứa nó nguyên văn; trang sau khi ghi được đọc lại
-  và kiểm có chứa nó, không thì bị xoá. Nguồn của trang là `memory <kind>:<id>`
-  và các cuộc hội thoại entry đến từ;
+  store của một cuộc hội thoại. Nội dung là đúng nội dung của entry, không bao
+  giờ là lời của curator, nên không gì bịa hay chèn vào đi kèm được; entry rỗng
+  thì không có gì để chuyển. Tiêu đề, tóm tắt, nội dung và nguồn của trang qua
+  các kiểm tra như một entry memory: không bí mật (`learned::secret_hits`),
+  không gì lái agent (`learned::steering_hits`). Trang sau khi ghi được đọc lại
+  và kiểm đúng là nội dung của entry, không thì bị xoá. Nguồn của trang là
+  `memory <kind>:<id>` và các cuộc hội thoại entry đến từ. Mỗi trang được ghi
+  vào bản ghi chờ của refinement (`pending_refinements`) ngay khi nó được tạo,
+  nên một tiến trình chết trước lần lưu không để lại trang nào: refinement kế
+  tiếp trong scope xoá nó;
 - viết lại entry thành câu tóm và một con trỏ, `<câu tóm> (details: global
   knowledge concepts/x.md)`, vừa trong 180 ký tự digest hiển thị của một entry.
   Câu tóm qua kiểm tra merge: nó là ý chính của entry bằng lời của entry.
 
-Refinement ghi update của entry và việc tạo trang; rollback đặt lại entry và
-xoá trang khi trang còn như lúc ghi. Khi lần lưu giữ con trỏ thất bại, trang bị
-xoá.
+Refinement ghi update của entry và việc tạo trang. Rollback chỉ xoá trang cùng
+với entry của nó: sau khi entry được đặt lại và lưu, và khi trang còn như lúc
+ghi; một entry đã đổi kể từ đó giữ con trỏ của nó, và trang ở lại. Khi lần lưu
+giữ con trỏ thất bại, trang bị xoá.
 
 ### 17.4 `dream.md`: memory phục vụ một mục tiêu
 
@@ -1436,8 +1460,12 @@ Các batch của một pass chạy theo thứ tự entry của chúng dễ trôi
 dẫn code không còn đúng (lần kiểm cuối, §14.3), rồi một trạng thái (`status`
 trong meta, hoặc một khoảng hiệu lực), rồi bao lâu kể từ khi entry được ghi hay
 đọc so với số lần nó được đọc hay tìm thấy, nên một entry cũ ít dùng đi trước
-một entry hay dùng. Chỉ các trường ha giữ quyết định; không có danh sách từ
-nào. Một pass hỏng giữa chừng đã kiểm những entry đó trước.
+một entry hay dùng. Một entry mà pass đã cho curator xem các lượt của nó được
+đánh dấu đã kiểm (`dream_checked.json` cạnh store, `kind:id` tới thời điểm) và
+đứng sau các entry khác, vị trí trở lại dần khi lần kiểm cũ đi (một nửa sau 7
+ngày; lần kiểm cũ hơn 90 ngày bị quên), nên ngân sách trích đoạn lần lượt đến
+mọi entry thay vì cứ vài entry đó. Chỉ các trường ha giữ quyết định; không có
+danh sách từ nào. Một pass hỏng giữa chừng đã kiểm những entry đó trước.
 
 ### 17.6 Mẫu lặp lại qua các phiên
 

@@ -1304,20 +1304,30 @@ spends its effort on what is likely to change. The code is
 
 ### 17.1 The turns behind an entry
 
-For each entry of a Deep Dream batch whose `origin` (or `edited_by`) names a
-conversation, the pass reads that conversation from its project store's
+For each entry of a Deep Dream batch whose `origin` names a conversation, or
+whose last edit (`edited_by`) quoted one - a review's edit or a correction,
+each with its quote; a Deep Dream merge names only the conversation the pass
+ran in, which said nothing of the entry, and is not read - the pass reads that conversation from its project store's
 journal, read-only, as the memory tool's provenance does
 (`memory_provenance::of_task`: what the user typed in each turn, and each tool
 call's result with the kind of its tool; the agent's own words are not
 read). The store is the entry's project's, then the project the pass runs in,
-then the others (at most 64 looked through). Of those turns it keeps the ones
-that hold the review's quote, then the rest by the weight of the entry's
-words each holds (each word by its IDF over the conversation's turns), each
-cut to 1,500 characters around what matched, at most four per entry.
+then the others (at most 64 looked through). Each turn is redacted first, as
+a session log's transcript is (`learned::redact` after
+`secret_values::redact`): a tool result that read a `.env` reaches neither the
+curator nor a quote. Of those turns it keeps the ones that hold the source's
+quote, then the rest by the weight of the entry's words each holds (each word
+by its IDF over the conversation's turns), but only a turn holding at least a
+third of the weight of all the entry's words (`dream::BEARING_MIN_SHARE`; a
+word no turn holds weighs as one a single turn holds) - a turn sharing a word
+or two of a longer entry is about something else. Each is cut to 1,500
+characters around what matched, at most four per entry.
 
 The budget is `dream::EVIDENCE_TOKENS` (6,000 tokens of excerpts per batch,
 about four bytes a token) and `ENTRY_EVIDENCE_TOKENS` (1,200 per entry). The
-entries likely to drift (§17.5) get theirs first. The curator reads them in a
+entries likely to drift (§17.5) get theirs first; once the budget is spent no
+journal is opened for the rest, which are named as having no turns. The
+curator reads them in a
 `<transcript_evidence>` block, each labelled by who said it (`[the user
 typed]`, `[a tool result, file]`), framed as records, never instructions; a
 `</` inside an excerpt cannot close the block. The entries with no turns are
@@ -1330,11 +1340,15 @@ A curator edit `{"action": "correct", "kind", "id", "title", "content",
 "evidence", "changed"}` changes what an entry claims. The host checks it
 before the apply:
 
-- `evidence` must be a span of that entry's excerpt, word for word
-  (`refine::quoted`: whitespace and case aside, a phrase of 12 characters or
-  more). Otherwise the edit is refused (`a correction's evidence must be a span
+- `evidence` must be one span of that entry's excerpt, word for word
+  (`dream::spans`: whitespace and case aside, 12 characters or more, and no
+  pieces joined by an ellipsis as a review's quote may be: "runs on port …
+  5432" is not found in "runs on port 6543, not 5432"). Otherwise the edit is
+  refused (`a correction's evidence must be a span
   of its entry's transcript excerpt ...`), recorded like any refusal. An
-  entry without an excerpt cannot be corrected.
+  entry without an excerpt cannot be corrected. An edit whose `evidence`
+  holds a secret (`learned::secret_hits`) is refused whatever its action, as
+  the quote would be kept in the entry's record and the refinement's.
 - The correction's words may be the excerpt's: the merge check (more than
   half of the content's words in none of the batch's entries) also counts the
   excerpt's words for it. It may only say what the transcript shows.
@@ -1365,13 +1379,15 @@ models. The host:
 - writes `unverified` when the review gave its edit `confidence: low` and no
   `verified`;
 - keeps an entry's `verified` through an update that says nothing of it,
-  except a correction, whose claim the old check never covered;
+  except a correction, whose claim the old check never covered, and a
+  `confirmed` whose content the update rewrites (whitespace aside; a demote,
+  whose detail moves unchanged, keeps it): the check was of the old words;
 - adds an edit's metadata to the entry's when it holds only `verified`,
   `verified_by` or `scope` (a pinned entry stays pinned);
 - drops any other value of `verified`, and the `verified_by` of an entry not
   confirmed;
-- keeps a Deep Dream `verified: confirmed` only when its `evidence` is in the
-  entry's excerpt; otherwise it is dropped and the record says so
+- keeps a Deep Dream `verified: confirmed` only when its `evidence` is one
+  span of the entry's excerpt; otherwise it is dropped and the record says so
   (`verified_dropped`).
 
 The digest marks an entry `unverified: check it before relying on it` when its
@@ -1388,23 +1404,34 @@ curator is offered `{"action": "demote", "kind", "id", "content", "page":
 target, as an alternative to deleting or cutting it. The host:
 
 - refuses it for a pinned entry or a constraint (read whole in every turn),
-  for a statement over 100 characters (`DEMOTE_SUMMARY_CHARS`), for a path
+  for a global entry kept for one project (`project` set) in the global pass,
+  whose detail the global library would show every project, for a statement
+  over 100 characters (`DEMOTE_SUMMARY_CHARS`), for a path
   over 48 characters or one a page holds already, and while changes wait for
   the person (`HA_MEMORY_REVIEW=all`): a demote is made whole or not at all;
 - writes the page through the knowledge store's own write (`Store::
   write_update`, origin `dream`): the global library for the global memory,
-  the project's for a conversation's store. Its content is the entry's whole
-  content, or the curator's page, which must hold it word for word; the page
-  as written is read back and checked to hold it, and removed if not. Its
-  sources are `memory <kind>:<id>` and the conversations the entry came from;
+  the project's for a conversation's store. Its content is the entry's
+  content exactly, never words of the curator's, so nothing invented or
+  injected rides along; an empty entry has none to move. Its title, summary,
+  content and sources pass the checks a memory entry does: no secret
+  (`learned::secret_hits`), nothing that steers the agent
+  (`learned::steering_hits`). The page as written is read back and checked
+  to be the entry's content, and removed if not. Its sources are `memory
+  <kind>:<id>` and the conversations the entry came from. Each page is noted
+  in the refinement's pending record (`pending_refinements`) as it lands, so
+  a process that dies before the save leaves no page behind: the next
+  refinement in the scope deletes it;
 - rewrites the entry to the statement and a pointer, `<statement> (details:
   global knowledge concepts/x.md)`, which fits the 180 characters the digest
   shows of an entry. The statement passes the merge check: it is the entry's
   point in its own words.
 
-The refinement records the entry's update and the page's create; a rollback
-puts the entry back and deletes the page while it is as written. When the
-save that keeps the pointer fails, the page is removed.
+The refinement records the entry's update and the page's create. A rollback
+deletes the page only with its entry: once the entry is put back and saved,
+and while the page is as written; an entry changed since keeps its pointer,
+and its page stays. When the save that keeps the pointer fails, the page is
+removed.
 
 ### 17.4 `dream.md`: memory in service of a goal
 
@@ -1426,9 +1453,13 @@ have drifted (`dream::drift_scores`), and a batch shows its entries in that
 order: a citation of code that no longer holds (its last check, §14.3), then
 a state (a `status` in the meta, or a period of validity), then how long
 since the entry was written or read against how often it was read or found,
-so a rarely used old entry comes before an often used one. Only the fields
-ha keeps decide; no word list does. A pass that fails part way has checked
-those first.
+so a rarely used old entry comes before an often used one. An entry a pass
+showed the curator the turns of is marked checked (`dream_checked.json`
+beside the store, `kind:id` to the time) and waits behind the others, its
+place coming back as the check ages (half of it after 7 days; a check older
+than 90 days is forgotten), so the excerpts' budget reaches every entry in
+turn rather than the same few. Only the fields ha keeps decide; no word list
+does. A pass that fails part way has checked those first.
 
 ### 17.6 Patterns across sessions
 

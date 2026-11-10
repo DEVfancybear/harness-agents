@@ -17,24 +17,33 @@
 #     procedure to a knowledge page that holds it word for word, leaving a
 #     short entry with a pointer;
 #  4. the next turn's request carries the short entry and not the detail, and
-#     the agent answers a question about the detail by reading the page.
+#     the agent answers a question about the detail by reading the page;
+#  5. in a home of its own ($LIVE_ROOT/dream-logs), the daily meditation reads
+#     the project's session logs (§20.6): two curated logs, of two other
+#     conversations, show the user making the same correction an open lesson
+#     holds once; a turn's review runs the meditation, which adds a signal
+#     from each log, its quote word for word in that log and its conversation
+#     the log's, and the gate (3 signals across 2 conversations) makes the
+#     lesson a rule.
 #
 # On 0.9.3 (HA=<0.9.3 ha.exe>, the control) the entry stays wrong, dream.md
-# is not read, nothing is demoted and nothing is marked unverified. Every
-# check prints PASS or FAIL; the conversation, the stores and the
-# diagnostics stay in $LIVE_ROOT/dream as evidence.
+# is not read, nothing is demoted, nothing is marked unverified, and the
+# meditation reads no log, so no signal comes from one and the lesson stays a
+# candidate. Every check prints PASS or FAIL; the conversation, the stores and
+# the diagnostics stay in $LIVE_ROOT/dream and $LIVE_ROOT/dream-logs as
+# evidence.
 #
 #   bash scripts/testing/live-tests/dream.sh
+#   DREAM_ONLY=logs bash scripts/testing/live-tests/dream.sh   # section 5 alone
 set -u
 source "$(dirname "$0")/env.sh"
-fresh dream
+ONLY=${DREAM_ONLY:-all}
+case "$ONLY" in
+  all | logs) ;;
+  *) echo "DREAM_ONLY is 'logs' (section 5 alone) or unset (every section)" >&2; exit 2 ;;
+esac
 export HA_PYTHON=${HA_PYTHON:-$PY}
 export HA_AUTO_REFINE=off HA_DIAG=debug
-D=$HA_HOME/data
-G=$D/harness
-P="$RX/p-dream"
-project "$P"
-TOKEN="ZEBRA-4417"
 
 # The first request that holds a phrase of its prompt: the turn's first
 # model call, before any tool result joined it.
@@ -66,6 +75,14 @@ for path in glob.glob(os.path.join(sys.argv[1], "diagnostics", "*.jsonl")):
             print(json.dumps(record.get("fields", {}), ensure_ascii=False))
 EOF
 }
+
+if [ "$ONLY" = all ]; then
+fresh dream
+D=$HA_HOME/data
+G=$D/harness
+P="$RX/p-dream"
+project "$P"
+TOKEN="ZEBRA-4417"
 
 echo "################ 1. the user states a fact"
 SAID="Our staging database listens on port 6543, not on 5432. Do not save anything to memory or knowledge and call no tool; just answer with the one word OK."
@@ -164,6 +181,129 @@ R=$(request "which chat channel gets the release notes in step 9")
 check "the request carries the short entry with its pointer" 'printf "%s" "$R" | grep -q "(details: global knowledge"'
 check "the request does not carry the detail" '! printf "%s" "$R" | grep -q "$TOKEN"'
 check "the agent answers from the page" 'last | grep -q "$TOKEN"'
+"$HA" shutdown --force >/dev/null 2>&1
+fi
+
+echo "################ 5. the meditation reads the project's session logs"
+fresh dream-logs
+D=$HA_HOME/data
+G=$D/harness
+P="$RX/p-logs"
+project "$P"
+L=$P/.harness/sessions
+# A review after every turn (the meditation runs after one), keeping the
+# thinking level fresh() set.
+"$PY" - "$HA_HOME/settings.json" <<'EOF'
+import json, os, sys
+path = sys.argv[1]
+settings = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}
+settings["autoRefine"] = {"turnInterval": 1}
+json.dump(settings, open(path, "w", encoding="utf-8"))
+EOF
+unset HA_AUTO_REFINE
+# The lessons as the reviews of two earlier conversations left them: the one
+# the logs repeat (les_justtest), with one signal, and another, so that two
+# lessons are open and the meditation is due (it runs at most once a day, and
+# this home never ran one; a retry starts the lessons over). And two curated
+# logs, of two other conversations, in which the user makes the correction
+# les_justtest holds again, in other words.
+seed() { "$PY" - "$G" "$L" <<'EOF'
+import datetime, json, os, sys
+lessons_dir, logs_dir = sys.argv[1], sys.argv[2]
+now = datetime.datetime.now(datetime.timezone.utc)
+def ago(days):
+    return (now - datetime.timedelta(days=days)).isoformat(timespec="seconds")
+def lesson(key, text, domain, conversation, evidence):
+    return {"id": key, "text": text, "kind": "correction", "domain": domain, "project": None,
+            "state": "candidate", "events": [],
+            "signals": [{"at": ago(3), "conversation": conversation, "against": False, "evidence": evidence}]}
+os.makedirs(lessons_dir, exist_ok=True)
+for name in ("lessons.json", "lessons_meditated"):
+    if os.path.exists(os.path.join(lessons_dir, name)):
+        os.remove(os.path.join(lessons_dir, name))
+lessons = {"schema": 1, "lessons": [
+    lesson("les_justtest", "when a repository has a justfile with a test recipe, run the tests with `just test` rather than plain `cargo test`",
+           "testing", "task_seed_earlier", "run them with just test, plain cargo test skips the fixtures"),
+    lesson("les_commits", "when writing a commit message, use the imperative mood",
+           "git", "task_seed_other", "write the commit message in the imperative mood")]}
+json.dump(lessons, open(os.path.join(lessons_dir, "lessons.json"), "w", encoding="utf-8"), indent=2)
+os.makedirs(logs_dir, exist_ok=True)
+logs = [
+    ("2026-11-05-10_00-fixture-test-failures.md", "task_log_fixtures", 2, "Fixture test failures",
+     "The tests passed once they ran through the justfile.",
+     "## Errors & Workarounds\n- `cargo test` failed with `fixture not found: data/sample.db`: the user corrected the agent that in this repository the tests run with `just test`, which builds the fixtures first, never with plain `cargo test`.",
+     "The suite passes with `just test`; nothing is pending."),
+    ("2026-11-06-15_30-parser-edge-cases.md", "task_log_parser", 1, "Parser edge cases",
+     "Two parser edge cases were fixed and the suite passes.",
+     "## Key Learnings\n- The user corrected the agent a second time: run the tests with `just test`, not `cargo test`; plain `cargo test` skips the fixture build and fails.",
+     "The parser handles empty input and a trailing comma; the tests run with `just test`."),
+]
+for name, conversation, days, topic, outcome, body, resume in logs:
+    text = (f"# Session Log: {name[:10]} - {topic}\n\n## Quick Reference (for AI scanning)\n"
+            f"**Conversation:** {conversation}\n**Through:** session_{conversation[5:]}\n**Written:** {ago(days)}\n"
+            f"**Confidence keywords:** just test, cargo test, fixtures, justfile, data/sample.db\n"
+            f"**Projects:** p-logs\n**Outcome:** {outcome}\n\n{body}\n\n---\n\n## Quick Resume Context\n{resume}\n")
+    open(os.path.join(logs_dir, name), "w", encoding="utf-8", newline="\n").write(text)
+EOF
+}
+# The lessons file: `lessons <python expression over d, the file's JSON>`.
+lessons() { "$PY" -c "
+import json, os, sys
+path = os.path.join(sys.argv[1], 'lessons.json')
+d = json.load(open(path, encoding='utf-8')) if os.path.exists(path) else {}
+print(eval(sys.argv[2], {'d': d}))" "$G" "$1" | tr -d '\r'; }
+justtest() { lessons "next((x for x in d.get('lessons', []) if x['id'] == 'les_justtest'), {})$1"; }
+# Each signal that came from a log, checked against the log it names: is its
+# quote in that log word for word (whitespace and case aside), and is its
+# conversation the log's?
+logged() { "$PY" - "$G" "$P" <<'EOF'
+import json, os, re, sys
+sys.stdout.reconfigure(encoding="utf-8")
+directory, root = sys.argv[1], sys.argv[2]
+path = os.path.join(directory, "lessons.json")
+data = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}
+flat = lambda text: " ".join(text.lower().split())
+for lesson in data.get("lessons", []):
+    for signal in lesson.get("signals", []):
+        if not signal.get("log"):
+            continue
+        log = os.path.join(root, signal["log"])
+        text = open(log, encoding="utf-8").read() if os.path.isfile(log) else ""
+        said = re.search(r"^\*\*Conversation:\*\*\s*(\S+)", text, re.M)
+        quote = flat(signal.get("evidence", ""))
+        quote = quote[:-3].strip() if quote.endswith("...") else quote  # a quote the loop clipped
+        quoted = len(quote) >= 12 and quote in flat(text)
+        own = bool(said) and said.group(1) == signal.get("conversation")
+        print(f"{'quoted' if quoted else 'unquoted'} {'own' if own else 'other'} {lesson['id']} {signal['log']} :: {signal.get('evidence', '')}")
+EOF
+}
+ASKED="Remember for this project: the changelog is kept in docs/CHANGES.md. Call no tool; just answer with the one word OK."
+# The precondition: the turn's review ran (its gate approved the stated fact)
+# and the meditation after it ran; and, for the gate's check, the meditation
+# named the open lesson for both logs rather than making a new one. Either is
+# the model's choice, so the turn is asked again, once, on lessons started
+# over.
+for attempt in 1 2; do
+  seed
+  printf '\n## %s (ha exec m%s)\n\n> %s\n\n' "$(date +%H:%M:%S)" "$attempt" "$ASKED" >> "$LOG"
+  (cd "$P" && "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto --output-format json "$ASKED" \
+    >"$RX/m$attempt.json" 2>"$RX/m$attempt.err")
+  sed 's/^/    /' "$RX/m$attempt.err" >> "$LOG"
+  RAN=$(lessons "len(d.get('meditations', []))")
+  REPEATS=$(justtest ".get('signals', [])" | "$PY" -c "import ast, sys; print(sum(1 for s in ast.literal_eval(sys.stdin.read() or '[]') if s.get('log')))")
+  echo "   attempt $attempt: meditations ${RAN:-0}, signals from a log on les_justtest ${REPEATS:-0}"
+  [ "${RAN:-0}" -ge 1 ] && [ "${REPEATS:-0}" -ge 2 ] && break
+  [ "$attempt" -lt 2 ] && echo "   the review approved nothing, or the meditation did not repeat the lesson from both logs; asking again in a fresh conversation"
+done
+logged | sed 's/^/   /'
+diag learning log_signal_refused | sed 's/^/   refused: /'
+echo "   les_justtest: $(justtest ".get('state')"), $(justtest ".get('signals', [])" | "$PY" -c "import ast, sys; s = ast.literal_eval(sys.stdin.read() or '[]'); print(len(s), 'signals from', len({x['conversation'] for x in s}), 'conversations')")"
+check "precondition: the turn's review ran the meditation" '[ "${RAN:-0}" -ge 1 ]'
+check "a learning log_signal record names a seeded log" 'diag learning log_signal | grep -q "sessions/"'
+check "a signal from a log quotes that log word for word and is its conversation's" 'logged | grep -q "^quoted own "'
+check "every signal from a log is quoted from it and is its conversation's" 'S=$(logged); [ -n "$S" ] && ! printf "%s\n" "$S" | grep -qv "^quoted own "'
+check "both logs repeat the open lesson: 3 signals from 3 conversations" '[ "${REPEATS:-0}" -ge 2 ]'
+check "the gate made the lesson a rule" '[ "$(justtest ".get(\"state\")")" = promoted ]'
 "$HA" shutdown --force >/dev/null 2>&1
 
 result
