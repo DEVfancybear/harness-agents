@@ -1019,7 +1019,7 @@ Memory has to earn its place, so it can be measured: one switch turns it off, wh
 - **Rendering.** A code block in an answer sits on a panel with a straight right edge; a heading's `code` is drawn as code; a run of blank lines in an answer is one; a typed request wraps between words (0.9.2 broke it inside a word).
 - **`HA_FRAME_LOG=<file>`** also logs, per frame, the bytes of answer text the live block held (`live=812`).
 
-### 12.24. Memory kept for what comes next, knowledge as a wiki, and history in one search
+### 12.24. Memory kept for what comes next, knowledge as a wiki, and history in one search (0.9.5)
 
 [The knowledge library as a wiki](../architecture/KNOWLEDGE_WIKI.en.md) and [Memory store](../architecture/MEMORY_STORE.en.md) §7 have the details.
 
@@ -1030,7 +1030,7 @@ Memory has to earn its place, so it can be measured: one switch turns it off, wh
 - **History in one search.** `memory` search takes `sources: ["memory", "knowledge", "history"]`: with `history` it also searches the turns of this project's conversations, as `history_search` with scope `project` does, and ranks them with the entries and pages in one list (each hit's `source`; a turn's `source_id` for `history_read`). The default is still memory alone.
 - **The bug report** has a *Knowledge wiki* section: the passes, each kind of edit applied and refused, the last refusals with why.
 
-### 12.25. The action bank: calls the model already decided, run without a model step
+### 12.25. The action bank: calls the model already decided, run without a model step (0.9.5)
 
 Off by default ([the action bank](../architecture/ACTION_BANK.en.md); HarnessMM, arXiv 2610.32813).
 
@@ -1039,7 +1039,7 @@ Off by default ([the action bank](../architecture/ACTION_BANK.en.md); HarnessMM,
 - **What it reports.** `ha exec --json` has a `bank` object (`authored`, `nodes`, `dispatched`, `model_steps_saved`, `abstained`, `discarded`, the selector's calls and input tokens, and `author_tokens_estimate`, an estimate of what writing the banks cost). `/context` has a `Bank:` line while it is on. Each call run from a bank writes a `bank/dispatched` certificate to the diagnostics, and `/bug-report` has an **Action bank** section.
 - **When it pays.** Only when banks are used: authoring costs output tokens on every bank, and a bank the model never gets to use is pure cost. On `gpt-6-luna`, offered the tool with no instruction to use it, the model banked nothing in six coding runs (the tool's schema cost 2% more input); asked to bank its test run, it did, and the run saved a model call ([measured result](../architecture/ACTION_BANK.en.md#8-measured-result)). Measure it on your own tasks before leaving it on; `scripts/testing/live-tests/bank.sh` has an A/B.
 
-### 12.26. Deep Dream that checks memory against what was said (after 0.9.3)
+### 12.26. Deep Dream that checks memory against what was said (0.9.5)
 
 After Anthropic's "The components of agent memory" ([MEMORY_STORE.en.md](../architecture/MEMORY_STORE.en.md) §17):
 

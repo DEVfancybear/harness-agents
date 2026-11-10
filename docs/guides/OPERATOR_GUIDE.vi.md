@@ -1018,7 +1018,7 @@ Chi tiết ở [Kho memory](../architecture/MEMORY_STORE.vi.md) §15.
 - **Hiển thị.** Code block trong câu trả lời nằm trên một nền panel có mép phải thẳng; `code` trong tiêu đề được vẽ như code; nhiều dòng trống liền nhau trong câu trả lời gộp làm một; yêu cầu bạn gõ xuống dòng giữa các từ (0.9.2 cắt giữa từ).
 - **`HA_FRAME_LOG=<file>`** ghi thêm, mỗi khung, số byte chữ trả lời đang nằm trong khối live (`live=812`).
 
-### 12.24. Memory giữ cho những gì sắp tới, knowledge như một wiki, và history trong một lần tìm
+### 12.24. Memory giữ cho những gì sắp tới, knowledge như một wiki, và history trong một lần tìm (0.9.5)
 
 [Thư viện knowledge như một wiki](../architecture/KNOWLEDGE_WIKI.vi.md) và [Memory store](../architecture/MEMORY_STORE.vi.md) §7 có chi tiết.
 
@@ -1029,7 +1029,7 @@ Chi tiết ở [Kho memory](../architecture/MEMORY_STORE.vi.md) §15.
 - **History trong một lần tìm.** `search` của memory nhận `sources: ["memory", "knowledge", "history"]`: với `history` nó tìm cả các lượt của những cuộc hội thoại trong dự án này, như `history_search` với scope `project`, và xếp chúng cùng entry và trang trong một danh sách (`source` của mỗi kết quả; `source_id` của một lượt dùng cho `history_read`). Mặc định vẫn chỉ là memory.
 - **Bug report** có mục *Knowledge wiki*: các lượt chạy, từng loại chỉnh sửa đã áp dụng và bị từ chối, các lần từ chối gần nhất kèm lý do.
 
-### 12.25. Action bank: các lệnh model đã quyết định xong, chạy không cần một bước model
+### 12.25. Action bank: các lệnh model đã quyết định xong, chạy không cần một bước model (0.9.5)
 
 Mặc định tắt ([action bank](../architecture/ACTION_BANK.vi.md); HarnessMM, arXiv 2610.32813).
 
@@ -1038,7 +1038,7 @@ Mặc định tắt ([action bank](../architecture/ACTION_BANK.vi.md); HarnessMM
 - **Nó báo gì.** `ha exec --json` có object `bank` (`authored`, `nodes`, `dispatched`, `model_steps_saved`, `abstained`, `discarded`, số lần gọi selector và input token của nó, và `author_tokens_estimate`, ước lượng chi phí viết bank). `/context` có dòng `Bank:` khi bật. Mỗi lệnh chạy từ bank ghi một chứng nhận `bank/dispatched` vào diagnostics, và `/bug-report` có mục **Action bank**.
 - **Khi nào có lợi.** Chỉ khi bank được dùng: mỗi bank tốn output token để viết, và một bank model không bao giờ dùng tới là chi phí thuần. Trên `gpt-6-luna`, khi chỉ được cấp tool mà không được yêu cầu dùng, model không đưa gì vào bank trong sáu lần chạy code (schema của tool tốn thêm 2% input); khi được yêu cầu đưa lần chạy test vào bank, nó làm, và lần chạy đó tiết kiệm một lần gọi model ([kết quả đo](../architecture/ACTION_BANK.vi.md#8-kết-quả-đo)). Hãy đo trên task của bạn trước khi để bật; `scripts/testing/live-tests/bank.sh` có một phép A/B.
 
-### 12.26. Deep Dream đối chiếu memory với điều đã được nói (sau 0.9.3)
+### 12.26. Deep Dream đối chiếu memory với điều đã được nói (0.9.5)
 
 Theo bài "The components of agent memory" của Anthropic ([MEMORY_STORE.vi.md](../architecture/MEMORY_STORE.vi.md) §17):
 
