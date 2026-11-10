@@ -91,6 +91,8 @@ pub struct McpRequests {
     servers: std::collections::BTreeMap<String, harness_types::McpServerConfigV2>,
     workspace: std::path::PathBuf,
     plugins: Vec<Value>,
+    /// The credential file the MCP sign-ins (`/mcp login`, `/plugins`) are in.
+    auth: Option<std::path::PathBuf>,
 }
 
 impl McpRequests {
@@ -103,6 +105,7 @@ impl McpRequests {
             servers,
             workspace,
             plugins: Vec::new(),
+            auth: None,
         }
     }
 
@@ -112,6 +115,28 @@ impl McpRequests {
     pub fn with_plugins(mut self, plugins: Vec<Value>) -> Self {
         self.plugins = plugins;
         self
+    }
+
+    /// The credential file holding the MCP sign-ins.
+    #[must_use]
+    pub fn with_auth(mut self, auth: std::path::PathBuf) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// The bearer an HTTP server's sign-in gives, refreshed when it is about
+    /// to expire. Seen while testing the app: a server signed in with `/mcp
+    /// login` failed to initialize from the kernel, which was never handed the
+    /// token - it looked for prime-agent's `auth.json`, which ha does not write.
+    fn signed_in_bearer(&self, name: &str) -> Option<String> {
+        let server = self.servers.get(name)?;
+        if server.bearer_token_env.is_some() {
+            return None;
+        }
+        let url = server.url.as_deref()?;
+        super::mcp_oauth::bearer(self.auth.as_deref()?, name, url)
+            .ok()
+            .flatten()
     }
 
     /// ha's server configuration in prime-agent's `McpServerConfig` shape. A
@@ -165,6 +190,18 @@ impl McpRequests {
             config.insert("url".to_owned(), json!(server.url));
             if let Some(variable) = &server.bearer_token_env {
                 config.insert("bearerTokenEnvVar".to_owned(), json!(variable));
+            }
+            // The server's own headers, and its sign-in as the bearer.
+            let mut headers = server
+                .headers
+                .iter()
+                .map(|(key, value)| (key.clone(), json!(value)))
+                .collect::<serde_json::Map<_, _>>();
+            if let Some(token) = self.signed_in_bearer(name) {
+                headers.insert("Authorization".to_owned(), json!(format!("Bearer {token}")));
+            }
+            if !headers.is_empty() {
+                config.insert("headers".to_owned(), Value::Object(headers));
             }
         }
         if !server.enabled_tools.is_empty() {
@@ -590,6 +627,63 @@ mod tests {
             events.try_recv(),
             Ok(SessionEvent::GoalCompleted { .. })
         ));
+    }
+
+    /// Seen while testing the app: Linear, signed in with `/mcp login`, failed
+    /// to initialize from the kernel, which was never handed the sign-in. The
+    /// kernel's configuration carries it as the bearer, with the server's own
+    /// headers; a server with a bearer variable keeps that instead.
+    #[tokio::test]
+    async fn a_signed_in_server_reaches_the_kernel_with_its_bearer() {
+        use super::McpRequests;
+        let temp = tempfile::tempdir().expect("temp");
+        let auth = temp.path().join("auth.json");
+        let url = "https://mcp.linear.app/mcp";
+        crate::interactive::credentials::save(
+            &auth,
+            &crate::interactive::mcp_oauth::credential_key("linear"),
+            &crate::interactive::credentials::Credential::McpOauth {
+                access: "fixture-access".to_owned(),
+                refresh: None,
+                expires: None,
+                endpoint: url.to_owned(),
+                token_endpoint: "https://mcp.linear.app/token".to_owned(),
+                client_id: "fixture-client".to_owned(),
+                resource: None,
+            },
+        )
+        .expect("saved");
+        let mut servers = std::collections::BTreeMap::new();
+        servers.insert(
+            "linear".to_owned(),
+            harness_types::McpServerConfigV2 {
+                transport: Some("streamable_http".to_owned()),
+                url: Some(url.to_owned()),
+                headers: [("X-Team".to_owned(), "core".to_owned())].into(),
+                ..harness_types::McpServerConfigV2::default()
+            },
+        );
+        servers.insert(
+            "remote".to_owned(),
+            harness_types::McpServerConfigV2 {
+                transport: Some("streamable_http".to_owned()),
+                url: Some("https://mcp.example.com/mcp".to_owned()),
+                bearer_token_env: Some("REMOTE_TOKEN".to_owned()),
+                ..harness_types::McpServerConfigV2::default()
+            },
+        );
+        let host = McpRequests::new(servers, temp.path().to_path_buf()).with_auth(auth);
+        let config = |server: &str| {
+            let host = &host;
+            let request = json!({"type": "mcp.config", "server": server});
+            async move { host.handle(&request).await.expect("known").expect("ok") }
+        };
+        let linear = config("linear").await;
+        assert_eq!(linear["headers"]["Authorization"], "Bearer fixture-access");
+        assert_eq!(linear["headers"]["X-Team"], "core");
+        let remote = config("remote").await;
+        assert_eq!(remote["bearerTokenEnvVar"], "REMOTE_TOKEN");
+        assert!(remote.get("headers").is_none(), "{remote}");
     }
 
     #[tokio::test]

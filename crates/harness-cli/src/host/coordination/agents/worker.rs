@@ -1175,11 +1175,13 @@ impl Agent {
             host.claim_conversation(&task)?;
         }
         controller.set_session_host(host);
-        if let Some(level) = &spec.thinking {
-            controller.set_thinking(level)?;
-        }
         if let Some(source) = &spec.resume {
             controller.resume_source(source)?;
+        }
+        // After the resume, which brings the conversation's own level back:
+        // the level given on the command line is the one the user asked for.
+        if let Some(level) = &spec.thinking {
+            controller.start_thinking(level)?;
         }
         controller.set_columns(100);
         let banner = controller.boot_lines();

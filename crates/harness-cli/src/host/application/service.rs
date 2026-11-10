@@ -638,6 +638,11 @@ pub trait SessionPort: Send {
     fn set_thinking(&mut self, _level: &str) -> Result<String, String> {
         Err("this backend does not support thinking levels".to_owned())
     }
+    /// The level a session starts at (`--thinking`): this session's, not the
+    /// default for new ones, as `--model` is.
+    fn start_thinking(&mut self, level: &str) -> Result<String, String> {
+        self.set_thinking(level)
+    }
     /// The level the next turn uses, for the status line.
     fn thinking_level(&self) -> Option<String> {
         None
@@ -4207,6 +4212,38 @@ impl AgentSessionService {
     }
 }
 
+/// The model and thinking level a conversation's turns ran on, as its task
+/// keeps them (`model`, `thinking`); `None` for what it does not keep or a
+/// store that cannot be read.
+fn conversation_model_settings(
+    store_dir: &Path,
+    task: &TaskId,
+) -> (Option<String>, Option<String>) {
+    let store_dir = store_dir.to_owned();
+    let task = task.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        runtime.block_on(async move {
+            let store = SqliteStore::open_read_only(store_dir).await.ok()?;
+            let model = store.session_setting(&task, "model").await.ok().flatten();
+            let thinking = store
+                .session_setting(&task, "thinking")
+                .await
+                .ok()
+                .flatten();
+            let _ = store.close().await;
+            Some((model, thinking))
+        })
+    })
+    .join()
+    .ok()
+    .flatten()
+    .unwrap_or_default()
+}
+
 pub(super) fn resolve_resume_in_project(
     store_dir: &Path,
     selector: &str,
@@ -4682,7 +4719,7 @@ impl SessionPort for AgentSessionService {
             &self.global_config_dir,
             &self.data_dir,
             &servers,
-            &super::credentials::resolve_path(&self.environment, &self.data_dir),
+            &super::credentials::resolve_file(&self.environment, &self.data_dir),
         )
     }
 
@@ -4766,7 +4803,7 @@ impl SessionPort for AgentSessionService {
             }
             (Some("logout"), Some(name)) => {
                 let removed = super::credentials::remove(
-                    &super::credentials::resolve_path(&self.environment, &self.data_dir),
+                    &super::credentials::resolve_file(&self.environment, &self.data_dir),
                     &super::mcp_oauth::credential_key(name),
                 )
                 .map_err(|error| error.to_string())?;
@@ -5826,46 +5863,11 @@ impl SessionPort for AgentSessionService {
     }
 
     fn set_thinking(&mut self, level: &str) -> Result<String, String> {
-        let config = self.configured()?;
-        let model = self.reasoning_of(&config);
-        // The provider's spelling (`max`) or this app's level name (`xhigh`).
-        let requested = harness_providers::thinking::resolve(model, level).ok_or_else(|| {
-            let names = harness_providers::thinking::offered(model)
-                .into_iter()
-                .map(|(_, name)| name)
-                .collect::<Vec<_>>();
-            format!(
-                "unknown thinking level {level:?}; {} offers {}",
-                config.model,
-                names.join(", ")
-            )
-        })?;
-        self.thinking = Some(requested);
-        // A running turn uses the new level from its next model call.
-        self.live.set_level(requested);
-        // prime-agent's `setThinkingLevel` keeps the level as the default for new
-        // sessions, unless it is `off` on a model that does not think.
-        if model.is_some_and(|model| model.reasoning)
-            || requested != harness_providers::ThinkingLevel::Off
-        {
-            let _ = super::config::save_setting(
-                &self.config_file,
-                "defaultThinkingLevel",
-                Some(serde_json::json!(requested.as_str())),
-            );
-        }
-        let used = harness_providers::thinking::clamp(model, requested);
-        let name = |level| harness_providers::thinking::provider_name(model, level);
-        Ok(if used == requested {
-            format!("thinking {} selected for the next turn", name(requested))
-        } else {
-            format!(
-                "thinking {} selected for the next turn; {} uses {}, the nearest level it offers",
-                name(requested),
-                config.model,
-                name(used)
-            )
-        })
+        self.choose_thinking(level, true)
+    }
+
+    fn start_thinking(&mut self, level: &str) -> Result<String, String> {
+        self.choose_thinking(level, false)
     }
 
     fn set_service_tier(&mut self, tier: &str) -> Result<String, String> {
@@ -6322,6 +6324,26 @@ impl SessionPort for AgentSessionService {
         // an empty conversation the next time it died.
         if let Ok(mut resumed) = self.resumed_task.lock() {
             *resumed = task;
+        }
+        // The conversation's own model and thinking level, which its turns
+        // run on: seen while testing the app, a conversation resumed from the
+        // picker ran on gpt-6-luna at max while the status line, the sidebar
+        // and the cost said deepseek-v4-flash at high. A model given on the
+        // command line still wins, as it does for the turn.
+        if source.is_some() {
+            let (model, thinking) = conversation_model_settings(&self.store_dir, &next_task);
+            if let Some(model) = model.filter(|_| self.config_overrides.model.is_none())
+                && let Ok(mut selection) = self.model_selection.lock()
+            {
+                *selection = TurnModelSelection::with_initial(Some(model));
+            }
+            if let Some(level) = thinking
+                .as_deref()
+                .and_then(harness_providers::ThinkingLevel::parse)
+            {
+                self.thinking = Some(level);
+                self.live.set_level(level);
+            }
         }
         if source.is_none() {
             self.task_id = next_task;
@@ -7096,12 +7118,75 @@ struct ForkPlan {
     before: bool,
 }
 
+/// The title of a conversation `/fork` (`before`) or `/clone` starts from one
+/// titled `title`. Seen while testing the app: a clone of a fork was listed
+/// as "... (fork) (fork)" - a clone read as a fork, and each branch added a
+/// mark. One mark, naming what made it.
+fn branch_title(title: &str, before: bool) -> String {
+    let mut base = title.trim_end();
+    while let Some(rest) = base
+        .strip_suffix(" (fork)")
+        .or_else(|| base.strip_suffix(" (clone)"))
+    {
+        base = rest.trim_end();
+    }
+    format!("{base} ({})", if before { "fork" } else { "clone" })
+}
+
 /// Who named a conversation: `/name` (the user) or the agent's `rlm.rename`.
 const TITLE_BY_SETTING: &str = "title_by";
 const TITLE_BY_USER: &str = "user";
 const TITLE_BY_MODEL: &str = "model";
 
 impl AgentSessionService {
+    /// Choose the thinking level for the next turns. `keep_default` (`/effort`,
+    /// prime-agent's `setThinkingLevel`) also keeps it as the default for new
+    /// sessions; a session's start level (`--thinking`) does not: `ha chat
+    /// --thinking low` once made every later session think low.
+    fn choose_thinking(&mut self, level: &str, keep_default: bool) -> Result<String, String> {
+        let config = self.configured()?;
+        let model = self.reasoning_of(&config);
+        // The provider's spelling (`max`) or this app's level name (`xhigh`).
+        let requested = harness_providers::thinking::resolve(model, level).ok_or_else(|| {
+            let names = harness_providers::thinking::offered(model)
+                .into_iter()
+                .map(|(_, name)| name)
+                .collect::<Vec<_>>();
+            format!(
+                "unknown thinking level {level:?}; {} offers {}",
+                config.model,
+                names.join(", ")
+            )
+        })?;
+        self.thinking = Some(requested);
+        // A running turn uses the new level from its next model call.
+        self.live.set_level(requested);
+        // prime-agent's `setThinkingLevel` keeps the level as the default for new
+        // sessions, unless it is `off` on a model that does not think.
+        if keep_default
+            && (model.is_some_and(|model| model.reasoning)
+                || requested != harness_providers::ThinkingLevel::Off)
+        {
+            let _ = super::config::save_setting(
+                &self.config_file,
+                "defaultThinkingLevel",
+                Some(serde_json::json!(requested.as_str())),
+            );
+        }
+        let used = harness_providers::thinking::clamp(model, requested);
+        let name = |level| harness_providers::thinking::provider_name(model, level);
+        Ok(if used == requested {
+            format!("thinking {} selected for the next turn", name(requested))
+        } else {
+            format!(
+                "thinking {} selected for the next turn; {} uses {}, the nearest level it offers",
+                name(requested),
+                config.model,
+                name(used)
+            )
+        })
+    }
+
     /// Name the conversation, as `by` asks. The agent's rename never replaces
     /// the user's name: a session the user named "Tạo game" was renamed by
     /// the model to a line of its progress report.
@@ -7221,7 +7306,7 @@ impl AgentSessionService {
         callback_port: Option<u16>,
     ) {
         let sender = self.sender.clone();
-        let auth_path = super::credentials::resolve_path(&self.environment, &self.data_dir);
+        let auth_path = super::credentials::resolve_file(&self.environment, &self.data_dir);
         let server = server.to_owned();
         let url = url.to_owned();
         let _ = std::thread::Builder::new()
@@ -8742,7 +8827,7 @@ async fn run_turn(
                 && let Ok(Some(title)) = store.session_setting(&parent_task, "title").await
             {
                 let _ = store
-                    .set_session_setting(&task_id, "title", &format!("{title} (fork)"))
+                    .set_session_setting(&task_id, "title", &branch_title(&title, plan.before))
                     .await;
             }
             fork_history = harness_runtime::conversation_history(&store, &forked_from)
@@ -9840,8 +9925,9 @@ async fn run_turn(
                     &global_config_dir,
                     &data_dir,
                     &config.mcp_servers,
-                    &super::credentials::resolve_path(&environment, &data_dir),
-                )),
+                    &super::credentials::resolve_file(&environment, &data_dir),
+                ))
+                .with_auth(super::credentials::resolve_file(&environment, &data_dir)),
             ));
             let requests: Arc<dyn super::repl::HostRequests> =
                 Arc::new(super::skill_requests::ChainedRequests(chain));
@@ -15162,6 +15248,151 @@ mod tests {
         assert_eq!(
             super::subagent_default_model(&context.paths.config_file),
             None
+        );
+    }
+
+    /// Seen while testing the app: a clone of a fork was listed as "... (fork)
+    /// (fork)". A branch carries one mark, naming what made it.
+    #[test]
+    fn a_branch_carries_one_mark_naming_what_made_it() {
+        assert_eq!(super::branch_title("Plan", true), "Plan (fork)");
+        assert_eq!(super::branch_title("Plan", false), "Plan (clone)");
+        assert_eq!(super::branch_title("Plan (fork)", false), "Plan (clone)");
+        assert_eq!(
+            super::branch_title("Plan (fork) (clone)", true),
+            "Plan (fork)"
+        );
+    }
+
+    /// Seen while testing the app: a conversation resumed from the picker ran
+    /// on its own model while the status line named the default one. The
+    /// model and level its task keeps are read back for the resume.
+    #[tokio::test]
+    async fn a_conversation_keeps_its_model_and_level_for_a_resume() {
+        let temp = tempfile::tempdir().expect("temp");
+        let task = harness_types::TaskId::generate();
+        let store = SqliteStore::open_writer(WriterOpenOptions::new(
+            temp.path(),
+            harness_types::HostId::generate(),
+        ))
+        .await
+        .expect("store");
+        store
+            .set_session_setting(&task, "model", "openai-codex/gpt-6-luna")
+            .await
+            .expect("model");
+        store
+            .set_session_setting(&task, "thinking", "max")
+            .await
+            .expect("thinking");
+        store.close().await.expect("closed");
+        assert_eq!(
+            super::conversation_model_settings(temp.path(), &task),
+            (
+                Some("openai-codex/gpt-6-luna".to_owned()),
+                Some("max".to_owned())
+            )
+        );
+        assert_eq!(
+            super::conversation_model_settings(temp.path(), &harness_types::TaskId::generate()),
+            (None, None)
+        );
+    }
+
+    /// Seen while testing the app: the user signed in to Linear from
+    /// `/plugins` and the sign-in failed with "credential file ...\private
+    /// could not be read: Access is denied" - the MCP sign-ins were handed
+    /// the credential directory, not its file, so no token was ever saved or
+    /// read. A token in the credential file shows its service connected.
+    #[test]
+    fn an_mcp_sign_in_is_read_from_the_credential_file() {
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project");
+        let url = "https://mcp.linear.app/mcp";
+        std::fs::write(
+            home.path().join("mcp-servers.json"),
+            serde_json::json!({"linear": {"transport": "streamable_http", "url": url}}).to_string(),
+        )
+        .expect("servers");
+        let environment = LaunchEnvironment::from_pairs([(
+            "HA_HOME",
+            home.path().to_string_lossy().into_owned(),
+        )]);
+        let context = bootstrap::resolve(LaunchRequest {
+            cwd: None,
+            caller_dir: project.path().to_path_buf(),
+            platform: HostPlatform::current(),
+            environment: environment.clone(),
+            explicit_data_dir: None,
+        })
+        .expect("launch context");
+        let channel = SessionChannel::new();
+        let service = AgentSessionService::new(&context, environment.clone(), channel.sender());
+        let status = |service: &AgentSessionService| {
+            let cards = service.plugin_cards();
+            cards
+                .iter()
+                .find(|card| card["serviceId"] == "linear")
+                .unwrap_or_else(|| panic!("a Linear card: {cards:?}"))["connectionStatus"]
+                .clone()
+        };
+        assert_eq!(status(&service), "not_connected", "no sign-in yet");
+        credentials::save(
+            &credentials::resolve_file(&environment, &context.paths.data_dir),
+            &super::super::mcp_oauth::credential_key("linear"),
+            &credentials::Credential::McpOauth {
+                access: "fixture-access".to_owned(),
+                refresh: None,
+                expires: None,
+                endpoint: url.to_owned(),
+                token_endpoint: "https://mcp.linear.app/token".to_owned(),
+                client_id: "fixture-client".to_owned(),
+                resource: None,
+            },
+        )
+        .expect("the sign-in is saved");
+        // prime's `pending`: signed in, the handshake checked at the first call.
+        assert_eq!(status(&service), "pending", "the sign-in is read");
+    }
+
+    /// A session's start level (`--thinking`) is that session's; `/effort`
+    /// keeps its level as the default for new sessions.
+    #[test]
+    fn a_sessions_start_level_is_not_the_default_for_new_ones() {
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project");
+        let environment = LaunchEnvironment::from_pairs([
+            ("HA_HOME", home.path().to_string_lossy().into_owned()),
+            ("DEEPSEEK_API_KEY", "fixture-thinking-key".to_owned()),
+        ]);
+        let context = bootstrap::resolve(LaunchRequest {
+            cwd: None,
+            caller_dir: project.path().to_path_buf(),
+            platform: HostPlatform::current(),
+            environment: environment.clone(),
+            explicit_data_dir: None,
+        })
+        .expect("launch context");
+        let channel = SessionChannel::new();
+        let mut service = AgentSessionService::new(&context, environment, channel.sender());
+        // Seen while testing the app: `ha chat --thinking low` once, and every
+        // later session started at low.
+        service
+            .start_thinking("low")
+            .expect("a level the model has");
+        assert_eq!(
+            super::default_thinking_level(&context.paths.config_file),
+            None
+        );
+        assert_eq!(
+            service.thinking,
+            Some(harness_providers::ThinkingLevel::Low)
+        );
+        // `/effort` keeps its level as the default, as prime-agent's does.
+        service.set_thinking("high").expect("a level the model has");
+        assert_eq!(
+            super::default_thinking_level(&context.paths.config_file),
+            Some(harness_providers::ThinkingLevel::High)
         );
     }
 
