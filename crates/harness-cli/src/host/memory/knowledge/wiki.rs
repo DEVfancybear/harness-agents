@@ -95,6 +95,20 @@ pub const GIVE_UP_COOL_OFF: std::time::Duration = std::time::Duration::from_hour
 const FIX_MAX_OLD_CHARS: usize = 2_000;
 const FIX_MAX_OLD_SHARE: f64 = 0.25;
 
+/// The longest single sentence a fix replaces whatever share of its page it
+/// is: a page of one claim is fixed by replacing that claim. Seen live: a
+/// one-line page's wrong count could not be fixed, being 54% of the page.
+const FIX_ONE_CLAIM_CHARS: usize = 300;
+
+/// Whether `old` is one claim: one line, one sentence, short.
+fn one_claim(old: &str) -> bool {
+    let old = old.trim();
+    let inner = old.trim_end_matches(['.', '!', '?']);
+    old.chars().count() <= FIX_ONE_CLAIM_CHARS
+        && !inner.contains('\n')
+        && ![". ", "! ", "? "].iter().any(|end| inner.contains(end))
+}
+
 /// The longest heading an index line may be.
 const INDEX_HEADING_CHARS: usize = 120;
 
@@ -1362,9 +1376,11 @@ fn fix(
     let page_prose = prose(&page.text).chars().count();
     #[allow(clippy::cast_precision_loss, reason = "character counts")]
     let share_of_page = old.chars().count() as f64 / page_prose.max(1) as f64;
-    if old.chars().count() > FIX_MAX_OLD_CHARS || share_of_page > FIX_MAX_OLD_SHARE {
+    if old.chars().count() > FIX_MAX_OLD_CHARS
+        || (share_of_page > FIX_MAX_OLD_SHARE && !one_claim(old))
+    {
         return Err(format!(
-            "the fix replaces {:.0}% of {path} ({} characters): a fix corrects a claim, at most {:.0}% of the page and {FIX_MAX_OLD_CHARS} characters",
+            "the fix replaces {:.0}% of {path} ({} characters): a fix corrects a claim, one sentence or at most {:.0}% of the page and {FIX_MAX_OLD_CHARS} characters",
             share_of_page * 100.0,
             old.chars().count(),
             FIX_MAX_OLD_SHARE * 100.0
@@ -2231,7 +2247,7 @@ mod review_tests {
             relative: true,
         };
         let (_dir, store, _) = library();
-        let claim = "A request is retried at most 4 times.";
+        let claim = "A request is retried at most 4 times. Each retry is logged.";
         page(
             &store,
             "limits.md",
@@ -2279,6 +2295,21 @@ mod review_tests {
                     "old": "4 times", "new": "6 times", "quote": "MAX_RETRIES = 6"}),
         );
         assert_eq!(fixed.applied.len(), 1, "{fixed:?}");
+        // A page of one claim is fixed by replacing that claim, though it is
+        // the whole page: as the live wiki suite's one-line limits page is.
+        let one = "A request is retried at most 4 times (MAX_RETRIES) before it fails.";
+        page(&store, "one.md", "Request limits", one, &["src/limits.py"]);
+        let whole_claim = apply_one(
+            &store,
+            &sources,
+            &json!({"edit": "fix", "page": "one.md", "source": "src/limits.py",
+                    "old": one, "new": "A request is retried at most 6 times (MAX_RETRIES) before it fails.",
+                    "quote": "MAX_RETRIES = 6"}),
+        );
+        assert_eq!(whole_claim.applied.len(), 1, "{whole_claim:?}");
+        assert!(super::one_claim(one));
+        assert!(!super::one_claim(claim), "two sentences");
+        assert!(!super::one_claim("line one\nline two"));
     }
 
     #[test]
