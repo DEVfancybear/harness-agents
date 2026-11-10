@@ -7869,6 +7869,18 @@ impl Reviews {
         }
         let mut learning = self.learning.clone();
         learning.in_play.clone_from(&job.in_play);
+        // An edit that keeps a child's project proposal is kept for the
+        // project, whatever scope the review wrote on it.
+        learning.project_findings = proposals
+            .iter()
+            .filter(|finding| {
+                finding
+                    .proposal
+                    .as_ref()
+                    .is_some_and(|proposal| proposal.scope == "project")
+            })
+            .map(super::delegation::finding_line)
+            .collect();
         AutoRefine {
             sender: self.sender.clone(),
             helper_provider: Arc::clone(&self.helper_provider),

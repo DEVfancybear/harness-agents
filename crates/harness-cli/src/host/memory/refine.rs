@@ -457,6 +457,10 @@ pub struct Learning {
     /// What Deep Dream and the meditation may reach beyond the memory: the
     /// project, and whether knowledge and session logs are on.
     pub dream: Dream,
+    /// The finding lines of the children's `scope: project` proposals the
+    /// review is given: an edit that keeps one is kept for the project
+    /// whatever scope the review wrote on it.
+    pub project_findings: Vec<String>,
 }
 
 impl Learning {
@@ -494,6 +498,7 @@ impl Learning {
                 workspace: (!workspace.as_os_str().is_empty()).then(|| workspace.to_path_buf()),
                 ..Dream::default()
             },
+            project_findings: Vec::new(),
         }
     }
 
@@ -4279,9 +4284,17 @@ pub async fn auto_refine(
     // A memory edit for this project (`scope: project`, as a child proposes
     // one) is the global store's, kept for the project; with no project it
     // is an ordinary global entry, which names the project in its words.
+    // So is one that keeps a child's `scope: project` proposal, whatever
+    // scope the review wrote on it: seen live, the review kept a child's fact
+    // about its project as `scope: global`, and it reached every project.
+    let project_findings = learning.map_or(&[][..], |learning| &learning.project_findings[..]);
     if let Some(project) = &project {
         for edit in &mut global_edits {
-            if edit.for_project() {
+            let keeps_project_finding = edit.text("kind") == Some("memory")
+                && edit.text("evidence").is_some_and(|evidence| {
+                    project_findings.iter().any(|line| quoted(evidence, line))
+                });
+            if edit.for_project() || keeps_project_finding {
                 edit.0.insert(
                     "project".to_owned(),
                     json!({"key": project.key, "name": project.name}),
@@ -9460,6 +9473,54 @@ Run `node scripts/build.js`.
         );
         assert_eq!(dropped[0].closed, "dropped");
         assert_eq!(memory_queue::all(data).len(), 1);
+    }
+
+    /// Seen live (memory-queue.sh): the review kept a child's `scope:
+    /// project` proposal with an edit of its own that said `scope: global`,
+    /// and the entry reached every project. An edit that quotes such a
+    /// finding is kept for the project whatever scope it says; one that
+    /// quotes nothing of it stays an ordinary global entry.
+    #[tokio::test]
+    async fn the_reviews_global_edit_of_a_project_finding_is_kept_for_the_project() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let config = directory.path().join("config");
+        let data = directory.path().join("data");
+        let workspace = directory.path().join("p6");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let layers = crate::interactive::learned::Layers::new(&config, &data, &workspace, true);
+        let mut learning = super::Learning::new(layers, &workspace, None);
+        let line = "config/owners.toml names team amber-kite-913 (evidence: \"team = \\\"amber-kite-913\\\"\")";
+        learning.project_findings = vec![line.to_owned()];
+        let reply = json!({"summary": "kept the child's finding", "rationale": "r", "expectedOutcome": "", "edits": [
+            {"action": "create", "kind": "memory", "title": "Project owners", "content": "config/owners.toml names team amber-kite-913.",
+             "scope": "global", "metadata": {"scope": "global"}, "reason": "a child read it",
+             "evidence": "config/owners.toml names team amber-kite-913"},
+            {"action": "create", "kind": "memory", "title": "Reply language", "content": "Always answer in Vietnamese.",
+             "scope": "global", "reason": "a lasting preference", "evidence": "luôn trả lời bằng tiếng Việt"}
+        ]})
+        .to_string();
+        let replies = Replies::new(&[reply]);
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = replies.clone();
+        let refined = super::auto_refine(
+            &provider,
+            "fixture-model",
+            &format!("[User]: luôn trả lời bằng tiếng Việt\n\n[Child finding]: {line}\n\n[Assistant]: vâng"),
+            &scopes,
+            None,
+            Some(&learning),
+            None,
+        )
+        .await
+        .expect("refined");
+        assert!(refined.global_error.is_none(), "{:?}", refined.global_error);
+        let state = load_raw(&scopes.global);
+        let project = &state["entries"]["memory"]["project_owners"]["project"];
+        assert_eq!(project["name"], "p6", "{state:#}");
+        assert!(
+            state["entries"]["memory"]["reply_language"]["project"].is_null(),
+            "{state:#}"
+        );
     }
 
     /// Seen in a report: a child's fact about one project (`scope:
