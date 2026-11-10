@@ -136,14 +136,21 @@ check "no second page on the backoff subject without an origin" '[ "$(grep -rli 
 check "a page the review wrote is marked so in the log" '! grep -q "\"origin\":\"review\"" -r "$K" || grep -q " by review" "$K/log.md"'
 
 echo "################ 6. the next turn is told what the review changed"
-if cat "$D"/sessions/*/harness/refinements.jsonl 2>/dev/null | grep -q '"applied":true'; then
-  say k5 "Lần review chạy nền vừa rồi đã thay đổi gì trong harness? Trả lời ngắn." | tail -4
-  R=$(request "Lần review chạy nền vừa rồi")
-  check "the turn's request carries what the review changed" 'printf "%s" "$R" | grep -q "a review that ran beside the conversation changed the harness"'
-  check "with the id that undoes it" 'printf "%s" "$R" | grep -q "refine --rollback"'
-else
-  say k5 "Theo bạn exponential backoff có nhược điểm gì? Trả lời một câu." >/dev/null
-  sleep 60
+# The precondition is this conversation's own review having changed the
+# harness: another conversation's (section 4's consolidation) is never told
+# here. A review that judged the turn worth nothing is retried with the
+# convention restated, at most twice.
+k5_changed() { find "$D/sessions" -name refinements.jsonl -newer "$RX/review5.marker" 2>/dev/null | xargs -r grep -l '"applied":true' 2>/dev/null | grep -q .; }
+attempts=1
+while ! k5_changed && [ "$attempts" -lt 3 ]; do
+  attempts=$((attempts + 1))
+  touch "$RX/review6.marker"
+  say k5 "Nhắc lại để bạn nhớ cho các lần sau: tên nhánh git của dự án này luôn theo dạng feat/<mô-tả-ngắn>. Trả lời một câu." >/dev/null
+  for _ in $(seq 1 18); do find "$D/sessions" -name review_watermark -newer "$RX/review6.marker" | grep -q . && break; sleep 10; done
+  sleep 5
+done
+check "precondition: this conversation's review changed the harness (attempts: $attempts)" k5_changed
+if k5_changed; then
   say k5 "Lần review chạy nền vừa rồi đã thay đổi gì trong harness? Trả lời ngắn." | tail -4
   R=$(request "Lần review chạy nền vừa rồi")
   check "the turn's request carries what the review changed" 'printf "%s" "$R" | grep -q "a review that ran beside the conversation changed the harness"'
