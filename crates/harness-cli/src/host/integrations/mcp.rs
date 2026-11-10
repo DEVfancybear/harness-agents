@@ -1186,7 +1186,7 @@ async fn connect_one(
                         explicit_data_dir: None,
                     })
                     .ok()
-                    .map(|paths| super::credentials::resolve_path(&environment, &paths.data_dir))
+                    .map(|paths| super::credentials::resolve_file(&environment, &paths.data_dir))
                     .map(|auth| super::mcp_oauth::bearer(&auth, name, url))
                     .transpose()
                     .map_err(|message| {
