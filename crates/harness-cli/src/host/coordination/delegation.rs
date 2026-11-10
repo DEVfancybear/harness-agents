@@ -783,14 +783,15 @@ pub fn findings_for_review(local: &Path) -> Option<String> {
                 if let Some(proposal) = &finding.proposal {
                     let _ = write!(
                         block,
-                        " [proposed as a {} memory entry{}, title \"{}\": keep it with a memory edit whose evidence quotes this finding when it lasts; one you do not keep waits for the person's review]",
+                        " [proposed as a {} memory entry{}, title \"{}\": keep it with a memory edit (\"scope\": \"{}\") whose evidence quotes this finding when it lasts; one you do not keep waits for the person's review]",
                         proposal.scope,
                         if proposal.path.is_empty() {
                             String::new()
                         } else {
                             format!(" in {}", proposal.path)
                         },
-                        one_line(&proposal.title)
+                        one_line(&proposal.title),
+                        proposal.scope
                     );
                 }
             }

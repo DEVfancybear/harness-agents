@@ -16,8 +16,11 @@
 #   5. (bug report 2026-11-10) the quiet session log that comes due while the
 #      session is parked is left to the next one - it failed with the park's
 #      error and told the user "the session log was not written:
-#      rate_limited". Its checks run in section 3 (HA_IDLE_REVIEW_SECONDS=20).
-# Sections 3 to 5 need MODEL on openai-codex: the agents reach ChatGPT through
+#      rate_limited". Its checks run in section 3 (HA_IDLE_REVIEW_SECONDS=20);
+#   6. (bug report 2026-11-10) a child of a session the limit parked makes no
+#      call on that provider - it called it a second after the park and met
+#      the same limit.
+# Sections 3 to 6 need MODEL on openai-codex: the agents reach ChatGPT through
 # quota_proxy.py, which answers with a usage limit while a flag file exists.
 # Every check prints PASS or FAIL; the conversation and the diagnostics stay in
 # $LIVE_ROOT/queue as evidence.
@@ -227,6 +230,37 @@ most=$(requests "$limited" | awk '$2 == 429 {n[$3]++} END {m=0; for (k in n) if 
 check "the child started before the limit (the precondition)" 'records child | awk -v since="$asked" "\$1 > since && \$1 < $limited && \$2 == \"started\"" | grep -q .'
 check "the child met the limit and stopped (the precondition)" 'records child | awk -v since="$limited" "\$1 > since && \$2 == \"failed\"" | grep -q .'
 check "no conversation asked again after a limit that resets in hours" '[ "$most" -eq 1 ]'
+rm -f "$X/limit"
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 6. a parked session's child makes no call on that provider"
+proxied "$RX/p" q6
+asked6=$(now_ms)
+"$HA" send q6 "Kiểm thử harness, làm đúng thứ tự: (1) dùng tool delegate với wait=false giao cho một agent role explorer nhiệm vụ: gọi run_shell đúng một lần với command Start-Sleep -Seconds 50 và timeout_ms 120000, rồi trả lời đúng CHILD-DONE. (2) Sau khi giao, tự gọi run_shell với command Start-Sleep -Seconds 15 và timeout_ms 60000. (3) Trả lời đúng một dòng: PARENT-DONE." >/dev/null 2>&1
+for _ in $(seq 1 60); do
+  records child | awk -v since="$asked6" '$1 > since && $2 == "started"' | grep -q . && break
+  sleep 3
+done
+# Both are in their sleeps: the parent's next call meets the limit first.
+sleep 5
+limited6=$(now_ms)
+touch "$X/limit"
+parked6=""
+for _ in $(seq 1 40); do
+  parked6=$(records provider | awk -v since="$limited6" '$1 > since && $2 == "quota_parked" {print $1; exit}')
+  [ -n "$parked6" ] && break
+  sleep 3
+done
+ended6=""
+for _ in $(seq 1 60); do
+  ended6=$(records child | awk -v since="$limited6" '$1 > since && ($2 == "failed" || $2 == "settled") {print $1; exit}')
+  [ -n "$ended6" ] && break
+  sleep 3
+done
+records child | awk -v since="$asked6" '$1 > since' | sed 's/^/   /'
+requests "${parked6:-$limited6}" | sed 's/^/   proxy after the park: /'
+check "the session was parked while its child still ran (the precondition)" '[ -n "$parked6" ] && [ -n "$ended6" ] && [ "$parked6" -lt "$ended6" ]'
+check "the child's call after the park reached no provider" '[ -n "$parked6" ] && [ -n "$ended6" ] && [ "$(requests "$parked6" | awk -v end="$ended6" "\$1 <= end" | wc -l)" -eq 0 ]'
 rm -f "$X/limit"
 "$HA" shutdown --force >/dev/null 2>&1
 

@@ -1754,6 +1754,8 @@ pub struct LiveTurn {
     selection: Mutex<LiveSelection>,
     /// The session model a turn left for the backup model, until it answers again.
     left_primary: Arc<Mutex<Option<String>>>,
+    /// The usage-limit park of the session, which its children read.
+    session_park: Arc<super::routing::SessionPark>,
     /// prime-agent's `compaction.enabled: false`: turns do not compact on their own.
     auto_compaction_off: std::sync::atomic::AtomicBool,
     /// prime-agent's `retry.enabled: false`: a failed model call is not retried.
@@ -1873,6 +1875,9 @@ struct ServiceChildModels {
     config_file: PathBuf,
     /// `[agents] default_model`, read after the setting.
     configured: Option<String>,
+    /// The session's usage-limit park: a child's model makes no call on a
+    /// provider the session is parked on.
+    park: Arc<super::routing::SessionPark>,
 }
 
 impl super::delegation::ChildModels for ServiceChildModels {
@@ -1956,6 +1961,7 @@ impl super::delegation::ChildModels for ServiceChildModels {
             credentials::Scope::Subagent,
         )
         .map_err(|error| error.to_string())?;
+        let provider = super::routing::ParkAware::wrap(provider, &entry.reference(), &self.park);
         Ok(super::delegation::ChildModel {
             provider,
             reference: entry.reference(),
@@ -2053,6 +2059,7 @@ impl LiveProvider {
                 .then_some(super::routing::UsageWait::PRIME),
             max_attempts,
             Arc::clone(&self.live.left_primary),
+            Arc::clone(&self.live.session_park),
         )
     }
 
@@ -7487,8 +7494,12 @@ impl AutoRefine {
     /// none when it found nothing to refine), and say once what of the
     /// review waits for the person. Returns how many changes it queued.
     fn settle(&self, refinements: &[super::refine::Refinement]) -> usize {
-        let outcomes =
-            super::refine::settle_child_proposals(&self.scopes, refinements, &self.proposals);
+        let outcomes = super::refine::settle_child_proposals(
+            &self.scopes,
+            refinements,
+            &self.proposals,
+            Some(&self.learning),
+        );
         for outcome in &outcomes {
             harness_types::diag::info("memory_queue", "child_proposal")
                 .task(&self.task)
@@ -9547,6 +9558,11 @@ async fn run_turn(
         credentials::Scope::Subagent,
     )
     .unwrap_or_else(|_| Arc::clone(&provider));
+    let child_provider = super::routing::ParkAware::wrap(
+        child_provider,
+        &format!("{}/{}", config.provider_id, config.model),
+        &live.session_park,
+    );
     // The depth children of this turn may spawn to, read for this conversation.
     let hashline_rule =
         super::config::HashlineRule::load(&config_file, environment.value("HA_HASHLINE"));
@@ -9622,6 +9638,7 @@ async fn run_turn(
                 session: task_id.as_ref().to_owned(),
                 config_file: config_file.clone(),
                 configured: config.agents_default_model.clone(),
+                park: Arc::clone(&live.session_park),
             })),
             runtime_config: RuntimeConfig {
                 context_window_tokens: config.context_window_tokens,
@@ -15201,6 +15218,7 @@ mod tests {
             session: "child-effort-regression".to_owned(),
             config_file,
             configured: None,
+            park: Arc::default(),
         };
         (temp, models)
     }

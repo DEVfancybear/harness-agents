@@ -467,5 +467,22 @@ check "the quote no tool result holds is refused" '[ -n "$held6" ] && records to
 check "the refusal is a plain failure, not an unknown outcome" '[ -n "$held6" ] && ! records tool failed "$since6" | grep "tool=note_finding" | grep -q "side effect may be uncertain" && ! records call settled "$since6" | grep "tool=note_finding" | grep -q "error_code=outcome_unknown"'
 check "a proposal with scope project is taken, not refused by the schema" '[ -n "$held6" ] && ! records call settled "$since6" | grep "tool=note_finding" | grep -q "error_code=invalid_call" && findings6 amber-kite-913 | grep -q "^project "'
 check "the quote of two lines without line numbers is found and kept" '[ -n "$held6" ] && findings6 amber-kite-913 | grep "amber-kite-913.*slate-wren-274" | grep -qvE "[0-9]+(#[0-9a-z]+)?: (team|pager)"'
+# The review settles the proposal: kept as its own edit, or left to the
+# person. Either way the entry is this project's (bug report 2026-11-10: a
+# child's project fact kept untagged reached every project).
+[ -n "$held6" ] && { wait_review "$since6"; wait_settled amber-kite-913; }
+settled6=$(proposals amber-kite-913 | tail -1)
+closed6=$(echo "$settled6" | awk '{print $2}')
+kept6=$(echo "$settled6" | sed -n 's/.*`\([^`]*\)`.*/\1/p')
+echo "   the project proposal ended: ${settled6:-none}"
+check "precondition: the review settled the project proposal (${closed6:-none})" 'echo "$closed6" | grep -qxE "kept|queued"'
+if [ "$closed6" = queued ]; then
+  check "it waits tagged with its project" '[ -n "$(queued amber-kite-913 "(i[\"edit\"].get(\"project\") or {}).get(\"key\")")" ]'
+  item6=$(queued amber-kite-913 | head -1)
+  "$HA" memory queue accept "$item6" > "$RX/q6-accept.txt" 2>&1
+  check "accepted, it is an entry kept for its project" '[ -n "$(global_has "" "(e.get(\"project\") or {}).get(\"name\")==\"p6\" and \"amber-kite-913\" in e.get(\"title\",\"\")+e.get(\"content\",\"\")")" ]'
+else
+  check "the review kept it as an entry for its project" '[ -n "$kept6" ] && [ -n "$(global_has "" "e.get(\"id\")==\"$kept6\" and (e.get(\"project\") or {}).get(\"name\")==\"p6\"")" ]'
+fi
 
 result
