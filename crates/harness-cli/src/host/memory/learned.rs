@@ -279,6 +279,12 @@ pub struct Usage {
     /// went from the conversation (Mengram's procedure outcomes).
     pub worked: u64,
     pub failed: u64,
+    /// How it went since the skill was last written: turns a check passed
+    /// after or the review judged worked, and turns a check failed after or
+    /// the review judged failed. A patch starts the count again, so a skill
+    /// that was rewritten is tried afresh ([`Usage::restricted`]).
+    pub trial_good: u64,
+    pub trial_bad: u64,
     /// The skill was archived. Seen on a live skill, it means the skill was
     /// moved back since - by hand or by a rollback.
     pub archived: bool,
@@ -296,8 +302,33 @@ impl Usage {
             checked_fail: count("checked_fail"),
             worked: count("worked"),
             failed: count("failed"),
+            trial_good: count("trial_good"),
+            trial_bad: count("trial_bad"),
             archived: value["archived"].as_bool().unwrap_or(false),
         }
+    }
+}
+
+/// Failures since a skill was last written before it is held back from recall.
+const RESTRICTED_FROM: u64 = 2;
+
+impl Usage {
+    /// Whether the skill has not been seen to work: no check passed after it
+    /// and no review judged a turn that followed it to have worked. Evolver
+    /// (arXiv 2611.07595) marks such a strategy unproven instead of taking a
+    /// draft for a validated one.
+    #[must_use]
+    pub const fn unproven(&self) -> bool {
+        self.worked + self.checked_pass == 0
+    }
+
+    /// Whether the skill is held back from recall: since it was last written
+    /// it failed twice or more, and more often than it worked. Evolver's
+    /// failure-based restriction. It stays in the library, where the curator
+    /// is told to rewrite it, and a patch lifts the restriction.
+    #[must_use]
+    pub const fn restricted(&self) -> bool {
+        self.trial_bad >= RESTRICTED_FROM && self.trial_bad > self.trial_good
     }
 }
 
@@ -488,6 +519,9 @@ pub fn library_documents(layers: &Layers) -> String {
 /// The latest failures a skill keeps, for the curator.
 const FAILURES_KEPT: usize = 5;
 
+/// The latest cases a skill keeps: the words of a turn it worked in.
+const CASES_KEPT: usize = 3;
+
 /// Record how following the learned skill `name` went, as the automatic review
 /// judged it from the conversation (after Mengram, whose procedures evolve
 /// from their failures): a failure keeps what the skill took for granted that
@@ -507,6 +541,21 @@ pub fn record_outcome(
     let clip = |text: &str| text.trim().chars().take(300).collect::<String>();
     update_usage(&layers.usage_file(layer, root), |usage| {
         bump(usage, name, if worked { "worked" } else { "failed" });
+        bump(usage, name, if worked { "trial_good" } else { "trial_bad" });
+        // Evolver's Capsule: a strategy goes with a concrete case it held in.
+        if worked && !evidence.trim().is_empty() {
+            let cases = &mut usage["skills"][name]["cases"];
+            if !cases.is_array() {
+                *cases = json!([]);
+            }
+            if let Some(cases) = cases.as_array_mut() {
+                let case = clip(evidence);
+                cases.retain(|kept| kept["evidence"].as_str() != Some(case.as_str()));
+                cases.push(json!({"at": now(), "evidence": case}));
+                let excess = cases.len().saturating_sub(CASES_KEPT);
+                cases.drain(..excess);
+            }
+        }
         if !worked && !assumption.trim().is_empty() {
             let failures = &mut usage["skills"][name]["failures"];
             if !failures.is_array() {
@@ -648,6 +697,11 @@ fn record_checks(layers: &Layers, checked: &BTreeMap<String, bool>) {
                     "checked_fail"
                 },
             );
+            bump(
+                usage,
+                name,
+                if *passed { "trial_good" } else { "trial_bad" },
+            );
         });
     }
 }
@@ -770,6 +824,8 @@ pub struct LearnedSkill {
     pub requests: u64,
     /// What the skill took for granted in the turns it failed, newest last.
     pub failures: Vec<String>,
+    /// The words of the turns it worked in, newest last.
+    pub cases: Vec<String>,
 }
 
 /// Every live learned skill, global first.
@@ -800,6 +856,12 @@ pub fn library(layers: &Layers) -> Vec<LearnedSkill> {
                     .into_iter()
                     .flatten()
                     .filter_map(|failure| failure["assumption"].as_str().map(str::to_owned))
+                    .collect(),
+                cases: raw["skills"][&name]["cases"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|case| case["evidence"].as_str().map(str::to_owned))
                     .collect(),
                 name,
             });
@@ -1755,6 +1817,9 @@ fn land(
             } else {
                 update_usage(&layers.usage_file(layer, root), |usage| {
                     bump(usage, &intent.name, "patch");
+                    // A skill that was rewritten is tried afresh.
+                    usage["skills"][&intent.name]["trial_good"] = json!(0);
+                    usage["skills"][&intent.name]["trial_bad"] = json!(0);
                 });
             }
             append_ledger(&directory, &ledger_entry(intent));
@@ -2283,6 +2348,8 @@ mod tests {
                 checked_fail: 0,
                 worked: 0,
                 failed: 0,
+                trial_good: 0,
+                trial_bad: 0,
                 archived: false,
             },
         };
@@ -2392,6 +2459,60 @@ mod tests {
             overview.contains("judged after use: 1 worked, 8 failed; last failure: assumption 6"),
             "{overview}"
         );
+        // Evolver's Capsule: the words of the turn it worked in go with it.
+        assert_eq!(deploy.cases, ["it shipped"]);
+    }
+
+    /// Evolver (arXiv 2611.07595): a skill nothing has shown to work is
+    /// unproven; one that fails more than it works since it was last written
+    /// is held back, and a patch gives it a fresh trial.
+    #[test]
+    fn a_skill_is_unproven_until_it_works_and_restricted_once_it_keeps_failing() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        assert!(
+            promote(
+                &layers,
+                &create("deploy", "Run the deploy script."),
+                &PromoteContext::default()
+            )
+            .ok
+        );
+        let usage = |layers: &Layers| {
+            library(layers)
+                .into_iter()
+                .find(|skill| skill.name == "deploy")
+                .expect("deploy")
+                .usage
+        };
+        assert!(usage(&layers).unproven() && !usage(&layers).restricted());
+        record_outcome(&layers, "deploy", false, "the port was free", "in use");
+        assert!(!usage(&layers).restricted(), "one failure is not a record");
+        record_outcome(&layers, "deploy", false, "the port was free", "in use");
+        assert!(usage(&layers).unproven() && usage(&layers).restricted());
+        // Working as often as it fails lifts it: the rule is "more often".
+        record_outcome(&layers, "deploy", true, "", "it shipped");
+        record_outcome(&layers, "deploy", true, "", "it shipped");
+        let now = usage(&layers);
+        assert!(!now.unproven() && !now.restricted(), "{now:?}");
+        let cases = library(&layers).remove(0).cases;
+        assert_eq!(cases, ["it shipped"], "the same case is kept once");
+        record_outcome(&layers, "deploy", false, "a", "b");
+        assert!(usage(&layers).restricted());
+        // A rewrite starts the trial again; what it did before stays counted.
+        let patched = promote(
+            &layers,
+            &Intent::from_value(&json!({
+                "action": "patch", "name": "deploy", "old_string": "deploy script",
+                "new_string": "deploy script once the port is free",
+                "reason": "it failed on a busy port", "evidence": "in use",
+            })),
+            &PromoteContext::default(),
+        );
+        assert!(patched.ok, "{:?}", patched.findings);
+        let after = usage(&layers);
+        assert!(!after.restricted() && !after.unproven(), "{after:?}");
+        assert_eq!((after.worked, after.failed), (2, 3));
     }
 
     /// The spec holds every skill to 200 description characters and 30 body

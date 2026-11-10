@@ -364,6 +364,31 @@ pub const DELEGATED_CHILD_SETTING: &str = "delegated_child";
 /// How the app frames a child's first input, prime-agent's `[task from parent]`.
 pub const CHILD_PROMPT_HEAD: &str = "[task from parent]";
 
+/// The line a child's first prompt lists its teammates under, and the mark of
+/// the notice that names one who joined later.
+const TEAM_HEAD: &str = "Teammates";
+const TEAM_JOINED: &str = "[teammate-joined";
+
+/// How much of a teammate's brief a child is shown.
+const TEAM_BRIEF_CHARS: usize = 240;
+
+/// How a child works beside its parent's other children, in an explorer's and
+/// a coder's instructions. Two papers:
+///
+/// - s3 (arXiv 2611.08615): agents that all work at once, each on its own
+///   copy of the task, repeat half as much of each other's work once they say
+///   which part they take and which they finished, and nothing makes them
+///   talk. Its shared prompt is the first part: no role, no required message,
+///   what is worth sending, checked apart from guessed, no polling.
+/// - Zero-shot coordination (arXiv 2611.06409): agents that cannot agree
+///   beforehand each take their own convention for the natural one, and fail
+///   together. Its coordination-friendly definition is the second part: no
+///   choice a partner would have to guess. A child can say its choice, which
+///   the paper's agents could not, so that comes before the fallback.
+///
+/// A verifier gets none of it: it judges alone.
+const TEAM_PROTOCOL: &str = " Your parent's other children are your teammates; your task lists the ones working now under `Teammates:`, and a `[teammate-joined ...]` message names one that starts later. Each has its own context and sees nothing of yours but what you send it with agent_message (receiver_role \"sibling\" and its name, or \"all\"). No message is required and working alone is fine. Send one when it may change a teammate's next step: which part you take when your tasks overlap, a result you checked, a dead end, a correction, or a specific question. Say whether it is checked or a guess. Do not repeat an update, do not ask a teammate for its status, and do not count a claim a teammate repeats as a second check of it. Where your work has to fit a teammate's or your parent's - a name, a format, an interface, who does which part - do not build on a choice they would have to guess. Take it from the brief or from what the project already does; when neither settles it, tell them your choice or ask before you build on it, or do what holds whichever way they chose.";
+
 /// The file in the root conversation's local harness folder keeping what its
 /// children found ([`ChildFinding`]), one JSON object a line.
 pub const CHILD_FINDINGS_FILE: &str = "child_findings.jsonl";
@@ -514,6 +539,18 @@ pub struct ChildProposal {
 
 /// Text on one line, its runs of blanks one space: how a finding is kept
 /// and how its evidence is found in a tool result.
+/// One teammate, as a child reads it.
+fn team_line(name: &str, role: AgentRole, objective: &str) -> String {
+    let brief = one_line(objective);
+    let shown = brief.chars().take(TEAM_BRIEF_CHARS).collect::<String>();
+    let more = if brief.chars().count() > TEAM_BRIEF_CHARS {
+        "..."
+    } else {
+        ""
+    };
+    format!("- {name} ({}): {shown}{more}", role.as_str())
+}
+
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -987,6 +1024,12 @@ struct ChildRecord {
     /// the child again: a verifier waiting on CI and its parent pinged each
     /// other every half minute for hours.
     notice_delivered: bool,
+    /// Its first prompt was built, with the teammates it had then: one that
+    /// joins later is announced to it ([`AgentsShared::announce`]).
+    briefed: bool,
+    /// The host started it for a judgement of its own (a goal's verifier, a
+    /// plateau's strategist): it is on nobody's team.
+    solo: bool,
     session_id: Option<SessionId>,
     /// Messages sent before the child's run opened its inbox.
     backlog: Vec<String>,
@@ -1067,6 +1110,13 @@ struct LedgerEntry {
 const LEDGER_HISTORY: usize = 40;
 
 impl ChildRecord {
+    /// Whether it is on its parent's team: a verifier judges alone, and so
+    /// does a child the host started for itself. Neither is told of the
+    /// others nor named to them.
+    fn teams(&self) -> bool {
+        !self.solo && matches!(self.role, AgentRole::Explorer | AgentRole::Coder)
+    }
+
     fn ledger_entry(&self) -> LedgerEntry {
         let (status, answer, error) = match &self.state {
             ChildState::Running => ("running", None, None),
@@ -1167,6 +1217,8 @@ impl ChildRecord {
             // A task done before the restart was answered then; one cut off
             // (now failed) still reports when it is woken and carries on.
             notice_delivered: announced,
+            briefed: true,
+            solo: false,
             session_id: None,
             backlog: Vec::new(),
             notes: VecDeque::new(),
@@ -1981,6 +2033,102 @@ impl AgentsShared {
         )
     }
 
+    /// The teammates of `task_id` for its first prompt: its parent's other
+    /// children that still work, each with its role and what it was asked.
+    /// The child is marked briefed under the same lock, so a teammate that
+    /// registers after this read announces itself ([`Self::announce`]) and one
+    /// that registered before it is listed: never both, never neither.
+    fn brief_on_team(&self, task_id: &TaskId) -> Option<String> {
+        let mut children = self.children.lock().ok()?;
+        let me = children
+            .iter_mut()
+            .find(|child| &child.task_id == task_id)?;
+        me.briefed = true;
+        if !me.teams() {
+            return None;
+        }
+        let parent = me.parent.clone();
+        let lines = children
+            .iter()
+            .filter(|child| {
+                &child.task_id != task_id
+                    && !child.deleted
+                    && child.parent == parent
+                    && !child.state.settled()
+                    && child.teams()
+            })
+            .map(|child| team_line(&child.name, child.role, &child.objective))
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{TEAM_HEAD}: your parent's other children, working now. Each was asked:\n{}",
+            lines.join("\n")
+        ))
+    }
+
+    /// Tell the teammates that were briefed before `task_id` registered that
+    /// it joined. The ones not briefed yet list it themselves.
+    async fn announce(&self, task_id: &TaskId) {
+        let Some((notice, briefed)) = self.children.lock().ok().and_then(|children| {
+            let me = children.iter().find(|child| &child.task_id == task_id)?;
+            if !me.teams() {
+                return None;
+            }
+            let briefed = children
+                .iter()
+                .filter(|child| {
+                    &child.task_id != task_id
+                        && !child.deleted
+                        && child.parent == me.parent
+                        && child.briefed
+                        && !child.state.settled()
+                        && child.teams()
+                })
+                .map(|child| child.task_id.clone())
+                .collect::<Vec<_>>();
+            Some((
+                format!(
+                    "{TEAM_JOINED}: {}]\n\nYour parent started another child beside you. It was asked:\n{}",
+                    me.name,
+                    team_line(&me.name, me.role, &me.objective)
+                ),
+                briefed,
+            ))
+        }) else {
+            return;
+        };
+        for teammate in briefed {
+            // One that settled since is not woken for this.
+            if self
+                .update(&teammate, |child| child.state.settled())
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let _ = self.deliver_to_child(&teammate, notice.clone()).await;
+        }
+    }
+
+    /// Why no sibling is named `name`, with the names there are.
+    fn no_sibling(&self, from: &TaskId, parent: Option<&TaskId>, name: &str) -> String {
+        let names = self
+            .names(parent)
+            .into_iter()
+            .filter(|(task_id, _, _)| task_id != from)
+            .map(|(_, name, _)| name)
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            format!("no sibling named {name:?}: your parent has no other child")
+        } else {
+            format!(
+                "no sibling named {name:?}; your parent's other children are {}",
+                names.join(", ")
+            )
+        }
+    }
+
     fn find(&self, parent: Option<&TaskId>, selector: &str) -> Option<TaskId> {
         if selector.is_empty() {
             return None;
@@ -2083,7 +2231,7 @@ impl AgentsShared {
                 let task_id = self
                     .find(parent.as_ref(), &name)
                     .filter(|task_id| task_id != from)
-                    .ok_or_else(|| format!("no sibling named {name:?}"))?;
+                    .ok_or_else(|| self.no_sibling(from, parent.as_ref(), &name))?;
                 let text = format!("[agent-message from sibling:{sender_name}]\n\n{message}");
                 let status = self.deliver_to_child(&task_id, text).await?;
                 self.record(&sender_name, &name, &message);
@@ -3184,7 +3332,6 @@ impl SessionAgents {
 
     /// Admit and dispatch one child, returning as soon as it is admitted - the part
     /// of prime-agent's `rlm.spawn` that happens before the child runs.
-    #[allow(clippy::too_many_lines)]
     async fn start(
         self: &Arc<Self>,
         role: AgentRole,
@@ -3192,6 +3339,22 @@ impl SessionAgents {
         name: Option<String>,
         launch: &ChildLaunch,
         parent: Option<&TaskId>,
+    ) -> Result<(TaskId, String), HarnessError> {
+        self.start_with(role, brief_text, name, launch, parent, false)
+            .await
+    }
+
+    /// [`Self::start`], and with `solo` a child of the host's own that is on
+    /// nobody's team.
+    #[allow(clippy::too_many_lines)]
+    async fn start_with(
+        self: &Arc<Self>,
+        role: AgentRole,
+        brief_text: String,
+        name: Option<String>,
+        launch: &ChildLaunch,
+        parent: Option<&TaskId>,
+        solo: bool,
     ) -> Result<(TaskId, String), HarnessError> {
         // prime-agent's spawn check: an agent at depth d spawns only while
         // d < RLM_MAX_DEPTH, the root reading the session's value and a child
@@ -3337,6 +3500,8 @@ impl SessionAgents {
                 suppress_notice: false,
                 replied: false,
                 notice_delivered: false,
+                briefed: false,
+                solo,
                 session_id: None,
                 backlog: Vec::new(),
                 notes: VecDeque::new(),
@@ -3366,6 +3531,7 @@ impl SessionAgents {
         if let Ok(mut launches) = self.shared.launches.lock() {
             launches.insert(task_id.clone(), launch.clone());
         }
+        self.shared.announce(&task_id).await;
         self.ensure_pump();
         let dispatched = scheduler.dispatch(WorkerRequest {
             task_id: task_id.clone(),
@@ -3654,7 +3820,7 @@ impl VerifierHandle {
         let launch = self.launch.for_role(role, model)?;
         let (task_id, _) = self
             .agents
-            .start(role, brief, None, &launch, None)
+            .start_with(role, brief, None, &launch, None, true)
             .await
             .map_err(|error| error.to_string())?;
         let _verification = Verification(&self.agents, &task_id);
@@ -4895,7 +5061,7 @@ impl ChildTools {
                 "type": "function",
                 "function": {
                     "name": "agent_message",
-                    "description": "Send a message to your parent agent (receiver_role \"parent\", the default), to a sibling by name (\"sibling\" with receiver_name), to one of your own children by name (\"child\" with receiver_name), or to all of them (\"all\"). The receiver reads it at its next step, or it wakes the root agent when that agent is idle. Use it to report what you found before you finish. Do not send a child a message only to ask for its status: each one wakes it for another run, and its result or its own message reaches you without asking.",
+                    "description": "Send a message to your parent agent (receiver_role \"parent\", the default), to a sibling by name (\"sibling\" with receiver_name; your task and `[teammate-joined ...]` messages name them), to one of your own children by name (\"child\" with receiver_name), or to all of them (\"all\"). The receiver reads it at its next step, or it wakes the root agent when that agent is idle. Use it to report what you found before you finish. Do not send a child a message only to ask for its status: each one wakes it for another run, and its result or its own message reaches you without asking.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -5800,7 +5966,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     child_policy(&launch.parent_policy),
                     harness_tools::coding_tool_schemas_for(hashline),
                     format!(
-                        "You are a child agent spawned by your parent agent. Task prompts are labeled `[task from parent]`.{} Use agent_message to tell your parent what you found when it helps before you finish. Once your task is done, a message that wakes you again sends your parent no notice when you stop: answer it with agent_message when it asks for something, and send nothing when you would only repeat a status it already has.{findings_line}",
+                        "You are a child agent spawned by your parent agent. Task prompts are labeled `[task from parent]`.{} Use agent_message to tell your parent what you found when it helps before you finish. Once your task is done, a message that wakes you again sends your parent no notice when you stop: answer it with agent_message when it asks for something, and send nothing when you would only repeat a status it already has.{TEAM_PROTOCOL}{findings_line}",
                         if can_spawn {
                             spawn_line
                         } else {
@@ -5841,7 +6007,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                         child_policy(&launch.parent_policy),
                         harness_tools::coding_tool_schemas_for(hashline),
                         format!(
-                            "You are a delegated coder. Work only in the isolated worktree assigned to you and follow the brief. Tool calls use the host approval and policy service. Leave your changes in that worktree (committed or not) and report what changed, with paths; do not merge, push or copy them into the user's checkout and do not claim they are there - your parent brings them in with integrate_children, which merges every coder's branch, runs the project checks on the result and applies it only if the user's checkout has not changed.{spawn_line}{findings_line}"
+                            "You are a delegated coder. Work only in the isolated worktree assigned to you and follow the brief. Tool calls use the host approval and policy service. Leave your changes in that worktree (committed or not) and report what changed, with paths; do not merge, push or copy them into the user's checkout and do not claim they are there - your parent brings them in with integrate_children, which merges every coder's branch, runs the project checks on the result and applies it only if the user's checkout has not changed.{spawn_line}{TEAM_PROTOCOL}{findings_line}"
                         ),
                     )
                 }
@@ -5887,6 +6053,9 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     std::mem::take(&mut child.backlog)
                 })
                 .unwrap_or_default();
+            // Who else works for its parent now, read as it is marked briefed:
+            // one that joins after this is announced to it instead.
+            let team = self.shared.brief_on_team(&task_id);
             // A child's own children work where it works, under its policy and
             // with its tools.
             let spawn = can_spawn.then(|| ChildSpawn {
@@ -5975,12 +6144,17 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 .shared
                 .update(&task_id, |child| (child.wake.take(), child.history.clone()))
                 .unwrap_or_default();
+            let woken = wake.is_some();
             let mut prompt = wake.unwrap_or_else(|| {
                 format!(
                     "{CHILD_PROMPT_HEAD}\n\nAnswer the delegated task below. Return concise results and identify changed files or findings with paths.\n\nBrief:\n{}",
                     request.brief.objective
                 )
             });
+            if let Some(team) = team.filter(|_| !woken) {
+                prompt.push_str("\n\n");
+                prompt.push_str(&team);
+            }
             for message in backlog {
                 prompt.push_str("\n\n");
                 prompt.push_str(&message);
@@ -9293,6 +9467,124 @@ mod real_worker_tests {
             !seen.contains("[steering correction from the user]\n[agent-message"),
             "an agent message is not the user's steering: {seen}"
         );
+    }
+
+    /// s3 (arXiv 2611.08615): a child is told who works beside it. The one
+    /// that starts second reads the first in its task; the first, briefed
+    /// before the second existed, is told it joined. Neither hears it twice.
+    #[tokio::test]
+    async fn a_child_is_told_its_teammates_and_the_one_that_joins_later() {
+        let bench = bench();
+        let provider = Scripted::new(vec![
+            Reply::Delay(1_200, Box::new(Reply::Tool("list_files", json!({})))),
+            Reply::Text("ok"),
+        ]);
+        let host = host(&bench, Arc::clone(&provider) as Arc<dyn ModelProvider>);
+        spawn(&host, "one", "map the parser").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        spawn(&host, "two", "map the lexer").await;
+        for name in ["one", "two"] {
+            assert!(matches!(
+                state_of(&bench.agents, name).await,
+                ChildState::Done { .. }
+            ));
+        }
+        let requests = provider.seen.lock().expect("seen").clone();
+        let texts = requests
+            .iter()
+            .map(|request| {
+                request
+                    .messages
+                    .iter()
+                    .map(|message| message.content.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n---\n")
+            })
+            .collect::<Vec<_>>();
+        let of = |brief: &str| {
+            texts
+                .iter()
+                .filter(|text| text.contains(&format!("Brief:\n{brief}")))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let (one, two) = (of("map the parser"), of("map the lexer"));
+        assert!(!one.is_empty() && !two.is_empty(), "{texts:?}");
+        // The second child's task lists the first.
+        assert!(
+            two.iter().all(|text| text
+                .contains("Teammates: your parent's other children, working now")
+                && text.contains("- one (explorer): map the parser")),
+            "{two:?}"
+        );
+        assert!(
+            two.iter().all(|text| !text.contains("[teammate-joined:")),
+            "the one it was listed is not announced to it too: {two:?}"
+        );
+        // The first had no teammate when it was briefed, and hears of the
+        // second at its next step.
+        assert!(
+            one.iter()
+                .all(|text| !text.contains("Teammates: your parent's other children")),
+            "{one:?}"
+        );
+        let last = one.last().expect("a request");
+        assert!(
+            last.contains("[teammate-joined: two]")
+                && last.contains("- two (explorer): map the lexer"),
+            "{last}"
+        );
+        // Both are told how to work beside each other: s3's protocol and the
+        // coordination-friendly definition of arXiv 2611.06409.
+        let system = &texts[0];
+        assert!(
+            system.contains("No message is required and working alone is fine")
+                && system.contains("do not build on a choice they would have to guess"),
+            "{system}"
+        );
+    }
+
+    /// A sibling's name a child gets wrong is answered with the names there are.
+    #[tokio::test]
+    async fn a_sibling_that_does_not_exist_is_answered_with_the_ones_that_do() {
+        let bench = bench();
+        let provider = Scripted::new(vec![
+            Reply::Delay(900, Box::new(Reply::Text("mapped"))),
+            Reply::Tool(
+                "agent_message",
+                json!({"message": "taking src/", "receiver_role": "sibling", "receiver_name": "nobody"}),
+            ),
+            Reply::Text("done"),
+        ]);
+        let host = host(&bench, Arc::clone(&provider) as Arc<dyn ModelProvider>);
+        spawn(&host, "one", "map the parser").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        spawn(&host, "two", "map the lexer").await;
+        for name in ["one", "two"] {
+            assert!(matches!(
+                state_of(&bench.agents, name).await,
+                ChildState::Done { .. }
+            ));
+        }
+        let seen = provider.requests_text();
+        assert!(
+            seen.contains("no sibling named \\\"nobody\\\"; your parent's other children are one")
+                || seen
+                    .contains("no sibling named \"nobody\"; your parent's other children are one"),
+            "{seen}"
+        );
+    }
+
+    #[test]
+    fn a_teammate_line_is_one_line_and_cut() {
+        let line = super::team_line("scout", super::AgentRole::Coder, "fix\n  the   parser");
+        assert_eq!(line, "- scout (coder): fix the parser");
+        let long = super::team_line(
+            "scout",
+            super::AgentRole::Explorer,
+            &"x".repeat(super::TEAM_BRIEF_CHARS + 5),
+        );
+        assert!(long.ends_with("...") && long.chars().count() < super::TEAM_BRIEF_CHARS + 40);
     }
 
     /// prime-agent: a message to a child that finished wakes it for a

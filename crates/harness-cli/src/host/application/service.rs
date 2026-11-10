@@ -10668,6 +10668,8 @@ async fn run_turn(
                 .field("skill", recalled.name.clone())
                 .field("score", recalled.score)
                 .field("failures", recalled.failures.len())
+                .field("cases", recalled.cases.len())
+                .field("unproven", recalled.unproven)
                 .emit();
             // A skill put in the turn is used, as one activated is: its use
             // keeps it from being archived as dormant, and the review judges

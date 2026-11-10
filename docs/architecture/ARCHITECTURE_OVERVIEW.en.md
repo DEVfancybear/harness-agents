@@ -199,7 +199,7 @@ The product is still single-host: one writable host owns a data directory at a t
 
 `harness-orchestrator` treats a delegated worker as a durable task, not as a prompt fragment. The host materializes role, scope, depth, worker-count and model-request limits before dispatch (defaults: depth 2, 3 workers, 8 queued, 24 model requests per worker). Results and parent delivery are persisted so a worker can finish while the parent is paused or can be inspected after a crash. A role preset (`coordinator`, `explorer`, `coder`, `reviewer`, `verifier`) is only a preset; it grants no authority by itself. A coder works in a host-owned isolated worktree on its own branch; worktrees isolate concurrent edits and are not a security boundary.
 
-In an interactive session the model delegates with the `delegate` tool. Children belong to the session, not to the turn that started it: spawning returns at admission, the parent is notified when a child settles, a message to a finished child wakes it for a follow-up turn, and a spawn ledger brings a conversation's children back after `/resume` or a worker restart. The scheduler and workspace planner are separate from the coding-tool gate: a child may propose an edit, but the host still applies the same tool policy, approval and receipt rules.
+In an interactive session the model delegates with the `delegate` tool. Children belong to the session, not to the turn that started it: spawning returns at admission, the parent is notified when a child settles, a message to a finished child wakes it for a follow-up turn, and a spawn ledger brings a conversation's children back after `/resume` or a worker restart. An explorer or a coder is told of its parent's other children that work beside it, with what each was asked, and how to work beside them ([teamwork](TEAMWORK.en.md)). The scheduler and workspace planner are separate from the coding-tool gate: a child may propose an edit, but the host still applies the same tool policy, approval and receipt rules.
 
 ### Extensions and MCP
 
@@ -331,6 +331,7 @@ Tests marked `#[ignore]` (the pseudo-terminal acceptance cases) are skipped by `
 - [Session continuity](SESSION_CONTINUITY.en.md)
 - [Sleep](SLEEP.en.md)
 - [Strategy revision and the runtime harness](STRATEGY_AND_RUNTIME.en.md)
+- [Teammates, conventions and proven skills](TEAMWORK.en.md)
 - [Live tests](../../scripts/testing/live-tests/README.md)
 - [Terminal interface](../guides/TUI.md)
 - [Build and release](../guides/BUILD_AND_RELEASE.md)

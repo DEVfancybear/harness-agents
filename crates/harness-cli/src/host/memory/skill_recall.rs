@@ -10,6 +10,16 @@
 //! request that fits none gets none. What the skill took for granted in the
 //! turns it failed goes with it: those assumptions were kept, and never read
 //! when the skill was used again.
+//!
+//! From Evolver (arXiv 2611.07595), whose reused strategies cut the tokens of
+//! tasks that already succeeded by 17% and which warns that an outdated one
+//! costs more than none:
+//! - a skill that fails more than it works since it was last written is not
+//!   recalled (its failure-based restriction), until a patch tries it afresh;
+//! - one nothing has shown to work is said to be unproven, not handed over as
+//!   if it were validated;
+//! - the words of a turn it worked in go with it (its Capsule: a concrete
+//!   case beside the strategy).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,12 +42,21 @@ pub struct Recalled {
     pub name: String,
     pub body: String,
     pub failures: Vec<String>,
+    /// The words of the turns it worked in, newest last.
+    pub cases: Vec<String>,
+    /// Nothing has shown it to work yet.
+    pub unproven: bool,
     pub score: f64,
 }
 
 /// The learned skill that fits `request`, if one stands out.
 #[must_use]
 pub fn recall(layers: &Layers, skills: &[LearnedSkill], request: &str) -> Option<Recalled> {
+    // A skill held back is not a candidate at all: the next best may fit.
+    let skills = skills
+        .iter()
+        .filter(|skill| !skill.usage.restricted())
+        .collect::<Vec<_>>();
     let bodies = skills
         .iter()
         .map(|skill| {
@@ -62,7 +81,7 @@ pub fn recall(layers: &Layers, skills: &[LearnedSkill], request: &str) -> Option
         })
         .collect::<Vec<_>>();
     let (best, score) = best_of(&documents, &words(request))?;
-    let skill = &skills[best];
+    let skill = skills[best];
     let mut body = bodies[best].trim().to_owned();
     if body.chars().count() > MAX_BODY_CHARS {
         body = body.chars().take(MAX_BODY_CHARS).collect::<String>();
@@ -72,6 +91,8 @@ pub fn recall(layers: &Layers, skills: &[LearnedSkill], request: &str) -> Option
         name: skill.name.clone(),
         body,
         failures: skill.failures.clone(),
+        cases: skill.cases.clone(),
+        unproven: skill.usage.unproven(),
         score,
     })
 }
@@ -162,6 +183,15 @@ pub fn block(recalled: &Recalled) -> ContextBlock {
         "A learned skill fits this request: {}. Its instructions follow; follow them where they fit, and say so when they do not.\n<skill name=\"{}\">\n{}\n</skill>",
         recalled.name, recalled.name, recalled.body
     );
+    if recalled.unproven {
+        text.push_str(
+            "\nNothing has shown it to work yet: it is a draft. Check each step's result as you go.",
+        );
+    }
+    if let Some(case) = recalled.cases.last() {
+        text.push_str("\nA turn it worked in showed: ");
+        text.push_str(case);
+    }
     if !recalled.failures.is_empty() {
         text.push_str("\nWhen it was followed before and failed, it had taken for granted:");
         for failure in &recalled.failures {
@@ -180,8 +210,115 @@ const RECALLED_TOKENS: u64 = 1_500;
 
 #[cfg(test)]
 mod tests {
-    use super::{best_of, without_front_matter};
+    use super::{Recalled, best_of, block, recall, without_front_matter};
+    use crate::interactive::learned::{
+        Intent, Layers, PromoteContext, library, promote, record_outcome,
+    };
     use harness_types::readout::words;
+    use serde_json::json;
+
+    fn learned(root: &std::path::Path, skills: &[(&str, &str)]) -> Layers {
+        let layers = Layers::new(
+            &root.join("config"),
+            &root.join("data"),
+            &root.join("workspace"),
+            true,
+        );
+        for (name, body) in skills {
+            let verdict = promote(
+                &layers,
+                &Intent::from_value(&json!({
+                    "action": "create", "name": name, "level": "project",
+                    "body": format!("---\nname: {name}\ndescription: Use it for {name}.\ncategory: ops\n---\n{body}\n"),
+                    "reason": "the user showed it", "evidence": "[User]: do it this way",
+                })),
+                &PromoteContext::default(),
+            );
+            assert!(verdict.ok, "{:?}", verdict.findings);
+        }
+        layers
+    }
+
+    /// Evolver's failure-based restriction: the skill that fits but keeps
+    /// failing is not recalled, and a patch tries it again.
+    #[test]
+    fn a_skill_that_keeps_failing_is_not_recalled_until_it_is_rewritten() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = learned(
+            directory.path(),
+            &[
+                (
+                    "db-migration",
+                    "Write the database migration and run it against staging.",
+                ),
+                (
+                    "release-notes",
+                    "Write the release notes from the merged changes.",
+                ),
+            ],
+        );
+        let request = "run the database migration against staging";
+        let first = recall(&layers, &library(&layers), request).expect("fits");
+        assert_eq!(first.name, "db-migration");
+        assert!(first.unproven && first.cases.is_empty());
+        for _ in 0..2 {
+            record_outcome(
+                &layers,
+                "db-migration",
+                false,
+                "staging was reachable",
+                "timeout",
+            );
+        }
+        assert!(
+            recall(&layers, &library(&layers), request).is_none(),
+            "held back, and the other skill does not fit"
+        );
+        let patched = promote(
+            &layers,
+            &Intent::from_value(&json!({
+                "action": "patch", "name": "db-migration", "old_string": "and run it",
+                "new_string": "check staging answers, and run it",
+                "reason": "it timed out", "evidence": "timeout",
+            })),
+            &PromoteContext::default(),
+        );
+        assert!(patched.ok, "{:?}", patched.findings);
+        let again = recall(&layers, &library(&layers), request).expect("tried afresh");
+        assert_eq!(again.name, "db-migration");
+        assert_eq!(
+            again.failures,
+            ["staging was reachable", "staging was reachable"]
+        );
+    }
+
+    /// Evolver's unproven draft and Capsule, as the turn reads them.
+    #[test]
+    fn the_block_says_a_skill_is_unproven_and_carries_the_case_it_worked_in() {
+        let mut recalled = Recalled {
+            name: "deploy".to_owned(),
+            body: "Run the deploy script.".to_owned(),
+            failures: Vec::new(),
+            cases: Vec::new(),
+            unproven: true,
+            score: 1.0,
+        };
+        let text = format!("{:?}", block(&recalled));
+        assert!(text.contains("Nothing has shown it to work yet"), "{text}");
+        assert!(!text.contains("A turn it worked in showed"), "{text}");
+        recalled.unproven = false;
+        recalled.cases = vec![
+            "older".to_owned(),
+            "deployed 3 services, smoke test green".to_owned(),
+        ];
+        let text = format!("{:?}", block(&recalled));
+        assert!(!text.contains("Nothing has shown it to work yet"), "{text}");
+        assert!(
+            text.contains("A turn it worked in showed: deployed 3 services, smoke test green")
+                && !text.contains("older"),
+            "{text}"
+        );
+    }
 
     fn docs(texts: &[&str]) -> Vec<Vec<String>> {
         texts.iter().map(|text| words(text)).collect()

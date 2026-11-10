@@ -331,6 +331,7 @@ Các test đánh dấu `#[ignore]` (ca acceptance dùng pseudo-terminal) bị `c
 - [Session continuity](SESSION_CONTINUITY.vi.md)
 - [Sleep](SLEEP.vi.md)
 - [Đổi chiến lược và runtime harness](STRATEGY_AND_RUNTIME.vi.md)
+- [Đồng đội, quy ước và skill đã kiểm chứng](TEAMWORK.vi.md)
 - [Live tests](../../scripts/testing/live-tests/README.md)
 - [Giao diện terminal](../guides/TUI.md)
 - [Build and release](../guides/BUILD_AND_RELEASE.md)

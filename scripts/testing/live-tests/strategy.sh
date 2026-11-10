@@ -135,6 +135,39 @@ say s4 "Chỉ trả lời: 2 cộng 2 bằng mấy?" | tail -1 | sed 's/^/   /'
 check "a request no skill fits recalls none" '[ -z "$(records skill recalled "$since")" ]'
 "$HA" shutdown --force >/dev/null 2>&1
 
+echo "################ 4b. Evolver: unproven, the case it worked in, held back when it keeps failing"
+# The skill of section 4 never worked: it went into that turn as unproven.
+check "a skill nothing has shown to work was recalled as unproven" 'records skill recalled 0 | grep release-notes | head -1 | grep -q "\"unproven\": true"'
+# Whether a request this home sent holds $1.
+sent() {
+  "$PY" - "$D" "$1" <<'PYEOF'
+import glob, os, sqlite3, sys
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    for (text,) in c.execute("select request_json from frozen_requests"):
+        if sys.argv[2] in text:
+            sys.exit(0)
+sys.exit(1)
+PYEOF
+}
+# It worked twice since, and the review kept the words of a turn it worked in.
+printf '{"skills": {"release-notes": {"use": 3, "worked": 2, "trial_good": 2, "failed": 1, "trial_bad": 1, "cases": [{"at": "2026-11-01", "evidence": "CHANGELOG.md now opens with the heading RN-7 FINCH-5521"}], "failures": [{"at": "2026-10-20", "assumption": "CHANGELOG.md already exists", "evidence": "no such file"}]}}}\n' > "$D/skill-usage/global.json"
+project "$RX/p4b"
+agent "$RX/p4b" s4b
+since=$(now_ms)
+say s4b "Viết release notes cho thay đổi: thêm bộ lọc theo ngày. Ghi vào changelog của dự án." | tail -2 | sed 's/^/   /'
+"$HA" shutdown --force >/dev/null 2>&1
+check "a skill that worked is recalled as proven, with its case" 'records skill recalled "$since" | grep release-notes | grep "\"unproven\": false" | grep -q "\"cases\": 1"'
+check "the turn's request carried the case it worked in" 'sent "A turn it worked in showed: CHANGELOG.md now opens with the heading RN-7 FINCH-5521"'
+# Since it was last written it failed three times and worked none: held back.
+printf '{"skills": {"release-notes": {"use": 6, "worked": 2, "trial_good": 0, "failed": 4, "trial_bad": 3, "failures": [{"at": "2026-11-05", "assumption": "CHANGELOG.md already exists", "evidence": "no such file"}]}}}\n' > "$D/skill-usage/global.json"
+project "$RX/p4c"
+agent "$RX/p4c" s4c
+since=$(now_ms)
+say s4c "Viết release notes cho thay đổi: thêm xuất PDF. Ghi vào changelog của dự án." | tail -2 | sed 's/^/   /'
+"$HA" shutdown --force >/dev/null 2>&1
+check "a skill that keeps failing is not recalled" '[ -z "$(records skill recalled "$since")" ]'
+
 echo "################ 5. the harness evolves a rule from failures, by itself"
 unset HA_AUTO_REFINE
 mkdir -p "$D/diagnostics"
