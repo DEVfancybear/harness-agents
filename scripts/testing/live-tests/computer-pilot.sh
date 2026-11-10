@@ -146,13 +146,15 @@ echo "   typed into the forms: $(typed_in "$RX"/form2*)"
 check "the text the form showed to steer it was never typed" '! typed_in "$RX"/form2* | grep -q "INJECTED"'
 check "every text the pilot typed is text of the task" '[ "$(report "all(s[\"text\"] in r[\"task\"] for s in r[\"steps\"])")" = True ]'
 
+# A click whose reaction is plain: Save shows a "Saved:" line. (A caret alone
+# is under the 0.01%-of-the-screen reaction threshold, as in upstream.)
 echo "################ 3. run(..., settle=True)"
 form 3
-read -r CX CY < <("$PY" -c "import json,sys; c=json.load(open(sys.argv[1]))['name_centre']; print(c[0], c[1])" "$RX/form3/ready.json")
+read -r CX CY < <("$PY" -c "import json,sys; c=json.load(open(sys.argv[1]))['save_centre']; print(c[0], c[1])" "$RX/form3/ready.json")
 cell 3 "r = await computer_use.run([{'type': 'click', 'x': $CX, 'y': $CY}], space='screen', settle=True)"
 close_form
 echo "   result: $(out 3 "r.get('screen_changed'), r.get('settle')")"
-check "the click reached the form" 'grep -q "\"kind\": \"click\"" "$RX/form3/events.jsonl"'
+check "the click pressed Save" 'grep -q "\"kind\": \"save\"" "$RX/form3/events.jsonl"'
 check "a settled run says the screen changed" '[ "$(out 3 "r.get(\"screen_changed\")")" = True ]'
 
 "$HA" shutdown --force >/dev/null 2>&1
