@@ -588,6 +588,18 @@ impl TurnHooks {
         }
     }
 
+    /// The mark that the model was asked to save on this approach to the
+    /// context's limit: beside the task state, so it outlives the turn.
+    fn flush_mark(&self) -> PathBuf {
+        let mut name = self
+            .state
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_default();
+        name.push(".flush_asked");
+        self.state.with_file_name(name)
+    }
+
     /// The files the workspace has changed, as git lists them: what a summary
     /// may have lost track of, edits made through the REPL included.
     fn changed_files(&self) -> Vec<String> {
@@ -639,6 +651,15 @@ impl harness_tools::TurnContextHooks for TurnHooks {
     }
 
     fn flush_note(&self) -> Option<String> {
+        // Asked once on this approach already, in an earlier turn.
+        let mark = self.flush_mark();
+        if mark.is_file() {
+            return None;
+        }
+        if let Some(parent) = mark.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&mark, "");
         let memory = if self.memory {
             " Write the lasting facts you learned - about the project, the user's preferences, decisions - to memory."
         } else {
@@ -647,6 +668,13 @@ impl harness_tools::TurnContextHooks for TurnHooks {
         Some(format!(
             "Before the earlier steps become a summary, save what must not be lost: update task_state with the checklist's status, every decision with its reason and every constraint the user set.{memory} Then go on with the task."
         ))
+    }
+
+    fn flush_cleared(&self) {
+        let mark = self.flush_mark();
+        if mark.is_file() {
+            let _ = std::fs::remove_file(mark);
+        }
     }
 }
 
@@ -1339,6 +1367,25 @@ mod tests {
         TaskStateHost {
             path: root.join(TASK_STATE_FILE),
         }
+    }
+
+    /// Seen in a bug report: a goal's short turns each neared the context's
+    /// limit and each was asked to save its state - 54 times for nine
+    /// summaries. A new turn's hooks are not asked again on the same
+    /// approach; once the context is clear (summarized), the next one is.
+    #[test]
+    fn the_request_to_save_is_made_once_per_approach_to_the_limit() {
+        use harness_tools::TurnContextHooks;
+        let root = tempfile::tempdir().expect("temp dir");
+        let state = root.path().join("harness").join(TASK_STATE_FILE);
+        let turn = || TurnHooks::new(&state, None, root.path(), true);
+        assert!(turn().flush_note().is_some(), "the first approach asks");
+        assert!(turn().flush_note().is_none(), "the next turn does not");
+        turn().flush_cleared();
+        assert!(
+            turn().flush_note().is_some(),
+            "after a summary it asks again"
+        );
     }
 
     /// The strategy is named once, the journal grows, and a decision after an

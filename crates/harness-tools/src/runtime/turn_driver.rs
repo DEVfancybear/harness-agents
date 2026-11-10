@@ -1148,8 +1148,13 @@ pub trait TurnContextHooks: Send + Sync {
     fn recap(&self) -> Option<String>;
 
     /// What to ask of the model when its context nears the point of being
-    /// summarized; `None` when the session has nowhere to save anything.
+    /// summarized; `None` when the session has nowhere to save anything, or
+    /// when it was asked already on this approach to the limit.
     fn flush_note(&self) -> Option<String>;
+
+    /// The context is not near its limit (any more): the next approach asks
+    /// again.
+    fn flush_cleared(&self) {}
 }
 
 /// How a recap introduces itself: the host's, never a new instruction.
@@ -2181,6 +2186,9 @@ impl TurnDriver {
             // sequence.
             let mut slots: Vec<(String, String, Slot)> = Vec::new();
             let mut announced = HashSet::new();
+            // The calls of one answer are one attempt: three probes sent
+            // together that each found nothing are not three tries.
+            regulator.next_batch();
             // What the tool hooks of this batch answered, by transcript id: text
             // for the model under each result, and a stop for the turn.
             let mut hook_notes: std::collections::HashMap<String, crate::HookResponse> =
@@ -2804,9 +2812,14 @@ impl TurnDriver {
                         format!("{RECAP_PREFIX}\n{recap}"),
                     ));
                 }
-                // Once per turn, before its first summary: what the model
-                // learned and decided is saved while it is still whole
-                // (OpenClaw's flush before compaction).
+                // Once per approach to the limit, before its summary: what
+                // the model learned and decided is saved while it is still
+                // whole (OpenClaw's flush before compaction). Asked once per
+                // turn, a goal's short turns were asked 54 times for nine
+                // summaries; the hooks remember it across turns.
+                if result.context != ContextPressure::NearLimit {
+                    hooks.flush_cleared();
+                }
                 if result.context == ContextPressure::NearLimit
                     && !flush_asked
                     && let Some(note) = hooks.flush_note()
@@ -4152,6 +4165,17 @@ fn regulate(
             .field("error_class", failure.class.clone())
             .field("error_code", failure.code.clone())
             .field("refused", failure.refused);
+    }
+    // A read of several files that failed in part settles ok - it read the
+    // rest - while its `tool.failed` names the parts that failed: a report
+    // showed the same call both ways and counted it twice.
+    if let Slot::Many(parts) = slot {
+        let failed = parts.iter().filter(|part| part.is_err()).count();
+        if failed > 0 {
+            record = record
+                .field("parts", parts.len())
+                .field("parts_failed", failed);
+        }
     }
     record.emit();
     let intervention = regulator.settle(name, &format!("{name}|{arguments}"), failure);

@@ -4681,8 +4681,44 @@ async fn inspect_coder_input(
         .map_err(coder_unavailable_error)?
     {
         InputInspection::Clean(snapshot) => Ok(snapshot),
-        InputInspection::Dirty(reasons) => Err(coder_unavailable_error(dirty_reasons(&reasons))),
+        InputInspection::Dirty(reasons) => {
+            let mut said = dirty_reasons(&reasons);
+            if reasons
+                .iter()
+                .any(|reason| matches!(reason, DirtyReason::NotARepository))
+            {
+                said.push_str(&repositories_below(workspace_root));
+            }
+            Err(coder_unavailable_error(said))
+        }
     }
+}
+
+/// What a coder refused for a workspace that is no repository says of the
+/// repositories right under it. Seen in a report: the session ran in
+/// `Downloads`, the project was `Downloads/NexaClip`, and the refusal named
+/// neither, so the model tried no other way.
+fn repositories_below(root: &std::path::Path) -> String {
+    let mut found = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().join(".git").exists())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    if found.is_empty() {
+        return String::new();
+    }
+    found.sort();
+    let shown = found
+        .iter()
+        .take(5)
+        .map(|name| format!("{name}/"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "; the Git repositories under it are {shown}: a coder works on the repository the session was started in, so for one of these start ha in that folder, or do the edit yourself or with an explorer's findings here"
+    )
 }
 
 async fn persist_worktree(
@@ -6674,6 +6710,21 @@ pub(super) mod tests {
         // A quote that is only numbers shows nothing once they are gone.
         assert!(!super::holds_evidence(read, "123456789:"));
         assert!(!super::holds_evidence(read, "20261110: }"));
+    }
+
+    /// Seen in a report: a coder was refused for a session in `Downloads`
+    /// ("workspace root is not a Git repository") while the project was the
+    /// repository `Downloads/NexaClip`. The refusal names it.
+    #[test]
+    fn a_coder_refused_outside_a_repository_names_the_ones_below() {
+        let root = tempfile::tempdir().expect("root");
+        assert_eq!(super::repositories_below(root.path()), "");
+        std::fs::create_dir_all(root.path().join("NexaClip").join(".git")).expect("repo");
+        std::fs::create_dir_all(root.path().join("photos")).expect("folder");
+        let said = super::repositories_below(root.path());
+        assert!(said.contains("NexaClip/"), "{said}");
+        assert!(!said.contains("photos"), "{said}");
+        assert!(said.contains("start ha in that folder"), "{said}");
     }
 
     /// Seen in a report: `note_finding`'s refusal of evidence no result held

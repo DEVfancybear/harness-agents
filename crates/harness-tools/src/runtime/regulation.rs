@@ -38,6 +38,9 @@ struct Settled {
     signature: String,
     effect: EffectClass,
     failure: Option<Failure>,
+    /// The attempt it belongs to: the model's answer that made it, so calls
+    /// sent together count once.
+    attempt: usize,
 }
 
 /// How a call failed, as a class that ignores what changes between attempts.
@@ -120,6 +123,9 @@ pub(crate) struct Regulator {
     /// The user steered since the last call: what they said may be what the
     /// same call was waiting for.
     steered: bool,
+    /// The model's answer whose calls settle now ([`Regulator::next_batch`]);
+    /// `None` until one is marked, and then each call is an attempt.
+    batch: Option<usize>,
 }
 
 impl Regulator {
@@ -154,6 +160,12 @@ impl Regulator {
         self.steered = true;
     }
 
+    /// The calls that settle next are the model's next answer: one attempt
+    /// however many it sends together.
+    pub(crate) fn next_batch(&mut self) {
+        self.batch = Some(self.batch.map_or(0, |batch| batch + 1));
+    }
+
     /// Record a settled call and say what, if anything, the trajectory shows.
     pub(crate) fn settle(
         &mut self,
@@ -167,11 +179,13 @@ impl Regulator {
         if failure.as_ref().is_some_and(|failure| failure.refused) {
             return None;
         }
+        let attempt = self.batch.unwrap_or(self.calls.len());
         self.calls.push(Settled {
             tool: tool.to_owned(),
             signature: signature.to_owned(),
             effect: effect_class_for(tool),
             failure,
+            attempt,
         });
         self.repeated_failure().or_else(|| self.oscillation())
     }
@@ -221,7 +235,14 @@ impl Regulator {
                 None => break,
             }
         }
-        let count = same.len();
+        // Seen in a bug report: three `where` probes sent in one answer each
+        // found nothing, and the model was told run_process "has failed 3
+        // times". Calls sent together are one attempt.
+        let count = same
+            .iter()
+            .map(|call| call.attempt)
+            .collect::<HashSet<_>>()
+            .len();
         let level = if count >= STOP_FAILURES {
             STOP_FAILURES
         } else if count >= REPEAT_FAILURES {
@@ -455,6 +476,36 @@ mod tests {
             .settle("read_file", "read_file|e", missing("y/a.rs"))
             .expect("noted");
         assert_eq!(fifth.kind, "stop_failing");
+    }
+
+    /// Seen in a bug report: three `where` probes sent in one answer each
+    /// found nothing, and the model was told "`run_process` has failed 3 times
+    /// in this turn". Calls of one answer are one attempt; the same failure
+    /// over three answers is still repeated.
+    #[test]
+    fn calls_sent_together_are_one_attempt() {
+        let mut regulator = Regulator::default();
+        regulator.next_batch();
+        for path in ["bin/cmake.exe", "bin/ninja.exe", "bin/clang.exe"] {
+            assert!(
+                regulator
+                    .settle("read_file", &format!("read_file|{path}"), missing(path))
+                    .is_none(),
+                "one answer's calls are not repeats"
+            );
+        }
+        regulator.next_batch();
+        assert!(
+            regulator
+                .settle("read_file", "read_file|d", missing("bin/make.exe"))
+                .is_none()
+        );
+        regulator.next_batch();
+        let third = regulator
+            .settle("read_file", "read_file|e", missing("bin/gcc.exe"))
+            .expect("the third answer that fails the same way is noted");
+        assert_eq!(third.kind, "repeated_failure");
+        assert!(third.note.contains("failed 3 times"), "{}", third.note);
     }
 
     #[test]
