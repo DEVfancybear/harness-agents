@@ -1,12 +1,23 @@
 ---
 name: computer-use
-description: Observe and control the primary logged-in Windows desktop using screenshots and bounded mouse/keyboard batches, or hand a narrow GUI task to TypeSafe's Jev as a fast, cheap pilot (computer_use.pilot). Use for authorized graphical tasks that cannot be completed with a narrower API. Requires an unlocked interactive Windows desktop, and a vision-capable model or (for the pilot) a TypeSafe key.
+description: Observe and control the primary logged-in Windows desktop with screenshots and bounded mouse/keyboard batches you choose (screenshot, run, zoom), or a narrow GUI task handed to TypeSafe's Jev as a fast, cheap pilot (pilot). Use for authorized graphical tasks that cannot be done through a narrower API. Requires an unlocked, interactive Windows desktop, and a vision-capable model for screenshot/run/zoom or the jev plugin and a TypeSafe key for pilot.
 ---
 
 # Computer Use
 
 Use the prepared `computer_use` module in the Python kernel. Imports do not
 initialize the GUI; PyAutoGUI is imported lazily at call time.
+
+| Call | Who looks at the screen | Use it for |
+| --- | --- | --- |
+| `screenshot()`, `zoom(region)` | you | seeing the desktop; small text and icons |
+| `run(actions, settle=False)` | you | input you decide: clicks, text of your own, keys, drags |
+| `pilot(task, ...)` | Jev, step by step | a narrow, well-defined task: fill a field with given text, press a button, search a site |
+
+Prefer `pilot` when the task is narrow and its text is known (it is fast, cheap
+and cannot be talked into typing something else); use `run` when a step needs
+judgment, text you compose, or a gesture the pilot does not have (drag, hotkey,
+right click). Either way, check the result on a fresh screenshot.
 
 ```python
 screen = await computer_use.screenshot()
@@ -57,17 +68,17 @@ print(result["status"], result["message"])   # done / unsure / stopped / gave_up
   website (`main.rs` resolves too; each verdict is in the report's
   `bare_sites`). A name Jev cannot place comes back in `unsure_sites`: pass
   the ones the task means in `websites` and run again. Only a URL or one of
-  `websites` opens before the first
-  step; a bare name opens only when Jev chooses to. A site with no dot
-  (`wikipedia`) is not guessed: pass it in `websites`. Put exact text in quotes.
-  On-screen text cannot make it type or open anything else.
+  `websites` opens before the first step; a bare name opens only when Jev
+  chooses to. A site with no dot (`wikipedia`) is not guessed: pass it in
+  `websites`. Put exact text in quotes. On-screen text cannot make it type or
+  open anything else.
 - It hands back instead of guessing: under `min_confidence` (0.5; 0.25 for
   scroll, wait and opening a website), when the screen did not change for 5
   steps, after `max_steps` (30), or when it says DONE. An unsure target is
   asked again on a zoomed close-up; a split between click / type / type and
   Enter does only the part enough of it agrees on.
-- `dry_run=True` opens the first website and returns Jev's first decision with
-  no input; `max_steps=1` lets you check each step yourself.
+- `dry_run=True` opens the first URL (if any) and returns Jev's first decision
+  with no input; `max_steps=1` lets you check each step yourself.
 - The result has the steps (action, detail, confidence, result), the cost and
   `report`: a folder under `.harness/artifacts/computer-use/pilot/` with each
   step's screenshot (Jev's target in red) and `report.json` (the newest 20).
@@ -80,6 +91,14 @@ print(result["status"], result["message"])   # done / unsure / stopped / gave_up
 - The same rules as `run`: the user's authorization, no consequential action
   (send, buy, delete, sign in) the user did not ask for, the top-left corner
   fail-safe, one controller. The mutex is held per step, not between steps.
+- When it hands back, read why before going on:
+  - `unsure` with WAIT steps that changed nothing: the screen may be locked, a
+    screen saver on, or the window hidden. Take a screenshot; Jev sees what you see.
+  - `failed` with a TypeSafe error (for example `400 max_tokens_exceeded`):
+    no further input was sent after it. Take a screenshot, then retry or carry
+    on with `run`.
+  - `unsure` on a click: make the task name the element more precisely, or
+    click it yourself with `run`.
 
 `run(actions, settle=True)` gives the same wait to your own batches: the
 after-screenshot is taken once the screen reacted and held still (up to 3
@@ -177,7 +196,9 @@ down/up, clipboard, or advanced automation API.
 
 Requires `PyAutoGUI==0.9.54`, Pillow, the bundled attach-image skill, and a
 vision-capable model in a Prime Agent Python kernel on the logged-in, unlocked
-Windows Default desktop. Skill `pyproject.toml` dependencies are **not
+Windows Default desktop. `pilot` needs no vision (Jev looks at the screen; a
+vision model is also shown the final screen), but needs `httpx`, the `jev`
+skill that `/jev on` brings, and a TypeSafe key. Skill `pyproject.toml` dependencies are **not
 installed automatically** in this repository; the managed kernel supplies them.
 A custom kernel interpreter must have these dependencies installed separately.
 Missing dependencies, unsupported platforms, inaccessible desktops, disabled
