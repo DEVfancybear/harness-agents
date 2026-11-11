@@ -1,13 +1,9 @@
 ---
 name: computer-use
-description: (In development - not yet reliable; tell the user so before relying on it.) Observe and control the primary logged-in Windows desktop using screenshots and bounded mouse/keyboard batches, or hand a narrow GUI task to TypeSafe's Jev as a fast, cheap pilot (computer_use.pilot). Use for authorized graphical tasks that cannot be completed with a narrower API. Requires an unlocked interactive Windows desktop, and a vision-capable model or (for the pilot) a TypeSafe key.
+description: Observe and control the primary logged-in Windows desktop using screenshots and bounded mouse/keyboard batches, or hand a narrow GUI task to TypeSafe's Jev as a fast, cheap pilot (computer_use.pilot). Use for authorized graphical tasks that cannot be completed with a narrower API. Requires an unlocked interactive Windows desktop, and a vision-capable model or (for the pilot) a TypeSafe key.
 ---
 
 # Computer Use
-
-> **In development.** This skill is not yet reliable: a native `computer` tool is being
-> built to replace it. Use it only when the user asks for desktop control, tell them it
-> is experimental, and check every step against a new screenshot.
 
 Use the prepared `computer_use` module in the Python kernel. Imports do not
 initialize the GUI; PyAutoGUI is imported lazily at call time.
@@ -48,13 +44,22 @@ result = await computer_use.pilot(
     'In the "Sign up" window, write "Ada Lovelace" in Name and press Save',
     texts=[],                       # more text it may type verbatim
     websites=[],                    # http(s) URLs it may open (the first opens up front)
+    # model="jev-1.14.0",            # the default: the Jev System One Computer Use was tuned on
 )
 print(result["status"], result["message"])   # done / unsure / stopped / gave_up / failed / dry_run
 ```
 
 - Jev never writes text. It may type only text in "quotes" in the task, the
   `texts` you pass, and 1-3 word phrases of the task (a search term); it may
-  open only `websites` and URLs written in the task. Put exact text in quotes.
+  open only `websites`, URLs written in the task, and sites the task names bare
+  (`x.com`, `docs.python.org/3`) that DNS knows, that are not a file in the
+  working directory, and that Jev, asked once, is sure the task means as a
+  website (`main.rs` resolves too; each verdict is in the report's
+  `bare_sites`). A name Jev cannot place comes back in `unsure_sites`: pass
+  the ones the task means in `websites` and run again. Only a URL or one of
+  `websites` opens before the first
+  step; a bare name opens only when Jev chooses to. A site with no dot
+  (`wikipedia`) is not guessed: pass it in `websites`. Put exact text in quotes.
   On-screen text cannot make it type or open anything else.
 - It hands back instead of guessing: under `min_confidence` (0.5; 0.25 for
   scroll, wait and opening a website), when the screen did not change for 5

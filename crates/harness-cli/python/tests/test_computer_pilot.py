@@ -75,16 +75,21 @@ class FakeJev:
 
     JevError = RuntimeError
 
-    def __init__(self, steps, closeup=None):
+    def __init__(self, steps, closeup=None, sites=None):
         self.steps = list(steps)
         self.closeup = closeup
+        self.sites = sites or {}  # host -> how sure Jev is the task means it as a website
         self.requests = []
 
     def _api_key(self):
         return "test-key"
 
     async def decide(self, state, questions, *, assets=None, threshold=None, model=None, timeout=45):
-        self.requests.append({"state": state, "questions": questions, "assets": assets})
+        self.requests.append({"state": state, "questions": questions, "assets": assets, "model": model})
+        if "site" in questions:
+            # One name per question, in the state beside the task.
+            answers = {"site": {"type": "noul", "noul": self.sites.get(state["name"], 0.0)}}
+            return {"answers": answers, "usage": {"input_tokens": 100}, "cost": 0.0000042}
         if state.get("screen") == "closeup":
             answers = {"target": self.closeup}
         else:
@@ -100,6 +105,7 @@ class PilotTests(unittest.IsolatedAsyncioTestCase):
         self.attachments = []
         self.vision = {"id": "fake-vision", "input": ["image"]}
         self.opened = []
+        self.known_hosts = set()
 
         async def host_request(kind, *args, **kwargs):
             self.assertEqual(kind, "model.info")
@@ -116,6 +122,8 @@ class PilotTests(unittest.IsolatedAsyncioTestCase):
             patch.object(desktop, "_REACT_SECONDS", 0.3),
             patch.object(desktop, "_SETTLE_INTERVAL", 0.01),
             patch.object(pilot_module.webbrowser, "open", side_effect=self.opened.append),
+            # No real DNS in unit tests: a name resolves only when a test says so.
+            patch.object(pilot_module, "_resolves", side_effect=lambda host: host in self.known_hosts),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -293,6 +301,91 @@ class PilotTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await computer_use.pilot("Look", websites=["file:///C:/Windows"])
 
+    async def test_a_site_named_bare_is_offered_when_dns_and_jev_agree(self):
+        self.known_hosts = {"docs.example.test", "guide.md"}
+        jev = self.use(FakeJev([
+            {"action": answer("OPEN_WEBSITE", 0.9), "target": target(0, 0, 0.1, 0.1), "website": answer("0", 0.9)},
+            {"action": answer("DONE", 0.9), "target": target(0, 0, 0.1, 0.1)},
+        ], sites={"docs.example.test": 0.97, "guide.md": 0.9}))
+        result = await computer_use.pilot("Go to docs.example.test/start and compare with guide.md and report.json")
+        self.assertEqual(result["status"], "done", result)
+        # Nothing opens up front for a bare name: Jev chose to open it.
+        self.assertEqual(self.opened, ["https://docs.example.test/start"])
+        screens = [r for r in jev.requests if "screen" in r["state"]]
+        self.assertEqual(screens[0]["state"]["history"], ["nothing yet"])
+        websites = screens[0]["questions"]["website"]["criteria"]
+        self.assertEqual(list(websites.values()), ["https://docs.example.test/start", "https://guide.md"])
+        report = json.loads((Path(result["report"]) / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual([(b["host"], b["resolves"], b["offered"]) for b in report["bare_sites"]],
+                         [("docs.example.test", True, True), ("guide.md", True, True), ("report.json", False, False)])
+
+    async def test_a_file_name_dns_knows_is_not_offered_when_jev_says_it_is_a_file(self):
+        # main.rs resolves (seen in review): DNS alone would offer https://main.rs.
+        self.known_hosts = {"main.rs"}
+        jev = self.use(FakeJev([{"action": answer("DONE", 0.9), "target": target(0, 0, 0.1, 0.1)}],
+                               sites={"main.rs": 0.05}))
+        result = await computer_use.pilot("Open main.rs in VS Code and check the imports")
+        screens = [r for r in jev.requests if "screen" in r["state"]]
+        self.assertNotIn("OPEN_WEBSITE", screens[0]["questions"]["action"]["criteria"])
+        report = json.loads((Path(result["report"]) / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["bare_sites"], [{"host": "main.rs", "resolves": True, "jev_yes": 0.05, "offered": False}])
+        self.assertEqual(self.opened, [])
+
+    async def test_a_name_jev_cannot_place_goes_back_to_the_caller(self):
+        self.known_hosts = {"outlook.com", "main.rs"}
+        jev = self.use(FakeJev([{"action": answer("DONE", 0.9), "target": target(0, 0, 0.1, 0.1)}],
+                               sites={"outlook.com": 0.6, "main.rs": 0.02}))
+        result = await computer_use.pilot("Send the report to bob via outlook.com, built from main.rs")
+        self.assertEqual(result["unsure_sites"], ["outlook.com"], "main.rs was a clear no, not unsure")
+        self.assertIn("pass it in websites=", result["message"])
+        self.assertEqual(self.opened, [])
+        asked = [r["state"] for r in jev.requests if "name" in r["state"]]
+        self.assertEqual(sorted(state["name"] for state in asked), ["main.rs", "outlook.com"])
+        self.assertTrue(all(state["task"].startswith("Send the report") for state in asked))
+        # Passed back in websites=, it is offered (and opened up front, as a website the caller gave).
+        self.use(FakeJev([{"action": answer("DONE", 0.9), "target": target(0, 0, 0.1, 0.1)}],
+                         sites={"outlook.com": 0.6}))
+        again = await computer_use.pilot("Send the report to bob via outlook.com", websites=["https://outlook.com"])
+        self.assertNotIn("unsure_sites", again)
+        self.assertEqual(self.opened, ["https://outlook.com"])
+
+    async def test_no_bare_site_without_jev_confirming(self):
+        self.known_hosts = {"x.com"}
+
+        class Failing(FakeJev):
+            async def decide(self, state, questions, **kwargs):
+                if any(name.startswith("site") for name in questions):
+                    raise RuntimeError("TypeSafe answered 503")
+                return await super().decide(state, questions, **kwargs)
+
+        jev = self.use(Failing([{"action": answer("DONE", 0.9), "target": target(0, 0, 0.1, 0.1)}]))
+        await computer_use.pilot("Go to x.com and post nothing")
+        self.assertNotIn("OPEN_WEBSITE", jev.requests[0]["questions"]["action"]["criteria"])
+
+    async def test_a_dns_lookup_that_hangs_blocks_nothing(self):
+        import time as clock
+
+        def resolves(host):
+            if host == "slow.test":
+                clock.sleep(3)
+            return True
+
+        with patch.object(pilot_module, "DNS_SECONDS", 0.3):
+            started = clock.monotonic()
+            known = await pilot_module._resolving(["slow.test", "fast.test"], resolves)
+            took = clock.monotonic() - started
+        self.assertEqual(known, {"fast.test"})
+        self.assertLess(took, 1.5)
+
+    async def test_jev_model_is_pinned_to_the_one_upstream_was_tuned_on(self):
+        jev = self.use(FakeJev([{"action": answer("DONE", 0.9), "target": target(0, 0, 0.1, 0.1)}] * 2))
+        await computer_use.pilot("Check the screen")
+        self.assertEqual(jev.requests[0]["model"], "jev-1.14.0")
+        await computer_use.pilot("Check the screen", model="jev-latest")
+        self.assertEqual(jev.requests[1]["model"], "jev-latest")
+        with self.assertRaises(ValueError):
+            await computer_use.pilot("Check the screen", model="")
+
     async def test_max_steps_hands_back(self):
         steps = [{"action": answer("SCROLL_DOWN", 0.9), "target": target(0.4, 0.4, 0.6, 0.6)} for _ in range(2)]
         self.use(FakeJev(steps))
@@ -341,9 +434,36 @@ class OptionTests(unittest.TestCase):
         self.assertNotIn("Great", options, "quoted text is offered whole, not in pieces")
         self.assertEqual(pilot_module.quoted_texts('post "Hello world'), ["Hello world"])
 
-    def test_website_options_take_urls_not_names(self):
-        urls = pilot_module.website_options("Open https://example.test/a, then wikipedia and x.com", ["https://given.test"])
-        self.assertEqual(urls, ["https://given.test", "https://example.test/a"])
+    def test_bare_sites_are_names_not_text_mail_or_paths(self):
+        task = ('Open x.com, then https://example.test/a, then en.wikipedia.org/wiki/Jev. and post "see go.dev" '
+                "to me@mail.test; read notes.txt, C:/site/app.example.test and docs.v2\\file, "
+                "admin at example.com:8080/admin, version 1.30, e.g. this, X.COM again")
+        self.assertEqual(pilot_module.bare_sites(task), [
+            ("x.com", "https://x.com"),
+            ("en.wikipedia.org", "https://en.wikipedia.org/wiki/Jev"),
+            ("notes.txt", "https://notes.txt"),
+            ("example.com", "https://example.com:8080/admin"),
+        ], "quoted text, an e-mail address, paths, versions and a repeat are not taken")
+
+    def test_website_options_order_and_confirmed_sites_only(self):
+        task = "Open x.com, then https://example.test/a, then en.wikipedia.org/wiki/Jev and notes.txt"
+        urls = pilot_module.website_options(task, ["https://given.test"], {"x.com", "en.wikipedia.org"})
+        self.assertEqual(urls, ["https://given.test", "https://x.com", "https://example.test/a",
+                                "https://en.wikipedia.org/wiki/Jev"])
+        self.assertEqual(pilot_module.website_options(task), ["https://example.test/a"])
+
+    def test_a_bare_name_that_is_a_file_here_is_not_a_site(self):
+        import os
+
+        prior = os.getcwd()
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "build.zip").write_text("")
+            os.chdir(folder)
+            try:
+                found = pilot_module.bare_sites("Unpack build.zip from example.com")
+            finally:
+                os.chdir(prior)
+        self.assertEqual(found, [("example.com", "https://example.com")])
 
     def test_split_chain(self):
         self.assertEqual(pilot_module._split_chain("CLICK", 0.9, {}, 0.5), ("CLICK", 0.9, ""))

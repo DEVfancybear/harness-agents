@@ -5,7 +5,9 @@
 #   2. the pilot writes the quoted name into a scratch form and presses Save,
 #      leaving a report (report.json, one annotated screenshot per step, the
 #      cost), and never types the text the form shows to steer it;
-#   3. run(..., settle=True) waits for the screen and says it changed.
+#   3. run(..., settle=True) waits for the screen and says it changed;
+#   4. a site the task names bare (example.com) is offered, never opened up
+#      front, and Jev is asked as jev-1.14.0, the model upstream was tuned on.
 # On 0.9.4 there is no computer_use.pilot and no settle: every check fails.
 #
 # The suite turns the jev plugin on (/jev on: the pilot needs the jev skill it
@@ -35,6 +37,10 @@ then
   exit 2
 fi
 
+# Precondition for section 4: DNS knows example.com (a bare site name is
+# offered only when it resolves).
+"$PY" -c "import socket; socket.getaddrinfo('example.com', 443)" 2>/dev/null   || { echo "PRECONDITION: example.com does not resolve here; the run is not a verdict"; exit 2; }
+
 P="$RX/p"
 project "$P"
 TOKEN=$(printf '%04d%04d' $((RANDOM % 10000)) $((RANDOM % 10000)))
@@ -47,8 +53,19 @@ form() {
   FORM_DIR="$RX/form$1"
   "$PY" "$HERE/computer-pilot/form.py" "$TOKEN" "$FORM_DIR" 240 &
   FORM_PID=$!
-  for _ in $(seq 1 50); do [ -f "$FORM_DIR/ready.json" ] && return 0; sleep 0.2; done
-  echo "   the form did not open"; return 1
+  for _ in $(seq 1 50); do [ -f "$FORM_DIR/ready.json" ] && break; sleep 0.2; done
+  [ -f "$FORM_DIR/ready.json" ] || { echo "   the form did not open"; return 1; }
+  sleep 0.5
+  # Precondition: the form is on the screen. A locked desktop or a screen saver
+  # shows Jev nothing to act on (seen live: one flat blue screen, three WAITs).
+  "$PY" - "$FORM_DIR/ready.json" <<'EOF' || { echo "PRECONDITION: the form is not on the screen (locked desktop, screen saver, or a window over it); the run is not a verdict"; close_form; exit 2; }
+import json, sys
+from PIL import ImageGrab
+x, y, w, h = json.load(open(sys.argv[1]))["window"]
+shot = ImageGrab.grab(bbox=(x, y, x + w, y + h)).convert("L")
+white = sum(shot.histogram()[240:]) / (w * h)
+sys.exit(0 if white > 0.5 else 1)  # the form is mostly white
+EOF
 }
 # Ask the open form to close (it polls for a `close` file) and wait for it to exit.
 close_form() {
@@ -156,6 +173,16 @@ close_form
 echo "   result: $(out 3 "r.get('screen_changed'), r.get('settle')")"
 check "the click pressed Save" 'grep -q "\"kind\": \"save\"" "$RX/form3/events.jsonl"'
 check "a settled run says the screen changed" '[ "$(out 3 "r.get(\"screen_changed\")")" = True ]'
+
+echo "################ 4. a site named bare, and the pinned Jev model"
+# A dry run: nothing opens up front for a bare name (only Jev may choose to).
+cell 4 "r = await computer_use.pilot('Open example.com and read its main heading; my notes on it are in main.rs.', dry_run=True)"
+echo "   report: $(report "r['model'], r['websites'], r.get('opened'), r['bare_sites'], [s['action'] for s in r['steps']]")"
+# A dry run ends dry_run or, when Jev is not sure, unsure: either way Jev answered.
+check "the pilot asked Jev jev-1.14.0 and got an answer" '[ "$(report "r[\"model\"] == \"jev-1.14.0\" and r[\"input_tokens\"] > 0 and len(r[\"steps\"]) <= 1")" = True ]'
+check "a file name written bare is not offered as a site" '[ "$(report "all(not b[\"offered\"] for b in r[\"bare_sites\"] if b[\"host\"] == \"main.rs\")")" = True ]'
+check "a site named bare is offered as a website" '[ "$(report "r[\"websites\"]")" = "['"'"'https://example.com'"'"']" ]'
+check "a site named bare is not opened up front" '[ "$(report "r.get(\"opened\")")" = None ]'
 
 "$HA" shutdown --force >/dev/null 2>&1
 result

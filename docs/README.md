@@ -18,7 +18,7 @@ code khác nhau thì code đúng, còn tài liệu là lỗi cần sửa.
 | Build, test, package and release / Build, kiểm thử, đóng gói và phát hành | [Build and release](guides/BUILD_AND_RELEASE.md) |
 | The live suites that drive the real `ha` against a real model / Các suite live chạy `ha` thật với model thật | [Live tests](../scripts/testing/live-tests/README.md) |
 | Jev beside the agent and the harness (plugin, off by default) / Jev bên cạnh agent và harness (plugin, mặc định tắt) | [Jev workflow](guides/JEV.en.md) · [Workflow Jev](guides/JEV.vi.md) |
-| Screenshots, mouse and keyboard on Windows / Chụp màn hình, chuột và bàn phím Windows | [Computer use](guides/COMPUTER_USE.md) (in development / đang phát triển) |
+| Screenshots, mouse and keyboard on Windows / Chụp màn hình, chuột và bàn phím Windows | [Computer use](guides/COMPUTER_USE.md) |
 
 ## Architecture / Kiến trúc
 
