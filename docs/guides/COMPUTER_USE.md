@@ -36,14 +36,16 @@ The result includes the raw screenshot path, raw/preview dimensions, preview-to-
 (brainstormity/System-One-Computer-Use, MIT) onto this skill's input: TypeSafe's Jev sees each screenshot and picks
 the next action, where, and which offered text to type; the step runs as a bounded batch and the next screenshot is
 taken once the screen has reacted and settled. Jev may type only quoted text, `texts` and 1-3 word phrases of the
-task, and open only `websites` and URLs in the task. It stops below 50% confidence (25% for scroll, wait, opening a
+task, and open only `websites`, URLs in the task and sites it names bare (`x.com`) that DNS knows and that are not a
+file here (only a URL or one of `websites` opens up front). Jev is `jev-1.14.0` unless `model=` says otherwise. It stops below 50% confidence (25% for scroll, wait, opening a
 website), after 5 unchanged screens or `max_steps`, and zooms in to re-ask an unsure click. Reports, with one
 annotated screenshot per step, stay in `.harness/artifacts/computer-use/pilot/` (the newest 20). It needs the jev
 plugin on (`/jev on`, which brings the `jev` skill) and a TypeSafe key (`/login typesafe`); screenshots
 are sent to TypeSafe. `run(..., settle=True)` waits the
 same way and returns `screen_changed`.
 
-Left out: the dashboard, closing browser tabs, clipboard link copy/paste, the site and app name tables, and Android
+Left out: the dashboard, closing browser tabs, clipboard link copy/paste, the site and app name tables (DNS replaces the
+top-level domain list; a site with no dot goes in `websites`), and Android
 over adb (no device to test it live yet).
 
 The live check is `scripts/testing/live-tests/computer-pilot.sh` (a TypeSafe key, the model, and a free desktop).

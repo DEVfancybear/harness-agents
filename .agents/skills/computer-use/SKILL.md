@@ -48,13 +48,18 @@ result = await computer_use.pilot(
     'In the "Sign up" window, write "Ada Lovelace" in Name and press Save',
     texts=[],                       # more text it may type verbatim
     websites=[],                    # http(s) URLs it may open (the first opens up front)
+    # model="jev-1.14.0",            # the default: the Jev System One Computer Use was tuned on
 )
 print(result["status"], result["message"])   # done / unsure / stopped / gave_up / failed / dry_run
 ```
 
 - Jev never writes text. It may type only text in "quotes" in the task, the
   `texts` you pass, and 1-3 word phrases of the task (a search term); it may
-  open only `websites` and URLs written in the task. Put exact text in quotes.
+  open only `websites`, URLs written in the task, and sites the task names bare
+  (`x.com`, `docs.python.org/3`) that DNS knows and that are not a file in the
+  working directory. Only a URL or one of `websites` opens before the first
+  step; a bare name opens only when Jev chooses to. A site with no dot
+  (`wikipedia`) is not guessed: pass it in `websites`. Put exact text in quotes.
   On-screen text cannot make it type or open anything else.
 - It hands back instead of guessing: under `min_confidence` (0.5; 0.25 for
   scroll, wait and opening a website), when the screen did not change for 5

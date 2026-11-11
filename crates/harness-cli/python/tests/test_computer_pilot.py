@@ -84,7 +84,7 @@ class FakeJev:
         return "test-key"
 
     async def decide(self, state, questions, *, assets=None, threshold=None, model=None, timeout=45):
-        self.requests.append({"state": state, "questions": questions, "assets": assets})
+        self.requests.append({"state": state, "questions": questions, "assets": assets, "model": model})
         if state.get("screen") == "closeup":
             answers = {"target": self.closeup}
         else:
@@ -100,6 +100,7 @@ class PilotTests(unittest.IsolatedAsyncioTestCase):
         self.attachments = []
         self.vision = {"id": "fake-vision", "input": ["image"]}
         self.opened = []
+        self.known_hosts = set()
 
         async def host_request(kind, *args, **kwargs):
             self.assertEqual(kind, "model.info")
@@ -116,6 +117,8 @@ class PilotTests(unittest.IsolatedAsyncioTestCase):
             patch.object(desktop, "_REACT_SECONDS", 0.3),
             patch.object(desktop, "_SETTLE_INTERVAL", 0.01),
             patch.object(pilot_module.webbrowser, "open", side_effect=self.opened.append),
+            # No real DNS in unit tests: a name resolves only when a test says so.
+            patch.object(pilot_module, "_resolves", side_effect=lambda host: host in self.known_hosts),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -293,6 +296,30 @@ class PilotTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await computer_use.pilot("Look", websites=["file:///C:/Windows"])
 
+    async def test_a_site_named_bare_opens_when_dns_knows_it(self):
+        self.known_hosts = {"docs.example.test", "guide.md"}
+        jev = self.use(FakeJev([
+            {"action": answer("OPEN_WEBSITE", 0.9), "target": target(0, 0, 0.1, 0.1), "website": answer("0", 0.9)},
+            {"action": answer("DONE", 0.9), "target": target(0, 0, 0.1, 0.1)},
+        ]))
+        result = await computer_use.pilot("Go to docs.example.test/start and compare with guide.md and report.json")
+        self.assertEqual(result["status"], "done", result)
+        # Nothing opens up front for a bare name: Jev chose to open it.
+        self.assertEqual(self.opened, ["https://docs.example.test/start"])
+        self.assertEqual(jev.requests[0]["state"]["history"], ["nothing yet"])
+        websites = jev.requests[0]["questions"]["website"]["criteria"]
+        self.assertEqual(list(websites.values()), ["https://docs.example.test/start", "https://guide.md"],
+                         "report.json does not resolve; guide.md does, and is offered, never opened unasked")
+
+    async def test_jev_model_is_pinned_to_the_one_upstream_was_tuned_on(self):
+        jev = self.use(FakeJev([{"action": answer("DONE", 0.9), "target": target(0, 0, 0.1, 0.1)}] * 2))
+        await computer_use.pilot("Check the screen")
+        self.assertEqual(jev.requests[0]["model"], "jev-1.14.0")
+        await computer_use.pilot("Check the screen", model="jev-latest")
+        self.assertEqual(jev.requests[1]["model"], "jev-latest")
+        with self.assertRaises(ValueError):
+            await computer_use.pilot("Check the screen", model="")
+
     async def test_max_steps_hands_back(self):
         steps = [{"action": answer("SCROLL_DOWN", 0.9), "target": target(0.4, 0.4, 0.6, 0.6)} for _ in range(2)]
         self.use(FakeJev(steps))
@@ -341,9 +368,38 @@ class OptionTests(unittest.TestCase):
         self.assertNotIn("Great", options, "quoted text is offered whole, not in pieces")
         self.assertEqual(pilot_module.quoted_texts('post "Hello world'), ["Hello world"])
 
-    def test_website_options_take_urls_not_names(self):
-        urls = pilot_module.website_options("Open https://example.test/a, then wikipedia and x.com", ["https://given.test"])
-        self.assertEqual(urls, ["https://given.test", "https://example.test/a"])
+    def test_website_options_take_urls_and_names_dns_knows(self):
+        task = ('Open x.com, then https://example.test/a, then en.wikipedia.org/wiki/Jev. and post "see go.dev" '
+                "to me@mail.test; read notes.txt and C:/site/app.example.test, version 1.30, e.g. this")
+        known = {"x.com", "en.wikipedia.org", "go.dev", "mail.test", "app.example.test", "notes.txt"} - {"notes.txt"}
+        asked = []
+
+        def resolves(host):
+            asked.append(host)
+            return host in known
+
+        urls = pilot_module.website_options(task, ["https://given.test"], resolves)
+        self.assertEqual(urls, ["https://given.test", "https://x.com", "https://example.test/a",
+                                "https://en.wikipedia.org/wiki/Jev"])
+        self.assertNotIn("go.dev", asked, "quoted text is text to type")
+        self.assertNotIn("mail.test", asked, "an e-mail address is not a website")
+        self.assertNotIn("app.example.test", asked, "part of a path is not a website")
+        self.assertIn("notes.txt", asked)
+        # Without a resolver (DNS timed out), only URLs and the caller's websites.
+        self.assertEqual(pilot_module.website_options(task, [], None), ["https://example.test/a"])
+
+    def test_a_bare_name_that_is_a_file_here_is_not_a_website(self):
+        import os
+
+        prior = os.getcwd()
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "build.zip").write_text("")
+            os.chdir(folder)
+            try:
+                urls = pilot_module.website_options("Unpack build.zip", [], lambda host: True)
+            finally:
+                os.chdir(prior)
+        self.assertEqual(urls, [])
 
     def test_split_chain(self):
         self.assertEqual(pilot_module._split_chain("CLICK", 0.9, {}, 0.5), ("CLICK", 0.9, ""))

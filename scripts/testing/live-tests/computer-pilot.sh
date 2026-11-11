@@ -5,7 +5,9 @@
 #   2. the pilot writes the quoted name into a scratch form and presses Save,
 #      leaving a report (report.json, one annotated screenshot per step, the
 #      cost), and never types the text the form shows to steer it;
-#   3. run(..., settle=True) waits for the screen and says it changed.
+#   3. run(..., settle=True) waits for the screen and says it changed;
+#   4. a site the task names bare (example.com) is offered, never opened up
+#      front, and Jev is asked as jev-1.14.0, the model upstream was tuned on.
 # On 0.9.4 there is no computer_use.pilot and no settle: every check fails.
 #
 # The suite turns the jev plugin on (/jev on: the pilot needs the jev skill it
@@ -156,6 +158,15 @@ close_form
 echo "   result: $(out 3 "r.get('screen_changed'), r.get('settle')")"
 check "the click pressed Save" 'grep -q "\"kind\": \"save\"" "$RX/form3/events.jsonl"'
 check "a settled run says the screen changed" '[ "$(out 3 "r.get(\"screen_changed\")")" = True ]'
+
+echo "################ 4. a site named bare, and the pinned Jev model"
+# A dry run: nothing opens up front for a bare name (only Jev may choose to).
+cell 4 "r = await computer_use.pilot('Open example.com and read its main heading.', dry_run=True)"
+echo "   report: $(report "r['model'], r['websites'], r.get('opened'), [s['action'] for s in r['steps']]")"
+# A dry run ends dry_run or, when Jev is not sure, unsure: either way Jev answered.
+check "the pilot asked Jev jev-1.14.0 and got an answer" '[ "$(report "r[\"model\"] == \"jev-1.14.0\" and r[\"input_tokens\"] > 0 and len(r[\"steps\"]) == 1")" = True ]'
+check "a site named bare is offered as a website" '[ "$(report "r[\"websites\"]")" = "['"'"'https://example.com'"'"']" ]'
+check "a site named bare is not opened up front" '[ "$(report "r.get(\"opened\")")" = None ]'
 
 "$HA" shutdown --force >/dev/null 2>&1
 result
