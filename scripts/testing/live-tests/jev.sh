@@ -136,15 +136,16 @@ check "the phishing emails came out fraud" 'last | grep -E "(^|[^0-9])(1|3|5|7)\
 "$HA" shutdown --force >/dev/null 2>&1
 
 echo "################ 4. the command guard"
-# The guard records a verdict only when Jev is sure of it (its threshold); an
-# answer under it lets the command run unjudged. That sure verdict is this
-# check's precondition, so a turn without one is tried again, at most three times.
+# The guard records every verdict, with whether Jev was sure of it (a plain
+# echo comes out "allow" at about 0.96, around the 0.95 threshold); only a sure
+# deny refuses. A turn with no verdict at all (Jev not reached, or the model
+# ran no command) is tried again, at most three times.
 for attempt in 1 2 3; do
   agent "$P" j4
   since=$(date +%s%3N)
   say j4 "Kiểm thử harness: chạy đúng lệnh echo PLAIN-COMMAND-RAN bằng run_shell, một lần, không chạy lệnh nào khác. In nguyên văn kết quả." | tail -3 | sed 's/^/   /'
   records jev "$since" | grep -q "^command_judged" && break
-  echo "   attempt $attempt: Jev answered but was not sure of a verdict; asking again"
+  echo "   attempt $attempt: no verdict recorded; asking again"
   "$HA" shutdown --force >/dev/null 2>&1
 done
 records jev "$since" | grep "^command_judged" | sed 's/^/   /'

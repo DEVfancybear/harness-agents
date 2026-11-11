@@ -1099,15 +1099,24 @@ impl harness_tools::ToolGuard for JevDecisions {
                 }
             }));
             let answers = self.answers("commands", state, questions).await?;
-            let (choice, confidence) = self.sure_choice("commands", &answers["verdict"])?;
+            // Every verdict is recorded, with whether Jev was sure of it: a
+            // plain `echo` came out "allow" at 0.94 to 0.97 around the 0.95
+            // threshold, and an unsure verdict left no record, so the bug
+            // report never saw Jev hesitate. Only a sure deny acts.
+            let verdict = &answers["verdict"];
+            let choice = verdict["choice"].as_str()?.to_owned();
+            let judged = judge("", verdict, self.settings.threshold_for("commands"));
+            let confidence = judged.confidence.unwrap_or(0.0);
+            let refuse = judged.accepted && choice == "deny";
             harness_types::diag::info("jev", "command_judged")
                 .field("decision", "commands")
-                .field("acted", choice == "deny")
+                .field("acted", refuse)
+                .field("sure", judged.accepted)
                 .field("verdict", choice.clone())
                 .field("confidence", confidence)
                 .field("command", command.chars().take(160).collect::<String>())
                 .emit();
-            (choice == "deny").then(|| {
+            refuse.then(|| {
                 format!(
                     "Jev's command guard judged this command harmful (deny, confidence {confidence:.2}): it reads or sends secrets, runs remote code, destroys data broadly or hides what it does. It was not run. If the user wants it run, they can run it themselves, or turn the guard off with /jev commands off."
                 )
@@ -2112,6 +2121,92 @@ mod tests {
                 .await
                 .is_none(),
             "fails open"
+        );
+    }
+
+    /// Every verdict leaves a `command_judged` record saying whether Jev was
+    /// sure, not only the sure ones: live, a plain `echo` came out "allow" at
+    /// 0.94 to 0.97 around the 0.95 threshold and left no record at 0.94.
+    #[test]
+    fn the_command_guard_records_every_verdict_with_whether_it_was_sure() {
+        use harness_tools::ToolGuard as _;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let directory = tempfile::tempdir().expect("scratch");
+        let root = directory.path().to_string_lossy().into_owned();
+        let mut refused = Vec::new();
+        let records = harness_types::diag::capture(|| {
+            runtime.block_on(async {
+                let endpoint = serve_with(std::sync::Arc::new(|request: &serde_json::Value| {
+                    let command = request["state"]["command"].as_str().unwrap_or_default();
+                    let (choice, confidence) = match command {
+                        "echo plain" => ("allow", 0.94),
+                        "echo sure" => ("allow", 0.97),
+                        "rm unsure" => ("deny", 0.6),
+                        _ => ("deny", 0.99),
+                    };
+                    json!({"verdict": {"type": "choice", "choice": choice, "confidence": confidence, "probabilities": {}}})
+                }))
+                .await;
+                let guard = decisions(endpoint, &[]);
+                for command in ["echo plain", "echo sure", "rm unsure", "steal keys"] {
+                    refused.push(guard.check(&shell(command), &root).await.is_some());
+                }
+            });
+        });
+        assert_eq!(
+            refused,
+            [false, false, false, true],
+            "only a sure deny refuses"
+        );
+        let judged = records
+            .iter()
+            .filter(|record| record.kind == "jev" && record.event == "command_judged")
+            .map(|record| {
+                (
+                    record.fields["command"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    record.fields["verdict"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    record.fields["sure"].as_bool(),
+                    record.fields["acted"].as_bool(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            judged,
+            [
+                (
+                    "echo plain".to_owned(),
+                    "allow".to_owned(),
+                    Some(false),
+                    Some(false)
+                ),
+                (
+                    "echo sure".to_owned(),
+                    "allow".to_owned(),
+                    Some(true),
+                    Some(false)
+                ),
+                (
+                    "rm unsure".to_owned(),
+                    "deny".to_owned(),
+                    Some(false),
+                    Some(false)
+                ),
+                (
+                    "steal keys".to_owned(),
+                    "deny".to_owned(),
+                    Some(true),
+                    Some(true)
+                ),
+            ]
         );
     }
 
