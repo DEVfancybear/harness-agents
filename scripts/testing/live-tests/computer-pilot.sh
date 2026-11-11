@@ -53,8 +53,19 @@ form() {
   FORM_DIR="$RX/form$1"
   "$PY" "$HERE/computer-pilot/form.py" "$TOKEN" "$FORM_DIR" 240 &
   FORM_PID=$!
-  for _ in $(seq 1 50); do [ -f "$FORM_DIR/ready.json" ] && return 0; sleep 0.2; done
-  echo "   the form did not open"; return 1
+  for _ in $(seq 1 50); do [ -f "$FORM_DIR/ready.json" ] && break; sleep 0.2; done
+  [ -f "$FORM_DIR/ready.json" ] || { echo "   the form did not open"; return 1; }
+  sleep 0.5
+  # Precondition: the form is on the screen. A locked desktop or a screen saver
+  # shows Jev nothing to act on (seen live: one flat blue screen, three WAITs).
+  "$PY" - "$FORM_DIR/ready.json" <<'EOF' || { echo "PRECONDITION: the form is not on the screen (locked desktop, screen saver, or a window over it); the run is not a verdict"; close_form; exit 2; }
+import json, sys
+from PIL import ImageGrab
+x, y, w, h = json.load(open(sys.argv[1]))["window"]
+shot = ImageGrab.grab(bbox=(x, y, x + w, y + h)).convert("L")
+white = sum(shot.histogram()[240:]) / (w * h)
+sys.exit(0 if white > 0.5 else 1)  # the form is mostly white
+EOF
 }
 # Ask the open form to close (it polls for a `close` file) and wait for it to exit.
 close_form() {
