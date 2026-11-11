@@ -32,6 +32,15 @@ _DRAG_STEPS = 12
 _KEEP_CAPTURES = 100
 _MOUSEEVENTF_HWHEEL = 0x01000
 _COORDINATE_SPACES = ("preview", "screen")
+# Waiting for the screen after input (System One Computer Use's wait_for_screen):
+# a share of the screen that changed, compared on a small grey copy of it.
+_PROBE_EDGE = 800
+_CHANGED_LEVEL = 16  # a grey level difference above this is a changed pixel
+_REACTED = 0.0001  # over 0.01% changed, outside what moves on its own: the screen reacted
+_STILL_ENOUGH = 0.004  # under 0.4% moving counts as still (a spinner, a caret)
+_REACT_SECONDS = 1.5  # how long to wait for a reaction before calling it none
+_SETTLE_SECONDS = 3.0
+_SETTLE_INTERVAL = 0.2
 
 # The last full-screen view the model was shown: its raw and preview sizes.
 # `space="preview"` coordinates are read against it, the way computer-use
@@ -624,6 +633,97 @@ def _run_action(pg, action: dict, held: _HeldInputs, stop: threading.Event, dead
                 _press_chord(pg, chord, held, stop, deadline)
 
 
+def _probe(image):
+    """A small grey copy of a capture, what change detection compares."""
+    probe = image.convert("L")
+    probe.thumbnail((_PROBE_EDGE, _PROBE_EDGE))
+    return probe
+
+
+def _changed(before, after):
+    """Black/white mask of the pixels that changed between two probes."""
+    from PIL import ImageChops
+
+    return ImageChops.difference(before, after).point(lambda value: 255 if value > _CHANGED_LEVEL else 0)
+
+
+def _grow(mask):
+    """Widen a mask a little, cheaply at 1/8 size, so it covers its neighbourhood."""
+    from PIL import Image, ImageFilter
+
+    coarse = mask.reduce(8).point(lambda value: 255 if value else 0).filter(ImageFilter.MaxFilter(3))
+    return coarse.resize(mask.size, Image.NEAREST)
+
+
+def _share(mask, ignore=None) -> float:
+    """The share of the screen a mask marks, leaving out `ignore`."""
+    from PIL import ImageChops
+
+    if ignore is not None:
+        mask = ImageChops.subtract(mask, ignore)
+    return mask.histogram()[255] / (mask.width * mask.height)
+
+
+def _settle(pg, before, size, stop: threading.Event, *, ignore=None, self_moving=None, seconds=_SETTLE_SECONDS, still_checks=1):
+    """Wait for the screen to react to input, then to hold still.
+
+    `before` is the probe of the screen before the input; `ignore` marks what
+    this wait leaves out (what moves on its own, and what changed since the
+    screenshot a decision was made on). `self_moving` is what is known to move
+    on its own; the small changes seen while the screen holds still are added
+    to it. Returns the last capture, what happened (`reacted`, `waited`, and
+    when it never held still, `timed_out` with what was still moving) and
+    `self_moving`, for the next wait.
+    """
+    from PIL import Image, ImageChops
+
+    started = time.monotonic()
+    deadline = started + seconds
+    widened = _grow(ignore) if ignore is not None else None
+    image, _ = _capture(pg, size)
+    try:
+        last = _probe(image)
+        while _share(_changed(before, last), widened) <= _REACTED and time.monotonic() < min(started + _REACT_SECONDS, deadline):
+            if stop.wait(0.1):
+                raise _WorkerStopped("computer_use batch cancelled")
+            image.close()
+            image = None
+            image, _ = _capture(pg, size)
+            last = _probe(image)
+        reacted = _share(_changed(before, last), widened) > _REACTED
+        if self_moving is None:
+            self_moving = Image.new("L", last.size)
+        still, moving = 0, None
+        while time.monotonic() < deadline:
+            if stop.wait(_SETTLE_INTERVAL):
+                raise _WorkerStopped("computer_use batch cancelled")
+            current_image, _ = _capture(pg, size)
+            current = _probe(current_image)
+            mask = _changed(last, current)
+            image.close()
+            image, last = current_image, current
+            if _share(mask, widened) <= _STILL_ENOUGH:
+                self_moving = ImageChops.lighter(self_moving, mask)
+                still += 1
+                if still >= still_checks:
+                    return image, {"reacted": reacted, "waited": round(time.monotonic() - started, 1)}, self_moving
+            else:
+                still = 0
+                box = mask.getbbox()
+                moving = {"share": round(_share(mask, widened), 4)}
+                if box:
+                    moving["box"] = [round(box[0] / mask.width, 2), round(box[1] / mask.height, 2),
+                                     round(box[2] / mask.width, 2), round(box[3] / mask.height, 2)]
+    except BaseException:
+        if image is not None:
+            image.close()
+        raise
+    info = {"reacted": reacted, "waited": round(time.monotonic() - started, 1), "timed_out": True}
+    if moving:
+        info["still_moving"] = moving
+    return image, info, self_moving
+
+
 def _prune_captures(folder: Path) -> None:
     """Keep the newest captures; a long session wrote one per batch, forever."""
     try:
@@ -642,6 +742,7 @@ def _worker(
     stop: threading.Event,
     expected_size: tuple[int, int] | None = None,
     region: tuple[int, int, int, int] | None = None,
+    settle: bool = False,
 ) -> dict:
     # The mutex must cover pre-input capture, all events, emergency cleanup, and
     # the after-capture. Windows mutex ownership is thread-bound, so do not put
@@ -657,9 +758,11 @@ def _worker(
         image, size = _capture(pg, expected_size)
         held = _HeldInputs(pg)
         completed = 0
+        waited = None
         try:
             compiled = _compile_actions(pg, actions, size)  # Validate EVERY key/coordinate before ANY input.
             if compiled:
+                before = _probe(image) if settle else None
                 image.close()
                 image = None
                 deadline = time.monotonic() + _MAX_BATCH_SECONDS
@@ -667,7 +770,10 @@ def _worker(
                     _run_action(pg, action, held, stop, deadline, size)
                     completed += 1
                 _cancel_check(stop)
-                image, size = _capture(pg, size)
+                if before is not None:
+                    image, waited, _ = _settle(pg, before, size, stop)
+                else:
+                    image, size = _capture(pg, size)
             _cancel_check(stop)
             if region is not None:
                 left, top, width, height = region
@@ -682,7 +788,11 @@ def _worker(
             image.save(path, format="PNG")
             _prune_captures(folder)
             _cancel_check(stop)
-            return {"path": str(path), "raw_size": list(size), "actions_completed": completed}
+            result = {"path": str(path), "raw_size": list(size), "actions_completed": completed}
+            if waited is not None:
+                result["screen_changed"] = waited["reacted"]
+                result["settle"] = waited
+            return result
         finally:
             try:
                 held.cleanup()
@@ -695,9 +805,15 @@ async def _drain_worker(
     actions: list[dict],
     expected_size: tuple[int, int] | None = None,
     region: tuple[int, int, int, int] | None = None,
+    settle: bool = False,
 ) -> dict:
+    return await _drain(lambda stop: _worker(actions, stop, expected_size, region, settle))
+
+
+async def _drain(target):
+    """Run `target(stop)` on a worker thread; on cancellation, stop it and wait for its cleanup."""
     stop = threading.Event()
-    worker = asyncio.create_task(asyncio.to_thread(_worker, actions, stop, expected_size, region))
+    worker = asyncio.create_task(asyncio.to_thread(target, stop))
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
@@ -791,8 +907,8 @@ async def _execute(
     *,
     space: str = "preview",
     region: tuple[float, float, float, float] | None = None,
+    settle: bool = False,
 ) -> dict:
-    global _LAST_VIEW
     validated = _validate_actions(actions)
     validated, expected = _in_screen_space(validated, space)
     screen_region = None
@@ -800,8 +916,18 @@ async def _execute(
         screen_region, region_expected = _zoom_region(region, space)
         expected = expected or region_expected
     await _preflight_vision()  # MUST precede every input, including a run without a prior screenshot.
-    result = await _drain_worker(validated, expected, screen_region)
+    result = await _drain_worker(validated, expected, screen_region, settle)
     preview_size, note = _emit_preview(result["path"])
+    _remember_view(result, preview_size, screen_region)
+    if note:
+        result["preview_note"] = note
+    return result
+
+
+def _remember_view(result: dict, preview_size: list[int], screen_region=None) -> None:
+    """Fill in the result's coordinate mapping; a full screenshot becomes what
+    the next `space="preview"` batch is read against."""
+    global _LAST_VIEW
     raw = result["raw_size"]
     result["preview_size"] = preview_size
     if screen_region is None:
@@ -820,9 +946,6 @@ async def _execute(
             "origin": {"x": left, "y": top},
             "note": "a zoom does not change what space='preview' coordinates refer to: the last full screenshot",
         }
-    if note:
-        result["preview_note"] = note
-    return result
 
 
 def _zoom_region(region, space: str) -> tuple[tuple[int, int, int, int], tuple[int, int] | None]:
@@ -870,7 +993,7 @@ async def zoom(region: list[float], *, space: str = "preview") -> dict:
     return await _execute([], space=space, region=tuple(region) if isinstance(region, list) else region)
 
 
-async def run(actions: list[dict], *, space: str = "preview") -> dict:
+async def run(actions: list[dict], *, space: str = "preview", settle: bool = False) -> dict:
     """Validate and execute a bounded batch, then emit one after-screenshot.
 
     Each dict has a type: move(x,y), click(optional x,y, button='left', clicks=1),
@@ -888,5 +1011,9 @@ async def run(actions: list[dict], *, space: str = "preview") -> dict:
     cancellation can leave partial effects that cannot be rolled back. On
     cancellation this call waits for worker cleanup and mutex release even if
     cancelled repeatedly. Ordinary input requires PyAutoGUI.FAILSAFE=True.
+
+    `settle=True` takes the after-screenshot once the screen has reacted to the
+    batch and held still (up to 3 seconds), instead of at once, and says
+    whether it changed (`screen_changed`, with `settle` saying how long it took).
     """
-    return await _execute(actions, space=space)
+    return await _execute(actions, space=space, settle=settle)

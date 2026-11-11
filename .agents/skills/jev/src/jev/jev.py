@@ -100,6 +100,16 @@ def judge(answer: dict, threshold: float) -> dict:
     return judged
 
 
+# TypeSafe asks a caller sending screenshots to say so: an image of a screen
+# may show anything, and the header accepts that (System One Computer Use).
+IMAGE_HEADER = "TypeSafe-Danger-Zone-Images"
+
+
+def _sends_images(body: dict) -> bool:
+    assets = body.get("assets") or {}
+    return any(isinstance(asset, dict) and asset.get("type") == "image" for asset in assets.values())
+
+
 async def _post(client, body: dict) -> dict:
     key = _api_key()
     if not key:
@@ -107,10 +117,11 @@ async def _post(client, body: dict) -> dict:
             "No TypeSafe key: the user can run /login typesafe or set TYPESAFE_API_KEY."
         )
     url = os.environ.get("HA_TYPESAFE_URL", "").strip() or ENDPOINT
+    headers = {"Authorization": f"Bearer {key}"}
+    if _sends_images(body):
+        headers[IMAGE_HEADER] = "true"
     for attempt in range(3):
-        response = await client.post(
-            url, json=body, headers={"Authorization": f"Bearer {key}"}
-        )
+        response = await client.post(url, json=body, headers=headers)
         if response.status_code == 429 and attempt < 2:
             after = response.headers.get("retry-after")
             try:
@@ -135,8 +146,14 @@ async def decide(
     threshold: float | None = None,
     model: str | None = None,
     timeout: float = 45,
+    assets: dict | None = None,
 ) -> dict:
-    """Ask Jev `questions` (name -> noul / choice / score question) about `state`.
+    """Ask Jev `questions` (name -> noul / choice / score / box question) about `state`.
+
+    `assets` names images the state refers to by name, e.g.
+    `{"screen": {"type": "image", "format": "jpg", "data_base64": ...}}` with
+    `state={"screen": "screen", ...}`; a `box` question then answers with a
+    `box` (left, top, right, bottom as fractions of the image).
 
     Returns the model, each answer judged against the threshold, the usage and
     the input cost in dollars.
@@ -144,8 +161,11 @@ async def decide(
     import httpx
 
     limit = _threshold(threshold)
+    body = {"model": _model(model), "state": state, "questions": questions}
+    if assets:
+        body["assets"] = assets
     async with httpx.AsyncClient(timeout=timeout) as client:
-        data = await _post(client, {"model": _model(model), "state": state, "questions": questions})
+        data = await _post(client, body)
     tokens = (data.get("usage") or {}).get("input_tokens") or 0
     return {
         "model": data.get("model"),
