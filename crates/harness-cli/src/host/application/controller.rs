@@ -4973,6 +4973,46 @@ impl InteractiveController {
                 Ok(lines) => self.reference("/memory", lines, &mut effects),
                 Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
             },
+            "/knowledge"
+                if raw_argument
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .next()
+                    == Some("bootstrap") =>
+            {
+                let focus = raw_argument
+                    .unwrap_or_default()
+                    .trim_start()
+                    .strip_prefix("bootstrap")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                if self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "the project is mapped when the running turn has finished".to_owned(),
+                    });
+                } else {
+                    // The library answers for whether it can be written: off,
+                    // the map would have nowhere to go.
+                    match self.service.knowledge("status") {
+                        Ok(lines) if lines.first().is_some_and(|line| line.contains(": off")) => {
+                            self.push_history(&mut effects, HistoryItem::Notice {
+                                message: "project knowledge is off: /knowledge on, then /knowledge bootstrap".to_owned(),
+                            });
+                        }
+                        Ok(_) => {
+                            self.continuations = 0;
+                            effects.extend(self.dispatch(
+                                super::lifecycle::knowledge_bootstrap_request(Some(&focus)),
+                                false,
+                            ));
+                        }
+                        Err(message) => {
+                            self.push_history(&mut effects, HistoryItem::Error { message });
+                        }
+                    }
+                }
+            }
             "/knowledge" => match self.service.knowledge(raw_argument.unwrap_or_default()) {
                 Ok(lines) => self.reference("/knowledge", lines, &mut effects),
                 Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),

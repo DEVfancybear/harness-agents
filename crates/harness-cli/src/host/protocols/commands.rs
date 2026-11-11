@@ -173,12 +173,20 @@ pub const SLASH_COMMANDS: [SlashCommand; 73] = [
     ),
     SlashCommand {
         options: &[
-            "status", "list", "search", "read", "graph", "refresh", "on", "off",
+            "status",
+            "list",
+            "search",
+            "read",
+            "graph",
+            "refresh",
+            "bootstrap",
+            "on",
+            "off",
         ],
         ..command(
             "/knowledge",
-            "[status|list|search <query>|read <path>|graph|refresh|on|off] [--global]",
-            "Manage topic knowledge, sources and links shared across conversations",
+            "[status|list|search <query>|read <path>|graph|refresh|bootstrap [focus]|on|off] [--global]",
+            "Manage topic knowledge, sources and links shared across conversations; bootstrap has the agent map the project into it",
         )
     },
     SlashCommand {

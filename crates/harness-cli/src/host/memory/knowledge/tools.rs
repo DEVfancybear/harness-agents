@@ -803,7 +803,8 @@ impl KnowledgeHost {
                 Ok(vec![serde_json::to_string(&payload).map_err(|error| error.to_string())?])
             }
             "serve" => Ok(vec!["Start the browser console from a terminal: ha knowledge serve --cwd DIR [--port PORT]".to_owned()]),
-            _ => Err("usage: /knowledge [status|list|search QUERY|read PATH|graph|refresh|on|off] [--global]; browser: ha knowledge serve --cwd DIR".to_owned()),
+            "bootstrap" => Ok(vec!["/knowledge bootstrap [focus] has the agent map the project into its knowledge library: run it in a chat".to_owned()]),
+            _ => Err("usage: /knowledge [status|list|search QUERY|read PATH|graph|refresh|bootstrap [FOCUS]|on|off] [--global]; browser: ha knowledge serve --cwd DIR".to_owned()),
         }
     }
 }

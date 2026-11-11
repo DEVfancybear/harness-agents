@@ -50,6 +50,13 @@ fn main() {
         command.arg(argument);
     }
     command.cwd(std::env::current_dir().expect("cwd"));
+    // The app is started with the caller's PATH. On Windows the pseudo-console
+    // library reads PATH from the registry again instead, so a directory a
+    // test put first was lost: an agent's `python` was the Store's alias
+    // (exit 9009) when the test had pointed it at a real interpreter.
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
     let mut child = pair.slave.spawn_command(command).expect("spawn");
     drop(pair.slave);
     let master = pair.master;

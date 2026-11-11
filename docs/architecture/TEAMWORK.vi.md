@@ -2,7 +2,7 @@
 
 [English](TEAMWORK.en.md) | Tiếng Việt
 
-Phần ha lấy từ năm bài báo đọc ngày 2026-11-10: nó hoạt động thế nào, và phần
+Phần ha lấy từ bảy bài báo đọc ngày 2026-11-10 và 11: nó hoạt động thế nào, và phần
 nào không lấy.
 
 - **[S] arXiv 2611.08615**, *s3: Simple Scaling of Swarms*: các agent làm việc
@@ -26,6 +26,16 @@ nào không lấy.
   0,74). Một supervisor đọc vì sao đội giậm chân rồi thiết kế lại nó - vai trò
   do nó tự đặt, cách các vai phối hợp, nơi ghi điều học được - trên các file
   tồn tại qua mọi đội.
+- **[R] arXiv 2610.37228**, *AutoRSE*: trong 4.425 thí nghiệm agent chạy để
+  cải thiện baseline hệ gợi ý, 91,7% là tinh chỉnh và ensemble. Cho agent tự
+  nghĩ tám ý rồi chọn gần như không đổi gì; ý tưởng lấy từ bài báo và chuyên
+  gia thì hơn 13%. Miền của bài không phải của ha; phần được lấy là phát hiện
+  về việc ý tưởng của agent đến từ đâu.
+- **[U] arXiv 2611.04035**, *Recursa*: một hệ thống thích nghi với miền mới
+  bằng cách trước hết lập bản đồ tài liệu với các agent song song (mỗi mục có
+  nguồn, phạm vi, mức chắc chắn, và ranh giới của phần đã đọc), rồi học từ các
+  bài có chấm điểm. Riêng việc lập bản đồ đã giảm một phần năm đến một phần tư
+  số lượt và token đầu vào của các task sau.
 - **[T] arXiv 2610.27307**, *TURTLE*: một proposer tiến hoá các task benchmark
   tới khi solver làm được khoảng một nửa số lần. Chưa lấy (xem dưới).
 
@@ -118,6 +128,29 @@ runtime](STRATEGY_AND_RUNTIME.vi.md)). Phần thêm vào:
 state hiển thị nó, còn agent quyết định. Không có gì tự khởi động. Record chẩn
 đoán `strategy proposed` có thêm `diagnosed` và `team_roles`.
 
+## Phương án từ bên ngoài ([R])
+
+Brief của strategist (`strategist_brief` trong `coordination/goal.rs`) giờ bảo
+nó, trước khi nêu gì, tìm những cách làm không phải của riêng nó: tài liệu và
+thư viện knowledge của project, cách code khác trong workspace đã giải việc
+tương tự, và web khi nó có tool web. Một phương án mang theo `source`
+(`Alternative::source`), hiển thị dạng `(from …)` trong lời từ chối, task
+state và `/strategy`; phương án của riêng strategist thì không ghi nguồn. [R]
+chỉ đo điều này trên hệ gợi ý: với ha đây là suy rộng có lý, chưa phải kết quả
+đã đo.
+
+## Lập bản đồ project trước khi làm ([U])
+
+`/knowledge bootstrap [focus]` (`knowledge_bootstrap_request` trong
+`application/lifecycle.rs`) bảo agent lập bản đồ project vào thư viện
+knowledge: nó chia project theo cách project tự chia, tự đọc phần nhỏ và giao
+mỗi phần còn lại cho một explorer có title, mở ít nhất một chỗ được trích của
+mỗi báo cáo trước khi giữ, rồi viết một trang dẫn đường, mỗi phần một trang và
+một trang ranh giới. Mỗi mục ghi nguồn dạng path:line, nơi nó đúng, và nó được
+đọc, suy ra hay chưa kiểm. Lệnh không sửa file nào của project. Đây là một
+turn như mọi turn: tốn lượt gọi model theo kích thước project, và không có gì
+tự chạy nó.
+
 ## Phần không lấy
 
 - **Phần huấn luyện của [S]** (phần thưởng đội, advantage theo nhóm): ha không
@@ -143,6 +176,10 @@ state hiển thị nó, còn agent quyết định. Không có gì tự khởi �
 - **Thư mục artifact theo từng đội và tài liệu tổng hợp do host giữ của [V]:**
   phát hiện đi vào journal và thư viện knowledge; gốc được bảo ghi điều một
   child tìm ra thành bài học.
+- **Benchmark của [R] và thang độ mới do ba model chấm:** chúng đo agent,
+  không đổi việc agent làm.
+- **Tự luyện trên bài tự viết của [U], và learner chỉ giữ sửa đổi khi bài qua
+  lại:** cả hai cần bài có người chấm. [T] cũng vậy.
 - **[T], toàn bộ, lúc này:** benchmark tự chỉnh là một lệnh riêng (`ha exec`
   làm solver, check của project làm người chấm, task được giữ quanh mức hoàn
   thành 50%). Mới đề xuất, chưa làm.
@@ -162,6 +199,10 @@ state hiển thị nó, còn agent quyết định. Không có gì tự khởi �
   `a_titled_child_is_told_its_name_and_a_second_takes_the_next_number` trong
   `delegation.rs`; `a_child_is_shown_the_lessons_of_the_task_and_not_its_plans`
   trong `task_state.rs`.
+- Unit, cho [R] và [U]: phần nguồn trong
+  `a_strategist_answer_carries_its_diagnosis_and_a_team_of_invented_roles`;
+  `the_bootstrap_request_asks_for_sources_scope_certainty_and_boundaries`
+  trong `lifecycle.rs`.
 - Live: `scripts/testing/live-tests/team.sh` (hai explorer chạy cùng lúc biết
   về nhau và trao đổi thứ tìm được theo tên; verifier không thuộc đội nào) và
   mục 4b của `strategy.sh` (chưa kiểm chứng, ca đã chạy, bị giữ lại).

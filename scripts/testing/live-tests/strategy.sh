@@ -152,6 +152,9 @@ for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3"
 sys.exit(1)
 PYEOF
 }
+# AutoRSE (arXiv 2610.37228): the plateau's strategist of section 2 was asked
+# to look for approaches that are not its own before naming any.
+check "the strategist was told to look outside its own ideas first" 'sent "look for approaches that are not your own"'
 # It worked twice since, and the review kept the words of a turn it worked in.
 printf '{"skills": {"release-notes": {"use": 3, "worked": 2, "trial_good": 2, "failed": 1, "trial_bad": 1, "cases": [{"at": "2026-11-01", "evidence": "CHANGELOG.md now opens with the heading RN-7 FINCH-5521"}], "failures": [{"at": "2026-10-20", "assumption": "CHANGELOG.md already exists", "evidence": "no such file"}]}}}\n' > "$D/skill-usage/global.json"
 project "$RX/p4b"

@@ -58,6 +58,13 @@ pub struct Alternative {
     /// team for it ([`TeamRole`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub team: Vec<TeamRole>,
+    /// Where the strategist took it from: a file, a knowledge page, a URL.
+    /// Empty when it is the strategist's own idea. `AutoRSE` (arXiv
+    /// 2610.37228) found agents' own ideas the bottleneck: brainstorming
+    /// eight and choosing among them changed little, and ideas brought in
+    /// from papers and experts gained 13% more.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
 }
 
 /// One member of the team a strategist proposes for an alternative, after
@@ -82,6 +89,9 @@ impl Alternative {
     /// team, one member a line.
     fn render(&self, indent: &str, text: &mut String) {
         let _ = write!(text, "\n{indent}- {}: {}", self.name, self.why);
+        if !self.source.is_empty() {
+            let _ = write!(text, " (from {})", self.source);
+        }
         for role in &self.team {
             let _ = write!(
                 text,

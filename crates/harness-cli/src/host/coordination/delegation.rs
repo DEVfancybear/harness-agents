@@ -9570,19 +9570,18 @@ mod real_worker_tests {
             two.iter().all(|text| !text.contains("[teammate-joined:")),
             "the one it was listed is not announced to it too: {two:?}"
         );
-        // The first had no teammate when it was briefed, and hears of the
-        // second at its next step.
-        assert!(
-            one.iter()
-                .all(|text| !text.contains("Teammates: your parent's other children")),
-            "{one:?}"
-        );
+        // The first hears of the second one way and never both: briefed
+        // before the second existed (the usual order here), it is told at
+        // its next step that it joined; briefed after, on a machine slow to
+        // start it, it reads the second in its task.
         let last = one.last().expect("a request");
         assert!(
-            last.contains("[teammate-joined: two]")
-                && last.contains("- two (explorer): map the lexer"),
-            "{last}"
+            last.contains("- two (explorer): map the lexer"),
+            "the first never heard of the second: {last}"
         );
+        let listed = last.contains("Teammates: your parent's other children");
+        let joined = last.contains("[teammate-joined: two]");
+        assert!(listed != joined, "listed {listed}, joined {joined}: {last}");
         // Both are told how to work beside each other: s3's protocol and the
         // coordination-friendly definition of arXiv 2611.06409.
         let system = &texts[0];

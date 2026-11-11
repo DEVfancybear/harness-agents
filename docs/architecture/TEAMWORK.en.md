@@ -2,8 +2,8 @@
 
 English | [Tiếng Việt](TEAMWORK.vi.md)
 
-What ha took from five papers read on 2026-11-10, how it works, and what is
-not taken.
+What ha took from seven papers read on 2026-11-10 and 11, how it works, and
+what is not taken.
 
 - **[S] arXiv 2611.08615**, *s3: Simple Scaling of Swarms*: agents that all
   work at once, each on its own copy of the task, with a message tool and no
@@ -25,6 +25,16 @@ not taken.
   supervisor reads why the team stalled and redesigns it - roles it invents,
   how they work together, where they write what they learn - over files that
   outlast every team.
+- **[R] arXiv 2610.37228**, *AutoRSE*: of 4,425 experiments agents ran to
+  improve recommender baselines, 91.7% were tuning and ensembling. Having the
+  agent brainstorm eight ideas and choose changed little; ideas brought in
+  from papers and experts gained 13% more. Its domain is not ha's; the finding
+  about where an agent's ideas come from is what is taken.
+- **[U] arXiv 2611.04035**, *Recursa*: a system adapts to a new domain by
+  first mapping its materials with parallel agents (each entry with its
+  source, scope and certainty, and the boundaries of what was read), then
+  learning from graded tasks. The mapping alone cut the turns and input tokens
+  of later tasks by a fifth to a quarter.
 - **[T] arXiv 2610.27307**, *TURTLE*: a proposer evolves benchmark tasks until
   a solver completes them about half the time. Not taken yet (below).
 
@@ -116,6 +126,29 @@ The team is advice, as every strategist proposal is: the refusal and the task
 state show it, and the agent decides. Nothing is started for it. The
 diagnostics' `strategy proposed` record carries `diagnosed` and `team_roles`.
 
+## Alternatives from outside ([R])
+
+The strategist's brief (`strategist_brief` in `coordination/goal.rs`) now has
+it look, before it names anything, for approaches that are not its own: the
+project's documents and knowledge library, how other code in the workspace
+solved something like it, and the web when it has web tools. An alternative
+carries its `source` (`Alternative::source`), shown as `(from …)` in the
+refusal, the task state and `/strategy`; one of the strategist's own names
+none. [R] measured this on recommender systems only: for ha it is a reasoned
+extension, not a measured result.
+
+## The project mapped before the work ([U])
+
+`/knowledge bootstrap [focus]` (`knowledge_bootstrap_request` in
+`application/lifecycle.rs`) has the agent map the project into its knowledge
+library: it divides the project as the project divides, reads small parts
+itself and delegates one titled explorer a part for the rest, opens at least
+one cited place of every report before keeping it, and writes a routing page,
+a page a part and a page of boundaries. Every entry says its source as
+path:line, where it holds, and whether it was read, inferred or not checked.
+It edits no project file. It is a turn like any other: it costs model calls
+in proportion to the project, and nothing runs it unasked.
+
 ## Not taken
 
 - **[S]'s training** (team reward, group-relative advantage): ha does not
@@ -140,6 +173,11 @@ diagnostics' `strategy proposed` record carries `diagnosed` and `team_roles`.
 - **[V]'s per-team artifact folders and a synthesis document the host
   keeps:** the journal and the knowledge library are where findings go; the
   root is told to record what a child found as a lesson.
+- **[R]'s benchmark and its novelty scale judged by three models:** they
+  measure agents; they do not change what one does.
+- **[U]'s self-practice on tasks it writes for itself, and its learners that
+  keep an edit only when the tasks pass again:** both need tasks with a
+  grader. So does [T].
 - **[T], all of it, for now:** a self-tuning benchmark is a command of its
   own (`ha exec` as the solver, a project's checks as the grader, tasks kept
   near a 50% completion rate). It is proposed, not built.
@@ -158,6 +196,10 @@ diagnostics' `strategy proposed` record carries `diagnosed` and `team_roles`.
   `a_titled_child_is_told_its_name_and_a_second_takes_the_next_number` in
   `delegation.rs`; `a_child_is_shown_the_lessons_of_the_task_and_not_its_plans`
   in `task_state.rs`.
+- Unit, for [R] and [U]: the source in
+  `a_strategist_answer_carries_its_diagnosis_and_a_team_of_invented_roles`;
+  `the_bootstrap_request_asks_for_sources_scope_certainty_and_boundaries` in
+  `lifecycle.rs`.
 - Live: `scripts/testing/live-tests/team.sh` (two explorers at once learn of
   each other and exchange what they found by name; a verifier is on nobody's
   team) and section 4b of `strategy.sh` (unproven, the case, held back).
