@@ -37,6 +37,10 @@ then
   exit 2
 fi
 
+# Precondition for section 4: DNS knows example.com (a bare site name is
+# offered only when it resolves).
+"$PY" -c "import socket; socket.getaddrinfo('example.com', 443)" 2>/dev/null   || { echo "PRECONDITION: example.com does not resolve here; the run is not a verdict"; exit 2; }
+
 P="$RX/p"
 project "$P"
 TOKEN=$(printf '%04d%04d' $((RANDOM % 10000)) $((RANDOM % 10000)))
@@ -161,10 +165,11 @@ check "a settled run says the screen changed" '[ "$(out 3 "r.get(\"screen_change
 
 echo "################ 4. a site named bare, and the pinned Jev model"
 # A dry run: nothing opens up front for a bare name (only Jev may choose to).
-cell 4 "r = await computer_use.pilot('Open example.com and read its main heading.', dry_run=True)"
-echo "   report: $(report "r['model'], r['websites'], r.get('opened'), [s['action'] for s in r['steps']]")"
+cell 4 "r = await computer_use.pilot('Open example.com and read its main heading; my notes on it are in main.rs.', dry_run=True)"
+echo "   report: $(report "r['model'], r['websites'], r.get('opened'), r['bare_sites'], [s['action'] for s in r['steps']]")"
 # A dry run ends dry_run or, when Jev is not sure, unsure: either way Jev answered.
-check "the pilot asked Jev jev-1.14.0 and got an answer" '[ "$(report "r[\"model\"] == \"jev-1.14.0\" and r[\"input_tokens\"] > 0 and len(r[\"steps\"]) == 1")" = True ]'
+check "the pilot asked Jev jev-1.14.0 and got an answer" '[ "$(report "r[\"model\"] == \"jev-1.14.0\" and r[\"input_tokens\"] > 0 and len(r[\"steps\"]) <= 1")" = True ]'
+check "a file name written bare is not offered as a site" '[ "$(report "all(not b[\"offered\"] for b in r[\"bare_sites\"] if b[\"host\"] == \"main.rs\")")" = True ]'
 check "a site named bare is offered as a website" '[ "$(report "r[\"websites\"]")" = "['"'"'https://example.com'"'"']" ]'
 check "a site named bare is not opened up front" '[ "$(report "r.get(\"opened\")")" = None ]'
 

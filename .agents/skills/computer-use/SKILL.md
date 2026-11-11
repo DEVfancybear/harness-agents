@@ -56,8 +56,10 @@ print(result["status"], result["message"])   # done / unsure / stopped / gave_up
 - Jev never writes text. It may type only text in "quotes" in the task, the
   `texts` you pass, and 1-3 word phrases of the task (a search term); it may
   open only `websites`, URLs written in the task, and sites the task names bare
-  (`x.com`, `docs.python.org/3`) that DNS knows and that are not a file in the
-  working directory. Only a URL or one of `websites` opens before the first
+  (`x.com`, `docs.python.org/3`) that DNS knows, that are not a file in the
+  working directory, and that Jev, asked once, is sure the task means as a
+  website (`main.rs` resolves too; each verdict is in the report's
+  `bare_sites`). Only a URL or one of `websites` opens before the first
   step; a bare name opens only when Jev chooses to. A site with no dot
   (`wikipedia`) is not guessed: pass it in `websites`. Put exact text in quotes.
   On-screen text cannot make it type or open anything else.
