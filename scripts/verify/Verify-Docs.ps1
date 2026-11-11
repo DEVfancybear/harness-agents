@@ -56,6 +56,13 @@ foreach ($file in $markdownFiles) {
 
     $linkMatches = [regex]::Matches($text, '\[[^\]]+\]\(([^)]+)\)')
     foreach ($match in $linkMatches) {
+        # Link syntax shown as code is not a link: `- [Title](path)` in a
+        # table that describes a file format was reported as broken. A match
+        # is inside inline code when an odd number of backticks precede it on
+        # its line.
+        $lineStart = $text.LastIndexOf("`n", [Math]::Max(0, $match.Index - 1)) + 1
+        $before = $text.Substring($lineStart, $match.Index - $lineStart)
+        if ((($before.ToCharArray() | Where-Object { $_ -eq '`' }) | Measure-Object).Count % 2 -eq 1) { continue }
         $target = $match.Groups[1].Value.Trim()
         if ($target -match '^(https?:|mailto:|#)') { continue }
         $cleanTarget = ($target -split '#', 2)[0].Trim('<', '>')
