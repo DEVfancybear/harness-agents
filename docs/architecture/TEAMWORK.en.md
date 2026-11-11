@@ -129,9 +129,14 @@ diagnostics' `strategy proposed` record carries `diagnosed` and `team_roles`.
 ## Alternatives from outside ([R])
 
 The strategist's brief (`strategist_brief` in `coordination/goal.rs`) now has
-it look, before it names anything, for approaches that are not its own: the
-project's documents and knowledge library, how other code in the workspace
-solved something like it, and the web when it has web tools. An alternative
+it look, before it names anything, for approaches that are not its own,
+nearest first: the project's documents and knowledge library, how other code
+in the workspace solved something like it, and the web for a specific
+technical question the stall raises - never for a general method of working.
+An approach is worth taking only when it answers what stalled; [R] itself
+found an idea that misses the baseline's weakness adds novelty and little
+else, and a live run whose strategist cited general process guides from the
+web spent its turns on them. An alternative
 carries its `source` (`Alternative::source`), shown as `(from …)` in the
 refusal, the task state and `/strategy`; one of the strategist's own names
 none. [R] measured this on recommender systems only: for ha it is a reasoned

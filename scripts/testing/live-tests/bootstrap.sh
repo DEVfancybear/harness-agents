@@ -41,13 +41,13 @@ EOF
 cat > "$P/billing/rates.py" <<'EOF'
 """Prices a shipment."""
 
-# The surcharge code finance agreed for remote islands.
-ISLAND_SURCHARGE_CODE = "PETREL-6093"
+# What a shipment to a remote island costs more, as finance agreed.
+REMOTE_MULTIPLIER = 1.37
 
 
 def price(weight_kg, remote=False):
     base = 4 + 2 * weight_kg
-    return base * (1.5 if remote else 1.0)
+    return base * (REMOTE_MULTIPLIER if remote else 1.0)
 EOF
 cat > "$P/docs/design.md" <<'EOF'
 # Design
@@ -103,11 +103,11 @@ check "the files hold what they held" '(cd "$P" && git diff --quiet HEAD -- READ
 
 echo "################ 4. a new conversation answers from the library"
 agent "$P" b2
-say b2 "Không đọc file mã nguồn nào (không dùng read_file, search_text, find_files hay shell); chỉ dùng tool knowledge. Mã phụ phí cho đảo xa trong project này là gì, và nó được ghi ở file nào, dòng nào?" > "$RX/answer.txt"
+say b2 "Không đọc file mã nguồn nào (không dùng read_file, search_text, find_files hay shell); chỉ dùng tool knowledge. Giá một lô hàng đi đảo xa được nhân với hệ số bao nhiêu trong project này, và hệ số đó được ghi ở file nào, dòng nào?" > "$RX/answer.txt"
 tail -3 "$RX/answer.txt" | sed 's/^/   /'
 "$HA" shutdown --force >/dev/null 2>&1
-check "precondition: the surcharge code is in a page" 'pages | xargs grep -l "PETREL-6093" 2>/dev/null | grep -q .'
-check "the answer gives the code" 'grep -q "PETREL-6093" "$RX/answer.txt"'
+check "precondition: the remote multiplier is in a page" 'pages | xargs grep -l "1\.37" 2>/dev/null | grep -q .'
+check "the answer gives the multiplier" 'grep -q "1[.,]37" "$RX/answer.txt"'
 check "and names the file it comes from" 'grep -q "billing/rates.py" "$RX/answer.txt"'
 
 result

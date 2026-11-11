@@ -131,9 +131,14 @@ state hiển thị nó, còn agent quyết định. Không có gì tự khởi �
 ## Phương án từ bên ngoài ([R])
 
 Brief của strategist (`strategist_brief` trong `coordination/goal.rs`) giờ bảo
-nó, trước khi nêu gì, tìm những cách làm không phải của riêng nó: tài liệu và
-thư viện knowledge của project, cách code khác trong workspace đã giải việc
-tương tự, và web khi nó có tool web. Một phương án mang theo `source`
+nó, trước khi nêu gì, tìm những cách làm không phải của riêng nó, gần trước xa
+sau: tài liệu và thư viện knowledge của project, cách code khác trong
+workspace đã giải việc tương tự, rồi web cho một câu hỏi kỹ thuật cụ thể mà
+chỗ kẹt đặt ra - không bao giờ cho một phương pháp làm việc chung. Một cách
+làm chỉ đáng lấy khi nó trả lời đúng chỗ kẹt; chính [R] thấy ý tưởng trượt
+điểm yếu của baseline thì thêm cái mới mà ít thêm gì khác, và một lượt live có
+strategist trích các hướng dẫn quy trình chung trên web đã tiêu hết turn vào
+chúng. Một phương án mang theo `source`
 (`Alternative::source`), hiển thị dạng `(from …)` trong lời từ chối, task
 state và `/strategy`; phương án của riêng strategist thì không ghi nguồn. [R]
 chỉ đo điều này trên hệ gợi ý: với ha đây là suy rộng có lý, chưa phải kết quả
