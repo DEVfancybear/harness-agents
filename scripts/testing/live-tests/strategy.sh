@@ -125,9 +125,19 @@ description: Use when the user asks for release notes or a changelog entry.
 EOF
 echo '{"created_by": "ha", "created": "2026-10-01T00:00:00Z"}' > "$HA_HOME/skills/release-notes/.ha-learned.json"
 mkdir -p "$D/skill-usage"
-printf '{"skills": {"release-notes": {"uses": 1, "failed": 1, "failures": [{"at": "2026-10-20", "assumption": "CHANGELOG.md already exists", "evidence": "no such file"}]}}}\n' > "$D/skill-usage/global.json"
+seed4() { printf '{"skills": {"release-notes": {"uses": 1, "failed": 1, "failures": [{"at": "2026-10-20", "assumption": "CHANGELOG.md already exists", "evidence": "no such file"}]}}}\n' > "$D/skill-usage/global.json"; }
+seed4
 project "$RX/p4"
+# A worker an earlier section left ending (its goal had children) writes the
+# counters once more as it goes: a run lost the seed to it, and the skill was
+# recalled with no failure. Wait for the file to stay as seeded.
+for _ in 1 2 3 4 5 6; do
+  sleep 5
+  grep -q "CHANGELOG.md already exists" "$D/skill-usage/global.json" 2>/dev/null && break
+  seed4
+done
 agent "$RX/p4" s4
+check "precondition: the seeded failure is in the skill's record when the turn starts" 'grep -q "CHANGELOG.md already exists" "$D/skill-usage/global.json"'
 since=$(now_ms)
 say s4 "Viết release notes cho thay đổi: thêm nút xuất CSV. Ghi vào changelog của dự án." | tail -3 | sed 's/^/   /'
 check "the fitting skill was recalled for the turn" 'records skill recalled "$since" | grep -q release-notes'
