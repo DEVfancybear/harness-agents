@@ -37,7 +37,8 @@ The result includes the raw screenshot path, raw/preview dimensions, preview-to-
 the next action, where, and which offered text to type; the step runs as a bounded batch and the next screenshot is
 taken once the screen has reacted and settled. Jev may type only quoted text, `texts` and 1-3 word phrases of the
 task, and open only `websites`, URLs in the task and sites it names bare (`x.com`) that DNS knows, that are not a
-file here and that Jev is sure the task means as a website (`main.rs` resolves too) (only a URL or one of `websites` opens up front). Jev is `jev-1.14.0` unless `model=` says otherwise. It stops below 50% confidence (25% for scroll, wait, opening a
+file here and that Jev is sure the task means as a website (`main.rs` resolves too; a name Jev cannot place comes back in
+`unsure_sites` for the model to pass in `websites`) (only a URL or one of `websites` opens up front). Jev is `jev-1.14.0` unless `model=` says otherwise. It stops below 50% confidence (25% for scroll, wait, opening a
 website), after 5 unchanged screens or `max_steps`, and zooms in to re-ask an unsure click. Reports, with one
 annotated screenshot per step, stay in `.harness/artifacts/computer-use/pilot/` (the newest 20). It needs the jev
 plugin on (`/jev on`, which brings the `jev` skill) and a TypeSafe key (`/login typesafe`); screenshots

@@ -59,7 +59,9 @@ print(result["status"], result["message"])   # done / unsure / stopped / gave_up
   (`x.com`, `docs.python.org/3`) that DNS knows, that are not a file in the
   working directory, and that Jev, asked once, is sure the task means as a
   website (`main.rs` resolves too; each verdict is in the report's
-  `bare_sites`). Only a URL or one of `websites` opens before the first
+  `bare_sites`). A name Jev cannot place comes back in `unsure_sites`: pass
+  the ones the task means in `websites` and run again. Only a URL or one of
+  `websites` opens before the first
   step; a bare name opens only when Jev chooses to. A site with no dot
   (`wikipedia`) is not guessed: pass it in `websites`. Put exact text in quotes.
   On-screen text cannot make it type or open anything else.

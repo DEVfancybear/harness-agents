@@ -86,13 +86,9 @@ class FakeJev:
 
     async def decide(self, state, questions, *, assets=None, threshold=None, model=None, timeout=45):
         self.requests.append({"state": state, "questions": questions, "assets": assets, "model": model})
-        if any(name.startswith("site") for name in questions):
-            import re
-
-            answers = {
-                name: {"type": "noul", "noul": self.sites.get(re.search(r"website `([^`]+)`", q["instructions"]).group(1), 0.0)}
-                for name, q in questions.items()
-            }
+        if "site" in questions:
+            # One name per question, in the state beside the task.
+            answers = {"site": {"type": "noul", "noul": self.sites.get(state["name"], 0.0)}}
             return {"answers": answers, "usage": {"input_tokens": 100}, "cost": 0.0000042}
         if state.get("screen") == "closeup":
             answers = {"target": self.closeup}
@@ -334,6 +330,24 @@ class PilotTests(unittest.IsolatedAsyncioTestCase):
         report = json.loads((Path(result["report"]) / "report.json").read_text(encoding="utf-8"))
         self.assertEqual(report["bare_sites"], [{"host": "main.rs", "resolves": True, "jev_yes": 0.05, "offered": False}])
         self.assertEqual(self.opened, [])
+
+    async def test_a_name_jev_cannot_place_goes_back_to_the_caller(self):
+        self.known_hosts = {"outlook.com", "main.rs"}
+        jev = self.use(FakeJev([{"action": answer("DONE", 0.9), "target": target(0, 0, 0.1, 0.1)}],
+                               sites={"outlook.com": 0.6, "main.rs": 0.02}))
+        result = await computer_use.pilot("Send the report to bob via outlook.com, built from main.rs")
+        self.assertEqual(result["unsure_sites"], ["outlook.com"], "main.rs was a clear no, not unsure")
+        self.assertIn("pass it in websites=", result["message"])
+        self.assertEqual(self.opened, [])
+        asked = [r["state"] for r in jev.requests if "name" in r["state"]]
+        self.assertEqual(sorted(state["name"] for state in asked), ["main.rs", "outlook.com"])
+        self.assertTrue(all(state["task"].startswith("Send the report") for state in asked))
+        # Passed back in websites=, it is offered (and opened up front, as a website the caller gave).
+        self.use(FakeJev([{"action": answer("DONE", 0.9), "target": target(0, 0, 0.1, 0.1)}],
+                         sites={"outlook.com": 0.6}))
+        again = await computer_use.pilot("Send the report to bob via outlook.com", websites=["https://outlook.com"])
+        self.assertNotIn("unsure_sites", again)
+        self.assertEqual(self.opened, ["https://outlook.com"])
 
     async def test_no_bare_site_without_jev_confirming(self):
         self.known_hosts = {"x.com"}

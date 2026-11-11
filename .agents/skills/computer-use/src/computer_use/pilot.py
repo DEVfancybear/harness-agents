@@ -28,6 +28,7 @@ import time
 import uuid
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlsplit
 from datetime import datetime
 from pathlib import Path
 
@@ -84,6 +85,9 @@ DNS_SECONDS = 2.0  # each lookup's budget
 # How sure Jev must be that the task means a website and not a file, a program
 # or code (`main.rs` and `asyncio.run` resolve too).
 BARE_SITE_SURE = 0.8
+# Between this and BARE_SITE_SURE Jev leans neither way: the name goes back to
+# the calling model, which can pass it in `websites` and run again.
+BARE_SITE_UNSURE = 0.2
 
 
 def quoted_texts(task: str) -> list[str]:
@@ -153,31 +157,50 @@ async def _resolving(hosts: list[str], resolves=None) -> set[str]:
     return {host for host, answer in zip(hosts, answers) if answer is True}
 
 
+# One question per name, with its own state and both answers described: on 15
+# sample names this split sites (0.95 and up) from files and code (0.02 and
+# down), where asking about every name in one state left sites at 0.67.
+SITE_QUESTION = {
+    "type": "noul",
+    "instructions": "Is `name`, as `task` uses it, a website to visit in a web browser?",
+    "criteria": {
+        "true": "`task` uses `name` as a website or web address: to open, visit, browse, search, post on, "
+                "or use as a web service.",
+        "false": "`task` uses `name` as a file, a folder, a program, an app, a code identifier, a command "
+                 "or anything else that is not a website.",
+    },
+}
+
+
 async def _meant_as_sites(jev, task: str, hosts: list[str], model: str) -> tuple[set[str], float, dict]:
-    """The hosts Jev is sure the task means as websites, in one call; on any
-    failure none (a bare name is never opened on a guess)."""
+    """The hosts Jev is sure the task means as websites, one question each, at
+    once; a question that fails offers nothing (a bare name is never opened on
+    a guess). Returns them, the cost, and each host's yes probability (or why
+    it has none)."""
     if not hosts:
         return set(), 0.0, {}
-    questions = {
-        f"site{i}": {
-            "type": "noul",
-            "instructions": f"Does `task` ask to go to the website `{host}` in a browser, rather than naming a "
-                            "file, a program, a code identifier or anything else that is not a website?",
-        }
-        for i, host in enumerate(hosts)
-    }
-    try:
-        result = await jev.decide({"task": task}, questions, model=model, timeout=TIMEOUT)
-    except Exception as error:  # noqa: BLE001 - no confirmation: no bare site
-        return set(), 0.0, {host: f"not asked: {error}"[:200] for host in hosts}
-    answers = result.get("answers") or {}
-    verdicts, sure = {}, set()
-    for i, host in enumerate(hosts):
-        probability = (answers.get(f"site{i}") or {}).get("noul")
+
+    async def ask(host):
+        try:
+            result = await jev.decide({"task": task, "name": host}, {"site": SITE_QUESTION}, model=model, timeout=TIMEOUT)
+        except Exception as error:  # noqa: BLE001 - no confirmation: not offered
+            return host, f"not asked: {error}"[:200], 0.0
+        probability = ((result.get("answers") or {}).get("site") or {}).get("noul")
+        return host, probability, result.get("cost") or 0.0
+
+    verdicts, sure, cost = {}, set(), 0.0
+    for host, probability, spent in await asyncio.gather(*(ask(host) for host in hosts)):
         verdicts[host] = probability
+        cost += spent
         if isinstance(probability, (int, float)) and probability >= BARE_SITE_SURE:
             sure.add(host)
-    return sure, result.get("cost") or 0.0, verdicts
+    return sure, cost, verdicts
+
+
+def _unsure_sites(verdicts: dict) -> list[str]:
+    """Hosts Jev leaned neither way on: the calling model decides them."""
+    return [host for host, probability in verdicts.items()
+            if isinstance(probability, (int, float)) and BARE_SITE_UNSURE <= probability < BARE_SITE_SURE]
 
 
 def website_options(task: str, websites=(), sites=()) -> list[str]:
@@ -556,7 +579,8 @@ async def pilot(
     Returns `status` (done, unsure, stopped, gave_up, failed, dry_run), a
     `message`, the steps (action, detail, confidence, result), the cost, and
     `report`: a folder with each step's screenshot (Jev's target in red) and
-    report.json. A vision model is shown the final screen. DONE is Jev's word,
+    report.json. `unsure_sites` names sites written bare that Jev could not
+    tell from a file or code: pass the ones the task means in `websites`. A vision model is shown the final screen. DONE is Jev's word,
     not proof: check the screen before telling the user the task is done.
     """
     _check_arguments(task, texts, websites, max_steps, min_confidence)
@@ -567,7 +591,9 @@ async def pilot(
     texts = [text for text in text_options(task, given) if _typable(text)]
     # Names written bare: DNS first, then Jev, which tells a site from a file
     # or code; each verdict goes in the report.
-    candidates = bare_sites(task)
+    # A name the caller already gave in `websites` is decided: not asked again.
+    given_hosts = {(urlsplit(url).hostname or "").lower() for url in websites}
+    candidates = [(host, url) for host, url in bare_sites(task) if host not in given_hosts]
     known = await _resolving([host for host, _ in candidates])
     resolved = [host for host, _ in candidates if host in known]
     sites, site_cost, verdicts = await _meant_as_sites(jev, task, resolved, model)
@@ -634,6 +660,12 @@ async def pilot(
         "seconds": run.report["seconds"],
         "report": str(run_dir),
     }
+    unsure = _unsure_sites(verdicts)
+    if unsure:
+        # Not guessed either way: the caller knows the task and decides.
+        result["unsure_sites"] = unsure
+        result["message"] += (f" Jev could not tell whether {', '.join(unsure)} is meant as a website, so it was "
+                              "not offered; pass it in websites= to let the pilot open it.")
     if final is not None:
         result["screenshot"] = str(final["path"])
         result["raw_size"] = list(final["size"])
