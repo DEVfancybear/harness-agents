@@ -641,6 +641,106 @@ async fn p2_s05b_a_cancelled_compaction_keeps_the_checkpoint() {
     close_writer(store).await;
 }
 
+/// A step stopped before its provider call leaves nothing open. In bug
+/// report 20261112 a turn canceled while its context was being summarized
+/// ended `canceled`, and its run read `running` and its command `claimed`
+/// from then on.
+#[tokio::test]
+async fn p2_a_step_canceled_before_its_provider_call_settles_its_run_and_command() {
+    let temp = TempDir::new().unwrap();
+    let store = writer(&temp).await;
+    let provider = Arc::new(MockProvider::text("never sent"));
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    );
+    let session_id = SessionId::generate();
+    let turn = request(
+        session_id.clone(),
+        TaskId::generate(),
+        "stop before the call",
+    );
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let error = runtime
+        .run_with_cancellation(turn.clone(), cancellation)
+        .await
+        .expect_err("a canceled step does not run");
+    assert_eq!(error.code(), ErrorCode::ProviderCanceled);
+    assert_eq!(provider.call_count(), 0, "the provider was not called");
+    let run = store
+        .run_by_input(&turn.input_id)
+        .await
+        .unwrap()
+        .expect("the run was claimed");
+    assert_eq!(run.state, harness_store_sqlite::RunState::Canceled);
+    assert_eq!(run.stop_reason.as_deref(), Some("provider_canceled"));
+    assert_eq!(
+        store.pending_runtime_commands(&session_id).await.unwrap(),
+        0,
+        "the step's command is settled"
+    );
+    drop(runtime);
+    close_writer(store).await;
+}
+
+/// A step whose provider failed for good ends its command as `failed`. It
+/// was written back as `pending`, which nothing claims again: bug report
+/// 20261112 lists four such commands, hours old, as work still to do.
+#[tokio::test]
+async fn p2_a_step_whose_provider_failed_leaves_no_pending_command() {
+    struct Down;
+    impl ModelProvider for Down {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::deepseek_fixture()
+        }
+        fn stream(
+            &self,
+            _request: ProviderRequest,
+            _cancellation: CancellationToken,
+        ) -> harness_providers::ProviderFuture {
+            Box::pin(async {
+                Err(harness_providers::ProviderError::new(
+                    ErrorCode::ServiceUnavailable,
+                    "Our servers are currently overloaded.",
+                ))
+            })
+        }
+    }
+    let temp = TempDir::new().unwrap();
+    let store = writer(&temp).await;
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        Arc::new(Down),
+        RuntimeConfig::default().with_max_attempts(1),
+    );
+    let session_id = SessionId::generate();
+    let turn = request(
+        session_id.clone(),
+        TaskId::generate(),
+        "the provider is down",
+    );
+    let error = runtime
+        .run(turn.clone())
+        .await
+        .expect_err("the provider failed");
+    assert_eq!(error.code(), ErrorCode::ServiceUnavailable);
+    let run = store
+        .run_by_input(&turn.input_id)
+        .await
+        .unwrap()
+        .expect("the run was claimed");
+    assert_eq!(run.state, harness_store_sqlite::RunState::Failed);
+    assert_eq!(
+        store.pending_runtime_commands(&session_id).await.unwrap(),
+        0,
+        "a command no step will run again is not pending"
+    );
+    drop(runtime);
+    close_writer(store).await;
+}
+
 #[tokio::test]
 async fn p2_s05_summary_failure_uses_deterministic_working_state_fallback() {
     let temp = TempDir::new().unwrap();

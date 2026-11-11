@@ -1732,6 +1732,10 @@ pub struct RunRequest {
     /// Shared the same way: every step of a turn sends the earlier turns, so
     /// each one summarises them again (from the cache) and the user is told once.
     earlier_compaction_noticed: Arc<AtomicBool>,
+    /// Shared the same way: a step of this turn sent the earlier turns as
+    /// their summary, so its later steps send that summary too, whether or
+    /// not the whole history would now measure as fitting.
+    earlier_summary_sent: Arc<AtomicBool>,
     /// Shared the same way: once a summary of the earlier turns failed, the
     /// turn's later steps do not wait on another that would fail the same way.
     earlier_summary_failed: Arc<AtomicBool>,
@@ -1789,6 +1793,7 @@ impl RunRequest {
             authority: SourceAuthority::User,
             auto_compaction_attempted: Arc::new(AtomicBool::new(false)),
             earlier_compaction_noticed: Arc::new(AtomicBool::new(false)),
+            earlier_summary_sent: Arc::new(AtomicBool::new(false)),
             earlier_summary_failed: Arc::new(AtomicBool::new(false)),
             turn_summary: Arc::new(Mutex::new(None)),
             turn_summary_failed: Arc::new(AtomicBool::new(false)),
@@ -3678,10 +3683,26 @@ pub struct RuntimeService {
     /// The provider's measured prompt over this host's estimate of it, at the
     /// last response that reported usage. See [`Self::estimate_scale`].
     estimate_scale: Arc<Mutex<Option<f64>>>,
+    /// The command and run each step in flight has claimed, by its input.
+    /// See [`Self::settle_abandoned_step`].
+    open_steps: Arc<Mutex<std::collections::HashMap<String, OpenStep>>>,
     /// The folder the tools work in, where a shell call's arguments are
     /// looked up as files for a summary's file lists. See
     /// [`Self::with_workspace_root`].
     workspace_root: Option<std::path::PathBuf>,
+}
+
+/// What a step in flight has claimed and must leave settled.
+struct OpenStep {
+    command_id: harness_types::RuntimeCommandId,
+    owner_generation: u64,
+    run_id: AgentRunId,
+}
+
+/// The key a step's [`OpenStep`] is kept under: one input runs one step at
+/// a time.
+fn open_step_key(request: &RunRequest) -> String {
+    format!("{}|{}", request.session_id, request.input_id)
 }
 
 /// The prompt tokens the provider reported for an attempt, when it did.
@@ -3822,6 +3843,7 @@ impl RuntimeService {
             tool_schema_facts: Arc::new(Mutex::new(None)),
             stored_packet: Arc::new(Mutex::new(None)),
             estimate_scale: Arc::new(Mutex::new(None)),
+            open_steps: Arc::new(Mutex::new(std::collections::HashMap::new())),
             workspace_root: None,
         }
     }
@@ -4033,21 +4055,98 @@ impl RuntimeService {
             )
             .await;
         let Err(error) = &first else {
+            self.settle_abandoned_step(request, None, false).await;
             return first;
         };
         if cancellation.is_cancelled() || !is_context_overflow(&error.to_string()) {
+            self.settle_abandoned_step(request, Some(error), true).await;
             return first;
         }
         let Ok(compacted) = self.compact(&request.session_id).await else {
+            self.settle_abandoned_step(request, Some(error), true).await;
             return first;
         };
+        // The step is tried once more on the same run: only its command ends.
+        self.settle_abandoned_step(request, Some(error), false)
+            .await;
         let mut request = request.clone();
         request.continuation_context = Some(compacted.packet.content);
         let mut appended = appended.to_vec();
         let budget = messages_tokens(&appended) / 2;
         fit_tool_results(&mut appended, budget);
-        self.run_inner(&request, cancellation, sink, false, &appended)
-            .await
+        let second = self
+            .run_inner(&request, cancellation, sink, false, &appended)
+            .await;
+        self.settle_abandoned_step(&request, second.as_ref().err(), true)
+            .await;
+        second
+    }
+
+    /// End what a step left open when it returned before its provider call
+    /// was settled: its claimed command, and with `finish_run` its run.
+    ///
+    /// A step claims a command and a run, and the code after its provider
+    /// loop settles both. A return before that left the run `running` and
+    /// the command `claimed` for good: bug report 20261112 has a turn
+    /// canceled while its context was being summarized that ended
+    /// `canceled` and whose run still reads `running`. A canceled step ends
+    /// both here. One that failed some other way before its provider call
+    /// ends its command only: its run stays `running`, as a store fault
+    /// leaves it. Rows the step settled itself are left as they are, and
+    /// `error` is `None` for a step that succeeded, whose run goes on.
+    async fn settle_abandoned_step(
+        &self,
+        request: &RunRequest,
+        error: Option<&RuntimeError>,
+        finish_run: bool,
+    ) {
+        let Some(open) = self
+            .open_steps
+            .lock()
+            .ok()
+            .and_then(|mut open| open.remove(&open_step_key(request)))
+        else {
+            return;
+        };
+        let Some(error) = error else {
+            return;
+        };
+        let canceled = error.code() == ErrorCode::ProviderCanceled;
+        if let Ok(Some(command)) = self.store.runtime_command(&open.command_id).await
+            && command.state == RuntimeCommandState::Claimed
+        {
+            let _ = self
+                .store
+                .complete_runtime_command(
+                    &open.command_id,
+                    open.owner_generation,
+                    if canceled {
+                        RuntimeCommandState::Canceled
+                    } else {
+                        RuntimeCommandState::Failed
+                    },
+                    Some(&error.to_string()),
+                )
+                .await;
+        }
+        if !finish_run || !canceled {
+            return;
+        }
+        if let Ok(Some(run)) = self.store.run_by_id(&open.run_id).await
+            && run.state == RunState::Running
+        {
+            let _ = self
+                .store
+                .finish_run(
+                    &run.run_id,
+                    run.revision,
+                    RunState::Canceled,
+                    None,
+                    Some("provider_canceled"),
+                    None,
+                )
+                .await;
+        }
     }
 
     /// Recover a session for a model step, reusing the fold of the previous step.
@@ -4166,6 +4265,19 @@ impl RuntimeService {
             )
             .await?;
         self.last_attempts.store(command.attempts, Ordering::SeqCst);
+        // From here the step owns a claimed command and a running run. A
+        // return before the provider answers settles neither, so the caller
+        // does: see [`Self::settle_abandoned_step`].
+        if let Ok(mut open) = self.open_steps.lock() {
+            open.insert(
+                open_step_key(request),
+                OpenStep {
+                    command_id: command_id.clone(),
+                    owner_generation: command.owner_generation,
+                    run_id: run.run_id.clone(),
+                },
+            );
+        }
         let recovery = self.recover_step(&session, &request.session_id).await?;
         // The run scope is validated up front even though nothing narrows it here.
         self.run_scope(request, &config)?;
@@ -4233,7 +4345,15 @@ impl RuntimeService {
         // compacted, and cut again to its newest few thousand tokens: a summary
         // call and a review every turn, and the model shown only the last steps
         // of a window that holds far more. The cut moves when this stops fitting.
-        if !fits(&attempt)
+        //
+        // Once a step of this turn has sent the summary, every later step
+        // does: whether the whole history fits is measured by a scale that
+        // moves with each response, and a history just over the threshold
+        // read as fitting one step later. That step sent all of it again
+        // (202k tokens after a step of 86k), was asked to save its state as
+        // if no summary had been written, and the step after went back to
+        // the summary.
+        if (!fits(&attempt) || request.earlier_summary_sent.load(Ordering::SeqCst))
             && let Some((covers, summary)) = self
                 .kept_summary(&request.task_id, &request.conversation)
                 .await
@@ -4258,6 +4378,7 @@ impl RuntimeService {
                     .field("covers", covers)
                     .field("after", estimate(&kept))
                     .emit();
+                request.earlier_summary_sent.store(true, Ordering::SeqCst);
                 earlier = std::borrow::Cow::Owned(conversation);
                 attempt = kept;
             }
@@ -4380,6 +4501,7 @@ impl RuntimeService {
                             format!("{COMPACTED_PREFIX}\n\n{summary}"),
                         )];
                         conversation.extend(recent);
+                        request.earlier_summary_sent.store(true, Ordering::SeqCst);
                         earlier = std::borrow::Cow::Owned(conversation);
                         attempt = self.build_context(
                             request,
@@ -5178,10 +5300,13 @@ impl RuntimeService {
             let error = last_error.unwrap_or_else(|| {
                 RuntimeError::new(ErrorCode::RetryExhausted, "provider retry budget exhausted")
             });
+            // A step that failed does not run its command again: the next
+            // step enqueues its own. Written back as `pending` it counted as
+            // work still to do for as long as the store was kept.
             let state = if error.code() == ErrorCode::ProviderCanceled {
                 RuntimeCommandState::Canceled
             } else {
-                RuntimeCommandState::Pending
+                RuntimeCommandState::Failed
             };
             let _ = self
                 .store
@@ -6533,7 +6658,45 @@ impl RuntimeService {
                 "continuation task does not match source session",
             ));
         }
-        self.prepare_continuation(source_session_id, request).await
+        self.prepare_continuation(source_session_id, request, None)
+            .await
+    }
+
+    /// [`Self::prepare_continuation_request`] for a turn the user watches and
+    /// can stop. A conversation near its replay bound is summarized into a
+    /// checkpoint here, before the run exists: `cancellation` stops that
+    /// summary as it stops the turn, and `notice` is told when it starts and
+    /// how it ended. Bug report 20261112 has one take four minutes with
+    /// nothing shown, nothing recorded and no way to stop it.
+    ///
+    /// # Errors
+    /// As [`Self::prepare_continuation_request`].
+    pub async fn prepare_watched_continuation_request(
+        &self,
+        source_session_id: &SessionId,
+        request: RunRequest,
+        cancellation: CancellationToken,
+        notice: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<RunRequest, RuntimeError> {
+        let source_task = self
+            .store
+            .session_task(source_session_id)
+            .await?
+            .ok_or_else(|| {
+                RuntimeError::new(ErrorCode::InvalidPayload, "source session does not exist")
+            })?;
+        if source_task != request.task_id {
+            return Err(RuntimeError::new(
+                ErrorCode::IdempotencyConflict,
+                "continuation task does not match source session",
+            ));
+        }
+        TURN_CANCELLATION
+            .scope(
+                cancellation,
+                self.prepare_continuation(source_session_id, request, Some(notice)),
+            )
+            .await
     }
 
     /// Run the first step of a continuation `request` already prepared by
@@ -6595,7 +6758,7 @@ impl RuntimeService {
             ));
         }
         let request = self
-            .prepare_continuation(source_session_id, request)
+            .prepare_continuation(source_session_id, request, None)
             .await?;
         let result = self.run(request).await?;
         self.store
@@ -6610,6 +6773,7 @@ impl RuntimeService {
         &self,
         source_session_id: &SessionId,
         request: RunRequest,
+        notice: Option<&(dyn Fn(String) + Send + Sync)>,
     ) -> Result<RunRequest, RuntimeError> {
         let mut history = self.conversation_history(source_session_id).await?;
         // Near the replay bound, the conversation becomes a checkpoint before
@@ -6620,7 +6784,62 @@ impl RuntimeService {
         // word. A checkpoint stands for everything before it instead.
         if history.near_replay_bound() && !request.auto_compaction_attempted.load(Ordering::SeqCst)
         {
-            let compacted = Box::pin(self.compact(source_session_id)).await.is_ok();
+            let replayed_bytes = history.replayed_bytes;
+            let turns = history.turn_inputs.len();
+            if let Some(notice) = notice {
+                notice(format!(
+                    "context: this conversation is near what a turn can replay ({turns} turn(s), {} KiB); summarizing it into a checkpoint before the turn starts",
+                    replayed_bytes / 1024
+                ));
+            }
+            let started = std::time::Instant::now();
+            let outcome = Box::pin(self.compact(source_session_id)).await;
+            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            // This summary runs before the run exists and outside a step, so
+            // nothing else records it.
+            match &outcome {
+                Ok(compacted) => {
+                    harness_types::diag::info("compaction", "replay_bound")
+                        .task(request.task_id.as_str())
+                        .session(source_session_id.as_str())
+                        .field("replayed_bytes", replayed_bytes)
+                        .field("turns", turns)
+                        .field("after", compacted.packet.token_estimate)
+                        .field("duration_ms", duration_ms)
+                        .emit();
+                    if let Some(notice) = notice {
+                        notice(format!(
+                            "context: summarized {turns} earlier turn(s) into a checkpoint (~{} tokens, {}s)",
+                            compacted.packet.token_estimate,
+                            duration_ms / 1000
+                        ));
+                    }
+                }
+                Err(error) => {
+                    harness_types::diag::at(
+                        if error.code() == ErrorCode::ProviderCanceled {
+                            harness_types::diag::Level::Warn
+                        } else {
+                            harness_types::diag::Level::Error
+                        },
+                        "compaction",
+                        "replay_bound_failed",
+                    )
+                    .task(request.task_id.as_str())
+                    .session(source_session_id.as_str())
+                    .msg(error.to_string())
+                    .field("replayed_bytes", replayed_bytes)
+                    .field("turns", turns)
+                    .field("duration_ms", duration_ms)
+                    .emit();
+                    if let Some(notice) = notice {
+                        notice(format!(
+                            "context: the conversation could not be summarized into a checkpoint ({error}); this turn replays it as it is"
+                        ));
+                    }
+                }
+            }
+            let compacted = outcome.is_ok();
             // The checkpoint's events are the source session's, and writing
             // them took the task back for that session from the turn it was
             // handed to: the new turn's admission then failed with

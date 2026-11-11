@@ -1916,10 +1916,18 @@ fn attach(
                 columns,
             },
             other => {
+                // Only a line that is not a request is unreadable. A read
+                // that failed is the connection ending, and says so.
                 if let Err(error) = other {
-                    log(&format!(
-                        "terminal {connection} sent an unreadable request: {error}"
-                    ));
+                    if error.kind() == std::io::ErrorKind::InvalidData {
+                        log(&format!(
+                            "terminal {connection} sent an unreadable request: {error}"
+                        ));
+                    } else {
+                        log(&format!(
+                            "terminal {connection}'s connection ended: {error}"
+                        ));
+                    }
                 }
                 let _ = inbox.send(Command::Detach { connection });
                 return;

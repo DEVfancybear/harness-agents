@@ -2940,6 +2940,7 @@ impl SqliteStore {
         let mut record = sqlx::query("SELECT command_id, session_id, task_id, state, attempts, owner_generation, payload_json, last_error FROM runtime_commands WHERE command_id = ?").bind(command_id.as_str()).fetch_optional(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "claim runtime command", error))?.ok_or_else(|| StoreError::new(ErrorCode::InvalidPayload, "runtime command does not exist")).and_then(|row| runtime_command_from_row(&row))?;
         if record.state == RuntimeCommandState::Completed
             || record.state == RuntimeCommandState::Canceled
+            || record.state == RuntimeCommandState::Failed
         {
             tx.rollback().await.ok();
             return Ok(record);

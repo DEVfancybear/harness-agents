@@ -2007,9 +2007,17 @@ impl TurnDriver {
             Some(source) => {
                 // The prepared request - the conversation this turn continues -
                 // is the one every later step sends too.
+                // A long conversation is summarized into a checkpoint here,
+                // before the run exists: the user is told, and can stop it.
+                let watcher = Arc::clone(&observer);
                 request = self
                     .runtime
-                    .prepare_continuation_request(source, request)
+                    .prepare_watched_continuation_request(
+                        source,
+                        request,
+                        cancellation.clone(),
+                        &move |notice| watcher.observe(TurnProgress::Notice(notice)),
+                    )
                     .await
                     .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
                 self.runtime

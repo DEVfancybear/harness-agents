@@ -146,6 +146,11 @@ fn run_terminal(
                 let code = run_remote(backend, &mut remote, prefs)?;
                 if code == super::agents_view::AGENTS_VIEW_EXIT {
                     let came_from = Some(remote.agent().id.clone());
+                    // The connection to the agent this terminal left closes
+                    // now. Held for as long as the view and what it opens
+                    // ran, the worker's read of it failed two minutes later
+                    // and was logged as "an unreadable request".
+                    drop(remote);
                     return agents_view_loop(context, environment, None, came_from);
                 }
                 return Ok(code);
@@ -341,6 +346,8 @@ pub fn attach(selector: &str) -> Result<ExitCode, HarnessError> {
     if code == super::agents_view::AGENTS_VIEW_EXIT {
         let context = resolve_context(&AppLaunch::default(), &environment)?;
         let came_from = Some(remote.agent().id.clone());
+        // As above: the agent this terminal left is not held open.
+        drop(remote);
         code = agents_view_loop(&context, &environment, None, came_from)?;
     }
     drop(guard);

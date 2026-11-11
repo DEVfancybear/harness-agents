@@ -2418,8 +2418,15 @@ impl InteractiveController {
             note_delivery("steered", &text, "turn_running", 0);
             self.push_history(
                 effects,
+                // A background command's end is delivered the same way,
+                // and is not a child's message.
                 HistoryItem::Notice {
-                    message: "a child's message reached the running turn".to_owned(),
+                    message: if text.starts_with("[bash-done ") {
+                        "a background command's end reached the running turn"
+                    } else {
+                        "a child's message reached the running turn"
+                    }
+                    .to_owned(),
                 },
             );
         } else if self.free_for_automatic_turn()

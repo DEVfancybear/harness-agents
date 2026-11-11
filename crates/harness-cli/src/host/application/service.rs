@@ -8864,13 +8864,6 @@ async fn run_turn(
     // The store is the session's, shared with the children that outlive this
     // turn; the lease keeps it open for the turn and lets it close when nobody
     // holds it.
-    harness_types::diag::info("turn", "start")
-        .task(task_id.as_str())
-        .session(session_id.as_str())
-        .field("input", request.input_id.as_str())
-        .field("model", selected_model.clone())
-        .field("by", turn_source(&request))
-        .emit();
     let lease = match agents.store().lease().await {
         Ok(lease) => lease,
         Err(error) => {
@@ -8918,6 +8911,17 @@ async fn run_turn(
         },
         None => task_id,
     };
+    // Recorded under the conversation the turn belongs to. Before the lines
+    // above it carried the id the agent was started with, which a resumed
+    // conversation does not keep: a bug report of one found no start for any
+    // of its turns and showed "-" for who started each.
+    harness_types::diag::info("turn", "start")
+        .task(task_id.as_str())
+        .session(session_id.as_str())
+        .field("input", request.input_id.as_str())
+        .field("model", selected_model.clone())
+        .field("by", turn_source(&request))
+        .emit();
     // The first turn of a fork reads the conversation up to the fork point; its
     // later turns continue it through the `forked_from` setting.
     let mut fork_history = None;

@@ -367,6 +367,10 @@ pub enum RuntimeCommandState {
     Claimed,
     Completed,
     Canceled,
+    /// The step that owned it failed and will not run it again. It was
+    /// written back as `pending`, which nothing ever claims: the command of
+    /// every step that ran out of retries counted as work still to do.
+    Failed,
 }
 
 impl RuntimeCommandState {
@@ -377,6 +381,7 @@ impl RuntimeCommandState {
             Self::Claimed => "claimed",
             Self::Completed => "completed",
             Self::Canceled => "canceled",
+            Self::Failed => "failed",
         }
     }
     pub fn parse(value: &str) -> Option<Self> {
@@ -385,6 +390,7 @@ impl RuntimeCommandState {
             "claimed" => Some(Self::Claimed),
             "completed" => Some(Self::Completed),
             "canceled" => Some(Self::Canceled),
+            "failed" => Some(Self::Failed),
             _ => None,
         }
     }

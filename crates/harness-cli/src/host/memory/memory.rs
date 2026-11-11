@@ -3626,6 +3626,31 @@ fn refused(message: String) -> HarnessError {
     HarnessError::new(ErrorCode::InvalidPayload, message)
 }
 
+/// What a `memory` call that ran answers the model with. `saved` is whether
+/// the call began a save.
+///
+/// A call refused before it saved anything changed nothing, so its outcome is
+/// known: a plain refusal the model corrects. As an error it was settled as
+/// "side effect may be uncertain; do not rerun automatically" - on a write
+/// refused because it may repeat a kept entry, whose refusal says to write
+/// again with `distinct: true`. Only a call that failed after it began to
+/// save stays an error, whose outcome is not known.
+fn memory_output(result: Result<Value, String>, saved: bool) -> Result<ToolOutput, HarnessError> {
+    match result {
+        Ok(payload) => Ok(ToolOutput::ExternalTool {
+            plugin_id: "memory".to_owned(),
+            tool_name: "memory".to_owned(),
+            payload,
+            inflight: 1,
+        }),
+        Err(reason) if !saved => Ok(ToolOutput::Denied {
+            code: ErrorCode::InvalidPayload.as_str().to_owned(),
+            reason,
+        }),
+        Err(reason) => Err(refused(reason)),
+    }
+}
+
 impl ExternalToolCatalog for MemoryHost {
     fn schemas(&self) -> Vec<Value> {
         if self.off {
@@ -3758,16 +3783,14 @@ impl ExternalToolDispatcher for MemoryHost {
             }
             let host = self.clone();
             let arguments = arguments.clone();
-            let payload = tokio::task::spawn_blocking(move || host.execute(&arguments))
-                .await
-                .map_err(|error| refused(format!("memory operation failed: {error}")))?
-                .map_err(refused)?;
-            Ok(ToolOutput::ExternalTool {
-                plugin_id: "memory".to_owned(),
-                tool_name: "memory".to_owned(),
-                payload,
-                inflight: 1,
+            let (result, saved) = tokio::task::spawn_blocking(move || {
+                let before = memory_store::saves_begun();
+                let result = host.execute(&arguments);
+                (result, memory_store::saves_begun() != before)
             })
+            .await
+            .map_err(|error| refused(format!("memory operation failed: {error}")))?;
+            memory_output(result, saved)
         })
     }
 }
@@ -4691,6 +4714,54 @@ mod tests {
             listed.as_array().map(Vec::len),
             Some(1),
             "saved state was kept"
+        );
+    }
+
+    /// A write refused while it ran, before it saved anything, is a plain
+    /// refusal: bug report 20261112 has one settled as "side effect may be
+    /// uncertain; do not rerun automatically" while its text said to write
+    /// again with `distinct: true`. One that failed after it began to save
+    /// stays an error.
+    #[test]
+    fn a_write_refused_before_it_saved_is_a_plain_refusal() {
+        let directory = tempfile::tempdir().expect("dir");
+        let host = host(directory.path());
+        for (title, content) in [
+            (
+                "Package manager",
+                "This project uses pnpm as its package manager.",
+            ),
+            (
+                "Deploy day",
+                "This project is deployed to Fly.io every Friday.",
+            ),
+            ("Reply language", "Answer the user in Vietnamese."),
+        ] {
+            let before = memory_store::saves_begun();
+            run(
+                &host,
+                &json!({"action":"write","scope":"global","title":title,"content":content}),
+            )
+            .expect("write");
+            assert_ne!(memory_store::saves_begun(), before, "a write saves");
+        }
+        let before = memory_store::saves_begun();
+        let result = run(
+            &host,
+            &json!({"action":"write","scope":"global","title":"Trình quản lý gói","content":"Dự án này dùng pnpm làm trình quản lý gói."}),
+        );
+        let saved = memory_store::saves_begun() != before;
+        assert!(!saved, "the refused write saved nothing");
+        match memory_output(result, saved) {
+            Ok(ToolOutput::Denied { code, reason }) => {
+                assert_eq!(code, "invalid_payload");
+                assert!(reason.contains("distinct: true"), "{reason}");
+            }
+            _ => panic!("a refusal before any save is a plain refusal"),
+        }
+        assert!(
+            memory_output(Err("the store could not be written".to_owned()), true).is_err(),
+            "a failure after a save began keeps its unknown outcome"
         );
     }
 

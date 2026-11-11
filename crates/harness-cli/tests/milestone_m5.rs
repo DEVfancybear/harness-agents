@@ -1127,6 +1127,86 @@ async fn a_turn_after_a_compaction_reuses_the_kept_summary_while_it_fits() {
     assert_eq!(summary.prompts.lock().expect("prompts").len(), written);
 }
 
+/// Once a step of a turn has sent the earlier turns as their summary, its
+/// later steps send it too. Whether the whole history fits is read in the
+/// provider's measure, which moves with each response: in bug report 20261112
+/// the step after a compaction measured the whole history as fitting and sent
+/// all of it again (202k tokens after a step of 86k), and the step after that
+/// went back to the summary.
+#[tokio::test]
+async fn a_turn_that_sent_the_summary_keeps_sending_it_when_the_measure_moves() {
+    let bench = bench();
+    let task = TaskId::generate();
+    let summary = Arc::new(RecordingSummary::default());
+    // The first response reports a prompt far smaller than estimated, so the
+    // scale falls from 2.5 to its floor and the whole history reads as fitting.
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("first"),
+            ProviderStreamEvent::usage(1, 1, 2),
+            ProviderStreamEvent::completed("stop"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("second"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let store = bench.open_store().await;
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig {
+            context_window_tokens: 16_000,
+            output_reservation_tokens: 1024,
+            compaction_reserve_tokens: 1000,
+            estimate_scale: Some(2.5),
+            ..RuntimeConfig::default()
+        },
+    )
+    .with_summarizer(Arc::clone(&summary) as Arc<dyn SummaryProvider>);
+    let turn = RunRequest::new(
+        SessionId::generate(),
+        task.clone(),
+        InputId::generate(),
+        "continue".to_owned(),
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("workspace"),
+    )
+    // A conversation no other test summarizes: summaries are cached by
+    // content for the whole process.
+    .with_conversation(worked_turns(60, "omega"));
+    runtime.run(turn.clone()).await.expect("the first step");
+    let written = summary.prompts.lock().expect("prompts").len();
+    assert!(written >= 1, "the first step compacted");
+    let transcript = vec![
+        harness_providers::ProviderMessage::new(MessageRole::Assistant, "first"),
+        harness_providers::ProviderMessage::new(MessageRole::User, "go on"),
+    ];
+    runtime
+        .continue_run(&turn, &transcript, CancellationToken::new(), None)
+        .await
+        .expect("the second step");
+    let seen = provider.seen();
+    assert_eq!(seen.len(), 2);
+    for (step, sent) in seen.iter().enumerate() {
+        assert!(
+            !sent
+                .messages
+                .iter()
+                .any(|message| message.content.contains("omega result 0:")),
+            "step {step} sends the summary, not the whole history again"
+        );
+    }
+    assert_eq!(
+        summary.prompts.lock().expect("prompts").len(),
+        written,
+        "the kept summary is read back, not written again"
+    );
+    drop(runtime);
+    close(store).await;
+}
+
 /// prime-agent cuts a turn too large to keep at an assistant message and
 /// summarises its start on its own, instead of summarising all of it away.
 #[tokio::test]

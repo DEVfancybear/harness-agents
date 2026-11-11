@@ -710,6 +710,20 @@ pub fn load_document(dir: &Path) -> Result<Value, String> {
     }
 }
 
+thread_local! {
+    /// How many [`save_document`] calls this thread has begun.
+    static SAVES_BEGUN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many document saves this thread has begun, whether or not they
+/// succeeded. A call that failed with the count unchanged wrote nothing: its
+/// outcome is known, and the `memory` tool reports it as a plain refusal
+/// instead of "side effect may be uncertain; do not rerun automatically".
+#[must_use]
+pub fn saves_begun() -> u64 {
+    SAVES_BEGUN.with(std::cell::Cell::get)
+}
+
 /// Save a whole document over a scope: each entry that differs from its row
 /// is inserted, updated or deleted, with one event each, in one transaction.
 /// An entry that names a removed one among its `aliases` is that entry
@@ -719,6 +733,7 @@ pub fn load_document(dir: &Path) -> Result<Value, String> {
 /// # Errors
 /// The store cannot be opened or written; nothing is then changed.
 pub fn save_document(dir: &Path, state: &Value, writer: &Writer) -> Result<usize, String> {
+    SAVES_BEGUN.with(|begun| begun.set(begun.get().wrapping_add(1)));
     // A document read from a store that could not be read is empty, and
     // saving it would delete every entry: nothing is written from it.
     if let Some(error) = state[UNREADABLE].as_str() {
