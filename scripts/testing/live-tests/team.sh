@@ -29,11 +29,11 @@ D="$HA_HOME/data"
 
 # What the children of this home's conversations were sent, as one JSON object
 # a child: {"task", "role", "name", "text"}; `text` is every message of every
-# request of the child, joined. A child's name is read from the notices that
-# name it; a request is a delta, so a child's text is all of them together.
+# request of the child, joined (a request is a delta, so a child's text is all
+# of them together). A child's name is the one its first prompt told it.
 children() {
   "$PY" - "$D" <<'PYEOF'
-import glob, json, os, sqlite3, sys
+import glob, json, os, re, sqlite3, sys
 sys.stdout.reconfigure(encoding="utf-8")
 for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
     c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -48,7 +48,13 @@ for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3"
             for call in m.get("tool_calls") or []:
                 parts.append(f"{call.get('name')} {call.get('arguments')}")
     for task, parts in texts.items():
-        print(json.dumps({"task": task, "role": roles[task], "name": f"{roles[task]}-{task[-8:]}", "text": "\n".join(parts)}, ensure_ascii=False))
+        text = "\n".join(parts)
+        # The name the child was told ("You are <name>."): its parent may have
+        # given it a title. A build that tells a child no name named it after
+        # its role and its task.
+        told = re.search(r"\n\nYou are (\S+?)\.(\n|$)", text)
+        name = told.group(1) if told else f"{roles[task]}-{task[-8:]}"
+        print(json.dumps({"task": task, "role": roles[task], "name": name, "text": text}, ensure_ascii=False))
 PYEOF
 }
 # The root's requests of this home, joined.

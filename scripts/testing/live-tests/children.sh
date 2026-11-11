@@ -85,7 +85,7 @@ for _ in $(seq 1 60); do
 done
 calls | sed 's/^/   calls: /'
 check "the child started on $FROM" '[ -n "$started" ]'
-check "the change named the running child moving to $MODEL" 'echo "$moved" | grep -qE "running children switch at their next model call: explorer-[0-9a-f]+ -> $MODEL"'
+check "the change named the running child moving to $MODEL" 'echo "$moved" | grep -qE "running children switch at their next model call: [^ ,;]+ -> $MODEL"'
 check "the same child then called $MODEL" 'calls | grep -qE "^$started( ${FROM#*/})+( ${MODEL#*/})+"'
 "$HA" send c1 "/agents" --wait 2>&1 | grep -iE "explorer" | head -3 | sed 's/^/   /'
 "$HA" shutdown --force >/dev/null 2>&1
@@ -94,7 +94,9 @@ echo "################ 2. a coder's file read before it is integrated"
 agent "$RX/p" c2
 say c2 "Kiểm thử harness, làm đúng thứ tự: (1) dùng tool delegate giao cho đúng một agent role coder nhiệm vụ: tạo file notes/made.txt chứa đúng một dòng MADE-BY-CODER rồi commit trong worktree của nó; đợi coder xong. (2) CHƯA gọi integrate_children. Gọi tool read_file với path notes/made.txt. (3) In nguyên văn thông báo lỗi read_file trả về, không làm gì thêm." | tail -4 | sed 's/^/   /'
 check "the read was refused in this checkout" '[ ! -f "$RX/p/notes/made.txt" ]'
-check "the refusal says the coder made it in its worktree" 'ans | grep -qE "coder-[0-9a-f]+ made it in its worktree" || grep -rqE "coder-[0-9a-f]+ made it in its worktree" "$HA_HOME/data/projects"'
+# The coder is named after its role and its task, or after the title its
+# parent gave it (0.9.6): either way the refusal names it.
+check "the refusal says the coder made it in its worktree" 'ans | grep -qE "[A-Za-z0-9_-]+-[0-9a-f]+ made it in its worktree" || grep -rqE "[A-Za-z0-9_-]+-[0-9a-f]+ made it in its worktree" "$HA_HOME/data/projects"'
 "$HA" shutdown --force >/dev/null 2>&1
 
 echo "################ 3. a goal waits for a child that is still working"
