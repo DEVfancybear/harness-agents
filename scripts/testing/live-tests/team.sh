@@ -4,7 +4,7 @@
 #     other's work once each knows who else is there and says what it takes;
 #   Zero-shot coordination (arXiv 2611.06409): agents that cannot agree
 #     beforehand each take their own convention for the natural one.
-# 0.9.4 gave a child `agent_message` to a sibling "by name" and never told it
+# 0.9.5 gave a child `agent_message` to a sibling "by name" and never told it
 # a sibling's name, its brief, or how to work beside it.
 #   1. two explorers started together each learn of the other: in its task
 #      (`Teammates:`) or, for the one briefed first, by a `[teammate-joined`
@@ -161,7 +161,7 @@ check "the explorer beside it was not told of the verifier" 'judge "$RX/kids-v.j
 
 echo "################ 4. a part invented for the task, and what the task learned (arXiv 2610.36848)"
 # The lesson is in the parent's journal only; the brief names neither it nor
-# the child's name. 0.9.4 named every child after its role and sent a child
+# the child's name. 0.9.5 named every child after its role and sent a child
 # the task's constraints and decisions, never what the task had learned.
 held=""
 for attempt in 1 2 3; do

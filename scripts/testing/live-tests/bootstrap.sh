@@ -3,7 +3,7 @@
 # never seen into its knowledge library before any task needs it. After
 # Recursa (arXiv 2611.04035), whose bootstrapping maps a domain's materials
 # with parallel agents, every entry with its source, its scope and how sure it
-# is, and records the boundaries of what was read. 0.9.4 had no such command:
+# is, and records the boundaries of what was read. 0.9.5 had no such command:
 # `/knowledge bootstrap` answered with the usage line.
 #   1. the command starts a turn with the mapping request, and the turn writes
 #      pages: one that routes, pages for the parts, one of boundaries;
