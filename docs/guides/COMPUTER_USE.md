@@ -1,14 +1,12 @@
 # Desktop computer use
 
-> **In development.** Desktop control is not yet reliable. The Python skill described
-> below still ships (`.agents/skills/computer-use/`); treat it as experimental. A native
-> `computer` tool meant to replace it is on the unmerged `feat/computer-use` branch: it
-> is not in `master` or in any release.
+> **Stable.** Desktop control (the `computer-use` skill: `screenshot`, `run`, `zoom`, and
+> Jev as the pilot) passes its live suite, `scripts/testing/live-tests/computer-pilot.sh`,
+> with a real model and TypeSafe's real Jev on a Windows desktop.
 >
-> **Đang phát triển.** Điều khiển máy tính chưa ổn định. Skill Python mô tả dưới đây vẫn
-> đi kèm (`.agents/skills/computer-use/`); chỉ nên dùng thử nghiệm. Một tool `computer`
-> native để thay nó nằm trên nhánh `feat/computer-use` chưa merge: nó chưa có trong
-> `master` hay bản release nào.
+> **Ổn định.** Điều khiển máy tính (skill `computer-use`: `screenshot`, `run`, `zoom`, và
+> Jev lái) qua bộ test live `scripts/testing/live-tests/computer-pilot.sh`, với model thật
+> và Jev thật của TypeSafe trên desktop Windows.
 
 ha ships a Python-backed `computer-use` skill for a vision-capable model on an unlocked Windows desktop. It uses real mouse/keyboard input and screenshots, including browser canvas games and native apps. `web_fetch` still only reads web text; it does not operate an app.
 
