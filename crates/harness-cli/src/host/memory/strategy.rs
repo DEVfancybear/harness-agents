@@ -522,7 +522,7 @@ impl StrategyState {
                     .iter()
                     .any(|proposal| !proposal.team.is_empty())
                 {
-                    text.push_str("\nA team is a suggestion: start each member with delegate, its title as the title and its mandate in the brief.");
+                    text.push_str("\nA team is optional, for parts that must run at once or be kept apart: where you can carry the approach out yourself, do. A member is started with delegate, its title as the title and its mandate in the brief.");
                 }
             }
         }

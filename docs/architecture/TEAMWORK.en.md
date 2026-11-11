@@ -124,6 +124,10 @@ runtime](STRATEGY_AND_RUNTIME.en.md)). What it adds:
 
 The team is advice, as every strategist proposal is: the refusal and the task
 state show it, and the agent decides. Nothing is started for it. The
+strategist is told most stalls need none - a team only for parts that must
+run at once or be kept apart - after live runs in which a team named for a
+small stall had the agent delegate where it could have acted, and the goal
+did not finish in the time it had. The
 diagnostics' `strategy proposed` record carries `diagnosed` and `team_roles`.
 
 ## Alternatives from outside ([R])

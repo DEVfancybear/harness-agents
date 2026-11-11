@@ -125,7 +125,11 @@ runtime](STRATEGY_AND_RUNTIME.vi.md)). Phần thêm vào:
 | Lịch sử tiến hoá | Các quyết định chiến lược và lần đánh giá trong task state, như trước | Đã có |
 
 Đội chỉ là lời khuyên, như mọi đề xuất của strategist: lời từ chối và task
-state hiển thị nó, còn agent quyết định. Không có gì tự khởi động. Record chẩn
+state hiển thị nó, còn agent quyết định. Không có gì tự khởi động. Strategist
+được bảo rằng phần lớn chỗ kẹt không cần đội - chỉ lập đội cho các phần phải
+chạy cùng lúc hoặc phải tách riêng - sau các lượt live mà đội được nêu cho một
+chỗ kẹt nhỏ khiến agent đi giao việc ở nơi nó tự làm được, và goal không xong
+trong thời gian có. Record chẩn
 đoán `strategy proposed` có thêm `diagnosed` và `team_roles`.
 
 ## Phương án từ bên ngoài ([R])
