@@ -56,7 +56,9 @@ elif what == "dropped-last":
 elif what == "whole-last":
     print(sum(1 for text in results(last) if "row 0001" in text))
 elif what == "whole-ever":
-    print(max((sum(1 for text in results(m) if "row 0001" in text) for m in requests), default=0))
+    # Over all the requests, by call: a step's request holds only what it added.
+    print(len({m.get("tool_call_id") for messages in requests for m in messages
+               if m.get("role") == "tool" and "row 0001" in str(m.get("content") or "")}))
 elif what == "drop-calls":
     print(distinct("drop_context"))
 elif what == "offered":
@@ -77,7 +79,7 @@ check "the turn read the six files one at a time (the precondition: $READS)" "[ 
 # A model that reads only each file's first lines leaves nothing whole to
 # keep: the checks on what stays whole are judged only when it read them whole.
 EVER=$(store whole-ever)
-check "it read the files whole (the precondition: $EVER whole in one request)" "[ $EVER -ge 2 ]"
+check "it read the files whole (the precondition: $EVER read whole)" "[ $EVER -ge 6 ]"
 KEEP=$(diag context dropped | grep -c '"by":"keep"')
 echo "   rolling drops recorded=$KEEP"
 check "the rolling drop was made and recorded ($KEEP)" "[ $KEEP -ge 1 ]"
