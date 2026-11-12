@@ -248,11 +248,16 @@ mkdir -p "$P1B/ops"
 jobs=(ledger invoice tariff)
 kept=""; keptat=""; forproject=""; REFUSED=""; STOP=0
 for a in 1 2 3; do
-  job=${jobs[$((a-1))]}; tok="inbox-4$a"
-  printf '# Settings of the nightly %s sync, run %s\nschedule = nightly\ninput_dir = spool/%s\nretries = 3\n' "$job" "$a" "$tok" > "$P1B/ops/sync-$a.cfg"
-  printf 'The nightly %s sync is configured in ops/sync-%s.cfg.\n' "$job" "$a" > "$P1B/ops/README-$a.txt"
+  job=${jobs[$((a-1))]}; tok="spool-eu-4$a"
+  # The first run's fixture (one setting in one file) was reviewed as "one-off
+  # lookup completed": nothing to keep. This one is worked out through a chain
+  # of settings and an override that wins in production.
+  printf 'The nightly %s sync reads its input folder from input_dir in ops/sync-%s.cfg.\n' "$job" "$a" > "$P1B/ops/README-$a.txt"
+  printf '# Settings of the nightly %s sync\nschedule = nightly\ninput_dir = ${SPOOL_ROOT}/inbox\nsettings_order = ops/env-%s.cfg, then ops/prod-override-%s.cfg (the last one wins in production)\n' "$job" "$a" "$a" > "$P1B/ops/sync-$a.cfg"
+  printf 'SPOOL_ROOT = spool-main\n' > "$P1B/ops/env-$a.cfg"
+  printf '# applied last in production\nSPOOL_ROOT = %s\n' "$tok" > "$P1B/ops/prod-override-$a.cfg"
   (cd "$P1B" && git add -A && git -c user.name=t -c user.email=t@t commit -qm "sync $a")
-  WD=$P1B REVIEW=1 run_exec p1b$a "MARK-P1B-$a. In this project the nightly $job sync is set up somewhere under ops/. Find out which folder it reads its input from (use search_text and read_file only) and answer in one sentence."
+  WD=$P1B REVIEW=1 run_exec p1b$a "MARK-P1B-$a. In this project the nightly $job sync is set up somewhere under ops/. Work out which folder the production run reads its input from, following the settings and the override it uses (use search_text and read_file only), and answer in one sentence with the folder."
   if refused p1b$a; then [ "$STOP" = 1 ] && break; continue; fi
   where=$(landed "$tok")
   echo "   attempt $a: the review kept the fact as: ${where:-nowhere}"
@@ -372,10 +377,13 @@ echo "################ 5. P4: a script that ran with exit 0 is recorded as teste
 # store). It was right: nothing had run the skill's file. So the flow is the
 # one a returning task makes: /refine keeps the script as a skill, the
 # conversation runs the skill's own file (by its path in the skill folder),
-# and the next /refine, updating the skill, quotes that run.
+# and the next /refine, updating the skill, quotes that run. The quote must be a
+# phrase: `quoted` (refine.rs, QUOTE_MIN_CHARS = 12) refuses a shorter one, and
+# the second run, whose script printed "paid=4" and whose review quoted exactly
+# that, was left `scriptRunsUnconfirmed` for it. So the script prints a phrase.
 # The run of the skill's file: the call names the skill folder's script, and
 # its result is the host's clean-exit line with the count.
-E_RAN5='any(name == "run_process" and ("skills/" + os.environ["SK"] + "/scripts/paidcount.py") in json.dumps(args).replace("\\\\", "/") for name, args in calls) and any("exit=Some(0) timed_out=false" in r and "paid=4" in r for r in results)'
+E_RAN5='any(name == "run_process" and ("skills/" + os.environ["SK"] + "/scripts/paidcount.py") in json.dumps(args).replace("\\\\", "/") for name, args in calls) and any("exit=Some(0) timed_out=false" in r and "paid orders counted: 4" in r for r in results)'
 pre5=""; REFUSED=""; STOP=0
 for a in 1 2 3; do
   Pb=$RX/p4b-$a; sk="order-count-$a"
@@ -384,8 +392,8 @@ for a in 1 2 3; do
   printf 'id,status\n1,paid\n2,open\n3,paid\n4,paid\n5,paid\n' > "$Pb/data/orders.csv"
   (cd "$Pb" && git add -A && git -c user.name=t -c user.email=t@t commit -qm orders)
   agent "$Pb" "a$a"
-  LINE="import csv; rows = list(csv.DictReader(open('data/orders.csv', encoding='utf-8'))); print('paid=%d' % sum(1 for row in rows if row['status'] == 'paid'))"
-  BODY="--- / name: $sk / description: Use when asked to count the paid orders. / category: ops / --- / Run scripts/paidcount.py from the project root; it prints paid=<the number of paid orders>."
+  LINE="import csv; rows = list(csv.DictReader(open('data/orders.csv', encoding='utf-8'))); print('paid orders counted: %d' % sum(1 for row in rows if row['status'] == 'paid'))"
+  BODY="--- / name: $sk / description: Use when asked to count the paid orders. / category: ops / --- / Run scripts/paidcount.py from the project root; it prints paid orders counted: <the number>."
   SKP=$(cygpath -m "$HA_HOME/skills/$sk/scripts/paidcount.py" 2>/dev/null || echo "$HA_HOME/skills/$sk/scripts/paidcount.py")
   out=$(say "a$a" "MARK-P4B-$a. Create tools/paidcount.py with write_file, holding exactly this one line, the text between LINE-BEGIN and LINE-END and not those markers: LINE-BEGIN $LINE LINE-END. Then run it once with run_process (executable python, args [\"tools/paidcount.py\"]) from the project root and tell me what it printed. Do nothing else."); echo "$out" | tail -2 | sed 's/^/   /'
   case "$out" in *rate_limited:*) REFUSED=$(echo "$out" | grep -m1 "rate_limited:"); STOP=1; "$HA" shutdown --force >/dev/null 2>&1; break;; esac
@@ -393,7 +401,7 @@ for a in 1 2 3; do
   case "$out" in *rate_limited:*) REFUSED=$(echo "$out" | grep -m1 "rate_limited:"); STOP=1; "$HA" shutdown --force >/dev/null 2>&1; break;; esac
   if [ ! -f "$HA_HOME/skills/$sk/scripts/paidcount.py" ]; then echo "   attempt $a: /refine did not write the skill's script"; "$HA" shutdown --force >/dev/null 2>&1; continue; fi
   out=$(say "a$a" "Now run the learned skill's own copy of the script, once, with run_process (executable python, args [\"$SKP\"]) from the project root, and tell me what it printed. Do nothing else."); echo "$out" | tail -2 | sed 's/^/   /'
-  out=$(say "a$a" "/refine The script scripts/paidcount.py of the learned skill $sk has now been run in this conversation, by its own path in the skill's folder. Update that skill: action update, name $sk, body the same SKILL.md lines as before ($BODY) with one more sentence at the end, 'Last run: it printed paid=4.', no files, and script_runs [{\"path\": \"scripts/paidcount.py\", \"evidence\": \"paid=4\"}]. Propose no memory edits."); echo "$out" | tail -3 | sed 's/^/   /'
+  out=$(say "a$a" "/refine The script scripts/paidcount.py of the learned skill $sk has now been run in this conversation, by its own path in the skill's folder. Update that skill: action update, name $sk, body the same SKILL.md lines as before ($BODY) with one more sentence at the end, 'Last run: it printed paid orders counted: 4.', no files, and script_runs [{\"path\": \"scripts/paidcount.py\", \"evidence\": \"paid orders counted: 4\"}]. Propose no memory edits."); echo "$out" | tail -3 | sed 's/^/   /'
   "$HA" shutdown --force >/dev/null 2>&1
   export SK=$sk
   if ev "MARK-P4B-$a" root "$E_RAN5"; then pre5=$a; break; fi
