@@ -570,7 +570,7 @@ impl Notes {
                 faults.push(Fault {
                     key: format!("marker:{}", marker.id),
                     message: format!(
-                        "[^{id}] (line {line}) has no definition: add the line `[^{id}]: <YYYY[-MM[-DD]]>; <reference>, ...` or take the marker out",
+                        "[^{id}] (line {line}) has no definition: add the line `[^{id}]: <YYYY[-MM[-DD]]>; <reference>, ...` or take the marker out; if it is code, not a footnote, put it in backticks",
                         id = marker.id,
                         line = marker.line
                     ),
@@ -858,6 +858,20 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("^same-id") && m.contains("one paragraph"))
         );
+    }
+
+    /// A regular-expression class such as `[^abc]` in prose reads as a footnote
+    /// marker; the refusal says the way out, and a page that already held one
+    /// can still be edited.
+    #[test]
+    fn a_class_in_prose_is_refused_with_the_way_out_and_passes_in_backticks() {
+        let bare = "# P\n\nThe pattern [^abc] skips them.\n";
+        let why = check("p.md", bare, &[], None).unwrap_err();
+        assert!(why.contains("[^abc]") && why.contains("backticks"), "{why}");
+        let quoted = "# P\n\nThe pattern `[^abc]` skips them.\n";
+        assert!(check("p.md", quoted, &[], None).is_ok());
+        let edited = format!("{bare}\nMore text.\n");
+        assert!(check("p.md", &edited, &[bare], None).is_ok());
     }
 
     #[test]
