@@ -332,6 +332,7 @@ Tests marked `#[ignore]` (the pseudo-terminal acceptance cases) are skipped by `
 - [Sleep](SLEEP.en.md)
 - [Strategy revision and the runtime harness](STRATEGY_AND_RUNTIME.en.md)
 - [Teammates, conventions and proven skills](TEAMWORK.en.md)
+- [What survives a conversation](CONTINUAL_LEARNING.en.md)
 - [Live tests](../../scripts/testing/live-tests/README.md)
 - [Terminal interface](../guides/TUI.md)
 - [Build and release](../guides/BUILD_AND_RELEASE.md)
