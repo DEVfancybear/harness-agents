@@ -248,16 +248,26 @@ mkdir -p "$P1B/ops"
 jobs=(ledger invoice tariff)
 kept=""; keptat=""; forproject=""; REFUSED=""; STOP=0
 for a in 1 2 3; do
-  job=${jobs[$((a-1))]}; tok="spool-eu-4$a"
-  # The first run's fixture (one setting in one file) was reviewed as "one-off
-  # lookup completed": nothing to keep. This one is worked out through a chain
-  # of settings and an override that wins in production.
-  printf 'The nightly %s sync reads its input folder from input_dir in ops/sync-%s.cfg.\n' "$job" "$a" > "$P1B/ops/README-$a.txt"
-  printf '# Settings of the nightly %s sync\nschedule = nightly\ninput_dir = ${SPOOL_ROOT}/inbox\nsettings_order = ops/env-%s.cfg, then ops/prod-override-%s.cfg (the last one wins in production)\n' "$job" "$a" "$a" > "$P1B/ops/sync-$a.cfg"
-  printf 'SPOOL_ROOT = spool-main\n' > "$P1B/ops/env-$a.cfg"
-  printf '# applied last in production\nSPOOL_ROOT = %s\n' "$tok" > "$P1B/ops/prod-override-$a.cfg"
-  (cd "$P1B" && git add -A && git -c user.name=t -c user.email=t@t commit -qm "sync $a")
-  WD=$P1B REVIEW=1 run_exec p1b$a "MARK-P1B-$a. In this project the nightly $job sync is set up somewhere under ops/. Work out which folder the production run reads its input from, following the settings and the override it uses (use search_text and read_file only), and answer in one sentence with the folder."
+  job=${jobs[$((a-1))]}; tok="warehouse-b4$a"
+  # What a review keeps as a fact of the project is what the turn found out the
+  # hard way and a later one cannot read off a file at a glance. The first
+  # fixtures (a setting in one file; then an override chain) were reviewed as
+  # "one-off lookup": nothing to keep (and once the review kept the procedure as
+  # a skill instead). This one fails the way it does for everyone: the script
+  # refuses to run without a target, then refuses the wrong one, and only
+  # ops/targets-N.txt says which target production uses.
+  cat > "$P1B/tools-export-$a.py" <<EOPY
+import sys
+if "--target" not in sys.argv:
+    sys.exit("export-$a: --target is required; the targets are listed in ops/targets-$a.txt")
+target = sys.argv[sys.argv.index("--target") + 1]
+if target != "$tok":
+    sys.exit("export-$a: target %s is not the production target; ops/targets-$a.txt marks it" % target)
+print("exported 12 $job rows to " + target)
+EOPY
+  printf 'sandbox-a    test only, wiped nightly\n%s    production\nscratch-z    deprecated\n' "$tok" > "$P1B/ops/targets-$a.txt"
+  (cd "$P1B" && git add -A && git -c user.name=t -c user.email=t@t commit -qm "export $a")
+  WD=$P1B REVIEW=1 run_exec p1b$a "MARK-P1B-$a. Run the $job export for production: python tools-export-$a.py in the project root (run_process, from the project root), and make it work. I run this export every month. Answer in one sentence with the command that worked."
   if refused p1b$a; then [ "$STOP" = 1 ] && break; continue; fi
   where=$(landed "$tok")
   echo "   attempt $a: the review kept the fact as: ${where:-nowhere}"
