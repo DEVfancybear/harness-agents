@@ -7300,7 +7300,9 @@ pub(super) mod tests {
             .expect("knowledge schema");
         assert_eq!(
             schema["function"]["parameters"]["properties"]["action"]["enum"],
-            json!(["list", "search", "read", "graph", "history"])
+            json!([
+                "list", "search", "read", "graph", "history", "evidence", "timeline", "recent"
+            ])
         );
         for action in ["list", "search", "read", "graph"] {
             let args = json!({"action":action,"scope":"project","query":"architecture","path":"architecture.md"});

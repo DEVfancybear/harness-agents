@@ -41,7 +41,9 @@ use harness_providers::ModelProvider;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::store::{Store, WIKI, WikiPage, WritePageUpdate};
+use super::store::{Store, WIKI, WikiPage, WritePageUpdate, is_definition, without_notes};
+
+pub use super::evidence::Sources;
 
 /// `HA_WIKI_DUE_NOW=1`: the pass is due as soon as the library changed and
 /// has work, without waiting a day since the last one (for tests).
@@ -119,9 +121,6 @@ const SOURCE_CHARS: usize = 12_000;
 /// The most characters of the prompt's pages and sources together.
 const PROMPT_CHARS: usize = 100_000;
 
-/// The most of a source file read.
-const SOURCE_READ: u64 = 1 << 20;
-
 /// The share of a new page's word weight the pages it is written from must
 /// hold.
 const CREATE_SUPPORT: f64 = 0.8;
@@ -154,7 +153,9 @@ Answer with one JSON object {"edits": [...]}, at most twelve edits, each one of:
 - {"edit": "create", "path": M, "title": "...", "summary": "one line", "content": "Markdown", "from": [pages], "reason": "..."}: write the missing page M from what the pages in `from` already say. Only their facts, in their words and language; nothing new.
 - {"edit": "merge", "keep": A, "absorb": B, "title": "...", "summary": "one line", "content": "Markdown", "reason": "..."}: A and B are one subject (only the pairs listed as same-subject). The content is the merged page: everything either says, nothing dropped, said once. Sources and related pages are joined by the host, and the pages that linked to B are pointed at A.
 - {"edit": "index", "title": "...", "summary": "one line", "content": "Markdown", "reason": "..."}: only when an index is asked for. The content lists every page by topic: `## Topic` headings and `- [Title](path)` lines, nothing else - no descriptions, no prose. Paths are relative to the library root. Write it in the library's language.
-- {"edit": "fix", "page": P, "source": S, "old": "...", "new": "...", "quote": "...", "reason": "..."}: page P says `old` (copied exactly, enough of it to occur once) and its source S says otherwise; `quote` is copied word for word from S and shows what is right; `new` replaces `old` and brings in nothing the quote does not say. Fix only what the source contradicts or corrects, never style.
+- {"edit": "fix", "page": P, "source": S, "old": "...", "new": "...", "quote": "...", "note": "...", "reason": "..."}: page P says `old` (copied exactly, enough of it to occur once) and its source S says otherwise; `quote` is copied word for word from S and shows what is right; `new` replaces `old` and brings in nothing the quote does not say. Fix only what the source contradicts or corrects, never style. When S is a workspace file and you know the lines the quote is on, end `new` with a footnote marker `[^id]` (an id the page does not use yet) and give its definition line as `note`: `[^id]: 2026-05-12; src/a.rs:12-14`.
+
+A statement may carry a footnote: a marker `[^id]` after it and, on a line of its own, `[^id]: <YYYY[-MM[-DD]]>; <reference>, <reference>` (the time is optional). A reference is a workspace path with its lines (`src/a.rs:12-14`), a history source_id, or an http(s) URL. The host looks up every reference an edit brings in and refuses the edit when one does not exist, so cite only what you were shown. In `create` and `merge`, keep the footnotes of the pages you write from, with ids that stay unique in the page.
 
 Keep the library small: merge rather than add, and never let a page grow past its sources. Preserve each page's language and provenance."#;
 
@@ -206,174 +207,6 @@ fn save_state(store: &Store, root: &Path, state: &State) {
             .msg(error)
             .emit();
     }
-}
-
-/// Where a page's sources are read: the workspace's files and the
-/// conversations of its project's journal.
-#[derive(Clone, Debug, Default)]
-pub struct Sources {
-    workspace: Option<PathBuf>,
-    journal: Option<PathBuf>,
-    /// Whether a path relative to the workspace names a source. The global
-    /// library is shared by every project: its pages' relative paths are not
-    /// this workspace's files, so only an absolute path into it, or a
-    /// conversation, is read for them.
-    relative: bool,
-}
-
-impl Sources {
-    #[must_use]
-    pub fn new(workspace: &Path, data_dir: &Path) -> Self {
-        Self {
-            workspace: Some(workspace.to_path_buf()),
-            journal: Some(crate::interactive::memory_provenance::store_dir(
-                data_dir,
-                &crate::interactive::memory::ProjectTag::of(workspace).key,
-            )),
-            relative: true,
-        }
-    }
-
-    /// The sources as a library of `scope` reads them: the global library
-    /// reads no path relative to this workspace.
-    #[must_use]
-    pub fn for_scope(&self, scope: &str) -> Self {
-        Self {
-            relative: self.relative && scope != "global",
-            ..self.clone()
-        }
-    }
-
-    /// The workspace file `source` names: a path in the workspace (a
-    /// `:line` or `:start-end` after it is left off) that is a file, and
-    /// neither a protected path (`.env`, `.git`, `.harness`, a key, a name
-    /// with `secret` or `credential` in it: `is_sensitive_workspace_path`)
-    /// nor one Git ignores. Its text goes to the model.
-    fn file(&self, source: &str) -> Option<PathBuf> {
-        let workspace = self.workspace.as_ref()?;
-        let source = source.trim();
-        if source.contains("://") || source.is_empty() {
-            return None;
-        }
-        let bare = match source.rsplit_once(':') {
-            Some((path, lines))
-                if !lines.is_empty() && lines.chars().all(|c| c.is_ascii_digit() || c == '-') =>
-            {
-                path
-            }
-            _ => source,
-        };
-        let path = Path::new(bare);
-        let full = if path.is_absolute() {
-            path.to_path_buf()
-        } else if self.relative {
-            workspace.join(path)
-        } else {
-            return None;
-        };
-        let full = full.canonicalize().ok()?;
-        let root = workspace.canonicalize().ok()?;
-        let inside = full.strip_prefix(&root).ok()?;
-        if !full.is_file()
-            || harness_tools::is_sensitive_workspace_path(inside)
-            || (!path.is_absolute() && harness_tools::is_sensitive_workspace_path(path))
-            || ignored(&root, &full)
-        {
-            return None;
-        }
-        Some(full)
-    }
-
-    /// The conversation `source` names: a word of it that is a conversation
-    /// id of the project's journal.
-    fn conversation(&self, source: &str) -> Option<String> {
-        self.journal.as_ref()?;
-        source
-            .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';' | '<' | '>'))
-            .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
-            .find(|word| harness_types::TaskId::parse(*word).is_ok())
-            .map(str::to_owned)
-    }
-
-    /// The text of `source`: a workspace file, or a conversation's turns.
-    fn read(&self, source: &str) -> Option<String> {
-        if let Some(path) = self.file(source) {
-            use std::io::Read as _;
-            let mut bytes = Vec::new();
-            std::fs::File::open(path)
-                .ok()?
-                .take(SOURCE_READ)
-                .read_to_end(&mut bytes)
-                .ok()?;
-            return Some(String::from_utf8_lossy(&bytes).into_owned());
-        }
-        let task = self.conversation(source)?;
-        let said = crate::interactive::memory_provenance::of_task(self.journal.as_ref()?, &task);
-        (!said.is_empty()).then(|| {
-            said.iter()
-                .map(|part| part.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-    }
-
-    /// What changes when the source changes, cheaply: a file's length and
-    /// time, a conversation's id.
-    fn stamp(&self, source: &str) -> Option<String> {
-        if let Some(path) = self.file(source) {
-            let metadata = std::fs::metadata(path).ok()?;
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |time| time.as_secs());
-            return Some(format!("{}:{modified}", metadata.len()));
-        }
-        self.conversation(source)
-    }
-}
-
-/// Whether Git ignores `file`, a file under `root`: the `.gitignore` files of
-/// `root` and of each folder down to the file, and `.git/info/exclude`. An
-/// ignored file is a build output or a local file the project keeps out of
-/// its history, not a source a page is checked against.
-fn ignored(root: &Path, file: &Path) -> bool {
-    let Ok(inside) = file.strip_prefix(root) else {
-        return true;
-    };
-    let mut folders = vec![root.to_path_buf()];
-    let mut folder = root.to_path_buf();
-    if let Some(parent) = inside.parent() {
-        for part in parent.components() {
-            folder.push(part);
-            folders.push(folder.clone());
-        }
-    }
-    let mut is_ignored = false;
-    for (index, folder) in folders.iter().enumerate() {
-        let mut builder = ignore::gitignore::GitignoreBuilder::new(folder);
-        let mut any = false;
-        for list in [
-            folder.join(".gitignore"),
-            folder.join(".git").join("info").join("exclude"),
-        ] {
-            if (index == 0 || list.ends_with(".gitignore")) && list.is_file() {
-                any |= builder.add(&list).is_none();
-            }
-        }
-        if !any {
-            continue;
-        }
-        let Ok(matcher) = builder.build() else {
-            continue;
-        };
-        match matcher.matched_path_or_any_parents(file, false) {
-            ignore::Match::Ignore(_) => is_ignored = true,
-            ignore::Match::Whitelist(_) => is_ignored = false,
-            ignore::Match::None => {}
-        }
-    }
-    is_ignored
 }
 
 /// Sources read once per pass.
@@ -1320,7 +1153,12 @@ fn create(
         }
         related.push(page.summary.path.clone());
     }
-    let share = weights.share(&words(&format!("{title} {summary} {content}")), &held);
+    // A footnote's id and path are not words the pages it is written from
+    // would have to hold.
+    let share = weights.share(
+        &words(&format!("{title} {summary} {}", without_notes(content))),
+        &held,
+    );
     if share < CREATE_SUPPORT {
         return Err(format!(
             "only {:.0}% of the new page's words are the pages' it is written from (at least {:.0}%): it says what they do not",
@@ -1365,6 +1203,22 @@ fn fix(
     let new = text(edit, "new")?;
     let quote = text(edit, "quote")?;
     refuse_secret(new)?;
+    // The footnote definition the fix cites with (`notes.rs`): one line,
+    // checked with the rest of the page's notes when the fix is applied.
+    let note = edit
+        .get("note")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|note| !note.is_empty());
+    if let Some(note) = note {
+        refuse_secret(note)?;
+        if note.contains('\n') || !is_definition(note) {
+            return Err(
+                "a fix's note is one footnote definition line: [^id]: <time>; <reference>"
+                    .to_owned(),
+            );
+        }
+    }
     let hash = known
         .hash(path)
         .ok_or_else(|| format!("{path} is not a page of the library"))?;
@@ -1400,7 +1254,7 @@ fn fix(
             "the quote is not in {source} word for word: a fix rests on the source's own words"
         ));
     }
-    let brought = words(new)
+    let brought = words(&without_notes(new))
         .difference(&words(old))
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -1412,7 +1266,12 @@ fn fix(
             FIX_SUPPORT * 100.0
         ));
     }
-    let grown = page.text.replacen(old, new, 1);
+    let mut grown = page.text.replacen(old, new, 1);
+    if let Some(note) = note {
+        // The footnote is part of the page the size guard weighs.
+        grown.push('\n');
+        grown.push_str(note);
+    }
     guard_size(
         store,
         sources,
@@ -1422,7 +1281,7 @@ fn fix(
             Some((grown, page.summary.sources.clone())),
         )]),
     )?;
-    let written = store.wiki_replace(path, &hash, old, new)?;
+    let written = store.wiki_replace(path, &hash, old, new, note)?;
     Ok(vec![written.path])
 }
 
@@ -1961,11 +1820,7 @@ mod tests {
             "/// The most retries a request gets.\npub const MAX_RETRIES: u32 = 6;\n",
         )
         .unwrap();
-        let sources = Sources {
-            workspace: Some(workspace),
-            journal: None,
-            relative: true,
-        };
+        let sources = Sources::in_workspace(workspace);
         page(
             &store,
             "concepts/limits.md",
@@ -2020,6 +1875,112 @@ mod tests {
         assert!(errors(&source_less)[0].contains("not a source"));
     }
 
+    /// `SoMem` (arXiv 2611.11929): the wiki pass's writes go through the same
+    /// check as the agent's. A fix may cite the place of its quote with a
+    /// footnote; the host adds the definition and looks the reference up; a
+    /// note that does not resolve leaves the page as it was.
+    #[test]
+    fn a_fix_may_cite_the_place_of_its_quote_and_a_note_that_does_not_resolve_changes_nothing() {
+        let (directory, _, root) = library();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("src/limits.rs"),
+            format!(
+                "/// The most retries a request gets.\npub const MAX_RETRIES: u32 = 6;\n{}",
+                "// A request that fails is retried after a pause that grows each time.\n"
+                    .repeat(8)
+            ),
+        )
+        .unwrap();
+        let sources = Sources::in_workspace(workspace);
+        let store = Store::new(root).with_sources(sources.clone());
+        page(
+            &store,
+            "concepts/limits.md",
+            "Limits",
+            "Request limits",
+            "A request is retried at most 4 times (MAX_RETRIES).",
+            &["src/limits.rs"],
+        );
+        let fix = |new: &str, note: &str| {
+            pass(
+                &store,
+                &sources,
+                &json!([{"edit": "fix", "page": "concepts/limits.md", "source": "src/limits.rs",
+                         "old": "at most 4 times", "new": new, "note": note,
+                         "quote": "pub const MAX_RETRIES: u32 = 6;"}]),
+            )
+        };
+        let content = || store.document("concepts/limits.md").unwrap().content;
+        let before = content();
+        let past_the_end = fix("at most 6 times.[^q]", "[^q]: 2026-11-12; src/limits.rs:99");
+        assert!(
+            errors(&past_the_end)[0].contains("has 10 line(s)"),
+            "{past_the_end:?}"
+        );
+        let loose = fix("at most 6 times.[^q]", "[^q] is the const");
+        assert!(
+            errors(&loose)[0].contains("one footnote definition line"),
+            "{loose:?}"
+        );
+        let unused = fix("at most 6 times.", "[^q]: 2026-11-12; src/limits.rs:2");
+        assert!(
+            errors(&unused)[0].contains("no statement uses it"),
+            "{unused:?}"
+        );
+        assert_eq!(content(), before, "a refused fix changes nothing");
+        let cited = fix("at most 6 times.[^q]", "[^q]: 2026-11-12; src/limits.rs:2");
+        assert_eq!(cited.applied.len(), 1, "{cited:?}");
+        let after = content();
+        assert!(
+            after.contains("at most 6 times.[^q] (MAX_RETRIES)."),
+            "{after}"
+        );
+        assert!(
+            after.contains("[^q]: 2026-11-12; src/limits.rs:2"),
+            "{after}"
+        );
+        let shown = store.evidence("concepts/limits.md", "q").unwrap();
+        assert!(
+            shown["references"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(">2| pub const MAX_RETRIES: u32 = 6;"),
+            "{shown}"
+        );
+    }
+
+    /// A created page that carries footnotes is held to the same words as
+    /// one that does not: an id and a path are not new claims.
+    #[test]
+    fn a_created_page_may_carry_footnotes_that_are_not_counted_as_new_words() {
+        let (_dir, store, _) = library();
+        page(
+            &store,
+            "concepts/cache.md",
+            "Cache",
+            "The response cache",
+            "The response cache keeps entries for ten minutes in Redis. See [eviction](eviction.md).",
+            &["docs/cache.md"],
+        );
+        let unnamed = pass(
+            &store,
+            &Sources::default(),
+            &json!([{"edit": "create", "path": "concepts/eviction.md", "title": "Cache eviction", "summary": "The response cache keeps entries for ten minutes",
+                     "content": "The response cache keeps entries for ten minutes in Redis.[^c1]\n", "from": ["concepts/cache.md"]}]),
+        );
+        assert!(errors(&unnamed)[0].contains("no definition"), "{unnamed:?}");
+        assert!(store.document("concepts/eviction.md").is_err());
+        let made = pass(
+            &store,
+            &Sources::default(),
+            &json!([{"edit": "create", "path": "concepts/eviction.md", "title": "Cache eviction", "summary": "The response cache keeps entries for ten minutes",
+                     "content": "The response cache keeps entries for ten minutes in Redis.[^c1]\n\n[^c1]: 2026-11; https://example.test/redis-cache-ttl\n", "from": ["concepts/cache.md"]}]),
+        );
+        assert_eq!(made.applied.len(), 1, "{made:?}");
+    }
+
     #[test]
     fn the_library_is_kept_smaller_than_the_sources_it_summarizes() {
         let (directory, store, _) = library();
@@ -2030,11 +1991,7 @@ mod tests {
             "Short note about the cache keys.",
         )
         .unwrap();
-        let sources = Sources {
-            workspace: Some(workspace),
-            journal: None,
-            relative: true,
-        };
+        let sources = Sources::in_workspace(workspace);
         page(
             &store,
             "cache.md",
@@ -2184,11 +2141,7 @@ mod review_tests {
     fn a_protected_or_ignored_file_is_never_a_source() {
         let directory = tempfile::tempdir().expect("dir");
         let workspace = workspace(&directory);
-        let sources = Sources {
-            workspace: Some(workspace.clone()),
-            journal: None,
-            relative: true,
-        };
+        let sources = Sources::in_workspace(workspace.clone());
         for protected in [
             ".env",
             ".harness/notes.md",
@@ -2226,11 +2179,7 @@ mod review_tests {
     fn the_global_library_reads_no_path_relative_to_this_workspace() {
         let directory = tempfile::tempdir().expect("dir");
         let workspace = workspace(&directory);
-        let sources = Sources {
-            workspace: Some(workspace.clone()),
-            journal: None,
-            relative: true,
-        };
+        let sources = Sources::in_workspace(workspace.clone());
         let global = sources.for_scope("global");
         assert!(global.file("src/limits.py").is_none());
         let absolute = workspace.join("src/limits.py").display().to_string();
@@ -2241,11 +2190,7 @@ mod review_tests {
     #[test]
     fn a_fix_replaces_a_claim_never_the_page() {
         let directory = tempfile::tempdir().expect("dir");
-        let sources = Sources {
-            workspace: Some(workspace(&directory)),
-            journal: None,
-            relative: true,
-        };
+        let sources = Sources::in_workspace(workspace(&directory));
         let (_dir, store, _) = library();
         let claim = "A request is retried at most 4 times. Each retry is logged.";
         page(
@@ -2315,11 +2260,7 @@ mod review_tests {
     #[test]
     fn the_prompt_stays_in_its_budget_and_marks_only_the_checks_it_showed() {
         let directory = tempfile::tempdir().expect("dir");
-        let sources = Sources {
-            workspace: Some(workspace(&directory)),
-            journal: None,
-            relative: true,
-        };
+        let sources = Sources::in_workspace(workspace(&directory));
         let (_dir, store, _) = library();
         let long = "word ".repeat(1_400);
         for index in 0..30 {

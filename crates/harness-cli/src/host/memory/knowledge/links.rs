@@ -2,8 +2,60 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The pages `markdown`, a page at `source`, links to.
 pub(super) fn targets(source: &str, markdown: &str) -> Vec<String> {
+    link_list(source, markdown)
+        .into_iter()
+        .map(|(target, _)| target)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The links that name a paragraph, `page.md#^anchor` (`notes.rs`): the
+/// page and the anchor. `targets` has always dropped a fragment; a fragment
+/// that begins with `^` is a paragraph's address and is kept here, so a
+/// write can check that the paragraph is there and a backlink can say which
+/// one a page cites.
+pub(super) fn citations(source: &str, markdown: &str) -> Vec<(String, String)> {
+    link_list(source, markdown)
+        .into_iter()
+        .filter_map(|(target, anchor)| anchor.map(|anchor| (target, anchor)))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// `markdown` with code, comments and spans masked, for `notes.rs` to read
+/// footnotes and anchors from the same text the links are read from.
+pub(super) fn visible(markdown: &str) -> String {
+    visible_markdown(markdown)
+}
+
+/// The visible text for finding links: a footnote's definition line holds
+/// references (`[^e1]: 2026-05; notes.md`), not links, and its first word
+/// would otherwise read as a link to a page of that name.
+fn visible_for_links(markdown: &str) -> String {
     let mut visible = visible_markdown(markdown);
+    let mut offset = 0;
+    for line in markdown.split_inclusive('\n') {
+        let trimmed = line.trim_start_matches(' ');
+        if line.len() - trimmed.len() <= 3 && trimmed.starts_with("[^") && trimmed.contains("]:") {
+            let mut masked = visible.as_bytes()[offset..offset + line.len()].to_vec();
+            mask(&mut masked);
+            visible.replace_range(
+                offset..offset + line.len(),
+                std::str::from_utf8(&masked).expect("Masked lines contain only ASCII"),
+            );
+        }
+        offset += line.len();
+    }
+    visible
+}
+
+/// Every link to a page, with the paragraph anchor in its fragment, if any.
+fn link_list(source: &str, markdown: &str) -> Vec<(String, Option<String>)> {
+    let mut visible = visible_for_links(markdown);
     let mut references = BTreeMap::new();
     let mut offset = 0;
     for line in visible.clone().split_inclusive('\n') {
@@ -27,10 +79,18 @@ pub(super) fn targets(source: &str, markdown: &str) -> Vec<String> {
     }
     parsed_links(&visible, &references)
         .into_iter()
-        .filter_map(|link| resolve(source, &link.href))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
+        .filter_map(|link| Some((resolve(source, &link.href)?, anchor_of(&link.href))))
         .collect()
+}
+
+/// The paragraph anchor a destination's fragment names: `#^id`.
+fn anchor_of(href: &str) -> Option<String> {
+    let fragment = href.split_once('#')?.1.split('?').next()?;
+    let id = fragment
+        .strip_prefix('^')
+        .or_else(|| fragment.strip_prefix("%5E"))
+        .or_else(|| fragment.strip_prefix("%5e"))?;
+    (!id.is_empty()).then(|| id.to_owned())
 }
 
 /// Rebase actual link destinations when pages move, leaving labels and prose intact.
@@ -40,7 +100,7 @@ pub(super) fn rewrite(
     markdown: &str,
     pages: &BTreeMap<String, String>,
 ) -> String {
-    let mut visible = visible_markdown(markdown);
+    let mut visible = visible_for_links(markdown);
     let mut references = BTreeMap::new();
     let mut replacements = BTreeMap::new();
     let mut record = |base: usize, href: String, start: usize, end: usize| {
@@ -109,7 +169,7 @@ pub(super) fn rewrite(
 /// pass's removal of a link to a page that does not exist. A reference link
 /// is left as it is.
 pub(super) fn unlink(source: &str, markdown: &str, gone: &BTreeSet<String>) -> String {
-    let visible = visible_markdown(markdown);
+    let visible = visible_for_links(markdown);
     let mut references = BTreeMap::new();
     for line in visible.split_inclusive('\n') {
         let trimmed = line.trim_start_matches(' ');
@@ -544,5 +604,35 @@ mod regression_tests {
             "]".repeat(50_000)
         );
         assert_eq!(targets("source.md", &nested), ["target.md"]);
+    }
+
+    /// `SoMem` (arXiv 2611.11929): a footnote's definition holds references,
+    /// not links - `[^e1]: notes.md` is not a link to the page `notes.md` -
+    /// and a fragment that begins with `^` names a paragraph, which `targets`
+    /// still reads as a link to the page.
+    #[test]
+    fn a_footnote_definition_is_not_a_link_and_a_fragment_that_names_a_paragraph_is_a_citation() {
+        let markdown = "Text.[^e1] See [it](b.md#^para-one), [again](b.md#^para-one) and [x](c.md#heading).\n\n[^e1]: 2026-05; notes.md\n[^e2]: other.md\n";
+        assert_eq!(targets("a.md", markdown), ["b.md", "c.md"]);
+        assert_eq!(
+            citations("a.md", markdown),
+            [("b.md".to_owned(), "para-one".to_owned())]
+        );
+        assert_eq!(
+            citations(
+                "a.md",
+                "[p](b.md#%5Eid-x) and [q](b.md#^) and `[r](b.md#^no)`"
+            ),
+            [("b.md".to_owned(), "id-x".to_owned())]
+        );
+        let pages = BTreeMap::from([("b.md".to_owned(), "moved/b.md".to_owned())]);
+        assert!(
+            rewrite("a.md", "a.md", markdown, &pages).contains("[it](moved/b.md#^para-one)"),
+            "the fragment survives a move"
+        );
+        assert!(
+            rewrite("a.md", "a.md", markdown, &pages).contains("[^e1]: 2026-05; notes.md"),
+            "a definition is left alone"
+        );
     }
 }

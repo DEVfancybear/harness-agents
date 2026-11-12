@@ -16,9 +16,16 @@ use unicode_normalization::UnicodeNormalization;
 mod links;
 #[path = "manage.rs"]
 mod manage;
+#[path = "notes.rs"]
+mod notes;
+#[path = "views.rs"]
+mod views;
 #[path = "wiki_store.rs"]
 mod wiki_store;
 
+use super::evidence::Sources;
+pub(crate) use notes::{is_definition, without_notes};
+pub(crate) use views::{Citation, SearchFilter};
 pub(crate) use wiki_store::{WIKI, WikiPage};
 
 const STATE: &str = ".ha-state.json";
@@ -101,6 +108,12 @@ pub(crate) struct PageSummary {
     /// read name them, and the wiki pass repoints or fills them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dangling: Vec<String>,
+    /// The paragraphs this page links to (`page.md#^anchor`) that the target
+    /// page does not define, as `page.md#^anchor`: a page's text can change
+    /// after the link was written. Reported with the dangling links, never a
+    /// failure of the scan (`SoMem`, arXiv 2611.11929: a link must resolve).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dangling_anchors: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,6 +133,16 @@ pub(crate) struct PageRead {
     /// The page's links to pages that do not exist.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dangling: Vec<String>,
+    /// Its links to paragraphs the target page does not define.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dangling_anchors: Vec<String>,
+    /// The paragraphs of this page that other pages cite, with the page
+    /// that cites each and the start of the paragraph.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cited_by: Vec<Citation>,
+    /// The paragraph anchors this page defines, for a link to name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub anchors: Vec<String>,
     pub truncated: bool,
 }
 
@@ -143,6 +166,10 @@ pub(crate) struct SearchHit {
     pub end_line: usize,
     pub score: f64,
     pub matched_queries: Vec<usize>,
+    /// With `since` or `until`, which time made the page match: the
+    /// `event_time` of a dated statement it holds, or its `updated_at`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_match: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -159,6 +186,20 @@ pub(crate) struct Stats {
     pub dangling: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dangling_first: Vec<String>,
+    /// How many links name a paragraph (`page.md#^anchor`) the target page
+    /// does not define, and the first of them as `page -> target#^anchor`.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub dangling_anchors: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dangling_anchors_first: Vec<String>,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if signature"
+)]
+const fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 /// How many dangling links status and `ha doctor` name; the rest are counted.
@@ -174,6 +215,10 @@ pub(crate) struct Graph {
 pub(crate) struct Edge {
     pub source: String,
     pub target: String,
+    /// The paragraphs of `target` the link cites (`page.md#^anchor`), when it
+    /// cites any: the edge is still the page-level one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub anchors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -226,6 +271,10 @@ pub(crate) struct Store {
     root: PathBuf,
     /// The library lives in the user's checkout: it keeps itself out of Git.
     self_ignoring: bool,
+    /// Where the references of a footnote are looked up when a page is
+    /// written (`notes::check`). A store the host did not equip reads only
+    /// their syntax.
+    sources: Option<Sources>,
 }
 
 impl Store {
@@ -233,7 +282,16 @@ impl Store {
         Self {
             root,
             self_ignoring: false,
+            sources: None,
         }
+    }
+
+    /// The sources the footnotes of a written page are resolved against: the
+    /// workspace's files and the project's journal. One resolver for the
+    /// store, the wiki pass and `knowledge evidence`.
+    pub(crate) fn with_sources(mut self, sources: Sources) -> Self {
+        self.sources = Some(sources);
+        self
     }
 
     /// A library inside a project checkout (`.harness/knowledge`). Its pages
@@ -378,6 +436,13 @@ impl Store {
                 total_lines: all.len(),
                 backlinks: backlinks(&pages, &page.summary.path),
                 dangling: page.summary.dangling.clone(),
+                dangling_anchors: page.summary.dangling_anchors.clone(),
+                cited_by: views::cited_by(&pages, &page.summary.path),
+                anchors: notes::parse(&page.text)
+                    .anchors
+                    .into_iter()
+                    .map(|anchor| anchor.id)
+                    .collect(),
                 truncated,
             })
         })
@@ -393,9 +458,21 @@ impl Store {
         queries: &[String],
         limit: usize,
     ) -> Result<Vec<SearchHit>, String> {
+        self.search_filtered(queries, limit, &SearchFilter::default())
+    }
+
+    /// A search of the pages inside `filter`: under a path prefix, and
+    /// holding a statement dated in a window of time (`views::apply_filter`).
+    pub(crate) fn search_filtered(
+        &self,
+        queries: &[String],
+        limit: usize,
+        filter: &SearchFilter,
+    ) -> Result<Vec<SearchHit>, String> {
         self.with_lock(|root| {
             require_enabled(root)?;
-            let pages = scan(root)?;
+            let mut pages = scan(root)?;
+            let time_matches = views::apply_filter(&mut pages, filter);
             let documents = search_documents(&pages);
             let mut merged: BTreeMap<String, SearchHit> = BTreeMap::new();
             let mut unique = Vec::new();
@@ -412,6 +489,7 @@ impl Store {
                 {
                     hit.score = 1.0 / (61.0 + f64::from(u32::try_from(rank).unwrap_or(u32::MAX)));
                     hit.matched_queries = vec![query_index];
+                    hit.time_match = time_matches.get(&hit.path).copied();
                     if let Some(existing) = merged.get_mut(&hit.path) {
                         existing.score += hit.score;
                         existing.matched_queries.push(query_index);
@@ -487,11 +565,24 @@ impl Store {
                 existing.map_or_else(|| path.clone(), |i| pages[i].summary.path.clone());
             let mut related = BTreeSet::new();
             for target in related_values {
-                let target = page_path(target)?;
+                // `page.md#^anchor` names a paragraph (`notes.rs`): it must be
+                // there. The page is kept as a page-level relation, as the
+                // metadata has always held them; the paragraph is cited in
+                // the body, which keeps the fragment.
+                let (page_part, fragment) = target
+                    .split_once('#')
+                    .map_or((target.as_str(), None), |(page, fragment)| {
+                        (page, Some(fragment))
+                    });
+                let target = page_path(page_part)?;
                 if normalized(&target) == normalized(&actual_path) {
                     return Err("a knowledge page cannot relate to itself".to_owned());
                 }
-                related.insert(find_page(&pages, &target)?.summary.path.clone());
+                let found = find_page(&pages, &target)?;
+                if let Some(fragment) = fragment {
+                    views::check_anchor(&found.summary.path, &found.text, fragment)?;
+                }
+                related.insert(found.summary.path.clone());
             }
             let mut metadata = Metadata {
                 title: title.clone(),
@@ -521,6 +612,16 @@ impl Store {
             } else if input.expected_hash.is_some() {
                 return Err("knowledge page no longer exists".to_owned());
             }
+            // The runtime, not the model, validates what a page cites
+            // (`SoMem`): the footnotes' references and the links to a
+            // paragraph. A refused write changes nothing.
+            let earlier = previous_text
+                .as_ref()
+                .map(|(_, text)| text.as_str())
+                .into_iter()
+                .collect::<Vec<_>>();
+            notes::check(&actual_path, &text, &earlier, self.sources.as_ref())?;
+            views::check_citations(&actual_path, &text, &earlier, &pages)?;
             let mut page = parse_page(&actual_path, text.clone())?;
             let mut admitted = pages
                 .iter()
@@ -765,9 +866,11 @@ impl Store {
             let edges = pages
                 .iter()
                 .flat_map(|page| {
-                    page.summary.related.iter().map(|target| Edge {
+                    let cited = views::cited_anchors(page);
+                    page.summary.related.iter().map(move |target| Edge {
                         source: page.summary.path.clone(),
                         target: target.clone(),
+                        anchors: cited.get(target).cloned().unwrap_or_default(),
                     })
                 })
                 .take(edge_limit)
@@ -823,26 +926,48 @@ impl Store {
             let limit = max_chars.min(20_000);
             let mut output = String::new();
             let mut shown = 0;
+            // The newest pages, set aside room for in the same bound: a page
+            // written last hour has no word of the goal yet and the ranking
+            // never reaches it (`SoMem`, arXiv 2611.11929, puts Recent in the
+            // initial context; its ablation says the effect is small, so
+            // this is three lines and room is kept for them, not taken).
+            let mut owed = views::newest(&pages, views::RECENT_IN_CATALOG)
+                .into_iter()
+                .map(|page| Ok((page.summary.path.as_str(), catalog_line(page)?)))
+                .collect::<Result<BTreeMap<_, _>, String>>()?;
+            let reserve = |owed: &BTreeMap<&str, String>| {
+                owed.values()
+                    .map(|line| line.chars().count() + 1)
+                    .sum::<usize>()
+                    + if owed.is_empty() {
+                        0
+                    } else {
+                        RECENT_HEADER.len() + 1
+                    }
+            };
             for page in ordered {
-                // JSON escaping keeps titles from impersonating instructions or
-                // fences. No hash: a page is read before it is changed, and the
-                // read gives it; in the catalog it was 40% of every line.
-                // Its age is: a page that records a state goes stale.
-                let mut entry = serde_json::json!({
-                    "path": page.summary.path,
-                    "title": page.summary.title,
-                    "summary": page.summary.summary,
-                });
-                if let Some(age) = page_age(&page.summary) {
-                    entry["updated"] = serde_json::json!(age);
-                }
-                let line = serde_json::to_string(&entry).map_err(error)?;
-                if output.chars().count() + line.chars().count() + 1 > limit.saturating_sub(80) {
+                let line = catalog_line(page)?;
+                let was_owed = owed.remove(page.summary.path.as_str());
+                if output.chars().count() + line.chars().count() + 1 + reserve(&owed)
+                    > limit.saturating_sub(80)
+                {
+                    if let Some(line) = was_owed {
+                        owed.insert(page.summary.path.as_str(), line);
+                    }
                     break;
                 }
                 output.push_str(&line);
                 output.push('\n');
                 shown += 1;
+            }
+            if !owed.is_empty() {
+                output.push_str(RECENT_HEADER);
+                output.push('\n');
+                for line in owed.values() {
+                    output.push_str(line);
+                    output.push('\n');
+                    shown += 1;
+                }
             }
             let more = pages.len() - shown;
             if more > 0 {
@@ -942,6 +1067,26 @@ impl Store {
         }
         result
     }
+}
+
+/// What introduces the catalog's newest pages that the ranked list did not
+/// show.
+const RECENT_HEADER: &str = "recently written (not in the list above):";
+
+/// One page of the catalog. JSON escaping keeps titles from impersonating
+/// instructions or fences. No hash: a page is read before it is changed, and
+/// the read gives it; in the catalog it was 40% of every line. Its age is
+/// there: a page that records a state goes stale.
+fn catalog_line(page: &Page) -> Result<String, String> {
+    let mut entry = serde_json::json!({
+        "path": page.summary.path,
+        "title": page.summary.title,
+        "summary": page.summary.summary,
+    });
+    if let Some(age) = page_age(&page.summary) {
+        entry["updated"] = serde_json::json!(age);
+    }
+    serde_json::to_string(&entry).map_err(error)
 }
 
 /// How long ago a page was written, as `3d ago`.
@@ -1242,6 +1387,7 @@ fn scan_reporting(root: &Path) -> Result<(Vec<Page>, Vec<String>), String> {
     for page in &mut pages {
         resolve_page_links(page, &admitted);
     }
+    views::resolve_anchor_links(&mut pages);
     skipped.sort();
     Ok((pages, skipped))
 }
@@ -1333,6 +1479,7 @@ fn parse_page(path: &str, text: String) -> Result<Page, String> {
             related: metadata.related,
             updated_at: metadata.updated_at,
             dangling: Vec::new(),
+            dangling_anchors: Vec::new(),
         },
         text,
     })
@@ -1565,6 +1712,15 @@ fn counts(pages: &[Page], enabled: bool, skipped: Vec<String>) -> Stats {
                 .map(move |target| format!("{} -> {target}", page.summary.path))
         })
         .collect::<Vec<_>>();
+    let dangling_anchors = pages
+        .iter()
+        .flat_map(|page| {
+            page.summary
+                .dangling_anchors
+                .iter()
+                .map(move |target| format!("{} -> {target}", page.summary.path))
+        })
+        .collect::<Vec<_>>();
     Stats {
         pages: pages.len(),
         links: pages.iter().map(|p| p.summary.related.len()).sum(),
@@ -1572,6 +1728,8 @@ fn counts(pages: &[Page], enabled: bool, skipped: Vec<String>) -> Stats {
         skipped,
         dangling: dangling.len(),
         dangling_first: dangling.into_iter().take(DANGLING_SHOWN).collect(),
+        dangling_anchors: dangling_anchors.len(),
+        dangling_anchors_first: dangling_anchors.into_iter().take(DANGLING_SHOWN).collect(),
     }
 }
 
@@ -1776,6 +1934,7 @@ fn rank_pages(pages: &[Page], documents: &[String], query: &str, limit: usize) -
             end_line: start + shown,
             score,
             matched_queries: vec![0],
+            time_match: None,
         });
     }
     sort_hits(&mut hits);
@@ -2694,7 +2853,14 @@ mod tests {
         cart.summary = "Giỏ hàng giữ sản phẩm trong 24 giờ".to_owned();
         store.write(cart).unwrap();
         let by_message = store.catalog(&[("tiếp tục", 2.0)], 3_000).unwrap();
-        assert!(!by_message.contains("cart-retention"), "{by_message}");
+        // The ranked list is the first pages by path; the page written last
+        // is not in it, and the catalog adds three of the newest pages the
+        // ranking did not show (SoMem's Recent).
+        let (listed, recent) = by_message
+            .split_once("recently written")
+            .expect("the newest pages the ranking did not show");
+        assert!(!listed.contains("cart-retention"), "{by_message}");
+        assert_eq!(recent.matches("\"path\"").count(), 3, "{by_message}");
         let ranked = store
             .catalog(
                 &[("Thiết kế chính sách giỏ hàng", 3.0), ("tiếp tục", 2.0)],

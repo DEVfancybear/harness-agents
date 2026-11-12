@@ -6,7 +6,7 @@
 
 use super::{
     BTreeMap, BTreeSet, Change, INDEX, MAX_PAGES, MAX_SCAN_BYTES, META, Metadata, Page,
-    PageSummary, Path, Store, add_log, change, error, find_page, hash, links, normalized,
+    PageSummary, Path, Store, add_log, change, error, find_page, hash, links, normalized, notes,
     page_path, parse_metadata, parse_page, remember, render_index, render_page, require_enabled,
     resolve_page_links, scan, single_line, transact,
 };
@@ -127,7 +127,8 @@ impl Store {
     /// The history keeps both as they were. Returns the pages changed.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the two pages with the hashes read, and what the merged page says"
+        clippy::too_many_lines,
+        reason = "the two pages with the hashes read, and what the merged page says; one locked read, check and write"
     )]
     pub(crate) fn wiki_merge(
         &self,
@@ -202,6 +203,15 @@ impl Store {
                 &render_page(&keep, &metadata, content)?,
                 &moved,
             );
+            // The merged text holds the footnotes of both pages: a note
+            // either page already held is not looked up again, a new fault is
+            // refused (the ids of two pages can collide).
+            notes::check(
+                &keep,
+                &text,
+                &[&pages[kept].text, &pages[gone].text],
+                self.sources.as_ref(),
+            )?;
             pages[kept] = parse_page(&keep, text)?;
             for page in &mut pages {
                 let path = page.summary.path.clone();
@@ -239,13 +249,17 @@ impl Store {
 
     /// Replace the one place `path` says `old` with `new`: a claim the wiki
     /// pass checked against the page's source. `old` must occur exactly once
-    /// in the page, outside its metadata line.
+    /// in the page, outside its metadata line. `note` is a footnote
+    /// definition line (`[^id]: 2026-05; path:line`) that `new` cites: the
+    /// pass adds it to the page, and the page's notes are checked as for any
+    /// write (`notes::check`).
     pub(crate) fn wiki_replace(
         &self,
         path: &str,
         expected_hash: &str,
         old: &str,
         new: &str,
+        note: Option<&str>,
     ) -> Result<PageSummary, String> {
         let path = page_path(path)?;
         if old.is_empty() {
@@ -272,7 +286,11 @@ impl Store {
                     ));
                 }
             }
-            let replaced = format!("{head}{}", body.replacen(old, new, 1));
+            let mut replaced = format!("{head}{}", body.replacen(old, new, 1));
+            if let Some(note) = note {
+                replaced = with_definition(&replaced, note);
+            }
+            notes::check(&actual, &replaced, &[text], self.sources.as_ref())?;
             let replaced = with_metadata(&actual, &replaced, |metadata| {
                 metadata.updated_at = Some(now());
             })?;
@@ -280,6 +298,16 @@ impl Store {
             commit_wiki(root, &before, &mut pages, "wiki fix")?;
             Ok(find_page(&pages, &actual)?.summary.clone())
         })
+    }
+}
+
+/// `text` with the footnote definition `line` as a block of its own, above
+/// the host's `## Related` section when the page has one.
+fn with_definition(text: &str, line: &str) -> String {
+    let line = line.trim();
+    match text.rfind("\n## Related\n") {
+        Some(at) => format!("{}\n{line}\n{}", &text[..at], &text[at..]),
+        None => format!("{}\n\n{line}\n", text.trim_end()),
     }
 }
 
