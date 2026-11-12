@@ -92,7 +92,8 @@ check "three pages or more were written" '[ "$count" -ge 3 ]'
 check "one page is of the boundaries: what was not read, what is not there" 'pages | xargs grep -liE "boundar|not read|not checked|unmapped|absent|ranh giới|chưa đọc" 2>/dev/null | grep -q .'
 
 echo "################ 2. a fact one file holds is in a page, with the file as its source"
-check "the row limit only ingest/reader.py holds is in a page" 'pages | xargs grep -l "48213" 2>/dev/null | grep -q .'
+# The number as the page writes it: a page of the first real run had it as 48,213.
+check "the row limit only ingest/reader.py holds is in a page" 'pages | xargs grep -lE "48[,. _]?213" 2>/dev/null | grep -q .'
 check "with that file named beside it as path:line" 'pages | xargs grep -hE "ingest/reader\.py:[0-9]+" 2>/dev/null | grep -q .'
 check "the entries say how sure they are" 'pages | xargs grep -liE "read in the file|inferred|not checked|đã đọc|suy ra|chưa kiểm" 2>/dev/null | grep -q .'
 
