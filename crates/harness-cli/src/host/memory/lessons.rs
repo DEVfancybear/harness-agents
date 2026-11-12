@@ -2502,7 +2502,7 @@ fn meditation_prompt(lessons: &Lessons, now: DateTime<Utc>, skills: bool, logs: 
         if skills {
             format!(
                 "- evolve: two or more PROMOTED rules that are steps of one workflow, which the agent would follow better as one learned skill: {{\"from\": [ids], \"name\": \"kebab-case-name\", \"level\": \"global\" or \"project\", \"body\": \"the whole SKILL.md\"}}, following:\n{}\n",
-                super::learned::SPEC
+                super::learned::spec()
             )
         } else {
             String::new()

@@ -100,7 +100,7 @@ trong `memory/refine.rs`; `scripts_note` trong `memory/skill_recall.rs`.
 | Bài báo | ha | Vì sao |
 |---|---|---|
 | Một chương trình đã kiểm thử cho mỗi task, chạy trước tiên khi task quay lại | `scripts/` của learned skill được liệt kê trong skill được recall: mỗi script kèm ngày một lần chạy thành công, hoặc "not run yet". Với script đã kiểm thử: chạy nó trước, trước khi làm lại việc bằng tay; nếu nó lỗi, sửa script và nói ra | Rule bằng lời phải nghĩ lại từ đầu; script thì chỉ cần chạy |
-| (kiểm thử trước khi lưu) | Review có thể đặt `script_runs` vào intent của skill: `{path, evidence}`, trích dẫn một lần chạy thành công. Host chỉ đánh dấu script đã kiểm thử nếu trích dẫn nằm trong một kết quả tool báo thoát sạch (`exit=Some(0) timed_out=false`) và lời gọi tạo ra kết quả đó nêu tên file của script | Host không chạy được script do model viết (chính sách phê duyệt cấm), nên "đã kiểm thử" là điều cuộc hội thoại đã cho thấy, được kiểm tra |
+| (kiểm thử trước khi lưu) | Review có thể đặt `script_runs` vào intent của skill: `{path, evidence}`, trích dẫn một lần chạy thành công. Host chỉ đánh dấu script đã kiểm thử nếu trích dẫn nằm trong một kết quả tool báo thoát sạch (`exit=Some(0) timed_out=false`) và lời gọi tạo ra kết quả đó nêu tên file của script. Trích dẫn đúng từng chữ và dài ít nhất 12 ký tự (`QUOTE_MIN_CHARS`); prompt của review nói điều đó, con số lấy từ chính hằng số ấy, và nói rằng khi output của script ngắn hơn thì trích thêm từ cùng kết quả, vốn còn có dòng thoát. Trích dẫn ngắn hơn thì lần chạy nằm lại trong `scriptRunsUnconfirmed` | Host không chạy được script do model viết (chính sách phê duyệt cấm), nên "đã kiểm thử" là điều cuộc hội thoại đã cho thấy, được kiểm tra |
 | (chương trình đã lưu vẫn phải là chương trình đã chạy) | Dấu đánh dấu giữ SHA-256 của script. Script bị ghi lại, bởi patch hay update, mất dấu; script sửa trực tiếp trên đĩa cũng vậy | Dấu đánh dấu là của nội dung một file |
 | Hướng dẫn chuyên gia bảo harness lưu một chương trình | Review được báo rằng một chuỗi lệnh đã giải một task có thể quay lại đáng giữ làm script của skill, kèm trích dẫn lần chạy | Review quyết định giữ gì; không có danh sách từ |
 
@@ -192,8 +192,9 @@ theo cùng cách.
   `a_script_run_is_recorded_as_tested_and_writing_it_again_clears_it` trong
   `learned.rs`;
   `a_script_run_is_confirmed_only_by_a_clean_result_of_a_call_that_named_it`
-  và `a_skill_intent_with_a_confirmed_run_marks_its_script_tested` trong
-  `refine.rs`;
+  `a_skill_intent_with_a_confirmed_run_marks_its_script_tested` và
+  `a_run_with_a_short_output_is_confirmed_by_quoting_more_of_the_same_result`
+  trong `refine.rs`;
   `the_block_lists_the_scripts_and_says_to_run_the_tested_one_first`,
   `the_scripts_list_stays_within_its_bound` và
   `a_recalled_skill_carries_its_scripts_and_a_changed_one_is_untested` trong

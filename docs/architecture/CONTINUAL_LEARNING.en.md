@@ -98,7 +98,7 @@ Code: `SkillScript`, `record_script_runs`, `clear_script_marks` and
 | Paper | ha | Why |
 |---|---|---|
 | A tested program per task, run first when the task returns | A learned skill's `scripts/` are listed in the recalled skill: each with the day a run of it succeeded, or "not run yet". For a tested one: run it first, before redoing the work by hand; if it fails, fix the script and say so | A rule in words has to be worked out again; a script is run |
-| (tested before it is stored) | The review may put `script_runs` on a skill intent: `{path, evidence}`, the quote of a successful run. The host marks the script tested only if the quote is in a tool result that reports a clean exit (`exit=Some(0) timed_out=false`) and the call that made the result names the script's file | The host cannot run a model-written script (the approval policy forbids it), so "tested" is what the conversation showed, checked |
+| (tested before it is stored) | The review may put `script_runs` on a skill intent: `{path, evidence}`, the quote of a successful run. The host marks the script tested only if the quote is in a tool result that reports a clean exit (`exit=Some(0) timed_out=false`) and the call that made the result names the script's file. The quote is word for word and at least 12 characters (`QUOTE_MIN_CHARS`); the review's prompt says so, with the number taken from that constant, and says that when the script's own output is shorter it quotes more of the same result, which also holds the exit line. A shorter quote leaves the run in `scriptRunsUnconfirmed` | The host cannot run a model-written script (the approval policy forbids it), so "tested" is what the conversation showed, checked |
 | (a stored program must still be the one that ran) | The mark holds the script's SHA-256. A script written again, by a patch or an update, loses it; so does one edited on disk | A mark is of one file's content |
 | The expert guidance told the harness to save a program | The review is told that a command sequence that solved a task which may come back is worth keeping as a script of the skill, with the quote of its run | The review decides what to keep; no word list |
 
@@ -191,7 +191,8 @@ its children's launch the same way.
   `a_script_run_is_recorded_as_tested_and_writing_it_again_clears_it` in
   `learned.rs`;
   `a_script_run_is_confirmed_only_by_a_clean_result_of_a_call_that_named_it`
-  and `a_skill_intent_with_a_confirmed_run_marks_its_script_tested` in
+  `a_skill_intent_with_a_confirmed_run_marks_its_script_tested` and
+  `a_run_with_a_short_output_is_confirmed_by_quoting_more_of_the_same_result` in
   `refine.rs`;
   `the_block_lists_the_scripts_and_says_to_run_the_tested_one_first`,
   `the_scripts_list_stays_within_its_bound` and

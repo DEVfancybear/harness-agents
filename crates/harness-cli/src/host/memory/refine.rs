@@ -529,7 +529,7 @@ impl Learning {
                 } else {
                     "unavailable (the project is not trusted); use level global"
                 },
-                super::learned::SPEC
+                super::learned::spec()
             ),
         ];
         if self.layers.project.is_some() {
@@ -2350,7 +2350,7 @@ const CLOSED_REFUSAL: &str = "the entry is closed (superseded by a correction, o
 
 /// The fewest characters a quote has, its pieces' own (not the ellipses
 /// joining them): a word or two is found anywhere.
-const QUOTE_MIN_CHARS: usize = 12;
+pub(super) const QUOTE_MIN_CHARS: usize = 12;
 
 /// The fewest characters each piece of a quote has: a letter or two between
 /// ellipses is found anywhere, in order.
@@ -10876,6 +10876,66 @@ Run `node scripts/build.js`.
             assert!(confirmed.is_empty(), "{why}: {confirmed:?}");
             assert_eq!(unconfirmed, [path], "{why}");
         }
+    }
+
+    const SHORT_RUN_TRANSCRIPT: &str = "[User]: count the paid orders\n\n[Assistant tool calls]: #1 run_shell(command=\"python scripts/paidcount.py\")\n\n[Tool result (run_shell) #1]: process python exit=Some(0) timed_out=false canceled=false queued=false tree_cleanup=nothing_to_clean\nstdout:\npaid=4\nstderr:\n";
+
+    /// Continual-ARC (arXiv 2611.14505): a run whose own output is shorter
+    /// than the minimum quote was dropped without the model being told why. The
+    /// prompt now states the rule, built from the constant, and a longer span
+    /// of the same result (the result of a process run holds its exit line and
+    /// stream labels) confirms the run.
+    #[test]
+    fn a_run_with_a_short_output_is_confirmed_by_quoting_more_of_the_same_result() {
+        let prompt = crate::interactive::learned::spec();
+        assert!(
+            prompt.contains(&format!(
+                "at least {} characters; when the script's own output is shorter, quote more of the same result",
+                super::QUOTE_MIN_CHARS
+            )),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("{script_quote_min}"));
+        let claim = |evidence: &str| json!({"script_runs": [{"path": "scripts/paidcount.py", "evidence": evidence}]});
+        let (confirmed, unconfirmed) =
+            super::confirmed_script_runs(&claim("paid=4"), SHORT_RUN_TRANSCRIPT);
+        assert!(confirmed.is_empty(), "six characters are no evidence");
+        assert_eq!(unconfirmed, ["scripts/paidcount.py"]);
+        for longer in [
+            "stdout: paid=4",
+            "stdout:\npaid=4\nstderr:",
+            "exit=Some(0) timed_out=false canceled=false ... paid=4",
+        ] {
+            let (confirmed, unconfirmed) =
+                super::confirmed_script_runs(&claim(longer), SHORT_RUN_TRANSCRIPT);
+            assert_eq!(confirmed.len(), 1, "{longer}: {unconfirmed:?}");
+            assert!(unconfirmed.is_empty());
+        }
+        let directory = tempfile::tempdir().expect("dir");
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let layers = crate::interactive::learned::Layers::new(
+            &directory.path().join("config"),
+            &directory.path().join("data"),
+            &workspace,
+            true,
+        );
+        let learning = super::Learning::new(layers.clone(), &workspace, None);
+        let intent = json!({
+            "action": "create", "name": "paid-count", "level": "project",
+            "body": "---\nname: paid-count\ndescription: Use it to count the paid orders.\ncategory: ops\n---\nRun scripts/paidcount.py first.\n",
+            "files": {"scripts/paidcount.py": "print('paid=4')\n"},
+            "script_runs": [{"path": "scripts/paidcount.py", "evidence": "stdout: paid=4"}],
+            "reason": "the task may come back", "evidence": "[User]: count the paid orders",
+        });
+        let record = super::promote_one(&intent, Some(&learning), Some(SHORT_RUN_TRANSCRIPT));
+        assert_eq!(
+            record["scriptRuns"],
+            json!(["scripts/paidcount.py"]),
+            "{record}"
+        );
+        let library = crate::interactive::learned::library(&layers);
+        assert!(library[0].scripts[0].tested_on.is_some());
     }
 
     /// A review that quotes a successful run of a script its skill carries gets
