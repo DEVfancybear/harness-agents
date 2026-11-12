@@ -127,6 +127,47 @@ pub struct GoalCheck {
     pub strategist: Option<(super::delegation::VerifierHandle, Option<String>)>,
 }
 
+/// What a goal that ends verified asks the agent to keep for the task's
+/// return, by the memory features that could act on it. Both off: nothing is
+/// asked, since nothing would keep it.
+///
+/// After Continual-ARC (arXiv 2611.14505): prime-agent saved nothing for the
+/// tasks that came back, and one message after every verdict, asking the
+/// harness to save anything that helps the task's future instances, made it
+/// learn (0.42 of the cost saved). ha asked only before a compaction
+/// summary. This is that message, once, at the one verdict ha trusts - the
+/// goal's verified end - and it is text in a tool result the agent reads
+/// anyway: no model call.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KeepAsk {
+    /// The `memory` tool is on: a project fact can be written now.
+    pub memory_tool: bool,
+    /// The automatic review is on: it reads this conversation next, and keeps
+    /// the steps that worked as a learned skill (a script for a command
+    /// sequence).
+    pub review: bool,
+}
+
+impl KeepAsk {
+    /// The paragraph that ends a verified goal's result, if any feature could
+    /// act on it.
+    fn paragraph(self) -> Option<String> {
+        let mut asks = Vec::new();
+        if self.memory_tool {
+            asks.push("A fact about the project that a tool result or a file showed: write it with the memory tool, scope project.");
+        }
+        if self.review {
+            asks.push("The steps that worked: put them in your reply in order, as the exact commands with the result that showed they worked. The review of this conversation can keep them as a learned skill, and as a script when they were a command sequence.");
+        }
+        (!asks.is_empty()).then(|| {
+            format!(
+                "\n\nIf this task may come back, save now what would let you do it at once next time. {} Memory written with scope local is gone with this conversation.",
+                asks.join(" ")
+            )
+        })
+    }
+}
+
 /// The `goal_complete` tool of one turn.
 #[derive(Clone)]
 pub struct GoalHost {
@@ -141,6 +182,8 @@ pub struct GoalHost {
     refused_unchanged: Arc<AtomicBool>,
     /// This turn already evaluated the strategy: the turn's end does not again.
     evaluated_turn: Arc<AtomicBool>,
+    /// What a verified end asks the agent to keep for the task's return.
+    keep: KeepAsk,
 }
 
 impl GoalHost {
@@ -153,6 +196,7 @@ impl GoalHost {
             failed_at: Arc::new(Mutex::new(None)),
             refused_unchanged: Arc::new(AtomicBool::new(false)),
             evaluated_turn: Arc::new(AtomicBool::new(false)),
+            keep: KeepAsk::default(),
         }
     }
 
@@ -160,6 +204,14 @@ impl GoalHost {
     #[must_use]
     pub fn with_check(mut self, check: GoalCheck) -> Self {
         self.check = Some(Arc::new(check));
+        self
+    }
+
+    /// Ask the agent to keep what a returning task needs when the goal ends
+    /// verified, as far as the memory features that could keep it are on.
+    #[must_use]
+    pub fn with_keep(mut self, keep: KeepAsk) -> Self {
+        self.keep = keep;
         self
     }
 
@@ -560,7 +612,10 @@ Fix every finding, check it yourself, then call goal_complete again.{decision}",
         self.evaluated(&check, "passed", super::strategy::stage::PASSED, 0, 0, "")
             .await;
         self.complete(&verified);
-        Ok(format!("The goal is complete and verified: {verified}"))
+        Ok(format!(
+            "The goal is complete and verified: {verified}{}",
+            self.keep.paragraph().unwrap_or_default()
+        ))
     }
 
     /// Mark the goal complete: the turn erases it from the task, and the controller
@@ -1390,6 +1445,64 @@ mod tests {
                 && brief.contains("Most stalls need no team"),
             "{brief}"
         );
+    }
+
+    /// Continual-ARC (arXiv 2611.14505): one message after the verdict, asking
+    /// to save what helps the task's future instances, made prime-agent learn.
+    /// A goal that ends verified asks once, in the result the agent reads,
+    /// for what the memory features on could keep; a goal that is refused asks
+    /// nothing, and a host with both features off asks nothing.
+    #[tokio::test]
+    async fn a_verified_goal_asks_what_to_keep_for_the_task_s_return() {
+        use super::KeepAsk;
+        let root = tempfile::tempdir().expect("root");
+        let (host, _events) = checked(root.path(), "echo ok");
+        let done = host
+            .with_keep(KeepAsk {
+                memory_tool: true,
+                review: true,
+            })
+            .finish("shipped")
+            .await
+            .expect("verified");
+        assert_eq!(
+            done.matches("If this task may come back").count(),
+            1,
+            "{done}"
+        );
+        assert!(done.contains("memory tool, scope project"), "{done}");
+        assert!(done.contains("learned skill"), "{done}");
+        assert!(
+            done.contains("scope local is gone with this conversation"),
+            "{done}"
+        );
+        // Only the memory tool: no promise of a review.
+        let (host, _events) = checked(root.path(), "echo ok");
+        let done = host
+            .with_keep(KeepAsk {
+                memory_tool: true,
+                review: false,
+            })
+            .finish("shipped")
+            .await
+            .expect("verified");
+        assert!(done.contains("memory tool"), "{done}");
+        assert!(!done.contains("learned skill"), "{done}");
+        // Neither feature on: nothing to ask for.
+        let (host, _events) = checked(root.path(), "echo ok");
+        let done = host.finish("shipped").await.expect("verified");
+        assert!(!done.contains("If this task may come back"), "{done}");
+        // A goal that is not complete asks nothing.
+        let (host, _events) = checked(root.path(), "exit 1");
+        let refused = host
+            .with_keep(KeepAsk {
+                memory_tool: true,
+                review: true,
+            })
+            .finish("shipped")
+            .await
+            .expect_err("refused");
+        assert!(!refused.contains("If this task may come back"), "{refused}");
     }
 
     /// Passing checks complete the goal, with their evidence in its summary.

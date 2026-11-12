@@ -9968,21 +9968,29 @@ async fn run_turn(
     // independent verifier judges, before the goal completes.
     let goal_host = match &goal {
         GoalRecord::Active(objective) => Some(
-            super::goal::GoalHost::new(sender.clone()).with_check(super::goal::GoalCheck {
-                root: workspace_root.clone(),
-                objective: objective.clone(),
-                checks: config.verify.checks.clone(),
-                judge: delegate_host
-                    .as_ref()
-                    .filter(|_| config.verify.judge)
-                    .map(|host| (host.verifier(), config.routing.verifier.clone())),
-                cancellation: cancellation.clone(),
-                task_state: Some(task_state_host.path().to_path_buf()),
-                // Named alternatives at a plateau, from a fresh context.
-                strategist: delegate_host
-                    .as_ref()
-                    .map(|host| (host.verifier(), config.routing.verifier.clone())),
-            }),
+            super::goal::GoalHost::new(sender.clone())
+                .with_check(super::goal::GoalCheck {
+                    root: workspace_root.clone(),
+                    objective: objective.clone(),
+                    checks: config.verify.checks.clone(),
+                    judge: delegate_host
+                        .as_ref()
+                        .filter(|_| config.verify.judge)
+                        .map(|host| (host.verifier(), config.routing.verifier.clone())),
+                    cancellation: cancellation.clone(),
+                    task_state: Some(task_state_host.path().to_path_buf()),
+                    // Named alternatives at a plateau, from a fresh context.
+                    strategist: delegate_host
+                        .as_ref()
+                        .map(|host| (host.verifier(), config.routing.verifier.clone())),
+                })
+                // A verified end asks what the task needs when it returns,
+                // as far as the memory features that could keep it are on
+                // (Continual-ARC, arXiv 2611.14505).
+                .with_keep(super::goal::KeepAsk {
+                    memory_tool: digest_on,
+                    review: reviews_on,
+                }),
         ),
         _ => None,
     };
