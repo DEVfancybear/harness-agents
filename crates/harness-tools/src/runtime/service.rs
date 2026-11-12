@@ -2117,6 +2117,14 @@ impl ToolExecutionService {
             .await
             .map_err(store_error)?;
         let truncated = hits.len() >= usize::try_from(wanted).unwrap_or(10);
+        // A search of this conversation that finds nothing whole may be
+        // looking for what an earlier conversation of the project holds.
+        let earlier = if project {
+            0
+        } else {
+            self.earlier_conversations(prepared, query, &hits, filter)
+                .await
+        };
         Ok(ToolOutput::HistorySearch {
             hits: hits
                 .into_iter()
@@ -2124,7 +2132,67 @@ impl ToolExecutionService {
                 .collect(),
             truncated,
             unindexed: caught.behind,
+            earlier,
         })
+    }
+
+    /// How many sources of the project's earlier conversations hold every
+    /// word of `query`, when none of this conversation's does.
+    ///
+    /// After Continual-ARC (arXiv 2611.14505): no harness kept evidence it had
+    /// already paid for, and each bought it again. ha keeps every tool result
+    /// searchable, but a search defaults to this conversation, so a returning
+    /// task found nothing and was never told an earlier conversation held the
+    /// answer. This is the same query over the same index with the project's
+    /// scope: a count, not hits - what the model did not ask for is not
+    /// returned - so one line tells it to ask. Whatever fails here is no
+    /// failure of the search: the count is then zero.
+    async fn earlier_conversations(
+        &self,
+        prepared: &PreparedToolRequest,
+        query: &str,
+        found: &[harness_store_sqlite::HistoryHit],
+        filter: &harness_store_sqlite::HistoryFilter,
+    ) -> u64 {
+        /// How long the project's other conversations may be caught up, and
+        /// how many of its sources are counted.
+        const EARLIER_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+        const EARLIER_COUNTED: usize = 20;
+        let whole = |hit: &harness_store_sqlite::HistoryHit| {
+            hit.query_terms > 0 && hit.matched_terms >= hit.query_terms
+        };
+        if found.iter().any(whole) {
+            return 0;
+        }
+        let Ok(scope) = self.history_scope(prepared, true).await else {
+            return 0;
+        };
+        if let Ok(caught) = self
+            .store
+            .catch_up_history(
+                None,
+                harness_store_sqlite::CatchUpPace::Until(std::time::Instant::now() + EARLIER_WAIT),
+            )
+            .await
+            && caught.behind > 0
+        {
+            self.store.catch_up_history_in_background(None);
+        }
+        let Ok(wider) = self
+            .store
+            .history_search_filtered(&scope, query, EARLIER_COUNTED, filter)
+            .await
+        else {
+            return 0;
+        };
+        let task = prepared.request.task_id.as_str();
+        u64::try_from(
+            wider
+                .iter()
+                .filter(|hit| hit.task_id != task && whole(hit))
+                .count(),
+        )
+        .unwrap_or(0)
     }
 
     /// `history_search` with `mode: readout` (`docs/architecture/MEMORY_READOUT.en.md`):
@@ -2215,6 +2283,7 @@ impl ToolExecutionService {
             hits,
             truncated: false,
             unindexed,
+            earlier: 0,
         })
     }
 

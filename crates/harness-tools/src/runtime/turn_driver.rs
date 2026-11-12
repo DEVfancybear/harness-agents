@@ -5517,13 +5517,21 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             hits,
             truncated,
             unindexed,
+            earlier,
         } => format!(
-            "history_search{}: {} hit(s){}\n{}",
+            "history_search{}: {} hit(s){}{}\n{}",
             if *truncated { " (truncated)" } else { "" },
             hits.len(),
             if *unindexed > 0 {
                 format!(
                     "; {unindexed} older conversation(s) are still being indexed and were not searched - search again later to include them"
+                )
+            } else {
+                String::new()
+            },
+            if *earlier > 0 {
+                format!(
+                    "; nothing here holds all your words, but {earlier} match(es) in earlier conversations of this project do - search again with scope project"
                 )
             } else {
                 String::new()

@@ -587,7 +587,7 @@ pub fn history_tool_schemas() -> Vec<Value> {
     vec![
         function_schema(
             "history_search",
-            "Search this conversation's journal for earlier sources by keyword, including exact identifiers. The sources holding every word are the hits; when none does, those holding the most words come first (matched=2/3), and a rare word counts more than a common one. With scope \"project\", search every earlier conversation in this project too (how something was done or decided before); hits from another conversation name it and when it started.",
+            "Search this conversation's journal for earlier sources by keyword, including exact identifiers. The sources holding every word are the hits; when none does, those holding the most words come first (matched=2/3), and a rare word counts more than a common one. With scope \"project\", search every earlier conversation in this project too (how something was done or decided before); hits from another conversation name it and when it started. A search of this conversation that finds nothing holding every word says when earlier conversations of the project do.",
             json!({
                 "query": string_schema(),
                 "limit": {"type": "integer", "minimum": 1, "maximum": HISTORY_SEARCH_MAX_LIMIT},
@@ -2012,6 +2012,12 @@ pub enum ToolOutput {
         /// the scope: they are being indexed and a later search reads them.
         #[serde(default, skip_serializing_if = "is_zero")]
         unindexed: u64,
+        /// Sources in earlier conversations of the project that hold every
+        /// word of a query this conversation holds nothing for. Counted only
+        /// for a search of this conversation, and not returned: the answer
+        /// says a search with scope `project` reads them.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        earlier: u64,
     },
     /// One exact page of an indexed journal source.
     HistoryRead {

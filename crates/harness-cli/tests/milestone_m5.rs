@@ -2481,6 +2481,80 @@ async fn a20_source_scope_fork() {
     close(store).await;
 }
 
+/// Continual-ARC (arXiv 2611.14505): no harness kept evidence it had paid
+/// for, and each bought it again. A search of this conversation that finds
+/// nothing holding every word says how many sources of the project's earlier
+/// conversations do, without returning them; a search that finds the words
+/// here, or one that already asks for the project, says nothing of the kind.
+#[tokio::test]
+async fn a20b_a_search_that_finds_nothing_here_counts_the_earlier_conversations() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let (session, task) = admit(&store, &bench, "recolor the zebra grid again").await;
+    let (earlier_session, _earlier_task) = admit(
+        &store,
+        &bench,
+        "the zebra grid is solved by running solve_zebra.py",
+    )
+    .await;
+    store.index_history(&session).await.expect("index");
+    store
+        .index_history(&earlier_session)
+        .await
+        .expect("index the earlier conversation");
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let search = |query: &'static str, project: bool| {
+        let tools = &tools;
+        let session = session.clone();
+        let task = task.clone();
+        let workspace = bench.workspace.clone();
+        async move {
+            let prepared = tools
+                .prepare(ToolRequest::new(
+                    session,
+                    task,
+                    "actor.a20b",
+                    &workspace,
+                    CodingToolAction::HistorySearch {
+                        query: query.to_owned(),
+                        limit: None,
+                        project,
+                        filter: harness_tools::HistorySearchFilter::default(),
+                    },
+                ))
+                .await
+                .expect("prepares");
+            let grant = tools.approve(&prepared).await.expect("approved");
+            let view = tools.execute(prepared, Some(grant)).await.expect("search");
+            let ToolOutput::HistorySearch { hits, earlier, .. } = view.output else {
+                panic!("a search returns hits: {:?}", view.output);
+            };
+            (hits, earlier)
+        }
+    };
+    // This conversation says "zebra grid" but not "solved": it holds no
+    // source with every word, and the earlier conversation does.
+    let (hits, earlier) = search("zebra grid solved", false).await;
+    assert!(
+        hits.iter().all(|hit| hit.conversation.is_none()),
+        "the earlier conversation's sources are not returned unasked: {hits:?}"
+    );
+    assert_eq!(earlier, 1, "{hits:?}");
+    // The words are here: nothing is missing.
+    let (_, earlier) = search("recolor zebra grid", false).await;
+    assert_eq!(earlier, 0);
+    // Nothing anywhere holds them.
+    let (_, earlier) = search("zebra grid purple_giraffe", false).await;
+    assert_eq!(earlier, 0);
+    // Asked for the project, the hits come back and nothing is counted twice.
+    let (hits, earlier) = search("zebra grid solved", true).await;
+    assert!(
+        hits.iter().any(|hit| hit.conversation.is_some()),
+        "{hits:?}"
+    );
+    assert_eq!(earlier, 0);
+}
+
 #[tokio::test]
 async fn m5_04_fork_policy_can_only_narrow() {
     let bench = bench();
