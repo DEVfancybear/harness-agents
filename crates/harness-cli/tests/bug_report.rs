@@ -387,6 +387,74 @@ fn a_bug_report_names_what_repeats() {
         "",
         serde_json::json!({"by":"user"}),
     ));
+    // What bug report 20261112 had to be searched for: the commands that
+    // ended into running turns, why a review's edit was refused, and the
+    // checkpoint written before a turn.
+    for second in 0..6 {
+        newer.push(record(
+            at(11) + second * 1_000,
+            "info",
+            "delivery",
+            "steered",
+            "",
+            serde_json::json!({"kind":"bash_done","reason":"turn_running","ahead":0}),
+        ));
+    }
+    for second in 0..2 {
+        newer.push(record(
+            at(12) + second * 1_000,
+            "info",
+            "review",
+            "applied",
+            "kept the prompt as it is",
+            serde_json::json!({"edits":1,"applied":0,"queued":0,"refusals":["lesson: the evidence is not a verbatim quote of the turns under review"]}),
+        ));
+    }
+    newer.push(record(
+        at(13),
+        "info",
+        "compaction",
+        "replay_bound",
+        "",
+        serde_json::json!({"turns":969,"replayed_bytes":4_300_000,"after":9_000,"duration_ms":240_000}),
+    ));
+    newer.push(record(
+        at(13) + 1_000,
+        "info",
+        "compaction",
+        "checkpoint_from_kept",
+        "",
+        serde_json::json!({"covers":900,"after_it":69}),
+    ));
+    for (second, what) in ["tool_result", "tool_result", "system"]
+        .into_iter()
+        .enumerate()
+    {
+        newer.push(record(
+            at(15) + i64::try_from(second).unwrap() * 1_000,
+            "info",
+            "cache",
+            "prefix_rewritten",
+            "",
+            serde_json::json!({"what":what,"at":7,"sent_before":40,"now":41}),
+        ));
+    }
+    newer.push(record(
+        at(16),
+        "info",
+        "context",
+        "dropped",
+        "",
+        serde_json::json!({"by":"keep","results":12,"bytes":204_800,"kept":12}),
+    ));
+    newer.push(record(
+        at(14),
+        "info",
+        "compaction",
+        "earlier_summary_canceled",
+        "",
+        serde_json::json!({"older":969,"prefix":0}),
+    ));
     let older = [record(
         at(-20),
         "warn",
@@ -448,6 +516,40 @@ fn a_bug_report_names_what_repeats() {
     assert!(
         patterns.contains("`list_skills` failed 5 times"),
         "{patterns}"
+    );
+    assert!(
+        patterns.contains(
+            "requests that rewrote what was already sent, so the provider's cache missed from there: 3 (system 1, tool_result 2)"
+        ),
+        "{patterns}"
+    );
+    assert!(
+        patterns.contains("tool results dropped by the rolling drop: 12 (200 KiB)"),
+        "{patterns}"
+    );
+    assert!(
+        patterns.contains("sent into running turns by the host: bash_done 6"),
+        "{patterns}"
+    );
+    assert!(
+        patterns.contains(
+            "a review's edit was refused 2 time(s) - lesson: the evidence is not a verbatim quote"
+        ),
+        "{patterns}"
+    );
+    assert!(
+        summary.contains(
+            "- checkpoints of the whole conversation: 1 before a turn started (240.0s in all, 0 failed), 0 inside a step; 1 written from a kept summary"
+        ),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("- summaries that failed: 0; canceled by the user: 1"),
+        "{summary}"
+    );
+    assert!(
+        !summary.contains("`compaction.earlier_summary_canceled`"),
+        "a summary the user stopped is no problem: {summary}"
     );
     let row = summary
         .lines()

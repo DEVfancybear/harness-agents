@@ -2689,3 +2689,168 @@ async fn compacting_again_with_nothing_new_keeps_the_summary() {
     drop(runtime);
     close(store).await;
 }
+
+/// The small window the compaction tests run on.
+fn small_window() -> RuntimeConfig {
+    RuntimeConfig {
+        context_window_tokens: 16_000,
+        output_reservation_tokens: 1024,
+        compaction_reserve_tokens: 1000,
+        estimate_scale: Some(2.5),
+        ..RuntimeConfig::default()
+    }
+}
+
+/// A tool result a step sent shortened is sent shortened by the steps after
+/// it, as the same text. Each step shortened from the whole results against
+/// a budget read in the provider's measure, which moves with every response:
+/// when it loosened, results sent short came back whole in the middle of what
+/// the provider had cached, and the request was read again from there.
+#[tokio::test]
+async fn a_result_sent_shortened_stays_shortened_when_the_measure_moves() {
+    let bench = bench();
+    // The second response reports a prompt far smaller than estimated: the
+    // scale falls to its floor and the third step's results would all fit.
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("one"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("two"),
+            ProviderStreamEvent::usage(1, 1, 2),
+            ProviderStreamEvent::completed("stop"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("three"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let store = bench.open_store().await;
+    let runtime = RuntimeService::new(Arc::clone(&store), provider.clone(), small_window());
+    let turn = RunRequest::new(
+        SessionId::generate(),
+        TaskId::generate(),
+        InputId::generate(),
+        "read the eight files".to_owned(),
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("workspace"),
+    );
+    runtime.run(turn.clone()).await.expect("the first step");
+    let calls = (0..8)
+        .map(|index| harness_providers::ProviderToolCall {
+            call_id: format!("delta-call-{index}"),
+            name: "read_file".to_owned(),
+            arguments: format!(r#"{{"path":"src/delta{index}.rs"}}"#),
+        })
+        .collect::<Vec<_>>();
+    let mut transcript = vec![harness_providers::ProviderMessage::assistant_with_calls(
+        String::new(),
+        calls,
+    )];
+    transcript.extend((0..8).map(|index| {
+        harness_providers::ProviderMessage::tool_result(
+            format!("delta-call-{index}"),
+            format!("delta result {index}: {}", "line ".repeat(700)),
+        )
+    }));
+    runtime
+        .continue_run(&turn, &transcript, CancellationToken::new(), None)
+        .await
+        .expect("the second step");
+    transcript.push(harness_providers::ProviderMessage::new(
+        MessageRole::Assistant,
+        "two",
+    ));
+    transcript.push(harness_providers::ProviderMessage::new(
+        MessageRole::User,
+        "go on",
+    ));
+    runtime
+        .continue_run(&turn, &transcript, CancellationToken::new(), None)
+        .await
+        .expect("the third step");
+    let seen = provider.seen();
+    assert_eq!(seen.len(), 3);
+    let shortened = seen[1]
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == MessageRole::Tool
+                && message
+                    .content
+                    .starts_with("[this earlier tool result was removed")
+        })
+        .count();
+    assert!(shortened >= 1, "the second step shortened results");
+    assert_eq!(
+        seen[2].messages[..seen[1].messages.len()],
+        seen[1].messages[..],
+        "the third step sends what the second sent, then more"
+    );
+    drop(runtime);
+    close(store).await;
+}
+
+/// A turn of a conversation continued from a summary sends the packet of its
+/// first step at every step, as any turn does. Every step of such a turn
+/// built its packet again - a conversation that was ever compacted carries
+/// its summary into each turn - so what changed in the session mid-turn
+/// changed a message in the middle of the request.
+#[tokio::test]
+async fn a_turn_continued_from_a_summary_sends_its_first_packet_at_every_step() {
+    let bench = bench();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("first"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("second"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let store = bench.open_store().await;
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    );
+    let turn = RunRequest::new(
+        SessionId::generate(),
+        TaskId::generate(),
+        InputId::generate(),
+        "continue".to_owned(),
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("workspace"),
+    )
+    .with_continuation_context("## Goal\nthe work so far".to_owned());
+    runtime.run(turn.clone()).await.expect("the first step");
+    append_note(
+        &store,
+        &turn.session_id,
+        &turn.task_id,
+        "NOTE_WRITTEN_MID_TURN",
+    )
+    .await;
+    let transcript = vec![
+        harness_providers::ProviderMessage::new(MessageRole::Assistant, "first"),
+        harness_providers::ProviderMessage::new(MessageRole::User, "go on"),
+    ];
+    runtime
+        .continue_run(&turn, &transcript, CancellationToken::new(), None)
+        .await
+        .expect("the second step");
+    let seen = provider.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(
+        seen[1].messages[..seen[0].messages.len()],
+        seen[0].messages[..],
+        "the second step sends what the first sent, then more"
+    );
+    drop(runtime);
+    close(store).await;
+}

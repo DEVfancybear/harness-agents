@@ -119,11 +119,12 @@ pub use service::{
 };
 pub use turn_driver::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ChangedFile, CompletionCheck,
-    EVALUATE_AT_FILES, EVALUATE_AT_LINES, ExternalToolCatalog, ExternalTools, FLUSH_PREFIX,
-    GoalReport, OutputAdmission, QuestionHost, RECAP_EVERY_STEPS, RECAP_PREFIX, ResultSummary,
-    ResultVisibility, TOOL_SCHEMA_TOOL, TurnContextHooks, TurnDriver, TurnEvaluation, TurnLimits,
-    TurnObserver, TurnOptions, TurnOutcome, TurnProgress, TurnReview, TurnStop, USE_TOOL_TOOL,
-    Visibility, execute_action_with_approval, tier_tool_schemas,
+    ContextDrop, DROP_CONTEXT_TOOL, DROP_KEEP_DEFAULT, EVALUATE_AT_FILES, EVALUATE_AT_LINES,
+    ExternalToolCatalog, ExternalTools, FLUSH_PREFIX, GoalReport, OutputAdmission, QuestionHost,
+    RECAP_EVERY_STEPS, RECAP_PREFIX, ResultSummary, ResultVisibility, TOOL_SCHEMA_TOOL,
+    TurnContextHooks, TurnDriver, TurnEvaluation, TurnLimits, TurnObserver, TurnOptions,
+    TurnOutcome, TurnProgress, TurnReview, TurnStop, USE_TOOL_TOOL, Visibility,
+    execute_action_with_approval, tier_tool_schemas,
 };
 pub use workspace::{
     git_branch, is_sensitive_workspace_path, observe_workspace, observed_file_hash,

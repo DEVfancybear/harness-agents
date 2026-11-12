@@ -13,11 +13,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     // nest deep (driver, runtime, compaction, summaries): a debug build's
     // frames overflowed the 1 MiB main stack Windows gives by default. The
     // main thread gets the 8 MiB Linux gives it.
+    // The fixture host drives a turn on its main thread the same way, and
+    // stands for `ha` in the tests that kill it mid-turn: it gets the same.
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        match env::var("CARGO_CFG_TARGET_ENV").as_deref() {
-            Ok("msvc") => println!("cargo:rustc-link-arg-bin=ha=/STACK:8388608"),
-            Ok("gnu") => println!("cargo:rustc-link-arg-bin=ha=-Wl,--stack,8388608"),
-            _ => {}
+        for bin in ["ha", "m4_fixture_host"] {
+            match env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+                Ok("msvc") => println!("cargo:rustc-link-arg-bin={bin}=/STACK:8388608"),
+                Ok("gnu") => println!("cargo:rustc-link-arg-bin={bin}=-Wl,--stack,8388608"),
+                _ => {}
+            }
         }
     }
     let repository = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("../..");

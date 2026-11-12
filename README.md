@@ -148,6 +148,7 @@ hint = "Fix the failing test before finishing."
 | `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENCODE_API_KEY` | — | Provider keys; a key saved with `/login` wins |
 | `HA_PROVIDER_ENDPOINT` / `HA_PROVIDER_MODEL` | DeepSeek / `deepseek-v4-flash` | Any OpenAI-compatible chat endpoint and model |
 | `HA_CACHE_RETENTION` | short | `long`: Anthropic's 1-hour cache, OpenAI's 24-hour retention |
+| `HA_CONTEXT_DROP` | off | `keep` or `keep:<n>`: a turn keeps its newest n tool results (12) and drops older ones a batch at a time; `tool`: the model gets `drop_context`; both with a comma |
 | `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` / `HA_TURN_DEADLINE_SECONDS` | no limit | Model calls, tool calls or seconds per turn before it pauses |
 | `HA_COMPACT_AT` | 200000 | Tokens of context before it is compacted, however large the model's window (`0`: the window's own bound) |
 | `HA_MEMORY` / `HA_MEMORY_OFF` | on / — | `off` turns memory off; `HA_MEMORY_OFF=digest,knowledge,...` turns off the named features only |
@@ -308,6 +309,7 @@ hint = "Sửa test đang fail trước khi kết thúc."
 | `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENCODE_API_KEY` | — | Khóa provider; khóa lưu bằng `/login` được ưu tiên |
 | `HA_PROVIDER_ENDPOINT` / `HA_PROVIDER_MODEL` | DeepSeek / `deepseek-v4-flash` | Endpoint chat tương thích OpenAI và model bất kỳ |
 | `HA_CACHE_RETENTION` | short | `long`: cache 1 giờ của Anthropic, giữ 24 giờ của OpenAI |
+| `HA_CONTEXT_DROP` | off | `keep` hoặc `keep:<n>`: một lượt giữ n kết quả tool mới nhất (12) và bỏ các kết quả cũ hơn theo từng lô; `tool`: model có thêm `drop_context`; dùng cả hai bằng dấu phẩy |
 | `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` / `HA_TURN_DEADLINE_SECONDS` | không giới hạn | Số lời gọi model, lời gọi tool hoặc số giây mỗi lượt trước khi tạm dừng |
 | `HA_COMPACT_AT` | 200000 | Số token context trước khi compact, dù cửa sổ của model lớn đến đâu (`0`: theo giới hạn của chính cửa sổ) |
 | `HA_MEMORY` / `HA_MEMORY_OFF` | bật / — | `off` tắt memory; `HA_MEMORY_OFF=digest,knowledge,...` chỉ tắt các tính năng được nêu |

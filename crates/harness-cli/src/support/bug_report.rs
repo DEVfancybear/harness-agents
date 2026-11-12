@@ -834,7 +834,18 @@ impl Report {
                     state.as_str(),
                     "completed" | "succeeded" | "done" | "canceled" | "cancelled" | "paused"
                 ) {
-                    self.problem(format!("run ended {state} ({stop})"), ms);
+                    // A run no step finished: its turn is still going, or
+                    // ended without settling it. "run ended running ()" said
+                    // neither.
+                    if state == "running" {
+                        self.problem(
+                            "run still open (running): its turn is going on, or ended without finishing it"
+                                .to_owned(),
+                            ms,
+                        );
+                    } else {
+                        self.problem(format!("run ended {state} ({stop})"), ms);
+                    }
                 }
                 ("info", "run", format!("started; ended {state} {stop}"))
             }
@@ -849,6 +860,16 @@ impl Report {
             ),
             "runtime_commands" => {
                 let error = column(cells, "last_error").unwrap_or_default();
+                // A command claimed and never settled has no error to show,
+                // and is the trace of a step that returned early.
+                if error.is_empty() && column(cells, "state").as_deref() == Some("claimed") {
+                    self.problem(
+                        "runtime command still claimed: its step is running, or ended without settling it"
+                            .to_owned(),
+                        ms,
+                    );
+                    return;
+                }
                 if error.is_empty() || error.starts_with("provider_canceled") {
                     return;
                 }
@@ -1132,6 +1153,86 @@ impl Report {
     /// the busiest ten minutes. A session where a verifier and its parent
     /// pinged each other every half minute for hours read as many short,
     /// healthy turns.
+    /// What repeats in how the host kept the context and the memory: its
+    /// own messages into running turns, the requests that rewrote what was
+    /// sent, the tool results dropped, and why the edits of reviews were
+    /// refused.
+    fn host_patterns(&self, lines: &mut Vec<String>) {
+        // What the host sent on its own into running turns, by kind: a
+        // hundred background commands ending in one session were found only
+        // by counting the timeline.
+        let mut steered: BTreeMap<String, usize> = BTreeMap::new();
+        for record in self.recorded("delivery", "steered") {
+            let kind = record["fields"]["kind"].as_str().unwrap_or("?").to_owned();
+            *steered.entry(kind).or_default() += 1;
+        }
+        if steered.values().sum::<usize>() >= 5 {
+            lines.push(format!(
+                "sent into running turns by the host: {}",
+                steered
+                    .iter()
+                    .map(|(kind, count)| format!("{kind} {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        // The requests that rewrote what the one before had sent, by what
+        // they rewrote: from there on the provider's cache does not hold.
+        let mut rewritten: BTreeMap<String, usize> = BTreeMap::new();
+        for record in self.recorded("cache", "prefix_rewritten") {
+            let what = record["fields"]["what"].as_str().unwrap_or("?").to_owned();
+            *rewritten.entry(what).or_default() += 1;
+        }
+        if !rewritten.is_empty() {
+            lines.push(format!(
+                "requests that rewrote what was already sent, so the provider's cache missed from there: {} ({})",
+                rewritten.values().sum::<usize>(),
+                rewritten
+                    .iter()
+                    .map(|(what, count)| format!("{what} {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        // Tool results dropped when nothing was over budget, by who asked.
+        let mut dropped: BTreeMap<String, (usize, u64)> = BTreeMap::new();
+        for record in self.recorded("context", "dropped") {
+            let by = match record["fields"]["by"].as_str() {
+                Some("tool") => "the model's drop_context",
+                Some("keep") => "the rolling drop",
+                _ => "?",
+            };
+            let entry = dropped.entry(by.to_owned()).or_default();
+            entry.0 += usize::try_from(record["fields"]["results"].as_u64().unwrap_or_default())
+                .unwrap_or_default();
+            entry.1 += record["fields"]["bytes"].as_u64().unwrap_or_default();
+        }
+        for (by, (results, bytes)) in &dropped {
+            lines.push(format!(
+                "tool results dropped by {by}: {results} ({} KiB)",
+                bytes / 1024
+            ));
+        }
+        // Why a review's edits were refused, each reason with its count.
+        let mut refusals: BTreeMap<String, usize> = BTreeMap::new();
+        for record in self.recorded("review", "applied") {
+            for reason in record["fields"]["refusals"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                if let Some(reason) = reason.as_str() {
+                    *refusals.entry(clip(reason, 260)).or_default() += 1;
+                }
+            }
+        }
+        for (reason, count) in &refusals {
+            lines.push(format!(
+                "a review's edit was refused {count} time(s) - {reason}"
+            ));
+        }
+    }
+
     fn summary_patterns(&self, out: &mut String) {
         let mut lines = Vec::new();
         let starts = self.recorded("turn", "start");
@@ -1210,6 +1311,7 @@ impl Report {
                 ms_text(busiest.1)
             ));
         }
+        self.host_patterns(&mut lines);
         let waits = self.recorded("goal", "waits_for_children").len();
         let continued = self.recorded("goal", "continued").len();
         if waits + continued > 0 {
@@ -1669,7 +1771,26 @@ impl Report {
             .sum();
         let failed = self.recorded("compaction", "earlier_summary_failed").len()
             + self.recorded("compaction", "turn_summary_failed").len();
-        if !summarized.is_empty() || steps + shortened + failed > 0 || trimmed > 0 {
+        let canceled = self
+            .recorded("compaction", "earlier_summary_canceled")
+            .len()
+            + self.recorded("compaction", "turn_summary_canceled").len();
+        // The checkpoints written outside a step's own summary: before a
+        // turn, when the conversation neared what a turn can replay, and when
+        // a request did not fit even after its summary.
+        let before_turn = self.recorded("compaction", "replay_bound");
+        let before_turn_failed = self.recorded("compaction", "replay_bound_failed").len();
+        let before_turn_ms: u64 = before_turn
+            .iter()
+            .filter_map(|record| field(record, "duration_ms"))
+            .sum();
+        let auto = self.recorded("compaction", "auto").len();
+        let from_kept = self.recorded("compaction", "checkpoint_from_kept").len();
+        let checkpoints = before_turn.len() + before_turn_failed + auto + from_kept;
+        if !summarized.is_empty()
+            || steps + shortened + failed + canceled + checkpoints > 0
+            || trimmed > 0
+        {
             let written = summarized
                 .iter()
                 .filter(|record| record["fields"]["model_call"] == true)
@@ -1694,7 +1815,18 @@ impl Report {
                 out,
                 "- tool results shortened: {shortened} time(s) to fit the window, {trimmed} older result(s) as long turns grew"
             );
-            let _ = writeln!(out, "- summaries that failed: {failed}\n");
+            if checkpoints > 0 {
+                let _ = writeln!(
+                    out,
+                    "- checkpoints of the whole conversation: {} before a turn started ({:.1}s in all, {before_turn_failed} failed), {auto} inside a step; {from_kept} written from a kept summary",
+                    before_turn.len(),
+                    seconds(before_turn_ms)
+                );
+            }
+            let _ = writeln!(
+                out,
+                "- summaries that failed: {failed}; canceled by the user: {canceled}\n"
+            );
         }
         let mut tools: BTreeMap<String, (usize, usize, u64, u64)> = BTreeMap::new();
         for (event, failed) in [("ok", false), ("failed", true)] {

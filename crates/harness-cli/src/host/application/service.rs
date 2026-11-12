@@ -8674,6 +8674,7 @@ fn review_record(
                 .field("edits", edits)
                 .field("applied", applied)
                 .field("queued", refinement.queued())
+                .field("refusals", refinement.refusals())
         }
         Err(error) => harness_types::diag::warn("review", event)
             .task(conversation)

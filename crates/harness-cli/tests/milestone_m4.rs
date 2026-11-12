@@ -5406,3 +5406,148 @@ async fn self_evaluation_waits_behind_the_verify_reminder() {
     assert!(evaluation.judged.lock().expect("judged").is_empty());
     assert_eq!(evaluation.finished.load(Ordering::SeqCst), 1);
 }
+
+/// AKV's cache-as-tool on a provider that caches a request by its start: the
+/// model drops its stale tool results with `drop_context`, the next step
+/// sends them as the one-line note, and so does the next turn - the record
+/// holds every result whole, and replayed from it the dropped ones came back.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one turn, its requests and the replay, written and read back"
+)]
+async fn results_the_model_dropped_stay_dropped_in_the_turn_and_the_next() {
+    let bench = bench();
+    for index in 0..3 {
+        std::fs::write(
+            bench.workspace.join(format!("src/big{index}.txt")),
+            format!("BIG{index} {}", "line of text\n".repeat(200)),
+        )
+        .expect("a file to read");
+    }
+    let read = |index: usize| {
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                format!("read{index}"),
+                "read_file",
+                serde_json::json!({"path": format!("src/big{index}.txt")}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ]
+    };
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        read(0),
+        read(1),
+        read(2),
+        // A read in the same response as the drop: its result has not been
+        // read yet when the drop is made, and is not dropped.
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "again",
+                "read_file",
+                serde_json::json!({"path": "src/big0.txt", "offset": 2}).to_string(),
+            ),
+            ProviderStreamEvent::tool_delta(
+                "drop",
+                "drop_context",
+                serde_json::json!({"keep_last": 1}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("Read all three."),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let store = bench.open_store().await;
+    // A window the three results fit: nothing is shortened for room.
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig {
+            context_window_tokens: 200_000,
+            ..RuntimeConfig::default()
+        },
+    ));
+    let driver = TurnDriver::new(
+        Arc::clone(&runtime),
+        ToolExecutionService::new(Arc::clone(&store)),
+    )
+    .with_context_drop(harness_tools::ContextDrop {
+        keep: None,
+        tool: true,
+    });
+    let session = SessionId::generate();
+    let request = RunRequest::new(
+        session.clone(),
+        TaskId::generate(),
+        InputId::generate(),
+        "read the three files".to_owned(),
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("observation"),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    driver
+        .run_turn(
+            request,
+            TurnOptions {
+                workspace_root: bench.workspace.clone(),
+                actor_id: "drop.test".to_owned(),
+                approvals: ApprovalMode::Auto,
+                limits: TurnLimits::default(),
+            },
+            Arc::new(SilentObserver),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn runs");
+    let seen = provider.seen();
+    assert_eq!(seen.len(), 5);
+    assert!(
+        seen[0]
+            .tool_schemas
+            .iter()
+            .any(|schema| schema["function"]["name"] == "drop_context"),
+        "the tool is offered"
+    );
+    let results = |messages: &[harness_providers::ProviderMessage]| {
+        messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>()
+    };
+    let before = results(&seen[3].messages);
+    assert_eq!(before.len(), 3);
+    assert!(
+        before.iter().all(|text| text.contains("line of text")),
+        "whole until the drop: {before:#?}"
+    );
+    let after = results(&seen[4].messages);
+    assert_eq!(after.len(), 5, "four reads and the drop's answer");
+    let note = "[earlier tool result shortened to save context";
+    assert!(
+        after[0].starts_with(note) && after[1].starts_with(note),
+        "{after:#?}"
+    );
+    assert!(
+        after[2].contains("BIG2"),
+        "the newest read stays: {after:#?}"
+    );
+    assert!(
+        after[3].contains("line of text"),
+        "a result not read yet is not dropped: {after:#?}"
+    );
+    assert!(after[4].contains("drop_context"), "{after:#?}");
+    // The next turn replays the turn as it was last sent.
+    let history = harness_runtime::conversation_history(&store, &session)
+        .await
+        .expect("history reads")
+        .messages;
+    assert_eq!(results(&history), after, "replayed as sent");
+    drop(driver);
+    drop(runtime);
+    close(store).await;
+}

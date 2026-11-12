@@ -52,8 +52,9 @@ const ESTIMATE_BYTES_PER_TOKEN: usize = 4;
 
 /// Calls a node may not make: the host's own control tools, and a question
 /// to the user, which needs a model to read the answer.
-const NOT_BANKABLE: [&str; 4] = [
+const NOT_BANKABLE: [&str; 5] = [
     ACTION_BANK_TOOL,
+    crate::turn_driver::DROP_CONTEXT_TOOL,
     crate::turn_driver::TOOL_SCHEMA_TOOL,
     crate::turn_driver::USE_TOOL_TOOL,
     "ask_user",

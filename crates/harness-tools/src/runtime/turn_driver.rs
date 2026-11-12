@@ -1006,6 +1006,186 @@ fn trimmable_results(transcript: &[ProviderMessage], keep_recent: usize) -> Vec<
         .collect()
 }
 
+/// How every shortened tool result starts, whichever way it was shortened.
+const SHORTENED_START: &str = "[earlier tool result shortened to ";
+
+/// Whether a tool result was shortened already. A message is rewritten once:
+/// each rewrite changes what the provider cached, and a result cut to its
+/// start was cut again to a bare note a few steps later.
+fn is_shortened(content: &str) -> bool {
+    content.starts_with(SHORTENED_START)
+}
+
+/// The tool a model drops its own stale tool results with.
+pub const DROP_CONTEXT_TOOL: &str = "drop_context";
+
+/// How many of the newest tool results a rolling drop keeps when the
+/// setting names no number: AKV's (arXiv 2610.28577) expert policy.
+pub const DROP_KEEP_DEFAULT: usize = 12;
+
+/// When a turn drops tool results it no longer needs, besides when it is
+/// over its budget - AKV's cache policies, on a provider that caches a
+/// request by its start. There a drop leaves the cache as it is; here it
+/// rewrites a message that was sent, so the request is read again from that
+/// message on. Hence both are off unless asked for (`HA_CONTEXT_DROP`), a
+/// rolling drop works in batches, and what was dropped stays dropped.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContextDrop {
+    /// Keep this many of the newest tool results whole and drop the older
+    /// ones, a batch at a time (AKV's turn trigger and turn selection on tool
+    /// responses; reasoning and the model's own messages are never dropped).
+    pub keep: Option<usize>,
+    /// Give the model `drop_context` (AKV's cache-as-tool).
+    pub tool: bool,
+}
+
+impl ContextDrop {
+    /// From `HA_CONTEXT_DROP`: `keep`, `keep:<n>`, `tool`, or both with a
+    /// comma. Anything else, and unset, is off.
+    #[must_use]
+    pub fn from_env() -> Self {
+        std::env::var("HA_CONTEXT_DROP")
+            .map(|value| Self::parse(&value))
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        let mut drop = Self::default();
+        for part in value.split(',').map(str::trim) {
+            if part == "tool" {
+                drop.tool = true;
+            } else if part == "keep" {
+                drop.keep = Some(DROP_KEEP_DEFAULT);
+            } else if let Some(count) = part
+                .strip_prefix("keep:")
+                .and_then(|count| count.trim().parse::<usize>().ok())
+            {
+                drop.keep = Some(count.max(1));
+            }
+        }
+        drop
+    }
+}
+
+/// The schema of [`DROP_CONTEXT_TOOL`].
+#[must_use]
+pub fn drop_context_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": DROP_CONTEXT_TOOL,
+            "description": "Drop older tool results of this turn from the context: each is replaced by a one-line note, and you can call its tool again if you need it. Use it when many large results are no longer needed for what is left to do. It rewrites what was already sent, so the provider reads the conversation again once: drop many results in one call, not a few at a time, and not when the turn is nearly done.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keep_last": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "How many of the newest tool results stay whole."
+                    },
+                    "tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Only drop results of these tools (by name); every tool when left out."
+                    }
+                },
+                "required": ["keep_last"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+/// What a `drop_context` call asked for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DropRequest {
+    keep_last: usize,
+    tools: Option<Vec<String>>,
+}
+
+impl DropRequest {
+    fn parse(arguments: &str) -> Result<Self, String> {
+        let value = serde_json::from_str::<Value>(arguments)
+            .map_err(|error| format!("its arguments are not JSON: {error}"))?;
+        let keep_last = value["keep_last"]
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or("keep_last must be a whole number, 0 or more")?;
+        let tools = match &value["tools"] {
+            Value::Null => None,
+            Value::Array(names) => Some(
+                names
+                    .iter()
+                    .filter_map(|name| name.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => return Err("tools must be a list of tool names".to_owned()),
+        };
+        Ok(Self { keep_last, tools })
+    }
+}
+
+/// The call whose result `transcript[index]` is, as the repeated-read check
+/// names it: `name|arguments`.
+fn result_signature(transcript: &[ProviderMessage], index: usize) -> Option<String> {
+    let call_id = transcript[index].tool_call_id.as_ref()?;
+    transcript[..index]
+        .iter()
+        .rev()
+        .flat_map(|message| message.tool_calls.iter())
+        .find(|call| &call.call_id == call_id)
+        .map(|call| format!("{}|{}", call.name, call.arguments))
+}
+
+/// The name of the tool whose result `transcript[index]` is.
+fn result_tool(transcript: &[ProviderMessage], index: usize) -> Option<&str> {
+    let call_id = transcript[index].tool_call_id.as_ref()?;
+    transcript[..index]
+        .iter()
+        .rev()
+        .flat_map(|message| message.tool_calls.iter())
+        .find(|call| &call.call_id == call_id)
+        .map(|call| call.name.as_str())
+}
+
+/// The tool results still whole, among those of `tools` when given: their
+/// places, oldest first.
+fn whole_results(transcript: &[ProviderMessage], tools: Option<&[String]>) -> Vec<usize> {
+    (0..transcript.len())
+        .filter(|index| {
+            let message = &transcript[*index];
+            message.role == MessageRole::Tool
+                && !is_shortened(&message.content)
+                && message.content.len() > ELIDED_RESULT.len()
+                // The answer to a drop is not a result to keep or to drop.
+                && result_tool(transcript, *index) != Some(DROP_CONTEXT_TOOL)
+                && tools.is_none_or(|tools| {
+                    result_tool(transcript, *index)
+                        .is_some_and(|name| tools.iter().any(|tool| tool == name))
+                })
+        })
+        .collect()
+}
+
+/// Drop all but the newest `keep_last` whole tool results (of `tools`, when
+/// given): each becomes the one-line note. Returns how many were dropped
+/// and the bytes that saved.
+fn drop_results(
+    transcript: &mut [ProviderMessage],
+    keep_last: usize,
+    tools: Option<&[String]>,
+) -> (usize, usize) {
+    let whole = whole_results(transcript, tools);
+    let drop = whole.len().saturating_sub(keep_last);
+    let mut saved = 0;
+    for index in whole.iter().take(drop) {
+        saved += transcript[*index].content.len() - ELIDED_RESULT.len();
+        ELIDED_RESULT.clone_into(&mut transcript[*index].content);
+    }
+    (drop, saved)
+}
+
 /// A result kept short: the note, then its start.
 fn short_result(content: &str) -> String {
     let head = content.chars().take(SHORT_RESULT_CHARS).collect::<String>();
@@ -1029,6 +1209,20 @@ fn long_result(content: &str) -> String {
         "[earlier tool result shortened to its start and end to save context; call the tool again for all of it]\n{head}\n[... {} characters left out ...]\n{tail}",
         chars - 2 * LONG_RESULT_CHARS
     )
+}
+
+/// Record a drop of tool results that was not for the budget: who asked
+/// (`tool`: the model, `keep`: the rolling drop), how many and how much.
+fn note_dropped(by: &'static str, count: usize, bytes: usize, kept: usize) {
+    if count == 0 {
+        return;
+    }
+    harness_types::diag::info("context", "dropped")
+        .field("by", by)
+        .field("results", count)
+        .field("bytes", bytes)
+        .field("kept", kept)
+        .emit();
 }
 
 /// Keep a long turn's transcript within budget by shortening its oldest tool results.
@@ -1077,6 +1271,9 @@ fn trim_transcript(
             break;
         }
         let message = &mut transcript[index];
+        if is_shortened(&message.content) {
+            continue;
+        }
         let replacement = match ranks.get(&index) {
             Some(Visibility::Short) => short_result(&message.content),
             Some(Visibility::Long) => long_result(&message.content),
@@ -1293,6 +1490,8 @@ pub struct TurnDriver {
     learned_rules: Arc<crate::rules::LearnedRules>,
     /// Which earlier results the current request needs, when the host judges it.
     visibility: Option<Arc<dyn ResultVisibility>>,
+    /// When the turn drops tool results besides over budget.
+    drop: ContextDrop,
     admission: Option<Arc<dyn OutputAdmission>>,
     completion: Option<Arc<dyn CompletionCheck>>,
     /// Without a completion check: remind the model, once, to check a change
@@ -1669,6 +1868,7 @@ impl TurnDriver {
             context_hooks: None,
             learned_rules: Arc::default(),
             visibility: None,
+            drop: ContextDrop::from_env(),
             admission: None,
             completion: None,
             verify_reminder: false,
@@ -1707,6 +1907,14 @@ impl TurnDriver {
     #[must_use]
     pub fn with_visibility(mut self, visibility: Arc<dyn ResultVisibility>) -> Self {
         self.visibility = Some(visibility);
+        self
+    }
+
+    /// When the turn drops tool results besides over budget; the default is
+    /// what `HA_CONTEXT_DROP` says.
+    #[must_use]
+    pub fn with_context_drop(mut self, drop: ContextDrop) -> Self {
+        self.drop = drop;
         self
     }
 
@@ -2002,6 +2210,16 @@ impl TurnDriver {
         {
             request.tool_schemas.push(crate::bank::action_bank_schema());
         }
+        if self.drop.tool && parameters_schema(&request.tool_schemas, DROP_CONTEXT_TOOL).is_none() {
+            request.tool_schemas.push(drop_context_schema());
+        }
+        // What `drop_context` calls asked for, applied before the next request.
+        let mut drop_requests: Vec<DropRequest> = Vec::new();
+        // The calls whose shortened result is kept with the conversation.
+        let mut sent_short: HashSet<String> = HashSet::new();
+        let mut dropped_total = 0_usize;
+        // How much of the transcript the last request carried.
+        let mut sent_len = 0_usize;
 
         let first_step = match source_session_id {
             Some(source) => {
@@ -2659,6 +2877,35 @@ impl TurnDriver {
                         transcript_id,
                         Slot::Failed(message.clone(), message),
                     ));
+                    continue;
+                }
+                // The turn's transcript is the driver's: a drop is noted
+                // here and made before the next request.
+                if name == DROP_CONTEXT_TOOL && self.drop.tool {
+                    let slot = match DropRequest::parse(&call.arguments) {
+                        Ok(asked) => {
+                            let answer = format!(
+                                "drop_context: before the next step, every tool result{} but the newest {} is replaced by a one-line note; call a tool again if you need its result.",
+                                asked
+                                    .tools
+                                    .as_ref()
+                                    .map_or_else(String::new, |tools| format!(
+                                        " of {}",
+                                        tools.join(", ")
+                                    )),
+                                asked.keep_last
+                            );
+                            self.record_bank_answer(&result.run_id, &call.call_id, &answer)
+                                .await;
+                            drop_requests.push(asked);
+                            Slot::Answered(answer)
+                        }
+                        Err(reason) => Slot::Failed(
+                            format!("drop_context refused, nothing was dropped: {reason}"),
+                            reason,
+                        ),
+                    };
+                    slots.push((name.clone(), transcript_id, slot));
                     continue;
                 }
                 if name == TOOL_SCHEMA_TOOL && !self.deferred.is_empty() {
@@ -3360,6 +3607,31 @@ impl TurnDriver {
                 }
             }
             transcript.extend(appended);
+            // What the model asked to drop, then the rolling drop: once the
+            // whole results are twice what it keeps, so a drop - which
+            // rewrites what was sent - comes once in that many results.
+            //
+            // Only what a request has carried: a result that came back with
+            // the call that asked for the drop, or in the same batch, has not
+            // been read yet, and dropped then it never would be.
+            let read = &mut transcript[..sent_len];
+            for asked in drop_requests.drain(..) {
+                let (count, bytes) = drop_results(read, asked.keep_last, asked.tools.as_deref());
+                note_dropped("tool", count, bytes, asked.keep_last);
+                dropped_total += count;
+            }
+            if let Some(keep) = self.drop.keep
+                && whole_results(read, None).len() >= keep.saturating_mul(2)
+            {
+                let (count, bytes) = drop_results(read, keep, None);
+                note_dropped("keep", count, bytes, keep);
+                if count > 0 && dropped_total == 0 {
+                    observer.observe(TurnProgress::Notice(format!(
+                        "context: dropped {count} older tool result(s) of this turn, keeping the newest {keep} (HA_CONTEXT_DROP)"
+                    )));
+                }
+                dropped_total += count;
+            }
             // Over budget: ask the host which earlier results this request
             // needs before any is shortened.
             let ranks = match &self.visibility {
@@ -3385,6 +3657,30 @@ impl TurnDriver {
             for signature in &elided {
                 unchanged_reads.remove(signature);
             }
+            // Every result this step shortened or dropped is kept as it is
+            // now sent: the turn's later steps send it from this transcript,
+            // and the turns after this one from that record.
+            let mut newly = Vec::new();
+            for (index, message) in transcript.iter().enumerate() {
+                if message.role != MessageRole::Tool || !is_shortened(&message.content) {
+                    continue;
+                }
+                let Some(call) = message.tool_call_id.clone() else {
+                    continue;
+                };
+                if sent_short.insert(call.clone()) {
+                    // A dropped result reads as gone: reading it again is
+                    // no repeat.
+                    if let Some(signature) = result_signature(&transcript, index) {
+                        unchanged_reads.remove(&signature);
+                    }
+                    newly.push((call, message.content.clone()));
+                }
+            }
+            self.runtime
+                .record_sent_results(&request.task_id, &request.session_id, &newly)
+                .await;
+            sent_len = transcript.len();
             if !elided.is_empty() {
                 let first = trimmed_total == 0;
                 trimmed_total += elided.len();
@@ -6339,5 +6635,137 @@ mod tier_tests {
             .expect_err("not deferred");
         assert!(refused.contains("called directly"), "{refused}");
         assert!(unwrap_use_tool(&deferred(), r#"{"arguments": {}}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod context_drop_tests {
+    use super::{
+        ContextDrop, DROP_KEEP_DEFAULT, DropRequest, ELIDED_RESULT, drop_results, is_shortened,
+        short_result, trim_transcript, whole_results,
+    };
+    use harness_providers::{MessageRole, ProviderMessage, ProviderToolCall};
+
+    /// `count` steps, each a call of `tool` and its result of `bytes` bytes.
+    fn steps(tool: &str, count: usize, bytes: usize) -> Vec<ProviderMessage> {
+        (0..count)
+            .flat_map(|index| {
+                let call = format!("{tool}-{index}");
+                [
+                    ProviderMessage::assistant_with_calls(
+                        String::new(),
+                        vec![ProviderToolCall {
+                            call_id: call.clone(),
+                            name: tool.to_owned(),
+                            arguments: format!(r#"{{"n":{index}}}"#),
+                        }],
+                    ),
+                    ProviderMessage::tool_result(call, "x".repeat(bytes)),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_setting_names_a_rolling_drop_the_tool_or_both() {
+        assert_eq!(ContextDrop::parse(""), ContextDrop::default());
+        assert_eq!(ContextDrop::parse("on"), ContextDrop::default());
+        assert_eq!(
+            ContextDrop::parse("keep"),
+            ContextDrop {
+                keep: Some(DROP_KEEP_DEFAULT),
+                tool: false
+            }
+        );
+        assert_eq!(
+            ContextDrop::parse("tool, keep:20"),
+            ContextDrop {
+                keep: Some(20),
+                tool: true
+            }
+        );
+        // Keeping none would drop the result the model is reading.
+        assert_eq!(ContextDrop::parse("keep:0").keep, Some(1));
+    }
+
+    #[test]
+    fn a_drop_request_names_how_many_stay_and_of_which_tools() {
+        assert_eq!(
+            DropRequest::parse(r#"{"keep_last": 3}"#),
+            Ok(DropRequest {
+                keep_last: 3,
+                tools: None
+            })
+        );
+        assert_eq!(
+            DropRequest::parse(r#"{"keep_last": 0, "tools": ["read_file"]}"#),
+            Ok(DropRequest {
+                keep_last: 0,
+                tools: Some(vec!["read_file".to_owned()])
+            })
+        );
+        assert!(DropRequest::parse(r#"{"tools": ["read_file"]}"#).is_err());
+        assert!(DropRequest::parse(r#"{"keep_last": -1}"#).is_err());
+        assert!(DropRequest::parse("keep 3").is_err());
+    }
+
+    /// The newest results stay whole, the older ones become the note, and
+    /// the model's own messages are never touched.
+    #[test]
+    fn a_drop_keeps_the_newest_results_and_every_assistant_message() {
+        let mut transcript = steps("read_file", 6, 500);
+        let before = transcript.clone();
+        assert_eq!(
+            drop_results(&mut transcript, 2, None),
+            (4, 4 * (500 - ELIDED_RESULT.len()))
+        );
+        for (index, message) in transcript.iter().enumerate() {
+            if message.role != MessageRole::Tool {
+                assert_eq!(message, &before[index]);
+            } else if index < 8 {
+                assert_eq!(message.content, ELIDED_RESULT);
+            } else {
+                assert_eq!(message, &before[index], "the newest two stay whole");
+            }
+        }
+        // What was dropped stays dropped: a second drop finds two whole
+        // results and keeps them.
+        let once = transcript.clone();
+        assert_eq!(drop_results(&mut transcript, 2, None), (0, 0));
+        assert_eq!(transcript, once);
+        assert_eq!(whole_results(&transcript, None), vec![9, 11]);
+    }
+
+    #[test]
+    fn a_drop_can_name_the_tools_whose_results_go() {
+        let mut transcript = steps("read_file", 3, 500);
+        transcript.extend(steps("run_shell", 3, 500));
+        let tools = ["run_shell".to_owned()];
+        assert_eq!(drop_results(&mut transcript, 1, Some(&tools)).0, 2);
+        assert_eq!(whole_results(&transcript, None).len(), 4);
+        assert!(
+            transcript[..6]
+                .iter()
+                .all(|message| !is_shortened(&message.content))
+        );
+    }
+
+    /// A result shortened once is not shortened again: each rewrite changes
+    /// a message the provider cached. A result cut to its start became the
+    /// bare note when a later step was over budget again.
+    #[test]
+    fn a_result_is_rewritten_once() {
+        let mut transcript = steps("read_file", 10, 40_000);
+        transcript[1].content = short_result(&transcript[1].content);
+        let short = transcript[1].content.clone();
+        let elided = trim_transcript(
+            &mut transcript,
+            200_000,
+            2,
+            &std::collections::HashMap::new(),
+        );
+        assert!(!elided.is_empty(), "the turn was over budget");
+        assert_eq!(transcript[1].content, short, "the short form is kept");
+        assert_eq!(transcript[3].content, ELIDED_RESULT);
     }
 }

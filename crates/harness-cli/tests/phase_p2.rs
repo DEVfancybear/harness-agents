@@ -1107,7 +1107,11 @@ async fn p2_c06c_a_continuation_whose_checkpoint_failed_still_owns_its_task() {
     )
     .with_summarizer(Arc::new(Summary(Arc::clone(&down))));
     runtime
-        .run(request(first.clone(), task_id.clone(), "original task"))
+        .run(request(
+            first.clone(),
+            task_id.clone(),
+            "original task, with a summarizer that goes down",
+        ))
         .await
         .unwrap();
     let mut previous = first;
@@ -1126,7 +1130,11 @@ async fn p2_c06c_a_continuation_whose_checkpoint_failed_still_owns_its_task() {
         let result = runtime
             .continue_task(
                 &previous,
-                request(next.clone(), task_id.clone(), &format!("continue {turn}")),
+                request(
+                    next.clone(),
+                    task_id.clone(),
+                    &format!("go on past the summarizer, {turn}"),
+                ),
             )
             .await;
         if near {
@@ -1442,4 +1450,230 @@ fn p2_provider_decoder_rejects_malformed_frame() {
     let mut decoder = SseDecoder::new();
     let error = decoder.feed(b"data: {not-json}\n\n").unwrap_err();
     assert_eq!(error.code(), ErrorCode::ProviderProtocol);
+}
+
+/// A provider that refuses its first `refusals` requests as over the model's
+/// window, then answers; it notes the state of the turn's run each time it is
+/// asked again.
+struct Overflowing {
+    refusals: usize,
+    calls: std::sync::atomic::AtomicUsize,
+    store: Arc<SqliteStore>,
+    input: InputId,
+    seen: Arc<std::sync::Mutex<Vec<harness_store_sqlite::RunState>>>,
+    answer: Arc<MockProvider>,
+}
+
+impl ModelProvider for Overflowing {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::deepseek_fixture()
+    }
+    fn stream(
+        &self,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> harness_providers::ProviderFuture {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let refuse = call < self.refusals;
+        let store = Arc::clone(&self.store);
+        let input = self.input.clone();
+        let seen = Arc::clone(&self.seen);
+        let answer = Arc::clone(&self.answer);
+        Box::pin(async move {
+            if call > 0
+                && let Ok(Some(run)) = store.run_by_input(&input).await
+            {
+                seen.lock().unwrap().push(run.state);
+            }
+            drop(store);
+            if refuse {
+                return Err(harness_providers::ProviderError::new(
+                    ErrorCode::InvalidPayload,
+                    "prompt is too long: 250000 tokens > 200000 maximum",
+                ));
+            }
+            answer.stream(request, cancellation).await
+        })
+    }
+}
+
+/// A request the provider refused as over its window is tried once more
+/// after a compaction, on the same run. The refused step finished the run as
+/// `failed` first: it read failed while the second try worked, and stayed
+/// failed whenever that try ended any way but by an answer.
+#[tokio::test]
+async fn p2_a_run_the_provider_refused_as_too_long_stays_open_for_its_second_try() {
+    let temp = TempDir::new().unwrap();
+    let store = writer(&temp).await;
+    let session_id = SessionId::generate();
+    let turn = request(session_id.clone(), TaskId::generate(), "a long request");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(Overflowing {
+        refusals: 1,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        store: Arc::clone(&store),
+        input: turn.input_id.clone(),
+        seen: Arc::clone(&seen),
+        answer: Arc::new(MockProvider::text("done")),
+    });
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        provider,
+        RuntimeConfig::default().with_max_attempts(1),
+    );
+    runtime
+        .run(turn.clone())
+        .await
+        .expect("the second try answers");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![harness_store_sqlite::RunState::Running],
+        "the run is open while it is tried again"
+    );
+    let run = store
+        .run_by_input(&turn.input_id)
+        .await
+        .unwrap()
+        .expect("the run was claimed");
+    assert_ne!(run.state, harness_store_sqlite::RunState::Failed);
+    assert_eq!(
+        store.pending_runtime_commands(&session_id).await.unwrap(),
+        0
+    );
+    drop(runtime);
+    close_writer(store).await;
+}
+
+/// The same when the second try is refused too: the run ends failed, once.
+#[tokio::test]
+async fn p2_a_run_refused_as_too_long_twice_ends_failed() {
+    let temp = TempDir::new().unwrap();
+    let store = writer(&temp).await;
+    let session_id = SessionId::generate();
+    let turn = request(session_id.clone(), TaskId::generate(), "a long request");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(Overflowing {
+        refusals: 2,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        store: Arc::clone(&store),
+        input: turn.input_id.clone(),
+        seen: Arc::clone(&seen),
+        answer: Arc::new(MockProvider::text("done")),
+    });
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        provider,
+        RuntimeConfig::default().with_max_attempts(1),
+    );
+    runtime
+        .run(turn.clone())
+        .await
+        .expect_err("both tries were refused");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![harness_store_sqlite::RunState::Running]
+    );
+    let run = store
+        .run_by_input(&turn.input_id)
+        .await
+        .unwrap()
+        .expect("the run was claimed");
+    assert_eq!(run.state, harness_store_sqlite::RunState::Failed);
+    assert_eq!(
+        store.pending_runtime_commands(&session_id).await.unwrap(),
+        0
+    );
+    drop(runtime);
+    close_writer(store).await;
+}
+
+/// A checkpoint of the whole conversation starts from the summary the turns'
+/// own compactions kept, and summarises only what came after it. It wrote
+/// the conversation again from its first message - a request per window of
+/// transcript, four minutes before a turn in bug report 20261112 - although
+/// that start already had its summary.
+#[tokio::test]
+async fn p2_a_checkpoint_starts_from_the_summary_the_turns_kept() {
+    #[derive(Default)]
+    struct Recording(std::sync::Mutex<Vec<String>>);
+    impl harness_runtime::SummaryProvider for Recording {
+        fn summarize(
+            &self,
+            _recovery: &harness_session::RecoveryView,
+        ) -> Result<String, harness_runtime::RuntimeError> {
+            Ok("session state".to_owned())
+        }
+        fn summarize_conversation(
+            &self,
+            prompt: &str,
+            _budget_tokens: u64,
+        ) -> Result<String, harness_runtime::RuntimeError> {
+            let mut prompts = self.0.lock().unwrap();
+            prompts.push(prompt.to_owned());
+            Ok(format!("## Goal\nKEPT_SUMMARY_{}", prompts.len()))
+        }
+    }
+    let temp = TempDir::new().unwrap();
+    let store = writer(&temp).await;
+    let summary = Arc::new(Recording::default());
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        Arc::new(MockProvider::text("zeta reply ".repeat(60))),
+        RuntimeConfig {
+            context_window_tokens: 40_000,
+            output_reservation_tokens: 1024,
+            compaction_reserve_tokens: 1000,
+            estimate_scale: Some(2.5),
+            ..RuntimeConfig::default()
+        },
+    )
+    .with_summarizer(Arc::clone(&summary) as Arc<dyn harness_runtime::SummaryProvider>);
+    let task_id = TaskId::generate();
+    let question = |turn: usize| format!("zeta question {turn}: {}", "context ".repeat(60));
+    let mut previous = SessionId::generate();
+    runtime
+        .run(request(previous.clone(), task_id.clone(), &question(0)))
+        .await
+        .unwrap();
+    for turn in 1..90 {
+        store.release_task_lease(&task_id).await.unwrap();
+        let next = SessionId::generate();
+        runtime
+            .continue_task(
+                &previous,
+                request(next.clone(), task_id.clone(), &question(turn)),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("turn {turn}: {error}"));
+        previous = next;
+    }
+    let kept = summary.0.lock().unwrap().len();
+    assert!(kept >= 1, "the turns summarised their earlier part");
+    assert!(
+        runtime
+            .conversation_history(&previous)
+            .await
+            .unwrap()
+            .summary
+            .is_none(),
+        "no checkpoint yet: the turns kept a summary of their own"
+    );
+    store.release_task_lease(&task_id).await.unwrap();
+    runtime.compact(&previous).await.expect("the checkpoint");
+    let prompts = summary.0.lock().unwrap()[kept..].to_vec();
+    assert!(!prompts.is_empty(), "what came after was summarised");
+    assert!(
+        prompts[0].contains("<previous-summary>\n## Goal\nKEPT_SUMMARY_"),
+        "it starts from the kept summary: {}",
+        prompts[0]
+    );
+    for prompt in &prompts {
+        let transcript = prompt.split("</conversation>").next().unwrap_or_default();
+        assert!(
+            !transcript.contains("[User]: zeta question 0:"),
+            "the start is not read again: {transcript}"
+        );
+    }
+    drop(runtime);
+    close_writer(store).await;
 }

@@ -2413,22 +2413,12 @@ impl InteractiveController {
 
     /// A child's message to its parent, delivered as prime-agent delivers agent
     /// messages: into the running turn at its next step, or as a turn of its own.
-    fn deliver_agent_message(&mut self, text: String, effects: &mut Vec<Effect>) {
+    ///
+    /// `steered` is what the user is told when it went into the running turn.
+    fn deliver_agent_message(&mut self, text: String, steered: String, effects: &mut Vec<Effect>) {
         if self.phase.has_active_run() && self.service.deliver_message(&text).is_ok() {
             note_delivery("steered", &text, "turn_running", 0);
-            self.push_history(
-                effects,
-                // A background command's end is delivered the same way,
-                // and is not a child's message.
-                HistoryItem::Notice {
-                    message: if text.starts_with("[bash-done ") {
-                        "a background command's end reached the running turn"
-                    } else {
-                        "a child's message reached the running turn"
-                    }
-                    .to_owned(),
-                },
-            );
+            self.push_history(effects, HistoryItem::Notice { message: steered });
         } else if self.free_for_automatic_turn()
             && !self.notices_held
             && self.pending_notices.is_empty()
@@ -3405,7 +3395,11 @@ impl InteractiveController {
                 }
             }
             SessionEvent::AgentMessage { text } => {
-                self.deliver_agent_message(text, effects);
+                self.deliver_agent_message(
+                    text,
+                    "a child's message reached the running turn".to_owned(),
+                    effects,
+                );
             }
             SessionEvent::AgentExchange { from, to, text } => {
                 self.push_history(effects, HistoryItem::AgentExchange { from, to, text });
@@ -3417,7 +3411,17 @@ impl InteractiveController {
                 command,
                 exit_code,
             } => {
-                self.deliver_agent_message(bash_done_notice(pid, &command, exit_code), effects);
+                // Which command ended and how: a turn that left many running
+                // showed the same line for each, a hundred times in one
+                // session, and none said what had finished.
+                self.deliver_agent_message(
+                    bash_done_notice(pid, &command, exit_code),
+                    format!(
+                        "background command ended (exit {exit_code}): {}",
+                        command_head(&command)
+                    ),
+                    effects,
+                );
             }
             SessionEvent::BashConsumed { pid, command } => {
                 // One read withdraws one notice that has not been delivered yet.
@@ -6907,6 +6911,36 @@ impl InteractiveController {
             self.phase = AppPhase::Closed;
             effects.push(Effect::Exit(EXIT_SUCCESS));
         }
+    }
+}
+
+/// The start of a command's first line, for a one-line notice.
+fn command_head(command: &str) -> String {
+    const HEAD_CHARS: usize = 72;
+    let line = command.trim().lines().next().unwrap_or_default().trim();
+    let rest = command.trim().len() > line.len();
+    if line.chars().count() <= HEAD_CHARS && !rest {
+        return line.to_owned();
+    }
+    let mut head = line.chars().take(HEAD_CHARS).collect::<String>();
+    head.push('…');
+    head
+}
+
+#[cfg(test)]
+mod command_head_tests {
+    use super::command_head;
+
+    /// A notice names the command in one line: short ones whole, long or
+    /// many-lined ones by their start.
+    #[test]
+    fn a_command_is_named_by_the_start_of_its_first_line() {
+        assert_eq!(command_head("  cargo test  "), "cargo test");
+        assert_eq!(command_head("make\nmake install"), "make…");
+        let long = "x".repeat(200);
+        let head = command_head(&long);
+        assert_eq!(head.chars().count(), 73);
+        assert!(head.ends_with('…'));
     }
 }
 

@@ -1592,6 +1592,10 @@ fn summary_cache() -> &'static Mutex<std::collections::HashMap<String, String>> 
 /// What a tool result shortened to fit the window says instead of its content.
 const FITTED_RESULT: &str = "[this earlier tool result was removed to keep the conversation within the model's context window; run the tool again if its output is needed]";
 
+/// How a tool result starts that the turn's driver shortened already
+/// (`harness-tools`): it is not shortened a second time here.
+const TURN_SHORTENED_START: &str = "[earlier tool result shortened to ";
+
 /// How much of a shortened tool result's start it keeps.
 const FITTED_HEAD_CHARS: usize = 400;
 
@@ -1631,7 +1635,10 @@ fn fit_tool_results(messages: &mut [ProviderMessage], budget: u64) -> usize {
         if total <= target || (total <= budget && Some(index) == newest) {
             break;
         }
-        if message.role != MessageRole::Tool || message.content.starts_with(FITTED_RESULT) {
+        if message.role != MessageRole::Tool
+            || message.content.starts_with(FITTED_RESULT)
+            || message.content.starts_with(TURN_SHORTENED_START)
+        {
             continue;
         }
         let fitted = fitted_result(&message.content);
@@ -1746,6 +1753,14 @@ pub struct RunRequest {
     turn_summary: Arc<Mutex<Option<(usize, String)>>>,
     /// The summary of this turn's steps failed: the turn goes on without it.
     turn_summary_failed: Arc<AtomicBool>,
+    /// This step is the one more try after the provider refused the request
+    /// as over its window: a refusal now ends the run.
+    overflow_retry: bool,
+    /// The results a step of this turn sent shortened, by call, as they
+    /// were sent. Shared across the turn's steps: a result sent short is sent
+    /// again as that text, whatever the budget of a later step would allow
+    /// and whatever the turn's own transcript has made of it since.
+    fitted_results: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// Whether a cold, long conversation starts fresh for this input.
     fresh_start_judge: Option<Arc<dyn FreshStartJudge>>,
 }
@@ -1797,6 +1812,8 @@ impl RunRequest {
             earlier_summary_failed: Arc::new(AtomicBool::new(false)),
             turn_summary: Arc::new(Mutex::new(None)),
             turn_summary_failed: Arc::new(AtomicBool::new(false)),
+            overflow_retry: false,
+            fitted_results: Arc::new(Mutex::new(std::collections::HashMap::new())),
             fresh_start_judge: None,
         }
     }
@@ -2686,10 +2703,16 @@ impl ConversationHistory {
     /// turns the host started are not theirs.
     #[must_use]
     pub fn user_texts(&self) -> Vec<String> {
+        self.user_texts_from(0)
+    }
+
+    /// [`Self::user_texts`] of the messages from `start` on.
+    fn user_texts_from(&self, start: usize) -> Vec<String> {
         let bare = self.bare_inputs();
         self.messages
             .iter()
             .enumerate()
+            .skip(start)
             .filter(|(_, message)| message.role == MessageRole::User)
             .map(|(index, message)| {
                 bare.iter()
@@ -3245,7 +3268,7 @@ async fn turn_steps(
     if steering.is_empty() && !used_tools {
         return Ok(None);
     }
-    let results = store.recovered_tool_results(session_id).await?;
+    let results = results_as_sent(store, session_id).await?;
     let started = store.tool_intent_call_ids(session_id).await?;
     let answered = attempts_in(attempts, &["completed"])
         .into_iter()
@@ -3317,6 +3340,73 @@ async fn turn_steps(
     } else {
         TurnBody::Worked(steps)
     }))
+}
+
+/// The task setting, per turn (`sent_results:<session id>`), that keeps the
+/// tool results the turn sent shortened, as they were sent, by call:
+/// `[[call id, text], ...]`, oldest first. Per turn because a call id is
+/// only unique within one: kept for the conversation, a later turn's
+/// `call_0` was replayed as an earlier turn's shortened result. AKV (arXiv 2610.28577) keeps its cache operations in a log every
+/// request restates; a provider that caches by a request's start needs the
+/// same of the text: what was cut once is cut the same way in every request
+/// after it, in this turn and the next.
+pub const SENT_RESULTS_SETTING: &str = "sent_results:";
+
+/// How many shortened results a turn keeps the sent form of: the oldest
+/// are forgotten first.
+const SENT_RESULTS_KEPT: usize = 4000;
+
+/// The tool results of the turn of `session`, each as the turn last sent it.
+///
+/// A result the turn sent shortened is replayed as it was sent. The record
+/// holds every result whole, so the next turn sent whole again what this one
+/// had cut: a different message in the middle of what the provider had
+/// cached, and the window the turn had made room in filled back up.
+async fn results_as_sent(
+    store: &SqliteStore,
+    session: &SessionId,
+) -> Result<Vec<harness_store_sqlite::RecoveredToolResult>, RuntimeError> {
+    let mut results = store.recovered_tool_results(session).await?;
+    if results.is_empty() {
+        return Ok(results);
+    }
+    let sent = sent_results(store, session).await;
+    if !sent.is_empty() {
+        for result in &mut results {
+            if let Some(text) = result.call_id.as_ref().and_then(|call| sent.get(call)) {
+                result.text.clone_from(text);
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// The results the conversation of `session` sent shortened, by call.
+async fn sent_results(
+    store: &SqliteStore,
+    session: &SessionId,
+) -> std::collections::HashMap<String, String> {
+    let Some(task) = store.session_task(session).await.ok().flatten() else {
+        return std::collections::HashMap::new();
+    };
+    read_sent_results(store, &task, session)
+        .await
+        .into_iter()
+        .collect()
+}
+
+async fn read_sent_results(
+    store: &SqliteStore,
+    task: &TaskId,
+    session: &SessionId,
+) -> Vec<(String, String)> {
+    store
+        .session_setting(task, &format!("{SENT_RESULTS_SETTING}{session}"))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
 }
 
 /// What goes back between two steps of a replayed turn besides the steps.
@@ -3683,6 +3773,10 @@ pub struct RuntimeService {
     /// The provider's measured prompt over this host's estimate of it, at the
     /// last response that reported usage. See [`Self::estimate_scale`].
     estimate_scale: Arc<Mutex<Option<f64>>>,
+    /// What the last request of each conversation was made of, part by part
+    /// ([`request_parts`]), to tell a request that only adds to it from one
+    /// that rewrites it. See [`rewritten_at`].
+    sent_parts: Arc<Mutex<std::collections::HashMap<String, Vec<u64>>>>,
     /// The command and run each step in flight has claimed, by its input.
     /// See [`Self::settle_abandoned_step`].
     open_steps: Arc<Mutex<std::collections::HashMap<String, OpenStep>>>,
@@ -3690,6 +3784,52 @@ pub struct RuntimeService {
     /// looked up as files for a summary's file lists. See
     /// [`Self::with_workspace_root`].
     workspace_root: Option<std::path::PathBuf>,
+}
+
+/// A request as the parts a provider's cache reads in order, each by its
+/// hash: the tools, then every message from the system prompt on.
+fn request_parts(tools: &[Value], conversation: &[ProviderMessage]) -> Vec<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut parts = Vec::with_capacity(conversation.len() + 1);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for tool in tools {
+        tool.to_string().hash(&mut hasher);
+    }
+    parts.push(hasher.finish());
+    // What a provider is sent of a message, hashed where it lies: a request
+    // of hundreds of messages is not serialised a second time for this.
+    parts.extend(conversation.iter().map(|message| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (message.role as u8).hash(&mut hasher);
+        message.content.hash(&mut hasher);
+        message.tool_call_id.hash(&mut hasher);
+        message.harness_issued.hash(&mut hasher);
+        for call in &message.tool_calls {
+            call.call_id.hash(&mut hasher);
+            call.name.hash(&mut hasher);
+            call.arguments.hash(&mut hasher);
+        }
+        message.attachments.len().hash(&mut hasher);
+        hasher.finish()
+    }));
+    parts
+}
+
+/// The first part of `before` that `now` does not repeat, when there is one:
+/// a request that sends all of the last one and more rewrote nothing.
+fn rewritten_at(before: &[u64], now: &[u64]) -> Option<usize> {
+    let same = before
+        .iter()
+        .zip(now)
+        .take_while(|(before, now)| before == now)
+        .count();
+    (same < before.len()).then_some(same)
+}
+
+/// Whether a summary ended because the turn was canceled, not because the
+/// summarizer failed.
+fn summary_canceled(error: &RuntimeError, cancellation: &CancellationToken) -> bool {
+    cancellation.is_cancelled() || error.code() == ErrorCode::ProviderCanceled
 }
 
 /// What a step in flight has claimed and must leave settled.
@@ -3844,6 +3984,7 @@ impl RuntimeService {
             stored_packet: Arc::new(Mutex::new(None)),
             estimate_scale: Arc::new(Mutex::new(None)),
             open_steps: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            sent_parts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             workspace_root: None,
         }
     }
@@ -4059,10 +4200,16 @@ impl RuntimeService {
             return first;
         };
         if cancellation.is_cancelled() || !is_context_overflow(&error.to_string()) {
+            // Canceled just after the step left its run open for a second
+            // try: no try follows.
+            if is_context_overflow(&error.to_string()) {
+                self.fail_open_run(request).await;
+            }
             self.settle_abandoned_step(request, Some(error), true).await;
             return first;
         }
         let Ok(compacted) = self.compact(&request.session_id).await else {
+            self.fail_open_run(request).await;
             self.settle_abandoned_step(request, Some(error), true).await;
             return first;
         };
@@ -4071,15 +4218,149 @@ impl RuntimeService {
             .await;
         let mut request = request.clone();
         request.continuation_context = Some(compacted.packet.content);
+        request.overflow_retry = true;
         let mut appended = appended.to_vec();
         let budget = messages_tokens(&appended) / 2;
         fit_tool_results(&mut appended, budget);
+        self.keep_fitted(&request, &appended).await;
         let second = self
             .run_inner(&request, cancellation, sink, false, &appended)
             .await;
+        // A second try that returned before its provider call left the run
+        // as the first did: open.
+        if second.is_err() {
+            self.fail_open_run(&request).await;
+        }
         self.settle_abandoned_step(&request, second.as_ref().err(), true)
             .await;
         second
+    }
+
+    /// Keep the form in which tool results were sent shortened, by call, so
+    /// every later request sends them the same way ([`SENT_RESULTS_SETTING`]).
+    /// A call already kept stays as it was first sent.
+    pub async fn record_sent_results(
+        &self,
+        task_id: &TaskId,
+        session_id: &SessionId,
+        results: &[(String, String)],
+    ) {
+        if results.is_empty() {
+            return;
+        }
+        let mut kept = read_sent_results(&self.store, task_id, session_id).await;
+        let before = kept.len();
+        for (call, text) in results {
+            if !kept.iter().any(|(known, _)| known == call) {
+                kept.push((call.clone(), text.clone()));
+            }
+        }
+        if kept.len() == before {
+            return;
+        }
+        if kept.len() > SENT_RESULTS_KEPT {
+            kept.drain(..kept.len() - SENT_RESULTS_KEPT);
+        }
+        // Losing it costs a cache miss at the next turn, never the turn.
+        if let Ok(text) = serde_json::to_string(&kept) {
+            let _ = self
+                .store
+                .set_session_setting(
+                    task_id,
+                    &format!("{SENT_RESULTS_SETTING}{session_id}"),
+                    &text,
+                )
+                .await;
+        }
+    }
+
+    /// Record a request that rewrote part of what its conversation's last
+    /// request sent, instead of only adding to it. A provider's cache holds a
+    /// request by its start: from the first part that changed on, the request
+    /// is read again at full price. Nothing recorded which requests did that,
+    /// or where: a low cache share in a report had no cause to point at.
+    fn note_rewritten(&self, request: &RunRequest, conversation: &[ProviderMessage]) {
+        let parts = request_parts(&request.tool_schemas, conversation);
+        let Ok(mut sent) = self.sent_parts.lock() else {
+            return;
+        };
+        if sent.len() >= 64 && !sent.contains_key(request.task_id.as_str()) {
+            sent.clear();
+        }
+        let before = sent.insert(request.task_id.as_str().to_owned(), parts.clone());
+        let Some(before) = before else {
+            return;
+        };
+        let Some(at) = rewritten_at(&before, &parts) else {
+            return;
+        };
+        // Part 0 is the tools, and the messages follow from the system prompt.
+        let what = match at {
+            0 => "tools",
+            1 => "system",
+            _ => match conversation.get(at - 1).map(|message| message.role) {
+                Some(MessageRole::Tool) => "tool_result",
+                Some(MessageRole::Assistant) => "assistant",
+                Some(_) => "user",
+                // The request ends before the last one did.
+                None => "shorter",
+            },
+        };
+        harness_types::diag::info("cache", "prefix_rewritten")
+            .task(request.task_id.as_str())
+            .session(request.session_id.as_str())
+            .field("what", what)
+            .field("at", at)
+            .field("sent_before", before.len())
+            .field("now", parts.len())
+            .emit();
+    }
+
+    /// Keep the results of `appended` this step shortened for room: for the
+    /// turn's later steps and, with the conversation, for the turns after.
+    async fn keep_fitted(&self, request: &RunRequest, appended: &[ProviderMessage]) {
+        let sent = appended
+            .iter()
+            .filter(|message| {
+                message.role == MessageRole::Tool && message.content.starts_with(FITTED_RESULT)
+            })
+            .filter_map(|message| Some((message.tool_call_id.clone()?, message.content.clone())))
+            .collect::<Vec<_>>();
+        if let Ok(mut fitted) = request.fitted_results.lock() {
+            for (call, text) in &sent {
+                fitted.entry(call.clone()).or_insert_with(|| text.clone());
+            }
+        }
+        self.record_sent_results(&request.task_id, &request.session_id, &sent)
+            .await;
+    }
+
+    /// End as failed the run of a step the provider refused as over its
+    /// window, when the try that would have followed cannot be made. The
+    /// step left it running for that try: see the end of [`Self::run_inner`].
+    async fn fail_open_run(&self, request: &RunRequest) {
+        let run_id = self.open_steps.lock().ok().and_then(|open| {
+            open.get(&open_step_key(request))
+                .map(|open| open.run_id.clone())
+        });
+        let Some(run_id) = run_id else {
+            return;
+        };
+        if let Ok(Some(run)) = self.store.run_by_id(&run_id).await
+            && run.state == RunState::Running
+        {
+            let _ = self
+                .store
+                .finish_run(
+                    &run.run_id,
+                    run.revision,
+                    RunState::Failed,
+                    None,
+                    Some("provider_failed"),
+                    None,
+                )
+                .await;
+        }
     }
 
     /// End what a step left open when it returned before its provider call
@@ -4177,6 +4458,30 @@ impl RuntimeService {
         // earlier turns, shortened tool results, a continuation context - is
         // held beside them and copies only when it happens.
         let mut appended = std::borrow::Cow::Borrowed(appended);
+        // A result an earlier step of this turn sent shortened is sent
+        // shortened again. Each step shortened from the whole results against
+        // a budget read in the provider's measure, which moves with every
+        // response: a result sent short came back whole a step later, a
+        // message in the middle of what the provider had cached, and
+        // everything after it was read again at full price.
+        if let Ok(fitted) = request.fitted_results.lock()
+            && !fitted.is_empty()
+        {
+            let sent = |message: &ProviderMessage| {
+                (message.role == MessageRole::Tool)
+                    .then(|| fitted.get(message.tool_call_id.as_ref()?))
+                    .flatten()
+                    .filter(|sent| **sent != message.content)
+                    .cloned()
+            };
+            if appended.iter().any(|message| sent(message).is_some()) {
+                for message in appended.to_mut().iter_mut() {
+                    if let Some(sent) = sent(message) {
+                        message.content = sent;
+                    }
+                }
+            }
+        }
         let config = self
             .config
             .lock()
@@ -4387,6 +4692,8 @@ impl RuntimeService {
         // whether it is close to having to: the driver recites the task after
         // the one and asks the model to save what matters at the other.
         let mut summarized = false;
+        // Whether this step wrote a checkpoint: the packet it sends is new.
+        let mut checkpointed = request.overflow_retry;
         let near_limit = matches!(&attempt, Ok(built)
             if self.scaled_estimate(&config, built.packet.token_estimate)
                 > threshold / 5 * 4
@@ -4560,6 +4867,18 @@ impl RuntimeService {
                         ));
                         }
                     }
+                    // A summary the user stopped did not fail: the turn ends
+                    // canceled just below, and a report that listed it as an
+                    // error sent its reader looking for a broken summarizer.
+                    Err(error) if summary_canceled(&error, &cancellation) => {
+                        harness_types::diag::info("compaction", "earlier_summary_canceled")
+                            .task(request.task_id.as_str())
+                            .session(request.session_id.as_str())
+                            .field("before", (before != u64::MAX).then_some(before))
+                            .field("older", older.len())
+                            .field("prefix", prefix.len())
+                            .emit();
+                    }
                     Err(error) => {
                         harness_types::diag::error("compaction", "earlier_summary_failed")
                             .task(request.task_id.as_str())
@@ -4588,6 +4907,7 @@ impl RuntimeService {
             let budget = messages_tokens(&appended).saturating_sub(over.max(1));
             let shortened = fit_tool_results(appended.to_mut(), budget);
             if shortened > 0 {
+                self.keep_fitted(request, &appended).await;
                 harness_types::diag::info("compaction", "tool_results_shortened")
                     .task(request.task_id.as_str())
                     .session(request.session_id.as_str())
@@ -4654,6 +4974,12 @@ impl RuntimeService {
                     ));
                 }
                 Ok(None) => {}
+                Err(error) if summary_canceled(&error, &cancellation) => {
+                    harness_types::diag::info("compaction", "turn_summary_canceled")
+                        .task(request.task_id.as_str())
+                        .session(request.session_id.as_str())
+                        .emit();
+                }
                 Err(error) => {
                     harness_types::diag::error("compaction", "turn_summary_failed")
                         .task(request.task_id.as_str())
@@ -4680,6 +5006,7 @@ impl RuntimeService {
                 .is_ok()
         {
             let compacted = self.compact(&request.session_id).await?;
+            checkpointed = true;
             harness_types::diag::info("compaction", "auto")
                 .task(request.task_id.as_str())
                 .session(request.session_id.as_str())
@@ -4746,7 +5073,16 @@ impl RuntimeService {
         // A step that compacted the context sends its new packet, which is kept.
         let packet_key = format!("{}|{}", request.session_id, request.input_id);
         let packet = {
-            let fresh = appended.is_empty() || continuation_context.is_some();
+            // Only a step that wrote a checkpoint, not every step of a
+            // conversation that has one: a conversation continued from a
+            // summary carries it into every turn, so each of its steps built
+            // the packet again and what changed in it mid-turn - the very
+            // thing this keeps out - cost the cache of the turn so far.
+            let known = self
+                .turn_packets
+                .lock()
+                .is_ok_and(|packets| packets.contains_key(&packet_key));
+            let fresh = appended.is_empty() || checkpointed || !known;
             // What the budget cut or left out of the packet that is sent, once
             // per packet: a block cut to its cap or dropped for the optional
             // budget is otherwise invisible to a bug report.
@@ -4820,6 +5156,7 @@ impl RuntimeService {
                 format!("provider transcript is invalid: {error}"),
             )
         })?;
+        self.note_rewritten(request, &conversation);
         let provider_request = ProviderRequest::new(
             harness_types::RequestId::generate(),
             capabilities.model.clone(),
@@ -5084,8 +5421,14 @@ impl RuntimeService {
                             prompt_tokens,
                             completion_tokens,
                             cache_read_tokens,
+                            cache_write_tokens,
                             ..
-                        } => Some((*prompt_tokens, *completion_tokens, *cache_read_tokens)),
+                        } => Some((
+                            *prompt_tokens,
+                            *completion_tokens,
+                            *cache_read_tokens,
+                            *cache_write_tokens,
+                        )),
                         _ => None,
                     });
                     note_model_call(&request.task_id);
@@ -5104,6 +5447,7 @@ impl RuntimeService {
                         .field("input", usage.map(|usage| usage.0))
                         .field("output", usage.map(|usage| usage.1))
                         .field("cached", usage.map(|usage| usage.2))
+                        .field("cache_write", usage.map(|usage| usage.3))
                         .field("tool_calls", assembled.tool_calls.len())
                         .field("finish", assembled.finish_reason.clone())
                         .emit();
@@ -5325,6 +5669,16 @@ impl RuntimeService {
             // A provider failure ends the run's provider path; the run record
             // says why, so a reopen never mistakes it for a completed turn.
             let canceled = error.code() == ErrorCode::ProviderCanceled;
+            // A request the provider refused as over its window is tried once
+            // more on this run, after a compaction
+            // ([`Self::run_recovering_overflow_scoped`]). Finished here, the
+            // run read `failed` while that try worked, and for good when it
+            // ended any way but by an answer; the caller ends it when the try
+            // cannot be made.
+            let tried_again = !request.overflow_retry
+                && !canceled
+                && !turn_cancellation().is_cancelled()
+                && is_context_overflow(&error.to_string());
             let _ = self
                 .store
                 .settle_run_step(
@@ -5334,25 +5688,27 @@ impl RuntimeService {
                     None,
                 )
                 .await;
-            let _ = self
-                .store
-                .finish_run(
-                    &run.run_id,
-                    run.revision,
-                    if canceled {
-                        RunState::Canceled
-                    } else {
-                        RunState::Failed
-                    },
-                    None,
-                    Some(if canceled {
-                        "provider_canceled"
-                    } else {
-                        "provider_failed"
-                    }),
-                    None,
-                )
-                .await;
+            if !tried_again {
+                let _ = self
+                    .store
+                    .finish_run(
+                        &run.run_id,
+                        run.revision,
+                        if canceled {
+                            RunState::Canceled
+                        } else {
+                            RunState::Failed
+                        },
+                        None,
+                        Some(if canceled {
+                            "provider_canceled"
+                        } else {
+                            "provider_failed"
+                        }),
+                        None,
+                    )
+                    .await;
+            }
             Err(error)
         }
     }
@@ -6294,15 +6650,44 @@ impl RuntimeService {
         guidance: Option<&str>,
     ) -> Result<Option<String>, RuntimeError> {
         let history = conversation_history(&self.store, session_id).await?;
-        let users = history.user_texts();
+        // The summary the turns' own compactions kept of this conversation's
+        // start is read back, and only what came after it is summarised: a
+        // checkpoint wrote all of it again from the first message, a request
+        // per window of transcript - four minutes before a turn, for a start
+        // that already had its summary. A summary the user gave instructions
+        // for is written from the conversation itself.
+        let kept = match self.store.session_task(session_id).await.ok().flatten() {
+            Some(task) if guidance.is_none() => self.kept_summary(&task, &history.as_sent()).await,
+            _ => None,
+        };
         let mut messages = Vec::new();
+        // With a checkpoint before it, the kept summary is one more message
+        // the new summary is written from, and the user's words are all kept.
+        let users = match (&kept, &history.summary) {
+            (Some((covers, _)), None) => history.user_texts_from(*covers),
+            _ => history.user_texts(),
+        };
         if let Some(summary) = history.summary {
             messages.push(ProviderMessage::new(
                 MessageRole::User,
                 format!("{COMPACTED_PREFIX}\n\n{summary}"),
             ));
         }
-        messages.extend(history.messages);
+        match kept {
+            Some((covers, summary)) => {
+                harness_types::diag::info("compaction", "checkpoint_from_kept")
+                    .session(session_id.as_str())
+                    .field("covers", covers)
+                    .field("after_it", history.messages.len() - covers)
+                    .emit();
+                messages.push(ProviderMessage::new(
+                    MessageRole::User,
+                    format!("{COMPACTED_PREFIX}\n\n{summary}"),
+                ));
+                messages.extend_from_slice(&history.messages[covers..]);
+            }
+            None => messages.extend(history.messages),
+        }
         if messages.is_empty() {
             return Ok(None);
         }
@@ -8238,6 +8623,37 @@ mod fresh_start_tests {
         assert!(
             note.ends_with("\n1. fix the parser\n2. add a test"),
             "{note}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod request_parts_tests {
+    use super::{MessageRole, ProviderMessage, request_parts, rewritten_at};
+
+    /// A request that repeats the last one and adds to it rewrote nothing;
+    /// one that changed an earlier message is named by the first such part,
+    /// counted from the tools.
+    #[test]
+    fn a_request_is_rewritten_where_it_first_differs_from_the_one_before() {
+        let message = |text: &str| ProviderMessage::new(MessageRole::User, text);
+        let first = [message("system"), message("question"), message("result")];
+        let before = request_parts(&[], &first);
+        let mut longer = first.to_vec();
+        longer.push(message("more"));
+        assert_eq!(rewritten_at(&before, &request_parts(&[], &longer)), None);
+        assert_eq!(rewritten_at(&before, &before), None);
+        longer[2] = message("the result, shortened");
+        assert_eq!(rewritten_at(&before, &request_parts(&[], &longer)), Some(3));
+        let tools = [serde_json::json!({"name": "read_file"})];
+        assert_eq!(
+            rewritten_at(&before, &request_parts(&tools, &first)),
+            Some(0)
+        );
+        // A request with less than the last one sent rewrote it too.
+        assert_eq!(
+            rewritten_at(&before, &request_parts(&[], &first[..2])),
+            Some(3)
         );
     }
 }
