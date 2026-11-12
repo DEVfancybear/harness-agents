@@ -61,6 +61,51 @@ run_exec() {
   "$PY" -c "import json,sys; print(json.load(open(sys.argv[1],encoding='utf-8')).get('response',''))" "$RX/$name.json" >> "$LOG" 2>/dev/null
   sed 's/^/    /' "$RX/$name.err" >> "$LOG"
 }
+# refusal <name>: the first stderr line of an `ha exec` turn the provider
+# refused - the host prints `<class>: <message>` (for example `rate_limited:
+# You have hit your ChatGPT usage limit ...`) and no answer - or nothing when
+# the turn answered. A refused turn is not the model skipping a step: the loops
+# below name it as its own failed precondition, and stop at a usage limit
+# (`rate_limited`), where another attempt only spends the next minutes' quota.
+refusal() {
+  "$PY" - "$RX/$1.json" "$RX/$1.err" <<'PYEOF' | tr -d '\r'
+import json, re, sys
+try:
+    if "response" in json.load(open(sys.argv[1], encoding="utf-8")):
+        sys.exit(0)
+except (OSError, ValueError):
+    pass
+try:
+    lines = open(sys.argv[2], encoding="utf-8", errors="replace").read().splitlines()
+except OSError:
+    lines = []
+for line in lines:
+    if re.match(r"[a-z][a-z_]*: ", line) and not line.startswith("ha: "):
+        print(line[:300])
+        break
+else:
+    print("no answer and no error line")
+PYEOF
+}
+# refused <turn>: sets REFUSED to the refusal line and returns 0 when the
+# provider refused the turn; STOP=1 when it was a usage limit.
+REFUSED=""; STOP=0
+refused() {
+  local line
+  line=$(refusal "$1")
+  [ -z "$line" ] && return 1
+  REFUSED=$line
+  echo "   the provider refused the turn $1: $line"
+  case "$line" in rate_limited:*) STOP=1;; esac
+  return 0
+}
+# A section's loop begins with `REFUSED=""; STOP=0`; when no attempt got its
+# precondition, `refusal_check <held>` fails by name if the provider refused.
+refusal_check() {
+  if [ -z "$1" ] && [ -n "$REFUSED" ]; then
+    check "precondition: the provider refused the turn: ${REFUSED:0:200}" false
+  fi
+}
 # What the model was sent and what the tools answered, read from the frozen
 # requests: `ev <marker> root|child <python expression>`. It looks at the first
 # conversation whose messages hold <marker> and judges the expression, true or
@@ -100,6 +145,14 @@ calls = [(c.get("name"), arguments(c)) for m in msgs for c in m.get("tool_calls"
 results = [content(m) for m in msgs if m.get("role") == "tool"]
 text = "\n".join([content(m) for m in msgs] + [f"{c.get('name')} {c.get('arguments')}" for m in msgs for c in m.get("tool_calls") or []])
 n = len(picked)
+# The knowledge catalog of the turn: the ranked list, then (when the newest
+# pages are not in it) the part under store.rs RECENT_HEADER.
+HEAD = "recently written (not in the list above):"
+seg = text.split("project knowledge:", 1)[1] if "project knowledge:" in text else ""
+listed, _, recent = seg.partition(HEAD)
+def paths(part):
+    return re.findall(r'"path":"([^"]+)"', part)
+newest = ["zz/fresh-1.md", "zz/fresh-2.md", "zz/fresh-3.md"]
 sys.exit(0 if eval("(" + expr.strip() + ")") else 1)
 PYEOF
 ev() { "$PY" "$RX/ev.py" "$D" "$@"; }
@@ -174,13 +227,25 @@ check "S3: /knowledge recent COUNT lists the newest pages" 'grep -q "zz/fresh-3.
 
 echo "################ 5. S3: the turn's catalog adds the newest pages the ranked list left out"
 run_exec c1 "MARK-S3C. Reply with the single word OK-CATALOG and call no tools."
-# store.rs RECENT_HEADER. The ranked list is the first pages by path (the
-# request names no page), so the zz/ pages are not in it.
-E_NOTLISTED='n >= 1 and "recently written (not in the list above):" in text and not any(("\"path\":\"zz/fresh-%d.md\"" % i) in text.split("recently written (not in the list above):", 1)[0] for i in (1, 2, 3))'
-E_RECENT='all(("\"path\":\"zz/fresh-%d.md\"" % i) in text.split("recently written (not in the list above):", 1)[-1] for i in (1, 2, 3))'
+r=$(refusal c1)
+check "precondition: the provider answered the catalog turn${r:+ - it refused: ${r:0:200}}" '[ -z "$r" ]'
+# store.rs `Store::catalog`: the catalog is the ranked list (ranked by the
+# request's words, so which pages it holds is the ranking's), and then the
+# newest three pages (views::newest) that the list did not hold, under
+# RECENT_HEADER, inside the same bound. A newest page the list holds is not
+# repeated. The first run's list held two of the three, and the part held the
+# third, as designed. So: when the list left at least one of the three out the
+# header must be there, with exactly the ones left out, and every one of the
+# three must be in the catalog once.
+E_LEFTOUT='seg != "" and not all(p in paths(listed) for p in newest)'
+E_HEADER='HEAD in seg'
+E_RECENT='HEAD in seg and paths(recent) and all(p in newest and p not in paths(listed) for p in paths(recent)) and all(p in paths(listed) + paths(recent) for p in newest) and len(paths(listed) + paths(recent)) == len(set(paths(listed) + paths(recent)))'
+# Passes on 0.9.7 too: the turn's request holds the catalog, and the ranked list left a newest page out
+# (were all three in it, nothing would be owed and the header rightly absent).
+check "precondition: the turn's catalog is in the request and its ranked list left at least one of the three newest pages out" 'ev MARK-S3C root "$E_LEFTOUT"'
 # 0.9.7 FAILS: the catalog was the ranked list alone.
-check "S3: the catalog has a part 'recently written (not in the list above):', and the ranked list does not hold those pages" 'ev MARK-S3C root "$E_NOTLISTED"'
-check "S3: that part holds the three newest pages" 'ev MARK-S3C root "$E_RECENT"'
+check "S3: the catalog has the part 'recently written (not in the list above):'" 'ev MARK-S3C root "$E_HEADER"'
+check "S3: that part holds exactly the newest pages the list left out, and each of the three newest is in the catalog once" 'ev MARK-S3C root "$E_RECENT"'
 
 echo "################ 6. S5: /knowledge bootstrap asks for footnotes the store checks"
 P5=$RX/p5
@@ -207,12 +272,14 @@ echo "################ 7. S1: a write whose footnote cites a file that is not th
 # words, so they are in the record only if the host said them.
 E_S1A_CALLED='any(name == "knowledge" and args.get("action") == "write" and "src/does-not-exist.rs:3" in str(args.get("content")) and "[^e1]" in str(args.get("content")) for name, args in calls)'
 E_S1A_REFUSED='"was not written, its footnotes do not hold" in text and "no such file" in text and "[^e1]" in text'
-asked1=""
+asked1=""; REFUSED=""; STOP=0
 for a in 1 2 3; do
   run_exec s1a$a "MARK-S1A-$a. Call the knowledge tool exactly once with action write, scope project, path ops/refused.md, title Refused, summary Where the cap came from, and this content (three lines: a sentence, an empty line, a footnote line):${NL}The cap was 10 in May.[^e1]${NL}${NL}[^e1]: 2026-05; src/does-not-exist.rs:3${NL}Make no other call, do not correct or retry the write, and answer with the tool's reply word for word."
+  if refused s1a$a; then [ "$STOP" = 1 ] && break; continue; fi
   if ev "MARK-S1A-$a" root "$E_S1A_CALLED"; then asked1=$a; break; fi
   echo "   attempt $a: the model did not make the write as asked"
 done
+refusal_check "$asked1"
 check "precondition: knowledge write was called with the footnote that cites src/does-not-exist.rs:3 (attempt ${asked1:-none})" '[ -n "$asked1" ]'
 # 0.9.7 FAILS: the page was written, its footnote never looked up.
 check "S1: the write was refused: 'was not written, its footnotes do not hold' and 'no such file'" '[ -n "$asked1" ] && ev "MARK-S1A-$asked1" root "$E_S1A_REFUSED"'
@@ -221,13 +288,15 @@ check "S1: a refused write creates no page" '[ -n "$asked1" ] && [ ! -e "$K/ops/
 E_S1B_CALLED='any(name == "knowledge" and args.get("action") == "write" and "src/limits.py:1-2" in str(args.get("content")) for name, args in calls) and any(name == "knowledge" and args.get("action") == "evidence" and args.get("note") in ("e1", "[^e1]") and args.get("path") == "ops/limits.md" for name, args in calls)'
 # evidence.rs `Sources::open`: the cited lines marked `>`, a little around them.
 E_S1B_LINES='any(">1|" in r and ">2|" in r and "MAX = 10" in r and "2026-05" in r for r in results)'
-asked2=""
+asked2=""; REFUSED=""; STOP=0
 for a in 1 2 3; do
   rm -f "$K/ops/limits.md"
   run_exec s1b$a "MARK-S1B-$a. Make exactly two knowledge tool calls, in this order. First: action write, scope project, path ops/limits.md, title Limits, summary How the limits changed, and this content (three lines: a sentence, an empty line, a footnote line):${NL}The cap was 10 in May.[^e1]${NL}${NL}[^e1]: 2026-05; src/limits.py:1-2${NL}Second: action evidence, scope project, path ops/limits.md, note e1. Then answer with the evidence call's reply word for word."
+  if refused s1b$a; then [ "$STOP" = 1 ] && break; continue; fi
   if ev "MARK-S1B-$a" root "$E_S1B_CALLED"; then asked2=$a; break; fi
   echo "   attempt $a: the model did not make both calls as asked"
 done
+refusal_check "$asked2"
 check "precondition: knowledge write (footnote src/limits.py:1-2) and knowledge evidence (note e1) were called (attempt ${asked2:-none})" '[ -n "$asked2" ]'
 # Passes on 0.9.7 too: a footnote of free text was part of the page, written unchecked.
 check "S1: a footnote that resolves is written with the page" '[ -n "$asked2" ] && grep -q "^\[\^e1\]: 2026-05; src/limits.py:1-2" "$K/ops/limits.md"'
@@ -236,19 +305,24 @@ check "S1: evidence returns the cited lines marked >N| and the event time" '[ -n
 
 echo "################ 8. S2: a write whose link names a paragraph the page lacks is refused"
 # views.rs check_citations: "<page> was not written, a link names a paragraph that is
-# not there: project.md has no paragraph anchored ^nope (it has ^orion-1)".
+# not there: project.md has no paragraph anchored ^nope (it has ^orion-1)". A link is
+# relative to the page's folder, so the page is written at the library's root, where
+# project.md is (a page ops/links.md linking project.md names ops/project.md, a page
+# that is not there: a dangling link, which the store allows by design - the first run).
 E_S2_CALLED='any(name == "knowledge" and args.get("action") == "write" and "project.md#^nope" in str(args.get("content")) for name, args in calls)'
 E_S2_REFUSED='"was not written, a link names a paragraph that is not there" in text and "^nope" in text and "^orion-1" in text'
-asked3=""
+asked3=""; REFUSED=""; STOP=0
 for a in 1 2 3; do
-  run_exec s2a$a "MARK-S2A-$a. Call the knowledge tool exactly once with action write, scope project, path ops/links.md, title Links, summary A page that links a paragraph, and this one-line content: Moved to B for [Orion](project.md#^nope).${NL}Make no other call, do not correct or retry the write, and answer with the tool's reply word for word."
+  run_exec s2a$a "MARK-S2A-$a. Call the knowledge tool exactly once with action write, scope project, path links.md, title Links, summary A page that links a paragraph, and this one-line content: Moved to B for [Orion](project.md#^nope).${NL}Make no other call, do not correct or retry the write, and answer with the tool's reply word for word."
+  if refused s2a$a; then [ "$STOP" = 1 ] && break; continue; fi
   if ev "MARK-S2A-$a" root "$E_S2_CALLED"; then asked3=$a; break; fi
   echo "   attempt $a: the model did not make the write as asked"
 done
+refusal_check "$asked3"
 check "precondition: knowledge write was called with a link to project.md#^nope (attempt ${asked3:-none})" '[ -n "$asked3" ]'
 # 0.9.7 FAILS: a fragment was dropped, the page written.
 check "S2: the write was refused, naming ^nope and the anchor the page does have" '[ -n "$asked3" ] && ev "MARK-S2A-$asked3" root "$E_S2_REFUSED"'
-check "S2: a refused write creates no page" '[ -n "$asked3" ] && [ ! -e "$K/ops/links.md" ]'
+check "S2: a refused write creates no page" '[ -n "$asked3" ] && [ ! -e "$K/links.md" ]'
 
 echo "################ 9. S4: a search with since returns hits that say which time matched"
 # store.rs SearchHit.time_match, views.rs apply_filter: ann.md holds statements
@@ -257,12 +331,14 @@ echo "################ 9. S4: a search with since returns hits that say which ti
 E_S4_CALLED='any(name == "knowledge" and args.get("action") == "search" and str(args.get("since")).startswith("2026-05") for name, args in calls)'
 E_S4_HITS='any("keyword_rrf" in r and "people/ann.md" in r and "zz/fresh-1.md" in r and "\"time_match\":\"event_time\"" in r.replace(" ", "") and "\"time_match\":\"updated_at\"" in r.replace(" ", "") for r in results)'
 E_S4_OUT='any("keyword_rrf" in r and "people/bob.md" not in r for r in results)'
-asked4=""
+asked4=""; REFUSED=""; STOP=0
 for a in 1 2 3; do
   run_exec s4$a "MARK-S4-$a. Call the knowledge tool exactly once with action search, query harbor, since 2026-05-01. Make no other call. Then answer with the single word DONE-S4."
+  if refused s4$a; then [ "$STOP" = 1 ] && break; continue; fi
   if ev "MARK-S4-$a" root "$E_S4_CALLED"; then asked4=$a; break; fi
   echo "   attempt $a: the model did not make the search as asked"
 done
+refusal_check "$asked4"
 check "precondition: knowledge search was called with since 2026-05-01 (attempt ${asked4:-none})" '[ -n "$asked4" ]'
 # 0.9.7 FAILS: search took no since, and no hit carried time_match.
 check "S4: the hits carry time_match: event_time for the page with a dated statement, updated_at for the page with none" '[ -n "$asked4" ] && ev "MARK-S4-$asked4" root "$E_S4_HITS"'

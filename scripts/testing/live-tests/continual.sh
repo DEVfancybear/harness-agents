@@ -53,6 +53,51 @@ run_exec() {
 }
 answer() { "$PY" -c "import json,sys; print(json.load(open(sys.argv[1],encoding='utf-8')).get('response',''))" "$RX/$1.json" 2>/dev/null; }
 
+# refusal <name>: the first stderr line of an `ha exec` turn the provider
+# refused - the host prints `<class>: <message>` (for example `rate_limited:
+# You have hit your ChatGPT usage limit ...`) and no answer - or nothing when
+# the turn answered. A refused turn is not the model skipping a step: the loops
+# below name it as its own failed precondition, and stop at a usage limit
+# (`rate_limited`), where another attempt only spends the next minutes' quota.
+refusal() {
+  "$PY" - "$RX/$1.json" "$RX/$1.err" <<'PYEOF' | tr -d '\r'
+import json, re, sys
+try:
+    if "response" in json.load(open(sys.argv[1], encoding="utf-8")):
+        sys.exit(0)
+except (OSError, ValueError):
+    pass
+try:
+    lines = open(sys.argv[2], encoding="utf-8", errors="replace").read().splitlines()
+except OSError:
+    lines = []
+for line in lines:
+    if re.match(r"[a-z][a-z_]*: ", line) and not line.startswith("ha: "):
+        print(line[:300])
+        break
+else:
+    print("no answer and no error line")
+PYEOF
+}
+# refused <turn>: sets REFUSED to the refusal line and returns 0 when the
+# provider refused the turn; STOP=1 when it was a usage limit.
+REFUSED=""; STOP=0
+refused() {
+  local line
+  line=$(refusal "$1")
+  [ -z "$line" ] && return 1
+  REFUSED=$line
+  echo "   the provider refused the turn $1: $line"
+  case "$line" in rate_limited:*) STOP=1;; esac
+  return 0
+}
+# A section's loop begins with `REFUSED=""; STOP=0`; when no attempt got its
+# precondition, `refusal_check <held>` fails by name if the provider refused.
+refusal_check() {
+  if [ -z "$1" ] && [ -n "$REFUSED" ]; then
+    check "precondition: the provider refused the turn: ${REFUSED:0:200}" false
+  fi
+}
 # What the model was sent and what the tools answered, read from the frozen
 # requests: `ev <marker> root|child <python expression>`. It looks at the
 # conversations whose messages hold <marker> (a root's, or a delegated child's)
@@ -161,6 +206,8 @@ json.dump({"schema": 1, "entries": {"memory": memory}, "refinements": []},
 PYEOF
 run_exec t1 "MARK-P2A. Do the harbor ledger reconcile task again. Reply with the single word OK-WHOLE and call no tools."
 echo "   $(answer t1 | head -c 200)"
+r=$(refusal t1)
+check "precondition: the provider answered the first turn${r:+ - it refused: ${r:0:200}}" '[ -z "$r" ]'
 # Passes on 0.9.7 too: the turn ran, and the store holds the entry whole.
 check "precondition: the turn's request was found" 'ev MARK-P2A root "n == 1"'
 check "precondition: the entry reached the store whole, its last step in it" '"$PY" "$MEMORY_STORE" rows "$G" memory | grep -q finalize_ledger_zk'
@@ -173,7 +220,13 @@ check "P1: the digest says who sees an entry: global, project, local and that lo
 check "P1: the digest no longer says to default to local" 'ev MARK-P2A root "\"Default to local continual harness refinement\" not in text"'
 # memory/harness.rs whole_entry, WHOLE_CONTENT_LIMIT. 0.9.7 FAILS: the entry is cut at 180 characters.
 check "P2: the entry that fits the request is shown whole: its last step is in the digest" 'ev MARK-P2A root "\"finalize_ledger_zk\" in text"'
-run_exec t2 "MARK-P2B. Paint the kitchen wall. Reply with the single word OK-CUT and call no tools."
+# The host ranks by the request's words with no list of words to skip: "the" and
+# "and" are words too, and an entry that holds two of them stands out when the
+# others hold none (the first run's control said "...and call no tools" and
+# the entry was whole). So the request shares one word with the store, "the".
+run_exec t2 "MARK-P2B. Paint the kitchen wall. Say OK-CUT."
+r=$(refusal t2)
+check "precondition: the provider answered the second turn${r:+ - it refused: ${r:0:200}}" '[ -z "$r" ]'
 # Passes on 0.9.7 too (a control): a request the entry does not fit gets it cut, as before.
 check "P2 control: a request that shares nothing with it gets the entry cut, not whole" 'ev MARK-P2B root "n == 1 and \"finalize_ledger_zk\" not in text"'
 
@@ -193,19 +246,21 @@ P1B=$RX/orion-sync
 project "$P1B"
 mkdir -p "$P1B/ops"
 jobs=(ledger invoice tariff)
-kept=""; keptat=""; forproject=""
+kept=""; keptat=""; forproject=""; REFUSED=""; STOP=0
 for a in 1 2 3; do
   job=${jobs[$((a-1))]}; tok="inbox-4$a"
   printf '# Settings of the nightly %s sync, run %s\nschedule = nightly\ninput_dir = spool/%s\nretries = 3\n' "$job" "$a" "$tok" > "$P1B/ops/sync-$a.cfg"
   printf 'The nightly %s sync is configured in ops/sync-%s.cfg.\n' "$job" "$a" > "$P1B/ops/README-$a.txt"
   (cd "$P1B" && git add -A && git -c user.name=t -c user.email=t@t commit -qm "sync $a")
   WD=$P1B REVIEW=1 run_exec p1b$a "MARK-P1B-$a. In this project the nightly $job sync is set up somewhere under ops/. Find out which folder it reads its input from (use search_text and read_file only) and answer in one sentence."
+  if refused p1b$a; then [ "$STOP" = 1 ] && break; continue; fi
   where=$(landed "$tok")
   echo "   attempt $a: the review kept the fact as: ${where:-nowhere}"
   [ -z "$where" ] && continue
   [ -z "$kept" ] && { kept=1; keptat=$a; }
   if printf '%s\n' "$where" | grep -qx "global orion-sync"; then forproject=$a; break; fi
 done
+refusal_check "$kept"
 # Passes on 0.9.7 too: the review ran and kept the fact somewhere. When it
 # kept it nowhere in three turns, the model judged it not worth keeping and
 # the feature was never reached.
@@ -285,7 +340,19 @@ PYEOF
 seed4
 P4=$RX/p4
 project "$P4"
-WD=$P4 run_exec t4 "MARK-P4A. Tally the harbor berth fees again. Reply with the single word OK-TALLY and call no tools."
+# The recall is the app's (service.rs run_turn); `ha exec` recalls no learned
+# skill (the first run, which used `ha exec`, saw `skill: 0` and no block), so
+# this turn is a chat turn, as strategy.sh's section 4.
+agent "$P4" t4a
+# A worker an earlier section left ending may write the usage counters once
+# more as it goes (strategy.sh): wait for the seed to stay.
+for _ in 1 2 3 4 5 6; do
+  sleep 5
+  grep -q '"scripts/solve.py"' "$D/skill-usage/global.json" 2>/dev/null && break
+  seed4
+done
+say t4a "MARK-P4A. Tally the harbor berth fees again. Reply with the single word OK-TALLY and call no tools." | tail -2 | sed 's/^/   /'
+"$HA" shutdown --force >/dev/null 2>&1
 # Passes on 0.9.7 too: the skill that fits was recalled for the turn.
 check "precondition: the learned skill that fits the request was recalled" 'ev MARK-P4A root "\"A learned skill fits this request: harbor-tally\" in text"'
 # skill_recall.rs scripts_note. 0.9.7 FAILS: the block listed no scripts.
@@ -295,37 +362,54 @@ E_FIRST='re.search(r"Run .+?/scripts/solve\.py first, before redoing the work by
 check "P4: it says to run the tested script first, and names no untested one" 'ev MARK-P4A root "$E_FIRST"'
 
 echo "################ 5. P4: a script that ran with exit 0 is recorded as tested (the host checks the quote and the call)"
-# The conversation writes and runs a one-line script; /refine then keeps it as
-# a learned skill and quotes the run (script_runs). The host marks it tested
-# only when the quote is in a tool result that reports exit=Some(0)
-# timed_out=false and the call that made it names tally.py (refine.rs
-# `confirmed_script_runs`, learned.rs `record_script_runs`).
-pre5=""
+# The host marks a skill's script tested only when the quote is in a tool
+# result that reports exit=Some(0) timed_out=false and the call that made it
+# names the script's file (refine.rs `confirmed_script_runs`, learned.rs
+# `record_script_runs`). The first run wrote tools/tally.py, ran it, and asked
+# /refine to keep it as scripts/tally.py and to quote that run: the review
+# left script_runs out, saying that the command ran tools/tally.py, not
+# scripts/tally.py (the refinement's `evidence` in the conversation's memory
+# store). It was right: nothing had run the skill's file. So the flow is the
+# one a returning task makes: /refine keeps the script as a skill, the
+# conversation runs the skill's own file (by its path in the skill folder),
+# and the next /refine, updating the skill, quotes that run.
+# The run of the skill's file: the call names the skill folder's script, and
+# its result is the host's clean-exit line with the count.
+E_RAN5='any(name == "run_process" and ("skills/" + os.environ["SK"] + "/scripts/paidcount.py") in json.dumps(args).replace("\\\\", "/") for name, args in calls) and any("exit=Some(0) timed_out=false" in r and "paid=4" in r for r in results)'
+pre5=""; REFUSED=""; STOP=0
 for a in 1 2 3; do
-  Pb=$RX/p4b-$a; sk="order-tally-$a"
+  Pb=$RX/p4b-$a; sk="order-count-$a"
   project "$Pb"
   mkdir -p "$Pb/data"
   printf 'id,status\n1,paid\n2,open\n3,paid\n4,paid\n5,paid\n' > "$Pb/data/orders.csv"
   (cd "$Pb" && git add -A && git -c user.name=t -c user.email=t@t commit -qm orders)
   agent "$Pb" "a$a"
   LINE="import csv; rows = list(csv.DictReader(open('data/orders.csv', encoding='utf-8'))); print('paid=%d' % sum(1 for row in rows if row['status'] == 'paid'))"
-  say "a$a" "MARK-P4B-$a. Create tools/tally.py with write_file, holding exactly this one line, the text between LINE-BEGIN and LINE-END and not those markers: LINE-BEGIN $LINE LINE-END. Then run it once with run_process (executable python, args [\"tools/tally.py\"]) from the project root and tell me what it printed. Do nothing else." | tail -2 | sed 's/^/   /'
-  say "a$a" "/refine Keep what this conversation solved as a learned skill: one skill intent, action create, name $sk, level global, a SKILL.md (front matter name: $sk, description: Use when asked to tally the paid orders, category: ops) that says to run scripts/tally.py from the project root, files {\"scripts/tally.py\": the exact one line of tools/tally.py from this conversation}, and script_runs [{\"path\": \"scripts/tally.py\", \"evidence\": \"paid=4\"}]. Propose no memory edits." | tail -3 | sed 's/^/   /'
+  BODY="--- / name: $sk / description: Use when asked to count the paid orders. / category: ops / --- / Run scripts/paidcount.py from the project root; it prints paid=<the number of paid orders>."
+  SKP=$(cygpath -m "$HA_HOME/skills/$sk/scripts/paidcount.py" 2>/dev/null || echo "$HA_HOME/skills/$sk/scripts/paidcount.py")
+  out=$(say "a$a" "MARK-P4B-$a. Create tools/paidcount.py with write_file, holding exactly this one line, the text between LINE-BEGIN and LINE-END and not those markers: LINE-BEGIN $LINE LINE-END. Then run it once with run_process (executable python, args [\"tools/paidcount.py\"]) from the project root and tell me what it printed. Do nothing else."); echo "$out" | tail -2 | sed 's/^/   /'
+  case "$out" in *rate_limited:*) REFUSED=$(echo "$out" | grep -m1 "rate_limited:"); STOP=1; "$HA" shutdown --force >/dev/null 2>&1; break;; esac
+  out=$(say "a$a" "/refine Keep what this conversation solved as a learned skill: one skill intent, action create, name $sk, level global, body the SKILL.md whose lines (shown here separated by ' / ') are: $BODY - and files {\"scripts/paidcount.py\": the exact one line of tools/paidcount.py from this conversation}. Give no script_runs yet: the skill's own file has not been run. Propose no memory edits."); echo "$out" | tail -3 | sed 's/^/   /'
+  case "$out" in *rate_limited:*) REFUSED=$(echo "$out" | grep -m1 "rate_limited:"); STOP=1; "$HA" shutdown --force >/dev/null 2>&1; break;; esac
+  if [ ! -f "$HA_HOME/skills/$sk/scripts/paidcount.py" ]; then echo "   attempt $a: /refine did not write the skill's script"; "$HA" shutdown --force >/dev/null 2>&1; continue; fi
+  out=$(say "a$a" "Now run the learned skill's own copy of the script, once, with run_process (executable python, args [\"$SKP\"]) from the project root, and tell me what it printed. Do nothing else."); echo "$out" | tail -2 | sed 's/^/   /'
+  out=$(say "a$a" "/refine The script scripts/paidcount.py of the learned skill $sk has now been run in this conversation, by its own path in the skill's folder. Update that skill: action update, name $sk, body the same SKILL.md lines as before ($BODY) with one more sentence at the end, 'Last run: it printed paid=4.', no files, and script_runs [{\"path\": \"scripts/paidcount.py\", \"evidence\": \"paid=4\"}]. Propose no memory edits."); echo "$out" | tail -3 | sed 's/^/   /'
   "$HA" shutdown --force >/dev/null 2>&1
-  ran=$(ev "MARK-P4B-$a" root 'any(name == "run_process" and "tally.py" in json.dumps(args) for name, args in calls) and any("exit=Some(0) timed_out=false" in r and "paid=4" in r for r in results)' && echo yes)
-  if [ "$ran" = yes ] && [ -f "$HA_HOME/skills/$sk/scripts/tally.py" ]; then pre5=$a; break; fi
-  echo "   attempt $a: ran the script with exit 0: ${ran:-no}; the skill has the script: $([ -f "$HA_HOME/skills/$sk/scripts/tally.py" ] && echo yes || echo no)"
+  export SK=$sk
+  if ev "MARK-P4B-$a" root "$E_RAN5"; then pre5=$a; break; fi
+  echo "   attempt $a: the skill's own script was not run with exit 0 as asked"
 done
-# Passes on 0.9.7 too: the conversation ran the script (exit=Some(0) timed_out=false is the host's
-# own line) and /refine wrote the skill with the script in it.
-check "precondition: the script was run with exit 0 and a learned skill carries it (attempt ${pre5:-none})" '[ -n "$pre5" ]'
+refusal_check "$pre5"
+# Passes on 0.9.7 too: /refine wrote the skill with the script, and the conversation ran the
+# skill's own file with exit 0 (exit=Some(0) timed_out=false is the host's own line).
+check "precondition: a learned skill carries the script and the conversation ran that file with exit 0 (attempt ${pre5:-none})" '[ -n "$pre5" ]'
 j_mark() {
-  "$PY" - "$HA_HOME/skills/order-tally-$pre5/scripts/tally.py" "$D/skill-usage/global.json" "order-tally-$pre5" <<'PYEOF'
+  "$PY" - "$HA_HOME/skills/order-count-$pre5/scripts/paidcount.py" "$D/skill-usage/global.json" "order-count-$pre5" <<'PYEOF'
 import hashlib, json, sys
 file, usage, skill = sys.argv[1:4]
 try:
     sha = hashlib.sha256(open(file, "rb").read()).hexdigest()
-    mark = json.load(open(usage, encoding="utf-8"))["skills"][skill]["scripts"]["scripts/tally.py"]
+    mark = json.load(open(usage, encoding="utf-8"))["skills"][skill]["scripts"]["scripts/paidcount.py"]
 except (OSError, KeyError, ValueError):
     sys.exit(1)
 sys.exit(0 if mark.get("sha") == sha and str(mark.get("at", ""))[:2] == "20" else 1)
@@ -341,6 +425,8 @@ mkdir -p "$P5/notes"
 printf 'The quillfeather marmoset tally closes on day 41.\n' > "$P5/notes/harbor-tally.txt"
 (cd "$P5" && git add -A && git -c user.name=t -c user.email=t@t commit -qm notes)
 WD=$P5 run_exec t5a "MARK-P5A. Read notes/harbor-tally.txt with read_file and tell me in one line on which day the tally closes."
+r=$(refusal t5a)
+check "precondition: the provider answered the turn that reads the file${r:+ - it refused: ${r:0:200}}" '[ -z "$r" ]'
 # The kind of the journal event that holds the three words in that
 # conversation (the file's result): a search restricted to it cannot match the
 # next conversation's own user message or call, which hold the words as well.
@@ -363,12 +449,14 @@ check "precondition: the earlier conversation read the file and a journal event 
 E_SEARCHED='any(name == "history_search" and "quillfeather" in str(args.get("query")) and os.environ["KIND5"] in str(args.get("kind")) and args.get("scope") in (None, "", "task") for name, args in calls)'
 E_EARLIER='any("history_search" in r and re.search(r"nothing here holds all your words, but [1-9][0-9]* match\(es\) in earlier conversations of this project do - search again with scope project", r) for r in results)'
 E_NOHITS='any("history_search" in r and "0 hit(s)" in r for r in results)'
-asked5=""
+asked5=""; REFUSED=""; STOP=0
 for a in 1 2 3; do
   WD=$P5 run_exec t5b$a "MARK-P5B-$a. Call history_search exactly once with query \"quillfeather marmoset tally\" and kind \"$KIND5\" (leave scope out, so that it searches this conversation only). Then reply with the single word DONE-P5."
+  if refused t5b$a; then [ "$STOP" = 1 ] && break; continue; fi
   if [ -n "$KIND5" ] && ev "MARK-P5B-$a" root "$E_SEARCHED"; then asked5=$a; break; fi
   echo "   attempt $a: the model did not make the call as asked"
 done
+refusal_check "$asked5"
 check "precondition: history_search was called with the words and the kind, at the default scope (attempt ${asked5:-none})" '[ -n "$asked5" ]'
 # turn_driver.rs render_tool_output. 0.9.7 FAILS: the result said "0 hit(s)" and nothing of the earlier conversation.
 check "P5: the empty search says earlier conversations of the project hold the words, and to search with scope project" '[ -n "$asked5" ] && ev "MARK-P5B-$asked5" root "$E_EARLIER"'
@@ -395,7 +483,7 @@ sub() { # sub <expression>: with $WORD and $MARK filled in
 }
 for variant in flag file; do
   if [ "$variant" = flag ]; then tag=A WORD=LANTERNWICK-27; else tag=B WORD=PLOVERMARK-58; fi
-  ok6=""
+  ok6=""; REFUSED=""; STOP=0
   for attempt in 1 2 3; do
     MARK="P6$tag$attempt"
     if [ "$variant" = flag ]; then
@@ -405,9 +493,11 @@ for variant in flag file; do
       child6 "t6$tag$attempt" "$MARK"
       rm -f "$HA_HOME/APPEND_SYSTEM.md"
     fi
+    if refused "t6$tag$attempt"; then [ "$STOP" = 1 ] && break; continue; fi
     if ev "MARK-$MARK" root "$(sub "$E_CALLED6")" && ev "CHILD-$MARK" child 'n >= 1'; then ok6=1; break; fi
     echo "   $variant, attempt $attempt: the model did not delegate as asked"
   done
+  refusal_check "$ok6"
   # Passes on 0.9.7 too: the root has the text in its system prompt, a child ran on the exact brief.
   check "precondition ($variant): the root's system prompt carries the appended text" 'ev "MARK-$MARK" root "$(sub "$E_ROOT6")"'
   check "precondition ($variant): the root delegated once as asked and a child ran, its brief free of the appended text" '[ -n "$ok6" ] && ev "CHILD-$MARK" child "$(sub "$E_BRIEF6")"'
