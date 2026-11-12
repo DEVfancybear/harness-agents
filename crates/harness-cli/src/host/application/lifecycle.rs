@@ -283,6 +283,10 @@ pub fn handoff_request(root: &Path, focus: Option<&str>) -> String {
 /// for. ha's library was written a page at a time, when a task happened to
 /// pass something worth keeping.
 ///
+/// Each entry's source is a footnote (`SoMem`, arXiv 2611.11929, `KNOWLEDGE_WIKI`):
+/// the knowledge tool checks that the file and lines it cites exist when the
+/// page is written, so the map is checkable, not only claimed.
+///
 /// Not taken: Recursa's self-practice on tasks it writes for itself and its
 /// learners that keep an edit only when it passes again - both need tasks
 /// with a grader, which ha has not.
@@ -294,7 +298,7 @@ pub fn knowledge_bootstrap_request(focus: Option<&str>) -> String {
         .map(|focus| format!("\n\nMap only this part, or put it first: {focus}"))
         .unwrap_or_default();
     format!(
-        "Map this project into its knowledge library now, so that later tasks start from what is known about it and do not explore it again. This is a study of the project, not a change to it: edit no project file.\n\n1. See what there is. List the top of the workspace, read the README and the instruction files, and list the knowledge library (knowledge, action list) to see what it already covers. Decide how the project divides: by component, by directory, by kind of document. The division follows the project, not a fixed scheme.\n2. Read it in parts. A part you can read in a few calls, read yourself. For the rest, delegate one explorer a part, all in one step with wait=false, each with a title for its part; they are told of each other. Ask each for the same things: what the part is for, the terms and conventions it uses, where its main pieces are (path:line), the commands that build, test or run it, how it depends on the other parts, and what it could not determine. An explorer cannot write knowledge; it reports to you.\n3. Check before you keep. For each report, open at least one of the places it cites and confirm it says what the report claims. Drop what does not hold.\n4. Write the pages with the knowledge tool, project scope: one page that routes to the others (what the project is, its parts, which page covers which), one page a part, and one page of boundaries - what the project holds, what it does not, and what was read only in part or not at all. Check the list first and update a page that covers the subject (with its current hash) rather than writing a second one.\n5. Every entry says three things: its source as path:line, where it holds (the whole project, one part, one version), and how sure it is - read in the file, inferred from it, or not checked. A later reader decides from these whether to trust the entry or open the source.\n\nWrite nothing you or an explorer did not read, and no key or password. When the pages are written, answer with the pages you wrote, one line each, and what is still unmapped.{focus}"
+        "Map this project into its knowledge library now, so that later tasks start from what is known about it and do not explore it again. This is a study of the project, not a change to it: edit no project file.\n\n1. See what there is. List the top of the workspace, read the README and the instruction files, and list the knowledge library (knowledge, action list) to see what it already covers. Decide how the project divides: by component, by directory, by kind of document. The division follows the project, not a fixed scheme.\n2. Read it in parts. A part you can read in a few calls, read yourself. For the rest, delegate one explorer a part, all in one step with wait=false, each with a title for its part; they are told of each other. Ask each for the same things: what the part is for, the terms and conventions it uses, where its main pieces are (path:line), the commands that build, test or run it, how it depends on the other parts, and what it could not determine. An explorer cannot write knowledge; it reports to you.\n3. Check before you keep. For each report, open at least one of the places it cites and confirm it says what the report claims. Drop what does not hold.\n4. Write the pages with the knowledge tool, project scope: one page that routes to the others (what the project is, its parts, which page covers which), one page a part, and one page of boundaries - what the project holds, what it does not, and what was read only in part or not at all. Check the list first and update a page that covers the subject (with its current hash) rather than writing a second one.\n5. Every entry says three things: its source, where it holds (the whole project, one part, one version), and how sure it is - read in the file, inferred from it, or not checked. The source is a footnote: end the entry's sentence with a marker `[^id]` and write on a line of its own `[^id]: path:line` (or `path:first-last`), a place you or an explorer read. The knowledge tool checks that the file and the lines exist and refuses the page otherwise, and its `evidence` action shows those lines to a later reader, who decides from them whether to trust the entry or open the source.\n\nWrite nothing you or an explorer did not read, and no key or password. When the pages are written, answer with the pages you wrote, one line each, and what is still unmapped.{focus}"
     )
 }
 
@@ -567,7 +571,8 @@ mod tests {
             "delegate one explorer a part",
             "open at least one of the places it cites",
             "one page of boundaries",
-            "its source as path:line",
+            "`[^id]: path:line`",
+            "refuses the page otherwise",
             "how sure it is",
             "Map only this part, or put it first: the parser",
         ] {
