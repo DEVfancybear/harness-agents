@@ -27,6 +27,9 @@ const DEFAULT_ENTRY_LIMIT: usize = 6;
 const RERANK_POOL: usize = 2 * DEFAULT_ENTRY_LIMIT;
 const DEFAULT_REFINEMENT_LIMIT: usize = 5;
 const DEFAULT_CONTENT_LIMIT: usize = 180;
+/// The characters of the one entry that stands out for the request, which
+/// the digest shows whole instead of cut at [`DEFAULT_CONTENT_LIMIT`].
+const WHOLE_CONTENT_LIMIT: usize = 1_200;
 /// The most query terms one digest ranks by (prime-agent caps at 48).
 const MAX_QUERY_TERMS: usize = 48;
 /// The grouping of an entry the user set as a rule for the work: `constraints`
@@ -678,6 +681,69 @@ fn ranked<'a>(
     shown
 }
 
+/// Which conversations see an entry, in the digest's header. After
+/// Continual-ARC (arXiv 2611.14505): prime-agent said to default to the
+/// conversation, and the model never wrote the wider scope, so a task that
+/// came back found nothing. Say who sees each scope, and that what a return
+/// needs is written wider than `local`.
+pub const SCOPE_REACH: &str = "Who sees an entry you write: global, every conversation; project, this project's conversations; local, only this one - and it is gone when this conversation ends. Keep local for current task progress, temporary blockers and session coordination. What a later conversation of this task or project would need (a fact the files or tools showed, how the task was solved, a durable preference) is written global or project, or it is lost.";
+
+/// One kind's entries as the digest ranks them: all of the kind, the count
+/// before the pinned were taken off, the unpinned entries, and each one's
+/// BM25 score against the request (`None`: no query word reached it).
+struct Pass<'a> {
+    kind: &'static str,
+    kept: usize,
+    entries: Vec<&'a Entry>,
+    scores: Vec<Option<f64>>,
+}
+
+/// The one entry the digest shows whole, if the request has one: the kind
+/// and id of the ranked entry whose score stands out from its kind's, by the
+/// scores' own spread ([`harness_types::readout::standout_of`], as learned
+/// skill recall judges it), the best such entry across the kinds.
+///
+/// After Continual-ARC (arXiv 2611.14505): the digest cut every entry to a
+/// few lines, chosen before the task was known, and a stored rule reached the
+/// model on 40 of 154 returns; when it did, the instance cost less than half.
+/// A rule cut at 180 characters loses the step that made it worth storing.
+/// A constraint is not a candidate (it is shown for every request already),
+/// and a word alone is no fit: the entry must share two of the request's
+/// words, however many entries there are (a common word that only one entry
+/// holds scores high). No word list: the choice is the scores' and the
+/// request's own.
+fn whole_entry(passes: &[Pass<'_>], terms: &[(String, f64)]) -> Option<(&'static str, String)> {
+    let mut best: Option<(f64, &'static str, String)> = None;
+    for pass in passes {
+        let members = (0..pass.entries.len())
+            .filter(|index| !is_constraint(pass.entries[*index]))
+            .collect::<Vec<_>>();
+        let scores = members
+            .iter()
+            .map(|index| pass.scores[*index].unwrap_or(0.0))
+            .collect::<Vec<_>>();
+        let few = |at: usize| {
+            let entry = pass.entries[members[at]];
+            let held = tokens(&format!(
+                "{} {}",
+                entry.title.as_deref().unwrap_or_default(),
+                entry.content.as_deref().unwrap_or_default()
+            ));
+            terms.iter().filter(|(term, _)| held.contains(term)).count() >= 2
+        };
+        if let Some(at) = harness_types::readout::standout_of(&scores, few).filter(|at| few(*at)) {
+            let entry = pass.entries[members[at]];
+            if best
+                .as_ref()
+                .is_none_or(|(score, _, _)| scores[at] > *score)
+            {
+                best = Some((scores[at], pass.kind, entry.id.clone()));
+            }
+        }
+    }
+    best.map(|(_, kind, id)| (kind, id))
+}
+
 /// [`format_digest`] with the entries it showed. Each kind's entries are
 /// ranked by [`ranked`]: the request's words first, then recency and use.
 #[must_use]
@@ -715,7 +781,7 @@ pub fn render_digest(state: &State, options: DigestOptions, terms: &[(String, f6
         String::new(),
         "Local continual harness entries belong to this conversation. Global continual harness entries persist across conversations.".to_owned(),
         "The continual harness entries below are compact summaries, not full descriptions. Use them as routing/context hints; inspect or refine the underlying continual harness entry only when detail matters.".to_owned(),
-        "Default to local continual harness refinement for current task progress, temporary blockers, and session coordination. Use global continual harness refinement only for stable cross-session lessons, durable user preferences, reusable skills/subagents, or explicitly project-qualified facts.".to_owned(),
+        SCOPE_REACH.to_owned(),
         "Use these continual harness prompt notes, memories, skills, and subagent specs when they are relevant. The base system prompt is immutable; prompt entries below are supplemental notes only.".to_owned(),
         String::new(),
         if options.refine {
@@ -746,16 +812,45 @@ pub fn render_digest(state: &State, options: DigestOptions, terms: &[(String, f6
             ],
         );
     }
+    // Memory search's BM25, the request's terms weighed as they came: whole
+    // words, their stems, and a word without accents matching one with them.
+    // Scored once per kind, over the whole kind, not inside the sort - and
+    // before anything is rendered, so the one entry that is shown whole can
+    // be chosen across the kinds.
+    let passes = KINDS
+        .iter()
+        .map(|kind| {
+            let mut entries = state
+                .entries
+                .get(kind)
+                .map_or_else(Vec::new, |entries| entries.iter().collect::<Vec<_>>());
+            let kept = entries.len();
+            // A pinned entry is shown whole above; the ranked list is the rest.
+            entries.retain(|entry| !entry.pinned);
+            let mut scores = vec![None; entries.len()];
+            if !terms.is_empty() {
+                for (index, score) in super::memory_search::bm25_scores(&entries, terms) {
+                    scores[index] = Some(score);
+                }
+            }
+            Pass {
+                kind,
+                kept,
+                entries,
+                scores,
+            }
+        })
+        .collect::<Vec<_>>();
+    let whole = whole_entry(&passes, terms);
     let mut shown_entries = pinned_lines(state, &mut lines);
     let mut total = 0;
-    for kind in KINDS {
-        let mut entries = state
-            .entries
-            .get(kind)
-            .map_or_else(Vec::new, |entries| entries.iter().collect::<Vec<_>>());
-        let kept = entries.len();
-        // A pinned entry is shown whole above; the ranked list is the rest.
-        entries.retain(|entry| !entry.pinned);
+    for Pass {
+        kind,
+        kept,
+        entries,
+        scores,
+    } in passes
+    {
         let pinned = kept - entries.len();
         // A constraint the user set is in view in every turn, ahead of the
         // ranked entries: ranked by the request, "never touch vendor/" fell
@@ -763,17 +858,7 @@ pub fn render_digest(state: &State, options: DigestOptions, terms: &[(String, f6
         // The constraints come first, up to their own limit, and the ranked
         // entries keep their places beside them: a list of rules never
         // pushes the entries the request is about out of the digest.
-        // Memory search's BM25, the request's terms weighed as they came:
-        // whole words, their stems, and a word without accents matching one
-        // with them. Scored once per kind, over the whole kind, not inside
-        // the sort.
         let all = entries.clone();
-        let mut scores = vec![None; all.len()];
-        if !terms.is_empty() {
-            for (index, score) in super::memory_search::bm25_scores(&all, terms) {
-                scores[index] = Some(score);
-            }
-        }
         let group = |constraint: bool, limit: usize| {
             let members = (0..all.len())
                 .filter(|index| is_constraint(all[*index]) == constraint)
@@ -863,7 +948,17 @@ pub fn render_digest(state: &State, options: DigestOptions, terms: &[(String, f6
                 entry.path,
                 entry.version,
                 age_suffix(entry),
-                compact(content, DEFAULT_CONTENT_LIMIT)
+                compact(
+                    content,
+                    if whole
+                        .as_ref()
+                        .is_some_and(|(whole_kind, id)| *whole_kind == kind && *id == entry.id)
+                    {
+                        WHOLE_CONTENT_LIMIT
+                    } else {
+                        DEFAULT_CONTENT_LIMIT
+                    }
+                )
             ));
         }
         if entries.len() > shown {
@@ -1482,6 +1577,125 @@ mod tests {
         assert!(
             digest.find("[local:vendor]").expect("constraint")
                 < digest.find("[local:parser-").expect("ranked"),
+            "{digest}"
+        );
+    }
+
+    /// A store of unrelated notes and one task entry whose last step lies
+    /// past the 180 characters a shown entry is cut at.
+    fn returning_task(kind: &str, tail: &str) -> serde_json::Value {
+        let mut entries = serde_json::Map::new();
+        for number in 0..9 {
+            entries.insert(
+                format!("other-{number}"),
+                json!({"title": format!("Other note {number}"), "content": "Unrelated weather note"}),
+            );
+        }
+        entries.insert(
+            "zebra-task".to_owned(),
+            json!({"title": "Zebra grid recolor task",
+                "content": format!("Zebra grid recolor task: read the demonstrations, {} {tail}", "then check the palette and the border. ".repeat(8))}),
+        );
+        json!({ kind: entries })
+    }
+
+    /// Continual-ARC (arXiv 2611.14505): the digest cut a stored rule to a
+    /// few lines, and it reached the model on 40 of 154 returns. The entry
+    /// the request stands out for is shown whole.
+    #[test]
+    fn the_entry_that_stands_out_for_the_request_is_shown_whole() {
+        let directory = tempfile::tempdir().expect("state");
+        write(
+            directory.path(),
+            &json!({"entries": returning_task("memory", "LAST-STEP-RUN-SOLVE-PY")}),
+        );
+        let state = load(directory.path(), "local");
+        let digest = format_digest(
+            &state,
+            DigestOptions::default(),
+            &weighted_terms(None, &["do the zebra grid recolor task again"]),
+        );
+        assert!(digest.contains("LAST-STEP-RUN-SOLVE-PY"), "{digest}");
+        // A request that shares nothing with it gets the entry cut, as before.
+        let other = format_digest(
+            &state,
+            DigestOptions::default(),
+            &weighted_terms(None, &["paint the kitchen wall"]),
+        );
+        assert!(!other.contains("LAST-STEP-RUN-SOLVE-PY"), "{other}");
+        // Nor does the digest of a request that names no entry above the rest.
+        let none = format_digest(&state, DigestOptions::default(), &[]);
+        assert!(!none.contains("LAST-STEP-RUN-SOLVE-PY"), "{none}");
+    }
+
+    /// Nothing is judged by a word or a fixed score: when every entry fits
+    /// the request alike, none stands out and every one is cut.
+    #[test]
+    fn no_entry_is_shown_whole_when_none_stands_out() {
+        let directory = tempfile::tempdir().expect("state");
+        let mut memories = serde_json::Map::new();
+        for number in 0..8 {
+            memories.insert(
+                format!("grid-{number}"),
+                json!({"title": format!("Grid recolor note {number}"),
+                    "content": format!("Grid recolor note {number}: {} LAST-STEP-{number}", "check the palette and the border. ".repeat(8))}),
+            );
+        }
+        write(directory.path(), &json!({"entries": {"memory": memories}}));
+        let digest = format_digest(
+            &load(directory.path(), "local"),
+            DigestOptions::default(),
+            &weighted_terms(None, &["grid recolor"]),
+        );
+        assert!(!digest.contains("LAST-STEP"), "{digest}");
+    }
+
+    /// At most one entry of a digest is whole, the best across the kinds, and
+    /// a constraint is never made so: it is in view already.
+    #[test]
+    fn one_entry_per_digest_is_shown_whole_and_never_a_constraint() {
+        let directory = tempfile::tempdir().expect("state");
+        let mut entries = returning_task("memory", "TAIL-MEMORY");
+        let mut prompts = returning_task("prompt", "TAIL-PROMPT");
+        // The prompt's entry fits the request less well.
+        prompts["prompt"]["zebra-task"]["title"] = json!("Zebra grid");
+        prompts["prompt"]["zebra-task"]["content"] = json!(format!(
+            "Zebra grid: {} TAIL-PROMPT",
+            "then check the palette and the border. ".repeat(8)
+        ));
+        entries["memory"]["rule"] = json!({"title": "Zebra grid recolor task rule", "path": "constraints/grid",
+            "content": format!("zebra grid recolor task rule: {} TAIL-RULE", "never touch the border. ".repeat(12))});
+        entries["prompt"] = prompts["prompt"].clone();
+        write(directory.path(), &json!({"entries": entries}));
+        let digest = format_digest(
+            &load(directory.path(), "local"),
+            DigestOptions::default(),
+            &weighted_terms(None, &["do the zebra grid recolor task again"]),
+        );
+        assert!(digest.contains("TAIL-MEMORY"), "{digest}");
+        assert!(!digest.contains("TAIL-PROMPT"), "{digest}");
+        assert!(!digest.contains("TAIL-RULE"), "{digest}");
+        assert!(digest.contains("[local:rule]"), "{digest}");
+    }
+
+    /// Continual-ARC: the header said to default to the conversation, and the
+    /// model never chose a wider scope. It says who sees each scope.
+    #[test]
+    fn the_digest_says_which_conversations_see_each_scope() {
+        let directory = tempfile::tempdir().expect("state");
+        write(directory.path(), &json!({"entries": {"memory": {}}}));
+        let digest = format_digest(
+            &load(directory.path(), "local"),
+            DigestOptions::default(),
+            &[],
+        );
+        assert!(!digest.contains("Default to local"), "{digest}");
+        assert!(
+            digest.contains("global, every conversation; project, this project's conversations; local, only this one"),
+            "{digest}"
+        );
+        assert!(
+            digest.contains("gone when this conversation ends"),
             "{digest}"
         );
     }

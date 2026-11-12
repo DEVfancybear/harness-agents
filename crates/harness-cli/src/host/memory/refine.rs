@@ -292,7 +292,7 @@ Continual harness components:
 - Name tools and calls exactly as the conversation used them. When the agent delegated with the `delegate` tool, merged with `integrate_children` or messaged children with `agent_message`, a skill or subagent spec says so; use the RLM forms (`rlm.spawn`, `rlm.collect`) only when the conversation shows the Python REPL in use. A procedure that names a mechanism the agent did not have fails the next time it is followed.
 
 Scope and persistence policy:
-- The default editable continual harness store is local to the current conversation. Use it for current-run coordination notes and project facts that should not affect other conversations. The task's plan, checklist, progress, decisions and blockers live in task_state, which the agent keeps and every turn carries whole: never copy them into a memory edit; a local edit holds what task_state does not (a finding about the code, a constraint met mid-task).
+- The default editable continual harness store is local to the current conversation, and a local entry is gone with that conversation. Use it for current-run coordination notes and what only this conversation needs. A fact about a project that a tool result or a file showed is not that: an automatic review keeps it for the project's later conversations (`about: project`, or `scope: project`). The task's plan, checklist, progress, decisions and blockers live in task_state, which the agent keeps and every turn carries whole: never copy them into a memory edit; a local edit holds what task_state does not (a finding about the code, a constraint met mid-task).
 - A caller may explicitly request global refinement. Global edits must be stable cross-session lessons, durable user preferences, reusable skills/subagents, or tool/environment facts that should affect future conversations.
 - Entry ids in the harness overview may carry a display-only `local:` or `global:` prefix. Always use the bare id (no prefix) in edits.
 - All edits in one refinement apply only to the requested scope's store. During a local refinement, global entries are read-only context: never propose update or delete edits for them; create a local entry instead when a session-specific override is genuinely needed.
@@ -3666,7 +3666,7 @@ async fn plan(
 
 /// The automatic review's scope: local by default, with memory that holds
 /// across conversations marked global.
-const AUTO_SCOPE_POLICY: &str = "Requested refinement scope: automatic review. Edits go to this conversation's local store unless marked otherwise. Mark a memory edit with \"scope\": \"global\" when it is a durable user preference, a correction of how the agent should work, or a stable fact about the user, their environment or a named project that future conversations need, and the main agent did not already save it: check the global entries in the overview, and update a global entry (with \"scope\": \"global\" and its bare id) when the conversation supersedes it instead of creating a duplicate. Never put task progress, temporary blockers or current-run coordination in global memory, nor task state such as commit ids, test counts or a done/in-progress status: the task's plan, checklist, progress, decisions and blockers live in task_state, which the agent keeps and every turn carries whole: never copy them into a memory edit; a local edit holds what task_state does not (a finding about the code, a constraint met mid-task). Keep a lasting result as knowledge when worth keeping. Entries that record a state go stale (the overview shows each entry's age): when the conversation shows one changed - a goal completed, work merged, a blocker resolved, a count moved - update or delete it, a local one freely and a global one with \"scope\": \"global\". Only memory edits may be global; every other kind stays local.";
+const AUTO_SCOPE_POLICY: &str = "Requested refinement scope: automatic review. A local entry reaches only this conversation's turns and is gone with it, so an edit stays local only when that is all it needs: current-run coordination, a finding that matters to this task alone, a constraint met mid-task. A fact about this project that a tool result or a file showed (how it builds, where something lives, what a config names) outlives the conversation: say \"about\": \"project\" and it is kept for the project's later conversations; \"scope\": \"project\" does the same. Mark a memory edit with \"scope\": \"global\" when it is a durable user preference, a correction of how the agent should work, or a stable fact about the user or their environment that future conversations in any project need, and the main agent did not already save it: check the global entries in the overview, and update a global entry (with \"scope\": \"global\" and its bare id) when the conversation supersedes it instead of creating a duplicate. Never put task progress, temporary blockers or current-run coordination in global memory, nor task state such as commit ids, test counts or a done/in-progress status: the task's plan, checklist, progress, decisions and blockers live in task_state, which the agent keeps and every turn carries whole: never copy them into a memory edit; a local edit holds what task_state does not (a finding about the code, a constraint met mid-task). Keep a lasting result as knowledge when worth keeping. Entries that record a state go stale (the overview shows each entry's age): when the conversation shows one changed - a goal completed, work merged, a blocker resolved, a count moved - update or delete it, a local one freely and a global one with \"scope\": \"global\". Only memory edits may be global; every other kind stays local.";
 
 /// What the automatic review may add to the knowledge library.
 const SKILL_OUTCOMES: &str = "For each learned skill in play that the conversation shows being followed, say how it went in a top-level `skillOutcomes` array: {\"skill\": \"its name\", \"outcome\": \"worked\" or \"failed\", \"evidence\": \"a verbatim quote from the conversation\", \"assumption\": \"for a failure: what the skill took for granted that turned out false\"}. Judge the skill, not the task: it failed when its own steps did not work as written - a command it gives broke, a file or path it names was missing - even when the agent then reached the goal another way, and it worked when following it as written did the job. Judge only from what the conversation shows - a check that passed or failed, a command that broke, the user confirming or correcting - and leave the array empty when it shows neither. A failure whose cause the skill could have checked first is also worth a patch to the skill that adds that check. A skill in play that you patch or update gets its outcome too: the patch fixes the skill, the outcome says how following it went.";
@@ -3857,6 +3857,24 @@ const PENDING_DIR: &str = "pending_refinements";
 /// refinement's; dropped without that - [`apply`] failed (the state's lock
 /// timed out, a save or the history failed) or the review was cut off - the
 /// writes are undone. A process that died mid-way leaves the record unlocked,
+    /// A new memory entry the review says is about the project, quotes the
+    /// conversation for, and gives no scope. After Continual-ARC (arXiv
+    /// 2611.14505): prime-agent's stores defaulted to the conversation, a
+    /// stored rule reached a later conversation only when written global, and
+    /// the model never opted in - so what it learned about a task was gone
+    /// when the task came back. A fact about the project is the project's
+    /// unless the review chose `local`. The review's own words decide what
+    /// the edit is about; the host matches no text.
+    fn observed_project_fact(&self) -> bool {
+        self.text("kind") == Some("memory")
+            && self.text("action") == Some("create")
+            && self.scope().is_none()
+            && self.text("about") == Some("project")
+            && self
+                .text("evidence")
+                .is_some_and(|evidence| !evidence.trim().is_empty())
+    }
+
 /// and the next refinement in the scope undoes it. Seen: a review whose apply
 /// timed out on the lock left its pages and skills behind with no refinement
 /// to roll them back.
@@ -4312,7 +4330,7 @@ pub async fn auto_refine(
                 && edit.text("evidence").is_some_and(|evidence| {
                     project_findings.iter().any(|line| quoted(evidence, line))
                 });
-            if keeps_project_finding {
+            if keeps_project_finding || edit.observed_project_fact() {
                 edit.0.insert("scope".to_owned(), json!("project"));
             }
         }
@@ -9677,6 +9695,62 @@ Run `node scripts/build.js`.
     /// `project` on an edit is dropped when the proposal is read.
     #[test]
     fn a_model_cannot_name_an_entrys_project() {
+    /// Continual-ARC (arXiv 2611.14505): a store that defaults to the
+    /// conversation taught a returning task nothing, because the model never
+    /// chose the wider scope. A new entry the review calls a fact about the
+    /// project, with a quote and no scope, is the project's; one it chose
+    /// `local` for, one about the user and one with no quote stay as they were.
+    #[tokio::test]
+    async fn a_project_fact_the_review_gives_no_scope_is_kept_for_the_project() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let config = directory.path().join("config");
+        let data = directory.path().join("data");
+        let workspace = directory.path().join("p7");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let layers = crate::interactive::learned::Layers::new(&config, &data, &workspace, true);
+        let learning = super::Learning::new(layers, &workspace, None);
+        let reply = json!({"summary": "kept what the files showed", "rationale": "r", "expectedOutcome": "", "edits": [
+            {"action": "create", "kind": "memory", "title": "Build command", "content": "The build runs through make ci-fast.",
+             "about": "project", "reason": "a file showed it", "evidence": "the build runs through make ci-fast"},
+            {"action": "create", "kind": "memory", "title": "Scratch branch", "content": "This conversation works on branch wip-lantern.",
+             "about": "project", "scope": "local", "reason": "only this conversation", "evidence": "works on branch wip-lantern"},
+            {"action": "create", "kind": "memory", "title": "Terse answers", "content": "The user wants terse answers.",
+             "about": "user", "reason": "said so", "evidence": "keep answers terse please"},
+            {"action": "create", "kind": "memory", "title": "Unquoted fact", "content": "The deploy goes out on Fridays.",
+             "about": "project", "reason": "a guess", "evidence": ""}
+        ]})
+        .to_string();
+        let replies = Replies::new(&[reply]);
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = replies.clone();
+        let refined = super::auto_refine(
+            &provider,
+            "fixture-model",
+            "[User]: keep answers terse please\n\n[Tool result]: the build runs through make ci-fast\n\n[Assistant]: ok, and this conversation works on branch wip-lantern",
+            &scopes,
+            None,
+            Some(&learning),
+            None,
+        )
+        .await
+        .expect("refined");
+        assert!(refined.global_error.is_none(), "{:?}", refined.global_error);
+        let global = load_raw(&scopes.global);
+        let local = load_raw(&scopes.local);
+        assert_eq!(
+            global["entries"]["memory"]["build_command"]["project"]["name"], "p7",
+            "{global:#}"
+        );
+        assert!(local["entries"]["memory"]["build_command"].is_null());
+        assert!(
+            !local["entries"]["memory"]["scratch_branch"].is_null(),
+            "{local:#}"
+        );
+        assert!(global["entries"]["memory"]["scratch_branch"].is_null());
+        assert!(global["entries"]["memory"]["terse_answers"]["project"].is_null());
+        assert!(global["entries"]["memory"]["unquoted_fact"].is_null());
+    }
+
         let proposal = super::Proposal::from_value(&json!({"edits": [
             {"action": "create", "kind": "memory", "title": "t", "content": "c",
              "project": {"key": "elsewhere", "name": "other"}}

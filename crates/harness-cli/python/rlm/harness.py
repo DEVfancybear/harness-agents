@@ -30,6 +30,12 @@ HarnessScope = Literal["local", "global"]
 _KINDS: tuple[HarnessKind, ...] = ("prompt", "memory", "skill", "subagent", "factory")
 _HOST_REQUEST = "harness"
 _WRITES = {"create", "update", "upsert", "delete", "record_refinement"}
+# What a write to the conversation's own store prints: the entry is gone with
+# the conversation unless it is written global.
+_LOCAL_WRITE_NOTE = (
+    "note: this {kind} entry ({id}) is this conversation's only and is gone when it ends; "
+    "pass global_=True to keep it for later conversations."
+)
 
 
 def _agent_dir() -> Path:
@@ -319,6 +325,13 @@ class HarnessState:
         entry = _entry(result)
         if entry is None:
             raise RuntimeError(f"harness {op} returned no entry")
+        if not (global_ or self.scope == "global"):
+            # After Continual-ARC (arXiv 2611.14505): prime-agent wrote to the
+            # session by default, a later conversation saw nothing of it, and
+            # the model never opted into the global store. The API keeps its
+            # default (prime-agent code relies on it); the write says what the
+            # default cost. The return value is the same entry as before.
+            print(_LOCAL_WRITE_NOTE.format(kind=entry.kind, id=entry.id))
         return entry
 
     def get(self, kind: HarnessKind, id: str, *, global_: bool = False, **kwargs: Any) -> HarnessEntry | None:

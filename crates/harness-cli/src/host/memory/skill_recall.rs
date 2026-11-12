@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use harness_session::{ContextBlock, ContextBlockKind};
-use harness_types::readout::{STANDOUT, STATISTIC_FROM, words};
+use harness_types::readout::{standout_of, words};
 use harness_types::search::bm25_idf;
 
 use super::learned::{Layers, LearnedSkill};
@@ -100,7 +100,8 @@ pub fn recall(layers: &Layers, skills: &[LearnedSkill], request: &str) -> Option
 /// The index and BM25 score of the document that stands out for the query.
 ///
 /// With enough documents for a spread to mean something, the best must lie
-/// [`STANDOUT`] deviations above the mean score; with fewer, it must match at
+/// [`STANDOUT`](harness_types::readout::STANDOUT) deviations above the mean
+/// score ([`standout_of`] judges it); with fewer, it must match at
 /// least two of the query's words, so one shared word is not a fit. Either
 /// way it must beat the next one.
 fn best_of(documents: &[Vec<String>], query: &[String]) -> Option<(usize, f64)> {
@@ -141,30 +142,9 @@ fn best_of(documents: &[Vec<String>], query: &[String]) -> Option<(usize, f64)> 
             (score, matched)
         })
         .collect::<Vec<_>>();
-    let mut order = (0..scored.len()).collect::<Vec<_>>();
-    order.sort_by(|left, right| scored[*right].0.total_cmp(&scored[*left].0));
-    let best = order[0];
-    let (score, matched) = scored[best];
-    if score <= 0.0 {
-        return None;
-    }
-    if order.len() > 1 && scored[order[1]].0 >= score {
-        return None;
-    }
-    if scored.len() >= STATISTIC_FROM {
-        #[allow(clippy::cast_precision_loss, reason = "document counts are small")]
-        let count = scored.len() as f64;
-        let mean = scored.iter().map(|(score, _)| score).sum::<f64>() / count;
-        let deviation = (scored
-            .iter()
-            .map(|(score, _)| (score - mean).powi(2))
-            .sum::<f64>()
-            / count)
-            .sqrt();
-        (score >= mean + STANDOUT * deviation).then_some((best, score))
-    } else {
-        (matched >= 2).then_some((best, score))
-    }
+    let bm25 = scored.iter().map(|(score, _)| *score).collect::<Vec<_>>();
+    let best = standout_of(&bm25, |index| scored[index].1 >= 2)?;
+    Some((best, bm25[best]))
 }
 
 fn without_front_matter(document: &str) -> &str {

@@ -6,6 +6,8 @@ scope a call targets, Python's argument errors, the factory gate and dry run,
 and how a reply becomes entries or an exception.
 """
 
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -83,6 +85,24 @@ class HarnessShimTests(unittest.TestCase):
         self.assertIsNone(fake.requests[-1]["id"])
         harness.get_harness_state(global_=True).list()
         self.assertTrue(fake.requests[-1]["global"])
+
+    def test_a_local_write_says_it_is_gone_with_the_conversation(self):
+        # Continual-ARC (arXiv 2611.14505): the default store was the
+        # session's, and a model that never chose the global one lost what it
+        # had learned when the task came back. The default stays; the write
+        # says what it costs, and what it returns is unchanged.
+        local = dict(ENTRY, scope="local")
+        self.host(result=local)
+        with redirect_stdout(io.StringIO()) as printed:
+            entry = self.state.create_memory("Language", "Answer in Vietnamese")
+        self.assertEqual(entry.scope, "local")
+        self.assertEqual(entry.content, "Answer in Vietnamese")
+        self.assertIn("this conversation's only", printed.getvalue())
+        self.assertIn("global_=True", printed.getvalue())
+        with redirect_stdout(io.StringIO()) as printed:
+            self.state.create_memory("Language", "Answer in Vietnamese", global_=True)
+            harness.get_harness_state(global_=True).create_memory("Language", "x")
+        self.assertEqual(printed.getvalue(), "", "a global write has nothing to warn of")
 
     def test_a_payload_type_cannot_reroute_the_request(self):
         fake = self.host(result=[])

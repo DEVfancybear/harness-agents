@@ -250,6 +250,43 @@ fn standing_out(
         .collect()
 }
 
+/// The index of the one score that stands out from the others, judged by the
+/// scores' own spread, or `None` when nothing does.
+///
+/// The best must be above zero and beat the next one. With [`STATISTIC_FROM`]
+/// scores or more it must also lie [`STANDOUT`] deviations above their mean;
+/// with fewer a spread says little, and `few` decides for the best (a recall
+/// asks that it match two of the query's words). A score of a document the
+/// query did not reach is `0.0`, and counts in the spread. Learned-skill
+/// recall and the digest's whole entry both choose this way.
+#[must_use]
+pub fn standout_of(scores: &[f64], few: impl Fn(usize) -> bool) -> Option<usize> {
+    let mut order = (0..scores.len()).collect::<Vec<_>>();
+    order.sort_by(|left, right| scores[*right].total_cmp(&scores[*left]));
+    let best = *order.first()?;
+    let score = scores[best];
+    if score <= 0.0 {
+        return None;
+    }
+    if order.len() > 1 && scores[order[1]] >= score {
+        return None;
+    }
+    if scores.len() >= STATISTIC_FROM {
+        #[allow(clippy::cast_precision_loss, reason = "document counts are small")]
+        let count = scores.len() as f64;
+        let mean = scores.iter().sum::<f64>() / count;
+        let deviation = (scores
+            .iter()
+            .map(|score| (score - mean).powi(2))
+            .sum::<f64>()
+            / count)
+            .sqrt();
+        (score >= mean + STANDOUT * deviation).then_some(best)
+    } else {
+        few(best).then_some(best)
+    }
+}
+
 /// Cosine similarity of two vectors of one dimension.
 #[must_use]
 pub fn cosine(left: &[f32], right: &[f32]) -> Option<f64> {
@@ -377,6 +414,21 @@ mod tests {
 
     fn vector(values: &[f32]) -> Vec<f32> {
         values.to_vec()
+    }
+
+    /// The best score is chosen only when it beats the next and, among five
+    /// or more, lies a deviation above the mean; among fewer the caller
+    /// decides.
+    #[test]
+    fn one_score_stands_out_by_the_spread_of_the_rest() {
+        assert_eq!(standout_of(&[], |_| true), None);
+        assert_eq!(standout_of(&[0.0, 0.0], |_| true), None);
+        assert_eq!(standout_of(&[2.0, 2.0], |_| true), None, "a tie");
+        assert_eq!(standout_of(&[1.0, 3.0], |_| true), Some(1));
+        assert_eq!(standout_of(&[1.0, 3.0], |_| false), None);
+        // Three near the top of five: the best does not stand out from them.
+        assert_eq!(standout_of(&[3.0, 2.9, 2.8, 0.1, 0.0], |_| true), None);
+        assert_eq!(standout_of(&[0.2, 0.1, 0.0, 9.0, 0.3], |_| false), Some(3));
     }
 
     /// Every slot reads the whole store; the first follows the query, and the

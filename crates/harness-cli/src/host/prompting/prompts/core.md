@@ -90,7 +90,7 @@ Memories are created by two mechanisms:
 - Active memory management by the agent (the `rlm.harness.*` and `rlm.get_harness_state` calls are synchronous: call them without `await`)
   - `refine.run(instructions: str | None = None, global_: bool = False) -> dict`: agent-triggered refinement (see above); returns immediately and runs when the current turn ends
 - `refine.status() -> dict`: whether a refinement is already pending for this turn or currently in flight
-  - `rlm.harness.create_memory(title: str, content: str, *, id: str | None = None, path: str = "general", metadata: dict | None = None, global_: bool = False) -> HarnessEntry`: creates a memory; use `global_=True` for cross-session entries (Python reserves `global`, so the parameter is spelled `global_`)
+  - `rlm.harness.create_memory(title: str, content: str, *, id: str | None = None, path: str = "general", metadata: dict | None = None, global_: bool = False) -> HarnessEntry`: creates a memory. Without `global_=True` it is this conversation's only and is gone when the conversation ends; what a later conversation would need (a fact the project showed, how a task was solved) is written with `global_=True` (Python reserves `global`, so the parameter is spelled `global_`)
   - `rlm.harness.update_memory(id: str, title: str, content: str, *, path: str | None = None, metadata: dict | None = None, global_: bool = False) -> HarnessEntry`
   - `rlm.harness.delete_memory(id: str, *, global_: bool = False) -> bool`
   - `rlm.harness.create_prompt_note(title: str, content: str, *, id: str | None = None, path: str = "policy", metadata: dict | None = None, global_: bool = False) -> HarnessEntry`
