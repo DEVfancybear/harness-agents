@@ -263,8 +263,10 @@ Khi đọc một trang sẽ thấy các `anchors` nó định nghĩa và `cited_
 liên kết tới một đoạn của nó, anchor, và phần đầu của đoạn. Một cạnh của đồ
 thị mang các `anchors` mà liên kết trích. Một liên kết có đoạn đã mất (trang
 đích được viết lại sau đó) không bị lượt quét từ chối: trang liệt kê nó là
-`dangling_anchors`, `/knowledge status` đếm chúng bên cạnh các liên kết treo,
-và lần ghi kế tiếp mang nó vào sẽ bị từ chối.
+`dangling_anchors`, và lần ghi kế tiếp mang nó vào sẽ bị từ chối.
+`/knowledge status` thêm `, N dangling anchor(s) (trang -> đích#^anchor; ...)`
+sau các liên kết treo, cùng dạng và chỉ khi có; thư viện không có thì đọc như
+trước. `ha doctor` không báo chúng.
 
 Không có gì được lưu cho các góc nhìn này. Một timeline ghi vào thư viện dưới
 dạng tệp sẽ bị quét như trang và phải giữ đồng bộ bằng tay.

@@ -902,23 +902,40 @@ impl KnowledgeHost {
     }
 }
 
-/// `, N dangling link(s)` and the first ones, for a library that is on.
+/// `, N dangling link(s)` and the first ones, for a library that is on; and,
+/// only when there are any, `, N dangling anchor(s)` the same way: links to a
+/// paragraph (`page.md#^anchor`) that the page they name no longer defines.
 fn dangling_note(stats: &super::store::Stats) -> String {
     if !stats.enabled {
         return String::new();
     }
-    let mut note = format!(", {} dangling link(s)", stats.dangling);
-    if !stats.dangling_first.is_empty() {
+    let mut note = counted(
+        ", ",
+        "dangling link(s)",
+        stats.dangling,
+        &stats.dangling_first,
+    );
+    if stats.dangling_anchors > 0 {
+        note.push_str(&counted(
+            ", ",
+            "dangling anchor(s)",
+            stats.dangling_anchors,
+            &stats.dangling_anchors_first,
+        ));
+    }
+    note
+}
+
+/// `<lead>N <what>` and, when the first ones are known, ` (a; b; ...)`.
+fn counted(lead: &str, what: &str, count: usize, first: &[String]) -> String {
+    let mut note = format!("{lead}{count} {what}");
+    if !first.is_empty() {
         let _ = std::fmt::Write::write_fmt(
             &mut note,
             format_args!(
                 " ({}{})",
-                stats.dangling_first.join("; "),
-                if stats.dangling > stats.dangling_first.len() {
-                    "; ..."
-                } else {
-                    ""
-                }
+                first.join("; "),
+                if count > first.len() { "; ..." } else { "" }
             ),
         );
     }
@@ -2156,6 +2173,29 @@ mod tests {
         assert_eq!(
             child.execute(&search).expect("search")["results"],
             json!([])
+        );
+    }
+
+    /// `/knowledge status` names a link to a paragraph the page lacks beside
+    /// the dangling links, and reads as it did without one.
+    #[test]
+    fn status_names_dangling_anchors_only_when_there_are_some() {
+        let root = tempfile::tempdir().unwrap();
+        let host = host(root.path());
+        host.execute(&page("project", "b.md", "Target text.\n"))
+            .unwrap();
+        let before = host.command("status").unwrap()[0].clone();
+        assert!(before.contains("0 dangling link(s)"), "{before}");
+        assert!(!before.contains("anchor"), "{before}");
+        std::fs::write(
+            root.path().join("project").join("a.md"),
+            "# A\n\nSee [it](b.md#^gone).\n",
+        )
+        .unwrap();
+        let after = host.command("status").unwrap()[0].clone();
+        assert!(
+            after.contains(", 0 dangling link(s), 1 dangling anchor(s) (a.md -> b.md#^gone)"),
+            "{after}"
         );
     }
 

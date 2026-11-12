@@ -258,8 +258,10 @@ A read of a page lists the `anchors` it defines and `cited_by`: each page that
 links to one of its paragraphs, the anchor, and the start of the paragraph. A
 graph edge carries the `anchors` its link cites. A link whose paragraph is
 gone (the target was rewritten later) is not refused by a scan: the page lists
-it as `dangling_anchors`, `/knowledge status` counts them beside the dangling
-links, and the next write that brings it in is refused.
+it as `dangling_anchors`, and the next write that brings it in is refused.
+`/knowledge status` adds `, N dangling anchor(s) (page -> target#^anchor; ...)`
+after the dangling links, in the same form and only when there are any; a
+library with none reads as before. `ha doctor` does not report them.
 
 Nothing is stored for these views. A timeline written into the library as
 files would be scanned as pages and kept in step by hand.
