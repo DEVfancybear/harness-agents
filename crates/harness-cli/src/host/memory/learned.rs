@@ -587,6 +587,116 @@ pub fn record_use(layers: &Layers, name: &str, kind: UseKind) -> bool {
     true
 }
 
+/// A script a learned skill carries (`scripts/...`), and when a run of it was
+/// seen to succeed.
+///
+/// After Continual-ARC (arXiv 2611.14505): what paid most was a tested,
+/// executable artifact per task, run first when the task came back (0.65 to
+/// 0.81 of the cost saved); a rule in words that says to check cost the
+/// lookup it was meant to save. The host cannot run a model-written script
+/// itself (the approval policy forbids it), so "tested" is what the
+/// conversation showed: a tool result that ran this script and exited 0, and
+/// the review quoted it (`record_script_runs`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillScript {
+    /// Relative to the skill's folder: `scripts/solve.py`.
+    pub path: String,
+    /// The day a run of this very file was seen to succeed (`YYYY-MM-DD`).
+    /// `None`: no run was seen, or the file changed since.
+    pub tested_on: Option<String>,
+}
+
+/// The most scripts of one skill listed, and how deep `scripts/` is read.
+const SCRIPTS_LISTED: usize = 16;
+const SCRIPTS_DEPTH: usize = 3;
+
+/// The files under `directory/scripts`, as `scripts/<relative>`, sorted.
+fn script_paths(directory: &Path, prefix: &str, depth: usize, found: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = format!("{prefix}/{name}");
+        match entry.file_type() {
+            Ok(kind) if kind.is_file() => found.push(path),
+            Ok(kind) if kind.is_dir() && depth < SCRIPTS_DEPTH => {
+                script_paths(&entry.path(), &path, depth + 1, found);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The scripts in `skill_directory`, each with the day a run of the file as it
+/// is now was seen to succeed, from the skill's usage `marks`.
+fn scripts_of(skill_directory: &Path, marks: &Value) -> Vec<SkillScript> {
+    let mut found = Vec::new();
+    script_paths(&skill_directory.join("scripts"), "scripts", 1, &mut found);
+    found.sort();
+    found.truncate(SCRIPTS_LISTED);
+    found
+        .into_iter()
+        .map(|path| {
+            let mark = &marks[&path];
+            // A mark is of one file's content: a script changed since is not
+            // the one that was run.
+            let tested_on = mark["sha"]
+                .as_str()
+                .filter(|sha| file_hash(&skill_directory.join(&path)).as_deref() == Some(*sha))
+                .and_then(|_| mark["at"].as_str())
+                .map(|at| at.chars().take(10).collect());
+            SkillScript { path, tested_on }
+        })
+        .collect()
+}
+
+/// Mark the scripts of learned skill `name` whose run the review quoted and
+/// the host confirmed (a tool result of the conversation ran the file and
+/// exited 0), as of the file now on disk. Returns how many were marked; a
+/// path that is not a file of the skill is not.
+pub fn record_script_runs(layers: &Layers, name: &str, runs: &[(String, String)]) -> usize {
+    let Some(layer) = layers.find(name) else {
+        return 0;
+    };
+    let root = layers.root(layer).expect("found layer is present");
+    let directory = root.join(name);
+    let clip = |text: &str| text.trim().chars().take(300).collect::<String>();
+    let marked = runs
+        .iter()
+        .filter(|(path, _)| path.starts_with("scripts/") && check_subfile(path).is_ok())
+        .filter_map(|(path, evidence)| {
+            let sha = file_hash(&directory.join(path))?;
+            Some((path.clone(), sha, clip(evidence)))
+        })
+        .collect::<Vec<_>>();
+    if marked.is_empty() {
+        return 0;
+    }
+    update_usage(&layers.usage_file(layer, root), |usage| {
+        if !usage["skills"][name].is_object() {
+            usage["skills"][name] = json!({});
+        }
+        for (path, sha, evidence) in &marked {
+            usage["skills"][name]["scripts"][path] =
+                json!({"at": now(), "sha": sha, "evidence": evidence});
+        }
+    });
+    marked.len()
+}
+
+/// Forget the tested mark of each of `paths`: the file was written or removed.
+fn clear_script_marks(usage: &mut Value, name: &str, paths: &[&str]) {
+    if let Some(marks) = usage["skills"][name]["scripts"].as_object_mut() {
+        for path in paths {
+            marks.remove(*path);
+        }
+    }
+}
+
 /// The layer's request count and the counters of its learned skills.
 #[must_use]
 pub fn usage(layers: &Layers, layer: Layer) -> (u64, BTreeMap<String, Usage>) {
@@ -826,6 +936,8 @@ pub struct LearnedSkill {
     pub failures: Vec<String>,
     /// The words of the turns it worked in, newest last.
     pub cases: Vec<String>,
+    /// The scripts it carries, and which of them a run was seen to succeed.
+    pub scripts: Vec<SkillScript>,
 }
 
 /// Every live learned skill, global first.
@@ -863,6 +975,7 @@ pub fn library(layers: &Layers) -> Vec<LearnedSkill> {
                     .flatten()
                     .filter_map(|case| case["evidence"].as_str().map(str::to_owned))
                     .collect(),
+                scripts: scripts_of(&root.join(&name), &raw["skills"][&name]["scripts"]),
                 name,
             });
         }
@@ -1756,6 +1869,9 @@ fn land(
             if target.is_file() {
                 std::fs::remove_file(&target).map_err(|error| format!("{relative}: {error}"))?;
             }
+            update_usage(&layers.usage_file(layer, root), |usage| {
+                clear_script_marks(usage, &intent.name, &[relative]);
+            });
             append_ledger(&directory, &ledger_entry(intent));
             Ok(json!({
                 "files": {relative: before},
@@ -1820,6 +1936,12 @@ fn land(
                     // A skill that was rewritten is tried afresh.
                     usage["skills"][&intent.name]["trial_good"] = json!(0);
                     usage["skills"][&intent.name]["trial_bad"] = json!(0);
+                    // A script that was written is not the one a run vouched for.
+                    clear_script_marks(
+                        usage,
+                        &intent.name,
+                        &intent.files.keys().map(String::as_str).collect::<Vec<_>>(),
+                    );
                 });
             }
             append_ledger(&directory, &ledger_entry(intent));
@@ -1975,13 +2097,15 @@ When to write one: a corrected approach, a non-trivial technique or fix, a setup
 
 Facts and procedure: a verified fact goes in as the fact itself, labelled with where it holds ("in this repository: the fixtures live in tests/data"), and a guessed one not at all; a procedure is written for the class of work. Repeated deterministic work belongs in scripts/, carried by the skill and named from SKILL.md.
 
+A command sequence that solved the task is worth keeping as a script of the skill (`scripts/<name>`), written so it does the whole job when run again, not as steps in prose: a returning task is done at once by running it, where a rule in words has to be worked out again. When the conversation ran the script and it exited cleanly, say so in the intent's `script_runs`: {"path": "scripts/<name>", "evidence": "a verbatim quote of the run's result"}. The host checks the quote against the tool result and the call that made it, and marks the script as tested; a script no run is quoted for is listed as not run yet, and a script changed later loses the mark.
+
 Compare first: if a learned skill already covers the class of work, patch or update it instead of creating a near-duplicate. When a new rule contradicts an older learned skill, rewrite the stale statement in the same refinement. When two learned skills plainly cover the same class, patch the broader one to absorb the other and delete the narrower one with absorbed_into set to the survivor.
 
 Create skills at the altitude of the class of work (`rust-test-debugging`, not `fix-test-in-foo-rs`), so the next lesson of the same kind patches into it.
 
 "checks after use" under <learned_skills> counts turns that used the skill and then ran the project's verification checks, by how they ended. Repeated fails after use make a skill a candidate to fix: patch the step the failing work followed, or, when it passes in some situations and fails in others, split it into variants whose descriptions name when each applies. Never delete a skill because checks failed after it: a failure can come from the task, not the skill, and a skill that helps only in some contexts averages out to no effect while still being worth keeping.
 
-Intent fields: {"action":"create|update|patch|remove_file|delete","name":"lowercase-hyphenated","level":"project|global (create only)","body":"full SKILL.md (create/update)","old_string":"patch: text that occurs exactly once in the live SKILL.md","new_string":"patch: replacement","files":{"references/<topic>.md":"content"},"path":"remove_file: relative path","absorbed_into":"delete: the learned skill that absorbed this one","reason":"why","evidence":"a verbatim quote from the conversation"}
+Intent fields: {"action":"create|update|patch|remove_file|delete","name":"lowercase-hyphenated","level":"project|global (create only)","body":"full SKILL.md (create/update)","old_string":"patch: text that occurs exactly once in the live SKILL.md","new_string":"patch: replacement","files":{"references/<topic>.md":"content"},"path":"remove_file: relative path","absorbed_into":"delete: the learned skill that absorbed this one","script_runs":[{"path":"scripts/<name>","evidence":"a verbatim quote of the result of running it"}],"reason":"why","evidence":"a verbatim quote from the conversation"}
 
 Format, enforced:
 - SKILL.md opens with front matter: `---`, `name: <the intent name>`, `description: <one sentence that says when to use it, trigger first>`, `category: <one lowercase word or hyphenated phrase, reusing an existing category>`, `---`.
@@ -2859,6 +2983,71 @@ mod tests {
         );
     }
 
+    /// Continual-ARC (arXiv 2611.14505): a tested program per task, run first
+    /// when the task returns. A script is listed as run only for the file a
+    /// quoted run vouched for: writing it again clears the mark.
+    #[test]
+    fn a_script_run_is_recorded_as_tested_and_writing_it_again_clears_it() {
+        use super::record_script_runs;
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let skill_of = |script: &str| {
+            Intent::from_value(&json!({
+                "action": "create", "name": "zebra-recolor", "level": "project",
+                "body": skill("zebra-recolor", "Run scripts/solve.py first, then check the border."),
+                "files": {"scripts/solve.py": script},
+                "reason": "the task came back", "evidence": "[User]: do it this way",
+            }))
+        };
+        let context = PromoteContext::default();
+        assert!(promote(&layers, &skill_of("print(1)"), &context).ok);
+        let scripts = |layers: &Layers| library(layers)[0].scripts.clone();
+        assert_eq!(scripts(&layers).len(), 1);
+        assert_eq!(scripts(&layers)[0].path, "scripts/solve.py");
+        assert_eq!(
+            scripts(&layers)[0].tested_on,
+            None,
+            "a new script was not run"
+        );
+        // Only a file of the skill under scripts/ can be marked.
+        let run = |path: &str| (path.to_owned(), "printed 1".to_owned());
+        assert_eq!(
+            record_script_runs(&layers, "zebra-recolor", &[run("scripts/missing.py")]),
+            0
+        );
+        assert_eq!(
+            record_script_runs(&layers, "zebra-recolor", &[run("SKILL.md")]),
+            0
+        );
+        assert_eq!(
+            record_script_runs(&layers, "no-such-skill", &[run("scripts/solve.py")]),
+            0
+        );
+        assert_eq!(
+            record_script_runs(&layers, "zebra-recolor", &[run("scripts/solve.py")]),
+            1
+        );
+        let marked = scripts(&layers)[0].tested_on.clone();
+        assert_eq!(marked.as_deref().map(str::len), Some(10), "{marked:?}");
+        // An update that writes the script again is not the file that ran.
+        let update = Intent::from_value(&json!({
+            "action": "update", "name": "zebra-recolor",
+            "body": skill("zebra-recolor", "Run scripts/solve.py first, then check the border."),
+            "files": {"scripts/solve.py": "print(2)"},
+            "reason": "the palette changed", "evidence": "[User]: the palette changed",
+        }));
+        let verdict = promote(&layers, &update, &context);
+        assert!(verdict.ok, "{:?}", verdict.findings);
+        assert_eq!(scripts(&layers)[0].tested_on, None);
+        let raw = super::load_usage(&layers.usage_file(
+            super::Layer::Project,
+            layers.root(super::Layer::Project).expect("project"),
+        ));
+        assert!(
+            raw["skills"]["zebra-recolor"]["scripts"]["scripts/solve.py"].is_null(),
+            "{raw}"
+        );
+    }
     #[test]
     fn evidence_is_redacted_but_ordinary_numbers_stay() {
         let text = redact(

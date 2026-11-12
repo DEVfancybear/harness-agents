@@ -22,12 +22,13 @@
 //!   case beside the strategy).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use harness_session::{ContextBlock, ContextBlockKind};
 use harness_types::readout::{standout_of, words};
 use harness_types::search::bm25_idf;
 
-use super::learned::{Layers, LearnedSkill};
+use super::learned::{Layers, LearnedSkill, SkillScript};
 
 /// BM25's term-frequency saturation and length normalization.
 const K1: f64 = 1.2;
@@ -46,6 +47,10 @@ pub struct Recalled {
     pub cases: Vec<String>,
     /// Nothing has shown it to work yet.
     pub unproven: bool,
+    /// The scripts the skill carries, with the day a run was seen to succeed.
+    pub scripts: Vec<SkillScript>,
+    /// The skill's folder, which the scripts' paths are relative to.
+    pub directory: Option<std::path::PathBuf>,
     pub score: f64,
 }
 
@@ -93,6 +98,8 @@ pub fn recall(layers: &Layers, skills: &[LearnedSkill], request: &str) -> Option
         failures: skill.failures.clone(),
         cases: skill.cases.clone(),
         unproven: skill.usage.unproven(),
+        scripts: skill.scripts.clone(),
+        directory: layers.root(skill.layer).map(|root| root.join(&skill.name)),
         score,
     })
 }
@@ -163,6 +170,7 @@ pub fn block(recalled: &Recalled) -> ContextBlock {
         "A learned skill fits this request: {}. Its instructions follow; follow them where they fit, and say so when they do not.\n<skill name=\"{}\">\n{}\n</skill>",
         recalled.name, recalled.name, recalled.body
     );
+    text.push_str(&scripts_note(recalled));
     if recalled.unproven {
         text.push_str(
             "\nNothing has shown it to work yet: it is a draft. Check each step's result as you go.",
@@ -185,12 +193,65 @@ pub fn block(recalled: &Recalled) -> ContextBlock {
         .with_rest_at(format!("the learned skill {}", recalled.name))
 }
 
+/// The most scripts a recalled skill lists, and the most characters of the
+/// list: the block is bounded ([`RECALLED_TOKENS`]) and its tail is what a
+/// cut loses, so the list is short and sits before the case and the failures.
+const SCRIPTS_LISTED: usize = 8;
+const SCRIPTS_CHARS: usize = 1_200;
+
+/// The skill's scripts as the turn reads them: each with the day a run of it
+/// was seen to succeed, or that none was; for a tested one, run it first.
+///
+/// After Continual-ARC (arXiv 2611.14505): what paid most was a tested,
+/// executable artifact per task, run first when the task returned (0.65 to
+/// 0.81 of the cost saved); the same knowledge as a rule in words saved far
+/// less, because the agent confirmed it again before using it.
+fn scripts_note(recalled: &Recalled) -> String {
+    if recalled.scripts.is_empty() {
+        return String::new();
+    }
+    let place = |script: &SkillScript| {
+        recalled.directory.as_ref().map_or_else(
+            || script.path.clone(),
+            |directory| {
+                format!(
+                    "{}/{}",
+                    directory.display().to_string().replace('\\', "/"),
+                    script.path
+                )
+            },
+        )
+    };
+    let mut ordered = recalled.scripts.iter().collect::<Vec<_>>();
+    // Tested first: a cut keeps the ones worth running.
+    ordered.sort_by_key(|script| script.tested_on.is_none());
+    let mut text = String::from("\nThis skill carries scripts:");
+    for script in ordered.iter().take(SCRIPTS_LISTED) {
+        let line = match &script.tested_on {
+            Some(day) => format!("\n- {}: ran successfully on {day}", place(script)),
+            None => format!("\n- {}: not run yet", place(script)),
+        };
+        if text.chars().count() + line.chars().count() > SCRIPTS_CHARS {
+            break;
+        }
+        text.push_str(&line);
+    }
+    if let Some(tested) = ordered.iter().find(|script| script.tested_on.is_some()) {
+        let _ = write!(
+            text,
+            "\nRun {} first, before redoing the work by hand; if it fails, fix the script and say so.",
+            place(tested)
+        );
+    }
+    text
+}
+
 /// The most tokens a recalled skill takes in a turn's context.
 const RECALLED_TOKENS: u64 = 1_500;
 
 #[cfg(test)]
 mod tests {
-    use super::{Recalled, best_of, block, recall, without_front_matter};
+    use super::{Recalled, SkillScript, best_of, block, recall, without_front_matter};
     use crate::interactive::learned::{
         Intent, Layers, PromoteContext, library, promote, record_outcome,
     };
@@ -281,6 +342,8 @@ mod tests {
             failures: Vec::new(),
             cases: Vec::new(),
             unproven: true,
+            scripts: Vec::new(),
+            directory: None,
             score: 1.0,
         };
         let text = format!("{:?}", block(&recalled));
@@ -298,6 +361,134 @@ mod tests {
                 && !text.contains("older"),
             "{text}"
         );
+    }
+
+    fn with_scripts(scripts: &[(&str, Option<&str>)]) -> Recalled {
+        Recalled {
+            name: "recolor-grid".to_owned(),
+            body: "Run the script.".to_owned(),
+            failures: Vec::new(),
+            cases: Vec::new(),
+            unproven: false,
+            scripts: scripts
+                .iter()
+                .map(|(path, day)| SkillScript {
+                    path: (*path).to_owned(),
+                    tested_on: day.map(str::to_owned),
+                })
+                .collect(),
+            directory: Some(std::path::PathBuf::from("C:\\skills\\recolor-grid")),
+            score: 1.0,
+        }
+    }
+
+    /// Continual-ARC (arXiv 2611.14505): a tested program run first when the
+    /// task returned saved 0.65 to 0.81 of the cost; a rule in words saved far
+    /// less. The block lists the scripts, says which were run, and tells the
+    /// agent to run a tested one before redoing the work by hand.
+    #[test]
+    fn the_block_lists_the_scripts_and_says_to_run_the_tested_one_first() {
+        let recalled = with_scripts(&[
+            ("scripts/draft.py", None),
+            ("scripts/solve.py", Some("2026-11-12")),
+        ]);
+        let text = format!("{:?}", block(&recalled));
+        assert!(
+            text.contains(
+                "C:/skills/recolor-grid/scripts/solve.py: ran successfully on 2026-11-12"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("C:/skills/recolor-grid/scripts/draft.py: not run yet"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Run C:/skills/recolor-grid/scripts/solve.py first, before redoing the work by hand; if it fails, fix the script and say so."),
+            "{text}"
+        );
+        assert!(
+            text.find("solve.py: ran").expect("tested")
+                < text.find("draft.py: not").expect("draft"),
+            "a tested script is listed first"
+        );
+        // Nothing run yet: nothing to run first.
+        let untested = format!("{:?}", block(&with_scripts(&[("scripts/draft.py", None)])));
+        assert!(untested.contains("not run yet"), "{untested}");
+        assert!(!untested.contains("first, before redoing"), "{untested}");
+        // A skill with no script says nothing of scripts.
+        assert!(!format!("{:?}", block(&with_scripts(&[]))).contains("carries scripts"));
+    }
+
+    /// The block is bounded: a skill with many long script names lists a few,
+    /// the tested ones among them.
+    #[test]
+    fn the_scripts_list_stays_within_its_bound() {
+        let names = (0..16)
+            .map(|number| format!("scripts/{}-{number}.py", "long-name-".repeat(8)))
+            .collect::<Vec<_>>();
+        let mut scripts = names
+            .iter()
+            .map(|name| (name.as_str(), None))
+            .collect::<Vec<_>>();
+        scripts.push(("scripts/tested.py", Some("2026-11-12")));
+        let note = super::scripts_note(&with_scripts(&scripts));
+        assert!(note.chars().count() < super::SCRIPTS_CHARS + 300, "{note}");
+        assert!(note.contains("tested.py: ran successfully"), "{note}");
+    }
+
+    /// A script a run vouched for is carried into the recalled skill with its
+    /// day, and a script changed after the run is not tested any more.
+    #[test]
+    fn a_recalled_skill_carries_its_scripts_and_a_changed_one_is_untested() {
+        use crate::interactive::learned::record_script_runs;
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = Layers::new(
+            &directory.path().join("config"),
+            &directory.path().join("data"),
+            &directory.path().join("workspace"),
+            true,
+        );
+        let verdict = promote(
+            &layers,
+            &Intent::from_value(&json!({
+                "action": "create", "name": "recolor-grid", "level": "project",
+                "body": "---\nname: recolor-grid\ndescription: Use it to recolor the zebra grid.\ncategory: ops\n---\nRecolor the zebra grid with scripts/solve.py.\n",
+                "files": {"scripts/solve.py": "print('recolored')\n"},
+                "reason": "the user showed it", "evidence": "[User]: do it this way",
+            })),
+            &PromoteContext::default(),
+        );
+        assert!(verdict.ok, "{:?}", verdict.findings);
+        let request = "recolor the zebra grid";
+        let before = recall(&layers, &library(&layers), request).expect("fits");
+        assert_eq!(before.scripts.len(), 1);
+        assert_eq!(before.scripts[0].tested_on, None);
+        let marked = record_script_runs(
+            &layers,
+            "recolor-grid",
+            &[("scripts/solve.py".to_owned(), "recolored".to_owned())],
+        );
+        assert_eq!(marked, 1);
+        let tested = recall(&layers, &library(&layers), request).expect("fits");
+        assert_eq!(
+            tested.scripts[0].tested_on.as_deref().map(str::len),
+            Some(10),
+            "{:?}",
+            tested.scripts
+        );
+        assert!(format!("{:?}", block(&tested)).contains("first, before redoing the work by hand"));
+        // The file is written again: the run was of another file.
+        let root = layers
+            .root(crate::interactive::learned::Layer::Project)
+            .expect("project");
+        std::fs::write(
+            root.join("recolor-grid/scripts/solve.py"),
+            "print('other')\n",
+        )
+        .expect("rewritten");
+        let changed = recall(&layers, &library(&layers), request).expect("fits");
+        assert_eq!(changed.scripts[0].tested_on, None);
     }
 
     fn docs(texts: &[&str]) -> Vec<Vec<String>> {

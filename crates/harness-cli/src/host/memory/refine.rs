@@ -307,7 +307,7 @@ Evidence and form (after Google Research's Harness2):
 - Write a verified fact as the fact itself, anchored to where it holds ("in project shop: the price column is in cents"), not only the way to find it again; write a procedure for the class of work, not for this one task; never record a guess as a fact.
 - Say how a fact or rule is known, in its edit's `metadata`: `"verified": "confirmed"` when the conversation shows it checked - a test or command that passed, the user confirming it - with `"verified_by"` saying how in a few words ("test passed: cargo test billing", "user confirmed"); `"verified": "unverified"` for a theory the conversation did not test, which a later conversation checks before relying on it. A trap the conversation ran into - something that looked right and went wrong - is worth a warning that names what sets it off and what happens. Memory is for what a later conversation needs and could not see for itself; which moments matter is your judgement.
 - Never record what was true of one moment (after CowAgent's evolution rules): an environment failure (a missing binary or interpreter, a credential, a network or provider error), a claim that a tool does not work or is unavailable, an error that went away on retry, or one task's narrative. Such an entry misleads every later conversation; the next one finds the environment as it is.
-- Choose the form by the kind of lesson: repeated deterministic work becomes a script a learned skill carries (scripts/); a multi-step workflow with a recognisable trigger becomes a learned skill whose description names that trigger; how the agent works (tools, retries, verification) and what a practitioner knows (the deliverable's parts, domain rules) are separate lessons. Prompt notes and memory are always on and paid for on every turn: keep them to short facts that hold on every turn, and when you add one, merge or remove one. Never keep one task's facts as durable global memory.
+- Choose the form by the kind of lesson: repeated deterministic work, and a command sequence that solved a task which may come back, becomes a script a learned skill carries (scripts/) - quote the result of its successful run in the intent's `script_runs` when the conversation ran it, so the next conversation runs it first; a multi-step workflow with a recognisable trigger becomes a learned skill whose description names that trigger; how the agent works (tools, retries, verification) and what a practitioner knows (the deliverable's parts, domain rules) are separate lessons. Prompt notes and memory are always on and paid for on every turn: keep them to short facts that hold on every turn, and when you add one, merge or remove one. Never keep one task's facts as durable global memory.
 
 When the conversation holds a line saying the turns above it were already reviewed, take lessons from the turns after that line; the earlier ones are context, and what they taught is already in the harness state or the learned skills.
 
@@ -2813,6 +2813,85 @@ fn same_version(current: &Value, expected: &Value) -> bool {
     }
 }
 
+/// How a process tool's result says it ended cleanly: the host's own line
+/// (`process <exe> exit=Some(0) timed_out=false ...`), not a word the model
+/// wrote.
+const PROCESS_EXITED_ZERO: &str = "exit=Some(0) timed_out=false";
+
+/// The runs of a skill's scripts that the conversation shows, from the
+/// `script_runs` the review put on a learned-skill intent
+/// (`{"path": "scripts/solve.py", "evidence": "<a verbatim quote of the
+/// run's result>"}`): the `(path, evidence)` of each that holds, and the paths
+/// that do not.
+///
+/// After Continual-ARC (arXiv 2611.14505), whose best harness kept a tested
+/// program per task and ran it first when the task came back. The host cannot
+/// run a model-written script (the approval policy forbids it), so a script is
+/// "tested" when the conversation ran it: the quote is in a tool result that
+/// reports a clean exit, and the call that produced that result names the
+/// script's file. A quote in a page, a file read or a child's report is no
+/// run.
+fn confirmed_script_runs(intent: &Value, transcript: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let squeeze = |text: &str| {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let blocks = transcript.split("\n\n").map(str::trim_start);
+    let calls = blocks
+        .clone()
+        .filter_map(|block| block.strip_prefix("[Assistant tool calls]: "))
+        .collect::<Vec<_>>();
+    // `#N tool(arguments)` up to the next call of the same message.
+    let call_of = |number: &str| {
+        let marker = format!("#{number} ");
+        let following = number
+            .parse::<u64>()
+            .map(|number| format!("; #{} ", number + 1))
+            .unwrap_or_default();
+        calls.iter().find_map(|block| {
+            let at = block
+                .match_indices(&marker)
+                .map(|(at, _)| at)
+                .find(|at| *at == 0 || block[..*at].ends_with("; "))?;
+            let call = &block[at..];
+            let end = if following.is_empty() {
+                None
+            } else {
+                call.find(&following)
+            };
+            Some(squeeze(end.map_or(call, |end| &call[..end])))
+        })
+    };
+    let results = blocks
+        .filter_map(|block| {
+            let (head, text) = block.strip_prefix("[Tool result (")?.split_once("]: ")?;
+            let (tool, number) = head.rsplit_once(" #")?;
+            (super::memory_provenance::tool_kind(tool.trim_end_matches(')')) == Some("tool"))
+                .then(|| (number.to_owned(), text.to_owned()))
+        })
+        .filter(|(_, text)| text.contains(PROCESS_EXITED_ZERO))
+        .collect::<Vec<_>>();
+    let mut confirmed = Vec::new();
+    let mut unconfirmed = Vec::new();
+    for claim in intent["script_runs"].as_array().into_iter().flatten() {
+        let path = claim["path"].as_str().unwrap_or_default().trim();
+        let evidence = claim["evidence"].as_str().unwrap_or_default();
+        let file = squeeze(path.rsplit('/').next().unwrap_or_default());
+        let ran = !file.is_empty()
+            && results.iter().any(|(number, text)| {
+                quoted(evidence, text) && call_of(number).is_some_and(|call| call.contains(&file))
+            });
+        if ran {
+            confirmed.push((path.to_owned(), evidence.to_owned()));
+        } else {
+            unconfirmed.push(path.to_owned());
+        }
+    }
+    (confirmed, unconfirmed)
+}
+
 /// Whether `quote` is in `text`, whitespace and case aside: whole, or as the
 /// pieces an ellipsis (`...`, `…`) joins, each after the one before.
 /// Quotation marks around it are not part of it, its pieces together are a
@@ -2998,7 +3077,11 @@ fn apply_skill_files(
 ) {
     applied_edits.extend(proposal.skill_records.iter().cloned());
     for intent in &proposal.skill_files {
-        applied_edits.push(promote_one(intent, learning));
+        applied_edits.push(promote_one(
+            intent,
+            learning,
+            proposal.evidence_in.as_deref(),
+        ));
     }
     for change in &proposal.skill_restores {
         let action = change["action"].as_str().unwrap_or_default();
@@ -3035,7 +3118,7 @@ fn apply_skill_files(
 }
 
 /// Promote one learned-skill intent and record the verdict as a refinement edit.
-fn promote_one(intent: &Value, learning: Option<&Learning>) -> Value {
+fn promote_one(intent: &Value, learning: Option<&Learning>, transcript: Option<&str>) -> Value {
     let parsed = super::learned::Intent::from_value(intent);
     let mut record = json!({
         "action": parsed.action,
@@ -3056,6 +3139,20 @@ fn promote_one(intent: &Value, learning: Option<&Learning>) -> Value {
             }
             if verdict.ok {
                 record["undo"] = verdict.undo;
+                // A script the review says ran, and the conversation shows
+                // it did, is recorded as tested; the rest is said to be not.
+                if let Some(transcript) = transcript {
+                    let (runs, unconfirmed) = confirmed_script_runs(intent, transcript);
+                    let marked =
+                        super::learned::record_script_runs(&learning.layers, &parsed.name, &runs);
+                    if marked > 0 {
+                        record["scriptRuns"] =
+                            json!(runs.iter().map(|(path, _)| path).collect::<Vec<_>>());
+                    }
+                    if !unconfirmed.is_empty() {
+                        record["scriptRunsUnconfirmed"] = json!(unconfirmed);
+                    }
+                }
             } else {
                 record["error"] = json!(verdict.findings.join("; "));
             }
@@ -3082,11 +3179,12 @@ async fn promote_with_repair(
     learning: &Learning,
     intents: &[Value],
     pending: &mut Pending,
+    transcript: Option<&str>,
 ) -> Vec<Value> {
     let mut records = intents
         .iter()
         .map(|intent| {
-            let record = promote_one(intent, Some(learning));
+            let record = promote_one(intent, Some(learning), transcript);
             pending.note(&record);
             record
         })
@@ -3124,7 +3222,7 @@ async fn promote_with_repair(
         }
     }
     for intent in repaired.iter().filter(|intent| intent.is_object()) {
-        let mut record = promote_one(intent, Some(learning));
+        let mut record = promote_one(intent, Some(learning), transcript);
         pending.note(&record);
         record["repaired"] = json!(true);
         records.push(record);
@@ -3759,6 +3857,24 @@ impl Edit {
         })
     }
 
+    /// A new memory entry the review says is about the project, quotes the
+    /// conversation for, and gives no scope. After Continual-ARC (arXiv
+    /// 2611.14505): prime-agent's stores defaulted to the conversation, a
+    /// stored rule reached a later conversation only when written global, and
+    /// the model never opted in - so what it learned about a task was gone
+    /// when the task came back. A fact about the project is the project's
+    /// unless the review chose `local`. The review's own words decide what
+    /// the edit is about; the host matches no text.
+    fn observed_project_fact(&self) -> bool {
+        self.text("kind") == Some("memory")
+            && self.text("action") == Some("create")
+            && self.scope().is_none()
+            && self.text("about") == Some("project")
+            && self
+                .text("evidence")
+                .is_some_and(|evidence| !evidence.trim().is_empty())
+    }
+
     /// An automatic review's memory edit meant for every conversation.
     fn wants_global(&self) -> bool {
         self.text("kind") == Some("memory") && matches!(self.scope(), Some("global" | "project"))
@@ -3857,24 +3973,6 @@ const PENDING_DIR: &str = "pending_refinements";
 /// refinement's; dropped without that - [`apply`] failed (the state's lock
 /// timed out, a save or the history failed) or the review was cut off - the
 /// writes are undone. A process that died mid-way leaves the record unlocked,
-    /// A new memory entry the review says is about the project, quotes the
-    /// conversation for, and gives no scope. After Continual-ARC (arXiv
-    /// 2611.14505): prime-agent's stores defaulted to the conversation, a
-    /// stored rule reached a later conversation only when written global, and
-    /// the model never opted in - so what it learned about a task was gone
-    /// when the task came back. A fact about the project is the project's
-    /// unless the review chose `local`. The review's own words decide what
-    /// the edit is about; the host matches no text.
-    fn observed_project_fact(&self) -> bool {
-        self.text("kind") == Some("memory")
-            && self.text("action") == Some("create")
-            && self.scope().is_none()
-            && self.text("about") == Some("project")
-            && self
-                .text("evidence")
-                .is_some_and(|evidence| !evidence.trim().is_empty())
-    }
-
 /// and the next refinement in the scope undoes it. Seen: a review whose apply
 /// timed out on the lock left its pages and skills behind with no refinement
 /// to roll them back.
@@ -4096,8 +4194,15 @@ async fn stage_skills(
     if let Some(learning) = learning
         && !proposal.skill_files.is_empty()
     {
-        proposal.skill_records =
-            promote_with_repair(provider, model, learning, &proposal.skill_files, pending).await;
+        proposal.skill_records = promote_with_repair(
+            provider,
+            model,
+            learning,
+            &proposal.skill_files,
+            pending,
+            proposal.evidence_in.as_deref(),
+        )
+        .await;
         let judged = judge_patched(
             provider,
             model,
@@ -9590,6 +9695,62 @@ Run `node scripts/build.js`.
         );
     }
 
+    /// Continual-ARC (arXiv 2611.14505): a store that defaults to the
+    /// conversation taught a returning task nothing, because the model never
+    /// chose the wider scope. A new entry the review calls a fact about the
+    /// project, with a quote and no scope, is the project's; one it chose
+    /// `local` for, one about the user and one with no quote stay as they were.
+    #[tokio::test]
+    async fn a_project_fact_the_review_gives_no_scope_is_kept_for_the_project() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let config = directory.path().join("config");
+        let data = directory.path().join("data");
+        let workspace = directory.path().join("p7");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let layers = crate::interactive::learned::Layers::new(&config, &data, &workspace, true);
+        let learning = super::Learning::new(layers, &workspace, None);
+        let reply = json!({"summary": "kept what the files showed", "rationale": "r", "expectedOutcome": "", "edits": [
+            {"action": "create", "kind": "memory", "title": "Build command", "content": "The build runs through make ci-fast.",
+             "about": "project", "reason": "a file showed it", "evidence": "the build runs through make ci-fast"},
+            {"action": "create", "kind": "memory", "title": "Scratch branch", "content": "This conversation works on branch wip-lantern.",
+             "about": "project", "scope": "local", "reason": "only this conversation", "evidence": "works on branch wip-lantern"},
+            {"action": "create", "kind": "memory", "title": "Terse answers", "content": "The user wants terse answers.",
+             "about": "user", "reason": "said so", "evidence": "keep answers terse please"},
+            {"action": "create", "kind": "memory", "title": "Unquoted fact", "content": "The deploy goes out on Fridays.",
+             "about": "project", "reason": "a guess", "evidence": ""}
+        ]})
+        .to_string();
+        let replies = Replies::new(&[reply]);
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = replies.clone();
+        let refined = super::auto_refine(
+            &provider,
+            "fixture-model",
+            "[User]: keep answers terse please\n\n[Tool result]: the build runs through make ci-fast\n\n[Assistant]: ok, and this conversation works on branch wip-lantern",
+            &scopes,
+            None,
+            Some(&learning),
+            None,
+        )
+        .await
+        .expect("refined");
+        assert!(refined.global_error.is_none(), "{:?}", refined.global_error);
+        let global = load_raw(&scopes.global);
+        let local = load_raw(&scopes.local);
+        assert_eq!(
+            global["entries"]["memory"]["build_command"]["project"]["name"], "p7",
+            "{global:#}"
+        );
+        assert!(local["entries"]["memory"]["build_command"].is_null());
+        assert!(
+            !local["entries"]["memory"]["scratch_branch"].is_null(),
+            "{local:#}"
+        );
+        assert!(global["entries"]["memory"]["scratch_branch"].is_null());
+        assert!(global["entries"]["memory"]["terse_answers"]["project"].is_null());
+        assert!(global["entries"]["memory"]["unquoted_fact"].is_null());
+    }
+
     /// Seen in a report: a child's fact about one project (`scope:
     /// project`) was kept in the global store untagged, so it reached every
     /// project. It waits tagged with its project, and accepted it is that
@@ -9695,62 +9856,6 @@ Run `node scripts/build.js`.
     /// `project` on an edit is dropped when the proposal is read.
     #[test]
     fn a_model_cannot_name_an_entrys_project() {
-    /// Continual-ARC (arXiv 2611.14505): a store that defaults to the
-    /// conversation taught a returning task nothing, because the model never
-    /// chose the wider scope. A new entry the review calls a fact about the
-    /// project, with a quote and no scope, is the project's; one it chose
-    /// `local` for, one about the user and one with no quote stay as they were.
-    #[tokio::test]
-    async fn a_project_fact_the_review_gives_no_scope_is_kept_for_the_project() {
-        let directory = tempfile::tempdir().expect("dir");
-        let scopes = scopes(directory.path());
-        let config = directory.path().join("config");
-        let data = directory.path().join("data");
-        let workspace = directory.path().join("p7");
-        std::fs::create_dir_all(&workspace).expect("workspace");
-        let layers = crate::interactive::learned::Layers::new(&config, &data, &workspace, true);
-        let learning = super::Learning::new(layers, &workspace, None);
-        let reply = json!({"summary": "kept what the files showed", "rationale": "r", "expectedOutcome": "", "edits": [
-            {"action": "create", "kind": "memory", "title": "Build command", "content": "The build runs through make ci-fast.",
-             "about": "project", "reason": "a file showed it", "evidence": "the build runs through make ci-fast"},
-            {"action": "create", "kind": "memory", "title": "Scratch branch", "content": "This conversation works on branch wip-lantern.",
-             "about": "project", "scope": "local", "reason": "only this conversation", "evidence": "works on branch wip-lantern"},
-            {"action": "create", "kind": "memory", "title": "Terse answers", "content": "The user wants terse answers.",
-             "about": "user", "reason": "said so", "evidence": "keep answers terse please"},
-            {"action": "create", "kind": "memory", "title": "Unquoted fact", "content": "The deploy goes out on Fridays.",
-             "about": "project", "reason": "a guess", "evidence": ""}
-        ]})
-        .to_string();
-        let replies = Replies::new(&[reply]);
-        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = replies.clone();
-        let refined = super::auto_refine(
-            &provider,
-            "fixture-model",
-            "[User]: keep answers terse please\n\n[Tool result]: the build runs through make ci-fast\n\n[Assistant]: ok, and this conversation works on branch wip-lantern",
-            &scopes,
-            None,
-            Some(&learning),
-            None,
-        )
-        .await
-        .expect("refined");
-        assert!(refined.global_error.is_none(), "{:?}", refined.global_error);
-        let global = load_raw(&scopes.global);
-        let local = load_raw(&scopes.local);
-        assert_eq!(
-            global["entries"]["memory"]["build_command"]["project"]["name"], "p7",
-            "{global:#}"
-        );
-        assert!(local["entries"]["memory"]["build_command"].is_null());
-        assert!(
-            !local["entries"]["memory"]["scratch_branch"].is_null(),
-            "{local:#}"
-        );
-        assert!(global["entries"]["memory"]["scratch_branch"].is_null());
-        assert!(global["entries"]["memory"]["terse_answers"]["project"].is_null());
-        assert!(global["entries"]["memory"]["unquoted_fact"].is_null());
-    }
-
         let proposal = super::Proposal::from_value(&json!({"edits": [
             {"action": "create", "kind": "memory", "title": "t", "content": "c",
              "project": {"key": "elsewhere", "name": "other"}}
@@ -10715,5 +10820,122 @@ Run `node scripts/build.js`.
             !kept.contains("memory:a") && kept.contains("memory:b"),
             "{kept}"
         );
+    }
+
+    const RUN_TRANSCRIPT: &str = "[User]: recolor the zebra grid\n\n[Assistant tool calls]: #1 read_file(path=\"solve.py\"); #2 run_shell(command=\"python solve.py\"); #3 run_shell(command=\"python broken.py\")\n\n[Tool result (read_file) #1]: print('recolored 14 cells')\n\n[Tool result (run_shell) #2]: process python exit=Some(0) timed_out=false canceled=false queued=false tree_cleanup=nothing_to_clean\nstdout:\nrecolored 14 cells\nstderr:\n\n\n[Tool result (run_shell) #3]: process python exit=Some(1) timed_out=false canceled=false queued=false tree_cleanup=nothing_to_clean\nstdout:\nrecolored 3 cells\nstderr:\nTraceback";
+
+    /// Continual-ARC (arXiv 2611.14505): a script is "tested" only when the
+    /// conversation ran it. The quote must be in a tool result that ended
+    /// cleanly, and the call that made the result must name the file; a quote
+    /// that is only in a file that was read, a run that failed, or a run of
+    /// another file is no run of this one.
+    #[test]
+    fn a_script_run_is_confirmed_only_by_a_clean_result_of_a_call_that_named_it() {
+        let claim = |path: &str, evidence: &str| json!({"script_runs": [{"path": path, "evidence": evidence}]});
+        let (confirmed, unconfirmed) = super::confirmed_script_runs(
+            &claim("scripts/solve.py", "stdout: recolored 14 cells"),
+            RUN_TRANSCRIPT,
+        );
+        assert_eq!(
+            confirmed,
+            [(
+                "scripts/solve.py".to_owned(),
+                "stdout: recolored 14 cells".to_owned()
+            )]
+        );
+        assert!(unconfirmed.is_empty());
+        for (path, evidence, why) in [
+            (
+                "scripts/solve.py",
+                "print('recolored 14 cells')",
+                "the quote is in a file that was read",
+            ),
+            (
+                "scripts/broken.py",
+                "stdout: recolored 3 cells",
+                "the run did not exit 0",
+            ),
+            (
+                "scripts/other.py",
+                "stdout: recolored 14 cells",
+                "the call named another file",
+            ),
+            (
+                "scripts/solve.py",
+                "stdout: painted 99 cells",
+                "the quote is in no result",
+            ),
+            (
+                "scripts/solve.py",
+                "cells",
+                "a quote that short is no evidence",
+            ),
+        ] {
+            let (confirmed, unconfirmed) =
+                super::confirmed_script_runs(&claim(path, evidence), RUN_TRANSCRIPT);
+            assert!(confirmed.is_empty(), "{why}: {confirmed:?}");
+            assert_eq!(unconfirmed, [path], "{why}");
+        }
+    }
+
+    /// A review that quotes a successful run of a script its skill carries gets
+    /// it recorded as tested; the same intent with a quote the conversation
+    /// does not hold records it as unconfirmed, and the skill still lands.
+    #[test]
+    fn a_skill_intent_with_a_confirmed_run_marks_its_script_tested() {
+        let directory = tempfile::tempdir().expect("dir");
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let layers = crate::interactive::learned::Layers::new(
+            &directory.path().join("config"),
+            &directory.path().join("data"),
+            &workspace,
+            true,
+        );
+        let learning = super::Learning::new(layers.clone(), &workspace, None);
+        let intent = |name: &str, evidence: &str| {
+            json!({
+                "action": "create", "name": name, "level": "project",
+                "body": format!("---\nname: {name}\ndescription: Use it to recolor the zebra grid.\ncategory: ops\n---\nRun scripts/solve.py first.\n"),
+                "files": {"scripts/solve.py": "print('recolored 14 cells')\n"},
+                "script_runs": [{"path": "scripts/solve.py", "evidence": evidence}],
+                "reason": "the task may come back", "evidence": "[User]: recolor the zebra grid",
+            })
+        };
+        let record = super::promote_one(
+            &intent("zebra-recolor", "stdout: recolored 14 cells"),
+            Some(&learning),
+            Some(RUN_TRANSCRIPT),
+        );
+        assert_eq!(record["applied"], true, "{record}");
+        assert_eq!(record["scriptRuns"], json!(["scripts/solve.py"]));
+        let library = crate::interactive::learned::library(&layers);
+        assert!(
+            library[0].scripts[0].tested_on.is_some(),
+            "{:?}",
+            library[0].scripts
+        );
+        let record = super::promote_one(
+            &intent("zebra-recolor-2", "stdout: painted 99 cells"),
+            Some(&learning),
+            Some(RUN_TRANSCRIPT),
+        );
+        assert_eq!(record["applied"], true, "{record}");
+        assert!(record["scriptRuns"].is_null());
+        assert_eq!(record["scriptRunsUnconfirmed"], json!(["scripts/solve.py"]));
+        let library = crate::interactive::learned::library(&layers);
+        let second = library
+            .iter()
+            .find(|skill| skill.name == "zebra-recolor-2")
+            .expect("skill");
+        assert_eq!(second.scripts[0].tested_on, None);
+        // With no conversation to check, nothing is marked.
+        let record = super::promote_one(
+            &intent("zebra-recolor-3", "stdout: recolored 14 cells"),
+            Some(&learning),
+            None,
+        );
+        assert_eq!(record["applied"], true, "{record}");
+        assert!(record["scriptRuns"].is_null());
     }
 }
