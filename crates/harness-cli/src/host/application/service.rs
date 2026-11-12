@@ -9837,6 +9837,14 @@ async fn run_turn(
     let action_bank = super::action_bank::enabled(&config_file, &environment)
         .then(|| super::action_bank::bank(jev_decisions.as_ref()));
     agents.set_action_bank(action_bank.clone());
+    // `--append-system-prompt`, else an `APPEND_SYSTEM.md`: it closes the root's
+    // system prompt and goes to each child it starts.
+    let appended = super::resources::appended_system(
+        &turn_overrides.append_system_prompt,
+        &workspace_root,
+        &global_config_dir,
+        config.project_trusted,
+    );
     let delegate_host = Some(super::delegation::DelegateHost::new(
         &agents,
         super::delegation::ChildLaunch {
@@ -9925,6 +9933,10 @@ async fn run_turn(
             learned: lessons_on.then(|| data_dir.clone()),
             conversation_dir: Some(super::harness::local_dir(&data_dir, task_id.as_str())),
             keep_findings: digest_on,
+            // What the parent's system prompt carries and a child's did not: the
+            // user's appended text and the additions for the child's own model.
+            appended_system: appended.clone(),
+            config_dir: global_config_dir.clone(),
         },
         cancellation.clone(),
     ));
@@ -10500,17 +10512,6 @@ async fn run_turn(
         0,
     ));
     // `--append-system-prompt`, else an `APPEND_SYSTEM.md`, closes the prompt.
-    let appended = if turn_overrides.append_system_prompt.is_empty() {
-        super::resources::append_system_prompt(
-            &workspace_root,
-            &global_config_dir,
-            config.project_trusted,
-        )
-        .into_iter()
-        .collect()
-    } else {
-        turn_overrides.append_system_prompt.clone()
-    };
     for text in appended.iter().filter(|text| !text.trim().is_empty()) {
         built_prompt.text.push_str("\n\n");
         built_prompt.text.push_str(text);

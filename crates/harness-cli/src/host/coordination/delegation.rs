@@ -489,6 +489,51 @@ fn proposal_of(propose: Option<&Value>, fact: &str) -> Result<Option<ChildPropos
 /// What a child's system text says of `note_finding`.
 const FINDINGS_LINE: &str = " When a tool result shows a lasting fact about the project worth knowing after this task - where something is configured, what a check needs, how a part works - record it with note_finding, quoting the tool result's words that show it: you cannot write memory, and your parent's review keeps what you note. To propose the fact as a memory entry, give note_finding `propose` (a title, and a path and a scope when they matter): your parent's review keeps it as its own edit, or else it waits for the person, who accepts or rejects it in the memory queue; it is never written by your authority. Note only what a tool result showed, never a guess or this task's progress.";
 
+/// The most characters of the user's appended system text a child's prompt
+/// carries. The root's own prompt has no bound; a child's shares its window
+/// with a brief, and the rest is the parent's to pass on.
+const APPENDED_FOR_CHILD_CHARS: usize = 4_000;
+
+/// What the root's system prompt carries that a child's role text does not,
+/// for the model this child runs on: the per-model additions (the segment
+/// before the session tail) and the text the user appended (the end of the
+/// prompt), in the root's order. Empty when there are neither.
+///
+/// After Continual-ARC (arXiv 2611.14505): a child's prompt lacked what the
+/// parent's system prompt carried, so the instructions a person wrote for the
+/// work reached the agent that was handed a task and not the ones it handed
+/// on. It is part of the child's system policy, built once when the child
+/// starts, so the provider's cached prefix is the same in every turn it takes.
+fn inherited_system(launch: &ChildLaunch) -> String {
+    let mut text = String::new();
+    let additions = super::model_prompts::resolve(&launch.model.reference, &launch.config_dir);
+    if let Some(extras) = additions.extras.filter(|extras| !extras.trim().is_empty()) {
+        text.push_str("\n\n");
+        text.push_str(extras.trim());
+    }
+    let appended = launch
+        .appended_system
+        .iter()
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !appended.is_empty() {
+        text.push_str("\n\n");
+        let total = appended.chars().count();
+        if total > APPENDED_FOR_CHILD_CHARS {
+            text.extend(appended.chars().take(APPENDED_FOR_CHILD_CHARS));
+            let _ = write!(
+                text,
+                "\n[cut: the user's appended instructions are {total} characters; the first {APPENDED_FOR_CHILD_CHARS} are here, and your parent has the rest]"
+            );
+        } else {
+            text.push_str(&appended);
+        }
+    }
+    text
+}
+
 /// A fact a child found, with the words of its tool result that show it.
 #[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
 pub struct ChildFinding {
@@ -911,6 +956,14 @@ pub struct ChildLaunch {
     /// Whether the root reviews its conversation (harness refinements on), so
     /// a child is offered `note_finding`.
     pub keep_findings: bool,
+    /// The texts the user appended to the root's system prompt
+    /// (`--append-system-prompt` or `APPEND_SYSTEM.md`). A child's system
+    /// prompt was its role alone, so "answer in Vietnamese" or "never touch
+    /// vendor/" reached the root and no child.
+    pub appended_system: Vec<String>,
+    /// The config directory the per-model prompt additions are read from, for
+    /// the model each child runs on.
+    pub config_dir: PathBuf,
 }
 
 impl ChildLaunch {
@@ -6064,6 +6117,9 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     };
                 }
             };
+            // What the root's system prompt carries and the child's did not,
+            // fixed here so the child's system prompt is the same in every turn.
+            let system_policy = format!("{system_policy}{}", inherited_system(&launch));
             // `[agents] max_workers`: past it a root's child waits here, its
             // row saying queued, until a running one ends. Unset, none waits.
             let _slot = if request.depth <= 1 {
@@ -7735,6 +7791,8 @@ pub(super) mod tests {
             learned: None,
             conversation_dir: None,
             keep_findings: false,
+            appended_system: Vec::new(),
+            config_dir: std::path::PathBuf::new(),
         }
     }
 
@@ -9589,6 +9647,81 @@ mod real_worker_tests {
             system.contains("No message is required and working alone is fine")
                 && system.contains("do not build on a choice they would have to guess"),
             "{system}"
+        );
+    }
+
+    /// Continual-ARC (arXiv 2611.14505): a child's prompt lacked what the
+    /// parent's system prompt carried. A child gets the text the user
+    /// appended and the additions of the model it runs on (here a model the
+    /// shipped rules know), after its role text, and the same in every turn
+    /// it takes, so the provider's cached prefix holds.
+    #[tokio::test]
+    async fn a_child_gets_the_appended_text_and_the_additions_of_its_own_model() {
+        let bench = bench();
+        let provider = Scripted::new(vec![
+            Reply::Tool("list_files", json!({})),
+            Reply::Text("ok"),
+        ]);
+        let mut launch =
+            super::tests::launch_for(&bench.repo, Arc::clone(&provider) as Arc<dyn ModelProvider>);
+        launch.model.reference = "zai/glm-5.3-flash".to_owned();
+        launch.appended_system = vec!["Always answer in Vietnamese.".to_owned()];
+        let host = DelegateHost::new(&bench.agents, launch, CancellationToken::new());
+        spawn(&host, "one", "map the parser").await;
+        assert!(matches!(
+            state_of(&bench.agents, "one").await,
+            ChildState::Done { .. }
+        ));
+        let requests = provider.seen.lock().expect("seen").clone();
+        assert!(requests.len() >= 2, "{}", requests.len());
+        let systems = requests
+            .iter()
+            .map(|request| {
+                request
+                    .messages
+                    .iter()
+                    .map(|message| message.content.clone())
+                    .find(|content| content.contains("You are a child agent"))
+                    .expect("the child's system policy")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            systems[0].contains("Never run shell commands through `subprocess`"),
+            "the additions for the child's model: {}",
+            systems[0]
+        );
+        assert!(
+            systems[0].ends_with("Always answer in Vietnamese."),
+            "the user's text closes it, as it closes the root's: {}",
+            systems[0]
+        );
+        assert!(
+            systems.iter().all(|system| *system == systems[0]),
+            "the system prompt is the same in every turn"
+        );
+    }
+
+    /// A model no rule names gets no additions, and a child of a launch with
+    /// nothing appended gets no extra text; the appended text is cut at a
+    /// bound, and the cut says what was left.
+    #[test]
+    fn what_a_child_inherits_is_bounded_and_empty_when_there_is_nothing() {
+        let bench = bench();
+        let provider = Scripted::new(Vec::new());
+        let mut launch =
+            super::tests::launch_for(&bench.repo, Arc::clone(&provider) as Arc<dyn ModelProvider>);
+        assert_eq!(super::inherited_system(&launch), "");
+        launch.appended_system = vec!["a".repeat(5_000), "  ".to_owned()];
+        let text = super::inherited_system(&launch);
+        assert!(
+            text.contains(&"a".repeat(super::APPENDED_FOR_CHILD_CHARS)),
+            "{}",
+            text.len()
+        );
+        assert!(!text.contains(&"a".repeat(super::APPENDED_FOR_CHILD_CHARS + 1)));
+        assert!(
+            text.contains("[cut: the user's appended instructions are 5000 characters"),
+            "{text}"
         );
     }
 

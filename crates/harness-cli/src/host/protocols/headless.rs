@@ -740,6 +740,22 @@ pub async fn run_with(
                     task_id.as_str(),
                 )),
                 keep_findings: digest_on,
+                // What the root's system prompt carries and a child's did not.
+                appended_system: super::resources::appended_system(
+                    &request.options.append_system_prompt,
+                    &context.project.root,
+                    context
+                        .paths
+                        .config_file
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new(".")),
+                    resolved_config.project_trusted,
+                ),
+                config_dir: context
+                    .paths
+                    .config_file
+                    .parent()
+                    .map_or_else(PathBuf::new, std::path::Path::to_path_buf),
             },
             cancellation.clone(),
         )

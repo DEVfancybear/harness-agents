@@ -181,6 +181,26 @@ pub fn append_system_prompt(
     prompt_file(workspace, config_dir, project_trusted, "APPEND_SYSTEM.md")
 }
 
+/// The texts a run appends to its system prompt: the launch's
+/// `--append-system-prompt` ones when it has any, else `APPEND_SYSTEM.md`.
+/// The one place that decides it, for the run's own prompt and for the
+/// children it starts.
+#[must_use]
+pub fn appended_system(
+    given: &[String],
+    workspace: &Path,
+    config_dir: &Path,
+    project_trusted: bool,
+) -> Vec<String> {
+    if given.is_empty() {
+        append_system_prompt(workspace, config_dir, project_trusted)
+            .into_iter()
+            .collect()
+    } else {
+        given.to_vec()
+    }
+}
+
 fn prompt_file(
     workspace: &Path,
     config_dir: &Path,
