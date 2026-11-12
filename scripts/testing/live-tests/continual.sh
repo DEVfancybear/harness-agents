@@ -391,10 +391,39 @@ echo "################ 5. P4: a script that ran with exit 0 is recorded as teste
 # phrase: `quoted` (refine.rs, QUOTE_MIN_CHARS = 12) refuses a shorter one, and
 # the second run, whose script printed "paid=4" and whose review quoted exactly
 # that, was left `scriptRunsUnconfirmed` for it. So the script prints a phrase.
+# refinement_state <skill>: what the conversation's reviews did to the skill's
+# files, from the refinement records (refinements.jsonl of each conversation's
+# store: `appliedEdits`, one per edit, with `kind: skill_file`):
+#   none      no review applied an update of the skill (a review that changes
+#             nothing records an empty `appliedEdits`: "Harness unchanged");
+#   updated   an update was applied, and the edit says nothing of script runs;
+#   proposed  an update was applied and the review proposed a run of a script:
+#             the host marks the edit `scriptRuns` (confirmed and marked) or
+#             `scriptRunsUnconfirmed` (refine.rs `promote_one`). 0.9.7 wrote
+#             neither, so on it a proposal reads as `updated`.
+refinement_state() {
+  "$PY" - "$D" "$1" <<'PYEOF' | tr -d '\r'
+import glob, json, os, sys
+state = "none"
+for name in glob.glob(os.path.join(sys.argv[1], "sessions", "*", "harness", "refinements.jsonl")):
+    for line in open(name, encoding="utf-8", errors="replace"):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        for edit in record.get("appliedEdits") or []:
+            if edit.get("kind") == "skill_file" and edit.get("id") == sys.argv[2] and edit.get("action") == "update" and edit.get("applied"):
+                if "scriptRuns" in edit or "scriptRunsUnconfirmed" in edit:
+                    state = "proposed"
+                elif state == "none":
+                    state = "updated"
+print(state)
+PYEOF
+}
 # The run of the skill's file: the call names the skill folder's script, and
 # its result is the host's clean-exit line with the count.
 E_RAN5='any(name == "run_process" and ("skills/" + os.environ["SK"] + "/scripts/paidcount.py") in json.dumps(args).replace("\\\\", "/") for name, args in calls) and any("exit=Some(0) timed_out=false" in r and "paid orders counted: 4" in r for r in results)'
-pre5=""; REFUSED=""; STOP=0
+pre5=""; upd5=""; REFUSED=""; STOP=0
 for a in 1 2 3; do
   Pb=$RX/p4b-$a; sk="order-count-$a"
   project "$Pb"
@@ -414,13 +443,36 @@ for a in 1 2 3; do
   out=$(say "a$a" "/refine The script scripts/paidcount.py of the learned skill $sk has now been run in this conversation, by its own path in the skill's folder. Update that skill: action update, name $sk, body the same SKILL.md lines as before ($BODY) with one more sentence at the end, 'Last run: it printed paid orders counted: 4.', no files, and script_runs [{\"path\": \"scripts/paidcount.py\", \"evidence\": \"paid orders counted: 4\"}]. Propose no memory edits."); echo "$out" | tail -3 | sed 's/^/   /'
   "$HA" shutdown --force >/dev/null 2>&1
   export SK=$sk
-  if ev "MARK-P4B-$a" root "$E_RAN5"; then pre5=$a; break; fi
-  echo "   attempt $a: the skill's own script was not run with exit 0 as asked"
+  if ! ev "MARK-P4B-$a" root "$E_RAN5"; then
+    echo "   attempt $a: the skill's own script was not run with exit 0 as asked"
+    continue
+  fi
+  # The second review is the model's step: it has to update the skill and put
+  # the run in script_runs. The first real run's second review answered "Harness
+  # unchanged": nothing for the host to check, and not a verdict on it.
+  case "$(refinement_state "$sk")" in
+    proposed) pre5=$a; break;;
+    updated)
+      # This build writes `scriptRuns` / `scriptRunsUnconfirmed` when a run was
+      # proposed; none here means it was left out - on 0.9.7 it means nothing.
+      upd5=$a
+      echo "   attempt $a: the second review updated the skill but its record shows no run of the script proposed"
+      ;;
+    *) echo "   attempt $a: the second review proposed no update of the skill";;
+  esac
 done
+# Three attempts and no record of a proposed run, though an update was applied:
+# the P4 check below judges the last such attempt (on 0.9.7, which records
+# nothing of a proposal, this is the only way to reach it).
+if [ -z "$pre5" ] && [ -n "$upd5" ]; then
+  pre5=$upd5
+  echo "   no attempt's record shows a run of the script proposed; judging attempt $pre5, whose update was applied"
+fi
 refusal_check "$pre5"
-# Passes on 0.9.7 too: /refine wrote the skill with the script, and the conversation ran the
-# skill's own file with exit 0 (exit=Some(0) timed_out=false is the host's own line).
-check "precondition: a learned skill carries the script and the conversation ran that file with exit 0 (attempt ${pre5:-none})" '[ -n "$pre5" ]'
+# Passes on 0.9.7 too: /refine wrote the skill with the script, the conversation ran the
+# skill's own file with exit 0 (exit=Some(0) timed_out=false is the host's own line), and the
+# second review applied an update of the skill (with the run proposed, where the record shows it).
+check "precondition: the skill carries the script, the conversation ran that file with exit 0, and the second review updated the skill (attempt ${pre5:-none})" '[ -n "$pre5" ]'
 j_mark() {
   "$PY" - "$HA_HOME/skills/order-count-$pre5/scripts/paidcount.py" "$D/skill-usage/global.json" "order-count-$pre5" <<'PYEOF'
 import hashlib, json, sys
