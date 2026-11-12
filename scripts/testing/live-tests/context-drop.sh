@@ -43,15 +43,22 @@ def results(messages):
     return [str(m.get("content") or "") for m in messages if m.get("role") == "tool"]
 def calls(messages, name):
     return sum(1 for m in messages for call in m.get("tool_calls") or [] if call.get("name") == name)
+# A step's request is recorded as what it added to the one before, and whole
+# only when it rewrote it: the calls of a turn are counted over all of them.
+def distinct(name):
+    return len({call.get("id") or call.get("arguments") for m in requests for message in m
+                for call in message.get("tool_calls") or [] if call.get("name") == name})
 last = requests[-1] if requests else []
 if what == "reads":
-    print(max((calls(m, "read_file") for m in requests), default=0))
+    print(distinct("read_file"))
 elif what == "dropped-last":
     print(sum(1 for text in results(last) if text.startswith(NOTE)))
 elif what == "whole-last":
     print(sum(1 for text in results(last) if "row 0001" in text))
+elif what == "whole-ever":
+    print(max((sum(1 for text in results(m) if "row 0001" in text) for m in requests), default=0))
 elif what == "drop-calls":
-    print(max((calls(m, "drop_context") for m in requests), default=0))
+    print(distinct("drop_context"))
 elif what == "offered":
     print(sum(1 for db in glob.glob(os.path.join(data, "projects", "*", "harness.sqlite3"))
               for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests")
@@ -63,10 +70,14 @@ diag() { cat "$HA_HOME"/data/diagnostics/*.jsonl 2>/dev/null | grep "\"kind\":\"
 agent "$P" d1
 
 echo "################ 1. a turn keeps its newest results and drops the older ones"
-say d1 "Đọc lần lượt gen/f1.txt, gen/f2.txt, gen/f3.txt, gen/f4.txt, gen/f5.txt, gen/f6.txt bằng read_file, mỗi lần gọi một file (không gọi song song, không dùng tool khác). Mỗi file có một mã ở dòng đầu dạng MARK-F<n>-<số>; ghi nhớ từng mã ngay khi đọc. Cuối cùng liệt kê đủ sáu mã." | tail -3
+say d1 "Đọc lần lượt gen/f1.txt, gen/f2.txt, gen/f3.txt, gen/f4.txt, gen/f5.txt, gen/f6.txt bằng read_file, mỗi lần gọi một file và đọc cả file (không gọi song song, không dùng tool khác, không giới hạn số dòng). Mỗi file có một mã ở dòng đầu dạng MARK-F<n>-<số>; ghi nhớ từng mã ngay khi đọc. Cuối cùng liệt kê đủ sáu mã." | tail -3
 READS=$(store reads)
 echo "   read_file calls in the turn=$READS"
 check "the turn read the six files one at a time (the precondition: $READS)" "[ $READS -ge 6 ]"
+# A model that reads only each file's first lines leaves nothing whole to
+# keep: the checks on what stays whole are judged only when it read them whole.
+EVER=$(store whole-ever)
+check "it read the files whole (the precondition: $EVER whole in one request)" "[ $EVER -ge 2 ]"
 KEEP=$(diag context dropped | grep -c '"by":"keep"')
 echo "   rolling drops recorded=$KEEP"
 check "the rolling drop was made and recorded ($KEEP)" "[ $KEEP -ge 1 ]"
