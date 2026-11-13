@@ -265,6 +265,11 @@ fn now() -> String {
 /// How one learned skill has been used since it landed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Usage {
+    /// Times the skill was put in front of the model by recall (not used:
+    /// offering a skill is not following it). Files from before the count
+    /// have none.
+    pub offered: u64,
+    /// Times the model activated it or the user ran it.
     pub uses: u64,
     pub views: u64,
     pub patches: u64,
@@ -294,6 +299,7 @@ impl Usage {
     fn from_value(value: &Value) -> Self {
         let count = |field: &str| value[field].as_u64().unwrap_or(0);
         Self {
+            offered: count("offered"),
             uses: count("use"),
             views: count("view"),
             patches: count("patch"),
@@ -377,6 +383,10 @@ fn revive_returned(layers: &Layers, layer: Layer, root: &Path) {
 /// What a use of a skill was.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UseKind {
+    /// Recall put it in a turn: the model was shown it, which says nothing of
+    /// whether it was followed. Only this keeps a skill nobody activates from
+    /// being archived as dormant.
+    Offered,
     /// The model activated it, or the user ran it.
     Use,
     /// One of its files was read.
@@ -578,6 +588,7 @@ pub fn record_use(layers: &Layers, name: &str, kind: UseKind) -> bool {
     };
     let root = layers.root(layer).expect("found layer is present");
     let field = match kind {
+        UseKind::Offered => "offered",
         UseKind::Use => "use",
         UseKind::View => "view",
     };
@@ -837,8 +848,12 @@ fn evaluate(members: &[Member], requests: u64, maturity: u64, capacity: usize) -
         }
         if member.usage.uses == 0 {
             // A skill whose files were read had recall value even if never
-            // activated: only no use and no view is dormancy.
-            if member.usage.views == 0 {
+            // activated, and one recall put in a turn was in front of the
+            // model, which never activating it does not show to be worth
+            // nothing: only no use, no view and no offer is dormancy. Its
+            // standing is the review's to judge (worked, failed), not a count
+            // of activations the model may not owe it.
+            if member.usage.views == 0 && member.usage.offered == 0 {
                 archive.insert(member.name.clone());
             }
             continue;
@@ -886,9 +901,10 @@ pub fn run_lifecycle(layers: &Layers) -> Vec<(Layer, String)> {
         for name in evaluate(&members, requests, layer.maturity(), layer.capacity()) {
             let usage = counters.get(&name).copied().unwrap_or_default();
             let reason = format!(
-                "lifecycle: {} use(s), {} view(s) over {} request(s)",
+                "lifecycle: {} use(s), {} view(s), {} offer(s) over {} request(s)",
                 usage.uses,
                 usage.views,
+                usage.offered,
                 requests.saturating_sub(usage.anchor)
             );
             append_ledger(
@@ -1024,10 +1040,11 @@ pub fn library_overview(skills: &[LearnedSkill]) -> String {
             .entry(skill.category.as_str())
             .or_default()
             .push(format!(
-                "- {} [{}]: {} (used {}, viewed {} in {seen} requests{probation}{checks})",
+                "- {} [{}]: {} (offered {}, activated {}, viewed {} in {seen} requests{probation}{checks})",
                 skill.name,
                 skill.layer.as_str(),
                 skill.description,
+                skill.usage.offered,
                 skill.usage.uses,
                 skill.usage.views,
             ));
@@ -2476,15 +2493,8 @@ mod tests {
             usage: Usage {
                 uses,
                 views,
-                patches: 0,
                 anchor,
-                checked_pass: 0,
-                checked_fail: 0,
-                worked: 0,
-                failed: 0,
-                trial_good: 0,
-                trial_bad: 0,
-                archived: false,
+                ..Usage::default()
             },
         };
         let members = [
@@ -2498,6 +2508,91 @@ mod tests {
         assert_eq!(
             evaluate(&members, 1000, 100, 2),
             vec!["dormant".to_owned(), "rare".to_owned()]
+        );
+    }
+
+    /// Offering a skill is not using it: recall counts the first, the model's
+    /// activation the second. A recall used to count a use, so 215 offers read as
+    /// 215 uses of a skill the review judged twice.
+    #[test]
+    fn a_skill_put_in_a_turn_is_offered_and_not_used() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        assert!(
+            promote(
+                &layers,
+                &create("offered-only", "Offer it."),
+                &PromoteContext::default()
+            )
+            .ok
+        );
+        for _ in 0..3 {
+            assert!(record_use(&layers, "offered-only", UseKind::Offered));
+        }
+        let usage = library(&layers)
+            .into_iter()
+            .find(|skill| skill.name == "offered-only")
+            .expect("skill")
+            .usage;
+        assert_eq!((usage.offered, usage.uses, usage.views), (3, 0, 0));
+        assert!(record_use(&layers, "offered-only", UseKind::Use));
+        let skills = library(&layers);
+        assert_eq!((skills[0].usage.offered, skills[0].usage.uses), (3, 1));
+        let overview = super::library_overview(&skills);
+        assert!(
+            overview.contains("(offered 3, activated 1, viewed 0 in 0 requests, on probation)"),
+            "{overview}"
+        );
+    }
+
+    /// A usage file from before the offered count still loads.
+    #[test]
+    fn a_usage_file_without_an_offered_count_still_loads() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        assert!(
+            promote(
+                &layers,
+                &create("old-record", "Old."),
+                &PromoteContext::default()
+            )
+            .ok
+        );
+        let layer = layers.find("old-record").expect("a layer");
+        let root = layers.root(layer).expect("its root");
+        std::fs::write(
+            layers.usage_file(layer, root),
+            r#"{"requests": 40, "skills": {"old-record": {"use": 215, "view": 3, "worked": 1, "failed": 1, "anchor": 2}}}"#,
+        )
+        .expect("old file");
+        let usage = library(&layers)[0].usage;
+        assert_eq!(
+            (
+                usage.offered,
+                usage.uses,
+                usage.views,
+                usage.worked,
+                usage.failed
+            ),
+            (0, 215, 3, 1, 1)
+        );
+    }
+
+    /// A skill recall put in front of the model is not dormant, although the
+    /// model never activated it: only no use, no view and no offer is.
+    #[test]
+    fn a_skill_that_was_offered_but_never_activated_is_not_archived_as_dormant() {
+        let member = |name: &str, offered| Member {
+            name: name.to_owned(),
+            usage: Usage {
+                offered,
+                ..Usage::default()
+            },
+        };
+        let members = [member("never-shown", 0), member("shown", 6)];
+        assert_eq!(
+            evaluate(&members, 1000, 100, 50),
+            vec!["never-shown".to_owned()]
         );
     }
 
@@ -2895,7 +2990,7 @@ mod tests {
         let skills = library(&layers);
         let overview = super::library_overview(&skills);
         assert!(
-            overview.contains("(used 1, viewed 0 in 1 requests, on probation)"),
+            overview.contains("(offered 0, activated 1, viewed 0 in 1 requests, on probation)"),
             "{overview}"
         );
         let note = super::prompt_note(&skills).expect("a note");

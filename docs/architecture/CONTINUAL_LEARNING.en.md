@@ -62,9 +62,12 @@ Code: `whole_entry`, `Pass` and `WHOLE_CONTENT_LIMIT` in `memory/harness.rs`;
 | Six entries, cut to a few lines, chosen before the task | The digest was already ranked against the request. The one entry that stands out for it is now shown up to 1,200 characters instead of 180 | A rule cut at 180 characters loses the step that made it worth storing |
 | (a rule reached the model on 40 of 154 returns) | An entry stands out when its score lies a deviation above the mean of its kind, as learned-skill recall judges it, and it shares at least two of the request's words | A fixed score or a word list would not hold across stores; a word that one entry alone holds is not a fit |
 
-`standout_of` is the choice `skill_recall::best_of` made, taken out so both use
-one: the best score beats the next and, among five entries or more, lies
-`STANDOUT` deviations above the mean. At most one entry of a digest is whole,
+`standout_of` is the choice `skill_recall::best_of` made until 0.9.7, taken out
+so both used one: the best score beats the next and, among five entries or more,
+lies `STANDOUT` deviations above the mean. Recall has its own rule since 0.9.8
+([strategy and runtime](STRATEGY_AND_RUNTIME.en.md)); a rule judged with the
+best in the spread nearly always found one to stand out in a library of a
+dozen, and the digest keeps `standout_of` as it is. At most one entry of a digest is whole,
 the best across the kinds. A constraint is never a candidate (it is shown for
 every request already), and a pinned entry is as it was. The digest block keeps
 its 3,000-token bound; the whole entry adds at most about a thousand

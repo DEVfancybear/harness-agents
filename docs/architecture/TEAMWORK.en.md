@@ -99,7 +99,8 @@ What was missing:
 | Probation: standing follows recorded outcomes | The count starts again at every patch (`trial_good`, `trial_bad` in `skill-usage/*.json`), so a rewritten skill is tried afresh | Without it one bad week would bar a skill for ever |
 
 A check that passed or failed after a skill was used counts in the trial too.
-The diagnostics' `skill recalled` record carries `cases` and `unproven`.
+The diagnostics' `skill recalled` record carries `cases`, `unproven` and, since
+0.9.8, `again` (the skill was already in the conversation, so only a line went in).
 
 ## A team remade at a plateau ([V])
 

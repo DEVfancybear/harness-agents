@@ -6,10 +6,18 @@
 //! ha listed its learned skills by name and left it to the model to activate
 //! one. Now the request is scored against every learned skill's name,
 //! description and body, and the best goes into the turn - only when its
-//! score stands out from the rest, judged by the scores' own spread, so a
-//! request that fits none gets none. What the skill took for granted in the
-//! turns it failed goes with it: those assumptions were kept, and never read
-//! when the skill was used again.
+//! score stands out from the rest, judged by the spread of the others' scores
+//! ([`best_of`]), so a request that fits none gets none. What the skill took
+//! for granted in the turns it failed goes with it: those assumptions were
+//! kept, and never read when the skill was used again.
+//!
+//! What is asked is a request ([`query`]): the active goal's objective and the
+//! newest input the user typed. Not an input the host or a child wrote (a
+//! goal's continuation, a report, a kernel notice), which shares words with
+//! every skill and asks nothing. A skill is put whole into a conversation once
+//! since its last compaction; later turns it fits get one line ([`again`]),
+//! because its text is already in the conversation ([`given_in`] finds it in
+//! the packets the conversation sent).
 //!
 //! From Evolver (arXiv 2611.07595), whose reused strategies cut the tokens of
 //! tasks that already succeeded by 17% and which warns that an outdated one
@@ -25,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use harness_session::{ContextBlock, ContextBlockKind};
-use harness_types::readout::{standout_of, words};
+use harness_types::readout::words;
 use harness_types::search::bm25_idf;
 
 use super::learned::{Layers, LearnedSkill, SkillScript};
@@ -104,17 +112,53 @@ pub fn recall(layers: &Layers, skills: &[LearnedSkill], request: &str) -> Option
     })
 }
 
+/// The words of the request a skill must hold to fit: one shared word is not a
+/// fit, whatever the library's size, and a word most skills hold is not one of
+/// the two ([`scores_of`]).
+const MIN_WORDS: usize = 2;
+
+/// How many deviations of the OTHER skills' scores the best must lie above
+/// their mean.
+///
+/// The best of n scores that all come from one distribution lies above its
+/// mean by k deviations with a chance of about n times the tail beyond k: at
+/// one deviation (the digest's `STANDOUT`, judged with the best in the spread)
+/// a dozen skills that fit nothing still produce a "best" 84 times in 100; at
+/// two, 27; at three, under 2. Scores of BM25 are skewed to the right, so the
+/// real chance is higher than the normal tail says, and three is the least
+/// that keeps a request that fits none from getting a skill. A skill that fits
+/// scores several times the rest, which three deviations of them do not stop.
+const OTHERS_DEVIATIONS: f64 = 3.0;
+
+/// The least spread of the others' scores, as a share of their mean. Scores
+/// that all agree (two skills that match the same words; a library of three)
+/// show no noise because there are too few of them to show it, not because
+/// there is none: the best then has to lead by half the mean times
+/// [`OTHERS_DEVIATIONS`], not by a hair.
+const FLAT_SPREAD: f64 = 0.5;
+
 /// The index and BM25 score of the document that stands out for the query.
 ///
-/// With enough documents for a spread to mean something, the best must lie
-/// [`STANDOUT`](harness_types::readout::STANDOUT) deviations above the mean
-/// score ([`standout_of`] judges it); with fewer, it must match at
-/// least two of the query's words, so one shared word is not a fit. Either
-/// way it must beat the next one.
+/// It must match at least [`MIN_WORDS`] of the query's words, beat the next
+/// one, and lie [`OTHERS_DEVIATIONS`] deviations above the mean of all the
+/// OTHER scores (the best left out, so it cannot raise the bar it must clear).
+/// A score of a skill the query did not reach is `0.0` and counts in the
+/// spread; when every other score is zero the two words decide. No word list:
+/// how much a word counts comes from the library.
 fn best_of(documents: &[Vec<String>], query: &[String]) -> Option<(usize, f64)> {
+    let scored = scores_of(documents, query);
+    let best = standout(&scored)?;
+    Some((best, scored[best].0))
+}
+
+/// Each document's BM25 score for the query and how many of the query's
+/// distinct words it holds that tell skills apart: held by at most half of
+/// them (a statistic of the library, not a word list; with one or two skills
+/// every word one of them holds tells).
+fn scores_of(documents: &[Vec<String>], query: &[String]) -> Vec<(f64, usize)> {
     let query = query.iter().collect::<BTreeSet<_>>();
     if documents.is_empty() || query.is_empty() {
-        return None;
+        return Vec::new();
     }
     #[allow(clippy::cast_precision_loss, reason = "word counts are small")]
     let average = documents.iter().map(Vec::len).sum::<usize>() as f64 / documents.len() as f64;
@@ -128,7 +172,11 @@ fn best_of(documents: &[Vec<String>], query: &[String]) -> Option<(usize, f64)> 
         .iter()
         .map(|term| (*term, bm25_idf(documents.len() as u64, holding(term))))
         .collect::<BTreeMap<_, _>>();
-    let scored = documents
+    let telling = query
+        .iter()
+        .map(|term| (*term, holding(term) * 2 <= (documents.len() as u64).max(2)))
+        .collect::<BTreeMap<_, _>>();
+    documents
         .iter()
         .map(|document| {
             let mut counts = BTreeMap::<&String, f64>::new();
@@ -141,17 +189,156 @@ fn best_of(documents: &[Vec<String>], query: &[String]) -> Option<(usize, f64)> 
             let mut matched = 0;
             for term in &query {
                 if let Some(frequency) = counts.get(term) {
-                    matched += 1;
+                    // A word most skills hold tells none of them apart: it
+                    // scores, by its small weight, but is not one of the
+                    // two words a fit needs.
+                    if telling[term] {
+                        matched += 1;
+                    }
                     score += idf[term] * frequency * (K1 + 1.0)
                         / (frequency + K1 * (1.0 - B + B * length / average.max(1.0)));
                 }
             }
             (score, matched)
         })
+        .collect()
+}
+
+/// The index of the one `(score, words matched)` that stands out ([`best_of`]).
+fn standout(scored: &[(f64, usize)]) -> Option<usize> {
+    let mut order = (0..scored.len()).collect::<Vec<_>>();
+    order.sort_by(|left, right| scored[*right].0.total_cmp(&scored[*left].0));
+    let best = *order.first()?;
+    let (score, matched) = scored[best];
+    if score <= 0.0 || matched < MIN_WORDS {
+        return None;
+    }
+    let others = order[1..]
+        .iter()
+        .map(|index| scored[*index].0)
         .collect::<Vec<_>>();
-    let bm25 = scored.iter().map(|(score, _)| *score).collect::<Vec<_>>();
-    let best = standout_of(&bm25, |index| scored[index].1 >= 2)?;
-    Some((best, bm25[best]))
+    if others.first().is_some_and(|next| *next >= score) {
+        return None;
+    }
+    if others.is_empty() {
+        return Some(best);
+    }
+    #[allow(clippy::cast_precision_loss, reason = "skill counts are small")]
+    let count = others.len() as f64;
+    let mean = others.iter().sum::<f64>() / count;
+    let deviation = (others
+        .iter()
+        .map(|other| (other - mean).powi(2))
+        .sum::<f64>()
+        / count)
+        .sqrt();
+    (score > mean + OTHERS_DEVIATIONS * deviation.max(FLAT_SPREAD * mean)).then_some(best)
+}
+
+// ---------------------------------------------------------------------------
+// What is asked
+
+/// The request recall is asked of: the active goal's objective and the newest
+/// input the user typed, joined; `None` when there is neither.
+///
+/// `typed` is what the user typed for this turn (empty for a turn the host
+/// started); `earlier` the user's earlier inputs of the conversation, newest
+/// first. An input the host or a child wrote is no request and adds nothing:
+/// the goal's continuation repeats the objective, a child's report or a kernel
+/// notice shares words with every skill. When this turn is the host's own, the
+/// newest earlier input of the user stands for it.
+#[must_use]
+pub fn query(goal: Option<&str>, typed: &str, earlier: &[String]) -> Option<String> {
+    let user = std::iter::once(typed)
+        .chain(earlier.iter().map(String::as_str))
+        .find_map(users_words);
+    let parts = goal
+        .map(str::trim)
+        .filter(|goal| !goal.is_empty())
+        .into_iter()
+        .chain(user)
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+/// What of `text` the user wrote: nothing for a turn the host started (a
+/// goal's continuation, a bracketed note such as `[python-state]` or
+/// `[child-exited: ...]`), and not the reports of delegated agents the app
+/// folds into the user's message after a Ctrl-C.
+fn users_words(text: &str) -> Option<&str> {
+    let own = text
+        .split(super::controller::HELD_REPORTS_LEAD)
+        .next()
+        .unwrap_or_default()
+        .trim();
+    (!own.is_empty() && !super::goal::is_host_text(own) && !is_tagged_note(own)).then_some(own)
+}
+
+/// Whether `text` opens with a bracketed lowercase tag - `[python-state]`,
+/// `[child-exited: ...]`, `[agent-message from child:x]` - the way a note the
+/// host sent itself does. Turns recorded before the typed words were kept have
+/// only this to tell them from the user's.
+fn is_tagged_note(text: &str) -> bool {
+    let first = text.lines().next().unwrap_or_default().trim();
+    first.strip_prefix('[').is_some_and(|rest| {
+        let tag = rest.split([']', ':']).next().unwrap_or_default();
+        !tag.is_empty()
+            && tag.chars().all(|character| {
+                character.is_ascii_lowercase() || character == '-' || character == ' '
+            })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Once per conversation
+
+/// How a skill's text opens in a message: a recalled block and a `/skill:`
+/// expansion both carry the skill in a tag of this form.
+const GIVEN_MARKER: &str = "<skill name=\"";
+
+/// The learned skills whose text `packet` (a message the conversation sent)
+/// holds: those a recall put in, and those the user ran with `/skill:`.
+#[must_use]
+pub fn given_in(packet: &str) -> BTreeSet<String> {
+    packet
+        .split(GIVEN_MARKER)
+        .skip(1)
+        .map(|rest| {
+            rest.chars()
+                .take_while(|character| {
+                    character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || *character == '-'
+                })
+                .collect::<String>()
+        })
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// The one line a turn carries when the skill that fits was already given
+/// whole to this conversation.
+#[must_use]
+pub fn again(name: &str) -> ContextBlock {
+    ContextBlock::mandatory(
+        "recalled-skill",
+        ContextBlockKind::Instruction,
+        format!(
+            "The learned skill {name} given earlier in this conversation still fits; its text is above, and activate_skill reads it again."
+        ),
+    )
+    .with_max_tokens(RECALLED_TOKENS)
+    .with_rest_at(format!("the learned skill {name}"))
+}
+
+/// The line the user is shown when a skill is put whole into a turn.
+#[must_use]
+pub fn notice(recalled: &Recalled) -> String {
+    format!(
+        "learned skill {} offered for this request{}",
+        recalled.name,
+        if recalled.unproven { " (unproven)" } else { "" }
+    )
 }
 
 fn without_front_matter(document: &str) -> &str {
@@ -533,5 +720,343 @@ mod tests {
             "# Body\nstep"
         );
         assert_eq!(without_front_matter("# Body"), "# Body");
+    }
+
+    /// A library of twelve, modelled on a real one: short "Use when ..."
+    /// descriptions and short bodies.
+    const LIBRARY: [(&str, &str, &str); 12] = [
+        (
+            "delegated-work-scope-audit",
+            "Use when delegating code edits to a child agent or before committing/integrating its output.",
+            "Before integrating a child's edits, run git diff in the child worktree and list every file it touched. Compare them with the files the brief named. Revert any edit outside that scope and tell the child.",
+        ),
+        (
+            "release-cut-checklist",
+            "Use when cutting a release or bumping the version of the workspace.",
+            "Bump the workspace version, build the candidate, run the live suites on its binary, commit, tag, and check the published checksum.",
+        ),
+        (
+            "flaky-test-triage",
+            "Use when a test passes and fails on reruns without any code change.",
+            "Rerun the failing test alone ten times, record the seed, bisect the shared state that leaks between tests, and fix the ordering.",
+        ),
+        (
+            "powershell-quoting",
+            "Use when a shell command with quotes or paths with spaces fails on Windows.",
+            "Wrap paths in double quotes, use single quoted here strings for multi line text, and call executables with spaces through the call operator.",
+        ),
+        (
+            "cargo-lock-contention",
+            "Use when cargo blocks waiting for a file lock on the build directory.",
+            "Another agent holds the build directory. Wait and retry, never kill its cargo process, and report it.",
+        ),
+        (
+            "live-evidence-report",
+            "Use when reporting the result of a live test run.",
+            "Quote each suite's RESULT line, the SHA-256 of the binary it ran on, the commit, and where the logs are.",
+        ),
+        (
+            "git-identity",
+            "Use when making a git commit and the author identity matters.",
+            "Commit as the maintainer's work identity, never the account email, and end the message with the attribution line.",
+        ),
+        (
+            "bilingual-docs-sync",
+            "Use when a doc changes that exists in English and Vietnamese.",
+            "Edit the en file and the vi file in the same change, keep the headings in step, and do not translate code names.",
+        ),
+        (
+            "clippy-warning-fixes",
+            "Use when clippy reports warnings that must be denied before the gate.",
+            "Run clippy with warnings denied across the workspace and all targets, fix the cause, and never allow a lint without a reason.",
+        ),
+        (
+            "bug-report-reading",
+            "Use when the maintainer sends a diagnostic bundle or a bug report to read.",
+            "Open the diagnostics jsonl first, count the events by kind, then read the turns around the first error and trace the cause.",
+        ),
+        (
+            "worktree-hygiene",
+            "Use when starting work in a repository other people are using.",
+            "Work in a worktree of your own, never edit a checkout someone else is using, and remove the worktree when done.",
+        ),
+        (
+            "memory-review-queue",
+            "Use when a memory entry waits for review or an entry should be superseded.",
+            "List the queue, show each item with its evidence, accept or reject by the user's words, and never accept an entry a child proposed alone.",
+        ),
+    ];
+
+    fn library_documents() -> Vec<Vec<String>> {
+        LIBRARY
+            .iter()
+            .map(|(name, description, body)| {
+                words(&format!("{} {description} {body}", name.replace('-', " ")))
+            })
+            .collect()
+    }
+
+    /// The name of the library's skill that fits, by the rule recall uses.
+    fn fits(request: &str) -> Option<&'static str> {
+        best_of(&library_documents(), &words(request)).map(|(index, _)| LIBRARY[index].0)
+    }
+
+    /// What recall asked before: the best of the scores had to lie one
+    /// deviation above the mean of ALL the scores, itself among them, and with
+    /// five skills or more no word had to match.
+    fn old_rule(request: &str) -> Option<&'static str> {
+        let scored = super::scores_of(&library_documents(), &words(request));
+        let bm25 = scored.iter().map(|(score, _)| *score).collect::<Vec<_>>();
+        // With five skills or more the words matched were not consulted.
+        harness_types::readout::standout_of(&bm25, |_| true).map(|index| LIBRARY[index].0)
+    }
+
+    /// Fails without the change: the old rule put a skill into a request about
+    /// something no skill covers.
+    #[test]
+    fn a_request_that_none_of_twelve_skills_covers_recalls_nothing() {
+        let request = "sing me a poem about autumn and make it rhyme";
+        assert!(
+            old_rule(request).is_some(),
+            "control: the old rule still recalled a skill for it"
+        );
+        assert_eq!(fits(request), None);
+        for request in [
+            "cook rice with saffron and a little butter",
+            "paint the kitchen wall a warmer white",
+            "summarize this novel for my book club",
+        ] {
+            assert_eq!(fits(request), None, "{request}");
+        }
+    }
+
+    #[test]
+    fn a_request_that_names_a_skills_situation_recalls_it() {
+        for (request, skill) in [
+            (
+                "I am about to integrate what the child agent edited; audit its output before I commit",
+                "delegated-work-scope-audit",
+            ),
+            (
+                "this test is flaky: it fails on a rerun with no code change",
+                "flaky-test-triage",
+            ),
+            (
+                "cargo is blocked waiting for the file lock on the build directory",
+                "cargo-lock-contention",
+            ),
+            (
+                "update the Vietnamese doc as well as the English one",
+                "bilingual-docs-sync",
+            ),
+            (
+                "the maintainer sent a bug report bundle, read the diagnostics",
+                "bug-report-reading",
+            ),
+        ] {
+            assert_eq!(fits(request), Some(skill), "{request}");
+        }
+    }
+
+    /// Fails without the change: a long text that shares a single word with
+    /// each of many skills, and the small words every text shares, is not a
+    /// request any of them fits.
+    #[test]
+    fn a_long_text_that_shares_scattered_words_with_many_skills_recalls_nothing() {
+        let text = "The child finished and its report is in. It ran the checks in its worktree, \
+            then looked at the docs and the version, waited for the cargo build, and said that the \
+            test run and the review of the queue are done. Nothing was committed, the logs are \
+            where they were, and the maintainer can read them when it is time to go on.";
+        assert!(
+            old_rule(text).is_some(),
+            "control: the old rule recalled a skill for it"
+        );
+        assert_eq!(fits(text), None);
+    }
+
+    /// Whatever the library's size, one shared word is not a fit, however
+    /// rare the word is.
+    #[test]
+    fn two_distinct_words_are_needed_in_a_library_of_any_size() {
+        assert_eq!(fits("clippy"), None);
+        assert_eq!(fits("what does clippy say about it"), None);
+        assert_eq!(fits("clippy warnings"), Some("clippy-warning-fixes"));
+        // And in a library of two.
+        let two = library_documents().into_iter().take(2).collect::<Vec<_>>();
+        assert!(best_of(&two, &words("version")).is_none());
+        assert!(best_of(&two, &words("bump the version")).is_some());
+    }
+
+    /// The best is judged against the OTHER skills' spread: when every other
+    /// score is zero the two words decide; when the others agree, a hair of a
+    /// lead is not enough.
+    #[test]
+    fn the_bar_is_the_others_spread_and_a_flat_field_needs_a_clear_lead() {
+        let alone = docs(&[
+            "deploy release staging run the deploy script",
+            "paint the wall",
+            "bake bread",
+            "water the plants",
+            "walk the dog",
+        ]);
+        assert!(best_of(&alone, &words("run the deploy script")).is_some());
+        // The same scores everywhere but one that leads by a hair.
+        let flat = super::standout(&[(1.0, 2), (0.95, 2), (0.95, 2), (0.95, 2), (0.95, 2)]);
+        assert_eq!(flat, None);
+        let clear = super::standout(&[(3.0, 2), (0.95, 2), (0.95, 2), (0.95, 2), (0.95, 2)]);
+        assert_eq!(clear, Some(0));
+        // A tie for the lead is no lead.
+        assert_eq!(super::standout(&[(2.0, 3), (2.0, 3), (0.0, 0)]), None);
+    }
+
+    /// The whole path, through the files of a library: a request no skill
+    /// covers recalls nothing, one that names a situation recalls its skill.
+    #[test]
+    fn recall_reads_a_library_of_twelve_from_disk() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = Layers::new(
+            &directory.path().join("config"),
+            &directory.path().join("data"),
+            &directory.path().join("workspace"),
+            true,
+        );
+        for (name, description, body) in LIBRARY {
+            let verdict = promote(
+                &layers,
+                &Intent::from_value(&json!({
+                    "action": "create", "name": name, "level": "project",
+                    "body": format!("---\nname: {name}\ndescription: {description}\ncategory: ops\n---\n{body}\n"),
+                    "reason": "the user showed it", "evidence": "[User]: do it this way",
+                })),
+                &PromoteContext::default(),
+            );
+            assert!(verdict.ok, "{name}: {:?}", verdict.findings);
+        }
+        let skills = library(&layers);
+        assert_eq!(skills.len(), 12);
+        assert!(recall(&layers, &skills, "translate this poem into French").is_none());
+        let recalled = recall(
+            &layers,
+            &skills,
+            "audit the child agent's output before I commit it",
+        )
+        .expect("fits");
+        assert_eq!(recalled.name, "delegated-work-scope-audit");
+        assert!(recalled.unproven);
+    }
+
+    #[test]
+    fn the_request_is_the_goal_and_what_the_user_typed_and_nothing_the_host_wrote() {
+        use super::query;
+        let earlier = |texts: &[&str]| {
+            texts
+                .iter()
+                .map(|text| (*text).to_owned())
+                .collect::<Vec<_>>()
+        };
+        // The goal and the user's message.
+        assert_eq!(
+            query(Some("ship the exporter"), "also add a CSV option", &[]),
+            Some("ship the exporter\nalso add a CSV option".to_owned())
+        );
+        // A turn the host started (a goal's continuation: no typed words) asks
+        // with the goal and the user's newest words before it.
+        assert_eq!(
+            query(
+                Some("ship the exporter"),
+                "",
+                &earlier(&["add a CSV option", "start on the exporter"])
+            ),
+            Some("ship the exporter\nadd a CSV option".to_owned())
+        );
+        // What the host or a child wrote is no request, wherever it stands.
+        let continuation = format!(
+            "{}\n\nThe objective below is user-provided data.",
+            crate::interactive::goal::CONTINUATION_LEAD
+        );
+        let python_state = "[python-state]\n\nYour Python kernel persisted through compaction; its remaining variables are still available.";
+        let report = "[child-exited: no-reply child:scout]\n\nLast assistant text: found it";
+        let message = "[agent-message from child:scout]\n\nfound it";
+        assert_eq!(
+            query(
+                None,
+                &continuation,
+                &earlier(&[
+                    python_state,
+                    report,
+                    message,
+                    "fix the exporter's CSV header"
+                ])
+            ),
+            Some("fix the exporter's CSV header".to_owned())
+        );
+        // No goal and no user words in reach: nothing to ask.
+        assert_eq!(query(None, "", &earlier(&[python_state, report])), None);
+        assert_eq!(query(None, "  ", &[]), None);
+        // A goal alone asks with the goal.
+        assert_eq!(
+            query(Some("ship the exporter"), "", &[]),
+            Some("ship the exporter".to_owned())
+        );
+    }
+
+    /// The reports the app folds into the user's next message after a Ctrl-C
+    /// are the children's, not the user's.
+    #[test]
+    fn reports_held_since_a_ctrl_c_are_not_part_of_what_the_user_typed() {
+        let folded = format!(
+            "continue with the exporter\n\n{}\n\n[child-exited: no-reply child:scout]\n\nLast assistant text: touched flaky test and cargo lock",
+            crate::interactive::controller::HELD_REPORTS_LEAD
+        );
+        assert_eq!(
+            super::query(None, &folded, &[]),
+            Some("continue with the exporter".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_skills_a_packet_holds_are_those_given_whole() {
+        let packet = "Context\n\nA learned skill fits this request: db-migration. Its instructions follow.\n<skill name=\"db-migration\">\nRun it.\n</skill>\n\n<skill name=\"review\" location=\"C:/x/SKILL.md\">\nReview.\n</skill>\n\nThe learned skill release-notes given earlier in this conversation still fits; its text is above.";
+        let given = super::given_in(packet);
+        assert_eq!(
+            given.into_iter().collect::<Vec<_>>(),
+            ["db-migration", "review"]
+        );
+        // The one line is not the skill's text.
+        assert!(super::given_in("The learned skill release-notes given earlier").is_empty());
+    }
+
+    #[test]
+    fn the_block_carries_a_skill_whole_and_the_line_carries_only_its_name() {
+        let recalled = Recalled {
+            name: "deploy".to_owned(),
+            body: "Run the deploy script.".to_owned(),
+            failures: Vec::new(),
+            cases: Vec::new(),
+            unproven: true,
+            scripts: Vec::new(),
+            directory: None,
+            score: 1.0,
+        };
+        let whole = format!("{:?}", block(&recalled));
+        assert!(whole.contains("Run the deploy script."), "{whole}");
+        let line = format!("{:?}", super::again("deploy"));
+        assert!(
+            line.contains("The learned skill deploy given earlier in this conversation still fits; its text is above, and activate_skill reads it again."),
+            "{line}"
+        );
+        assert!(!line.contains("Run the deploy script."), "{line}");
+        assert_eq!(
+            super::notice(&recalled),
+            "learned skill deploy offered for this request (unproven)"
+        );
+        let proven = Recalled {
+            unproven: false,
+            ..recalled
+        };
+        assert_eq!(
+            super::notice(&proven),
+            "learned skill deploy offered for this request"
+        );
     }
 }

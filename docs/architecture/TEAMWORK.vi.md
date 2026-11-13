@@ -101,7 +101,8 @@ dùng, kết quả do review phán, các giả định đã sai. Phần còn thi
 | Thử thách: vị thế theo kết quả ghi nhận | Bộ đếm bắt đầu lại ở mỗi lần patch (`trial_good`, `trial_bad` trong `skill-usage/*.json`), nên skill đã viết lại được thử lại từ đầu | Không có nó thì một tuần xấu khoá skill mãi mãi |
 
 Check qua hay hỏng sau khi skill được dùng cũng tính vào lần thử. Record chẩn
-đoán `skill recalled` có thêm `cases` và `unproven`.
+đoán `skill recalled` có thêm `cases`, `unproven` và, từ 0.9.8, `again` (skill đã
+ở trong hội thoại nên chỉ một dòng được đưa vào).
 
 ## Đội được dựng lại ở plateau ([V])
 

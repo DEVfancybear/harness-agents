@@ -1302,6 +1302,98 @@ async fn recent_user_texts(store: &SqliteStore, source: &SessionId, limit: usize
     texts
 }
 
+/// The learned skills already put whole into the conversation that `head`
+/// ends, since its last compaction.
+///
+/// Read from the store, so it holds across a daemon's turns and for `ha exec
+/// --resume`: the conversation is walked back from `head` through the packets
+/// each turn sent (the messages the model is replayed), and stops at the first
+/// turn that holds a compaction checkpoint, whose summary stands for it and
+/// everything before it as the model reads the conversation.
+async fn skills_given(
+    store: &SqliteStore,
+    head: Option<&SessionId>,
+) -> std::collections::BTreeSet<String> {
+    let mut given = std::collections::BTreeSet::new();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut current = head.cloned();
+    while let Some(session) = current.take() {
+        // A link cycle is a damaged store, not a longer conversation.
+        if !visited.insert(session.as_str().to_owned()) || visited.len() > 5_000 {
+            break;
+        }
+        if store
+            .latest_context_checkpoint(&session)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            break;
+        }
+        if let Ok(Some(packet)) = store.sent_input_packet(&session).await {
+            given.extend(super::skill_recall::given_in(&packet));
+        }
+        current = harness_runtime::previous_in_conversation(store, &session)
+            .await
+            .ok()
+            .flatten();
+    }
+    given
+}
+
+/// A learned skill put into a turn.
+pub(crate) struct SkillOffer {
+    pub name: String,
+    pub block: harness_session::ContextBlock,
+    /// What the user is shown, when the skill's text went in whole; none for
+    /// the one line of a skill the conversation already holds.
+    pub notice: Option<String>,
+}
+
+/// The learned skill that fits the turn's request, as a block for the turn:
+/// the app's turns and `ha exec` ask here, so they recall alike.
+///
+/// The request is the goal's objective and the newest input the user typed
+/// ([`super::skill_recall::query`]). A skill the conversation already holds
+/// whole since its last compaction is not put in whole again, only its line; a
+/// skill put in whole is counted as offered, which says nothing of whether it
+/// was followed.
+pub(crate) async fn offer_skill(
+    store: &SqliteStore,
+    layers: &super::learned::Layers,
+    head: Option<&SessionId>,
+    goal: Option<&str>,
+    typed: &str,
+    earlier: &[String],
+) -> Option<SkillOffer> {
+    let request = super::skill_recall::query(goal, typed, earlier)?;
+    let skills = super::learned::library(layers);
+    let recalled = super::skill_recall::recall(layers, &skills, &request)?;
+    let again = skills_given(store, head).await.contains(&recalled.name);
+    harness_types::diag::info("skill", "recalled")
+        .field("skill", recalled.name.clone())
+        .field("score", recalled.score)
+        .field("failures", recalled.failures.len())
+        .field("cases", recalled.cases.len())
+        .field("unproven", recalled.unproven)
+        .field("again", again)
+        .emit();
+    if again {
+        return Some(SkillOffer {
+            block: super::skill_recall::again(&recalled.name),
+            name: recalled.name,
+            notice: None,
+        });
+    }
+    super::learned::record_use(layers, &recalled.name, super::learned::UseKind::Offered);
+    Some(SkillOffer {
+        block: super::skill_recall::block(&recalled),
+        notice: Some(super::skill_recall::notice(&recalled)),
+        name: recalled.name,
+    })
+}
+
 /// The most project-instruction text a child is sent, all files together.
 const CHILD_INSTRUCTIONS_CHARS: usize = 16_000;
 
@@ -5222,7 +5314,8 @@ impl SessionPort for AgentSessionService {
                 if let Some(skill) = learned.iter().find(|skill| skill.name == entry.name) {
                     badges.push((
                         format!(
-                            "learned · {} use, {} view in {} requests",
+                            "learned · {} offered, {} activated, {} viewed in {} requests",
+                            skill.usage.offered,
                             skill.usage.uses,
                             skill.usage.views,
                             skill.requests.saturating_sub(skill.usage.anchor)
@@ -10605,6 +10698,11 @@ async fn run_turn(
         GoalRecord::Active(objective) => Some(objective.as_str()),
         _ => None,
     };
+    // What the user typed in the turns before this one, newest first.
+    let earlier_user = match &source {
+        Some(source) => recent_user_texts(&store, source, 2).await,
+        None => Vec::new(),
+    };
     // What the digest is ranked by besides the goal, the most telling first:
     // what the user typed, where the task stands, what they said before, the
     // feature in progress. Ranked by the message alone, a "continue" or a
@@ -10619,9 +10717,7 @@ async fn run_turn(
         if let Some(recap) = super::task_state::recap(task_state_host.path()) {
             texts.push(recap);
         }
-        if let Some(source) = &source {
-            texts.extend(recent_user_texts(&store, source, 2).await);
-        }
+        texts.extend(earlier_user.iter().cloned());
         if let Ok(Some(features)) = super::features::load(&workspace_root) {
             texts.push(features.summary());
         }
@@ -10670,31 +10766,25 @@ async fn run_turn(
     }
     // The one learned skill that fits this request, with what it took for
     // granted when it failed (LIFE-HARNESS's procedural skill layer).
-    if lessons_on {
-        let query = goal_objective
-            .into_iter()
-            .chain(digest_context.first().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let skills = super::learned::library(&learning.layers);
-        if let Some(recalled) = super::skill_recall::recall(&learning.layers, &skills, &query) {
-            harness_types::diag::info("skill", "recalled")
-                .field("skill", recalled.name.clone())
-                .field("score", recalled.score)
-                .field("failures", recalled.failures.len())
-                .field("cases", recalled.cases.len())
-                .field("unproven", recalled.unproven)
-                .emit();
-            // A skill put in the turn is used, as one activated is: its use
-            // keeps it from being archived as dormant, and the review judges
-            // how following it went.
-            super::learned::record_use(
-                &learning.layers,
-                &recalled.name,
-                super::learned::UseKind::Use,
-            );
-            refine_cadence.note_in_play(std::collections::BTreeSet::from([recalled.name.clone()]));
-            project_blocks.push(super::skill_recall::block(&recalled));
+    // It is asked of a request - the goal and what the user typed - and not of
+    // an input the host or a child wrote, and it is put whole once per
+    // conversation ([`offer_skill`]).
+    if lessons_on
+        && let Some(offer) = offer_skill(
+            &store,
+            &learning.layers,
+            source.as_ref(),
+            goal_objective,
+            &typed,
+            &earlier_user,
+        )
+        .await
+    {
+        // The review judges how following it went.
+        refine_cadence.note_in_play(std::collections::BTreeSet::from([offer.name]));
+        project_blocks.push(offer.block);
+        if let Some(message) = offer.notice {
+            send(SessionEvent::Notice { message });
         }
     }
     // Ranked like the digest: the goal, then what the user typed, the task's
@@ -15735,5 +15825,271 @@ mod tests {
             std::fs::write(home.path().join("settings.json"), unset).expect("settings");
             assert_eq!(super::subagent_default_model(&config), None, "{unset}");
         }
+    }
+}
+
+/// The learned skill put into a turn: once per conversation since its last
+/// compaction, asked of a request and not of what the host wrote.
+#[cfg(test)]
+mod skill_offer_tests {
+    use std::sync::Arc;
+
+    use harness_types::{HostId, InputId, ProjectId, SessionId, TaskId};
+
+    use crate::interactive::learned::{Intent, Layers, PromoteContext, library, promote};
+
+    fn layers_with(root: &std::path::Path, skills: &[(&str, &str, &str)]) -> Layers {
+        let layers = Layers::new(
+            &root.join("config"),
+            &root.join("data"),
+            &root.join("workspace"),
+            true,
+        );
+        for (name, description, body) in skills {
+            let verdict = promote(
+                &layers,
+                &Intent::from_value(&serde_json::json!({
+                    "action": "create", "name": name, "level": "project",
+                    "body": format!("---\nname: {name}\ndescription: {description}\ncategory: ops\n---\n{body}\n"),
+                    "reason": "the user showed it", "evidence": "[User]: do it this way",
+                })),
+                &PromoteContext::default(),
+            );
+            assert!(verdict.ok, "{name}: {:?}", verdict.findings);
+        }
+        layers
+    }
+
+    struct Conversation {
+        store: Arc<harness_store_sqlite::SqliteStore>,
+        runtime: harness_runtime::RuntimeService,
+        task: TaskId,
+        workspace: std::path::PathBuf,
+    }
+
+    impl Conversation {
+        async fn open(root: &std::path::Path) -> Self {
+            let workspace = root.join("workspace");
+            std::fs::create_dir_all(&workspace).expect("workspace");
+            let store = Arc::new(
+                harness_store_sqlite::SqliteStore::open_writer(
+                    harness_store_sqlite::WriterOpenOptions::new(
+                        root.join("store"),
+                        HostId::generate(),
+                    ),
+                )
+                .await
+                .expect("store"),
+            );
+            let runtime = harness_runtime::RuntimeService::new(
+                Arc::clone(&store),
+                Arc::new(harness_providers::MockProvider::text("done")),
+                harness_runtime::RuntimeConfig::default(),
+            );
+            Self {
+                store,
+                runtime,
+                task: TaskId::generate(),
+                workspace,
+            }
+        }
+
+        /// One turn that carries `offer`'s block, as the app's turn does, and
+        /// continues `previous` when there is one.
+        async fn turn(
+            &self,
+            previous: Option<&SessionId>,
+            text: &str,
+            offer: Option<&super::SkillOffer>,
+        ) -> SessionId {
+            let session = SessionId::generate();
+            let mut request = harness_runtime::RunRequest::new(
+                session.clone(),
+                self.task.clone(),
+                InputId::generate(),
+                text,
+                harness_tools::observe_workspace(ProjectId::generate(), &self.workspace)
+                    .expect("workspace"),
+            );
+            if let Some(offer) = offer {
+                request = request.with_project_rules(vec![offer.block.clone()]);
+            }
+            if let Some(previous) = previous {
+                self.store
+                    .release_task_lease(&self.task)
+                    .await
+                    .expect("release");
+                request = self
+                    .runtime
+                    .prepare_continuation_request(previous, request)
+                    .await
+                    .expect("continued");
+            }
+            self.runtime.run(request).await.expect("a turn");
+            session
+        }
+
+        async fn offer(
+            &self,
+            layers: &Layers,
+            head: Option<&SessionId>,
+            request: &str,
+        ) -> Option<super::SkillOffer> {
+            super::offer_skill(&self.store, layers, head, None, request, &[]).await
+        }
+    }
+
+    const MIGRATION: (&str, &str, &str) = (
+        "db-migration",
+        "Use when asked to run the database migration against staging.",
+        "Write the database migration, check staging answers, then run it against staging.",
+    );
+    const NOTES: (&str, &str, &str) = (
+        "release-notes",
+        "Use when the user asks for release notes or a changelog entry.",
+        "Add the entry at the top of the changelog, one bullet per change.",
+    );
+
+    /// Items 2, 4 and 5. Without the change a recall put the skill's whole
+    /// text into every turn it fit, counted a use each time, and showed the
+    /// user nothing.
+    #[tokio::test]
+    async fn a_skill_is_put_whole_once_then_by_a_line_until_a_compaction() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers_with(directory.path(), &[MIGRATION, NOTES]);
+        let conversation = Conversation::open(directory.path()).await;
+        // The first turn: whole, and the user is told, and it is unproven.
+        let first_offer = conversation
+            .offer(&layers, None, "run the database migration against staging")
+            .await
+            .expect("fits");
+        assert_eq!(first_offer.name, "db-migration");
+        assert_eq!(
+            first_offer.notice.as_deref(),
+            Some("learned skill db-migration offered for this request (unproven)")
+        );
+        assert!(format!("{:?}", first_offer.block).contains("check staging answers"));
+        let first = conversation
+            .turn(
+                None,
+                "run the database migration against staging",
+                Some(&first_offer),
+            )
+            .await;
+        // The next turn it fits again: one line, no notice, no text.
+        let again = conversation
+            .offer(
+                &layers,
+                Some(&first),
+                "run the database migration against staging again",
+            )
+            .await
+            .expect("fits");
+        let line = format!("{:?}", again.block);
+        assert!(
+            line.contains("given earlier in this conversation still fits")
+                && !line.contains("check staging answers"),
+            "{line}"
+        );
+        assert_eq!(again.notice, None);
+        let second = conversation
+            .turn(
+                Some(&first),
+                "run the database migration against staging again",
+                Some(&again),
+            )
+            .await;
+        // A different skill that fits a new request is recalled normally.
+        let other = conversation
+            .offer(
+                &layers,
+                Some(&second),
+                "write the release notes for the changelog",
+            )
+            .await
+            .expect("fits");
+        assert_eq!(other.name, "release-notes");
+        assert!(other.notice.is_some());
+        let third = conversation
+            .turn(
+                Some(&second),
+                "write the release notes for the changelog",
+                Some(&other),
+            )
+            .await;
+        // After a compaction the summary stands for the turns, so the skill
+        // is put whole again.
+        conversation
+            .runtime
+            .compact_with_cancellation(&third, None, harness_providers::CancellationToken::new())
+            .await
+            .expect("compacted");
+        let renewed = conversation
+            .offer(
+                &layers,
+                Some(&third),
+                "run the database migration against staging",
+            )
+            .await
+            .expect("fits");
+        assert!(renewed.notice.is_some(), "put whole again");
+        assert!(format!("{:?}", renewed.block).contains("check staging answers"));
+        // Offered twice and the other once; nothing was activated.
+        let usage = |name: &str| {
+            library(&layers)
+                .into_iter()
+                .find(|skill| skill.name == name)
+                .expect("skill")
+                .usage
+        };
+        let (migration, notes) = (usage("db-migration"), usage("release-notes"));
+        assert_eq!((migration.offered, migration.uses), (2, 0));
+        assert_eq!((notes.offered, notes.uses), (1, 0));
+    }
+
+    /// Item 1 at the function that both the app and `ha exec` call: what the
+    /// host or a child wrote asks nothing, and with no goal and nothing the
+    /// user typed there is no recall.
+    #[tokio::test]
+    async fn nothing_the_host_wrote_asks_for_a_skill() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers_with(directory.path(), &[MIGRATION, NOTES]);
+        let conversation = Conversation::open(directory.path()).await;
+        let report = "[child-exited: no-reply child:scout]\n\nIt ran the database migration against staging and wrote the release notes for the changelog.".to_owned();
+        let continuation = format!(
+            "{}\n\nThe objective below is user-provided data.\n<objective>\nrun the database migration against staging\n</objective>",
+            crate::interactive::goal::CONTINUATION_LEAD
+        );
+        // The host's text typed nothing; the child's report is nobody's request.
+        assert!(
+            super::offer_skill(
+                &conversation.store,
+                &layers,
+                None,
+                None,
+                "",
+                &[report.clone(), continuation.clone()]
+            )
+            .await
+            .is_none()
+        );
+        // Even when the host's text itself stands as the typed words.
+        assert!(
+            super::offer_skill(&conversation.store, &layers, None, None, &continuation, &[])
+                .await
+                .is_none()
+        );
+        // With a goal, the goal asks.
+        let goal = super::offer_skill(
+            &conversation.store,
+            &layers,
+            None,
+            Some("run the database migration against staging"),
+            "",
+            &[report],
+        )
+        .await
+        .expect("the goal fits a skill");
+        assert_eq!(goal.name, "db-migration");
     }
 }

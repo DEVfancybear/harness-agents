@@ -39,6 +39,11 @@ pub const EXIT_SUCCESS: u8 = 0;
 pub const DEFAULT_MAX_STEPS: u32 = 8;
 pub const DEFAULT_MAX_TOOL_CALLS: u32 = 16;
 
+/// The line that opens the reports of delegated agents the app folds into the
+/// user's next message after a Ctrl-C: what follows it is not the user's.
+pub(crate) const HELD_REPORTS_LEAD: &str =
+    "[Reports of delegated agents that came in after the user stopped the work]";
+
 /// What the app sends when it continues a turn a bound stopped.
 ///
 /// It says why it is speaking, because a bare `continue` makes the model guess whether
@@ -3705,13 +3710,9 @@ impl InteractiveController {
         if self.notices_held && !self.pending_notices.is_empty() {
             let notices = self.pending_notices.drain(..).collect::<Vec<_>>();
             folded = notices.len();
-            sent.push_str(
-                "
-
-[Reports of delegated agents that came in after the user stopped the work]
-
-",
-            );
+            sent.push_str("\n\n");
+            sent.push_str(HELD_REPORTS_LEAD);
+            sent.push_str("\n\n");
             sent.push_str(&notices.join(
                 "
 

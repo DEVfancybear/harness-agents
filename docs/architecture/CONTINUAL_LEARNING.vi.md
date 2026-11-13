@@ -65,9 +65,12 @@ Code: `whole_entry`, `Pass` và `WHOLE_CONTENT_LIMIT` trong `memory/harness.rs`;
 | Sáu entry, cắt còn vài dòng, chọn trước khi biết task | Digest vốn đã xếp hạng theo yêu cầu. Entry nổi bật theo yêu cầu nay được hiện đến 1.200 ký tự thay vì 180 | Rule bị cắt ở 180 ký tự mất đúng bước khiến nó đáng lưu |
 | (rule đến được model ở 40 trong 154 lần quay lại) | Một entry nổi bật khi điểm của nó cao hơn trung bình của loại đó một độ lệch, như recall learned skill phán đoán, và nó chung ít nhất hai từ của yêu cầu | Điểm cố định hay danh sách từ không đúng với mọi kho; một từ chỉ một entry có thì không phải là khớp |
 
-`standout_of` là phép chọn mà `skill_recall::best_of` đã dùng, tách ra để cả hai
-dùng chung: điểm cao nhất phải hơn điểm kế và, với từ năm entry trở lên, cao hơn
-trung bình `STANDOUT` độ lệch. Mỗi digest có nhiều nhất một entry hiện đầy đủ,
+`standout_of` là phép chọn mà `skill_recall::best_of` đã dùng đến 0.9.7, tách ra
+để cả hai dùng chung: điểm cao nhất phải hơn điểm kế và, với từ năm entry trở
+lên, cao hơn trung bình `STANDOUT` độ lệch. Từ 0.9.8 recall có quy tắc riêng
+([chiến lược và runtime](STRATEGY_AND_RUNTIME.vi.md)); quy tắc tính cả skill tốt
+nhất vào độ lệch gần như luôn tìm ra một skill nổi bật trong thư viện cỡ chục
+skill, còn digest giữ nguyên `standout_of`. Mỗi digest có nhiều nhất một entry hiện đầy đủ,
 entry tốt nhất qua các loại. Constraint không bao giờ là ứng viên (nó vốn đã
 hiện cho mọi yêu cầu), và entry được ghim giữ như cũ. Block digest giữ giới hạn
 3.000 token; entry đầy đủ thêm tối đa khoảng một nghìn ký tự.

@@ -1092,6 +1092,39 @@ pub async fn run_with(
         eprintln!("{notice}");
     }
     project_blocks.extend(markdown_memory);
+    // The learned skill that fits the prompt, as the app recalls it: one
+    // function asks, so the request, the once-per-conversation rule and the
+    // notice are the same. The notice goes to stderr, where the auto-refine
+    // line is.
+    let mut skill_in_play = None;
+    if lessons_on {
+        let layers = super::learned::Layers::new(
+            context
+                .paths
+                .config_file
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+            &context.paths.data_dir,
+            &context.project.root,
+            resolved_config.project_trusted,
+        );
+        if let Some(offer) = super::service::offer_skill(
+            &store,
+            &layers,
+            resumed_from.as_ref().map(|(session, _)| session),
+            None,
+            &request.prompt,
+            &[],
+        )
+        .await
+        {
+            if let Some(message) = &offer.notice {
+                out.stderr(message);
+            }
+            project_blocks.push(offer.block);
+            skill_in_play = Some(offer.name);
+        }
+    }
     let run_request = run_request.with_project_rules(project_blocks);
     // A resumed conversation that went cold starts fresh, as in the app.
     let run_request =
@@ -1549,6 +1582,8 @@ pub async fn run_with(
             environment,
             resolved_config.project_trusted,
         );
+        // The skill this run was given is in play for its review.
+        learning.in_play.extend(skill_in_play);
         learning.dream.knowledge = knowledge_on;
         learning.dream.session_logs =
             super::session_log::enabled(&context.paths.config_file, environment);
