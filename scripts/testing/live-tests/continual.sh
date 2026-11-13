@@ -349,15 +349,16 @@ sha = lambda name: hashlib.sha256(open(os.path.join(skill, "scripts", name), "rb
 marks = {"scripts/solve.py": {"at": "2026-11-10T09:00:00Z", "sha": sha("solve.py"), "evidence": "berth fees: 4120"},
          "scripts/stale.py": {"at": "2026-11-10T09:05:00Z", "sha": "0" * 64, "evidence": "older"}}
 os.makedirs(os.path.dirname(usage), exist_ok=True)
-json.dump({"skills": {"harbor-tally": {"uses": 1, "worked": 1, "trial_good": 1, "scripts": marks}}}, open(usage, "w", encoding="utf-8"))
+json.dump({"skills": {"harbor-tally": {"use": 1, "worked": 1, "trial_good": 1, "scripts": marks}}}, open(usage, "w", encoding="utf-8"))
 PYEOF
 }
 seed4
 P4=$RX/p4
 project "$P4"
-# The recall is the app's (service.rs run_turn); `ha exec` recalls no learned
-# skill (the first run, which used `ha exec`, saw `skill: 0` and no block), so
-# this turn is a chat turn, as strategy.sh's section 4.
+# This turn is a chat turn, as strategy.sh's section 4, so that the same check
+# runs on 0.9.7, whose `ha exec` recalled no learned skill (the first run, which
+# used `ha exec`, saw `skill: 0` and no block). Since 0.9.8 `ha exec` recalls
+# as the app does (`offer_skill`, service.rs; recall.sh covers both paths).
 agent "$P4" t4a
 # A worker an earlier section left ending may write the usage counters once
 # more as it goes (strategy.sh): wait for the seed to stay.

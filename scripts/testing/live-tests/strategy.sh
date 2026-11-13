@@ -125,7 +125,7 @@ description: Use when the user asks for release notes or a changelog entry.
 EOF
 echo '{"created_by": "ha", "created": "2026-10-01T00:00:00Z"}' > "$HA_HOME/skills/release-notes/.ha-learned.json"
 mkdir -p "$D/skill-usage"
-seed4() { printf '{"skills": {"release-notes": {"uses": 1, "failed": 1, "failures": [{"at": "2026-10-20", "assumption": "CHANGELOG.md already exists", "evidence": "no such file"}]}}}\n' > "$D/skill-usage/global.json"; }
+seed4() { printf '{"skills": {"release-notes": {"use": 1, "failed": 1, "failures": [{"at": "2026-10-20", "assumption": "CHANGELOG.md already exists", "evidence": "no such file"}]}}}\n' > "$D/skill-usage/global.json"; }
 seed4
 project "$RX/p4"
 # A worker an earlier section left ending (its goal had children) writes the
