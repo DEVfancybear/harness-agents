@@ -2831,6 +2831,18 @@ mod tests {
         assert!(!store.root.exists());
     }
 
+    /// Give the page at `path` the write time `at` in its metadata line, as a
+    /// page saved at that moment would have: tests that order pages by when
+    /// they were written must not depend on how fast the store wrote them.
+    fn set_updated_at(root: &Path, path: &str, at: &str) {
+        let file = root.join(path);
+        let text = fs::read_to_string(&file).unwrap();
+        let key = "\"updated_at\":\"";
+        let start = text.find(key).unwrap() + key.len();
+        let end = start + text[start..].find('"').unwrap();
+        fs::write(&file, format!("{}{at}{}", &text[..start], &text[end..])).unwrap();
+    }
+
     /// Seen: with sixty pages, a "continue" matched nothing and the catalog
     /// showed the first pages by path, without the one about the task. Ranked
     /// by the goal too, it leads; and a catalog that leaves pages out says so.
@@ -2852,6 +2864,17 @@ mod tests {
         cart.title = "Chính sách giỏ hàng".to_owned();
         cart.summary = "Giỏ hàng giữ sản phẩm trong 24 giờ".to_owned();
         store.write(cart).unwrap();
+        // A page's write time is in seconds, so sixty-one pages written in one
+        // second all tie (seen on a fast Linux runner, where "the newest" was
+        // the first three by path). The test is about which pages are the
+        // newest, so it says so: all but the last three were written long ago.
+        for index in 0..58 {
+            set_updated_at(
+                &store.root,
+                &format!("analysis/a-{index:02}.md"),
+                "2026-01-01T00:00:00Z",
+            );
+        }
         let by_message = store.catalog(&[("tiếp tục", 2.0)], 3_000).unwrap();
         // The ranked list is the first pages by path; the page written last
         // is not in it, and the catalog adds three of the newest pages the
