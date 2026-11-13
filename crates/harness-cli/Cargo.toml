@@ -108,7 +108,7 @@ harness-extensions = { path = "../harness-extensions" }
 harness-maintenance = { path = "../harness-maintenance" }
 proptest.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

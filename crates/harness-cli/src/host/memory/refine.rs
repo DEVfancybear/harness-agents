@@ -3509,10 +3509,54 @@ async fn complete(
     }
 }
 
+/// The wait before an upkeep call is made again, when the provider named none.
+const UPKEEP_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The longest wait a provider's `retry-after` may ask of an upkeep call.
+const UPKEEP_RETRY_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why one provider attempt failed: the five-minute limit, or the provider.
+enum AttemptError {
+    TimedOut,
+    Provider(harness_providers::ProviderError),
+}
+
+/// One provider attempt of an upkeep call: the stream, then its assembly. A
+/// provider that streams its refusal fails at the second step.
+async fn attempt(
+    provider: &Arc<dyn ModelProvider>,
+    request: ProviderRequest,
+) -> Result<
+    (
+        Vec<harness_providers::ProviderStreamEvent>,
+        harness_providers::ProviderResponse,
+    ),
+    AttemptError,
+> {
+    let events = tokio::time::timeout(
+        std::time::Duration::from_mins(5),
+        provider.stream(request, CancellationToken::new()),
+    )
+    .await
+    .map_err(|_| AttemptError::TimedOut)?
+    .map_err(AttemptError::Provider)?;
+    let response = harness_providers::assemble_stream(&events).map_err(AttemptError::Provider)?;
+    Ok((events, response))
+}
+
 /// One model call of the memory's upkeep. Each is recorded (`refine.call`:
 /// its purpose, model, time and tokens) so the bug report sets what keeping
 /// memory costs beside what read it: a store built ahead of any question
 /// pays off only when it is read (`MemoryTax`, arXiv 2610.29823).
+///
+/// A provider error whose code says a repeat may succeed (a stream cut
+/// mid-reply, a rate limit, an overloaded server) is tried once more, after
+/// the wait the provider named, at most 30 seconds, or two. The agent's own
+/// turn loop retries such errors; this call did not, and a cut stream failed
+/// the whole `/refine` twice in the live knowledge suite. At most two provider
+/// calls: the second failure is returned as it is. The five-minute timeout and
+/// an error no repeat can fix (a key, a balance, a bad request) are not
+/// retried. The error's code decides, never its message.
 async fn complete_once(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
@@ -3522,15 +3566,18 @@ async fn complete_once(
     max_tokens: u32,
 ) -> Result<String, String> {
     let started = std::time::Instant::now();
-    let request = ProviderRequest::new(
-        RequestId::generate(),
-        model,
-        vec![
-            ProviderMessage::new(MessageRole::System, system),
-            ProviderMessage::new(MessageRole::User, user),
-        ],
-    )
-    .with_max_output_tokens(max_tokens);
+    let elapsed_ms = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let request = || {
+        ProviderRequest::new(
+            RequestId::generate(),
+            model,
+            vec![
+                ProviderMessage::new(MessageRole::System, system),
+                ProviderMessage::new(MessageRole::User, user.clone()),
+            ],
+        )
+        .with_max_output_tokens(max_tokens)
+    };
     // A call that failed or timed out is in the diagnostics too, with its
     // error's class: the bug report's upkeep table counts what memory upkeep
     // cost, failures included.
@@ -3547,16 +3594,30 @@ async fn complete_once(
             .emit();
         error
     };
-    let events = tokio::time::timeout(
-        std::time::Duration::from_mins(5),
-        provider.stream(request, CancellationToken::new()),
-    )
-    .await
-    .map_err(|_| failed(CALL_TIMED_OUT.to_owned()))?
-    .map_err(|error| failed(format!("the refinement model call failed: {error}")))?;
-    // A provider that streams its refusal fails here, not above.
-    let response = harness_providers::assemble_stream(&events)
-        .map_err(|error| failed(format!("the refinement model call failed: {error}")))?;
+    let mut retried = false;
+    let (events, response) = loop {
+        match attempt(provider, request()).await {
+            Ok(done) => break done,
+            Err(AttemptError::TimedOut) => return Err(failed(CALL_TIMED_OUT.to_owned())),
+            Err(AttemptError::Provider(error)) if !retried && error.is_retryable() => {
+                retried = true;
+                harness_types::diag::warn("refine", "call_retried")
+                    .field("purpose", purpose)
+                    .field("model", model)
+                    .field("duration_ms", elapsed_ms())
+                    .field("class", error.code().as_str())
+                    .msg(error.to_string())
+                    .emit();
+                let wait = error
+                    .retry_after()
+                    .map_or(UPKEEP_RETRY_WAIT, |asked| asked.min(UPKEEP_RETRY_WAIT_CAP));
+                tokio::time::sleep(wait).await;
+            }
+            Err(AttemptError::Provider(error)) => {
+                return Err(failed(format!("the refinement model call failed: {error}")));
+            }
+        }
+    };
     let usage = events.iter().rev().find_map(|event| match event {
         harness_providers::ProviderStreamEvent::Usage {
             prompt_tokens,
@@ -8580,6 +8641,141 @@ mod tests {
             .expect("the retry answers");
         assert_eq!(text, "{\"summary\": \"whole\"}");
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A model whose calls answer, in order, with the given results; the last
+    /// one repeats. It counts the calls.
+    struct Scripted {
+        results: Vec<
+            Result<Vec<harness_providers::ProviderStreamEvent>, harness_providers::ProviderError>,
+        >,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Scripted {
+        fn provider(
+            results: Vec<
+                Result<
+                    Vec<harness_providers::ProviderStreamEvent>,
+                    harness_providers::ProviderError,
+                >,
+            >,
+        ) -> (
+            std::sync::Arc<Self>,
+            std::sync::Arc<dyn harness_providers::ModelProvider>,
+        ) {
+            let scripted = std::sync::Arc::new(Self {
+                results,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let dynamic: std::sync::Arc<dyn harness_providers::ModelProvider> = scripted.clone();
+            (scripted, dynamic)
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl harness_providers::ModelProvider for Scripted {
+        fn capabilities(&self) -> harness_providers::ModelCapabilities {
+            harness_providers::MockProvider::text("").capabilities()
+        }
+
+        fn stream(
+            &self,
+            _request: harness_providers::ProviderRequest,
+            _cancellation: harness_providers::CancellationToken,
+        ) -> harness_providers::ProviderFuture {
+            let index = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .min(self.results.len() - 1);
+            let result = self.results[index].clone();
+            Box::pin(async move { result })
+        }
+    }
+
+    fn text_answer(text: &str) -> Vec<harness_providers::ProviderStreamEvent> {
+        use harness_providers::ProviderStreamEvent;
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text(text),
+            ProviderStreamEvent::completed("stop"),
+        ]
+    }
+
+    fn cut_stream() -> harness_providers::ProviderError {
+        harness_providers::ProviderError::new(
+            harness_types::ErrorCode::ProviderProtocol,
+            "provider stream failed: error decoding response body",
+        )
+    }
+
+    /// A stream cut mid-reply, seen twice in the live knowledge suite, failed
+    /// the whole `/refine`. The agent's turn loop retries it; the upkeep call
+    /// now makes it once more.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_cut_off_by_a_transient_error_is_made_once_more() {
+        let (scripted, provider) =
+            Scripted::provider(vec![Err(cut_stream()), Ok(text_answer("whole"))]);
+        let text = super::complete(&provider, "m", "test", "system", "user".to_owned(), 1024)
+            .await
+            .expect("the second call answers");
+        assert_eq!(text, "whole");
+        assert_eq!(scripted.calls(), 2);
+    }
+
+    /// Two provider calls at most: the second failure is the caller's, with
+    /// the message it always had.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_fails_twice_is_not_made_a_third_time() {
+        let (scripted, provider) = Scripted::provider(vec![Err(cut_stream())]);
+        let error = super::complete(&provider, "m", "test", "system", "user".to_owned(), 1024)
+            .await
+            .expect_err("both calls fail");
+        assert!(
+            error.starts_with("the refinement model call failed: "),
+            "{error}"
+        );
+        assert_eq!(scripted.calls(), 2);
+    }
+
+    /// An error no repeat can fix is returned at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_refused_for_its_key_is_not_made_again() {
+        let refused = harness_providers::ProviderError::new(
+            harness_types::ErrorCode::MissingAuthority,
+            "provider returned HTTP 401",
+        );
+        let (scripted, provider) = Scripted::provider(vec![Err(refused), Ok(text_answer("whole"))]);
+        let error = super::complete(&provider, "m", "test", "system", "user".to_owned(), 1024)
+            .await
+            .expect_err("the refusal is final");
+        assert!(
+            error.starts_with("the refinement model call failed: "),
+            "{error}"
+        );
+        assert_eq!(scripted.calls(), 1);
+    }
+
+    /// The provider's own wait is honoured, and capped.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_before_the_second_call_is_the_providers_up_to_a_cap() {
+        let asked =
+            |seconds| cut_stream().with_retry_after(Some(std::time::Duration::from_secs(seconds)));
+        for (error, expected) in [
+            (cut_stream(), super::UPKEEP_RETRY_WAIT),
+            (asked(7), std::time::Duration::from_secs(7)),
+            (asked(600), super::UPKEEP_RETRY_WAIT_CAP),
+        ] {
+            let (_, provider) = Scripted::provider(vec![Err(error), Ok(text_answer("whole"))]);
+            let before = tokio::time::Instant::now();
+            super::complete(&provider, "m", "test", "system", "user".to_owned(), 1024)
+                .await
+                .expect("the second call answers");
+            assert_eq!(before.elapsed(), expected);
+        }
     }
 
     /// A lesson the promoter refused is not lost: the findings go back to the
