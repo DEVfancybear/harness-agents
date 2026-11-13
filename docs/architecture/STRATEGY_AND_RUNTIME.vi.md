@@ -80,7 +80,9 @@ quyết định) và `crates/harness-cli/src/host/coordination/goal.rs` (nơi go
 - **Plateau.** Ba lần đánh giá dưới cùng một chiến lược mà không tiến thêm là
   plateau. Khi đó một child explorer với context mới (strategist) được hỏi một
   lần cho mỗi plateau, để nêu tên 2–3 chiến lược *khác*. Lời từ chối và task
-  state mang các phương án đó. Nếu quyết định tiếp tục được đưa ra tại một
+  state mang các phương án đó. Một câu trả lời không nêu tên phương án nào, và
+  một lần hỏi bị lỗi, đều tính là đã hỏi (chẩn đoán, nếu có, vẫn được hiển thị):
+  nếu hỏi lại ở mỗi lần đánh giá thì một plateau tốn mỗi lần hai ba phút. Nếu quyết định tiếp tục được đưa ra tại một
   plateau, phải qua thêm đủ một plateau đánh giá nữa thì strategist mới được
   hỏi lại. Quyết định `continue` sau một lần đánh giá bình thường không giữ
   strategist lại.

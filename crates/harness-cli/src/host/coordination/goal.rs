@@ -387,32 +387,10 @@ impl GoalHost {
                 "strategy: no progress over several evaluations; asking a strategist for other approaches"
                     .to_owned(),
             );
-            match strategist
+            let answer = strategist
                 .consult(strategist_brief(&check.objective, &task), model.as_deref())
-                .await
-            {
-                Ok(answer) => {
-                    proposals = proposals_of(&answer);
-                    diagnosis = diagnosis_of(&answer);
-                    super::task_state::record_proposals(path, proposals.clone(), diagnosis.clone());
-                    harness_types::diag::info("strategy", "proposed")
-                        .field("count", proposals.len())
-                        .field("diagnosed", !diagnosis.is_empty())
-                        .field(
-                            "team_roles",
-                            proposals
-                                .iter()
-                                .map(|proposal| proposal.team.len())
-                                .sum::<usize>(),
-                        )
-                        .emit();
-                }
-                Err(error) => {
-                    harness_types::diag::warn("strategy", "strategist_failed")
-                        .msg(error)
-                        .emit();
-                }
-            }
+                .await;
+            (proposals, diagnosis) = settle_consult(path, answer);
         }
         let mut text = String::from(
             "\n\nThis was an evaluation of your strategy. Before going on, decide whether it is still paying: record task_state decide with kind continue or switch and the evidence.",
@@ -424,13 +402,15 @@ impl GoalHost {
                 super::strategy::PLATEAU
             );
         }
+        // A diagnosis stands without alternatives: the strategist may have said
+        // why it stalled and named nothing.
+        if !diagnosis.is_empty() {
+            let _ = write!(
+                text,
+                " A strategist that read the task afresh says why it stalled: {diagnosis}"
+            );
+        }
         if !proposals.is_empty() {
-            if !diagnosis.is_empty() {
-                let _ = write!(
-                    text,
-                    " A strategist that read the task afresh says why it stalled: {diagnosis}"
-                );
-            }
             text.push_str(" A strategist that read the task afresh names these alternatives:");
             for proposal in &proposals {
                 let _ = write!(text, "\n- {}: {}", proposal.name, proposal.why);
@@ -874,6 +854,43 @@ impl GoalState {
 /// How much a failure left behind: its lines with something on them.
 fn lines(text: &str) -> u32 {
     u32::try_from(text.lines().filter(|line| !line.trim().is_empty()).count()).unwrap_or(u32::MAX)
+}
+
+/// Record what a consult of the strategist came to, and give the alternatives
+/// and the diagnosis to show the agent. Whatever it came to is recorded as
+/// asked (`record_proposals`): an answer naming nothing, and a consult that
+/// failed, would otherwise be asked for again at every evaluation of the same
+/// plateau. A failure keeps its warning; an answer keeps its `proposed` event.
+fn settle_consult(
+    path: &std::path::Path,
+    answer: Result<String, String>,
+) -> (Vec<super::strategy::Alternative>, String) {
+    match answer {
+        Ok(answer) => {
+            let proposals = proposals_of(&answer);
+            let diagnosis = diagnosis_of(&answer);
+            super::task_state::record_proposals(path, proposals.clone(), diagnosis.clone());
+            harness_types::diag::info("strategy", "proposed")
+                .field("count", proposals.len())
+                .field("diagnosed", !diagnosis.is_empty())
+                .field(
+                    "team_roles",
+                    proposals
+                        .iter()
+                        .map(|proposal| proposal.team.len())
+                        .sum::<usize>(),
+                )
+                .emit();
+            (proposals, diagnosis)
+        }
+        Err(error) => {
+            harness_types::diag::warn("strategy", "strategist_failed")
+                .msg(error)
+                .emit();
+            super::task_state::record_proposals(path, Vec::new(), String::new());
+            (Vec::new(), String::new())
+        }
+    }
 }
 
 /// What the strategist is asked: the goal, the strategy that stopped getting
@@ -1366,6 +1383,86 @@ mod tests {
         assert!(super::proposals_of("no json here").is_empty());
         assert!(proposals[0].team.is_empty());
         assert!(super::diagnosis_of("no json here").is_empty());
+    }
+
+    /// How often a strategist is consulted over six evaluations of a task that
+    /// gets no further, when each consult comes to `answer`.
+    fn consults_over_a_plateau(answer: &Result<String, String>) -> usize {
+        let data = tempfile::tempdir().expect("data");
+        let path = data.path().join("task_state.json");
+        let mut consults = 0;
+        for _ in 0..6 {
+            let (standing, _) = super::super::task_state::record_evaluation(
+                &path,
+                "checks",
+                super::super::strategy::stage::CHECKS,
+                2,
+                0,
+                "2 failed",
+            )
+            .expect("recorded");
+            // `evaluated` consults exactly when the standing wants it.
+            if standing.wants_proposals {
+                consults += 1;
+                super::settle_consult(&path, answer.clone());
+            }
+        }
+        consults
+    }
+
+    /// Seen live: a strategist that named nothing (or failed) was asked again
+    /// at every evaluation of the same plateau, two or three minutes each. Its
+    /// answer, whatever it is, counts as asked.
+    #[test]
+    fn a_strategist_that_names_nothing_or_fails_is_asked_once_per_plateau() {
+        for (what, answer) in [
+            (
+                "prose",
+                Ok("I read it and have no approach to add.".to_owned()),
+            ),
+            (
+                "an empty list",
+                Ok(r#"{"diagnosis": "", "alternatives": []}"#.to_owned()),
+            ),
+            (
+                "a diagnosis only",
+                Ok(r#"{"diagnosis": "it repeats one line", "alternatives": []}"#.to_owned()),
+            ),
+            ("a failure", Err("the explorer was stopped".to_owned())),
+        ] {
+            assert_eq!(consults_over_a_plateau(&answer), 1, "{what}");
+        }
+    }
+
+    /// A diagnosis without alternatives is kept and shown as a diagnosis; the
+    /// alternatives of an earlier plateau are not shown as new.
+    #[test]
+    fn a_diagnosis_without_alternatives_is_kept_and_an_earlier_plateaus_alternatives_are_not() {
+        let data = tempfile::tempdir().expect("data");
+        let path = data.path().join("task_state.json");
+        // A state with no evaluation is empty and not written; a consult comes
+        // after evaluations.
+        super::super::task_state::record_evaluation(
+            &path,
+            "checks",
+            super::super::strategy::stage::CHECKS,
+            2,
+            0,
+            "2 failed",
+        )
+        .expect("recorded");
+        let named = r#"{"diagnosis": "first", "alternatives": [{"name": "use a parser", "why": "it nests"}]}"#;
+        let (proposals, _) = super::settle_consult(&path, Ok(named.to_owned()));
+        assert_eq!(proposals.len(), 1);
+        let (proposals, diagnosis) = super::settle_consult(
+            &path,
+            Ok(r#"{"diagnosis": "second", "alternatives": []}"#.to_owned()),
+        );
+        assert!(proposals.is_empty());
+        assert_eq!(diagnosis, "second");
+        let kept = super::super::task_state::load(&path).strategy;
+        assert!(kept.proposals.is_empty(), "replaced, not kept beside");
+        assert_eq!(kept.diagnosis, "second");
     }
 
     /// Evolving Agent Teams (arXiv 2610.36848): the strategist says why the

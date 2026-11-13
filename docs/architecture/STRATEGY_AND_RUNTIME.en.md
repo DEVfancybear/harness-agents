@@ -79,7 +79,10 @@ is evaluated).
 - **Plateau.** Three evaluations under one strategy without getting further is
   a plateau. An explorer child with a fresh context, the strategist, is asked
   once per plateau for two or three *other* strategies, named. The refusal and
-  the state carry them. A decision to continue made at a plateau gets a
+  the state carry them. An answer that names none, and a consult that fails,
+  count as asked (the diagnosis, if it gave one, is still shown): asked again
+  at every evaluation, a plateau cost a consult of two or three minutes each
+  time. A decision to continue made at a plateau gets a
   plateau's worth of evaluations before the strategist is asked again. The
   `continue` decided after an ordinary evaluation does not hold it back.
 - **`compare_children`** runs the project's checks in each coder's own

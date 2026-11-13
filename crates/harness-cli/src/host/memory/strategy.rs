@@ -251,8 +251,9 @@ pub struct StrategyState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Standing {
     pub plateau: bool,
-    /// The strategist should be asked for alternatives: a plateau, and none
-    /// named since the last decision.
+    /// The strategist should be asked for alternatives: a plateau, and not
+    /// asked since the last decision (whatever it answered, naming nothing
+    /// included).
     pub wants_proposals: bool,
 }
 
@@ -423,7 +424,8 @@ impl StrategyState {
         self.journal.drain(..excess);
     }
 
-    /// The strategist's alternatives, kept until the next decision.
+    /// The strategist's alternatives, kept until the next decision. None is
+    /// an answer too: the strategist was asked.
     #[cfg(test)]
     pub fn propose(&mut self, proposals: Vec<Alternative>) {
         self.propose_with(proposals, String::new());
@@ -505,14 +507,16 @@ impl StrategyState {
                     "\nPLATEAU: {PLATEAU} or more evaluations under this strategy without getting further. More of the same is unlikely to finish the task: prefer a switch, and continue only with evidence that this strategy is about to succeed."
                 );
             }
+            // A diagnosis stands without alternatives: a strategist that read
+            // the task and named nothing may still have said why it stalled.
+            if !self.diagnosis.is_empty() {
+                let _ = write!(
+                    text,
+                    "\nWhy it stalled, as a strategist that read the task afresh sees it: {}",
+                    self.diagnosis
+                );
+            }
             if !self.proposals.is_empty() {
-                if !self.diagnosis.is_empty() {
-                    let _ = write!(
-                        text,
-                        "\nWhy it stalled, as a strategist that read the task afresh sees it: {}",
-                        self.diagnosis
-                    );
-                }
                 text.push_str("\nAlternatives named by a strategist that read the task afresh:");
                 for proposal in &self.proposals {
                     proposal.render("", text);
@@ -605,7 +609,7 @@ pub fn view(state: &StrategyState) -> Vec<String> {
             ));
         }
     }
-    if !state.proposals.is_empty() {
+    if !state.proposals.is_empty() || !state.diagnosis.is_empty() {
         lines.push(String::new());
         if !state.diagnosis.is_empty() {
             lines.push(format!(
@@ -613,7 +617,9 @@ pub fn view(state: &StrategyState) -> Vec<String> {
                 state.diagnosis
             ));
         }
-        lines.push("Alternatives the strategist named, not yet decided on:".to_owned());
+        if !state.proposals.is_empty() {
+            lines.push("Alternatives the strategist named, not yet decided on:".to_owned());
+        }
         for proposal in &state.proposals {
             let mut text = String::new();
             proposal.render("  ", &mut text);
@@ -752,6 +758,43 @@ mod tests {
             .expect("continued");
         // A decision to continue gets a plateau's worth of evaluations
         // before the strategist is asked again.
+        for _ in 0..2 {
+            assert!(
+                !state
+                    .evaluate("checks", stage::CHECKS, 2, 0, "")
+                    .wants_proposals
+            );
+        }
+        assert!(
+            state
+                .evaluate("checks", stage::CHECKS, 2, 0, "")
+                .wants_proposals
+        );
+    }
+
+    /// A strategist that named nothing was still asked: it is not asked again
+    /// until a decision and a plateau's worth of evaluations, and what it said
+    /// of the stall is shown without alternatives.
+    #[test]
+    fn an_answer_naming_nothing_counts_as_asked() {
+        let mut state = StrategyState::default();
+        for _ in 0..3 {
+            state.evaluate("checks", stage::CHECKS, 2, 0, "2 failed");
+        }
+        state.propose_with(vec![], "it repeats one line".to_owned());
+        for _ in 0..5 {
+            let standing = state.evaluate("checks", stage::CHECKS, 2, 0, "2 failed");
+            assert!(standing.plateau && !standing.wants_proposals);
+        }
+        let mut text = String::new();
+        state.render(&mut text);
+        assert!(text.contains("Why it stalled"), "{text}");
+        assert!(text.contains("it repeats one line"), "{text}");
+        assert!(!text.contains("Alternatives named"), "{text}");
+        state
+            .decide(DecisionKind::Continue, None, "once more".to_owned())
+            .expect("continued");
+        assert!(state.diagnosis.is_empty());
         for _ in 0..2 {
             assert!(
                 !state

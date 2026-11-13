@@ -17,13 +17,20 @@ echo "################ 1. a goal goes on past ten automatic turns"
 agent "$RX/p" g1
 # Sent without waiting: the goal never finishes, so a wait for it would not end.
 "$HA" send g1 "/goal Đây là bài kiểm thử của harness: mỗi lượt chỉ trả lời đúng một dòng 'CHUA-XONG' rồi kết thúc lượt. Tuyệt đối không gọi goal_complete và không gọi tool nào." >/dev/null 2>&1
+# A turn that changes nothing is a plateau after three evaluations, and then a
+# strategist (a delegated explorer) is consulted ONCE: at THINKING=max that is
+# two to three minutes in which no turn runs. A wait of a fixed count of polls
+# (sixty, about five minutes) left no room for it; the wait is in seconds, with
+# room for one consult and the twelve turns after it.
+wait_s=${GOAL_WAIT_S:-600}
+started=$SECONDS
 turns=0
-for _ in $(seq 1 60); do
+while [ $((SECONDS - started)) -lt "$wait_s" ]; do
   turns=$(continued); turns=${turns:-0}
   [ "$turns" -ge 12 ] && break
   sleep 5
 done
-echo "   continued $turns turn(s)"
+echo "   continued $turns turn(s) in $((SECONDS - started)) s (waited at most $wait_s s)"
 "$HA" send g1 "/goal status" --wait 2>&1 | sed 's/^/   /' | head -6
 check "the goal was continued past ten turns" '[ "$turns" -ge 12 ]'
 check "it is still active, not paused by a count" '"$HA" send g1 "/goal status" --wait 2>&1 | grep -qi "status: *active"'

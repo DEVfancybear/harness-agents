@@ -1065,12 +1065,14 @@ pub fn note_workspace(path: &Path, fingerprint: &str) {
     let _ = save(path, &state);
 }
 
-/// Keep the alternatives a strategist named, for the next decision. None
-/// named is not kept: the next evaluation asks again.
+/// Keep what a strategist answered, for the next decision, and that it was
+/// asked. An answer that names no alternative is recorded too (with its
+/// diagnosis, if it gave one): the strategist is asked once per plateau, and
+/// an answer naming nothing left the next evaluation asking again at every
+/// evaluation for as long as the plateau lasted (seen live: two consults of
+/// about two minutes each in five minutes, and the goal went on at a crawl).
+/// A failed consult is recorded the same way, as an answer with nothing.
 pub fn record_proposals(path: &Path, proposals: Vec<Alternative>, diagnosis: String) {
-    if proposals.is_empty() {
-        return;
-    }
     let Ok(_guard) = file_lock().lock() else {
         return;
     };
