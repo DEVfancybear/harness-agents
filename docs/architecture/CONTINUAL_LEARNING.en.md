@@ -188,6 +188,11 @@ worked: a tool result, or the user's message saying so. The rejection rule for
 one-off noise is read with it: a guess no result confirmed and the failed
 attempts are still noise. No word list decides it; the review judges.
 
+The name reaches the entry from either side. The `memory` tool tells the agent to
+put that name in the title of its own write. When the agent saved the solution
+without it, the gate still approves and the review retitles that entry (an
+`update` by its id) instead of writing a second one.
+
 ## Not taken
 
 - **The benchmark as a test suite in ha.** It measures harnesses on a puzzle

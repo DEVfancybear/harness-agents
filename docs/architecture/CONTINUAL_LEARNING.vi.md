@@ -190,6 +190,11 @@ kết quả của một tool, hoặc tin nhắn của người dùng nói vậy.
 một lần được đọc cùng: một phỏng đoán không kết quả nào xác nhận và các lần thử
 thất bại vẫn là nhiễu. Không có danh sách từ nào quyết định; review tự đánh giá.
 
+Tên đến được entry từ cả hai phía. Tool `memory` bảo agent đặt tên đó vào tiêu đề
+của lần ghi do chính nó làm. Khi agent đã lưu lời giải mà không có tên, gate vẫn
+duyệt và review đặt lại tiêu đề cho entry đó (một `update` theo id của nó) thay vì
+ghi thêm một entry thứ hai.
+
 ## Không lấy
 
 - **Benchmark làm bộ test trong ha.** Nó đo harness trên một chuỗi câu đố; nó

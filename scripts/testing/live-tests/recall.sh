@@ -486,6 +486,8 @@ echo "################ 7. P8: a problem that comes back is kept by its name"
 # under that name - a memory entry's title, a learned skill's name or a
 # knowledge page's title carries it. 0.9.7's review kept one generic rule or
 # nothing (not certain: it may have named it anyway).
+# The name may come from the agent's own memory write (the tool says to title it
+# by the name) or from the review retitling an entry that holds the fix without it.
 # kept_by_name: lines naming a store entry whose title/name carries OPS-4471
 # (case and punctuation aside).
 kept_by_name() { "$PY" - "$D" "$HA_HOME" "$P" <<'PYEOF'

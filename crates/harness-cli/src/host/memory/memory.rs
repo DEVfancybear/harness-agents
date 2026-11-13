@@ -3706,7 +3706,7 @@ impl ExternalToolCatalog for MemoryHost {
                 "kind":{"type":"string","enum":KINDS,"description":"memory (default for write) or prompt; list and search cover both when omitted."},
                 "scope":{"type":"string","enum":scopes,"description":"global: every conversation and project; project: this project's conversations; local: this one. Required to create; list, search and read cover them all when omitted."},
                 "id":{"type":"string","description":"An entry id from list, search or history (a global:/project:/local: prefix picks the scope), its memory_id (which never changes), or its <tree>/<name> address. With write, updates that entry."},
-                "title":{"type":"string","description":"write: a short name for the fact or rule; an update by id keeps the entry's title when this is left out."},
+                "title":{"type":"string","description":"write: a short name for the fact or rule; when the entry is what solved a problem that has a name of its own (a ticket, an error text, a file) and may come back, that name is in the title. An update by id keeps the entry's title when this is left out."},
                 "content":{"type":"string","description":"write: the whole entry, replacing the old content. One fact or rule, self-contained. An update by id that changes only other fields (meta, tree, temporal, pinned, title, name) leaves it out."},
                 "path":{"type":"string","description":"write: an optional grouping such as user/preferences or project/<name>; constraints (or constraints/<topic>) for a rule the user set for the work, shown in every turn ahead of the ranked entries."},
                 "tree":{"type":"string","description":"tree, delete_tree, history: an absolute tree such as /global/team. search, count: a tree (the entries at and below it), an lquery such as /global/*/decisions, */!draft/* or /global/*{1}, or a label search such as api & !draft; labels may be joined by . instead of /, and a tree without a leading / is read below its scope's root. write: where the entry sits, instead of path: absolute (/global/user/preferences, /local/..., or this project's /projects/<key>/..., which also picks the scope - one in another scope moves the entry there) or relative to scope. Labels are letters, digits, _ and -."},
@@ -4113,6 +4113,24 @@ mod tests {
             super::super::refine::load_raw(&root.global)["entries"]["memory"]["deploy_day"]["version"],
             1
         );
+    }
+
+    /// The agent's own write is titled by the name of a problem that may come
+    /// back (a ticket, an error text, a file), so a later request naming it
+    /// finds the entry; the tool says so where the agent reads how to write.
+    #[test]
+    fn the_tool_tells_the_agent_to_put_a_returning_problems_name_in_the_title() {
+        let directory = tempfile::tempdir().expect("dir");
+        let schema = host(directory.path()).schemas();
+        let title = schema[0]["function"]["parameters"]["properties"]["title"]["description"]
+            .as_str()
+            .expect("the title's description");
+        assert!(
+            title.contains("solved a problem that has a name of its own")
+                && title.contains("that name is in the title"),
+            "{title}"
+        );
+        assert!(title.contains("keeps the entry's title"), "{title}");
     }
 
     #[test]
