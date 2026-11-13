@@ -28,7 +28,7 @@ ha's side of the first, second and fourth already stood on different ground:
 the `memory` tool makes the model name a scope, the digest is ranked against
 the request, and a learned skill may carry `scripts/`. What was left were the
 defaults and the words around them, and the places where a finding of the
-paper had no counterpart. They are six small changes.
+paper had no counterpart. They are six small changes, and two more that came from a run of the benchmark (P7, P8).
 
 ## Scope: say who sees an entry (P1)
 
@@ -147,6 +147,44 @@ child's system prompt is the same in every turn and the provider's cached prefix
 holds. Grandchildren inherit it with the rest of the launch. `ha exec` builds
 its children's launch the same way.
 
+## The review's note is not the user's (P7)
+
+Code: `plan`, `REVIEW_NOTE_HEADER` and `AUTO_REFINE_REVIEW_SYSTEM_PROMPT` in
+`crates/harness-cli/src/host/memory/refine.rs`.
+
+The automatic review runs in two model calls: the gate decides whether to refine
+and writes a note of what is worth keeping, and the planner proposes the edits.
+The planner was given the gate's note in the block that holds what the user types
+after `/refine`, so it believed the user had asked, wrote so in its rationale and
+quoted the gate's sentence as an edit's evidence. The host refused those edits,
+rightly: only the conversation, and what the user typed, are evidence. In a run
+of 24 conversations 39 of about 50 proposed edits were refused this way. Now
+instructions the user did not type (the gate's, the agent's through `refine.run`,
+`/learn`'s) reach the planner in a `<review_note>` block that says what it is: not
+written by the user, a pointer at what looked worth keeping, nobody's request and
+no evidence. Every edit's evidence is still a verbatim quote of the conversation,
+and an edit whose words the conversation does not hold is left out. Only what the
+user typed keeps `<user_refine_instructions>`. The gate is asked for the same
+thing from its side: name each thing worth keeping and, for each, the words of
+the conversation that show it, copied exactly. The host's check did not change.
+
+## A problem that comes back is kept by its name (P8)
+
+Code: `AUTO_SCOPE_POLICY` and the gate's prompt in `refine.rs`.
+
+The paper's tasks came back with fresh inputs and each ended with a verdict, yet
+the reviews kept one generic rule and never what solved a given task. The review
+is now told, in general terms: when the conversation solved a problem that may
+come back (it says so, or the problem carries a name of its own: an identifier, a
+file, an error text), what finally worked and what told it from the attempts that
+failed is worth keeping where a later conversation finds it. That is a learned
+skill when it is a procedure, else a memory entry about the project (global when
+it is not about one project), titled with the name the problem goes by, so that a
+request naming it matches the entry. The evidence is the result that showed it
+worked: a tool result, or the user's message saying so. The rejection rule for
+one-off noise is read with it: a guess no result confirmed and the failed
+attempts are still noise. No word list decides it; the review judges.
+
 ## Not taken
 
 - **The benchmark as a test suite in ha.** It measures harnesses on a puzzle
@@ -205,3 +243,7 @@ its children's launch the same way.
   `a_child_gets_the_appended_text_and_the_additions_of_its_own_model` and
   `what_a_child_inherits_is_bounded_and_empty_when_there_is_nothing` in
   `delegation.rs`.
+- Unit, P7 and P8 in `refine.rs`:
+  `instructions_the_user_did_not_type_reach_the_planner_as_a_note_not_theirs`,
+  `an_edit_quoting_the_gate_s_note_is_refused_and_one_quoting_the_conversation_is_kept`
+  and `the_review_is_told_to_keep_what_solved_a_problem_that_may_come_back`.

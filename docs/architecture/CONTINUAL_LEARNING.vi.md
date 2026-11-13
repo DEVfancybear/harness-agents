@@ -31,7 +31,7 @@ nào không lấy.
 Với điểm thứ nhất, thứ hai và thứ tư, ha đã đứng trên nền khác: tool `memory`
 buộc model nêu scope, digest được xếp hạng theo yêu cầu, và learned skill có thể
 mang `scripts/`. Phần còn lại là các mặc định và lời lẽ quanh chúng, cùng chỗ
-mà một phát hiện của bài chưa có phần tương ứng. Đó là sáu thay đổi nhỏ.
+mà một phát hiện của bài chưa có phần tương ứng. Đó là sáu thay đổi nhỏ, và hai thay đổi nữa đến từ một lần chạy benchmark (P7, P8).
 
 ## Scope: nói rõ ai thấy một entry (P1)
 
@@ -149,6 +149,44 @@ của child giống hệt ở mọi lượt và prefix cache của provider vẫ
 hưởng nó cùng phần còn lại của launch. `ha exec` dựng launch cho child của nó
 theo cùng cách.
 
+## Ghi chú của review không phải lời người dùng (P7)
+
+Code: `plan`, `REVIEW_NOTE_HEADER` và `AUTO_REFINE_REVIEW_SYSTEM_PROMPT` trong
+`crates/harness-cli/src/host/memory/refine.rs`.
+
+Review tự động chạy bằng hai lần gọi model: gate quyết định có refine không và
+viết ghi chú về thứ đáng giữ, còn planner đề xuất các edit. Planner từng nhận ghi
+chú của gate trong block dành cho thứ người dùng gõ sau `/refine`, nên nó tưởng
+người dùng đã yêu cầu, ghi như vậy trong rationale và trích câu của gate làm
+evidence của edit. Host từ chối các edit đó, đúng: chỉ cuộc hội thoại và thứ
+người dùng gõ mới là evidence. Trong một lần chạy 24 cuộc hội thoại, 39 trên
+khoảng 50 edit được đề xuất bị từ chối theo cách này. Nay chỉ dẫn người dùng
+không gõ (của gate, của agent qua `refine.run`, của `/learn`) đến planner trong
+block `<review_note>` nói rõ nó là gì: không do người dùng viết, chỉ ra thứ có vẻ
+đáng giữ, không phải yêu cầu của ai và không phải evidence. Evidence của mọi edit
+vẫn là trích nguyên văn từ cuộc hội thoại, và edit mà cuộc hội thoại không có lời
+nào chứng minh thì bị bỏ. Chỉ thứ người dùng gõ mới giữ
+`<user_refine_instructions>`. Gate được yêu cầu điều tương tự từ phía nó: nêu
+từng thứ đáng giữ và, với mỗi thứ, lời trong cuộc hội thoại cho thấy điều đó,
+chép nguyên văn. Phép kiểm tra của host không đổi.
+
+## Vấn đề sẽ quay lại được giữ theo tên của nó (P8)
+
+Code: `AUTO_SCOPE_POLICY` và prompt của gate trong `refine.rs`.
+
+Các task trong bài quay lại với đầu vào mới và mỗi lần kết thúc bằng một phán
+quyết, nhưng các review chỉ giữ một rule chung chung, không bao giờ giữ thứ đã
+giải được một task cụ thể. Nay review được bảo, theo cách chung: khi cuộc hội
+thoại đã giải một vấn đề có thể quay lại (nó nói vậy, hoặc vấn đề mang tên riêng:
+một mã định danh, một file, một dòng lỗi), thứ cuối cùng đã chạy và thứ phân biệt
+nó với các lần thử thất bại đáng được giữ ở nơi cuộc hội thoại sau tìm thấy. Đó là
+learned skill nếu là một quy trình, còn không là một memory entry về project
+(global khi không thuộc riêng project nào), đặt tiêu đề bằng tên của vấn đề để
+một yêu cầu nêu tên đó khớp với entry. Evidence là kết quả cho thấy nó chạy được:
+kết quả của một tool, hoặc tin nhắn của người dùng nói vậy. Quy tắc từ chối nhiễu
+một lần được đọc cùng: một phỏng đoán không kết quả nào xác nhận và các lần thử
+thất bại vẫn là nhiễu. Không có danh sách từ nào quyết định; review tự đánh giá.
+
 ## Không lấy
 
 - **Benchmark làm bộ test trong ha.** Nó đo harness trên một chuỗi câu đố; nó
@@ -206,3 +244,7 @@ theo cùng cách.
   `a_child_gets_the_appended_text_and_the_additions_of_its_own_model` và
   `what_a_child_inherits_is_bounded_and_empty_when_there_is_nothing` trong
   `delegation.rs`.
+- Unit, P7 và P8 trong `refine.rs`:
+  `instructions_the_user_did_not_type_reach_the_planner_as_a_note_not_theirs`,
+  `an_edit_quoting_the_gate_s_note_is_refused_and_one_quoting_the_conversation_is_kept`
+  và `the_review_is_told_to_keep_what_solved_a_problem_that_may_come_back`.
