@@ -140,7 +140,37 @@ echo "################ 6. the next turn is told what the review changed"
 # harness: another conversation's (section 4's consolidation) is never told
 # here. A review that judged the turn worth nothing is retried with the
 # convention restated, at most twice.
-k5_changed() { find "$D/sessions" -name refinements.jsonl -newer "$RX/review5.marker" 2>/dev/null | xargs -r grep -l '"applied":true' 2>/dev/null | grep -q .; }
+# A review's edits to memory every conversation sees are recorded beside the
+# global store, under the review's id with `_global`: a convention of the
+# project is kept there, and the conversation's own record then holds no edit.
+k5_changed() {
+  "$PY" - "$D" "$RX/review5.marker" <<'PYEOF'
+import glob, json, os, sys
+data, marker = sys.argv[1], os.path.getmtime(sys.argv[2])
+def records(path):
+    try:
+        for line in open(path, encoding="utf-8", errors="replace"):
+            try:
+                yield json.loads(line)
+            except ValueError:
+                pass
+    except OSError:
+        return
+applied = lambda record: any(edit.get("applied") for edit in record.get("appliedEdits") or [])
+ids, changed = set(), False
+for path in glob.glob(os.path.join(data, "sessions", "*", "harness", "refinements.jsonl")):
+    if os.path.getmtime(path) <= marker:
+        continue
+    for record in records(path):
+        ids.add(str(record.get("id")))
+        changed = changed or applied(record)
+for record in records(os.path.join(data, "harness", "refinements.jsonl")):
+    own = str(record.get("id", ""))
+    if own.endswith("_global") and own[: -len("_global")] in ids:
+        changed = changed or applied(record)
+sys.exit(0 if changed else 1)
+PYEOF
+}
 attempts=1
 while ! k5_changed && [ "$attempts" -lt 3 ]; do
   attempts=$((attempts + 1))
