@@ -108,8 +108,20 @@ pub fn consider(layers: &Layers, skills: &[LearnedSkill], request: &str) -> Cons
             ))
         })
         .collect::<Vec<_>>();
+    // The trigger: when to use the skill, its name and its description. The body
+    // is how.
+    let triggers = skills
+        .iter()
+        .map(|skill| {
+            words(&format!(
+                "{} {}",
+                skill.name.replace(['-', '_'], " "),
+                skill.description
+            ))
+        })
+        .collect::<Vec<_>>();
     let query = words(request);
-    let fits = scores_of(&documents, &query);
+    let fits = scores_of(&documents, &triggers, &query);
     let scores = skills
         .iter()
         .zip(&fits)
@@ -144,9 +156,9 @@ pub fn consider(layers: &Layers, skills: &[LearnedSkill], request: &str) -> Cons
     }
 }
 
-/// The words of the request a skill must hold to fit: one shared word is not a
-/// fit, whatever the library's size, and a word most skills hold is not one of
-/// the two ([`scores_of`]).
+/// The words of the request a skill's trigger must hold to fit: one shared word
+/// is not a fit, whatever the library's size, and a word most skills hold is
+/// not one of the two ([`scores_of`]).
 const MIN_WORDS: usize = 2;
 
 /// How many deviations of the OTHER skills' scores the best must lie above
@@ -169,62 +181,49 @@ const OTHERS_DEVIATIONS: f64 = 3.0;
 /// [`OTHERS_DEVIATIONS`], not by a hair.
 const FLAT_SPREAD: f64 = 0.5;
 
-/// The share of the request's own weight the words that tell skills apart and
-/// the best skill holds must carry ([`Fit::share`]).
-///
-/// The spread rule says the best skill stands out from the others; it cannot
-/// say the skill is what the request is about. A party prompt that happened to
-/// hold "staging" and one common word scored every other skill about zero, so a
-/// migration skill stood out of nothing. A whole skill in a turn is a cost the
-/// request has to earn, and a request earns it when the skill accounts for a
-/// good part of what the request says. Measured on the seeded library of
-/// seven: a request about the skill holds 0.6 to 0.8 of its weight ("run the
-/// db migration on staging"), and 0.36 when a marker and "reply with the single
-/// word OK and call no tools" ride with it; the party prompt holds 0.11 and a
-/// long goal that mentions the migration in one sentence 0.16 (0.13 to 0.23 in
-/// a library of twelve for requests that fit none). A quarter lies between
-/// the last of those and the first two, with room on both sides; a third lay
-/// on the edge of the marked request. A request that merely mentions a skill
-/// among other things falls to the catalog, which carries the skill's name for
-/// the model to read it if it judges it fits.
-const MIN_SHARE: f64 = 0.25;
-
 /// How one skill fits a request.
 #[derive(Clone, Copy, Debug)]
 struct Fit {
     /// BM25 score of the skill's name, description and body.
     score: f64,
-    /// The distinct words of the request that tell skills apart which the skill
-    /// holds.
+    /// The distinct words of the request that tell skills apart and that are in
+    /// the skill's trigger (its name or its description).
     words: usize,
-    /// The IDF-weighted share of the request's distinct words that those words
-    /// make. A word of the request that no skill holds weighs the most a word
-    /// can in this library (as if a single skill held it): it is as telling as a
-    /// word can be, and a skill cannot match it.
-    share: f64,
 }
 
 /// The index and BM25 score of the document that stands out for the query.
 ///
-/// It must match at least [`MIN_WORDS`] of the query's words, beat the next
-/// one, lie [`OTHERS_DEVIATIONS`] deviations above the mean of all the OTHER
-/// scores (the best left out, so it cannot raise the bar it must clear), and
-/// carry [`MIN_SHARE`] of the request's weight. A score of a skill the query
-/// did not reach is `0.0` and counts in the spread; when every other score is
-/// zero the two words and the share decide. No word list: how much a word
-/// counts comes from the library.
+/// It must hold at least [`MIN_WORDS`] telling words of the query in its
+/// trigger, beat the next one, and lie [`OTHERS_DEVIATIONS`] deviations above
+/// the mean of all the OTHER scores (the best left out, so it cannot raise the
+/// bar it must clear). A score of a skill the query did not reach is `0.0` and
+/// counts in the spread; when every other score is zero the two words decide.
+/// No word list: how much a word counts comes from the library.
+///
+/// A skill's description says when to use it, and its body how. The request
+/// says what the user wants done, so a word it shares with the WHEN is a
+/// reason to offer the skill, and a word it shares only with the HOW is a
+/// coincidence of vocabulary: a party prompt that said "staging" (the
+/// description) and "with" (only in the body, "with the flag --safe-order")
+/// put a migration skill whole into the turn. Body words still score, for the
+/// ranking and the spread, but do not count toward the two. A request in
+/// another language than the skill's is not held against it: the words the
+/// library does not know are no evidence either way, and a skill whose own
+/// name and trigger the request names ("release notes", "changelog") fits
+/// whatever else is said.
 #[cfg(test)]
 fn best_of(documents: &[Vec<String>], query: &[String]) -> Option<(usize, f64)> {
-    let fits = scores_of(documents, query);
+    let fits = scores_of(documents, documents, query);
     let best = standout(&fits)?;
     Some((best, fits[best].score))
 }
 
-/// Each document's [`Fit`] for the query. The words that count toward the two
-/// and the share are those that tell skills apart: held by at most half of them
-/// (a statistic of the library, not a word list; with one or two skills every
+/// Each document's [`Fit`] for the query, `triggers` being the part of each
+/// document that says when to use it. The words that count toward the two are
+/// those that tell skills apart: held by at most half of the skills (a
+/// statistic of the library, not a word list; with one or two skills every
 /// word one of them holds tells).
-fn scores_of(documents: &[Vec<String>], query: &[String]) -> Vec<Fit> {
+fn scores_of(documents: &[Vec<String>], triggers: &[Vec<String>], query: &[String]) -> Vec<Fit> {
     let query = query.iter().collect::<BTreeSet<_>>();
     if documents.is_empty() || query.is_empty() {
         return Vec::new();
@@ -246,22 +245,10 @@ fn scores_of(documents: &[Vec<String>], query: &[String]) -> Vec<Fit> {
         .iter()
         .map(|term| (*term, holding(term) * 2 <= count.max(2)))
         .collect::<BTreeMap<_, _>>();
-    // What the request weighs: a word some skill holds by its IDF, one none
-    // holds as much as the rarest word a skill can hold.
-    let rarest = bm25_idf(count, 1);
-    let weight = query
-        .iter()
-        .map(|term| {
-            if holding(term) == 0 {
-                rarest
-            } else {
-                idf[term]
-            }
-        })
-        .sum::<f64>();
     documents
         .iter()
-        .map(|document| {
+        .zip(triggers)
+        .map(|(document, trigger)| {
             let mut counts = BTreeMap::<&String, f64>::new();
             for word in document {
                 *counts.entry(word).or_default() += 1.0;
@@ -270,15 +257,13 @@ fn scores_of(documents: &[Vec<String>], query: &[String]) -> Vec<Fit> {
             let length = document.len() as f64;
             let mut score = 0.0;
             let mut matched = 0;
-            let mut held = 0.0;
             for term in &query {
                 if let Some(frequency) = counts.get(term) {
-                    // A word most skills hold tells none of them apart: it
-                    // scores, by its small weight, but is not one of the
-                    // two words a fit needs, and carries no share.
-                    if telling[term] {
+                    // A word most skills hold tells none of them apart, and
+                    // one only the body holds is no trigger: they score, by
+                    // their weight, but are not among the two a fit needs.
+                    if telling[term] && trigger.contains(term) {
                         matched += 1;
-                        held += idf[term];
                     }
                     score += idf[term] * frequency * (K1 + 1.0)
                         / (frequency + K1 * (1.0 - B + B * length / average.max(1.0)));
@@ -287,7 +272,6 @@ fn scores_of(documents: &[Vec<String>], query: &[String]) -> Vec<Fit> {
             Fit {
                 score,
                 words: matched,
-                share: if weight > 0.0 { held / weight } else { 0.0 },
             }
         })
         .collect()
@@ -298,12 +282,8 @@ fn standout(fits: &[Fit]) -> Option<usize> {
     let mut order = (0..fits.len()).collect::<Vec<_>>();
     order.sort_by(|left, right| fits[*right].score.total_cmp(&fits[*left].score));
     let best = *order.first()?;
-    let Fit {
-        score,
-        words,
-        share,
-    } = fits[best];
-    if score <= 0.0 || words < MIN_WORDS || share < MIN_SHARE {
+    let Fit { score, words } = fits[best];
+    if score <= 0.0 || words < MIN_WORDS {
         return None;
     }
     let others = order[1..]
@@ -686,7 +666,7 @@ mod tests {
                 ),
             ],
         );
-        let request = "run the database migration against staging";
+        let request = "run the db migration against staging";
         let first = recall(&layers, &library(&layers), request).expect("fits");
         assert_eq!(first.name, "db-migration");
         assert!(first.unproven && first.cases.is_empty());
@@ -988,37 +968,32 @@ mod tests {
         ),
     ];
 
-    /// Fits that carry the whole of a request's weight.
+    /// Fits of the given scores and trigger words.
     fn fits_of(scored: &[(f64, usize)]) -> Vec<super::Fit> {
         scored
             .iter()
             .map(|(score, words)| super::Fit {
                 score: *score,
                 words: *words,
-                share: 1.0,
             })
             .collect()
     }
 
     fn library_documents() -> Vec<Vec<String>> {
-        LIBRARY
-            .iter()
-            .map(|(name, description, body)| {
-                words(&format!("{} {description} {body}", name.replace('-', " ")))
-            })
-            .collect()
+        documents_of(&LIBRARY)
     }
 
     /// The name of the library's skill that fits, by the rule recall uses.
     fn fits(request: &str) -> Option<&'static str> {
-        best_of(&library_documents(), &words(request)).map(|(index, _)| LIBRARY[index].0)
+        fit_in(&LIBRARY, request).0
     }
 
     /// What recall asked before: the best of the scores had to lie one
     /// deviation above the mean of ALL the scores, itself among them, and with
     /// five skills or more no word had to match.
     fn old_rule(request: &str) -> Option<&'static str> {
-        let scored = super::scores_of(&library_documents(), &words(request));
+        let documents = library_documents();
+        let scored = super::scores_of(&documents, &documents, &words(request));
         let bm25 = scored.iter().map(|fit| fit.score).collect::<Vec<_>>();
         // With five skills or more the words matched were not consulted.
         harness_types::readout::standout_of(&bm25, |_| true).map(|index| LIBRARY[index].0)
@@ -1336,47 +1311,93 @@ mod tests {
             .collect()
     }
 
-    /// The skill of `library` that fits `request`, and whether it would, were
-    /// the request's share of weight not asked of it.
+    fn triggers_of(library: &[(&str, &str, &str)]) -> Vec<Vec<String>> {
+        library
+            .iter()
+            .map(|(name, description, _)| {
+                words(&format!("{} {description}", name.replace('-', " ")))
+            })
+            .collect()
+    }
+
+    /// The skill of `library` that fits `request`, and the one that would if
+    /// the body's words counted toward the two like the trigger's (the rule
+    /// of the first 0.9.8 build, which put a skill whole for a coincidence).
     fn fit_in(
         library: &[(&'static str, &str, &str)],
         request: &str,
     ) -> (Option<&'static str>, Option<&'static str>) {
         let documents = documents_of(library);
-        let fits = super::scores_of(&documents, &words(request));
         let name = |index: Option<usize>| index.map(|index| library[index].0);
-        let spread_alone = fits
-            .iter()
-            .map(|fit| super::Fit { share: 1.0, ..*fit })
-            .collect::<Vec<_>>();
+        let query = words(request);
+        let now = super::scores_of(&documents, &triggers_of(library), &query);
+        let bodies_count = super::scores_of(&documents, &documents, &query);
         (
-            name(super::standout(&fits)),
-            name(super::standout(&spread_alone)),
+            name(super::standout(&now)),
+            name(super::standout(&bodies_count)),
         )
     }
 
+    /// The twelve, with the seven's release-notes in the place of the last.
+    fn twelve_with_release_notes() -> Vec<(&'static str, &'static str, &'static str)> {
+        let mut library = LIBRARY.to_vec();
+        library[11] = SEVEN[1];
+        library
+    }
+
+    /// The single skill strategy.sh seeds.
+    const ONLY_RELEASE_NOTES: [(&str, &str, &str); 1] = [(
+        "release-notes",
+        "Use when the user asks for release notes or a changelog entry.",
+        "Add the entry at the top of CHANGELOG.md, under a heading that starts with RN-7. One bullet per change, in the user's words.",
+    )];
+
     const LONG_GOAL: &str = "Make the exporter reliable. Read the tracker, list every open bug, and decide which are in scope. Then run the database migration against staging, because the schema changed. Afterwards update the dashboards, write a short note for the team about what moved, and ask the reviewers which parts they want to see first. Keep the notes short and in plain words.";
 
-    /// Fails without the change: two telling words that the party prompt shares
-    /// with a skill ("staging", "asked") while every other skill scored about
-    /// zero put the migration skill whole into the turn.
+    /// Fails without the change: "staging" (the description) and "with" (only in
+    /// the body, "with the flag --safe-order") put the migration skill whole
+    /// into a party prompt while every other skill scored about zero.
     #[test]
-    fn a_prompt_that_shares_two_words_by_coincidence_does_not_put_a_skill_whole() {
+    fn a_prompt_that_shares_a_word_with_the_how_of_a_skill_does_not_put_it_whole() {
         let party = "MARK-R3A. When asked to plan the party, use the staging area for the cake. Reply with the single word OK-R3A and call no tools.";
-        let (now, without_the_share) = fit_in(&SEVEN, party);
-        assert_eq!(without_the_share, Some("db-migration"), "control");
+        let (now, bodies_count) = fit_in(&SEVEN, party);
+        assert_eq!(bodies_count, Some("db-migration"), "control");
         assert_eq!(now, None);
-        // The same in the library of twelve: two words of one skill, by chance.
+        // The same in the library of twelve: "people" is in a trigger,
+        // "checkout" only in the body.
         let people = "Please plan the party for the people next Friday, order a big cake with candles, and use the checkout area for the music and the balloons.";
-        let (now, without_the_share) = fit_in(&LIBRARY, people);
-        assert_eq!(without_the_share, Some("worktree-hygiene"), "control");
+        let (now, bodies_count) = fit_in(&LIBRARY, people);
+        assert_eq!(bodies_count, Some("worktree-hygiene"), "control");
         assert_eq!(now, None);
     }
 
-    /// A request about a skill's situation still puts it whole, with the
-    /// boilerplate a test prompt carries or without.
+    /// A request in another language than the skill's, that names the skill's
+    /// own name and trigger, fits whatever else it says: the words the library
+    /// does not know are no evidence against it.
     #[test]
-    fn a_request_about_a_skills_situation_still_puts_it_whole() {
+    fn a_request_in_another_language_that_names_the_trigger_puts_the_skill_whole() {
+        let request =
+            "Viết release notes cho thay đổi: thêm nút xuất CSV. Ghi vào changelog của dự án.";
+        assert_eq!(
+            fit_in(&ONLY_RELEASE_NOTES, request).0,
+            Some("release-notes")
+        );
+        assert_eq!(fit_in(&SEVEN, request).0, Some("release-notes"));
+        assert_eq!(
+            fit_in(&twelve_with_release_notes(), request).0,
+            Some("release-notes")
+        );
+        // And a Vietnamese request that names no trigger word fits none.
+        assert_eq!(
+            fit_in(&SEVEN, "Chạy bản di chuyển cơ sở dữ liệu trên máy thử").0,
+            None
+        );
+    }
+
+    /// A request about a skill's situation puts it whole, with the boilerplate
+    /// a test prompt carries or without.
+    #[test]
+    fn a_request_about_a_skills_situation_puts_it_whole() {
         for request in [
             "run the db migration on staging",
             "please run the database migration on staging",
@@ -1393,14 +1414,35 @@ mod tests {
         );
     }
 
-    /// Intended: a long goal that names a skill's situation in one sentence
-    /// among many is not a request for that skill. It falls to the catalog,
-    /// which names the skill for the model to read if it judges it fits.
+    /// The rule judges the trigger's words, not the share of the request: a
+    /// long goal that names a skill's situation in the trigger's words, in one
+    /// sentence among many, now puts the skill whole. That is acceptable: the
+    /// goal does ask for the migration, and the skill's text is the cost of
+    /// being wrong about a whole sentence of it.
     #[test]
-    fn a_long_goal_that_mentions_a_situation_in_one_sentence_falls_to_the_catalog() {
-        let (now, without_the_share) = fit_in(&SEVEN, LONG_GOAL);
-        assert_eq!(without_the_share, Some("db-migration"), "control");
+    fn a_long_goal_that_names_a_situation_in_the_triggers_words_puts_the_skill_whole() {
+        let (now, bodies_count) = fit_in(&SEVEN, LONG_GOAL);
+        assert_eq!(bodies_count, Some("db-migration"), "control: as before");
+        assert_eq!(now, Some("db-migration"));
+    }
+
+    /// A request that shares two words with a skill's body only is a
+    /// coincidence of vocabulary: nothing is put whole, and the catalog
+    /// carries the skills' names.
+    #[test]
+    fn a_request_that_shares_two_words_with_a_body_only_gets_the_catalog() {
+        let request = "Check the health page of the site and report the rows it changed.";
+        let (now, bodies_count) = fit_in(&SEVEN, request);
+        assert_eq!(bodies_count, Some("db-migration"), "control");
         assert_eq!(now, None);
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = disk_library(directory.path(), &SEVEN);
+        let skills = library(&layers);
+        let considered = super::consider(&layers, &skills, request);
+        assert!(considered.recalled.is_none());
+        let catalog = super::catalog(&skills, &considered.scores).expect("the catalog");
+        assert_eq!(catalog.listed, 7);
+        assert!(text_of(&catalog).contains("- db-migration:"));
     }
 
     fn disk_library(root: &std::path::Path, skills: &[(&str, &str, &str)]) -> Layers {
