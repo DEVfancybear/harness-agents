@@ -760,11 +760,30 @@ pub async fn run_with(
             cancellation.clone(),
         )
     });
+    // The learned skills' tools, as the app has them: the catalog of learned
+    // skills a turn carries tells the model to read one with `activate_skill`,
+    // and without the tool (a run had none before 0.9.8) it cannot.
+    let skill_host = if lessons_on {
+        super::skills::discover(
+            context
+                .paths
+                .config_file
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+            &context.project.root,
+            environment,
+            resolved_config.project_trusted,
+        )
+        .ok()
+        .map(|catalog| super::skills::SkillHost::new(catalog, Arc::default()))
+    } else {
+        None
+    };
     let dispatcher = super::mcp::combined_dispatcher_with_delegate(
         None,
         active_extensions.as_ref(),
         delegate_host.as_ref(),
-        None,
+        skill_host.as_ref(),
         web_host.as_ref(),
         None,
         None,
@@ -850,7 +869,7 @@ pub async fn run_with(
         None,
         active_extensions.as_ref(),
         delegate_host.as_ref(),
-        None,
+        skill_host.as_ref(),
         web_host.as_ref(),
         None,
         None,
@@ -1122,7 +1141,7 @@ pub async fn run_with(
                 out.stderr(message);
             }
             project_blocks.push(offer.block);
-            skill_in_play = Some(offer.name);
+            skill_in_play = offer.name;
         }
     }
     let run_request = run_request.with_project_rules(project_blocks);

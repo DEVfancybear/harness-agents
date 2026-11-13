@@ -143,3 +143,100 @@ fn exec_offers_the_skill_that_fits_once_per_conversation() {
         "{usage}"
     );
 }
+
+/// The `lines` of each `skill catalog` record the runs left in the diagnostics.
+fn catalogs(root: &Path) -> Vec<u64> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root.join("data").join("diagnostics")) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        for line in text.lines() {
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if record["kind"] == "skill" && record["event"] == "catalog" {
+                found.push(record["fields"]["lines"].as_u64().unwrap_or(0));
+            }
+        }
+    }
+    found
+}
+
+/// When no skill stands out (here a request in another language than the
+/// skills'), the run carries the catalog of the learned skills, once: the next
+/// run of the conversation does not repeat it, and a new conversation has it.
+/// A catalog is neither an offer nor a use, and the user is told nothing.
+#[test]
+fn exec_carries_the_catalog_once_when_nothing_stands_out() {
+    let root = tempfile::tempdir().expect("temporary home and project");
+    learned_skill(
+        root.path(),
+        "db-migration",
+        "Use when asked to run the database migration against staging.",
+        "Write the database migration, check staging answers, then run it against staging.",
+    );
+    learned_skill(
+        root.path(),
+        "release-notes",
+        "Use when the user asks for release notes or a changelog entry.",
+        "Add the entry at the top of the changelog, one bullet per change.",
+    );
+    let request = "chạy bản di chuyển cơ sở dữ liệu trên máy thử";
+    let first = run(
+        root.path(),
+        &["exec", request, "--mock", "--output-format", "json"],
+    );
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+    assert!(
+        !stderr(&first).contains("offered for this request"),
+        "{}",
+        stderr(&first)
+    );
+    assert_eq!(catalogs(root.path()), [2]);
+    let second = run(
+        root.path(),
+        &[
+            "exec",
+            "tiếp tục đi",
+            "--mock",
+            "--continue",
+            "--output-format",
+            "json",
+        ],
+    );
+    assert_eq!(second.status.code(), Some(0), "{}", stderr(&second));
+    assert_eq!(
+        json(&second)["resumed_from"],
+        json(&first)["session_id"],
+        "the second run continued the first"
+    );
+    assert_eq!(catalogs(root.path()), [2], "the conversation holds it");
+    // Another conversation has none yet.
+    let third = run(
+        root.path(),
+        &["exec", request, "--mock", "--output-format", "json"],
+    );
+    assert_eq!(third.status.code(), Some(0), "{}", stderr(&third));
+    assert_eq!(catalogs(root.path()), [2, 2]);
+    // Not an offer, not a use.
+    let usage = root
+        .path()
+        .join("data")
+        .join("skill-usage")
+        .join("global.json");
+    if let Ok(text) = std::fs::read_to_string(usage) {
+        let usage: serde_json::Value = serde_json::from_str(&text).expect("usage JSON");
+        for (name, skill) in usage["skills"].as_object().into_iter().flatten() {
+            assert!(
+                skill["offered"].is_null() || skill["offered"] == 0,
+                "{name}: {usage}"
+            );
+            assert!(
+                skill["use"].is_null() || skill["use"] == 0,
+                "{name}: {usage}"
+            );
+        }
+    }
+}

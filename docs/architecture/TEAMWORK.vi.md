@@ -102,7 +102,7 @@ dùng, kết quả do review phán, các giả định đã sai. Phần còn thi
 
 Check qua hay hỏng sau khi skill được dùng cũng tính vào lần thử. Record chẩn
 đoán `skill recalled` có thêm `cases`, `unproven` và, từ 0.9.8, `again` (skill đã
-ở trong hội thoại nên chỉ một dòng được đưa vào).
+ở trong hội thoại nên chỉ một dòng được đưa vào). Lượt không skill nào khớp mà hội thoại chưa có catalog để lại record `skill catalog` với `lines` và `left_out`.
 
 ## Đội được dựng lại ở plateau ([V])
 

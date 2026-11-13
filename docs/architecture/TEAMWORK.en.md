@@ -100,7 +100,7 @@ What was missing:
 
 A check that passed or failed after a skill was used counts in the trial too.
 The diagnostics' `skill recalled` record carries `cases`, `unproven` and, since
-0.9.8, `again` (the skill was already in the conversation, so only a line went in).
+0.9.8, `again` (the skill was already in the conversation, so only a line went in). A turn where no skill fit and the conversation held no catalog leaves a `skill catalog` record with `lines` and `left_out`.
 
 ## A team remade at a plateau ([V])
 

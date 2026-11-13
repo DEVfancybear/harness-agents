@@ -278,6 +278,8 @@ for variant in 1 2; do
   check "precondition ($variant): the turn's request was found" 'ev "$MARK" root "n == 1"'
   # Passes on 0.9.7 too on exec (no recall there); on the app path 0.9.7 recalled a skill for most turns.
   check "no recall ($variant): no skill block and no line in the turn" 'ev "$MARK" root "$e"'
+  # 0.9.7 FAILS: no list of the learned skills reached an exec turn. Once per conversation; each run here is its own.
+  check "no recall ($variant): the turn carries the catalog of the seven learned skills instead" 'ev "$MARK" root "\"<learned_skills>\" in turn(\"$MARK\") and len(re.findall(r\"^- [a-z-]+: \", turn(\"$MARK\"), re.M)) == 7"'
   check "no recall ($variant): no notice on stderr" '! grep -q "offered for this request" "$RX/r3$variant.err"'
 done
 check "no recall: the offers counted are still the one of section 1" '[ "$(offered_total)" = 1 ]'
@@ -300,11 +302,23 @@ E_R4='"A learned skill fits this request: db-migration" in turn("MARK-R4A") and 
 check "app: the first turn carries the skill whole, the second one line, the conversation one block" 'ev MARK-R4A root "$E_R4"'
 E_R4C='"A learned skill fits" not in turn("MARK-R4C") and "given earlier in this conversation" not in turn("MARK-R4C")'
 check "app: a turn that fits no skill carries nothing" 'ev MARK-R4A root "$E_R4C"'
+# Nothing stood out in the third turn, so it carries the catalog of the learned skills, once.
+E_R4CAT='"<learned_skills>" not in turn("MARK-R4A") and "<learned_skills>" not in turn("MARK-R4B") and "<learned_skills>" in turn("MARK-R4C")'
+check "app: the turn that fits no skill carries the catalog of the learned skills" 'ev MARK-R4A root "$E_R4CAT"'
 # The diagnostics record every recall with `again` (service.rs offer_skill).
 check "app: the recalls were whole, then given earlier: again=false,true" '[ "$(recall_again "$since4")" = "false,true" ]'
 # The notice is a session event of the app; `ha send --wait` is assumed to print it with the answer.
-check "app: the notice is shown for the first turn" 'printf "%s" "$out1" | grep -qF "learned skill db-migration offered for this request"'
-check "app: and not for the second" '! printf "%s" "$out2" | grep -qF "offered for this request"'
+# `ha send --wait` prints only the answer; a notice goes to the attached TUI
+# and is recorded in the diagnostics (kind notice, event shown).
+notice_count() { cat "$D"/diagnostics/*.jsonl 2>/dev/null | "$PY" -c "
+import json,sys
+since,text=int(sys.argv[1]),sys.argv[2]; n=0
+for l in sys.stdin:
+    try: r=json.loads(l)
+    except ValueError: continue
+    if r.get('kind')=='notice' and r.get('event')=='shown' and r.get('ms',0)>=since and text in r.get('msg',''): n+=1
+print(n)" "$1" "$2" | tr -d ''; }
+check "app: the notice was shown once, for the first turn (diagnostics)" '[ "$(notice_count "$since4" "learned skill db-migration offered for this request")" = 1 ]'
 
 echo "################ 5. a goal's continuation asks nothing"
 # The goal is none of the skills'; the host's continuation text ("Continue

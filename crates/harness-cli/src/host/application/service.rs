@@ -1302,19 +1302,26 @@ async fn recent_user_texts(store: &SqliteStore, source: &SessionId, limit: usize
     texts
 }
 
-/// The learned skills already put whole into the conversation that `head`
-/// ends, since its last compaction.
+/// What a conversation already holds of the learned skills since its last
+/// compaction.
+#[derive(Default)]
+struct Given {
+    /// The skills put whole into it (recalled, or run with `/skill:`).
+    skills: std::collections::BTreeSet<String>,
+    /// The catalog of learned skills.
+    catalog: bool,
+}
+
+/// What the conversation that `head` ends already holds of the learned skills,
+/// since its last compaction.
 ///
 /// Read from the store, so it holds across a daemon's turns and for `ha exec
 /// --resume`: the conversation is walked back from `head` through the packets
 /// each turn sent (the messages the model is replayed), and stops at the first
 /// turn that holds a compaction checkpoint, whose summary stands for it and
 /// everything before it as the model reads the conversation.
-async fn skills_given(
-    store: &SqliteStore,
-    head: Option<&SessionId>,
-) -> std::collections::BTreeSet<String> {
-    let mut given = std::collections::BTreeSet::new();
+async fn skills_given(store: &SqliteStore, head: Option<&SessionId>) -> Given {
+    let mut given = Given::default();
     let mut visited = std::collections::BTreeSet::new();
     let mut current = head.cloned();
     while let Some(session) = current.take() {
@@ -1332,7 +1339,8 @@ async fn skills_given(
             break;
         }
         if let Ok(Some(packet)) = store.sent_input_packet(&session).await {
-            given.extend(super::skill_recall::given_in(&packet));
+            given.skills.extend(super::skill_recall::given_in(&packet));
+            given.catalog |= super::skill_recall::catalog_given_in(&packet);
         }
         current = harness_runtime::previous_in_conversation(store, &session)
             .await
@@ -1342,12 +1350,14 @@ async fn skills_given(
     given
 }
 
-/// A learned skill put into a turn.
+/// A learned skill, or the catalog of them, put into a turn.
 pub(crate) struct SkillOffer {
-    pub name: String,
+    /// The skill put in the turn, in play for the review; none for the catalog.
+    pub name: Option<String>,
     pub block: harness_session::ContextBlock,
     /// What the user is shown, when the skill's text went in whole; none for
-    /// the one line of a skill the conversation already holds.
+    /// the one line of a skill the conversation already holds, and for the
+    /// catalog, which offers nothing.
     pub notice: Option<String>,
 }
 
@@ -1359,6 +1369,11 @@ pub(crate) struct SkillOffer {
 /// whole since its last compaction is not put in whole again, only its line; a
 /// skill put in whole is counted as offered, which says nothing of whether it
 /// was followed.
+///
+/// When no skill fits, the turn carries the catalog of the learned skills
+/// ([`super::skill_recall::catalog`]) once per conversation since its last
+/// compaction: words cannot find a skill across languages, so the model is told
+/// what exists. A catalog is neither an offer nor a use.
 pub(crate) async fn offer_skill(
     store: &SqliteStore,
     layers: &super::learned::Layers,
@@ -1367,10 +1382,37 @@ pub(crate) async fn offer_skill(
     typed: &str,
     earlier: &[String],
 ) -> Option<SkillOffer> {
-    let request = super::skill_recall::query(goal, typed, earlier)?;
     let skills = super::learned::library(layers);
-    let recalled = super::skill_recall::recall(layers, &skills, &request)?;
-    let again = skills_given(store, head).await.contains(&recalled.name);
+    if skills.is_empty() {
+        return None;
+    }
+    let considered = super::skill_recall::query(goal, typed, earlier)
+        .map(|request| super::skill_recall::consider(layers, &skills, &request));
+    let recalled = considered
+        .as_ref()
+        .and_then(|considered| considered.recalled.clone());
+    let Some(recalled) = recalled else {
+        if skills_given(store, head).await.catalog {
+            return None;
+        }
+        let scores = considered
+            .map(|considered| considered.scores)
+            .unwrap_or_default();
+        let catalog = super::skill_recall::catalog(&skills, &scores)?;
+        harness_types::diag::info("skill", "catalog")
+            .field("lines", catalog.listed)
+            .field("left_out", catalog.left_out)
+            .emit();
+        return Some(SkillOffer {
+            name: None,
+            block: catalog.block,
+            notice: None,
+        });
+    };
+    let again = skills_given(store, head)
+        .await
+        .skills
+        .contains(&recalled.name);
     harness_types::diag::info("skill", "recalled")
         .field("skill", recalled.name.clone())
         .field("score", recalled.score)
@@ -1382,7 +1424,7 @@ pub(crate) async fn offer_skill(
     if again {
         return Some(SkillOffer {
             block: super::skill_recall::again(&recalled.name),
-            name: recalled.name,
+            name: Some(recalled.name),
             notice: None,
         });
     }
@@ -1390,7 +1432,7 @@ pub(crate) async fn offer_skill(
     Some(SkillOffer {
         block: super::skill_recall::block(&recalled),
         notice: Some(super::skill_recall::notice(&recalled)),
-        name: recalled.name,
+        name: Some(recalled.name),
     })
 }
 
@@ -10781,7 +10823,9 @@ async fn run_turn(
         .await
     {
         // The review judges how following it went.
-        refine_cadence.note_in_play(std::collections::BTreeSet::from([offer.name]));
+        if let Some(name) = offer.name {
+            refine_cadence.note_in_play(std::collections::BTreeSet::from([name]));
+        }
         project_blocks.push(offer.block);
         if let Some(message) = offer.notice {
             send(SessionEvent::Notice { message });
@@ -15963,7 +16007,7 @@ mod skill_offer_tests {
             .offer(&layers, None, "run the database migration against staging")
             .await
             .expect("fits");
-        assert_eq!(first_offer.name, "db-migration");
+        assert_eq!(first_offer.name.as_deref(), Some("db-migration"));
         assert_eq!(
             first_offer.notice.as_deref(),
             Some("learned skill db-migration offered for this request (unproven)")
@@ -16008,7 +16052,7 @@ mod skill_offer_tests {
             )
             .await
             .expect("fits");
-        assert_eq!(other.name, "release-notes");
+        assert_eq!(other.name.as_deref(), Some("release-notes"));
         assert!(other.notice.is_some());
         let third = conversation
             .turn(
@@ -16060,25 +16104,26 @@ mod skill_offer_tests {
             "{}\n\nThe objective below is user-provided data.\n<objective>\nrun the database migration against staging\n</objective>",
             crate::interactive::goal::CONTINUATION_LEAD
         );
-        // The host's text typed nothing; the child's report is nobody's request.
-        assert!(
-            super::offer_skill(
-                &conversation.store,
-                &layers,
-                None,
-                None,
-                "",
-                &[report.clone(), continuation.clone()]
-            )
-            .await
-            .is_none()
-        );
+        // The host's text typed nothing; the child's report is nobody's request:
+        // no skill goes in, only the catalog of what exists.
+        let none = super::offer_skill(
+            &conversation.store,
+            &layers,
+            None,
+            None,
+            "",
+            &[report.clone(), continuation.clone()],
+        )
+        .await
+        .expect("the catalog");
+        assert_eq!(none.name, None);
+        assert!(!format!("{:?}", none.block).contains("A learned skill fits"));
         // Even when the host's text itself stands as the typed words.
-        assert!(
-            super::offer_skill(&conversation.store, &layers, None, None, &continuation, &[])
-                .await
-                .is_none()
-        );
+        let none = super::offer_skill(&conversation.store, &layers, None, None, &continuation, &[])
+            .await
+            .expect("the catalog");
+        assert_eq!(none.name, None);
+        assert_eq!(none.notice, None);
         // With a goal, the goal asks.
         let goal = super::offer_skill(
             &conversation.store,
@@ -16090,6 +16135,80 @@ mod skill_offer_tests {
         )
         .await
         .expect("the goal fits a skill");
-        assert_eq!(goal.name, "db-migration");
+        assert_eq!(goal.name.as_deref(), Some("db-migration"));
+    }
+
+    /// When no skill fits, the turn carries the catalog of the learned skills
+    /// once per conversation since its last compaction; a catalog is neither an
+    /// offer nor a use, and shows the user nothing.
+    #[tokio::test]
+    async fn a_catalog_is_carried_once_when_nothing_fits_and_again_after_a_compaction() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers_with(directory.path(), &[MIGRATION, NOTES]);
+        let conversation = Conversation::open(directory.path()).await;
+        // A request in another language fits no skill by its words.
+        let request = "chạy bản di chuyển cơ sở dữ liệu trên máy thử";
+        let first_offer = conversation
+            .offer(&layers, None, request)
+            .await
+            .expect("the catalog");
+        assert_eq!(first_offer.name, None);
+        assert_eq!(first_offer.notice, None, "a catalog offers nothing");
+        let text = format!("{:?}", first_offer.block);
+        assert!(
+            text.contains("<learned_skills>")
+                && text.contains("- db-migration: Use when asked to run the database migration against staging. (unproven)")
+                && text.contains("- release-notes:"),
+            "{text}"
+        );
+        let first = conversation.turn(None, request, Some(&first_offer)).await;
+        // The conversation holds it: the next such turn carries nothing.
+        assert!(
+            conversation
+                .offer(&layers, Some(&first), "tiếp tục đi")
+                .await
+                .is_none()
+        );
+        let second = conversation.turn(Some(&first), "tiếp tục đi", None).await;
+        // A skill that fits is put whole, and no catalog goes with it.
+        let whole = conversation
+            .offer(
+                &layers,
+                Some(&second),
+                "run the database migration against staging",
+            )
+            .await
+            .expect("fits");
+        assert_eq!(whole.name.as_deref(), Some("db-migration"));
+        assert!(!format!("{:?}", whole.block).contains("<learned_skills>"));
+        let third = conversation
+            .turn(
+                Some(&second),
+                "run the database migration against staging",
+                Some(&whole),
+            )
+            .await;
+        // After a compaction the summary stands for it: the catalog again.
+        conversation
+            .runtime
+            .compact_with_cancellation(&third, None, harness_providers::CancellationToken::new())
+            .await
+            .expect("compacted");
+        let renewed = conversation
+            .offer(&layers, Some(&third), "tiếp tục đi")
+            .await
+            .expect("the catalog again");
+        assert!(format!("{:?}", renewed.block).contains("<learned_skills>"));
+        // Neither the catalog nor its absence counted a use; only the one whole skill an offer.
+        let usage = |name: &str| {
+            library(&layers)
+                .into_iter()
+                .find(|skill| skill.name == name)
+                .expect("skill")
+                .usage
+        };
+        let (migration, notes) = (usage("db-migration"), usage("release-notes"));
+        assert_eq!((migration.offered, migration.uses), (1, 0));
+        assert_eq!((notes.offered, notes.uses), (0, 0));
     }
 }

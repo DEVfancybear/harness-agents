@@ -63,8 +63,23 @@ pub struct Recalled {
 }
 
 /// The learned skill that fits `request`, if one stands out.
+#[cfg(test)]
 #[must_use]
 pub fn recall(layers: &Layers, skills: &[LearnedSkill], request: &str) -> Option<Recalled> {
+    consider(layers, skills, request).recalled
+}
+
+/// What recall made of a request: the skill that fits, if one does, and each
+/// candidate's score, which orders the catalog when none fits.
+#[derive(Debug)]
+pub struct Considered {
+    pub recalled: Option<Recalled>,
+    pub scores: BTreeMap<String, f64>,
+}
+
+/// [`recall`], with the scores of the skills it weighed.
+#[must_use]
+pub fn consider(layers: &Layers, skills: &[LearnedSkill], request: &str) -> Considered {
     // A skill held back is not a candidate at all: the next best may fit.
     let skills = skills
         .iter()
@@ -93,14 +108,27 @@ pub fn recall(layers: &Layers, skills: &[LearnedSkill], request: &str) -> Option
             ))
         })
         .collect::<Vec<_>>();
-    let (best, score) = best_of(&documents, &words(request))?;
+    let query = words(request);
+    let fits = scores_of(&documents, &query);
+    let scores = skills
+        .iter()
+        .zip(&fits)
+        .map(|(skill, fit)| (skill.name.clone(), fit.score))
+        .collect::<BTreeMap<_, _>>();
+    let Some(best) = standout(&fits) else {
+        return Considered {
+            recalled: None,
+            scores,
+        };
+    };
+    let score = fits[best].score;
     let skill = skills[best];
     let mut body = bodies[best].trim().to_owned();
     if body.chars().count() > MAX_BODY_CHARS {
         body = body.chars().take(MAX_BODY_CHARS).collect::<String>();
         body.push_str("\n…(cut; activate_skill reads it whole)");
     }
-    Some(Recalled {
+    let recalled = Recalled {
         name: skill.name.clone(),
         body,
         failures: skill.failures.clone(),
@@ -109,7 +137,11 @@ pub fn recall(layers: &Layers, skills: &[LearnedSkill], request: &str) -> Option
         scripts: skill.scripts.clone(),
         directory: layers.root(skill.layer).map(|root| root.join(&skill.name)),
         score,
-    })
+    };
+    Considered {
+        recalled: Some(recalled),
+        scores,
+    }
 }
 
 /// The words of the request a skill must hold to fit: one shared word is not a
@@ -137,31 +169,69 @@ const OTHERS_DEVIATIONS: f64 = 3.0;
 /// [`OTHERS_DEVIATIONS`], not by a hair.
 const FLAT_SPREAD: f64 = 0.5;
 
+/// The share of the request's own weight the words that tell skills apart and
+/// the best skill holds must carry ([`Fit::share`]).
+///
+/// The spread rule says the best skill stands out from the others; it cannot
+/// say the skill is what the request is about. A party prompt that happened to
+/// hold "staging" and one common word scored every other skill about zero, so a
+/// migration skill stood out of nothing. A whole skill in a turn is a cost the
+/// request has to earn, and a request earns it when the skill accounts for a
+/// good part of what the request says. Measured on the seeded library of
+/// seven: a request about the skill holds 0.6 to 0.8 of its weight ("run the
+/// db migration on staging"), and 0.36 when a marker and "reply with the single
+/// word OK and call no tools" ride with it; the party prompt holds 0.11 and a
+/// long goal that mentions the migration in one sentence 0.16 (0.13 to 0.23 in
+/// a library of twelve for requests that fit none). A quarter lies between
+/// the last of those and the first two, with room on both sides; a third lay
+/// on the edge of the marked request. A request that merely mentions a skill
+/// among other things falls to the catalog, which carries the skill's name for
+/// the model to read it if it judges it fits.
+const MIN_SHARE: f64 = 0.25;
+
+/// How one skill fits a request.
+#[derive(Clone, Copy, Debug)]
+struct Fit {
+    /// BM25 score of the skill's name, description and body.
+    score: f64,
+    /// The distinct words of the request that tell skills apart which the skill
+    /// holds.
+    words: usize,
+    /// The IDF-weighted share of the request's distinct words that those words
+    /// make. A word of the request that no skill holds weighs the most a word
+    /// can in this library (as if a single skill held it): it is as telling as a
+    /// word can be, and a skill cannot match it.
+    share: f64,
+}
+
 /// The index and BM25 score of the document that stands out for the query.
 ///
 /// It must match at least [`MIN_WORDS`] of the query's words, beat the next
-/// one, and lie [`OTHERS_DEVIATIONS`] deviations above the mean of all the
-/// OTHER scores (the best left out, so it cannot raise the bar it must clear).
-/// A score of a skill the query did not reach is `0.0` and counts in the
-/// spread; when every other score is zero the two words decide. No word list:
-/// how much a word counts comes from the library.
+/// one, lie [`OTHERS_DEVIATIONS`] deviations above the mean of all the OTHER
+/// scores (the best left out, so it cannot raise the bar it must clear), and
+/// carry [`MIN_SHARE`] of the request's weight. A score of a skill the query
+/// did not reach is `0.0` and counts in the spread; when every other score is
+/// zero the two words and the share decide. No word list: how much a word
+/// counts comes from the library.
+#[cfg(test)]
 fn best_of(documents: &[Vec<String>], query: &[String]) -> Option<(usize, f64)> {
-    let scored = scores_of(documents, query);
-    let best = standout(&scored)?;
-    Some((best, scored[best].0))
+    let fits = scores_of(documents, query);
+    let best = standout(&fits)?;
+    Some((best, fits[best].score))
 }
 
-/// Each document's BM25 score for the query and how many of the query's
-/// distinct words it holds that tell skills apart: held by at most half of
-/// them (a statistic of the library, not a word list; with one or two skills
-/// every word one of them holds tells).
-fn scores_of(documents: &[Vec<String>], query: &[String]) -> Vec<(f64, usize)> {
+/// Each document's [`Fit`] for the query. The words that count toward the two
+/// and the share are those that tell skills apart: held by at most half of them
+/// (a statistic of the library, not a word list; with one or two skills every
+/// word one of them holds tells).
+fn scores_of(documents: &[Vec<String>], query: &[String]) -> Vec<Fit> {
     let query = query.iter().collect::<BTreeSet<_>>();
     if documents.is_empty() || query.is_empty() {
         return Vec::new();
     }
     #[allow(clippy::cast_precision_loss, reason = "word counts are small")]
     let average = documents.iter().map(Vec::len).sum::<usize>() as f64 / documents.len() as f64;
+    let count = documents.len() as u64;
     let holding = |term: &String| {
         documents
             .iter()
@@ -170,12 +240,25 @@ fn scores_of(documents: &[Vec<String>], query: &[String]) -> Vec<(f64, usize)> {
     };
     let idf = query
         .iter()
-        .map(|term| (*term, bm25_idf(documents.len() as u64, holding(term))))
+        .map(|term| (*term, bm25_idf(count, holding(term))))
         .collect::<BTreeMap<_, _>>();
     let telling = query
         .iter()
-        .map(|term| (*term, holding(term) * 2 <= (documents.len() as u64).max(2)))
+        .map(|term| (*term, holding(term) * 2 <= count.max(2)))
         .collect::<BTreeMap<_, _>>();
+    // What the request weighs: a word some skill holds by its IDF, one none
+    // holds as much as the rarest word a skill can hold.
+    let rarest = bm25_idf(count, 1);
+    let weight = query
+        .iter()
+        .map(|term| {
+            if holding(term) == 0 {
+                rarest
+            } else {
+                idf[term]
+            }
+        })
+        .sum::<f64>();
     documents
         .iter()
         .map(|document| {
@@ -187,35 +270,45 @@ fn scores_of(documents: &[Vec<String>], query: &[String]) -> Vec<(f64, usize)> {
             let length = document.len() as f64;
             let mut score = 0.0;
             let mut matched = 0;
+            let mut held = 0.0;
             for term in &query {
                 if let Some(frequency) = counts.get(term) {
                     // A word most skills hold tells none of them apart: it
                     // scores, by its small weight, but is not one of the
-                    // two words a fit needs.
+                    // two words a fit needs, and carries no share.
                     if telling[term] {
                         matched += 1;
+                        held += idf[term];
                     }
                     score += idf[term] * frequency * (K1 + 1.0)
                         / (frequency + K1 * (1.0 - B + B * length / average.max(1.0)));
                 }
             }
-            (score, matched)
+            Fit {
+                score,
+                words: matched,
+                share: if weight > 0.0 { held / weight } else { 0.0 },
+            }
         })
         .collect()
 }
 
-/// The index of the one `(score, words matched)` that stands out ([`best_of`]).
-fn standout(scored: &[(f64, usize)]) -> Option<usize> {
-    let mut order = (0..scored.len()).collect::<Vec<_>>();
-    order.sort_by(|left, right| scored[*right].0.total_cmp(&scored[*left].0));
+/// The index of the one [`Fit`] that stands out ([`best_of`]).
+fn standout(fits: &[Fit]) -> Option<usize> {
+    let mut order = (0..fits.len()).collect::<Vec<_>>();
+    order.sort_by(|left, right| fits[*right].score.total_cmp(&fits[*left].score));
     let best = *order.first()?;
-    let (score, matched) = scored[best];
-    if score <= 0.0 || matched < MIN_WORDS {
+    let Fit {
+        score,
+        words,
+        share,
+    } = fits[best];
+    if score <= 0.0 || words < MIN_WORDS || share < MIN_SHARE {
         return None;
     }
     let others = order[1..]
         .iter()
-        .map(|index| scored[*index].0)
+        .map(|index| fits[*index].score)
         .collect::<Vec<_>>();
     if others.first().is_some_and(|next| *next >= score) {
         return None;
@@ -339,6 +432,114 @@ pub fn notice(recalled: &Recalled) -> String {
         recalled.name,
         if recalled.unproven { " (unproven)" } else { "" }
     )
+}
+
+// ---------------------------------------------------------------------------
+// The catalog: when no skill fits, the names
+
+/// The most skills one catalog lists, and the most characters of the list.
+///
+/// A line is `name: description` (a description is at most 200 characters), so
+/// forty lines of the usual 80 to 120 characters fit in the character bound,
+/// which is about 1,500 tokens: a catalog is a nudge, not a second system
+/// prompt. A larger library lists the skills nearest the request first, then
+/// the most recently used, and says how many it left out.
+const CATALOG_LINES: usize = 40;
+const CATALOG_CHARS: usize = 6_000;
+
+/// The most tokens the catalog block takes in a turn's context.
+const CATALOG_TOKENS: u64 = 2_000;
+
+/// What opens the catalog's list in a message, so a later turn can tell the
+/// conversation already holds it ([`catalog_given_in`]).
+const CATALOG_MARKER: &str = "<learned_skills>";
+
+/// The catalog of learned skills a turn carries when none was put whole.
+#[derive(Debug)]
+pub struct Catalog {
+    pub block: ContextBlock,
+    /// The skills it lists.
+    pub listed: usize,
+    /// The skills it leaves out for the bound.
+    pub left_out: usize,
+}
+
+/// A catalog of the learned skills, for a turn where recall put none whole:
+/// one `name: description` line each, unproven ones marked, those recall holds
+/// back left out. `scores` (from [`consider`]) puts the skills nearest the
+/// request first; the rest follow by the most recently activated, viewed or
+/// worked. `None` when there is nothing to list.
+///
+/// Recall by words cannot cross a language (a request in Vietnamese, skills in
+/// English), and a request that mentions a skill among many things does not
+/// stand out: the model can judge a description in any language, so it is told
+/// what exists and decides.
+#[must_use]
+pub fn catalog(skills: &[LearnedSkill], scores: &BTreeMap<String, f64>) -> Option<Catalog> {
+    let mut candidates = skills
+        .iter()
+        .filter(|skill| !skill.usage.restricted())
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+    let score = |skill: &LearnedSkill| scores.get(&skill.name).copied().unwrap_or(0.0);
+    candidates.sort_by(|left, right| {
+        score(right)
+            .total_cmp(&score(left))
+            .then_with(|| right.last_used.cmp(&left.last_used))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let mut lines = Vec::new();
+    let mut chars = 0;
+    for skill in &candidates {
+        let description = skill
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let line = format!(
+            "- {}: {description}{}",
+            skill.name,
+            if skill.usage.unproven() {
+                " (unproven)"
+            } else {
+                ""
+            }
+        );
+        if lines.len() == CATALOG_LINES || chars + line.chars().count() + 1 > CATALOG_CHARS {
+            break;
+        }
+        chars += line.chars().count() + 1;
+        lines.push(line);
+    }
+    let listed = lines.len();
+    let left_out = candidates.len() - listed;
+    let mut text = format!(
+        "These are procedures earlier conversations learned. When one fits what you are about to do, read it with activate_skill before starting; when none fits, ignore the list.\n{CATALOG_MARKER}\n{}",
+        lines.join("\n")
+    );
+    if left_out > 0 {
+        let _ = write!(
+            text,
+            "\n({left_out} more not listed; list_skills shows all.)"
+        );
+    }
+    text.push_str("\n</learned_skills>");
+    let block = ContextBlock::mandatory("learned-skills", ContextBlockKind::Instruction, text)
+        .with_max_tokens(CATALOG_TOKENS)
+        .with_rest_at("list_skills");
+    Some(Catalog {
+        block,
+        listed,
+        left_out,
+    })
+}
+
+/// Whether `packet` (a message the conversation sent) holds the catalog.
+#[must_use]
+pub fn catalog_given_in(packet: &str) -> bool {
+    packet.contains(CATALOG_MARKER)
 }
 
 fn without_front_matter(document: &str) -> &str {
@@ -787,6 +988,18 @@ mod tests {
         ),
     ];
 
+    /// Fits that carry the whole of a request's weight.
+    fn fits_of(scored: &[(f64, usize)]) -> Vec<super::Fit> {
+        scored
+            .iter()
+            .map(|(score, words)| super::Fit {
+                score: *score,
+                words: *words,
+                share: 1.0,
+            })
+            .collect()
+    }
+
     fn library_documents() -> Vec<Vec<String>> {
         LIBRARY
             .iter()
@@ -806,7 +1019,7 @@ mod tests {
     /// five skills or more no word had to match.
     fn old_rule(request: &str) -> Option<&'static str> {
         let scored = super::scores_of(&library_documents(), &words(request));
-        let bm25 = scored.iter().map(|(score, _)| *score).collect::<Vec<_>>();
+        let bm25 = scored.iter().map(|fit| fit.score).collect::<Vec<_>>();
         // With five skills or more the words matched were not consulted.
         harness_types::readout::standout_of(&bm25, |_| true).map(|index| LIBRARY[index].0)
     }
@@ -901,12 +1114,27 @@ mod tests {
         ]);
         assert!(best_of(&alone, &words("run the deploy script")).is_some());
         // The same scores everywhere but one that leads by a hair.
-        let flat = super::standout(&[(1.0, 2), (0.95, 2), (0.95, 2), (0.95, 2), (0.95, 2)]);
+        let flat = super::standout(&fits_of(&[
+            (1.0, 2),
+            (0.95, 2),
+            (0.95, 2),
+            (0.95, 2),
+            (0.95, 2),
+        ]));
         assert_eq!(flat, None);
-        let clear = super::standout(&[(3.0, 2), (0.95, 2), (0.95, 2), (0.95, 2), (0.95, 2)]);
+        let clear = super::standout(&fits_of(&[
+            (3.0, 2),
+            (0.95, 2),
+            (0.95, 2),
+            (0.95, 2),
+            (0.95, 2),
+        ]));
         assert_eq!(clear, Some(0));
         // A tie for the lead is no lead.
-        assert_eq!(super::standout(&[(2.0, 3), (2.0, 3), (0.0, 0)]), None);
+        assert_eq!(
+            super::standout(&fits_of(&[(2.0, 3), (2.0, 3), (0.0, 0)])),
+            None
+        );
     }
 
     /// The whole path, through the files of a library: a request no skill
@@ -1058,5 +1286,271 @@ mod tests {
             super::notice(&proven),
             "learned skill deploy offered for this request"
         );
+    }
+
+    /// The seven skills recall.sh seeds in a user's library.
+    const SEVEN: [(&str, &str, &str); 7] = [
+        (
+            "db-migration",
+            "Use when asked to run the database migration against staging.",
+            "Write the database migration, check that staging answers its health page, then run the migration against staging with the flag --safe-order and report the rows it changed.",
+        ),
+        (
+            "release-notes",
+            "Use when asked to write release notes or a changelog entry.",
+            "Add the entry at the top of the changelog, one bullet per change, in the words of the people who asked for it.",
+        ),
+        (
+            "image-resize",
+            "Use when asked to resize product images for the storefront.",
+            "Resize every product image to 800 pixels wide, keep the aspect ratio, and save the thumbnails beside the originals.",
+        ),
+        (
+            "invoice-export",
+            "Use when asked to export invoices to the accounting system.",
+            "Export the invoices of the closed month as a CSV file, check the totals against the ledger, then upload the file to the accounting system.",
+        ),
+        (
+            "log-rotation",
+            "Use when asked to rotate and compress the server logs.",
+            "Rotate the server logs at midnight, compress the old files with gzip, and delete archives older than thirty days.",
+        ),
+        (
+            "cert-renewal",
+            "Use when asked to renew the TLS certificate for the proxy.",
+            "Request a new TLS certificate, install it on the proxy, reload the proxy, and check the expiry date in the browser.",
+        ),
+        (
+            "audit-requirements",
+            "Use when asked to audit the current state against every requirement and report the remaining proof.",
+            "Audit the state of the work against each requirement, list the proof for each one, and report the status and the remaining tokens of effort.",
+        ),
+    ];
+
+    fn documents_of(library: &[(&str, &str, &str)]) -> Vec<Vec<String>> {
+        library
+            .iter()
+            .map(|(name, description, body)| {
+                words(&format!("{} {description} {body}", name.replace('-', " ")))
+            })
+            .collect()
+    }
+
+    /// The skill of `library` that fits `request`, and whether it would, were
+    /// the request's share of weight not asked of it.
+    fn fit_in(
+        library: &[(&'static str, &str, &str)],
+        request: &str,
+    ) -> (Option<&'static str>, Option<&'static str>) {
+        let documents = documents_of(library);
+        let fits = super::scores_of(&documents, &words(request));
+        let name = |index: Option<usize>| index.map(|index| library[index].0);
+        let spread_alone = fits
+            .iter()
+            .map(|fit| super::Fit { share: 1.0, ..*fit })
+            .collect::<Vec<_>>();
+        (
+            name(super::standout(&fits)),
+            name(super::standout(&spread_alone)),
+        )
+    }
+
+    const LONG_GOAL: &str = "Make the exporter reliable. Read the tracker, list every open bug, and decide which are in scope. Then run the database migration against staging, because the schema changed. Afterwards update the dashboards, write a short note for the team about what moved, and ask the reviewers which parts they want to see first. Keep the notes short and in plain words.";
+
+    /// Fails without the change: two telling words that the party prompt shares
+    /// with a skill ("staging", "asked") while every other skill scored about
+    /// zero put the migration skill whole into the turn.
+    #[test]
+    fn a_prompt_that_shares_two_words_by_coincidence_does_not_put_a_skill_whole() {
+        let party = "MARK-R3A. When asked to plan the party, use the staging area for the cake. Reply with the single word OK-R3A and call no tools.";
+        let (now, without_the_share) = fit_in(&SEVEN, party);
+        assert_eq!(without_the_share, Some("db-migration"), "control");
+        assert_eq!(now, None);
+        // The same in the library of twelve: two words of one skill, by chance.
+        let people = "Please plan the party for the people next Friday, order a big cake with candles, and use the checkout area for the music and the balloons.";
+        let (now, without_the_share) = fit_in(&LIBRARY, people);
+        assert_eq!(without_the_share, Some("worktree-hygiene"), "control");
+        assert_eq!(now, None);
+    }
+
+    /// A request about a skill's situation still puts it whole, with the
+    /// boilerplate a test prompt carries or without.
+    #[test]
+    fn a_request_about_a_skills_situation_still_puts_it_whole() {
+        for request in [
+            "run the db migration on staging",
+            "please run the database migration on staging",
+            "Run the database migration against staging again",
+            "MARK-R1. Run the database migration against staging. Reply with the single word OK-R1 and call no tools.",
+            "MARK-R2. Run the database migration against staging again. Reply with the single word OK-R2 and call no tools.",
+        ] {
+            assert_eq!(fit_in(&SEVEN, request).0, Some("db-migration"), "{request}");
+        }
+        assert_eq!(
+            fit_in(&SEVEN, "sing me the song of autumn").0,
+            None,
+            "a request that fits none"
+        );
+    }
+
+    /// Intended: a long goal that names a skill's situation in one sentence
+    /// among many is not a request for that skill. It falls to the catalog,
+    /// which names the skill for the model to read if it judges it fits.
+    #[test]
+    fn a_long_goal_that_mentions_a_situation_in_one_sentence_falls_to_the_catalog() {
+        let (now, without_the_share) = fit_in(&SEVEN, LONG_GOAL);
+        assert_eq!(without_the_share, Some("db-migration"), "control");
+        assert_eq!(now, None);
+    }
+
+    fn disk_library(root: &std::path::Path, skills: &[(&str, &str, &str)]) -> Layers {
+        let layers = Layers::new(
+            &root.join("config"),
+            &root.join("data"),
+            &root.join("workspace"),
+            true,
+        );
+        for (name, description, body) in skills {
+            let verdict = promote(
+                &layers,
+                &Intent::from_value(&json!({
+                    "action": "create", "name": name, "level": "project",
+                    "body": format!("---\nname: {name}\ndescription: {description}\ncategory: ops\n---\n{body}\n"),
+                    "reason": "the user showed it", "evidence": "[User]: do it this way",
+                })),
+                &PromoteContext::default(),
+            );
+            assert!(verdict.ok, "{name}: {:?}", verdict.findings);
+        }
+        layers
+    }
+
+    fn text_of(catalog: &super::Catalog) -> String {
+        format!("{:?}", catalog.block)
+    }
+
+    #[test]
+    fn the_catalog_lists_each_skill_once_unproven_marked_and_held_back_ones_left_out() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = disk_library(directory.path(), &SEVEN);
+        // One skill worked, so it is no draft; one keeps failing, so it is held back.
+        record_outcome(
+            &layers,
+            "release-notes",
+            true,
+            "",
+            "the changelog opens with RN-7",
+        );
+        for _ in 0..2 {
+            record_outcome(&layers, "log-rotation", false, "gzip exists", "no gzip");
+        }
+        let skills = library(&layers);
+        let catalog =
+            super::catalog(&skills, &std::collections::BTreeMap::new()).expect("a catalog");
+        let text = text_of(&catalog);
+        assert_eq!((catalog.listed, catalog.left_out), (6, 0), "{text}");
+        assert!(
+            text.contains("- db-migration: Use when asked to run the database migration against staging. (unproven)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "- release-notes: Use when asked to write release notes or a changelog entry."
+            ) && !text.contains("release notes or a changelog entry. (unproven)"),
+            "{text}"
+        );
+        assert!(!text.contains("log-rotation"), "held back: {text}");
+        assert!(
+            text.contains(
+                "read it with activate_skill before starting; when none fits, ignore the list"
+            ),
+            "{text}"
+        );
+        assert!(super::catalog_given_in(&text));
+        assert!(!super::catalog_given_in(
+            "A learned skill fits this request: x."
+        ));
+        // No skill, or only held-back ones: nothing to list.
+        assert!(super::catalog(&[], &std::collections::BTreeMap::new()).is_none());
+    }
+
+    /// The skills nearest the request come first, then the most recently used.
+    #[test]
+    fn the_catalog_puts_the_nearest_skills_first_and_then_the_most_recently_used() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = disk_library(directory.path(), &SEVEN);
+        assert!(crate::interactive::learned::record_use(
+            &layers,
+            "cert-renewal",
+            crate::interactive::learned::UseKind::Use
+        ));
+        let skills = library(&layers);
+        let scores = [("image-resize".to_owned(), 5.0)].into_iter().collect();
+        let text = text_of(&super::catalog(&skills, &scores).expect("a catalog"));
+        let position = |name: &str| text.find(&format!("- {name}:")).expect(name);
+        assert!(
+            position("image-resize") < position("cert-renewal"),
+            "{text}"
+        );
+        assert!(
+            position("cert-renewal") < position("db-migration"),
+            "{text}"
+        );
+        // An offer is not a taking: it does not move a skill up.
+        assert!(crate::interactive::learned::record_use(
+            &layers,
+            "invoice-export",
+            crate::interactive::learned::UseKind::Offered
+        ));
+        let text = text_of(
+            &super::catalog(&library(&layers), &std::collections::BTreeMap::new())
+                .expect("a catalog"),
+        );
+        let position = |name: &str| text.find(&format!("- {name}:")).expect(name);
+        assert!(
+            position("cert-renewal") < position("invoice-export"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_catalog_is_bounded_and_says_what_it_left_out() {
+        let directory = tempfile::tempdir().expect("dir");
+        let many = (0..60)
+            .map(|number| {
+                (
+                    format!("skill-number-{number:02}"),
+                    format!(
+                        "Use when asked to handle case {number} of the {} kind.",
+                        "very long ".repeat(12)
+                    ),
+                    "Do it.".to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let borrowed = many
+            .iter()
+            .map(|(name, description, body)| (name.as_str(), description.as_str(), body.as_str()))
+            .collect::<Vec<_>>();
+        let layers = disk_library(directory.path(), &borrowed);
+        let catalog = super::catalog(&library(&layers), &std::collections::BTreeMap::new())
+            .expect("a catalog");
+        let text = text_of(&catalog);
+        assert!(
+            catalog.listed <= super::CATALOG_LINES && catalog.listed > 0,
+            "{}",
+            catalog.listed
+        );
+        assert_eq!(catalog.listed + catalog.left_out, 60);
+        assert!(catalog.left_out > 0);
+        assert!(
+            text.contains(&format!(
+                "({} more not listed; list_skills shows all.)",
+                catalog.left_out
+            )),
+            "{text}"
+        );
+        // The list within its bound (the sentence above and the tags around it excepted).
+        assert!(text.len() < super::CATALOG_CHARS + 1_200, "{}", text.len());
     }
 }

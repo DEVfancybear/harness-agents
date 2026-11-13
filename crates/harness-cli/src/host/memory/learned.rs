@@ -551,6 +551,9 @@ pub fn record_outcome(
     let clip = |text: &str| text.trim().chars().take(300).collect::<String>();
     update_usage(&layers.usage_file(layer, root), |usage| {
         bump(usage, name, if worked { "worked" } else { "failed" });
+        if worked {
+            usage["skills"][name]["last"] = json!(now());
+        }
         bump(usage, name, if worked { "trial_good" } else { "trial_bad" });
         // Evolver's Capsule: a strategy goes with a concrete case it held in.
         if worked && !evidence.trim().is_empty() {
@@ -594,6 +597,11 @@ pub fn record_use(layers: &Layers, name: &str, kind: UseKind) -> bool {
     };
     update_usage(&layers.usage_file(layer, root), |usage| {
         bump(usage, name, field);
+        // When it was last taken: an activation or a view. A recall that only
+        // offered it is not a taking.
+        if kind != UseKind::Offered {
+            usage["skills"][name]["last"] = json!(now());
+        }
     });
     true
 }
@@ -954,6 +962,9 @@ pub struct LearnedSkill {
     pub cases: Vec<String>,
     /// The scripts it carries, and which of them a run was seen to succeed.
     pub scripts: Vec<SkillScript>,
+    /// When it was last activated, viewed or judged to have worked (RFC 3339,
+    /// so it sorts); empty when never.
+    pub last_used: String,
 }
 
 /// Every live learned skill, global first.
@@ -992,6 +1003,10 @@ pub fn library(layers: &Layers) -> Vec<LearnedSkill> {
                     .filter_map(|case| case["evidence"].as_str().map(str::to_owned))
                     .collect(),
                 scripts: scripts_of(&root.join(&name), &raw["skills"][&name]["scripts"]),
+                last_used: raw["skills"][&name]["last"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
                 name,
             });
         }
