@@ -317,7 +317,7 @@ for l in sys.stdin:
     try: r=json.loads(l)
     except ValueError: continue
     if r.get('kind')=='notice' and r.get('event')=='shown' and r.get('ms',0)>=since and text in r.get('msg',''): n+=1
-print(n)" "$1" "$2" | tr -d ''; }
+print(n)" "$1" "$2" | tr -d '\r'; }
 check "app: the notice was shown once, for the first turn (diagnostics)" '[ "$(notice_count "$since4" "learned skill db-migration offered for this request")" = 1 ]'
 
 echo "################ 5. a goal's continuation asks nothing"
