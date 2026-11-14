@@ -5597,11 +5597,12 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
                 ),
             }
         }
+        // The id says which skill and version; the digest and the channel are
+        // bookkeeping the model cannot use. What it can use is where the text
+        // is now: it asked again for skills whose text it already held.
         ToolOutput::SkillActivated { block } => format!(
-            "activated skill {} ({}) on the {} context channel",
-            block.id,
-            block.digest.as_str(),
-            block.channel.as_str()
+            "activated skill {}: its instructions are now in this conversation's context, and activating it again adds nothing",
+            block.id
         ),
         // A refusal in words, not the debug form `Denied { code: .., reason: .. }`.
         ToolOutput::Denied { code, reason } => format!("{name} failed ({code}): {reason}"),

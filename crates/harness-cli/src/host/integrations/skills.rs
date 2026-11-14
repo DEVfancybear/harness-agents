@@ -1,7 +1,7 @@
 //! Trusted skill and prompt-command roots for one workspace.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -195,12 +195,18 @@ fn bundled_io_error(error: &std::io::Error) -> HarnessError {
     )
 }
 
+/// The learned skills whose whole text the turn's context holds, which the host
+/// fills before the turn runs (`offer_skill`): `activate_skill` for one of them
+/// loads nothing and says so.
+pub type HeldSkills = Arc<Mutex<BTreeSet<String>>>;
+
 /// The model-facing skill catalogue and digest-pinned activation dispatcher.
 /// Both tools use the shared external-tool policy, approval, intent and receipt
 /// path; activation returns a typed Skill-channel block for the next model step.
 pub struct SkillHost {
     catalog: SkillCatalog,
     active: Arc<Mutex<BTreeMap<String, SkillActivation>>>,
+    held: HeldSkills,
 }
 
 impl SkillHost {
@@ -209,7 +215,17 @@ impl SkillHost {
         catalog: SkillCatalog,
         active: Arc<Mutex<BTreeMap<String, SkillActivation>>>,
     ) -> Self {
-        Self { catalog, active }
+        Self {
+            catalog,
+            active,
+            held: HeldSkills::default(),
+        }
+    }
+
+    /// The skills the turn's context already holds whole; the host fills it.
+    #[must_use]
+    pub fn held(&self) -> HeldSkills {
+        Arc::clone(&self.held)
     }
 
     #[must_use]
@@ -224,6 +240,7 @@ impl SkillHost {
         Arc::new(SkillToolDispatcher {
             catalog: self.catalog.clone(),
             active: Arc::clone(&self.active),
+            held: Arc::clone(&self.held),
         })
     }
 }
@@ -353,6 +370,7 @@ fn listed_skills<'a>(
 struct SkillToolDispatcher {
     catalog: SkillCatalog,
     active: Arc<Mutex<BTreeMap<String, SkillActivation>>>,
+    held: HeldSkills,
 }
 
 impl SkillToolDispatcher {
@@ -515,10 +533,52 @@ impl SkillToolDispatcher {
         })
     }
 
+    /// What to tell the model when the skill's text is already in its context,
+    /// and `None` when activating it would load something new.
+    ///
+    /// Two ways it is there: the skill is active with the digest on disk now (an
+    /// earlier activation or a `/skill:` run; the app puts every active skill
+    /// into each turn, and a turn's later steps carry one activated in it), or
+    /// the host put it whole into the conversation (a recalled skill, found by
+    /// name: that text carries no digest to compare).
+    fn already_in_context(
+        &self,
+        name: &str,
+        digest: &harness_types::ContentHash,
+    ) -> Option<String> {
+        if self.active.lock().is_ok_and(|active| {
+            active
+                .get(name)
+                .is_some_and(|activation| &activation.entry.digest == digest)
+        }) {
+            return Some(format!(
+                "skill {name} is already active in this conversation: its instructions are in your context. Nothing was loaded again."
+            ));
+        }
+        self.held
+            .lock()
+            .is_ok_and(|held| held.contains(name))
+            .then(|| {
+                format!(
+                    "skill {name} is already in this conversation: its instructions are above, inside <skill name=\"{name}\">. Nothing was loaded again."
+                )
+            })
+    }
+
     fn activate(&self, arguments: &Value) -> Result<ToolOutput, HarnessError> {
         self.validate("activate_skill", arguments)?;
         let name = arguments["name"].as_str().expect("validated skill name");
         let entry = self.catalog.entry(name).expect("validated catalog entry");
+        if let Some(text) = self.already_in_context(name, &entry.digest) {
+            // Loading it again would add the same text a second time, and the
+            // model asked once a turn for a skill it already held.
+            return Ok(ToolOutput::ExternalTool {
+                plugin_id: "skill".to_owned(),
+                tool_name: "activate_skill".to_owned(),
+                payload: json!({"name": name, "already": true, "text": text}),
+                inflight: 1,
+            });
+        }
         let activation = self
             .catalog
             .activate(name, Some(&entry.digest), 1)
@@ -609,7 +669,7 @@ mod tests {
     use harness_session::ContextChannel;
     use harness_types::ErrorCode;
 
-    use super::{SkillHost, SkillToolDispatcher, commands, discover, expand};
+    use super::{HeldSkills, SkillHost, SkillToolDispatcher, commands, discover, expand};
 
     fn skill_catalog(root: &std::path::Path) -> SkillCatalog {
         let skill = root.join("review");
@@ -733,6 +793,7 @@ mod tests {
         let dispatcher = SkillToolDispatcher {
             catalog,
             active: Arc::clone(&active),
+            held: HeldSkills::default(),
         };
         let arguments = serde_json::json!({"name": "release", "path": "SKILL.md"});
         assert_eq!(
@@ -780,6 +841,7 @@ mod tests {
         let dispatcher = SkillToolDispatcher {
             catalog,
             active: Arc::new(Mutex::new(BTreeMap::new())),
+            held: HeldSkills::default(),
         };
         let harness_tools::ToolOutput::SkillActivated { block } = dispatcher
             .activate(&serde_json::json!({ "name": "research" }))
@@ -887,6 +949,7 @@ mod tests {
         let dispatcher = SkillToolDispatcher {
             catalog: catalog.clone(),
             active: Arc::new(Mutex::new(BTreeMap::new())),
+            held: HeldSkills::default(),
         };
         let refused = dispatcher
             .validate("activate_skill", &serde_json::json!({ "name": "release" }))
@@ -924,6 +987,7 @@ mod tests {
         let dispatcher = SkillToolDispatcher {
             catalog: catalog.clone(),
             active: Arc::new(Mutex::new(BTreeMap::new())),
+            held: HeldSkills::default(),
         };
         for accepted in [
             serde_json::json!({}),
@@ -988,6 +1052,7 @@ mod tests {
         let dispatcher = SkillToolDispatcher {
             catalog,
             active: Arc::clone(&active),
+            held: HeldSkills::default(),
         };
         let arguments = serde_json::json!({
             "name": "review",
@@ -1033,6 +1098,89 @@ mod tests {
             .validate("activate_skill", &serde_json::json!({ "name": "nope" }))
             .expect_err("unknown skill");
         assert!(unknown.to_string().contains("review"), "{unknown}");
+    }
+
+    /// Measured on a benchmark: a skill the conversation held whole was
+    /// activated 108 times, once a turn. An activation of text already in the
+    /// context loads nothing and says where the text is.
+    #[test]
+    fn activating_a_skill_the_conversation_already_holds_loads_nothing() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let catalog = skill_catalog(&temporary.path().join("skills"));
+        let active = Arc::new(Mutex::new(BTreeMap::new()));
+        let host = SkillHost::new(catalog, Arc::clone(&active));
+        let dispatcher = SkillToolDispatcher {
+            catalog: host.catalog.clone(),
+            active: Arc::clone(&active),
+            held: host.held(),
+        };
+        let arguments = serde_json::json!({"name": "review"});
+        let text_of = |output: harness_tools::ToolOutput| match output {
+            harness_tools::ToolOutput::ExternalTool {
+                plugin_id,
+                tool_name,
+                payload,
+                ..
+            } => {
+                assert_eq!(
+                    (plugin_id.as_str(), tool_name.as_str()),
+                    ("skill", "activate_skill")
+                );
+                payload["text"].as_str().expect("text").to_owned()
+            }
+            other => panic!("nothing is loaded again: {other:?}"),
+        };
+        // The host put the skill whole into the conversation: nothing to load.
+        host.held()
+            .lock()
+            .expect("held")
+            .insert("review".to_owned());
+        assert_eq!(
+            text_of(dispatcher.activate(&arguments).expect("answers")),
+            "skill review is already in this conversation: its instructions are above, inside <skill name=\"review\">. Nothing was loaded again."
+        );
+        assert!(
+            active.lock().expect("active map").is_empty(),
+            "no second copy of the text is made active"
+        );
+        // Not held: the first activation loads it.
+        host.held().lock().expect("held").clear();
+        let activated = dispatcher.activate(&arguments).expect("first activation");
+        assert!(matches!(
+            activated,
+            harness_tools::ToolOutput::SkillActivated { .. }
+        ));
+        assert_eq!(active.lock().expect("active map").len(), 1);
+        // The same skill again, in the same turn or a later one of the app (the
+        // active map outlives a turn): the text is in the context.
+        let again = text_of(dispatcher.activate(&arguments).expect("answers"));
+        assert!(
+            again.starts_with("skill review is already active in this conversation")
+                && again.ends_with("Nothing was loaded again."),
+            "{again}"
+        );
+        // A skill whose file changed since it was activated is a new text.
+        let changed = temporary.path().join("skills/review/SKILL.md");
+        std::fs::write(
+            &changed,
+            "---\nname: review\nversion: 1.3\ndescription: Review Rust changes\nrequested_tools: [read_file]\n---\nUse the new review checklist.\n",
+        )
+        .expect("changed skill");
+        let catalog = SkillCatalog::discover(&[TrustedSkillRoot::new(
+            temporary.path().join("skills"),
+            SkillSource::User,
+        )])
+        .expect("catalog scans again");
+        let dispatcher = SkillToolDispatcher {
+            catalog,
+            active: Arc::clone(&active),
+            held: HeldSkills::default(),
+        };
+        let reloaded = dispatcher.activate(&arguments).expect("reloaded");
+        let harness_tools::ToolOutput::SkillActivated { block } = reloaded else {
+            panic!("a changed skill is loaded again");
+        };
+        assert!(block.text.contains("Use the new review checklist."));
     }
 
     #[test]

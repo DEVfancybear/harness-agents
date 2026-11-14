@@ -31,7 +31,7 @@ nào không lấy.
 Với điểm thứ nhất, thứ hai và thứ tư, ha đã đứng trên nền khác: tool `memory`
 buộc model nêu scope, digest được xếp hạng theo yêu cầu, và learned skill có thể
 mang `scripts/`. Phần còn lại là các mặc định và lời lẽ quanh chúng, cùng chỗ
-mà một phát hiện của bài chưa có phần tương ứng. Đó là sáu thay đổi nhỏ, và hai thay đổi nữa đến từ một lần chạy benchmark (P7, P8).
+mà một phát hiện của bài chưa có phần tương ứng. Đó là sáu thay đổi nhỏ, và ba thay đổi nữa đến từ một lần chạy benchmark (P7, P8, P9).
 
 ## Scope: nói rõ ai thấy một entry (P1)
 
@@ -195,6 +195,56 @@ của lần ghi do chính nó làm. Khi agent đã lưu lời giải mà không 
 duyệt và review đặt lại tiêu đề cho entry đó (một `update` theo id của nó) thay vì
 ghi thêm một entry thứ hai.
 
+## Task quay lại bắt đầu từ điều các lần trước đã tìm ra (P9)
+
+Code: `related_logs`, `related_block`, `given_logs_in`, `revise` và `prompt` trong
+`crates/harness-cli/src/host/memory/session_log.rs`. Thiết kế theo ReHarness
+(arXiv 2610.12668): một reflection cho mỗi episode, truy xuất theo độ giống với
+truy vấn mới, và các reflection đã truy xuất được sửa ngược theo kết quả của
+episode mới (ablation của họ: 0,217 khi có bước sửa, 0,144 khi không).
+
+Một lần chạy benchmark (6 task, mỗi task 4 lượt, mỗi lượt là một cuộc hội thoại
+mới nêu mã task trong tin nhắn đầu) cho thấy vòng lặp hở ở cả hai đầu. ha ghi một
+session log cho mỗi cuộc hội thoại, và cả 24 log đều mang mã task trong keywords.
+Nhưng cuộc hội thoại mới chỉ được cho xem log mới nhất - cuộc trước, một task
+không liên quan - mà không bao giờ thấy các log nêu đúng điều yêu cầu của nó nêu,
+nên không lượt nào bắt đầu từ điều các lượt trước của cùng task đã tìm ra. Và các
+log viết "lưới chính xác nằm trong cuộc hội thoại" thay vì chính phát hiện, thứ
+mà phiên sau không đọc được.
+
+- **Theo tên, ngay lúc bắt đầu.** Lượt đầu của một cuộc hội thoại mới (app và
+  `ha exec` như nhau; cuộc hội thoại được resume thì không) được cho xem tối đa
+  ba log của các cuộc hội thoại trước nêu điều yêu cầu - goal và những gì người
+  dùng gõ - nêu, thêm vào log mới nhất vốn vẫn luôn được cho xem. Một từ của yêu
+  cầu phân biệt được các log khi không quá một phần tư số log chứa nó ở bất kỳ
+  đâu (một thống kê của chính các log, không phải danh sách từ); một log liên quan
+  khi topic hoặc Quick Reference của nó chứa một từ phân biệt được. Dưới bốn log
+  thì từ không phân biệt được gì và không log nào được chọn. Các log liên quan
+  xếp theo số từ phân biệt được mà chúng chứa, rồi theo trọng số của các từ đó
+  (idf của BM25), rồi theo cái mới hơn. Mỗi log hiện cùng outcome và các mục chứa
+  điều nó đã tìm ra, trong `<session-log conversation="...">`, như tài liệu lịch
+  sử: điều nó tìm ra không cần tìm lại, nhưng phải đối chiếu với thứ agent đang
+  thấy, và outcome nó báo không phải bằng chứng xác minh. Log của cuộc hội thoại
+  còn mở bị bỏ qua. Diagnostics: `session_log` / `related` (count, candidates,
+  words).
+- **Chính phát hiện, ngay trong log.** Hướng dẫn viết log đòi quy tắc, lệnh hay
+  giá trị đó và không bao giờ chỉ vào cuộc hội thoại; vấn đề chưa giải được thì
+  nói thế trong Outcome, kèm điều đã thử, mỗi lần thử cho thấy gì và điều còn
+  chưa biết; còn vấn đề mang tên riêng (một ticket, một mã định danh, một dòng
+  lỗi, một file) được đặt đầu tiên trong keywords, đúng như cuộc hội thoại viết.
+- **Được lượt sau sửa lại.** Các log mà một cuộc hội thoại đã được cho xem được
+  đọc từ packet của lượt đầu. Khi log của nó được ghi, model cũng thấy các log đó
+  và nói trong `## Earlier Logs Revisited` log nào trong số đó cuộc hội thoại này
+  xác nhận, sửa hay giới hạn, mỗi log một dòng. Host nối dòng đó vào log cũ dưới
+  `## Later Conversations` (`- <ngày> (<conversation>): <ghi chú>`), mỗi cuộc hội
+  thoại một dòng, giữ năm dòng mới nhất, và lần sau khi log được cho xem thì mục
+  này hiện trước, như điều thắng log ở chỗ hai bên khác nhau. Chỉ log mà cuộc hội
+  thoại đã được cho xem mới nhận ghi chú. Mục này của host: khi log được ghi lại
+  nó được giữ nguyên, bất kể model viết gì. Log là một phần của daily note của
+  markdown store thì được sửa tại chỗ khi giới hạn của note còn đủ; không thì để
+  nguyên. Bước sửa lỗi không bao giờ làm hỏng việc ghi log (`session_log` /
+  `revised`).
+
 ## Không lấy
 
 - **Benchmark làm bộ test trong ha.** Nó đo harness trên một chuỗi câu đố; nó
@@ -256,3 +306,15 @@ ghi thêm một entry thứ hai.
   `instructions_the_user_did_not_type_reach_the_planner_as_a_note_not_theirs`,
   `an_edit_quoting_the_gate_s_note_is_refused_and_one_quoting_the_conversation_is_kept`
   và `the_review_is_told_to_keep_what_solved_a_problem_that_may_come_back`.
+- Unit, P9 trong `session_log.rs`:
+  `a_rare_name_in_the_keywords_finds_its_logs_and_a_word_most_logs_hold_does_not`,
+  `fewer_than_four_candidates_choose_no_log_by_words`,
+  `related_logs_are_ranked_by_telling_words_then_weight_then_age_and_three_are_kept`,
+  `the_related_block_states_what_was_found_and_what_later_conversations_found_first`,
+  `a_new_conversation_is_shown_the_logs_its_request_names_and_a_resumed_one_is_not`,
+  `the_prompt_states_the_finding_and_names_the_problem_first`,
+  `notes_go_to_the_given_logs_only_replace_the_same_conversations_and_keep_five`,
+  `what_later_conversations_found_survives_a_rewrite_of_the_log_whatever_the_model_wrote`,
+  `a_log_in_the_days_note_gets_its_notes_in_place_while_the_cap_holds` và
+  `the_log_of_a_conversation_revises_the_logs_its_first_turn_was_given`. Live:
+  `scripts/testing/live-tests/related-logs.sh`.

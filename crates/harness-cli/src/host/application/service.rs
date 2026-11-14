@@ -1308,8 +1308,18 @@ async fn recent_user_texts(store: &SqliteStore, source: &SessionId, limit: usize
 struct Given {
     /// The skills put whole into it (recalled, or run with `/skill:`).
     skills: std::collections::BTreeSet<String>,
+    /// Those of them whose body was cut: the rest is still for `activate_skill`.
+    cut: std::collections::BTreeSet<String>,
     /// The catalog of learned skills.
     catalog: bool,
+}
+
+impl Given {
+    /// The skills whose whole text the conversation holds: neither the catalog
+    /// lists them as ones to read nor `activate_skill` loads them again.
+    fn held(&self) -> std::collections::BTreeSet<String> {
+        self.skills.difference(&self.cut).cloned().collect()
+    }
 }
 
 /// What the conversation that `head` ends already holds of the learned skills,
@@ -1340,6 +1350,7 @@ async fn skills_given(store: &SqliteStore, head: Option<&SessionId>) -> Given {
         }
         if let Ok(Some(packet)) = store.sent_input_packet(&session).await {
             given.skills.extend(super::skill_recall::given_in(&packet));
+            given.cut.extend(super::skill_recall::cut_in(&packet));
             given.catalog |= super::skill_recall::catalog_given_in(&packet);
         }
         current = harness_runtime::previous_in_conversation(store, &session)
@@ -1373,7 +1384,13 @@ pub(crate) struct SkillOffer {
 /// When no skill fits, the turn carries the catalog of the learned skills
 /// ([`super::skill_recall::catalog`]) once per conversation since its last
 /// compaction: words cannot find a skill across languages, so the model is told
-/// what exists. A catalog is neither an offer nor a use.
+/// what exists. A library too small to tell words apart gets the catalog and no
+/// skill whole, and the catalog lists only the skills the conversation does not
+/// hold already. A catalog is neither an offer nor a use.
+///
+/// `turn_skills` is filled with the skills whose whole text the turn will carry
+/// (those the conversation holds, and the one put whole now), for the turn's
+/// `activate_skill` to answer that nothing needs loading again.
 pub(crate) async fn offer_skill(
     store: &SqliteStore,
     layers: &super::learned::Layers,
@@ -1381,24 +1398,45 @@ pub(crate) async fn offer_skill(
     goal: Option<&str>,
     typed: &str,
     earlier: &[String],
+    turn_skills: Option<&super::skills::HeldSkills>,
 ) -> Option<SkillOffer> {
     let skills = super::learned::library(layers);
     if skills.is_empty() {
         return None;
     }
+    let given = skills_given(store, head).await;
+    let mut in_context = given.held();
     let considered = super::skill_recall::query(goal, typed, earlier)
         .map(|request| super::skill_recall::consider(layers, &skills, &request));
     let recalled = considered
         .as_ref()
         .and_then(|considered| considered.recalled.clone());
+    let again = recalled
+        .as_ref()
+        .is_some_and(|recalled| given.skills.contains(&recalled.name));
+    // A skill put whole into this very turn is in its context too.
+    if let Some(recalled) = &recalled
+        && !again
+        && !super::skill_recall::is_cut(&recalled.body)
+    {
+        in_context.insert(recalled.name.clone());
+    }
+    // `activate_skill` answers for these that their text is there already.
+    if let Some(shared) = turn_skills
+        && let Ok(mut shared) = shared.lock()
+    {
+        shared.clone_from(&in_context);
+    }
     let Some(recalled) = recalled else {
-        if skills_given(store, head).await.catalog {
+        if given.catalog {
             return None;
         }
         let scores = considered
             .map(|considered| considered.scores)
             .unwrap_or_default();
-        let catalog = super::skill_recall::catalog(&skills, &scores)?;
+        // A skill the conversation holds whole is not listed as one to read:
+        // its text is there, and the model took the line as an order.
+        let catalog = super::skill_recall::catalog(&skills, &scores, &in_context)?;
         harness_types::diag::info("skill", "catalog")
             .field("lines", catalog.listed)
             .field("left_out", catalog.left_out)
@@ -1409,10 +1447,6 @@ pub(crate) async fn offer_skill(
             notice: None,
         });
     };
-    let again = skills_given(store, head)
-        .await
-        .skills
-        .contains(&recalled.name);
     harness_types::diag::info("skill", "recalled")
         .field("skill", recalled.name.clone())
         .field("score", recalled.score)
@@ -10709,8 +10743,19 @@ async fn run_turn(
         }
     }
     // What a new conversation hears of the previous one, once: its session
-    // log when it has one, and its last turns unless the log covers them.
+    // log when it has one, and its last turns unless the log covers them; and
+    // the logs of earlier conversations that name what this request names. The
+    // request is the goal and what the user typed, as a skill is asked for
+    // ([`super::skill_recall::query`]): a turn the host started asks nothing.
     if fork_plan.is_none() && request.compact_guidance.is_none() {
+        let asked = super::skill_recall::query(
+            match &goal {
+                GoalRecord::Active(objective) => Some(objective.as_str()),
+                _ => None,
+            },
+            &typed,
+            &[],
+        );
         project_blocks.extend(
             super::session_log::previous_conversation_blocks(
                 &store,
@@ -10722,6 +10767,7 @@ async fn run_turn(
                 &workspace_root,
                 carried.as_ref(),
                 &chrono::Local::now().fixed_offset(),
+                asked.as_deref(),
             )
             .await,
         );
@@ -10819,6 +10865,10 @@ async fn run_turn(
             goal_objective,
             &typed,
             &earlier_user,
+            skill_host
+                .as_ref()
+                .map(super::skills::SkillHost::held)
+                .as_ref(),
         )
         .await
     {
@@ -15979,7 +16029,7 @@ mod skill_offer_tests {
             head: Option<&SessionId>,
             request: &str,
         ) -> Option<super::SkillOffer> {
-            super::offer_skill(&self.store, layers, head, None, request, &[]).await
+            super::offer_skill(&self.store, layers, head, None, request, &[], None).await
         }
     }
 
@@ -15993,6 +16043,19 @@ mod skill_offer_tests {
         "Use when the user asks for release notes or a changelog entry.",
         "Add the entry at the top of the changelog, one bullet per change.",
     );
+    /// Skills about other things: words decide only in a library of four or more.
+    const FILLERS: [(&str, &str, &str); 2] = [
+        (
+            "image-resize",
+            "Use when asked to resize product images for the storefront.",
+            "Resize every product image to 800 pixels wide.",
+        ),
+        (
+            "log-rotation",
+            "Use when asked to rotate and compress the server logs.",
+            "Rotate the server logs at midnight and compress the old files.",
+        ),
+    ];
 
     /// Items 2, 4 and 5. Without the change a recall put the skill's whole
     /// text into every turn it fit, counted a use each time, and showed the
@@ -16000,7 +16063,10 @@ mod skill_offer_tests {
     #[tokio::test]
     async fn a_skill_is_put_whole_once_then_by_a_line_until_a_compaction() {
         let directory = tempfile::tempdir().expect("dir");
-        let layers = layers_with(directory.path(), &[MIGRATION, NOTES]);
+        let layers = layers_with(
+            directory.path(),
+            &[MIGRATION, NOTES, FILLERS[0], FILLERS[1]],
+        );
         let conversation = Conversation::open(directory.path()).await;
         // The first turn: whole, and the user is told, and it is unproven.
         let first_offer = conversation
@@ -16097,7 +16163,10 @@ mod skill_offer_tests {
     #[tokio::test]
     async fn nothing_the_host_wrote_asks_for_a_skill() {
         let directory = tempfile::tempdir().expect("dir");
-        let layers = layers_with(directory.path(), &[MIGRATION, NOTES]);
+        let layers = layers_with(
+            directory.path(),
+            &[MIGRATION, NOTES, FILLERS[0], FILLERS[1]],
+        );
         let conversation = Conversation::open(directory.path()).await;
         let report = "[child-exited: no-reply child:scout]\n\nIt ran the database migration against staging and wrote the release notes for the changelog.".to_owned();
         let continuation = format!(
@@ -16113,15 +16182,24 @@ mod skill_offer_tests {
             None,
             "",
             &[report.clone(), continuation.clone()],
+            None,
         )
         .await
         .expect("the catalog");
         assert_eq!(none.name, None);
         assert!(!format!("{:?}", none.block).contains("A learned skill fits"));
         // Even when the host's text itself stands as the typed words.
-        let none = super::offer_skill(&conversation.store, &layers, None, None, &continuation, &[])
-            .await
-            .expect("the catalog");
+        let none = super::offer_skill(
+            &conversation.store,
+            &layers,
+            None,
+            None,
+            &continuation,
+            &[],
+            None,
+        )
+        .await
+        .expect("the catalog");
         assert_eq!(none.name, None);
         assert_eq!(none.notice, None);
         // With a goal, the goal asks.
@@ -16132,6 +16210,7 @@ mod skill_offer_tests {
             Some("run the database migration against staging"),
             "",
             &[report],
+            None,
         )
         .await
         .expect("the goal fits a skill");
@@ -16144,7 +16223,10 @@ mod skill_offer_tests {
     #[tokio::test]
     async fn a_catalog_is_carried_once_when_nothing_fits_and_again_after_a_compaction() {
         let directory = tempfile::tempdir().expect("dir");
-        let layers = layers_with(directory.path(), &[MIGRATION, NOTES]);
+        let layers = layers_with(
+            directory.path(),
+            &[MIGRATION, NOTES, FILLERS[0], FILLERS[1]],
+        );
         let conversation = Conversation::open(directory.path()).await;
         // A request in another language fits no skill by its words.
         let request = "chạy bản di chuyển cơ sở dữ liệu trên máy thử";
@@ -16210,5 +16292,69 @@ mod skill_offer_tests {
         let (migration, notes) = (usage("db-migration"), usage("release-notes"));
         assert_eq!((migration.offered, migration.uses), (1, 0));
         assert_eq!((notes.offered, notes.uses), (0, 0));
+    }
+
+    /// Fails without the change: the catalog of a later turn listed the skill
+    /// the conversation already held whole and told the model to read it with
+    /// `activate_skill`, which it did once a turn.
+    #[tokio::test]
+    async fn the_catalog_does_not_list_a_skill_the_conversation_holds_whole() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers_with(
+            directory.path(),
+            &[MIGRATION, NOTES, FILLERS[0], FILLERS[1]],
+        );
+        let conversation = Conversation::open(directory.path()).await;
+        let held = super::super::skills::HeldSkills::default();
+        let whole = super::offer_skill(
+            &conversation.store,
+            &layers,
+            None,
+            None,
+            "run the database migration against staging",
+            &[],
+            Some(&held),
+        )
+        .await
+        .expect("fits");
+        assert_eq!(whole.name.as_deref(), Some("db-migration"));
+        // The turn that put it whole holds its text, for activate_skill to say so.
+        assert_eq!(
+            held.lock().expect("held").iter().collect::<Vec<_>>(),
+            ["db-migration"]
+        );
+        let first = conversation
+            .turn(
+                None,
+                "run the database migration against staging",
+                Some(&whole),
+            )
+            .await;
+        // A request that fits none: the catalog names the others, not the one held.
+        let later = super::super::skills::HeldSkills::default();
+        let catalog = super::offer_skill(
+            &conversation.store,
+            &layers,
+            Some(&first),
+            None,
+            "tiếp tục đi",
+            &[],
+            Some(&later),
+        )
+        .await
+        .expect("the catalog of the rest");
+        assert_eq!(
+            later.lock().expect("held").iter().collect::<Vec<_>>(),
+            ["db-migration"],
+            "a later turn still holds it"
+        );
+        let text = format!("{:?}", catalog.block);
+        assert!(
+            text.contains("<learned_skills>")
+                && text.contains("- release-notes:")
+                && text.contains("- image-resize:")
+                && !text.contains("db-migration"),
+            "{text}"
+        );
     }
 }

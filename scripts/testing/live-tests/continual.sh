@@ -338,6 +338,18 @@ description: Use when asked to tally the harbor berth fees.
 Run the script under scripts/ that totals the berth fees, then report the total.
 EOF
 echo '{"created_by": "ha", "created": "2026-10-01T00:00:00Z"}' > "$S4/.ha-learned.json"
+# Recall judges by words only in a library of four skills or more (a library
+# of one or two cannot tell which of its words tell skills apart), so three skills
+# about other things stand beside it; none shares a word of its trigger with the
+# request below.
+filler() { # filler <name> <description> <body>
+  mkdir -p "$HA_HOME/skills/$1"
+  printf -- '---\nname: %s\ndescription: %s\n---\n%s\n' "$1" "$2" "$3" > "$HA_HOME/skills/$1/SKILL.md"
+  echo '{"created_by": "ha", "created": "2026-10-01T00:00:00Z"}' > "$HA_HOME/skills/$1/.ha-learned.json"
+}
+filler image-resize "Use when asked to resize product images for the storefront." "Resize every product image to 800 pixels wide, keep the aspect ratio, and save the thumbnails beside the originals."
+filler log-rotation "Use when asked to rotate and compress the server logs." "Rotate the server logs at midnight, compress the old files, and delete archives older than thirty days."
+filler cert-renewal "Use when asked to renew the TLS certificate for the proxy." "Request a new TLS certificate, install it on the proxy, reload the proxy, and check the expiry date in the browser."
 printf 'print("berth fees: 4120")\n' > "$S4/scripts/solve.py"
 printf 'print("draft")\n' > "$S4/scripts/draft.py"
 printf 'print("older")\n' > "$S4/scripts/stale.py"

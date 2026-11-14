@@ -28,7 +28,7 @@ ha's side of the first, second and fourth already stood on different ground:
 the `memory` tool makes the model name a scope, the digest is ranked against
 the request, and a learned skill may carry `scripts/`. What was left were the
 defaults and the words around them, and the places where a finding of the
-paper had no counterpart. They are six small changes, and two more that came from a run of the benchmark (P7, P8).
+paper had no counterpart. They are six small changes, and three more that came from a run of the benchmark (P7, P8, P9).
 
 ## Scope: say who sees an entry (P1)
 
@@ -193,6 +193,58 @@ put that name in the title of its own write. When the agent saved the solution
 without it, the gate still approves and the review retitles that entry (an
 `update` by its id) instead of writing a second one.
 
+## A returning task starts from what its earlier visits found (P9)
+
+Code: `related_logs`, `related_block`, `given_logs_in`, `revise` and `prompt` in
+`crates/harness-cli/src/host/memory/session_log.rs`. Design after ReHarness
+(arXiv 2610.12668): a reflection per episode, retrieved by similarity to the new
+query, and the retrieved reflections revised backward by the new episode's
+outcome (their ablation: 0.217 with the revision, 0.144 without).
+
+A run of the benchmark (6 tasks, 4 visits each, every visit a new conversation
+naming its task id in the first message) showed the loop open at both ends. ha
+writes one session log per conversation, and all 24 carried the task id in their
+keywords. But a new conversation was shown only the newest log - the previous
+conversation, an unrelated task - and never the logs that name what its request
+names, so no visit started from what the earlier visits of the same task found.
+And the logs said "its exact grid appears in the conversation" instead of the
+finding, which a later session cannot read.
+
+- **By name, at the start.** A fresh conversation's first turn (the app and
+  `ha exec` alike; a resumed one is not) is shown up to three logs of earlier
+  conversations that name what the request - the goal and what the user typed -
+  names, after the newest log it was always shown. A word of the request tells
+  logs apart when at most a quarter of the logs hold it anywhere (a statistic of
+  the logs, not a list of words); a log is related when its topic or its Quick
+  Reference holds a telling word. With fewer than four logs words tell nothing
+  and none is chosen. Related logs are ranked by how many telling words they
+  hold, then by the words' weight (BM25 idf), then by being newer. Each is shown
+  with its outcome and the sections that hold what it found, inside
+  `<session-log conversation="...">`, as historical reference: what it found
+  need not be found again, but it is checked against what is in front of the
+  agent, and an outcome it reports is not verification evidence. Logs of
+  conversations still open are left out. Diagnostics: `session_log` /
+  `related` (count, candidates, words).
+- **The finding itself, in the log.** The log's instructions ask for the rule,
+  the command or the value itself and never a pointer to the conversation; an
+  unsolved problem is said so in the Outcome, with what was tried, what each
+  attempt showed and what is still unknown; and a problem with a name of its own
+  (a ticket, an identifier, an error text, a file) comes first in the keywords,
+  as the conversation writes it.
+- **Revised by the next visit.** The logs a conversation was shown are read from
+  its first turn's packet. When its log is written, the model also sees those
+  logs, and says in `## Earlier Logs Revisited` which of them this conversation
+  confirms, corrects or limits, one line each. The host appends that line to
+  that earlier log under `## Later Conversations`
+  (`- <date> (<conversation>): <note>`), one per conversation, the newest five
+  kept, and shows the section first the next time the log is shown, as what
+  outranks the log where they differ. Only a log the conversation was given can
+  get a note. The section is the host's: a rewrite of the log carries it over
+  whatever the model wrote. A log that is a section of the markdown store's
+  daily note is revised in place when the note's cap still holds; otherwise it
+  is left as it is. A failure of the revision never fails the log
+  (`session_log` / `revised`).
+
 ## Not taken
 
 - **The benchmark as a test suite in ha.** It measures harnesses on a puzzle
@@ -255,3 +307,15 @@ without it, the gate still approves and the review retitles that entry (an
   `instructions_the_user_did_not_type_reach_the_planner_as_a_note_not_theirs`,
   `an_edit_quoting_the_gate_s_note_is_refused_and_one_quoting_the_conversation_is_kept`
   and `the_review_is_told_to_keep_what_solved_a_problem_that_may_come_back`.
+- Unit, P9 in `session_log.rs`:
+  `a_rare_name_in_the_keywords_finds_its_logs_and_a_word_most_logs_hold_does_not`,
+  `fewer_than_four_candidates_choose_no_log_by_words`,
+  `related_logs_are_ranked_by_telling_words_then_weight_then_age_and_three_are_kept`,
+  `the_related_block_states_what_was_found_and_what_later_conversations_found_first`,
+  `a_new_conversation_is_shown_the_logs_its_request_names_and_a_resumed_one_is_not`,
+  `the_prompt_states_the_finding_and_names_the_problem_first`,
+  `notes_go_to_the_given_logs_only_replace_the_same_conversations_and_keep_five`,
+  `what_later_conversations_found_survives_a_rewrite_of_the_log_whatever_the_model_wrote`,
+  `a_log_in_the_days_note_gets_its_notes_in_place_while_the_cap_holds` and
+  `the_log_of_a_conversation_revises_the_logs_its_first_turn_was_given`. Live:
+  `scripts/testing/live-tests/related-logs.sh`.

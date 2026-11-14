@@ -7,7 +7,10 @@
 //! one. Now the request is scored against every learned skill's name,
 //! description and body, and the best goes into the turn - only when its
 //! score stands out from the rest, judged by the spread of the others' scores
-//! ([`best_of`]), so a request that fits none gets none. What the skill took
+//! ([`best_of`]), so a request that fits none gets none. A library of fewer
+//! than [`MIN_LIBRARY`] skills is too small for words to tell which fits (every
+//! word one skill holds seems to tell it apart), so it never puts a skill whole:
+//! the catalog names what exists and the model decides. What the skill took
 //! for granted in the turns it failed goes with it: those assumptions were
 //! kept, and never read when the skill was used again.
 //!
@@ -17,7 +20,8 @@
 //! every skill and asks nothing. A skill is put whole into a conversation once
 //! since its last compaction; later turns it fits get one line ([`again`]),
 //! because its text is already in the conversation ([`given_in`] finds it in
-//! the packets the conversation sent).
+//! the packets the conversation sent), and the catalog does not list it as one
+//! to read.
 //!
 //! From Evolver (arXiv 2611.07595), whose reused strategies cut the tokens of
 //! tasks that already succeeded by 17% and which warns that an outdated one
@@ -44,6 +48,9 @@ const B: f64 = 0.75;
 
 /// The most of a skill's body a turn carries.
 const MAX_BODY_CHARS: usize = 4_000;
+
+/// What ends a body that was cut: the rest is for `activate_skill` to read.
+const CUT_NOTE: &str = "\n…(cut; activate_skill reads it whole)";
 
 /// A learned skill recalled for a request.
 #[derive(Clone, Debug, PartialEq)]
@@ -127,7 +134,12 @@ pub fn consider(layers: &Layers, skills: &[LearnedSkill], request: &str) -> Cons
         .zip(&fits)
         .map(|(skill, fit)| (skill.name.clone(), fit.score))
         .collect::<BTreeMap<_, _>>();
-    let Some(best) = standout(&fits) else {
+    // Words cannot tell which of a handful of skills fits: the scores order the
+    // catalog, and the model decides ([`MIN_LIBRARY`]).
+    let Some(best) = (skills.len() >= MIN_LIBRARY)
+        .then(|| standout(&fits))
+        .flatten()
+    else {
         return Considered {
             recalled: None,
             scores,
@@ -138,7 +150,7 @@ pub fn consider(layers: &Layers, skills: &[LearnedSkill], request: &str) -> Cons
     let mut body = bodies[best].trim().to_owned();
     if body.chars().count() > MAX_BODY_CHARS {
         body = body.chars().take(MAX_BODY_CHARS).collect::<String>();
-        body.push_str("\n…(cut; activate_skill reads it whole)");
+        body.push_str(CUT_NOTE);
     }
     let recalled = Recalled {
         name: skill.name.clone(),
@@ -155,6 +167,19 @@ pub fn consider(layers: &Layers, skills: &[LearnedSkill], request: &str) -> Cons
         scores,
     }
 }
+
+/// The fewest candidate skills a library needs for words to decide which one
+/// fits.
+///
+/// The best is judged against the spread of the OTHER skills' scores, and three
+/// others are the least that show one ([`FLAT_SPREAD`] says a library of three
+/// shows none). A word also tells skills apart only when at most half of the
+/// skills hold it, which in a library of one or two is every word one of them
+/// holds: a benchmark's single skill about one kind of puzzle was put whole into
+/// conversations about five others, because "grid" and "ARC" were in it and in
+/// nothing else. Below this size no skill is put whole; the catalog tells the
+/// model what exists and the model decides.
+const MIN_LIBRARY: usize = 4;
 
 /// The words of the request a skill's trigger must hold to fit: one shared word
 /// is not a fit, whatever the library's size, and a word most skills hold is
@@ -221,8 +246,9 @@ fn best_of(documents: &[Vec<String>], query: &[String]) -> Option<(usize, f64)> 
 /// Each document's [`Fit`] for the query, `triggers` being the part of each
 /// document that says when to use it. The words that count toward the two are
 /// those that tell skills apart: held by at most half of the skills (a
-/// statistic of the library, not a word list; with one or two skills every
-/// word one of them holds tells).
+/// statistic of the library, not a word list). In a library of one or two every
+/// word one of them holds tells, so [`consider`] does not let such a library
+/// decide ([`MIN_LIBRARY`]); the scores still order its catalog.
 fn scores_of(documents: &[Vec<String>], triggers: &[Vec<String>], query: &[String]) -> Vec<Fit> {
     let query = query.iter().collect::<BTreeSet<_>>();
     if documents.is_empty() || query.is_empty() {
@@ -277,7 +303,9 @@ fn scores_of(documents: &[Vec<String>], triggers: &[Vec<String>], query: &[Strin
         .collect()
 }
 
-/// The index of the one [`Fit`] that stands out ([`best_of`]).
+/// The index of the one [`Fit`] that stands out ([`best_of`]). It judges the
+/// fits it is given; that a library is large enough to be judged is [`consider`]'s
+/// rule ([`MIN_LIBRARY`]).
 fn standout(fits: &[Fit]) -> Option<usize> {
     let mut order = (0..fits.len()).collect::<Vec<_>>();
     order.sort_by(|left, right| fits[*right].score.total_cmp(&fits[*left].score));
@@ -389,6 +417,35 @@ pub fn given_in(packet: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// Whether a recalled body was cut at [`MAX_BODY_CHARS`].
+#[must_use]
+pub fn is_cut(body: &str) -> bool {
+    body.ends_with(CUT_NOTE)
+}
+
+/// The skills `packet` holds only in part: a body cut at [`MAX_BODY_CHARS`],
+/// whose rest `activate_skill` reads. The conversation holds their text, but not
+/// all of it.
+#[must_use]
+pub fn cut_in(packet: &str) -> BTreeSet<String> {
+    packet
+        .split(GIVEN_MARKER)
+        .skip(1)
+        .filter_map(|rest| {
+            let name = rest
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || *character == '-'
+                })
+                .collect::<String>();
+            let block = rest.split("</skill>").next().unwrap_or(rest);
+            (!name.is_empty() && block.contains(CUT_NOTE.trim_start())).then_some(name)
+        })
+        .collect()
+}
+
 /// The one line a turn carries when the skill that fits was already given
 /// whole to this conversation.
 #[must_use]
@@ -397,7 +454,7 @@ pub fn again(name: &str) -> ContextBlock {
         "recalled-skill",
         ContextBlockKind::Instruction,
         format!(
-            "The learned skill {name} given earlier in this conversation still fits; its text is above, and activate_skill reads it again."
+            "The learned skill {name} given earlier in this conversation still fits; its text is above and need not be activated again."
         ),
     )
     .with_max_tokens(RECALLED_TOKENS)
@@ -446,19 +503,25 @@ pub struct Catalog {
 
 /// A catalog of the learned skills, for a turn where recall put none whole:
 /// one `name: description` line each, unproven ones marked, those recall holds
-/// back left out. `scores` (from [`consider`]) puts the skills nearest the
-/// request first; the rest follow by the most recently activated, viewed or
-/// worked. `None` when there is nothing to list.
+/// back left out, and so are those in `held`: the skills whose whole text the
+/// conversation already holds, which the model would read again at the list's
+/// word. `scores` (from [`consider`]) puts the skills nearest the request first;
+/// the rest follow by the most recently activated, viewed or worked. `None`
+/// when there is nothing left to list.
 ///
 /// Recall by words cannot cross a language (a request in Vietnamese, skills in
 /// English), and a request that mentions a skill among many things does not
 /// stand out: the model can judge a description in any language, so it is told
 /// what exists and decides.
 #[must_use]
-pub fn catalog(skills: &[LearnedSkill], scores: &BTreeMap<String, f64>) -> Option<Catalog> {
+pub fn catalog(
+    skills: &[LearnedSkill],
+    scores: &BTreeMap<String, f64>,
+    held: &BTreeSet<String>,
+) -> Option<Catalog> {
     let mut candidates = skills
         .iter()
-        .filter(|skill| !skill.usage.restricted())
+        .filter(|skill| !skill.usage.restricted() && !held.contains(&skill.name))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         return None;
@@ -664,6 +727,11 @@ mod tests {
                     "release-notes",
                     "Write the release notes from the merged changes.",
                 ),
+                // Words decide only in a library of four or more, the held-back
+                // skill not counted.
+                ("image-resize", "Resize every product image to 800 pixels."),
+                ("log-rotation", "Rotate the server logs at midnight."),
+                ("cert-renewal", "Renew the TLS certificate of the proxy."),
             ],
         );
         let request = "run the db migration against staging";
@@ -828,6 +896,19 @@ mod tests {
             &PromoteContext::default(),
         );
         assert!(verdict.ok, "{:?}", verdict.findings);
+        // Words decide only in a library of four or more.
+        for (name, description, body) in &SEVEN[1..4] {
+            let filler = promote(
+                &layers,
+                &Intent::from_value(&json!({
+                    "action": "create", "name": name, "level": "project",
+                    "body": format!("---\nname: {name}\ndescription: {description}\ncategory: ops\n---\n{body}\n"),
+                    "reason": "the user showed it", "evidence": "[User]: do it this way",
+                })),
+                &PromoteContext::default(),
+            );
+            assert!(filler.ok, "{name}: {:?}", filler.findings);
+        }
         let request = "recolor the zebra grid";
         let before = recall(&layers, &library(&layers), request).expect("fits");
         assert_eq!(before.scripts.len(), 1);
@@ -1229,6 +1310,26 @@ mod tests {
         assert!(super::given_in("The learned skill release-notes given earlier").is_empty());
     }
 
+    /// A body cut at the bound is in the conversation only in part: the rest is
+    /// still for `activate_skill`, so it is not one the conversation holds whole.
+    #[test]
+    fn a_body_cut_at_the_bound_is_not_one_the_conversation_holds_whole() {
+        let cut = format!("Do it.{}", super::CUT_NOTE);
+        assert!(super::is_cut(&cut) && !super::is_cut("Do it."));
+        let packet = format!(
+            "<skill name=\"long-one\">\n{cut}\n</skill>\n\n<skill name=\"short-one\">\nTrim.\n</skill>"
+        );
+        assert_eq!(
+            super::cut_in(&packet).into_iter().collect::<Vec<_>>(),
+            ["long-one"]
+        );
+        assert_eq!(
+            super::given_in(&packet).into_iter().collect::<Vec<_>>(),
+            ["long-one", "short-one"]
+        );
+        assert!(super::cut_in("<skill name=\"short-one\">\nTrim.\n</skill>").is_empty());
+    }
+
     #[test]
     fn the_block_carries_a_skill_whole_and_the_line_carries_only_its_name() {
         let recalled = Recalled {
@@ -1245,7 +1346,7 @@ mod tests {
         assert!(whole.contains("Run the deploy script."), "{whole}");
         let line = format!("{:?}", super::again("deploy"));
         assert!(
-            line.contains("The learned skill deploy given earlier in this conversation still fits; its text is above, and activate_skill reads it again."),
+            line.contains("The learned skill deploy given earlier in this conversation still fits; its text is above and need not be activated again."),
             "{line}"
         );
         assert!(!line.contains("Run the deploy script."), "{line}");
@@ -1440,7 +1541,8 @@ mod tests {
         let skills = library(&layers);
         let considered = super::consider(&layers, &skills, request);
         assert!(considered.recalled.is_none());
-        let catalog = super::catalog(&skills, &considered.scores).expect("the catalog");
+        let catalog =
+            super::catalog(&skills, &considered.scores, &no_skills()).expect("the catalog");
         assert_eq!(catalog.listed, 7);
         assert!(text_of(&catalog).contains("- db-migration:"));
     }
@@ -1471,6 +1573,77 @@ mod tests {
         format!("{:?}", catalog.block)
     }
 
+    /// No skill held by the conversation.
+    fn no_skills() -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::new()
+    }
+
+    /// Fails without the change: a library of one skill put it whole into a
+    /// request that shared two of its trigger words, because with one skill
+    /// every word it holds tells it apart from the rest. The scores still order
+    /// the catalog, which names the skill.
+    #[test]
+    fn a_library_too_small_to_tell_words_apart_gets_the_catalog_and_no_skill_whole() {
+        let request = "write the release notes for the changelog entry of the new exporter";
+        assert_eq!(
+            fit_in(&ONLY_RELEASE_NOTES, request).0,
+            Some("release-notes"),
+            "control: the rule alone fits the one skill"
+        );
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = disk_library(directory.path(), &ONLY_RELEASE_NOTES);
+        let skills = library(&layers);
+        let considered = super::consider(&layers, &skills, request);
+        assert!(considered.recalled.is_none());
+        assert!(considered.scores["release-notes"] > 0.0);
+        let catalog = super::catalog(&skills, &considered.scores, &no_skills()).expect("catalog");
+        assert_eq!(catalog.listed, 1);
+        assert!(text_of(&catalog).contains("- release-notes:"));
+        // Three skills are still too few.
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = disk_library(directory.path(), &SEVEN[..3]);
+        let request = "run the database migration against staging";
+        assert!(recall(&layers, &library(&layers), request).is_none());
+    }
+
+    /// With four skills the best has three others to stand out from.
+    #[test]
+    fn a_library_of_four_still_recalls_the_skill_that_fits() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = disk_library(directory.path(), &SEVEN[..4]);
+        let skills = library(&layers);
+        assert_eq!(skills.len(), super::MIN_LIBRARY);
+        let recalled = recall(
+            &layers,
+            &skills,
+            "run the database migration against staging",
+        )
+        .expect("fits");
+        assert_eq!(recalled.name, "db-migration");
+        // A request that fits none still gets none.
+        assert!(recall(&layers, &skills, "paint the kitchen wall a warmer white").is_none());
+    }
+
+    /// Fails without the change: the catalog listed a skill the conversation
+    /// already held whole and told the model to read it with `activate_skill`, and
+    /// the model did so once a turn.
+    #[test]
+    fn the_catalog_leaves_out_the_skills_the_conversation_holds() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = disk_library(directory.path(), &SEVEN);
+        let skills = library(&layers);
+        let held = ["db-migration".to_owned()].into_iter().collect();
+        let catalog =
+            super::catalog(&skills, &std::collections::BTreeMap::new(), &held).expect("catalog");
+        let text = text_of(&catalog);
+        assert_eq!((catalog.listed, catalog.left_out), (6, 0), "{text}");
+        assert!(!text.contains("db-migration"), "{text}");
+        assert!(text.contains("- release-notes:"), "{text}");
+        // All of them held: nothing to list.
+        let all = skills.iter().map(|skill| skill.name.clone()).collect();
+        assert!(super::catalog(&skills, &std::collections::BTreeMap::new(), &all).is_none());
+    }
+
     #[test]
     fn the_catalog_lists_each_skill_once_unproven_marked_and_held_back_ones_left_out() {
         let directory = tempfile::tempdir().expect("dir");
@@ -1487,8 +1660,8 @@ mod tests {
             record_outcome(&layers, "log-rotation", false, "gzip exists", "no gzip");
         }
         let skills = library(&layers);
-        let catalog =
-            super::catalog(&skills, &std::collections::BTreeMap::new()).expect("a catalog");
+        let catalog = super::catalog(&skills, &std::collections::BTreeMap::new(), &no_skills())
+            .expect("a catalog");
         let text = text_of(&catalog);
         assert_eq!((catalog.listed, catalog.left_out), (6, 0), "{text}");
         assert!(
@@ -1513,7 +1686,7 @@ mod tests {
             "A learned skill fits this request: x."
         ));
         // No skill, or only held-back ones: nothing to list.
-        assert!(super::catalog(&[], &std::collections::BTreeMap::new()).is_none());
+        assert!(super::catalog(&[], &std::collections::BTreeMap::new(), &no_skills()).is_none());
     }
 
     /// The skills nearest the request come first, then the most recently used.
@@ -1528,7 +1701,7 @@ mod tests {
         ));
         let skills = library(&layers);
         let scores = [("image-resize".to_owned(), 5.0)].into_iter().collect();
-        let text = text_of(&super::catalog(&skills, &scores).expect("a catalog"));
+        let text = text_of(&super::catalog(&skills, &scores, &no_skills()).expect("a catalog"));
         let position = |name: &str| text.find(&format!("- {name}:")).expect(name);
         assert!(
             position("image-resize") < position("cert-renewal"),
@@ -1545,8 +1718,12 @@ mod tests {
             crate::interactive::learned::UseKind::Offered
         ));
         let text = text_of(
-            &super::catalog(&library(&layers), &std::collections::BTreeMap::new())
-                .expect("a catalog"),
+            &super::catalog(
+                &library(&layers),
+                &std::collections::BTreeMap::new(),
+                &no_skills(),
+            )
+            .expect("a catalog"),
         );
         let position = |name: &str| text.find(&format!("- {name}:")).expect(name);
         assert!(
@@ -1575,8 +1752,12 @@ mod tests {
             .map(|(name, description, body)| (name.as_str(), description.as_str(), body.as_str()))
             .collect::<Vec<_>>();
         let layers = disk_library(directory.path(), &borrowed);
-        let catalog = super::catalog(&library(&layers), &std::collections::BTreeMap::new())
-            .expect("a catalog");
+        let catalog = super::catalog(
+            &library(&layers),
+            &std::collections::BTreeMap::new(),
+            &no_skills(),
+        )
+        .expect("a catalog");
         let text = text_of(&catalog);
         assert!(
             catalog.listed <= super::CATALOG_LINES && catalog.listed > 0,

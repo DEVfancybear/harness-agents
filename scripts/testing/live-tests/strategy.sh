@@ -124,6 +124,20 @@ description: Use when the user asks for release notes or a changelog entry.
 2. One bullet per change, in the user's words.
 EOF
 echo '{"created_by": "ha", "created": "2026-10-01T00:00:00Z"}' > "$HA_HOME/skills/release-notes/.ha-learned.json"
+# Recall judges by words only in a library of four skills or more (a library
+# of one or two cannot tell which of its words tell skills apart). Four skills
+# about other things stand beside release-notes, so that the library still has
+# four candidates in 4c, when release-notes is held back for failing. None
+# shares a word of its trigger with the requests below.
+filler() { # filler <name> <description> <body>
+  mkdir -p "$HA_HOME/skills/$1"
+  printf -- '---\nname: %s\ndescription: %s\n---\n%s\n' "$1" "$2" "$3" > "$HA_HOME/skills/$1/SKILL.md"
+  echo '{"created_by": "ha", "created": "2026-10-01T00:00:00Z"}' > "$HA_HOME/skills/$1/.ha-learned.json"
+}
+filler image-resize "Use when asked to resize product images for the storefront." "Resize every product image to 800 pixels wide, keep the aspect ratio, and save the thumbnails beside the originals."
+filler log-rotation "Use when asked to rotate and compress the server logs." "Rotate the server logs at midnight, compress the old files, and delete archives older than thirty days."
+filler cert-renewal "Use when asked to renew the TLS certificate for the proxy." "Request a new TLS certificate, install it on the proxy, reload the proxy, and check the expiry date in the browser."
+filler invoice-export "Use when asked to export invoices to the accounting system." "Export the invoices of the closed month, check the totals against the ledger, then upload the file to the accounting system."
 mkdir -p "$D/skill-usage"
 seed4() { printf '{"skills": {"release-notes": {"use": 1, "failed": 1, "failures": [{"at": "2026-10-20", "assumption": "CHANGELOG.md already exists", "evidence": "no such file"}]}}}\n' > "$D/skill-usage/global.json"; }
 seed4

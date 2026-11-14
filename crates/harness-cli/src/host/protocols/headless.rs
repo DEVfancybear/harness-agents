@@ -1134,6 +1134,10 @@ pub async fn run_with(
             None,
             &request.prompt,
             &[],
+            skill_host
+                .as_ref()
+                .map(super::skills::SkillHost::held)
+                .as_ref(),
         )
         .await
         {
@@ -1143,6 +1147,17 @@ pub async fn run_with(
             project_blocks.push(offer.block);
             skill_in_play = offer.name;
         }
+    }
+    // A new conversation's first turn is shown the session logs of earlier
+    // conversations that name what its prompt names, as the app shows them
+    // ([`super::session_log::related_block`]). This path builds no other start
+    // block from the previous conversation.
+    if resumed_from.is_none()
+        && super::session_log::enabled(&context.paths.config_file, environment)
+        && let Some(block) =
+            super::session_log::related_block(&task_id, &context.project.root, &request.prompt)
+    {
+        project_blocks.push(block);
     }
     let run_request = run_request.with_project_rules(project_blocks);
     // A resumed conversation that went cold starts fresh, as in the app.

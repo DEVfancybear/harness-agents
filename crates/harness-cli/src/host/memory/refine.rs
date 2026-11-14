@@ -541,7 +541,7 @@ impl Learning {
         }
         if !self.in_play.is_empty() {
             parts.push(format!(
-                "<learned_skills_in_play>\n{}\nThese learned skills were loaded during the turns under review. If the conversation shows one was wrong, missing a step or outdated, patch that skill first: it is the one that was followed.\n</learned_skills_in_play>",
+                "<learned_skills_in_play>\n{}\nThese learned skills were loaded during the turns under review. If the conversation shows one was wrong, missing a step or outdated, patch that skill first: it is the one that was followed. What the conversation learned about a different problem than the one the skill is for is not a patch to it: it is an entry or a skill of its own. When the skill was offered for a request it does not cover, the patch narrows its description to what it is for (naming what told this request apart); it does not widen the skill to cover the request.\n</learned_skills_in_play>",
                 self.in_play.join(", ")
             ));
         }
@@ -3840,7 +3840,7 @@ const REVIEW_NOTE_HEADER: &str = "This note was not written by the user: ha's ow
 const AUTO_SCOPE_POLICY: &str = "Requested refinement scope: automatic review. A local entry reaches only this conversation's turns and is gone with it, so an edit stays local only when that is all it needs: current-run coordination, a finding that matters to this task alone, a constraint met mid-task. A fact about this project that a tool result or a file showed (how it builds, where something lives, what a config names) outlives the conversation: say \"about\": \"project\" and it is kept for the project's later conversations; \"scope\": \"project\" does the same. Mark a memory edit with \"scope\": \"global\" when it is a durable user preference, a correction of how the agent should work, or a stable fact about the user or their environment that future conversations in any project need, and the main agent did not already save it: check the global entries in the overview, and update a global entry (with \"scope\": \"global\" and its bare id) when the conversation supersedes it instead of creating a duplicate. Never put task progress, temporary blockers or current-run coordination in global memory, nor task state such as commit ids, test counts or a done/in-progress status: the task's plan, checklist, progress, decisions and blockers live in task_state, which the agent keeps and every turn carries whole: never copy them into a memory edit; a local edit holds what task_state does not (a finding about the code, a constraint met mid-task). Keep a lasting result as knowledge when worth keeping. When the conversation solved a problem that may come back - it says so, or the problem carries a name of its own (an identifier, a file, an error text) - what finally worked, and what told it from the attempts that failed, is worth keeping where a later conversation finds it: a learned skill when it is a procedure, else a memory entry about the project (global when it is not about one project), titled with the name the problem goes by so that a request naming it matches the entry. When an entry (the agent's own too) already holds what worked and its title does not carry the name, the edit is an update of that entry, by its id, giving it the title with the name - never a second entry for the same fact. Its evidence is the result that showed it worked: a tool result, or the user's message saying so. Keep only what the conversation showed to work: not the attempts that failed, not a guess no result confirmed, not one-off noise. Entries that record a state go stale (the overview shows each entry's age): when the conversation shows one changed - a goal completed, work merged, a blocker resolved, a count moved - update or delete it, a local one freely and a global one with \"scope\": \"global\". Only memory edits may be global; every other kind stays local.";
 
 /// What the automatic review may add to the knowledge library.
-const SKILL_OUTCOMES: &str = "For each learned skill in play that the conversation shows being followed, say how it went in a top-level `skillOutcomes` array: {\"skill\": \"its name\", \"outcome\": \"worked\" or \"failed\", \"evidence\": \"a verbatim quote from the conversation\", \"assumption\": \"for a failure: what the skill took for granted that turned out false\"}. Judge the skill, not the task: it failed when its own steps did not work as written - a command it gives broke, a file or path it names was missing - even when the agent then reached the goal another way, and it worked when following it as written did the job. Judge only from what the conversation shows - a check that passed or failed, a command that broke, the user confirming or correcting - and leave the array empty when it shows neither. A failure whose cause the skill could have checked first is also worth a patch to the skill that adds that check. A skill in play that you patch or update gets its outcome too: the patch fixes the skill, the outcome says how following it went.";
+const SKILL_OUTCOMES: &str = "For each learned skill in play that the conversation shows being followed, say how it went in a top-level `skillOutcomes` array: {\"skill\": \"its name\", \"outcome\": \"worked\" or \"failed\", \"evidence\": \"a verbatim quote from the conversation\", \"assumption\": \"for a failure: what the skill took for granted that turned out false\"}. Judge the skill, not the task: it failed when its own steps did not work as written - a command it gives broke, a file or path it names was missing - even when the agent then reached the goal another way, and it worked when following it as written did the job. Judge only from what the conversation shows - a check that passed or failed, a command that broke, the user confirming or correcting - and leave the array empty when it shows neither. A failure whose cause the skill could have checked first is also worth a patch to the skill that adds that check. A skill in play that you patch or update gets its outcome too: the patch fixes the skill, the outcome says how following it went. A skill in play that did not fit the request - the conversation was about something other than what it is for - was not followed: it gets no worked or failed outcome, and the patch narrows its description instead.";
 
 /// Keep the review's judgement of each learned skill in play: only a skill in
 /// play, only `worked` or `failed`, and a failure only with its assumption.
@@ -6219,7 +6219,7 @@ pub async fn review(
         if !learning.in_play.is_empty() {
             let _ = write!(
                 block,
-                "\n<learned_skills_in_play>\n{}\nA learned skill in play that the conversation shows wrong or incomplete is worth refining.\n</learned_skills_in_play>",
+                "\n<learned_skills_in_play>\n{}\nA learned skill in play that the conversation shows wrong or incomplete is worth refining, and so is one offered for a request it does not cover: its description is narrowed.\n</learned_skills_in_play>",
                 learning.in_play.join(", ")
             );
         }
@@ -8551,6 +8551,65 @@ mod tests {
             super::AUTO_SCOPE_POLICY.contains("its title does not carry the name")
                 && super::AUTO_SCOPE_POLICY.contains("an update of that entry, by its id")
                 && super::AUTO_SCOPE_POLICY.contains("never a second entry for the same fact"),
+        );
+    }
+
+    /// A skill offered for a request it does not cover was patched with the
+    /// patterns of other puzzles, and no failure counted against it. The
+    /// review is told that what the conversation learned about another problem
+    /// is a thing of its own, that a skill which did not fit was not followed
+    /// (no outcome), and that the patch narrows its description.
+    #[tokio::test]
+    async fn a_skill_offered_for_a_request_it_does_not_cover_is_narrowed_not_widened() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let workspace = directory.path().join("workspace");
+        let layers = crate::interactive::learned::Layers::new(
+            &directory.path().join("config"),
+            &directory.path().join("data"),
+            &workspace,
+            true,
+        );
+        let mut learning = super::Learning::new(layers, &workspace, None);
+        learning.in_play = vec!["grid-gaps".to_owned()];
+        // The planner's note.
+        let planner = learning.prompt_parts().join("\n");
+        for sentence in [
+            "about a different problem than the one the skill is for is not a patch to it",
+            "it is an entry or a skill of its own",
+            "the patch narrows its description to what it is for",
+            "it does not widen the skill to cover the request",
+        ] {
+            assert!(planner.contains(sentence), "{sentence}: {planner}");
+        }
+        // The outcomes' instructions.
+        for sentence in [
+            "did not fit the request",
+            "was not followed: it gets no worked or failed outcome",
+            "the patch narrows its description instead",
+        ] {
+            assert!(super::SKILL_OUTCOMES.contains(sentence), "{sentence}");
+        }
+        // The gate's note.
+        let replies =
+            Replies::new(&["{\"shouldRefine\": false, \"rationale\": \"nothing\"}".to_owned()]);
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = replies.clone();
+        super::review(
+            &provider,
+            "fixture-model",
+            "conversation",
+            &scopes,
+            25,
+            Some(&learning),
+        )
+        .await
+        .expect("answered");
+        assert!(
+            replies
+                .prompt(0)
+                .contains("is worth refining, and so is one offered for a request it does not cover: its description is narrowed."),
+            "{}",
+            replies.prompt(0)
         );
     }
 

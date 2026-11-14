@@ -60,6 +60,14 @@ Mỗi hội thoại một log, theo `/compress` của CPR. Hình dạng:
   `## Setup & Config`, `## Pending Tasks` (`- [ ]`), `## Errors & Workarounds`,
   `## Custom Notes`: mỗi mục chỉ có khi có nội dung
 - `---`, rồi `## Quick Resume Context` (2-3 câu)
+- Cuộc hội thoại đã được cho xem log cũ lúc bắt đầu (dưới đây) còn ghi
+  `## Earlier Logs Revisited`; và log đã được các cuộc sau sửa lại mang
+  `## Later Conversations` trước đường kẻ, do host ghi, không bao giờ do model
+  ([CONTINUAL_LEARNING.vi.md](CONTINUAL_LEARNING.vi.md), P9)
+
+Log nêu điều đã tìm ra - quy tắc, lệnh, giá trị - và không bao giờ chỉ vào cuộc hội
+thoại để lấy nó, nói trong Outcome khi vấn đề chưa giải được, và đặt tên riêng của vấn đề
+(một ticket, một dòng lỗi, một file) đầu tiên trong keywords.
 
 **Ở đâu.** Project có kho markdown nhận log dưới dạng một mục `## Session <HH:MM> -
 <chủ đề>` trong `memory/YYYY-MM-DD.md` của ngày đó (các mục con thấp hơn một bậc), tức
@@ -160,6 +168,15 @@ Prompt đầu tiên của hội thoại mới nghe về hội thoại trước �
 - Không có log thì session brief được gửi như trước.
 - Khi task state của hội thoại trước được mang sang (checklist của nó là chính xác), việc
   còn dở trong log bị bỏ ra để các bước không bị liệt kê hai lần.
+- Lượt đầu của hội thoại mới còn nghe về các log của hội thoại trước nêu điều yêu cầu của nó
+  nêu (`related-session-logs`, trên kênh reference, trong app và trong `ha exec`; không có
+  trong hội thoại được resume): tối đa 3 log, chọn theo những từ của yêu cầu mà không quá một
+  phần tư số log chứa, mỗi log kèm outcome, các ghi chú mà cuộc hội thoại sau để lại dưới nó
+  (hiện trước) và các mục learnings, fixes, errors, decisions, trong
+  `<session-log conversation="...">`. Đó là lời của chính log, tài liệu lịch sử: điều nó tìm
+  ra không cần tìm lại, và cuộc hội thoại đối chiếu nó với repository. Dưới 4 log thì từ không
+  phân biệt được gì và không log nào được chọn. Diagnostics: `session_log` / `related` và,
+  khi log của chính cuộc hội thoại sửa các log nó được xem, `revised`.
 - Handoff là một khối riêng của startup brief (`session-handoff`), trên kênh reference.
   Khi log mới hơn `.harness/progress.md`, khối nói điều đó trong một dòng.
 

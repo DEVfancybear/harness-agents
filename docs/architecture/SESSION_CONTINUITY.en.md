@@ -62,6 +62,14 @@ One log per conversation, after CPR's `/compress`. Its shape:
   `## Setup & Config`, `## Pending Tasks` (`- [ ]`), `## Errors & Workarounds`,
   `## Custom Notes`: each only when it has content
 - `---`, then `## Quick Resume Context` (2-3 sentences)
+- A conversation that was given earlier logs at its start (below) also writes
+  `## Earlier Logs Revisited`; and a log that later conversations revised carries
+  `## Later Conversations` before the rule, written by the host and never by the model
+  ([CONTINUAL_LEARNING.en.md](CONTINUAL_LEARNING.en.md), P9)
+
+The log states what was found - the rule, the command, the value - and never points at
+the conversation for it, says in the Outcome when the problem was not solved, and puts a
+problem's own name (a ticket, an error text, a file) first in its keywords.
 
 **Where.** A project with a markdown store gets the log as a `## Session <HH:MM> -
 <topic>` section of that day's `memory/YYYY-MM-DD.md` (its subsections one level
@@ -168,6 +176,16 @@ The first prompt of a new conversation hears of the previous one once:
 - With no log, the session brief is sent as before.
 - When the previous conversation's task state is carried over (its checklist is exact),
   the log's pending tasks are left out so the steps are not listed twice.
+- A new conversation's first turn also hears of the logs of earlier conversations that name
+  what its request names (`related-session-logs`, on the reference channel, in the app and in
+  `ha exec`; not in a resumed conversation): up to 3 logs, chosen by the words of the request
+  that at most a quarter of the logs hold, each with its outcome, the notes later conversations
+  left under it (first) and its learnings, fixes, errors and decisions, in
+  `<session-log conversation="...">`. It is the log's own words, historical reference: what
+  it found need not be found again, and the conversation checks it against the repository.
+  With fewer than 4 logs words tell nothing and none is chosen. Diagnostics: `session_log`
+  / `related` and, when the conversation's own log revises the logs it was given,
+  `revised`.
 - The handoff is its own block of the startup brief (`session-handoff`), on the reference
   channel. When the log is newer than `.harness/progress.md`, the block says so in one
   line.
