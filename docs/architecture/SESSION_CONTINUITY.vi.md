@@ -95,7 +95,7 @@ nhất (tối đa 50 lượt, 120.000 ký tự), nên điều các lượt đầ
 - khi rời một hội thoại: `/new`, `/resume` sang hội thoại khác, `/fork` hay `/clone`, và
   khi thoát chat (`/quit`, Ctrl-D) - ngay lập tức, nên lúc mở hội thoại sau có thể đã thấy
   log (nếu log còn đang được ghi, lúc mở quay về dùng các lượt cuối);
-- khi một lần chạy `ha exec` kết thúc, trước khi tiến trình thoát (chờ tối đa 30 giây; log lâu hơn vẫn còn nợ);
+- khi một lần chạy `ha exec` kết thúc, trước khi tiến trình thoát (chờ tối đa 90 giây; log lâu hơn vẫn còn nợ);
 - khi phiên lặng đi - đúng lúc idle review chạy, 10 phút sau lượt cuối
   (`HA_IDLE_REVIEW_SECONDS`), nếu trong lúc đó không có lượt mới nào của cùng hội thoại
   (lượt của hội thoại khác không chặn nó); cả sau một lượt lỗi hay bị dừng;

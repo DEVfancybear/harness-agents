@@ -1692,12 +1692,14 @@ pub async fn run_with(
     // before the process exits, when the conversation did enough for one. It
     // is owed first, so a run killed while it writes leaves it to the next
     // start of ha in this project. The exit waits at most
-    // `SESSION_LOG_EXIT_WAIT` for it; a log that takes longer stays owed.
+    // `SESSION_LOG_EXIT_WAIT` for it; a log that takes longer stays owed. (It
+    // was 30 seconds: a log written with the logs the conversation was given
+    // in front of the model, at the highest thinking, took 27 and then more.)
     if provider_config.is_some()
         && !cancellation.is_cancelled()
         && super::session_log::enabled(&context.paths.config_file, environment)
     {
-        const SESSION_LOG_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+        const SESSION_LOG_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
         let root = &context.project.root;
         super::session_log::owe(
             &context.project_store_dir(),

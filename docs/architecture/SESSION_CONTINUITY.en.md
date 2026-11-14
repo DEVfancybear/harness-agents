@@ -99,7 +99,7 @@ through.
 - when the conversation is left: `/new`, `/resume` of another, `/fork` or `/clone`, and
   the chat's exit (`/quit`, Ctrl-D) - at once, so the next conversation's start may already
   find it (if it is still being written, the start falls back to the last turns);
-- at the end of an `ha exec` run, before the process exits (waiting at most 30 seconds; a log that takes longer stays owed);
+- at the end of an `ha exec` run, before the process exits (waiting at most 90 seconds; a log that takes longer stays owed);
 - when the session goes quiet - the moment the idle review runs, 10 minutes after the
   last turn (`HA_IDLE_REVIEW_SECONDS`), when no later turn of the same conversation
   started meanwhile (a turn of another conversation does not stop it); after a failed or
