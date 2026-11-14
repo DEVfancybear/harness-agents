@@ -215,8 +215,9 @@ finding, which a later session cannot read.
   conversations that name what the request - the goal and what the user typed -
   names, after the newest log it was always shown. A word of the request tells
   logs apart when at most a quarter of the logs hold it anywhere (a statistic of
-  the logs, not a list of words); a log is related when its topic or its Quick
-  Reference holds a telling word. With fewer than four logs words tell nothing
+  the logs, not a list of words); a log is related when its topic, its
+  keywords or its projects hold a telling word (the names it goes by, not the
+  sentence of its outcome). With fewer than four logs words tell nothing
   and none is chosen. Related logs are ranked by how many telling words they
   hold, then by the words' weight (BM25 idf), then by being newer. Each is shown
   with its outcome and the sections that hold what it found, inside

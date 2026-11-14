@@ -218,7 +218,8 @@ mà phiên sau không đọc được.
   dùng gõ - nêu, thêm vào log mới nhất vốn vẫn luôn được cho xem. Một từ của yêu
   cầu phân biệt được các log khi không quá một phần tư số log chứa nó ở bất kỳ
   đâu (một thống kê của chính các log, không phải danh sách từ); một log liên quan
-  khi topic hoặc Quick Reference của nó chứa một từ phân biệt được. Dưới bốn log
+  khi topic, keywords hoặc projects của nó chứa một từ phân biệt được (những tên
+  gọi của log, không phải câu outcome). Dưới bốn log
   thì từ không phân biệt được gì và không log nào được chọn. Các log liên quan
   xếp theo số từ phân biệt được mà chúng chứa, rồi theo trọng số của các từ đó
   (idf của BM25), rồi theo cái mới hơn. Mỗi log hiện cùng outcome và các mục chứa

@@ -69,8 +69,10 @@ echo "################ 4. /preserve keeps AGENTS.md short, with an archive"
 {
   echo "# Agents"
   echo
-  echo "## Commands (PROTECTED)"
-  echo "- test: python -m pytest"
+  # A convention, not a command: a protected command the project cannot run
+  # (pytest, with no tests) made the model stop and ask before it edited.
+  echo "## Conventions (PROTECTED)"
+  echo "- Decisions go in DECISIONS.md, newest first."
   echo
   echo "## Session Notes (2026-01-05) (ARCHIVABLE)"
   for index in $(seq 1 200); do echo "- old note $index about a finished spike"; done
@@ -78,8 +80,9 @@ echo "################ 4. /preserve keeps AGENTS.md short, with an archive"
 (cd "$P" && git add -A && git -c user.name=t -c user.email=t@t commit -qm agents)
 "$HA" send l2 "/preserve" --wait > "$RX/preserve.out" 2>&1
 tail -6 "$RX/preserve.out" | sed 's/^/   /'
+check "precondition: the /preserve turn ended without a question to the user" '! grep -q "waiting for input" "$RX/preserve.out"'
 check "AGENTS.md is at most 200 lines" '[ "$(wc -l < "$P/AGENTS.md")" -le 200 ]'
-check "the protected section stayed" 'grep -q "python -m pytest" "$P/AGENTS.md"'
+check "the protected section stayed" 'grep -q "newest first" "$P/AGENTS.md"'
 check "the archivable notes moved to AGENTS-Archive.md" '[ -f "$P/AGENTS-Archive.md" ] && grep -q "old note 150" "$P/AGENTS-Archive.md" && grep -q "^## Archived: " "$P/AGENTS-Archive.md"'
 check "it says the line count" 'grep -qiE "[0-9]+ (lines?|dòng)|(line count|số dòng)[^0-9]{0,6}[0-9]+" "$RX/preserve.out"'
 "$HA" shutdown --force >/dev/null 2>&1

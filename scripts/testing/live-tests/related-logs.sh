@@ -213,9 +213,9 @@ echo "   seeded: $(ls "$S" | wc -l) logs"
 check "precondition: ten logs were seeded" '[ "$(ls "$S" | wc -l)" -eq 10 ]'
 
 # The rule of the host, restated for the seed: a word of the prompt tells when
-# at most a quarter of the logs hold it; a log is related when its topic or
-# Quick Reference holds one. `seed_related <prompt>` prints the logs it
-# relates (by their first keyword), so a seed that cannot give the answer the
+# at most a quarter of the logs hold it; a log is related when its topic, its
+# keywords or its projects hold one (not its outcome, a sentence).
+# `seed_related <prompt>` prints the logs it relates (by their first keyword), so a seed that cannot give the answer the
 # checks expect is a failed precondition, not a failed feature.
 seed_related() {
   "$PY" - "$S" "$1" <<'PYEOF' | tr -d '\r'
@@ -227,8 +227,8 @@ for path in glob.glob(os.path.join(sys.argv[1], "*.md")):
     text = open(path, encoding="utf-8").read()
     body = "\n".join(l for l in text.splitlines() if not re.match(r"\s*\*\*(Conversation|Through|Written):\*\*", l))
     topic = text.splitlines()[0].split(" - ", 1)[1]
-    reference = body.split("## Quick Reference (for AI scanning)")[1].split("\n## ")[0]
-    logs.append((os.path.basename(path), words(body), words(topic + " " + reference)))
+    names = " ".join(l.split(":**", 1)[1] for l in body.splitlines() if re.match(r"\s*\*\*(Confidence keywords|Projects):\*\*", l))
+    logs.append((os.path.basename(path), words(body), words(topic + " " + names)))
 asked = words(sys.argv[2])
 telling = {w for w in asked if 0 < sum(w in held for _, held, _ in logs) * 4 <= len(logs)}
 print(" ".join(sorted(name for name, _, trigger in logs if telling & trigger)))
@@ -262,6 +262,9 @@ fi
 
 echo "################ 2. a prompt that names nothing the logs hold gets none"
 since2=$(now_ms)
+# "and" is a word of this prompt and of the second ticket log's outcome, and of
+# no other log: rare enough to tell, but no name of the log. A build that
+# matched the outcome too (5f8d5a9) related that log by it: 1 of 10.
 PROMPT2="MARK-L2. Describe the colour of the sky at noon in one short sentence and call no tools."
 check "precondition: the first run wrote no log of its own (ten candidates)" '[ "$(ls "$S" | wc -l)" -eq 10 ]'
 check "precondition: no word of the prompt relates a log in the seed" '[ -z "$(seed_related "$PROMPT2")" ]'

@@ -42,7 +42,7 @@
 //!   keywords.
 //! - Retrieval is by the words of the request ([`related_logs`]): a word tells
 //!   logs apart when at most a quarter of them hold it, and a log is related
-//!   when its topic and Quick Reference hold one. No word list; with fewer than
+//!   when its topic, keywords or projects hold one. No word list; with fewer than
 //!   [`MIN_RELATED_CANDIDATES`] logs words tell nothing and only the newest log
 //!   is shown.
 //! - The revision: the logs a conversation was given are read from its first
@@ -183,6 +183,10 @@ const WRITTEN_FIELD: &str = "**Written:**";
 const HOST_FIELDS: [&str; 3] = [CONVERSATION_FIELD, THROUGH_FIELD, WRITTEN_FIELD];
 
 const QUICK_REFERENCE: &str = "Quick Reference (for AI scanning)";
+/// The Quick Reference fields that name a log: with its topic, what a request
+/// is matched against ([`related_logs`]).
+const KEYWORDS_FIELD: &str = "**Confidence keywords:**";
+const PROJECTS_FIELD: &str = "**Projects:**";
 const QUICK_RESUME: &str = "Quick Resume Context";
 const PENDING_TASKS: &str = "Pending Tasks";
 
@@ -1978,7 +1982,7 @@ pub(super) async fn start_block(
 const START_TOKENS: u64 = 1_500;
 
 /// A related log: the log, and the words of the request that told it apart
-/// from the other logs and that its topic or Quick Reference holds.
+/// from the other logs and that its topic, keywords or projects hold.
 #[derive(Debug)]
 struct Related<'a> {
     log: &'a SessionLog,
@@ -2003,8 +2007,10 @@ fn without_host_fields(text: &str) -> String {
 /// A word of the request *tells* when at most one in [`TELLING_SHARE`] of the
 /// candidates hold it anywhere in their text: a statistic of the logs, so an
 /// identifier few logs hold tells, and a word most hold does not. A log is
-/// related when its trigger - its topic and its Quick Reference, which is its
-/// keywords, projects and outcome - holds a telling word. With fewer than
+/// related when its trigger - the names it goes by: its topic, its keywords
+/// and its projects - holds a telling word. The outcome is a sentence, and in
+/// a handful of short logs a word of any sentence ("and") is rare enough to
+/// tell, so it is no trigger. With fewer than
 /// [`MIN_RELATED_CANDIDATES`] candidates none is chosen. Related logs are
 /// ranked by how many telling words they hold, then by the weight of those
 /// words (BM25's idf over the candidates), then by being newer.
@@ -2042,10 +2048,12 @@ fn related_logs<'a>(candidates: &[&'a SessionLog], request: &str) -> Vec<Related
     let mut related = candidates
         .iter()
         .filter_map(|log| {
+            let reference = section_body(&log.text, QUICK_REFERENCE).unwrap_or_default();
             let trigger = harness_types::readout::words(&format!(
-                "{} {}",
+                "{} {} {}",
                 log.topic,
-                without_host_fields(&section_body(&log.text, QUICK_REFERENCE).unwrap_or_default())
+                field(&reference, KEYWORDS_FIELD).unwrap_or_default(),
+                field(&reference, PROJECTS_FIELD).unwrap_or_default()
             ))
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
@@ -3695,6 +3703,29 @@ mod tests {
         assert!(related_logs(&refs(&logs), "").is_empty());
         // A name no log holds finds none.
         assert!(related_logs(&refs(&logs), "ZZQ-9999").is_empty());
+    }
+
+    /// In a handful of short logs a word of any sentence is rare: "and" is in
+    /// one outcome here and in no other log. It tells, and names nothing.
+    #[test]
+    fn a_word_of_the_outcome_sentence_names_no_log() {
+        let root = tempfile::tempdir().expect("root");
+        fillers(root.path(), 9);
+        put(
+            root.path(),
+            "task_o",
+            &Draft::parse(
+                "# Session Log: 2026-11-10 - Nightly job\n\n## Quick Reference (for AI scanning)\n**Confidence keywords:** nightly, queue\n**Projects:** cli\n**Outcome:** It came back and the flag held.\n\n## Key Learnings\n- something\n\n---\n\n## Quick Resume Context\nResume.",
+            )
+            .expect("a log"),
+            "2026-11-12T10:00:00+07:00",
+        );
+        let logs = logs_of(root.path());
+        assert!(related_logs(&refs(&logs), "the sky and the sea").is_empty());
+        assert_eq!(
+            conversations(&related_logs(&refs(&logs), "the nightly run")),
+            ["task_o"]
+        );
     }
 
     #[test]
