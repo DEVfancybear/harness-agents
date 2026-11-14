@@ -67,6 +67,19 @@ fn exec_offers_the_skill_that_fits_once_per_conversation() {
         "Use when the user asks for release notes or a changelog entry.",
         "Add the entry at the top of the changelog, one bullet per change.",
     );
+    // Words decide only in a library of four or more: two about other things.
+    learned_skill(
+        root.path(),
+        "image-resize",
+        "Use when asked to resize product images for the storefront.",
+        "Resize every product image to 800 pixels wide.",
+    );
+    learned_skill(
+        root.path(),
+        "log-rotation",
+        "Use when asked to rotate and compress the server logs.",
+        "Rotate the server logs at midnight and compress the old files.",
+    );
     let prompt = "run the database migration against staging";
     let first = run(
         root.path(),
