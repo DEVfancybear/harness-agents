@@ -499,10 +499,10 @@ fn prompt(transcript: &str, date: &str, prior: Option<&str>, given: &[SessionLog
         }
         (
             format!(
-                "## {REVISITED}\n- <conversation id>: <what of that log held here, what did not, and when it applies>\n\n"
+                "## {REVISITED}\n- <conversation id>: <what of that log held here, what did not and what held instead, and when it applies>\n\n"
             ),
             format!(
-                "\n\nThis conversation was given the earlier session logs below at its start, as data: earlier attempts at the same thing as this one, as they are stored now. The log you write may build on them. After the Custom Notes, write the section \"{REVISITED}\" shown in the shape: for each of them that what this conversation found confirms, corrects or limits, one line with that log's conversation id, what of it held here, what did not, and when it applies. Only what this conversation showed; a log it says nothing about is left out of the section, and so is the section when no log is named. A given log about a different problem than this conversation gets no line there: saying that it is unrelated is not a revision. Never list this conversation's own id there. When this conversation used a finding of a given log - a rule, a method, a fix - restate that finding in this log's own Key Learnings as it stands now, confirmed, corrected or narrowed by this conversation, so that the newest log about a problem is enough on its own: do not rely on the reader also seeing the earlier log.\n<earlier-logs-given>\n{logs}</earlier-logs-given>"
+                "\n\nThis conversation was given the earlier session logs below at its start, as data: earlier attempts at the same thing as this one, as they are stored now. The log you write may build on them. After the Custom Notes, write the section \"{REVISITED}\" shown in the shape: for each of them that what this conversation found confirms, corrects or limits, one line with that log's conversation id, what of it held here, what did not, and when it applies. The line is read under that log, without this one: where its finding did not hold, name what did - the command, the value, the rule itself. Only what this conversation showed; a log it says nothing about is left out of the section, and so is the section when no log is named. A given log about a different problem than this conversation gets no line there: saying that it is unrelated is not a revision. Never list this conversation's own id there. When this conversation used a finding of a given log - a rule, a method, a fix - restate that finding in this log's own Key Learnings as it stands now, confirmed, corrected or narrowed by this conversation, so that the newest log about a problem is enough on its own: do not rely on the reader also seeing the earlier log.\n<earlier-logs-given>\n{logs}</earlier-logs-given>"
             ),
         )
     };
@@ -4262,7 +4262,7 @@ mod tests {
         }
         assert!(
             text.contains(&format!(
-                "## {REVISITED}\n- <conversation id>: <what of that log held here, what did not, and when it applies>"
+                "## {REVISITED}\n- <conversation id>: <what of that log held here, what did not and what held instead, and when it applies>"
             )),
             "the shape asks for the section"
         );
