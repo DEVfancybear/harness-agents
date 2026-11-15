@@ -258,15 +258,18 @@ impl Job {
 
     /// Take `other`'s work into this job: the newer span is read (a session
     /// read whole stays whole), the turns add up, and the skills in play join.
+    /// `newer` says `other` is the newer of the two: the caller knows which
+    /// came in later, and the clock does not (two jobs written within one
+    /// millisecond carry one time, and the older one's span was then read).
     /// `sooner` takes the earlier of the two times - new work brings a retry
     /// forward - else the later stands (a failure's backoff is kept).
-    fn absorb(&mut self, other: &Self, sooner: bool) {
+    fn absorb(&mut self, other: &Self, newer: bool, sooner: bool) {
         if other.session == self.session {
             self.whole |= other.whole;
             if self.before.is_none() {
                 self.before.clone_from(&other.before);
             }
-        } else if other.enqueued_at >= self.enqueued_at {
+        } else if newer {
             self.session.clone_from(&other.session);
             self.whole = other.whole;
             self.before.clone_from(&other.before);
@@ -275,7 +278,7 @@ impl Job {
         // The newer job names the store as it is now: a store that moved
         // (`ha project rekey`, a repository found again) left this job its
         // old directory.
-        if other.enqueued_at >= self.enqueued_at && other.project.is_some() {
+        if newer && other.project.is_some() {
             self.project.clone_from(&other.project);
         }
         self.turns = self.turns.saturating_add(other.turns);
@@ -496,7 +499,7 @@ pub fn enqueue(data_dir: &Path, job: Job) -> Result<Job, String> {
         waiting.claimed = None;
         // New turns bring a review that failed forward; an upkeep pass,
         // asked for again at every turn's end, keeps its backoff.
-        waiting.absorb(&job, job.kind == Kind::Review);
+        waiting.absorb(&job, true, job.kind == Kind::Review);
         (waiting, true)
     } else {
         let id = format!(
@@ -764,7 +767,7 @@ impl Claimed {
                 .flatten();
             match newer {
                 Some(mut newer) => {
-                    newer.absorb(&job, false);
+                    newer.absorb(&job, false, false);
                     save(&self.data_dir, &newer)?;
                     std::fs::remove_file(job_path(&self.data_dir, &job.id))
                         .map_err(|error| error.to_string())
@@ -1053,6 +1056,28 @@ mod tests {
         assert_eq!(kept[0].attempts, 1);
         assert_eq!(kept[0].error_class.as_deref(), Some("timeout"));
         assert!(kept[0].next_at > chrono::Utc::now().timestamp_millis());
+    }
+
+    /// Two jobs written within one millisecond carry one time. The job that
+    /// came in while the other ran is the newer, and its span is the one read:
+    /// by the time alone the failed job's span replaced it (a Linux runner
+    /// wrote both in one millisecond).
+    #[test]
+    fn a_failed_job_joins_the_one_that_came_in_meanwhile_whatever_the_clock_says() {
+        let directory = tempfile::tempdir().expect("dir");
+        let data = directory.path();
+        enqueue(data, review("task-1", "s1", 1)).expect("enqueued");
+        let running = claim(data, |_| true).expect("claim").expect("due");
+        let later = enqueue(data, review("task-1", "s2", 1)).expect("more work");
+        // The same millisecond, as a fast machine writes them.
+        let mut later = later;
+        later.enqueued_at = running.job.enqueued_at;
+        super::save(data, &later).expect("saved");
+        running.failed("the refinement model call timed out");
+        let kept = jobs(data);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].session.as_deref(), Some("s2"));
+        assert_eq!(kept[0].turns, 2);
     }
 
     #[test]
