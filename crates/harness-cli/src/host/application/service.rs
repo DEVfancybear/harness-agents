@@ -1312,6 +1312,10 @@ struct Given {
     cut: std::collections::BTreeSet<String>,
     /// The catalog of learned skills.
     catalog: bool,
+    /// Those of `skills` the model activated, whose text is the result of the
+    /// call: the conversation is sent that result, so the skill's block is
+    /// not put in a later turn's packet as well.
+    activated: std::collections::BTreeSet<String>,
 }
 
 impl Given {
@@ -1320,6 +1324,21 @@ impl Given {
     fn held(&self) -> std::collections::BTreeSet<String> {
         self.skills.difference(&self.cut).cloned().collect()
     }
+}
+
+/// The blocks of the skills active in this process that a turn's packet
+/// carries: not those the model activated whose result the conversation still
+/// sends whole (`activated`). Their text is in that result, at every turn, and
+/// the packet gave it a second time.
+fn active_skill_blocks<'a>(
+    active: impl IntoIterator<Item = (&'a String, harness_session::ContextBlock)>,
+    activated: &std::collections::BTreeSet<String>,
+) -> Vec<harness_session::ContextBlock> {
+    active
+        .into_iter()
+        .filter(|(name, _)| !activated.contains(*name))
+        .map(|(_, block)| block)
+        .collect()
 }
 
 /// What the conversation that `head` ends already holds of the learned skills,
@@ -1363,11 +1382,13 @@ async fn skills_given(store: &SqliteStore, head: Option<&SessionId>) -> Given {
         )
         .await
         {
-            given.skills.extend(
-                results
-                    .iter()
-                    .filter_map(|result| super::skill_recall::held_in_result(result)),
-            );
+            for name in results
+                .iter()
+                .filter_map(|result| super::skill_recall::held_in_result(result))
+            {
+                given.activated.insert(name.clone());
+                given.skills.insert(name);
+            }
         }
         current = harness_runtime::previous_in_conversation(store, &session)
             .await
@@ -1417,11 +1438,20 @@ pub(crate) async fn offer_skill(
     turn_skills: Option<&super::skills::HeldSkills>,
 ) -> Option<SkillOffer> {
     let skills = super::learned::library(layers);
-    if skills.is_empty() {
-        return None;
-    }
     let given = skills_given(store, head).await;
     let mut in_context = given.held();
+    if skills.is_empty() {
+        // No learned skill to offer, and still a conversation that may hold a
+        // skill the model activated - one ha ships, say: `activate_skill`
+        // answers from this set. It was left empty here, so after `ha exec
+        // --resume` such a skill was loaded again at every turn.
+        if let Some(shared) = turn_skills
+            && let Ok(mut shared) = shared.lock()
+        {
+            shared.clone_from(&in_context);
+        }
+        return None;
+    }
     let considered = super::skill_recall::query(goal, typed, earlier)
         .map(|request| super::skill_recall::consider(layers, &skills, &request));
     let recalled = considered
@@ -10719,12 +10749,14 @@ async fn run_turn(
         .await,
     );
     project_blocks.extend(markdown_memory);
+    // A skill the model activated is in the result of that call, which the
+    // conversation is sent at every turn; one the user ran is only here.
+    let activated = skills_given(&store, source.as_ref()).await.activated;
     if let Ok(active) = active_skills.lock() {
-        project_blocks.extend(
-            active
-                .values()
-                .map(harness_extensions::SkillActivation::block),
-        );
+        project_blocks.extend(active_skill_blocks(
+            active.iter().map(|(name, skill)| (name, skill.block())),
+            &activated,
+        ));
     }
     if let GoalRecord::Active(objective) = &goal {
         project_blocks.push(super::goal::goal_block(objective));
@@ -16048,6 +16080,37 @@ mod skill_offer_tests {
             super::offer_skill(&self.store, layers, head, None, request, &[], None).await
         }
 
+        /// A tool result of the turn `session`, as the store records one.
+        async fn tool_result(&self, session: &SessionId, call: &str, text: &str) {
+            let payload = serde_json::json!({"model_view": {"call_id": call, "text": text}})
+                .as_object()
+                .expect("object")
+                .clone();
+            self.store
+                .append_event_for_test(harness_types::EventEnvelope {
+                    schema_version: harness_types::P0_SCHEMA_VERSION,
+                    event_id: harness_types::EventId::generate(),
+                    session_id: session.clone(),
+                    seq: self.store.next_sequence(session).await.expect("sequence"),
+                    event_type: "receipt.recorded".to_owned(),
+                    producer: harness_types::ProducerIdentity {
+                        plugin_id: "fixture".to_owned(),
+                        implementation_version: "1".to_owned(),
+                    },
+                    authority: harness_types::SourceAuthority::RuntimeObserved,
+                    correlation_id: None,
+                    causation_id: None,
+                    continuity_critical: false,
+                    payload_hash: harness_types::ContentHash::from_canonical_json(
+                        &serde_json::Value::Object(payload.clone()),
+                    )
+                    .expect("hash"),
+                    payload,
+                })
+                .await
+                .expect("the receipt is stored");
+        }
+
         /// [`Self::offer`] with the set the turn's `activate_skill` answers from.
         async fn offer_held(
             &self,
@@ -16393,6 +16456,33 @@ mod skill_offer_tests {
         );
     }
 
+    /// The packet of a later turn leaves out the block of a skill the model
+    /// activated, whose text the conversation is sent in the call's result,
+    /// and keeps the block of a skill the user ran. Both were in the packet,
+    /// so an activated skill was given twice at every later turn.
+    #[test]
+    fn a_later_packet_leaves_out_the_block_of_a_skill_the_result_holds() {
+        let block = |name: &str| {
+            harness_session::ContextBlock::mandatory(
+                format!("skill:{name}@1"),
+                harness_session::ContextBlockKind::Skill,
+                "text",
+            )
+        };
+        let (ran, activated) = ("db-migration".to_owned(), "release-notes".to_owned());
+        let held = std::collections::BTreeSet::from([activated.clone()]);
+        let kept = super::active_skill_blocks(
+            [(&ran, block(&ran)), (&activated, block(&activated))],
+            &held,
+        );
+        assert_eq!(
+            kept.iter()
+                .map(|block| block.id.as_str())
+                .collect::<Vec<_>>(),
+            ["skill:db-migration@1"]
+        );
+    }
+
     /// The result of an `activate_skill` call carries the skill, and a later
     /// turn reads it from there: the catalog leaves the skill out. Fails
     /// without the change: only the packets were read, and a skill the model
@@ -16420,38 +16510,7 @@ mod skill_offer_tests {
             "{}release-notes: its instructions follow, and they stay in this conversation from here on; activating it again adds nothing.\n<skill name=\"release-notes\">\nAdd the entry at the top.\n</skill>",
             harness_tools::SKILL_ACTIVATED_PREFIX
         );
-        let payload = serde_json::json!({"model_view": {"call_id": "call_0", "text": result}})
-            .as_object()
-            .expect("object")
-            .clone();
-        conversation
-            .store
-            .append_event_for_test(harness_types::EventEnvelope {
-                schema_version: harness_types::P0_SCHEMA_VERSION,
-                event_id: harness_types::EventId::generate(),
-                session_id: first.clone(),
-                seq: conversation
-                    .store
-                    .next_sequence(&first)
-                    .await
-                    .expect("sequence"),
-                event_type: "receipt.recorded".to_owned(),
-                producer: harness_types::ProducerIdentity {
-                    plugin_id: "fixture".to_owned(),
-                    implementation_version: "1".to_owned(),
-                },
-                authority: harness_types::SourceAuthority::RuntimeObserved,
-                correlation_id: None,
-                causation_id: None,
-                continuity_critical: false,
-                payload_hash: harness_types::ContentHash::from_canonical_json(
-                    &serde_json::Value::Object(payload.clone()),
-                )
-                .expect("hash"),
-                payload,
-            })
-            .await
-            .expect("the receipt is stored");
+        conversation.tool_result(&first, "call_0", &result).await;
         let held = super::super::skills::HeldSkills::default();
         let catalog = conversation
             .offer_held(&layers, &first, &held)
@@ -16466,6 +16525,21 @@ mod skill_offer_tests {
         assert!(
             text.contains("- db-migration:") && !text.contains("release-notes"),
             "{text}"
+        );
+        // A library with no learned skill offers nothing, and `activate_skill`
+        // still answers from what the conversation holds.
+        let empty = tempfile::tempdir().expect("dir");
+        let no_skills = layers_with(empty.path(), &[]);
+        let held_anyway = super::super::skills::HeldSkills::default();
+        assert!(
+            conversation
+                .offer_held(&no_skills, &first, &held_anyway)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            held_anyway.lock().expect("held").iter().collect::<Vec<_>>(),
+            ["release-notes"]
         );
         // The turn shortened that result to save room: the text is gone, so the
         // skill is not held and the catalog lists it again.
