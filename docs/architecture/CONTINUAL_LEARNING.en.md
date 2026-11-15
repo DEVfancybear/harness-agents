@@ -215,11 +215,14 @@ finding, which a later session cannot read.
   conversations that name what the request - the goal and what the user typed -
   names, after the newest log it was always shown. A word of the request tells
   logs apart when at most a quarter of the logs hold it anywhere (a statistic of
-  the logs, not a list of words); a log is related when its topic, its
-  keywords or its projects hold a telling word (the names it goes by, not the
-  sentence of its outcome). With fewer than four logs words tell nothing
-  and none is chosen. Related logs are ranked by how many telling words they
-  hold, then by the words' weight (BM25 idf), then by being newer. Each is shown
+  the logs, not a list of words); a telling word matches a log when its topic,
+  its keywords or its projects hold it (the names it goes by, not the sentence
+  of its outcome). A log is related when a telling word matches it. With fewer
+  than four logs words tell nothing and none is chosen. Related logs are ranked
+  by the rarest word that matches each (the fewest logs hold it), then by the
+  weight (BM25 idf) of all the words that match it, then by being newer. So
+  words many logs share, such as "submit" or "request", cannot lift the logs of
+  another problem over the logs of the one the request names. Each is shown
   with its outcome and the sections that hold what it found, inside
   `<session-log conversation="...">`, as historical reference: what it found
   need not be found again, but it is checked against what is in front of the
@@ -231,7 +234,15 @@ finding, which a later session cannot read.
   unsolved problem is said so in the Outcome, with what was tried, what each
   attempt showed and what is still unknown; and a problem with a name of its own
   (a ticket, an identifier, an error text, a file) comes first in the keywords,
-  as the conversation writes it.
+  as the conversation writes it. When such a problem may come back with
+  different inputs, the log records what carries over - the rule, the method,
+  the cause, how the answer was reached - apart from this session's particular
+  values; an answer that fits only this session's input is recorded as that,
+  with the input it was for, and when no rule was established the log says which
+  candidate rules were tried and what refuted each. A conversation that used a
+  finding of a log it was given restates it in its own Key Learnings as it now
+  stands, so the newest log about a problem is enough on its own; a given log
+  about another problem gets no line in `## Earlier Logs Revisited`.
 - **Revised by the next visit.** The logs a conversation was shown are read from
   its first turn's packet. When its log is written, the model also sees those
   logs, and says in `## Earlier Logs Revisited` which of them this conversation

@@ -171,7 +171,11 @@ Prompt đầu tiên của hội thoại mới nghe về hội thoại trước �
 - Lượt đầu của hội thoại mới còn nghe về các log của hội thoại trước nêu điều yêu cầu của nó
   nêu (`related-session-logs`, trên kênh reference, trong app và trong `ha exec`; không có
   trong hội thoại được resume): tối đa 3 log, chọn theo những từ của yêu cầu mà không quá một
-  phần tư số log chứa, mỗi log kèm outcome, các ghi chú mà cuộc hội thoại sau để lại dưới nó
+  phần tư số log chứa và có trong topic, keywords hoặc projects của log, xếp theo từ hiếm nhất
+  như vậy mà mỗi log chứa (nên từ nhiều log cùng có không thể đẩy log của vấn đề khác lên trên
+  log của vấn đề mà yêu cầu nêu tên), rồi theo trọng số của các từ khớp với nó, rồi theo cái
+  mới hơn.
+  Mỗi log kèm outcome, các ghi chú mà cuộc hội thoại sau để lại dưới nó
   (hiện trước) và các mục learnings, fixes, errors, decisions, trong
   `<session-log conversation="...">`. Đó là lời của chính log, tài liệu lịch sử: điều nó tìm
   ra không cần tìm lại, và cuộc hội thoại đối chiếu nó với repository. Dưới 4 log thì từ không

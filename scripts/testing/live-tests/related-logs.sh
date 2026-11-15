@@ -214,7 +214,8 @@ check "precondition: ten logs were seeded" '[ "$(ls "$S" | wc -l)" -eq 10 ]'
 
 # The rule of the host, restated for the seed: a word of the prompt tells when
 # at most a quarter of the logs hold it; a log is related when its topic, its
-# keywords or its projects hold one (not its outcome, a sentence).
+# keywords or its projects hold one (not its outcome, a sentence); the three
+# whose rarest such word the fewest logs hold are kept.
 # `seed_related <prompt>` prints the logs it relates (by their first keyword), so a seed that cannot give the answer the
 # checks expect is a failed precondition, not a failed feature.
 seed_related() {
@@ -231,7 +232,10 @@ for path in glob.glob(os.path.join(sys.argv[1], "*.md")):
     logs.append((os.path.basename(path), words(body), words(topic + " " + names)))
 asked = words(sys.argv[2])
 telling = {w for w in asked if 0 < sum(w in held for _, held, _ in logs) * 4 <= len(logs)}
-print(" ".join(sorted(name for name, _, trigger in logs if telling & trigger)))
+# Related: the logs a telling word matches, the rarest word's first, three kept.
+doc_freq = lambda w: sum(w in held for _, held, _ in logs)
+related = sorted((min(doc_freq(w) for w in telling & trigger), name) for name, _, trigger in logs if telling & trigger)
+print(" ".join(sorted(name for _, name in related[:3])))
 PYEOF
 }
 

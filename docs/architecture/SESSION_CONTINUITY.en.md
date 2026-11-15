@@ -179,7 +179,10 @@ The first prompt of a new conversation hears of the previous one once:
 - A new conversation's first turn also hears of the logs of earlier conversations that name
   what its request names (`related-session-logs`, on the reference channel, in the app and in
   `ha exec`; not in a resumed conversation): up to 3 logs, chosen by the words of the request
-  that at most a quarter of the logs hold, each with its outcome, the notes later conversations
+  that at most a quarter of the logs hold and that a log's topic, keywords or projects hold,
+  ranked by the rarest such word each log holds (so words many logs share cannot lift the log
+  of another problem over the logs of the one the request names), then by the weight of the
+  words that match it, then by being newer. Each comes with its outcome, the notes later conversations
   left under it (first) and its learnings, fixes, errors and decisions, in
   `<session-log conversation="...">`. It is the log's own words, historical reference: what
   it found need not be found again, and the conversation checks it against the repository.

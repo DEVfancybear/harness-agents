@@ -217,12 +217,14 @@ mà phiên sau không đọc được.
   ba log của các cuộc hội thoại trước nêu điều yêu cầu - goal và những gì người
   dùng gõ - nêu, thêm vào log mới nhất vốn vẫn luôn được cho xem. Một từ của yêu
   cầu phân biệt được các log khi không quá một phần tư số log chứa nó ở bất kỳ
-  đâu (một thống kê của chính các log, không phải danh sách từ); một log liên quan
-  khi topic, keywords hoặc projects của nó chứa một từ phân biệt được (những tên
-  gọi của log, không phải câu outcome). Dưới bốn log
-  thì từ không phân biệt được gì và không log nào được chọn. Các log liên quan
-  xếp theo số từ phân biệt được mà chúng chứa, rồi theo trọng số của các từ đó
-  (idf của BM25), rồi theo cái mới hơn. Mỗi log hiện cùng outcome và các mục chứa
+  đâu (một thống kê của chính các log, không phải danh sách từ); một từ phân biệt
+  được khớp với một log khi topic, keywords hoặc projects của log chứa nó (những
+  tên gọi của log, không phải câu outcome). Một log liên quan khi có một từ phân
+  biệt được khớp với nó. Dưới bốn log thì từ không phân biệt được gì và không log
+  nào được chọn. Các log liên quan xếp theo từ hiếm nhất khớp với từng log (ít log
+  chứa nhất), rồi theo trọng số (idf của BM25) của mọi từ khớp với nó, rồi theo
+  cái mới hơn. Nhờ vậy những từ nhiều log cùng có, như "submit" hay "request",
+  không thể đẩy log của vấn đề khác lên trên log của vấn đề mà yêu cầu nêu tên. Mỗi log hiện cùng outcome và các mục chứa
   điều nó đã tìm ra, trong `<session-log conversation="...">`, như tài liệu lịch
   sử: điều nó tìm ra không cần tìm lại, nhưng phải đối chiếu với thứ agent đang
   thấy, và outcome nó báo không phải bằng chứng xác minh. Log của cuộc hội thoại
@@ -233,6 +235,15 @@ mà phiên sau không đọc được.
   nói thế trong Outcome, kèm điều đã thử, mỗi lần thử cho thấy gì và điều còn
   chưa biết; còn vấn đề mang tên riêng (một ticket, một mã định danh, một dòng
   lỗi, một file) được đặt đầu tiên trong keywords, đúng như cuộc hội thoại viết.
+  Khi vấn đề như vậy có thể quay lại với đầu vào khác, log ghi điều được mang
+  sang lần sau - quy tắc, phương pháp, nguyên nhân, cách đi tới đáp án - tách
+  khỏi các giá trị riêng của phiên này; đáp án chỉ khớp với đầu vào của phiên này
+  thì được ghi đúng như thế, kèm đầu vào mà nó dành cho, và khi chưa xác lập được
+  quy tắc nào thì log nói đã thử những quy tắc ứng viên nào và điều gì bác bỏ
+  từng quy tắc. Cuộc hội thoại đã dùng một phát hiện của log được cho xem thì
+  viết lại phát hiện đó trong Key Learnings của chính nó, đúng như hiện nay, để
+  log mới nhất về một vấn đề tự đủ dùng; log được cho xem mà thuộc vấn đề khác
+  thì không có dòng nào trong `## Earlier Logs Revisited`.
 - **Được lượt sau sửa lại.** Các log mà một cuộc hội thoại đã được cho xem được
   đọc từ packet của lượt đầu. Khi log của nó được ghi, model cũng thấy các log đó
   và nói trong `## Earlier Logs Revisited` log nào trong số đó cuộc hội thoại này
