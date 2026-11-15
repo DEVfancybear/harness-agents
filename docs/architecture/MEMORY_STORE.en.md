@@ -1050,7 +1050,8 @@ one with `..` or a drive is refused, and so is one that does not parse
   every step, so the provider's cache holds it; a block added to the
   packet in the middle of a turn would reach the model only at the next turn.
   The result reaches the next call, as the instructions of a directory a call
-  reached do (`NestedInstructions`).
+  reached do (`NestedInstructions`), and as the text of a skill the model
+  activates does (the result of `activate_skill`).
 - **Once per conversation.** The conversation's store records what it loaded
   (`scoped_loaded`: the entry's memory id, the path that loaded it, the time,
   and how many times the conversation had been compacted then, as its

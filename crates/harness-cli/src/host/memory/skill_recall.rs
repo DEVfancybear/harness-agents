@@ -397,6 +397,10 @@ fn is_tagged_note(text: &str) -> bool {
 /// expansion both carry the skill in a tag of this form.
 const GIVEN_MARKER: &str = "<skill name=\"";
 
+/// What a stored tool result holds when it may hold a skill ([`held_in_result`]),
+/// for the store to find those results without reading the others.
+pub const GIVEN_NEEDLE: &str = "<skill name=";
+
 /// The learned skills whose text `packet` (a message the conversation sent)
 /// holds: those a recall put in, and those the user ran with `/skill:`.
 #[must_use]
@@ -415,6 +419,27 @@ pub fn given_in(packet: &str) -> BTreeSet<String> {
         })
         .filter(|name| !name.is_empty())
         .collect()
+}
+
+/// The skill whose whole text `result` holds, when it is the result of an
+/// `activate_skill` call: the model asked for the skill and the result is its
+/// text, in the tag a recalled skill is given in.
+///
+/// Only a result that opens as an activation does (another tool's result may
+/// show the tag as text), that ends with the tag closed (a result clipped on
+/// replay lost its end), and that does not say the skill was cut for being
+/// longer than one result holds. The caller leaves out results shortened or
+/// dropped to save room.
+#[must_use]
+pub fn held_in_result(result: &str) -> Option<String> {
+    if !result.starts_with(harness_tools::SKILL_ACTIVATED_PREFIX)
+        || !result.trim_end().ends_with("</skill>")
+    {
+        return None;
+    }
+    let (_, rest) = result.split_once(GIVEN_MARKER)?;
+    let (name, text) = rest.split_once("\">")?;
+    (!name.is_empty() && !text.contains(harness_tools::SKILL_RESULT_CUT)).then(|| name.to_owned())
 }
 
 /// Whether a recalled body was cut at [`MAX_BODY_CHARS`].
@@ -1328,6 +1353,49 @@ mod tests {
             ["long-one", "short-one"]
         );
         assert!(super::cut_in("<skill name=\"short-one\">\nTrim.\n</skill>").is_empty());
+    }
+
+    fn activation_result(name: &str, body: &str) -> String {
+        format!(
+            "{}{name}: its instructions follow, and they stay in this conversation from here on; activating it again adds nothing.\n<skill name=\"{name}\">\n{body}\n</skill>",
+            harness_tools::SKILL_ACTIVATED_PREFIX
+        )
+    }
+
+    /// The result of `activate_skill` carries the skill in the tag a recall uses:
+    /// the packet scan finds it, and it counts as held when it is whole.
+    #[test]
+    fn a_skill_in_an_activation_result_is_one_the_conversation_holds() {
+        let result = activation_result("grid-rules", "The code word is QZ-7741-LIME.");
+        assert_eq!(
+            super::given_in(&result).into_iter().collect::<Vec<_>>(),
+            ["grid-rules"]
+        );
+        assert_eq!(
+            super::held_in_result(&result).as_deref(),
+            Some("grid-rules")
+        );
+        // Clipped on replay: the end, and the closing tag, are gone.
+        let clipped = format!("{}\n[truncated]", &result[..result.len() - 20]);
+        assert_eq!(super::held_in_result(&clipped), None);
+        // Cut for its length: the conversation holds part of it.
+        let cut = activation_result(
+            "grid-rules",
+            &format!("Start.\n{}", harness_tools::SKILL_RESULT_CUT),
+        );
+        assert_eq!(super::held_in_result(&cut), None);
+        // Another tool's result may show the tag as text.
+        assert_eq!(
+            super::held_in_result("<skill name=\"grid-rules\">\nText.\n</skill>"),
+            None
+        );
+        assert_eq!(
+            super::held_in_result(&format!(
+                "read_file x:\n{}",
+                activation_result("grid-rules", "Text.")
+            )),
+            None
+        );
     }
 
     #[test]

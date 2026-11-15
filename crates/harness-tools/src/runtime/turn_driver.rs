@@ -5597,18 +5597,51 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
                 ),
             }
         }
-        // The id says which skill and version; the digest and the channel are
-        // bookkeeping the model cannot use. What it can use is where the text
-        // is now: it asked again for skills whose text it already held.
-        ToolOutput::SkillActivated { block } => format!(
-            "activated skill {}: its instructions are now in this conversation's context, and activating it again adds nothing",
-            block.id
-        ),
+        // The skill's text is this result. It used to say the instructions were
+        // "now in this conversation's context" and leave them in a block of the
+        // request's rules, which a turn does not send after its first step: the
+        // model was told it held a skill it never saw, and asked for it again.
+        ToolOutput::SkillActivated { block } => render_skill_activated(block),
         // A refusal in words, not the debug form `Denied { code: .., reason: .. }`.
         ToolOutput::Denied { code, reason } => format!("{name} failed ({code}): {reason}"),
         ToolOutput::OutcomeUnknown { reason } => format!("{name} outcome unknown: {reason}"),
     };
     truncate_text(&body, TOOL_RESULT_LIMIT)
+}
+
+/// How the result of `activate_skill` opens. The host finds the skills a
+/// conversation holds by it.
+pub const SKILL_ACTIVATED_PREFIX: &str = "activated skill ";
+
+/// What ends a skill's text in an `activate_skill` result when the skill is
+/// longer than a tool result holds: the result then does not hold it whole.
+pub const SKILL_RESULT_CUT: &str = "…(cut: the skill is longer than one tool result holds)";
+
+/// An activated skill as the result the model reads: a line saying so, then the
+/// skill's text in the `<skill name>` tag a recalled skill uses.
+///
+/// A skill longer than [`TOOL_RESULT_LIMIT`] is cut inside its tag, with
+/// [`SKILL_RESULT_CUT`] said at the cut, so the tag is closed and the cut is
+/// told: a plain cut of the result dropped the closing tag and the notice with
+/// it, and the end of the skill looked like its end.
+fn render_skill_activated(block: &harness_session::ContextBlock) -> String {
+    // The block's id is `skill:<name>@<version>`.
+    let reference = block.id.strip_prefix("skill:").unwrap_or(&block.id);
+    let name = reference
+        .rsplit_once('@')
+        .map_or(reference, |(name, _)| name);
+    let head = format!(
+        "{SKILL_ACTIVATED_PREFIX}{name}: its instructions follow, and they stay in this conversation from here on; activating it again adds nothing.\n<skill name=\"{name}\">\n"
+    );
+    let tail = "\n</skill>";
+    let text = block.text.trim_end();
+    let room = TOOL_RESULT_LIMIT.saturating_sub(head.chars().count() + tail.len());
+    if text.chars().count() <= room {
+        return format!("{head}{text}{tail}");
+    }
+    let kept = room.saturating_sub(SKILL_RESULT_CUT.chars().count() + 1);
+    let kept = text.chars().take(kept).collect::<String>();
+    format!("{head}{kept}\n{SKILL_RESULT_CUT}{tail}")
 }
 
 /// An edit's diff below its summary line, cut to the shared output limits.
@@ -5740,6 +5773,73 @@ mod tool_output_render_tests {
         assert!(summary.starts_with("path=src/lib/orders.ts "), "{summary}");
         assert!(!summary.contains("request a narrower range"), "{summary}");
         assert!(summary.ends_with('…'), "{summary}");
+    }
+
+    fn skill_block(name: &str, text: &str) -> harness_session::ContextBlock {
+        harness_session::ContextBlock::mandatory(
+            format!("skill:{name}@1.0"),
+            harness_session::ContextBlockKind::Skill,
+            text,
+        )
+        .on_channel(harness_session::ContextChannel::Skill)
+    }
+
+    /// Measured on a benchmark: a skill the model activated 20 times reached it
+    /// in none of 32 requests, because the result said the instructions were in
+    /// its context and they were in a block the turn did not send. The result
+    /// now holds the skill's text, in the tag a recalled skill is given in.
+    #[test]
+    fn an_activated_skill_is_the_text_of_its_result() {
+        let block = skill_block(
+            "grid-rules",
+            "Skill `grid-rules` is active.\n---\nThe code word is QZ-7741-LIME.\n",
+        );
+        let text = render_tool_output(
+            "activate_skill",
+            &ToolOutput::SkillActivated {
+                block: block.clone(),
+            },
+        );
+        assert!(
+            text.starts_with(super::SKILL_ACTIVATED_PREFIX)
+                && text.lines().next().is_some_and(|line| {
+                    line.starts_with("activated skill grid-rules: ")
+                        && line.contains("stay in this conversation")
+                        && line.contains("activating it again adds nothing")
+                }),
+            "{text}"
+        );
+        assert!(text.contains("<skill name=\"grid-rules\">\n"), "{text}");
+        assert!(text.contains("The code word is QZ-7741-LIME."), "{text}");
+        assert!(text.ends_with("\n</skill>"), "{text}");
+        assert!(!text.contains(super::SKILL_RESULT_CUT), "{text}");
+        assert!(!text.contains("skill:grid-rules@1.0"), "{text}");
+    }
+
+    /// A skill longer than a tool result holds is cut inside its tag with the
+    /// cut said: a plain cut of the result dropped the closing tag, and the end
+    /// of what was kept looked like the end of the skill.
+    #[test]
+    fn a_skill_longer_than_a_result_is_cut_inside_its_tag_and_says_so() {
+        let body = "line of the skill\n".repeat(10_000);
+        let text = render_tool_output(
+            "activate_skill",
+            &ToolOutput::SkillActivated {
+                block: skill_block("long-skill", &body),
+            },
+        );
+        assert!(
+            text.chars().count() <= super::TOOL_RESULT_LIMIT,
+            "{}",
+            text.chars().count()
+        );
+        assert!(text.contains("<skill name=\"long-skill\">\n"));
+        assert!(
+            text.ends_with(&format!("\n{}\n</skill>", super::SKILL_RESULT_CUT)),
+            "{}",
+            &text[text.len() - 120..]
+        );
+        assert!(!text.contains("request a narrower range"));
     }
 
     fn stream(text: &str) -> StreamTail {

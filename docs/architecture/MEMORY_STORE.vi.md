@@ -1062,7 +1062,8 @@ parse được cũng vậy (`paths[0] "src/[billing" is not a glob: ...`). `[]` 
 - **Vì sao đi kèm kết quả.** Một lượt gửi context packet của bước đầu tiên ở
   mọi bước, để cache của provider giữ được nó; một block thêm vào packet giữa
   lượt chỉ tới được model ở lượt sau. Kết quả thì tới được lần gọi kế tiếp,
-  như instruction của một thư mục mà lần gọi chạm tới (`NestedInstructions`).
+  như instruction của một thư mục mà lần gọi chạm tới (`NestedInstructions`),
+  và như nội dung skill mà model activate (kết quả của `activate_skill`).
 - **Mỗi hội thoại một lần.** Kho của hội thoại ghi những gì nó đã nạp
   (`scoped_loaded`: memory id của entry, đường dẫn đã nạp nó, thời điểm, và số
   lần hội thoại đã bị compact lúc đó, theo số sự kiện `compaction.completed`

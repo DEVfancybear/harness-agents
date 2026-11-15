@@ -1353,6 +1353,22 @@ async fn skills_given(store: &SqliteStore, head: Option<&SessionId>) -> Given {
             given.cut.extend(super::skill_recall::cut_in(&packet));
             given.catalog |= super::skill_recall::catalog_given_in(&packet);
         }
+        // A skill the model activated is in the result of that call, not in the
+        // packet: the packet is the turn's first step, sent before the call. A
+        // result shortened or dropped since no longer holds it.
+        if let Ok(results) = harness_runtime::whole_tool_results_holding(
+            store,
+            &session,
+            super::skill_recall::GIVEN_NEEDLE,
+        )
+        .await
+        {
+            given.skills.extend(
+                results
+                    .iter()
+                    .filter_map(|result| super::skill_recall::held_in_result(result)),
+            );
+        }
         current = harness_runtime::previous_in_conversation(store, &session)
             .await
             .ok()
@@ -16031,6 +16047,25 @@ mod skill_offer_tests {
         ) -> Option<super::SkillOffer> {
             super::offer_skill(&self.store, layers, head, None, request, &[], None).await
         }
+
+        /// [`Self::offer`] with the set the turn's `activate_skill` answers from.
+        async fn offer_held(
+            &self,
+            layers: &Layers,
+            session: &SessionId,
+            in_turn: &super::super::skills::HeldSkills,
+        ) -> Option<super::SkillOffer> {
+            super::offer_skill(
+                &self.store,
+                layers,
+                Some(session),
+                None,
+                "tiếp tục đi",
+                &[],
+                Some(in_turn),
+            )
+            .await
+        }
     }
 
     const MIGRATION: (&str, &str, &str) = (
@@ -16356,5 +16391,107 @@ mod skill_offer_tests {
                 && !text.contains("db-migration"),
             "{text}"
         );
+    }
+
+    /// The result of an `activate_skill` call carries the skill, and a later
+    /// turn reads it from there: the catalog leaves the skill out. Fails
+    /// without the change: only the packets were read, and a skill the model
+    /// activated was in none of them, so the catalog listed it again and
+    /// `activate_skill` loaded it once a turn.
+    #[tokio::test]
+    async fn a_skill_the_model_activated_is_held_until_its_result_is_shortened() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers_with(
+            directory.path(),
+            &[MIGRATION, NOTES, FILLERS[0], FILLERS[1]],
+        );
+        let conversation = Conversation::open(directory.path()).await;
+        let first = conversation.turn(None, "tiếp tục đi", None).await;
+        // The conversation holds no skill yet: the catalog lists them all.
+        let none = super::super::skills::HeldSkills::default();
+        let catalog = conversation
+            .offer_held(&layers, &first, &none)
+            .await
+            .expect("the catalog");
+        assert!(none.lock().expect("held").is_empty());
+        assert!(format!("{:?}", catalog.block).contains("- release-notes:"));
+        // The model activated release-notes in the turn: its text is the result.
+        let result = format!(
+            "{}release-notes: its instructions follow, and they stay in this conversation from here on; activating it again adds nothing.\n<skill name=\"release-notes\">\nAdd the entry at the top.\n</skill>",
+            harness_tools::SKILL_ACTIVATED_PREFIX
+        );
+        let payload = serde_json::json!({"model_view": {"call_id": "call_0", "text": result}})
+            .as_object()
+            .expect("object")
+            .clone();
+        conversation
+            .store
+            .append_event_for_test(harness_types::EventEnvelope {
+                schema_version: harness_types::P0_SCHEMA_VERSION,
+                event_id: harness_types::EventId::generate(),
+                session_id: first.clone(),
+                seq: conversation
+                    .store
+                    .next_sequence(&first)
+                    .await
+                    .expect("sequence"),
+                event_type: "receipt.recorded".to_owned(),
+                producer: harness_types::ProducerIdentity {
+                    plugin_id: "fixture".to_owned(),
+                    implementation_version: "1".to_owned(),
+                },
+                authority: harness_types::SourceAuthority::RuntimeObserved,
+                correlation_id: None,
+                causation_id: None,
+                continuity_critical: false,
+                payload_hash: harness_types::ContentHash::from_canonical_json(
+                    &serde_json::Value::Object(payload.clone()),
+                )
+                .expect("hash"),
+                payload,
+            })
+            .await
+            .expect("the receipt is stored");
+        let held = super::super::skills::HeldSkills::default();
+        let catalog = conversation
+            .offer_held(&layers, &first, &held)
+            .await
+            .expect("the catalog of the rest");
+        assert_eq!(
+            held.lock().expect("held").iter().collect::<Vec<_>>(),
+            ["release-notes"],
+            "activate_skill answers that it is in the conversation"
+        );
+        let text = format!("{:?}", catalog.block);
+        assert!(
+            text.contains("- db-migration:") && !text.contains("release-notes"),
+            "{text}"
+        );
+        // The turn shortened that result to save room: the text is gone, so the
+        // skill is not held and the catalog lists it again.
+        let shortened = serde_json::to_string(&[(
+            "call_0",
+            format!(
+                "[earlier tool result shortened to its start to save context; call the tool again for all of it]\n{}",
+                &result[..200]
+            ),
+        )])
+        .expect("json");
+        conversation
+            .store
+            .set_session_setting(
+                &conversation.task,
+                &format!("{}{first}", harness_runtime::SENT_RESULTS_SETTING),
+                &shortened,
+            )
+            .await
+            .expect("setting");
+        let gone = super::super::skills::HeldSkills::default();
+        let catalog = conversation
+            .offer_held(&layers, &first, &gone)
+            .await
+            .expect("the catalog again");
+        assert!(gone.lock().expect("held").is_empty());
+        assert!(format!("{:?}", catalog.block).contains("- release-notes:"));
     }
 }

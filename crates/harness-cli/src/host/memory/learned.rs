@@ -1187,7 +1187,12 @@ fn rule(family: &'static str, name: &'static str, pattern: &str) -> Rule {
 
 /// What never leaves in evidence, and never lands in a skill.
 static SECRET_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
-    let mut card = rule("pii", "credit_card", r"\b(?:\d[ -]?){12,15}\d\b");
+    // A card number is written whole or in groups (4-4-4-4, 4-6-5, 4-6-4), never one
+    // digit at a time: a separator is allowed only between groups of three digits or
+    // more. A grid row such as `0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0` passed the check and
+    // was redacted whole, and a transcript with its rows missing read as input that
+    // "cannot be reconstructed".
+    let mut card = rule("pii", "credit_card", r"\b\d{3,19}(?:[ -]\d{3,19}){0,5}\b");
     card.luhn = true;
     vec![
         rule("secret", "aws_access_key_id", r"AKIA[0-9A-Z]{16}"),
@@ -1221,13 +1226,13 @@ static SECRET_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
 /// Whether `found` is a part of a decimal number: the digits after its point
 /// (`score=20.319646402472134`, which a report redacted as a card number ten
 /// times), or before it.
-fn in_a_decimal(text: &str, found: &regex::Match<'_>) -> bool {
-    let before = text[..found.start()]
+fn in_a_decimal(text: &str, found: std::ops::Range<usize>) -> bool {
+    let before = text[..found.start]
         .chars()
         .rev()
         .take(2)
         .collect::<Vec<_>>();
-    let after = text[found.end()..].chars().take(2).collect::<Vec<_>>();
+    let after = text[found.end..].chars().take(2).collect::<Vec<_>>();
     matches!(before.as_slice(), ['.', digit, ..] if digit.is_ascii_digit())
         || matches!(after.as_slice(), ['.', digit, ..] if digit.is_ascii_digit())
 }
@@ -1256,6 +1261,42 @@ fn luhn(candidate: &str) -> bool {
     sum.is_multiple_of(10)
 }
 
+/// The spans of a run of digit groups (`found`) that are a card number: the
+/// longest run of whole groups, from the earliest group, that passes the check.
+///
+/// A card followed by its security code (`4111 1111 1111 1111 123`) matches as
+/// one run of 19 digits, which is no card; the card is its first four groups.
+fn card_spans(text: &str, found: &regex::Match<'_>) -> Vec<std::ops::Range<usize>> {
+    let groups = found
+        .as_str()
+        .match_indices(|character: char| character.is_ascii_digit())
+        .map(|(offset, _)| offset)
+        .fold(Vec::<(usize, usize)>::new(), |mut groups, offset| {
+            match groups.last_mut() {
+                Some(last) if last.1 == offset => last.1 = offset + 1,
+                _ => groups.push((offset, offset + 1)),
+            }
+            groups
+        });
+    let mut spans = Vec::new();
+    let mut first = 0;
+    while first < groups.len() {
+        let window = (first..groups.len()).rev().find_map(|last| {
+            let range = found.start() + groups[first].0..found.start() + groups[last].1;
+            (luhn(&text[range.clone()]) && !in_a_decimal(text, range.clone()))
+                .then_some((range, last))
+        });
+        match window {
+            Some((range, last)) => {
+                spans.push(range);
+                first = last + 1;
+            }
+            None => first += 1,
+        }
+    }
+    spans
+}
+
 /// `text` with every secret and personal datum replaced by
 /// `[REDACTED:<family>:<name>]`.
 #[must_use]
@@ -1267,8 +1308,14 @@ pub fn redact(text: &str) -> String {
         .flat_map(|rule| {
             rule.pattern
                 .find_iter(text)
-                .filter(|found| !rule.luhn || (luhn(found.as_str()) && !in_a_decimal(text, found)))
-                .map(move |found| (found.start(), found.end(), rule))
+                .flat_map(move |found| {
+                    if rule.luhn {
+                        card_spans(text, &found)
+                    } else {
+                        vec![found.range()]
+                    }
+                })
+                .map(move |span| (span.start, span.end, rule))
         })
         .collect::<Vec<_>>();
     spans.sort_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
@@ -3197,5 +3244,60 @@ mod tests {
         assert!(text.contains("20.319646402472134"), "{text}");
         let text = redact("paid with 4111 1111 1111 1111.");
         assert!(text.contains("[REDACTED:pii:credit_card]"), "{text}");
+    }
+
+    /// Seen in a benchmark's transcripts: a row of a grid, `0 0 0 0 0 0 0 0 0 0
+    /// 0 0 0 0 0 0`, passed the check as a 16-digit card and was redacted, and
+    /// the session log said the rows "cannot be reconstructed". A card has
+    /// groups of digits; one digit at a time is a row.
+    #[test]
+    fn a_row_of_single_digits_is_not_a_card() {
+        let row = |digits: &str| {
+            digits
+                .chars()
+                .map(String::from)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for digits in [
+            "0".repeat(13),
+            "0".repeat(15),
+            "0".repeat(16),
+            "6".repeat(13),
+            // Mixed rows that pass the check, 16, 13 and 15 digits long.
+            "1234567890123452".to_owned(),
+            "1234567890128".to_owned(),
+            "000000000000000".to_owned(),
+        ] {
+            let grid = row(&digits);
+            assert!(super::luhn(&grid), "the row passes the check: {grid}");
+            assert_eq!(redact(&grid), grid, "{grid}");
+            let lines = format!("Input:\n{grid}\n{grid}\nOutput:\n{grid}");
+            assert_eq!(redact(&lines), lines);
+        }
+    }
+
+    /// A card is written whole or in groups, and a card followed by its
+    /// security code is the card and the code.
+    #[test]
+    fn a_card_written_in_groups_is_still_redacted() {
+        for card in [
+            "4111 1111 1111 1111",
+            "4111-1111-1111-1111",
+            "4111111111111111",
+            // An Amex: 4, 6 and 5 digits.
+            "3782 822463 10005",
+            "378282246310005",
+        ] {
+            assert_eq!(
+                redact(&format!("card {card} ok")),
+                "card [REDACTED:pii:credit_card] ok",
+                "{card}"
+            );
+        }
+        assert_eq!(
+            redact("card 4111 1111 1111 1111 123 exp"),
+            "card [REDACTED:pii:credit_card] 123 exp"
+        );
     }
 }

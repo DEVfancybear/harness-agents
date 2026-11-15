@@ -3381,6 +3381,40 @@ async fn results_as_sent(
     Ok(results)
 }
 
+/// The tool results of the turn of `session` that hold `needle`, as the turn
+/// sent them, and still whole.
+///
+/// A result the turn shortened or dropped to save room is left out: the
+/// conversation no longer holds what it said, and the model is told to call the
+/// tool again. Only the results that hold `needle` are read from the store, so a
+/// long conversation is searched without parsing every result of every turn.
+///
+/// # Errors
+/// Fails only when the store cannot be read.
+pub async fn whole_tool_results_holding(
+    store: &SqliteStore,
+    session: &SessionId,
+    needle: &str,
+) -> Result<Vec<String>, RuntimeError> {
+    let mut results = store
+        .recovered_tool_results_containing(session, needle)
+        .await?;
+    if results.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sent = sent_results(store, session).await;
+    for result in &mut results {
+        if let Some(text) = result.call_id.as_ref().and_then(|call| sent.get(call)) {
+            result.text.clone_from(text);
+        }
+    }
+    Ok(results
+        .into_iter()
+        .map(|result| result.text)
+        .filter(|text| !text.starts_with(TURN_SHORTENED_START) && !text.starts_with(FITTED_RESULT))
+        .collect())
+}
+
 /// The results the conversation of `session` sent shortened, by call.
 async fn sent_results(
     store: &SqliteStore,
@@ -5070,6 +5104,12 @@ impl RuntimeService {
         // changed it, and every step after missed the cache for the whole turn so
         // far. A turn now sends the packet of its first step at every step; what
         // changed since is in the steps' own messages, which the model reads too.
+        // A skill activated mid-turn is in the result of its `activate_skill` call
+        // (its text, in a `<skill name>` tag), not in the packet: the block the
+        // call also adds to the request's rules reaches the packet of the next
+        // turn, or of a step that compacted. It used to be only in that block, so
+        // the model was told the skill was in its context and the text was in no
+        // request of the turn.
         // A step that compacted the context sends its new packet, which is kept.
         let packet_key = format!("{}|{}", request.session_id, request.input_id);
         let packet = {

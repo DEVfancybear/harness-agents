@@ -1531,10 +1531,24 @@ impl SqliteStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<RecoveredToolResult>, StoreError> {
+        self.recovered_tool_results_containing(session_id, "").await
+    }
+
+    /// [`Self::recovered_tool_results`], only the events whose stored form holds
+    /// `needle` (empty: all). The match is on the stored text, before any JSON is
+    /// parsed, so a conversation is searched for one marker without reading
+    /// every result of every turn.
+    pub async fn recovered_tool_results_containing(
+        &self,
+        session_id: &SessionId,
+        needle: &str,
+    ) -> Result<Vec<RecoveredToolResult>, StoreError> {
         let rows = sqlx::query(
-            "SELECT sequence, event_json FROM events WHERE session_id = ? ORDER BY sequence",
+            "SELECT sequence, event_json FROM events WHERE session_id = ? AND (? = '' OR instr(event_json, ?) > 0) ORDER BY sequence",
         )
         .bind(session_id.as_str())
+        .bind(needle)
+        .bind(needle)
         .fetch_all(&self.readers)
         .await
         .map_err(|error| {
