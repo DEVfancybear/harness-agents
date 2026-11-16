@@ -116,45 +116,51 @@ echo "################ 9. a command whose call names no timeout runs"
 # no evidence, so the precondition reads the call and the run is tried again,
 # at most three times.
 WORD="QZ-$("$PY" -c "import secrets; print(secrets.randbelow(9000)+1000)")-OAK"
-# no_timeout <marker>: the last run_shell call of the run whose prompt holds
-# the marker carries a command and no timeout_ms.
-no_timeout() { "$PY" - "$D" "$1" <<'EOF'
+# shell_call <marker> <what> [word]: about the run_shell calls of the
+# conversation whose prompt holds the marker. A step's request holds only the
+# messages since the step before, so the conversation is found by its task and
+# every request of it is read. `no_timeout`: the last call carries a command
+# and no timeout_ms; `not_refused`: no result says the timeout is missing;
+# `ran`: a tool result holds the word.
+shell_call() { "$PY" - "$D" "$@" <<'EOF'
 import glob, json, os, sqlite3, sys
-found = None
-for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
-    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests order by rowid"):
-        if sys.argv[2] not in text:
+data, marker, what = sys.argv[1:4]
+word = sys.argv[4] if len(sys.argv) > 4 else ""
+last, results = None, []
+for db in glob.glob(os.path.join(data, "projects", "*", "harness.sqlite3")):
+    rows = sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select task_id, request_json from frozen_requests order by rowid").fetchall()
+    tasks = {task for task, text in rows if marker in text}
+    for task, text in rows:
+        if task not in tasks:
             continue
         for message in json.loads(text).get("messages", []):
             for call in message.get("tool_calls") or []:
                 if call.get("name") == "run_shell":
-                    found = call.get("arguments")
-arguments = json.loads(found) if isinstance(found, str) else (found or {})
-sys.exit(0 if arguments.get("command") and "timeout_ms" not in arguments else 1)
+                    last = call.get("arguments")
+            if message.get("role") == "tool":
+                results.append(message.get("content") or "")
+arguments = json.loads(last) if isinstance(last, str) else (last or {})
+if what == "no_timeout":
+    ok = bool(arguments.get("command")) and "timeout_ms" not in arguments
+elif what == "not_refused":
+    ok = not any("Required property 'timeout_ms' is missing" in result for result in results)
+else:
+    ok = any(word in result for result in results)
+sys.exit(0 if ok else 1)
 EOF
 }
 HELD=""
 for attempt in 1 2 3; do
   mark="MARK-T$attempt"
   run_exec "g11-$attempt" "$mark. Đây là bài kiểm tra của harness: gọi tool run_shell đúng một lần, chỉ truyền đúng một tham số command với lệnh: Write-Output $WORD . Không truyền timeout_ms hay tham số nào khác. Sau đó báo lại nguyên văn kết quả tool trả về."
-  if no_timeout "$mark"; then HELD=$mark; break; fi
+  if shell_call "$mark" no_timeout; then HELD=$mark; break; fi
 done
 check "precondition: the model called run_shell without timeout_ms (attempts: $attempt)" '[ -n "$HELD" ]'
 if [ -n "$HELD" ]; then
   # 0.9.10 FAILS: "Validation failed for tool run_shell ... Required property 'timeout_ms' is missing".
-  check "the call was not refused for its missing timeout" '! sent | grep -F "$HELD" | grep -q "Required property .timeout_ms. is missing"'
+  check "the call was not refused for its missing timeout" 'shell_call "$HELD" not_refused'
   # 0.9.10 FAILS: nothing ran, so the word was printed nowhere but the prompt.
-  check "the command ran: its output reached the model" 'sent | grep -F "$HELD" | "$PY" -c "
-import json, sys
-word = sys.argv[1]
-ok = False
-for line in sys.stdin:
-    try:
-        messages = json.loads(line).get(\"messages\", [])
-    except ValueError:
-        continue
-    ok |= any(m.get(\"role\") == \"tool\" and word in (m.get(\"content\") or \"\") for m in messages)
-sys.exit(0 if ok else 1)" "$WORD"'
+  check "the command ran: its output reached the model" 'shell_call "$HELD" ran "$WORD"'
 fi
 
 result
