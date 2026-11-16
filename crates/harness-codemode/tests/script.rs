@@ -649,3 +649,15 @@ fn large_texts_and_deep_values_stay_within_bounds() {
     );
     assert!(error.message.contains("nested"), "{error:?}");
 }
+
+/// Found by the live suite: a file with CRLF line ends.
+#[test]
+fn lines_end_at_carriage_returns_as_in_javascript() {
+    assert_eq!(
+        value(
+            r"const t = 'a: 1\r\nweight: 42\r\nb: 2\r\n'; return [t.match(/^weight: (\d+)$/m)[1], t.match(/^b.*$/m)[0], 'x\ry'.match(/x.y/)]"
+        ),
+        r#"["42","b: 2",null]"#
+    );
+    assert_eq!(value(r"return 'x\ry'.match(/x.y/s)[0].length"), "3");
+}

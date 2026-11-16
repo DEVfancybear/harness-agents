@@ -61,7 +61,9 @@ back-reference, qua `fancy-regex`), và tự chèn dấu chấm phẩy. Các bui
 là `JSON`, `Math`, `Object`, `Array`, `String`, `Number`, `Boolean`,
 `Promise`, `Map`, `Set`, `RegExp`, `Date` (UTC), các lỗi,
 `parseInt`/`parseFloat`, các hàm URI và `structuredClone`. Object, `Map` và
-`Set` giữ thứ tự chèn.
+`Set` giữ thứ tự chèn. Như JavaScript, một dòng kết thúc ở `\r`, U+2028 và
+U+2029 cũng như ở `\n`: với `m`, `^` và `$` khớp ở đó, và `.` không bao giờ
+khớp với chúng, nên file có kết thúc dòng CRLF được đọc đúng.
 
 Những gì chương trình không dùng được sẽ bị từ chối kèm thông báo nói rõ:
 `class`, generator, getter và setter, `import`/`export`, BigInt, tagged

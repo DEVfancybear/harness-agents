@@ -63,7 +63,9 @@ back-references, through `fancy-regex`), and automatic semicolon insertion.
 The built-ins are `JSON`, `Math`, `Object`, `Array`, `String`, `Number`,
 `Boolean`, `Promise`, `Map`, `Set`, `RegExp`, `Date` (UTC), the errors,
 `parseInt`/`parseFloat`, the URI functions and `structuredClone`. Objects,
-`Map` and `Set` keep insertion order.
+`Map` and `Set` keep insertion order. As in JavaScript, a line ends at `\r`,
+U+2028 and U+2029 as well as `\n`: with `m`, `^` and `$` match there, and `.`
+never matches one, so a file with CRLF line ends reads as it should.
 
 What a program cannot use is refused with a message that says so: `class`,
 generators, getters and setters, `import`/`export`, BigInt, tagged

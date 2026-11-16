@@ -221,7 +221,7 @@ fn without_line_numbers(content: &str) -> String {
         .join("\n")
 }
 
-/// What `store()` kept, by session, while the app runs: each session's keys
+/// What `store()` kept, by conversation (its task id), while the app runs: its keys
 /// and their JSON text, in the order they were set. With a store directory
 /// it is also written to `<dir>/<session>.json`, so a resumed conversation
 /// (`ha exec --resume`, an app started again) loads it.

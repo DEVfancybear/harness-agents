@@ -354,6 +354,8 @@ fn translate(pattern: &str, flags: &str) -> String {
     if !inline.is_empty() {
         let _ = write!(out, "(?{inline})");
     }
+    let multiline = flags.contains('m');
+    let dot_all = flags.contains('s');
     let chars: Vec<char> = pattern.chars().collect();
     let mut index = 0;
     let mut in_class = false;
@@ -419,6 +421,12 @@ fn translate(pattern: &str, flags: &str) -> String {
                 out.push('\\');
                 out.push(c);
             }
+            // JavaScript ends a line at `\r`, U+2028 and U+2029 as well as at
+            // `\n`: with `m`, `^` and `$` match there, and `.` never matches
+            // one. A text with CRLF line ends is the common case.
+            '^' if !in_class && multiline => out.push_str("(?:^|(?<=[\\r\\x{2028}\\x{2029}]))"),
+            '$' if !in_class && multiline => out.push_str("(?:$|(?=[\\r\\x{2028}\\x{2029}]))"),
+            '.' if !in_class && !dot_all => out.push_str("[^\\n\\r\\x{2028}\\x{2029}]"),
             c => out.push(c),
         }
         index += 1;

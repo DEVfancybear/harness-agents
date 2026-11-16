@@ -4092,7 +4092,10 @@ impl TurnDriver {
         };
         let (run_options, max_chars) = crate::codemode::run_options(&parsed.options);
         let tools = crate::codemode::reachable(context.tool_schemas, &self.deferred);
-        let session = context.session_id.as_str().to_owned();
+        // The store belongs to the conversation: its task id, which a
+        // resumed conversation (`ha exec --resume`) keeps; the session id is
+        // new each time.
+        let session = context.task_id.as_str().to_owned();
         let codemode = self.codemode.clone().unwrap_or_default();
         let started = Instant::now();
         let outcome = harness_codemode::execute(
