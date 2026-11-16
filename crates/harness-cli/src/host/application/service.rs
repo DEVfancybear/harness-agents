@@ -800,6 +800,10 @@ pub trait SessionPort: Send {
     fn action_bank(&mut self, _enable: Option<bool>) -> Result<String, String> {
         Err("this backend runs no turn loop".to_owned())
     }
+    /// `/codemode on|off|status`: the codemode tool, off by default (`codemode`).
+    fn codemode(&mut self, _enable: Option<bool>) -> Result<String, String> {
+        Err("this backend runs no turn loop".to_owned())
+    }
     /// prime-agent's global `harnessRefinements` switch: report or set it.
     fn refinements(&mut self, _enable: Option<bool>) -> Result<String, String> {
         Err("this backend keeps no harness".to_owned())
@@ -7096,6 +7100,10 @@ impl SessionPort for AgentSessionService {
         super::action_bank::set(&self.config_file, &self.environment, enable)
     }
 
+    fn codemode(&mut self, enable: Option<bool>) -> Result<String, String> {
+        super::codemode::set(&self.config_file, &self.environment, enable)
+    }
+
     fn jev_decision(&mut self, decision: &str, enable: bool) -> Result<String, String> {
         if !super::jev::DECISIONS
             .iter()
@@ -10052,6 +10060,9 @@ async fn run_turn(
     let action_bank = super::action_bank::enabled(&config_file, &environment)
         .then(|| super::action_bank::bank(jev_decisions.as_ref()));
     agents.set_action_bank(action_bank.clone());
+    // Codemode (`/codemode`), off by default; children run with it too.
+    let codemode = super::codemode::enabled(&config_file, &environment);
+    agents.set_codemode(codemode);
     // `--append-system-prompt`, else an `APPEND_SYSTEM.md`: it closes the root's
     // system prompt and goes to each child it starts.
     let appended = super::resources::appended_system(
@@ -10382,6 +10393,11 @@ async fn run_turn(
     let driver = match action_bank {
         Some(bank) => driver.with_action_bank(bank),
         None => driver,
+    };
+    let driver = if codemode {
+        driver.with_codemode(harness_tools::Codemode)
+    } else {
+        driver
     };
     let driver =
         match &jev_decisions {
