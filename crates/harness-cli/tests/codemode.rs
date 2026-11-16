@@ -138,7 +138,7 @@ async fn run(bench: &Bench, code: &str, approvals: ApprovalMode, codemode: bool)
         ToolExecutionService::new(Arc::clone(&store)),
     );
     let driver = if codemode {
-        driver.with_codemode(Codemode)
+        driver.with_codemode(Codemode::default())
     } else {
         driver
     };

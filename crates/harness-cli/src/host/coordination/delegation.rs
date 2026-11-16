@@ -1552,8 +1552,8 @@ struct AgentsShared {
     results: Mutex<Option<TurnJudges>>,
     /// The action bank children run with: the parent's, when it is on.
     bank: Mutex<Option<harness_tools::ActionBank>>,
-    /// Whether children are offered `codemode`: the parent's setting.
-    codemode: std::sync::atomic::AtomicBool,
+    /// The codemode children are offered: the parent's, when it is on.
+    codemode: Mutex<Option<harness_tools::Codemode>>,
     running_workers: Mutex<u32>,
     worker_freed: tokio::sync::Notify,
     children: Mutex<Vec<ChildRecord>>,
@@ -1644,7 +1644,7 @@ impl AgentsShared {
             guard: Mutex::new(None),
             results: Mutex::new(None),
             bank: Mutex::new(None),
-            codemode: std::sync::atomic::AtomicBool::new(false),
+            codemode: Mutex::new(None),
             running_workers: Mutex::new(0),
             worker_freed: tokio::sync::Notify::new(),
             children: Mutex::new(Vec::new()),
@@ -2694,12 +2694,12 @@ impl SessionAgents {
         }
     }
 
-    /// Whether children started from here on are offered `codemode`: the
-    /// parent's setting, so a child inherits it.
-    pub fn set_codemode(&self, on: bool) {
-        self.shared
-            .codemode
-            .store(on, std::sync::atomic::Ordering::Relaxed);
+    /// The codemode children started from here on are offered: the
+    /// parent's (`None` while it is off), so a child inherits it.
+    pub fn set_codemode(&self, codemode: Option<harness_tools::Codemode>) {
+        if let Ok(mut current) = self.shared.codemode.lock() {
+            *current = codemode;
+        }
     }
 
     /// The action bank children started from here on run with: the
@@ -6310,14 +6310,16 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 Some(bank) => driver.with_action_bank(bank),
                 None => driver,
             };
-            let driver = if self
+            // The parent's codemode, when it is on.
+            let codemode = self
                 .shared
                 .codemode
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                driver.with_codemode(harness_tools::Codemode)
-            } else {
-                driver
+                .lock()
+                .ok()
+                .and_then(|codemode| codemode.clone());
+            let driver = match codemode {
+                Some(codemode) => driver.with_codemode(codemode),
+                None => driver,
             };
             // A child's question is shown to the user, named after the child, and
             // the child waits for the answer.

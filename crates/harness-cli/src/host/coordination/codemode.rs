@@ -63,6 +63,15 @@ pub fn set(
     Ok(status(config_file, environment))
 }
 
+/// Codemode for a driver: each conversation's `store()` kept under
+/// `<data-dir>/codemode`, so a resumed conversation loads it.
+#[must_use]
+pub fn codemode(data_dir: &Path) -> harness_tools::Codemode {
+    harness_tools::Codemode {
+        store_dir: Some(data_dir.join("codemode")),
+    }
+}
+
 /// `/codemode status`.
 #[must_use]
 pub fn status(config_file: &Path, environment: &LaunchEnvironment) -> String {

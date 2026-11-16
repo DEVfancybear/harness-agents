@@ -10061,8 +10061,9 @@ async fn run_turn(
         .then(|| super::action_bank::bank(jev_decisions.as_ref()));
     agents.set_action_bank(action_bank.clone());
     // Codemode (`/codemode`), off by default; children run with it too.
-    let codemode = super::codemode::enabled(&config_file, &environment);
-    agents.set_codemode(codemode);
+    let codemode = super::codemode::enabled(&config_file, &environment)
+        .then(|| super::codemode::codemode(&data_dir));
+    agents.set_codemode(codemode.clone());
     // `--append-system-prompt`, else an `APPEND_SYSTEM.md`: it closes the root's
     // system prompt and goes to each child it starts.
     let appended = super::resources::appended_system(
@@ -10394,10 +10395,9 @@ async fn run_turn(
         Some(bank) => driver.with_action_bank(bank),
         None => driver,
     };
-    let driver = if codemode {
-        driver.with_codemode(harness_tools::Codemode)
-    } else {
-        driver
+    let driver = match codemode {
+        Some(codemode) => driver.with_codemode(codemode),
+        None => driver,
     };
     let driver =
         match &jev_decisions {

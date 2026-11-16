@@ -650,7 +650,8 @@ pub async fn run_with(
     let bank_on = super::action_bank::enabled(&context.paths.config_file, environment);
     let action_bank = bank_on.then(|| super::action_bank::bank(jev_decisions.as_ref()));
     // Codemode (`HA_CODEMODE`, `codemode`), off by default; children too.
-    let codemode_on = super::codemode::enabled(&context.paths.config_file, environment);
+    let codemode = super::codemode::enabled(&context.paths.config_file, environment)
+        .then(|| super::codemode::codemode(&context.paths.data_dir));
     let agents = provider_config.as_ref().and_then(|config| {
         let agents = super::delegation::SessionAgents::new(
             super::store_lease::SharedStore::for_dir(context.project_store_dir()),
@@ -672,7 +673,7 @@ pub async fn run_with(
                 .map(|decisions| decisions as Arc<dyn harness_tools::ToolGuard>),
         );
         agents.set_action_bank(action_bank.clone());
-        agents.set_codemode(codemode_on);
+        agents.set_codemode(codemode.clone());
         agents.set_turn_judges(jev_decisions.clone().map(|decisions| {
             super::delegation::TurnJudges {
                 visibility: Arc::clone(&decisions) as Arc<dyn harness_tools::ResultVisibility>,
@@ -825,10 +826,9 @@ pub async fn run_with(
         Some(bank) => driver.with_action_bank(bank),
         None => driver,
     };
-    let driver = if codemode_on {
-        driver.with_codemode(harness_tools::Codemode)
-    } else {
-        driver
+    let driver = match codemode {
+        Some(codemode) => driver.with_codemode(codemode),
+        None => driver,
     };
     // What the harness learned from failed calls, as in the app.
     let driver = if lessons_on {

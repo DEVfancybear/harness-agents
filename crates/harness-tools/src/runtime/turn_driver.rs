@@ -4046,18 +4046,19 @@ impl TurnDriver {
         let (run_options, max_chars) = crate::codemode::run_options(&parsed.options);
         let tools = crate::codemode::reachable(context.tool_schemas, &self.deferred);
         let session = context.session_id.as_str().to_owned();
+        let codemode = self.codemode.clone().unwrap_or_default();
         let started = Instant::now();
         let outcome = harness_codemode::execute(
             parsed.code,
             crate::codemode::tool_infos(&tools),
-            crate::codemode::load_store(&session),
+            crate::codemode::load_store(&codemode, &session),
             run_options,
             |calls| self.codemode_batch(calls, context),
             context.cancellation.cancelled(),
         )
         .await;
         if outcome.ok() {
-            crate::codemode::save_store(&session, &outcome.store_writes);
+            crate::codemode::save_store(&codemode, &session, &outcome.store_writes);
         }
         let failed = outcome
             .calls

@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -48,8 +49,12 @@ const CHARS_PER_TOKEN: usize = 4;
 const DECLARATIONS_BUDGET: usize = 12_000;
 
 /// Codemode in a driver: off unless the host turns it on.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Codemode;
+#[derive(Clone, Debug, Default)]
+pub struct Codemode {
+    /// Where each conversation's `store()` is kept between runs of `ha`;
+    /// `None` keeps it in memory only.
+    pub store_dir: Option<PathBuf>,
+}
 
 fn function_of(schema: &Value) -> &Value {
     schema.get("function").unwrap_or(schema)
@@ -216,21 +221,59 @@ fn without_line_numbers(content: &str) -> String {
         .join("\n")
 }
 
-/// What `store()` kept, by session: it lasts as long as the app runs.
-/// Each session's keys and their JSON text, in the order they were set.
+/// What `store()` kept, by session, while the app runs: each session's keys
+/// and their JSON text, in the order they were set. With a store directory
+/// it is also written to `<dir>/<session>.json`, so a resumed conversation
+/// (`ha exec --resume`, an app started again) loads it.
 type Stores = HashMap<String, Vec<(String, String)>>;
 
 static STORES: LazyLock<Mutex<Stores>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-pub fn load_store(session: &str) -> Vec<(String, String)> {
-    STORES
-        .lock()
-        .ok()
-        .and_then(|stores| stores.get(session).cloned())
-        .unwrap_or_default()
+/// A session id as a file name: what is not a letter, digit, `-` or `_`
+/// becomes `_`.
+fn store_file(dir: &Path, session: &str) -> PathBuf {
+    let name: String = session
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    dir.join(format!("{name}.json"))
 }
 
-pub fn save_store(session: &str, writes: &harness_codemode::StoreWrites) {
+fn read_store_file(path: &Path) -> Option<Vec<(String, String)>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let entries: Vec<(String, String)> = serde_json::from_str(&text).ok()?;
+    // Each value must still be JSON a program can load.
+    Some(
+        entries
+            .into_iter()
+            .filter(|(_, json)| serde_json::from_str::<Value>(json).is_ok())
+            .collect(),
+    )
+}
+
+pub fn load_store(codemode: &Codemode, session: &str) -> Vec<(String, String)> {
+    let Ok(mut stores) = STORES.lock() else {
+        return Vec::new();
+    };
+    if let Some(store) = stores.get(session) {
+        return store.clone();
+    }
+    let loaded = codemode
+        .store_dir
+        .as_deref()
+        .and_then(|dir| read_store_file(&store_file(dir, session)))
+        .unwrap_or_default();
+    stores.insert(session.to_owned(), loaded.clone());
+    loaded
+}
+
+pub fn save_store(codemode: &Codemode, session: &str, writes: &harness_codemode::StoreWrites) {
     if writes.set.is_empty() && writes.delete.is_empty() {
         return;
     }
@@ -246,6 +289,23 @@ pub fn save_store(session: &str, writes: &harness_codemode::StoreWrites) {
             Some(entry) => entry.1.clone_from(json),
             None => store.push((key.clone(), json.clone())),
         }
+    }
+    let Some(dir) = codemode.store_dir.as_deref() else {
+        return;
+    };
+    // Written whole and renamed into place, under the lock, so a reader
+    // never sees half a file.
+    let path = store_file(dir, session);
+    let written = std::fs::create_dir_all(dir).and_then(|()| {
+        let text = serde_json::to_string(store).unwrap_or_else(|_| "[]".to_owned());
+        let partial = path.with_extension("json.partial");
+        std::fs::write(&partial, text)?;
+        std::fs::rename(&partial, &path)
+    });
+    if let Err(error) = written {
+        harness_types::diag::warn("codemode", "store_not_saved")
+            .field("error", error.to_string())
+            .emit();
     }
 }
 
@@ -278,7 +338,7 @@ pub fn run_options(
 mod tests {
     use serde_json::json;
 
-    use super::{codemode_schema, load_store, reachable, save_store};
+    use super::{Codemode, codemode_schema, load_store, reachable, save_store};
 
     fn tool(name: &str) -> serde_json::Value {
         json!({"type": "function", "function": {"name": name, "description": format!("{name} does a thing\nmore"), "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}})
@@ -344,7 +404,12 @@ mod tests {
     }
 
     #[test]
-    fn keeps_store_writes_by_session() {
+    fn keeps_store_writes_by_session_and_on_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        let codemode = Codemode {
+            store_dir: Some(directory.path().join("codemode")),
+        };
+        let session = "codemode-test-session";
         let writes = harness_codemode::StoreWrites {
             set: vec![
                 ("a".to_owned(), "1".to_owned()),
@@ -352,18 +417,26 @@ mod tests {
             ],
             delete: Vec::new(),
         };
-        save_store("codemode-test-session", &writes);
+        save_store(&codemode, session, &writes);
         save_store(
-            "codemode-test-session",
+            &codemode,
+            session,
             &harness_codemode::StoreWrites {
                 set: vec![("a".to_owned(), "3".to_owned())],
                 delete: vec!["b".to_owned()],
             },
         );
         assert_eq!(
-            load_store("codemode-test-session"),
+            load_store(&codemode, session),
             vec![("a".to_owned(), "3".to_owned())]
         );
-        assert!(load_store("another-session").is_empty());
+        assert!(load_store(&codemode, "another-session").is_empty());
+        // Another process finds it on disk.
+        let on_disk = super::read_store_file(&super::store_file(
+            directory.path().join("codemode").as_path(),
+            session,
+        ));
+        assert_eq!(on_disk, Some(vec![("a".to_owned(), "3".to_owned())]));
+        assert!(super::store_file(directory.path(), "../x y").ends_with("___x_y.json"));
     }
 }
