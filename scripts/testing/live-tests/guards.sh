@@ -109,4 +109,52 @@ check "the change was made" 'grep -q "fn double" "$P/src/keep.rs"'
 check "the model was reminded to check it" 'sent | grep -q "Before you finish: this turn changed [^\"]*keep.rs[^\"]* and ran no command after the last change"'
 check "a run that changes only prose is not reminded" 'run_exec g10 "Dùng tool write_file tạo file NOTES.md với đúng một dòng: ghi chú. Không chạy lệnh nào."; [ -f "$P/NOTES.md" ] && ! sent | grep -q "this turn changed NOTES.md"'
 
+echo "################ 9. a command whose call names no timeout runs"
+# contracts.rs process_timeout. The timeout was required: a call without it was
+# refused before anything ran (Continual-ARC on 0.9.10: 18 run_shell calls of
+# 18). The model is asked to leave it out; a run where it named one anyway is
+# no evidence, so the precondition reads the call and the run is tried again,
+# at most three times.
+WORD="QZ-$("$PY" -c "import secrets; print(secrets.randbelow(9000)+1000)")-OAK"
+# no_timeout <marker>: the last run_shell call of the run whose prompt holds
+# the marker carries a command and no timeout_ms.
+no_timeout() { "$PY" - "$D" "$1" <<'EOF'
+import glob, json, os, sqlite3, sys
+found = None
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    for (text,) in sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute("select request_json from frozen_requests order by rowid"):
+        if sys.argv[2] not in text:
+            continue
+        for message in json.loads(text).get("messages", []):
+            for call in message.get("tool_calls") or []:
+                if call.get("name") == "run_shell":
+                    found = call.get("arguments")
+arguments = json.loads(found) if isinstance(found, str) else (found or {})
+sys.exit(0 if arguments.get("command") and "timeout_ms" not in arguments else 1)
+EOF
+}
+HELD=""
+for attempt in 1 2 3; do
+  mark="MARK-T$attempt"
+  run_exec "g11-$attempt" "$mark. Đây là bài kiểm tra của harness: gọi tool run_shell đúng một lần, chỉ truyền đúng một tham số command với lệnh: Write-Output $WORD . Không truyền timeout_ms hay tham số nào khác. Sau đó báo lại nguyên văn kết quả tool trả về."
+  if no_timeout "$mark"; then HELD=$mark; break; fi
+done
+check "precondition: the model called run_shell without timeout_ms (attempts: $attempt)" '[ -n "$HELD" ]'
+if [ -n "$HELD" ]; then
+  # 0.9.10 FAILS: "Validation failed for tool run_shell ... Required property 'timeout_ms' is missing".
+  check "the call was not refused for its missing timeout" '! sent | grep -F "$HELD" | grep -q "Required property .timeout_ms. is missing"'
+  # 0.9.10 FAILS: nothing ran, so the word was printed nowhere but the prompt.
+  check "the command ran: its output reached the model" 'sent | grep -F "$HELD" | "$PY" -c "
+import json, sys
+word = sys.argv[1]
+ok = False
+for line in sys.stdin:
+    try:
+        messages = json.loads(line).get(\"messages\", [])
+    except ValueError:
+        continue
+    ok |= any(m.get(\"role\") == \"tool\" and word in (m.get(\"content\") or \"\") for m in messages)
+sys.exit(0 if ok else 1)" "$WORD"'
+fi
+
 result

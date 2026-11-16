@@ -466,6 +466,42 @@ fn workspace_tool_schemas(hashline: bool) -> Vec<Value> {
     ]
 }
 
+/// How long a process runs when the call names no `timeout_ms`.
+///
+/// The timeout was required. A model that left it out had the call refused
+/// before anything ran, and one benchmark run of 24 conversations made 18
+/// `run_shell` calls, every one without it: the model never ran a command, and
+/// answered what a few lines of code would have checked by guessing.
+pub const DEFAULT_PROCESS_TIMEOUT_MS: u64 = 60_000;
+
+/// The schema of a process's `timeout_ms`, which may be left out.
+fn timeout_schema() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": 1,
+        "description": format!(
+            "Milliseconds before the process is stopped: {DEFAULT_PROCESS_TIMEOUT_MS} when left out. The host caps it."
+        )
+    })
+}
+
+/// A process's `timeout_ms`: the default when the call leaves it out, and an
+/// error only for a value that is not a whole number of milliseconds.
+fn process_timeout(
+    object: &serde_json::Map<String, Value>,
+    what: &str,
+) -> Result<u64, harness_types::HarnessError> {
+    match object.get("timeout_ms") {
+        None | Some(Value::Null) => Ok(DEFAULT_PROCESS_TIMEOUT_MS),
+        Some(value) => value.as_u64().filter(|ms| *ms >= 1).ok_or_else(|| {
+            harness_types::HarnessError::new(
+                harness_types::ErrorCode::InvalidPayload,
+                format!("provider {what} timeout_ms is invalid"),
+            )
+        }),
+    }
+}
+
 fn process_tool_schemas() -> Vec<Value> {
     vec![
         function_schema(
@@ -474,22 +510,22 @@ fn process_tool_schemas() -> Vec<Value> {
             json!({
                 "executable": string_schema(),
                 "args": {"type": "array", "items": string_schema()},
-                "timeout_ms": {"type": "integer", "minimum": 1},
+                "timeout_ms": timeout_schema(),
                 "isolation": isolation_schema(),
                 "env": environment_schema()
             }),
-            &["executable", "args", "timeout_ms"],
+            &["executable"],
         ),
         function_schema(
             "run_shell",
             "Run an explicitly requested shell command; never use this for structured argv.",
             json!({
                 "command": string_schema(),
-                "timeout_ms": {"type": "integer", "minimum": 1},
+                "timeout_ms": timeout_schema(),
                 "isolation": isolation_schema(),
                 "env": environment_schema()
             }),
-            &["command", "timeout_ms"],
+            &["command"],
         ),
         function_schema(
             "read_process_output",
@@ -1043,34 +1079,28 @@ impl CodingToolAction {
                     .map(|limit| limit.min(crate::find::FIND_MAX_LIMIT)),
             }),
             "run_process" => {
-                let args = object
-                    .get("args")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| {
+                // No `args` is a program run with none.
+                let no_args = Vec::new();
+                let args = match object.get("args") {
+                    None | Some(Value::Null) => &no_args,
+                    Some(value) => value.as_array().ok_or_else(|| {
                         harness_types::HarnessError::new(
                             harness_types::ErrorCode::InvalidPayload,
                             "provider process args must be an array",
                         )
-                    })?
-                    .iter()
-                    .map(|value| {
-                        value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
-                            harness_types::HarnessError::new(
-                                harness_types::ErrorCode::InvalidPayload,
-                                "provider process args must contain strings",
-                            )
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let timeout_ms = object
-                    .get("timeout_ms")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| {
+                    })?,
+                }
+                .iter()
+                .map(|value| {
+                    value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
                         harness_types::HarnessError::new(
                             harness_types::ErrorCode::InvalidPayload,
-                            "provider process timeout_ms is missing or invalid",
+                            "provider process args must contain strings",
                         )
-                    })?;
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+                let timeout_ms = process_timeout(object, "process")?;
                 Ok(Self::RunProcess {
                     executable: required_string(object, "executable")?,
                     args,
@@ -1081,15 +1111,7 @@ impl CodingToolAction {
             }
             "run_shell" => Ok(Self::RunShell {
                 command: required_string(object, "command")?,
-                timeout_ms: object
-                    .get("timeout_ms")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| {
-                        harness_types::HarnessError::new(
-                            harness_types::ErrorCode::InvalidPayload,
-                            "provider shell timeout_ms is missing or invalid",
-                        )
-                    })?,
+                timeout_ms: process_timeout(object, "shell")?,
                 isolation: parse_isolation(object.get("isolation"))?,
                 env: parse_env_bindings(object.get("env"))?,
             }),
@@ -2432,5 +2454,61 @@ mod schema_parser_agreement_tests {
                 assert!(allowed.contains(required), "{name} requires {required}");
             }
         }
+    }
+}
+/// A call that names no `timeout_ms` runs with the default. It was
+/// required, and a model that left it out (18 `run_shell` calls of 18 in
+/// one benchmark run) was refused before anything ran.
+#[test]
+fn a_process_call_without_a_timeout_runs_with_the_default() {
+    for schema in process_tool_schemas() {
+        let function = &schema["function"];
+        let name = function["name"].as_str().expect("name");
+        if name != "run_shell" && name != "run_process" {
+            continue;
+        }
+        let required = function["parameters"]["required"]
+            .as_array()
+            .expect("required");
+        assert!(
+            !required
+                .iter()
+                .any(|field| field == "timeout_ms" || field == "args"),
+            "{name}: {required:?}"
+        );
+    }
+    let CodingToolAction::RunShell { timeout_ms, .. } =
+        CodingToolAction::from_provider_call("run_shell", r#"{"command":"echo hi"}"#)
+            .expect("parses")
+    else {
+        panic!("a shell command");
+    };
+    assert_eq!(timeout_ms, DEFAULT_PROCESS_TIMEOUT_MS);
+    let CodingToolAction::RunProcess {
+        timeout_ms, args, ..
+    } = CodingToolAction::from_provider_call("run_process", r#"{"executable":"python"}"#)
+        .expect("parses")
+    else {
+        panic!("a process");
+    };
+    assert_eq!(timeout_ms, DEFAULT_PROCESS_TIMEOUT_MS);
+    assert!(args.is_empty());
+    // A timeout the call does name is kept, and a wrong one is still refused.
+    let CodingToolAction::RunShell { timeout_ms, .. } = CodingToolAction::from_provider_call(
+        "run_shell",
+        r#"{"command":"echo hi","timeout_ms":5000}"#,
+    )
+    .expect("parses") else {
+        panic!("a shell command");
+    };
+    assert_eq!(timeout_ms, 5000);
+    for bad in [
+        r#"{"command":"echo hi","timeout_ms":0}"#,
+        r#"{"command":"echo hi","timeout_ms":"soon"}"#,
+    ] {
+        assert!(
+            CodingToolAction::from_provider_call("run_shell", bad).is_err(),
+            "{bad}"
+        );
     }
 }

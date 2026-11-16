@@ -497,7 +497,7 @@ Harness tự chạy các check, theo thứ tự, dừng ở check hỏng đầu 
 | --- | --- | --- |
 | Workspace | `read_file`, `list_files`, `search_text`, `glob`, `find_files` | Đọc và tìm kiếm có giới hạn trong workspace |
 | Sửa file | `apply_patch`, `write_file`, `edit_file` | Ghi với hash/điều kiện match và phê duyệt; `write_file` tự tạo thư mục còn thiếu bên trong workspace |
-| Process | `run_process`, `run_shell`, `read_process_output` | Chạy lệnh và đọc output artifact có giới hạn. Trên Windows, những gì chúng khởi chạy (và những gì `bash()` của `python_repl` khởi chạy) chạy ở mức ưu tiên dưới bình thường, nên một bản build chiếm mọi nhân vẫn để terminal phản hồi |
+| Process | `run_process`, `run_shell`, `read_process_output` | Chạy lệnh và đọc output artifact có giới hạn. Có thể bỏ `timeout_ms` (khi đó là 60000, host đặt trần), và `args` của `run_process` cũng vậy: trước đây lệnh gọi thiếu timeout bị từ chối trước khi chạy bất cứ thứ gì. Trên Windows, những gì chúng khởi chạy (và những gì `bash()` của `python_repl` khởi chạy) chạy ở mức ưu tiên dưới bình thường, nên một bản build chiếm mọi nhân vẫn để terminal phản hồi |
 | Git | `git_status`, `git_diff`, `git_log` | Quan sát repository |
 | Task | `task_update`, `delegate`, `integrate_children`, `feature` | Ghi next action; giao explorer, coder hoặc verifier; đưa việc của coder về checkout; thao tác feature list |
 | Lịch sử | `history_search`, `history_read` | Tìm và đọc journal của hội thoại; với `scope: "project"`, cả mọi hội thoại trước của dự án (kết quả từ hội thoại khác ghi rõ hội thoại đó và lúc nó bắt đầu) |

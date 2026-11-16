@@ -502,7 +502,7 @@ The harness runs the checks itself, in order, stopping at the first failure, in 
 | --- | --- | --- |
 | Workspace | `read_file`, `list_files`, `search_text`, `glob`, `find_files` | Bounded reads and searches within the workspace |
 | File edits | `apply_patch`, `write_file`, `edit_file` | Writes with hash or match conditions and approval; `write_file` creates missing directories inside the workspace |
-| Process | `run_process`, `run_shell`, `read_process_output` | Run commands and read bounded output artifacts. On Windows what they start (and what `python_repl`'s `bash()` starts) runs at below-normal priority, so a build that takes every core leaves the terminal responsive |
+| Process | `run_process`, `run_shell`, `read_process_output` | Run commands and read bounded output artifacts. `timeout_ms` may be left out (60000 then, capped by the host), and so may `run_process`'s `args`: a call without the timeout used to be refused before anything ran. On Windows what they start (and what `python_repl`'s `bash()` starts) runs at below-normal priority, so a build that takes every core leaves the terminal responsive |
 | Git | `git_status`, `git_diff`, `git_log` | Observe the repository |
 | Task | `task_update`, `delegate`, `integrate_children`, `feature` | Record a next action; delegate to an explorer, a coder or a verifier; bring coders' work into the checkout; work the feature list |
 | History | `history_search`, `history_read` | Search and read the conversation's journal; with `scope: "project"`, every earlier conversation of the project (a hit from another one names it and when it started) |
