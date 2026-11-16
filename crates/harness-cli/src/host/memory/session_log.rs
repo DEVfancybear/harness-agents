@@ -373,6 +373,25 @@ pub fn owe(marks: &Path, task: &TaskId, session: &SessionId) {
     .write(&mark_path(marks, task));
 }
 
+/// Give up the logs this process owes under `marks`: each stays owed, to no
+/// process, so the next ha that starts in the project writes it. A process
+/// that stops in order calls this; its mark otherwise kept the log for it
+/// until it was seen to be gone.
+pub(super) fn disown_owed(marks: &Path) {
+    let Ok(entries) = std::fs::read_dir(marks.join(OWED_DIR)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(mut mark) = Mark::read(&path)
+            && mark.owner == *PROCESS
+        {
+            mark.owner = String::new();
+            mark.write(&path);
+        }
+    }
+}
+
 /// The conversations under `marks` whose owed log this process may write
 /// now, each with the turn it is owed through: not one another live process
 /// runs, not one with a turn running here, not `except`, and not one whose

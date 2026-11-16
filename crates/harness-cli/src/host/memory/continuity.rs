@@ -122,6 +122,43 @@ impl Drop for OpenConversation {
     }
 }
 
+/// Let go of what this process marked under `store`: the conversations it
+/// held open, and the session logs it owed, which stay owed to whoever starts
+/// next.
+fn release_in(store: &Path) {
+    if let Ok(entries) = std::fs::read_dir(store.join(OPEN_DIR)) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if std::fs::read_to_string(&path).is_ok_and(|owner| owner.trim() == *PROCESS) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    super::session_log::disown_owed(store);
+}
+
+/// A process that stops in order lets go of every conversation it held open
+/// and every log it owed, in the project stores it opened one under.
+///
+/// A worker that was told to stop left its marks, and they named it until
+/// its process was gone and seen to be gone. A conversation started right
+/// after - the user quits and starts again - took the one just closed for
+/// somebody's work in progress: it was not shown the task that one left
+/// unfinished, nor its session log (`memory.sh`, section 13, ten seconds
+/// after the worker stopped).
+pub fn release_all() {
+    let stores = STORES
+        .lock()
+        .map(|stores| stores.clone())
+        .unwrap_or_default();
+    for store in &stores {
+        release_in(store);
+    }
+    if let Ok(mut open) = OPEN.lock() {
+        open.clear();
+    }
+}
+
 /// Whether the owner a mark names is a process still running other than
 /// this one.
 pub(super) fn owner_is_another_live_process(owner: &str) -> bool {
@@ -242,6 +279,21 @@ mod tests {
         drop(second);
         assert!(!is_live(&task));
         assert!(!mark.exists());
+    }
+
+    /// A process that stops in order takes its own marks with it and leaves
+    /// another process's: the conversation it held is closed, not live.
+    #[test]
+    fn a_stopping_process_lets_go_of_its_marks_and_of_no_others() {
+        let store = tempfile::tempdir().expect("store");
+        let open = store.path().join(super::OPEN_DIR);
+        std::fs::create_dir_all(&open).expect("dir");
+        let (own, other) = (TaskId::generate(), TaskId::generate());
+        std::fs::write(open.join(own.as_str()), super::PROCESS.as_str()).expect("mark");
+        std::fs::write(open.join(other.as_str()), "1:1").expect("mark");
+        super::release_in(store.path());
+        assert!(!open.join(own.as_str()).exists());
+        assert!(open.join(other.as_str()).is_file());
     }
 
     /// Another process's mark makes a conversation live only while that

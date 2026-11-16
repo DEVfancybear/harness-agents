@@ -358,6 +358,9 @@ pub fn run(args: &WorkerArgs) -> Result<(), String> {
         worker.stop_all();
         worker.keep_journal();
     }
+    // The conversations it ran are closed now, whatever this process still
+    // has to finish before it is gone.
+    super::super::continuity::release_all();
     registry::remove_if_owned(&args.registry, &key, std::process::id());
     log("worker stopped");
     drop(lock);
