@@ -9728,11 +9728,18 @@ mod real_worker_tests {
     }
 
     /// A sibling's name a child gets wrong is answered with the names there are.
+    ///
+    /// The two children share one script, and which of them asks first is the
+    /// machine's to decide: on a slow CI runner the second child took the
+    /// first reply, the first child sent the message, and the answer named
+    /// "two" where the test read "one". Either child is the other's sibling.
+    /// The first reply waits long enough for both to be running when the
+    /// message is sent.
     #[tokio::test]
     async fn a_sibling_that_does_not_exist_is_answered_with_the_ones_that_do() {
         let bench = bench();
         let provider = Scripted::new(vec![
-            Reply::Delay(900, Box::new(Reply::Text("mapped"))),
+            Reply::Delay(2_500, Box::new(Reply::Text("mapped"))),
             Reply::Tool(
                 "agent_message",
                 json!({"message": "taking src/", "receiver_role": "sibling", "receiver_name": "nobody"}),
@@ -9750,12 +9757,14 @@ mod real_worker_tests {
             ));
         }
         let seen = provider.requests_text();
-        assert!(
-            seen.contains("no sibling named \\\"nobody\\\"; your parent's other children are one")
-                || seen
-                    .contains("no sibling named \"nobody\"; your parent's other children are one"),
-            "{seen}"
-        );
+        let answered = |sibling: &str| {
+            seen.contains(&format!(
+                "no sibling named \\\"nobody\\\"; your parent's other children are {sibling}"
+            )) || seen.contains(&format!(
+                "no sibling named \"nobody\"; your parent's other children are {sibling}"
+            ))
+        };
+        assert!(answered("one") || answered("two"), "{seen}");
     }
 
     /// Evolving Agent Teams (arXiv 2610.36848): a child is named after the
