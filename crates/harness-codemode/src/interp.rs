@@ -88,11 +88,26 @@ pub type Env = Rc<Scope>;
 
 impl Scope {
     pub fn new(parent: Option<Env>, function: bool) -> Env {
-        Rc::new(Self {
+        let scope = Rc::new(Self {
             vars: RefCell::new(HashMap::new()),
             parent,
             function,
-        })
+        });
+        crate::heap::scope(&scope);
+        scope
+    }
+
+    /// Every value the scope holds, taken out of it (`crate::heap`).
+    pub fn take_values(&self) -> Vec<Value> {
+        std::mem::take(&mut *self.vars.borrow_mut())
+            .into_values()
+            .map(|binding| binding.value)
+            .collect()
+    }
+
+    /// Whether `name` is declared in this scope itself.
+    pub fn has_own(&self, name: &str) -> bool {
+        self.vars.borrow().contains_key(name)
     }
 
     pub fn declare(&self, name: Rc<str>, value: Value, mutable: bool) {
@@ -163,6 +178,9 @@ pub struct Interp<'h> {
     /// Keys `store()` set (`Some(json)`) or deleted (`None`), in order.
     pub writes: IndexMap<String, Option<String>>,
     allocated: usize,
+    /// The script's scopes, kept until the run's values are let go of
+    /// (`crate::heap::release`), so none is freed deep before.
+    roots: Vec<Env>,
     random: u64,
 }
 
@@ -201,6 +219,7 @@ impl<'h> Interp<'h> {
             store_chars,
             writes: IndexMap::new(),
             allocated: 0,
+            roots: Vec::new(),
             random: seed | 1,
         }
     }
@@ -210,6 +229,8 @@ impl<'h> Interp<'h> {
         let global = Scope::new(None, true);
         builtins::install_globals(self, &global);
         let script = Scope::new(Some(global), true);
+        self.roots.push(Rc::clone(&script));
+        hoist_vars(body, &script);
         let outcome = match self.exec_block(body, &script) {
             Ok(()) => Ok(Value::Undefined),
             Err(Flow::Return(value)) => Ok(value),
@@ -377,11 +398,13 @@ impl<'h> Interp<'h> {
         props.insert(Rc::from("name"), Value::str(name));
         props.insert(Rc::from("message"), Value::str(message));
         props.insert(Rc::from("stack"), Value::str(stack));
-        Value::Object(Rc::new(Object {
+        let error = Rc::new(Object {
             props: RefCell::new(props),
             class: Class::Error,
             frozen: std::cell::Cell::new(false),
-        }))
+        });
+        crate::heap::object(&error);
+        Value::Object(error)
     }
 
     pub fn throw(&self, name: &str, message: impl AsRef<str>) -> Flow {
@@ -443,6 +466,11 @@ impl<'h> Interp<'h> {
             StmtKind::Empty | StmtKind::Function(..) => Ok(()),
             StmtKind::Var(kind, declarators) => {
                 for declarator in declarators {
+                    // `var x;` leaves an `x` that is already there as it is:
+                    // every `var` was hoisted as `undefined`.
+                    if *kind == VarKind::Var && declarator.init.is_none() {
+                        continue;
+                    }
                     let value = match &declarator.init {
                         Some(init) => self.eval(init, env)?,
                         None => Value::Undefined,
@@ -662,12 +690,33 @@ impl<'h> Interp<'h> {
                 keys,
             } => {
                 let source = self.eval(iterable, env)?;
-                let items = if *keys {
-                    builtins::for_in_keys(&source)
-                } else {
-                    self.iterate(&source)?
+                // An array is read as the loop goes, as JavaScript's array
+                // iterator reads it: an item pushed in the body is visited.
+                let live = match (&source, *keys) {
+                    (Value::Array(array), false) => Some(Rc::clone(array)),
+                    _ => None,
                 };
-                for item in items {
+                let mut items = match &live {
+                    Some(_) => Vec::new().into_iter(),
+                    None if *keys => builtins::for_in_keys(&source).into_iter(),
+                    None => self.iterate(&source)?.into_iter(),
+                };
+                let mut position = 0_usize;
+                loop {
+                    let item = match &live {
+                        Some(array) => {
+                            let next = array.items.borrow().get(position).cloned();
+                            position += 1;
+                            match next {
+                                Some(item) => item,
+                                None => break,
+                            }
+                        }
+                        None => match items.next() {
+                            Some(item) => item,
+                            None => break,
+                        },
+                    };
                     self.tick()?;
                     let scope = Scope::new(Some(Rc::clone(env)), false);
                     match head {
@@ -882,9 +931,21 @@ impl<'h> Interp<'h> {
                 prefix,
                 target,
             } => {
-                let old = to_number(&self.eval(target, env)?);
-                let new = if *increment { old + 1.0 } else { old - 1.0 };
-                self.assign_to(target, Value::Number(new), env)?;
+                let step = |old: f64| if *increment { old + 1.0 } else { old - 1.0 };
+                // The target's object and key are evaluated once: `a[i++]++`.
+                let (old, new) = if let Expr::Member { object, key, .. } = &**target {
+                    let object = self.eval(object, env)?;
+                    let key = self.member_key(key, env)?;
+                    let old = to_number(&builtins::get_property(self, &object, &key)?);
+                    let new = step(old);
+                    builtins::set_property(self, &object, &key, Value::Number(new))?;
+                    (old, new)
+                } else {
+                    let old = to_number(&self.eval(target, env)?);
+                    let new = step(old);
+                    self.assign_to(target, Value::Number(new), env)?;
+                    (old, new)
+                };
                 Ok(Value::Number(if *prefix { new } else { old }))
             }
             Expr::Binary(op, left, right) => {
@@ -1268,6 +1329,9 @@ impl<'h> Interp<'h> {
                 Some(VarKind::Let),
             )?;
         }
+        if let FunctionBody::Block(body) = &def.body {
+            hoist_vars(body, &scope);
+        }
         match &def.body {
             FunctionBody::Expr(expr) => self.eval(expr, &scope),
             FunctionBody::Block(body) => match self.exec_block(body, &scope) {
@@ -1580,6 +1644,82 @@ fn describe_callee(expr: &Expr) -> String {
         Expr::Call { callee, .. } => format!("{}(...)", describe_callee(callee)),
         Expr::Chain(inner) => describe_callee(inner),
         _ => "expression".to_owned(),
+    }
+}
+
+/// Declare, as `undefined`, every `var` of a function body (or the
+/// script) in its scope, where it is not declared yet: `var` is hoisted.
+fn hoist_vars(body: &[Stmt], scope: &Env) {
+    let mut names = Vec::new();
+    for stmt in body {
+        var_names(stmt, &mut names);
+    }
+    for name in names {
+        if !scope.has_own(&name) {
+            scope.declare(name, Value::Undefined, true);
+        }
+    }
+}
+
+/// The `var` names a statement declares, not counting nested functions.
+fn var_names(stmt: &Stmt, out: &mut Vec<Rc<str>>) {
+    match &stmt.kind {
+        StmtKind::Var(VarKind::Var, declarators) => {
+            for declarator in declarators {
+                pattern_names(&declarator.target, out);
+            }
+        }
+        StmtKind::If(_, then, otherwise) => {
+            var_names(then, out);
+            if let Some(otherwise) = otherwise {
+                var_names(otherwise, out);
+            }
+        }
+        StmtKind::For { init, body, .. } => {
+            if let Some(ForInit::Var(VarKind::Var, declarators)) = init {
+                for declarator in declarators {
+                    pattern_names(&declarator.target, out);
+                }
+            }
+            var_names(body, out);
+        }
+        StmtKind::ForEach { head, body, .. } => {
+            if let ForHead::Var(VarKind::Var, target) = head {
+                pattern_names(target, out);
+            }
+            var_names(body, out);
+        }
+        StmtKind::While(_, body) | StmtKind::DoWhile(body, _) | StmtKind::Labeled(_, body) => {
+            var_names(body, out);
+        }
+        StmtKind::Block(body) => {
+            for stmt in body {
+                var_names(stmt, out);
+            }
+        }
+        StmtKind::Try {
+            block,
+            handler,
+            finalizer,
+            ..
+        } => {
+            for part in [Some(block), handler.as_ref(), finalizer.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                for stmt in part {
+                    var_names(stmt, out);
+                }
+            }
+        }
+        StmtKind::Switch(_, cases) => {
+            for case in cases {
+                for stmt in &case.body {
+                    var_names(stmt, out);
+                }
+            }
+        }
+        _ => {}
     }
 }
 

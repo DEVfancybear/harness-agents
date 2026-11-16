@@ -2984,6 +2984,9 @@ impl TurnDriver {
                         &mut announced,
                     )
                     .await?;
+                    // The program's calls stop with the turn, and when the
+                    // program is stopped (its deadline): a child token.
+                    let program_cancellation = cancellation.child_token();
                     let context = CodemodeContext {
                         session_id: &result.session_id,
                         task_id: &result.task_id,
@@ -2991,18 +2994,24 @@ impl TurnDriver {
                         tool_schemas: &request.tool_schemas,
                         options: &options,
                         observer: &observer,
-                        cancellation: &cancellation,
+                        cancellation: &program_cancellation,
                         sequence: tool_calls,
                         made: std::sync::atomic::AtomicU32::new(0),
                         finished: std::sync::Mutex::new(Vec::new()),
+                        hooks: std::sync::Mutex::new(crate::HookResponse::default()),
                     };
                     let slot = self.run_codemode(&call.arguments, &context).await;
                     let finished = context.finished.into_inner().unwrap_or_default();
                     for (view, arguments) in finished {
-                        self.remember_hash(&view.output);
                         note_change(&mut changed_files, &view.output, &arguments);
                         executions.push(view);
                     }
+                    // What the hooks of the program's calls said reaches the
+                    // model with the program's result, and a hook that stops
+                    // the turn stops it.
+                    let hooks = context.hooks.into_inner().unwrap_or_default();
+                    let slot = with_hook_feedback(slot, &hooks);
+                    hook_notes.insert(transcript_id.clone(), hooks);
                     slots.push((name.clone(), transcript_id, slot));
                     continue;
                 }
@@ -4017,6 +4026,44 @@ struct CodemodeContext<'a> {
     made: std::sync::atomic::AtomicU32,
     /// The calls that ran, with their arguments, for the turn's records.
     finished: std::sync::Mutex<Vec<(ToolExecutionView, String)>>,
+    /// What the hooks of the program's calls answered, kept together.
+    hooks: std::sync::Mutex<crate::HookResponse>,
+}
+
+/// The most calls one program may make; past it each call is refused.
+const MAX_CODEMODE_CALLS: u32 = 1000;
+
+impl CodemodeContext<'_> {
+    /// Keep a call's hook answer: its text for the model, and a stop.
+    fn keep_hooks(&self, note: crate::HookResponse) {
+        if let Ok(mut hooks) = self.hooks.lock() {
+            hooks.context.extend(note.context);
+            hooks.host_context.extend(note.host_context);
+            if hooks.stop.is_none() {
+                hooks.stop = note.stop;
+            }
+        }
+    }
+}
+
+/// A codemode result with what the hooks of its calls said, as a call's
+/// result carries its hooks' feedback.
+fn with_hook_feedback(slot: Slot, hooks: &crate::HookResponse) -> Slot {
+    let mut feedback = String::new();
+    if let Some(context) = hooks.context_text() {
+        let _ = write!(feedback, "\n\nHook feedback:\n{context}");
+    }
+    if let Some(context) = hooks.host_context_text() {
+        let _ = write!(feedback, "\n\n{context}");
+    }
+    if feedback.is_empty() {
+        return slot;
+    }
+    match slot {
+        Slot::Answered(text) => Slot::Answered(format!("{text}{feedback}")),
+        Slot::Failed(text, detail) => Slot::Failed(format!("{text}{feedback}"), detail),
+        other => other,
+    }
 }
 
 impl TurnDriver {
@@ -4055,6 +4102,7 @@ impl TurnDriver {
             run_options,
             |calls| self.codemode_batch(calls, context),
             context.cancellation.cancelled(),
+            || context.cancellation.cancel(),
         )
         .await;
         if outcome.ok() {
@@ -4123,7 +4171,7 @@ impl TurnDriver {
             let done = match (state, outcome) {
                 (CodemodeState::Ready(ready), Some(outcome)) => {
                     let mut hook_note = crate::HookResponse::default();
-                    complete_action(
+                    let done = complete_action(
                         &self.tools,
                         ready,
                         outcome,
@@ -4131,7 +4179,9 @@ impl TurnDriver {
                         context.cancellation,
                         &mut hook_note,
                     )
-                    .await
+                    .await;
+                    context.keep_hooks(hook_note);
+                    done
                 }
                 (CodemodeState::Done(done), _) => done,
                 (CodemodeState::Ready(_), None) => Err(HarnessError::new(
@@ -4140,7 +4190,7 @@ impl TurnDriver {
                 )),
             };
             answers.push(settle_codemode_call(
-                &name, &call_id, arguments, done, context,
+                self, &name, &call_id, arguments, done, context,
             ));
         }
         answers
@@ -4205,6 +4255,7 @@ impl TurnDriver {
                 Err(error) => CodemodeState::Done(Err(error)),
             },
         };
+        context.keep_hooks(hook_note);
         CodemodeEntry {
             name: call.name,
             call_id,
@@ -4223,6 +4274,12 @@ impl TurnDriver {
         call_id: &str,
         context: &CodemodeContext<'_>,
     ) -> Result<ToolRequest, HarnessError> {
+        if context.made.load(std::sync::atomic::Ordering::Relaxed) > MAX_CODEMODE_CALLS {
+            return Err(HarnessError::new(
+                ErrorCode::PolicyDenied,
+                format!("a codemode program may make at most {MAX_CODEMODE_CALLS} tool calls"),
+            ));
+        }
         if crate::codemode::NOT_FROM_CODEMODE.contains(&name) {
             return Err(HarnessError::new(
                 ErrorCode::PolicyDenied,
@@ -4250,6 +4307,16 @@ impl TurnDriver {
                 "in a codemode program read one file per call: `await Promise.all(paths.map(path => tools.read_file({ path })))`",
             ));
         }
+        // Rules learned from this project's failures, as for a model call.
+        if !self.learned_rules.is_empty() {
+            let realized = self.learned_rules.realize(name, arguments);
+            if let Some(refusal) = realized.refusal {
+                return Err(HarnessError::new(ErrorCode::PolicyDenied, refusal));
+            }
+            if let Some(rewritten) = realized.arguments {
+                *arguments = rewritten;
+            }
+        }
         let call = NormalizedToolCall {
             call_id: call_id.to_owned(),
             name: name.to_owned(),
@@ -4270,6 +4337,7 @@ impl TurnDriver {
 /// Show a program's finished call, keep it for the turn's records, and say
 /// what the program reads: the value, or why the call did not succeed.
 fn settle_codemode_call(
+    driver: &TurnDriver,
     name: &str,
     call_id: &str,
     arguments: String,
@@ -4279,6 +4347,9 @@ fn settle_codemode_call(
     announce_settled(context.observer, name, call_id, &done);
     match done {
         Ok(view) => {
+            // A later call of the same program writes against what this
+            // one read or wrote.
+            driver.remember_hash(&view.output);
             let answer = match failure_detail(&view.output) {
                 Some(detail) => Err(format!("{name} was not run: {detail}")),
                 None => Ok(crate::codemode::script_value(name, &view.output)),

@@ -163,6 +163,70 @@ pub fn array_method(
             "Array.prototype.{method} called on a value that is not an array"
         )));
     };
+    // Methods that call no callback work on the array itself; the others
+    // walk a copy taken when they start. `push` in a loop stays linear.
+    match method {
+        "push" | "unshift" => {
+            let array = writable(interp, array, method)?;
+            let len = array.items.borrow().len();
+            grow(interp, len, args.len())?;
+            let mut items = array.items.borrow_mut();
+            if method == "push" {
+                items.extend(args.iter().cloned());
+            } else {
+                items.splice(0..0, args.iter().cloned());
+            }
+            return Ok(index(items.len()));
+        }
+        "pop" => {
+            return Ok(writable(interp, array, method)?
+                .items
+                .borrow_mut()
+                .pop()
+                .unwrap_or(Value::Undefined));
+        }
+        "shift" => {
+            let array = writable(interp, array, method)?;
+            let mut items = array.items.borrow_mut();
+            return Ok(if items.is_empty() {
+                Value::Undefined
+            } else {
+                items.remove(0)
+            });
+        }
+        "at" => {
+            let items = array.items.borrow();
+            let position = to_integer(&arg(args, 0));
+            let position = if position < 0.0 {
+                items.len() as f64 + position
+            } else {
+                position
+            };
+            return Ok(if position < 0.0 || position >= items.len() as f64 {
+                Value::Undefined
+            } else {
+                items[position as usize].clone()
+            });
+        }
+        "includes" | "indexOf" => {
+            let wanted = arg(args, 0);
+            let items = array.items.borrow();
+            let start = relative_index(&arg(args, 1), items.len(), 0);
+            let found = items[start..].iter().position(|item| {
+                if method == "includes" {
+                    same_value_zero(item, &wanted)
+                } else {
+                    strict_equals(item, &wanted)
+                }
+            });
+            return Ok(if method == "includes" {
+                Value::Bool(found.is_some())
+            } else {
+                Value::Number(found.map_or(-1.0, |position| (position + start) as f64))
+            });
+        }
+        _ => {}
+    }
     let items = array.items.borrow().clone();
     let len = items.len();
     let callback = arg(args, 0);
@@ -174,19 +238,6 @@ pub fn array_method(
         )
     };
     Ok(match method {
-        "at" => {
-            let position = to_integer(&arg(args, 0));
-            let position = if position < 0.0 {
-                len as f64 + position
-            } else {
-                position
-            };
-            if position < 0.0 || position >= len as f64 {
-                Value::Undefined
-            } else {
-                items[position as usize].clone()
-            }
-        }
         "concat" => {
             let mut joined = items;
             for value in args {
@@ -273,25 +324,6 @@ pub fn array_method(
             interp.alloc(out.len() * 16)?;
             Value::array(out)
         }
-        "includes" => {
-            let wanted = arg(args, 0);
-            let start = relative_index(&arg(args, 1), len, 0);
-            Value::Bool(
-                items[start..]
-                    .iter()
-                    .any(|item| same_value_zero(item, &wanted)),
-            )
-        }
-        "indexOf" => {
-            let wanted = arg(args, 0);
-            let start = relative_index(&arg(args, 1), len, 0);
-            Value::Number(
-                items[start..]
-                    .iter()
-                    .position(|item| strict_equals(item, &wanted))
-                    .map_or(-1.0, |position| (position + start) as f64),
-            )
-        }
         "lastIndexOf" => {
             let wanted = arg(args, 0);
             Value::Number(
@@ -318,34 +350,6 @@ pub fn array_method(
             }
             interp.alloc(text.len())?;
             Value::str(text)
-        }
-        "pop" => writable(interp, array, "pop")?
-            .items
-            .borrow_mut()
-            .pop()
-            .unwrap_or(Value::Undefined),
-        "shift" => {
-            let array = writable(interp, array, "shift")?;
-            let mut items = array.items.borrow_mut();
-            if items.is_empty() {
-                Value::Undefined
-            } else {
-                items.remove(0)
-            }
-        }
-        "push" => {
-            let array = writable(interp, array, "push")?;
-            grow(interp, len, args.len())?;
-            let mut items = array.items.borrow_mut();
-            items.extend(args.iter().cloned());
-            index(items.len())
-        }
-        "unshift" => {
-            let array = writable(interp, array, "unshift")?;
-            grow(interp, len, args.len())?;
-            let mut items = array.items.borrow_mut();
-            items.splice(0..0, args.iter().cloned());
-            index(items.len())
         }
         "reduce" | "reduceRight" => {
             require_function(interp, &callback, &format!("Array.prototype.{method}"))?;
@@ -471,7 +475,7 @@ pub fn new_map(interp: &mut Interp<'_>, source: &Value) -> R<Value> {
         }
     }
     interp.alloc(entries.len() * 48)?;
-    Ok(Value::Map(Rc::new(RefCell::new(entries))))
+    Ok(Value::map(entries))
 }
 
 pub fn new_set(interp: &mut Interp<'_>, source: &Value) -> R<Value> {
@@ -482,7 +486,7 @@ pub fn new_set(interp: &mut Interp<'_>, source: &Value) -> R<Value> {
         }
     }
     interp.alloc(entries.len() * 32)?;
-    Ok(Value::Set(Rc::new(RefCell::new(entries))))
+    Ok(Value::set(entries))
 }
 
 pub fn map_method(interp: &mut Interp<'_>, method: &str, this: &Value, args: &[Value]) -> R<Value> {

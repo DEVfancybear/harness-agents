@@ -582,3 +582,70 @@ fn renders_the_result_for_the_model() {
         "(the script printed nothing and returned undefined)"
     );
 }
+
+/// What the fresh review of the first version found, each now right.
+#[test]
+fn review_findings_hold() {
+    // `for...of` reads the array as it goes: a queue grows while it is walked.
+    assert_eq!(
+        value(
+            "const seen = []; const queue = [1]; for (const n of queue) { seen.push(n); if (n < 4) queue.push(n + 1) } return seen"
+        ),
+        "[1,2,3,4]"
+    );
+    // `toFixed` rounds a tie away from zero, and a zero has no sign.
+    assert_eq!(
+        value(
+            "return [(12.5).toFixed(0), (0.125).toFixed(2), (1.005).toFixed(2), (-0).toFixed(2), (-1.5).toFixed(0), (9.995).toFixed(2), (999.5).toFixed(0), (2.5).toPrecision(1)]"
+        ),
+        r#"["13","0.13","1.00","0.00","-2","9.99","1000","3"]"#
+    );
+    // `a[i++]++` evaluates `i++` once.
+    assert_eq!(
+        value("const a = [0, 0, 0]; let i = 0; a[i++]++; return [a, i]"),
+        "[[1,0,0],1]"
+    );
+    assert_eq!(
+        value(
+            "let calls = 0; const o = { n: 1 }; const get = () => { calls++; return o }; get().n++; return [o.n, calls]"
+        ),
+        "[2,1]"
+    );
+    // `var` is hoisted, and `var x;` keeps what `x` holds.
+    assert_eq!(value("if (false) { var r = 1 } return r"), "undefined");
+    assert_eq!(value("var x = 5; var x; return x"), "5");
+    assert_eq!(
+        value("function f() { if (true) { var y = 2 } return y } return f()"),
+        "2"
+    );
+}
+
+#[test]
+fn large_texts_and_deep_values_stay_within_bounds() {
+    // A regular expression over a large text shares it with every match.
+    assert_eq!(
+        value("const s = 'a\t'.repeat(200000); return s.replace(/\t/g, ' ').length"),
+        "400000"
+    );
+    // Splitting a large text that is not ASCII is linear.
+    let started = std::time::Instant::now();
+    assert_eq!(
+        value(r"return 'é line\n'.repeat(50000).split(/\n/).length"),
+        "50001"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    // A chain hundreds of thousands deep is freed without a stack overflow.
+    assert_eq!(
+        value("let h = null; for (let i = 0; i < 300000; i++) h = { next: h }; return 1"),
+        "1"
+    );
+    // JSON past ten thousand levels is refused, not a hang.
+    let error = failure(
+        "let h = null; for (let i = 0; i < 20000; i++) h = { next: h }; return JSON.stringify(h).length",
+    );
+    assert!(error.message.contains("nested"), "{error:?}");
+}

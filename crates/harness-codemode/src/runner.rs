@@ -158,9 +158,9 @@ fn run_here(
     };
     let store: IndexMap<String, String> = store.into_iter().collect();
     let mut interp = Interp::new(host, limits, tools, store);
-    let outcome = interp.run(&body);
-    let outcome = match outcome {
-        Outcome::Returned(value) => match json_stringify(&value, "") {
+    let finished = interp.run(&body);
+    let outcome = match &finished {
+        Outcome::Returned(value) => match json_stringify(value, "") {
             Ok(json) => Ok(json),
             Err(crate::value::JsonError::Cycle) => Err(ScriptError {
                 kind: ErrorKind::Script,
@@ -177,8 +177,8 @@ fn run_here(
             }),
         },
         Outcome::Exited => Ok(None),
-        Outcome::Threw(value) => Err(error_of(&value)),
-        Outcome::Fatal(fatal) => Err(fatal_error(fatal)),
+        Outcome::Threw(value) => Err(error_of(value)),
+        Outcome::Fatal(fatal) => Err(fatal_error(fatal.clone())),
     };
     let store_writes = if outcome.is_ok() {
         let mut writes = StoreWrites::default();
@@ -192,12 +192,18 @@ fn run_here(
     } else {
         StoreWrites::default()
     };
-    CodemodeResult {
+    let result = CodemodeResult {
         outcome,
         output: std::mem::take(&mut interp.output),
         calls: std::mem::take(&mut interp.calls),
         store_writes,
-    }
+    };
+    // Everything the run made is let go of now, cycles included, while the
+    // interpreter still holds its scopes: nothing is freed deep.
+    crate::heap::release();
+    drop(finished);
+    drop(interp);
+    result
 }
 
 type Reply = std::sync::mpsc::SyncSender<Result<Vec<Result<String, String>>, Fatal>>;
@@ -240,18 +246,27 @@ const TIMED_OUT: (ErrorKind, &str) = (ErrorKind::Timeout, "Execution timed out")
 /// Run `code` on a thread of its own. `call` runs one batch of the script's
 /// calls and answers each (the JSON text of its value, or its error
 /// message); `cancelled` resolves when the caller gives up on the run.
-pub async fn execute<F, Fut, C>(
+/// `on_stop` is called once if the run is stopped (deadline or
+/// cancellation) while a batch runs: the host stops those calls, and they
+/// are awaited, so none is dropped half done.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the run's whole life: start, its calls, a stop, and the grace after it"
+)]
+pub async fn execute<F, Fut, C, S>(
     code: String,
     tools: Vec<ToolInfo>,
     store: Vec<(String, String)>,
     options: RunOptions,
     mut call: F,
     cancelled: C,
+    mut on_stop: S,
 ) -> CodemodeResult
 where
     F: FnMut(Vec<HostCall>) -> Fut,
     Fut: Future<Output = Vec<Result<String, String>>>,
     C: Future<Output = ()>,
+    S: FnMut(),
 {
     let cancel = Arc::new(AtomicBool::new(false));
     let (requests, mut incoming) = tokio::sync::mpsc::unbounded_channel();
@@ -291,17 +306,40 @@ where
             () = &mut sleep => break TIMED_OUT,
             request = incoming.recv() => {
                 let Some((calls, reply)) = request else { continue };
-                let (answers, stop) = tokio::select! {
-                    answers = call(calls) => (Ok(answers), None),
-                    () = &mut cancelled => (Err(Fatal::Aborted(ABORTED.1.to_owned())), Some(ABORTED)),
-                    () = &mut sleep => (Err(Fatal::Timeout(TIMED_OUT.1.to_owned())), Some(TIMED_OUT)),
+                // A stop while calls run does not drop them: the host is told
+                // to stop them (`on_stop`), and they settle with their
+                // receipts before the script hears of the stop.
+                let running = call(calls);
+                tokio::pin!(running);
+                let mut stop = None;
+                let answers = loop {
+                    tokio::select! {
+                        answers = &mut running => break answers,
+                        () = &mut cancelled, if stop.is_none() => {
+                            stop = Some(ABORTED);
+                            cancel.store(true, Ordering::Relaxed);
+                            on_stop();
+                        }
+                        () = &mut sleep, if stop.is_none() => {
+                            stop = Some(TIMED_OUT);
+                            cancel.store(true, Ordering::Relaxed);
+                            on_stop();
+                        }
+                    }
                 };
-                if stop.is_some() {
-                    cancel.store(true, Ordering::Relaxed);
-                }
-                let _ = reply.send(answers);
-                if let Some(stop) = stop {
-                    break stop;
+                match stop {
+                    None => {
+                        let _ = reply.send(Ok(answers));
+                    }
+                    Some(stop) => {
+                        let fatal = if stop.0 == ErrorKind::Timeout {
+                            Fatal::Timeout(stop.1.to_owned())
+                        } else {
+                            Fatal::Aborted(stop.1.to_owned())
+                        };
+                        let _ = reply.send(Err(fatal));
+                        break stop;
+                    }
                 }
             }
         }

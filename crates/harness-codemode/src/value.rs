@@ -148,19 +148,35 @@ impl Value {
     }
 
     pub fn array(items: Vec<Value>) -> Self {
-        Self::Array(Rc::new(Array {
+        let array = Rc::new(Array {
             items: RefCell::new(items),
             extra: RefCell::new(IndexMap::new()),
             frozen: Cell::new(false),
-        }))
+        });
+        crate::heap::array(&array);
+        Self::Array(array)
     }
 
     pub fn object(props: IndexMap<Rc<str>, Value>) -> Self {
-        Self::Object(Rc::new(Object {
+        let object = Rc::new(Object {
             props: RefCell::new(props),
             class: Class::Object,
             frozen: Cell::new(false),
-        }))
+        });
+        crate::heap::object(&object);
+        Self::Object(object)
+    }
+
+    pub fn map(entries: IndexMap<MapKey, (Value, Value)>) -> Self {
+        let map = Rc::new(RefCell::new(entries));
+        crate::heap::map(&map);
+        Self::Map(map)
+    }
+
+    pub fn set(entries: IndexMap<MapKey, Value>) -> Self {
+        let set = Rc::new(RefCell::new(entries));
+        crate::heap::set(&set);
+        Self::Set(set)
     }
 
     pub fn object_from<const N: usize>(entries: [(&str, Value); N]) -> Self {
@@ -421,7 +437,15 @@ pub fn date_iso(time: f64) -> Option<String> {
 }
 
 /// `String(value)`.
+/// How deep `JSON.stringify` and `String()` go into nested values.
+const MAX_JSON_DEPTH: usize = 10_000;
+const MAX_STRING_DEPTH: usize = 1_000;
+
 pub fn to_string(value: &Value) -> String {
+    to_string_at(value, 0)
+}
+
+fn to_string_at(value: &Value, depth: usize) -> String {
     match value {
         Value::Undefined => "undefined".to_owned(),
         Value::Null => "null".to_owned(),
@@ -442,7 +466,9 @@ pub fn to_string(value: &Value) -> String {
                     {
                         continue;
                     }
-                    text.push_str(&to_string(item));
+                    if depth < MAX_STRING_DEPTH {
+                        text.push_str(&to_string_at(item, depth + 1));
+                    }
                 }
             }
             text
@@ -531,7 +557,7 @@ pub enum JsonError {
 /// `undefined` (a function, `undefined`).
 pub fn json_stringify(value: &Value, indent: &str) -> Result<Option<String>, JsonError> {
     let mut out = String::new();
-    let mut stack = Vec::new();
+    let mut stack = std::collections::HashSet::new();
     if write_json(value, indent, 0, &mut stack, &mut out)? {
         Ok(Some(out))
     } else {
@@ -544,7 +570,7 @@ fn write_json(
     value: &Value,
     indent: &str,
     level: usize,
-    stack: &mut Vec<usize>,
+    stack: &mut std::collections::HashSet<usize>,
     out: &mut String,
 ) -> Result<bool, JsonError> {
     let newline = |out: &mut String, level: usize| {
@@ -574,10 +600,15 @@ fn write_json(
         Value::Promise(_) => return Err(JsonError::Unsupported("a Promise (await it first)")),
         Value::Array(array) => {
             let address = value.address().unwrap_or(0);
+            if stack.len() >= MAX_JSON_DEPTH {
+                return Err(JsonError::Unsupported(
+                    "a value nested more than 10000 levels deep",
+                ));
+            }
             if stack.contains(&address) {
                 return Err(JsonError::Cycle);
             }
-            stack.push(address);
+            stack.insert(address);
             let items = array.items.borrow().clone();
             out.push('[');
             for (index, item) in items.iter().enumerate() {
@@ -593,14 +624,19 @@ fn write_json(
                 newline(out, level);
             }
             out.push(']');
-            stack.pop();
+            stack.remove(&address);
         }
         Value::Object(object) => {
             let address = value.address().unwrap_or(0);
+            if stack.len() >= MAX_JSON_DEPTH {
+                return Err(JsonError::Unsupported(
+                    "a value nested more than 10000 levels deep",
+                ));
+            }
             if stack.contains(&address) {
                 return Err(JsonError::Cycle);
             }
-            stack.push(address);
+            stack.insert(address);
             let props: Vec<(Rc<str>, Value)> = object
                 .props
                 .borrow()
@@ -630,7 +666,7 @@ fn write_json(
                 newline(out, level);
             }
             out.push('}');
-            stack.pop();
+            stack.remove(&address);
         }
         // Like engines: Map, Set, RegExp and namespaces have no own
         // enumerable properties.

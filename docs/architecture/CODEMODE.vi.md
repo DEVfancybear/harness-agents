@@ -88,6 +88,17 @@ Driver trả lời mỗi lô như trả lời một lô lần gọi của chính
 3. Các side effect chạy song song và hoàn tất theo thứ tự, kèm receipt và
    hook `post_tool_use`. Một lần gọi phải chạy riêng (ghi file, chạy process)
    làm cả lô chạy lần lượt từng lần gọi.
+   - Các rule học được từ lỗi của project áp dụng như với lần gọi của model.
+     Điều các hook trả lời đến model cùng kết quả của chương trình, và một
+     hook kết thúc lượt thì lượt kết thúc.
+   - Một chương trình viết lại được file nó vừa đọc: hash file của mỗi lần
+     gọi được giữ ngay khi nó hoàn tất, nên lần ghi sau mang theo nó.
+   - Khi chương trình bị dừng (hết hạn, hoặc lượt bị hủy), các lần gọi đang
+     chạy bị hủy và hoàn tất kèm receipt trước khi chương trình biết.
+   - Một chương trình được gọi 1.000 lần. Chúng không tính vào giới hạn số
+     lần gọi tool của chính lượt, và việc từ chối một lần gọi lặp lại lần
+     vừa hỏng không áp dụng cho chúng: logic của chương trình quyết định nó
+     gọi gì.
 4. Mỗi lần gọi là một thẻ riêng cho người dùng (`<id lần gọi codemode>.1`,
    `.2`, ...) và là một execution của lượt, nên danh sách file đã đổi, lời
    nhắc kiểm tra và bằng chứng của goal đều thấy nó. Model chỉ thấy kết quả
@@ -128,6 +139,9 @@ gì vào store.
 | Đệ quy | 400 lần gọi lồng nhau, rồi một `RangeError` bắt được |
 | Store | 256 Ki ký tự JSON một giá trị, 1 Mi tổng cộng |
 | Mảng | 50 triệu phần tử |
+| Lần gọi | 1.000 một chương trình |
+
+Mọi thứ một lần chạy tạo ra được giải phóng khi nó kết thúc, kể cả tham chiếu vòng.
 
 Script bị dừng được báo ở lần kiểm tra kế tiếp; script kẹt trong một
 built-in dài không được chờ quá 3 giây.

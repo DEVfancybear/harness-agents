@@ -302,3 +302,22 @@ async fn codemode_is_offered_only_when_it_is_on() {
     let run = run(&bench, "return 1", ApprovalMode::Auto, false).await;
     assert!(!tool_names(&run.seen[0]).contains(&"codemode".to_owned()));
 }
+
+#[tokio::test]
+async fn a_program_rewrites_a_file_it_read_and_writes_it_twice() {
+    let bench = bench();
+    let run = run(
+        &bench,
+        "const text = await tools.read_file({ path: 'src/b.rs' });\n\
+         await tools.write_file({ path: 'src/b.rs', content: text.replace('fn b()', 'fn renamed()') });\n\
+         await tools.write_file({ path: 'src/b.rs', content: text.replace('fn b()', 'fn twice()') });\n\
+         return 'ok';",
+        ApprovalMode::Auto,
+        true,
+    )
+    .await;
+    let result = codemode_result(&run);
+    assert_eq!(result, "=> \"ok\"", "{result}");
+    let written = std::fs::read_to_string(bench.workspace.join("src/b.rs")).expect("b.rs");
+    assert!(written.starts_with("fn twice() {}"), "{written}");
+}

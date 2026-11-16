@@ -293,17 +293,7 @@ pub fn string_method(
                 return Ok(Value::Null);
             };
             if regex.flags.contains('g') {
-                let mut found = Vec::new();
-                for found_match in regex.regex.find_iter(&text) {
-                    let found_match = found_match.map_err(|error| regex_failure(interp, &error))?;
-                    found.push(Value::str(found_match.as_str()));
-                }
-                regex.last_index.set(0);
-                if found.is_empty() {
-                    Value::Null
-                } else {
-                    Value::array(found)
-                }
+                match_global(interp, regex, &text)?
             } else {
                 exec(interp, regex, &text, 0)?.map_or(Value::Null, |found| found.0)
             }
@@ -318,17 +308,7 @@ pub fn string_method(
                     "String.prototype.matchAll called with a non-global RegExp argument",
                 ));
             }
-            let mut found = Vec::new();
-            let mut position = 0;
-            while position <= len {
-                let Some((found_match, start, end)) = exec(interp, regex, &text, position)? else {
-                    break;
-                };
-                found.push(found_match);
-                position = if end == start { end + 1 } else { end };
-                interp.tick()?;
-            }
-            Value::array(found)
+            match_all(interp, regex, &text)?
         }
         "search" => {
             let regex = regex_argument(interp, &arg(args, 0), "")?;
@@ -473,68 +453,216 @@ pub fn make_regex(interp: &mut Interp<'_>, pattern: &str, flags: &str) -> R<Valu
     })))
 }
 
-/// `regex.exec(text)` from character `from` (or `lastIndex` for a global or
-/// sticky one): the match array with `index`, `input` and `groups`, and
-/// where the match starts and ends, in characters.
-fn exec(
-    interp: &mut Interp<'_>,
-    regex: &RegexObj,
-    text: &str,
-    from: usize,
-) -> R<Option<(Value, usize, usize)>> {
-    let start = byte_of(text, from);
-    if start > text.len() {
+/// One match, in byte offsets of the text it was found in: the whole match
+/// first, then each group (`None` for a group that took no part).
+struct Found {
+    groups: Vec<Option<(usize, usize)>>,
+}
+
+impl Found {
+    fn start(&self) -> usize {
+        self.groups
+            .first()
+            .copied()
+            .flatten()
+            .map_or(0, |group| group.0)
+    }
+
+    fn end(&self) -> usize {
+        self.groups
+            .first()
+            .copied()
+            .flatten()
+            .map_or(0, |group| group.1)
+    }
+
+    fn text<'a>(&self, text: &'a str, group: usize) -> Option<&'a str> {
+        self.groups
+            .get(group)
+            .copied()
+            .flatten()
+            .map(|(start, end)| &text[start..end])
+    }
+}
+
+/// The next match at or after byte `from`; a sticky expression's only at
+/// `from`.
+fn find_at(interp: &Interp<'_>, regex: &RegexObj, text: &str, from: usize) -> R<Option<Found>> {
+    if from > text.len() {
         return Ok(None);
     }
     let captures = regex
         .regex
-        .captures_from_pos(text, start)
+        .captures_from_pos(text, from)
         .map_err(|error| regex_failure(interp, &error))?;
     let Some(captures) = captures else {
         return Ok(None);
     };
-    let whole = captures
-        .get(0)
-        .map_or((start, start), |m| (m.start(), m.end()));
-    if regex.flags.contains('y') && whole.0 != start {
+    let found = Found {
+        groups: (0..captures.len())
+            .map(|group| captures.get(group).map(|m| (m.start(), m.end())))
+            .collect(),
+    };
+    if regex.flags.contains('y') && found.start() != from {
         return Ok(None);
     }
-    let mut items = Vec::with_capacity(captures.len());
-    for group in 0..captures.len() {
-        items.push(
-            captures
-                .get(group)
-                .map_or(Value::Undefined, |m| Value::str(m.as_str())),
-        );
+    Ok(Some(found))
+}
+
+/// Where the next search goes after a match ending at `end`: past it, or
+/// past the next character when the match was empty.
+fn next_from(text: &str, found: &Found) -> usize {
+    let end = found.end();
+    if end > found.start() {
+        return end;
     }
+    text[end..]
+        .chars()
+        .next()
+        .map_or(end + 1, |c| end + c.len_utf8())
+}
+
+/// Character positions of byte offsets asked in increasing order, counted
+/// on from the last one, so a scan of a whole text is linear.
+struct Chars<'a> {
+    text: &'a str,
+    byte: usize,
+    count: usize,
+}
+
+impl<'a> Chars<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            byte: 0,
+            count: 0,
+        }
+    }
+
+    fn at(&mut self, byte: usize) -> usize {
+        if self.text.is_ascii() {
+            return byte;
+        }
+        if byte < self.byte {
+            self.byte = 0;
+            self.count = 0;
+        }
+        self.count += self.text[self.byte..byte].chars().count();
+        self.byte = byte;
+        self.count
+    }
+}
+
+/// The names of an expression's groups, by group number.
+fn group_names(regex: &RegexObj) -> Vec<Option<String>> {
+    regex
+        .regex
+        .capture_names()
+        .map(|name| name.map(str::to_owned))
+        .collect()
+}
+
+/// The `groups` object of a match: `undefined` without named groups.
+fn groups_object(names: &[Option<String>], found: &Found, text: &str) -> Value {
     let mut groups = IndexMap::new();
-    for (index, name) in regex.regex.capture_names().enumerate() {
+    for (group, name) in names.iter().enumerate() {
         if let Some(name) = name {
             groups.insert(
-                Rc::from(name),
-                captures
-                    .get(index)
-                    .map_or(Value::Undefined, |m| Value::str(m.as_str())),
+                Rc::from(name.as_str()),
+                found.text(text, group).map_or(Value::Undefined, Value::str),
             );
         }
     }
-    let (start, end) = (char_of(text, whole.0), char_of(text, whole.1));
+    if groups.is_empty() {
+        Value::Undefined
+    } else {
+        Value::object(groups)
+    }
+}
+
+/// The match array of `exec`: its groups, and `index` (in characters),
+/// `input` (the searched string itself, not a copy) and `groups`.
+fn match_array(
+    interp: &mut Interp<'_>,
+    names: &[Option<String>],
+    text: &str,
+    input: &Value,
+    found: &Found,
+    index: usize,
+) -> R<Value> {
+    let items: Vec<Value> = (0..found.groups.len())
+        .map(|group| found.text(text, group).map_or(Value::Undefined, Value::str))
+        .collect();
+    let matched: usize = found
+        .groups
+        .iter()
+        .flatten()
+        .map(|(start, end)| end - start)
+        .sum();
+    interp.alloc(matched + items.len() * 16 + 64)?;
     let array = Value::array(items);
     if let Value::Array(inner) = &array {
         let mut extra = inner.extra.borrow_mut();
-        extra.insert(Rc::from("index"), Value::Number(start as f64));
-        extra.insert(Rc::from("input"), Value::str(text));
-        extra.insert(
-            Rc::from("groups"),
-            if groups.is_empty() {
-                Value::Undefined
-            } else {
-                Value::object(groups)
-            },
-        );
+        extra.insert(Rc::from("index"), Value::Number(index as f64));
+        extra.insert(Rc::from("input"), input.clone());
+        extra.insert(Rc::from("groups"), groups_object(names, found, text));
     }
-    interp.alloc(text.len().min(4096))?;
+    Ok(array)
+}
+
+/// `regex.exec(input)` from character `from`: the match array and where the
+/// match starts and ends, in characters.
+fn exec(
+    interp: &mut Interp<'_>,
+    regex: &RegexObj,
+    input: &Rc<str>,
+    from: usize,
+) -> R<Option<(Value, usize, usize)>> {
+    let text: &str = input;
+    let Some(found) = find_at(interp, regex, text, byte_of(text, from))? else {
+        return Ok(None);
+    };
+    let mut chars = Chars::new(text);
+    let start = chars.at(found.start());
+    let end = chars.at(found.end());
+    let array = match_array(
+        interp,
+        &group_names(regex),
+        text,
+        &Value::Str(input.clone()),
+        &found,
+        start,
+    )?;
     Ok(Some((array, start, end)))
+}
+
+/// `match` with a global expression: every matched string.
+fn match_global(interp: &mut Interp<'_>, regex: &RegexObj, text: &str) -> R<Value> {
+    let mut found = Vec::new();
+    for item in all_matches(interp, regex, text, true)? {
+        found.push(Value::str(item.text(text, 0).unwrap_or("")));
+    }
+    regex.last_index.set(0);
+    interp.alloc(found.len() * 16)?;
+    Ok(if found.is_empty() {
+        Value::Null
+    } else {
+        Value::array(found)
+    })
+}
+
+/// `matchAll`: the match array of every match.
+fn match_all(interp: &mut Interp<'_>, regex: &RegexObj, input: &Rc<str>) -> R<Value> {
+    let text: &str = input;
+    let names = group_names(regex);
+    let shared = Value::Str(input.clone());
+    let mut chars = Chars::new(text);
+    let mut arrays = Vec::new();
+    for found in all_matches(interp, regex, text, true)? {
+        let index = chars.at(found.start());
+        arrays.push(match_array(interp, &names, text, &shared, &found, index)?);
+    }
+    Ok(Value::array(arrays))
 }
 
 pub fn regex_method(
@@ -551,10 +679,13 @@ pub fn regex_method(
     match method {
         "toString" => Ok(Value::str(to_string(this))),
         "test" | "exec" => {
-            let text = to_string(&arg(args, 0));
+            let input: Rc<str> = match arg(args, 0) {
+                Value::Str(text) => text,
+                other => Rc::from(to_string(&other)),
+            };
             let advancing = regex.flags.contains('g') || regex.flags.contains('y');
             let from = if advancing { regex.last_index.get() } else { 0 };
-            if from > length(&text) {
+            if from > length(&input) {
                 regex.last_index.set(0);
                 return Ok(if method == "test" {
                     Value::Bool(false)
@@ -562,7 +693,7 @@ pub fn regex_method(
                     Value::Null
                 });
             }
-            let found = exec(interp, regex, &text, from)?;
+            let found = exec(interp, regex, &input, from)?;
             if let Some((found, _, end)) = found {
                 if advancing {
                     regex.last_index.set(end);
@@ -587,40 +718,34 @@ pub fn regex_method(
     }
 }
 
-/// Every match of `regex` in `text`, as (start, end) character positions
-/// and the match arrays.
+/// Every match of `regex` in `text` (only the first unless `global`), in
+/// byte offsets.
 fn all_matches(
     interp: &mut Interp<'_>,
     regex: &RegexObj,
     text: &str,
     global: bool,
-) -> R<Vec<(Value, usize, usize)>> {
+) -> R<Vec<Found>> {
     let mut found = Vec::new();
     let mut position = 0;
-    let len = length(text);
-    while position <= len {
-        let Some((item, start, end)) = exec(interp, regex, text, position)? else {
+    while position <= text.len() {
+        let Some(item) = find_at(interp, regex, text, position)? else {
             break;
         };
-        found.push((item, start, end));
+        position = next_from(text, &item);
+        found.push(item);
         if !global {
             break;
         }
-        position = if end == start { end + 1 } else { end };
         interp.tick()?;
+        interp.alloc(64)?;
     }
     Ok(found)
 }
 
 /// `$&`, `$1`, `$<name>`, `` $` ``, `$'` and `$$` in a replacement.
-fn expand(
-    template: &str,
-    text: &str,
-    found: &[Value],
-    start: usize,
-    end: usize,
-    groups: &Value,
-) -> String {
+fn expand(template: &str, text: &str, found: &Found, names: &[Option<String>]) -> String {
+    let group_count = found.groups.len();
     let mut out = String::new();
     let chars: Vec<char> = template.chars().collect();
     let mut index = 0;
@@ -637,25 +762,22 @@ fn expand(
                 index += 2;
             }
             '&' => {
-                out.push_str(&found.first().map(to_string).unwrap_or_default());
+                out.push_str(found.text(text, 0).unwrap_or(""));
                 index += 2;
             }
             '`' => {
-                out.push_str(slice(text, 0, start));
+                out.push_str(&text[..found.start()]);
                 index += 2;
             }
             '\'' => {
-                out.push_str(slice(text, end, length(text)));
+                out.push_str(&text[found.end()..]);
                 index += 2;
             }
-            '<' => {
-                let close = chars[index..].iter().position(|c| *c == '>');
-                if let (Some(close), Value::Object(_)) = (close, groups) {
+            '<' if names.iter().any(Option::is_some) => {
+                if let Some(close) = chars[index..].iter().position(|c| *c == '>') {
                     let name: String = chars[index + 2..index + close].iter().collect();
-                    if let Some(value) = groups.own(&name)
-                        && !matches!(value, Value::Undefined)
-                    {
-                        out.push_str(&to_string(&value));
+                    if let Some(group) = names.iter().position(|n| n.as_deref() == Some(&name)) {
+                        out.push_str(found.text(text, group).unwrap_or(""));
                     }
                     index += close + 1;
                 } else {
@@ -668,15 +790,13 @@ fn expand(
                     .get(index + 2)
                     .filter(|d| d.is_ascii_digit())
                     .and_then(|d| format!("{c}{d}").parse().ok())
-                    .filter(|n: &usize| *n > 0 && *n < found.len());
+                    .filter(|n: &usize| *n > 0 && *n < group_count);
                 let (group, width) = match two {
                     Some(group) => (group, 3),
                     None => (c.to_digit(10).unwrap_or(0) as usize, 2),
                 };
-                if group > 0 && group < found.len() {
-                    if !matches!(found[group], Value::Undefined) {
-                        out.push_str(&to_string(&found[group]));
-                    }
+                if group > 0 && group < group_count {
+                    out.push_str(found.text(text, group).unwrap_or(""));
                     index += width;
                 } else {
                     out.push('$');
@@ -692,92 +812,76 @@ fn expand(
     out
 }
 
-fn replace(interp: &mut Interp<'_>, text: &str, args: &[Value], all: bool) -> R<Value> {
+fn replace(interp: &mut Interp<'_>, input: &Rc<str>, args: &[Value], all: bool) -> R<Value> {
+    let text: &str = input;
     let pattern = arg(args, 0);
     let replacement = arg(args, 1);
-    let len = length(text);
-    // (start, end, match array) of each match to replace.
-    let mut matches: Vec<(usize, usize, Vec<Value>, Value)> = Vec::new();
-    match &pattern {
+    let mut names: Vec<Option<String>> = vec![None];
+    let matches: Vec<Found> = match &pattern {
         Value::Regex(regex) => {
             let global = regex.flags.contains('g');
             if all && !global {
                 return Err(interp.type_error("replaceAll must be called with a global RegExp"));
             }
-            for (item, start, end) in all_matches(interp, regex, text, global)? {
-                let (values, groups) = match &item {
-                    Value::Array(array) => (
-                        array.items.borrow().clone(),
-                        array
-                            .extra
-                            .borrow()
-                            .get("groups")
-                            .cloned()
-                            .unwrap_or(Value::Undefined),
-                    ),
-                    _ => (Vec::new(), Value::Undefined),
-                };
-                matches.push((start, end, values, groups));
-            }
+            names = group_names(regex);
+            let found = all_matches(interp, regex, text, global)?;
             if global {
                 regex.last_index.set(0);
             }
+            found
         }
         other => {
             let needle = to_string(other);
-            let needle_len = length(&needle);
+            let mut found = Vec::new();
             let mut position = 0;
-            while position <= len {
-                let Some(start) = index_of(text, &needle, position) else {
+            while position <= text.len() {
+                let Some(start) = text[position..]
+                    .find(needle.as_str())
+                    .map(|at| at + position)
+                else {
                     break;
                 };
-                matches.push((
-                    start,
-                    start + needle_len,
-                    vec![Value::str(needle.as_str())],
-                    Value::Undefined,
-                ));
+                let item = Found {
+                    groups: vec![Some((start, start + needle.len()))],
+                };
+                position = next_from(text, &item);
+                found.push(item);
                 if !all {
                     break;
                 }
-                position = if needle_len == 0 {
-                    start + 1
-                } else {
-                    start + needle_len
-                };
                 interp.tick()?;
             }
+            found
         }
-    }
+    };
+    let template = (!matches!(replacement, Value::Function(_))).then(|| to_string(&replacement));
+    let shared = Value::Str(input.clone());
+    let mut chars = Chars::new(text);
     let mut out = String::new();
     let mut last = 0;
-    for (start, end, values, groups) in matches {
-        out.push_str(slice(text, last, start));
-        if matches!(replacement, Value::Function(_)) {
-            let mut call_args = values.clone();
-            call_args.push(Value::Number(start as f64));
-            call_args.push(Value::str(text));
+    for found in &matches {
+        out.push_str(&text[last..found.start()]);
+        if let Some(template) = &template {
+            out.push_str(&expand(template, text, found, &names));
+        } else {
+            let mut call_args: Vec<Value> = (0..found.groups.len())
+                .map(|group| found.text(text, group).map_or(Value::Undefined, Value::str))
+                .collect();
+            call_args.push(Value::Number(chars.at(found.start()) as f64));
+            call_args.push(shared.clone());
+            let groups = groups_object(&names, found, text);
             if !matches!(groups, Value::Undefined) {
-                call_args.push(groups.clone());
+                call_args.push(groups);
             }
             let result = interp.call(&replacement, Value::Undefined, call_args)?;
             out.push_str(&to_string(&result));
-        } else {
-            out.push_str(&expand(
-                &to_string(&replacement),
-                text,
-                &values,
-                start,
-                end,
-                &groups,
-            ));
         }
-        last = end;
+        last = found.end();
         if out.len() > MAX_STRING_CHARS {
             return Err(interp.throw("RangeError", "Invalid string length"));
         }
     }
-    out.push_str(slice(text, last.min(len), len));
+    out.push_str(&text[last.min(text.len())..]);
     interp.alloc(out.len())?;
     Ok(Value::str(out))
 }
@@ -792,9 +896,8 @@ fn split(interp: &mut Interp<'_>, text: &str, args: &[Value]) -> R<Value> {
     match &separator {
         Value::Undefined => parts.push(Value::str(text)),
         Value::Regex(regex) => {
-            let len = length(text);
-            if len == 0 {
-                let empty_match = exec(interp, regex, text, 0)?.is_some();
+            if text.is_empty() {
+                let empty_match = find_at(interp, regex, text, 0)?.is_some();
                 return Ok(Value::array(if empty_match {
                     Vec::new()
                 } else {
@@ -803,28 +906,32 @@ fn split(interp: &mut Interp<'_>, text: &str, args: &[Value]) -> R<Value> {
             }
             let mut last = 0;
             let mut position = 0;
-            while position < len {
-                let Some((item, start, end)) = exec(interp, regex, text, position)? else {
+            while position < text.len() {
+                let Some(found) = find_at(interp, regex, text, position)? else {
                     break;
                 };
-                if start >= len {
+                let (start, end) = (found.start(), found.end());
+                if start >= text.len() {
                     break;
                 }
                 // An empty match splits between characters, never before
                 // the first one or where the last piece ended.
                 if end == start && start <= last {
-                    position = start + 1;
+                    position = next_from(text, &found);
                     continue;
                 }
-                parts.push(Value::str(slice(text, last, start)));
-                if let Value::Array(array) = &item {
-                    parts.extend(array.items.borrow().iter().skip(1).cloned());
+                parts.push(Value::str(&text[last..start]));
+                for group in 1..found.groups.len() {
+                    parts.push(found.text(text, group).map_or(Value::Undefined, Value::str));
                 }
                 last = end;
-                position = if end == start { end + 1 } else { end };
+                position = next_from(text, &found);
                 interp.tick()?;
+                if parts.len() >= limit {
+                    break;
+                }
             }
-            parts.push(Value::str(slice(text, last, len)));
+            parts.push(Value::str(&text[last..]));
         }
         other => {
             let separator = to_string(other);

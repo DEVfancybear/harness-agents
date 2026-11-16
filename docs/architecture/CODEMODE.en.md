@@ -91,6 +91,18 @@ calls:
 3. The side effects run side by side and settle in order, with their
    receipts and `post_tool_use` hooks. A call that must run alone (a write,
    a process) makes the batch run one call after another.
+   - The rules learned from the project's failures apply as to a model call.
+     What the hooks answer reaches the model with the program's result, and
+     a hook that ends the turn ends it.
+   - A program can rewrite a file it read: each call's file hash is kept as
+     it settles, so the next write carries it.
+   - When the program is stopped (its deadline, or the turn is canceled),
+     the calls running are canceled and settle with their receipts before
+     the program hears of it.
+   - A program may make 1,000 calls. They do not count toward the turn's
+     own limit on tool calls, and the refusal of a call that repeats one
+     that just failed does not apply to them: the program's own logic
+     decides what it calls.
 4. Each call is a card of its own for the user (`<codemode call id>.1`, `.2`,
    ...) and one of the turn's executions, so the changed files, the verify
    reminder and the goal evidence see it. The model sees only the program's
@@ -131,6 +143,9 @@ its output up to the failure and writes nothing to the store.
 | Recursion | 400 nested calls, then a catchable `RangeError` |
 | Store | 256 Ki characters of JSON a value, 1 Mi in all |
 | Arrays | 50 million items |
+| Calls | 1,000 a program |
+
+Everything a run made is freed when it ends, reference cycles included.
 
 A stopped script is told at its next poll; one stuck in a single long
 built-in is not waited for past 3 seconds.

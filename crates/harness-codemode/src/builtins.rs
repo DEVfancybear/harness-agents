@@ -863,7 +863,7 @@ fn deep_clone(interp: &mut Interp<'_>, value: &Value, depth: usize) -> R<Value> 
                     ),
                 );
             }
-            Value::Map(Rc::new(std::cell::RefCell::new(copied)))
+            Value::map(copied)
         }
         Value::Set(set) => {
             let entries: Vec<_> = set
@@ -875,7 +875,7 @@ fn deep_clone(interp: &mut Interp<'_>, value: &Value, depth: usize) -> R<Value> 
             for (key, item) in entries {
                 copied.insert(key, deep_clone(interp, &item, depth + 1)?);
             }
-            Value::Set(Rc::new(std::cell::RefCell::new(copied)))
+            Value::set(copied)
         }
         Value::Function(_) | Value::Promise(_) | Value::Tools | Value::Namespace(_) => {
             return Err(interp.throw(
@@ -957,7 +957,7 @@ fn number_method(interp: &mut Interp<'_>, method: &str, number: f64, args: &[Val
             if !number.is_finite() || number.abs() >= 1e21 {
                 Value::str(number_to_string(number))
             } else {
-                Value::str(format!("{number:.*}", digits as usize))
+                Value::str(to_fixed(number, digits as usize))
             }
         }
         "toPrecision" => {
@@ -988,7 +988,7 @@ fn number_method(interp: &mut Interp<'_>, method: &str, number: f64, args: &[Val
                 ))
             } else {
                 let decimals = (precision as i64 - 1 - exponent).max(0) as usize;
-                Value::str(format!("{number:.decimals$}"))
+                Value::str(to_fixed(number, decimals))
             }
         }
         "toString" => {
@@ -1465,7 +1465,7 @@ fn static_call(interp: &mut Interp<'_>, owner: &str, method: &str, args: &[Value
                         list.items.borrow_mut().push(item);
                     }
                 }
-                return Ok(Value::Map(Rc::new(std::cell::RefCell::new(groups))));
+                return Ok(Value::map(groups));
             }
             let mut groups: IndexMap<Rc<str>, Value> = IndexMap::new();
             for (index, item) in items.into_iter().enumerate() {
@@ -1744,4 +1744,56 @@ pub fn construct_native(interp: &mut Interp<'_>, name: &str, args: Vec<Value>) -
         "Number" | "String" | "Boolean" => call_native(interp, name, Value::Undefined, args),
         name => Err(interp.type_error(format!("{name} is not a constructor"))),
     }
+}
+
+/// `Number.prototype.toFixed`: `digits` decimals, a tie rounded away from
+/// zero, as JavaScript rounds it (`(12.5).toFixed(0)` is "13", not Rust's
+/// "12"), and no sign on a result that is zero.
+pub fn to_fixed(number: f64, digits: usize) -> String {
+    // The binary value's decimal digits, far enough past `digits` to tell a
+    // tie from a value just below or above one.
+    let exact = format!("{:.*}", digits + 30, number.abs());
+    let (whole, fraction) = exact.split_once('.').unwrap_or((&exact, ""));
+    let mut kept: Vec<u8> = whole
+        .bytes()
+        .chain(fraction.bytes().take(digits))
+        .map(|byte| byte - b'0')
+        .collect();
+    if fraction
+        .as_bytes()
+        .get(digits)
+        .is_some_and(|next| *next >= b'5')
+    {
+        let mut position = kept.len();
+        loop {
+            if position == 0 {
+                kept.insert(0, 1);
+                break;
+            }
+            position -= 1;
+            if kept[position] == 9 {
+                kept[position] = 0;
+            } else {
+                kept[position] += 1;
+                break;
+            }
+        }
+    }
+    let whole_len = kept.len() - digits;
+    let mut text: String = kept[..whole_len]
+        .iter()
+        .map(|digit| char::from(b'0' + digit))
+        .collect();
+    if digits > 0 {
+        text.push('.');
+        text.extend(
+            kept[whole_len..]
+                .iter()
+                .map(|digit| char::from(b'0' + digit)),
+        );
+    }
+    if number < 0.0 && kept.iter().any(|digit| *digit != 0) {
+        text.insert(0, '-');
+    }
+    text
 }

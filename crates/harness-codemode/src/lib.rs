@@ -40,6 +40,7 @@ pub mod ast;
 mod builtins;
 mod dates;
 pub mod declarations;
+mod heap;
 pub mod identifier;
 mod interp;
 mod lexer;
