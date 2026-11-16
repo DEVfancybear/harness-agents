@@ -119,7 +119,10 @@ print(sum(weights.values()), max(weights, key=weights.get))
 PY
 )
 echo "   fixture: sum of weights $SUM, heaviest $HEAVIEST"
-TASK1="Use the codemode tool: write one program that reads each of notes/n01.txt to notes/n12.txt with read_file, finds the line 'weight: <number>' in each, stores the sum with store('weights', sum), and prints the sum of the weights and the name of the file with the largest weight. Do not read the files with your own read_file calls; one codemode program does all of it. Then tell me the sum and the file."
+# The prompt names no file by its path: ha attaches a file a prompt names to
+# the first request, which would put a file's text in the context before any
+# program ran.
+TASK1="Use the codemode tool: write one program that reads each of the twelve files in the notes folder (named n, then a two-digit number from 01 to 12, then .txt) with read_file, finds the line 'weight: <number>' in each, stores the sum with store('weights', sum), and prints the sum of the weights and the name of the file with the largest weight. Do not read the files with your own read_file calls; one codemode program does all of it. Then tell me the sum and the file."
 
 # --- 1. One program reads twelve files; only its output reaches the model.
 held=0
