@@ -796,7 +796,7 @@ pub trait SessionPort: Send {
     fn jev_decision(&mut self, _decision: &str, _enable: bool) -> Result<String, String> {
         Err("this backend has no plugins".to_owned())
     }
-    /// `/bank on|off|status`: the action bank, off by default (`actionBank`).
+    /// `/bank on|off|status`: the action bank, on by default (`actionBank`).
     fn action_bank(&mut self, _enable: Option<bool>) -> Result<String, String> {
         Err("this backend runs no turn loop".to_owned())
     }
@@ -10056,7 +10056,7 @@ async fn run_turn(
                 completion: decisions as Arc<dyn harness_tools::CompletionCheck>,
             }),
     );
-    // The action bank (`/bank`), off by default; children run with it too.
+    // The action bank (`/bank`), on by default; children run with it too.
     let action_bank = super::action_bank::enabled(&config_file, &environment)
         .then(|| super::action_bank::bank(jev_decisions.as_ref()));
     agents.set_action_bank(action_bank.clone());

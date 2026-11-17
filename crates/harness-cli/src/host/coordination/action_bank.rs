@@ -1,12 +1,12 @@
-//! The action bank switch: `HarnessMM`'s guarded decision reuse, off by default.
+//! The action bank switch: `HarnessMM`'s guarded decision reuse, on by default.
 //!
 //! On, the model may queue calls it has already fully decided (`action_bank`),
 //! and a ready one runs without a model step (`harness_tools::bank`,
-//! `docs/architecture/ACTION_BANK.en.md`). The paper's negative results - banks
-//! rarely usable cost more to author than they save - are why it is off until
-//! turned on: `/bank on`, settings.json `"actionBank": true`, or
-//! `HA_ACTION_BANK=on`, which wins over the setting either way. Children run
-//! with their parent's setting.
+//! `docs/architecture/ACTION_BANK.en.md`). It is on from 0.9.11. The paper's
+//! negative results, where banks were rarely usable and cost more to author
+//! than they saved, are why it can be turned off: `/bank off`, settings.json
+//! `"actionBank": false`, or `HA_ACTION_BANK=off`, which wins over the setting
+//! either way. Children run with their parent's setting.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ fn parse(value: &str) -> Option<bool> {
 }
 
 /// Whether the bank is on: `HA_ACTION_BANK` when it says, else the setting,
-/// else off.
+/// else on.
 #[must_use]
 pub fn enabled(config_file: &Path, environment: &LaunchEnvironment) -> bool {
     environment
@@ -38,7 +38,7 @@ pub fn enabled(config_file: &Path, environment: &LaunchEnvironment) -> bool {
         .or_else(|| {
             super::config::load_setting(config_file, SETTING).and_then(|setting| setting.as_bool())
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Save the setting, and say what it now is.
@@ -74,13 +74,21 @@ pub fn status(config_file: &Path, environment: &LaunchEnvironment) -> String {
             )
         })
         .unwrap_or_default();
+    let source = if super::config::load_setting(config_file, SETTING)
+        .and_then(|setting| setting.as_bool())
+        .is_some()
+    {
+        format!("settings.json {SETTING}")
+    } else {
+        "the default".to_owned()
+    };
     if enabled(config_file, environment) {
         format!(
-            "Action bank: on (settings.json {SETTING}). The model may queue calls it has fully decided (write, build, test), and a ready one runs without a model step; with jev on, its `bank` decision picks among several. /bank off turns it off.{forced}"
+            "Action bank: on ({source}). The model may queue calls it has fully decided (write, build, test), and a ready one runs without a model step; with jev on, its `bank` decision picks among several. /bank off turns it off.{forced}"
         )
     } else {
         format!(
-            "Action bank: off (the default). /bank on lets the model queue calls it has fully decided, so a ready one runs without a model step; it saves model calls only when banks are used, so measure it on your tasks.{forced}"
+            "Action bank: off ({source}). /bank on lets the model queue calls it has fully decided, so a ready one runs without a model step; it saves model calls only when banks are used, so measure it on your tasks.{forced}"
         )
     }
 }
@@ -187,9 +195,12 @@ mod tests {
     }
 
     #[test]
-    fn off_by_default_the_setting_turns_it_on_and_the_variable_wins() {
+    fn on_by_default_the_setting_turns_it_off_and_the_variable_wins() {
         let temp = tempfile::tempdir().expect("temp");
         let config = temp.path().join("config.toml");
+        assert!(enabled(&config, &environment(None)));
+        assert!(status(&config, &environment(None)).starts_with("Action bank: on (the default)"));
+        set(&config, &environment(None), Some(false)).expect("saved");
         assert!(!enabled(&config, &environment(None)));
         set(&config, &environment(None), Some(true)).expect("saved");
         assert!(enabled(&config, &environment(None)));

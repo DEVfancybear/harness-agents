@@ -1,13 +1,13 @@
-//! The codemode switch, off by default.
+//! The codemode switch, on by default.
 //!
 //! On, the model is offered `codemode`: one JavaScript program that calls
 //! the turn's tools as `await tools.<name>(args)`, each call gated as the
 //! model's own, and only what the program prints and returns comes back
 //! (`harness_tools::codemode`, `docs/architecture/CODEMODE.en.md`). It adds
-//! a tool and its declarations to every request, so it is off until turned
-//! on: `/codemode on`, settings.json `"codemode": true`, or
-//! `HA_CODEMODE=on`, which wins over the setting either way. Children run
-//! with their parent's setting.
+//! a tool and its declarations to every request; turn it off with
+//! `/codemode off`, settings.json `"codemode": false`, or `HA_CODEMODE=off`,
+//! which wins over the setting either way. Children run with their parent's
+//! setting.
 
 use std::path::Path;
 
@@ -34,15 +34,17 @@ fn forced(environment: &LaunchEnvironment) -> Option<bool> {
         .and_then(parse)
 }
 
+fn setting(config_file: &Path) -> Option<bool> {
+    super::config::load_setting(config_file, SETTING).and_then(|setting| setting.as_bool())
+}
+
 /// Whether codemode is on: `HA_CODEMODE` when it says, else the setting,
-/// else off.
+/// else on.
 #[must_use]
 pub fn enabled(config_file: &Path, environment: &LaunchEnvironment) -> bool {
     forced(environment)
-        .or_else(|| {
-            super::config::load_setting(config_file, SETTING).and_then(|setting| setting.as_bool())
-        })
-        .unwrap_or(false)
+        .or_else(|| setting(config_file))
+        .unwrap_or(true)
 }
 
 /// Save the setting, and say what it now is.
@@ -83,13 +85,18 @@ pub fn status(config_file: &Path, environment: &LaunchEnvironment) -> String {
             )
         })
         .unwrap_or_default();
+    let source = if setting(config_file).is_some() {
+        format!("settings.json {SETTING}")
+    } else {
+        "the default".to_owned()
+    };
     if enabled(config_file, environment) {
         format!(
-            "Codemode: on (settings.json {SETTING}). The model may run one JavaScript program that calls its tools, each call approved and checked as its own, and reads only what the program prints and returns. /codemode off turns it off.{forced}"
+            "Codemode: on ({source}). The model may run one JavaScript program that calls its tools, each call approved and checked as its own, and reads only what the program prints and returns. /codemode off turns it off.{forced}"
         )
     } else {
         format!(
-            "Codemode: off (the default). /codemode on offers the model one JavaScript program that calls its tools, so a step of many calls whose results it only filters or combines costs one result in the context.{forced}"
+            "Codemode: off ({source}). /codemode on offers the model one JavaScript program that calls its tools, so a step of many calls whose results it only filters or combines costs one result in the context.{forced}"
         )
     }
 }
@@ -100,18 +107,19 @@ mod tests {
     use super::{SETTING, enabled, set, status};
 
     #[test]
-    fn is_off_until_the_setting_or_the_variable_turns_it_on() {
+    fn is_on_until_the_setting_or_the_variable_turns_it_off() {
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("settings.json");
         let plain = LaunchEnvironment::from_pairs(Vec::<(String, String)>::new());
-        assert!(!enabled(&config, &plain));
-        assert!(status(&config, &plain).starts_with("Codemode: off"));
-        set(&config, &plain, Some(true)).unwrap();
         assert!(enabled(&config, &plain));
+        assert!(status(&config, &plain).starts_with("Codemode: on (the default)"));
+        set(&config, &plain, Some(false)).unwrap();
+        assert!(!enabled(&config, &plain));
+        assert!(status(&config, &plain).starts_with("Codemode: off (settings.json codemode)"));
         let saved = std::fs::read_to_string(&config).unwrap();
         assert!(saved.contains(SETTING), "{saved}");
-        let forced_off = LaunchEnvironment::from_pairs([("HA_CODEMODE", "off")]);
-        assert!(!enabled(&config, &forced_off));
-        assert!(status(&config, &forced_off).contains("HA_CODEMODE=off overrides"));
+        let forced_on = LaunchEnvironment::from_pairs([("HA_CODEMODE", "on")]);
+        assert!(enabled(&config, &forced_on));
+        assert!(status(&config, &forced_on).contains("HA_CODEMODE=on overrides"));
     }
 }

@@ -14,10 +14,11 @@ Recursive Self-Improvement for Harness Token Efficiency", arXiv 2610.32813, mụ
 guarded decision reuse (GDR) và certified callback substitution (CCS) - chứ
 không cài vòng tự cải tiến prompt offline (RSI) của bài báo.
 
-Nó **mặc định tắt**. Chính kết quả âm của bài báo (Terminal-Bench, GAIA2) là
-những lần chạy mà bank hiếm khi dùng được, nên viết bank tốn output nhiều hơn số
-lần gọi model nó tiết kiệm. Bật bằng `/bank on`, `"actionBank": true` trong
-settings.json, hoặc `HA_ACTION_BANK=on`; hãy đo trên task của bạn (mục 8).
+Nó **mặc định bật** từ 0.9.11 (trước đó tắt). Chính kết quả âm của bài báo
+(Terminal-Bench, GAIA2) là những lần chạy mà bank hiếm khi dùng được, nên viết
+bank tốn output nhiều hơn số lần gọi model nó tiết kiệm: khi vậy hãy tắt bằng
+`/bank off`, `"actionBank": false` trong settings.json, hoặc
+`HA_ACTION_BANK=off`, và đo trên task của bạn (mục 8).
 
 Code: `crates/harness-tools/src/runtime/bank.rs` (bank, guard, receipt, trait
 selector), `TurnDriver::run_turn_inner`, `bank_settled` và `bank_next` trong

@@ -169,12 +169,12 @@ pub const SLASH_COMMANDS: [SlashCommand; 74] = [
     command(
         "/bank",
         "[on|off|status]",
-        "Show or set the action bank (off by default): calls the model fully decided run without a model step",
+        "Show or set the action bank (on by default): calls the model fully decided run without a model step",
     ),
     command(
         "/codemode",
         "[on|off|status]",
-        "Show or set codemode (off by default): one JavaScript program that calls the tools, and only what it prints comes back",
+        "Show or set codemode (on by default): one JavaScript program that calls the tools, and only what it prints comes back",
     ),
     SlashCommand {
         options: &[

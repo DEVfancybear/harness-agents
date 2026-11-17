@@ -15,9 +15,9 @@ trình trong QuickJS biên dịch sang WebAssembly, trên một worker thread. h
 **không có VM**: chương trình được chạy bởi một interpreter viết bằng Rust,
 trong crate `harness-codemode`, trên một thread riêng.
 
-Nó **tắt theo mặc định**: nó thêm một tool, cùng phần khai báo các tool, vào
-mọi request. Bật bằng `/codemode on`, `"codemode": true` trong settings.json,
-hoặc `HA_CODEMODE=on`, biến này thắng setting.
+Nó **bật theo mặc định** (từ 0.9.11). Nó thêm một tool, cùng phần khai báo
+các tool, vào mọi request; tắt bằng `/codemode off`, `"codemode": false`
+trong settings.json, hoặc `HA_CODEMODE=off`, biến này thắng setting.
 
 Code: `crates/harness-codemode` (lexer, parser và evaluator, các built-in,
 dòng `// @options`, phần khai báo, runner),

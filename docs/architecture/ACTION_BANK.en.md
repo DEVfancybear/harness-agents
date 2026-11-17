@@ -14,11 +14,12 @@ C.4 and D). ha implements the execution mechanism - executable decision graphs
 (EDG), guarded decision reuse (GDR) and certified callback substitution (CCS) -
 and not the paper's offline recursive self-improvement of prompts.
 
-It is **off by default**. The paper's own negative results (Terminal-Bench,
-GAIA2) are runs where banks were rarely usable, so authoring them cost more
-output than the model calls they saved. Turn it on with `/bank on`,
-`"actionBank": true` in settings.json, or `HA_ACTION_BANK=on`; measure it on
-your own tasks (section 8).
+It is **on by default** from 0.9.11 (off before). The paper's own negative
+results (Terminal-Bench, GAIA2) are runs where banks were rarely usable, so
+authoring them cost more output than the model calls they saved: turn it off
+with `/bank off`, `"actionBank": false` in settings.json, or
+`HA_ACTION_BANK=off` where that is so, and measure it on your own tasks
+(section 8).
 
 Code: `crates/harness-tools/src/runtime/bank.rs` (the bank, its guards and
 receipts, the selector trait), `TurnDriver::run_turn_inner`, `bank_settled` and

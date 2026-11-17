@@ -16,9 +16,10 @@ program in QuickJS compiled to WebAssembly, in a worker thread. ha has **no
 VM**: the program is run by an interpreter written in Rust, in the
 `harness-codemode` crate, on a thread of its own.
 
-It is **off by default**: it adds a tool, and the tools' declarations, to
-every request. Turn it on with `/codemode on`, `"codemode": true` in
-settings.json, or `HA_CODEMODE=on`, which overrides the setting.
+It is **on by default** (since 0.9.11). It adds a tool, and the tools'
+declarations, to every request; turn it off with `/codemode off`,
+`"codemode": false` in settings.json, or `HA_CODEMODE=off`, which overrides
+the setting.
 
 Code: `crates/harness-codemode` (the lexer, parser and evaluator, the
 built-ins, the `// @options` line, the declarations, the runner),

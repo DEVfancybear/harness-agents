@@ -645,7 +645,7 @@ pub async fn run_with(
     // waits for its children. Nobody can answer an approval here, so a gated
     // action a child asks for is refused, as the root's is.
     let (child_events, mut child_inbox) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
-    // The action bank (`HA_ACTION_BANK`, `actionBank`), off by default; the
+    // The action bank (`HA_ACTION_BANK`, `actionBank`), on by default; the
     // run's children run with it too.
     let bank_on = super::action_bank::enabled(&context.paths.config_file, environment);
     let action_bank = bank_on.then(|| super::action_bank::bank(jev_decisions.as_ref()));

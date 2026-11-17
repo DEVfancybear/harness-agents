@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Codemode (docs/architecture/CODEMODE.en.md), with a real model, in `ha exec`:
 #
-#   1. With HA_CODEMODE=on, a task over twelve files (sum the `weight:` lines,
+#   1. With codemode on (the default since 0.9.11), a task over twelve files (sum the `weight:` lines,
 #      name the heaviest file) done as one codemode program: the program made
 #      the twelve reads (a `codemode/run` record), the answer is right, and no
 #      request the model was sent holds a line only the files hold - their
@@ -128,7 +128,7 @@ TASK1="Use the codemode tool: write one program that reads each of the twelve fi
 held=0
 for attempt in 1 2 3; do
   since=$(now_ms)
-  HA_CODEMODE=on run "$P1" "task1-$attempt" "$TASK1" --approval full-auto
+  run "$P1" "task1-$attempt" "$TASK1" --approval full-auto
   if [ "$(most codemode run "$since" calls)" -ge 12 ]; then held=1; T1="$RX/task1-$attempt.json"; S1=$since; break; fi
 done
 check "precondition: the model ran a codemode program that made the twelve reads (attempts: $attempt)" '[ "$held" = 1 ]'
@@ -143,7 +143,7 @@ if [ "$held" = 1 ]; then
   # --- 2. A new process resumes the conversation; the store survives.
   session=$(jget "$T1" session_id)
   since=$(now_ms)
-  HA_CODEMODE=on run "$P1" resume "Use the codemode tool again: one program that prints load('weights'). Tell me exactly what it printed." --approval full-auto --resume "$session"
+  run "$P1" resume "Use the codemode tool again: one program that prints load('weights'). Tell me exactly what it printed." --approval full-auto --resume "$session"
   ran=$(count codemode run "$since")
   check "precondition: the resumed conversation ran a codemode program ($ran)" '[ "$ran" -ge 1 ]'
   check "the second program, in a new process, loaded the sum the first one stored ($SUM)" '[ "$ran" -ge 1 ] && jget "$RX/resume.json" response | grep -q "$SUM"'
@@ -157,7 +157,7 @@ TASK3="Use the codemode tool: one program that calls tools.run_process({ executa
 held=0
 for attempt in 1 2 3; do
   since=$(now_ms)
-  HA_CODEMODE=on run "$P3" "gate-$attempt" "$TASK3" --approval auto-edit
+  run "$P3" "gate-$attempt" "$TASK3" --approval auto-edit
   if [ "$(most codemode run "$since" calls)" -ge 1 ]; then held=1; S3=$since; T3="$RX/gate-$attempt.json"; break; fi
 done
 check "precondition: a codemode program called run_process (attempts: $attempt)" '[ "$held" = 1 ]'
