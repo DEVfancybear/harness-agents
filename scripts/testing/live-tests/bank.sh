@@ -86,7 +86,12 @@ fixture() {
 # --- 1. A banked call runs without a model step, and the conversation resumes.
 P1="$RX/p1"
 fixture "$P1"
-TASK1="Create app/stats.py with a function median(values) that returns the median of a non-empty list of numbers (the mean of the two middle values for an even count), and tests/test_stats.py with unittest tests for an odd count, an even count and an unsorted list. Then run the tests with: $TESTS . You already know every call you will make: write both files and, in the same response, queue the test run with action_bank (after root, when ok)."
+TASK1="Create app/stats.py with a function median(values) that returns the median of a non-empty list of numbers (the mean of the two middle values for an even count), and tests/test_stats.py with unittest tests for an odd count, an even count and an unsorted list. Then run the tests with this command, exactly as quoted: \`$TESTS\`. You already know every call you will make: write both files and, in the same response, queue with action_bank node 'test' (after root, when ok) running that test command with run_process (the Python path as the executable, the rest as its arguments), and node 'status' (after 'test', when ok) running run_shell with the command \`git status --short\`."
+# Commands are quoted: a command followed by a sentence's period was run with
+# the period as an argument.
+# The chain is asked for because the model (gpt-6-luna, 2026-11-17, on 0.9.10
+# and 0.9.11 alike) queues a lone node in a response of its own, which saves
+# no step; the second node of a chain saves one wherever it is authored.
 held=0
 for attempt in 1 2 3; do
   since=$(now_ms)
