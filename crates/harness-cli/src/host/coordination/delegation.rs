@@ -1091,6 +1091,10 @@ struct ChildRecord {
     suppress_notice: bool,
     /// The child sent its parent a message since its task began.
     replied: bool,
+    /// What the child sent its parent with `agent_message`, oldest first: a
+    /// consult reads its answer there when the child put it in a message
+    /// and ended with a summary.
+    to_parent: Vec<String>,
     /// The child's task was answered or announced once: a run a later message
     /// wakes it for ends without another no-reply notice, as prime-agent's
     /// `notice_delivered`. Each such notice woke the parent, which messaged
@@ -1287,6 +1291,7 @@ impl ChildRecord {
             deleted: false,
             suppress_notice: true,
             replied: false,
+            to_parent: Vec::new(),
             // A task done before the restart was answered then; one cut off
             // (now failed) still reports when it is woken and carries on.
             notice_delivered: announced,
@@ -2318,6 +2323,7 @@ impl AgentsShared {
                     "[agent-message from child:{sender_name}]\n\n{message}"
                 ))
                 .await?;
+                self.update(from, |child| child.to_parent.push(message.clone()));
                 self.record(&sender_name, &parent_name, &message);
                 receipts.push(receipt("parent", &sender_name, &message, status));
             }
@@ -3602,6 +3608,7 @@ impl SessionAgents {
                 deleted: false,
                 suppress_notice: false,
                 replied: false,
+                to_parent: Vec::new(),
                 notice_delivered: false,
                 briefed: false,
                 solo,
@@ -3891,7 +3898,19 @@ impl VerifierHandle {
     /// # Errors
     /// The explorer could not start, failed, or was stopped.
     pub async fn consult(&self, brief: String, model: Option<&str>) -> Result<String, String> {
-        self.run(AgentRole::Explorer, brief, model).await
+        let (answer, to_parent) = self.run_reading(AgentRole::Explorer, brief, model).await?;
+        // A child is told it may send its parent what it found with
+        // agent_message: an explorer that sent the object it was asked for
+        // that way and ended with a summary still gave it.
+        if answer.contains('{') {
+            return Ok(answer);
+        }
+        Ok(
+            match to_parent.iter().rev().find(|message| message.contains('{')) {
+                Some(message) => format!("{message}\n\n{answer}"),
+                None => answer,
+            },
+        )
     }
 
     async fn run(
@@ -3900,6 +3919,18 @@ impl VerifierHandle {
         brief: String,
         model: Option<&str>,
     ) -> Result<String, String> {
+        self.run_reading(role, brief, model)
+            .await
+            .map(|(answer, _)| answer)
+    }
+
+    /// The child's answer, and what it sent its parent with `agent_message`.
+    async fn run_reading(
+        &self,
+        role: AgentRole,
+        brief: String,
+        model: Option<&str>,
+    ) -> Result<(String, Vec<String>), String> {
         struct Verification<'a>(&'a SessionAgents, &'a TaskId);
         impl Drop for Verification<'_> {
             fn drop(&mut self) {
@@ -3939,7 +3970,14 @@ impl VerifierHandle {
                     error.to_string()
                 }
             })? {
-            Some(ChildState::Done { answer, .. }) => Ok(answer),
+            Some(ChildState::Done { answer, .. }) => {
+                let to_parent = self
+                    .agents
+                    .shared
+                    .update(&task_id, |child| child.to_parent.clone())
+                    .unwrap_or_default();
+                Ok((answer, to_parent))
+            }
             Some(ChildState::Partial { error, .. } | ChildState::Failed { error }) => Err(error),
             Some(ChildState::Cancelled { reason }) => Err(reason),
             Some(ChildState::Running) | None => Err("the verifier's record is gone".to_owned()),
@@ -9250,6 +9288,41 @@ mod real_worker_tests {
             stopped.is_ok(),
             "a canceled verification must stop calling its model"
         );
+    }
+
+    /// Found live on 0.9.11: a strategist sent its parent the JSON it was
+    /// asked for with `agent_message` and ended with a summary; the consult
+    /// read only the summary and saw no alternatives.
+    #[tokio::test]
+    async fn a_consult_reads_the_object_its_explorer_sent_by_message() {
+        let bench = bench();
+        let provider = Scripted::new(vec![
+            Reply::Tool(
+                "agent_message",
+                json!({"receiver_role": "parent", "message": "{\"diagnosis\":\"stuck\",\"alternatives\":[{\"name\":\"other\"}]}"}),
+            ),
+            Reply::Text("I sent the parent the diagnosis."),
+        ]);
+        let first = host(&bench, provider);
+        let answer = first
+            .verifier()
+            .consult("find other approaches".to_owned(), None)
+            .await
+            .expect("consulted");
+        assert!(answer.starts_with("{\"diagnosis\":\"stuck\""), "{answer}");
+        assert!(
+            answer.ends_with("I sent the parent the diagnosis."),
+            "{answer}"
+        );
+        // An answer that holds its own object is read as it is.
+        let provider = Scripted::new(vec![Reply::Text("{\"diagnosis\":\"own\"}")]);
+        let own = host(&bench, provider);
+        let answer = own
+            .verifier()
+            .consult("find other approaches".to_owned(), None)
+            .await
+            .expect("consulted");
+        assert_eq!(answer, "{\"diagnosis\":\"own\"}");
     }
 
     #[tokio::test]
