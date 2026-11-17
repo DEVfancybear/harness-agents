@@ -1508,6 +1508,9 @@ pub struct TurnDriver {
     /// The action bank, when it is on: the `action_bank` tool is offered and
     /// its ready calls run without a model step.
     bank: Option<crate::bank::ActionBank>,
+    /// Whether the `codemode` tool is offered: one JavaScript program that
+    /// calls the turn's tools (`crate::codemode`).
+    codemode: Option<crate::codemode::Codemode>,
 }
 
 /// A workspace path as a key: one separator, no leading `./`.
@@ -1876,7 +1879,17 @@ impl TurnDriver {
             evaluate_automatically: false,
             deferred: Arc::default(),
             bank: None,
+            codemode: None,
         }
+    }
+
+    /// Offer `codemode` (`docs/architecture/CODEMODE.en.md`): the model may
+    /// run one JavaScript program whose calls to the turn's tools are gated
+    /// as its own, and read only what the program prints and returns.
+    #[must_use]
+    pub fn with_codemode(mut self, codemode: crate::codemode::Codemode) -> Self {
+        self.codemode = Some(codemode);
+        self
     }
 
     /// Turn the action bank on (`docs/architecture/ACTION_BANK.en.md`): the
@@ -2212,6 +2225,12 @@ impl TurnDriver {
         }
         if self.drop.tool && parameters_schema(&request.tool_schemas, DROP_CONTEXT_TOOL).is_none() {
             request.tool_schemas.push(drop_context_schema());
+        }
+        if self.codemode.is_some()
+            && parameters_schema(&request.tool_schemas, crate::codemode::CODEMODE_TOOL).is_none()
+        {
+            let schema = crate::codemode::codemode_schema(&request.tool_schemas, &self.deferred);
+            request.tool_schemas.push(schema);
         }
         // What `drop_context` calls asked for, applied before the next request.
         let mut drop_requests: Vec<DropRequest> = Vec::new();
@@ -2950,6 +2969,49 @@ impl TurnDriver {
                         self.record_bank_answer(&result.run_id, &call.call_id, text)
                             .await;
                     }
+                    slots.push((name.clone(), transcript_id, slot));
+                    continue;
+                }
+                // A codemode program runs after what came before it in the
+                // batch, as a call that runs alone: its calls may write.
+                if name == crate::codemode::CODEMODE_TOOL && self.codemode.is_some() {
+                    run_ready_slots(
+                        &self.tools,
+                        &mut slots,
+                        &observer,
+                        &cancellation,
+                        &mut hook_notes,
+                        &mut announced,
+                    )
+                    .await?;
+                    // The program's calls stop with the turn, and when the
+                    // program is stopped (its deadline): a child token.
+                    let program_cancellation = cancellation.child_token();
+                    let context = CodemodeContext {
+                        session_id: &result.session_id,
+                        task_id: &result.task_id,
+                        transcript_id: &transcript_id,
+                        tool_schemas: &request.tool_schemas,
+                        options: &options,
+                        observer: &observer,
+                        cancellation: &program_cancellation,
+                        sequence: tool_calls,
+                        made: std::sync::atomic::AtomicU32::new(0),
+                        finished: std::sync::Mutex::new(Vec::new()),
+                        hooks: std::sync::Mutex::new(crate::HookResponse::default()),
+                    };
+                    let slot = self.run_codemode(&call.arguments, &context).await;
+                    let finished = context.finished.into_inner().unwrap_or_default();
+                    for (view, arguments) in finished {
+                        note_change(&mut changed_files, &view.output, &arguments);
+                        executions.push(view);
+                    }
+                    // What the hooks of the program's calls said reaches the
+                    // model with the program's result, and a hook that stops
+                    // the turn stops it.
+                    let hooks = context.hooks.into_inner().unwrap_or_default();
+                    let slot = with_hook_feedback(slot, &hooks);
+                    hook_notes.insert(transcript_id.clone(), hooks);
                     slots.push((name.clone(), transcript_id, slot));
                     continue;
                 }
@@ -3947,6 +4009,378 @@ impl TurnDriver {
             )
         })
     }
+}
+
+/// What a codemode program's calls need from the turn that runs it.
+struct CodemodeContext<'a> {
+    session_id: &'a harness_types::SessionId,
+    task_id: &'a harness_types::TaskId,
+    /// The `codemode` call's id; its calls are `<id>.1`, `<id>.2`, ...
+    transcript_id: &'a str,
+    tool_schemas: &'a [Value],
+    options: &'a TurnOptions,
+    observer: &'a Arc<dyn TurnObserver>,
+    cancellation: &'a CancellationToken,
+    /// The turn's call count when the program started, for the gate.
+    sequence: u32,
+    made: std::sync::atomic::AtomicU32,
+    /// The calls that ran, with their arguments, for the turn's records.
+    finished: std::sync::Mutex<Vec<(ToolExecutionView, String)>>,
+    /// What the hooks of the program's calls answered, kept together.
+    hooks: std::sync::Mutex<crate::HookResponse>,
+}
+
+/// The most calls one program may make; past it each call is refused.
+const MAX_CODEMODE_CALLS: u32 = 1000;
+
+impl CodemodeContext<'_> {
+    /// Keep a call's hook answer: its text for the model, and a stop.
+    fn keep_hooks(&self, note: crate::HookResponse) {
+        if let Ok(mut hooks) = self.hooks.lock() {
+            hooks.context.extend(note.context);
+            hooks.host_context.extend(note.host_context);
+            if hooks.stop.is_none() {
+                hooks.stop = note.stop;
+            }
+        }
+    }
+}
+
+/// A codemode result with what the hooks of its calls said, as a call's
+/// result carries its hooks' feedback.
+fn with_hook_feedback(slot: Slot, hooks: &crate::HookResponse) -> Slot {
+    let mut feedback = String::new();
+    if let Some(context) = hooks.context_text() {
+        let _ = write!(feedback, "\n\nHook feedback:\n{context}");
+    }
+    if let Some(context) = hooks.host_context_text() {
+        let _ = write!(feedback, "\n\n{context}");
+    }
+    if feedback.is_empty() {
+        return slot;
+    }
+    match slot {
+        Slot::Answered(text) => Slot::Answered(format!("{text}{feedback}")),
+        Slot::Failed(text, detail) => Slot::Failed(format!("{text}{feedback}"), detail),
+        other => other,
+    }
+}
+
+impl TurnDriver {
+    /// Run a `codemode` call's program; what the model reads is the slot.
+    async fn run_codemode(&self, arguments: &str, context: &CodemodeContext<'_>) -> Slot {
+        let code = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|arguments| {
+                arguments
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        let Some(code) = code else {
+            let reason = "codemode needs `code`: a JavaScript program as a string".to_owned();
+            return Slot::Failed(reason.clone(), reason);
+        };
+        let parsed = match harness_codemode::parse_source(&code) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                return Slot::Failed(
+                    format!("codemode did not run the program: {reason}"),
+                    reason,
+                );
+            }
+        };
+        let (run_options, max_chars) = crate::codemode::run_options(&parsed.options);
+        let tools = crate::codemode::reachable(context.tool_schemas, &self.deferred);
+        // The store belongs to the conversation: its task id, which a
+        // resumed conversation (`ha exec --resume`) keeps; the session id is
+        // new each time.
+        let session = context.task_id.as_str().to_owned();
+        let codemode = self.codemode.clone().unwrap_or_default();
+        let started = Instant::now();
+        let outcome = harness_codemode::execute(
+            parsed.code,
+            crate::codemode::tool_infos(&tools),
+            crate::codemode::load_store(&codemode, &session),
+            run_options,
+            |calls| self.codemode_batch(calls, context),
+            context.cancellation.cancelled(),
+            || context.cancellation.cancel(),
+        )
+        .await;
+        if outcome.ok() {
+            crate::codemode::save_store(&codemode, &session, &outcome.store_writes);
+        }
+        let failed = outcome
+            .calls
+            .iter()
+            .filter(|call| call.status != harness_codemode::CallStatus::Ok)
+            .count();
+        let mut record = harness_types::diag::info("codemode", "run")
+            .call(context.transcript_id)
+            .field("calls", outcome.calls.len())
+            .field("failed_calls", failed)
+            .field("output_items", outcome.output.len())
+            .field(
+                "ms",
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            );
+        if let Err(error) = &outcome.outcome {
+            record = record.field("error", error.kind.as_str());
+        }
+        record.emit();
+        let text = harness_codemode::render_result(&outcome, max_chars);
+        match &outcome.outcome {
+            Ok(_) => Slot::Answered(text),
+            Err(error) => Slot::Failed(text, format!("{}: {}", error.kind.as_str(), error.message)),
+        }
+    }
+
+    /// One batch of a program's calls, as a batch of the model's calls runs:
+    /// each crosses its gate (policy, hooks, approval, intent) in the order
+    /// the program made them, then the side effects run side by side and
+    /// settle in order. A call that must run alone makes the whole batch run
+    /// one call after another.
+    async fn codemode_batch(
+        &self,
+        calls: Vec<harness_codemode::HostCall>,
+        context: &CodemodeContext<'_>,
+    ) -> Vec<Result<String, String>> {
+        let one_by_one = calls.iter().any(|call| runs_alone(&call.name));
+        let mut entries: Vec<CodemodeEntry> = Vec::with_capacity(calls.len());
+        for call in calls {
+            entries.push(self.codemode_gate(call, one_by_one, context).await);
+        }
+        // The side effects of the calls through their gate, side by side.
+        let outcomes = futures_util::future::join_all(entries.iter().map(|entry| async {
+            match &entry.state {
+                CodemodeState::Ready(ready) => Some(
+                    self.tools
+                        .run_begun(&ready.begun, context.cancellation.clone())
+                        .await,
+                ),
+                CodemodeState::Done(_) => None,
+            }
+        }))
+        .await;
+        let mut answers = Vec::with_capacity(entries.len());
+        for (entry, outcome) in entries.into_iter().zip(outcomes) {
+            let CodemodeEntry {
+                name,
+                call_id,
+                arguments,
+                state,
+            } = entry;
+            let done = match (state, outcome) {
+                (CodemodeState::Ready(ready), Some(outcome)) => {
+                    let mut hook_note = crate::HookResponse::default();
+                    let done = complete_action(
+                        &self.tools,
+                        ready,
+                        outcome,
+                        context.observer,
+                        context.cancellation,
+                        &mut hook_note,
+                    )
+                    .await;
+                    context.keep_hooks(hook_note);
+                    done
+                }
+                (CodemodeState::Done(done), _) => done,
+                (CodemodeState::Ready(_), None) => Err(HarnessError::new(
+                    ErrorCode::ProviderProtocol,
+                    "a codemode call was gated but never run",
+                )),
+            };
+            answers.push(settle_codemode_call(
+                self, &name, &call_id, arguments, done, context,
+            ));
+        }
+        answers
+    }
+
+    /// A program's call through its gate, shown as its own card: refused,
+    /// answered, run already (`run_now`), or ready for its side effect.
+    async fn codemode_gate(
+        &self,
+        call: harness_codemode::HostCall,
+        run_now: bool,
+        context: &CodemodeContext<'_>,
+    ) -> CodemodeEntry {
+        let index = context
+            .made
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let call_id = format!("{}.{index}", context.transcript_id);
+        let mut arguments = match call.args.as_deref() {
+            None | Some("null") => "{}".to_owned(),
+            Some(arguments) => arguments.to_owned(),
+        };
+        context.observer.observe(TurnProgress::ToolStarted {
+            name: call.name.clone(),
+            call_id: call_id.clone(),
+            summary: summarize_arguments(&arguments),
+            input: arguments.clone(),
+        });
+        let mut hook_note = crate::HookResponse::default();
+        let state = match self.codemode_request(&call.name, &mut arguments, &call_id, context) {
+            Err(error) => CodemodeState::Done(Err(error)),
+            Ok(request) => match gate_action(
+                &self.tools,
+                request,
+                context.options,
+                context.sequence,
+                context.observer,
+                context.cancellation,
+                &mut hook_note,
+            )
+            .await
+            {
+                Ok(Gated::Done(done)) => CodemodeState::Done(done),
+                Ok(Gated::Ready(ready)) if run_now => {
+                    let outcome = self
+                        .tools
+                        .run_begun(&ready.begun, context.cancellation.clone())
+                        .await;
+                    CodemodeState::Done(
+                        complete_action(
+                            &self.tools,
+                            ready,
+                            outcome,
+                            context.observer,
+                            context.cancellation,
+                            &mut hook_note,
+                        )
+                        .await,
+                    )
+                }
+                Ok(Gated::Ready(ready)) => CodemodeState::Ready(ready),
+                Err(error) => CodemodeState::Done(Err(error)),
+            },
+        };
+        context.keep_hooks(hook_note);
+        CodemodeEntry {
+            name: call.name,
+            call_id,
+            arguments,
+            state,
+        }
+    }
+
+    /// A program's call as the request its gate takes: refused for a control
+    /// tool or one the turn does not have, and checked against its schema as
+    /// a call the model makes, with its coercion.
+    fn codemode_request(
+        &self,
+        name: &str,
+        arguments: &mut String,
+        call_id: &str,
+        context: &CodemodeContext<'_>,
+    ) -> Result<ToolRequest, HarnessError> {
+        if context.made.load(std::sync::atomic::Ordering::Relaxed) > MAX_CODEMODE_CALLS {
+            return Err(HarnessError::new(
+                ErrorCode::PolicyDenied,
+                format!("a codemode program may make at most {MAX_CODEMODE_CALLS} tool calls"),
+            ));
+        }
+        if crate::codemode::NOT_FROM_CODEMODE.contains(&name) {
+            return Err(HarnessError::new(
+                ErrorCode::PolicyDenied,
+                format!(
+                    "tools.{name} cannot be called from a codemode program; call {name} directly"
+                ),
+            ));
+        }
+        let Some(schema) = parameters_schema(context.tool_schemas, name)
+            .or_else(|| parameters_schema(&self.deferred, name))
+        else {
+            return Err(HarnessError::new(
+                ErrorCode::PolicyDenied,
+                format!("tools.{name} is not a tool of this turn"),
+            ));
+        };
+        match crate::validation::validate_tool_arguments_json(name, schema, arguments) {
+            Ok(None) => {}
+            Ok(Some(coerced)) => *arguments = coerced.to_string(),
+            Err(message) => return Err(HarnessError::new(ErrorCode::InvalidPayload, message)),
+        }
+        if name == "read_file" && read_paths(arguments).is_some() {
+            return Err(HarnessError::new(
+                ErrorCode::InvalidPayload,
+                "in a codemode program read one file per call: `await Promise.all(paths.map(path => tools.read_file({ path })))`",
+            ));
+        }
+        // Rules learned from this project's failures, as for a model call.
+        if !self.learned_rules.is_empty() {
+            let realized = self.learned_rules.realize(name, arguments);
+            if let Some(refusal) = realized.refusal {
+                return Err(HarnessError::new(ErrorCode::PolicyDenied, refusal));
+            }
+            if let Some(rewritten) = realized.arguments {
+                *arguments = rewritten;
+            }
+        }
+        let call = NormalizedToolCall {
+            call_id: call_id.to_owned(),
+            name: name.to_owned(),
+            arguments: arguments.clone(),
+        };
+        let action = self.resolve_action(&call)?;
+        Ok(ToolRequest::new(
+            context.session_id.clone(),
+            context.task_id.clone(),
+            context.options.actor_id.clone(),
+            context.options.workspace_root.clone(),
+            action,
+        )
+        .with_call_id(call_id.to_owned()))
+    }
+}
+
+/// Show a program's finished call, keep it for the turn's records, and say
+/// what the program reads: the value, or why the call did not succeed.
+fn settle_codemode_call(
+    driver: &TurnDriver,
+    name: &str,
+    call_id: &str,
+    arguments: String,
+    done: Result<ToolExecutionView, HarnessError>,
+    context: &CodemodeContext<'_>,
+) -> Result<String, String> {
+    announce_settled(context.observer, name, call_id, &done);
+    match done {
+        Ok(view) => {
+            // A later call of the same program writes against what this
+            // one read or wrote.
+            driver.remember_hash(&view.output);
+            let answer = match failure_detail(&view.output) {
+                Some(detail) => Err(format!("{name} was not run: {detail}")),
+                None => Ok(crate::codemode::script_value(name, &view.output)),
+            };
+            if let Ok(mut finished) = context.finished.lock() {
+                finished.push((view, arguments));
+            }
+            answer
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// A program's call between its gate and its result.
+struct CodemodeEntry {
+    name: String,
+    call_id: String,
+    arguments: String,
+    state: CodemodeState,
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one value per call, moved once, as `Gated` is"
+)]
+enum CodemodeState {
+    Done(Result<ToolExecutionView, HarnessError>),
+    Ready(Box<ReadyAction>),
 }
 
 /// Execute a host-initiated action through the same policy, approval and receipt

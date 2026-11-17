@@ -33,6 +33,8 @@ pub mod branch_summary;
 pub mod checks;
 #[path = "protocols/cli_extras.rs"]
 pub mod cli_extras;
+#[path = "coordination/codemode.rs"]
+pub mod codemode;
 #[path = "protocols/commands.rs"]
 pub mod commands;
 #[path = "configuration/config.rs"]

@@ -10,6 +10,8 @@
 mod bank;
 #[path = "processes/capture.rs"]
 mod capture;
+#[path = "runtime/codemode.rs"]
+mod codemode;
 #[path = "security/command_guard.rs"]
 mod command_guard;
 mod contracts;
@@ -69,6 +71,7 @@ pub use capture::{
     DEFAULT_TAIL_PREVIEW_BYTES, ProcessSpoolConfig, STREAM_TAIL_BYTES, SpoolLimits, StreamTail,
     parse_capture_header,
 };
+pub use codemode::{CODEMODE_TOOL, Codemode, codemode_schema};
 pub use contracts::{
     ApprovalGrant, AskUserInput, CaptureStream, CodingToolAction, EDIT_FILE_MAX_EDITS,
     ENV_REFERENCE_PREFIX, EditSpec, EffectClass, EnvBinding, GIT_LOG_DEFAULT_LIMIT,

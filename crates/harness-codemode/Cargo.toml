@@ -1,0 +1,24 @@
+[package]
+name = "harness-codemode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Codemode for ha: model-written JavaScript whose only capability is calling the host's tools, run by an interpreter written in Rust"
+
+[dependencies]
+# `new Date()`, `toISOString()` and `Date.parse` in scripts. Already in Cargo.lock.
+chrono.workspace = true
+# JavaScript regular expressions use look-around and back-references, which
+# `regex` does not have. Already in Cargo.lock through harness-tools.
+fancy-regex = "=0.16.2"
+# Objects, `Map` and `Set` keep insertion order, as JavaScript's do. Already in
+# Cargo.lock.
+indexmap = "=2.14.2"
+serde_json.workspace = true
+# Channels and the deadline between the script's thread and the async host.
+tokio.workspace = true
+
+[lints]
+workspace = true

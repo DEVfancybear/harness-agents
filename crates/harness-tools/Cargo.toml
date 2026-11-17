@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The `codemode` host tool: the interpreter its programs run in.
+harness-codemode = { path = "../harness-codemode" }
 harness-providers = { path = "../harness-providers" }
 harness-runtime = { path = "../harness-runtime" }
 harness-session = { path = "../harness-session" }
@@ -18,6 +20,8 @@ chrono.workspace = true
 # prime-agent's destructive-git guard is written with look-ahead patterns;
 # this version is already in Cargo.lock.
 fancy-regex = "=0.16.2"
+# A codemode program's `Promise.all`: its calls run side by side.
+futures-util.workspace = true
 globset.workspace = true
 ignore.workspace = true
 memchr.workspace = true

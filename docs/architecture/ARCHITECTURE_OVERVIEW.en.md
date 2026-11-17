@@ -61,7 +61,7 @@ The graph is a responsibility map of the main dependency edges (every crate also
 
 ## 4. Crate map
 
-The workspace has eleven crates.
+The workspace has twelve crates.
 
 | Crate | Owns | Does not own |
 |---|---|---|
@@ -71,7 +71,8 @@ The workspace has eleven crates.
 | `harness-session` | Atomic input admission, instruction ledger, projections, snapshots, deterministic recovery views, and the context builder (typed context blocks with channels) | Model classification, process execution, UI state |
 | `harness-providers` | Provider request/response types, the mock provider, OpenAI Chat, OpenAI Responses (API and the ChatGPT Codex backend) and Anthropic Messages adapters, SSE decoding, thinking levels, rate-limit parsing, prompt-cache request fields | Session mutation, tool approval, workspace writes |
 | `harness-runtime` | Run state machine, budgets, frozen requests, provider attempts, human input, goal evaluation, compaction, fork/rollback/resume of a conversation, the run inbox, session-file import/export | Direct terminal UI, arbitrary filesystem/process effects |
-| `harness-tools` | Coding-tool descriptors, canonicalization, path policy and approval modes, durable intents/receipts, filesystem/Git/process adapters, the bounded model-tool-model turn driver, hooks, the destructive-git guard, command guards and secret-value redaction (`security/command_guard.rs`, `secret_values.rs`, see [guards](GUARDS.en.md)), trajectory regulation and learned rules (`runtime/regulation.rs`, `runtime/rules.rs`, see [strategy and runtime](STRATEGY_AND_RUNTIME.en.md)), the verify reminder and the `TurnEvaluation` gate in the turn driver (`runtime/turn_driver.rs`, see [self-evaluation](SELF_EVALUATION.en.md)), tiered tool disclosure through `tool_schema`/`use_tool`, and strict-execution capability probes | Model selection, terminal widgets, cross-session extraction |
+| `harness-tools` | Coding-tool descriptors, canonicalization, path policy and approval modes, durable intents/receipts, filesystem/Git/process adapters, the bounded model-tool-model turn driver, hooks, the destructive-git guard, command guards and secret-value redaction (`security/command_guard.rs`, `secret_values.rs`, see [guards](GUARDS.en.md)), trajectory regulation and learned rules (`runtime/regulation.rs`, `runtime/rules.rs`, see [strategy and runtime](STRATEGY_AND_RUNTIME.en.md)), the verify reminder and the `TurnEvaluation` gate in the turn driver (`runtime/turn_driver.rs`, see [self-evaluation](SELF_EVALUATION.en.md)), tiered tool disclosure through `tool_schema`/`use_tool`, the `codemode` host tool and the gate for a program's calls (`runtime/codemode.rs`, see [codemode](CODEMODE.en.md)), and strict-execution capability probes | Model selection, terminal widgets, cross-session extraction |
+| `harness-codemode` | The codemode interpreter: the lexer, parser and evaluator of the JavaScript a program is written in, its built-ins, the `// @options` line, TypeScript declarations from JSON Schemas, and the runner that puts a program on its own thread and hands its tool calls to async code (see [codemode](CODEMODE.en.md)) | Tools, policy, approvals, files, processes or the network: a program reaches only what its host answers |
 | `harness-orchestrator` | Delegation contracts and grants, the durable task DAG, bounded worker scheduling, host-owned isolated worktrees, revision-bound integration | Provider protocol details, tool policy implementation, raw SQL authority |
 | `harness-extensions` | Extension handshake and trust, capability negotiation, the NDJSON stdio transport, external tool/provider bridges, the MCP client (stdio and Streamable HTTP), the tool catalogue, versioned skill composition | Trust by name alone, host policy bypass, direct database ownership |
 | `harness-maintenance` | Backup/restore verification, compatibility checks, migration copies, retention pins/tombstones, garbage collection and support bundles | Normal turn execution or interactive presentation |
@@ -83,12 +84,13 @@ The intended dependency direction is inward toward stable contracts. These are t
 
 ```text
 harness-types                       (depends on no sibling)
+harness-codemode                    (depends on no sibling)
   ├── harness-kernel
   ├── harness-providers
   └── harness-store-sqlite
         └── harness-session
               └── harness-runtime   (also providers)
-                    ├── harness-tools          (also providers, session, store)
+                    ├── harness-tools          (also codemode, providers, session, store)
                     └── harness-orchestrator   (also kernel, providers, session, store)
 harness-extensions  -> kernel, providers, session, tools
 harness-maintenance -> session, store
@@ -99,7 +101,7 @@ Higher-level crates depend on more than one sibling because they compose a use c
 
 ### 4.2 Source layout
 
-The eleven crates remain flat peers under `crates/`, with their public module paths and dependency graph unchanged. The CLI entrypoint is `src/main.rs`; handlers live in `src/commands/`, diagnostics in `src/support/`, and interactive/background host code in `src/host/`:
+The twelve crates remain flat peers under `crates/`, with their public module paths and dependency graph unchanged. The CLI entrypoint is `src/main.rs`; handlers live in `src/commands/`, diagnostics in `src/support/`, and interactive/background host code in `src/host/`:
 
 | Host folder | Responsibility |
 |---|---|

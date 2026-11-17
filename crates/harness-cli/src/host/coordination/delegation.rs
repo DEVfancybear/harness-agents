@@ -1552,6 +1552,8 @@ struct AgentsShared {
     results: Mutex<Option<TurnJudges>>,
     /// The action bank children run with: the parent's, when it is on.
     bank: Mutex<Option<harness_tools::ActionBank>>,
+    /// The codemode children are offered: the parent's, when it is on.
+    codemode: Mutex<Option<harness_tools::Codemode>>,
     running_workers: Mutex<u32>,
     worker_freed: tokio::sync::Notify,
     children: Mutex<Vec<ChildRecord>>,
@@ -1642,6 +1644,7 @@ impl AgentsShared {
             guard: Mutex::new(None),
             results: Mutex::new(None),
             bank: Mutex::new(None),
+            codemode: Mutex::new(None),
             running_workers: Mutex::new(0),
             worker_freed: tokio::sync::Notify::new(),
             children: Mutex::new(Vec::new()),
@@ -2688,6 +2691,14 @@ impl SessionAgents {
     pub fn set_turn_judges(&self, judges: Option<TurnJudges>) {
         if let Ok(mut current) = self.shared.results.lock() {
             *current = judges;
+        }
+    }
+
+    /// The codemode children started from here on are offered: the
+    /// parent's (`None` while it is off), so a child inherits it.
+    pub fn set_codemode(&self, codemode: Option<harness_tools::Codemode>) {
+        if let Ok(mut current) = self.shared.codemode.lock() {
+            *current = codemode;
         }
     }
 
@@ -6297,6 +6308,17 @@ impl WorkerBackend for InteractiveWorkerBackend {
             let bank = self.shared.bank.lock().ok().and_then(|bank| bank.clone());
             let driver = match bank {
                 Some(bank) => driver.with_action_bank(bank),
+                None => driver,
+            };
+            // The parent's codemode, when it is on.
+            let codemode = self
+                .shared
+                .codemode
+                .lock()
+                .ok()
+                .and_then(|codemode| codemode.clone());
+            let driver = match codemode {
+                Some(codemode) => driver.with_codemode(codemode),
                 None => driver,
             };
             // A child's question is shown to the user, named after the child, and

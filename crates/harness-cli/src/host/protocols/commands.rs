@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 73] = [
+pub const SLASH_COMMANDS: [SlashCommand; 74] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -170,6 +170,11 @@ pub const SLASH_COMMANDS: [SlashCommand; 73] = [
         "/bank",
         "[on|off|status]",
         "Show or set the action bank (off by default): calls the model fully decided run without a model step",
+    ),
+    command(
+        "/codemode",
+        "[on|off|status]",
+        "Show or set codemode (off by default): one JavaScript program that calls the tools, and only what it prints comes back",
     ),
     SlashCommand {
         options: &[

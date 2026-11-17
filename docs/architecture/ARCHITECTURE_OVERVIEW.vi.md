@@ -61,7 +61,7 @@ flowchart TD
 
 ## 4. Bản đồ crate
 
-Workspace có mười một crate.
+Workspace có mười hai crate.
 
 | Crate | Sở hữu | Không sở hữu |
 |---|---|---|
@@ -71,7 +71,8 @@ Workspace có mười một crate.
 | `harness-session` | Atomic input admission, instruction ledger, projections, snapshots, recovery views xác định được và context builder (context block có kiểu, có channel) | Model classification, process execution, UI state |
 | `harness-providers` | Provider request/response types, mock provider, adapter OpenAI Chat, OpenAI Responses (API và backend ChatGPT Codex) và Anthropic Messages, giải mã SSE, thinking level, parse rate-limit, trường prompt-cache trong request | Session mutation, tool approval, ghi workspace |
 | `harness-runtime` | Run state machine, budgets, frozen requests, provider attempts, human input, đánh giá goal, compaction, fork/rollback/resume hội thoại, run inbox, import/export session file | Terminal UI trực tiếp, filesystem/process effects tùy ý |
-| `harness-tools` | Coding-tool descriptors, canonicalization, path policy và approval mode, durable intents/receipts, adapter filesystem/Git/process, turn driver model-tool-model có giới hạn, hooks, destructive-git guard, guard cho lệnh và che giá trị bí mật (`security/command_guard.rs`, `secret_values.rs`, xem [guard](GUARDS.vi.md)), theo dõi trajectory và luật học được (`runtime/regulation.rs`, `runtime/rules.rs`, xem [chiến lược và runtime](STRATEGY_AND_RUNTIME.vi.md)), lời nhắc kiểm tra (verify reminder) và gate `TurnEvaluation` trong turn driver (`runtime/turn_driver.rs`, xem [tự đánh giá](SELF_EVALUATION.vi.md)), công bố tool theo tầng qua `tool_schema`/`use_tool`, và strict-execution capability probes | Model selection, terminal widgets, cross-session extraction |
+| `harness-tools` | Coding-tool descriptors, canonicalization, path policy và approval mode, durable intents/receipts, adapter filesystem/Git/process, turn driver model-tool-model có giới hạn, hooks, destructive-git guard, guard cho lệnh và che giá trị bí mật (`security/command_guard.rs`, `secret_values.rs`, xem [guard](GUARDS.vi.md)), theo dõi trajectory và luật học được (`runtime/regulation.rs`, `runtime/rules.rs`, xem [chiến lược và runtime](STRATEGY_AND_RUNTIME.vi.md)), lời nhắc kiểm tra (verify reminder) và gate `TurnEvaluation` trong turn driver (`runtime/turn_driver.rs`, xem [tự đánh giá](SELF_EVALUATION.vi.md)), công bố tool theo tầng qua `tool_schema`/`use_tool`, host tool `codemode` và cổng cho các lần gọi của một chương trình (`runtime/codemode.rs`, xem [codemode](CODEMODE.vi.md)), và strict-execution capability probes | Model selection, terminal widgets, cross-session extraction |
+| `harness-codemode` | Interpreter của codemode: lexer, parser và evaluator cho thứ JavaScript chương trình được viết bằng, các built-in, dòng `// @options`, khai báo TypeScript từ JSON Schema, và runner đặt chương trình lên một thread riêng rồi chuyển các lần gọi tool của nó cho code async (xem [codemode](CODEMODE.vi.md)) | Tool, policy, lần duyệt, file, process hay mạng: chương trình chỉ chạm được những gì host trả lời |
 | `harness-orchestrator` | Delegation contracts và grants, durable task DAG, worker scheduling có giới hạn, worktree cô lập do host sở hữu, integration gắn với revision | Chi tiết provider protocol, triển khai tool policy, raw SQL authority |
 | `harness-extensions` | Extension handshake và trust, capability negotiation, transport NDJSON stdio, bridge tool/provider ngoài, MCP client (stdio và Streamable HTTP), tool catalogue, skill composition có version | Trust chỉ dựa trên tên, bypass host policy, database ownership trực tiếp |
 | `harness-maintenance` | Backup/restore verification, compatibility checks, migration copies, retention pins/tombstones, garbage collection và support bundle | Turn execution thông thường hoặc presentation tương tác |
@@ -83,12 +84,13 @@ Hướng dependency chủ đạo đi vào các contract ổn định. Đây là 
 
 ```text
 harness-types                       (không phụ thuộc sibling nào)
+harness-codemode                    (không phụ thuộc sibling nào)
   ├── harness-kernel
   ├── harness-providers
   └── harness-store-sqlite
         └── harness-session
               └── harness-runtime   (thêm providers)
-                    ├── harness-tools          (thêm providers, session, store)
+                    ├── harness-tools          (thêm codemode, providers, session, store)
                     └── harness-orchestrator   (thêm kernel, providers, session, store)
 harness-extensions  -> kernel, providers, session, tools
 harness-maintenance -> session, store
@@ -99,7 +101,7 @@ Các crate tầng trên phụ thuộc nhiều sibling để compose một use ca
 
 ### 4.2 Bố cục source
 
-Mười một crate vẫn nằm ngang hàng trong `crates/`, giữ public module path và dependency graph. Entrypoint CLI là `src/main.rs`; handler nằm trong `src/commands/`, diagnostics trong `src/support/`, code host tương tác/chạy nền trong `src/host/`:
+Mười hai crate vẫn nằm ngang hàng trong `crates/`, giữ public module path và dependency graph. Entrypoint CLI là `src/main.rs`; handler nằm trong `src/commands/`, diagnostics trong `src/support/`, code host tương tác/chạy nền trong `src/host/`:
 
 | Folder host | Trách nhiệm |
 |---|---|

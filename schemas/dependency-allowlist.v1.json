@@ -9,6 +9,7 @@
   ],
   "allow": {
     "harness-types": [],
+    "harness-codemode": [],
     "harness-providers": ["harness-types"],
     "harness-kernel": ["harness-types"],
     "harness-store-sqlite": ["harness-types"],
@@ -20,6 +21,7 @@
       "harness-types"
     ],
     "harness-tools": [
+      "harness-codemode",
       "harness-providers",
       "harness-runtime",
       "harness-session",
