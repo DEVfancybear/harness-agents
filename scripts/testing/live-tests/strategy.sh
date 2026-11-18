@@ -102,6 +102,14 @@ check "a strategist named other strategies" 'records strategy proposed "$since" 
 check "and said why the strategy stalled" 'records strategy proposed "$since" | grep -q "\"diagnosed\": true"'
 check "the agent recorded a switch" 'records strategy decided "$since" | grep -q "\"kind\": \"switch\""'
 check "the switched strategy passed the check" 'grep -q XONG-42 "$P2/result.txt" 2>/dev/null'
+# Bug report 20261118-160828: a strategist's own agent_message woke the parent
+# for a turn of its own (20 of 23 strategists did), and one was taken as the
+# person's answer to the agent's question. Nothing else is delegated here.
+check "the strategist's messages started no turn of their own" '! records turn start "$since" | grep -q "\"by\": \"agent_message\""'
+# The agent names its strategy in the person's language: a switch to one of the
+# strategist's alternatives says so by its place (decide.alternative), and is
+# counted (0.9.11 counted 0 of 41).
+check "the switch was counted as taking the strategist's alternative" 'records strategy decided "$since" | grep "\"kind\": \"switch\"" | grep -q "\"proposed\": true"'
 
 echo "################ 3. /strategy shows what happened"
 "$HA" send s2 "/strategy" --wait > "$RX/strategy.txt" 2>&1
@@ -109,6 +117,34 @@ sed 's/^/   /' "$RX/strategy.txt" | head -24
 check "it names the strategy and the evaluations" 'grep -q "Strategy:" "$RX/strategy.txt" && grep -q "Evaluations" "$RX/strategy.txt"'
 check "it lists the switch" 'grep -q "switch " "$RX/strategy.txt"'
 "$HA" send s2 "/goal clear" --wait >/dev/null 2>&1
+"$HA" shutdown --force >/dev/null 2>&1
+
+echo "################ 3b. a goal's turn that ends on a question waits for the person"
+# Bug report 20261118-160828: the turn that asked was evaluated as a turn short
+# of the goal, the strategist was asked for alternatives while the question
+# waited, and its message was sent as the person's answer.
+P3="$RX/p3b"
+project "$P3"
+agent "$P3" s3b
+since=$(now_ms)
+"$HA" send s3b "/goal Kiểm thử harness về câu hỏi. Lượt đầu tiên: ghi task_state với chiến lược tên 'hỏi trước' và hai mục 'hỏi người dùng' và 'ghi answer.txt', rồi gọi ask_user đúng một lần với câu hỏi 'Ghi chữ nào vào answer.txt?' và hai lựa chọn MAU-XANH-7 và MAU-DO-7. Không làm gì khác trước khi người dùng trả lời. Khi đã có câu trả lời: ghi đúng chữ người dùng chọn vào answer.txt bằng write_file, đánh dấu hai mục là xong và gọi goal_complete." >/dev/null 2>&1
+asked=1
+for _ in $(seq 1 60); do
+  records turn terminal "$since" | grep -q waiting_input && { asked=0; break; }
+  sleep 5
+done
+sleep 20
+check "the first turn ended on the question (the precondition)" '[ "$asked" -eq 0 ]'
+check "the turn that asked was not evaluated" '! records strategy evaluated "$since" | grep -q evaluated'
+# The goal's own first turn is the only one the person started so far.
+check "nothing answered it before the person did" '[ "$(records turn start "$since" | grep -c "\"by\": \"user\"")" -le 1 ]'
+"$HA" send s3b "MAU-XANH-7" --wait >/dev/null 2>&1
+for _ in $(seq 1 60); do
+  "$HA" send s3b "/goal status" --wait 2>&1 | grep -qi "status: *complete" && break
+  sleep 5
+done
+check "the person's answer reached the agent" 'grep -q MAU-XANH-7 "$P3/answer.txt" 2>/dev/null'
+"$HA" send s3b "/goal clear" --wait >/dev/null 2>&1
 "$HA" shutdown --force >/dev/null 2>&1
 
 echo "################ 4. the learned skill that fits is in the turn"

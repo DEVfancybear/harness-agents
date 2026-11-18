@@ -3552,10 +3552,18 @@ impl InteractiveController {
                         }
                     }
                 }
+                // A turn that ended on a question waits for the person's answer,
+                // and what the host holds is not that answer. Seen live: a
+                // strategist's message, held while the question was asked, was
+                // sent as the answer to it when the turn ended - attaching the
+                // files it named - and the agent read it as the person's reply.
+                // The reports and heartbeats run once the answer's turn ends.
+                let answering = self.pending_question.is_some();
                 // What a child reported while this turn ran is read now, one turn
                 // for each report - unless the usage limit parked the session:
                 // then the reports wait for it to resume.
-                if !self.notices_held
+                if !answering
+                    && !self.notices_held
                     && !self.parked()
                     && let Some(text) = self.pending_notices.pop_front()
                 {
@@ -3565,7 +3573,8 @@ impl InteractiveController {
                     return;
                 }
                 // A heartbeat that waited for this turn runs now.
-                if !self.parked()
+                if !answering
+                    && !self.parked()
                     && let Some(text) = self.pending_heartbeats.pop_front()
                 {
                     effects.extend(self.dispatch(text, true));
@@ -3753,6 +3762,9 @@ impl InteractiveController {
         }
         // While a gated action waits, the next line is the answer — never a new
         // request that would run beside the pending one.
+        if automatic && self.held_for_the_person(&text) {
+            return Vec::new();
+        }
         if self.phase == AppPhase::WaitingApproval {
             return self.answer(&text);
         }
@@ -3836,6 +3848,22 @@ impl InteractiveController {
         }
         effects.push(Effect::Redraw);
         effects
+    }
+
+    /// Only the person answers what waits on them - a question, an approval,
+    /// an MCP elicitation: what the host sends by itself (a child's report or
+    /// message, a heartbeat) waits for that answer instead of becoming it.
+    /// True when `text` was held so.
+    fn held_for_the_person(&mut self, text: &str) -> bool {
+        let waiting = matches!(
+            self.phase,
+            AppPhase::WaitingApproval | AppPhase::WaitingInput | AppPhase::WaitingMcpInput
+        );
+        if waiting {
+            self.note_held(text, self.pending_notices.len());
+            self.pending_notices.push_back(text.to_owned());
+        }
+        waiting
     }
 
     fn submit_question_answer(&mut self, text: String) -> Vec<Effect> {
@@ -12686,6 +12714,97 @@ Command: \"npm run build\""
         assert_eq!(
             submissions(&harness).last().map(String::as_str),
             Some("second message")
+        );
+    }
+
+    /// Found live on 0.9.11 (bug report 20261118-160828): a strategist's
+    /// message, held while the agent's question was open, was sent as the
+    /// person's answer when the turn ended on that question, and the agent
+    /// read it as the reply. Only the person answers; what the host holds runs
+    /// once the answer's turn has ended.
+    #[test]
+    fn a_held_message_never_answers_the_question_the_turn_ended_on() {
+        let mut harness = tui_bench(true);
+        let _ = submit_text(&mut harness.controller, "verify the native path");
+        harness
+            .events
+            .send(SessionEvent::QuestionRequired {
+                question_id: "question-env".to_owned(),
+                prompt: "Is there an isolated Windows VM?".to_owned(),
+                options: vec!["yes".to_owned(), "no".to_owned()],
+            })
+            .expect("question event");
+        let message = "[agent-message from child:explorer-2c846460]\n\n{\"alternatives\":[]}";
+        harness
+            .events
+            .send(SessionEvent::AgentMessage {
+                text: message.to_owned(),
+            })
+            .expect("child message");
+        harness
+            .port
+            .heartbeats_due
+            .lock()
+            .expect("heartbeats")
+            .push(crate::interactive::heartbeat::Due {
+                text: "[heartbeat: every 5m run#1] check".to_owned(),
+                delivery: crate::interactive::heartbeat::Delivery::FollowUp,
+            });
+        let _ = harness.controller.pump_events();
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::WaitingInput {
+                    question_id: Some("question-env".to_owned()),
+                },
+            })
+            .expect("question turn ends");
+        let _ = harness.controller.pump_events();
+        assert_eq!(harness.controller.phase(), AppPhase::WaitingInput);
+        assert_eq!(
+            submissions(&harness),
+            ["verify the native path"],
+            "nothing the host held is sent while the question waits"
+        );
+        assert_eq!(
+            harness
+                .port
+                .answer_questions
+                .lock()
+                .expect("question answer log")
+                .as_slice(),
+            [None]
+        );
+        // An automatic dispatch that reaches the open question waits too.
+        let _ = harness
+            .controller
+            .dispatch("[child-done child:x]".to_owned(), true);
+        assert_eq!(submissions(&harness), ["verify the native path"]);
+
+        // The person answers; the held message has its own turn after that.
+        let _ = submit_text(&mut harness.controller, "no");
+        assert_eq!(
+            harness
+                .port
+                .answer_questions
+                .lock()
+                .expect("question answer log")
+                .as_slice(),
+            [None, Some("question-env".to_owned())]
+        );
+        end_with(&mut harness, RunOutcome::Done);
+        let sent = submissions(&harness);
+        assert_eq!(sent[..2], ["verify the native path", "no"], "{sent:?}");
+        assert_eq!(sent.get(2).map(String::as_str), Some(message), "{sent:?}");
+        assert_eq!(
+            harness
+                .port
+                .answer_questions
+                .lock()
+                .expect("question answer log")
+                .last(),
+            Some(&None),
+            "the held message is not an answer"
         );
     }
 
