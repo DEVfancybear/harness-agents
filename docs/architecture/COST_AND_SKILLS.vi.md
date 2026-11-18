@@ -177,8 +177,11 @@ sách dùng chung, bước repair, lịch sử).
     rõ điều đó (`rollback_skipped`);
   - bản cũ cũng đang hỏng thì không khôi phục; skill vẫn bị giữ lại khỏi
     recall như trước.
-  Review chấm văn bản nó đã thấy: một kết quả báo cáo trong chính lần refine
-  đã sửa skill là của bản cũ, không phải của bản sửa.
+  Review chấm văn bản mà cuộc hội thoại đã làm theo, nên kết quả của nó được
+  ghi trước khi các thay đổi của chính lần refine đó được áp: khi có một bản
+  sửa đang chạy thử, lần dùng tính cho hoặc chống lại bản sửa đó (và một bản
+  sửa thay thế bản đang hỏng thì giữ bản cũ ổn, bản hỏng được giữ dưới dạng
+  `superseded`); khi không có, nó tính cho bản cũ.
 - **Bản sửa bị từ chối được giữ và hiển thị.** Mỗi skill giữ năm bản sửa gần
   nhất bị từ chối (promoter từ chối ngay cả sau bước repair), bị rollback,
   hoặc bị thay thế khi đang bị chấm xấu (`superseded`), kèm lý do và tóm tắt

@@ -180,8 +180,11 @@ buffer, `revision_stats`) and `crates/harness-cli/src/host/memory/refine.rs`
     is not overwritten; the record says so (`rollback_skipped`);
   - an incumbent that was failing too is not restored; the skill stays held
     back from recall as before.
-  The review judges the text it saw: an outcome reported in the refinement
-  that also revised the skill is the incumbent's, not the revision's.
+  The review judges the text the conversation followed, so its outcomes are
+  recorded before the same refinement's changes land: with a revision on
+  trial, the use counts for or against that revision (and a revision that
+  then replaces a failing one keeps the sound incumbent, the failing one kept
+  as `superseded`); with none, it counts for the incumbent.
 - **Rejected revisions are kept and shown.** Each skill keeps its last five
   refused (the promoter refused it even after the repair pass), rolled-back,
   or superseded (replaced while judged worse) revisions, with the reason and a short summary of the edits. The refiner's

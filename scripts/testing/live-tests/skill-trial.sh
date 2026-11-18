@@ -10,10 +10,12 @@
 #      skill is refused) and the revision goes on trial, the incumbent's
 #      counters kept.
 #   2. The revised command breaks in the next conversations; the review judges
-#      the skill failed, and at two failed uses the revision is rolled back by
-#      itself: SKILL.md is the incumbent's text again, its counters are back,
-#      the rolled-back revision is kept with its reason, and `ha learning
-#      report` counts it.
+#      the skill failed and the failure counts against the revision. It does
+#      not stand: two failed uses roll it back by itself (SKILL.md is the
+#      incumbent's text, its counters back, kept as rolled_back), or the
+#      review's fix after a failed use replaces it (kept as superseded) and
+#      is judged against the sound incumbent; `ha learning report` counts how
+#      the trial settled.
 #   3. `ha learning prune --skill <name>` prunes a long proven skill: it is
 #      shorter, and on trial with the objective `prune`.
 #
@@ -109,18 +111,23 @@ if [ "$held" = 1 ]; then
   check "the revision is an edit or a patch, not a whole rewrite of a proven skill (ledger: $(ledger_actions))" 'ledger_actions | grep -qE "(edit|patch) *$"'
   check "the revision is on trial, with the incumbent's three uses that worked kept ($(usage 'u.get("trial", {}).get("incumbent")'))" '[ "$(usage "u.get(\"trial\", {}).get(\"incumbent\", {}).get(\"worked\")")" = 3 ]'
 
-  # --- 2. Two failed uses roll the revision back.
+  # --- 2. The failing revision does not stand.
   for use in 1 2 3 4; do
     run "use-$use" "$USE"
     echo "   use $use: trial_bad=$(usage 'u.get("trial_bad")') trial_good=$(usage 'u.get("trial_good")') trial=$(usage '"open" if u.get("trial") else "none"')"
     if [ "$(usage '"open" if u.get("trial") else "none"')" = none ]; then break; fi
   done
+  # The failing revision does not stand, one of two ways: two failed uses
+  # roll it back to the incumbent, or the review fixes it after a failed use,
+  # the failing one is kept as superseded and the fix is judged against the
+  # incumbent (and kept when its uses work).
   rolled=$(usage 'sum(1 for r in u.get("rejected", []) if r.get("kind") == "rolled_back")')
-  check "precondition: the review judged the revised skill in use, and its trial settled (uses: $use)" '[ "$(usage "\"open\" if u.get(\"trial\") else \"none\"")" = none ]'
-  check "the revision was rolled back by itself: SKILL.md is the incumbent's text again" '[ "$(skill_text)" = "$INCUMBENT" ]'
-  check "the incumbent's counters are back (worked: $(usage 'u.get("worked")'))" '[ "$(usage "u.get(\"worked\")")" = 3 ]'
-  check "the rolled-back revision is kept with its reason ($rolled; $(usage '[r.get("reason") for r in u.get("rejected", [])][-1:]'))" '[ "${rolled:-0}" -ge 1 ]'
-  check "ha learning report counts the rollback" '"$HA" learning report 2>&1 | tee "$RX/report.txt" | grep -qiE "[1-9][0-9]* rolled back"'
+  superseded=$(usage 'sum(1 for r in u.get("rejected", []) if r.get("kind") == "superseded" and "--summary-only" in r.get("edits_summary", ""))')
+  echo "   rejected: $(usage '[(r.get("kind"), r.get("reason")) for r in u.get("rejected", [])]')"
+  check "the failing revision was rejected: rolled back ($rolled) or superseded by a fix ($superseded)" '[ "${rolled:-0}" -ge 1 ] || [ "${superseded:-0}" -ge 1 ]'
+  check "the revision that broke the command is not the skill now (no --summary-only in SKILL.md)" '! skill_text | grep -q -- "--summary-only"'
+  check "a failed use counted against the revision, not the incumbent (trial events: $(tr -d '\r' < "$D/skill-usage/revisions.jsonl" 2>/dev/null | py -c "import json,sys; print([json.loads(l)[\"event\"] for l in sys.stdin if l.strip()])"))" '[ "${rolled:-0}" -ge 1 ] && [ "$(skill_text)" = "$INCUMBENT" ] && [ "$(usage "u.get(\"worked\")")" = 3 ] || [ "${superseded:-0}" -ge 1 ]'
+  check "ha learning report counts how the revision was settled" '"$HA" learning report 2>&1 | tee "$RX/report.txt" | grep -qiE "[1-9][0-9]* (rolled back|accepted)"'
 fi
 
 # --- 3. `ha learning prune` shortens a long proven skill, on trial as a prune.
