@@ -9187,6 +9187,7 @@ mod evaluates_strategy_tests {
             pending_question: question,
             final_finish_reason: None,
             bank: harness_tools::BankTally::default(),
+            reread: harness_tools::RereadTally::default(),
         }
     }
 
