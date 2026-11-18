@@ -14,7 +14,9 @@
 #   5. Every run's JSON gives `cost_usd` by part (cache read, cache write,
 #      uncached input, output) adding up to its total.
 #
-# A precondition the model must meet (it made the reads the check needs) is
+# The line the checks count sits past the first ten lines, which a
+# `list_files` preview shows. A precondition the model must meet (it made the
+# reads the check needs) is
 # retried up to three times and named when it never held. Codemode and the
 # action bank are off: a program's reads never reach the transcript at all.
 # The control is this script with HA=<the previous release's ha.exe>: 0.9.11
@@ -59,7 +61,7 @@ hits, calls = 0, {"read_file": 0, "edit_file": 0, "run_process": 0}
 def walk(value):
     if isinstance(value, dict):
         name = value.get("name")
-        if name in calls and "arguments" in value:
+        if isinstance(name, str) and name in calls and "arguments" in value:
             calls[name] += 1
         for item in value.values():
             walk(item)
@@ -107,7 +109,7 @@ words = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda".split(
 lines = [" ".join(random.choice(words) for _ in range(10)) for _ in range(120)]
 for at in (20, 45, 70, 95):
     lines[at] = f"weight: {random.randint(10, 99)}"
-lines[9] = f"FILLER-{sys.argv[2]} a line only this file holds"
+lines[33] = f"FILLER-{sys.argv[2]} a line only this file holds"
 lines[104] = "status: draft"
 open(f"{sys.argv[1]}/plan.txt", "w", encoding="utf-8", newline="\n").write("\n".join(lines) + "\n")
 PY
