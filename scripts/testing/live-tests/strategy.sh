@@ -110,6 +110,32 @@ check "the strategist's messages started no turn of their own" '! records turn s
 # strategist's alternatives says so by its place (decide.alternative), and is
 # counted (0.9.11 counted 0 of 41).
 check "the switch was counted as taking the strategist's alternative" 'records strategy decided "$since" | grep "\"kind\": \"switch\"" | grep -q "\"proposed\": true"'
+# Bug report 20261118-160828: the strategists of a Vietnamese goal answered in
+# English or Vietnamese, and its strategies drifted into French and Portuguese.
+# Every alternative a strategist names is written in the goal's language: its
+# letters, not a list of words, say Vietnamese (U+1EA0-U+1EF9, đ, ă, ơ, ư).
+langs=$("$PY" - "$D/delegation/ledger" <<'PYEOF'
+import glob, json, os, re, sys
+viet = re.compile("[Ạ-ỹĐđĂăƠơƯư]")
+names = []
+for path in glob.glob(os.path.join(sys.argv[1], "*.json")):
+    for child in json.load(open(path, encoding="utf-8")):
+        if "You are a strategist" not in (child.get("objective") or ""):
+            continue
+        answer = child.get("answer") or ""
+        start, end = answer.find("{"), answer.rfind("}")
+        try:
+            names += [a.get("name", "") for a in json.loads(answer[start:end + 1]).get("alternatives", [])]
+        except ValueError:
+            pass
+print(len(names), sum(1 for n in names if viet.search(n)))
+PYEOF
+)
+langs=$(echo "$langs" | tr -d '\r')
+echo "   strategist alternatives, all and in Vietnamese: $langs"
+# A name may keep a technical term as it is ("fixture runner fail-closed"), so
+# two in three, not every one.
+check "the strategist named its alternatives in the goal's language" '[ "${langs%% *}" -ge 1 ] && [ $(( ${langs##* } * 3 )) -ge $(( ${langs%% *} * 2 )) ]'
 
 echo "################ 3. /strategy shows what happened"
 "$HA" send s2 "/strategy" --wait > "$RX/strategy.txt" 2>&1

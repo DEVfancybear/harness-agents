@@ -936,6 +936,12 @@ fn strategist_brief(objective: &str, state: &super::task_state::TaskState) -> St
             let _ = write!(brief, "\n- {}", entry.text);
         }
     }
+    // Seen in bug report 20261118-160828: strategists of one Vietnamese goal
+    // answered in English or Vietnamese, and the agent's strategies drifted
+    // into French and Portuguese.
+    brief.push_str(
+        "\n\nWrite the diagnosis and every alternative's name and why in the language the goal is written in.",
+    );
     brief.push_str(
         "\n\nWhatever you found, and however little, answer with this JSON object and nothing else - no prose before or after it:{\"diagnosis\": \"why it stalled, in one or two sentences\", \"alternatives\": [{\"name\": \"the approach in a few words\", \"why\": \"why it could succeed where the current one stalled\", \"source\": \"the file, knowledge page or URL it comes from; leave out when it is your own idea\", \"team\": [{\"title\": \"the role's name\", \"kind\": \"explorer | coder | verifier\", \"mandate\": \"what it does, what it leaves alone, what it hands back\"}]}]}",
     );
@@ -1540,7 +1546,10 @@ mod tests {
                 && brief.contains("answer with this JSON object and nothing else")
                 // A team named for a stall one agent could clear cost a live
                 // goal its turns.
-                && brief.contains("Most stalls need no team"),
+                && brief.contains("Most stalls need no team")
+                // Bug report 20261118-160828: one goal's strategists wrote in
+                // two languages, and its strategies drifted into two more.
+                && brief.contains("in the language the goal is written in"),
             "{brief}"
         );
     }

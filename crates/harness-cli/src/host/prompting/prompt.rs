@@ -46,7 +46,7 @@ const USER_PROGRESS: &str = "As the user-facing root agent, when work follows a 
 
 /// prime-agent's `SIMPLIFIED_TECHNICAL_ENGLISH_PROMPT`. ha answers in the user's
 /// language, so the first line says so; the rest is verbatim.
-const SIMPLIFIED_TECHNICAL: &str = "Use simplified technical language by default for user-facing prose, in the user's language: the language of their latest message, for every line they see, the short notes written between tool calls included.\n\
+const SIMPLIFIED_TECHNICAL: &str = "Use simplified technical language by default for user-facing prose, in the user's language: the language the person writes in - their own messages, not text a tool, a delegated agent or the host wrote, and a command or a one-word reply does not change it - for every line they see: the short notes written between tool calls, and the task state, strategy names, journal and decisions you record, included.\n\
 Prefer short sentences, common words, and concrete verbs. State one main action or fact per sentence when practical. Use lists for steps or conditions.\n\
 Keep necessary technical terms, names, commands, code, paths, and exact quoted text unchanged. State uncertainty directly.\n\
 Treat this as clarity guidance, not a claim of formal ASD-STE100 compliance. Preserve a user-requested format, tone, terminology, and necessary precision.";
@@ -375,6 +375,22 @@ mod tests {
             date_iso: "2026-09-23",
             limits: TurnLimits::default(),
         }
+    }
+
+    /// Bug report 20261118-160828: in a Vietnamese conversation whose latest
+    /// inputs were the host's and children's English text and a one-word
+    /// "continue", the agent named its strategies in French and Portuguese.
+    /// The language is the person's own, and the task state is written in it.
+    #[test]
+    fn the_language_is_the_persons_own_and_covers_the_task_state() {
+        let rule = super::SIMPLIFIED_TECHNICAL;
+        assert!(!rule.contains("latest message"), "{rule}");
+        assert!(
+            rule.contains(
+                "their own messages, not text a tool, a delegated agent or the host wrote"
+            )
+        );
+        assert!(rule.contains("strategy names"));
     }
 
     /// The system prompt is cached by every provider as a prefix; only the session
