@@ -1820,6 +1820,10 @@ pub struct LearnedSkill {
     pub baseline: Cost,
     /// Non-blank lines of the `SKILL.md` body.
     pub body_lines: usize,
+    /// The turns judged step by step with the skill in play, and the mean of
+    /// how much the steps after its activation helped (`step_judge`, the last
+    /// thirty days); `None` when no judged turn had it.
+    pub progress: Option<(usize, f64)>,
 }
 
 /// A revision of a learned skill that did not stand: the promoter refused it
@@ -1846,7 +1850,12 @@ pub fn library(layers: &Layers) -> Vec<LearnedSkill> {
             let document =
                 std::fs::read_to_string(root.join(&name).join("SKILL.md")).unwrap_or_default();
             let front = FrontMatter::parse(&document);
+            let progress = layers
+                .usage_dir
+                .parent()
+                .and_then(|data| super::step_judge::skill_progress(data, None, &name));
             skills.push(LearnedSkill {
+                progress,
                 layer,
                 description: front
                     .as_ref()
@@ -1971,6 +1980,16 @@ pub fn library_overview(skills: &[LearnedSkill]) -> String {
                 entry,
                 "\n  cost: {}",
                 skill.usage.cost.line(&skill.baseline)
+            );
+        }
+        // How much the steps after it helped, as a separate judge saw each
+        // whole turn: a skill whose steps keep not helping is worth an edit.
+        if let Some((turns, mean)) = skill.progress {
+            let _ = write!(
+                entry,
+                "
+  steps after its activation judged helpful in hindsight: {:.0}% over {turns} turn(s)",
+                mean * 100.0
             );
         }
         // What was tried on this skill and did not stand, newest first, so a

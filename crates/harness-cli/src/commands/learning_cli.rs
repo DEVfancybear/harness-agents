@@ -3,7 +3,9 @@
 use clap::{Args, Subcommand};
 use harness_types::{ErrorCode, HarnessError};
 
-use crate::interactive::{bootstrap, cli_extras, harness, learned, lessons, memory, self_eval};
+use crate::interactive::{
+    bootstrap, cli_extras, harness, learned, lessons, memory, self_eval, step_judge,
+};
 
 #[derive(Debug, Args)]
 pub struct LearningCommand {
@@ -217,6 +219,11 @@ pub async fn run(command: LearningCommand) -> Result<(), HarnessError> {
             // model is not an independent signal, so it never becomes one.
             println!();
             for line in self_eval::stats(&global, now) {
+                println!("{line}");
+            }
+            // Each step of a finished turn judged in hindsight: did it help?
+            println!();
+            for line in step_judge::stats(&cli_extras::current_data_dir()?, now) {
                 println!("{line}");
             }
             // The learned skills' revisions: bounded edits kept on trial.

@@ -838,10 +838,6 @@ pub fn mark_given(local: &Path, through: &str) {
 /// helped (a turn's `mean_after`, averaged over the turns). `project` limits
 /// it to one project's turns. `None` when no judged turn had the skill.
 #[must_use]
-#[allow(
-    dead_code,
-    reason = "read by the learned skills lifecycle, wired in learned.rs"
-)]
 pub fn skill_progress(data_dir: &Path, project: Option<&str>, name: &str) -> Option<(usize, f64)> {
     skill_progress_at(data_dir, project, name, chrono::Utc::now())
 }
@@ -876,10 +872,6 @@ fn skill_progress_at(
 /// judged, how many were valid, what the steps helped on average, the share
 /// judged not to help, and the tools with the highest share of those.
 #[must_use]
-#[allow(
-    dead_code,
-    reason = "read by `ha learning report`, wired in learning_cli.rs"
-)]
 pub fn stats(data_dir: &Path, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
     let since = now - chrono::Duration::days(READ_DAYS);
     let records = read(&super::harness::global_dir(data_dir), Some(since));
