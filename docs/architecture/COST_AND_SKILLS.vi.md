@@ -113,7 +113,12 @@ kết quả, và output được lưu (executions, memory, receipt, codemode) v�
   runtime fit hay gấp vào tóm tắt. Trước mỗi request, một con trỏ mà đích của
   nó đã mất sẽ được thay lại bằng văn bản đầy đủ. Kết quả của các turn trước
   không bao giờ được trỏ tới: runtime có thể tóm tắt hoặc rút gọn chúng khi
-  dựng request kế tiếp, và driver không biết là cái nào.
+  dựng request kế tiếp, và driver không biết là cái nào. Còn hai khe hở, đều
+  tự phục hồi được: runtime fit hoặc gấp ngay trong request nó gửi, nên một
+  con trỏ tạo ra ở đúng bước đó được khôi phục từ bước sau; và một con trỏ
+  còn trong cuộc hội thoại có thể, ở một turn sau, nằm sau một kết quả mà
+  runtime đã rút gọn. Kết quả bị rút gọn tự nói nó đã bị rút gọn, và con trỏ
+  bảo truyền `"fresh": true`.
 - **Dòng lặp lại trong output lệnh.** Trong kết quả `run_shell`, `run_process`
   và `read_process_output`, một dãy từ 4 dòng giống nhau trở lên (bỏ qua
   khoảng trắng cuối dòng) thành dòng đầu và `[previous line repeated N more
@@ -275,7 +280,9 @@ và kết quả của một turn, đọc từ journal), được nối trong
   - `ha exec --json` có `step_judge: {judged, actions, mean, low}`, hoặc
     `{judged: false, reason}` (`off`, `reviews_off`, `mock`, `no_answer`,
     `too_few_actions`, `invalid`, `provider_failed`, ...). Trong `ha exec`
-    lời gọi của judge được tính vào `upkeep_usage`.
+    lời gọi của judge được tính vào `upkeep_usage`, và process chờ nó (tối
+    đa 3 phút) trước khi thoát, như chờ self-evaluation: một lần chạy theo
+    script không muốn lời gọi thêm này thì đặt `HA_STEP_JUDGE=off`.
 
 ## 7. Công tắc
 

@@ -116,7 +116,11 @@ codemode) is whole.
   each request, a pointer whose target is gone by now is replaced by its full
   text. Results of earlier turns are never pointed to: the runtime may
   summarize or shorten them when it builds the next request, and the driver
-  cannot see which.
+  cannot see which. Two windows remain, both recoverable: the runtime fits or
+  folds inside the request it sends, so a pointer made in that very step is
+  restored from the next one; and a pointer kept in the conversation may, in
+  a later turn, sit after a result the runtime shortened. The shortened
+  result says it was shortened, and the pointer says to pass `"fresh": true`.
 - **Repeated lines of command output.** In `run_shell`, `run_process` and
   `read_process_output` results, a run of 4 or more identical lines (trailing
   whitespace aside) is the first line and `[previous line repeated N more
@@ -282,7 +286,10 @@ calls, arguments and results from the journal), wired in
   - `ha exec --json` has `step_judge: {judged, actions, mean, low}`, or
     `{judged: false, reason}` (`off`, `reviews_off`, `mock`, `no_answer`,
     `too_few_actions`, `invalid`, `provider_failed`, ...). In `ha exec` the
-    judge's call counts in `upkeep_usage`.
+    judge's call counts in `upkeep_usage`, and the process waits for it
+    (at most 3 minutes) before it exits, as it waits for self-evaluation:
+    a scripted run that does not want the extra call sets
+    `HA_STEP_JUDGE=off`.
 
 ## 7. Switches
 
