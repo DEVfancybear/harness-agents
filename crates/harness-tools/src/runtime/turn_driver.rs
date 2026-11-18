@@ -303,6 +303,10 @@ pub struct TurnOutcome {
     pub final_finish_reason: Option<String>,
     /// What the action bank did in this turn; all zero while it is off.
     pub bank: crate::bank::BankTally,
+    /// What the turn did not send twice: re-reads answered by a pointer or by
+    /// the changed lines, collapsed repeated lines of command output, and the
+    /// bytes that saved (`HA_REREAD`); all zero while it is off.
+    pub reread: crate::reread::RereadTally,
 }
 
 /// What one goal evaluation run reported, in words the CLI can print.
@@ -1012,7 +1016,7 @@ const SHORTENED_START: &str = "[earlier tool result shortened to ";
 /// Whether a tool result was shortened already. A message is rewritten once:
 /// each rewrite changes what the provider cached, and a result cut to its
 /// start was cut again to a bare note a few steps later.
-fn is_shortened(content: &str) -> bool {
+pub(crate) fn is_shortened(content: &str) -> bool {
     content.starts_with(SHORTENED_START)
 }
 
@@ -1492,6 +1496,8 @@ pub struct TurnDriver {
     visibility: Option<Arc<dyn ResultVisibility>>,
     /// When the turn drops tool results besides over budget.
     drop: ContextDrop,
+    /// Whether a re-read the model holds is not sent again (`HA_REREAD`).
+    reread: crate::reread::Mode,
     admission: Option<Arc<dyn OutputAdmission>>,
     completion: Option<Arc<dyn CompletionCheck>>,
     /// Without a completion check: remind the model, once, to check a change
@@ -1514,7 +1520,7 @@ pub struct TurnDriver {
 }
 
 /// A workspace path as a key: one separator, no leading `./`.
-fn seen_key(path: &str) -> String {
+pub(crate) fn seen_key(path: &str) -> String {
     let path = path.replace('\\', "/");
     path.trim_start_matches("./").to_owned()
 }
@@ -1872,6 +1878,7 @@ impl TurnDriver {
             learned_rules: Arc::default(),
             visibility: None,
             drop: ContextDrop::from_env(),
+            reread: crate::reread::Mode::from_env(),
             admission: None,
             completion: None,
             verify_reminder: false,
@@ -1928,6 +1935,15 @@ impl TurnDriver {
     #[must_use]
     pub fn with_context_drop(mut self, drop: ContextDrop) -> Self {
         self.drop = drop;
+        self
+    }
+
+    /// Whether a re-read the model holds whole is answered with a pointer or
+    /// the changed lines, and repeated lines of command output are collapsed;
+    /// the default is what `HA_REREAD` says (on unless `off`).
+    #[must_use]
+    pub fn with_reread(mut self, on: bool) -> Self {
+        self.reread = crate::reread::Mode::from_flag(on);
         self
     }
 
@@ -2155,6 +2171,9 @@ impl TurnDriver {
         let task_id = request.task_id.clone();
         let input_id = request.input_id.clone();
         let mut executions = Vec::new();
+        // What this turn does not send twice (`crate::reread`).
+        let mut reread =
+            crate::reread::Reread::new(self.reread.is_on(), task_id.as_str(), session_id.as_str());
         let mut tool_calls = 0_u32;
         // One step is one model call, and the first call is already one: counting the
         // dispatch again after each round of tools made `max_steps` mean about half of
@@ -3398,15 +3417,52 @@ impl TurnDriver {
                             .unwrap_or_default();
                         // The user sees all of it; the transcript takes what
                         // this request needs.
-                        let admitted = self
-                            .admit(
-                                &request.text,
-                                &name,
+                        // What the model reads is not always the whole text: a
+                        // read it holds above is a pointer, a small change is
+                        // its lines, command output has its runs of one line
+                        // once (`crate::reread`).
+                        let (model_text, settled) = {
+                            let fitted = |id: &str| request.result_was_fitted(id);
+                            let held = crate::reread::Held {
+                                transcript: &transcript,
+                                batch: &appended,
+                                fitted: &fitted,
+                                folded_until: request.turn_folded_until(),
+                            };
+                            match reread.read_for_model(
+                                &held,
+                                &transcript_id,
                                 &arguments,
-                                rendered.clone(),
-                                &cancellation,
-                            )
-                            .await;
+                                &view.output,
+                                &rendered,
+                            ) {
+                                Some(text) => (text, true),
+                                None => (
+                                    reread
+                                        .output_for_model(&name, &transcript_id, &rendered)
+                                        .unwrap_or_else(|| rendered.clone()),
+                                    false,
+                                ),
+                            }
+                        };
+                        let admitted = if settled {
+                            model_text
+                        } else {
+                            let admitted = self
+                                .admit(
+                                    &request.text,
+                                    &name,
+                                    &arguments,
+                                    model_text.clone(),
+                                    &cancellation,
+                                )
+                                .await;
+                            // Only a read the model holds whole is pointed to.
+                            if admitted == model_text {
+                                reread.keep_read(&transcript_id, &view.output);
+                            }
+                            admitted
+                        };
                         if !shown {
                             observer.observe(TurnProgress::ToolOutput {
                                 name: name.clone(),
@@ -3462,7 +3518,15 @@ impl TurnDriver {
                         appended.push(ProviderMessage::tool_result(transcript_id, text));
                     }
                     Slot::Many(parts) => {
+                        let arguments = appended
+                            .iter()
+                            .flat_map(|message| message.tool_calls.iter())
+                            .find(|call| call.call_id == transcript_id)
+                            .map(|call| call.arguments.clone())
+                            .unwrap_or_default();
+                        // What the user is shown, and what the model reads.
                         let mut texts = Vec::new();
+                        let mut model_texts = Vec::new();
                         let mut failures = Vec::new();
                         for part in parts {
                             match part {
@@ -3471,21 +3535,43 @@ impl TurnDriver {
                                     if let Some(detail) = failure_detail(&view.output) {
                                         failures.push(detail);
                                     }
-                                    texts.push(render_tool_output(&name, &view.output));
+                                    let text = render_tool_output(&name, &view.output);
+                                    let sent = {
+                                        let fitted = |id: &str| request.result_was_fitted(id);
+                                        let held = crate::reread::Held {
+                                            transcript: &transcript,
+                                            batch: &appended,
+                                            fitted: &fitted,
+                                            folded_until: request.turn_folded_until(),
+                                        };
+                                        reread.read_for_model(
+                                            &held,
+                                            &transcript_id,
+                                            &arguments,
+                                            &view.output,
+                                            &text,
+                                        )
+                                    };
+                                    if sent.is_none() {
+                                        reread.keep_read(&transcript_id, &view.output);
+                                    }
+                                    model_texts.push(sent.unwrap_or_else(|| text.clone()));
+                                    texts.push(text);
                                     note_change(&mut changed_files, &view.output, "");
                                     executions.push(view);
                                 }
                                 Err(error) => {
                                     failures.push(error.to_string());
-                                    texts.push(format!("tool {name} failed: {error}"));
+                                    let text = format!("tool {name} failed: {error}");
+                                    model_texts.push(text.clone());
+                                    texts.push(text);
                                 }
                             }
                         }
-                        let rendered = texts.join("\n\n");
                         observer.observe(TurnProgress::ToolOutput {
                             name: name.clone(),
                             call_id: transcript_id.clone(),
-                            text: rendered.clone(),
+                            text: texts.join("\n\n"),
                         });
                         observer.observe(TurnProgress::ToolSettled {
                             name: name.clone(),
@@ -3493,6 +3579,7 @@ impl TurnDriver {
                             ok: failures.is_empty(),
                             detail: (!failures.is_empty()).then(|| failures.join("; ")),
                         });
+                        let rendered = model_texts.join("\n\n");
                         let note = hook_notes.get(&transcript_id);
                         let rendered = match note.and_then(crate::HookResponse::context_text) {
                             Some(context) => format!("{rendered}\n\nHook feedback:\n{context}"),
@@ -3712,6 +3799,14 @@ impl TurnDriver {
                 KEEP_RECENT_RESULTS,
                 &ranks,
             );
+            // A read answered by a pointer or by the changed lines is sent in
+            // full again when what it points to was dropped, shortened or
+            // folded away by now: the model is never pointed at text it lacks.
+            reread.reconcile(
+                &mut transcript,
+                &|id| request.result_was_fitted(id),
+                request.turn_folded_until(),
+            );
             // A shortened result tells the model to call the tool again; that call
             // reads what the model can no longer see, so it is not a repeat. Measured:
             // an explorer whose 38 results were shortened re-read 31 of them as told,
@@ -3919,6 +4014,7 @@ impl TurnDriver {
             pending_question,
             final_finish_reason: result.finish_reason.clone(),
             bank: bank_state.tally,
+            reread: reread.tally,
         })
     }
 
@@ -7310,5 +7406,96 @@ mod context_drop_tests {
         assert!(!elided.is_empty(), "the turn was over budget");
         assert_eq!(transcript[1].content, short, "the short form is kept");
         assert_eq!(transcript[3].content, ELIDED_RESULT);
+    }
+}
+
+/// A re-read the model no longer holds whole is sent whole: the driver's own
+/// drop and trim are what make a result not whole.
+#[cfg(test)]
+mod reread_driver_tests {
+    use super::{drop_results, render_tool_output, trim_transcript};
+    use crate::reread::testing::{ask, file, output};
+    use crate::reread::{Held, Reread};
+    use harness_providers::{ProviderMessage, ProviderToolCall};
+
+    const ARGS: &str = r#"{"path":"src/a.rs"}"#;
+
+    fn call(id: &str, name: &str) -> ProviderMessage {
+        ProviderMessage::assistant_with_calls(
+            String::new(),
+            vec![ProviderToolCall {
+                call_id: id.to_owned(),
+                name: name.to_owned(),
+                arguments: ARGS.to_owned(),
+            }],
+        )
+    }
+
+    /// The model read `src/a.rs` as call `c1`.
+    fn after_a_read() -> (Reread, Vec<ProviderMessage>, crate::ToolOutput, String) {
+        let read = output("src/a.rs", &file(80), 0, 200);
+        let whole = render_tool_output("read_file", &read);
+        let mut reread = Reread::new(true, "task", "session");
+        let mut transcript = vec![call("c1", "read_file")];
+        ask(&mut reread, &mut transcript, "c1", ARGS, &read);
+        (reread, transcript, read, whole)
+    }
+
+    fn read_again(
+        reread: &mut Reread,
+        transcript: &[ProviderMessage],
+        read: &crate::ToolOutput,
+        whole: &str,
+    ) -> Option<String> {
+        let held = Held {
+            transcript,
+            batch: &[],
+            fitted: &|_| false,
+            folded_until: 0,
+        };
+        reread.read_for_model(&held, "c2", ARGS, read, whole)
+    }
+
+    #[test]
+    fn a_read_after_the_result_was_dropped_is_sent_whole() {
+        let (mut reread, mut transcript, read, whole) = after_a_read();
+        assert!(read_again(&mut reread, &transcript, &read, &whole).is_some());
+        let (dropped, _) = drop_results(&mut transcript, 0, None);
+        assert_eq!(dropped, 1);
+        assert!(read_again(&mut reread, &transcript, &read, &whole).is_none());
+    }
+
+    #[test]
+    fn a_read_after_the_result_was_trimmed_for_room_is_sent_whole() {
+        let (mut reread, mut transcript, read, whole) = after_a_read();
+        for index in 0..9 {
+            let id = format!("filler-{index}");
+            transcript.push(call(&id, "run_shell"));
+            transcript.push(ProviderMessage::tool_result(id, "x".repeat(40_000)));
+        }
+        let elided = trim_transcript(
+            &mut transcript,
+            200_000,
+            2,
+            &std::collections::HashMap::new(),
+        );
+        assert!(!elided.is_empty());
+        assert!(super::is_shortened(&transcript[1].content));
+        assert!(read_again(&mut reread, &transcript, &read, &whole).is_none());
+    }
+
+    #[test]
+    fn a_pointer_sent_before_a_drop_is_the_text_again_when_the_next_request_goes() {
+        let (mut reread, mut transcript, read, whole) = after_a_read();
+        let pointer = ask(&mut reread, &mut transcript, "c2", ARGS, &read);
+        assert_ne!(pointer, whole);
+        drop_results(&mut transcript, 1, None);
+        // The pointer's own result is the one kept; what it points to is gone.
+        assert!(super::is_shortened(&transcript[1].content));
+        assert_eq!(transcript[2].content, pointer);
+        reread.reconcile(&mut transcript, &|_| false, 0);
+        assert_eq!(transcript[2].content, whole);
+        assert_eq!(reread.tally.unchanged, 0);
+        assert_eq!(reread.tally.saved_bytes, 0);
     }
 }

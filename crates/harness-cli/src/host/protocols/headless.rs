@@ -1500,6 +1500,15 @@ pub async fn run_with(
         // What the action bank did: banks authored, nodes, calls run without a
         // model step. `usage` above already holds the authoring and fallbacks.
         "bank": super::action_bank::report(bank_on, &outcome.bank),
+        // What the turn did not send twice (`HA_REREAD`): re-reads answered by
+        // a pointer or by the changed lines, collapsed repeated lines of
+        // command output, and the bytes that saved.
+        "reread": {
+            "unchanged": outcome.reread.unchanged,
+            "delta": outcome.reread.delta,
+            "collapsed": outcome.reread.collapsed,
+            "saved_bytes": outcome.reread.saved_bytes,
+        },
     });
     if request.options.output_format.is_some() {
         output["acceptance"] = serde_json::json!({

@@ -5551,3 +5551,240 @@ async fn results_the_model_dropped_stay_dropped_in_the_turn_and_the_next() {
     drop(runtime);
     close(store).await;
 }
+
+/// One scripted turn that makes `calls` (name, arguments) one per step and then
+/// answers: what the provider was sent each step, and the outcome.
+async fn reread_turn(
+    bench: &Bench,
+    calls: Vec<(&'static str, serde_json::Value)>,
+    configure: impl FnOnce(TurnDriver) -> TurnDriver,
+) -> (TurnOutcome, Vec<ProviderRequest>) {
+    let mut script = calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, arguments))| {
+            vec![
+                ProviderStreamEvent::started(),
+                ProviderStreamEvent::tool_delta(
+                    format!("call{index}"),
+                    name,
+                    arguments.to_string(),
+                ),
+                ProviderStreamEvent::completed("tool_calls"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    script.push(vec![
+        ProviderStreamEvent::started(),
+        ProviderStreamEvent::text("Done."),
+        ProviderStreamEvent::completed("stop"),
+    ]);
+    let provider = Arc::new(ScriptedProvider::new(script));
+    let store = bench.open_store().await;
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig {
+            context_window_tokens: 200_000,
+            ..RuntimeConfig::default()
+        },
+    ));
+    let driver = configure(TurnDriver::new(
+        Arc::clone(&runtime),
+        ToolExecutionService::new(Arc::clone(&store)),
+    ));
+    let request = RunRequest::new(
+        SessionId::generate(),
+        TaskId::generate(),
+        InputId::generate(),
+        "read the file again".to_owned(),
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("observation"),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    let outcome = driver
+        .run_turn(
+            request,
+            TurnOptions {
+                workspace_root: bench.workspace.clone(),
+                actor_id: "reread.test".to_owned(),
+                approvals: ApprovalMode::Auto,
+                limits: TurnLimits::default(),
+            },
+            Arc::new(SilentObserver),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn runs");
+    let seen = provider.seen();
+    drop(driver);
+    drop(runtime);
+    close(store).await;
+    (outcome, seen)
+}
+
+fn tool_results(request: &ProviderRequest) -> Vec<String> {
+    request
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+        .map(|message| message.content.clone())
+        .collect()
+}
+
+fn write_numbered(bench: &Bench, name: &str, lines: usize) {
+    let text = (1..=lines)
+        .map(|number| format!("row {number} of the table\n"))
+        .collect::<Vec<_>>()
+        .concat();
+    std::fs::write(bench.workspace.join("src").join(name), text).expect("a file to read");
+}
+
+/// Arxiv 2611.12122: a re-read of a file the model holds whole is a pointer
+/// to that result, `fresh` reads it again, and the same read after the earlier
+/// result was dropped is sent whole.
+#[tokio::test]
+async fn a_re_read_the_model_holds_is_a_pointer_and_fresh_or_a_drop_sends_it_whole() {
+    let bench = bench();
+    write_numbered(&bench, "table.txt", 120);
+    let read = serde_json::json!({"path": "src/table.txt"});
+    let fresh = serde_json::json!({"path": "src/table.txt", "fresh": true});
+    let (outcome, seen) = reread_turn(
+        &bench,
+        vec![
+            ("read_file", read.clone()),
+            ("read_file", read.clone()),
+            ("read_file", fresh),
+            // The first result is dropped; the file is read again.
+            ("drop_context", serde_json::json!({"keep_last": 0})),
+            ("read_file", read),
+        ],
+        |driver| {
+            driver.with_context_drop(harness_tools::ContextDrop {
+                keep: None,
+                tool: true,
+            })
+        },
+    )
+    .await;
+    assert_eq!(seen.len(), 6);
+    let second = tool_results(&seen[2]);
+    assert!(second[0].contains("row 120 of the table"), "{}", second[0]);
+    assert!(
+        second[1].starts_with("src/table.txt: unchanged since your read_file call call0"),
+        "{}",
+        second[1]
+    );
+    assert!(second[1].len() < second[0].len() / 4, "{}", second[1]);
+    let third = tool_results(&seen[3]);
+    assert!(
+        third[2].contains("row 120 of the table"),
+        "fresh reads it in full: {}",
+        third[2]
+    );
+    // After the drop the file is sent whole again, not pointed at.
+    let last = tool_results(&seen[5]);
+    assert!(
+        last[0].starts_with("[earlier tool result shortened"),
+        "{}",
+        last[0]
+    );
+    assert!(
+        last.last()
+            .is_some_and(|text| text.contains("row 120 of the table")),
+        "a read after a drop is whole: {last:#?}"
+    );
+    assert_eq!(outcome.reread.unchanged, 1);
+    assert_eq!(outcome.reread.delta, 0);
+    assert!(outcome.reread.saved_bytes > 1_000);
+}
+
+/// A read after a small edit is only the changed lines; `HA_REREAD=off`
+/// (`with_reread(false)`) sends everything as before.
+#[tokio::test]
+async fn a_read_after_an_edit_is_only_the_changed_lines_and_the_switch_turns_it_off() {
+    let bench = bench();
+    for (name, on) in [("on.txt", true), ("off.txt", false)] {
+        write_numbered(&bench, name, 120);
+        let path = format!("src/{name}");
+        let (outcome, seen) = reread_turn(
+            &bench,
+            vec![
+                ("read_file", serde_json::json!({"path": path})),
+                (
+                    "edit_file",
+                    serde_json::json!({
+                        "path": path,
+                        "old_string": "row 60 of the table",
+                        "new_string": "row 60, edited"
+                    }),
+                ),
+                ("read_file", serde_json::json!({"path": path})),
+            ],
+            |driver| driver.with_reread(on),
+        )
+        .await;
+        let last = tool_results(seen.last().expect("requests"));
+        let again = last.last().expect("the second read");
+        if on {
+            assert!(
+                again.contains(
+                    "(changed since your read_file call call0; only the changed lines are shown)"
+                ),
+                "{again}"
+            );
+            assert!(
+                again.contains("lines 1-59 unchanged since call call0"),
+                "{again}"
+            );
+            assert!(again.contains("\n60: row 60, edited\n"), "{again}");
+            assert!(
+                again.contains("lines 61-120 unchanged since call call0"),
+                "{again}"
+            );
+            assert!(!again.contains("row 100 of the table"), "{again}");
+            assert_eq!(outcome.reread.delta, 1);
+            assert!(outcome.reread.saved_bytes > 1_000);
+        } else {
+            assert!(again.contains("60: row 60, edited"), "{again}");
+            assert!(again.contains("row 100 of the table"), "{again}");
+            assert_eq!(outcome.reread, harness_tools::RereadTally::default());
+        }
+    }
+}
+
+/// A command that prints one line again and again is shown once with its
+/// count, and the capture the model can page through keeps every line.
+#[tokio::test]
+async fn repeated_lines_of_command_output_are_collapsed_and_the_capture_is_whole() {
+    let bench = bench();
+    let command = if cfg!(windows) {
+        "1..300 | ForEach-Object { 'waiting for the lock' }"
+    } else {
+        "i=0; while [ $i -lt 300 ]; do echo waiting for the lock; i=$((i+1)); done"
+    };
+    let (outcome, seen) = reread_turn(
+        &bench,
+        vec![("run_shell", serde_json::json!({"command": command}))],
+        |driver| driver,
+    )
+    .await;
+    // PowerShell ends its lines with CRLF; the first line is shown as it was.
+    let result = tool_results(&seen[1]).remove(0).replace('\r', "");
+    assert!(
+        result.contains("waiting for the lock\n[previous line repeated 299 more times]"),
+        "{result}"
+    );
+    assert!(result.len() < 1_500, "{}", result.len());
+    // The user-facing output the executions hold is the whole of it.
+    let ToolOutput::Process { stdout_tail, .. } =
+        &outcome.executions.last().expect("an execution").output
+    else {
+        panic!("a process result");
+    };
+    assert_eq!(
+        stdout_tail.text.matches("waiting for the lock").count(),
+        300
+    );
+    assert_eq!(outcome.reread.collapsed, 1);
+    assert!(outcome.reread.saved_bytes > 4_000);
+}

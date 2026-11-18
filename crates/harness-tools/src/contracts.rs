@@ -282,7 +282,7 @@ pub const fn coding_tool_names() -> &'static [&'static str] {
 /// schema check before it gets here.
 fn allowed_fields(name: &str) -> Option<&'static [&'static str]> {
     Some(match name {
-        "read_file" => &["path", "paths", "offset", "limit"],
+        "read_file" => &["path", "paths", "offset", "limit", "fresh"],
         "list_files" => &["path", "preview"],
         "git_diff" => &["path"],
         "search_text" => &[
@@ -388,7 +388,8 @@ fn workspace_tool_schemas(hashline: bool) -> Vec<Value> {
                 "path": string_schema(),
                 "paths": {"type": "array", "items": string_schema(), "minItems": 1, "maxItems": READ_FILE_MAX_PATHS},
                 "offset": {"type": "integer", "description": "Zero-based first line; negative counts from the end."},
-                "limit": {"type": "integer", "minimum": 1, "description": format!("Lines to read, at most {READ_FILE_MAX_LINES}; more is read as {READ_FILE_MAX_LINES}.")}
+                "limit": {"type": "integer", "minimum": 1, "description": format!("Lines to read, at most {READ_FILE_MAX_LINES}; more is read as {READ_FILE_MAX_LINES}.")},
+                "fresh": {"type": "boolean", "description": "Send the text again even when your earlier read_file result of it is still above and the file is unchanged (the answer then only points to that result)."}
             }),
             &[],
         ),
@@ -999,6 +1000,8 @@ impl CodingToolAction {
                 // context_lines: refusing limit=520 cost the model a step.
                 let limit = parse_optional_bounded_u32(object, "limit", 1, u32::MAX)?
                     .map(|limit| limit.min(READ_FILE_MAX_LINES));
+                // `fresh` is the turn driver's: here it only has to be a boolean.
+                parse_optional_bool(object, "fresh")?;
                 Ok(Self::ReadFile {
                     path: required_string(object, "path")?,
                     offset,
@@ -2338,6 +2341,41 @@ mod search_context_tests {
             }
             other => panic!("not a read: {other:?}"),
         }
+    }
+
+    /// `fresh` is the turn driver's switch for a re-read: the schema offers
+    /// it, a boolean is accepted (and the read is the same read), and
+    /// anything else is refused for its form.
+    #[test]
+    fn read_file_takes_a_fresh_boolean() {
+        let schemas = super::workspace_tool_schemas(false);
+        let schema = schemas
+            .iter()
+            .find(|schema| schema["function"]["name"] == "read_file")
+            .map(|schema| schema["function"]["parameters"].clone())
+            .expect("schema");
+        assert_eq!(schema["properties"]["fresh"]["type"], "boolean");
+        for arguments in [
+            r#"{"path":"a.rs","fresh":true}"#,
+            r#"{"path":"a.rs","fresh":false}"#,
+        ] {
+            assert!(
+                crate::validation::validate_tool_arguments_json("read_file", &schema, arguments)
+                    .is_ok(),
+                "{arguments}"
+            );
+            assert!(CodingToolAction::from_provider_call("read_file", arguments).is_ok());
+        }
+        assert_eq!(
+            CodingToolAction::from_provider_call("read_file", r#"{"path":"a.rs","fresh":true}"#)
+                .expect("parses"),
+            CodingToolAction::from_provider_call("read_file", r#"{"path":"a.rs"}"#)
+                .expect("parses")
+        );
+        assert!(
+            CodingToolAction::from_provider_call("read_file", r#"{"path":"a.rs","fresh":"yes"}"#)
+                .is_err()
+        );
     }
 }
 

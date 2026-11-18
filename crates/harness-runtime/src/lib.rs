@@ -1875,6 +1875,28 @@ impl RunRequest {
         self
     }
 
+    /// Whether a step of this turn sent the tool result of `call_id`
+    /// shortened to fit the model's window. The turn's own transcript still
+    /// holds that result whole; the request the provider got did not.
+    #[must_use]
+    pub fn result_was_fitted(&self, call_id: &str) -> bool {
+        self.fitted_results
+            .lock()
+            .is_ok_and(|fitted| fitted.contains_key(call_id))
+    }
+
+    /// How many leading messages of the turn's own steps a step folded into a
+    /// summary because the turn outgrew the window: none of their results
+    /// was sent whole. Zero while the turn has not been folded.
+    #[must_use]
+    pub fn turn_folded_until(&self) -> usize {
+        self.turn_summary
+            .lock()
+            .ok()
+            .and_then(|summary| summary.as_ref().map(|(cut, _)| *cut))
+            .unwrap_or(0)
+    }
+
     /// What the user said in `conversation[start..end]`, by place, oldest
     /// first: each turn's question as written, and what they sent while a
     /// turn ran. The host's own notes are not theirs.

@@ -38,6 +38,8 @@ mod process;
 mod references;
 #[path = "runtime/regulation.rs"]
 mod regulation;
+#[path = "runtime/reread.rs"]
+mod reread;
 #[path = "runtime/rules.rs"]
 mod rules;
 #[path = "filesystem/search.rs"]
@@ -113,6 +115,7 @@ pub use process::{
 pub use command_guard::protect_host_dirs;
 pub use harness_runtime::AcceptanceState;
 pub use hooks::{HOOK_EVENTS, HookResponse, fit_payload, hook_matches, run_hooks};
+pub use reread::RereadTally;
 pub use rules::{LearnedRule, LearnedRules, Realized, RuleAction, RuleState};
 pub use secrets::{HostEnvironmentSecrets, SecretResolver};
 pub use service::{
