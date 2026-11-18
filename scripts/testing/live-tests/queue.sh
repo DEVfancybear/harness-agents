@@ -236,7 +236,10 @@ rm -f "$X/limit"
 echo "################ 6. a parked session's child makes no call on that provider"
 proxied "$RX/p" q6
 asked6=$(now_ms)
-"$HA" send q6 "Kiểm thử harness, làm đúng thứ tự: (1) dùng tool delegate với wait=false giao cho một agent role explorer nhiệm vụ: gọi run_shell đúng một lần với command Start-Sleep -Seconds 50 và timeout_ms 120000, rồi trả lời đúng CHILD-DONE. (2) Sau khi giao, tự gọi run_shell với command Start-Sleep -Seconds 15 và timeout_ms 60000. (3) Trả lời đúng một dòng: PARENT-DONE." >/dev/null 2>&1
+# The parent waits in python_repl, not run_shell: the two agents' shells run
+# one after the other, and a parent's sleep queued behind the child's 50 s one
+# met the limit after the child had ended (seen twice on the 0.9.12 candidate).
+"$HA" send q6 "Kiểm thử harness, làm đúng thứ tự: (1) dùng tool delegate với wait=false giao cho một agent role explorer nhiệm vụ: gọi run_shell đúng một lần với command Start-Sleep -Seconds 50 và timeout_ms 120000, rồi trả lời đúng CHILD-DONE. (2) Sau khi giao, tự gọi python_repl với code: import time; time.sleep(15) (không dùng run_shell). (3) Trả lời đúng một dòng: PARENT-DONE." >/dev/null 2>&1
 for _ in $(seq 1 60); do
   records child | awk -v since="$asked6" '$1 > since && $2 == "started"' | grep -q . && break
   sleep 3
