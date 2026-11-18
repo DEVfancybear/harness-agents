@@ -111,11 +111,11 @@ if [ "$held" = 1 ]; then
   check "the judge's call is counted in upkeep_usage ($(jget "$R" upkeep_usage.model_calls) calls)" '[ "$(jget "$R" upkeep_usage.model_calls)" -ge 1 ] 2>/dev/null'
   check "the answer is right: the sum is $SUM" 'jget "$R" response | grep -q "$SUM"'
   reads_mean=$(judged "$session" "round(sum(s['helped'] for s in j['steps'] if 'n' in s.get('args','') and 'history' not in s.get('args','') and s['tool']=='read_file') / max(1, sum(1 for s in j['steps'] if 'n' in s.get('args','') and 'history' not in s.get('args','') and s['tool']=='read_file')), 2)")
-  check "the reads the answer needed are judged to have helped (mean $reads_mean)" 'py -c "import sys; sys.exit(0 if float(sys.argv[1] or 0) >= 0.6 else 1)" "$reads_mean"'
+  check "the reads the answer needed are judged to have helped (mean $reads_mean)" '"$PY" -c "import sys; sys.exit(0 if float(sys.argv[1] or 0) >= 0.6 else 1)" "$reads_mean"'
   history=$(judged "$session" "[s['helped'] for s in j['steps'] if 'history' in s.get('args','')]")
   echo "   the read of the file the answer did not need: ${history:-[] (the model did not read it)}"
   if [ -n "$history" ] && [ "$history" != "[]" ]; then
-    check "a read whose text the answer never used is scored below the reads it needed ($history < $reads_mean)" 'py -c "import sys, ast; sys.exit(0 if max(ast.literal_eval(sys.argv[1])) < float(sys.argv[2]) else 1)" "$history" "$reads_mean"'
+    check "a read whose text the answer never used is scored below the reads it needed ($history < $reads_mean)" '"$PY" -c "import sys, ast; sys.exit(0 if max(ast.literal_eval(sys.argv[1])) < float(sys.argv[2]) else 1)" "$history" "$reads_mean"'
   fi
 fi
 
