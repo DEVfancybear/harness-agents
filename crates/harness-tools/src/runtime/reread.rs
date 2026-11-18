@@ -567,6 +567,9 @@ fn delta_body(old: &Read, new: &Numbered<'_>) -> Option<(String, usize)> {
     if changed * 2 > after.len() || changed > DELTA_MAX_CHANGED {
         return None;
     }
+    // The new read stopped before the end of the file (its trailer says where
+    // to read on), so old lines past its last row were cut, not removed.
+    let cut = !new.trailer.trim().is_empty();
     let mut body = String::new();
     let mut line = |text: &str| {
         if !body.is_empty() {
@@ -617,14 +620,33 @@ fn delta_body(old: &Read, new: &Numbered<'_>) -> Option<(String, usize)> {
             DiffOp::Delete {
                 old_len, new_index, ..
             } => {
-                // Lines that left the range at either end are not a change in it.
+                let mut note = String::new();
                 if new_index > 0 && new_index < new.rows.len() {
-                    let mut note = String::new();
                     let _ = write!(
                         note,
                         "[{old_len} line(s) removed after line {}]",
                         new.first + new_index - 1
                     );
+                } else if new_index >= new.rows.len() {
+                    // At the end: lines past a read that was cut off are not a
+                    // change; a read that reached the end of the file says the
+                    // file got shorter.
+                    if !cut {
+                        let _ = write!(
+                            note,
+                            "[{old_len} line(s) removed after line {}]",
+                            new.last()
+                        );
+                    }
+                } else if new.first == old.first {
+                    // At the start: a read that began later did not show them.
+                    let _ = write!(
+                        note,
+                        "[{old_len} line(s) removed before line {}]",
+                        new.first
+                    );
+                }
+                if !note.is_empty() {
                     line(&note);
                 }
             }
@@ -964,6 +986,60 @@ mod tests {
         assert_eq!(
             body,
             "lines 1-9 unchanged since call c1\n10: an inserted line\nlines 11-60 unchanged since call c1 (lines 10-59 there)\n[1 line(s) removed after line 60]\nlines 61-100 unchanged since call c1"
+        );
+    }
+
+    /// The body of the delta a second read of `after` is answered with, after
+    /// a first read of `before`; `limit` is how many lines the second asks for.
+    fn delta_of(before: &[String], after: &[String], limit: usize) -> String {
+        let (mut reread, mut transcript) = (reread(), Vec::new());
+        ask(
+            &mut reread,
+            &mut transcript,
+            "c1",
+            ARGS,
+            &output(PATH, before, 0, 200),
+        );
+        let text = ask(
+            &mut reread,
+            &mut transcript,
+            "c2",
+            ARGS,
+            &output(PATH, after, 0, limit),
+        );
+        assert_eq!(reread.tally.delta, 1, "{text}");
+        text.split_once(":\n").expect("a header").1.to_owned()
+    }
+
+    #[test]
+    fn a_read_after_the_last_lines_were_deleted_says_so() {
+        let before = file(100);
+        let after = before[..97].to_vec();
+        assert_eq!(
+            delta_of(&before, &after, 200),
+            "lines 1-97 unchanged since call c1\n[3 line(s) removed after line 97]"
+        );
+    }
+
+    #[test]
+    fn a_read_after_the_first_lines_were_deleted_says_so() {
+        let before = file(100);
+        let after = before[3..].to_vec();
+        assert_eq!(
+            delta_of(&before, &after, 200),
+            "[3 line(s) removed before line 1]\nlines 1-97 unchanged since call c1 (lines 4-100 there)"
+        );
+    }
+
+    #[test]
+    fn a_read_cut_off_before_a_deletion_does_not_mention_it() {
+        let before = file(100);
+        // Lines 91-100 are gone and the file goes on, but the read stops at 80.
+        let mut after = before[..90].to_vec();
+        after.extend((91..=200).map(|number| format!("new {number}")));
+        assert_eq!(
+            delta_of(&before, &after, 80),
+            "lines 1-80 unchanged since call c1\n\n[Showing lines 1-80 of 200. Use offset=80 to continue.]"
         );
     }
 

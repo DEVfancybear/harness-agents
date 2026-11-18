@@ -13,7 +13,7 @@
 //! host checks only the shape of the answer, computes the mean, the low steps
 //! and the progress after each learned skill itself, and keeps one line per
 //! judged turn in `step-judgments.jsonl`. The review reads the steps judged
-//! not to help; `skill_progress` and `stats` are for the learned skills'
+//! not to help; `skills_progress` and `stats` are for the learned skills'
 //! lifecycle and `ha learning report`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -833,39 +833,59 @@ pub fn mark_given(local: &Path, through: &str) {
     }
 }
 
-/// How the turns judged with a learned skill in play went: how many turns of
-/// the last thirty days, and the mean of what the steps from its activation
-/// helped (a turn's `mean_after`, averaged over the turns). `project` limits
-/// it to one project's turns. `None` when no judged turn had the skill.
+/// How the turns judged with a learned skill in play went, for every skill (the
+/// turns of the last thirty days, and the mean of what the steps from its
+/// activation helped, a turn's `mean_after`, averaged over the turns), from one
+/// read of the log (up to ten megabytes), for a caller that wants several.
 #[must_use]
-pub fn skill_progress(data_dir: &Path, project: Option<&str>, name: &str) -> Option<(usize, f64)> {
-    skill_progress_at(data_dir, project, name, chrono::Utc::now())
+pub fn skills_progress(data_dir: &Path, project: Option<&str>) -> BTreeMap<String, (usize, f64)> {
+    skills_progress_at(data_dir, project, chrono::Utc::now())
 }
 
+fn skills_progress_at(
+    data_dir: &Path,
+    project: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> BTreeMap<String, (usize, f64)> {
+    let since = now - chrono::Duration::days(READ_DAYS);
+    // Each skill's mean for every turn it was in play.
+    let mut turns = BTreeMap::<String, Vec<f64>>::new();
+    for kept in read(&super::harness::global_dir(data_dir), Some(since)) {
+        if kept.record["valid"].as_bool() != Some(true)
+            || project.is_some_and(|project| kept.record["project"].as_str() != Some(project))
+        {
+            continue;
+        }
+        let mut spans = BTreeMap::<&str, Vec<f64>>::new();
+        for skill in kept.record["skills"].as_array().into_iter().flatten() {
+            if let (Some(name), Some(mean)) = (skill["name"].as_str(), skill["mean_after"].as_f64())
+            {
+                spans.entry(name).or_default().push(mean);
+            }
+        }
+        for (name, means) in spans {
+            if let Some(mean) = mean_of(means.into_iter()) {
+                turns.entry(name.to_owned()).or_default().push(mean);
+            }
+        }
+    }
+    turns
+        .into_iter()
+        .filter_map(|(name, means)| {
+            let count = means.len();
+            mean_of(means.into_iter()).map(|mean| (name, (count, round2(mean))))
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn skill_progress_at(
     data_dir: &Path,
     project: Option<&str>,
     name: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<(usize, f64)> {
-    let since = now - chrono::Duration::days(READ_DAYS);
-    let means = read(&super::harness::global_dir(data_dir), Some(since))
-        .into_iter()
-        .filter(|kept| {
-            kept.record["valid"].as_bool() == Some(true)
-                && project.is_none_or(|project| kept.record["project"].as_str() == Some(project))
-        })
-        .filter_map(|kept| {
-            let spans = kept.record["skills"]
-                .as_array()?
-                .iter()
-                .filter(|skill| skill["name"].as_str() == Some(name))
-                .filter_map(|skill| skill["mean_after"].as_f64());
-            mean_of(spans)
-        })
-        .collect::<Vec<_>>();
-    let turns = means.len();
-    mean_of(means.into_iter()).map(|mean| (turns, round2(mean)))
+    skills_progress_at(data_dir, project, now).remove(name)
 }
 
 /// The judgments of the last thirty days for `ha learning report`: the turns
@@ -1399,6 +1419,39 @@ mod tests {
             None
         );
         assert_eq!(skill_progress_at(data.path(), None, "gamma", now), None);
+    }
+
+    /// One read of the log gives the progress of every skill in it, the same
+    /// as asking for each, and a project limits all of them.
+    #[test]
+    fn the_progress_of_every_skill_comes_from_one_read() {
+        let data = tempfile::tempdir().expect("dir");
+        let global = crate::interactive::harness::global_dir(data.path());
+        let now = chrono::Utc::now();
+        for line in [
+            kept_turn(now, 1, "p1", Some(("alpha", 0.8)), &[("read_file", 0.9)]),
+            kept_turn(now, 5, "p2", Some(("alpha", 0.4)), &[("read_file", 0.9)]),
+            kept_turn(now, 2, "p1", Some(("beta", 0.1)), &[("read_file", 0.9)]),
+            kept_turn(now, 40, "p1", Some(("beta", 0.9)), &[("read_file", 0.9)]),
+        ] {
+            append(&global, &line).expect("append");
+        }
+        let all = skills_progress_at(data.path(), None, now);
+        assert_eq!(
+            all.into_iter().collect::<Vec<_>>(),
+            vec![
+                ("alpha".to_owned(), (2, 0.6)),
+                ("beta".to_owned(), (1, 0.1))
+            ]
+        );
+        // A project limits every skill at once.
+        let only = skills_progress_at(data.path(), Some("p1"), now);
+        assert_eq!(only.get("alpha"), Some(&(1, 0.8)));
+        assert_eq!(only.get("beta"), Some(&(1, 0.1)));
+        assert_eq!(
+            skill_progress_at(data.path(), None, "beta", now),
+            Some((1, 0.1))
+        );
     }
 
     /// The stats read the last thirty days: turns judged, the invalid ones,

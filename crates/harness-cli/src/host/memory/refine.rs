@@ -523,7 +523,9 @@ impl Learning {
         let mut parts = vec![
             format!(
                 "<learned_skills>\n{}\n</learned_skills>",
-                super::learned::library_overview(&super::learned::library(&self.layers))
+                super::learned::library_overview(&super::learned::library_with_progress(
+                    &self.layers
+                ))
             ),
             format!("<other_skill_names>\n{taken}\n</other_skill_names>"),
             format!(
@@ -5006,7 +5008,7 @@ async fn curate_skills(
     learning: &Learning,
     instructions: Option<&str>,
 ) -> Result<Proposal, String> {
-    let skills = super::learned::library(&learning.layers);
+    let skills = super::learned::library_with_progress(&learning.layers);
     let snapshot = super::learned::snapshot(&learning.layers)?;
     let mut parts = vec![
         format!(
@@ -6560,7 +6562,7 @@ pub async fn review(
     let learned = learning.map_or_else(String::new, |learning| {
         let mut block = format!(
             "<learned_skills>\n{}\n</learned_skills>",
-            super::learned::library_overview(&super::learned::library(&learning.layers))
+            super::learned::library_overview(&super::learned::library_with_progress(&learning.layers))
         );
         if !learning.in_play.is_empty() {
             let _ = write!(

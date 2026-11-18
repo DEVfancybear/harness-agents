@@ -539,9 +539,31 @@ fn load_usage(path: &Path) -> Value {
         .unwrap_or_else(|| json!({"requests": 0, "skills": {}}))
 }
 
-/// Counters are best effort: two processes bumping one file at once can lose a
-/// count, never corrupt the file, because it is replaced whole.
+/// How long an update waits for another that holds the file's lock.
+const USAGE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Load, change and replace the usage file under an exclusive lock (the
+/// `.lock` file beside it), so the turn path, the background review, the
+/// curator and the prune task, in this process or another, do not lose each
+/// other's update: the file holds a revision's trial, which one lost write
+/// would erase or bring back after it closed. The lock is held only for the
+/// load, `change` and the write, never across a model call, and `change` must
+/// not call `update_usage` (the lock is not re-entrant: that would wait for
+/// itself). The file is replaced whole, so it is never corrupt; should the
+/// lock not be had in [`USAGE_LOCK_WAIT`], the update is made without it, as
+/// before the lock, and may lose a count.
 fn update_usage(path: &Path, change: impl FnOnce(&mut Value)) {
+    let mut lock_name = path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_default();
+    lock_name.push(".lock");
+    let _lock = super::files::hold(
+        &path.with_file_name(lock_name),
+        USAGE_LOCK_WAIT,
+        "skill usage",
+    )
+    .ok();
     let mut usage = load_usage(path);
     if !usage["skills"].is_object() {
         usage["skills"] = json!({});
@@ -1343,6 +1365,9 @@ const OBJECTIVE_PRUNE: &str = "prune";
 const PRUNE_COST_LIMIT: f64 = 1.10;
 /// Cost-measured turns a prune needs before its cost is judged.
 const PRUNE_COST_TURNS: u64 = 2;
+/// Measured turns after which a good prune that costs more steps than the
+/// version it replaced, but within [`PRUNE_COST_LIMIT`], is kept.
+const PRUNE_DEARER_ACCEPTED_TURNS: u64 = 4;
 
 /// How a prune's measured cost compares with the version it replaced.
 #[derive(Debug, PartialEq)]
@@ -1424,15 +1449,29 @@ fn settle_trial(layers: &Layers, layer: Layer, root: &Path, name: &str) {
     if let Some(CostVerdict::Worse(why)) = &cost {
         roll_back_trial(layers, layer, root, name, counters, (good, bad), Some(why));
     } else if good >= TRIAL_SETTLED_AT && good > bad {
-        // Judged well, but a prune that has not shown it costs no more waits.
-        if matches!(cost, Some(CostVerdict::Dearer | CostVerdict::Unmeasured)) {
-            return;
-        }
+        // Judged well, but a prune that has not shown it costs no more waits,
+        // within reason: one that costs up to the limit more over enough turns
+        // is kept (it is shorter, and EfficientSkill allows that much), and so
+        // is one whose turns were never measured (`ha exec` records no cost).
+        let measured = Cost::from_value(&counters["cost"])
+            .since(Cost::from_value(&trial["incumbent_cost"]))
+            .turns;
+        let cost_note = match cost {
+            Some(CostVerdict::Dearer) if measured < PRUNE_DEARER_ACCEPTED_TURNS => return,
+            Some(CostVerdict::Unmeasured) if measured > 0 => return,
+            Some(CostVerdict::Dearer) => format!(
+                "; it takes more steps per turn than the version it replaced, over {measured} turns, within the {PRUNE_COST_LIMIT}x allowed"
+            ),
+            Some(CostVerdict::Unmeasured) => {
+                "; its cost was not measured (no turn of the revision recorded one)".to_owned()
+            }
+            _ => String::new(),
+        };
         update_usage(&file, |usage| close_trial(usage, name));
         log_revision(layers, "accepted", name, &ledger_id);
         harness_types::diag::info("skill", "revision_accepted")
             .msg(format!(
-                "the revision of {name} is kept: {good} good, {bad} bad judged uses"
+                "the revision of {name} is kept: {good} good, {bad} bad judged uses{cost_note}"
             ))
             .field("skill", name)
             .field("ledger_id", ledger_id.as_str())
@@ -1448,6 +1487,35 @@ fn settle_trial(layers: &Layers, layer: Layer, root: &Path, name: &str) {
             update_usage(&file, |usage| close_trial(usage, name));
         }
     }
+}
+
+/// Bring back each skill deleted into a revision that is being rolled back
+/// (`absorbed`, the trial's list): the revision held their content, and the
+/// text it goes back to does not. A skill that cannot come back (its name is
+/// live again, say) is reported, and the others still do. The words for the
+/// rollback's reason, or nothing when there were none.
+fn revive_absorbed(layers: &Layers, absorbed: &Value) -> String {
+    let (mut revived, mut stuck) = (Vec::new(), Vec::new());
+    for entry in absorbed.as_array().into_iter().flatten() {
+        let name = entry["name"].as_str().unwrap_or_default();
+        let level = entry["level"].as_str().unwrap_or_default();
+        match restore(layers, "delete", name, level, &entry["undo"]) {
+            Ok(()) => revived.push(name.to_owned()),
+            Err(why) => stuck.push(format!("{name} ({why})")),
+        }
+    }
+    let mut words = String::new();
+    if !revived.is_empty() {
+        let _ = write!(
+            words,
+            "; brought back the skill(s) it absorbed: {}",
+            revived.join(", ")
+        );
+    }
+    if !stuck.is_empty() {
+        let _ = write!(words, "; could not bring back {}", stuck.join(", "));
+    }
+    words
 }
 
 /// Put the incumbent back (`counters` are the skill's usage record, `good` and
@@ -1483,6 +1551,13 @@ fn roll_back_trial(
     let summary = trial["edits_summary"].as_str().unwrap_or_default();
     let action = trial["action"].as_str().unwrap_or("patch");
     let restored = restore(layers, action, name, layer.as_str(), &trial["undo"]);
+    // The skills the revision absorbed come back with the text it replaced; when
+    // the revision stays (a user's edit is kept), so does what it holds.
+    let absorbed = if restored.is_ok() {
+        revive_absorbed(layers, &trial["absorbed"])
+    } else {
+        String::new()
+    };
     let basis = format!(
         "the incumbent had {} worked and {} failed, {} check(s) passed and {} failed",
         count("worked"),
@@ -1493,13 +1568,13 @@ fn roll_back_trial(
     let (reason, restored_ok) = match (&restored, costly) {
         (Ok(()), Some(cost)) => (
             format!(
-                "costs more than the version it replaced: {cost} ({good} good, {bad} bad judged uses); {basis}"
+                "costs more than the version it replaced: {cost} ({good} good, {bad} bad judged uses){absorbed}; {basis}"
             ),
             true,
         ),
         (Ok(()), None) => (
             format!(
-                "judged worse than the version it replaced: {bad} bad, {good} good uses; {basis}"
+                "judged worse than the version it replaced: {bad} bad, {good} good uses{absorbed}; {basis}"
             ),
             true,
         ),
@@ -1850,12 +1925,8 @@ pub fn library(layers: &Layers) -> Vec<LearnedSkill> {
             let document =
                 std::fs::read_to_string(root.join(&name).join("SKILL.md")).unwrap_or_default();
             let front = FrontMatter::parse(&document);
-            let progress = layers
-                .usage_dir
-                .parent()
-                .and_then(|data| super::step_judge::skill_progress(data, None, &name));
             skills.push(LearnedSkill {
-                progress,
+                progress: None,
                 layer,
                 description: front
                     .as_ref()
@@ -1916,6 +1987,23 @@ pub fn library(layers: &Layers) -> Vec<LearnedSkill> {
                 body_lines: skill_size(&document).map_or(0, |size| size.body_lines),
                 name,
             });
+        }
+    }
+    skills
+}
+
+/// [`library`] with how each skill's judged turns went (`progress`), from one
+/// read of the step-judgments log: for the refiner's overview, which is the
+/// only place that shows it. [`library`] does not read the log, as it is called
+/// on every turn. `Layers` does not know the project's key, so the progress is
+/// over the turns of every project.
+#[must_use]
+pub fn library_with_progress(layers: &Layers) -> Vec<LearnedSkill> {
+    let mut skills = library(layers);
+    if let Some(data) = layers.usage_dir.parent() {
+        let progress = super::step_judge::skills_progress(data, None);
+        for skill in &mut skills {
+            skill.progress = progress.get(&skill.name).copied();
         }
     }
     skills
@@ -2094,7 +2182,7 @@ pub fn prune_candidates(
     layers: &Layers,
     only: Option<&str>,
 ) -> (Vec<(LearnedSkill, String)>, Vec<String>) {
-    let mut skills = library(layers);
+    let mut skills = library_with_progress(layers);
     let mut refused = Vec::new();
     if let Some(only) = only {
         skills.retain(|skill| skill.name == only);
@@ -3210,6 +3298,76 @@ fn subfile_target(directory: &Path, relative: &str) -> Result<PathBuf, String> {
     Ok(target)
 }
 
+/// Count a landed change to a learned skill as a revision on trial: the version
+/// it replaced is the incumbent, kept until the revision has shown itself
+/// better ([`settle_trial`]); a change in the same refinement joins the trial
+/// ([`begin_trial`]). `written` are the support files the change wrote or
+/// removed.
+fn revise(usage: &mut Value, intent: &Intent, id: &str, undo: &Value, written: &[&str]) {
+    begin_trial(usage, &intent.name, id, intent, undo);
+    bump(usage, &intent.name, "patch");
+    // A skill that was rewritten is tried afresh.
+    usage["skills"][&intent.name]["trial_good"] = json!(0);
+    usage["skills"][&intent.name]["trial_bad"] = json!(0);
+    // A script that was written is not the one a run vouched for.
+    clear_script_marks(usage, &intent.name, written);
+}
+
+/// Keep, in the trial of the umbrella a deleted skill was absorbed into, what
+/// undoing that delete needs: the umbrella's revision is what holds the
+/// sibling's content now, so a rollback of it must bring the sibling back too.
+/// Nothing when the umbrella has no revision on trial.
+fn note_absorbed(layers: &Layers, umbrella: &str, name: &str, level: Layer, undo: &Value) {
+    let Some(layer) = layers.find(umbrella) else {
+        return;
+    };
+    let root = layers.root(layer).expect("found layer is present");
+    update_usage(&layers.usage_file(layer, root), |usage| {
+        let trial = &mut usage["skills"][umbrella]["trial"];
+        if !trial.is_object() {
+            return;
+        }
+        if !trial["absorbed"].is_array() {
+            trial["absorbed"] = json!([]);
+        }
+        if let Some(absorbed) = trial["absorbed"].as_array_mut() {
+            absorbed.push(json!({"name": name, "level": level.as_str(), "undo": undo}));
+        }
+    });
+}
+
+/// Land a linted `remove_file`: the file goes, and its content into the undo of
+/// the revision it belongs to.
+fn land_remove_file(
+    layers: &Layers,
+    intent: &Intent,
+    id: &str,
+    layer: Layer,
+    root: &Path,
+) -> Result<Value, String> {
+    let directory = root.join(&intent.name);
+    let relative = intent.path.as_deref().expect("linted path");
+    let target = subfile_target(&directory, relative)?;
+    let before = std::fs::read_to_string(&target).ok();
+    if target.is_file() {
+        std::fs::remove_file(&target).map_err(|error| format!("{relative}: {error}"))?;
+    }
+    let undo = json!({
+        "ledger_id": id,
+        "files": {relative: before},
+        "written": skill_hash(&directory),
+        WRITTEN_FILES: {relative: null},
+    });
+    // A removed file is part of the revision on trial, so a rollback puts it
+    // back with the incumbent `SKILL.md` that points to it.
+    update_usage(&layers.usage_file(layer, root), |usage| {
+        revise(usage, intent, id, &undo, &[relative]);
+    });
+    log_revision(layers, "started", &intent.name, id);
+    append_ledger(&directory, &ledger_entry(intent, id));
+    Ok(undo)
+}
+
 /// Land a linted intent and say what rollback needs to undo it.
 fn land(
     layers: &Layers,
@@ -3226,26 +3384,13 @@ fn land(
             append_ledger(&directory, &ledger_entry(intent, &id));
             let archived = archive(root, &intent.name)?;
             mark_archived(layers, layer, root, &intent.name);
-            Ok(json!({"archived": archived.display().to_string()}))
-        }
-        "remove_file" => {
-            let relative = intent.path.as_deref().expect("linted path");
-            let target = subfile_target(&directory, relative)?;
-            let before = std::fs::read_to_string(&target).ok();
-            if target.is_file() {
-                std::fs::remove_file(&target).map_err(|error| format!("{relative}: {error}"))?;
+            let undo = json!({"archived": archived.display().to_string()});
+            if let Some(umbrella) = intent.absorbed_into.as_deref() {
+                note_absorbed(layers, umbrella, &intent.name, layer, &undo);
             }
-            update_usage(&layers.usage_file(layer, root), |usage| {
-                clear_script_marks(usage, &intent.name, &[relative]);
-            });
-            append_ledger(&directory, &ledger_entry(intent, &id));
-            Ok(json!({
-                "ledger_id": id,
-                "files": {relative: before},
-                "written": skill_hash(&directory),
-                WRITTEN_FILES: {relative: null},
-            }))
+            Ok(undo)
         }
+        "remove_file" => land_remove_file(layers, intent, &id, layer, root),
         _ => {
             let body = body.expect("shaped body");
             let existed = directory.exists();
@@ -3306,17 +3451,11 @@ fn land(
                 });
             } else {
                 update_usage(&layers.usage_file(layer, root), |usage| {
-                    // The version this replaces is the incumbent, kept until the
-                    // revision has shown itself better ([`settle_trial`]).
-                    begin_trial(usage, &intent.name, &id, intent, &undo);
-                    bump(usage, &intent.name, "patch");
-                    // A skill that was rewritten is tried afresh.
-                    usage["skills"][&intent.name]["trial_good"] = json!(0);
-                    usage["skills"][&intent.name]["trial_bad"] = json!(0);
-                    // A script that was written is not the one a run vouched for.
-                    clear_script_marks(
+                    revise(
                         usage,
-                        &intent.name,
+                        intent,
+                        &id,
+                        &undo,
                         &intent.files.keys().map(String::as_str).collect::<Vec<_>>(),
                     );
                 });
@@ -5638,13 +5777,12 @@ mod tests {
         let (_, full) = pruned_deploy(&layers);
         let pruned = text_of(&layers, "deploy");
         assert_ne!(pruned, full);
-        // Two good judged uses, but no measured turn yet: the prune waits.
+        // One costly turn is too few to judge the cost.
+        turn_of(&layers, "deploy", cost_of(9, 7, Some(1_100)));
+        // Two good judged uses, but one measured turn: the prune waits.
         for _ in 0..2 {
             assert!(record_outcome(&layers, "deploy", true, "", "it shipped"));
         }
-        assert!(raw_usage(&layers)["skills"]["deploy"]["trial"].is_object());
-        // One costly turn is too few to judge the cost.
-        turn_of(&layers, "deploy", cost_of(9, 7, Some(1_100)));
         assert!(raw_usage(&layers)["skills"]["deploy"]["trial"].is_object());
         assert_eq!(text_of(&layers, "deploy"), pruned);
         // The second: 9 steps a turn against 7, over the limit of 7.7.
@@ -5717,6 +5855,339 @@ mod tests {
                 "{steps:?}: {raw}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The prune's cost judgement, a removed file in a revision, a curator merge
+    // on trial, and the usage file under its lock
+
+    /// A good prune that costs a little more steps per turn than the version it
+    /// replaced (7.0), under the limit (7.7), is kept after four measured
+    /// turns, not before; one that goes over the limit is rolled back as ever.
+    #[test]
+    fn a_good_prune_within_the_limit_is_kept_after_four_measured_turns() {
+        for (steps, kept) in [([7, 8, 8, 7], true), ([7, 8, 8, 9], false)] {
+            let directory = tempfile::tempdir().expect("dir");
+            let layers = layers(directory.path());
+            let (_, full) = pruned_deploy(&layers);
+            let pruned = text_of(&layers, "deploy");
+            for (turn, steps) in steps.into_iter().enumerate() {
+                turn_of(&layers, "deploy", cost_of(steps, 5, None));
+                if turn == 0 {
+                    for _ in 0..2 {
+                        assert!(record_outcome(&layers, "deploy", true, "", "it shipped"));
+                    }
+                }
+                // Dearer over fewer than four turns waits.
+                if turn < 3 {
+                    let raw = raw_usage(&layers);
+                    assert!(
+                        raw["skills"]["deploy"]["trial"].is_object(),
+                        "turn {turn}: {raw}"
+                    );
+                }
+            }
+            let raw = raw_usage(&layers);
+            let counters = &raw["skills"]["deploy"];
+            assert!(counters["trial"].is_null(), "{counters}");
+            if kept {
+                assert_eq!(text_of(&layers, "deploy"), pruned);
+                assert!(counters["rejected"].is_null(), "{counters}");
+            } else {
+                assert_eq!(text_of(&layers, "deploy"), full);
+                assert_eq!(counters["rejected"][0]["kind"], "rolled_back");
+            }
+        }
+    }
+
+    /// A prune none of whose turns were measured (`ha exec` records no cost) is
+    /// judged by its outcomes alone, and the acceptance says so.
+    #[test]
+    fn a_good_prune_whose_turns_were_not_measured_is_kept_by_its_outcomes() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let (_, full) = pruned_deploy(&layers);
+        let pruned = text_of(&layers, "deploy");
+        assert_ne!(pruned, full);
+        let records = harness_types::diag::capture(|| {
+            for _ in 0..2 {
+                assert!(record_outcome(&layers, "deploy", true, "", "it shipped"));
+            }
+        });
+        let raw = raw_usage(&layers);
+        assert!(raw["skills"]["deploy"]["trial"].is_null(), "{raw}");
+        assert!(raw["skills"]["deploy"]["rejected"].is_null(), "{raw}");
+        assert_eq!(text_of(&layers, "deploy"), pruned);
+        let accepted = records
+            .iter()
+            .find(|record| record.event == "revision_accepted")
+            .expect("accepted");
+        assert!(
+            accepted.message.contains("cost was not measured"),
+            "{}",
+            accepted.message
+        );
+        let stats = revision_stats(&directory.path().join("data"), chrono::Utc::now());
+        assert!(stats[1].contains("1 accepted"), "{stats:?}");
+    }
+
+    const REFERENCED: &str = "Run it. See references/a.md.";
+
+    /// A `deploy` that works, with a reference its `SKILL.md` points to.
+    fn deploy_with_reference(layers: &Layers) {
+        let mut created = create("deploy", REFERENCED);
+        created
+            .files
+            .insert("references/a.md".to_owned(), "Details.".to_owned());
+        assert!(promote(layers, &created, &PromoteContext::default()).ok);
+        for _ in 0..2 {
+            assert!(record_outcome(layers, "deploy", true, "", "it shipped"));
+        }
+    }
+
+    /// Edit the pointer out of `deploy` and remove the file it pointed to.
+    fn drop_the_reference(layers: &Layers) {
+        let context = PromoteContext::default();
+        let edited = promote(
+            layers,
+            &edit(
+                "deploy",
+                json!([{"op": "delete", "target": " See references/a.md."}]),
+            ),
+            &context,
+        );
+        assert!(edited.ok, "{:?}", edited.findings);
+        let removed = promote(
+            layers,
+            &Intent::from_value(&json!({
+                "action": "remove_file", "name": "deploy", "path": "references/a.md",
+                "reason": "r", "evidence": "e",
+            })),
+            &context,
+        );
+        assert!(removed.ok, "{:?}", removed.findings);
+    }
+
+    fn reference_of(layers: &Layers) -> std::path::PathBuf {
+        layers
+            .project
+            .clone()
+            .expect("project")
+            .join("deploy/references/a.md")
+    }
+
+    #[test]
+    fn a_file_removed_in_a_revision_comes_back_when_the_revision_is_rolled_back() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        deploy_with_reference(&layers);
+        drop_the_reference(&layers);
+        assert!(!reference_of(&layers).exists());
+        assert!(!text_of(&layers, "deploy").contains("references/a.md"));
+        // One revision, with the file in its undo.
+        let trial = raw_usage(&layers)["skills"]["deploy"]["trial"].clone();
+        assert_eq!(trial["undo"]["files"]["references/a.md"], "Details.");
+        assert_eq!(trial["ledger_ids"].as_array().map(Vec::len), Some(2));
+        bad_uses(&layers, "deploy");
+        let raw = raw_usage(&layers);
+        assert!(raw["skills"]["deploy"]["trial"].is_null(), "{raw}");
+        assert_eq!(
+            raw["skills"]["deploy"]["rejected"][0]["kind"],
+            "rolled_back"
+        );
+        assert!(text_of(&layers, "deploy").contains(REFERENCED));
+        assert_eq!(
+            std::fs::read_to_string(reference_of(&layers)).expect("the file is back"),
+            "Details."
+        );
+    }
+
+    /// The file was written again since it was removed: the rollback does not
+    /// write the old one over it, as for any file a change wrote.
+    #[test]
+    fn a_rollback_keeps_a_file_written_since_it_was_removed() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        deploy_with_reference(&layers);
+        drop_the_reference(&layers);
+        std::fs::write(reference_of(&layers), "The user wrote this.").expect("write");
+        bad_uses(&layers, "deploy");
+        assert_eq!(
+            std::fs::read_to_string(reference_of(&layers)).expect("kept"),
+            "The user wrote this."
+        );
+        assert!(!text_of(&layers, "deploy").contains("references/a.md"));
+        let raw = raw_usage(&layers);
+        let reason = raw["skills"]["deploy"]["rejected"][0]["reason"]
+            .as_str()
+            .expect("reason");
+        assert!(reason.contains("not rolled back"), "{reason}");
+    }
+
+    fn bad_uses(layers: &Layers, name: &str) {
+        for _ in 0..2 {
+            assert!(record_outcome(
+                layers,
+                name,
+                false,
+                "it was fine",
+                "it broke"
+            ));
+        }
+    }
+
+    /// A curator merge: the umbrella is edited and a sibling deleted into it.
+    fn merge_into_umbrella(layers: &Layers) {
+        proven(layers, "rust-testing", "Test rules.");
+        land_skill(layers, "ci-flaky", "Retry a flaky test once.");
+        let context = PromoteContext::default();
+        let merged = promote(
+            layers,
+            &edit(
+                "rust-testing",
+                json!([{"op": "append", "content": "Retry a flaky test once."}]),
+            ),
+            &context,
+        );
+        assert!(merged.ok, "{:?}", merged.findings);
+        let deleted = promote(
+            layers,
+            &Intent::from_value(&json!({
+                "action": "delete", "name": "ci-flaky", "absorbed_into": "rust-testing",
+                "reason": "merged", "evidence": "e",
+            })),
+            &context,
+        );
+        assert!(deleted.ok, "{:?}", deleted.findings);
+    }
+
+    #[test]
+    fn rolling_back_an_umbrella_brings_back_the_skills_it_absorbed() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        merge_into_umbrella(&layers);
+        let root = layers.project.clone().expect("project");
+        assert!(!is_learned(&root, "ci-flaky"));
+        let trial = raw_usage(&layers)["skills"]["rust-testing"]["trial"].clone();
+        assert_eq!(trial["absorbed"][0]["name"], "ci-flaky", "{trial}");
+        bad_uses(&layers, "rust-testing");
+        assert!(!text_of(&layers, "rust-testing").contains("flaky"));
+        assert!(is_learned(&root, "ci-flaky"));
+        assert!(
+            text_of(&layers, "ci-flaky").contains("Retry a flaky test once."),
+            "the absorbed skill is whole"
+        );
+        let raw = raw_usage(&layers);
+        let reason = raw["skills"]["rust-testing"]["rejected"][0]["reason"]
+            .as_str()
+            .expect("reason");
+        assert!(
+            reason.contains("brought back") && reason.contains("ci-flaky"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn an_umbrella_kept_by_its_uses_keeps_the_absorbed_skills_gone() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        merge_into_umbrella(&layers);
+        for _ in 0..2 {
+            assert!(record_outcome(
+                &layers,
+                "rust-testing",
+                true,
+                "",
+                "it shipped"
+            ));
+        }
+        let root = layers.project.clone().expect("project");
+        assert!(raw_usage(&layers)["skills"]["rust-testing"]["trial"].is_null());
+        assert!(text_of(&layers, "rust-testing").contains("flaky"));
+        assert!(!is_learned(&root, "ci-flaky"));
+    }
+
+    /// A skill that cannot come back is reported; the umbrella is still rolled
+    /// back.
+    #[test]
+    fn an_absorbed_skill_that_cannot_come_back_is_reported_not_fatal() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        merge_into_umbrella(&layers);
+        // The name was taken again.
+        land_skill(&layers, "ci-flaky", "Something else.");
+        bad_uses(&layers, "rust-testing");
+        assert!(!text_of(&layers, "rust-testing").contains("flaky"));
+        assert!(text_of(&layers, "ci-flaky").contains("Something else."));
+        let raw = raw_usage(&layers);
+        let reason = raw["skills"]["rust-testing"]["rejected"][0]["reason"]
+            .as_str()
+            .expect("reason");
+        assert!(reason.contains("could not bring back ci-flaky"), "{reason}");
+        assert!(reason.contains("exists again"), "{reason}");
+    }
+
+    /// Updates of one usage file from several threads lose none: the file holds
+    /// a revision's trial, which a lost update would erase or bring back.
+    #[test]
+    fn concurrent_usage_updates_lose_none() {
+        let directory = tempfile::tempdir().expect("dir");
+        let path = directory.path().join("skill-usage").join("global.json");
+        let (threads, each) = (8, 25);
+        let start = std::sync::Barrier::new(threads);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    start.wait();
+                    for _ in 0..each {
+                        super::update_usage(&path, |usage| super::bump(usage, "alpha", "use"));
+                    }
+                });
+            }
+        });
+        let raw = super::load_usage(&path);
+        assert_eq!(raw["skills"]["alpha"]["use"], threads * each);
+    }
+
+    /// The library read on every turn does not read the step-judgments log; the
+    /// one made for the refiner reads it once for all the skills.
+    #[test]
+    fn only_the_refiner_library_carries_how_the_steps_were_judged() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        land_skill(&layers, "alpha", "Do alpha.");
+        land_skill(&layers, "beta", "Do beta.");
+        land_skill(&layers, "gamma", "Do gamma.");
+        let data = directory.path().join("data");
+        let log = super::super::harness::global_dir(&data);
+        for (name, mean) in [("alpha", 0.5), ("beta", 0.25), ("alpha", 0.75)] {
+            super::super::step_judge::append(
+                &log,
+                &json!({
+                    "at": chrono::Utc::now().to_rfc3339(), "valid": true, "conversation": "t",
+                    "project": "p", "steps": [],
+                    "skills": [{"name": name, "from_step": 1, "mean_after": mean}],
+                }),
+            )
+            .expect("append");
+        }
+        assert!(
+            library(&layers)
+                .iter()
+                .all(|skill| skill.progress.is_none())
+        );
+        let progress = super::library_with_progress(&layers)
+            .into_iter()
+            .map(|skill| (skill.name, skill.progress))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            progress,
+            vec![
+                ("alpha".to_owned(), Some((2, 0.63))),
+                ("beta".to_owned(), Some((1, 0.25))),
+                ("gamma".to_owned(), None),
+            ]
+        );
     }
 
     #[test]
