@@ -124,7 +124,18 @@ fn g13_json_reports_usage_and_the_memory_features_that_were_off() {
         ] {
             assert!(on[field][count].is_u64(), "{field}.{count}: {on}");
         }
+        // The dollars are there, null: the mock profile makes no priced call.
+        assert!(
+            on[field]
+                .get("cost_usd")
+                .is_some_and(serde_json::Value::is_null),
+            "{field}.cost_usd: {on}"
+        );
     }
+    assert!(
+        on.get("cost_usd").is_some_and(serde_json::Value::is_null),
+        "cost_usd: {on}"
+    );
     assert_eq!(on["memory"]["off"], serde_json::json!([]), "{on}");
     let off = exec(&[("HA_MEMORY", "off")]);
     assert_eq!(

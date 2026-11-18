@@ -531,10 +531,24 @@ pub async fn run_with(
     let run_usage = Arc::new(super::usage_tally::UsageTally::default());
     let children_usage = Arc::new(super::usage_tally::UsageTally::default());
     let upkeep_usage = Arc::new(super::usage_tally::UsageTally::default());
+    // Each call is priced by the model it names: the config's prices, the
+    // run's own model, and the catalog's for a child on another model.
+    let prices = super::usage_tally::catalog_prices(
+        resolved_config.model_prices.clone(),
+        provider_config.as_ref().map(|config| {
+            (
+                config.provider_id.clone(),
+                config.model.clone(),
+                config.model_price,
+            )
+        }),
+        &context.paths.data_dir,
+    );
     let children_provider =
-        super::usage_tally::Tallied::wrap(Arc::clone(&provider), &children_usage);
-    let upkeep_provider = super::usage_tally::Tallied::wrap(Arc::clone(&provider), &upkeep_usage);
-    let provider = super::usage_tally::Tallied::wrap(provider, &run_usage);
+        super::usage_tally::Tallied::wrap(Arc::clone(&provider), &children_usage, &prices);
+    let upkeep_provider =
+        super::usage_tally::Tallied::wrap(Arc::clone(&provider), &upkeep_usage, &prices);
+    let provider = super::usage_tally::Tallied::wrap(provider, &run_usage, &prices);
     // Which memory features this run has (`HA_MEMORY`, `HA_MEMORY_OFF`).
     let memory_switch = super::memory_switch::Switch::load(&context.paths.config_file, environment);
     memory_switch.record(Some(task_id.as_str()));
@@ -1764,6 +1778,13 @@ pub async fn run_with(
     // What the background memory passes of this process used: the
     // self-evaluation, the reviews and consolidation, the session log.
     output["upkeep_usage"] = upkeep_usage.json();
+    // What the whole process spent, by kind of token: the three tallies'
+    // dollars together; `null` when one of them had a call without a price.
+    output["cost_usd"] = super::usage_tally::cost_json(super::usage_tally::combined_spend(&[
+        &run_usage,
+        &children_usage,
+        &upkeep_usage,
+    ]));
     if format == OutputFormat::Json {
         out.stdout(&output.to_string());
     } else if format == OutputFormat::StreamJson {

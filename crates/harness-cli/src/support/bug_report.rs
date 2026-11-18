@@ -1713,6 +1713,16 @@ impl Report {
                 (cached * 100).checked_div(input).unwrap_or_default(),
                 sum("output")
             );
+            // What the calls cost, by kind of token, at the catalog's prices.
+            let catalog = crate::interactive::providers::Catalog::load(&self.data_dir);
+            if let Some(line) = calls_dollars(&calls, |model| {
+                catalog
+                    .find(model)
+                    .and_then(|found| found.cost.as_ref())
+                    .and_then(crate::interactive::cost::ModelPrice::of_catalog)
+            }) {
+                let _ = writeln!(out, "- {line}");
+            }
             // The cache decision of each input: carried on (the judge asked
             // or not) or started fresh.
             let reused = self.recorded("cache", "reused");
@@ -2852,6 +2862,47 @@ impl Report {
     }
 }
 
+/// What the `provider.call` records cost in dollars, by kind of token, each
+/// call at the price `price_of` gives for its model: `cost $0.0123: cache read
+/// $0.0100 (81%), ...`. `None` when no call reported its usage, or when one
+/// that did named a model with no price (a partial sum would read as the whole).
+fn calls_dollars(
+    calls: &[&Value],
+    price_of: impl Fn(&str) -> Option<crate::interactive::cost::ModelPrice>,
+) -> Option<String> {
+    use crate::interactive::cost::{CostParts, Usage, split_cost};
+    let mut sum = CostParts::default();
+    let mut counted = false;
+    for call in calls {
+        let fields = &call["fields"];
+        let Some(input) = fields["input"].as_u64() else {
+            continue;
+        };
+        let usage = Usage {
+            input_tokens: input,
+            output_tokens: fields["output"].as_u64().unwrap_or_default(),
+            cache_read_tokens: fields["cached"].as_u64().unwrap_or_default(),
+            cache_write_tokens: fields["cache_write"].as_u64().unwrap_or_default(),
+        };
+        sum = sum.plus(split_cost(price_of(fields["model"].as_str()?), usage)?);
+        counted = true;
+    }
+    if !counted || sum.total <= 0.0 {
+        return None;
+    }
+    let part = |name: &str, dollars: f64| {
+        format!("{name} ${dollars:.4} ({:.0}%)", dollars / sum.total * 100.0)
+    };
+    Some(format!(
+        "cost ${:.4}: {}, {}, {}, {}",
+        sum.total,
+        part("cache read", sum.cache_read),
+        part("cache write", sum.cache_write),
+        part("uncached input", sum.uncached_input),
+        part("output", sum.output)
+    ))
+}
+
 /// The newest of `records` of conversation `task` at or before `at`.
 fn newest_by<'a>(records: &[&'a Value], task: &str, at: i64) -> Option<&'a Value> {
     records
@@ -3355,6 +3406,37 @@ mod tests {
         assert!(String::from_utf8_lossy(&entries[1].1).contains("Tiếng Việt"));
     }
 
+    /// The report's model-call section adds the calls' dollars by kind of
+    /// token when every call that reported usage has a priced model.
+    #[test]
+    fn the_calls_are_summed_in_dollars_when_all_are_priced() {
+        use crate::interactive::cost::ModelPrice;
+        let call = |model: &str, input: u64, output: u64, cached: u64, write: u64| {
+            serde_json::json!({"fields": {"model": model, "input": input, "output": output,
+                "cached": cached, "cache_write": write}})
+        };
+        let price = |model: &str| {
+            (model == "m").then_some(ModelPrice {
+                input_per_mtok: 10.0,
+                output_per_mtok: 20.0,
+                cache_read_per_mtok: Some(1.0),
+                cache_write_per_mtok: Some(12.5),
+            })
+        };
+        let first = call("m", 1_000_000, 100_000, 800_000, 100_000);
+        let unreported = serde_json::json!({"fields": {"model": "m", "input": null}});
+        // uncached 1.0 + read 0.8 + write 1.25 + output 2.0 = 5.05.
+        assert_eq!(
+            super::calls_dollars(&[&first, &unreported], price).as_deref(),
+            Some(
+                "cost $5.0500: cache read $0.8000 (16%), cache write $1.2500 (25%), \
+                 uncached input $1.0000 (20%), output $2.0000 (40%)"
+            )
+        );
+        let other = call("unpriced", 10, 1, 0, 0);
+        assert_eq!(super::calls_dollars(&[&first, &other], price), None);
+        assert_eq!(super::calls_dollars(&[&unreported], price), None);
+    }
     #[test]
     fn a_window_is_a_number_and_a_unit() {
         assert_eq!(parse_window("90s").unwrap().as_secs(), 90);

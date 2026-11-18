@@ -133,13 +133,8 @@ pub fn config_for(
     config.credential = credential;
     config.model_price = entry
         .cost
-        .filter(|cost| cost.input > 0.0 || cost.output > 0.0)
-        .map(|cost| super::cost::ModelPrice {
-            input_per_mtok: cost.input,
-            output_per_mtok: cost.output,
-            cache_read_per_mtok: Some(cost.cache_read),
-            cache_write_per_mtok: Some(cost.cache_write),
-        });
+        .as_ref()
+        .and_then(super::cost::ModelPrice::of_catalog);
     // A model without a window takes pi's default, never the window of the
     // model it replaced.
     config.context_window_tokens = entry

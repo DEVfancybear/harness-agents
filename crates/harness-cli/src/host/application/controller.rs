@@ -4900,11 +4900,10 @@ impl InteractiveController {
                 }
             }
             "/cost" => {
-                self.reference(
-                    "/cost",
-                    vec![format!("session cost: {}", self.service.cost_summary())],
-                    &mut effects,
-                );
+                let mut lines = vec![format!("session cost: {}", self.service.cost_summary())];
+                // Where the dollars went, by kind of token.
+                lines.extend(self.service.cost_breakdown());
+                self.reference("/cost", lines, &mut effects);
             }
             "/context" => {
                 self.reference("/context", self.service.context_summary(), &mut effects);

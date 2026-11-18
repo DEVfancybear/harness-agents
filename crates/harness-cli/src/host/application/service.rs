@@ -510,6 +510,10 @@ pub trait SessionPort: Send {
     fn cost_summary(&self) -> String {
         "n/a".to_owned()
     }
+    /// `/cost`'s second line: the cost by kind of token, when it is priced.
+    fn cost_breakdown(&self) -> Option<String> {
+        None
+    }
     fn context_summary(&self) -> Vec<String> {
         vec!["no context packet has been built in this session yet".to_owned()]
     }
@@ -1655,14 +1659,7 @@ pub(super) fn resolve_provider_with_overrides(
                     "{}/{}",
                     resolved.provider.id, resolved.provider.model
                 ))
-                .and_then(|model| model.cost)
-                .filter(|cost| cost.input > 0.0 || cost.output > 0.0)
-                .map(|cost| ModelPrice {
-                    input_per_mtok: cost.input,
-                    output_per_mtok: cost.output,
-                    cache_read_per_mtok: Some(cost.cache_read),
-                    cache_write_per_mtok: Some(cost.cache_write),
-                })
+                .and_then(|model| model.cost.as_ref().and_then(ModelPrice::of_catalog))
         });
     let max_retry_after_seconds = resolved.retry_after_max_seconds;
     Ok(ProviderConfig {
@@ -5688,6 +5685,16 @@ impl SessionPort for AgentSessionService {
             ),
             (None, _) => own,
         }
+    }
+
+    fn cost_breakdown(&self) -> Option<String> {
+        let line = self.cost_tracker.lock().ok()?.breakdown()?;
+        // The children's dollars are not split: say whose these are.
+        Some(if self.agents.children_spend().is_some() {
+            format!("this agent: {line}")
+        } else {
+            line
+        })
     }
 
     fn refine_history(&self, limit: usize) -> Vec<String> {
