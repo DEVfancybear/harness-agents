@@ -539,8 +539,10 @@ fn load_usage(path: &Path) -> Value {
         .unwrap_or_else(|| json!({"requests": 0, "skills": {}}))
 }
 
-/// How long an update waits for another that holds the file's lock.
-const USAGE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long an update waits for another that holds the file's lock. The
+/// critical sections are short (a load, a change and one write), so a wait this
+/// long is only ever spent behind a holder that is slow, not one that is stuck.
+const USAGE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Load, change and replace the usage file under an exclusive lock (the
 /// `.lock` file beside it), so the turn path, the background review, the
@@ -549,28 +551,46 @@ const USAGE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// would erase or bring back after it closed. The lock is held only for the
 /// load, `change` and the write, never across a model call, and `change` must
 /// not call `update_usage` (the lock is not re-entrant: that would wait for
-/// itself). The file is replaced whole, so it is never corrupt; should the
-/// lock not be had in [`USAGE_LOCK_WAIT`], the update is made without it, as
-/// before the lock, and may lose a count.
+/// itself). The file is replaced whole, so it is never corrupt. Should the
+/// lock not be had in [`USAGE_LOCK_WAIT`] (or not be opened), the problem is
+/// reported to the diagnostics and the update is made without it, so a stuck
+/// lock never loses the update outright, though it may lose a count.
 fn update_usage(path: &Path, change: impl FnOnce(&mut Value)) {
     let mut lock_name = path
         .file_name()
         .map(std::ffi::OsString::from)
         .unwrap_or_default();
     lock_name.push(".lock");
-    let _lock = super::files::hold(
+    // The directory first, so the first update into a fresh one is locked too.
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _lock = match super::files::hold(
         &path.with_file_name(lock_name),
         USAGE_LOCK_WAIT,
         "skill usage",
-    )
-    .ok();
+    ) {
+        Ok(lock) => Some(lock),
+        Err(error) => {
+            harness_types::diag::warn("skill", "usage_unlocked")
+                .field("file", path.display().to_string())
+                .field("error", error)
+                .emit();
+            None
+        }
+    };
     let mut usage = load_usage(path);
     if !usage["skills"].is_object() {
         usage["skills"] = json!({});
     }
     change(&mut usage);
-    if let Ok(text) = serde_json::to_string_pretty(&usage) {
-        let _ = write_atomic(path, &text);
+    if let Ok(text) = serde_json::to_string_pretty(&usage)
+        && let Err(error) = write_atomic(path, &text)
+    {
+        harness_types::diag::warn("skill", "usage_not_written")
+            .field("file", path.display().to_string())
+            .field("error", error)
+            .emit();
     }
 }
 
@@ -6115,6 +6135,32 @@ mod tests {
         });
         let raw = super::load_usage(&path);
         assert_eq!(raw["skills"]["alpha"]["use"], threads * each);
+    }
+
+    /// The first updates into a directory that does not exist yet are locked
+    /// too: two threads racing into a fresh one lose nothing.
+    #[test]
+    fn first_usage_updates_into_a_missing_directory_are_locked() {
+        for round in 0..20 {
+            let directory = tempfile::tempdir().expect("dir");
+            let path = directory
+                .path()
+                .join("a")
+                .join(format!("fresh-{round}"))
+                .join("global.json");
+            assert!(!path.parent().expect("parent").exists());
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                for _ in 0..2 {
+                    scope.spawn(|| {
+                        start.wait();
+                        super::update_usage(&path, |usage| super::bump(usage, "alpha", "use"));
+                    });
+                }
+            });
+            let raw = super::load_usage(&path);
+            assert_eq!(raw["skills"]["alpha"]["use"], 2, "round {round}: {raw}");
+        }
     }
 
     /// The library read on every turn does not read the step-judgments log; the
