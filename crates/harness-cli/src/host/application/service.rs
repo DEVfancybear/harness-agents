@@ -8863,6 +8863,121 @@ pub(super) async fn refine_transcript(
     )
 }
 
+/// The output tokens the session has used so far (0 when the usage is not
+/// readable).
+fn session_output_tokens(usage: &Mutex<CostTracker>) -> u64 {
+    usage.lock().map_or(0, |tracker| tracker.tokens().1)
+}
+
+/// The output tokens a turn used, when they are known: what the session's usage
+/// gained since `before`. A provider that reports no usage gains nothing, which
+/// is unknown and not a turn that wrote nothing.
+fn turn_output_tokens(before: u64, usage: &Mutex<CostTracker>) -> Option<u64> {
+    let gained = session_output_tokens(usage).saturating_sub(before);
+    (gained > 0).then_some(gained)
+}
+
+/// `ha learning prune`: run the prune pass now with the configured model, on
+/// the learned skills of the current project, and say what it did. It runs
+/// whatever `HA_SKILL_PRUNE` says (that only stops the automatic pass).
+///
+/// # Errors
+/// No model is configured, or the pass could not read or write the skills.
+pub async fn prune_command(
+    only: Option<&str>,
+    model: Option<String>,
+    thinking: Option<String>,
+) -> Result<Vec<String>, HarnessError> {
+    let caller_dir = std::env::current_dir().map_err(|error| {
+        HarnessError::new(
+            ErrorCode::StorageOpenFailed,
+            format!("the current working directory could not be resolved: {error}"),
+        )
+    })?;
+    let environment = LaunchEnvironment::capture();
+    let context = super::bootstrap::resolve(super::bootstrap::LaunchRequest {
+        cwd: None,
+        caller_dir,
+        platform: super::paths::HostPlatform::current(),
+        environment: environment.clone(),
+        explicit_data_dir: None,
+    })?;
+    // With the harness refinements or memory's `lessons` off, no learned skill
+    // is kept, so none is pruned.
+    let memory_switch =
+        super::memory_switch::Switch::load(&context.paths.config_file, &environment);
+    if !super::config::harness_refinements(&context.paths.config_file)
+        || !memory_switch.on(super::memory_switch::Feature::Lessons)
+    {
+        return Ok(vec![
+            "learned skills are off (harness refinements, or memory's lessons switch): nothing was pruned"
+                .to_owned(),
+        ]);
+    }
+    let overrides = ConfigOverrides {
+        model,
+        thinking,
+        ..ConfigOverrides::default()
+    };
+    let config = resolve_provider_with_overrides(
+        &context.paths.config_file,
+        &context.project.root,
+        &environment,
+        &context.paths.data_dir,
+        &overrides,
+    )
+    .map_err(|message| HarnessError::new(ErrorCode::ServiceUnavailable, message))?;
+    validate_credential_file(&environment, &context.paths.data_dir)
+        .map_err(|message| HarnessError::new(ErrorCode::SecretNotGranted, message))?;
+    let provider = build_provider(
+        &config,
+        Arc::new(EnvironmentCredential::new(
+            config.provider_id.clone(),
+            config.credential_variable(),
+            context.paths.data_dir.clone(),
+        )),
+        ModelCapabilities {
+            provider_id: config.provider_id.clone(),
+            model: config.model.clone(),
+            supports_streaming: true,
+            supports_tools: true,
+            fixture: false,
+        },
+        harness_providers::ThinkingLevel::parse(&config.thinking).unwrap_or_default(),
+        "learning-prune",
+        &context.paths.data_dir,
+    )
+    .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+    let trusted = super::config::resolve_layers(
+        &context.paths.config_file,
+        &context.project.root,
+        &environment,
+        &overrides,
+    )
+    .is_ok_and(|resolved| resolved.project_trusted);
+    let config_dir = context
+        .paths
+        .config_file
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let learning = refine_learning(
+        config_dir,
+        &context.paths.data_dir,
+        &context.project.root,
+        &environment,
+        trusted,
+    );
+    let scopes = super::refine::HarnessScopes {
+        global: super::harness::global_dir(&context.paths.data_dir),
+        local: super::harness::local_dir(&context.paths.data_dir, "learning-prune"),
+        review: super::memory_queue::ReviewMode::load(&context.paths.config_file, &environment),
+    };
+    super::refine::prune(&provider, &config.model, &scopes, &learning, only)
+        .await
+        .map(|report| report.lines())
+        .map_err(|error| HarnessError::new(ErrorCode::StorageWriteFailed, error))
+}
+
 /// What `/refine` needs to write learned skills in this workspace.
 pub(super) fn refine_learning(
     global_config_dir: &Path,
@@ -10928,6 +11043,8 @@ async fn run_turn(
     // It is asked of a request - the goal and what the user typed - and not of
     // an input the host or a child wrote, and it is put whole once per
     // conversation ([`offer_skill`]).
+    // The skill recall put in this turn, whose cost the turn is counted with.
+    let mut offered_skill = None;
     if lessons_on
         && let Some(offer) = offer_skill(
             &store,
@@ -10945,6 +11062,7 @@ async fn run_turn(
     {
         // The review judges how following it went.
         if let Some(name) = offer.name {
+            offered_skill = Some(name.clone());
             refine_cadence.note_in_play(std::collections::BTreeSet::from([name]));
         }
         project_blocks.push(offer.block);
@@ -11066,6 +11184,10 @@ async fn run_turn(
         approvals: ApprovalMode::Ask(gate as Arc<dyn ApprovalGate>),
         limits,
     };
+    // The turn's output tokens are what the session's usage gained while it ran
+    // (the observer below records every model call's usage there).
+    let turn_usage = Arc::clone(&cost_tracker);
+    let output_before = session_output_tokens(&turn_usage);
     let observer: Arc<dyn TurnObserver> = Arc::new(ChannelObserver {
         sender: sender.clone(),
         cost_tracker,
@@ -11399,13 +11521,22 @@ async fn run_turn(
         };
         // Every so many requests the curator folds the learned library into
         // class-level skills, beside the conversation like the review.
-        if auto_refine
+        // After it, on the same cadence, the prune pass shortens the proven
+        // skills that are long or cost more than a turn without one
+        // (`HA_SKILL_PRUNE=off` stops it).
+        let skills_due = auto_refine
             && refinements
             && !cancellation.is_cancelled()
             && requests > 0
-            && requests.is_multiple_of(super::refine::CURATE_EVERY_REQUESTS)
-            && super::learned::library(&learning.layers).len() >= super::refine::CURATE_MIN_SKILLS
-        {
+            && requests.is_multiple_of(super::refine::CURATE_EVERY_REQUESTS);
+        let curate_due = skills_due
+            && super::learned::library(&learning.layers).len() >= super::refine::CURATE_MIN_SKILLS;
+        let prune_due = skills_due
+            && super::learned::prune_enabled(&environment)
+            && !super::learned::prune_candidates(&learning.layers, None)
+                .0
+                .is_empty();
+        if curate_due || prune_due {
             let sender = sender.clone();
             let provider = Arc::clone(&provider);
             let model = config.model.clone();
@@ -11416,14 +11547,22 @@ async fn run_turn(
             };
             let learning = learning.clone();
             let conversation = goal_task.as_str().to_owned();
-            send(SessionEvent::Notice {
-                message: "skills: consolidating the learned skill library in the background"
-                    .to_owned(),
-            });
+            if curate_due {
+                send(SessionEvent::Notice {
+                    message: "skills: consolidating the learned skill library in the background"
+                        .to_owned(),
+                });
+            }
             tokio::spawn(async move {
-                let event =
-                    match super::refine::curate(&provider, &model, &scopes, Some(&learning), None)
-                        .await
+                if curate_due {
+                    let event = match super::refine::curate(
+                        &provider,
+                        &model,
+                        &scopes,
+                        Some(&learning),
+                        None,
+                    )
+                    .await
                     {
                         Ok(refinement) => {
                             review_record("curated", &conversation, Ok(&refinement)).emit();
@@ -11436,7 +11575,34 @@ async fn run_turn(
                             }
                         }
                     };
-                let _ = sender.send(event);
+                    let _ = sender.send(event);
+                }
+                if prune_due {
+                    let event =
+                        match super::refine::prune(&provider, &model, &scopes, &learning, None)
+                            .await
+                        {
+                            Ok(report) => match &report.refinement {
+                                Some(refinement) => {
+                                    review_record("pruned", &conversation, Ok(refinement)).emit();
+                                    refined_event(refinement)
+                                }
+                                None => SessionEvent::Notice {
+                                    message: format!(
+                                        "skills: pruning: {}",
+                                        report.lines().join("; ")
+                                    ),
+                                },
+                            },
+                            Err(error) => {
+                                review_record("pruned", &conversation, Err(error.as_str())).emit();
+                                SessionEvent::Notice {
+                                    message: format!("skills: pruning skipped: {error}"),
+                                }
+                            }
+                        };
+                    let _ = sender.send(event);
+                }
             });
         }
         // The global memory, once it has grown and changed enough, is
@@ -11553,6 +11719,12 @@ async fn run_turn(
                 &learning.layers,
                 &learning.context.workspace,
                 &turn.executions,
+                offered_skill.as_deref(),
+                super::learned::TurnCost {
+                    steps: u64::from(turn.steps),
+                    tool_calls: u64::from(turn.tool_calls),
+                    output_tokens: turn_output_tokens(output_before, &turn_usage),
+                },
             ));
         }
         if lessons_on && super::learned::lifecycle_enabled(&environment) {

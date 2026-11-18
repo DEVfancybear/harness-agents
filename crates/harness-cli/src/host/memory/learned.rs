@@ -305,6 +305,8 @@ pub struct Usage {
     /// that was rewritten is tried afresh ([`Usage::restricted`]).
     pub trial_good: u64,
     pub trial_bad: u64,
+    /// What the turns that had the skill in play cost.
+    pub cost: Cost,
     /// The skill was archived. Seen on a live skill, it means the skill was
     /// moved back since - by hand or by a rollback.
     pub archived: bool,
@@ -325,9 +327,130 @@ impl Usage {
             failed: count("failed"),
             trial_good: count("trial_good"),
             trial_bad: count("trial_bad"),
+            cost: Cost::from_value(&value["cost"]),
             archived: value["archived"].as_bool().unwrap_or(false),
         }
     }
+}
+
+/// What one finished turn cost, as the host measured it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TurnCost {
+    /// Model steps.
+    pub steps: u64,
+    pub tool_calls: u64,
+    /// Output tokens of the turn's model calls; `None` when the turn's caller
+    /// could not measure them (a provider that reports no usage).
+    pub output_tokens: Option<u64>,
+}
+
+/// The sum of the costs of turns (`EfficientSkill`, arXiv 2611.19823: a skill is
+/// pruned only while the turns it takes do not cost more). Kept for the turns
+/// that had a learned skill in play, per skill, and for the turns that had none
+/// (the library's baseline) in the usage file.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Cost {
+    pub turns: u64,
+    pub steps: u64,
+    pub tool_calls: u64,
+    pub output_tokens: u64,
+    /// The turns whose output tokens were known: `output_tokens` is their sum,
+    /// so a turn that could not be measured does not pull the mean down.
+    pub output_turns: u64,
+}
+
+impl Cost {
+    fn from_value(value: &Value) -> Self {
+        let count = |field: &str| value[field].as_u64().unwrap_or(0);
+        Self {
+            turns: count("turns"),
+            steps: count("steps"),
+            tool_calls: count("tool_calls"),
+            output_tokens: count("output_tokens"),
+            output_turns: count("output_turns"),
+        }
+    }
+
+    fn to_value(self) -> Value {
+        json!({
+            "turns": self.turns,
+            "steps": self.steps,
+            "tool_calls": self.tool_calls,
+            "output_tokens": self.output_tokens,
+            "output_turns": self.output_turns,
+        })
+    }
+
+    /// What came after `earlier`, a record of the same counters taken before.
+    fn since(self, earlier: Self) -> Self {
+        Self {
+            turns: self.turns.saturating_sub(earlier.turns),
+            steps: self.steps.saturating_sub(earlier.steps),
+            tool_calls: self.tool_calls.saturating_sub(earlier.tool_calls),
+            output_tokens: self.output_tokens.saturating_sub(earlier.output_tokens),
+            output_turns: self.output_turns.saturating_sub(earlier.output_turns),
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss, reason = "counts of turns and steps")]
+    fn mean(total: u64, turns: u64) -> Option<f64> {
+        (turns > 0).then(|| total as f64 / turns as f64)
+    }
+
+    /// Steps per turn, when a turn was measured.
+    #[must_use]
+    pub fn mean_steps(&self) -> Option<f64> {
+        Self::mean(self.steps, self.turns)
+    }
+
+    /// Tool calls per turn, when a turn was measured.
+    #[must_use]
+    pub fn mean_tool_calls(&self) -> Option<f64> {
+        Self::mean(self.tool_calls, self.turns)
+    }
+
+    /// Output tokens per turn, over the turns that could measure them.
+    #[must_use]
+    pub fn mean_output_tokens(&self) -> Option<f64> {
+        Self::mean(self.output_tokens, self.output_turns)
+    }
+
+    /// The means in a clause: `mean 6.2 steps, 8.4 calls, 1200 output tokens`
+    /// (the last only when a turn measured it); empty before any turn.
+    fn means(&self) -> String {
+        let (Some(steps), Some(calls)) = (self.mean_steps(), self.mean_tool_calls()) else {
+            return String::new();
+        };
+        let mut text = format!("mean {steps:.1} steps, {calls:.1} calls");
+        if let Some(output) = self.mean_output_tokens() {
+            let _ = write!(text, ", {output:.0} output tokens");
+        }
+        text
+    }
+
+    /// The line a skill's cost is shown by, beside the baseline's when the
+    /// library has one: `5 turns, mean 6.2 steps, 8.4 calls, 1200 output
+    /// tokens (turns without a skill: mean 9.0 steps, 11.1 calls)`.
+    fn line(&self, baseline: &Self) -> String {
+        let mut text = format!("{} turns, {}", self.turns, self.means());
+        if baseline.turns > 0 {
+            let _ = write!(text, " (turns without a skill: {})", baseline.means());
+        }
+        text
+    }
+}
+
+/// Add one turn's cost to the cost record at `counters[field]`.
+fn add_cost(counters: &mut Value, field: &str, cost: TurnCost) {
+    let mut total = Cost::from_value(&counters[field]);
+    total.turns += 1;
+    total.steps += cost.steps;
+    total.tool_calls += cost.tool_calls;
+    if let Some(output) = cost.output_tokens {
+        total.output_tokens += output;
+        total.output_turns += 1;
+    }
+    counters[field] = total.to_value();
 }
 
 /// Failures since a skill was last written before it is held back from recall.
@@ -802,10 +925,17 @@ pub fn usage(layers: &Layers, layer: Layer) -> (u64, BTreeMap<String, Usage>) {
 /// When the harness ran verification checks later in the turn, the last run's
 /// result counts against each skill used before it: which skills the work that
 /// passed or failed followed. Nothing is inferred for a turn that ran no check.
+///
+/// The turn's `cost` is added to each learned skill in play (`offered` is the
+/// skill recall put whole in the turn, if any, and the skills used count too),
+/// or to the library's baseline when the turn called a tool and had none: the
+/// cost of the work without a skill, which a skill's cost is read against.
 pub fn record_turn(
     layers: &Layers,
     workspace: &Path,
     executions: &[harness_tools::ToolExecutionView],
+    offered: Option<&str>,
+    cost: TurnCost,
 ) -> BTreeSet<String> {
     let mut used = BTreeSet::<String>::new();
     // The last check result after each used skill.
@@ -864,8 +994,52 @@ pub fn record_turn(
             }
         }
     }
+    // Cost first: a check that settles a trial below reads it.
+    let in_play = used
+        .iter()
+        .map(String::as_str)
+        .chain(offered)
+        .filter(|name| layers.find(name).is_some())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    record_cost(layers, &in_play, cost);
     record_checks(layers, &checked);
+    // A trial whose cost is the question settles on the turn's cost alone.
+    for name in in_play.iter().filter(|name| !checked.contains_key(*name)) {
+        if let Some(layer) = layers.find(name) {
+            let root = layers.root(layer).expect("found layer is present");
+            settle_trial(layers, layer, root, name);
+        }
+    }
     used
+}
+
+/// Add the turn's cost to each skill in play, or to every present layer's
+/// baseline when none is and the turn called a tool.
+fn record_cost(layers: &Layers, in_play: &BTreeSet<String>, cost: TurnCost) {
+    if in_play.is_empty() {
+        if cost.tool_calls == 0 {
+            return;
+        }
+        for (layer, root) in layers.present() {
+            update_usage(&layers.usage_file(layer, root), |usage| {
+                add_cost(usage, "baseline", cost);
+            });
+        }
+        return;
+    }
+    for name in in_play {
+        let Some(layer) = layers.find(name) else {
+            continue;
+        };
+        let root = layers.root(layer).expect("found layer is present");
+        update_usage(&layers.usage_file(layer, root), |usage| {
+            if !usage["skills"][name].is_object() {
+                usage["skills"][name] = json!({});
+            }
+            add_cost(&mut usage["skills"][name], "cost", cost);
+        });
+    }
 }
 
 /// Count, for each learned skill, whether the checks run after it was used
@@ -1058,25 +1232,52 @@ fn log_revision(layers: &Layers, event: &str, name: &str, ledger_id: &str) {
 /// Open the trial of the revision `undo` records, in the usage record. A trial
 /// still without a judged use takes the new change into itself, so one
 /// refinement's several changes to a skill are one revision with the first
-/// incumbent; an older trial that was judged is closed, and the version it
+/// incumbent. A trial judged worse so far than better is replaced the same
+/// way: the revision it tried is kept among the rejected ones (`superseded`),
+/// and the incumbent it would have gone back to stays the one the new revision
+/// goes back to, so a fix of a failing revision is not measured against the
+/// failing text. An older trial judged no worse is closed, and the version it
 /// judged is the incumbent now.
 fn begin_trial(usage: &mut Value, name: &str, ledger_id: &str, intent: &Intent, undo: &Value) {
     let summary = edits_summary(intent);
     let summary = summary.as_str();
     let counters = &usage["skills"][name];
-    let judged =
-        counters["trial_good"].as_u64().unwrap_or(0) + counters["trial_bad"].as_u64().unwrap_or(0);
-    if counters["trial"].is_object() && judged == 0 {
+    let good = counters["trial_good"].as_u64().unwrap_or(0);
+    let bad = counters["trial_bad"].as_u64().unwrap_or(0);
+    let failing = bad > good;
+    if counters["trial"].is_object() && (good + bad == 0 || failing) {
+        if failing {
+            let old = &counters["trial"];
+            let record = rejected_record(
+                "superseded",
+                old["ledger_id"].as_str(),
+                &format!(
+                    "replaced by a later revision while judged worse: {bad} bad, {good} good uses"
+                ),
+                old["edits_summary"].as_str().unwrap_or_default(),
+                "",
+            );
+            push_rejected(usage, name, record);
+        }
         let trial = &mut usage["skills"][name]["trial"];
         trial["ledger_id"] = json!(ledger_id);
         if let Some(ids) = trial["ledger_ids"].as_array_mut() {
             ids.push(json!(ledger_id));
         }
-        let joined = format!(
-            "{}; {summary}",
-            trial["edits_summary"].as_str().unwrap_or("")
-        );
+        let joined = if failing {
+            summary.to_owned()
+        } else {
+            format!(
+                "{}; {summary}",
+                trial["edits_summary"].as_str().unwrap_or("")
+            )
+        };
         trial["edits_summary"] = json!(joined);
+        // A repair that joins a prune is judged as a repair: its text is
+        // the question now, and a repair is not held to cost.
+        if !intent.prune {
+            trial["objective"] = json!(OBJECTIVE_REPAIR);
+        }
         // The first incumbent's text stays; the hashes are of the last write.
         trial["undo"]["written"] = undo["written"].clone();
         for (relative, hash) in undo[WRITTEN_FILES].as_object().into_iter().flatten() {
@@ -1089,15 +1290,90 @@ fn begin_trial(usage: &mut Value, name: &str, ledger_id: &str, intent: &Intent, 
         }
         return;
     }
+    // What the version being replaced cost per turn: the sums it had when the
+    // revision landed, from which the revision's own are the difference.
+    let incumbent_cost = Cost::from_value(&usage["skills"][name]["cost"]);
     usage["skills"][name]["trial"] = json!({
         "action": intent.action,
+        "objective": if intent.prune { OBJECTIVE_PRUNE } else { OBJECTIVE_REPAIR },
         "ledger_id": ledger_id,
         "ledger_ids": [ledger_id],
         "began": now(),
         "incumbent": incumbent_of(&usage["skills"][name]),
+        "incumbent_cost": incumbent_cost.to_value(),
+        "incumbent_mean": {
+            "steps": incumbent_cost.mean_steps(),
+            "tool_calls": incumbent_cost.mean_tool_calls(),
+            "output_tokens": incumbent_cost.mean_output_tokens(),
+        },
         "edits_summary": summary,
         "undo": undo,
     });
+}
+
+/// What a trial is for: a repair of a skill that failed (`SkillOpt`, judged on
+/// outcomes alone) or a prune of one that works (`EfficientSkill`, which must
+/// also not cost more).
+const OBJECTIVE_REPAIR: &str = "repair";
+const OBJECTIVE_PRUNE: &str = "prune";
+/// A pruned skill is rolled back once its turns cost this much more than the
+/// version it replaced.
+const PRUNE_COST_LIMIT: f64 = 1.10;
+/// Cost-measured turns a prune needs before its cost is judged.
+const PRUNE_COST_TURNS: u64 = 2;
+
+/// How a prune's measured cost compares with the version it replaced.
+#[derive(Debug, PartialEq)]
+enum CostVerdict {
+    /// Over the limit; the words say by which measure.
+    Worse(String),
+    /// Measured, and no more steps per turn than the incumbent's.
+    Cheaper,
+    /// Measured, between the incumbent's cost and the limit: neither.
+    Dearer,
+    /// Too few measured turns yet, so the question stays open.
+    Unmeasured,
+    /// The incumbent was never measured: nothing to compare with.
+    NoBasis,
+}
+
+/// Judge a prune trial's cost: the revision's turns since it landed against
+/// the incumbent's mean, on steps and, when both know them, output tokens.
+fn prune_cost_verdict(trial: &Value, cost_now: Cost) -> CostVerdict {
+    let incumbent = Cost::from_value(&trial["incumbent_cost"]);
+    let Some(before_steps) = incumbent.mean_steps() else {
+        return CostVerdict::NoBasis;
+    };
+    let revision = cost_now.since(incumbent);
+    let Some(steps) = revision
+        .mean_steps()
+        .filter(|_| revision.turns >= PRUNE_COST_TURNS)
+    else {
+        return CostVerdict::Unmeasured;
+    };
+    if steps > before_steps * PRUNE_COST_LIMIT {
+        return CostVerdict::Worse(format!(
+            "the pruned version takes {steps:.1} steps per turn over {} turns, the version it replaced {before_steps:.1}",
+            revision.turns
+        ));
+    }
+    if revision.output_turns >= PRUNE_COST_TURNS
+        && let (Some(output), Some(before_output)) = (
+            revision.mean_output_tokens(),
+            incumbent.mean_output_tokens(),
+        )
+        && output > before_output * PRUNE_COST_LIMIT
+    {
+        return CostVerdict::Worse(format!(
+            "the pruned version writes {output:.0} output tokens per turn over {} turns, the version it replaced {before_output:.0}",
+            revision.output_turns
+        ));
+    }
+    if steps <= before_steps {
+        CostVerdict::Cheaper
+    } else {
+        CostVerdict::Dearer
+    }
 }
 
 /// Drop the skill's trial record: it is settled.
@@ -1119,7 +1395,17 @@ fn settle_trial(layers: &Layers, layer: Layer, root: &Path, name: &str) {
     let good = counters["trial_good"].as_u64().unwrap_or(0);
     let bad = counters["trial_bad"].as_u64().unwrap_or(0);
     let ledger_id = trial["ledger_id"].as_str().unwrap_or_default().to_owned();
-    if good >= TRIAL_SETTLED_AT && good > bad {
+    // A prune is held to what it costs as well as to how it went (a repair is
+    // not: EfficientSkill's first phase is unconstrained).
+    let cost = (trial["objective"] == OBJECTIVE_PRUNE)
+        .then(|| prune_cost_verdict(trial, Cost::from_value(&counters["cost"])));
+    if let Some(CostVerdict::Worse(why)) = &cost {
+        roll_back_trial(layers, layer, root, name, counters, (good, bad), Some(why));
+    } else if good >= TRIAL_SETTLED_AT && good > bad {
+        // Judged well, but a prune that has not shown it costs no more waits.
+        if matches!(cost, Some(CostVerdict::Dearer | CostVerdict::Unmeasured)) {
+            return;
+        }
         update_usage(&file, |usage| close_trial(usage, name));
         log_revision(layers, "accepted", name, &ledger_id);
         harness_types::diag::info("skill", "revision_accepted")
@@ -1133,7 +1419,7 @@ fn settle_trial(layers: &Layers, layer: Layer, root: &Path, name: &str) {
             .emit();
     } else if bad >= TRIAL_SETTLED_AT && bad > good {
         if incumbent_sound(&trial["incumbent"]) {
-            roll_back_trial(layers, layer, root, name, counters, (good, bad));
+            roll_back_trial(layers, layer, root, name, counters, (good, bad), None);
         } else {
             // The version it replaced was failing too: nothing better to go
             // back to, and the restriction on a skill that keeps failing stands.
@@ -1146,6 +1432,8 @@ fn settle_trial(layers: &Layers, layer: Layer, root: &Path, name: &str) {
 /// `bad` the revision's judged uses): its text and files by the undo the ledger
 /// kept, its counters, and a record of the revision among the rejected ones. A
 /// skill changed since the revision keeps what it is, and the record says so.
+/// `costly` is why a pruned version goes back though it was not judged worse:
+/// it cost more.
 fn roll_back_trial(
     layers: &Layers,
     layer: Layer,
@@ -1153,6 +1441,7 @@ fn roll_back_trial(
     name: &str,
     counters: &Value,
     (good, bad): (u64, u64),
+    costly: Option<&str>,
 ) {
     let trial = &counters["trial"];
     let incumbent = trial["incumbent"].clone();
@@ -1179,18 +1468,29 @@ fn roll_back_trial(
         count("checked_pass"),
         count("checked_fail")
     );
-    let (reason, restored_ok) = match &restored {
-        Ok(()) => (
+    let (reason, restored_ok) = match (&restored, costly) {
+        (Ok(()), Some(cost)) => (
+            format!(
+                "costs more than the version it replaced: {cost} ({good} good, {bad} bad judged uses); {basis}"
+            ),
+            true,
+        ),
+        (Ok(()), None) => (
             format!(
                 "judged worse than the version it replaced: {bad} bad, {good} good uses; {basis}"
             ),
             true,
         ),
-        Err(why) => (
+        (Err(why), Some(cost)) => (
+            format!("costs more ({cost}) but not rolled back: {why}"),
+            false,
+        ),
+        (Err(why), None) => (
             format!("judged worse ({bad} bad, {good} good uses) but not rolled back: {why}"),
             false,
         ),
     };
+    let incumbent_cost = Cost::from_value(&trial["incumbent_cost"]);
     let record = rejected_record(
         "rolled_back",
         Some(&ledger_id),
@@ -1203,6 +1503,8 @@ fn roll_back_trial(
             for field in INCUMBENT_FIELDS {
                 usage["skills"][name][field] = json!(count(field));
             }
+            // The turns the revision took were not the incumbent's.
+            usage["skills"][name]["cost"] = incumbent_cost.to_value();
         }
         close_trial(usage, name);
         push_rejected(usage, name, record);
@@ -1280,13 +1582,77 @@ pub fn revision_stats(data_dir: &Path, now: chrono::DateTime<chrono::Utc>) -> Ve
     vec![
         "Learned-skill revisions, last 30 days".to_owned(),
         format!(
-            "  {} revised, {on_trial} on trial now, {} accepted, {} rolled back, {} refused",
+            "  {} revised ({} of them pruned), {on_trial} on trial now, {} accepted, {} rolled back, {} refused",
             count("started"),
+            count("prune"),
             count("accepted"),
             count("rolled_back"),
             count("refused")
         ),
     ]
+}
+
+/// The cost lines of `ha learning report`: what a turn costs on average with
+/// each learned skill in play, next to what a turn that called a tool costs
+/// with none (each layer's own baseline).
+#[must_use]
+pub fn cost_stats(data_dir: &Path) -> Vec<String> {
+    let dir = data_dir.join("skill-usage");
+    let mut files = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    let mut lines = Vec::new();
+    for path in files {
+        let raw = load_usage(&path);
+        let baseline = Cost::from_value(&raw["baseline"]);
+        let mut skills = raw["skills"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, counters)| counters["archived"] != true)
+            .map(|(name, counters)| (name.as_str(), Cost::from_value(&counters["cost"])))
+            .filter(|(_, cost)| cost.turns > 0)
+            .collect::<Vec<_>>();
+        if skills.is_empty() && baseline.turns == 0 {
+            continue;
+        }
+        skills.sort_by(|left, right| left.0.cmp(right.0));
+        let layer = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .map_or_else(
+                || "?".to_owned(),
+                |stem| {
+                    if stem == "global" {
+                        stem
+                    } else {
+                        "project".to_owned()
+                    }
+                },
+            );
+        if lines.is_empty() {
+            lines.push("Learned-skill cost per turn".to_owned());
+        }
+        if baseline.turns > 0 {
+            lines.push(format!(
+                "  [{layer}] turns without a skill: {} turns, {}",
+                baseline.turns,
+                baseline.means()
+            ));
+        }
+        for (name, cost) in skills {
+            lines.push(format!("  [{layer}] {name}: {}", cost.line(&baseline)));
+        }
+    }
+    lines
 }
 
 // ---------------------------------------------------------------------------
@@ -1424,6 +1790,14 @@ pub struct LearnedSkill {
     /// Judged uses of the revision on trial, as `(good, bad)`; `None` when no
     /// revision is on trial.
     pub on_trial: Option<(u64, u64)>,
+    /// What the revision on trial is for: `repair` or `prune`; empty when none
+    /// is on trial.
+    pub trial_objective: String,
+    /// The layer's turns that had no learned skill in play and called a tool:
+    /// what a turn costs without one, which the skill's cost is read against.
+    pub baseline: Cost,
+    /// Non-blank lines of the `SKILL.md` body.
+    pub body_lines: usize,
 }
 
 /// A revision of a learned skill that did not stand: the promoter refused it
@@ -1498,6 +1872,17 @@ pub fn library(layers: &Layers) -> Vec<LearnedSkill> {
                     let count = |field: &str| raw["skills"][&name][field].as_u64().unwrap_or(0);
                     (count("trial_good"), count("trial_bad"))
                 }),
+                trial_objective: raw["skills"][&name]["trial"]["objective"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        raw["skills"][&name]["trial"]
+                            .is_object()
+                            .then(|| OBJECTIVE_REPAIR.to_owned())
+                    })
+                    .unwrap_or_default(),
+                baseline: Cost::from_value(&raw["baseline"]),
+                body_lines: skill_size(&document).map_or(0, |size| size.body_lines),
                 name,
             });
         }
@@ -1542,7 +1927,12 @@ pub fn library_overview(skills: &[LearnedSkill]) -> String {
             String::new()
         };
         let trial = skill.on_trial.map_or_else(String::new, |(good, bad)| {
-            format!("; revision on trial: {good} good, {bad} bad")
+            let prune = if skill.trial_objective == OBJECTIVE_PRUNE {
+                " (a prune, held to cost)"
+            } else {
+                ""
+            };
+            format!("; revision on trial{prune}: {good} good, {bad} bad")
         });
         let checks = checks + &judged + &trial;
         let mut entry = format!(
@@ -1554,6 +1944,13 @@ pub fn library_overview(skills: &[LearnedSkill]) -> String {
             skill.usage.uses,
             skill.usage.views,
         );
+        if skill.usage.cost.turns > 0 {
+            let _ = write!(
+                entry,
+                "\n  cost: {}",
+                skill.usage.cost.line(&skill.baseline)
+            );
+        }
         // What was tried on this skill and did not stand, newest first, so a
         // revision is not proposed again as it was.
         for rejected in skill.rejected.iter().rev().take(REJECTED_SHOWN) {
@@ -1576,6 +1973,111 @@ pub fn library_overview(skills: &[LearnedSkill]) -> String {
         .map(|(category, lines)| format!("## {category}\n{}", lines.join("\n")))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The most skills one prune pass is given.
+pub const PRUNE_MAX_SKILLS: usize = 3;
+/// Non-blank body lines from which a proven skill is long enough to prune.
+pub const PRUNE_LONG_LINES: usize = 20;
+/// Judged or checked successes that make a skill proven for a prune: pruning a
+/// skill that does not work yet stalls (`EfficientSkill`), so the first phase
+/// comes first.
+const PRUNE_PROVEN_AT: u64 = 2;
+/// Cost-measured turns a skill and the baseline each need before the skill is
+/// called costly.
+const PRUNE_COSTLY_TURNS: u64 = 2;
+/// Where `HA_SKILL_PRUNE=off` turns the automatic prune pass off.
+pub const PRUNE_VARIABLE: &str = "HA_SKILL_PRUNE";
+
+/// Whether the automatic prune pass runs: `HA_SKILL_PRUNE=off` stops it (`ha
+/// learning prune` still runs when asked).
+#[must_use]
+pub fn prune_enabled(environment: &super::paths::LaunchEnvironment) -> bool {
+    !environment
+        .value(PRUNE_VARIABLE)
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "no"
+            )
+        })
+}
+
+/// Why `skill` is worth pruning (`Ok`, in words) or is not (`Err`): it works
+/// (worked + checks passed), it is not on trial, not restricted, and it is
+/// long or costs more steps than a turn without a skill.
+fn prune_fit(skill: &LearnedSkill) -> Result<String, String> {
+    let name = &skill.name;
+    let proven = skill.usage.worked + skill.usage.checked_pass;
+    if proven < PRUNE_PROVEN_AT {
+        return Err(format!(
+            "{name} is not proven yet ({proven} judged worked or checked; {PRUNE_PROVEN_AT} needed): a skill that does not work is repaired before it is pruned"
+        ));
+    }
+    if skill.on_trial.is_some() {
+        return Err(format!("{name} has a revision on trial"));
+    }
+    if skill.usage.restricted() {
+        return Err(format!("{name} is restricted: it keeps failing"));
+    }
+    let costly = match (skill.usage.cost.mean_steps(), skill.baseline.mean_steps()) {
+        (Some(own), Some(baseline))
+            if skill.usage.cost.turns >= PRUNE_COSTLY_TURNS
+                && skill.baseline.turns >= PRUNE_COSTLY_TURNS
+                && own > baseline =>
+        {
+            Some(format!(
+                "its turns take {own:.1} steps, a turn without a skill {baseline:.1}"
+            ))
+        }
+        _ => None,
+    };
+    let long = (skill.body_lines >= PRUNE_LONG_LINES)
+        .then(|| format!("it is {} lines long", skill.body_lines));
+    match (long, costly) {
+        (Some(long), Some(costly)) => Ok(format!("{long}, and {costly}")),
+        (Some(reason), None) | (None, Some(reason)) => Ok(reason),
+        (None, None) => Err(format!(
+            "{name} is short ({} lines) and costs no more than a turn without a skill",
+            skill.body_lines
+        )),
+    }
+}
+
+/// The learned skills a prune pass is given, at most [`PRUNE_MAX_SKILLS`], the
+/// longest first, each with why; and, for a skill that was asked for by name
+/// (`only`), why it is not one.
+#[must_use]
+pub fn prune_candidates(
+    layers: &Layers,
+    only: Option<&str>,
+) -> (Vec<(LearnedSkill, String)>, Vec<String>) {
+    let mut skills = library(layers);
+    let mut refused = Vec::new();
+    if let Some(only) = only {
+        skills.retain(|skill| skill.name == only);
+        if skills.is_empty() {
+            refused.push(format!("{only} is not a learned skill ha wrote"));
+        }
+    }
+    let mut chosen = Vec::new();
+    for skill in skills {
+        match prune_fit(&skill) {
+            Ok(reason) => chosen.push((skill, reason)),
+            Err(why) if only.is_some() => refused.push(why),
+            Err(_) => {}
+        }
+    }
+    chosen.sort_by(|left, right| {
+        right
+            .0
+            .body_lines
+            .cmp(&left.0.body_lines)
+            .then_with(|| left.0.name.cmp(&right.0.name))
+    });
+    chosen.truncate(PRUNE_MAX_SKILLS);
+    (chosen, refused)
 }
 
 /// The line the system prompt adds under the skill list, naming the skills ha
@@ -1926,6 +2428,10 @@ pub struct Intent {
     pub absorbed_into: Option<String>,
     pub reason: String,
     pub evidence: String,
+    /// The intent is a prune (`EfficientSkill`'s second phase), made by the host's
+    /// prune pass and never read from what the model wrote: it must leave
+    /// `SKILL.md` shorter, and the trial it opens is held to cost as well.
+    pub prune: bool,
 }
 
 impl Intent {
@@ -1972,6 +2478,7 @@ impl Intent {
             absorbed_into: text("absorbed_into").filter(|name| !name.is_empty()),
             reason: text("reason").unwrap_or_default(),
             evidence: text("evidence").unwrap_or_default(),
+            prune: false,
         }
     }
 }
@@ -2213,6 +2720,20 @@ fn skill_size(document: &str) -> Option<SkillSize> {
             .lines()
             .filter(|line| !line.trim().is_empty())
             .count(),
+    })
+}
+
+/// Why a prune that makes `before` into `after` is refused: it must leave the
+/// skill shorter, in non-blank body lines or in characters. A prune that only
+/// rewords costs the turns nothing and risks what the skill says.
+fn prune_refusal(before: &str, after: &str) -> Option<String> {
+    let lines = |document: &str| skill_size(document).map_or(0, |size| size.body_lines);
+    let (lines_before, lines_after) = (lines(before), lines(after));
+    let (chars_before, chars_after) = (before.chars().count(), after.chars().count());
+    (lines_after >= lines_before && chars_after >= chars_before).then(|| {
+        format!(
+            "prune: the pruned SKILL.md is {lines_after} body lines and {chars_after} characters, not shorter than the {lines_before} lines and {chars_before} characters it is; a prune must make the skill shorter"
+        )
     })
 }
 
@@ -2523,6 +3044,17 @@ fn promote_unbudgeted(
         _ => None,
     };
     let mut findings = lint(intent, shaped.as_deref(), layer, &directory, context);
+    if intent.prune {
+        if action != "edit" {
+            findings.push(format!(
+                "prune: a prune is made of edit intents, not {action}"
+            ));
+        } else if let (Some(before), Some(after)) = (live.as_deref(), shaped.as_deref())
+            && let Some(finding) = prune_refusal(before, after)
+        {
+            findings.push(finding);
+        }
+    }
     if action == "remove_file" {
         match intent.path.as_deref() {
             None => findings.push("shape: remove_file requires path".to_owned()),
@@ -2599,6 +3131,9 @@ fn ledger_entry(intent: &Intent, id: &str) -> Value {
     }
     if intent.action == "edit" {
         entry["edits"] = json!(edits_summary(intent));
+    }
+    if intent.prune {
+        entry["prune"] = json!(true);
     }
     entry
 }
@@ -2745,6 +3280,9 @@ fn land(
                     );
                 });
                 log_revision(layers, "started", &intent.name, &id);
+                if intent.prune {
+                    log_revision(layers, "prune", &intent.name, &id);
+                }
             }
             append_ledger(&directory, &ledger_entry(intent, &id));
             Ok(undo)
@@ -2934,9 +3472,10 @@ Format, enforced:
 #[cfg(test)]
 mod tests {
     use super::{
-        BODY_MAX_LINES, FAILURES_KEPT, Intent, Layer, Layers, Member, PromoteContext, Usage,
-        UseKind, evaluate, is_learned, library, library_overview, promote, record_outcome,
-        record_use, redact, restore, run_lifecycle, usage,
+        BODY_MAX_LINES, Cost, FAILURES_KEPT, Intent, Layer, Layers, Member, PRUNE_LONG_LINES,
+        PRUNE_VARIABLE, PromoteContext, TurnCost, Usage, UseKind, cost_stats, evaluate, is_learned,
+        library, library_overview, promote, prune_candidates, prune_enabled, record_outcome,
+        record_turn, record_use, redact, restore, revision_stats, run_lifecycle, usage,
     };
     use serde_json::json;
 
@@ -3846,7 +4385,7 @@ mod tests {
             vec![viewed("unchecked")],
         ];
         for turn in &turns {
-            super::record_turn(&layers, &workspace, turn);
+            record_turn(&layers, &workspace, turn, None, TurnCost::default());
         }
         let (_, counters) = usage(&layers, Layer::Project);
         let fix = counters["flaky-fix"];
@@ -4514,6 +5053,47 @@ mod tests {
     }
 
     #[test]
+    fn a_revision_that_replaces_a_failing_one_goes_back_to_the_sound_incumbent() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        land_skill(&layers, "deploy", "Run the deploy script.");
+        assert!(record_outcome(&layers, "deploy", true, "", "it shipped"));
+        let original = text_of(&layers, "deploy");
+        let first = edit(
+            "deploy",
+            json!([{"op": "replace", "target": "deploy script", "content": "deploy script --fast"}]),
+        );
+        assert!(promote(&layers, &first, &PromoteContext::default()).ok);
+        record_outcome(&layers, "deploy", false, "--fast exists", "unknown flag");
+        // A fix of the failing revision, before its trial settled.
+        let second = edit(
+            "deploy",
+            json!([{"op": "replace", "target": "--fast", "content": "--quick"}]),
+        );
+        let landed = promote(&layers, &second, &PromoteContext::default());
+        assert!(landed.ok, "{:?}", landed.findings);
+        let raw = raw_usage(&layers);
+        let trial = &raw["skills"]["deploy"]["trial"];
+        assert_eq!(trial["incumbent"]["worked"], 1, "{trial}");
+        assert_eq!(trial["ledger_id"], landed.undo["ledger_id"]);
+        let rejected = &raw["skills"]["deploy"]["rejected"];
+        assert_eq!(rejected[0]["kind"], "superseded", "{rejected}");
+        assert!(
+            rejected[0]["edits_summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("--fast")),
+            "{rejected}"
+        );
+        // The fix fails too: back to the text that worked, not to the first revision.
+        record_outcome(&layers, "deploy", false, "--quick exists", "unknown flag");
+        record_outcome(&layers, "deploy", false, "--quick exists", "unknown flag");
+        assert_eq!(text_of(&layers, "deploy"), original);
+        let raw = raw_usage(&layers);
+        assert!(raw["skills"]["deploy"]["trial"].is_null(), "{raw}");
+        assert_eq!(usage(&layers, Layer::Project).1["deploy"].worked, 1);
+    }
+
+    #[test]
     fn several_revisions_in_one_refinement_are_one_trial_with_the_first_incumbent() {
         let directory = tempfile::tempdir().expect("dir");
         let layers = layers(directory.path());
@@ -4633,5 +5213,478 @@ mod tests {
         ] {
             assert!(spec.contains(needle), "{needle}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // What a skill costs, and the guarded prune (EfficientSkill)
+
+    fn cost_of(steps: u64, calls: u64, output: Option<u64>) -> TurnCost {
+        TurnCost {
+            steps,
+            tool_calls: calls,
+            output_tokens: output,
+        }
+    }
+
+    fn numbered(lines: usize) -> String {
+        (0..lines)
+            .map(|line| format!("Step {line:02} of the procedure."))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A skill that works: judged to have worked twice.
+    fn proven(layers: &Layers, name: &str, body: &str) {
+        land_skill(layers, name, body);
+        for _ in 0..2 {
+            assert!(record_outcome(layers, name, true, "", "it shipped"));
+        }
+    }
+
+    fn prune_of(name: &str, edits: impl Into<serde_json::Value>) -> Intent {
+        let mut intent = edit(name, edits);
+        intent.prune = true;
+        intent
+    }
+
+    /// A turn that viewed `name`'s files, so the skill was in play.
+    fn turn_of(layers: &Layers, name: &str, cost: TurnCost) {
+        let workspace = layers.project.clone().expect("project");
+        record_turn(layers, &workspace, &[viewed(name)], None, cost);
+    }
+
+    #[test]
+    fn a_turn_costs_each_skill_in_play_and_the_baseline_when_none_is() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let workspace = directory.path().join("workspace");
+        land_skill(&layers, "alpha", "Do alpha.");
+        land_skill(&layers, "beta", "Do beta.");
+        // Used: alpha is viewed; beta was put in the turn by recall.
+        record_turn(
+            &layers,
+            &workspace,
+            &[viewed("alpha")],
+            Some("beta"),
+            cost_of(4, 6, Some(100)),
+        );
+        // A turn whose output tokens are unknown counts apart.
+        record_turn(
+            &layers,
+            &workspace,
+            &[viewed("alpha")],
+            None,
+            cost_of(2, 3, None),
+        );
+        // A turn with no skill and tool calls is the baseline (a name recall
+        // gave that is no learned skill puts none in play); one with no tool
+        // call is neither.
+        record_turn(&layers, &workspace, &[], None, cost_of(9, 12, Some(900)));
+        record_turn(
+            &layers,
+            &workspace,
+            &[],
+            Some("nothing"),
+            cost_of(2, 1, None),
+        );
+        record_turn(&layers, &workspace, &[], None, cost_of(3, 0, Some(50)));
+
+        let counters = usage(&layers, Layer::Project).1;
+        let alpha = counters["alpha"].cost;
+        assert_eq!(
+            (alpha.turns, alpha.steps, alpha.tool_calls),
+            (2, 6, 9),
+            "{alpha:?}"
+        );
+        assert_eq!(
+            (alpha.output_tokens, alpha.output_turns),
+            (100, 1),
+            "{alpha:?}"
+        );
+        assert_eq!(alpha.mean_output_tokens(), Some(100.0));
+        assert_eq!(alpha.mean_steps(), Some(3.0));
+        let beta = counters["beta"].cost;
+        assert_eq!((beta.turns, beta.steps, beta.output_turns), (1, 4, 1));
+        let baseline = Cost::from_value(&raw_usage(&layers)["baseline"]);
+        assert_eq!(
+            baseline,
+            Cost {
+                turns: 2,
+                steps: 11,
+                tool_calls: 13,
+                output_tokens: 900,
+                output_turns: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn the_overview_and_the_report_show_what_a_skill_costs_next_to_the_baseline() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let workspace = directory.path().join("workspace");
+        land_skill(&layers, "alpha", "Do alpha.");
+        land_skill(&layers, "quiet", "Do quiet.");
+        turn_of(&layers, "alpha", cost_of(4, 6, Some(1_000)));
+        turn_of(&layers, "alpha", cost_of(8, 10, Some(2_000)));
+        record_turn(&layers, &workspace, &[], None, cost_of(9, 12, None));
+        let overview = library_overview(&library(&layers));
+        assert!(
+            overview.contains(
+                "\n  cost: 2 turns, mean 6.0 steps, 8.0 calls, 1500 output tokens (turns without a skill: mean 9.0 steps, 12.0 calls)"
+            ),
+            "{overview}"
+        );
+        // A skill with no measured turn has no cost line.
+        assert_eq!(overview.matches("cost:").count(), 1, "{overview}");
+        let report = cost_stats(&directory.path().join("data"));
+        assert!(
+            report.contains(&"Learned-skill cost per turn".to_owned()),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|line| line.contains("turns without a skill: 1 turns, mean 9.0 steps")),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|line| line.contains("alpha: 2 turns, mean 6.0 steps")
+                    && line.contains("(turns without a skill: mean 9.0 steps")),
+            "{report:?}"
+        );
+        assert!(
+            !report.iter().any(|line| line.contains("quiet")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_proven_skill_that_is_long_or_costly_is_a_prune_candidate() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let workspace = directory.path().join("workspace");
+        let long = numbered(PRUNE_LONG_LINES + 2);
+        // Not proven: long, but it was judged to have worked once.
+        land_skill(&layers, "unproven-long", &long);
+        assert!(record_outcome(&layers, "unproven-long", true, "", "once"));
+        // Proven and long, but a revision of it is on trial.
+        proven(&layers, "trial-long", &long);
+        let landed = promote(
+            &layers,
+            &edit(
+                "trial-long",
+                json!([{"op": "append", "content": "One more."}]),
+            ),
+            &PromoteContext::default(),
+        );
+        assert!(landed.ok, "{:?}", landed.findings);
+        // Proven and long, but it keeps failing: restricted.
+        proven(&layers, "restricted-long", &long);
+        for _ in 0..3 {
+            assert!(record_outcome(&layers, "restricted-long", false, "a", "b"));
+        }
+        // Proven, short, and no dearer than the baseline.
+        proven(&layers, "short-cheap", "Do it.");
+        // Proven and long.
+        proven(&layers, "long-proven", &long);
+        // Proven and short, but its turns cost more than the baseline's.
+        proven(&layers, "costly-proven", "Do it.");
+        for _ in 0..3 {
+            turn_of(&layers, "costly-proven", cost_of(8, 8, None));
+            turn_of(&layers, "short-cheap", cost_of(3, 3, None));
+            record_turn(&layers, &workspace, &[], None, cost_of(4, 4, None));
+        }
+        // Costly on one measured turn only is not costly yet.
+        proven(&layers, "costly-once", "Do it.");
+        turn_of(&layers, "costly-once", cost_of(30, 30, None));
+
+        let (chosen, refused) = prune_candidates(&layers, None);
+        assert!(refused.is_empty(), "{refused:?}");
+        let names = chosen
+            .iter()
+            .map(|(skill, _)| skill.name.as_str())
+            .collect::<Vec<_>>();
+        // The longest first.
+        assert_eq!(names, ["long-proven", "costly-proven"], "{chosen:?}");
+        assert!(chosen[0].1.contains("lines long"), "{chosen:?}");
+        assert!(
+            chosen[1].1.contains("8.0 steps") && chosen[1].1.contains("4.0"),
+            "{chosen:?}"
+        );
+
+        for (name, needle) in [
+            ("unproven-long", "not proven"),
+            ("trial-long", "on trial"),
+            ("restricted-long", "restricted"),
+            ("short-cheap", "short"),
+            ("nothing-here", "not a learned skill"),
+        ] {
+            let (none, why) = prune_candidates(&layers, Some(name));
+            assert!(none.is_empty(), "{name}");
+            assert!(why[0].contains(needle), "{name}: {why:?}");
+        }
+        let (one, _) = prune_candidates(&layers, Some("costly-proven"));
+        assert_eq!(one.len(), 1);
+    }
+
+    #[test]
+    fn a_prune_that_does_not_shorten_the_skill_is_refused_naming_both_sizes() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        proven(&layers, "deploy", "Build it.\nShip it.\nCheck it.");
+        let before = text_of(&layers, "deploy");
+        // Longer in both.
+        let verdict = promote(
+            &layers,
+            &prune_of(
+                "deploy",
+                json!([{"op": "append", "content": "Tell the user."}]),
+            ),
+            &PromoteContext::default(),
+        );
+        assert!(!verdict.ok);
+        let finding = verdict.findings.join("; ");
+        assert!(
+            finding.contains("prune:")
+                && finding.contains("4 body lines")
+                && finding.contains("not shorter than the 3 lines"),
+            "{finding}"
+        );
+        // The same lines and a longer text is not shorter either.
+        let verdict = promote(
+            &layers,
+            &prune_of(
+                "deploy",
+                json!([{"op": "replace", "target": "Ship it.", "content": "Ship it!!"}]),
+            ),
+            &PromoteContext::default(),
+        );
+        assert!(!verdict.ok && verdict.findings.join(";").contains("prune:"));
+        // A prune is made of edits.
+        let mut patched = patch("deploy", "Check it.", "");
+        patched.prune = true;
+        let verdict = promote(&layers, &patched, &PromoteContext::default());
+        assert!(
+            !verdict.ok && verdict.findings.join(";").contains("made of edit intents"),
+            "{:?}",
+            verdict.findings
+        );
+        assert_eq!(text_of(&layers, "deploy"), before);
+        // Shorter lands, on a prune trial.
+        let verdict = promote(
+            &layers,
+            &prune_of("deploy", json!([{"op": "delete", "target": "Check it."}])),
+            &PromoteContext::default(),
+        );
+        assert!(verdict.ok, "{:?}", verdict.findings);
+        assert_eq!(
+            raw_usage(&layers)["skills"]["deploy"]["trial"]["objective"],
+            "prune"
+        );
+        // An ordinary revision is not held to shrink, and joining the trial
+        // makes it a repair's.
+        let verdict = promote(
+            &layers,
+            &edit(
+                "deploy",
+                json!([{"op": "append", "content": "Tell the user."}]),
+            ),
+            &PromoteContext::default(),
+        );
+        assert!(verdict.ok, "{:?}", verdict.findings);
+        assert_eq!(
+            raw_usage(&layers)["skills"]["deploy"]["trial"]["objective"],
+            "repair"
+        );
+    }
+
+    /// A proven `deploy` with two measured turns (6 and 8 steps, 1000 and
+    /// 1400 output tokens), and a prune of it that has just landed. Returns
+    /// the trial and the text before the prune.
+    fn pruned_deploy(layers: &Layers) -> (serde_json::Value, String) {
+        proven(layers, "deploy", "Build it.\nShip it.\nCheck it.\nTell it.");
+        let full = text_of(layers, "deploy");
+        turn_of(layers, "deploy", cost_of(6, 5, Some(1_000)));
+        turn_of(layers, "deploy", cost_of(8, 7, Some(1_400)));
+        let landed = promote(
+            layers,
+            &prune_of("deploy", json!([{"op": "delete", "target": "Tell it."}])),
+            &PromoteContext::default(),
+        );
+        assert!(landed.ok, "{:?}", landed.findings);
+        (raw_usage(layers)["skills"]["deploy"]["trial"].clone(), full)
+    }
+
+    #[test]
+    fn a_landed_prune_starts_a_prune_trial_with_the_incumbents_mean_cost() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let (trial, _) = pruned_deploy(&layers);
+        assert_eq!(trial["objective"], "prune", "{trial}");
+        assert_eq!(trial["incumbent_cost"]["turns"], 2);
+        assert_eq!(trial["incumbent_cost"]["steps"], 14);
+        assert_eq!(trial["incumbent_mean"]["steps"], 7.0);
+        assert_eq!(trial["incumbent_mean"]["tool_calls"], 6.0);
+        assert_eq!(trial["incumbent_mean"]["output_tokens"], 1_200.0);
+        let skills = library(&layers);
+        assert_eq!(skills[0].trial_objective, "prune");
+        let overview = library_overview(&skills);
+        assert!(
+            overview.contains("revision on trial (a prune, held to cost)"),
+            "{overview}"
+        );
+        let lines = revision_stats(&directory.path().join("data"), chrono::Utc::now());
+        assert!(
+            lines[1].starts_with("  1 revised (1 of them pruned), 1 on trial now"),
+            "{lines:?}"
+        );
+        let ledger = std::fs::read_to_string(
+            layers
+                .project
+                .clone()
+                .expect("project")
+                .join("deploy/.ledger.jsonl"),
+        )
+        .expect("ledger");
+        assert!(ledger.contains("\"prune\":true"), "{ledger}");
+    }
+
+    #[test]
+    fn a_prune_costing_more_is_rolled_back_even_when_judged_good() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let (_, full) = pruned_deploy(&layers);
+        let pruned = text_of(&layers, "deploy");
+        assert_ne!(pruned, full);
+        // Two good judged uses, but no measured turn yet: the prune waits.
+        for _ in 0..2 {
+            assert!(record_outcome(&layers, "deploy", true, "", "it shipped"));
+        }
+        assert!(raw_usage(&layers)["skills"]["deploy"]["trial"].is_object());
+        // One costly turn is too few to judge the cost.
+        turn_of(&layers, "deploy", cost_of(9, 7, Some(1_100)));
+        assert!(raw_usage(&layers)["skills"]["deploy"]["trial"].is_object());
+        assert_eq!(text_of(&layers, "deploy"), pruned);
+        // The second: 9 steps a turn against 7, over the limit of 7.7.
+        turn_of(&layers, "deploy", cost_of(9, 7, Some(1_100)));
+        assert_eq!(text_of(&layers, "deploy"), full);
+        let raw = raw_usage(&layers);
+        let counters = &raw["skills"]["deploy"];
+        assert!(counters["trial"].is_null(), "{counters}");
+        // The incumbent's counters and cost are back.
+        assert_eq!(counters["cost"]["turns"], 2);
+        assert_eq!(counters["worked"], 2);
+        assert_eq!(counters["trial_good"], 2);
+        let rejected = &counters["rejected"][0];
+        assert_eq!(rejected["kind"], "rolled_back");
+        let reason = rejected["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains("costs more than the version it replaced")
+                && reason.contains("9.0 steps per turn")
+                && reason.contains("7.0"),
+            "{reason}"
+        );
+        let stats = revision_stats(&directory.path().join("data"), chrono::Utc::now());
+        assert!(stats[1].contains("1 rolled back"), "{stats:?}");
+    }
+
+    #[test]
+    fn a_prune_that_writes_more_tokens_is_rolled_back_when_both_are_known() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let (_, full) = pruned_deploy(&layers);
+        // As many steps as before, a quarter more output tokens.
+        turn_of(&layers, "deploy", cost_of(7, 6, Some(1_500)));
+        turn_of(&layers, "deploy", cost_of(7, 6, Some(1_500)));
+        let raw = raw_usage(&layers);
+        assert!(raw["skills"]["deploy"]["trial"].is_null(), "{raw}");
+        let reason = raw["skills"]["deploy"]["rejected"][0]["reason"]
+            .as_str()
+            .expect("reason");
+        assert!(reason.contains("output tokens per turn"), "{reason}");
+        assert_eq!(text_of(&layers, "deploy"), full);
+    }
+
+    #[test]
+    fn a_prune_that_costs_the_same_or_less_is_accepted_and_a_dearer_one_waits() {
+        for (steps, open) in [
+            ((5, 5), false),
+            // Prose got shorter, the turns cost the same.
+            ((7, 7), false),
+            // Over the incumbent's 7.0, under the limit of 7.7: neither.
+            ((7, 8), true),
+        ] {
+            let directory = tempfile::tempdir().expect("dir");
+            let layers = layers(directory.path());
+            pruned_deploy(&layers);
+            let pruned = text_of(&layers, "deploy");
+            turn_of(&layers, "deploy", cost_of(steps.0, 5, None));
+            turn_of(&layers, "deploy", cost_of(steps.1, 5, None));
+            for _ in 0..2 {
+                assert!(record_outcome(&layers, "deploy", true, "", "it shipped"));
+            }
+            let raw = raw_usage(&layers);
+            assert_eq!(
+                raw["skills"]["deploy"]["trial"].is_object(),
+                open,
+                "{steps:?}: {raw}"
+            );
+            assert_eq!(text_of(&layers, "deploy"), pruned, "{steps:?}");
+            assert!(
+                raw["skills"]["deploy"]["rejected"].is_null(),
+                "{steps:?}: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repair_trial_is_not_held_to_cost() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        proven(&layers, "deploy", "Build it.\nShip it.");
+        turn_of(&layers, "deploy", cost_of(2, 2, Some(100)));
+        turn_of(&layers, "deploy", cost_of(2, 2, Some(100)));
+        assert!(
+            promote(
+                &layers,
+                &edit(
+                    "deploy",
+                    json!([{"op": "append", "content": "Check the port first."}])
+                ),
+                &PromoteContext::default()
+            )
+            .ok
+        );
+        assert_eq!(
+            raw_usage(&layers)["skills"]["deploy"]["trial"]["objective"],
+            "repair"
+        );
+        let repaired = text_of(&layers, "deploy");
+        for _ in 0..3 {
+            turn_of(&layers, "deploy", cost_of(30, 30, Some(9_000)));
+        }
+        for _ in 0..2 {
+            assert!(record_outcome(&layers, "deploy", true, "", "it shipped"));
+        }
+        let raw = raw_usage(&layers);
+        assert!(raw["skills"]["deploy"]["trial"].is_null(), "{raw}");
+        assert!(raw["skills"]["deploy"]["rejected"].is_null(), "{raw}");
+        assert_eq!(text_of(&layers, "deploy"), repaired);
+    }
+
+    #[test]
+    fn the_prune_switch_is_off_only_when_it_says_so() {
+        let environment = |value: Option<&'static str>| {
+            super::super::paths::LaunchEnvironment::from_pairs(
+                value.map(|value| (PRUNE_VARIABLE, value)),
+            )
+        };
+        assert!(prune_enabled(&environment(None)));
+        assert!(prune_enabled(&environment(Some("on"))));
+        assert!(!prune_enabled(&environment(Some("off"))));
+        assert!(!prune_enabled(&environment(Some(" OFF "))));
     }
 }

@@ -1317,7 +1317,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
         Some(Command::Mcp(command)) => mcp_cli::run(command),
         Some(Command::Memory(command)) => memory_cli::run(command),
         Some(Command::Project(command)) => project_cli::run(command),
-        Some(Command::Learning(command)) => learning_cli::run(command),
+        Some(Command::Learning(command)) => Box::pin(learning_cli::run(command)).await,
         Some(Command::Init { data_dir, json }) => init_store(&data_dir, json).await,
         Some(Command::Package(command)) => package_cli::run(command),
         Some(Command::Config(ConfigCommand { command: None })) => {

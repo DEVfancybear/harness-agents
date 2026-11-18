@@ -79,6 +79,22 @@ enum LearningSubcommand {
     /// Make a project's lesson one for every project; the gate then writes
     /// its rule where a rule for every project goes.
     Promote { id: String },
+    /// Prune the learned skills that work now (`EfficientSkill`'s second phase):
+    /// the configured model shortens the proven ones that are long or cost
+    /// more steps than a turn without a skill; each pruned skill is on trial
+    /// and goes back when it costs more or does worse. `HA_SKILL_PRUNE=off`
+    /// stops the automatic pass, not this command.
+    Prune {
+        /// Prune only this learned skill.
+        #[arg(long, value_name = "NAME")]
+        skill: Option<String>,
+        /// The model that prunes, instead of the configured one.
+        #[arg(long, value_name = "PROVIDER/MODEL")]
+        model: Option<String>,
+        /// Its thinking level (off .. max).
+        #[arg(long, value_name = "LEVEL")]
+        thinking: Option<String>,
+    },
 }
 
 fn scope_filter(scope: &str) -> Result<lessons::ScopeFilter, HarnessError> {
@@ -116,7 +132,7 @@ fn failed(error: String) -> HarnessError {
 /// The data directory cannot be resolved, the lessons cannot be read or
 /// written, or there is no such lesson.
 #[allow(clippy::too_many_lines, reason = "one arm per `ha learning` command")]
-pub fn run(command: LearningCommand) -> Result<(), HarnessError> {
+pub async fn run(command: LearningCommand) -> Result<(), HarnessError> {
     let global = harness::global_dir(&cli_extras::current_data_dir()?);
     let places = lessons::Places {
         global: global.clone(),
@@ -208,6 +224,15 @@ pub fn run(command: LearningCommand) -> Result<(), HarnessError> {
             for line in learned::revision_stats(&cli_extras::current_data_dir()?, now) {
                 println!("{line}");
             }
+            // What a turn costs with each learned skill in play, against one
+            // with none.
+            let costs = learned::cost_stats(&cli_extras::current_data_dir()?);
+            if !costs.is_empty() {
+                println!();
+                for line in costs {
+                    println!("{line}");
+                }
+            }
             if let Some(path) = html {
                 std::fs::write(&path, lessons::report_html(&kept, now, all))
                     .map_err(|error| failed(format!("cannot write {}: {error}", path.display())))?;
@@ -288,6 +313,19 @@ pub fn run(command: LearningCommand) -> Result<(), HarnessError> {
                 for line in lessons::distill(&places, now).map_err(failed)?.lines() {
                     println!("{line}");
                 }
+            }
+            Ok(())
+        }
+        LearningSubcommand::Prune {
+            skill,
+            model,
+            thinking,
+        } => {
+            for line in
+                crate::interactive::service::prune_command(skill.as_deref(), model, thinking)
+                    .await?
+            {
+                println!("{line}");
             }
             Ok(())
         }
