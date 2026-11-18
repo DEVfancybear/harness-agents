@@ -938,7 +938,13 @@ impl InteractiveController {
             self.run_next_queued(effects);
             return "queued";
         }
-        if user_free || self.free_for_automatic_turn() {
+        // The user's own message answers the agent's open question, as one
+        // typed in the terminal does. Seen live: `ha send` to an agent waiting
+        // on its question was queued "after the active run" with no run to
+        // finish, and the question was never answered.
+        let user_answers =
+            !from_agent && self.phase == AppPhase::WaitingInput && self.pending_question.is_some();
+        if user_free || user_answers || self.free_for_automatic_turn() {
             let produced = self.submit(text.clone());
             if let Some(receipt) = receipt {
                 if self.phase.has_active_run() {
@@ -12805,6 +12811,57 @@ Command: \"npm run build\""
                 .last(),
             Some(&None),
             "the held message is not an answer"
+        );
+    }
+
+    /// Found live while checking the fix above: `ha send` to an agent waiting
+    /// on its question was queued "after the active run" with no run to
+    /// finish, and the question was never answered. The user's message
+    /// answers it, as one typed in the terminal does; another agent's waits.
+    #[test]
+    fn a_sent_message_from_the_user_answers_the_open_question() {
+        let mut harness = tui_bench(true);
+        let _ = submit_text(&mut harness.controller, "pick a color");
+        harness
+            .events
+            .send(SessionEvent::QuestionRequired {
+                question_id: "question-sent".to_owned(),
+                prompt: "Which color?".to_owned(),
+                options: vec!["blue".to_owned(), "green".to_owned()],
+            })
+            .expect("question event");
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::WaitingInput {
+                    question_id: Some("question-sent".to_owned()),
+                },
+            })
+            .expect("question turn ends");
+        let _ = harness.controller.pump_events();
+        let mut effects = Vec::new();
+        let (_, from_agent) = harness.controller.deliver_tracked(
+            "[agent-message from child:scout]\n\nblue".to_owned(),
+            true,
+            true,
+            &mut effects,
+        );
+        assert_eq!(from_agent, "queued", "another agent does not answer");
+        assert_eq!(submissions(&harness), ["pick a color"]);
+        let (_, outcome) =
+            harness
+                .controller
+                .deliver_tracked("green".to_owned(), true, false, &mut effects);
+        assert_eq!(outcome, "delivered");
+        assert_eq!(submissions(&harness), ["pick a color", "green"]);
+        assert_eq!(
+            harness
+                .port
+                .answer_questions
+                .lock()
+                .expect("question answer log")
+                .as_slice(),
+            [None, Some("question-sent".to_owned())]
         );
     }
 
