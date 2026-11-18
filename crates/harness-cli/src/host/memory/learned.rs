@@ -1,7 +1,7 @@
 //! Skills ha writes for itself, and the life they lead afterwards.
 //!
 //! Ported from tigerless-labs/autoharness. The model never writes a learned
-//! skill's files: `/refine` proposes intents (`create`, `update`, `patch`,
+//! skill's files: `/refine` proposes intents (`create`, `update`, `patch`, `edit`,
 //! `remove_file`, `delete`), and [`promote`] is the one writer. It shapes the
 //! final text in memory, lints it, and only then lands it, subfiles first and
 //! `SKILL.md` last, each with a temporary file and a rename, so a reader never sees
@@ -50,6 +50,21 @@ pub const DESCRIPTION_MAX_CHARS: usize = 200;
 /// The most non-blank body lines a created or rewritten skill may have. A skill is
 /// a rule; backing detail belongs in `references/`.
 pub const BODY_MAX_LINES: usize = 30;
+/// The most edits one refinement may make to one learned skill, summed over its
+/// intents (a `patch` counts as one). `SkillOpt` (arXiv 2605.23904): a revision is
+/// a bounded step, the textual learning rate; a whole rewrite of a skill that
+/// works is how a good rule gets lost.
+pub const SKILL_EDIT_BUDGET: usize = 4;
+/// The rejected revisions a skill keeps, and how many the refiner is shown.
+const REJECTED_KEPT: usize = 5;
+const REJECTED_SHOWN: usize = 3;
+/// What each part of a rejected revision's summary is clipped to.
+const SUMMARY_PART_CHARS: usize = 120;
+/// Revision events, one JSON line each, for `ha learning report`.
+const REVISION_LOG: &str = "revisions.jsonl";
+const REVISION_LOG_KEPT: usize = 500;
+/// Judged uses a revision needs, one way or the other, to be settled.
+const TRIAL_SETTLED_AT: u64 = 2;
 const SUBFILE_MAX_BYTES: usize = 64 * 1024;
 const SUBFILES_MAX: usize = 16;
 const EVIDENCE_MAX_CHARS: usize = 2_000;
@@ -526,6 +541,13 @@ pub fn library_documents(layers: &Layers) -> String {
     parts.join("\n\n")
 }
 
+/// The `SKILL.md` of the live learned skill `name`, as it is on disk.
+#[must_use]
+pub fn live_document(layers: &Layers, name: &str) -> Option<String> {
+    let layer = layers.find(name)?;
+    std::fs::read_to_string(layers.root(layer)?.join(name).join("SKILL.md")).ok()
+}
+
 /// The latest failures a skill keeps, for the curator.
 const FAILURES_KEPT: usize = 5;
 
@@ -544,17 +566,52 @@ pub fn record_outcome(
     assumption: &str,
     evidence: &str,
 ) -> bool {
+    record_outcome_of(layers, name, worked, assumption, evidence, false)
+}
+
+/// [`record_outcome`] for a turn that followed the text a revision has just
+/// replaced: the review judges it in the refinement that revised the skill, but
+/// it is the incumbent's outcome, so it is counted for the incumbent and not
+/// against the revision's trial. Without a trial open it is an ordinary outcome.
+pub fn record_outcome_of_incumbent(
+    layers: &Layers,
+    name: &str,
+    worked: bool,
+    assumption: &str,
+    evidence: &str,
+) -> bool {
+    record_outcome_of(layers, name, worked, assumption, evidence, true)
+}
+
+fn record_outcome_of(
+    layers: &Layers,
+    name: &str,
+    worked: bool,
+    assumption: &str,
+    evidence: &str,
+    of_incumbent: bool,
+) -> bool {
     let Some(layer) = layers.find(name) else {
         return false;
     };
     let root = layers.root(layer).expect("found layer is present");
     let clip = |text: &str| text.trim().chars().take(300).collect::<String>();
+    let mut counted_on_trial = true;
     update_usage(&layers.usage_file(layer, root), |usage| {
         bump(usage, name, if worked { "worked" } else { "failed" });
         if worked {
             usage["skills"][name]["last"] = json!(now());
         }
-        bump(usage, name, if worked { "trial_good" } else { "trial_bad" });
+        if of_incumbent && usage["skills"][name]["trial"].is_object() {
+            counted_on_trial = false;
+            let field = if worked { "worked" } else { "failed" };
+            let current = usage["skills"][name]["trial"]["incumbent"][field]
+                .as_u64()
+                .unwrap_or(0);
+            usage["skills"][name]["trial"]["incumbent"][field] = json!(current + 1);
+        } else {
+            bump(usage, name, if worked { "trial_good" } else { "trial_bad" });
+        }
         // Evolver's Capsule: a strategy goes with a concrete case it held in.
         if worked && !evidence.trim().is_empty() {
             let cases = &mut usage["skills"][name]["cases"];
@@ -581,6 +638,9 @@ pub fn record_outcome(
             }
         }
     });
+    if counted_on_trial {
+        settle_trial(layers, layer, root, name);
+    }
     true
 }
 
@@ -832,7 +892,401 @@ fn record_checks(layers: &Layers, checked: &BTreeMap<String, bool>) {
                 if *passed { "trial_good" } else { "trial_bad" },
             );
         });
+        settle_trial(layers, layer, root, name);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Revisions on trial
+//
+// After SkillOpt (arXiv 2605.23904): the version a revision replaces is the
+// incumbent, and it is kept until the revision has shown itself better. A
+// revision that lands on a learned skill (`edit`, `patch`, `update`) opens a
+// trial in the skill's usage record: the ledger id of the change, the
+// incumbent's counters, and the undo the ledger's `restore` needs. Judged uses
+// then decide it: two good and more good than bad accepts the revision; two bad
+// and more bad than good rolls it back, when the incumbent was not failing
+// itself. A tie leaves the trial open.
+
+/// The counters the incumbent is remembered by.
+const INCUMBENT_FIELDS: [&str; 6] = [
+    "worked",
+    "failed",
+    "checked_pass",
+    "checked_fail",
+    "trial_good",
+    "trial_bad",
+];
+
+fn incumbent_of(counters: &Value) -> Value {
+    let mut incumbent = Map::new();
+    for field in INCUMBENT_FIELDS {
+        incumbent.insert(
+            field.to_owned(),
+            json!(counters[field].as_u64().unwrap_or(0)),
+        );
+    }
+    Value::Object(incumbent)
+}
+
+/// Whether the replaced version is worth going back to: it was seen to work.
+/// (Working more often than failing implies it worked at all, so this is the
+/// whole of "not failing itself".)
+fn incumbent_sound(incumbent: &Value) -> bool {
+    let count = |field: &str| incumbent[field].as_u64().unwrap_or(0);
+    count("worked") + count("checked_pass") > 0
+}
+
+/// One line of `text`: whitespace folded, redacted, clipped to `limit`.
+fn one_line(text: &str, limit: usize) -> String {
+    let flat = redact(text.trim())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.chars().count() > limit {
+        flat.chars().take(limit).collect::<String>() + "…"
+    } else {
+        flat
+    }
+}
+
+/// What an intent changes, in a line: the op and the first characters of each
+/// target and content, redacted as the ledger redacts.
+fn edits_summary(intent: &Intent) -> String {
+    let part = |text: &str| format!("{:?}", one_line(text, SUMMARY_PART_CHARS));
+    match intent.action.as_str() {
+        "edit" => intent
+            .edits
+            .iter()
+            .map(|edit| {
+                let mut line = edit.op.clone();
+                if let Some(target) = &edit.target {
+                    let _ = write!(line, " {}", part(target));
+                }
+                if let Some(content) = &edit.content {
+                    let _ = write!(line, " -> {}", part(content));
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+        "patch" => format!(
+            "patch {} -> {}",
+            part(intent.old_string.as_deref().unwrap_or_default()),
+            part(intent.new_string.as_deref().unwrap_or_default())
+        ),
+        "update" => format!(
+            "update (whole rewrite) {}",
+            part(intent.body.as_deref().unwrap_or_default())
+        ),
+        other => other.to_owned(),
+    }
+}
+
+/// A rejected revision as the skill keeps it.
+fn rejected_record(
+    kind: &str,
+    ledger_id: Option<&str>,
+    reason: &str,
+    summary: &str,
+    evidence: &str,
+) -> Value {
+    json!({
+        "at": now(),
+        "ledger_id": ledger_id,
+        "kind": kind,
+        "reason": one_line(reason, 300),
+        "edits_summary": summary,
+        "evidence": one_line(evidence, 300),
+    })
+}
+
+/// Keep `record` among the skill's last [`REJECTED_KEPT`] rejected revisions.
+fn push_rejected(usage: &mut Value, name: &str, record: Value) {
+    if !usage["skills"][name].is_object() {
+        usage["skills"][name] = json!({});
+    }
+    let rejected = &mut usage["skills"][name]["rejected"];
+    if !rejected.is_array() {
+        *rejected = json!([]);
+    }
+    if let Some(rejected) = rejected.as_array_mut() {
+        rejected.push(record);
+        let excess = rejected.len().saturating_sub(REJECTED_KEPT);
+        rejected.drain(..excess);
+    }
+}
+
+/// Keep that the promoter refused `intent` for the learned skill it names, even
+/// after the repair pass, so the next refinement is told what was tried and why
+/// it did not stand. `false` when the intent is not about a live learned skill.
+pub fn record_refused(layers: &Layers, intent: &Intent, findings: &str) -> bool {
+    let Some(layer) = layers.find(&intent.name) else {
+        return false;
+    };
+    let root = layers.root(layer).expect("found layer is present");
+    update_usage(&layers.usage_file(layer, root), |usage| {
+        push_rejected(
+            usage,
+            &intent.name,
+            rejected_record(
+                "refused",
+                None,
+                findings,
+                &edits_summary(intent),
+                &intent.evidence,
+            ),
+        );
+    });
+    log_revision(layers, "refused", &intent.name, "");
+    true
+}
+
+/// Append one revision event to the log `ha learning report` counts.
+fn log_revision(layers: &Layers, event: &str, name: &str, ledger_id: &str) {
+    let path = layers.usage_dir.join(REVISION_LOG);
+    let mut lines = std::fs::read_to_string(&path)
+        .map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
+        .unwrap_or_default();
+    lines.push(
+        json!({"at": now(), "event": event, "skill": name, "ledger_id": ledger_id}).to_string(),
+    );
+    let start = lines.len().saturating_sub(REVISION_LOG_KEPT);
+    let _ = write_atomic(&path, &(lines[start..].join("\n") + "\n"));
+}
+
+/// Open the trial of the revision `undo` records, in the usage record. A trial
+/// still without a judged use takes the new change into itself, so one
+/// refinement's several changes to a skill are one revision with the first
+/// incumbent; an older trial that was judged is closed, and the version it
+/// judged is the incumbent now.
+fn begin_trial(usage: &mut Value, name: &str, ledger_id: &str, intent: &Intent, undo: &Value) {
+    let summary = edits_summary(intent);
+    let summary = summary.as_str();
+    let counters = &usage["skills"][name];
+    let judged =
+        counters["trial_good"].as_u64().unwrap_or(0) + counters["trial_bad"].as_u64().unwrap_or(0);
+    if counters["trial"].is_object() && judged == 0 {
+        let trial = &mut usage["skills"][name]["trial"];
+        trial["ledger_id"] = json!(ledger_id);
+        if let Some(ids) = trial["ledger_ids"].as_array_mut() {
+            ids.push(json!(ledger_id));
+        }
+        let joined = format!(
+            "{}; {summary}",
+            trial["edits_summary"].as_str().unwrap_or("")
+        );
+        trial["edits_summary"] = json!(joined);
+        // The first incumbent's text stays; the hashes are of the last write.
+        trial["undo"]["written"] = undo["written"].clone();
+        for (relative, hash) in undo[WRITTEN_FILES].as_object().into_iter().flatten() {
+            trial["undo"][WRITTEN_FILES][relative] = hash.clone();
+        }
+        for (relative, content) in undo["files"].as_object().into_iter().flatten() {
+            if trial["undo"]["files"].get(relative).is_none() {
+                trial["undo"]["files"][relative] = content.clone();
+            }
+        }
+        return;
+    }
+    usage["skills"][name]["trial"] = json!({
+        "action": intent.action,
+        "ledger_id": ledger_id,
+        "ledger_ids": [ledger_id],
+        "began": now(),
+        "incumbent": incumbent_of(&usage["skills"][name]),
+        "edits_summary": summary,
+        "undo": undo,
+    });
+}
+
+/// Drop the skill's trial record: it is settled.
+fn close_trial(usage: &mut Value, name: &str) {
+    if let Some(counters) = usage["skills"][name].as_object_mut() {
+        counters.remove("trial");
+    }
+}
+
+/// Decide the skill's revision on trial, if it has one, after a judged use.
+fn settle_trial(layers: &Layers, layer: Layer, root: &Path, name: &str) {
+    let file = layers.usage_file(layer, root);
+    let raw = load_usage(&file);
+    let counters = &raw["skills"][name];
+    let trial = &counters["trial"];
+    if !trial.is_object() {
+        return;
+    }
+    let good = counters["trial_good"].as_u64().unwrap_or(0);
+    let bad = counters["trial_bad"].as_u64().unwrap_or(0);
+    let ledger_id = trial["ledger_id"].as_str().unwrap_or_default().to_owned();
+    if good >= TRIAL_SETTLED_AT && good > bad {
+        update_usage(&file, |usage| close_trial(usage, name));
+        log_revision(layers, "accepted", name, &ledger_id);
+        harness_types::diag::info("skill", "revision_accepted")
+            .msg(format!(
+                "the revision of {name} is kept: {good} good, {bad} bad judged uses"
+            ))
+            .field("skill", name)
+            .field("ledger_id", ledger_id.as_str())
+            .field("good", good)
+            .field("bad", bad)
+            .emit();
+    } else if bad >= TRIAL_SETTLED_AT && bad > good {
+        if incumbent_sound(&trial["incumbent"]) {
+            roll_back_trial(layers, layer, root, name, counters, (good, bad));
+        } else {
+            // The version it replaced was failing too: nothing better to go
+            // back to, and the restriction on a skill that keeps failing stands.
+            update_usage(&file, |usage| close_trial(usage, name));
+        }
+    }
+}
+
+/// Put the incumbent back (`counters` are the skill's usage record, `good` and
+/// `bad` the revision's judged uses): its text and files by the undo the ledger
+/// kept, its counters, and a record of the revision among the rejected ones. A
+/// skill changed since the revision keeps what it is, and the record says so.
+fn roll_back_trial(
+    layers: &Layers,
+    layer: Layer,
+    root: &Path,
+    name: &str,
+    counters: &Value,
+    (good, bad): (u64, u64),
+) {
+    let trial = &counters["trial"];
+    let incumbent = trial["incumbent"].clone();
+    let count = |field: &str| incumbent[field].as_u64().unwrap_or(0);
+    let ledger_id = trial["ledger_id"].as_str().unwrap_or_default().to_owned();
+    let last_failure = counters["failures"]
+        .as_array()
+        .and_then(|failures| failures.last())
+        .map(|failure| {
+            format!(
+                "last failure: {} ({})",
+                failure["assumption"].as_str().unwrap_or_default(),
+                failure["evidence"].as_str().unwrap_or_default()
+            )
+        })
+        .unwrap_or_default();
+    let summary = trial["edits_summary"].as_str().unwrap_or_default();
+    let action = trial["action"].as_str().unwrap_or("patch");
+    let restored = restore(layers, action, name, layer.as_str(), &trial["undo"]);
+    let basis = format!(
+        "the incumbent had {} worked and {} failed, {} check(s) passed and {} failed",
+        count("worked"),
+        count("failed"),
+        count("checked_pass"),
+        count("checked_fail")
+    );
+    let (reason, restored_ok) = match &restored {
+        Ok(()) => (
+            format!(
+                "judged worse than the version it replaced: {bad} bad, {good} good uses; {basis}"
+            ),
+            true,
+        ),
+        Err(why) => (
+            format!("judged worse ({bad} bad, {good} good uses) but not rolled back: {why}"),
+            false,
+        ),
+    };
+    let record = rejected_record(
+        "rolled_back",
+        Some(&ledger_id),
+        &reason,
+        summary,
+        &last_failure,
+    );
+    update_usage(&layers.usage_file(layer, root), |usage| {
+        if restored_ok {
+            for field in INCUMBENT_FIELDS {
+                usage["skills"][name][field] = json!(count(field));
+            }
+        }
+        close_trial(usage, name);
+        push_rejected(usage, name, record);
+    });
+    if !restored_ok {
+        append_ledger(
+            &root.join(name),
+            &json!({"at": now(), "action": "rollback_skipped", "reason": reason}),
+        );
+    }
+    log_revision(
+        layers,
+        if restored_ok {
+            "rolled_back"
+        } else {
+            "rollback_skipped"
+        },
+        name,
+        &ledger_id,
+    );
+    harness_types::diag::info("skill", "rollback")
+        .msg(format!("the revision of {name}: {reason}"))
+        .field("skill", name)
+        .field("ledger_id", ledger_id.as_str())
+        .field("good", good)
+        .field("bad", bad)
+        .field("restored", restored_ok)
+        .field("incumbent_worked", count("worked"))
+        .field("incumbent_failed", count("failed"))
+        .emit();
+}
+
+/// The revision lines of `ha learning report`: what was revised, accepted,
+/// rolled back and refused in the last thirty days, and how many revisions are
+/// on trial now.
+#[must_use]
+pub fn revision_stats(data_dir: &Path, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+    let dir = data_dir.join("skill-usage");
+    let since = now - chrono::Duration::days(30);
+    let mut counts = BTreeMap::<String, usize>::new();
+    for line in std::fs::read_to_string(dir.join(REVISION_LOG))
+        .unwrap_or_default()
+        .lines()
+    {
+        let Ok(record) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let recent = record["at"]
+            .as_str()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|at| at >= since);
+        if let (true, Some(event)) = (recent, record["event"].as_str()) {
+            *counts.entry(event.to_owned()).or_default() += 1;
+        }
+    }
+    let on_trial = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .map(|path| {
+            load_usage(&path)["skills"].as_object().map_or(0, |skills| {
+                skills
+                    .values()
+                    .filter(|counters| counters["trial"].is_object())
+                    .count()
+            })
+        })
+        .sum::<usize>();
+    let count = |event: &str| counts.get(event).copied().unwrap_or(0);
+    vec![
+        "Learned-skill revisions, last 30 days".to_owned(),
+        format!(
+            "  {} revised, {on_trial} on trial now, {} accepted, {} rolled back, {} refused",
+            count("started"),
+            count("accepted"),
+            count("rolled_back"),
+            count("refused")
+        ),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -965,6 +1419,24 @@ pub struct LearnedSkill {
     /// When it was last activated, viewed or judged to have worked (RFC 3339,
     /// so it sorts); empty when never.
     pub last_used: String,
+    /// The last revisions of it that did not stand, newest last.
+    pub rejected: Vec<RejectedRevision>,
+    /// Judged uses of the revision on trial, as `(good, bad)`; `None` when no
+    /// revision is on trial.
+    pub on_trial: Option<(u64, u64)>,
+}
+
+/// A revision of a learned skill that did not stand: the promoter refused it
+/// (`refused`), or the skill's judged uses were worse with it than with the
+/// version it replaced (`rolled_back`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RejectedRevision {
+    /// RFC 3339.
+    pub at: String,
+    pub kind: String,
+    pub reason: String,
+    /// The edits, in a line: each op with the start of its target and content.
+    pub edits: String,
 }
 
 /// Every live learned skill, global first.
@@ -1007,6 +1479,25 @@ pub fn library(layers: &Layers) -> Vec<LearnedSkill> {
                     .as_str()
                     .unwrap_or_default()
                     .to_owned(),
+                rejected: raw["skills"][&name]["rejected"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|record| {
+                        let text =
+                            |field: &str| record[field].as_str().unwrap_or_default().to_owned();
+                        RejectedRevision {
+                            at: text("at"),
+                            kind: text("kind"),
+                            reason: text("reason"),
+                            edits: text("edits_summary"),
+                        }
+                    })
+                    .collect(),
+                on_trial: raw["skills"][&name]["trial"].is_object().then(|| {
+                    let count = |field: &str| raw["skills"][&name][field].as_u64().unwrap_or(0);
+                    (count("trial_good"), count("trial_bad"))
+                }),
                 name,
             });
         }
@@ -1050,19 +1541,35 @@ pub fn library_overview(skills: &[LearnedSkill]) -> String {
         } else {
             String::new()
         };
-        let checks = checks + &judged;
+        let trial = skill.on_trial.map_or_else(String::new, |(good, bad)| {
+            format!("; revision on trial: {good} good, {bad} bad")
+        });
+        let checks = checks + &judged + &trial;
+        let mut entry = format!(
+            "- {} [{}]: {} (offered {}, activated {}, viewed {} in {seen} requests{probation}{checks})",
+            skill.name,
+            skill.layer.as_str(),
+            skill.description,
+            skill.usage.offered,
+            skill.usage.uses,
+            skill.usage.views,
+        );
+        // What was tried on this skill and did not stand, newest first, so a
+        // revision is not proposed again as it was.
+        for rejected in skill.rejected.iter().rev().take(REJECTED_SHOWN) {
+            let _ = write!(
+                entry,
+                "\n  rejected before: {} {}: {}; tried: {}",
+                rejected.kind,
+                rejected.at.get(..10).unwrap_or(&rejected.at),
+                rejected.reason,
+                rejected.edits
+            );
+        }
         groups
             .entry(skill.category.as_str())
             .or_default()
-            .push(format!(
-                "- {} [{}]: {} (offered {}, activated {}, viewed {} in {seen} requests{probation}{checks})",
-                skill.name,
-                skill.layer.as_str(),
-                skill.description,
-                skill.usage.offered,
-                skill.usage.uses,
-                skill.usage.views,
-            ));
+            .push(entry);
     }
     groups
         .into_iter()
@@ -1393,6 +1900,16 @@ pub(crate) fn unsafe_hits(text: &str) -> Vec<&'static str> {
 // ---------------------------------------------------------------------------
 // Intents
 
+/// One structured change to a learned skill's `SKILL.md`: `append` adds
+/// `content` at the end; `insert_after` puts it after the one place `target`
+/// occurs; `replace` swaps that `target` for it; `delete` removes it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EditOp {
+    pub op: String,
+    pub target: Option<String>,
+    pub content: Option<String>,
+}
+
 /// What `/refine` asks for one learned skill.
 #[derive(Clone, Debug, Default)]
 pub struct Intent {
@@ -1402,6 +1919,8 @@ pub struct Intent {
     pub body: Option<String>,
     pub old_string: Option<String>,
     pub new_string: Option<String>,
+    /// `edit`: the changes, applied in order.
+    pub edits: Vec<EditOp>,
     pub files: BTreeMap<String, String>,
     pub path: Option<String>,
     pub absorbed_into: Option<String>,
@@ -1420,6 +1939,22 @@ impl Intent {
             body: text("body"),
             old_string: text("old_string"),
             new_string: text("new_string"),
+            // An entry that is not an object stays, empty, so the refusal can
+            // name its index.
+            edits: value["edits"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|edit| EditOp {
+                    op: edit["op"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_ascii_lowercase(),
+                    target: edit["target"].as_str().map(str::to_owned),
+                    content: edit["content"].as_str().map(str::to_owned),
+                })
+                .collect(),
             files: value["files"]
                 .as_object()
                 .map(|files| {
@@ -1471,6 +2006,120 @@ impl Verdict {
             undo: Value::Null,
         }
     }
+}
+
+impl Intent {
+    /// What the intent spends of [`SKILL_EDIT_BUDGET`]: each of its `edits`, and
+    /// one for a `patch`; a `create` or a whole `update` spends none (an
+    /// `update` of a skill that works is refused instead).
+    #[must_use]
+    pub fn edit_cost(&self) -> usize {
+        match self.action.as_str() {
+            "edit" => self.edits.len().max(1),
+            "patch" => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// The edits already made to each learned skill in one refinement, against
+/// [`SKILL_EDIT_BUDGET`]. A refinement keeps one across its intents and its repair
+/// pass; [`promote`] alone checks one intent against a budget of its own.
+#[derive(Clone, Debug, Default)]
+pub struct EditBudget {
+    spent: BTreeMap<String, usize>,
+}
+
+impl EditBudget {
+    /// Why `intent` would take its skill past the budget, or `None`.
+    fn refusal(&self, intent: &Intent) -> Option<String> {
+        let cost = intent.edit_cost();
+        let spent = self.spent.get(&intent.name).copied().unwrap_or(0);
+        (cost > 0 && spent + cost > SKILL_EDIT_BUDGET).then(|| {
+            format!(
+                "budget: {} may take {SKILL_EDIT_BUDGET} edits in one refinement ({spent} already made, this intent has {cost}); send at most {} edit(s), the ones that matter most, and leave the rest for a later refinement",
+                intent.name,
+                SKILL_EDIT_BUDGET.saturating_sub(spent)
+            )
+        })
+    }
+
+    fn spend(&mut self, intent: &Intent) {
+        let cost = intent.edit_cost();
+        if cost > 0 {
+            *self.spent.entry(intent.name.clone()).or_default() += cost;
+        }
+    }
+}
+
+/// Apply an `edit` intent's changes, in order, to `live`, the whole `SKILL.md`
+/// (front matter included, so a description can be narrowed). Any change whose
+/// target is missing or not unique refuses all of them, naming it.
+fn apply_edits(live: &str, edits: &[EditOp]) -> Result<String, String> {
+    if edits.is_empty() {
+        return Err("shape: edit requires a non-empty edits array".to_owned());
+    }
+    let mut text = live.to_owned();
+    for (index, edit) in edits.iter().enumerate() {
+        let content = edit.content.as_deref();
+        match edit.op.as_str() {
+            "append" => {
+                let content = content
+                    .ok_or_else(|| format!("shape: edits[{index}] append requires content"))?;
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(content);
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+            }
+            op @ ("insert_after" | "replace" | "delete") => {
+                let target = edit
+                    .target
+                    .as_deref()
+                    .filter(|target| !target.is_empty())
+                    .ok_or_else(|| format!("shape: edits[{index}] {op} requires a target"))?;
+                let content = if op == "delete" {
+                    ""
+                } else {
+                    content.ok_or_else(|| format!("shape: edits[{index}] {op} requires content"))?
+                };
+                let start = match text.matches(target).count() {
+                    1 => text.find(target).expect("counted once"),
+                    0 => {
+                        return Err(format!(
+                            "shape: edits[{index}] target is not in SKILL.md (as the edits before it left it)"
+                        ));
+                    }
+                    count => {
+                        return Err(format!(
+                            "shape: edits[{index}] target matches {count} places; quote more of the line"
+                        ));
+                    }
+                };
+                let end = start + target.len();
+                if op == "insert_after" {
+                    // Content after a target that ends its line is a line of its
+                    // own, whether or not the model began it with a newline.
+                    let rest = &text[end..];
+                    let ends_line =
+                        rest.is_empty() || rest.starts_with('\n') || rest.starts_with("\r\n");
+                    let begins_line = content.starts_with('\n') || content.starts_with("\r\n");
+                    let separator = if ends_line && !begins_line { "\n" } else { "" };
+                    text.insert_str(end, &format!("{separator}{content}"));
+                } else {
+                    text.replace_range(start..end, content);
+                }
+            }
+            other => {
+                return Err(format!(
+                    "shape: edits[{index}] op {other:?} must be append, insert_after, replace or delete"
+                ));
+            }
+        }
+    }
+    Ok(text)
 }
 
 /// A relative subfile path under one of the four support directories, made of
@@ -1700,17 +2349,44 @@ fn lint(
     findings
 }
 
-/// Promote one intent: shape, lint, and only on a clean lint, land.
+/// Promote one intent: shape, lint, and only on a clean lint, land. The intent
+/// is held to [`SKILL_EDIT_BUDGET`] on its own; a refinement that promotes
+/// several uses [`promote_within`] so its intents share one budget.
 #[must_use]
+pub fn promote(layers: &Layers, intent: &Intent, context: &PromoteContext) -> Verdict {
+    promote_within(layers, intent, context, &mut EditBudget::default())
+}
+
+/// [`promote`] against the edits the refinement already made (`budget`), which
+/// a landed `edit` or `patch` adds to.
+#[must_use]
+pub fn promote_within(
+    layers: &Layers,
+    intent: &Intent,
+    context: &PromoteContext,
+    budget: &mut EditBudget,
+) -> Verdict {
+    let verdict = promote_unbudgeted(layers, intent, context, budget);
+    if verdict.ok {
+        budget.spend(intent);
+    }
+    verdict
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one admission gate, read top to bottom"
 )]
-pub fn promote(layers: &Layers, intent: &Intent, context: &PromoteContext) -> Verdict {
+fn promote_unbudgeted(
+    layers: &Layers,
+    intent: &Intent,
+    context: &PromoteContext,
+    budget: &EditBudget,
+) -> Verdict {
     let action = intent.action.as_str();
     if !matches!(
         action,
-        "create" | "update" | "patch" | "remove_file" | "delete"
+        "create" | "update" | "patch" | "edit" | "remove_file" | "delete"
     ) {
         return Verdict::reject(None, vec![format!("routing: unknown action {action:?}")]);
     }
@@ -1773,7 +2449,7 @@ pub fn promote(layers: &Layers, intent: &Intent, context: &PromoteContext) -> Ve
             return Verdict::reject(
                 Some(layer),
                 vec![format!(
-                    "routing: {} already exists; patch or update it",
+                    "routing: {} already exists; edit or patch it",
                     intent.name
                 )],
             );
@@ -1788,8 +2464,27 @@ pub fn promote(layers: &Layers, intent: &Intent, context: &PromoteContext) -> Ve
             );
         }
     }
+    if let Some(refusal) = budget.refusal(intent) {
+        return Verdict::reject(Some(layer), vec![refusal]);
+    }
+    if action == "update"
+        && let Some(counters) = usage(layers, layer).1.get(&intent.name)
+        && !counters.unproven()
+    {
+        return Verdict::reject(
+            Some(layer),
+            vec![format!(
+                "proven: {} has worked ({} judged worked, {} checks passed), so a whole rewrite is refused: it throws away what works. Use action edit with at most {SKILL_EDIT_BUDGET} edits (append, insert_after, replace, delete), or patch",
+                intent.name, counters.worked, counters.checked_pass
+            )],
+        );
+    }
     let live = std::fs::read_to_string(directory.join("SKILL.md")).ok();
     let shaped = match action {
+        "edit" => match apply_edits(live.as_deref().unwrap_or_default(), &intent.edits) {
+            Ok(text) => Some(text),
+            Err(finding) => return Verdict::reject(Some(layer), vec![finding]),
+        },
         "create" | "update" => match &intent.body {
             Some(body) => Some(body.clone()),
             None => {
@@ -1869,7 +2564,18 @@ pub fn promote(layers: &Layers, intent: &Intent, context: &PromoteContext) -> Ve
     }
 }
 
-fn ledger_entry(intent: &Intent) -> Value {
+/// A fresh id for one change, so the ledger line, the undo and a trial name it
+/// the same way.
+fn change_id() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "c{}-{}",
+        chrono::Utc::now().format("%Y%m%d%H%M%S%3f"),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+fn ledger_entry(intent: &Intent, id: &str) -> Value {
     let mut evidence = redact(intent.evidence.trim());
     if evidence.chars().count() > EVIDENCE_MAX_CHARS {
         evidence = evidence
@@ -1882,6 +2588,7 @@ fn ledger_entry(intent: &Intent) -> Value {
         "at": now(),
         "action": intent.action,
         "reason": redact(intent.reason.trim()),
+        "id": id,
         "evidence": evidence,
     });
     if let Some(path) = &intent.path {
@@ -1889,6 +2596,9 @@ fn ledger_entry(intent: &Intent) -> Value {
     }
     if let Some(umbrella) = &intent.absorbed_into {
         entry["absorbed_into"] = json!(umbrella);
+    }
+    if intent.action == "edit" {
+        entry["edits"] = json!(edits_summary(intent));
     }
     entry
 }
@@ -1934,9 +2644,10 @@ fn land(
     root: &Path,
 ) -> Result<Value, String> {
     let directory = root.join(&intent.name);
+    let id = change_id();
     match intent.action.as_str() {
         "delete" => {
-            append_ledger(&directory, &ledger_entry(intent));
+            append_ledger(&directory, &ledger_entry(intent, &id));
             let archived = archive(root, &intent.name)?;
             mark_archived(layers, layer, root, &intent.name);
             Ok(json!({"archived": archived.display().to_string()}))
@@ -1951,8 +2662,9 @@ fn land(
             update_usage(&layers.usage_file(layer, root), |usage| {
                 clear_script_marks(usage, &intent.name, &[relative]);
             });
-            append_ledger(&directory, &ledger_entry(intent));
+            append_ledger(&directory, &ledger_entry(intent, &id));
             Ok(json!({
+                "ledger_id": id,
                 "files": {relative: before},
                 "written": skill_hash(&directory),
                 WRITTEN_FILES: {relative: null},
@@ -1999,6 +2711,13 @@ fn land(
                 .map(|(relative, target)| ((*relative).clone(), json!(file_hash(target))))
                 .collect::<Map<_, _>>();
             let (requests, _) = usage(layers, layer);
+            let undo = json!({
+                "ledger_id": id,
+                "body": live,
+                "files": previous,
+                "written": written,
+                WRITTEN_FILES: written_files,
+            });
             if intent.action == "create" {
                 write_atomic(
                     &directory.join(MARKER_FILE),
@@ -2011,6 +2730,9 @@ fn land(
                 });
             } else {
                 update_usage(&layers.usage_file(layer, root), |usage| {
+                    // The version this replaces is the incumbent, kept until the
+                    // revision has shown itself better ([`settle_trial`]).
+                    begin_trial(usage, &intent.name, &id, intent, &undo);
                     bump(usage, &intent.name, "patch");
                     // A skill that was rewritten is tried afresh.
                     usage["skills"][&intent.name]["trial_good"] = json!(0);
@@ -2022,14 +2744,10 @@ fn land(
                         &intent.files.keys().map(String::as_str).collect::<Vec<_>>(),
                     );
                 });
+                log_revision(layers, "started", &intent.name, &id);
             }
-            append_ledger(&directory, &ledger_entry(intent));
-            Ok(json!({
-                "body": live,
-                "files": previous,
-                "written": written,
-                WRITTEN_FILES: written_files,
-            }))
+            append_ledger(&directory, &ledger_entry(intent, &id));
+            Ok(undo)
         }
     }
 }
@@ -2073,7 +2791,11 @@ pub fn changed_since(
     undo: &Value,
 ) -> Option<String> {
     let written = undo["written"].as_str()?;
-    if !matches!(action, "create" | "update" | "patch" | "remove_file") || !valid_name(name) {
+    if !matches!(
+        action,
+        "create" | "update" | "patch" | "edit" | "remove_file"
+    ) || !valid_name(name)
+    {
         return None;
     }
     let directory = layers.root(Layer::parse(level)?)?.join(name);
@@ -2142,7 +2864,7 @@ pub fn restore(
             append_ledger(&directory, &entry("rollback of delete"));
             Ok(())
         }
-        "update" | "patch" | "remove_file" => {
+        "update" | "patch" | "edit" | "remove_file" => {
             if !is_learned(&root, name) {
                 return Err(format!("{name} is no longer live"));
             }
@@ -2177,6 +2899,7 @@ pub fn spec() -> String {
         "{script_quote_min}",
         &super::refine::QUOTE_MIN_CHARS.to_string(),
     )
+    .replace("{edit_budget}", &SKILL_EDIT_BUDGET.to_string())
 }
 
 /// How `/refine` writes learned skills: the format every intent must meet.
@@ -2188,13 +2911,17 @@ Facts and procedure: a verified fact goes in as the fact itself, labelled with w
 
 A command sequence that solved the task is worth keeping as a script of the skill (`scripts/<name>`), written so it does the whole job when run again, not as steps in prose: a returning task is done at once by running it, where a rule in words has to be worked out again. When the conversation ran the script and it exited cleanly, say so in the intent's `script_runs`: {"path": "scripts/<name>", "evidence": "a verbatim quote of the run's result"}. The evidence is copied word for word from the tool result of that run and is at least {script_quote_min} characters; when the script's own output is shorter, quote more of the same result (the result of a process run also holds its exit line). The host checks the quote against the tool result and the call that made it, and marks the script as tested; a script no run is quoted for is listed as not run yet, and a script changed later loses the mark.
 
-Compare first: if a learned skill already covers the class of work, patch or update it instead of creating a near-duplicate. When a new rule contradicts an older learned skill, rewrite the stale statement in the same refinement. When two learned skills plainly cover the same class, patch the broader one to absorb the other and delete the narrower one with absorbed_into set to the survivor.
+Compare first: if a learned skill already covers the class of work, edit, patch or update it instead of creating a near-duplicate. When a new rule contradicts an older learned skill, rewrite the stale statement in the same refinement. When two learned skills plainly cover the same class, patch the broader one to absorb the other and delete the narrower one with absorbed_into set to the survivor.
 
 Create skills at the altitude of the class of work (`rust-test-debugging`, not `fix-test-in-foo-rs`), so the next lesson of the same kind patches into it.
 
+Revise in small steps: change an existing learned skill with the `edit` action, a list of at most {edit_budget} changes applied in order to the live SKILL.md: {"op":"append","content":"..."} adds at the end; {"op":"insert_after","target":"...","content":"..."} puts content after `target`; {"op":"replace","target":"...","content":"..."} swaps `target` for content; {"op":"delete","target":"..."} removes it. A `target` is an exact quote that occurs exactly once (as the edits before it left the text); one that is missing or occurs more than once refuses the whole intent, naming the edit. One refinement may make at most {edit_budget} edits to one skill, summed over all its intents, and a `patch` is one edit: choose the changes that matter most and leave the rest for a later refinement. A whole `update` of a skill that has been seen to work (a review judged it worked, or a check passed after it) is refused: use `edit`. `update` is for a skill not yet seen to work.
+
+A revision is on trial. The version it replaced is kept: when the skill's next judged uses go worse with the revision (two bad, and more bad than good), the host puts the earlier version back; the revision is kept for good once they go better (two good, and more good than bad), and a tie leaves the trial open. Under <learned_skills>, "rejected before" lines are revisions of that skill that were refused or rolled back, with why and what was tried: do not propose the same change again.
+
 "checks after use" under <learned_skills> counts turns that used the skill and then ran the project's verification checks, by how they ended. Repeated fails after use make a skill a candidate to fix: patch the step the failing work followed, or, when it passes in some situations and fails in others, split it into variants whose descriptions name when each applies. Never delete a skill because checks failed after it: a failure can come from the task, not the skill, and a skill that helps only in some contexts averages out to no effect while still being worth keeping.
 
-Intent fields: {"action":"create|update|patch|remove_file|delete","name":"lowercase-hyphenated","level":"project|global (create only)","body":"full SKILL.md (create/update)","old_string":"patch: text that occurs exactly once in the live SKILL.md","new_string":"patch: replacement","files":{"references/<topic>.md":"content"},"path":"remove_file: relative path","absorbed_into":"delete: the learned skill that absorbed this one","script_runs":[{"path":"scripts/<name>","evidence":"a verbatim quote of the result of running it"}],"reason":"why","evidence":"a verbatim quote from the conversation"}
+Intent fields: {"action":"create|update|patch|edit|remove_file|delete","name":"lowercase-hyphenated","level":"project|global (create only)","body":"full SKILL.md (create/update)","old_string":"patch: text that occurs exactly once in the live SKILL.md","new_string":"patch: replacement","edits":[{"op":"append|insert_after|replace|delete","target":"exact text that occurs once (not for append)","content":"the text to add or put in its place (not for delete)"}],"files":{"references/<topic>.md":"content"},"path":"remove_file: relative path","absorbed_into":"delete: the learned skill that absorbed this one","script_runs":[{"path":"scripts/<name>","evidence":"a verbatim quote of the result of running it"}],"reason":"why","evidence":"a verbatim quote from the conversation"}
 
 Format, enforced:
 - SKILL.md opens with front matter: `---`, `name: <the intent name>`, `description: <one sentence that says when to use it, trigger first>`, `category: <one lowercase word or hyphenated phrase, reusing an existing category>`, `---`.
@@ -3299,5 +4026,612 @@ mod tests {
             redact("card 4111 1111 1111 1111 123 exp"),
             "card [REDACTED:pii:credit_card] 123 exp"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded edits, revisions on trial, the rejected buffer
+
+    fn land_skill(layers: &Layers, name: &str, body: &str) {
+        let verdict = promote(layers, &create(name, body), &PromoteContext::default());
+        assert!(verdict.ok, "{:?}", verdict.findings);
+    }
+
+    fn text_of(layers: &Layers, name: &str) -> String {
+        std::fs::read_to_string(
+            layers
+                .project
+                .clone()
+                .expect("project")
+                .join(name)
+                .join("SKILL.md"),
+        )
+        .expect("SKILL.md")
+    }
+
+    fn raw_usage(layers: &Layers) -> serde_json::Value {
+        let root = layers.project.clone().expect("project");
+        super::load_usage(&layers.usage_file(Layer::Project, &root))
+    }
+
+    fn edit(name: &str, edits: impl Into<serde_json::Value>) -> Intent {
+        Intent::from_value(&json!({
+            "action": "edit",
+            "name": name,
+            "edits": edits.into(),
+            "reason": "the user corrected the approach",
+            "evidence": "[User]: do it this way",
+        }))
+    }
+
+    fn appends(count: usize) -> serde_json::Value {
+        json!(
+            (0..count)
+                .map(|index| json!({"op": "append", "content": format!("Extra rule {index}.")}))
+                .collect::<Vec<_>>()
+        )
+    }
+
+    fn patch(name: &str, old: &str, new: &str) -> Intent {
+        Intent::from_value(&json!({
+            "action": "patch", "name": name, "old_string": old, "new_string": new,
+            "reason": "the user corrected the approach", "evidence": "[User]: do it this way",
+        }))
+    }
+
+    /// A proven `deploy` (it worked once) and a revision of it on trial.
+    fn deploy_on_trial(layers: &Layers) {
+        land_skill(layers, "deploy", "Run the deploy script.");
+        assert!(record_outcome(layers, "deploy", true, "", "it shipped"));
+        let landed = promote(
+            layers,
+            &edit(
+                "deploy",
+                json!([{"op": "replace", "target": "deploy script", "content": "deploy script, then restart"}]),
+            ),
+            &PromoteContext::default(),
+        );
+        assert!(landed.ok, "{:?}", landed.findings);
+    }
+
+    #[test]
+    fn each_edit_op_applies_in_order() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        land_skill(&layers, "deploy", "Build it.\nShip it.\nCheck it.");
+        let verdict = promote(
+            &layers,
+            &edit(
+                "deploy",
+                json!([
+                    {"op": "replace", "target": "Build it.", "content": "Build it with --locked."},
+                    // Its target is what the edit before it wrote.
+                    {"op": "insert_after", "target": "--locked.", "content": "Clean first."},
+                    {"op": "delete", "target": "Check it.\n"},
+                    {"op": "append", "content": "Tell the user."},
+                ]),
+            ),
+            &PromoteContext::default(),
+        );
+        assert!(verdict.ok, "{:?}", verdict.findings);
+        let text = text_of(&layers, "deploy");
+        assert!(text.starts_with("---\nname: deploy\n"), "{text}");
+        assert!(
+            text.ends_with("Build it with --locked.\nClean first.\nShip it.\nTell the user.\n"),
+            "{text}"
+        );
+        let ledger = std::fs::read_to_string(
+            layers
+                .project
+                .clone()
+                .expect("project")
+                .join("deploy/.ledger.jsonl"),
+        )
+        .expect("ledger");
+        assert!(
+            ledger.contains("\"action\":\"edit\"") && ledger.contains("\"id\":\"c"),
+            "{ledger}"
+        );
+        assert_eq!(usage(&layers, Layer::Project).1["deploy"].patches, 1);
+    }
+
+    #[test]
+    fn an_edit_with_a_missing_or_ambiguous_target_refuses_the_intent_naming_the_index() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        land_skill(&layers, "twice", "Run it. Run it again.");
+        let before = text_of(&layers, "twice");
+        for (edits, needle) in [
+            (
+                json!([{"op": "append", "content": "x"}, {"op": "replace", "target": "nowhere", "content": "y"}]),
+                "edits[1] target is not in SKILL.md",
+            ),
+            (
+                json!([{"op": "delete", "target": "Run it"}]),
+                "edits[0] target matches 2 places",
+            ),
+            (
+                json!([{"op": "flip", "target": "x"}]),
+                "edits[0] op \"flip\"",
+            ),
+            (
+                json!([{"op": "replace", "target": "Run it."}]),
+                "edits[0] replace requires content",
+            ),
+            (
+                json!([{"op": "append", "content": "ok"}, 7]),
+                "edits[1] op \"\"",
+            ),
+            (json!([]), "non-empty edits"),
+        ] {
+            let verdict = promote(&layers, &edit("twice", edits), &PromoteContext::default());
+            assert!(!verdict.ok, "{needle}");
+            assert!(
+                verdict
+                    .findings
+                    .iter()
+                    .any(|finding| finding.contains(needle)),
+                "{needle}: {:?}",
+                verdict.findings
+            );
+            // All of the edits or none: the append before the bad one did not land.
+            assert_eq!(text_of(&layers, "twice"), before, "{needle}");
+        }
+        assert_eq!(usage(&layers, Layer::Project).1["twice"].patches, 0);
+    }
+
+    #[test]
+    fn five_edits_are_refused_and_four_are_accepted() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        land_skill(&layers, "deploy", "Run the deploy script.");
+        let five = promote(
+            &layers,
+            &edit("deploy", appends(5)),
+            &PromoteContext::default(),
+        );
+        assert!(!five.ok);
+        assert!(
+            five.findings[0].starts_with("budget"),
+            "{:?}",
+            five.findings
+        );
+        assert!(!text_of(&layers, "deploy").contains("Extra rule"));
+        let four = promote(
+            &layers,
+            &edit("deploy", appends(super::SKILL_EDIT_BUDGET)),
+            &PromoteContext::default(),
+        );
+        assert!(four.ok, "{:?}", four.findings);
+        assert!(text_of(&layers, "deploy").contains("Extra rule 3."));
+    }
+
+    #[test]
+    fn the_edit_budget_is_summed_over_the_intents_for_one_skill() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let context = PromoteContext::default();
+        land_skill(&layers, "deploy", "Build it.\nShip it.");
+        land_skill(&layers, "other", "Other rule.");
+        let mut budget = super::EditBudget::default();
+        let three =
+            super::promote_within(&layers, &edit("deploy", appends(3)), &context, &mut budget);
+        assert!(three.ok, "{:?}", three.findings);
+        let two =
+            super::promote_within(&layers, &edit("deploy", appends(2)), &context, &mut budget);
+        assert!(!two.ok);
+        assert!(
+            two.findings[0].contains("3 already made") && two.findings[0].contains("at most 1"),
+            "{:?}",
+            two.findings
+        );
+        // A refused intent spends nothing, and a patch is one edit.
+        let patched = super::promote_within(
+            &layers,
+            &patch("deploy", "Build it.", "Build it twice."),
+            &context,
+            &mut budget,
+        );
+        assert!(patched.ok, "{:?}", patched.findings);
+        let over = super::promote_within(
+            &layers,
+            &patch("deploy", "Ship it.", "Ship it twice."),
+            &context,
+            &mut budget,
+        );
+        assert!(
+            !over.ok && over.findings[0].starts_with("budget"),
+            "{:?}",
+            over.findings
+        );
+        // The budget is per skill, and a new refinement starts a new one.
+        let elsewhere =
+            super::promote_within(&layers, &edit("other", appends(4)), &context, &mut budget);
+        assert!(elsewhere.ok, "{:?}", elsewhere.findings);
+        let fresh = super::promote_within(
+            &layers,
+            &patch("deploy", "Ship it.", "Ship it twice."),
+            &context,
+            &mut super::EditBudget::default(),
+        );
+        assert!(fresh.ok, "{:?}", fresh.findings);
+    }
+
+    #[test]
+    fn a_whole_update_of_a_proven_skill_is_refused_and_of_an_unproven_one_allowed() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let context = PromoteContext::default();
+        land_skill(&layers, "deploy", "Run the deploy script.");
+        let rewrite = |body: &str| {
+            let mut intent = create("deploy", body);
+            "update".clone_into(&mut intent.action);
+            intent
+        };
+        let unproven = promote(&layers, &rewrite("Run the deploy script twice."), &context);
+        assert!(unproven.ok, "{:?}", unproven.findings);
+        assert!(record_outcome(&layers, "deploy", true, "", "it shipped"));
+        let before = text_of(&layers, "deploy");
+        let proven = promote(&layers, &rewrite("Something else entirely."), &context);
+        assert!(!proven.ok);
+        assert!(
+            proven.findings[0].starts_with("proven")
+                && proven.findings[0].contains("edit with at most 4 edits"),
+            "{:?}",
+            proven.findings
+        );
+        assert_eq!(text_of(&layers, "deploy"), before);
+        let edited = promote(&layers, &edit("deploy", appends(1)), &context);
+        assert!(edited.ok, "{:?}", edited.findings);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one revision's whole life, read top to bottom"
+    )]
+    fn a_revision_judged_worse_twice_is_rolled_back_with_its_files_and_counters() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        land_skill(&layers, "deploy", "Run the deploy script.");
+        assert!(record_outcome(&layers, "deploy", true, "", "it shipped"));
+        let original = text_of(&layers, "deploy");
+        let before = usage(&layers, Layer::Project).1["deploy"];
+        let mut revision = edit(
+            "deploy",
+            json!([
+                {"op": "replace", "target": "deploy script", "content": "deploy script, then restart"},
+                {"op": "append", "content": "See references/why.md."},
+            ]),
+        );
+        revision
+            .files
+            .insert("references/why.md".to_owned(), "Because.".to_owned());
+        let landed = promote(&layers, &revision, &PromoteContext::default());
+        assert!(landed.ok, "{:?}", landed.findings);
+        let skill_dir = layers.project.clone().expect("project").join("deploy");
+        assert!(skill_dir.join("references/why.md").is_file());
+        let trial = raw_usage(&layers)["skills"]["deploy"]["trial"].clone();
+        assert_eq!(trial["ledger_id"], landed.undo["ledger_id"], "{trial}");
+        assert_eq!(trial["incumbent"]["worked"], 1);
+        assert!(trial["began"].is_string());
+        assert!(
+            std::fs::read_to_string(skill_dir.join(".ledger.jsonl"))
+                .expect("ledger")
+                .contains(landed.undo["ledger_id"].as_str().expect("id"))
+        );
+
+        let records = harness_types::diag::capture(|| {
+            record_outcome(&layers, "deploy", false, "the port was free", "in use");
+            assert!(
+                raw_usage(&layers)["skills"]["deploy"]["trial"].is_object(),
+                "one bad use settles nothing"
+            );
+            record_outcome(&layers, "deploy", false, "the port was free", "in use");
+        });
+        assert_eq!(text_of(&layers, "deploy"), original);
+        assert!(!skill_dir.join("references/why.md").exists());
+        let after = usage(&layers, Layer::Project).1["deploy"];
+        assert_eq!(
+            (
+                after.worked,
+                after.failed,
+                after.checked_pass,
+                after.checked_fail
+            ),
+            (
+                before.worked,
+                before.failed,
+                before.checked_pass,
+                before.checked_fail
+            )
+        );
+        assert_eq!(
+            (after.trial_good, after.trial_bad),
+            (before.trial_good, before.trial_bad)
+        );
+        let raw = raw_usage(&layers);
+        assert!(raw["skills"]["deploy"]["trial"].is_null(), "{raw}");
+        let rejected = &raw["skills"]["deploy"]["rejected"];
+        assert_eq!(rejected.as_array().map(Vec::len), Some(1), "{rejected}");
+        assert_eq!(rejected[0]["kind"], "rolled_back");
+        assert_eq!(rejected[0]["ledger_id"], landed.undo["ledger_id"]);
+        let reason = rejected[0]["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains("2 bad, 0 good") && reason.contains("1 worked"),
+            "{reason}"
+        );
+        let summary = rejected[0]["edits_summary"].as_str().expect("summary");
+        assert!(
+            summary.contains("replace \"deploy script\"") && summary.contains("append"),
+            "{summary}"
+        );
+        assert!(
+            rejected[0]["evidence"]
+                .as_str()
+                .expect("evidence")
+                .contains("the port was free"),
+            "{rejected}"
+        );
+        let event = records
+            .iter()
+            .find(|record| record.kind == "skill" && record.event == "rollback")
+            .expect("skill.rollback");
+        assert_eq!(event.fields["skill"], "deploy");
+        assert_eq!(
+            (event.fields["bad"].as_u64(), event.fields["good"].as_u64()),
+            (Some(2), Some(0))
+        );
+        assert!(
+            std::fs::read_to_string(skill_dir.join(".ledger.jsonl"))
+                .expect("ledger")
+                .contains("rollback of edit")
+        );
+        // ha learning report counts it.
+        let stats = super::revision_stats(&directory.path().join("data"), chrono::Utc::now());
+        assert!(
+            stats[1].contains("1 revised")
+                && stats[1].contains("0 on trial now")
+                && stats[1].contains("1 rolled back"),
+            "{stats:?}"
+        );
+    }
+
+    #[test]
+    fn a_revision_that_ties_stays_on_trial_and_two_good_uses_accept_it() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        deploy_on_trial(&layers);
+        let revised = text_of(&layers, "deploy");
+        record_outcome(&layers, "deploy", true, "", "it shipped again");
+        record_outcome(&layers, "deploy", false, "a", "b");
+        assert!(
+            raw_usage(&layers)["skills"]["deploy"]["trial"].is_object(),
+            "one good and one bad is a tie"
+        );
+        assert_eq!(text_of(&layers, "deploy"), revised);
+        let overview = library_overview(&library(&layers));
+        assert!(
+            overview.contains("revision on trial: 1 good, 1 bad"),
+            "{overview}"
+        );
+        let records = harness_types::diag::capture(|| {
+            record_outcome(&layers, "deploy", true, "", "it shipped a third time");
+        });
+        let raw = raw_usage(&layers);
+        assert!(raw["skills"]["deploy"]["trial"].is_null(), "{raw}");
+        assert!(raw["skills"]["deploy"]["rejected"].is_null(), "{raw}");
+        assert_eq!(text_of(&layers, "deploy"), revised);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.kind == "skill" && record.event == "revision_accepted")
+        );
+        let stats = super::revision_stats(&directory.path().join("data"), chrono::Utc::now());
+        assert!(stats[1].contains("1 accepted"), "{stats:?}");
+    }
+
+    #[test]
+    fn a_check_that_fails_after_a_revision_settles_its_trial_too() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        land_skill(&layers, "deploy", "Run the deploy script.");
+        assert!(record_outcome(&layers, "deploy", true, "", "it shipped"));
+        let original = text_of(&layers, "deploy");
+        let landed = promote(
+            &layers,
+            &edit("deploy", appends(1)),
+            &PromoteContext::default(),
+        );
+        assert!(landed.ok, "{:?}", landed.findings);
+        let failed = std::collections::BTreeMap::from([("deploy".to_owned(), false)]);
+        super::record_checks(&layers, &failed);
+        super::record_checks(&layers, &failed);
+        assert_eq!(text_of(&layers, "deploy"), original);
+        assert!(raw_usage(&layers)["skills"]["deploy"]["trial"].is_null());
+    }
+
+    #[test]
+    fn a_failing_incumbent_is_not_restored() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        land_skill(&layers, "deploy", "Run the deploy script.");
+        record_outcome(&layers, "deploy", false, "the port was free", "in use");
+        let landed = promote(
+            &layers,
+            &edit(
+                "deploy",
+                json!([{"op": "append", "content": "Check the port first."}]),
+            ),
+            &PromoteContext::default(),
+        );
+        assert!(landed.ok, "{:?}", landed.findings);
+        let revised = text_of(&layers, "deploy");
+        record_outcome(&layers, "deploy", false, "the port was free", "in use");
+        record_outcome(&layers, "deploy", false, "the port was free", "in use");
+        assert_eq!(
+            text_of(&layers, "deploy"),
+            revised,
+            "nothing better to go back to"
+        );
+        let raw = raw_usage(&layers);
+        assert!(raw["skills"]["deploy"]["trial"].is_null(), "{raw}");
+        assert!(raw["skills"]["deploy"]["rejected"].is_null(), "{raw}");
+        // Today's restriction stands.
+        let current = library(&layers).remove(0).usage;
+        assert!(current.restricted(), "{current:?}");
+        assert_eq!(current.failed, 3);
+    }
+
+    #[test]
+    fn a_skill_changed_since_the_revision_is_not_overwritten_by_a_rollback() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        deploy_on_trial(&layers);
+        let by_hand = skill("deploy", "The user rewrote this by hand.");
+        std::fs::write(
+            layers
+                .project
+                .clone()
+                .expect("project")
+                .join("deploy/SKILL.md"),
+            &by_hand,
+        )
+        .expect("a later edit");
+        record_outcome(&layers, "deploy", false, "a", "b");
+        record_outcome(&layers, "deploy", false, "a", "b");
+        assert_eq!(text_of(&layers, "deploy"), by_hand);
+        let raw = raw_usage(&layers);
+        assert!(raw["skills"]["deploy"]["trial"].is_null(), "{raw}");
+        let reason = raw["skills"]["deploy"]["rejected"][0]["reason"]
+            .as_str()
+            .expect("reason");
+        assert!(
+            reason.contains("changed since") && reason.contains("not rolled back"),
+            "{reason}"
+        );
+        // The counters are of the text that is there: not put back.
+        assert_eq!(usage(&layers, Layer::Project).1["deploy"].failed, 2);
+    }
+
+    #[test]
+    fn several_revisions_in_one_refinement_are_one_trial_with_the_first_incumbent() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        let context = PromoteContext::default();
+        land_skill(&layers, "deploy", "Run the deploy script.");
+        assert!(record_outcome(&layers, "deploy", true, "", "it shipped"));
+        let original = text_of(&layers, "deploy");
+        let mut budget = super::EditBudget::default();
+        for intent in [
+            edit("deploy", json!([{"op": "append", "content": "First."}])),
+            patch(
+                "deploy",
+                "Run the deploy script.",
+                "Run the deploy script twice.",
+            ),
+        ] {
+            let landed = super::promote_within(&layers, &intent, &context, &mut budget);
+            assert!(landed.ok, "{:?}", landed.findings);
+        }
+        let trial = raw_usage(&layers)["skills"]["deploy"]["trial"].clone();
+        assert_eq!(
+            trial["ledger_ids"].as_array().map(Vec::len),
+            Some(2),
+            "{trial}"
+        );
+        // The review's outcome of the text before the revisions is the
+        // incumbent's, not the revisions'.
+        assert!(super::record_outcome_of_incumbent(
+            &layers,
+            "deploy",
+            true,
+            "",
+            "it shipped before"
+        ));
+        let raw = raw_usage(&layers);
+        assert_eq!(
+            raw["skills"]["deploy"]["trial"]["incumbent"]["worked"], 2,
+            "{raw}"
+        );
+        assert_eq!(raw["skills"]["deploy"]["trial_good"], 0, "{raw}");
+        record_outcome(&layers, "deploy", false, "a", "b");
+        record_outcome(&layers, "deploy", false, "a", "b");
+        assert_eq!(text_of(&layers, "deploy"), original);
+        assert_eq!(usage(&layers, Layer::Project).1["deploy"].worked, 2);
+    }
+
+    #[test]
+    fn the_rejected_buffer_keeps_five_and_the_overview_shows_three() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        land_skill(&layers, "deploy", "Run the deploy script.");
+        for index in 0..7 {
+            let intent = edit(
+                "deploy",
+                json!([{
+                    "op": "replace",
+                    "target": format!("old {index}"),
+                    "content": format!("new {index} sk-abcdefghijklmnopqrstuvwxyz"),
+                }]),
+            );
+            assert!(super::record_refused(
+                &layers,
+                &intent,
+                &format!("shape: edits[0] target {index} is not in SKILL.md")
+            ));
+        }
+        assert!(!super::record_refused(
+            &layers,
+            &edit("nobody", appends(1)),
+            "x"
+        ));
+        let raw = raw_usage(&layers);
+        let rejected = raw["skills"]["deploy"]["rejected"]
+            .as_array()
+            .expect("rejected");
+        assert_eq!(rejected.len(), super::REJECTED_KEPT);
+        assert_eq!(rejected[0]["kind"], "refused");
+        assert!(
+            rejected[0]["reason"]
+                .as_str()
+                .expect("reason")
+                .contains("target 2 ")
+        );
+        let summary = rejected[4]["edits_summary"].as_str().expect("summary");
+        assert!(
+            summary.contains("old 6")
+                && summary.contains("REDACTED")
+                && !summary.contains("sk-abc"),
+            "{summary}"
+        );
+        let skills = library(&layers);
+        assert_eq!(skills[0].rejected.len(), 5);
+        let overview = library_overview(&skills);
+        let lines = overview
+            .lines()
+            .filter(|line| line.trim_start().starts_with("rejected before: refused "))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{overview}");
+        assert!(
+            lines[0].contains("target 6 ") && lines[0].contains("tried: replace \"old 6\""),
+            "{overview}"
+        );
+        assert!(!overview.contains("target 3 "), "{overview}");
+    }
+
+    #[test]
+    fn the_spec_teaches_the_edit_action_and_its_budget() {
+        let spec = super::spec();
+        assert!(!spec.contains("{edit_budget}"));
+        for needle in [
+            "`edit` action",
+            "at most 4 changes",
+            "at most 4 edits to one skill",
+            "A whole `update` of a skill that has been seen to work",
+            "rejected before",
+            "\"action\":\"create|update|patch|edit|remove_file|delete\"",
+        ] {
+            assert!(spec.contains(needle), "{needle}");
+        }
     }
 }

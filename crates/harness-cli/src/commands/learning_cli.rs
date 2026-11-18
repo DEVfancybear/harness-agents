@@ -3,7 +3,7 @@
 use clap::{Args, Subcommand};
 use harness_types::{ErrorCode, HarnessError};
 
-use crate::interactive::{bootstrap, cli_extras, harness, lessons, memory, self_eval};
+use crate::interactive::{bootstrap, cli_extras, harness, learned, lessons, memory, self_eval};
 
 #[derive(Debug, Args)]
 pub struct LearningCommand {
@@ -201,6 +201,11 @@ pub fn run(command: LearningCommand) -> Result<(), HarnessError> {
             // model is not an independent signal, so it never becomes one.
             println!();
             for line in self_eval::stats(&global, now) {
+                println!("{line}");
+            }
+            // The learned skills' revisions: bounded edits kept on trial.
+            println!();
+            for line in learned::revision_stats(&cli_extras::current_data_dir()?, now) {
                 println!("{line}");
             }
             if let Some(path) = html {
