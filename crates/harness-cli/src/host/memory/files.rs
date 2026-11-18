@@ -19,6 +19,12 @@ use std::time::{Duration, Instant};
 /// How often a waiting [`hold`] tries the lock again.
 const POLL: Duration = Duration::from_millis(5);
 
+/// How many times a step the system refuses for an instant is tried again, and
+/// how long it waits between tries: a rename over a file another handle has
+/// open, or a lock file just created, is refused on Windows for a moment.
+const TRANSIENT_TRIES: u32 = 100;
+const TRANSIENT_WAIT: Duration = Duration::from_millis(10);
+
 /// Distinguishes the temporary files of one process's concurrent writes.
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
@@ -29,17 +35,41 @@ static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 /// The directory or the file cannot be created or opened; the message names
 /// `what`.
 pub fn open_lock(path: &Path, what: &str) -> Result<File, String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("{what}: cannot create {}: {error}", parent.display()))?;
+    let mut tries = 0;
+    loop {
+        let opened = (|| {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    (
+                        error.kind(),
+                        format!("{what}: cannot create {}: {error}", parent.display()),
+                    )
+                })?;
+            }
+            File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+                .map_err(|error| {
+                    (
+                        error.kind(),
+                        format!("{what}: cannot open the lock {}: {error}", path.display()),
+                    )
+                })
+        })();
+        match opened {
+            Ok(file) => return Ok(file),
+            // On Windows, threads creating one directory at once, or a scanner
+            // holding the new file for a moment, are refused for an instant.
+            Err((std::io::ErrorKind::PermissionDenied, _)) if tries < TRANSIENT_TRIES => {
+                tries += 1;
+                std::thread::sleep(TRANSIENT_WAIT);
+            }
+            Err((_, message)) => return Err(message),
+        }
     }
-    File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .map_err(|error| format!("{what}: cannot open the lock {}: {error}", path.display()))
 }
 
 /// Try once to take the lock `file` stands for: `true` when this handle holds
@@ -127,14 +157,33 @@ pub fn write_atomic_checked(
             .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
         drop(file);
         check()?;
-        std::fs::rename(&temporary, path)
-            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        rename_over(&temporary, path)?;
         sync_directory(parent)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+/// Rename `from` over `to`, trying again for about a second when the system
+/// refuses it as a permission error, which on Windows is what a target open in
+/// another handle for that instant gives.
+fn rename_over(from: &Path, to: &Path) -> Result<(), String> {
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && tries < TRANSIENT_TRIES =>
+            {
+                tries += 1;
+                std::thread::sleep(TRANSIENT_WAIT);
+            }
+            Err(error) => return Err(format!("cannot write {}: {error}", to.display())),
+        }
+    }
 }
 
 /// Sync a directory, so a rename into it survives a crash. Only Unix can open
