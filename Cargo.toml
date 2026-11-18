@@ -78,7 +78,9 @@ ratatui = { version = "=0.30.2", default-features = false, features = ["crosster
 unicode-width = "=0.2.2"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Deny, not forbid: every library crate forbids it itself; the CLI denies it
+# and allows the one kernel32 call `support/boot.rs` makes.
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

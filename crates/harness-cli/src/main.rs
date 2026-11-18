@@ -1,6 +1,8 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![allow(clippy::struct_excessive_bools, reason = "one flag per launch mode")]
 
+#[path = "support/boot.rs"]
+mod boot;
 #[path = "support/bug_report.rs"]
 mod bug_report;
 #[path = "commands/delegation_cli.rs"]
