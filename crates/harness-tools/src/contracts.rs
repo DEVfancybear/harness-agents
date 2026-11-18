@@ -389,7 +389,7 @@ fn workspace_tool_schemas(hashline: bool) -> Vec<Value> {
                 "paths": {"type": "array", "items": string_schema(), "minItems": 1, "maxItems": READ_FILE_MAX_PATHS},
                 "offset": {"type": "integer", "description": "Zero-based first line; negative counts from the end."},
                 "limit": {"type": "integer", "minimum": 1, "description": format!("Lines to read, at most {READ_FILE_MAX_LINES}; more is read as {READ_FILE_MAX_LINES}.")},
-                "fresh": {"type": "boolean", "description": "Send the text again even when your earlier read_file result of it is still above and the file is unchanged (the answer then only points to that result)."}
+                "fresh": {"type": "boolean", "description": "Only for a file that has not changed since your earlier read_file result of it above: send its text again instead of a pointer to that result. A re-read of a file that changed since is answered with its changed lines, which are its current content; it needs no fresh."}
             }),
             &[],
         ),

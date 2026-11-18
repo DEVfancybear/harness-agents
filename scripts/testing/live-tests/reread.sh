@@ -52,17 +52,26 @@ run() {
   jget "$RX/$name.json" response >> "$LOG"
 }
 # What the requests sent from <home> hold: `requests <home> <text> <evidence>`
-# prints "<times text was sent> <read_file calls> <edit_file calls> <run_process calls>".
+# prints "<times text was sent> <read_file calls> <edit_file calls> <run_process calls>
+# <read_file calls that asked for "fresh": true>".
 requests() {
   py - "$(winpath "$1/data")" "$2" "$(winpath "$3")" <<'PY'
 import glob, json, os, sqlite3, sys
 data, text, evidence = sys.argv[1], sys.argv[2], sys.argv[3]
-hits, calls = 0, {"read_file": 0, "edit_file": 0, "run_process": 0}
+hits, calls, fresh = 0, {"read_file": 0, "edit_file": 0, "run_process": 0}, 0
 def walk(value):
     if isinstance(value, dict):
         name = value.get("name")
         if isinstance(name, str) and name in calls and "arguments" in value:
             calls[name] += 1
+            if name == "read_file":
+                try:
+                    fresh_read = json.loads(value["arguments"]).get("fresh") is True
+                except (TypeError, ValueError, AttributeError):
+                    fresh_read = False
+                if fresh_read:
+                    global fresh
+                    fresh += 1
         for item in value.values():
             walk(item)
     elif isinstance(value, list):
@@ -78,7 +87,7 @@ with open(evidence, "w", encoding="utf-8") as out:
                 hits += 1
                 out.write(f"{db} request {rowid}: ...{request[max(0, at - 300):at + 200]}...\n\n")
                 at = request.find(text, at + 1)
-print(hits, calls["read_file"], calls["edit_file"], calls["run_process"])
+print(hits, calls["read_file"], calls["edit_file"], calls["run_process"], fresh)
 PY
 }
 # Whether a run's `cost_usd` has its four parts adding up to a total above 0.
@@ -127,10 +136,10 @@ held=0
 for attempt in 1 2 3; do
   H="$RX/h1-$attempt"
   run "$H" "$P" "read-twice-$attempt" "$TASK1" --approval full-auto
-  read -r hits reads _ _ < <(requests "$H" "$FILLER" "$RX/evidence-1-$attempt.txt")
-  if [ "$reads" -ge 2 ]; then held=1; R1="$RX/read-twice-$attempt.json"; break; fi
+  read -r hits reads _ _ fresh < <(requests "$H" "$FILLER" "$RX/evidence-1-$attempt.txt")
+  if [ "$reads" -ge 2 ] && [ "$fresh" = 0 ]; then held=1; R1="$RX/read-twice-$attempt.json"; break; fi
 done
-check "precondition: the model read the file twice in one turn ($reads read_file calls; attempts: $attempt)" '[ "$held" = 1 ]'
+check "precondition: the model read the file twice in one turn, not asking for it fresh ($reads read_file calls, $fresh fresh; attempts: $attempt)" '[ "$held" = 1 ]'
 if [ "$held" = 1 ]; then
   check "the file's text reached the model once, not once per read ($hits; $RX/evidence-1-$attempt.txt)" '[ "$hits" = 1 ]'
   check "ha exec counts the pointer and the bytes it saved (reread: $(jget "$R1" reread))" '[ "$(jget "$R1" reread.unchanged)" -ge 1 ] 2>/dev/null && [ "$(jget "$R1" reread.saved_bytes)" -gt 1000 ] 2>/dev/null'
@@ -145,10 +154,10 @@ for attempt in 1 2 3; do
   (cd "$RX/p2" && git checkout -q -- . )
   H="$RX/h2-$attempt"
   run "$H" "$RX/p2" "read-edit-read-$attempt" "$TASK2" --approval full-auto
-  read -r hits reads edits _ < <(requests "$H" "$FILLER" "$RX/evidence-2-$attempt.txt")
-  if [ "$reads" -ge 2 ] && [ "$edits" -ge 1 ] && grep -q "status: final" "$RX/p2/notes/plan.txt"; then held=1; R2="$RX/read-edit-read-$attempt.json"; break; fi
+  read -r hits reads edits _ fresh < <(requests "$H" "$FILLER" "$RX/evidence-2-$attempt.txt")
+  if [ "$reads" -ge 2 ] && [ "$edits" -ge 1 ] && [ "$fresh" = 0 ] && grep -q "status: final" "$RX/p2/notes/plan.txt"; then held=1; R2="$RX/read-edit-read-$attempt.json"; break; fi
 done
-check "precondition: the model read, changed and read the file again ($reads reads, $edits edits; attempts: $attempt)" '[ "$held" = 1 ]'
+check "precondition: the model read, changed and read the file again, not asking for it fresh ($reads reads, $edits edits, $fresh fresh; attempts: $attempt)" '[ "$held" = 1 ]'
 if [ "$held" = 1 ]; then
   check "the lines that did not change reached the model once ($hits; $RX/evidence-2-$attempt.txt)" '[ "$hits" = 1 ]'
   check "ha exec counts the changed-lines read (reread: $(jget "$R2" reread))" '[ "$(jget "$R2" reread.delta)" -ge 1 ] 2>/dev/null'
@@ -160,7 +169,7 @@ held=0
 for attempt in 1 2 3; do
   H="$RX/h3-$attempt"
   run "$H" "$P" "ticks-$attempt" "$TASK3" --approval full-auto
-  read -r hits _ _ runs < <(requests "$H" "tick-$TOKEN" "$RX/evidence-3-$attempt.txt")
+  read -r hits _ _ runs _ < <(requests "$H" "tick-$TOKEN" "$RX/evidence-3-$attempt.txt")
   if [ "$runs" -ge 1 ]; then held=1; R3="$RX/ticks-$attempt.json"; break; fi
 done
 check "precondition: the model ran the command ($runs run_process calls; attempts: $attempt)" '[ "$held" = 1 ]'
