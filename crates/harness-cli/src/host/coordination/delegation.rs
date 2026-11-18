@@ -2296,8 +2296,10 @@ impl AgentsShared {
     /// A message a child sends with its `agent_message` tool.
     async fn send_from_child(&self, from: &TaskId, arguments: &Value) -> Result<Value, String> {
         let (message, role, name) = message_arguments(arguments)?;
-        let (sender_name, parent) = self
-            .update(from, |child| (child.name.clone(), child.parent.clone()))
+        let (sender_name, parent, solo) = self
+            .update(from, |child| {
+                (child.name.clone(), child.parent.clone(), child.solo)
+            })
             .ok_or("the sending child is gone")?;
         self.take_token(from.as_str())?;
         let parent_name = parent
@@ -2309,6 +2311,13 @@ impl AgentsShared {
         let to_parent = async |text: String| -> Result<&'static str, String> {
             self.update(from, |child| child.replied = true);
             match &parent {
+                // A child the host started for a judgement of its own (a
+                // goal's verifier, a plateau's strategist) answers the host,
+                // which reads what it sent with its answer. Sent on to the
+                // conversation, each message woke it for a turn of its own:
+                // 20 of 23 strategists did on 0.9.11, and one such message
+                // was taken as the person's answer to the agent's question.
+                None if solo => Ok("delivered"),
                 None => {
                     let _ = self.sender.send(SessionEvent::AgentMessage { text });
                     Ok("delivered")
@@ -9292,10 +9301,13 @@ mod real_worker_tests {
 
     /// Found live on 0.9.11: a strategist sent its parent the JSON it was
     /// asked for with `agent_message` and ended with a summary; the consult
-    /// read only the summary and saw no alternatives.
+    /// read only the summary and saw no alternatives. The message is the
+    /// host's to read, not the conversation's: sent on, it woke the parent for
+    /// a turn of its own, and once was taken as the person's answer to the
+    /// agent's question (bug report 20261118-160828).
     #[tokio::test]
     async fn a_consult_reads_the_object_its_explorer_sent_by_message() {
-        let bench = bench();
+        let mut bench = bench();
         let provider = Scripted::new(vec![
             Reply::Tool(
                 "agent_message",
@@ -9314,6 +9326,7 @@ mod real_worker_tests {
             answer.ends_with("I sent the parent the diagnosis."),
             "{answer}"
         );
+        no_child_event(&mut bench.events, Duration::from_millis(300)).await;
         // An answer that holds its own object is read as it is.
         let provider = Scripted::new(vec![Reply::Text("{\"diagnosis\":\"own\"}")]);
         let own = host(&bench, provider);

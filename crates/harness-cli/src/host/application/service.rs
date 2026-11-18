@@ -9153,6 +9153,57 @@ enum GoalRecord {
     Keep,
 }
 
+/// Whether a goal's turn that ended this way is an evaluation of its strategy.
+/// A turn that paused on the agent's question waits for the person, not on its
+/// strategy: evaluated, it counted toward a plateau and the strategist was
+/// asked for alternatives while the question was open - 30 seconds before the
+/// question's turn could end, its message then taken as the person's answer
+/// (bug report 20261118-160828).
+fn evaluates_strategy(turn: &harness_tools::TurnOutcome) -> bool {
+    turn.pending_question.is_none()
+}
+
+#[cfg(test)]
+mod evaluates_strategy_tests {
+    use harness_types::{AgentRunId, InputId, QuestionId, SessionId, TaskId};
+
+    fn turn(
+        stop: harness_tools::TurnStop,
+        question: Option<QuestionId>,
+    ) -> harness_tools::TurnOutcome {
+        harness_tools::TurnOutcome {
+            session_id: SessionId::generate(),
+            task_id: TaskId::generate(),
+            input_id: InputId::generate(),
+            run_id: AgentRunId::generate(),
+            run_revision: 0,
+            final_text: String::new(),
+            steps: 2,
+            tool_calls: 2,
+            executions: Vec::new(),
+            stop,
+            acceptance: harness_runtime::AcceptanceState::NotEvaluated,
+            goal: None,
+            pending_question: question,
+            final_finish_reason: None,
+            bank: harness_tools::BankTally::default(),
+        }
+    }
+
+    /// A turn that paused on the agent's question is not an evaluation of its
+    /// strategy; one that ended short of the goal, at its end or a bound, is.
+    #[test]
+    fn a_turn_waiting_on_the_person_is_not_an_evaluation() {
+        use harness_tools::TurnStop;
+        assert!(!super::evaluates_strategy(&turn(
+            TurnStop::NeedsInput,
+            Some(QuestionId::generate())
+        )));
+        assert!(super::evaluates_strategy(&turn(TurnStop::Final, None)));
+        assert!(super::evaluates_strategy(&turn(TurnStop::StepLimit, None)));
+    }
+}
+
 /// One turn, from admission to terminal event.
 ///
 /// Linear setup followed by one bounded turn: the length is the wiring, not
@@ -11966,7 +12017,7 @@ async fn run_turn(
     // A goal's turn that ended short of it is an evaluation of the strategy,
     // whether or not the model asked for one.
     if let Some(host) = &goal_host
-        && outcome.is_ok()
+        && outcome.as_ref().is_ok_and(evaluates_strategy)
         && !cancellation.is_cancelled()
     {
         host.evaluate_turn().await;

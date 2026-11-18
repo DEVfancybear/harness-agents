@@ -953,7 +953,18 @@ fn apply_strategy(state: &mut TaskState, arguments: &Value) -> Result<(), Harnes
             .filter(|value| !value.is_null())
             .map(|value| strategy_of(value, "decide.strategy"))
             .transpose()?;
-        state.strategy.decide(kind, to, evidence).map_err(refused)?;
+        // The strategist's alternative a switch takes, by its place in the
+        // list; a number written as text is read too.
+        let alternative = value.get("alternative").and_then(|place| {
+            place
+                .as_u64()
+                .or_else(|| place.as_str().and_then(|text| text.trim().parse().ok()))
+                .and_then(|place| usize::try_from(place).ok())
+        });
+        state
+            .strategy
+            .decide_taking(kind, to, evidence, alternative)
+            .map_err(refused)?;
     }
     Ok(())
 }
@@ -1224,7 +1235,8 @@ impl ExternalToolCatalog for TaskStateHost {
                     "strategy":{"type":"object","description":"switch: the strategy switched to.","properties":{
                         "name":{"type":"string"},
                         "why":{"type":"string"}
-                    },"required":["name"],"additionalProperties":false}
+                    },"required":["name"],"additionalProperties":false},
+                    "alternative":{"type":"integer","minimum":1,"description":"switch: the strategist's alternative this takes, by its place in the list it named (1 for the first); leave out for a strategy of your own."}
                 },"required":["kind","evidence"],"additionalProperties":false}
             },"required":["action"],"additionalProperties":false}
         }})]
@@ -1483,6 +1495,50 @@ mod tests {
             .execute(&json!({"action": "update", "decide": {"kind": "continue"}}))
             .expect_err("a decision gives its evidence");
         assert!(missing.to_string().contains("evidence"), "{missing}");
+    }
+
+    /// Found live on 0.9.11 (bug report 20261118-160828): the agent named the
+    /// strategist's alternative in the person's language, and no switch of 41
+    /// was counted as taking one. A switch says which it takes by its place.
+    #[test]
+    fn a_switch_takes_an_alternative_by_its_place_whatever_it_is_named() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let host = host(root.path());
+        let proposals = || {
+            vec![
+                Alternative {
+                    name: "Verify actual window-close behavior".to_owned(),
+                    ..Alternative::default()
+                },
+                Alternative {
+                    name: "Redesign image selection around independently bounded candidates"
+                        .to_owned(),
+                    ..Alternative::default()
+                },
+            ]
+        };
+        host.execute(&json!({"action": "update", "strategy": {"name": "Tách logic"}}))
+            .expect("named");
+        record_evaluation(host.path(), "unchanged", 0, 2, 0, "").expect("recorded");
+        record_proposals(host.path(), proposals(), String::new());
+        let shown = load(host.path()).render();
+        assert!(shown.contains("decide.alternative"), "{shown}");
+        host.execute(&json!({"action": "update", "decide": {"kind": "switch",
+            "evidence": "the strategist read it afresh", "alternative": 2,
+            "strategy": {"name": "Thiết kế lại lựa chọn ảnh với các ứng viên có giới hạn độc lập"}}}))
+            .expect("switched");
+        let decision = load(host.path()).strategy.decisions.last().cloned();
+        assert!(decision.is_some_and(|decision| decision.proposed));
+
+        // A place that names no alternative is a strategy of the agent's own.
+        record_evaluation(host.path(), "unchanged", 0, 2, 0, "").expect("recorded");
+        record_proposals(host.path(), proposals(), String::new());
+        host.execute(&json!({"action": "update", "decide": {"kind": "switch",
+            "evidence": "none fits", "alternative": "5",
+            "strategy": {"name": "Hỏi người dùng"}}}))
+            .expect("switched");
+        let state = load(host.path()).strategy;
+        assert_eq!(state.measures(), (2, 2, 1));
     }
 
     #[test]

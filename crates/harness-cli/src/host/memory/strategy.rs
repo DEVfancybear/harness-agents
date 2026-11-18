@@ -84,6 +84,10 @@ pub struct TeamRole {
     pub mandate: String,
 }
 
+/// How a switch says it takes one of the strategist's alternatives: by its
+/// place in the list, so a strategy named in the person's language still counts.
+pub const TAKE_ALTERNATIVE: &str = "\nTo take one of them, switch with decide.alternative set to its place in this list (1 for the first); name the strategy in your own words if you like.";
+
 impl Alternative {
     /// The alternative as the model reads it: its name and reason, then its
     /// team, one member a line.
@@ -370,11 +374,33 @@ impl StrategyState {
     ///
     /// # Errors
     /// A switch names no strategy, or one that is the current strategy.
+    #[cfg(test)]
     pub fn decide(
         &mut self,
         kind: DecisionKind,
         to: Option<Strategy>,
         evidence: String,
+    ) -> Result<StrategyDecision, String> {
+        self.decide_taking(kind, to, evidence, None)
+    }
+
+    /// [`Self::decide`], with the strategist's alternative a switch takes, by
+    /// its place among the proposals (1 for the first). A switch takes one
+    /// when it names it so, or when its name is the alternative's: matched by
+    /// name alone, none was ever counted live - the agent names its strategy
+    /// in the person's language, translating or shortening the strategist's
+    /// ("Redesign image selection around independently bounded candidates"
+    /// became "Thiết kế lại lựa chọn ảnh với các ứng viên có giới hạn độc
+    /// lập"), and 0.9.11 counted 0 of 41 switches as taking an alternative.
+    ///
+    /// # Errors
+    /// A switch names no strategy, or one that is the current strategy.
+    pub fn decide_taking(
+        &mut self,
+        kind: DecisionKind,
+        to: Option<Strategy>,
+        evidence: String,
+        alternative: Option<usize>,
     ) -> Result<StrategyDecision, String> {
         let from = self.strategy_name();
         let mut decision = StrategyDecision {
@@ -393,10 +419,14 @@ impl StrategyState {
                     "task_state: {from:?} is the current strategy; continue with it, or switch to another"
                 ));
             }
-            decision.proposed = self
-                .proposals
-                .iter()
-                .any(|proposal| same_name(&proposal.name, &to.name));
+            let taken = alternative
+                .and_then(|place| place.checked_sub(1))
+                .is_some_and(|index| index < self.proposals.len());
+            decision.proposed = taken
+                || self
+                    .proposals
+                    .iter()
+                    .any(|proposal| same_name(&proposal.name, &to.name));
             decision.to.clone_from(&to.name);
             self.current = Some(to);
         }
@@ -521,6 +551,7 @@ impl StrategyState {
                 for proposal in &self.proposals {
                     proposal.render("", text);
                 }
+                text.push_str(TAKE_ALTERNATIVE);
                 if self
                     .proposals
                     .iter()
