@@ -137,6 +137,13 @@ fn g13_json_reports_usage_and_the_memory_features_that_were_off() {
         "cost_usd: {on}"
     );
     assert_eq!(on["memory"]["off"], serde_json::json!([]), "{on}");
+    // The hindsight step judge calls a model; the mock profile has none, so
+    // the run says it judged nothing and why.
+    assert_eq!(
+        on["step_judge"],
+        serde_json::json!({"judged": false, "reason": "mock"}),
+        "{on}"
+    );
     let off = exec(&[("HA_MEMORY", "off")]);
     assert_eq!(
         off["memory"]["off"],

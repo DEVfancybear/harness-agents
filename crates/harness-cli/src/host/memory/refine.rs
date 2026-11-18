@@ -4592,6 +4592,14 @@ pub async fn auto_refine(
         // it saved as memory too would be kept twice.
         extra.push(MARKDOWN_STORE_POLICY.to_owned());
     }
+    // The steps a separate judge found did not help, in the turns judged since
+    // this conversation's review last read them.
+    let step_judgments = super::step_judge::review_part(
+        &scopes.global,
+        &scopes.local,
+        &conversation_of(&scopes.local),
+    );
+    extra.extend(step_judgments.iter().map(|part| part.text.clone()));
     let local_baseline = load_raw(&scopes.local);
     let global_baseline = load_raw(&scopes.global);
     let mut proposal = plan(
@@ -4606,6 +4614,9 @@ pub async fn auto_refine(
         extra,
     )
     .await?;
+    if let Some(part) = &step_judgments {
+        super::step_judge::mark_given(&scopes.local, &part.through);
+    }
     // Every memory edit quotes what the review read: the conversation, which
     // holds a child's findings too. The gate's instructions are a model's
     // words, not the user's, and are no evidence.

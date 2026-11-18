@@ -11714,6 +11714,46 @@ async fn run_turn(
             )
             .await;
         }
+        // A hindsight judge of the turn's steps (arXiv 2611.17167): a turn that
+        // ended with an answer after enough tool calls has each action scored
+        // for whether it helped, with the whole turn in view. A review, so
+        // memory's `reviews` off turns it off; a model call of the helper's
+        // beside the conversation, after the answer.
+        if super::step_judge::gate(
+            super::step_judge::mode(&config_file, &environment),
+            reviews_on,
+            helper_provider.capabilities().fixture,
+            turn.stop == harness_tools::TurnStop::Final && !turn.final_text.trim().is_empty(),
+            usize::try_from(turn.tool_calls).unwrap_or(usize::MAX),
+        )
+        .is_ok()
+            && !cancellation.is_cancelled()
+        {
+            let activated = super::step_judge::activated_skills(&turn.executions);
+            let learned = if activated.is_empty() {
+                std::collections::BTreeSet::new()
+            } else {
+                super::step_judge::learned_names(&learning.layers)
+            };
+            let judge = super::step_judge::Judge::new(
+                Arc::clone(&helper_provider),
+                helper_model.clone(),
+                super::harness::global_dir(&data_dir),
+                goal_task.as_str().to_owned(),
+                super::bootstrap::project_key_of(&learning.context.workspace),
+            );
+            let facts = super::step_judge::TurnFacts {
+                session: turn.session_id.clone(),
+                task: turn.task_id.clone(),
+                answer: turn.final_text.clone(),
+                activated,
+                learned,
+            };
+            let store_dir = store_dir.clone();
+            spawn_off_workers(async move {
+                super::step_judge::judge_in(store_dir, judge, facts).await;
+            });
+        }
         if lessons_on {
             refine_cadence.note_in_play(super::learned::record_turn(
                 &learning.layers,

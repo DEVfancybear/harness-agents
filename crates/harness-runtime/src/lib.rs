@@ -3641,6 +3641,56 @@ pub async fn conversation_transcript(
     Ok(parts.join("\n\n"))
 }
 
+/// One tool call a turn made, with the result the model was shown for it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnAction {
+    pub name: String,
+    /// The call's arguments as the model wrote them (JSON text).
+    pub arguments: String,
+    /// What the model was shown, when the call's result was recorded.
+    pub result: Option<String>,
+}
+
+/// The tool calls the turn of `session_id` made, in the order the model made
+/// them: the calls of its completed model steps, each once, with its recorded
+/// result. A call the harness ran itself (an action bank node) is not one.
+///
+/// # Errors
+/// The store cannot be read.
+pub async fn turn_actions(
+    store: &SqliteStore,
+    session_id: &SessionId,
+) -> Result<Vec<TurnAction>, RuntimeError> {
+    let decoded = decoded_attempts(store, session_id).await?;
+    let attempts = attempts_in(&decoded, &["completed", "canceled"]);
+    let results = store.recovered_tool_results(session_id).await?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut actions = Vec::new();
+    for attempt in attempts {
+        let Some(response) = attempt.response.as_ref() else {
+            continue;
+        };
+        // An unfinished response's calls never ran.
+        if !response.is_dispatchable() {
+            continue;
+        }
+        for call in &response.tool_calls {
+            if !seen.insert(call.call_id.clone()) {
+                continue;
+            }
+            actions.push(TurnAction {
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                result: results
+                    .iter()
+                    .rfind(|result| result.call_id.as_deref() == Some(call.call_id.as_str()))
+                    .map(|result| result.text.clone()),
+            });
+        }
+    }
+    Ok(actions)
+}
+
 /// A part's text as the transcript holds it: a blank line inside it is kept
 /// as a line holding one space, so the blank lines between parts are the only
 /// ones. A label that a tool result (a fetched page, a file) carries after a

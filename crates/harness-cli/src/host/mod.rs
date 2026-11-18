@@ -196,6 +196,8 @@ pub mod skills;
 pub mod sleep;
 #[path = "application/status_panel.rs"]
 pub mod status_panel;
+#[path = "memory/step_judge.rs"]
+pub mod step_judge;
 #[path = "application/store_lease.rs"]
 pub mod store_lease;
 #[path = "memory/strategy.rs"]

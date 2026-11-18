@@ -1531,6 +1531,64 @@ pub async fn run_with(
         });
     }
 
+    // A hindsight judge of the turn's steps, as the app runs one after a
+    // turn. No process is left to run it beside the run, so it is done before
+    // the process exits: its record and its usage land, and the review below
+    // reads it. The mock profile calls no model to judge with.
+    let step_judge = match (
+        super::step_judge::gate(
+            super::step_judge::mode(&context.paths.config_file, environment),
+            reviews_on,
+            provider_config.is_none(),
+            outcome.stop == harness_tools::TurnStop::Final && !outcome.final_text.trim().is_empty(),
+            usize::try_from(outcome.tool_calls).unwrap_or(usize::MAX),
+        ),
+        &provider_config,
+    ) {
+        (Err(reason), _) => super::step_judge::Outcome::Skipped(reason),
+        (Ok(()), Some(config)) if !cancellation.is_cancelled() => {
+            let activated = super::step_judge::activated_skills(&outcome.executions);
+            let learned = if activated.is_empty() {
+                std::collections::BTreeSet::new()
+            } else {
+                super::step_judge::learned_names(
+                    &super::service::refine_learning(
+                        context
+                            .paths
+                            .config_file
+                            .parent()
+                            .unwrap_or_else(|| std::path::Path::new(".")),
+                        &context.paths.data_dir,
+                        &context.project.root,
+                        environment,
+                        resolved_config.project_trusted,
+                    )
+                    .layers,
+                )
+            };
+            let judge = super::step_judge::Judge::new(
+                Arc::clone(&upkeep_provider),
+                config.model.clone(),
+                super::harness::global_dir(&context.paths.data_dir),
+                outcome.task_id.as_str().to_owned(),
+                super::bootstrap::project_key_of(&context.project.root),
+            );
+            let facts = super::step_judge::TurnFacts {
+                session: outcome.session_id.clone(),
+                task: outcome.task_id.clone(),
+                answer: outcome.final_text.clone(),
+                activated,
+                learned,
+            };
+            tokio::select! {
+                judged = super::step_judge::judge_turn(&judge, &store, &facts) => judged,
+                () = cancellation.cancelled() => super::step_judge::Outcome::Skipped("canceled"),
+            }
+        }
+        (Ok(()), _) => super::step_judge::Outcome::Skipped("canceled"),
+    };
+    output["step_judge"] = step_judge.report();
+
     // The automatic review, as the app runs one at a session's end: what the
     // conversation's runs did since its last review is counted, and when it is
     // enough a review job is written for it (`sleep`). The count restarts only
