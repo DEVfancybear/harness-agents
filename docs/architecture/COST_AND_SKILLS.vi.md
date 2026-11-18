@@ -230,7 +230,52 @@ luật chi phí của trial prune, `cost_stats`), `refine.rs` (`prune`,
 
 ## 6. Judge hindsight chấm từng bước (P4)
 
-(viết cùng code; xem commit thêm nó)
+Code: `crates/harness-cli/src/host/memory/step_judge.rs` (cổng, prompt, kiểm
+tra hình dạng, log, khối cho review, `skill_progress`, `stats`),
+`turn_actions` trong `crates/harness-runtime/src/lib.rs` (các lời gọi, đối số
+và kết quả của một turn, đọc từ journal), được nối trong
+`application/service.rs` (app, sau turn, không chặn turn) và
+`protocols/headless.rs` (`ha exec`, trước khi thoát).
+
+- **Khi nào.** Sau một turn kết thúc bằng câu trả lời và có từ 6 lời gọi tool
+  trở lên, trong app và trong `ha exec`; không cho agent con, không trong
+  profile mock, và không khi review của memory bị tắt. `"stepJudge": "auto" |
+  "off"` trong `settings.json`, hoặc `HA_STEP_JUDGE`, biến này thắng.
+- **Câu hỏi và ngữ cảnh là bộ tốt nhất của P4.** Một lời gọi tới helper model
+  mà self-evaluation dùng, với yêu cầu (4.000 ký tự đầu), mọi hành động theo
+  thứ tự (đánh số từ 1: tool, đối số, đầu và cuối kết quả) và câu trả lời cuối
+  (2.000 ký tự cuối), dưới dạng dữ liệu. Với mỗi hành động nó hỏi *hành động
+  này có giúp đạt yêu cầu không?* (Progress), nhìn cả turn (Hindsight): một
+  bước mà công dụng chỉ lộ ra về sau thì có giúp; một bước lặp lại không cần,
+  bị hoàn tác, kết quả không bao giờ được dùng, hoặc không liên quan tới yêu
+  cầu thì không giúp; turn có thành công không không phải là câu hỏi. Không
+  nhãn kết quả nào tới judge: không self-evaluation, không verdict của goal,
+  không tóm tắt check. Turn có hơn 80 hành động được chấm theo 80 hành động
+  cuối, giữ nguyên số thứ tự.
+- **Host chỉ kiểm tra hình dạng.** Mỗi hành động đúng một lần, `helped` là số
+  từ 0 tới 1, `why` là chuỗi. Sai hình dạng thì phán quyết được ghi là không
+  hợp lệ; không điền thêm gì.
+- **Ghi lại.** Mỗi turn một dòng trong `<data>/harness/step-judgments.jsonl`
+  (chuyển sang file cũ khi quá 5 MB): các bước với điểm và lý do, điểm trung
+  bình, các bước dưới 0,3, và với mỗi learned skill được activate trong turn,
+  điểm trung bình của các bước từ lúc activate tới lần activate kế tiếp hoặc
+  hết turn. Diagnostics `step_judge evaluated` / `step_judge invalid`.
+- **Được dùng.**
+  - Lần review kế tiếp của cuộc hội thoại nhận một khối `<step_judgments>`:
+    tối đa 12 bước bị chấm là không giúp kể từ lần review trước đã nhận
+    chúng, dưới dạng dữ liệu; một mẫu lặp lại có thể thành lesson hay một sửa
+    đổi skill, một lần đơn lẻ thì không. Khối chỉ được đánh dấu đã đưa sau khi
+    lời gọi của review thành công.
+  - Góc nhìn của refiner về một learned skill cho thấy các bước sau khi nó
+    được activate bị chấm có ích tới đâu, trong 30 ngày qua (`steps after its
+    activation judged helpful in hindsight: 72% over 5 turn(s)`): teacher của
+    P4, cho một harness không huấn luyện model.
+  - `ha learning report` cho số turn được chấm, điểm trung bình, tỷ lệ bị chấm
+    không giúp và các tool hay bị chấm không giúp nhất.
+  - `ha exec --json` có `step_judge: {judged, actions, mean, low}`, hoặc
+    `{judged: false, reason}` (`off`, `reviews_off`, `mock`, `no_answer`,
+    `too_few_actions`, `invalid`, `provider_failed`, ...). Trong `ha exec`
+    lời gọi của judge được tính vào `upkeep_usage`.
 
 ## 7. Công tắc
 
@@ -240,6 +285,7 @@ luật chi phí của trial prune, `cost_stats`), `refine.rs` (`prune`,
 | — | bật | §3 không có công tắc: nó chỉ báo cáo |
 | — | bật | §4 là cách learned skill được sửa; tắt memory (`HA_MEMORY=off`) thì không sửa gì |
 | `HA_SKILL_PRUNE=off` | bật | bước tự động của §5; `ha learning prune` vẫn chạy |
+| `HA_STEP_JUDGE=off`, `"stepJudge": "off"` | bật | §6; tắt review của memory cũng tắt nó |
 
 ## 8. Không làm
 
@@ -272,5 +318,9 @@ luật chi phí của trial prune, `cost_stats`), `refine.rs` (`prune`,
   thì gửi đầy đủ; đọc sau khi sửa là các dòng đã đổi và công tắc tắt được nó;
   dòng output lặp lại được gộp và bản ghi vẫn đầy đủ. `tests/g13_headless.rs`:
   `cost_usd` trong JSON.
-- Live, với model thật: `scripts/testing/live-tests/reread.sh` (§2, §3) và
-  `scripts/testing/live-tests/skill-trial.sh` (§4, §5).
+- `step_judge.rs`: prompt chứa turn và không có nhãn kết quả, cổng, công tắc,
+  câu trả lời sai hình dạng, log và việc xoay vòng, tiến độ từng skill, khối
+  cho review kể từ lần review trước, thống kê, một turn được chấm từ journal.
+- Live, với model thật: `scripts/testing/live-tests/reread.sh` (§2, §3),
+  `scripts/testing/live-tests/skill-trial.sh` (§4, §5) và
+  `scripts/testing/live-tests/step-judge.sh` (§6).

@@ -236,7 +236,53 @@ the prune trial's cost rule, `cost_stats`), `refine.rs` (`prune`,
 
 ## 6. A hindsight judge of each step (P4)
 
-(written with the code; see the commit that adds it)
+Code: `crates/harness-cli/src/host/memory/step_judge.rs` (the gate, the
+prompt, the shape check, the log, the review's block, `skill_progress`,
+`stats`), `turn_actions` in `crates/harness-runtime/src/lib.rs` (a turn's
+calls, arguments and results from the journal), wired in
+`application/service.rs` (the app, after the turn, off the turn's path) and
+`protocols/headless.rs` (`ha exec`, before it exits).
+
+- **When.** After a turn that ended with an answer and made 6 or more tool
+  calls, in the app and in `ha exec`; not for a delegated child, not in the
+  mock profile, and not with memory's reviews off. `"stepJudge": "auto" |
+  "off"` in `settings.json`, or `HA_STEP_JUDGE`, which wins.
+- **The question and the context are P4's best.** One call to the helper
+  model self-evaluation uses, with the request (its first 4,000
+  characters), every action in order (numbered from 1: the tool, its
+  arguments, the head and end of its result) and the final answer (its last
+  2,000 characters), as data. It asks, for each action, *did this action help
+  achieve the request?* (Progress), with the whole turn in view (Hindsight):
+  a step whose use shows only later helped; a step repeated without need,
+  undone later, whose result was never used, or unrelated to the request did
+  not; whether the turn succeeded is not the question. No outcome label
+  reaches the judge: no self-evaluation, no goal verdict, no check summary.
+  A turn of more than 80 actions is judged by its last 80, numbered as they
+  were.
+- **The host checks only the shape.** Every action once, `helped` a number
+  from 0 to 1, `why` a string. Out of shape, the judgment is recorded
+  invalid; nothing is filled in.
+- **Kept.** One line a turn in `<data>/harness/step-judgments.jsonl` (moved
+  aside past 5 MB): the steps with their scores and reasons, the mean, the
+  steps below 0.3, and for each learned skill activated in the turn the mean
+  of the steps from its activation to the next activation or the end.
+  Diagnostics `step_judge evaluated` / `step_judge invalid`.
+- **Used.**
+  - The next review of the conversation gets a `<step_judgments>` block: at
+    most 12 steps judged not to help since the last review given them, as
+    data; a pattern that recurs may become a lesson or a skill edit, a single
+    one does not. The block is marked given only after the review's call
+    succeeded.
+  - The refiner's view of a learned skill shows how helpful the steps after
+    its activation were judged, over the last 30 days (`steps after its
+    activation judged helpful in hindsight: 72% over 5 turn(s)`): P4's
+    teacher, for a harness that trains no model.
+  - `ha learning report` gives the turns judged, the mean, the share judged
+    not to help and the tools judged not to help most often.
+  - `ha exec --json` has `step_judge: {judged, actions, mean, low}`, or
+    `{judged: false, reason}` (`off`, `reviews_off`, `mock`, `no_answer`,
+    `too_few_actions`, `invalid`, `provider_failed`, ...). In `ha exec` the
+    judge's call counts in `upkeep_usage`.
 
 ## 7. Switches
 
@@ -246,6 +292,7 @@ the prune trial's cost rule, `cost_stats`), `refine.rs` (`prune`,
 | — | on | §3 has no switch: it only reports |
 | — | on | §4 is how a learned skill is revised; memory off (`HA_MEMORY=off`) revises nothing |
 | `HA_SKILL_PRUNE=off` | on | §5's automatic pass; `ha learning prune` still runs |
+| `HA_STEP_JUDGE=off`, `"stepJudge": "off"` | on | §6; memory's reviews off turns it off too |
 
 ## 8. Not taken
 
@@ -277,5 +324,10 @@ the prune trial's cost rule, `cost_stats`), `refine.rs` (`prune`,
   whole; a read after an edit is the changed lines and the switch turns it
   off; repeated output lines are collapsed and the capture is whole.
   `tests/g13_headless.rs`: `cost_usd` in the JSON.
-- Live, with a real model: `scripts/testing/live-tests/reread.sh` (§2, §3)
-  and `scripts/testing/live-tests/skill-trial.sh` (§4, §5).
+- `step_judge.rs`: the prompt holds the turn and no outcome label, the gate,
+  the switches, out-of-shape answers, the log and its rotation, each skill's
+  progress, the review's block since the last review, the stats, a turn
+  judged from its journal.
+- Live, with a real model: `scripts/testing/live-tests/reread.sh` (§2, §3),
+  `scripts/testing/live-tests/skill-trial.sh` (§4, §5) and
+  `scripts/testing/live-tests/step-judge.sh` (§6).
