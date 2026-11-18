@@ -3943,7 +3943,10 @@ const AUTO_SCOPE_POLICY: &str = "Requested refinement scope: automatic review. A
 const SKILL_OUTCOMES: &str = "For each learned skill in play that the conversation shows being followed, say how it went in a top-level `skillOutcomes` array: {\"skill\": \"its name\", \"outcome\": \"worked\" or \"failed\", \"evidence\": \"a verbatim quote from the conversation\", \"assumption\": \"for a failure: what the skill took for granted that turned out false\"}. Judge the skill, not the task: it failed when its own steps did not work as written - a command it gives broke, a file or path it names was missing - even when the agent then reached the goal another way, and it worked when following it as written did the job. Judge only from what the conversation shows - a check that passed or failed, a command that broke, the user confirming or correcting - and leave the array empty when it shows neither. A failure whose cause the skill could have checked first is also worth a patch to the skill that adds that check. A skill in play that you edit, patch or update gets its outcome too: the patch fixes the skill, the outcome says how following it went. A skill in play that did not fit the request - the conversation was about something other than what it is for - was not followed: it gets no worked or failed outcome, and the patch narrows its description instead.";
 
 /// Keep the review's judgement of each learned skill in play: only a skill in
-/// play, only `worked` or `failed`, and a failure only with its assumption.
+/// play, only `worked` or `failed`, and an outcome only with its evidence. A
+/// failure the review gave no assumption for is kept with a stand-in, and every
+/// outcome kept or dropped is a diagnostics record (`skill outcome`,
+/// `skill outcome_dropped`).
 ///
 /// The review judges a skill it also revised in the same refinement from the turns
 /// that followed the text before the revision, so that outcome belongs to the
@@ -3958,33 +3961,80 @@ fn record_skill_outcomes(learning: &Learning, outcomes: &[Value], landed: &[Valu
         })
         .filter_map(|record| record["id"].as_str())
         .collect::<std::collections::BTreeSet<_>>();
+    // Which skills have a revision on trial, read once and before anything is
+    // recorded (a recorded outcome may settle the trial).
+    let on_trial = if outcomes.is_empty() {
+        std::collections::BTreeSet::new()
+    } else {
+        super::learned::library(&learning.layers)
+            .into_iter()
+            .filter(|skill| skill.on_trial.is_some())
+            .map(|skill| skill.name)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let dropped = |skill: &str, reason: &str| {
+        harness_types::diag::info("skill", "outcome_dropped")
+            .field("skill", skill)
+            .field("reason", reason)
+            .emit();
+    };
     outcomes
         .iter()
         .filter_map(|outcome| {
             let skill = outcome["skill"].as_str()?;
-            let worked = match outcome["outcome"].as_str()? {
-                "worked" => true,
-                "failed" => false,
-                _ => return None,
+            let worked = match outcome["outcome"].as_str() {
+                Some("worked") => true,
+                Some("failed") => false,
+                other => {
+                    dropped(
+                        skill,
+                        &format!(
+                            "the outcome is neither worked nor failed ({})",
+                            other.unwrap_or("none")
+                        ),
+                    );
+                    return None;
+                }
             };
             let assumption = outcome["assumption"].as_str().unwrap_or_default();
             let evidence = outcome["evidence"].as_str().unwrap_or_default();
-            if !learning.in_play.iter().any(|name| name == skill)
-                || evidence.trim().is_empty()
-                || (!worked && assumption.trim().is_empty())
-            {
+            if !learning.in_play.iter().any(|name| name == skill) {
+                dropped(skill, "the skill is not in play");
                 return None;
             }
-            let record = if revised.contains(skill) {
+            if evidence.trim().is_empty() {
+                dropped(skill, "the evidence is empty");
+                return None;
+            }
+            // The failure is the signal a trial needs; the review that left
+            // out what the skill took for granted still saw it fail.
+            let assumption = if !worked && assumption.trim().is_empty() {
+                NO_ASSUMPTION
+            } else {
+                assumption
+            };
+            let incumbent = revised.contains(skill);
+            let record = if incumbent {
                 super::learned::record_outcome_of_incumbent
             } else {
                 super::learned::record_outcome
             };
-            record(&learning.layers, skill, worked, assumption, evidence)
-                .then(|| json!({"skill": skill, "outcome": if worked { "worked" } else { "failed" }, "assumption": assumption, "evidence": evidence}))
+            if !record(&learning.layers, skill, worked, assumption, evidence) {
+                dropped(skill, "the skill is not a learned skill");
+                return None;
+            }
+            harness_types::diag::info("skill", "outcome")
+                .field("skill", skill)
+                .field("worked", worked)
+                .field("on_trial", on_trial.contains(skill) && !incumbent)
+                .emit();
+            Some(json!({"skill": skill, "outcome": if worked { "worked" } else { "failed" }, "assumption": assumption, "evidence": evidence}))
         })
         .collect()
 }
+
+/// What a failed outcome records when the review named no assumption.
+const NO_ASSUMPTION: &str = "(the review named none)";
 
 const KNOWLEDGE_PROPOSALS: &str = "Knowledge (not an edit kind) is the user's library of topical Markdown pages shared across conversations. When the conversation produced substantive reusable knowledge the main agent did not save - a researched conclusion, a method or concept worked out, a source the user shared to study - propose it in a top-level `knowledge` array: {\"scope\": \"project\" or \"global\", \"path\": \"concepts/short-name.md\", \"title\": \"...\", \"summary\": \"one line\", \"content\": \"Markdown, in the material's language\", \"sources\": [\"URLs or documents it came from\"], \"evidence\": \"a verbatim quote from the conversation that the page rests on\", \"reason\": \"why\"}. Use project scope unless the knowledge is explicitly shared across projects; use sources/, concepts/, entities/ or analysis/ for the path. Only new subjects: never a page listed below, nor one on the same subject under another name - a page already there is the agent's to update. A page without a verbatim quote from the conversation as its evidence is refused. When a statement rests on a file or a web page the conversation read, cite it in the content: end the statement with a marker `[^id]` and write on a line of its own `[^id]: <YYYY[-MM[-DD]]>; path:line, https://...` (the time is optional); the host looks every reference up and refuses a page whose footnote cites a file or line that is not there, so cite only what the conversation showed. Skip trivial exchanges, task progress, secrets, personal facts (memory) and procedures (learned skills). Weigh this whatever the review's instructions focus on. Leave `knowledge` empty when nothing meets the bar.";
 
@@ -6549,6 +6599,27 @@ pub struct Review {
     pub instructions: Option<String>,
 }
 
+/// The learned skills in play that have a revision on trial.
+fn in_play_on_trial(learning: &Learning) -> Vec<String> {
+    if learning.in_play.is_empty() {
+        return Vec::new();
+    }
+    super::learned::library(&learning.layers)
+        .into_iter()
+        .filter(|skill| skill.on_trial.is_some() && learning.in_play.contains(&skill.name))
+        .map(|skill| skill.name)
+        .collect()
+}
+
+/// What the plan is asked when the gate found nothing to refine but a learned
+/// skill was in play: only how following it went.
+#[must_use]
+pub fn judge_in_play_instructions(rationale: &str) -> String {
+    format!(
+        "Nothing else needs refining ({rationale}). Judge the learned skills in play from the conversation and report their outcomes; propose no other edit unless the conversation clearly needs it."
+    )
+}
+
 /// `reviewAutoRefine`: ask whether this checkpoint should refine.
 pub async fn review(
     provider: &Arc<dyn ModelProvider>,
@@ -6558,6 +6629,29 @@ pub async fn review(
     turns_since_last_review: u32,
     learning: Option<&Learning>,
 ) -> Result<Review, String> {
+    // A revision on trial is settled by the judged uses of it, and only the
+    // plan judges a skill's use (`SKILL_OUTCOMES`): a gate that saw nothing to
+    // refine must not keep the plan from it. Seen: a revised command failed
+    // four times in `ha exec` and its trial counted none, because the gate
+    // said no each time. So the review goes to the plan whatever the gate
+    // would say, and the gate is not asked.
+    let on_trial = learning.map_or_else(Vec::new, in_play_on_trial);
+    if !on_trial.is_empty() {
+        let skills = on_trial.join(", ");
+        harness_types::diag::info("review", "trial_judged")
+            .field("skills", skills.clone())
+            .msg("a learned skill in play has a revision on trial: the review goes to the plan")
+            .emit();
+        return Ok(Review {
+            should_refine: true,
+            rationale: format!(
+                "a learned skill in play has a revision on trial: its use is judged ({skills})"
+            ),
+            instructions: Some(format!(
+                "A learned skill in play has a revision on trial ({skills}): judge how following it went from the conversation and report its outcome, worked or failed, in skillOutcomes. Propose no other edit unless the conversation clearly needs it."
+            )),
+        });
+    }
     let history = history(scopes);
     let learned = learning.map_or_else(String::new, |learning| {
         let mut block = format!(
@@ -11885,6 +11979,217 @@ Run `node scripts/build.js`.
         );
         assert_eq!(record["applied"], true, "{record}");
         assert!(record["scriptRuns"].is_null());
+    }
+
+    /// A learned skill `deploy` that worked once, with a revision of it on
+    /// trial, and in play.
+    fn skill_on_trial(
+        root: &std::path::Path,
+    ) -> (
+        HarnessScopes,
+        super::Learning,
+        crate::interactive::learned::Layers,
+    ) {
+        let workspace = root.join("workspace");
+        let layers = crate::interactive::learned::Layers::new(
+            &root.join("config"),
+            &root.join("data"),
+            &workspace,
+            true,
+        );
+        let mut learning = super::Learning::new(layers.clone(), &workspace, None);
+        let created = crate::interactive::learned::promote(
+            &layers,
+            &crate::interactive::learned::Intent::from_value(&json!({
+                "action": "create", "name": "deploy", "level": "project",
+                "body": "---\nname: deploy\ndescription: Use when shipping.\ncategory: ops\n---\nRun the deploy script.\n",
+                "reason": "r", "evidence": "e",
+            })),
+            &learning.context,
+        );
+        assert!(created.ok, "{:?}", created.findings);
+        assert!(crate::interactive::learned::record_outcome(
+            &layers,
+            "deploy",
+            true,
+            "",
+            "it shipped"
+        ));
+        let revised = crate::interactive::learned::promote(
+            &layers,
+            &crate::interactive::learned::Intent::from_value(&json!({
+                "action": "edit", "name": "deploy",
+                "edits": [{"op": "replace", "target": "deploy script", "content": "deploy script, then restart"}],
+                "reason": "the user corrected the approach", "evidence": "[User]: do it this way",
+            })),
+            &learning.context,
+        );
+        assert!(revised.ok, "{:?}", revised.findings);
+        learning.in_play = vec!["deploy".to_owned()];
+        (scopes(root), learning, layers)
+    }
+
+    fn trial_of(layers: &crate::interactive::learned::Layers) -> Option<(u64, u64)> {
+        crate::interactive::learned::library(layers)
+            .into_iter()
+            .find(|skill| skill.name == "deploy")
+            .expect("skill")
+            .on_trial
+    }
+
+    /// The gate's "no" does not keep the plan from a learned skill in play
+    /// whose revision is on trial: the use is judged, and a failure counts
+    /// against the trial. With no revision on trial the gate decides.
+    #[test]
+    fn a_skill_on_trial_in_play_sends_the_review_to_the_plan_whatever_the_gate_says() {
+        let directory = tempfile::tempdir().expect("dir");
+        let (scopes, learning, layers) = skill_on_trial(directory.path());
+        assert_eq!(trial_of(&layers), Some((0, 0)));
+        let gate_no = "{\"shouldRefine\": false, \"rationale\": \"the report failed, but no working alternative was established\"}".to_owned();
+        let plan = json!({
+            "summary": "the revised command failed",
+            "skillOutcomes": [{
+                "skill": "deploy", "outcome": "failed",
+                "evidence": "deploy.sh: exit status 2",
+                // The review named no assumption.
+            }]
+        })
+        .to_string();
+        // The first answer is the plan's: the gate is not asked.
+        let replies = Replies::new(&[plan]);
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = replies.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let conversation = "[User]: deploy\n[Tool]: deploy.sh: exit status 2";
+        let records = harness_types::diag::capture(|| {
+            let review = runtime
+                .block_on(super::review(
+                    &provider,
+                    "fixture-model",
+                    conversation,
+                    &scopes,
+                    3,
+                    Some(&learning),
+                ))
+                .expect("reviewed");
+            assert!(review.should_refine, "{review:?}");
+            assert!(review.rationale.contains("revision on trial"), "{review:?}");
+            // The gate was not asked.
+            assert_eq!(replies.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            runtime
+                .block_on(super::auto_refine(
+                    &provider,
+                    "fixture-model",
+                    conversation,
+                    &scopes,
+                    review.instructions,
+                    Some(&learning),
+                    None,
+                ))
+                .expect("refined");
+        });
+        assert!(
+            records
+                .iter()
+                .any(|record| record.kind == "review" && record.event == "trial_judged"),
+            "{records:?}"
+        );
+        // The plan ran, and its judged failure counts against the trial.
+        assert!(replies.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        assert!(
+            replies.prompt(0).contains("has a revision on trial"),
+            "{}",
+            replies.prompt(0)
+        );
+        assert_eq!(trial_of(&layers), Some((0, 1)));
+
+        // No revision on trial: the gate is asked, and its "no" stands.
+        let directory = tempfile::tempdir().expect("dir");
+        let (scopes, mut learning, layers) = skill_on_trial(directory.path());
+        assert!(crate::interactive::learned::record_outcome(
+            &layers,
+            "deploy",
+            true,
+            "",
+            "it shipped"
+        ));
+        assert!(
+            crate::interactive::learned::record_outcome(&layers, "deploy", true, "", "again"),
+            "the second good use accepts the revision"
+        );
+        assert_eq!(trial_of(&layers), None);
+        learning.in_play = vec!["deploy".to_owned()];
+        let replies = Replies::new(&[gate_no]);
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = replies.clone();
+        let review = runtime
+            .block_on(super::review(
+                &provider,
+                "fixture-model",
+                conversation,
+                &scopes,
+                3,
+                Some(&learning),
+            ))
+            .expect("reviewed");
+        assert!(!review.should_refine, "{review:?}");
+        assert_eq!(replies.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A failure the review gave no assumption for is kept, and counts against
+    /// the revision on trial; every outcome kept or dropped says so in the
+    /// diagnostics.
+    #[test]
+    fn a_failure_without_an_assumption_is_recorded_and_a_dropped_outcome_says_why() {
+        let directory = tempfile::tempdir().expect("dir");
+        let (_, learning, layers) = skill_on_trial(directory.path());
+        let outcomes = [
+            json!({"skill": "deploy", "outcome": "failed", "evidence": "deploy.sh: exit status 2"}),
+            // Not in play.
+            json!({"skill": "other", "outcome": "worked", "evidence": "it shipped"}),
+            // No evidence.
+            json!({"skill": "deploy", "outcome": "worked", "evidence": "  "}),
+        ];
+        let mut kept = Vec::new();
+        let records = harness_types::diag::capture(|| {
+            kept = super::record_skill_outcomes(&learning, &outcomes, &[]);
+        });
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0]["outcome"], "failed");
+        assert_eq!(kept[0]["assumption"], super::NO_ASSUMPTION);
+        assert_eq!(trial_of(&layers), Some((0, 1)));
+        let recorded = records
+            .iter()
+            .find(|record| record.kind == "skill" && record.event == "outcome")
+            .expect("an outcome record");
+        assert_eq!(recorded.fields["skill"], "deploy");
+        assert_eq!(recorded.fields["worked"], false);
+        assert_eq!(recorded.fields["on_trial"], true);
+        let reasons = records
+            .iter()
+            .filter(|record| record.kind == "skill" && record.event == "outcome_dropped")
+            .map(|record| {
+                (
+                    record.fields["skill"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    record.fields["reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons,
+            [
+                ("other".to_owned(), "the skill is not in play".to_owned()),
+                ("deploy".to_owned(), "the evidence is empty".to_owned()),
+            ],
+            "{records:?}"
+        );
     }
 
     /// The prune pass: what it is told, what it may do, what lands.

@@ -7902,10 +7902,9 @@ impl AutoRefine {
             // assumption - is the library's record of whether it works. Seen:
             // the agent repaired a broken skill itself, the gate saw nothing
             // left to refine, and the failure was never recorded.
-            Ok(review) if !self.learning.in_play.is_empty() => Some(format!(
-                "Nothing else needs refining ({}). Judge the learned skills in play from the conversation and report their outcomes; propose no other edit unless the conversation clearly needs it.",
-                review.rationale
-            )),
+            Ok(review) if !self.learning.in_play.is_empty() => {
+                Some(super::refine::judge_in_play_instructions(&review.rationale))
+            }
             Ok(review) => {
                 if let Some(reviewed) = &self.reviewed {
                     super::refine::mark_reviewed(&self.scopes.local, reviewed);
@@ -8183,7 +8182,14 @@ impl Reviews {
             let _ = self.sender.send(SessionEvent::Notice { message });
         }
         let mut learning = self.learning.clone();
-        learning.in_play.clone_from(&job.in_play);
+        // The skills in play are the job's, and the ones the run that reviews
+        // it already knows of (an `ha exec` run queues its review with none:
+        // it learns them from its own executions, and they were lost here).
+        for name in &job.in_play {
+            if !learning.in_play.contains(name) {
+                learning.in_play.push(name.clone());
+            }
+        }
         // An edit that keeps a child's project proposal is kept for the
         // project, whatever scope the review wrote on it.
         learning.project_findings = proposals
