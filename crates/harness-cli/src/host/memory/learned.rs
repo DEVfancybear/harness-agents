@@ -704,6 +704,10 @@ const CASES_KEPT: usize = 3;
 /// from their failures): a failure keeps what the skill took for granted that
 /// turned out false, the latest five, so the curator can patch the skill with
 /// a check for it. `false` when `name` is not a learned skill.
+///
+/// The outcome is of the text the conversation followed, so a review records it
+/// before it changes the skill: it counts for the revision on trial, if there
+/// is one, and may settle it.
 pub fn record_outcome(
     layers: &Layers,
     name: &str,
@@ -711,52 +715,17 @@ pub fn record_outcome(
     assumption: &str,
     evidence: &str,
 ) -> bool {
-    record_outcome_of(layers, name, worked, assumption, evidence, false)
-}
-
-/// [`record_outcome`] for a turn that followed the text a revision has just
-/// replaced: the review judges it in the refinement that revised the skill, but
-/// it is the incumbent's outcome, so it is counted for the incumbent and not
-/// against the revision's trial. Without a trial open it is an ordinary outcome.
-pub fn record_outcome_of_incumbent(
-    layers: &Layers,
-    name: &str,
-    worked: bool,
-    assumption: &str,
-    evidence: &str,
-) -> bool {
-    record_outcome_of(layers, name, worked, assumption, evidence, true)
-}
-
-fn record_outcome_of(
-    layers: &Layers,
-    name: &str,
-    worked: bool,
-    assumption: &str,
-    evidence: &str,
-    of_incumbent: bool,
-) -> bool {
     let Some(layer) = layers.find(name) else {
         return false;
     };
     let root = layers.root(layer).expect("found layer is present");
     let clip = |text: &str| text.trim().chars().take(300).collect::<String>();
-    let mut counted_on_trial = true;
     update_usage(&layers.usage_file(layer, root), |usage| {
         bump(usage, name, if worked { "worked" } else { "failed" });
         if worked {
             usage["skills"][name]["last"] = json!(now());
         }
-        if of_incumbent && usage["skills"][name]["trial"].is_object() {
-            counted_on_trial = false;
-            let field = if worked { "worked" } else { "failed" };
-            let current = usage["skills"][name]["trial"]["incumbent"][field]
-                .as_u64()
-                .unwrap_or(0);
-            usage["skills"][name]["trial"]["incumbent"][field] = json!(current + 1);
-        } else {
-            bump(usage, name, if worked { "trial_good" } else { "trial_bad" });
-        }
+        bump(usage, name, if worked { "trial_good" } else { "trial_bad" });
         // Evolver's Capsule: a strategy goes with a concrete case it held in.
         if worked && !evidence.trim().is_empty() {
             let cases = &mut usage["skills"][name]["cases"];
@@ -783,9 +752,7 @@ fn record_outcome_of(
             }
         }
     });
-    if counted_on_trial {
-        settle_trial(layers, layer, root, name);
-    }
+    settle_trial(layers, layer, root, name);
     true
 }
 
@@ -5319,6 +5286,15 @@ mod tests {
         land_skill(&layers, "deploy", "Run the deploy script.");
         assert!(record_outcome(&layers, "deploy", true, "", "it shipped"));
         let original = text_of(&layers, "deploy");
+        // The review's outcome of the text the conversation followed comes
+        // before the revisions of the same refinement land.
+        assert!(record_outcome(
+            &layers,
+            "deploy",
+            true,
+            "",
+            "it shipped before"
+        ));
         let mut budget = super::EditBudget::default();
         for intent in [
             edit("deploy", json!([{"op": "append", "content": "First."}])),
@@ -5337,15 +5313,7 @@ mod tests {
             Some(2),
             "{trial}"
         );
-        // The review's outcome of the text before the revisions is the
-        // incumbent's, not the revisions'.
-        assert!(super::record_outcome_of_incumbent(
-            &layers,
-            "deploy",
-            true,
-            "",
-            "it shipped before"
-        ));
+        // The outcome is the incumbent's, not the revisions'.
         let raw = raw_usage(&layers);
         assert_eq!(
             raw["skills"]["deploy"]["trial"]["incumbent"]["worked"], 2,

@@ -3825,10 +3825,6 @@ Learned skills in play: {}
     });
     let mut pending = Pending::begin(scopes.dir(options.global), &id, learning)?;
     stage_skills(provider, model, learning, &mut proposal, &mut pending).await;
-    if let Some(learning) = learning {
-        proposal.skill_outcome_records =
-            record_skill_outcomes(learning, &proposal.skill_outcomes, &proposal.skill_records);
-    }
     let refinement = match apply(
         scopes,
         &proposal,
@@ -3948,19 +3944,9 @@ const SKILL_OUTCOMES: &str = "For each learned skill in play that the conversati
 /// outcome kept or dropped is a diagnostics record (`skill outcome`,
 /// `skill outcome_dropped`).
 ///
-/// The review judges a skill it also revised in the same refinement from the turns
-/// that followed the text before the revision, so that outcome belongs to the
-/// version the revision replaced, not to the revision's trial (`landed` are the
-/// refinement's skill records).
-fn record_skill_outcomes(learning: &Learning, outcomes: &[Value], landed: &[Value]) -> Vec<Value> {
-    let revised = landed
-        .iter()
-        .filter(|record| {
-            record["applied"] == true
-                && matches!(record["action"].as_str(), Some("patch" | "update" | "edit"))
-        })
-        .filter_map(|record| record["id"].as_str())
-        .collect::<std::collections::BTreeSet<_>>();
+/// The outcome is of the text the conversation followed, so it is recorded
+/// before the refinement changes any skill ([`stage_skills`]).
+fn record_skill_outcomes(learning: &Learning, outcomes: &[Value]) -> Vec<Value> {
     // Which skills have a revision on trial, read once and before anything is
     // recorded (a recorded outcome may settle the trial).
     let on_trial = if outcomes.is_empty() {
@@ -4013,20 +3999,15 @@ fn record_skill_outcomes(learning: &Learning, outcomes: &[Value], landed: &[Valu
             } else {
                 assumption
             };
-            let incumbent = revised.contains(skill);
-            let record = if incumbent {
-                super::learned::record_outcome_of_incumbent
-            } else {
-                super::learned::record_outcome
-            };
-            if !record(&learning.layers, skill, worked, assumption, evidence) {
+            if !super::learned::record_outcome(&learning.layers, skill, worked, assumption, evidence)
+            {
                 dropped(skill, "the skill is not a learned skill");
                 return None;
             }
             harness_types::diag::info("skill", "outcome")
                 .field("skill", skill)
                 .field("worked", worked)
-                .field("on_trial", on_trial.contains(skill) && !incumbent)
+                .field("on_trial", on_trial.contains(skill))
                 .emit();
             Some(json!({"skill": skill, "outcome": if worked { "worked" } else { "failed" }, "assumption": assumption, "evidence": evidence}))
         })
@@ -4423,8 +4404,15 @@ fn recover_pending(dir: &Path, layers: Option<&super::learned::Layers>) {
     }
 }
 
-/// Promote the proposal's learned-skill intents (with their repair) as the
-/// refinement's pending writes.
+/// Record the review's judgement of the learned skills in play, then promote the
+/// proposal's learned-skill intents (with their repair) as the refinement's
+/// pending writes.
+///
+/// The order is the point. An outcome is of the text the conversation followed,
+/// which is the text before this refinement's changes: the revision on trial
+/// when one was open, else the incumbent. Recorded first, it counts for that
+/// text and may settle its trial; a change that lands after it begins a trial
+/// on the counters as they then stand.
 async fn stage_skills(
     provider: &Arc<dyn ModelProvider>,
     model: &str,
@@ -4432,18 +4420,12 @@ async fn stage_skills(
     proposal: &mut Proposal,
     pending: &mut Pending,
 ) {
-    if let Some(learning) = learning
-        && !proposal.skill_files.is_empty()
-    {
-        proposal.skill_records = promote_with_repair(
-            provider,
-            model,
-            learning,
-            &proposal.skill_files,
-            pending,
-            proposal.evidence_in.as_deref(),
-        )
-        .await;
+    let Some(learning) = learning else {
+        return;
+    };
+    // What a patch says of how its skill went is judged from the intents, so it
+    // needs no landing.
+    if !proposal.skill_files.is_empty() {
         let judged = judge_patched(
             provider,
             model,
@@ -4453,6 +4435,18 @@ async fn stage_skills(
         )
         .await;
         proposal.skill_outcomes.extend(judged);
+    }
+    proposal.skill_outcome_records = record_skill_outcomes(learning, &proposal.skill_outcomes);
+    if !proposal.skill_files.is_empty() {
+        proposal.skill_records = promote_with_repair(
+            provider,
+            model,
+            learning,
+            &proposal.skill_files,
+            pending,
+            proposal.evidence_in.as_deref(),
+        )
+        .await;
         proposal.skill_files.clear();
     }
 }
@@ -4748,10 +4742,6 @@ pub async fn auto_refine(
     if let Some(host) = knowledge.filter(|_| catalog.is_some()) {
         proposal.knowledge_records =
             create_pages(host, &proposal.knowledge, conversation, &mut pending);
-    }
-    if let Some(learning) = learning {
-        proposal.skill_outcome_records =
-            record_skill_outcomes(learning, &proposal.skill_outcomes, &proposal.skill_records);
     }
     // The global memory entries and the learned skills this review writes: a
     // lesson saved as one is a rule already.
@@ -9789,7 +9779,8 @@ Run `node scripts/build.js`.
         let provider = Replies::new(&[
             json!({"summary": "the build entry point was wrong", "skillFiles": [patch]})
                 .to_string(),
-            json!({"skillFiles": [patch]}).to_string(),
+            // The patch is judged first (its outcome is recorded before any
+            // change lands), then the refused patch is repaired.
             json!({"skillOutcomes": [{
                 "skill": "build-check",
                 "outcome": "failed",
@@ -9797,6 +9788,7 @@ Run `node scripts/build.js`.
                 "assumption": "the project builds with node scripts/build.js"
             }]})
             .to_string(),
+            json!({"skillFiles": [patch]}).to_string(),
         ]);
         let dynamic: std::sync::Arc<dyn harness_providers::ModelProvider> = provider.clone();
         super::refine(
@@ -12153,7 +12145,7 @@ Run `node scripts/build.js`.
         ];
         let mut kept = Vec::new();
         let records = harness_types::diag::capture(|| {
-            kept = super::record_skill_outcomes(&learning, &outcomes, &[]);
+            kept = super::record_skill_outcomes(&learning, &outcomes);
         });
         assert_eq!(kept.len(), 1, "{kept:?}");
         assert_eq!(kept[0]["outcome"], "failed");
@@ -12190,6 +12182,221 @@ Run `node scripts/build.js`.
             ],
             "{records:?}"
         );
+    }
+
+    /// The usage record of the project layer of `skill_on_trial`'s skill.
+    fn project_usage(root: &std::path::Path) -> serde_json::Value {
+        let directory = root.join("data").join("skill-usage");
+        let file = std::fs::read_dir(&directory)
+            .expect("usage dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with("project-"))
+            })
+            .expect("project usage file");
+        serde_json::from_str(&std::fs::read_to_string(file).expect("usage")).expect("json")
+    }
+
+    /// A requested refinement of `conversation` answered by `replies`, over a
+    /// learning whose skill `deploy` is in play.
+    fn refine_deploy(
+        scopes: &HarnessScopes,
+        learning: &super::Learning,
+        replies: &[String],
+    ) -> super::Refinement {
+        let provider = Replies::new(replies);
+        let dynamic: std::sync::Arc<dyn harness_providers::ModelProvider> = provider;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(super::refine(
+                &dynamic,
+                "fixture-model",
+                "[User]: deploy\n[Tool]: deploy.sh: restart failed with exit status 2",
+                scopes,
+                &RefineOptions::default(),
+                Some(learning),
+            ))
+            .expect("refined")
+    }
+
+    fn deploy_edit(target: &str, content: &str) -> serde_json::Value {
+        json!({
+            "action": "edit", "name": "deploy",
+            "edits": [{"op": "replace", "target": target, "content": content}],
+            "reason": "the revised command failed",
+            "evidence": "deploy.sh: restart failed with exit status 2",
+        })
+    }
+
+    fn deploy_outcome(outcome: &str) -> serde_json::Value {
+        json!({
+            "skill": "deploy", "outcome": outcome,
+            "evidence": "deploy.sh: restart failed with exit status 2",
+            "assumption": "the deploy restarts the service",
+        })
+    }
+
+    /// The failing revision on trial is judged first, so the fix that lands in
+    /// the same refinement replaces it: it is kept as superseded, the sound
+    /// incumbent is the new trial's incumbent, and the failure counts against
+    /// the revision and not against the incumbent.
+    #[test]
+    fn a_failure_and_its_fix_in_one_refinement_leave_the_incumbent_sound() {
+        let directory = tempfile::tempdir().expect("dir");
+        let (scopes, learning, layers) = skill_on_trial(directory.path());
+        let ledger_before =
+            project_usage(directory.path())["skills"]["deploy"]["trial"]["ledger_id"].clone();
+        let plan = json!({
+            "summary": "the revised command failed",
+            "skillOutcomes": [deploy_outcome("failed")],
+            "skillFiles": [deploy_edit("then restart", "then check the status")],
+        })
+        .to_string();
+        let refinement = refine_deploy(&scopes, &learning, &[plan]);
+        assert!(
+            refinement
+                .edits()
+                .iter()
+                .any(|edit| edit["kind"] == super::SKILL_FILE_KIND && edit["applied"] == true),
+            "{:?}",
+            refinement.edits()
+        );
+        let usage = project_usage(directory.path());
+        let deploy = &usage["skills"]["deploy"];
+        let text = crate::interactive::learned::live_document(&layers, "deploy").expect("skill");
+        assert!(text.contains("then check the status"), "{text}");
+        // The failure is the revision's, kept among the rejected as superseded.
+        assert_eq!(deploy["failed"], 1, "{usage}");
+        let rejected = deploy["rejected"].as_array().expect("rejected");
+        assert_eq!(rejected.len(), 1, "{usage}");
+        assert_eq!(rejected[0]["kind"], "superseded", "{usage}");
+        assert_eq!(rejected[0]["ledger_id"], ledger_before, "{usage}");
+        assert!(
+            rejected[0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("1 bad, 0 good")),
+            "{usage}"
+        );
+        // The new trial goes back to the sound original, which never failed.
+        let trial = &deploy["trial"];
+        assert!(trial.is_object(), "{usage}");
+        assert_ne!(trial["ledger_id"], ledger_before, "{usage}");
+        assert_eq!(trial["incumbent"]["worked"], 1, "{usage}");
+        assert_eq!(
+            trial["incumbent"]["failed"].as_u64().unwrap_or(0),
+            0,
+            "{usage}"
+        );
+        assert_eq!(
+            trial["incumbent"]["trial_bad"].as_u64().unwrap_or(0),
+            0,
+            "{usage}"
+        );
+        // The fix is tried afresh.
+        assert_eq!(deploy["trial_bad"], 0, "{usage}");
+    }
+
+    /// With no revision on trial the followed text is the incumbent: its outcome
+    /// is an ordinary one, and the trial the patch opens captures it.
+    #[test]
+    fn an_outcome_with_no_trial_open_is_the_new_trials_incumbents() {
+        let directory = tempfile::tempdir().expect("dir");
+        let (scopes, learning, layers) = skill_on_trial(directory.path());
+        for evidence in ["again", "and again"] {
+            assert!(crate::interactive::learned::record_outcome(
+                &layers, "deploy", true, "", evidence
+            ));
+        }
+        assert_eq!(trial_of(&layers), None);
+        let plan = json!({
+            "summary": "the deploy could say more",
+            "skillOutcomes": [deploy_outcome("worked")],
+            "skillFiles": [deploy_edit("then restart", "then restart and check")],
+        })
+        .to_string();
+        refine_deploy(&scopes, &learning, &[plan]);
+        let usage = project_usage(directory.path());
+        let deploy = &usage["skills"]["deploy"];
+        // One from `skill_on_trial`, two more, and this review's.
+        assert_eq!(deploy["worked"], 4, "{usage}");
+        assert_eq!(deploy["trial"]["incumbent"]["worked"], 4, "{usage}");
+        assert_eq!(
+            deploy["trial"]["incumbent"]["failed"].as_u64().unwrap_or(0),
+            0,
+            "{usage}"
+        );
+        assert!(
+            deploy["rejected"].as_array().is_none_or(Vec::is_empty),
+            "{usage}"
+        );
+        assert_eq!(trial_of(&layers), Some((0, 0)));
+    }
+
+    /// A second failure rolls the revision back in the refinement whose edit
+    /// was written against the revision's text: the incumbent text is back, the
+    /// edit is refused and says so, and nothing panics.
+    #[test]
+    fn a_failure_that_rolls_the_revision_back_refuses_the_edit_written_against_it() {
+        let directory = tempfile::tempdir().expect("dir");
+        let (scopes, learning, layers) = skill_on_trial(directory.path());
+        assert!(crate::interactive::learned::record_outcome(
+            &layers,
+            "deploy",
+            false,
+            "the deploy restarts the service",
+            "restart failed"
+        ));
+        assert_eq!(trial_of(&layers), Some((0, 1)));
+        let plan = json!({
+            "summary": "the revised command failed again",
+            "skillOutcomes": [deploy_outcome("failed")],
+            "skillFiles": [deploy_edit("then restart", "then check the status")],
+        })
+        .to_string();
+        // The refused edit is sent back for a repair, which has nothing to add.
+        let refinement = refine_deploy(
+            &scopes,
+            &learning,
+            &[plan, json!({"skillFiles": []}).to_string()],
+        );
+        let text = crate::interactive::learned::live_document(&layers, "deploy").expect("skill");
+        assert!(
+            text.contains("Run the deploy script.") && !text.contains("restart"),
+            "{text}"
+        );
+        // The repair pass found nothing, so the refused edit is reported as superseded.
+        let edits = refinement.superseded();
+        let edit = edits
+            .iter()
+            .find(|edit| edit["kind"] == super::SKILL_FILE_KIND)
+            .expect("the skill edit is reported");
+        assert_ne!(edit["applied"], true, "{edit}");
+        assert!(
+            edit["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("target is not in SKILL.md")),
+            "{edit}"
+        );
+        let usage = project_usage(directory.path());
+        let deploy = &usage["skills"]["deploy"];
+        assert!(deploy["trial"].is_null(), "{usage}");
+        let kinds = deploy["rejected"]
+            .as_array()
+            .expect("rejected")
+            .iter()
+            .map(|record| record["kind"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["rolled_back", "refused"], "{usage}");
+        // The incumbent's counters are back, with no failure of its own.
+        assert_eq!(deploy["worked"], 1, "{usage}");
+        assert_eq!(deploy["failed"].as_u64().unwrap_or(0), 0, "{usage}");
     }
 
     /// The prune pass: what it is told, what it may do, what lands.
