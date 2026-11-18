@@ -918,6 +918,28 @@ pub fn usage(layers: &Layers, layer: Layer) -> (u64, BTreeMap<String, Usage>) {
     (value["requests"].as_u64().unwrap_or(0), skills)
 }
 
+/// The learned skills the model activated in a turn, by `activate_skill`. In
+/// `ha exec` they are in play for the review as in the app (where
+/// [`record_turn`] counts them): a skill the model loaded itself is judged
+/// too, not only the one recall put into the turn.
+#[must_use]
+pub fn activated(layers: &Layers, executions: &[harness_tools::ToolExecutionView]) -> Vec<String> {
+    let mut names = Vec::<String>::new();
+    for execution in executions {
+        if let harness_tools::ToolOutput::SkillActivated { block } = &execution.output
+            && let Some(name) = block
+                .id
+                .strip_prefix("skill:")
+                .and_then(|reference| reference.rsplit_once('@').map(|(name, _)| name))
+            && layers.find(name).is_some()
+            && !names.iter().any(|known| known == name)
+        {
+            names.push(name.to_owned());
+        }
+    }
+    names
+}
+
 /// Count what one finished turn did with learned skills, and say which learned
 /// skills it used: activations are uses,
 /// `read_skill_file` and a `read_file` inside a learned skill's folder are views.
@@ -4349,6 +4371,44 @@ mod tests {
 
     fn viewed(name: &str) -> harness_tools::ToolExecutionView {
         ran("skill", "read_skill_file", json!({"name": name}))
+    }
+
+    fn activation(name: &str) -> harness_tools::ToolExecutionView {
+        harness_tools::ToolExecutionView {
+            schema_version: 1,
+            execution_id: None,
+            receipt: None,
+            output: harness_tools::ToolOutput::SkillActivated {
+                block: harness_session::ContextBlock::mandatory(
+                    format!("skill:{name}@sha256:0"),
+                    harness_session::ContextBlockKind::Skill,
+                    "Do it.",
+                ),
+            },
+            observer_failure: None,
+        }
+    }
+
+    /// `ha exec` puts in play for its review each learned skill the model
+    /// activated, once, and no skill that is not a learned one.
+    #[test]
+    fn the_learned_skills_a_turn_activated_are_named_once() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        for name in ["weekly-report", "release-notes"] {
+            assert!(promote(&layers, &create(name, "Do it."), &PromoteContext::default()).ok);
+        }
+        let turn = [
+            activation("weekly-report"),
+            viewed("release-notes"),
+            activation("weekly-report"),
+            activation("pdf"),
+            activation("release-notes"),
+        ];
+        assert_eq!(
+            super::activated(&layers, &turn),
+            ["weekly-report", "release-notes"]
+        );
     }
 
     fn checks(outcome: Option<bool>) -> harness_tools::ToolExecutionView {

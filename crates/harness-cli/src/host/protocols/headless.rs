@@ -1647,8 +1647,15 @@ pub async fn run_with(
             environment,
             resolved_config.project_trusted,
         );
-        // The skill this run was given is in play for its review.
+        // The skill this run was given is in play for its review, and so is
+        // a learned skill the model activated itself: the review judges how
+        // following it went (a revision on trial is settled by that).
         learning.in_play.extend(skill_in_play);
+        for name in super::learned::activated(&learning.layers, &outcome.executions) {
+            if !learning.in_play.contains(&name) {
+                learning.in_play.push(name);
+            }
+        }
         learning.dream.knowledge = knowledge_on;
         learning.dream.session_logs =
             super::session_log::enabled(&context.paths.config_file, environment);

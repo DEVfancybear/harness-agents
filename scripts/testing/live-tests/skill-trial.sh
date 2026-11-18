@@ -36,8 +36,8 @@ description: Make this project's weekly sales report: run its report script and 
 1. Run the report script with run_process: executable \`python\`, args [\"report.py\"], in the project root.
 2. Give the user the line that starts with TOTAL, as printed."
 
-setup() {
-  fresh skill-trial
+setup() {  # setup [name]: a fresh home (default skill-trial)
+  fresh "${1:-skill-trial}"
   export HA_DAEMON=off HA_SELF_EVAL=off HA_SESSION_LOG=off HA_REPL=off HA_CODEMODE=off HA_ACTION_BANK=off HA_STEP_JUDGE=off
   unset HA_AUTO_REFINE
   D=$HA_HOME/data
@@ -124,7 +124,8 @@ if [ "$held" = 1 ]; then
 fi
 
 # --- 3. `ha learning prune` shortens a long proven skill, on trial as a prune.
-setup
+# A home of its own, so sections 1 and 2 keep their evidence.
+setup skill-prune
 LONG=release-notes
 mkdir -p "$HA_HOME/skills/$LONG"
 {
