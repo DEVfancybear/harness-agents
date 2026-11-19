@@ -1338,7 +1338,7 @@ async fn finish_exited_group(
 /// No process exists, so there is nothing to terminate or reap and the tree is
 /// trivially clean; `queued` records whether the caller actually waited behind
 /// another call or was withdrawn before the runner took it.
-fn canceled_before_spawn(executable: &str, queued: bool) -> ProcessResult {
+pub(crate) fn canceled_before_spawn(executable: &str, queued: bool) -> ProcessResult {
     ProcessResult {
         executable: executable.to_owned(),
         shell: None,

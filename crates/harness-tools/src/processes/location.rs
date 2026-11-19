@@ -28,6 +28,8 @@
 //! replace.
 
 use std::collections::HashMap;
+
+use harness_providers::CancellationToken;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -672,6 +674,15 @@ impl<V> Recent<V> {
     }
 }
 
+/// A call's turn among the calls of its conversation ([`Places::take_turn`]).
+pub(crate) enum Turn {
+    /// It holds the turn (none while the switch is off), and whether it
+    /// waited behind another call for it.
+    Held(Option<tokio::sync::OwnedMutexGuard<()>>, bool),
+    /// It was withdrawn while it waited.
+    Canceled,
+}
+
 /// The places of the conversations of one tool service, and the one-line notes
 /// their calls leave for the result.
 #[derive(Debug)]
@@ -729,19 +740,43 @@ impl Places {
     /// start place before it had the process permit, and the call that ran first
     /// could store its end place before the second, started from the old one,
     /// stored its own over it. `None` while the switch is off.
+    #[cfg(test)]
     pub(crate) async fn serialize(&self, task: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        Some(self.turn_lock(task)?.lock_owned().await)
+    }
+
+    /// The lock that orders the calls of `task`; `None` while the switch is off.
+    fn turn_lock(&self, task: &str) -> Option<std::sync::Arc<tokio::sync::Mutex<()>>> {
         if !self.enabled {
             return None;
         }
-        let lock = {
-            let mut locks = self.locks.lock().ok()?;
-            if locks.len() >= KEPT_LIMIT && !locks.contains_key(task) {
-                // Only the locks nobody holds or waits for can go.
-                locks.retain(|_, lock| std::sync::Arc::strong_count(lock) > 1);
-            }
-            std::sync::Arc::clone(locks.entry(task.to_owned()).or_default())
+        let mut locks = self.locks.lock().ok()?;
+        if locks.len() >= KEPT_LIMIT && !locks.contains_key(task) {
+            // Only the locks nobody holds or waits for can go.
+            locks.retain(|_, lock| std::sync::Arc::strong_count(lock) > 1);
+        }
+        Some(std::sync::Arc::clone(
+            locks.entry(task.to_owned()).or_default(),
+        ))
+    }
+
+    /// [`Self::serialize`], withdrawn when `cancellation` fires while the call
+    /// waits for its turn. A call that waited behind another of its
+    /// conversation was queued, as one waiting for the process permit is: it
+    /// waited for the turn and then found the permit free, and was reported
+    /// as never queued, and one canceled while it waited ran nothing and
+    /// said nothing of it.
+    pub(crate) async fn take_turn(&self, task: &str, cancellation: &CancellationToken) -> Turn {
+        let Some(lock) = self.turn_lock(task) else {
+            return Turn::Held(None, false);
         };
-        Some(lock.lock_owned().await)
+        if let Ok(guard) = std::sync::Arc::clone(&lock).try_lock_owned() {
+            return Turn::Held(Some(guard), false);
+        }
+        tokio::select! {
+            guard = lock.lock_owned() => Turn::Held(Some(guard), true),
+            () = cancellation.cancelled() => Turn::Canceled,
+        }
     }
 
     /// Where the next call of `task` starts in `root`; nothing while the switch

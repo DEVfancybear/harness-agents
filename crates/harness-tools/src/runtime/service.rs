@@ -2051,10 +2051,26 @@ impl ToolExecutionService {
                 // Where an earlier shell call of this conversation left off.
                 // The conversation's turn: from reading where it starts to storing
                 // where the last call ended, no other call of it does either.
-                let serial = self
+                let (serial, waited) = match self
                     .places
-                    .serialize(prepared.request.task_id.as_str())
-                    .await;
+                    .take_turn(prepared.request.task_id.as_str(), &cancellation)
+                    .await
+                {
+                    crate::location::Turn::Held(serial, waited) => (serial, waited),
+                    crate::location::Turn::Canceled => {
+                        let lease = self
+                            .begin_backend_lease(
+                                prepared,
+                                action,
+                                *timeout_ms,
+                                *isolation,
+                                execution_id,
+                            )
+                            .await?;
+                        let withdrawn = process::canceled_before_spawn(executable, true);
+                        return self.finish_backend_lease(root, lease, Ok(withdrawn)).await;
+                    }
+                };
                 let place = self.places.start(prepared.request.task_id.as_str(), root);
                 let dir = place.dir.clone().unwrap_or_else(|| root.to_owned());
                 // The guard judged this call from where the shell was; if a call
@@ -2096,7 +2112,11 @@ impl ToolExecutionService {
                     environment,
                     &self.spool,
                 )
-                .await;
+                .await
+                .map(|mut result| {
+                    result.queued |= waited;
+                    result
+                });
                 self.places.finish(
                     prepared.request.task_id.as_str(),
                     execution_id.as_str(),
@@ -2118,10 +2138,26 @@ impl ToolExecutionService {
                 // the command's relative paths are read from there.
                 // The conversation's turn: from reading where it starts to storing
                 // where it ended, no other call of it does either.
-                let serial = self
+                let (serial, waited) = match self
                     .places
-                    .serialize(prepared.request.task_id.as_str())
-                    .await;
+                    .take_turn(prepared.request.task_id.as_str(), &cancellation)
+                    .await
+                {
+                    crate::location::Turn::Held(serial, waited) => (serial, waited),
+                    crate::location::Turn::Canceled => {
+                        let lease = self
+                            .begin_backend_lease(
+                                prepared,
+                                action,
+                                *timeout_ms,
+                                *isolation,
+                                execution_id,
+                            )
+                            .await?;
+                        let withdrawn = process::canceled_before_spawn("shell", true);
+                        return self.finish_backend_lease(root, lease, Ok(withdrawn)).await;
+                    }
+                };
                 let place = self.places.start(prepared.request.task_id.as_str(), root);
                 let dir = place.dir.clone().unwrap_or_else(|| root.to_owned());
                 // The guard judged this call from where the shell was; if a call
@@ -2179,7 +2215,8 @@ impl ToolExecutionService {
                 // Where the shell ended counts only when the command ran to its
                 // end: a timeout or a cancel left it wherever it was killed.
                 let (output, end) = match output {
-                    Ok((result, end)) => {
+                    Ok((mut result, end)) => {
+                        result.queued |= waited;
                         let end = end.filter(|_| !result.timed_out && !result.canceled);
                         (Ok(result), end)
                     }
