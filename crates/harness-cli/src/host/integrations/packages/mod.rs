@@ -9,6 +9,7 @@
 //! (prime's `.prime/agent`), and `--offline`/`HA_OFFLINE` stands for
 //! `PI_OFFLINE`.
 
+pub mod command;
 mod git;
 mod manager;
 mod npm;

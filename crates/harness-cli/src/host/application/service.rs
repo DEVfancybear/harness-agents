@@ -416,6 +416,12 @@ pub trait SessionPort: Send {
     fn mcp_summary(&self) -> Vec<String> {
         vec!["MCP status is unavailable".to_owned()]
     }
+    /// `/package install | remove | update | list`: the packages of skills,
+    /// prompt templates and themes. A change runs in the background and
+    /// reports as notices; the answer says what started.
+    fn package(&mut self, _words: &[String]) -> Result<Vec<String>, String> {
+        Err("this backend does not manage packages".to_owned())
+    }
     /// `/mcp add | list | get | remove`: change the servers the app manages.
     fn manage_mcp(&mut self, _args: &[String]) -> Result<Vec<String>, String> {
         Err("this backend does not manage MCP servers".to_owned())
@@ -608,6 +614,14 @@ pub trait SessionPort: Send {
     /// wait for the person's review.
     fn memory(&mut self, _argument: &str) -> Result<Vec<String>, String> {
         Err("this backend has no memory store".to_owned())
+    }
+    /// The run-time values the slash menu offers after a command's first word,
+    /// under the keys of [`super::commands::values`]: the memory changes that
+    /// wait, the refinements `--rollback` takes, the proposed checks, the
+    /// scheduled jobs, the heartbeats and the MCP servers. Read when the menu
+    /// is refreshed, never on a key press.
+    fn argument_values(&self) -> Vec<(&'static str, Vec<(String, String)>)> {
+        Vec::new()
     }
     /// What leaving now would leave the next session to trip over.
     fn clean_state(&self) -> Vec<String> {
@@ -5995,10 +6009,133 @@ impl SessionPort for AgentSessionService {
         match words.split_first() {
             Some((&"queue", rest)) => Ok(super::memory_queue::command(&self.data_dir, rest).lines),
             None => Ok(super::memory_queue::command(&self.data_dir, &[]).lines),
+            // The queue's actions without `queue`: the list says `accept <id>`,
+            // and that is what a person types next.
+            Some((&("list" | "ls" | "show" | "accept" | "reject"), _)) => {
+                Ok(super::memory_queue::command(&self.data_dir, &words).lines)
+            }
             Some((other, _)) => Err(format!(
-                "/memory {other}: unknown; /memory queue [show <id>|accept <id>...|reject <id>...]"
+                "/memory {other}: unknown; /memory [queue] [list|show <id>|accept <id>...|reject <id>...]"
             )),
         }
+    }
+
+    fn argument_values(&self) -> Vec<(&'static str, Vec<(String, String)>)> {
+        use super::commands::values;
+        // The layers, not a provider: values are offered before one is set up.
+        let config = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .ok();
+        let checks = config
+            .as_ref()
+            .map(|config| {
+                super::checks::choices(&super::learned::Layers::new(
+                    &self.global_config_dir,
+                    &self.data_dir,
+                    &self.workspace_root,
+                    config.project_trusted,
+                ))
+            })
+            .unwrap_or_default();
+        let servers = config
+            .map(|config| {
+                config
+                    .mcp_servers
+                    .keys()
+                    .map(|name| (name.clone(), "configured MCP server".to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let scopes = super::refine::HarnessScopes {
+            global: super::harness::global_dir(&self.data_dir),
+            local: super::harness::local_dir(&self.data_dir, self.task_id.as_str()),
+            review: super::memory_queue::ReviewMode::default(),
+        };
+        vec![
+            (
+                values::MEMORY_QUEUE,
+                super::memory_queue::choices(&self.data_dir),
+            ),
+            (
+                values::REFINEMENTS,
+                super::refine::rollback_choices(&scopes, 20),
+            ),
+            (values::CHECKS, checks),
+            (values::SCHEDULES, self.schedules.choices()),
+            (values::HEARTBEATS, self.heartbeats.choices()),
+            (values::MCP_SERVERS, servers),
+            (
+                values::PACKAGES,
+                super::packages::command::choices(&self.workspace_root, &self.package_dir()),
+            ),
+        ]
+    }
+
+    fn package(&mut self, words: &[String]) -> Result<Vec<String>, String> {
+        use super::packages::command::{self, Action};
+        static RUNNING: AtomicBool = AtomicBool::new(false);
+        /// Lets the next change start however this one ends, a panic too.
+        struct Running;
+        impl Drop for Running {
+            fn drop(&mut self) {
+                RUNNING.store(false, Ordering::SeqCst);
+            }
+        }
+        let action = command::parse(words)?;
+        let workspace = self.workspace_root.clone();
+        let agent_dir = self.package_dir();
+        if action == Action::List {
+            let mut lines = command::run(
+                &mut command::manager(&workspace, &agent_dir, |_| {}),
+                &action,
+            )?;
+            lines.push(String::new());
+            lines.extend(command::USAGE.iter().map(|line| (*line).to_owned()));
+            return Ok(lines);
+        }
+        // npm and git take their time: the change runs beside the app, which
+        // stays usable, and says how it went as notices.
+        if RUNNING.swap(true, Ordering::SeqCst) {
+            return Err("a package change is still running; try again when it finishes".to_owned());
+        }
+        super::packages::set_offline(super::offline::is_offline(&self.environment));
+        let sender = self.sender.clone();
+        let started = match &action {
+            Action::Install { source, .. } => format!("installing {source}..."),
+            Action::Remove { source, .. } => format!("removing {source}..."),
+            Action::Update {
+                source: Some(source),
+            } => format!("updating {source}..."),
+            Action::Update { source: None } | Action::List => "updating packages...".to_owned(),
+        };
+        let running = Running;
+        let spawned = std::thread::Builder::new()
+            .name("ha-package".to_owned())
+            .spawn(move || {
+                let running = running;
+                let notice = move |message: String| {
+                    let _ = sender.send(SessionEvent::Notice { message });
+                };
+                let progress = notice.clone();
+                let mut manager = command::manager(&workspace, &agent_dir, move |step| {
+                    progress(step.to_owned());
+                });
+                let outcome = command::run(&mut manager, &action);
+                drop(running);
+                match outcome {
+                    Ok(lines) => lines.into_iter().for_each(&notice),
+                    Err(message) => notice(format!("package change failed: {message}")),
+                }
+            });
+        if let Err(error) = spawned {
+            // The closure, and the guard in it, is dropped with the error.
+            return Err(format!("could not start the package change: {error}"));
+        }
+        Ok(vec![started])
     }
 
     fn run_gates(&mut self, job: super::autonomous::GateJob) -> Result<(), String> {
@@ -7543,6 +7680,14 @@ impl AgentSessionService {
     /// each step arrives as a notice.
     fn start_mcp_login(&self, server: &str, url: &str) {
         self.start_mcp_login_with(server, url, None, None);
+    }
+
+    /// Where the user's packages are recorded: the config directory, as
+    /// `ha package` uses it.
+    fn package_dir(&self) -> PathBuf {
+        self.config_file
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
     }
 
     /// [`Self::start_mcp_login`] with the server's configured OAuth client and
@@ -14591,6 +14736,116 @@ mod tests {
         assert!(
             super::super::session_log::owed(&marks, None).is_empty(),
             "and nothing is owed after"
+        );
+    }
+
+    /// `/package` in the app: an install starts beside the app and reports as
+    /// notices, the list and the slash menu then show the package, and a
+    /// removal takes it out of both.
+    #[tokio::test]
+    async fn package_installs_and_removes_from_the_app() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        let package = temp.path().join("greet");
+        std::fs::create_dir_all(&home).expect("fixture home");
+        std::fs::create_dir_all(&project).expect("fixture project");
+        std::fs::create_dir_all(&package).expect("fixture skill");
+        std::fs::write(
+            package.join("SKILL.md"),
+            "---\nname: greet\ndescription: greet the user\n---\nGreet.\n",
+        )
+        .expect("fixture skill");
+        let environment =
+            LaunchEnvironment::from_pairs([("HA_HOME", home.to_string_lossy().into_owned())]);
+        let context = bootstrap::resolve(LaunchRequest {
+            cwd: None,
+            caller_dir: project.clone(),
+            platform: HostPlatform::current(),
+            environment: environment.clone(),
+            explicit_data_dir: None,
+        })
+        .expect("context resolves");
+        let mut channel = SessionChannel::new();
+        let mut service = AgentSessionService::new(&context, environment, channel.sender());
+        let source = package.display().to_string();
+        let mut notices = Vec::new();
+        let mut settle = async |expected: &str, notices: &mut Vec<String>| {
+            for _ in 0..200 {
+                notices.extend(channel.drain().into_iter().filter_map(|event| match event {
+                    SessionEvent::Notice { message } => Some(message),
+                    _ => None,
+                }));
+                if notices.iter().any(|notice| notice == expected) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("no notice {expected:?} in {notices:?}");
+        };
+
+        assert_eq!(
+            service.package(&[]).expect("list")[0],
+            "No packages installed."
+        );
+        assert_eq!(
+            service
+                .package(&["install".to_owned(), source.clone()])
+                .expect("install starts"),
+            [format!("installing {source}...")]
+        );
+        settle(&format!("Installed {source}"), &mut notices).await;
+        let listed = service.package(&["list".to_owned()]).expect("list");
+        assert_eq!(listed[0], "User packages:");
+        assert!(listed[2].ends_with("greet"), "{listed:?}");
+        let offered = |service: &AgentSessionService| {
+            service
+                .argument_values()
+                .into_iter()
+                .find(|(key, _)| *key == super::super::commands::values::PACKAGES)
+                .map(|(_, values)| values)
+                .unwrap_or_default()
+        };
+        let menu = offered(&service);
+        assert_eq!(menu.len(), 1, "{menu:?}");
+        // A local package is offered as the path to it from the project, as a
+        // typed source is read.
+        assert!(menu[0].0.ends_with("greet"), "{menu:?}");
+        assert!(menu[0].1.starts_with("user package · "), "{menu:?}");
+        // A skill published on its own is the package's skill.
+        assert!(
+            service
+                .skills_summary()
+                .iter()
+                .any(|line| line.contains("greet")),
+            "{:?}",
+            service.skills_summary()
+        );
+
+        // What the menu offers removes it.
+        let named = menu[0].0.clone();
+        service
+            .package(&["remove".to_owned(), named.clone()])
+            .expect("removal starts");
+        settle(&format!("Removed {named}"), &mut notices).await;
+        assert!(offered(&service).is_empty());
+        assert!(
+            !service
+                .skills_summary()
+                .iter()
+                .any(|line| line.contains("greet"))
+        );
+        service
+            .package(&["remove".to_owned(), source.clone()])
+            .expect("removal starts");
+        settle(
+            &format!("package change failed: No matching package found for {source}"),
+            &mut notices,
+        )
+        .await;
+        assert!(
+            service.package(&["frobnicate".to_owned()]).is_err(),
+            "an unknown action says so before anything starts"
         );
     }
 

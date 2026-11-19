@@ -606,6 +606,27 @@ pub struct Counts {
     pub unreadable: usize,
 }
 
+/// The items waiting under the data directory `data`, oldest first as `list`
+/// shows them, for the slash menu: each id with its title and what it changes.
+#[must_use]
+pub fn choices(data: &Path) -> Vec<(String, String)> {
+    all(data)
+        .into_iter()
+        .map(|located| {
+            let item = located.item;
+            let description = format!(
+                "{} · {} {} {}, by {}",
+                clip(item.text("title"), 80),
+                item.text("action"),
+                item.scope,
+                item.text("kind"),
+                item.proposer()
+            );
+            (item.id, description)
+        })
+        .collect()
+}
+
 /// [`Counts`] under the data directory `data`.
 #[must_use]
 pub fn counts(data: &Path) -> Counts {
@@ -1078,6 +1099,41 @@ mod tests {
             json!({"via": "review"}),
             "test".to_owned(),
         )
+    }
+
+    #[test]
+    fn the_slash_menu_offers_each_waiting_id_with_its_title() {
+        let data = tempfile::tempdir().expect("data");
+        let global = super::super::harness::global_dir(data.path());
+        std::fs::create_dir_all(&global).expect("dir");
+        assert!(choices(data.path()).is_empty(), "nothing waits yet");
+        let Offered::Queued(id) = offer(
+            &global,
+            item(edit(
+                "create",
+                "flutter_sdk_paths",
+                "NexaClip Flutter SDK paths",
+                "The SDK is under C:/flutter",
+            )),
+        )
+        .expect("offer") else {
+            panic!("queued");
+        };
+        let offered = choices(data.path());
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].0, id);
+        assert!(
+            offered[0]
+                .1
+                .starts_with("NexaClip Flutter SDK paths · create global memory"),
+            "{offered:?}"
+        );
+        let rejected = command(data.path(), &["reject", &id]);
+        assert!(rejected.ok, "{:?}", rejected.lines);
+        assert!(
+            choices(data.path()).is_empty(),
+            "a decided change waits no more"
+        );
     }
 
     #[test]

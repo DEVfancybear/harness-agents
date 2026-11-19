@@ -679,6 +679,31 @@ impl Schedules {
             .unwrap_or_default()
     }
 
+    /// Each job's id with its status, schedule and prompt, for the slash menu.
+    #[must_use]
+    pub fn choices(&self) -> Vec<(String, String)> {
+        self.inner
+            .lock()
+            .map(|inner| {
+                inner
+                    .jobs
+                    .iter()
+                    .map(|job| {
+                        let prompt: String = job.prompt.chars().take(80).collect();
+                        (
+                            job.id.clone(),
+                            format!(
+                                "{} · {} · {prompt}",
+                                format!("{:?}", job.status).to_lowercase(),
+                                job.schedule.expression
+                            ),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The jobs due at `now`, each run once however many runs it missed, with
     /// its next run counted from now, as prime-agent's heartbeat prompt.
     pub fn due(&self, now: DateTime<Utc>) -> Vec<Due> {

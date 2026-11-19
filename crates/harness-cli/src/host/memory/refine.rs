@@ -749,6 +749,32 @@ fn history(scopes: &HarnessScopes) -> Vec<Value> {
 /// How many refinements `/refine --history` shows by default.
 const HISTORY_SHOWN: usize = 10;
 
+/// The ids `/refine --rollback` takes, newest first, each with its summary:
+/// what the slash menu offers after `--rollback`.
+#[must_use]
+pub fn rollback_choices(scopes: &HarnessScopes, limit: usize) -> Vec<(String, String)> {
+    let mut records = history(scopes);
+    records.sort_by_key(|record| std::cmp::Reverse(record["id"].as_str().map(refinement_nanos)));
+    records
+        .into_iter()
+        .take(limit)
+        .filter_map(|record| {
+            let id = record["id"].as_str()?.to_owned();
+            let scope = record["scope"].as_str().unwrap_or("local").to_owned();
+            let summary = Refinement { record }.summary();
+            Some((id, format!("{} · {scope}", clip(&summary, 100))))
+        })
+        .collect()
+}
+
+/// When a refinement was recorded, from its id (`refine_<nanos>_...`).
+fn refinement_nanos(id: &str) -> i64 {
+    id.strip_prefix("refine_")
+        .and_then(|id| id.split('_').next())
+        .and_then(|nanos| nanos.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
 /// `/refine --history [N]`: the latest refinements of the global store and
 /// this conversation, newest first - what the automatic review, `/refine`,
 /// `/learn` and the memory curator changed, and why, with the ids
@@ -7192,6 +7218,12 @@ mod tests {
             lines.last().map(String::as_str),
             Some("Undo one with /refine --rollback <id>.")
         );
+        // The slash menu offers that id after `/refine --rollback `.
+        let choices = super::rollback_choices(&scopes, 20);
+        assert_eq!(choices.len(), 1, "{choices:?}");
+        assert_eq!(choices[0].0, result.id());
+        assert_eq!(choices[0].1, "keep the tab rule · global");
+        assert!(super::rollback_choices(&scopes, 0).is_empty());
     }
 
     /// autoharness's chain through `/refine`: the model proposes learned-skill
