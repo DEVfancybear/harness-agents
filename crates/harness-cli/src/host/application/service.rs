@@ -14808,7 +14808,10 @@ mod tests {
         };
         let menu = offered(&service);
         assert_eq!(menu.len(), 1, "{menu:?}");
-        assert_eq!(menu[0].1, "user package");
+        // A local package is offered as the path to it from the project, as a
+        // typed source is read.
+        assert!(menu[0].0.ends_with("greet"), "{menu:?}");
+        assert!(menu[0].1.starts_with("user package · "), "{menu:?}");
         // A skill published on its own is the package's skill.
         assert!(
             service

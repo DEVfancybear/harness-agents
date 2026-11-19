@@ -3,9 +3,10 @@
 
 use std::path::Path;
 
+use super::source::parse_source;
 use super::{
-    ConfiguredPackage, PackageManager, ProgressEvent, ProgressEventKind, SettingsManager,
-    UserOrProject,
+    ConfiguredPackage, PackageManager, ParsedSource, ProgressEvent, ProgressEventKind,
+    SettingsManager, UserOrProject,
 };
 
 /// One package command.
@@ -165,11 +166,38 @@ pub fn list_lines(packages: &[ConfiguredPackage]) -> Vec<String> {
     lines
 }
 
+/// How to type `path` from `workspace`: relative when that is shorter and
+/// reads back to it, as the removal reads it; absolute otherwise.
+fn typed_form(workspace: &Path, path: &Path) -> String {
+    let absolute = path.display().to_string();
+    let relative = super::source::path_relative(workspace, path);
+    let relative = if relative.is_empty() {
+        ".".to_owned()
+    } else if relative.starts_with("..") {
+        relative
+    } else {
+        format!("./{relative}")
+    };
+    if relative.len() < absolute.len()
+        && super::source::lexical_resolve(workspace, &relative) == path
+    {
+        relative
+    } else {
+        absolute
+    }
+}
+
 /// The installed sources for the slash menu, each with its scope.
+///
+/// Settings keep a local source relative to themselves (`../pkg` beside the
+/// config directory), but a typed source is read from the working directory:
+/// the menu offers a local one as the path to it from the working directory,
+/// which removes it, and names the settings entry beside it.
 #[must_use]
 pub fn choices(workspace: &Path, agent_dir: &Path) -> Vec<(String, String)> {
     let settings = SettingsManager::create(workspace, agent_dir);
-    PackageManager::new(workspace, agent_dir, settings)
+    let manager = PackageManager::new(workspace, agent_dir, settings);
+    manager
         .list_configured_packages()
         .into_iter()
         .map(|package| {
@@ -177,14 +205,29 @@ pub fn choices(workspace: &Path, agent_dir: &Path) -> Vec<(String, String)> {
                 UserOrProject::User => "user package",
                 UserOrProject::Project => "project package (--local)",
             };
-            (package.source, scope.to_owned())
+            match parse_source(&package.source) {
+                ParsedSource::Local(local) => {
+                    let resolved = PackageManager::resolve_path_from_base(
+                        &local.path,
+                        &manager.base_dir_for_scope(package.scope.into()),
+                    );
+                    let path = typed_form(workspace, &resolved);
+                    let value = if path.chars().any(char::is_whitespace) {
+                        format!("\"{path}\"")
+                    } else {
+                        path
+                    };
+                    (value, format!("{scope} · {}", package.source))
+                }
+                ParsedSource::Npm(_) | ParsedSource::Git(_) => (package.source, scope.to_owned()),
+            }
         })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, choices, list_lines, manager, parse, run};
+    use super::{Action, choices, list_lines, manager, parse, run, typed_form};
 
     fn words(line: &str) -> Vec<String> {
         line.split_whitespace().map(str::to_owned).collect()
@@ -229,10 +272,41 @@ mod tests {
         assert!(parse(&words("frobnicate")).unwrap_err().contains("unknown"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_menu_path_reads_back_from_the_working_directory() {
+        use std::path::Path;
+        let work = Path::new(r"C:\Users\runneradmin\AppData\Local\Temp\t\project");
+        assert_eq!(
+            typed_form(
+                work,
+                Path::new(r"C:\Users\runneradmin\AppData\Local\Temp\t\greet")
+            ),
+            "../greet"
+        );
+        assert_eq!(typed_form(work, work), ".");
+        assert_eq!(
+            typed_form(work, &work.join("vendor").join("skills")),
+            "./vendor/skills"
+        );
+        // The same folder under its short name: the relative form still reads
+        // back to that spelling.
+        let short = Path::new(r"C:\Users\RUNNER~1\AppData\Local\Temp\t\greet");
+        let typed = typed_form(work, short);
+        assert_eq!(super::super::source::lexical_resolve(work, &typed), short);
+        // Another drive has no relative form.
+        assert_eq!(
+            typed_form(work, Path::new(r"D:\skills\greet")),
+            r"D:\skills\greet"
+        );
+    }
+
     #[test]
     fn a_local_package_installs_lists_offers_and_removes() {
         let root = tempfile::tempdir().expect("temp");
-        let workspace = root.path().join("work");
+        // Not beside the config directory: what settings keep relative to
+        // themselves is not relative to the working directory.
+        let workspace = root.path().join("deep/in/work");
         let agent_dir = root.path().join("config");
         let package = root.path().join("pkg");
         std::fs::create_dir_all(package.join("skills/hello")).expect("package");
@@ -273,9 +347,13 @@ mod tests {
         let offered = choices(&workspace, &agent_dir);
         assert_eq!(
             offered,
-            vec![("../pkg".to_owned(), "user package".to_owned())]
+            vec![(
+                "../../../pkg".to_owned(),
+                "user package · ../pkg".to_owned()
+            )]
         );
-        // What the menu offers removes it.
+        // What the menu offers removes it, from a working directory the
+        // settings entry is not relative to.
         let named = offered[0].0.clone();
         assert_eq!(
             run(
