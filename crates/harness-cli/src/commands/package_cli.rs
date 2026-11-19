@@ -9,10 +9,7 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 use harness_types::{ErrorCode, HarnessError};
 
-use crate::interactive::packages::{
-    ConfiguredPackage, PackageManager, ProgressEvent, ProgressEventKind, SettingsManager,
-    UserOrProject,
-};
+use crate::interactive::packages::command::{self as package_command, Action};
 
 #[derive(Debug, Args)]
 pub struct PackageCommand {
@@ -58,49 +55,17 @@ pub fn run(command: PackageCommand) -> Result<(), HarnessError> {
     crate::interactive::packages::set_offline(crate::interactive::offline::is_offline(
         &environment,
     ));
-    let settings = SettingsManager::create(&cwd, &agent_dir);
-    let mut manager = PackageManager::new(cwd, agent_dir, settings);
-    manager.set_progress_callback(Box::new(|event: &ProgressEvent| {
-        if event.kind == ProgressEventKind::Start
-            && let Some(message) = &event.message
-        {
-            println!("{message}");
-        }
-    }));
-    let scope = |local: bool| {
-        if local {
-            UserOrProject::Project
-        } else {
-            UserOrProject::User
-        }
+    let mut manager = package_command::manager(&cwd, &agent_dir, |step| println!("{step}"));
+    let action = match command.command {
+        PackageSubcommand::Install { source, local } => Action::Install { source, local },
+        PackageSubcommand::Remove { source, local } => Action::Remove { source, local },
+        PackageSubcommand::Update { source } => Action::Update { source },
+        PackageSubcommand::List => Action::List,
     };
-    match command.command {
-        PackageSubcommand::Install { source, local } => {
-            manager
-                .install_and_persist(&source, scope(local))
-                .map_err(failure)?;
-            println!("Installed {source}");
-        }
-        PackageSubcommand::Remove { source, local } => {
-            if !manager
-                .remove_and_persist(&source, scope(local))
-                .map_err(failure)?
-            {
-                return Err(HarnessError::new(
-                    ErrorCode::ConfigReadError,
-                    format!("No matching package found for {source}"),
-                ));
-            }
-            println!("Removed {source}");
-        }
-        PackageSubcommand::Update { source } => {
-            manager.update(source.as_deref()).map_err(failure)?;
-            match source {
-                Some(source) => println!("Updated {source}"),
-                None => println!("Updated packages"),
-            }
-        }
-        PackageSubcommand::List => print_package_list(&manager.list_configured_packages()),
+    let lines = package_command::run(&mut manager, &action)
+        .map_err(|message| HarnessError::new(ErrorCode::ConfigReadError, message))?;
+    for line in lines {
+        println!("{line}");
     }
     Ok(())
 }
@@ -118,52 +83,4 @@ pub fn agent_dir() -> Result<PathBuf, HarnessError> {
         .config_file
         .parent()
         .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf))
-}
-
-#[allow(clippy::needless_pass_by_value, reason = "it is map_err's callback")]
-fn failure(error: anyhow::Error) -> HarnessError {
-    HarnessError::new(ErrorCode::ConfigReadError, format!("Error: {error}"))
-}
-
-/// Print the configured package list (user section, then project section).
-fn print_package_list(packages: &[ConfiguredPackage]) {
-    if packages.is_empty() {
-        println!("No packages installed.");
-        return;
-    }
-    let user_packages: Vec<_> = packages
-        .iter()
-        .filter(|package| package.scope == UserOrProject::User)
-        .collect();
-    let project_packages: Vec<_> = packages
-        .iter()
-        .filter(|package| package.scope == UserOrProject::Project)
-        .collect();
-    if !user_packages.is_empty() {
-        println!("User packages:");
-        for package in &user_packages {
-            print_configured_package(package);
-        }
-    }
-    if !project_packages.is_empty() {
-        if !user_packages.is_empty() {
-            println!();
-        }
-        println!("Project packages:");
-        for package in &project_packages {
-            print_configured_package(package);
-        }
-    }
-}
-
-fn print_configured_package(package: &ConfiguredPackage) {
-    let display = if package.filtered {
-        format!("{} (filtered)", package.source)
-    } else {
-        package.source.clone()
-    };
-    println!("  {display}");
-    if let Some(installed_path) = &package.installed_path {
-        println!("    {}", installed_path.display());
-    }
 }

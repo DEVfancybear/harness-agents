@@ -70,6 +70,17 @@ impl PackageManager {
                 has_any_dir = true;
             }
         }
+        // A skill published on its own (a repo or folder whose root is one
+        // `SKILL.md`, as most skill repositories are) is the package's one
+        // skill: it has no manifest and no `skills/` to put it in.
+        let root_skill = package_root.join("SKILL.md");
+        super::super::probe::note(&root_skill);
+        if !has_any_dir && root_skill.is_file() {
+            accumulator
+                .map(ResourceType::Skills)
+                .add(&root_skill, metadata.clone(), true);
+            return true;
+        }
         has_any_dir
     }
 

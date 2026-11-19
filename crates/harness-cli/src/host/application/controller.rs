@@ -297,6 +297,11 @@ pub struct InteractiveController {
     /// menu is next offered, not at every turn's end: reading them is a scan
     /// of the skill folders, on the thread a terminal's key waits for.
     menu_stale: bool,
+    /// The argument menu's run-time records (memory changes waiting, the
+    /// refinements, checks, jobs, heartbeats and MCP servers) are read again
+    /// before the menu is next offered: after a turn and after a command,
+    /// never on every key.
+    values_stale: bool,
     /// When a key last came in: the menu is read ahead only while none has
     /// for a while, so the read never holds up typing.
     last_key: Option<Instant>,
@@ -469,6 +474,7 @@ impl InteractiveController {
             last_run_elapsed: Duration::ZERO,
             last_request: None,
             menu_stale: true,
+            values_stale: true,
             last_key: None,
             fallback_reason: None,
             tick: 0,
@@ -1309,6 +1315,10 @@ impl InteractiveController {
             self.menu_stale = false;
             self.editor.set_menu_commands(self.service.menu_commands());
         }
+        if opens && !self.plain {
+            self.read_argument_values();
+            self.held_argument_values();
+        }
     }
 
     /// Read the slash menu while nothing is typed, so the `/` that opens it
@@ -1316,10 +1326,78 @@ impl InteractiveController {
     /// 150 ms), and the key that asked for it waited that long.
     fn read_menu_ahead(&mut self) {
         const QUIET: std::time::Duration = std::time::Duration::from_secs(2);
-        if self.menu_stale && !self.plain && self.last_key.is_none_or(|at| at.elapsed() >= QUIET) {
+        if self.plain || self.last_key.is_some_and(|at| at.elapsed() < QUIET) {
+            return;
+        }
+        if self.menu_stale {
             self.menu_stale = false;
             self.editor.set_menu_commands(self.service.menu_commands());
         }
+        self.read_argument_values();
+    }
+
+    /// The argument menu's records the service reads from disk (the memory
+    /// changes waiting, the refinements, checks, jobs, heartbeats and MCP
+    /// servers), once after each turn or command that may have changed them.
+    fn read_argument_values(&mut self) {
+        if !self.values_stale {
+            return;
+        }
+        self.values_stale = false;
+        for (key, values) in self.service.argument_values() {
+            self.editor.set_argument_options(key, values);
+        }
+    }
+
+    /// The argument menu's records this controller holds in memory: the
+    /// sessions `/resume` listed, the turns `/fork` or `/tree` listed, the
+    /// queued follow-ups and the delegated children. Copied whenever a key may
+    /// open the menu, so a child that started a moment ago is offered.
+    fn held_argument_values(&mut self) {
+        use super::commands::values;
+        let clip = |text: &str| -> String {
+            let line = text.lines().next().unwrap_or_default();
+            line.chars().take(80).collect()
+        };
+        let sessions = self
+            .session_candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.session_id.clone(),
+                    format!("{} {}", candidate.task_id, candidate.detail),
+                )
+            })
+            .collect();
+        let turns = self
+            .turn_points
+            .iter()
+            .enumerate()
+            .map(|(index, (_, text))| ((index + 1).to_string(), clip(text)))
+            .collect();
+        let queued = self
+            .queue
+            .lines()
+            .iter()
+            .filter_map(|line| {
+                let (number, text) = line.split_once(". ")?;
+                Some((number.to_owned(), text.to_owned()))
+            })
+            .collect();
+        let agents = self
+            .service
+            .subagents()
+            .into_iter()
+            .filter(|child| child.status == "running")
+            .map(|child| {
+                let task = clip(&child.program);
+                (child.name, format!("{} · {task}", child.model))
+            })
+            .collect();
+        self.editor.set_argument_options(values::SESSIONS, sessions);
+        self.editor.set_argument_options(values::TURNS, turns);
+        self.editor.set_argument_options(values::QUEUED, queued);
+        self.editor.set_argument_options(values::AGENTS, agents);
     }
 
     fn refresh_menu(&mut self) {
@@ -1328,6 +1406,7 @@ impl InteractiveController {
             return;
         }
         self.menu_stale = true;
+        self.values_stale = true;
         let stored = self.service.stored_credentials();
         self.editor
             .set_argument_options("/login", login_options(&stored, true));
@@ -3089,6 +3168,11 @@ impl InteractiveController {
                     effects.push(Effect::Redraw);
                     return;
                 }
+                // A background change (a package installed, a sign-in done) can
+                // add commands and values: the menu reads them again when it
+                // next opens, not now.
+                self.menu_stale = true;
+                self.values_stale = true;
                 // An action that ran without a panel is announced before it runs. In
                 // the TUI that was one `[info] allowed by ...` row above every tool
                 // card - half the transcript of a read-heavy turn. The reason now rides
@@ -4455,6 +4539,9 @@ impl InteractiveController {
             .filter(|rest| !rest.is_empty());
         let argument = raw_argument.and_then(|rest| rest.split_whitespace().next());
         let mut effects = Vec::new();
+        // A command may change what the argument menu offers (`/memory queue
+        // accept` takes an id out of the queue): its records are read again.
+        self.values_stale = true;
         // An alias runs its command: `/thinking` is `/effort`, `/exit` is `/quit`.
         let typed = name;
         let name = super::commands::canonical(typed);
@@ -4611,6 +4698,25 @@ impl InteractiveController {
                 }
             }
             "/plugins" => self.plugins_command(raw_argument, &mut effects),
+            "/package" => {
+                // `ha package` in the app: a list answers in the panel; an
+                // install, removal or update starts and reports as notices.
+                let words = raw_argument
+                    .map(super::mcp_config::split_words)
+                    .unwrap_or_default();
+                match self.service.package(&words) {
+                    Ok(lines) if lines.len() == 1 => self.push_history(
+                        &mut effects,
+                        HistoryItem::Notice {
+                            message: lines.into_iter().next().unwrap_or_default(),
+                        },
+                    ),
+                    Ok(lines) => self.reference("/package", lines, &mut effects),
+                    Err(message) => {
+                        self.push_history(&mut effects, HistoryItem::Error { message });
+                    }
+                }
+            }
             "/queue" => self.queue_command(raw_argument, &mut effects),
             "/stash" => return self.stash_prompt(),
             "/autonomous" => self.autonomous_command(raw_argument, &mut effects),
@@ -7467,9 +7573,38 @@ mod tests {
         running_children: Arc<std::sync::atomic::AtomicUsize>,
         /// Whether each submission was the host's own (`automatic`).
         automatics: Arc<Mutex<Vec<bool>>>,
+        /// The memory changes waiting for review, by id.
+        memory_queue: Arc<Mutex<Vec<String>>>,
+        /// Every `/memory` argument, as the port received it.
+        memory_commands: Arc<Mutex<Vec<String>>>,
     }
 
     impl SessionPort for RecordingPort {
+        fn memory(&mut self, argument: &str) -> Result<Vec<String>, String> {
+            self.memory_commands
+                .lock()
+                .expect("memory commands")
+                .push(argument.to_owned());
+            if let Some(id) = argument.strip_prefix("queue accept ") {
+                self.memory_queue
+                    .lock()
+                    .expect("memory queue")
+                    .retain(|waiting| waiting != id);
+            }
+            Ok(vec![format!("memory: {argument}")])
+        }
+
+        fn argument_values(&self) -> Vec<(&'static str, Vec<(String, String)>)> {
+            let waiting = self.memory_queue.lock().expect("memory queue");
+            vec![(
+                crate::interactive::commands::values::MEMORY_QUEUE,
+                waiting
+                    .iter()
+                    .map(|id| (id.clone(), format!("the change {id}")))
+                    .collect(),
+            )]
+        }
+
         fn running_children(&self) -> usize {
             self.running_children
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -14106,6 +14241,60 @@ Command: \"npm run build\""
         let _ = submit_text(&mut harness.controller, "/model");
         assert_eq!(harness.controller.editor.text(), "/model ");
         assert!(!harness.controller.editor.suggestions().is_empty());
+    }
+
+    /// The person's way through the review queue: `/memory` lists the waiting
+    /// changes, and typing the accept offers the action and then each id;
+    /// Enter on an id accepts it, and the next menu no longer offers it.
+    #[test]
+    fn memory_queue_accept_offers_the_waiting_ids_and_enter_accepts_one() {
+        let harness = tui_bench(true);
+        harness
+            .port
+            .memory_queue
+            .lock()
+            .expect("queue")
+            .extend(["mq-8768207a".to_owned(), "mq-b8db4def".to_owned()]);
+        let mut controller = harness.controller;
+        let _ = controller.boot_lines();
+        type_text(&mut controller, "/memory queue a");
+        assert_eq!(
+            controller.editor.suggestions()[0].completion,
+            "/memory queue accept "
+        );
+        let _ = controller.handle_key(Key::Tab);
+        assert_eq!(controller.editor.text(), "/memory queue accept ");
+        let offered: Vec<&str> = controller
+            .editor
+            .suggestions()
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        assert_eq!(offered, ["mq-8768207a", "mq-b8db4def"]);
+        assert_eq!(
+            controller.editor.suggestions()[0].description,
+            "the change mq-8768207a"
+        );
+        let _ = controller.handle_key(Key::Enter);
+        assert_eq!(
+            harness
+                .port
+                .memory_commands
+                .lock()
+                .expect("commands")
+                .as_slice(),
+            ["queue accept mq-8768207a"],
+            "Enter on the id ran the accept"
+        );
+        assert_eq!(controller.editor.text(), "");
+        type_text(&mut controller, "/memory queue accept ");
+        let offered: Vec<&str> = controller
+            .editor
+            .suggestions()
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        assert_eq!(offered, ["mq-b8db4def"], "the accepted change is gone");
     }
 
     #[test]
