@@ -218,9 +218,9 @@ fn read_file(path: &Path) -> Result<Read, String> {
         ));
     }
     let declared_image = claims_to_be_an_image(&name);
-    let (bytes, exceeded) = if declared_image {
-        // Refuse on the declared size before reading: a sparse or misnamed
-        // multi-gigabyte file must not be loaded to discover it is too big.
+    // Refuse on the declared size before reading: a sparse or misnamed
+    // multi-gigabyte file must not be loaded to discover it is too big.
+    let whole_image = || {
         if metadata.len() > MAX_IMAGE_BYTES as u64 {
             return Err(format!(
                 "{name}: {} is larger than the {} MiB an image may be",
@@ -228,12 +228,18 @@ fn read_file(path: &Path) -> Result<Read, String> {
                 MAX_IMAGE_BYTES / (1024 * 1024)
             ));
         }
-        let bytes = std::fs::read(&resolved).map_err(|error| format!("{name}: {error}"))?;
-        (bytes, false)
+        std::fs::read(&resolved).map_err(|error| format!("{name}: {error}"))
+    };
+    let (bytes, exceeded) = if declared_image {
+        (whole_image()?, false)
     } else {
         read_capped(&resolved)?
     };
     if let Some(media_type) = sniff(&bytes) {
+        // An image whose name does not say so was read to the file ceiling:
+        // its bytes are read whole, or the provider gets a cut-off image it
+        // cannot parse.
+        let bytes = if exceeded { whole_image()? } else { bytes };
         return Ok(Read::Image(image_attachment(&name, media_type, &bytes)?));
     }
     if exceeded {
@@ -610,6 +616,14 @@ fn candidate_paths(text: &str) -> Vec<String> {
                 ',' | ';' | ':' | ')' | '(' | '[' | ']' | '<' | '>'
             )
         });
+        // The sentence's own full stop is not the name's: Windows opens
+        // `shot.png.` as `shot.png`, but the name would no longer say image.
+        let sentence = trimmed.trim_end_matches(['.', '!', '?']);
+        let trimmed = if sentence.is_empty() {
+            trimmed
+        } else {
+            sentence
+        };
         if !trimmed.is_empty() {
             candidates.push(trimmed.to_owned());
         }
@@ -883,6 +897,39 @@ mod tests {
         let twice = from_message(&format!("\"{0}\" and \"{0}\"", once.display()), temp.path());
         assert_eq!(twice.files.len(), 1, "{twice:?}");
         assert_eq!(twice.files[0].bytes, 5, "{twice:?}");
+    }
+
+    /// `ha exec "Look at shot.png. ..."` (live image.sh): the sentence's full
+    /// stop stayed on the name, Windows opened `shot.png.` all the same, and the
+    /// name no longer saying image, a 1.7 MB PNG was read to the 256 KiB text
+    /// ceiling and sent cut off - "could not parse image: unexpected end of file".
+    #[test]
+    fn an_image_the_name_does_not_announce_is_attached_whole() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let mut big = PNG.to_vec();
+        big.resize(MAX_FILE_BYTES * 3, 0x55);
+        write(temp.path(), "shot.png", &big);
+        write(temp.path(), "shot.txt", &big);
+        let found = from_message("Look at shot.png. And shot.txt!", temp.path());
+        assert_eq!(found.images.len(), 2, "{found:?}");
+        for image in &found.images {
+            let harness_providers::ImageSource::Inline { data_base64, .. } =
+                &image.attachment.source
+            else {
+                panic!("an inline image: {image:?}");
+            };
+            assert_eq!(
+                data_base64.len(),
+                big.len().div_ceil(3) * 4,
+                "{}",
+                image.source
+            );
+            assert!(
+                !image.attachment.label.contains(".png."),
+                "{}",
+                image.attachment.label
+            );
+        }
     }
 
     /// A credential file is refused whether it would have been an image or text.
