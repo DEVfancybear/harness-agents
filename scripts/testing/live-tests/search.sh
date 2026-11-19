@@ -82,6 +82,22 @@ printf 'mod loader; // changed\n' > "$P/src/config/mod.rs"
 printf 'if a {\n    retry();\n}\nif b {\n    retry();\n}\n' > "$P/dup.txt"
 
 agent "$P" s1
+# receipt <tool>: the latest result of that tool, as the store holds it - what
+# the model read, which a model copying it out may shorten.
+receipt() {
+  "$PY" - "$1" "$HA_HOME"/data/projects/*/harness.sqlite3 <<'PYEOF' | tr -d '\r'
+import sqlite3, sys
+sys.stdout.reconfigure(encoding="utf-8")
+tool, latest = sys.argv[1], None
+for path in sys.argv[2:]:
+    store = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    for (content,) in store.execute(
+        "select content from history_sources where kind = 'receipt.recorded' "
+        "and content like ? order by rowid desc limit 1", (tool + ":%",)):
+        latest = content
+print(latest or "")
+PYEOF
+}
 echo "################ 1. find_files through typos"
 say s1 "Kiểm thử harness: gọi tool find_files đúng một lần với query 'confg lodaer'. In nguyên văn toàn bộ kết quả tool, không gọi tool nào khác." | tail -4 | sed 's/^/   /'
 check "a find_files result came back" 'last | grep -q "find_files"'
@@ -91,8 +107,10 @@ check "'mian' put src/main.rs first" 'last | grep -E "src/main.rs|tests/main_tes
 
 echo "################ 2. find_files by git status"
 say s1 "Gọi tool find_files đúng một lần với query 'git:modified'. In nguyên văn toàn bộ kết quả tool." | tail -4 | sed 's/^/   /'
-check "git:modified listed the changed file with its status" 'last | grep -qE "src/config/mod.rs.*\[modified\]"'
-check "git:modified left the clean files out" '! (last | grep -q "src/config/loader.rs")'
+receipt find_files | sed 's/^/   tool: /'
+# The tool's own result: a model copying it out has dropped the status.
+check "git:modified listed the changed file with its status" 'receipt find_files | grep -qE "src/config/mod.rs.*\[modified\]"'
+check "git:modified left the clean files out" '! (receipt find_files | grep -q "src/config/loader.rs")'
 
 echo "################ 3. any_of finds every spelling in one call"
 say s1 "Gọi tool search_text đúng một lần với query 'prepare_upload' và any_of ['prepareUpload']. In nguyên văn toàn bộ kết quả tool." | tail -6 | sed 's/^/   /'
