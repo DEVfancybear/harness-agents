@@ -118,7 +118,10 @@ pub fn from_message(text: &str, workspace: &Path) -> Attachments {
             }
             continue;
         }
-        let Some(path) = resolve(&candidate, workspace) else {
+        let Some(path) = sentence_word(&candidate)
+            .and_then(|word| resolve(word, workspace))
+            .or_else(|| resolve(&candidate, workspace))
+        else {
             continue;
         };
         match read_file(&path) {
@@ -220,15 +223,30 @@ fn read_file(path: &Path) -> Result<Read, String> {
     let declared_image = claims_to_be_an_image(&name);
     // Refuse on the declared size before reading: a sparse or misnamed
     // multi-gigabyte file must not be loaded to discover it is too big.
+    // The read itself is bounded too: a file still being written may have
+    // grown since its size was taken.
+    let too_big = |size: u64| {
+        format!(
+            "{name}: {} is larger than the {} MiB an image may be",
+            human_size(size),
+            MAX_IMAGE_BYTES / (1024 * 1024)
+        )
+    };
     let whole_image = || {
         if metadata.len() > MAX_IMAGE_BYTES as u64 {
-            return Err(format!(
-                "{name}: {} is larger than the {} MiB an image may be",
-                human_size(metadata.len()),
-                MAX_IMAGE_BYTES / (1024 * 1024)
-            ));
+            return Err(too_big(metadata.len()));
         }
-        std::fs::read(&resolved).map_err(|error| format!("{name}: {error}"))
+        let mut bytes = Vec::new();
+        std::fs::File::open(&resolved)
+            .and_then(|file| {
+                file.take(MAX_IMAGE_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)
+            })
+            .map_err(|error| format!("{name}: {error}"))?;
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err(too_big(bytes.len() as u64));
+        }
+        Ok(bytes)
     };
     let (bytes, exceeded) = if declared_image {
         (whole_image()?, false)
@@ -239,7 +257,14 @@ fn read_file(path: &Path) -> Result<Read, String> {
         // An image whose name does not say so was read to the file ceiling:
         // its bytes are read whole, or the provider gets a cut-off image it
         // cannot parse.
-        let bytes = if exceeded { whole_image()? } else { bytes };
+        if !exceeded {
+            return Ok(Read::Image(image_attachment(&name, media_type, &bytes)?));
+        }
+        let bytes = whole_image()?;
+        // Read again, it is judged again: it may have been replaced between.
+        let Some(media_type) = sniff(&bytes) else {
+            return Err(format!("{name}: it changed while it was read"));
+        };
         return Ok(Read::Image(image_attachment(&name, media_type, &bytes)?));
     }
     if exceeded {
@@ -616,19 +641,30 @@ fn candidate_paths(text: &str) -> Vec<String> {
                 ',' | ';' | ':' | ')' | '(' | '[' | ']' | '<' | '>'
             )
         });
-        // The sentence's own full stop is not the name's: Windows opens
-        // `shot.png.` as `shot.png`, but the name would no longer say image.
-        let sentence = trimmed.trim_end_matches(['.', '!', '?']);
-        let trimmed = if sentence.is_empty() {
-            trimmed
-        } else {
-            sentence
-        };
         if !trimmed.is_empty() {
             candidates.push(trimmed.to_owned());
         }
     }
     candidates
+}
+
+/// The word without the sentence's own punctuation, when it had some: the
+/// full stop of `Look at shot.png.`, and the brackets around `(shot.png).`.
+/// Windows opens `shot.png.` as `shot.png`, but the name would no longer say
+/// image. A file whose name does end so (`notes!`) is still found by the word
+/// as written, which is tried when this one names nothing.
+fn sentence_word(word: &str) -> Option<&str> {
+    let mut current = word;
+    loop {
+        let next = current
+            .trim_end_matches(['.', '!', '?'])
+            .trim_matches(['(', ')', '[', ']', '<', '>', ',', ';', ':']);
+        if next == current || next.is_empty() {
+            break;
+        }
+        current = next;
+    }
+    (current != word).then_some(current)
 }
 
 /// Resolve a token the way a user means it: absolute, or relative to the workspace.
@@ -910,7 +946,7 @@ mod tests {
         big.resize(MAX_FILE_BYTES * 3, 0x55);
         write(temp.path(), "shot.png", &big);
         write(temp.path(), "shot.txt", &big);
-        let found = from_message("Look at shot.png. And shot.txt!", temp.path());
+        let found = from_message("Look at shot.png. And (shot.txt)!", temp.path());
         assert_eq!(found.images.len(), 2, "{found:?}");
         for image in &found.images {
             let harness_providers::ImageSource::Inline { data_base64, .. } =
@@ -930,6 +966,13 @@ mod tests {
                 image.attachment.label
             );
         }
+
+        // A name that does end so is still found by the word as written, as
+        // `/attach "notes!"` puts it in the message.
+        write(temp.path(), "notes!", b"the notes");
+        let named = from_message("read notes!", temp.path());
+        assert_eq!(named.files.len(), 1, "{named:?}");
+        assert_eq!(named.files[0].content, "the notes", "{named:?}");
     }
 
     /// A credential file is refused whether it would have been an image or text.
@@ -987,6 +1030,13 @@ mod tests {
         assert_eq!(
             found.images[0].attachment.label,
             "broken.png (image url, downloaded by the model)"
+        );
+
+        // A link's own last character is not the sentence's.
+        let exclaimed = from_message("see https://cdn.example.com/a/b.jpg?tag=wow!", temp.path());
+        assert!(
+            exclaimed.images[0].attachment.url().ends_with("tag=wow!"),
+            "{exclaimed:?}"
         );
 
         // A query string is part of the link, and the extension is what decides.
