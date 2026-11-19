@@ -236,10 +236,10 @@ rm -f "$X/limit"
 echo "################ 6. a parked session's child makes no call on that provider"
 proxied "$RX/p" q6
 asked6=$(now_ms)
-# The parent waits in python_repl, not run_shell: the two agents' shells run
-# one after the other, and a parent's sleep queued behind the child's 50 s one
-# met the limit after the child had ended (seen twice on the 0.9.12 candidate).
-"$HA" send q6 "Kiểm thử harness, làm đúng thứ tự: (1) dùng tool delegate với wait=false giao cho một agent role explorer nhiệm vụ: gọi run_shell đúng một lần với command Start-Sleep -Seconds 50 và timeout_ms 120000, rồi trả lời đúng CHILD-DONE. (2) Sau khi giao, tự gọi python_repl với code: import time; time.sleep(15) (không dùng run_shell). (3) Trả lời đúng một dòng: PARENT-DONE." >/dev/null 2>&1
+# Both sleep in run_shell: a parent's shell does not wait for its child's. On
+# the 0.9.12 candidate before the fix it did - the parent's 15 s sleep took
+# 66.7 s behind the child's 50 s one - and the park came after the child ended.
+"$HA" send q6 "Kiểm thử harness, làm đúng thứ tự: (1) dùng tool delegate với wait=false giao cho một agent role explorer nhiệm vụ: gọi run_shell đúng một lần với command Start-Sleep -Seconds 50 và timeout_ms 120000, rồi trả lời đúng CHILD-DONE. (2) Sau khi giao, tự gọi run_shell với command Start-Sleep -Seconds 15 và timeout_ms 60000. (3) Trả lời đúng một dòng: PARENT-DONE." >/dev/null 2>&1
 for _ in $(seq 1 60); do
   records child | awk -v since="$asked6" '$1 > since && $2 == "started"' | grep -q . && break
   sleep 3
@@ -262,6 +262,10 @@ for _ in $(seq 1 60); do
 done
 records child | awk -v since="$asked6" '$1 > since' | sed 's/^/   /'
 requests "${parked6:-$limited6}" | sed 's/^/   proxy after the park: /'
+# The parent's 15-second shell ran beside the child's 50-second one.
+shells6=$(records tool | awk -v since="$asked6" '$1 > since && /tool=run_shell/' | grep -o "elapsed_ms=[0-9]*" | cut -d= -f2 | sort -n | tr '\n' ' ')
+echo "   run_shell elapsed (ms): $shells6"
+check "the parent's shell did not wait for its child's" '[ -n "$shells6" ] && [ "$(echo $shells6 | cut -d" " -f1)" -lt 40000 ]'
 check "the session was parked while its child still ran (the precondition)" '[ -n "$parked6" ] && [ -n "$ended6" ] && [ "$parked6" -lt "$ended6" ]'
 check "the child's call after the park reached no provider" '[ -n "$parked6" ] && [ -n "$ended6" ] && [ "$(requests "$parked6" | awk -v end="$ended6" "\$1 <= end" | wc -l)" -eq 0 ]'
 rm -f "$X/limit"

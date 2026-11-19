@@ -127,6 +127,36 @@ sleep 3
 say a1 "Answer with one word: ok" >/dev/null
 check "the agent came back and answers" 'last | grep -qi ok'
 
+echo "== a process the computer's restart ended (bug report 20261118-160828)"
+# A worker whose log starts before the computer last started and never says
+# how it ended: the report said "still running, or killed or crashed".
+boot=$("$PY" - "$HA_HOME/data/diagnostics" <<'EOF'
+import ctypes, datetime, json, os, sys, time
+now = int(time.time() * 1000)
+try:
+    up = ctypes.windll.kernel32.GetTickCount64
+    up.restype = ctypes.c_uint64
+    boot = now - int(up())
+except AttributeError:
+    boot = now - int(float(open("/proc/uptime").read().split()[0]) * 1000)
+ms = boot - 120_000
+ts = datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+day = ts[:10].replace("-", "")
+os.makedirs(sys.argv[1], exist_ok=True)
+with open(os.path.join(sys.argv[1], f"{day}-worker-999991.jsonl"), "a", encoding="utf-8") as f:
+    for seq, (kind, event) in enumerate([("process", "start"), ("notice", "shown")]):
+        f.write(json.dumps({"build": "seed", "event": event, "kind": kind, "level": "info", "ms": ms + seq,
+                            "msg": "", "pid": 999991, "role": "worker", "seq": seq, "ts": ts, "v": 1}) + "\n")
+print((now - ms) // 3_600_000 + 2)
+EOF
+)
+boot=$(echo "$boot" | tr -d '\r')
+"$HA" bug-report --since "${boot}h" --out "$RX/report-boot.zip" > /dev/null 2>&1
+"$PY" -c "import zipfile,sys; sys.stdout.reconfigure(encoding='utf-8'); sys.stdout.write(zipfile.ZipFile(sys.argv[1]).read('SUMMARY.md').decode('utf-8'))" "$RX/report-boot.zip" > "$RX/report-boot.md" 2>/dev/null
+grep "pid 999991" "$RX/report-boot.md" | sed 's/^/   /'
+check "a process started before the computer last started ended with it" 'grep "pid 999991" "$RX/report-boot.md" | grep -q "ended with the computer"'
+rm -f "$HA_HOME"/data/diagnostics/*-worker-999991.jsonl
+
 echo "== ha bug-report"
 "$HA" bug-report --since 1h --out "$RX/report.zip" --json > "$RX/report.json" 2>"$RX/report.err"
 check "the report is written" '[ -s "$RX/report.zip" ]'

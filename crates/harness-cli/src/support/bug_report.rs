@@ -96,6 +96,9 @@ struct Report {
     notes: Vec<String>,
     known_secrets: Vec<String>,
     redactions: usize,
+    /// When the computer last started: a process without an exit record that
+    /// started before then ended with the computer.
+    booted_ms: Option<i64>,
 }
 
 /// Parse `30m`, `2h`, `3d`, `90s` (a bare number is hours).
@@ -195,6 +198,7 @@ async fn gather(options: Options) -> Result<Report, HarnessError> {
         notes: Vec::new(),
         known_secrets,
         redactions: 0,
+        booted_ms: crate::boot::booted_ms(now_ms()),
     };
     if let Some(task) = &report.options.task {
         report.conversations.insert(task.clone());
@@ -1120,10 +1124,17 @@ impl Report {
                         )
                     })
                     .unwrap_or_default();
-                format!(
-                    "{role} pid {pid}, started {}: no exit record - still running, or killed or crashed (a stack overflow leaves no panic); its last record: {last}",
-                    ms_text(ms)
-                )
+                match self.booted_ms {
+                    Some(booted) if crate::boot::ended_with_the_computer(ms, Some(booted)) => format!(
+                        "{role} pid {pid}, started {}: no exit record - it ended with the computer, which started again at {} (a power loss, a hard reset or a restart leaves no record); its last record: {last}",
+                        ms_text(ms),
+                        ms_text(booted)
+                    ),
+                    _ => format!(
+                        "{role} pid {pid}, started {}: no exit record - still running, or killed or crashed (a stack overflow leaves no panic); its last record: {last}",
+                        ms_text(ms)
+                    ),
+                }
             })
             .collect()
     }
@@ -3390,6 +3401,57 @@ pub async fn print_timeline(
 #[cfg(test)]
 mod tests {
     use super::{parse_window, withhold_secret_lines, zip};
+
+    /// Bug report 20261118-160828: a worker had no exit record because the
+    /// computer went down under it (Windows: "the previous system shutdown
+    /// ... was unexpected"); the report said "still running, or killed or
+    /// crashed". A process started before the computer last did ended with it.
+    #[test]
+    fn a_process_started_before_the_boot_ended_with_the_computer() {
+        let record = |pid: u64, ms: i64, kind: &str, event: &str| {
+            serde_json::json!({"role": "worker", "pid": pid, "ms": ms, "kind": kind,
+                "event": event, "ts": super::ms_text(ms)})
+        };
+        let report = super::Report {
+            options: super::Options {
+                since: std::time::Duration::from_hours(24),
+                task: None,
+                session: None,
+                include_content: false,
+            },
+            since_ms: 0,
+            data_dir: std::path::PathBuf::new(),
+            files: std::collections::BTreeMap::new(),
+            points: Vec::new(),
+            records: vec![
+                record(4700, 1_000, "process", "start"),
+                record(4700, 2_000, "notice", "shown"),
+                record(18392, 5_000, "process", "start"),
+            ],
+            store_problems: std::collections::BTreeMap::new(),
+            log_panics: std::collections::BTreeMap::new(),
+            conversations: std::collections::BTreeSet::new(),
+            children: std::collections::BTreeMap::new(),
+            notes: Vec::new(),
+            known_secrets: Vec::new(),
+            redactions: 0,
+            booted_ms: Some(3_000),
+        };
+        let unclean = report.unclean_exits();
+        assert_eq!(unclean.len(), 2, "{unclean:?}");
+        assert!(
+            unclean[1].starts_with("worker pid 18392")
+                && unclean[1].contains("still running, or killed"),
+            "{unclean:?}"
+        );
+        assert!(
+            unclean[0].starts_with("worker pid 4700")
+                && unclean[0].contains("ended with the computer")
+                && unclean[0].contains(&super::ms_text(3_000))
+                && unclean[0].contains("notice.shown"),
+            "{unclean:?}"
+        );
+    }
 
     #[test]
     fn a_zip_reads_back_with_its_names_and_bytes() {

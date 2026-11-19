@@ -2,7 +2,7 @@ use std::{
     io,
     path::Path,
     process::{ExitStatus, Stdio},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -224,11 +224,23 @@ fn internal_process_permits() -> &'static tokio::sync::Semaphore {
 /// std serializes the `CreateProcess` calls themselves so pipe handles are not
 /// inherited across children. What still must hold - one `wait` per child and
 /// no `try_wait` before it - is per child and unchanged.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// `Owned` is the queue of one tool service - one agent's turn: its calls
+/// queue as `Exclusive` ones do, and another agent's do not wait on them. The
+/// host-wide queue made a parent's 15-second sleep wait out its child's
+/// 50-second one, and a conversation's shell every other agent's build in the
+/// same worker.
+#[derive(Clone, Debug)]
 pub(crate) enum ProcessLane {
     Exclusive,
     Internal,
+    Owned(ProcessQueue),
 }
+
+/// One owner's process queue: the model's processes of one tool service run
+/// one at a time, as the tool contract says, beside other owners' processes.
+#[derive(Clone, Debug, Default)]
+pub struct ProcessQueue(Arc<tokio::sync::Mutex<()>>);
 
 /// The permit a running process holds; released when the run ends.
 enum ProcessPermit {
@@ -238,11 +250,12 @@ enum ProcessPermit {
     Internal(
         #[allow(dead_code, reason = "held for its drop")] tokio::sync::SemaphorePermit<'static>,
     ),
+    Owned(#[allow(dead_code, reason = "held for its drop")] tokio::sync::OwnedMutexGuard<()>),
 }
 
 impl ProcessPermit {
     /// The permit without waiting, if one is free.
-    fn try_acquire(lane: ProcessLane) -> Option<Self> {
+    fn try_acquire(lane: &ProcessLane) -> Option<Self> {
         match lane {
             ProcessLane::Exclusive => process_execution_lock()
                 .try_lock()
@@ -252,12 +265,15 @@ impl ProcessPermit {
                 .try_acquire()
                 .ok()
                 .map(Self::Internal),
+            ProcessLane::Owned(queue) => {
+                Arc::clone(&queue.0).try_lock_owned().ok().map(Self::Owned)
+            }
         }
     }
 
     /// Wait for the permit. `None` only if the semaphore were closed, which
     /// this module never does.
-    async fn acquire(lane: ProcessLane) -> Option<Self> {
+    async fn acquire(lane: &ProcessLane) -> Option<Self> {
         match lane {
             ProcessLane::Exclusive => Some(Self::Exclusive(process_execution_lock().lock().await)),
             ProcessLane::Internal => internal_process_permits()
@@ -265,6 +281,7 @@ impl ProcessPermit {
                 .await
                 .ok()
                 .map(Self::Internal),
+            ProcessLane::Owned(queue) => Some(Self::Owned(Arc::clone(&queue.0).lock_owned().await)),
         }
     }
 }
@@ -278,7 +295,7 @@ pub(crate) struct ProcessResult {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub canceled: bool,
-    /// Whether this call had to wait for the host-wide process permit.
+    /// Whether this call had to wait for its process permit.
     ///
     /// It is recorded so a canceled queue member is distinguishable from a call
     /// that was withdrawn before it ever reached the runner.
@@ -296,7 +313,12 @@ pub(crate) struct ProcessResult {
     pub capture: Option<FinalizedCapture>,
 }
 
-pub(crate) async fn run_structured(
+/// A structured process the model asked for, in `queue` - its tool service's
+/// own - instead of the host-wide queue: it waits only for that service's
+/// other processes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_structured_in(
+    queue: &ProcessQueue,
     root: &Path,
     executable: &str,
     args: &[String],
@@ -305,7 +327,7 @@ pub(crate) async fn run_structured(
     environment: &ProcessEnvironment,
     spool: &ProcessSpoolConfig,
 ) -> Result<ProcessResult, HarnessError> {
-    run_structured_with_host(
+    run(
         root,
         executable,
         args,
@@ -314,6 +336,31 @@ pub(crate) async fn run_structured(
         environment,
         spool,
         &HostEnvironment::from_process(),
+        None,
+        ProcessLane::Owned(queue.clone()),
+    )
+    .await
+}
+
+/// [`run_shell`], in `queue` instead of the host-wide queue.
+pub(crate) async fn run_shell_in(
+    queue: &ProcessQueue,
+    root: &Path,
+    command: &str,
+    timeout_ms: u64,
+    cancellation: CancellationToken,
+    environment: &ProcessEnvironment,
+    spool: &ProcessSpoolConfig,
+) -> Result<ProcessResult, HarnessError> {
+    run_shell_in_lane(
+        root,
+        command,
+        timeout_ms,
+        cancellation,
+        environment,
+        spool,
+        &HostEnvironment::from_process(),
+        ProcessLane::Owned(queue.clone()),
     )
     .await
 }
@@ -960,11 +1007,11 @@ async fn run(
     // The queue is cancellation-aware: a call withdrawn by its caller must not
     // start a process later, when the permit finally reaches it. The fast path
     // keeps the uncontended case free of a select branch.
-    let (guard, queued) = if let Some(guard) = ProcessPermit::try_acquire(lane) {
+    let (guard, queued) = if let Some(guard) = ProcessPermit::try_acquire(&lane) {
         (guard, false)
     } else {
         let guard = tokio::select! {
-            guard = ProcessPermit::acquire(lane) => guard,
+            guard = ProcessPermit::acquire(&lane) => guard,
             () = cancellation.cancelled() => {
                 return Ok(canceled_before_spawn(executable, true));
             }
@@ -1347,4 +1394,30 @@ async fn join_reader(
             format!("process output reader did not complete: {error}"),
         )
     })?
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::{ProcessLane, ProcessPermit, ProcessQueue};
+
+    /// Found live on the 0.9.12 candidate (queue.sh): one host-wide queue made
+    /// a parent's 15-second sleep wait out its child's 50-second one. A tool
+    /// service's model processes queue behind each other only.
+    #[tokio::test]
+    async fn one_agents_process_does_not_wait_for_anothers() {
+        let parent = ProcessQueue::default();
+        let child = ProcessQueue::default();
+        let running = ProcessPermit::try_acquire(&ProcessLane::Owned(child.clone()))
+            .expect("the child's process runs");
+        assert!(
+            ProcessPermit::try_acquire(&ProcessLane::Owned(parent.clone())).is_some(),
+            "the parent's process does not queue behind the child's"
+        );
+        assert!(
+            ProcessPermit::try_acquire(&ProcessLane::Owned(child.clone())).is_none(),
+            "the child's next process queues behind its own"
+        );
+        drop(running);
+        assert!(ProcessPermit::try_acquire(&ProcessLane::Owned(child)).is_some());
+    }
 }

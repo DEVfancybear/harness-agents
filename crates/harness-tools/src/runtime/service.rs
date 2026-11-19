@@ -297,6 +297,9 @@ pub struct ToolExecutionService {
     elsewhere: Option<Arc<dyn PathElsewhere>>,
     /// A host's check before a command runs (the jev plugin's command guard).
     guard: Option<Arc<dyn ToolGuard>>,
+    /// The queue this service's model processes wait in: one at a time
+    /// within the service, beside other agents' (`ProcessLane::Owned`).
+    process_queue: process::ProcessQueue,
 }
 
 /// A host's own check before a command runs, after the policy allowed it:
@@ -327,6 +330,7 @@ impl ToolExecutionService {
             hashline: false,
             elsewhere: None,
             guard: None,
+            process_queue: process::ProcessQueue::default(),
         }
     }
 
@@ -1948,7 +1952,8 @@ impl ToolExecutionService {
                 let lease = self
                     .begin_backend_lease(prepared, action, *timeout_ms, *isolation, execution_id)
                     .await?;
-                let output = process::run_structured(
+                let output = process::run_structured_in(
+                    &self.process_queue,
                     root,
                     executable,
                     args,
@@ -1997,7 +2002,8 @@ impl ToolExecutionService {
                 let lease = self
                     .begin_backend_lease(prepared, action, *timeout_ms, *isolation, execution_id)
                     .await?;
-                let output = process::run_shell(
+                let output = process::run_shell_in(
+                    &self.process_queue,
                     root,
                     command,
                     *timeout_ms,
