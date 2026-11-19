@@ -424,6 +424,38 @@ impl Heartbeats {
         }
     }
 
+    /// Each heartbeat's id with its status, interval and instruction, for the
+    /// slash menu.
+    #[must_use]
+    pub fn choices(&self) -> Vec<(String, String)> {
+        let Ok(listed) = self.handle("rlm_heartbeat.list", &json!({})) else {
+            return Vec::new();
+        };
+        listed["heartbeats"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        let instruction: String = row["instruction"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .chars()
+                            .take(80)
+                            .collect();
+                        Some((
+                            row["id"].as_str()?.to_owned(),
+                            format!(
+                                "{} · {} · {instruction}",
+                                row["status"].as_str().unwrap_or_default(),
+                                row["schedule"]["expression"].as_str().unwrap_or_default()
+                            ),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// How many heartbeats there are, paused ones included.
     #[must_use]
     pub fn count(&self) -> usize {

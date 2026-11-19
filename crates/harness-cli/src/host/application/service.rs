@@ -609,6 +609,14 @@ pub trait SessionPort: Send {
     fn memory(&mut self, _argument: &str) -> Result<Vec<String>, String> {
         Err("this backend has no memory store".to_owned())
     }
+    /// The run-time values the slash menu offers after a command's first word,
+    /// under the keys of [`super::commands::values`]: the memory changes that
+    /// wait, the refinements `--rollback` takes, the proposed checks, the
+    /// scheduled jobs, the heartbeats and the MCP servers. Read when the menu
+    /// is refreshed, never on a key press.
+    fn argument_values(&self) -> Vec<(&'static str, Vec<(String, String)>)> {
+        Vec::new()
+    }
     /// What leaving now would leave the next session to trip over.
     fn clean_state(&self) -> Vec<String> {
         Vec::new()
@@ -5995,10 +6003,59 @@ impl SessionPort for AgentSessionService {
         match words.split_first() {
             Some((&"queue", rest)) => Ok(super::memory_queue::command(&self.data_dir, rest).lines),
             None => Ok(super::memory_queue::command(&self.data_dir, &[]).lines),
+            // The queue's actions without `queue`: the list says `accept <id>`,
+            // and that is what a person types next.
+            Some((&("list" | "ls" | "show" | "accept" | "reject"), _)) => {
+                Ok(super::memory_queue::command(&self.data_dir, &words).lines)
+            }
             Some((other, _)) => Err(format!(
-                "/memory {other}: unknown; /memory queue [show <id>|accept <id>...|reject <id>...]"
+                "/memory {other}: unknown; /memory [queue] [list|show <id>|accept <id>...|reject <id>...]"
             )),
         }
+    }
+
+    fn argument_values(&self) -> Vec<(&'static str, Vec<(String, String)>)> {
+        use super::commands::values;
+        let config = self.configured().ok();
+        let checks = config
+            .as_ref()
+            .map(|config| {
+                super::checks::choices(&super::learned::Layers::new(
+                    &self.global_config_dir,
+                    &self.data_dir,
+                    &self.workspace_root,
+                    config.project_trusted,
+                ))
+            })
+            .unwrap_or_default();
+        let servers = config
+            .map(|config| {
+                config
+                    .mcp_servers
+                    .keys()
+                    .map(|name| (name.clone(), "configured MCP server".to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let scopes = super::refine::HarnessScopes {
+            global: super::harness::global_dir(&self.data_dir),
+            local: super::harness::local_dir(&self.data_dir, self.task_id.as_str()),
+            review: super::memory_queue::ReviewMode::default(),
+        };
+        vec![
+            (
+                values::MEMORY_QUEUE,
+                super::memory_queue::choices(&self.data_dir),
+            ),
+            (
+                values::REFINEMENTS,
+                super::refine::rollback_choices(&scopes, 20),
+            ),
+            (values::CHECKS, checks),
+            (values::SCHEDULES, self.schedules.choices()),
+            (values::HEARTBEATS, self.heartbeats.choices()),
+            (values::MCP_SERVERS, servers),
+        ]
     }
 
     fn run_gates(&mut self, job: super::autonomous::GateJob) -> Result<(), String> {

@@ -228,6 +228,22 @@ pub fn prompt_part(existing: &[super::verify::Check]) -> String {
     )
 }
 
+/// The proposed checks' names with their commands, for the slash menu; none
+/// for a project that is not trusted or whose proposals cannot be read.
+#[must_use]
+pub fn choices(layers: &super::learned::Layers) -> Vec<(String, String)> {
+    store_path(layers)
+        .and_then(|path| load(&path).ok())
+        .map(|store| {
+            store
+                .proposals
+                .into_iter()
+                .map(|proposal| (proposal.name, proposal.command))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// `/checks [list|accept <name>|reject <name>]`.
 ///
 /// # Errors

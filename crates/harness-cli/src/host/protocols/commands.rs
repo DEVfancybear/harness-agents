@@ -19,11 +19,6 @@ pub struct SlashCommand {
     pub arguments: &'static str,
     /// One line, short enough for one menu row.
     pub summary: &'static str,
-    /// Values the argument menu offers, when they are fixed. A value may carry
-    /// its own placeholder after its first word (`add <name> -- <command>`): the
-    /// menu shows it whole, and choosing it types the first word and a space so
-    /// the rest can be entered, instead of running the command without it.
-    pub options: &'static [&'static str],
 }
 
 impl SlashCommand {
@@ -52,7 +47,6 @@ const fn command(
         aliases: &[],
         arguments,
         summary,
-        options: &[],
     }
 }
 
@@ -63,7 +57,6 @@ pub const SLASH_COMMANDS: [SlashCommand; 74] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
-        options: &["off", "minimal", "low", "medium", "high", "xhigh", "max"],
         ..command(
             "/effort",
             "[level]",
@@ -110,19 +103,11 @@ pub const SLASH_COMMANDS: [SlashCommand; 74] = [
     command("/hotkeys", "", "Show all keyboard shortcuts"),
     command("/login", "[provider]", "Configure provider authentication"),
     command("/logout", "[provider]", "Remove provider authentication"),
-    SlashCommand {
-        options: &[
-            "add <name> -- <command> [args...] | --url <url>",
-            "list",
-            "get <name>",
-            "remove <name>",
-        ],
-        ..command(
-            "/mcp",
-            "[add|list|get|remove|login|logout]",
-            "Show MCP servers, or add, inspect and remove them",
-        )
-    },
+    command(
+        "/mcp",
+        "[add|list|get|remove|login|logout]",
+        "Show MCP servers, or add, inspect and remove them",
+    ),
     command(
         "/plugins",
         "[search]",
@@ -176,40 +161,21 @@ pub const SLASH_COMMANDS: [SlashCommand; 74] = [
         "[on|off|status]",
         "Show or set codemode (on by default): one JavaScript program that calls the tools, and only what it prints comes back",
     ),
-    SlashCommand {
-        options: &[
-            "status",
-            "list",
-            "search",
-            "read",
-            "graph",
-            "refresh",
-            "bootstrap",
-            "on",
-            "off",
-        ],
-        ..command(
-            "/knowledge",
-            "[status|list|search <query>|read <path>|graph|refresh|bootstrap [focus]|on|off] [--global]",
-            "Manage topic knowledge, sources and links shared across conversations; bootstrap has the agent map the project into it",
-        )
-    },
-    SlashCommand {
-        options: &["list", "accept", "reject"],
-        ..command(
-            "/checks",
-            "[list|accept <name>|reject <name>]",
-            "Review the checks learning proposed; accepted ones join [verify]",
-        )
-    },
-    SlashCommand {
-        options: &["queue"],
-        ..command(
-            "/memory",
-            "queue [show <id>|accept <id>...|reject <id>...]",
-            "Review the memory changes that wait for you; accepted ones join memory",
-        )
-    },
+    command(
+        "/knowledge",
+        "[status|list|search <query>|read <path>|graph|refresh|bootstrap [focus]|on|off] [--global]",
+        "Manage topic knowledge, sources and links shared across conversations; bootstrap has the agent map the project into it",
+    ),
+    command(
+        "/checks",
+        "[list|accept <name>|reject <name>]",
+        "Review the checks learning proposed; accepted ones join [verify]",
+    ),
+    command(
+        "/memory",
+        "[queue] [list|show <id>|accept <id>...|reject <id>...]",
+        "Review the memory changes that wait for you; accepted ones join memory",
+    ),
     command(
         "/strategy",
         "",
@@ -255,30 +221,21 @@ pub const SLASH_COMMANDS: [SlashCommand; 74] = [
         "",
         "Show the project's feature list and what is verified",
     ),
-    SlashCommand {
-        options: &["status", "pause", "resume", "clear"],
-        ..command(
-            "/goal",
-            "[objective]",
-            "Set or view a persistent goal; supports pause, resume, and clear",
-        )
-    },
-    SlashCommand {
-        options: &["status", "on", "off"],
-        ..command(
-            "/autonomous",
-            "[status|off|on [--max-continuations <n>] [--max-turns <n>] [--max-tokens <n>] [--timeout-ms <n>] [--gate <command>]]",
-            "Set or view autonomous mode with an optional budget",
-        )
-    },
-    SlashCommand {
-        options: &["list", "add", "pause", "resume", "cancel"],
-        ..command(
-            "/schedule",
-            "[list|add <when> -- <prompt>|pause|resume|cancel <id>]",
-            "Schedule prompts for this conversation (in 10m, every 1h, at <date>, cron)",
-        )
-    },
+    command(
+        "/goal",
+        "[objective]",
+        "Set or view a persistent goal; supports pause, resume, and clear",
+    ),
+    command(
+        "/autonomous",
+        "[status|off|on [--max-continuations <n>] [--max-turns <n>] [--max-tokens <n>] [--timeout-ms <n>] [--gate <command>]]",
+        "Set or view autonomous mode with an optional budget",
+    ),
+    command(
+        "/schedule",
+        "[list|add <when> -- <prompt>|pause|resume|cancel <id>]",
+        "Schedule prompts for this conversation (in 10m, every 1h, at <date>, cron)",
+    ),
     command(
         "/resume",
         "[selector]",
@@ -395,7 +352,6 @@ pub const SLASH_COMMANDS: [SlashCommand; 74] = [
     },
     SlashCommand {
         aliases: &["/permission", "/mode"],
-        options: &["ask", "auto-edit", "full-auto"],
         ..command(
             "/permissions",
             "[mode]",
@@ -418,14 +374,11 @@ pub const SLASH_COMMANDS: [SlashCommand; 74] = [
         "",
         "List trusted hook commands and where they come from",
     ),
-    SlashCommand {
-        options: &["yes"],
-        ..command(
-            "/trust",
-            "[yes]",
-            "Trust this project's config after explicit confirmation",
-        )
-    },
+    command(
+        "/trust",
+        "[yes]",
+        "Trust this project's config after explicit confirmation",
+    ),
     command("/init", "", "Print a starter AGENTS.md sample"),
     command(
         "/image",
@@ -502,8 +455,9 @@ pub fn matching(buffer: &str) -> Vec<MenuItem> {
     suggest(buffer, &[], &ArgumentOptions::new())
 }
 
-/// Values the argument menu offers for commands whose options change at run time
-/// (`/model`, `/login`), keyed by the command's canonical name.
+/// Values the argument menu offers that change at run time: a command's
+/// canonical name keys its first word's (`/model`, `/login`), a key of
+/// [`values`] the records a later word takes (`/memory queue accept <id>`).
 pub type ArgumentOptions = BTreeMap<&'static str, Vec<(String, String)>>;
 
 /// The rows the menu offers for a buffer, best match first; empty when the buffer
@@ -576,51 +530,73 @@ fn suggest_names(buffer: &str, extra: &[MenuCommand]) -> Vec<MenuItem> {
     rank(scored, query.is_empty())
 }
 
+/// The rows for the word being typed after a command: the values its grammar
+/// allows there ([`slot`]), the best match first.
 fn suggest_arguments(name: &str, argument: &str, dynamic: &ArgumentOptions) -> Vec<MenuItem> {
-    // One word of argument is completed; a longer one is free text.
-    if argument.contains(char::is_whitespace) {
-        return Vec::new();
-    }
     let Some(command) = builtin(name) else {
         return Vec::new();
     };
-    let options: Vec<(String, String)> = match dynamic.get(command.name) {
-        Some(options) => options.clone(),
-        None => command
-            .options
-            .iter()
-            .map(|option| ((*option).to_owned(), String::new()))
-            .collect(),
-    };
-    // An option that names more input after its first word completes to that
-    // word and a space: the argument is not finished, so accepting it must not
-    // submit (`/mcp add` alone has no server to add).
-    let word = |value: &str| {
+    // The word being typed is what follows the last blank; the words before it
+    // say which values it may take.
+    let start = argument
+        .char_indices()
+        .rfind(|(_, character)| character.is_whitespace())
+        .map_or(0, |(at, character)| at + character.len_utf8());
+    let (before, typed) = argument.split_at(start);
+    let words: Vec<&str> = before.split_whitespace().collect();
+    let slot = slot(command.name, &words, dynamic);
+    if slot.typed_only && typed.is_empty() {
+        return Vec::new();
+    }
+    let head = |value: &str| {
         value
             .split_whitespace()
             .next()
             .unwrap_or_default()
             .to_owned()
     };
-    if options.iter().any(|(value, _)| word(value) == argument) {
+    let mut options = slot.values;
+    if typed.starts_with('-') {
+        options.extend(slot.flags);
+    }
+    // A value already on the line is not offered again (a second id, a flag).
+    options.retain(|(value, _)| !words.contains(&head(value).as_str()));
+    // A value typed in full needs no menu: Enter runs it.
+    if options.iter().any(|(value, _)| head(value) == typed) {
         return Vec::new();
     }
+    let query = typed.to_lowercase();
     let scored = options
         .into_iter()
         .enumerate()
         .filter_map(|(order, (value, description))| {
-            let head = word(&value);
-            let score = fuzzy_score(argument, &head)?;
-            let takes_more = value.trim() != head;
+            let first = head(&value);
+            let score = if slot.free {
+                first.to_lowercase().starts_with(&query).then_some(0.0)
+            } else {
+                fuzzy_score(typed, &first)
+            }
+            .or_else(|| {
+                // A record is found by the words of its description too, after
+                // every value its own name matches.
+                if !slot.by_description || query.chars().count() < 2 {
+                    return None;
+                }
+                let at = description.to_lowercase().find(&query)?;
+                Some(1000.0 + f64::from(u32::try_from(at).unwrap_or(u32::MAX)))
+            })?;
+            // A value that names more input after its first word completes to
+            // that word and a space: the argument is not finished, so accepting
+            // it must not submit (`/mcp add` alone has no server to add).
+            let takes_more = value.trim() != first;
             Some((
                 score,
                 order,
                 MenuItem {
-                    completion: if takes_more {
-                        format!("{name} {head} ")
-                    } else {
-                        format!("{name} {head}")
-                    },
+                    completion: format!(
+                        "{name} {before}{first}{}",
+                        if takes_more { " " } else { "" }
+                    ),
                     label: value,
                     description,
                     tag: None,
@@ -628,7 +604,446 @@ fn suggest_arguments(name: &str, argument: &str, dynamic: &ArgumentOptions) -> V
             ))
         })
         .collect();
-    rank(scored, argument.is_empty())
+    rank(scored, typed.is_empty())
+}
+
+/// Keys of [`ArgumentOptions`] for the run-time values a word after a
+/// command's first one takes. The host fills them from state it already
+/// holds, when the menu is read, never on a key press.
+pub mod values {
+    /// Memory changes waiting for review, by id, titled (`/memory queue accept`).
+    pub const MEMORY_QUEUE: &str = "memory-queue";
+    /// Recorded refinements, newest first (`/refine --rollback`).
+    pub const REFINEMENTS: &str = "refinements";
+    /// Checks learning proposed, by name (`/checks accept`).
+    pub const CHECKS: &str = "checks";
+    /// This conversation's scheduled jobs, by id (`/schedule cancel`).
+    pub const SCHEDULES: &str = "schedules";
+    /// This session's heartbeats, by id (`/heartbeats pause`).
+    pub const HEARTBEATS: &str = "heartbeats";
+    /// Configured MCP servers, by name (`/mcp get`).
+    pub const MCP_SERVERS: &str = "mcp-servers";
+    /// Sessions of the last `/resume` listing, by id.
+    pub const SESSIONS: &str = "sessions";
+    /// Turns of the last `/fork` or `/tree` listing, by number.
+    pub const TURNS: &str = "turns";
+    /// Follow-ups waiting in the queue, by number (`/queue drop`).
+    pub const QUEUED: &str = "queued";
+    /// Running delegated children, by name (`/agents stop`).
+    pub const AGENTS: &str = "agents";
+}
+
+/// What the word being typed may be, given the words before it.
+#[derive(Debug, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "three independent ways a word is matched"
+)]
+struct Slot {
+    /// Values to choose from, each with its description. A value may carry its
+    /// own placeholder after its first word (`accept <id>...`): the menu shows
+    /// it whole, and choosing it types the first word and a space.
+    values: Vec<(String, String)>,
+    /// Flags, offered once the word starts with `-`, as a shell offers them:
+    /// a blank word with Enter keeps running the command as it is.
+    flags: Vec<(String, String)>,
+    /// The word may be free text (`/goal <objective>`): only a value it begins
+    /// is offered, so a word of a sentence never turns into a subcommand.
+    free: bool,
+    /// Offered only once something is typed: the word is optional here, and
+    /// Enter on the blank runs what is on the line (a second id after `accept`).
+    typed_only: bool,
+    /// The values are records (ids, numbers) named by their descriptions: a
+    /// word of the description finds one (`flutter` finds the memory change
+    /// about Flutter).
+    by_description: bool,
+}
+
+fn fixed(values: &[(&str, &str)]) -> Vec<(String, String)> {
+    values
+        .iter()
+        .map(|(value, description)| ((*value).to_owned(), (*description).to_owned()))
+        .collect()
+}
+
+fn choose(values: &[(&str, &str)]) -> Slot {
+    Slot {
+        values: fixed(values),
+        ..Slot::default()
+    }
+}
+
+fn free(values: &[(&str, &str)], flags: &[(&str, &str)]) -> Slot {
+    Slot {
+        values: fixed(values),
+        flags: fixed(flags),
+        free: true,
+        ..Slot::default()
+    }
+}
+
+fn flags(flags: &[(&str, &str)]) -> Slot {
+    free(&[], flags)
+}
+
+/// The run-time records under `key` of [`values`].
+fn records(dynamic: &ArgumentOptions, key: &str) -> Slot {
+    Slot {
+        values: dynamic.get(key).cloned().unwrap_or_default(),
+        by_description: true,
+        ..Slot::default()
+    }
+}
+
+/// Whether `word` is one of `flags` that takes a value next (`--gate <command>`).
+fn takes_value(flags: &[(&str, &str)], word: &str) -> bool {
+    flags.iter().any(|(flag, _)| {
+        let mut parts = flag.split(' ');
+        parts.next() == Some(word)
+            && parts
+                .next()
+                .is_some_and(|value| value.starts_with('<') || value.contains('='))
+    })
+}
+
+const SWITCH: &[(&str, &str)] = &[
+    ("status", "show whether it is on"),
+    ("on", "turn it on"),
+    ("off", "turn it off"),
+];
+
+const ON_OFF: &[(&str, &str)] = &[("on", "turn it on"), ("off", "turn it off")];
+
+const INTERVALS: &[(&str, &str)] = &[
+    ("5m", "five minutes"),
+    ("10m", "ten minutes"),
+    ("30m", "half an hour"),
+    ("1h", "an hour"),
+    ("6h", "six hours"),
+    ("1d", "a day"),
+];
+
+const DELIVERY: &[(&str, &str)] = &[
+    (
+        "--steer",
+        "deliver as a correction at the run's next safe step",
+    ),
+    (
+        "--follow-up",
+        "deliver after the active run finishes (the default)",
+    ),
+];
+
+const MEMORY_ACTIONS: &[(&str, &str)] = &[
+    (
+        "queue <action>",
+        "the memory changes that wait for your review",
+    ),
+    ("list", "list the changes that wait for your review"),
+    ("show <id>...", "one change with its evidence and diff"),
+    ("accept <id>...", "apply the changes to memory"),
+    ("reject <id>...", "keep the changes out of memory"),
+];
+
+const KNOWLEDGE_ACTIONS: &[(&str, &str)] = &[
+    (
+        "status",
+        "whether knowledge is on, with its pages and links",
+    ),
+    ("list [offset]", "the pages"),
+    ("search <query>", "find pages by their words"),
+    ("read <path>", "one page"),
+    ("graph", "the pages and their links"),
+    ("timeline [folder]", "pages by when they changed"),
+    ("recent [count]", "the latest pages"),
+    ("refresh", "re-read the library from disk"),
+    (
+        "bootstrap [focus]",
+        "have the agent map the project into it",
+    ),
+    ("on", "turn knowledge on"),
+    ("off", "turn knowledge off"),
+];
+
+const GLOBAL: &[(&str, &str)] = &[("--global", "the global library, not the project's")];
+
+const REFINE_FLAGS: &[(&str, &str)] = &[
+    (
+        "--global",
+        "refine the global store, not this conversation's",
+    ),
+    ("--rollback <id>", "undo one recorded refinement"),
+    ("--curate", "curate memory: merge, retire and fix entries"),
+    ("--history [n]", "show the latest refinements and their ids"),
+];
+
+const AUTONOMOUS_FLAGS: &[(&str, &str)] = &[
+    (
+        "--max-continuations <n>",
+        "stop after this many continuations",
+    ),
+    ("--max-turns <n>", "stop after this many turns"),
+    ("--max-tokens <n>", "stop after this many tokens"),
+    ("--timeout-ms <n>", "stop after this long"),
+    ("--gate <command>", "end when this command passes"),
+    ("--gate-retries <n>", "how often a failed gate is retried"),
+];
+
+const MCP_ADD_FLAGS: &[(&str, &str)] = &[
+    ("--env KEY=VALUE", "an environment variable for the server"),
+    ("--cwd <dir>", "the folder the server starts in"),
+    ("--url <https-url>", "a remote server instead of a command"),
+    (
+        "--bearer-token-env-var <var>",
+        "the variable holding the remote server's token",
+    ),
+    ("--force", "replace a server of the same name"),
+    ("--", "the command and its arguments follow"),
+];
+
+/// The grammar of every built-in command's arguments: what the word after
+/// `words` may be. A command whose first word's values change at run time
+/// (`/model`, `/login`, `/effort`) takes them from `dynamic` under its own
+/// name; a later word's records come under a key of [`values`].
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table of every command's grammar reads best in one place"
+)]
+fn slot(name: &str, words: &[&str], dynamic: &ArgumentOptions) -> Slot {
+    if words.is_empty()
+        && let Some(values) = dynamic.get(name).filter(|values| !values.is_empty())
+    {
+        return Slot {
+            values: values.clone(),
+            ..Slot::default()
+        };
+    }
+    let last = words.last().copied().unwrap_or_default();
+    match (name, words) {
+        ("/effort", []) => choose(&[
+            ("off", ""),
+            ("minimal", ""),
+            ("low", ""),
+            ("medium", ""),
+            ("high", ""),
+            ("xhigh", ""),
+            ("max", ""),
+        ]),
+        ("/tier", []) => choose(&[
+            ("default", "the provider's standard tier"),
+            ("flex", "slower and cheaper"),
+            ("priority", "faster, at a higher price"),
+            ("auto", "let the provider choose"),
+        ]),
+        ("/permissions", []) => choose(&[
+            ("ask", "ask before every change and command"),
+            ("auto-edit", "edit files without asking; ask for commands"),
+            ("full-auto", "run without asking"),
+        ]),
+        ("/subagent-effort" | "/subagent-model", []) => {
+            choose(&[("inherit", "children run as this agent does")])
+        }
+        ("/fullscreen", []) => choose(ON_OFF),
+        ("/trust", []) => choose(&[("yes", "trust this project's config")]),
+        ("/refinements" | "/factory" | "/bank" | "/codemode", []) => choose(SWITCH),
+        ("/jev", []) => {
+            let mut slot = choose(SWITCH);
+            slot.values.extend(
+                super::jev::DECISIONS.iter().map(|(decision, meaning)| {
+                    (format!("{decision} on|off"), (*meaning).to_owned())
+                }),
+            );
+            slot
+        }
+        ("/jev", [decision])
+            if super::jev::DECISIONS
+                .iter()
+                .any(|(known, _)| known == decision) =>
+        {
+            choose(ON_OFF)
+        }
+        ("/memory", _) => {
+            let rest = words.strip_prefix(&["queue"][..]).unwrap_or(words);
+            match rest {
+                [] if words.is_empty() => choose(MEMORY_ACTIONS),
+                [] => choose(&MEMORY_ACTIONS[1..]),
+                [action, ids @ ..] if matches!(*action, "show" | "accept" | "reject") => Slot {
+                    typed_only: !ids.is_empty(),
+                    ..records(dynamic, values::MEMORY_QUEUE)
+                },
+                _ => Slot::default(),
+            }
+        }
+        ("/refine", _) if last == "--rollback" => records(dynamic, values::REFINEMENTS),
+        ("/refine", _) if last == "--history" => Slot::default(),
+        ("/refine", _) => flags(REFINE_FLAGS),
+        ("/new", _) if last == "--name" || words.contains(&"--") => Slot::default(),
+        ("/new", _) => flags(&[
+            ("--name <name>", "name the new session"),
+            ("--", "the first prompt follows"),
+        ]),
+        ("/handoff", _) => flags(&[(
+            "--reset",
+            "continue in a fresh conversation after writing it",
+        )]),
+        ("/knowledge", []) => Slot {
+            flags: fixed(GLOBAL),
+            ..choose(KNOWLEDGE_ACTIONS)
+        },
+        ("/knowledge", _) => flags(GLOBAL),
+        ("/checks", []) => choose(&[
+            ("list", "the checks that wait for you"),
+            ("accept <name>", "add one to [verify]"),
+            ("reject <name>", "drop one"),
+        ]),
+        ("/checks", ["accept" | "reject"]) => records(dynamic, values::CHECKS),
+        ("/goal", []) => free(
+            &[
+                ("status", "show the goal"),
+                ("pause", "pause it"),
+                ("resume", "resume it"),
+                ("clear", "drop it"),
+            ],
+            &[],
+        ),
+        ("/autonomous", []) => choose(&[
+            ("status", "show autonomous mode and its budget"),
+            ("on [budget]", "carry the conversation on by itself"),
+            ("off", "stop"),
+        ]),
+        ("/autonomous", ["on" | "enable", ..]) if !takes_value(AUTONOMOUS_FLAGS, last) => {
+            flags(AUTONOMOUS_FLAGS)
+        }
+        ("/schedule", []) => choose(&[
+            ("list", "this conversation's jobs"),
+            ("add <when> -- <prompt>", "schedule a prompt"),
+            ("pause <id>", "pause a job"),
+            ("resume <id>", "resume a job"),
+            ("cancel <id>", "delete a job"),
+        ]),
+        ("/schedule", ["pause" | "resume" | "cancel" | "delete"]) => {
+            records(dynamic, values::SCHEDULES)
+        }
+        ("/schedule", ["add", rest @ ..]) => {
+            let when: Vec<&str> = rest
+                .iter()
+                .copied()
+                .filter(|word| !word.starts_with("--"))
+                .collect();
+            match when.as_slice() {
+                [] => free(
+                    &[
+                        ("in <duration>", "once, after a delay: in 10m"),
+                        ("every <duration>", "again and again: every 1h"),
+                        ("at <date>", "once, at an ISO date"),
+                        ("@hourly", "every hour"),
+                        ("@daily", "every day at midnight"),
+                        ("@weekly", "every Sunday"),
+                        ("@monthly", "the first of every month"),
+                    ],
+                    DELIVERY,
+                ),
+                ["in" | "every" | "each"] if !last.starts_with("--") => free(INTERVALS, &[]),
+                _ => Slot::default(),
+            }
+        }
+        ("/heartbeat", rest) if rest.iter().all(|word| word.starts_with("--")) => free(
+            &[("every <interval>", "how often it runs (5m without it)")],
+            DELIVERY,
+        ),
+        ("/heartbeat", ["every" | "each"]) => free(INTERVALS, &[]),
+        ("/heartbeat", ["every" | "each", _, rest @ ..])
+            if rest.iter().all(|word| word.starts_with("--")) =>
+        {
+            flags(DELIVERY)
+        }
+        ("/heartbeats", []) => choose(&[
+            ("list", "this session's heartbeats"),
+            ("pause <id>", "pause one"),
+            ("resume <id>", "resume one"),
+            ("delete <id>", "delete one"),
+        ]),
+        ("/heartbeats", ["pause" | "resume" | "delete" | "stop" | "remove"]) => {
+            records(dynamic, values::HEARTBEATS)
+        }
+        ("/mcp", []) => choose(&[
+            (
+                "add <name> -- <command> [args...] | --url <url>",
+                "add a server",
+            ),
+            ("list", "the servers"),
+            ("get <name>", "one server's configuration"),
+            ("remove <name>", "remove a server"),
+            ("login <name>", "sign in to a server"),
+            ("logout <name>", "sign out of a server"),
+        ]),
+        ("/mcp", ["get" | "remove" | "login" | "logout"]) => records(dynamic, values::MCP_SERVERS),
+        ("/mcp", ["add", _, ..]) if !words.contains(&"--") && !takes_value(MCP_ADD_FLAGS, last) => {
+            flags(MCP_ADD_FLAGS)
+        }
+        ("/queue", []) => free(
+            &[
+                ("list", "the queued follow-ups"),
+                ("edit <n> <text>", "rewrite one"),
+                ("drop <n>", "remove one"),
+                ("up <n>", "move one earlier"),
+                ("down <n>", "move one later"),
+            ],
+            &[],
+        ),
+        ("/queue", ["edit" | "drop" | "up" | "down"]) => records(dynamic, values::QUEUED),
+        ("/agents", []) => choose(&[
+            ("stop [name]", "stop a delegated child, or all of them"),
+            ("messages [action]", "the messages agents send each other"),
+        ]),
+        ("/agents", ["stop"]) => {
+            let mut slot = records(dynamic, values::AGENTS);
+            slot.values
+                .push(("all".to_owned(), "stop every child".to_owned()));
+            slot
+        }
+        ("/agents", ["messages"]) => choose(&[
+            ("status", "whether messages are taken in"),
+            ("pause", "stop taking them in and drop the queued ones"),
+            ("resume", "take them in again"),
+            ("clear", "drop the queued ones"),
+        ]),
+        ("/resume", [] | ["--compact"]) => {
+            let mut slot = records(dynamic, values::SESSIONS);
+            slot.values
+                .insert(0, ("latest".to_owned(), "the latest session".to_owned()));
+            slot.flags = fixed(&[("--compact", "summarize it first")]);
+            slot.free = true;
+            slot
+        }
+        ("/fork", []) | ("/tree", ["label"]) => records(dynamic, values::TURNS),
+        ("/tree", []) => {
+            let mut slot = records(dynamic, values::TURNS);
+            slot.values
+                .push(("label <number> [text]".to_owned(), "name a turn".to_owned()));
+            slot
+        }
+        ("/tree", [number]) if number.parse::<usize>().is_ok() => flags(&[(
+            "--summarize [focus]",
+            "continue there, summarizing the turns left behind",
+        )]),
+        ("/rlm-max-depth", []) => free(&[("unlimited", "no depth limit")], &[]),
+        ("/rlm-max-depth", [_]) => flags(&[("--global", "for every chat, not only this one")]),
+        ("/scoped-models", _) => {
+            let mut values = if words.is_empty() {
+                fixed(&[("clear", "cycle through every model again")])
+            } else {
+                Vec::new()
+            };
+            values.extend(dynamic.get("/model").cloned().unwrap_or_default());
+            Slot {
+                values,
+                ..Slot::default()
+            }
+        }
+        ("/plugins", []) => free(&[("connect <id>", "connect one service by its id")], &[]),
+        _ => Slot::default(),
+    }
 }
 
 /// Best match first; with nothing typed yet, the table's own order.
@@ -848,5 +1263,409 @@ mod tests {
         assert_eq!(closest("/modell"), Some("/model"));
         assert_eq!(closest("/exti"), Some("/quit"));
         assert_eq!(closest("/zzzzzzzz"), None);
+    }
+
+    // Argument completion, command by command.
+
+    use super::{MenuItem, SLASH_COMMANDS, matching, values};
+
+    fn records(entries: &[(&'static str, &[(&str, &str)])]) -> ArgumentOptions {
+        let mut dynamic = ArgumentOptions::new();
+        for (key, rows) in entries {
+            dynamic.insert(
+                key,
+                rows.iter()
+                    .map(|(value, description)| ((*value).to_owned(), (*description).to_owned()))
+                    .collect(),
+            );
+        }
+        dynamic
+    }
+
+    fn rows(buffer: &str, dynamic: &ArgumentOptions) -> Vec<MenuItem> {
+        suggest(buffer, &[], dynamic)
+    }
+
+    fn heads(buffer: &str, dynamic: &ArgumentOptions) -> Vec<String> {
+        rows(buffer, dynamic)
+            .iter()
+            .map(|item| item.name().to_owned())
+            .collect()
+    }
+
+    fn bare(buffer: &str) -> Vec<String> {
+        heads(buffer, &ArgumentOptions::new())
+    }
+
+    fn queue() -> ArgumentOptions {
+        records(&[(
+            values::MEMORY_QUEUE,
+            &[
+                (
+                    "mq-8768207a",
+                    "NexaClip Windows listener state test with MSVC · create global memory",
+                ),
+                (
+                    "mq-b8db4def",
+                    "NexaClip Flutter SDK on Windows · create global memory",
+                ),
+                (
+                    "mq-1ee5ca95",
+                    "NexaClip Flutter test environment on Windows · create global memory",
+                ),
+            ],
+        )])
+    }
+
+    #[test]
+    fn memory_offers_the_queue_actions_then_the_waiting_ids_with_their_titles() {
+        let dynamic = queue();
+        assert_eq!(
+            bare("/memory "),
+            ["queue", "list", "show", "accept", "reject"]
+        );
+        assert_eq!(
+            rows("/memory ", &dynamic)[0].completion,
+            "/memory queue ",
+            "queue takes an action: choosing it keeps the line open"
+        );
+        assert_eq!(bare("/memory queue "), ["list", "show", "accept", "reject"]);
+        assert_eq!(
+            rows("/memory queue a", &dynamic)[0].completion,
+            "/memory queue accept "
+        );
+        let ids = rows("/memory queue accept ", &dynamic);
+        assert_eq!(
+            ids.iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["mq-8768207a", "mq-b8db4def", "mq-1ee5ca95"],
+            "every waiting id, in the order /memory lists them"
+        );
+        assert!(ids[0].description.contains("Windows listener"), "{ids:?}");
+        assert_eq!(
+            rows("/memory queue accept mq-b8", &dynamic)[0].completion,
+            "/memory queue accept mq-b8db4def"
+        );
+        assert!(
+            heads("/memory queue accept mq-b8db4def", &dynamic).is_empty(),
+            "an id typed in full needs no menu: Enter accepts it"
+        );
+        // A word of the title finds the change.
+        assert_eq!(
+            heads("/memory queue reject flutter", &dynamic),
+            ["mq-b8db4def", "mq-1ee5ca95"]
+        );
+        // `show` takes ids too, and the shorthand without `queue` completes alike.
+        assert_eq!(heads("/memory show ", &dynamic).len(), 3);
+        assert_eq!(
+            rows("/memory accept mq-87", &dynamic)[0].completion,
+            "/memory accept mq-8768207a"
+        );
+    }
+
+    #[test]
+    fn memory_offers_a_second_id_only_once_one_is_typed_and_never_the_first_again() {
+        let dynamic = queue();
+        assert!(
+            heads("/memory queue accept mq-8768207a ", &dynamic).is_empty(),
+            "a blank after the first id is Enter's to run, not a second row's"
+        );
+        assert_eq!(
+            heads("/memory queue accept mq-8768207a mq", &dynamic),
+            ["mq-b8db4def", "mq-1ee5ca95"]
+        );
+        assert!(heads("/memory queue list ", &dynamic).is_empty());
+        assert!(heads("/memory queue accept ", &ArgumentOptions::new()).is_empty());
+    }
+
+    #[test]
+    fn refine_offers_its_flags_on_a_dash_and_the_refinements_after_rollback() {
+        let dynamic = records(&[(
+            values::REFINEMENTS,
+            &[("refine_1700_a", "Tightened the memory digest · global")],
+        )]);
+        assert!(
+            heads("/refine ", &dynamic).is_empty(),
+            "instructions are free text"
+        );
+        assert_eq!(
+            heads("/refine -", &dynamic),
+            ["--global", "--rollback", "--curate", "--history"]
+        );
+        assert_eq!(
+            rows("/refine --rol", &dynamic)[0].completion,
+            "/refine --rollback "
+        );
+        assert_eq!(heads("/refine --rollback ", &dynamic), ["refine_1700_a"]);
+        assert_eq!(
+            rows("/refine --rollback dig", &dynamic)[0].completion,
+            "/refine --rollback refine_1700_a"
+        );
+        assert!(
+            !heads("/refine --global -", &dynamic).contains(&"--global".to_owned()),
+            "a flag on the line is not offered again"
+        );
+        assert!(heads("/refine --history ", &dynamic).is_empty());
+        assert!(heads("/refine tighten the", &dynamic).is_empty());
+    }
+
+    #[test]
+    fn jev_offers_the_switch_and_its_decisions_then_on_or_off() {
+        let first = bare("/jev ");
+        assert_eq!(&first[..3], ["status", "on", "off"]);
+        assert_eq!(first.len(), 3 + super::super::jev::DECISIONS.len());
+        assert!(first.contains(&"commands".to_owned()), "{first:?}");
+        assert_eq!(
+            matching("/jev comm")[0].completion,
+            "/jev commands ",
+            "a decision takes on or off next"
+        );
+        assert_eq!(bare("/jev commands "), ["on", "off"]);
+        assert!(bare("/jev status ").is_empty());
+    }
+
+    #[test]
+    fn switches_offer_status_on_and_off() {
+        for name in ["/bank", "/codemode", "/factory", "/refinements"] {
+            assert_eq!(bare(&format!("{name} ")), ["status", "on", "off"], "{name}");
+            assert_eq!(
+                matching(&format!("{name} of"))[0].completion,
+                format!("{name} off")
+            );
+        }
+        assert_eq!(bare("/fullscreen "), ["on", "off"]);
+        assert_eq!(bare("/trust "), ["yes"]);
+    }
+
+    #[test]
+    fn knowledge_offers_its_actions_and_global_anywhere() {
+        let actions = bare("/knowledge ");
+        assert_eq!(actions[0], "status");
+        for action in [
+            "search",
+            "read",
+            "bootstrap",
+            "timeline",
+            "recent",
+            "on",
+            "off",
+        ] {
+            assert!(
+                actions.contains(&action.to_owned()),
+                "{action}: {actions:?}"
+            );
+        }
+        assert_eq!(
+            matching("/knowledge sea")[0].completion,
+            "/knowledge search "
+        );
+        assert_eq!(bare("/knowledge -"), ["--global"]);
+        assert_eq!(bare("/knowledge list -"), ["--global"]);
+        assert!(bare("/knowledge search rust ").is_empty());
+    }
+
+    #[test]
+    fn checks_offer_the_proposed_checks_by_name() {
+        let dynamic = records(&[(values::CHECKS, &[("no-fs-in-renderer", "rg fs src/ui")])]);
+        assert_eq!(bare("/checks "), ["list", "accept", "reject"]);
+        assert_eq!(heads("/checks accept ", &dynamic), ["no-fs-in-renderer"]);
+        assert_eq!(heads("/checks reject no", &dynamic), ["no-fs-in-renderer"]);
+        assert!(heads("/checks list ", &dynamic).is_empty());
+    }
+
+    #[test]
+    fn schedule_offers_its_actions_the_ways_to_say_when_and_the_jobs() {
+        let dynamic = records(&[(values::SCHEDULES, &[("job-1", "active · every 1h · lint")])]);
+        assert_eq!(
+            bare("/schedule "),
+            ["list", "add", "pause", "resume", "cancel"]
+        );
+        let when = bare("/schedule add ");
+        assert_eq!(&when[..3], ["in", "every", "at"]);
+        assert!(when.contains(&"@daily".to_owned()), "{when:?}");
+        assert_eq!(bare("/schedule add -"), ["--steer", "--follow-up"]);
+        assert_eq!(bare("/schedule add --steer e"), ["every"]);
+        assert_eq!(bare("/schedule add in ")[0], "5m");
+        assert!(bare("/schedule add in 10m ").is_empty());
+        assert_eq!(heads("/schedule cancel ", &dynamic), ["job-1"]);
+    }
+
+    #[test]
+    fn heartbeats_offer_the_interval_flags_and_the_heartbeats() {
+        let dynamic = records(&[(values::HEARTBEATS, &[("hb-1", "active · 10m · check CI")])]);
+        assert_eq!(bare("/heartbeat "), ["every"]);
+        assert_eq!(bare("/heartbeat -"), ["--steer", "--follow-up"]);
+        assert_eq!(bare("/heartbeat every ")[0], "5m");
+        assert_eq!(bare("/heartbeat every 10m -"), ["--steer", "--follow-up"]);
+        assert!(
+            bare("/heartbeat check").is_empty(),
+            "an instruction is free text"
+        );
+        assert!(bare("/heartbeat every 10m check ").is_empty());
+        assert_eq!(bare("/heartbeats "), ["list", "pause", "resume", "delete"]);
+        assert_eq!(heads("/heartbeats pause ", &dynamic), ["hb-1"]);
+    }
+
+    #[test]
+    fn mcp_offers_its_actions_the_servers_and_the_add_flags() {
+        let dynamic = records(&[(
+            values::MCP_SERVERS,
+            &[("codebase-memory", "configured MCP server")],
+        )]);
+        assert_eq!(
+            bare("/mcp "),
+            ["add", "list", "get", "remove", "login", "logout"]
+        );
+        for action in ["get", "remove", "login", "logout"] {
+            assert_eq!(
+                heads(&format!("/mcp {action} "), &dynamic),
+                ["codebase-memory"]
+            );
+        }
+        assert!(bare("/mcp add ").is_empty(), "the server's name is free");
+        assert!(bare("/mcp add docs -").contains(&"--url".to_owned()));
+        assert!(
+            bare("/mcp add docs --cwd ").is_empty(),
+            "--cwd takes a folder"
+        );
+        assert!(
+            bare("/mcp add docs -- npx -").is_empty(),
+            "after -- the command is the server's"
+        );
+    }
+
+    #[test]
+    fn free_text_commands_offer_only_a_value_the_word_begins() {
+        assert_eq!(bare("/goal "), ["status", "pause", "resume", "clear"]);
+        assert_eq!(matching("/goal st")[0].completion, "/goal status");
+        assert!(
+            bare("/goal use").is_empty(),
+            "a fuzzy match would turn the objective `use` into pause"
+        );
+        assert!(bare("/goal ship the release").is_empty());
+        assert_eq!(bare("/queue "), ["list", "edit", "drop", "up", "down"]);
+        assert!(bare("/queue please").is_empty());
+        assert_eq!(bare("/plugins "), ["connect"]);
+        assert_eq!(bare("/rlm-max-depth "), ["unlimited"]);
+        assert_eq!(bare("/rlm-max-depth 3 -"), ["--global"]);
+    }
+
+    #[test]
+    fn autonomous_offers_on_off_and_its_budget_flags() {
+        assert_eq!(bare("/autonomous "), ["status", "on", "off"]);
+        assert_eq!(matching("/autonomous o")[0].label, "on [budget]");
+        assert_eq!(matching("/autonomous o")[0].completion, "/autonomous on ");
+        assert!(bare("/autonomous on ").is_empty());
+        let budget = bare("/autonomous on -");
+        assert!(budget.contains(&"--max-turns".to_owned()), "{budget:?}");
+        assert!(
+            bare("/autonomous on --gate ").is_empty(),
+            "the gate is a command"
+        );
+        assert!(!bare("/autonomous on --max-turns 5 -").contains(&"--max-turns".to_owned()));
+        assert!(bare("/autonomous off ").is_empty());
+    }
+
+    #[test]
+    fn queue_agents_resume_fork_and_tree_offer_what_this_session_holds() {
+        let dynamic = records(&[
+            (values::QUEUED, &[("1", "Follow-up: run the tests")]),
+            (
+                values::AGENTS,
+                &[("verifier-1c78", "gpt-6 · check the diff")],
+            ),
+            (values::SESSIONS, &[("s-42", "task-9 renamed the parser")]),
+            (
+                values::TURNS,
+                &[("1", "fix the parser"), ("2", "add tests")],
+            ),
+        ]);
+        assert_eq!(heads("/queue drop ", &dynamic), ["1"]);
+        assert_eq!(bare("/agents "), ["stop", "messages"]);
+        assert_eq!(heads("/agents stop ", &dynamic), ["verifier-1c78", "all"]);
+        assert_eq!(
+            bare("/agents messages "),
+            ["status", "pause", "resume", "clear"]
+        );
+        assert_eq!(heads("/resume ", &dynamic), ["latest", "s-42"]);
+        assert_eq!(heads("/resume pars", &dynamic), ["s-42"]);
+        assert_eq!(heads("/resume -", &dynamic), ["--compact"]);
+        assert_eq!(heads("/resume --compact ", &dynamic), ["latest", "s-42"]);
+        assert_eq!(heads("/fork ", &dynamic), ["1", "2"]);
+        assert_eq!(heads("/tree ", &dynamic), ["1", "2", "label"]);
+        assert_eq!(heads("/tree label ", &dynamic), ["1", "2"]);
+        assert_eq!(heads("/tree 1 -", &dynamic), ["--summarize"]);
+        assert_eq!(heads("/tree tests", &dynamic), ["2"]);
+    }
+
+    #[test]
+    fn new_handoff_and_scoped_models_offer_their_flags_and_models() {
+        assert_eq!(bare("/new -"), ["--name", "--"]);
+        assert!(bare("/new --name ").is_empty());
+        assert!(bare("/new -- fix it -").is_empty());
+        assert_eq!(bare("/handoff -"), ["--reset"]);
+        let dynamic = records(&[("/model", &[("openai/gpt-6", "GPT-6"), ("deepseek/v4", "")])]);
+        assert_eq!(
+            heads("/scoped-models ", &dynamic),
+            ["clear", "openai/gpt-6", "deepseek/v4"]
+        );
+        assert_eq!(
+            heads("/scoped-models openai/gpt-6 ", &dynamic),
+            ["deepseek/v4"]
+        );
+    }
+
+    #[test]
+    fn settings_offer_their_fixed_values_until_the_app_names_its_own() {
+        assert_eq!(bare("/tier "), ["default", "flex", "priority", "auto"]);
+        assert_eq!(bare("/permissions "), ["ask", "auto-edit", "full-auto"]);
+        assert_eq!(bare("/subagent-effort "), ["inherit"]);
+        assert_eq!(bare("/subagent-model "), ["inherit"]);
+        let dynamic = records(&[("/tier", &[("priority", "faster (current)")])]);
+        assert_eq!(heads("/tier ", &dynamic), ["priority"]);
+    }
+
+    /// The audit: every built-in command that takes an argument offers
+    /// something to complete it, on a blank or on a dash, unless its argument
+    /// is free text or a path.
+    #[test]
+    fn every_command_with_an_argument_offers_its_values() {
+        const FREE: &[&str] = &[
+            "/export",
+            "/name",
+            "/compact",
+            "/learn",
+            "/recall",
+            "/preserve",
+            "/review",
+            "/self-eval",
+            "/import",
+            "/steer",
+            "/btw",
+            "/attach",
+        ];
+        // What the app names at run time, as the controller fills it.
+        let dynamic = records(&[
+            ("/model", &[("openai/gpt-6", "GPT-6")]),
+            ("/login", &[("openai", "OpenAI")]),
+            ("/logout", &[("openai", "OpenAI · api key")]),
+            ("/subagent-login", &[("openai", "OpenAI")]),
+            ("/subagent-logout", &[("openai", "OpenAI · api key")]),
+            (values::TURNS, &[("1", "fix the parser")]),
+        ]);
+        for command in SLASH_COMMANDS
+            .iter()
+            .filter(|command| !command.arguments.is_empty())
+        {
+            let blank = rows(&format!("{} ", command.name), &dynamic);
+            let dash = rows(&format!("{} -", command.name), &dynamic);
+            assert!(
+                !blank.is_empty() || !dash.is_empty() || FREE.contains(&command.name),
+                "{} offers nothing to complete `{}`",
+                command.name,
+                command.arguments
+            );
+        }
     }
 }
