@@ -99,32 +99,52 @@ for line in open(sys.argv[1], encoding='utf-8'):
 CORRECT="A correction for the learned skill $SKILL, for next time: the report script must now be run with the --summary-only flag, as python report.py --summary-only. Do not run anything now; only say you have noted it."
 USE="Make this week's sales report with the learned skill $SKILL, following its steps as written, and tell me the total."
 
-# --- 1. The review revises the proven skill with an edit; the revision is on trial.
-held=0
-for attempt in 1 2 3; do
-  setup
-  run "correct-$attempt" "$CORRECT"
-  if skill_text | grep -q -- "--summary-only"; then held=1; break; fi
-done
-check "precondition: the review revised the skill with the correction (attempts: $attempt; ledger: $(ledger_actions))" '[ "$held" = 1 ]'
-if [ "$held" = 1 ]; then
-  check "the revision is an edit or a patch, not a whole rewrite of a proven skill (ledger: $(ledger_actions))" 'ledger_actions | grep -qE "(edit|patch) *$"'
-  check "the revision is on trial, with the incumbent's three uses that worked kept ($(usage 'u.get("trial", {}).get("incumbent")'))" '[ "$(usage "u.get(\"trial\", {}).get(\"incumbent\", {}).get(\"worked\")")" = 3 ]'
+# A use whose run_process call passed --summary-only and was refused (exit 2):
+# the revision, followed as written, broke the command.
+broke() {
+  py - "$(winpath "$D")" <<'PY'
+import glob, json, os, sqlite3, sys
+calls, broken = {}, 0
+for db in glob.glob(os.path.join(sys.argv[1], "projects", "*", "harness.sqlite3")):
+    connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    for (request,) in connection.execute("select request_json from frozen_requests"):
+        for message in json.loads(request).get("messages") or []:
+            for call in message.get("tool_calls") or []:
+                if call.get("name") == "run_process" and "--summary-only" in str(call.get("arguments")):
+                    calls[call.get("call_id")] = True
+            if message.get("role") == "tool" and calls.get(message.get("tool_call_id"))                     and "exit=Some(2)" in str(message.get("content")):
+                broken += 1
+print(broken)
+PY
+}
 
-  # --- 2. The failing revision does not stand.
+# --- 1, 2. The review revises the proven skill with an edit; the revision is on
+# trial; followed as written it breaks the command, and it does not stand. The
+# review may instead write a revision that checks the flag first: it breaks
+# nothing, and the round is tried again (the precondition names it).
+held=0; revised=0
+for round in 1 2 3; do
+  setup "skill-trial-r$round"
+  run "correct" "$CORRECT"
+  skill_text | grep -q -- "--summary-only" || continue
+  revised=1
+  ledger1=$(ledger_actions)
+  incumbent_worked=$(usage 'u.get("trial", {}).get("incumbent", {}).get("worked")')
   for use in 1 2 3 4 5 6; do
     run "use-$use" "$USE"
-    echo "   use $use: trial_bad=$(usage 'u.get("trial_bad")') trial_good=$(usage 'u.get("trial_good")') trial=$(usage '"open" if u.get("trial") else "none"')"
+    echo "   round $round use $use: trial_bad=$(usage 'u.get("trial_bad")') trial_good=$(usage 'u.get("trial_good")') trial=$(usage '"open" if u.get("trial") else "none"') broke=$(broke)"
     if [ "$(usage '"open" if u.get("trial") else "none"')" = none ]; then break; fi
   done
-  # The failing revision does not stand, one of two ways: two failed uses
-  # roll it back to the incumbent, or the review fixes it after a failed use,
-  # the failing one is kept as superseded and the fix is judged against the
-  # incumbent (and kept when its uses work).
+  if [ "$(broke)" -ge 1 ] && [ "$(usage '"open" if u.get("trial") else "none"')" = none ]; then held=1; break; fi
+done
+check "precondition: the review revised the skill with the correction (rounds: $round)" '[ "$revised" = 1 ]'
+check "precondition: a use followed the revision as written and its command broke, and the trial settled (rounds: $round)" '[ "$held" = 1 ]'
+if [ "$held" = 1 ]; then
+  check "the revision was an edit or a patch, not a whole rewrite of a proven skill (ledger: $ledger1)" 'printf "%s" "$ledger1" | grep -qE "(edit|patch) *$"'
+  check "the revision went on trial with the incumbent's three uses that worked kept ($incumbent_worked)" '[ "$incumbent_worked" = 3 ]'
   rolled=$(usage 'sum(1 for r in u.get("rejected", []) if r.get("kind") == "rolled_back")')
   superseded=$(usage 'sum(1 for r in u.get("rejected", []) if r.get("kind") == "superseded" and "--summary-only" in r.get("edits_summary", ""))')
   echo "   rejected: $(usage '[(r.get("kind"), r.get("reason")) for r in u.get("rejected", [])]')"
-  check "precondition: the review judged the skill in use until its trial settled (uses: $use)" '[ "$(usage "\"open\" if u.get(\"trial\") else \"none\"")" = none ]'
   check "the failing revision was rejected: rolled back ($rolled) or superseded by a fix ($superseded)" '[ "${rolled:-0}" -ge 1 ] || [ "${superseded:-0}" -ge 1 ]'
   check "the revision that broke the command is not the skill now (its args do not pass --summary-only)" '! skill_text | grep -qF "\"report.py\", \"--summary-only\""'
   check "a failed use counted against the revision, not the incumbent (trial events: $(tr -d '\r' < "$D/skill-usage/revisions.jsonl" 2>/dev/null | py -c "import json,sys; print([json.loads(l)[\"event\"] for l in sys.stdin if l.strip()])"))" '[ "${rolled:-0}" -ge 1 ] && [ "$(skill_text)" = "$INCUMBENT" ] && [ "$(usage "u.get(\"worked\")")" = 3 ] || [ "${superseded:-0}" -ge 1 ]'
@@ -132,36 +152,48 @@ if [ "$held" = 1 ]; then
 fi
 
 # --- 3. `ha learning prune` shortens a long proven skill, on trial as a prune.
-# A home of its own, so sections 1 and 2 keep their evidence.
-setup skill-prune
+# A home of its own each attempt, so sections 1 and 2 keep their evidence. The
+# model's edits must name text the skill holds; an edit the promoter refuses
+# lands nothing, and the attempt is made again (the precondition names it).
 LONG=release-notes
-mkdir -p "$HA_HOME/skills/$LONG"
-{
-  printf -- '---\nname: %s\ndescription: Write the release notes of this project from its git log, grouped by kind of change.\n---\n' "$LONG"
-  for step in "Run git log from the last tag to HEAD with run_process." \
-              "Read every commit subject in the output carefully." \
-              "Group the commits by their prefix: feat, fix, docs, test, chore." \
-              "Write one section per group, in that order." \
-              "Write each commit as one bullet, its subject without the prefix."; do
-    printf '%s\n' "- $step" "- Remember: $step" "- It is important that you always do this: $step" "- Check again that you did this: $step" "- Do not forget: $step"
-  done
-  printf '%s\n' "- Give the user the notes."
-} > "$HA_HOME/skills/$LONG/SKILL.md"
-echo '{"created_by": "ha", "created": "2026-10-01T00:00:00Z"}' > "$HA_HOME/skills/$LONG/.ha-learned.json"
-cat > "$D/skill-usage/global.json" <<EOF
+landed=0
+for attempt in 1 2 3; do
+  setup "skill-prune-$attempt"
+  mkdir -p "$HA_HOME/skills/$LONG"
+  {
+    printf -- '---
+name: %s
+description: Write the release notes of this project from its git log, grouped by kind of change.
+---
+' "$LONG"
+    for step in "Run git log from the last tag to HEAD with run_process."                 "Read every commit subject in the output carefully."                 "Group the commits by their prefix: feat, fix, docs, test, chore."                 "Write one section per group, in that order."                 "Write each commit as one bullet, its subject without the prefix."; do
+      printf '%s
+' "- $step" "- Remember: $step" "- It is important that you always do this: $step" "- Check again that you did this: $step" "- Do not forget: $step"
+    done
+    printf '%s
+' "- Give the user the notes."
+  } > "$HA_HOME/skills/$LONG/SKILL.md"
+  echo '{"created_by": "ha", "created": "2026-10-01T00:00:00Z"}' > "$HA_HOME/skills/$LONG/.ha-learned.json"
+  cat > "$D/skill-usage/global.json" <<EOF
 {"requests": 20, "skills": {"$LONG": {"offered": 4, "use": 4, "worked": 4, "last": "2026-11-12T00:00:00Z"}}}
 EOF
-before_lines=$(grep -cv '^\s*$' "$HA_HOME/skills/$LONG/SKILL.md")
-before_chars=$(wc -c < "$HA_HOME/skills/$LONG/SKILL.md")
-(cd "$P" && "$HA" learning prune --skill "$LONG" --model "$MODEL" "${TH[@]}" > "$RX/prune.txt" 2>&1)
+  before_lines=$(grep -cv '^\s*$' "$HA_HOME/skills/$LONG/SKILL.md")
+  before_chars=$(wc -c < "$HA_HOME/skills/$LONG/SKILL.md")
+  (cd "$P" && "$HA" learning prune --skill "$LONG" --model "$MODEL" "${TH[@]}" > "$RX/prune.txt" 2>&1)
+  SKILL=$LONG
+  echo "   prune attempt $attempt: $(tr -d '' < "$RX/prune.txt" | tail -2 | tr '
+' ' ')"
+  if ledger_actions | grep -qE "edit *$"; then landed=1; break; fi
+done
 after_lines=$(grep -cv '^\s*$' "$HA_HOME/skills/$LONG/SKILL.md")
 after_chars=$(wc -c < "$HA_HOME/skills/$LONG/SKILL.md")
-SKILL=$LONG
-check "ha learning prune ran ($RX/prune.txt)" 'grep -qi "prune" "$RX/prune.txt" && ! grep -qi "unrecognized\|unknown command\|error:" "$RX/prune.txt"'
-check "the pruned skill is shorter ($before_lines -> $after_lines non-blank lines, $before_chars -> $after_chars bytes)" '[ "$after_lines" -lt "$before_lines" ] && [ "$after_chars" -lt "$before_chars" ]'
-check "the pruned skill keeps its steps (git log, the groups, one bullet per commit)" 'grep -qi "git log" "$HA_HOME/skills/$LONG/SKILL.md" && grep -qi "feat" "$HA_HOME/skills/$LONG/SKILL.md" && grep -qi "bullet" "$HA_HOME/skills/$LONG/SKILL.md"'
-check "the prune is on trial with the objective prune ($(usage 'u.get("trial", {}).get("objective")'))" '[ "$(usage "u.get(\"trial\", {}).get(\"objective\")")" = prune ]'
-check "the prune is an edit (ledger: $(ledger_actions))" 'ledger_actions | grep -qE "edit *$"'
+check "ha learning prune ran ($RX/prune.txt)" 'grep -qi "prune" "$RX/prune.txt" && ! grep -qi "unrecognized\|unknown command" "$RX/prune.txt"'
+check "precondition: the model's prune landed as an edit (attempts: $attempt)" '[ "$landed" = 1 ]'
+if [ "$landed" = 1 ]; then
+  check "the pruned skill is shorter ($before_lines -> $after_lines non-blank lines, $before_chars -> $after_chars bytes)" '[ "$after_lines" -lt "$before_lines" ] && [ "$after_chars" -lt "$before_chars" ]'
+  check "the pruned skill keeps its steps (git log, the groups, one bullet per commit)" 'grep -qi "git log" "$HA_HOME/skills/$LONG/SKILL.md" && grep -qi "feat" "$HA_HOME/skills/$LONG/SKILL.md" && grep -qi "bullet" "$HA_HOME/skills/$LONG/SKILL.md"'
+  check "the prune is on trial with the objective prune ($(usage 'u.get("trial", {}).get("objective")'))" '[ "$(usage "u.get(\"trial\", {}).get(\"objective\")")" = prune ]'
+fi
 
 echo "   ha: $HA ($(sha256sum "$HA" | cut -c1-16))"
 result
