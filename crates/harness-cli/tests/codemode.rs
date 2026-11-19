@@ -131,7 +131,14 @@ async fn run(bench: &Bench, code: &str, approvals: ApprovalMode, codemode: bool)
     let runtime = Arc::new(RuntimeService::new(
         Arc::clone(&store),
         provider.clone(),
-        RuntimeConfig::default(),
+        // The default window is 8K tokens: every tool's schema is sent with
+        // the request, and two more tools (git_search, git_show) left no room
+        // for a program's result, which was then cut from the next request.
+        // A model ha drives has a window many times this.
+        RuntimeConfig {
+            context_window_tokens: 32_768,
+            ..RuntimeConfig::default()
+        },
     ));
     let driver = TurnDriver::new(
         Arc::clone(&runtime),

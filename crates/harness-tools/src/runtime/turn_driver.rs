@@ -4621,7 +4621,7 @@ struct ReadyAction {
     clippy::too_many_lines,
     reason = "every gate in the order it runs: policy, guard, hooks, approval, intent"
 )]
-async fn gate_action(
+async fn gate_action_inner(
     tools: &ToolExecutionService,
     request: ToolRequest,
     options: &TurnOptions,
@@ -4746,6 +4746,37 @@ async fn gate_action(
             Ok(Gated::Done(Err(error)))
         }
     }
+}
+
+/// [`gate_action_inner`], and the end of what the command guard judged for the
+/// call when it never gets to a shell: only a call that is ready to run takes
+/// that to its dispatch; one refused, blocked, denied or failed on the way
+/// leaves it behind.
+async fn gate_action(
+    tools: &ToolExecutionService,
+    request: ToolRequest,
+    options: &TurnOptions,
+    sequence: u32,
+    observer: &Arc<dyn TurnObserver>,
+    cancellation: &CancellationToken,
+    hook_note: &mut crate::HookResponse,
+) -> Result<Gated, HarnessError> {
+    let invocation = request.invocation_id.clone();
+    // Boxed: the gate is a long future, and a turn holds one for every call.
+    let gated = Box::pin(gate_action_inner(
+        tools,
+        request,
+        options,
+        sequence,
+        observer,
+        cancellation,
+        hook_note,
+    ))
+    .await;
+    if !matches!(gated, Ok(Gated::Ready(_))) {
+        tools.forget_guard_verdict(&invocation);
+    }
+    gated
 }
 
 /// A call's tool as the records name it: a plugin, MCP or skill tool by its
@@ -5037,6 +5068,7 @@ async fn resolve_action_approval(
                     prepared,
                     &options.workspace_root,
                     ToolExecutionService::approval_diff(prepared)?,
+                    tools.location_summary(prepared),
                 );
                 let request_id = proposal.request_id.clone();
                 // Asked and answered are both recorded, with the wait: the
@@ -5147,10 +5179,17 @@ fn proposal_for(
     prepared: &PreparedToolRequest,
     workspace_root: &std::path::Path,
     diff: Option<String>,
+    location: Option<String>,
 ) -> ApprovalProposal {
     let action = prepared.action();
     let kind = action.kind();
     let mut summary = summarize_action(action);
+    // Where a shell call starts, when an earlier call left it elsewhere than the
+    // root with the host's `PATH`: the person approves the command with that.
+    if let Some(location) = location {
+        summary.push('\n');
+        summary.push_str(&location);
+    }
     if let Some(diff) = diff {
         summary.push('\n');
         summary.push_str(&diff);
@@ -7988,8 +8027,8 @@ mod scripted_turn_tests {
             "the move is told: {first}"
         );
         assert!(
-            !first.contains("ran in"),
-            "the first call ran at the root: {first}"
+            first.contains("ran in ."),
+            "the first call ran at the root, and says so: {first}"
         );
         assert!(
             result_text(&run, "b").contains("ran in sub"),
@@ -8263,5 +8302,98 @@ mod scripted_turn_tests {
             "{}",
             result_text(&run, "a")
         );
+    }
+
+    /// A command guard that judges nothing but is asked.
+    struct Asked;
+
+    impl crate::ToolGuard for Asked {
+        fn check<'a>(
+            &'a self,
+            _action: &'a crate::CodingToolAction,
+            _workspace_root: &'a str,
+            _working_dir: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>>
+        {
+            Box::pin(async { None })
+        }
+    }
+
+    /// What the command guard judged for a call is kept for its dispatch. A call
+    /// that ends before one (the approval was not given, a hook blocked it, the
+    /// user refused) must not leave it behind; one that is ready to run takes it
+    /// there.
+    #[tokio::test]
+    async fn what_the_guard_judged_goes_when_the_call_never_reaches_a_shell() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                temp.path().join("data"),
+                HostId::generate(),
+            ))
+            .await
+            .expect("store opens"),
+        );
+        let tools = ToolExecutionService::new(Arc::clone(&store)).with_guard(Arc::new(Asked));
+        let observer: Arc<dyn TurnObserver> = Arc::new(Notices::default());
+        let project = ProjectId::generate();
+        let cancellation = CancellationToken::new();
+        for (approvals, expected_left) in [(ApprovalMode::None, 0), (ApprovalMode::Auto, 1)] {
+            let (session, task) = (SessionId::generate(), TaskId::generate());
+            harness_session::SessionService::new(Arc::clone(&store))
+                .admit_input(harness_session::AdmitInputRequest {
+                    session_id: session.clone(),
+                    task_id: task.clone(),
+                    input_id: InputId::generate(),
+                    expected_sequence: 1,
+                    authority: harness_types::SourceAuthority::User,
+                    raw_text: "go".to_owned(),
+                    workspace: observe_workspace(project.clone(), &workspace).expect("observation"),
+                    initial_plan_items: Vec::new(),
+                })
+                .await
+                .expect("input admitted");
+            let request = crate::ToolRequest::new(
+                session,
+                task,
+                "test.actor",
+                workspace.clone(),
+                crate::CodingToolAction::RunShell {
+                    command: "echo hi".to_owned(),
+                    timeout_ms: 60_000,
+                    isolation: crate::IsolationMode::BestEffort,
+                    env: Vec::new(),
+                },
+            );
+            let options = TurnOptions {
+                workspace_root: workspace.clone(),
+                actor_id: "test.actor".to_owned(),
+                approvals,
+                limits: TurnLimits::default(),
+            };
+            let before = tools.guard_verdicts_kept();
+            let mut note = crate::HookResponse::default();
+            let gated = super::gate_action(
+                &tools,
+                request,
+                &options,
+                1,
+                &observer,
+                &cancellation,
+                &mut note,
+            )
+            .await
+            .map_err(|error| error.to_string())
+            .map(|gated| matches!(gated, super::Gated::Ready(_)));
+            // Not approved: it ends there. Approved: it is ready to run.
+            assert_eq!(gated.expect("gated"), expected_left == 1);
+            assert_eq!(
+                tools.guard_verdicts_kept(),
+                before + expected_left,
+                "{expected_left} verdict(s) kept"
+            );
+        }
     }
 }

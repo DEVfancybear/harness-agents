@@ -239,6 +239,11 @@ luật chi phí của trial prune, `cost_stats`), `refine.rs` (`prune`,
   PROVIDER/MODEL] [--thinking LEVEL]` chạy ngay (bất kể `HA_SKILL_PRUNE`; không
   chạy khi learned skill bị tắt). Diagnostics: `skill prune` với số ứng viên,
   số áp được và số bị từ chối.
+- **Skill mastered cũng được cắt gọn.** Skill được đánh dấu `mastered` (xem [cổng
+  tự cải thiện](SELF_IMPROVEMENT_GATE.vi.md)) là ứng viên thường gặp. Quy tắc
+  "chỉ thêm" nói về các bản sửa làm đổi điều skill làm; prompt của prune nói rằng
+  prune được rút gọn câu chữ và bỏ những gì không dòng "worked before" nào của
+  skill dựa vào, giữ mọi bước mà các dòng đó dựa vào, và không thêm quy tắc.
 
 ## 6. Judge hindsight chấm từng bước (P4)
 

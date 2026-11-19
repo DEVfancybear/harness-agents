@@ -5,7 +5,7 @@
 # from an empty step (docs/architecture/GUARDS.en.md "Where a command runs";
 # docs/architecture/STRATEGY_AND_RUNTIME.en.md "Recovery from an empty step").
 #
-# 1. `run_shell` is called twice: `Set-Location sub`, then a command that
+# 1. `run_shell` is called twice: `Set-Location sub` (`cd sub` on Unix), then a command that
 #    prints a file of `sub` through a glob. 0.9.14 started every call at the
 #    root, so the second command found no file. The guards read a relative
 #    path from the directory the command runs in: a recursive delete of an
@@ -35,6 +35,17 @@ mkdir -p "$P/sub" "$P/sub/old"
 echo "$WORD" > "$P/sub/found-$RANDOM.txt"
 # Untracked work in a folder of `sub`: git cannot give it back.
 echo "draft that exists only here" > "$P/sub/old/draft.md"
+# The commands the model is asked to run, in the shell `run_shell` starts: pwsh
+# on Windows, sh elsewhere. *_WORD is what tells which call of a conversation is
+# which (a part of its command line).
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    ENTER="Set-Location sub"; READ="Get-Content *.txt"; DELETE="Remove-Item -Recurse -Force old"
+    ENTER_WORD="Set-Location"; READ_WORD="Get-Content"; DELETE_WORD="Remove-Item" ;;
+  *)
+    ENTER="cd sub"; READ="cat *.txt"; DELETE="rm -rf old"
+    ENTER_WORD="cd sub"; READ_WORD="cat"; DELETE_WORD="rm -rf" ;;
+esac
 
 run_exec() {
   local name="$1"; shift
@@ -104,34 +115,34 @@ Sau đó báo lại nguyên văn kết quả tool của lần 2."
 }
 
 echo "################ 1. a directory a shell call left is where the next one starts"
-two_calls s1 "Set-Location sub" "Get-Content *.txt" Set-Location Get-Content
+two_calls s1 "$ENTER" "$READ" "$ENTER_WORD" "$READ_WORD"
 if [ -n "$MARK" ]; then
   # The second command's glob finds the file only in `sub`. 0.9.14 FAILS: the
   # second call started at the root, where no .txt file is.
-  check "the second command ran in sub: its output holds the file's word" 'in_result "$CALLS" Set-Location Get-Content 1 "$WORD"'
+  check "the second command ran in sub: its output holds the file's word" 'in_result "$CALLS" "$ENTER_WORD" "$READ_WORD" 1 "$WORD"'
   # 0.9.14 FAILS: nothing told the model where the next call would start.
-  check "the first result says where the next call starts" 'in_result "$CALLS" Set-Location Get-Content 0 "the next call starts in sub"'
-  check "the second result says where it ran" 'in_result "$CALLS" Set-Location Get-Content 1 "ran in sub"'
+  check "the first result says where the next call starts" 'in_result "$CALLS" "$ENTER_WORD" "$READ_WORD" 0 "the next call starts in sub"'
+  check "the second result says where it ran" 'in_result "$CALLS" "$ENTER_WORD" "$READ_WORD" 1 "ran in sub"'
 fi
 
 echo "################ 1b. a command that exits itself still moves the place"
 # The recording runs when the shell exits, `exit N` included (before it was
 # appended after the command and an `exit` never reached it).
-two_calls s3 "Set-Location sub; exit 3" "Get-Content *.txt" Set-Location Get-Content
+two_calls s3 "$ENTER; exit 3" "$READ" "$ENTER_WORD" "$READ_WORD"
 if [ -n "$MARK" ]; then
   # 0.9.14 FAILS: nothing kept the directory.
-  check "the second command ran in sub after the first said exit 3" 'in_result "$CALLS" Set-Location Get-Content 1 "$WORD"'
-  check "the first call kept its own status" 'in_result "$CALLS" Set-Location Get-Content 0 "exit=Some(3)"'
+  check "the second command ran in sub after the first said exit 3" 'in_result "$CALLS" "$ENTER_WORD" "$READ_WORD" 1 "$WORD"'
+  check "the first call kept its own status" 'in_result "$CALLS" "$ENTER_WORD" "$READ_WORD" 0 "exit=Some(3)"'
 fi
 
 echo "################ 2. the guards read a relative path from where the command runs"
-two_calls s2 "Set-Location sub" "Remove-Item -Recurse -Force old" Set-Location Remove-Item
+two_calls s2 "$ENTER" "$DELETE" "$ENTER_WORD" "$DELETE_WORD"
 if [ -n "$MARK" ]; then
   # 0.9.14 FAILS this one: the second call ran at the root, and the guard read
   # `old` from there, where it names nothing, so nothing refused it and the
   # command ran (against nothing). Resolved from `sub`, `old` holds untracked
   # work git cannot give back.
-  check "the delete named from sub was refused by its guard" 'in_result "$CALLS" Set-Location Remove-Item 1 "[recursive-delete]"'
+  check "the delete named from sub was refused by its guard" 'in_result "$CALLS" "$ENTER_WORD" "$DELETE_WORD" 1 "[recursive-delete]"'
   # Passes on 0.9.14 as well, for the reason above: the delete ran at the root.
   check "the untracked work is still there" '[ -f "$P/sub/old/draft.md" ]'
 fi

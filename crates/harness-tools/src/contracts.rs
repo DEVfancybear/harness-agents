@@ -2052,6 +2052,10 @@ pub struct ApprovalGrant {
     pub(crate) workspace_fingerprint: ContentHash,
     pub(crate) policy_revision: u64,
     pub(crate) tool_revision: u64,
+    /// Where a shell or process call starts when it is not the root with the
+    /// host's `PATH` (`location::Place::binding`), empty otherwise: an approval
+    /// given for one place does not run the call in another.
+    pub(crate) shell_place: String,
     pub(crate) expires_at_unix_ms: Option<u64>,
 }
 

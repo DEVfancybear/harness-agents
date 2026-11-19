@@ -59,6 +59,15 @@ is not, and a rollback or an accepted queued change is not a planner's edit.
   replaces the older one. The reason, the summary of what was proposed and the
   evidence quote are one line each, clipped to 300, 200 and 200 characters, and
   redacted as memory text is.
+- **Refusals for safety keep no word of the edit.** An edit refused because it
+  holds a secret, steering text (an injection or exfiltration pattern), or a
+  fetched page's words made a rule (and a Deep Dream edit whose quote holds a
+  secret) is marked `safety` where it is refused. Its record keeps only the
+  kind, the action, the reason, and the target: the entry's id when the edit
+  named one, `a new entry` for a create (a new entry's id and title are the
+  edit's own words). It has no summary and no quote, and the part says *refused
+  for safety: its words are not kept*, so the ledger never carries the text
+  back into every later prompt.
 - **Read back.** Every planner of memory edits - the automatic review, `/refine`
   and `/learn` (`plan`), and Deep Dream's batch curator (`memory_edits`) - gets a
   `<refused_before>` part, the newest first, up to 12 over both scopes, after
@@ -69,7 +78,8 @@ is not, and a rollback or an accepted queued change is not a planner's edit.
   / `refusal_not_kept` when the file cannot be read or written; an unreadable
   ledger is not written over). `refine` / `planner_given` is written for each
   plan, with the names of the prompt's parts and counts only (refused lines,
-  standings, "worked before" and "revised" lines): the prompt itself is not
+  standings, "worked before" and "revised" lines, all counted from the prompt
+  text the planner is given, not from the library): the prompt itself is not
   stored, so a bug report and the live tests see that the parts reached the
   planner.
 
@@ -122,6 +132,13 @@ the three. The same sentences are in the learned-skill format text that the
 planner, the curator and the repair pass read, and the repair prompt asks to
 keep the condition or the "only add" when it fixes an intent.
 
+**A prune is not such a revision.** The "only add" rule is about revisions that
+change what a skill does. The prune pass (`ha learning prune`, [cost and
+skills](COST_AND_SKILLS.en.md) section 5) reads the same format text and the same
+status, and mastered skills are its usual candidates: its prompt says a prune may
+shorten the wording and drop what none of the skill's "worked before" lines
+relies on, but keeps every step those lines rely on, and adds no rule.
+
 ## 5. Not taken
 
 - **GUARD's Soft-HURT gate** (checking a revision against what worked before it
@@ -158,7 +175,10 @@ keep the condition or the "only add" when it fixes an intent.
   unreadable ledger not written over; the part and its instruction);
   `refine.rs` (`an_edit_the_host_refused_is_kept_and_the_next_planner_is_told`,
   `a_skipped_or_queued_edit_is_not_kept_but_a_refused_one_among_them_is`,
-  `the_planner_is_told_a_skills_standing_and_asked_for_a_cause`);
+  `the_planner_is_told_a_skills_standing_and_asked_for_a_cause`,
+  `an_edit_refused_for_safety_is_kept_without_its_words`,
+  `the_planner_given_record_counts_the_standings_from_the_prompt`; `refused.rs` also
+  `a_refusal_for_safety_keeps_no_word_of_the_edit_and_an_ordinary_one_keeps_them`);
   `learned.rs` (`a_revisions_cause_and_expectation_live_in_its_trial_and_its_history_line`,
   `a_rolled_back_a_superseded_and_a_refused_revision_keep_their_cause_and_counts`,
   `the_accepted_history_keeps_the_last_five`,

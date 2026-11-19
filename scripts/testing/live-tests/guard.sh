@@ -234,7 +234,9 @@ done
 # Passes on 0.9.14 too only as far as the review runs; it writes no planner_given there.
 check "precondition: the review reached the planner with the two skills in the library (attempt ${held2:-none})" '[ -n "$held2" ]'
 if [ -n "$held2" ]; then
-  # 0.9.14 FAILS: no standing is computed.
+  # 0.9.14 FAILS: no standing is computed. The record counts the standings from
+  # the <learned_skills> part of the planner's prompt itself (the host's
+  # `planner_given`), so a library view that never reached the prompt counts none.
   check "G2: the planner was given $REGRESSED as regressed and $MASTERED as mastered" \
     'given_has "\"$REGRESSED=regressed\" in f.get(\"standings\", \"\") and \"$MASTERED=mastered\" in f.get(\"standings\", \"\")"'
   # 0.9.14 FAILS: a mastered skill's cases were not shown.
@@ -265,7 +267,12 @@ try:
 except Exception:
     u = {}
 print(u.get('trial', {}).get(sys.argv[3], ''))" "$(winpath "$D/skill-usage/global.json")" "$SKILL" "$1"; }
-revised=""
+# `cause` and `expect` are asked for but optional, so a review that revised the
+# skill and gave neither skipped a step, not the feature: the round is tried
+# again (up to three times), and the check is judged only after a revision
+# landed (the precondition), failing by its name when none of the revisions
+# carried them.
+revised=""; hypothesis=""
 for attempt in 1 2 3; do
   setup guard-revision
   mkdir -p "$HA_HOME/skills/$SKILL" "$D/skill-usage"
@@ -277,15 +284,19 @@ for attempt in 1 2 3; do
 EOF
   run_exec r1 "$CORRECT"
   if provider_refused r1; then continue; fi
-  if tr -d '\r' < "$HA_HOME/skills/$SKILL/SKILL.md" | grep -q -- "--summary-only" && [ -n "$(trial_field ledger_id)" ]; then revised=$attempt; break; fi
-  echo "   attempt $attempt: the review did not revise $SKILL"
+  if tr -d '\r' < "$HA_HOME/skills/$SKILL/SKILL.md" | grep -q -- "--summary-only" && [ -n "$(trial_field ledger_id)" ]; then
+    [ -z "$revised" ] && revised=$attempt
+    echo "   attempt $attempt: cause: $(trial_field cause) | expect: $(trial_field expect)"
+    if [ -n "$(trial_field cause)" ] && [ -n "$(trial_field expect)" ]; then hypothesis=$attempt; break; fi
+  else
+    echo "   attempt $attempt: the review did not revise $SKILL"
+  fi
 done
+# Passes on 0.9.14 too: the review revised the skill and the revision is on trial.
 check "precondition: the review revised the proven skill and the revision is on trial (attempt ${revised:-none})" '[ -n "$revised" ]'
 if [ -n "$revised" ]; then
-  echo "   cause: $(trial_field cause)"
-  echo "   expect: $(trial_field expect)"
   # 0.9.14 FAILS: the planner was not asked for them and the trial keeps none.
-  check "G1b: the trial keeps the cause the revision addressed and what it expects" '[ -n "$(trial_field cause)" ] && [ -n "$(trial_field expect)" ]'
+  check "G1b: a revision's trial keeps the cause it addressed and what it expects (attempt ${hypothesis:-none} of 3)" '[ -n "$hypothesis" ]'
 fi
 
 echo "evidence: $LIVE_ROOT/guard-ledger, $LIVE_ROOT/guard-standing, $LIVE_ROOT/guard-revision (conversation.md, the *.json answers, the state in home/data)"

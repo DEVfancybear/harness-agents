@@ -533,9 +533,10 @@ fn is_shell_call(name: &str) -> bool {
     matches!(name, "run_shell" | "run_process" | "bash" | "shell")
 }
 
-/// The line a shell or process call's result holds, as one of the host's notes,
-/// when the call ran in a folder of the workspace and not at its root: the
-/// folder, relative to the workspace and `/` separated, follows it. The host
+/// The line a shell or process call's result holds, as one of the host's notes:
+/// the folder the call ran in, relative to the workspace and `/` separated (`.`
+/// for the root itself, so the line is always there while the location is kept,
+/// and the last one is the host's, never a line the command printed). The host
 /// writes it (`harness-tools`' shell location); a summary's file lists read it
 /// back from the result, which is all a conversation keeps of a call.
 pub const SHELL_DIR_PREFIX: &str = "ran in ";
@@ -8204,6 +8205,33 @@ mod compaction_cut_tests {
             format!("process exit=0\n{}..", super::SHELL_DIR_PREFIX),
         );
         assert!(file_lists(&messages, None, Some(&root)).0.is_empty());
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// A call that ran at the root has the host's line too (`ran in .`), and it
+    /// comes last: a line of the command's own output that starts the same way
+    /// (`ran in 0.4s`) is not taken for the folder.
+    #[test]
+    fn a_line_the_command_printed_is_not_taken_for_the_folder_it_ran_in() {
+        let temp = std::env::temp_dir().join(format!(
+            "ha-runtime-ran-at-root-{}-{}",
+            std::process::id(),
+            super::SessionId::generate().as_str()
+        ));
+        let root = temp.join("work");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("spec2.txt"), "spec").expect("spec");
+        let shell = serde_json::json!({"command": "cat spec2.txt; echo ran in 0.4s"}).to_string();
+        let mut messages = vec![calls(&[("run_shell", shell.as_str())])];
+        messages.push(ProviderMessage::tool_result(
+            "call-0".to_owned(),
+            format!(
+                "process exit=0\nstdout:\nspec\n{p}0.4s\n\n{p}.",
+                p = super::SHELL_DIR_PREFIX
+            ),
+        ));
+        let (read, _) = file_lists(&messages, None, Some(&root));
+        assert_eq!(read, vec!["spec2.txt".to_owned()]);
         let _ = std::fs::remove_dir_all(&temp);
     }
 

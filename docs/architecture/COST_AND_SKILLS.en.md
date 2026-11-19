@@ -245,6 +245,12 @@ the prune trial's cost rule, `cost_stats`), `refine.rs` (`prune`,
   [--skill NAME] [--model PROVIDER/MODEL] [--thinking LEVEL]` runs it now
   (whatever `HA_SKILL_PRUNE` says; not with learned skills off). Diagnostics:
   `skill prune` with the candidates, landed and refused.
+- **A mastered skill is pruned too.** A skill marked `mastered` (see [the
+  self-improvement gate](SELF_IMPROVEMENT_GATE.en.md)) is a usual candidate. The
+  "only add" rule is about revisions that change what a skill does; the prune
+  prompt says a prune may shorten the wording and drop what none of the skill's
+  "worked before" lines relies on, keeps every step those lines rely on, and adds
+  no rule.
 
 ## 6. A hindsight judge of each step (P4)
 

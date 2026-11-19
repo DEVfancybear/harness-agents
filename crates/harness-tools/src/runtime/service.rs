@@ -610,8 +610,44 @@ impl ToolExecutionService {
         if let Some(reason) = &prepared.policy_denial {
             Decision::Deny(reason.clone())
         } else {
-            self.policy.decide(prepared.action())
+            // A rule that allowed a command allowed it with the `PATH` it was
+            // written for: while a shell call has changed it, the rule does not
+            // decide (full-auto and a person's answer still do).
+            self.policy
+                .decide_with(prepared.action(), self.shell_place(prepared).path.is_some())
         }
+    }
+
+    /// Where a shell or process call of `prepared` starts now: the root with the
+    /// host's `PATH`, or where an earlier shell call of the conversation left it.
+    pub(crate) fn shell_place(&self, prepared: &PreparedToolRequest) -> crate::location::Place {
+        if !matches!(
+            prepared.final_action,
+            CodingToolAction::RunShell { .. } | CodingToolAction::RunProcess { .. }
+        ) {
+            return crate::location::Place::default();
+        }
+        self.places
+            .start(prepared.request.task_id.as_str(), &prepared.workspace_root)
+    }
+
+    /// What the person who approves the call is told about where it starts,
+    /// when that is not the root with the host's `PATH`.
+    #[must_use]
+    pub fn location_summary(&self, prepared: &PreparedToolRequest) -> Option<String> {
+        self.shell_place(prepared).summary(&prepared.workspace_root)
+    }
+
+    /// The call ended without reaching a shell (refused, blocked, failed first):
+    /// what the command guard judged for it is dropped.
+    pub fn forget_guard_verdict(&self, invocation: &harness_types::ToolInvocationId) {
+        self.places.forget_judged(invocation.as_str());
+    }
+
+    /// How many command-guard verdicts are kept for calls not yet dispatched.
+    #[cfg(test)]
+    pub(crate) fn guard_verdicts_kept(&self) -> usize {
+        self.places.judged_len()
     }
 
     /// Replace how `secret://` references are resolved for this host.
@@ -841,7 +877,8 @@ impl ToolExecutionService {
             ));
         }
         let approval_id = harness_types::ToolApprovalId::generate();
-        let binding_json = json!({
+        let shell_place = self.shell_place(prepared).binding();
+        let mut binding_json = json!({
             "schema_version": TOOL_CONTRACT_VERSION,
             "approval_id": approval_id,
             "session_id": prepared.request.session_id,
@@ -856,6 +893,9 @@ impl ToolExecutionService {
             "tool_revision": TOOL_CONTRACT_VERSION,
             "expires_at_unix_ms": expires_at_unix_ms,
         });
+        if !shell_place.is_empty() {
+            binding_json["shell_place"] = json!(shell_place);
+        }
         let binding_hash = ContentHash::from_canonical_json(&binding_json)?;
         let grant = ApprovalGrant {
             approval_id: approval_id.clone(),
@@ -870,6 +910,7 @@ impl ToolExecutionService {
             policy_revision: prepared.policy_revision,
             tool_revision: u64::from(TOOL_CONTRACT_VERSION),
             expires_at_unix_ms,
+            shell_place,
         };
         self.store
             .issue_tool_approval(ToolApprovalRecord {
@@ -1013,7 +1054,8 @@ impl ToolExecutionService {
                 )
                 .await;
         };
-        if let Some((code, reason)) = approval_mismatch(&prepared, &approval) {
+        let shell_place = self.shell_place(&prepared).binding();
+        if let Some((code, reason)) = approval_mismatch(&prepared, &approval, &shell_place) {
             return self
                 .record_denied_begun(&prepared, execution_id, Some(&approval), code, &reason)
                 .await;
@@ -3087,6 +3129,7 @@ fn binding_from_grant(grant: &ApprovalGrant) -> ToolApprovalBinding {
 fn approval_mismatch(
     prepared: &PreparedToolRequest,
     approval: &ApprovalGrant,
+    shell_place: &str,
 ) -> Option<(ErrorCode, String)> {
     if approval.actor_id != prepared.request.actor_id
         || approval.session_id != prepared.request.session_id
@@ -3098,6 +3141,7 @@ fn approval_mismatch(
         || approval.workspace_fingerprint != prepared.workspace_fingerprint
         || approval.policy_revision != prepared.policy_revision
         || approval.tool_revision != u64::from(TOOL_CONTRACT_VERSION)
+        || approval.shell_place != shell_place
     {
         return Some((
             ErrorCode::ApprovalStale,
@@ -3844,6 +3888,154 @@ mod tests {
             }
             other => panic!("the stale verdict let it run: {other:?}"),
         }
+    }
+
+    fn grant_for(prepared: &PreparedToolRequest, shell_place: &str) -> crate::ApprovalGrant {
+        crate::ApprovalGrant {
+            approval_id: harness_types::ToolApprovalId::generate(),
+            session_id: prepared.request.session_id.clone(),
+            task_id: prepared.request.task_id.clone(),
+            invocation_id: prepared.request.invocation_id.clone(),
+            call_id: prepared.request.call_id.clone(),
+            actor_id: prepared.request.actor_id.clone(),
+            action_hash: prepared.action_hash.clone(),
+            workspace_root: prepared.workspace_root_text.clone(),
+            workspace_fingerprint: prepared.workspace_fingerprint.clone(),
+            policy_revision: prepared.policy_revision,
+            tool_revision: u64::from(crate::TOOL_CONTRACT_VERSION),
+            shell_place: shell_place.to_owned(),
+            expires_at_unix_ms: None,
+        }
+    }
+
+    fn prepared_shell(command: &str) -> PreparedToolRequest {
+        let root = std::env::temp_dir().join("ha-g-approval-place");
+        let action = CodingToolAction::RunShell {
+            command: command.to_owned(),
+            timeout_ms: 5_000,
+            isolation: crate::IsolationMode::BestEffort,
+            env: Vec::new(),
+        };
+        PreparedToolRequest {
+            request: ToolRequest::new(
+                SessionId::generate(),
+                TaskId::generate(),
+                "test.actor",
+                root.clone(),
+                action.clone(),
+            ),
+            action_hash: action.canonical_hash().expect("canonical action hash"),
+            final_action: action,
+            workspace_root: root.clone(),
+            workspace_root_text: root.to_string_lossy().into_owned(),
+            workspace_fingerprint: ContentHash::from_bytes(b"workspace"),
+            workspace_identity_hash: ContentHash::from_bytes(b"identity"),
+            project_id: ProjectId::generate(),
+            policy_revision: 0,
+            policy_denial: None,
+        }
+    }
+
+    /// An approval given for a call that starts in one place is not good for the
+    /// same call in another: the directory or the `PATH` it runs with is part of
+    /// what the person approved.
+    #[test]
+    fn an_approval_given_for_one_place_does_not_run_the_call_in_another() {
+        let prepared = prepared_shell("make");
+        let at_root = grant_for(&prepared, "");
+        assert!(super::approval_mismatch(&prepared, &at_root, "").is_none());
+        let in_sub = r#"{"dir":"/w/sub","path":null}"#;
+        let (code, reason) = super::approval_mismatch(&prepared, &at_root, in_sub)
+            .expect("an approval for the root is not one for a folder");
+        assert_eq!(code, ErrorCode::ApprovalStale);
+        assert!(reason.contains("approval does not bind"), "{reason}");
+        let for_sub = grant_for(&prepared, in_sub);
+        assert!(super::approval_mismatch(&prepared, &for_sub, in_sub).is_none());
+        assert!(super::approval_mismatch(&prepared, &for_sub, "").is_some());
+        assert!(
+            super::approval_mismatch(&prepared, &for_sub, r#"{"dir":"/w/sub","path":"/x"}"#)
+                .is_some(),
+            "nor is one for a folder good with another PATH"
+        );
+    }
+
+    /// A rule that allows `run_shell(echo *)` stops deciding once a shell call
+    /// has changed `PATH`: the call asks, and the person who is asked is told.
+    #[tokio::test]
+    async fn an_allow_rule_asks_while_a_shell_call_has_changed_the_path() {
+        let temp = std::env::temp_dir().join(format!(
+            "harness-tools-rule-path-{}",
+            harness_types::InputId::generate()
+        ));
+        let workspace = temp.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                temp.join("data"),
+                HostId::generate(),
+            ))
+            .await
+            .expect("store opens"),
+        );
+        let policy =
+            ToolPolicy::new(1, Vec::new()).with_tool_rules(vec![crate::ToolPatternRule::allow(
+                "run_shell(*)",
+                "agreed",
+            )]);
+        let service = ToolExecutionService::new(Arc::clone(&store)).with_policy(policy);
+        let (session, task) = (SessionId::generate(), TaskId::generate());
+        harness_session::SessionService::new(Arc::clone(&store))
+            .admit_input(harness_session::AdmitInputRequest {
+                session_id: session.clone(),
+                task_id: task.clone(),
+                input_id: InputId::generate(),
+                expected_sequence: 1,
+                authority: harness_types::SourceAuthority::User,
+                raw_text: "go".to_owned(),
+                workspace: observe_workspace(ProjectId::generate(), &workspace)
+                    .expect("observation"),
+                initial_plan_items: Vec::new(),
+            })
+            .await
+            .expect("input admitted");
+        let call = |command: &str| {
+            ToolRequest::new(
+                session.clone(),
+                task.clone(),
+                "test.actor",
+                workspace.clone(),
+                CodingToolAction::RunShell {
+                    command: command.to_owned(),
+                    timeout_ms: 60_000,
+                    isolation: crate::IsolationMode::BestEffort,
+                    env: Vec::new(),
+                },
+            )
+        };
+        let change = if cfg!(windows) {
+            "$env:PATH = 'C:\\zz-other-dir;' + $env:PATH"
+        } else {
+            "PATH=/zz-other-dir:$PATH; export PATH"
+        };
+        let first = service.prepare(call(change)).await.expect("prepared");
+        let second = service.prepare(call("echo hi")).await.expect("prepared");
+        assert!(matches!(
+            service.decision(&second),
+            crate::Decision::Allow { .. }
+        ));
+        assert_eq!(service.location_summary(&second), None);
+        let grant = service.approve(&first).await.expect("approved");
+        service.execute(first, Some(grant)).await.expect("runs");
+        assert_eq!(service.decision(&second), crate::Decision::Ask);
+        let summary = service.location_summary(&second).expect("told");
+        assert!(summary.contains("zz-other-dir"), "{summary}");
+        drop(service);
+        Arc::try_unwrap(store)
+            .expect("single owner")
+            .close()
+            .await
+            .expect("store closes");
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     /// The kinds a host may auto-approve, and the three that it never may.

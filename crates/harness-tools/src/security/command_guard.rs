@@ -344,13 +344,37 @@ fn literal(word: &str) -> bool {
         && !word.starts_with('-')
 }
 
+/// `path` without the verbatim prefix Windows' `canonicalize` gives
+/// (`\\?\C:\w` is `C:\w`, `\\?\UNC\srv\share` is `\\srv\share`). In a verbatim
+/// path only `\` separates components and `.` and `..` are names, so a word
+/// such as `../.harness/x` joined to one stayed an unresolved name and went
+/// unseen by every comparison below. Other paths are returned as they are.
+fn plain(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// `word` as an absolute path, read from `root` when it is relative: `/` and
+/// `\` both separate (a Windows path takes either), the verbatim prefix of
+/// `root` is gone ([`plain`]), and `.` and `..` are applied as text.
 fn absolute(root: &Path, word: &str) -> PathBuf {
-    let path = Path::new(word);
+    let word = if cfg!(windows) {
+        word.replace('/', "\\")
+    } else {
+        word.to_owned()
+    };
+    let path = Path::new(&word);
     lexical(
         &if path.is_absolute() || word.starts_with('/') || word.starts_with('\\') {
-            path.to_path_buf()
+            plain(path)
         } else {
-            root.join(path)
+            plain(root).join(path)
         },
     )
 }
@@ -849,8 +873,12 @@ async fn judge(
     cancellation: &harness_providers::CancellationToken,
     spool: &crate::capture::ProcessSpoolConfig,
 ) -> Option<Refusal> {
-    let mut protected = protected.to_vec();
-    protected.extend(host_dirs());
+    // Every path below is compared as text, so each is in one form: the
+    // verbatim prefix `canonicalize` gives on Windows is gone ([`plain`]).
+    let (root_plain, dir_plain) = (plain(root), plain(dir));
+    let (root, dir) = (root_plain.as_path(), dir_plain.as_path());
+    let mut protected: Vec<PathBuf> = protected.iter().map(|path| plain(path)).collect();
+    protected.extend(host_dirs().iter().map(|path| plain(path)));
     protected.push(root.join(".harness"));
     let mut relocated = false;
     for (index, segment) in segments.iter().enumerate() {
@@ -1281,5 +1309,104 @@ mod tests {
         )
         .await;
         assert!(refusal.is_some());
+    }
+
+    /// The workspace root the host holds is `canonicalize`d, which on Windows is
+    /// a verbatim path (`\?\F:\ws`). There only `\` separates components and
+    /// `..` is a name, so `../.harness/x` joined to it stayed unresolved and
+    /// `.harness` went unseen, from the root (`./.harness/x`) as from a folder.
+    /// The test uses a canonicalized root, as the host does.
+    #[tokio::test]
+    async fn dot_segments_and_slashes_are_resolved_against_the_root_the_host_holds() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().join("w");
+        std::fs::create_dir_all(root.join("sub")).expect("sub");
+        std::fs::create_dir_all(root.join(".harness")).expect("harness");
+        let root = std::fs::canonicalize(&root).expect("canonical");
+        let sub = root.join("sub");
+        let spool = spool(dir.path());
+        let judged = |from: PathBuf, command: &'static str| {
+            let root = root.clone();
+            let spool = spool.clone();
+            async move {
+                shell_refusal(
+                    &root,
+                    &from,
+                    command,
+                    &[],
+                    harness_providers::CancellationToken::new(),
+                    &spool,
+                )
+                .await
+            }
+        };
+        let mut cases = vec![
+            (sub.clone(), "Set-Content ../.harness/features.json x"),
+            (sub.clone(), "echo x > ../.harness/features.json"),
+            (root.clone(), "Set-Content ./.harness/x y"),
+            (root.clone(), "Set-Content sub/../.harness/x y"),
+        ];
+        if cfg!(windows) {
+            cases.push((sub.clone(), r"Set-Content ..\.harness\features.json x"));
+        }
+        for (from, command) in cases {
+            let refusal = judged(from, command).await;
+            assert_eq!(
+                refusal.map(|refusal| refusal.guard),
+                Some("harness-integrity"),
+                "{command}"
+            );
+        }
+        // The same file named by the path the model was shown, which has no
+        // verbatim prefix, and one inside the workspace that is not `.harness`.
+        let shown = plain(&root).to_string_lossy().replace('\\', "/");
+        let hidden: &'static str =
+            Box::leak(format!("Set-Content {shown}/.harness/x y").into_boxed_str());
+        let open: &'static str =
+            Box::leak(format!("Set-Content {shown}/notes.txt x").into_boxed_str());
+        for from in [root.clone(), sub.clone()] {
+            let refusal = judged(from.clone(), hidden).await;
+            assert_eq!(
+                refusal.map(|refusal| refusal.guard),
+                Some("harness-integrity"),
+                "{hidden} from {from:?}"
+            );
+            assert!(judged(from, open).await.is_none(), "{open}");
+        }
+        // Inside the workspace and not `.harness`: nothing refuses it.
+        assert!(
+            judged(sub.clone(), "Set-Content ../notes.txt x")
+                .await
+                .is_none()
+        );
+        // Out of the workspace by the path alone: no git needed to say so.
+        let refusal = judged(sub, "rm -rf ../../elsewhere")
+            .await
+            .expect("refused");
+        assert_eq!(refusal.guard, "recursive-delete");
+        assert!(
+            refusal.reason.contains("is outside the workspace"),
+            "{}",
+            refusal.reason
+        );
+    }
+
+    #[test]
+    fn the_verbatim_prefix_is_taken_off_a_path() {
+        let bs = "\\";
+        let verbatim = format!("{bs}{bs}?{bs}");
+        assert_eq!(
+            plain(Path::new(&format!("{verbatim}C:{bs}w{bs}sub"))),
+            PathBuf::from(format!("C:{bs}w{bs}sub"))
+        );
+        assert_eq!(
+            plain(Path::new(&format!("{verbatim}UNC{bs}srv{bs}share{bs}w"))),
+            PathBuf::from(format!("{bs}{bs}srv{bs}share{bs}w"))
+        );
+        assert_eq!(plain(Path::new("/w/sub")), PathBuf::from("/w/sub"));
+        assert_eq!(
+            plain(Path::new(&format!("C:{bs}w"))),
+            PathBuf::from(format!("C:{bs}w"))
+        );
     }
 }

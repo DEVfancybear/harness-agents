@@ -385,12 +385,9 @@ pub(crate) async fn run_shell_in(
     environment: &ProcessEnvironment,
     spool: &ProcessSpoolConfig,
 ) -> Result<(ProcessResult, Option<location::End>), HarnessError> {
-    let side_file = track.then(|| {
-        let side_file = location::side_file_in(spool.root());
-        std::fs::create_dir_all(spool.root()).ok();
-        std::fs::remove_file(&side_file).ok();
-        side_file
-    });
+    // The side file is in a directory of this user alone (`location`), not in
+    // the spool other users can reach.
+    let side_file = if track { location::side_file() } else { None };
     let result = run_shell_in_lane(
         dir,
         command,
@@ -401,14 +398,10 @@ pub(crate) async fn run_shell_in(
         &HostEnvironment::from_process(),
         ProcessLane::Owned(queue.clone()),
         path,
-        side_file.as_deref(),
+        side_file.as_ref().map(location::SideFile::path),
     )
     .await;
-    let end = side_file.and_then(|side_file| {
-        let text = std::fs::read_to_string(&side_file).ok();
-        std::fs::remove_file(&side_file).ok();
-        text.as_deref().and_then(location::parse_end)
-    });
+    let end = side_file.and_then(|side_file| side_file.take());
     result.map(|result| (result, end))
 }
 

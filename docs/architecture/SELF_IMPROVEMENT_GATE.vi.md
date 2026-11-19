@@ -58,6 +58,14 @@ của planner.
   của GUARD), bản cũ nhất bị bỏ. Bản ghi cùng kind, target và lý do thay bản cũ.
   Lý do, tóm tắt điều đã đề xuất và trích dẫn bằng chứng mỗi thứ một dòng, cắt
   còn 300, 200 và 200 ký tự, và được che như văn bản memory.
+- **Sửa đổi bị từ chối vì an toàn không giữ chữ nào của nó.** Sửa đổi bị từ chối
+  vì chứa bí mật, văn bản điều khiển (mẫu injection hoặc exfiltration), hoặc lời
+  của một trang web bị biến thành luật (và sửa đổi của Deep Dream có câu trích
+  chứa bí mật) được đánh dấu `safety` ngay chỗ bị từ chối. Bản ghi của nó chỉ giữ
+  kind, action, lý do, và target: id của entry khi sửa đổi có nêu id, `a new
+  entry` với lệnh create (id và tiêu đề của entry mới chính là lời của sửa đổi).
+  Không có tóm tắt, không có câu trích, và phần prompt ghi *refused for safety:
+  its words are not kept*, nên sổ cái không mang chữ đó trở lại mọi prompt sau.
 - **Đọc lại.** Mọi planner của sửa đổi memory - review tự động, `/refine` và
   `/learn` (`plan`), và curator theo lô của Deep Dream (`memory_edits`) - nhận một
   phần `<refused_before>`, mới nhất trước, tối đa 12 trên cả hai scope, sau câu
@@ -68,7 +76,8 @@ của planner.
   `refine` / `refusal_not_kept` khi không đọc hoặc ghi được file; sổ cái không
   đọc được thì không bị ghi đè). `refine` / `planner_given` được ghi cho mỗi lần
   lên kế hoạch, chỉ gồm tên các phần của prompt và số đếm (số dòng bị từ chối,
-  standing, dòng "worked before" và "revised"): bản thân prompt không được lưu,
+  standing, dòng "worked before" và "revised", đều đếm từ chính văn bản prompt
+  mà planner nhận, không phải từ thư viện): bản thân prompt không được lưu,
   nên bug report và các live test thấy được rằng các phần đã tới planner.
 
 ## 3. Nguyên nhân và kỳ vọng của một bản sửa, và lịch sử của nó
@@ -119,6 +128,13 @@ nào trong ba loại. Các câu này cũng nằm trong văn bản định dạng
 planner, curator và lượt repair đọc, và prompt repair yêu cầu giữ điều kiện hoặc
 "chỉ thêm" khi sửa một intent.
 
+**Cắt gọn (prune) không phải một bản sửa như vậy.** Quy tắc "chỉ thêm" nói về các
+bản sửa làm đổi điều skill làm. Lượt prune (`ha learning prune`, [chi phí và
+skill](COST_AND_SKILLS.vi.md) mục 5) đọc cùng văn bản định dạng và cùng status, và
+skill mastered là ứng viên quen thuộc của nó: prompt của prune nói rằng prune được
+rút gọn câu chữ và bỏ những gì không dòng "worked before" nào dựa vào, nhưng giữ
+mọi bước mà các dòng đó dựa vào, và không thêm quy tắc.
+
 ## 5. Không lấy
 
 - **Cổng Soft-HURT của GUARD** (kiểm một bản sửa với điều đã chạy tốt trước khi nó
@@ -155,7 +171,10 @@ planner, curator và lượt repair đọc, và prompt repair yêu cầu giữ �
   được không bị ghi đè; phần prompt và chỉ dẫn của nó); `refine.rs`
   (`an_edit_the_host_refused_is_kept_and_the_next_planner_is_told`,
   `a_skipped_or_queued_edit_is_not_kept_but_a_refused_one_among_them_is`,
-  `the_planner_is_told_a_skills_standing_and_asked_for_a_cause`); `learned.rs`
+  `the_planner_is_told_a_skills_standing_and_asked_for_a_cause`,
+  `an_edit_refused_for_safety_is_kept_without_its_words`,
+  `the_planner_given_record_counts_the_standings_from_the_prompt`; `refused.rs` also
+  `a_refusal_for_safety_keeps_no_word_of_the_edit_and_an_ordinary_one_keeps_them`); `learned.rs`
   (`a_revisions_cause_and_expectation_live_in_its_trial_and_its_history_line`,
   `a_rolled_back_a_superseded_and_a_refused_revision_keep_their_cause_and_counts`,
   `the_accepted_history_keeps_the_last_five`,

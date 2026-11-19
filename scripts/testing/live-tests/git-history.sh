@@ -90,6 +90,8 @@ EOF
 #               model may search more than once, and the best evidence counts;
 #   which       always exit 0, printing which search calls listed it first and
 #               with what query (information);
+#   show_called a git_show named the fix commit (a hash prefix of 7 or more
+#               characters, or the full one), whatever it returned;
 #   shown       a git_show named the fix commit (a hash prefix of 7 or more
 #               characters, or the full one) and its result holds the marker;
 #   shown_more  that result also holds the commit's whole message and the
@@ -110,6 +112,8 @@ elif what == "which":
         top = re.search(r"(?m)^1[.] " + re.escape(fix[:7]), s["result"]) is not None
         print(f"INFO  git_search call {number} (query {s['arguments'].get('query')!r}): the fix commit is " + ("hit 1" if top else "not hit 1"))
     ok = True
+elif what == "show_called":
+    ok = bool(shows)
 elif what == "shown":
     ok = any(marker in c["result"] for c in shows)
 elif what == "shown_more":
@@ -121,23 +125,36 @@ EOF
 }
 
 # The model may answer from `git log` in the shell, or skip a step: the checks
-# are about what the tools return, so a run that never called git_search is
-# tried again, at most three times, and the precondition says how many it took.
-MARK=""
+# are about what the tools return, so a run that never called git_search, or
+# never called git_show on the commit it found, is tried again, at most three
+# times. Each precondition says how many attempts it took, and the checks that
+# need the call are judged only when it was made; a precondition that never
+# held fails by its name.
+SEARCH_AT=""; SHOW_AT=""
 for attempt in 1 2 3; do
   mark="MARK-gh$attempt"
   run_exec "ask-$attempt" "$mark. Trong lịch sử git của dự án này, commit nào trước đây đã sửa việc làm tròn tổng hóa đơn (invoice totals)? Hãy dùng các tool lịch sử git: git_search để tìm commit theo nội dung của nó, rồi git_show để đọc commit tìm được. Trả lời: 7 ký tự đầu của hash commit đó, và nguyên văn dòng mã mà commit đó đã thêm."
   calls "$mark" > "$RX/ask-$attempt.calls.json"
-  if judge "$RX/ask-$attempt.calls.json" searched "$FIX" "$MARKER"; then MARK=$mark; break; fi
+  if [ -z "$SEARCH_AT" ] && judge "$RX/ask-$attempt.calls.json" searched "$FIX" "$MARKER"; then SEARCH_AT=$attempt; fi
+  if [ -z "$SHOW_AT" ] && judge "$RX/ask-$attempt.calls.json" show_called "$FIX" "$MARKER"; then SHOW_AT=$attempt; fi
+  [ -n "$SEARCH_AT" ] && [ -n "$SHOW_AT" ] && break
 done
-check "precondition: the model called git_search (attempts: $attempt)" '[ -n "$MARK" ]'
-if [ -n "$MARK" ]; then
-  CALLS="$RX/ask-$attempt.calls.json"
-  ANSWER=$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1],encoding='utf-8')).get('response',''))" "$RX/ask-$attempt.json")
-  echo "################ the commit is found by what its message was about and read"
+answer_of() { "$PY" -c "import json,sys; print(json.load(open(sys.argv[1],encoding='utf-8')).get('response',''))" "$RX/ask-$1.json"; }
+# Passes on 0.9.14 too: the model (the tool is its to call) called git_search.
+check "precondition: the model called git_search (attempt ${SEARCH_AT:-none} of $attempt)" '[ -n "$SEARCH_AT" ]'
+if [ -n "$SEARCH_AT" ]; then
+  CALLS="$RX/ask-$SEARCH_AT.calls.json"
+  echo "################ the commit is found by what its message was about"
   # 0.9.14 FAILS: it has no git_search, so no search result is ever sent.
   judge "$CALLS" which "$FIX" "$MARKER"
   check "a git_search result lists the commit that fixed the rounding as hit 1" 'judge "$CALLS" first "$FIX" "$MARKER"'
+fi
+# Passes on 0.9.14 too: the model called git_show on the commit it found.
+check "precondition: the model called git_show on the found commit (attempt ${SHOW_AT:-none} of $attempt)" '[ -n "$SHOW_AT" ]'
+if [ -n "$SHOW_AT" ]; then
+  CALLS="$RX/ask-$SHOW_AT.calls.json"
+  ANSWER=$(answer_of "$SHOW_AT")
+  echo "################ the commit is read"
   # 0.9.14 FAILS: it has no git_show, and git_diff shows only uncommitted
   # changes, so no result the model is sent holds the marker, which no file at
   # HEAD holds either.

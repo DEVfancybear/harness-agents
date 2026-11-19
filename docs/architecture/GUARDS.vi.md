@@ -117,24 +117,46 @@ những harness tự tiến hoá cứ phải tự nghĩ ra. Nay (`processes/loca
 - Host đặt một đoạn ghi nhận phía trước mỗi lệnh `run_shell`, không bao giờ nối
   sau nó (chữ nối thêm sau lệnh bị đọc như một phần của lệnh: heredoc không có
   điểm kết hay dấu gạch chéo ngược ở cuối nuốt mất nó, và lệnh tự thoát thì không
-  bao giờ chạy tới). Khi shell thoát, bằng cách nào cũng vậy, nó ghi thư mục cuối
-  và `PATH` vào một file phụ do host chọn trong spool của process (không bao giờ
-  ghi ra stdout), và giữ nguyên trạng thái như lệnh đã tạo ra:
-  - `sh`: một bẫy `EXIT` lưu `$?`, ghi `pwd` và `$PATH`, rồi thoát với trạng thái
-    đã lưu. Lệnh tự đặt bẫy `EXIT` thì thay bẫy của ta: không giữ vị trí nào cho
-    nó (hành vi cũ). Lỗi cú pháp để vị trí ở chỗ lần gọi bắt đầu.
+  bao giờ chạy tới), ngay trên dòng đầu của lệnh, nên số dòng trong mọi thông báo
+  về lệnh vẫn là số dòng của model. Khi shell thoát, bằng cách nào cũng vậy, nó
+  ghi thư mục cuối và `PATH` vào một file phụ, và giữ nguyên trạng thái như lệnh
+  đã tạo ra:
+  - `sh`: một bẫy `EXIT` lưu `$?`, mở đầu bằng `set +eu` (lệnh đã bật `set -e`
+    hay `set -u` vẫn giữ trạng thái của nó: việc ghi, hay một `PATH` bị unset,
+    không đổi được), ghi `pwd` và `$PATH`, rồi thoát với trạng thái đã lưu. Trạng
+    thái trên 128 ứng với một tín hiệu là chương trình bị tín hiệu đó giết, mà
+    shell không phân biệt được với `exit 143`: bẫy khi đó gửi chính tín hiệu ấy
+    cho shell, nên lần gọi kết thúc bằng tín hiệu, như trước khi có bẫy. Lệnh tự
+    đặt bẫy `EXIT` thì thay bẫy của ta: không giữ vị trí nào cho nó (hành vi cũ).
+    Lỗi cú pháp ở dòng đầu làm shell dừng trước khi bẫy được đặt: trạng thái 2,
+    vị trí không đổi.
   - `pwsh` và `powershell.exe`: một sự kiện engine `PowerShell.Exiting` đăng ký
-    đầu tiên (nó cũng chạy khi `exit N`, trên PowerShell 7 và 5.1), và một dòng
-    trạng thái sau lệnh và một dòng trống. Đã đo trên cả hai: `-Command` thoát 0
-    khi câu lệnh cuối thành công, 1 khi nó hỏng (mã riêng của chương trình native
-    bị mất) và N với `exit N`. Dòng trạng thái thoát 0 khi thành công,
-    `$LASTEXITCODE` của chương trình native khi lệnh hỏng và nó là số nguyên khác
-    0, còn lại là 1; nên `exit 5` của một chương trình native nay cho 5 (trước là
-    1), thành công vẫn là 0, và `exit N` vẫn là N. Lệnh không parse được thì
-    không chạy gì, nên vị trí giữ nguyên.
+    với `-SupportEvent`, nên nó không phải job: `Get-Job | Wait-Job` chỉ chờ job
+    của lệnh, và `Get-Job | Remove-Job` không thấy gì của ta. Nó cũng chạy khi
+    `exit N` (đã kiểm trên PowerShell 7 và 5.1). PowerShell đòi các câu lệnh
+    `using` và khối `param` (kèm attribute phía trước) ở đầu script, nên việc
+    đăng ký đặt sau cái cuối cùng trong số đó, trên cùng một dòng, tìm theo
+    đúng ngữ pháp của chúng; nếu không có thì đặt trước câu lệnh đầu tiên. Chú
+    thích và `#requires` vẫn ở đầu. Lệnh không đóng được một trong chúng thì
+    không parse được, và không đăng ký gì. Một dòng trạng thái đi sau lệnh, cách
+    một dòng trống. Đã đo trên cả hai: `-Command` thoát 0 khi câu lệnh cuối thành
+    công, 1 khi nó hỏng (mã riêng của chương trình native bị mất) và N với
+    `exit N`. Dòng trạng thái thoát 0 khi thành công, `$LASTEXITCODE` của chương
+    trình native khi lệnh hỏng và nó là số nguyên khác 0, còn lại là 1; nên
+    `exit 5` của một chương trình native nay cho 5 (trước là 1), thành công vẫn
+    là 0, và `exit N` vẫn là N. Lệnh không parse được thì không chạy gì, nên vị
+    trí giữ nguyên.
   - Lệnh bị kill, hết giờ hoặc bị huỷ thì không ghi file, nên vị trí giữ nguyên.
+  - File phụ nằm trong một thư mục do host tạo chỉ cho người dùng của nó (mode
+    0700 trên Unix, tên ngẫu nhiên, được kiểm là thư mục vừa tạo, không phải
+    link, thuộc người dùng), với một cái tên không ai đoán được. Trước đây nó ở
+    spool dùng chung (`/tmp/ha-tool-spool`), với tên người dùng khác trên máy có
+    thể đoán, và được ghi xuyên qua link. Host chỉ đọc nó khi nó là file thường
+    của người dùng, không phải link, rồi xoá nó.
 - Host giữ, theo từng cuộc trò chuyện (task), thư mục và `PATH` cuối cùng; lần
-  `run_shell` và `run_process` tiếp theo của cuộc trò chuyện đó bắt đầu từ đó.
+  `run_shell` và `run_process` tiếp theo của cuộc trò chuyện đó bắt đầu từ đó. Nó
+  giữ vị trí của 256 cuộc trò chuyện dùng gần nhất: quá số đó thì cái ít được
+  dùng gần đây nhất bị bỏ, không bao giờ là cái đang có một lần gọi trong lượt.
 - Các lần gọi của một cuộc trò chuyện lần lượt chờ nhau: một lần gọi đọc vị trí
   bắt đầu và lưu vị trí kết thúc khi đang giữ khoá của cuộc trò chuyện, sau khi
   mọi lần gọi trước nó đã lưu xong. Trước đây nó đọc vị trí trước khi giữ permit
@@ -167,8 +189,22 @@ những harness tự tiến hoá cứ phải tự nghĩ ra. Nay (`processes/loca
   (`working_dir`, và các script nó đọc). Một `cd` trong cùng lệnh vẫn để các đích
   sau nó không kiểm được, như trước. Danh sách file trong bản tóm tắt khi nén đọc
   từ thư mục mà kết quả của lệnh nêu tên.
-- Kết quả cho biết lệnh chạy ở đâu khi đó không phải gốc (`ran in sub`) và, khi
-  lệnh đã chuyển chỗ, lệnh tiếp theo sẽ bắt đầu ở đâu.
+- Người duyệt một lệnh được cho biết nó bắt đầu ở đâu khi đó không phải gốc với
+  `PATH` của host (thư mục, và `PATH`), và phần duyệt ràng buộc điều đó: một phần
+  duyệt cho lần gọi ở một chỗ không chạy lần gọi đó ở chỗ khác. Một luật cho phép
+  hay một phần duyệt bền vững không quyết định một lệnh khi một lần gọi shell đã
+  đổi `PATH`: nó hỏi (full-auto vẫn cho phép; luật cấm vẫn cấm).
+- Mọi đường dẫn các guard so sánh đều ở một dạng: tiền tố verbatim mà
+  `canonicalize` của Windows trả về (`\\?\F:\w`) bị bỏ, `/` và `\` đều là dấu
+  ngăn cách, và `.` với `..` được áp dụng như văn bản. Trong đường dẫn verbatim
+  `..` là một cái tên, nên `../.harness/x` từ một thư mục con, hay
+  `./.harness/x` từ gốc, từng không bị thấy.
+- Ghi chú `ran in <thư mục>` luôn có trong kết quả của lần gọi shell hay process
+  khi vị trí được giữ (`ran in .` ở gốc), nên dòng `ran in` cuối cùng của một
+  kết quả luôn là của host, và một dòng do lệnh in ra (`ran in 0.4s`) không bị
+  nhận nhầm là thư mục.
+- Kết quả cho biết lệnh chạy ở đâu (`ran in sub`; `ran in .` ở gốc) và, khi lệnh
+  đã chuyển chỗ, lệnh tiếp theo sẽ bắt đầu ở đâu.
 - `HA_SHELL_KEEP_LOCATION=off` trả lại hành vi cũ: mọi lần gọi bắt đầu ở gốc với
   `PATH` của host.
 

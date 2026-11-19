@@ -117,26 +117,47 @@ runtime mechanisms that self-evolving harnesses keep inventing. Now
 - The host puts a recording in front of each `run_shell` command, never after it
   (text appended to a command is read as part of it: an unterminated heredoc or
   a trailing backslash swallowed it, and a command that exits itself never
-  reached it). It writes the shell's final directory and `PATH` to a side file
-  the host chose in the process spool (never to stdout) when the shell exits,
-  however it does, and leaves the status as the command made it:
-  - `sh`: an `EXIT` trap that saves `$?`, writes `pwd` and `$PATH`, and exits
-    with the saved status. A command that sets its own `EXIT` trap replaces
-    ours: no location is kept for it (the old behavior). A syntax error leaves
-    the place where the call started.
+  reached it), on the command's own first line, so the line numbers of every
+  message about the command are the model's. It writes the shell's final
+  directory and `PATH` to a side file when the shell exits, however it does, and
+  leaves the status as the command made it:
+  - `sh`: an `EXIT` trap that saves `$?`, starts with `set +eu` (a command that
+    turned on `set -e` or `set -u` keeps its status: the write, or an unset
+    `PATH`, cannot change it), writes `pwd` and `$PATH`, and exits with the saved
+    status. A status above 128 that names a signal is a program the signal
+    killed, which the shell cannot tell from `exit 143`: the trap then raises
+    the signal on the shell itself, so the call ends by the signal, as it did
+    without the trap. A command that sets its own `EXIT` trap replaces ours: no
+    location is kept for it (the old behavior). A syntax error in the first line
+    stops the shell before the trap is set: status 2, the place unchanged.
   - `pwsh` and `powershell.exe`: a `PowerShell.Exiting` engine event registered
-    first (it runs on `exit N` too, on PowerShell 7 and 5.1), and a status
-    line after the command and a blank line. Measured on both: `-Command` exits
-    0 when the last statement succeeded, 1 when it failed (a native program's own
-    code is lost) and N for `exit N`. The status line exits 0 on success, the
-    native program's `$LASTEXITCODE` when the command failed and it is a
-    non-zero integer, else 1; so a native `exit 5` now gives 5 (it gave 1), a
-    success stays 0, and `exit N` stays N. A command that does not parse runs
-    nothing, so the place stays.
+    with `-SupportEvent`, so it is not a job: `Get-Job | Wait-Job` waits for the
+    command's jobs only, and `Get-Job | Remove-Job` finds nothing of ours. It
+    runs on `exit N` too (checked on PowerShell 7 and 5.1). PowerShell wants
+    `using` statements and a `param` block (attributes before it) at the top of a
+    script, so the registration goes after the last of them, on the same line,
+    found by their grammar; with none, before the first statement. Comments and
+    `#requires` stay first. A command that does not close one of them does not
+    parse, and nothing is registered. A status line follows the command after a
+    blank line. Measured on both: `-Command` exits 0 when the last statement
+    succeeded, 1 when it failed (a native program's own code is lost) and N for
+    `exit N`. The status line exits 0 on success, the native program's
+    `$LASTEXITCODE` when the command failed and it is a non-zero integer, else
+    1; so a native `exit 5` now gives 5 (it gave 1), a success stays 0, and
+    `exit N` stays N. A command that does not parse runs nothing, so the place
+    stays.
   - A command that is killed, times out or is canceled writes no file, so the
     place stays as it was.
+  - The side file is in a directory made by the host for its user alone (mode
+    0700 on Unix, a random name, checked to be the directory just made, not a
+    link, owned by the user), under a name nobody can guess. It used to be in the
+    shared spool (`/tmp/ha-tool-spool`), with a name another local user could
+    guess, written through links. The host reads it only when it is a plain file
+    of the user, not a link, and removes it.
 - The host keeps, per conversation (task), the last directory and `PATH`; the
-  next `run_shell` and `run_process` of that conversation start there.
+  next `run_shell` and `run_process` of that conversation start there. It keeps
+  the places of the 256 conversations used last: past that the least recently
+  used goes, never one with a call in its turn.
 - The calls of one conversation take turns: a call reads its start place and
   stores its end place while it holds the conversation's lock, after any call
   before it has stored its own. It used to read the place before it held the
@@ -171,8 +192,21 @@ runtime mechanisms that self-evolving harnesses keep inventing. Now
   inside the same command still leaves the targets after it unchecked, as before.
   The file lists of a compaction summary read a relative word of a command from
   the folder its result names.
-- The result says where the command ran when that was not the root (`ran in
-  sub`) and, when the command moved, where the next one starts.
+- The person who is asked to approve a command is shown where it starts when
+  that is not the root with the host's `PATH` (the folder, and the `PATH`), and
+  the approval binds it: one given for a call in one place does not run it in
+  another. An allow rule or a persistent approval does not decide a command
+  while a shell call has changed `PATH`: it asks (full-auto still allows; deny
+  rules still deny).
+- Every path the guards compare is in one form: the verbatim prefix Windows'
+  `canonicalize` gives (`\\?\F:\w`) is taken off, `/` and `\` both separate, and
+  `.` and `..` are applied as text. In a verbatim path `..` is a name, so
+  `../.harness/x` from a folder, or `./.harness/x` from the root, went unseen.
+- The note `ran in <folder>` is always in the result of a shell or process call
+  while the location is kept (`ran in .` at the root), so the last such line of
+  a result is the host's and a line the command printed (`ran in 0.4s`) is not
+  taken for the folder.
+- The result says where the command ran (`ran in sub`; `ran in .` at the root) and, when the command moved, where the next one starts.
 - `HA_SHELL_KEEP_LOCATION=off` restores the old behaviour: every call starts at
   the root with the host's `PATH`.
 
