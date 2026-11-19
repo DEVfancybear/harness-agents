@@ -5,7 +5,10 @@
 # to 8 MiB - made the request "mandatory context requires ... tokens" more than
 # the window. Here `ha exec` names a 1.7 MB PNG (its top a red band, the rest
 # noise that does not compress):
-#   1. the run answers what the image shows, so the image reached the model;
+#   1. the run answers what the image shows, so the image reached the model -
+#      named mid-sentence, and at a sentence's end (its full stop once stayed on
+#      the name, which then read the PNG to the 256 KiB text ceiling and sent it
+#      cut off: "could not parse image");
 #   2. no request was refused as too large for the window;
 #   3. the request's estimate stays near the tokens the provider counted.
 # Every check prints PASS or FAIL; the evidence stays in $LIVE_ROOT/image.
@@ -38,11 +41,17 @@ EOF
 size=$(wc -c < "$P/shot.png")
 check "the image is over a megabyte (the precondition)" '[ "$size" -gt 1048576 ]'
 
-echo "== ha exec naming the image"
-(cd "$P" && "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto "Look at shot.png. What colour is the band across its top? Answer with one English word." >"$RX/exec.out" 2>"$RX/exec.err")
+echo "== ha exec naming the image mid-sentence"
+(cd "$P" && "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto "Look at shot.png and tell me the colour of the band across its top, in one English word." >"$RX/exec.out" 2>"$RX/exec.err")
 tail -3 "$RX/exec.out" | sed 's/^/   /'
 check "the run answers what the image shows" 'grep -qi red "$RX/exec.out"'
 check "no request was refused as too large for the window" '! grep -qi "mandatory context\|context_overflow\|mandatory_context_overflow" "$RX/exec.out" "$RX/exec.err" "$HA_HOME"/data/diagnostics/*.jsonl'
+
+echo "== ha exec naming the image at a sentence's end"
+(cd "$P" && "$HA" exec --model "$MODEL" "${TH[@]}" --approval full-auto "Look at shot.png. What colour is the band across its top? Answer with one English word." >"$RX/exec2.out" 2>"$RX/exec2.err")
+tail -3 "$RX/exec2.out" | sed 's/^/   /'
+grep -i "image attached" "$RX/exec2.err" | sed 's/^/   /'
+check "the image named at a sentence's end is attached whole and read" 'grep -qi red "$RX/exec2.out" && ! grep -qi "could not parse image" "$RX/exec2.err"'
 
 # The first model call carries the image: its estimate against the input the
 # provider counted. Text alone is estimated about a tenth over.
